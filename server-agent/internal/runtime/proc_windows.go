@@ -7,6 +7,17 @@ package runtime
 
 import "os/exec"
 
+// killedBySIGKILL is always false on Windows: there is no POSIX signal delivery
+// and no OOM-killer-sends-SIGKILL convention, so the cold-start RAM bootstrap
+// classifier (task 4.4) has no kill-signal signature to read here. A Windows
+// host therefore classifies a bootstrap death as memory pressure ONLY through
+// the RSS-near-budget signature (bootstrapDiedOfMemoryPressure), which needs no
+// signal. The parameter is unused, kept so the two builds share one signature.
+func killedBySIGKILL(err error) bool {
+	_ = err
+	return false
+}
+
 // setProcGroup is a no-op on Windows: syscall.SysProcAttr has no Setpgid
 // field there, and (see terminateGroup below) this platform has no
 // graceful group-signal equivalent for an arbitrary child process anyway.

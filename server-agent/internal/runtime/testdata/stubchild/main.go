@@ -35,6 +35,7 @@ func main() {
 	healthDelay := flag.Duration("health-delay", 0, "delay after which /health starts answering 200")
 	crashAfter := flag.Duration("crash-after", 0, "if > 0, exit with -exit-code this long after start")
 	exitCode := flag.Int("exit-code", 1, "process exit code used by -crash-after")
+	crashSignal := flag.Bool("crash-signal", false, "if set with -crash-after, the process SIGKILLs ITSELF after the delay instead of exiting with -exit-code -- stands in for an OOM-kill so a test can exercise the manager's memory-pressure classification (task 4.4)")
 	invocationLog := flag.String("invocation-log", "", "if set, append one line (this PID) per invocation -- proves how many times the binary was actually exec'd, independent of the manager's own bookkeeping")
 	envLog := flag.String("env-log", "", "if set, write what this process ACTUALLY received for -env-name, as \"set:<value>\" or \"unset\" -- the only way to observe a child's own environment from the parent's test, and it deliberately distinguishes an absent variable from one set to the empty string")
 	envName := flag.String("env-name", "", "the environment variable -env-log reports")
@@ -112,6 +113,17 @@ func main() {
 	if *crashAfter > 0 {
 		go func() {
 			time.Sleep(*crashAfter)
+			if *crashSignal {
+				// Stand in for an OOM-kill: the kernel terminating a process
+				// with SIGKILL is exactly what the manager's memory-pressure
+				// classifier reads (task 4.4). Sending it to our own PID makes
+				// cmd.Wait() in the parent report a signalled exit, which
+				// os.Exit cannot reproduce.
+				fmt.Fprintln(os.Stderr, "stubchild: scripted SIGKILL (simulated OOM)")
+				syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				// Unreachable once the signal lands; keep the goroutine honest.
+				select {}
+			}
 			fmt.Fprintln(os.Stderr, "stubchild: scripted crash")
 			os.Exit(*exitCode)
 		}()

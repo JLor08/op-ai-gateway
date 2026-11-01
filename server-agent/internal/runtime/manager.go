@@ -97,6 +97,71 @@ var (
 	notPermittedRetryInterval = 5 * time.Second
 )
 
+// Cold-start RAM bootstrap failure-handling knobs (task 4.4). These bound the
+// one escalation a stuck bootstrap is allowed, so that responding to memory
+// pressure can NEVER become an unbounded evict-and-retry ("C3") storm. They are
+// consts, not tunable vars: the whole point is a hard, non-configurable ceiling.
+const (
+	// ramBootstrapMaxRetries is the number of guarded evict-and-retry
+	// escalations a single stuck bootstrap may trigger before it falls back to
+	// the ordinary StateStartFailed crash-loop backoff. ONE: the first
+	// memory-pressure death evicts an idle process and retries once; a SECOND
+	// consecutive memory-pressure death does NOT escalate again (no further
+	// eviction), it goes straight to StateStartFailed. The per-spec counter it
+	// bounds (specState.ramBootstrapRetries) is reset only by a successful RAM
+	// measurement, so a later, unrelated pressure event can earn the one shot
+	// again -- but a bootstrap that keeps dying escalates at most once, and the
+	// eviction count stays bounded however many times the child OOMs.
+	ramBootstrapMaxRetries = 1
+	// ramBootstrapMeasureBeats bounds the TERMINATION case: a bootstrap that
+	// comes up healthy but is never measured would hold the RAMBootstrapInFlight
+	// interlock (task 4.1) forever -- and that interlock makes every OTHER RAM
+	// admission on the host Wait. After this many fruitless measurement beats
+	// (idleTickInterval each, so ~10 beats on the production cadence) the owner
+	// forces the spec to StateStartFailed so the interlock cannot hang the host
+	// indefinitely. The counter (specState.ramBootstrapBeats) only advances while
+	// a RAM measurer is installed and the spec is a healthy, still-unmeasured
+	// bootstrap; a real measurement resets it.
+	ramBootstrapMeasureBeats = 10
+	// ramPressureBudgetNum / ramPressureBudgetDen define "the last-measured RSS
+	// was near the host RAM budget at death" as a fraction (9/10 = 90%). A
+	// bootstrap whose own final RSS reached at least this share of the whole
+	// host-RAM pool is treated as having died of memory pressure even without a
+	// readable kill signal: one process alone that large was crowding the pool.
+	// Integer math (measuredRAM*Den >= budget*Num) avoids floating point. The
+	// fraction is deliberately high: the signature must not fire for a process
+	// that merely used a healthy slice of the pool, only for one that all but
+	// filled it.
+	ramPressureBudgetNum = 9
+	ramPressureBudgetDen = 10
+)
+
+// bootstrapDiedOfMemoryPressure classifies a bootstrap process's death from its
+// EXIT SIGNATURE and its LAST MEASUREMENT -- never free text (task 4.4). It
+// returns true for the two memory-pressure signatures and false for everything
+// else (a plain non-zero exit, a config/binary error), which is the genuine
+// crash the existing crash-loop backoff already handles unchanged.
+//
+//   - oomSignaled: the kernel killed the process with SIGKILL (the Linux OOM
+//     killer's signal; see killedBySIGKILL). The agent's OWN SIGKILL escalation
+//     never reaches here -- it rides the intentional-stop branch of
+//     onProcExited -- so a SIGKILL seen on the crash path is an external kill,
+//     overwhelmingly an OOM for a model mid-load.
+//   - the RSS-near-budget signature: the process's last measured resident RAM
+//     reached ramPressureBudgetNum/Den of the host-RAM budget at death. Needs a
+//     real budget (a hardware sample) and a real measurement; with either
+//     missing only the signal can classify, which is the conservative direction
+//     (fall through to a genuine crash rather than evict on a guess).
+func bootstrapDiedOfMemoryPressure(oomSignaled bool, measuredRAMMB, hostRAMBudgetMB int) bool {
+	if oomSignaled {
+		return true
+	}
+	if hostRAMBudgetMB > 0 && measuredRAMMB > 0 {
+		return measuredRAMMB*ramPressureBudgetDen >= hostRAMBudgetMB*ramPressureBudgetNum
+	}
+	return false
+}
+
 // Typed errors the router maps to HTTP
 // (docs/architecture/cross-cutting/agent-runtime-manager.md §4.3 "Stable
 // error codes"). Stable identity (errors.Is), stable wire code (Error()
@@ -990,6 +1055,34 @@ type specState struct {
 	// specState); an in-place config edit keeps the same specState and the marker.
 	vramBootstrapDone bool
 
+	// ramBootstrapRetries is the anti-storm counter for the cold-start RAM
+	// bootstrap's memory-pressure escalation (task 4.4). It counts the guarded
+	// evict-and-retry escalations THIS spec has spent on a stuck bootstrap, and is
+	// bounded by ramBootstrapMaxRetries: the first memory-pressure death
+	// increments it from 0 to 1 and escalates (evict an idle process, retry once);
+	// a death while it is already at the ceiling does NOT escalate again (no
+	// further eviction) and goes straight to StateStartFailed.
+	//
+	// It is RESET TO 0 ONLY BY A SUCCESSFUL RAM MEASUREMENT (applyMeasurement),
+	// which is the signal that the bootstrap resolved -- the RAM twin of
+	// vramBootstrapDone's resolve-on-measurement rule. That is what lets a later,
+	// unrelated pressure event earn the one shot again while still guaranteeing a
+	// bootstrap that keeps dying before it is ever measured escalates at most
+	// once. It is owner-goroutine state (§5.5), never cleared on exit: a stuck
+	// bootstrap's streak must survive its own restarts, exactly like
+	// vramBootstrapDone and unlike the per-process measurement.
+	ramBootstrapRetries int
+
+	// ramBootstrapBeats is the anti-hang counter for the TERMINATION case (task
+	// 4.4). A bootstrap that comes up HEALTHY but is never measured would hold the
+	// RAMBootstrapInFlight interlock (task 4.1) forever, and that interlock makes
+	// every other RAM admission on the host Wait. applyMeasurement advances this
+	// once per fruitless measurement beat while a RAM measurer is installed and
+	// the spec is still a healthy, unmeasured bootstrap; at ramBootstrapMeasureBeats
+	// the owner forces the spec to StateStartFailed so the interlock is bounded. A
+	// real measurement resets it to 0. Owner-goroutine state, like the counter above.
+	ramBootstrapBeats int
+
 	// waitingOnRAM is true while this spec's most recent admission verdict was a
 	// Wait the host-RAM pool contributed to (Decision.WaitOnRAM). It is the one
 	// kind of Wait a new hardware sample can end by itself, so it is what
@@ -1688,6 +1781,15 @@ func (o *owner) vramBootstrapEligible(st *specState) bool {
 	return o.m.measurer.Load() != nil && !st.vramBootstrapDone && specHasUnknownVRAM(st.spec)
 }
 
+// wantsUp reports whether anything wants st running right now: a queued request,
+// or an operator pin / force_running. It is admitAndStart's own admission
+// precondition, factored out so the cold-start bootstrap memory-pressure
+// escalation (onProcExited, task 4.4) can ask the identical question -- an
+// eviction to free RAM for a retry is worth nothing if no retry is coming.
+func (o *owner) wantsUp(st *specState) bool {
+	return len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
+}
+
 // admitAndStart is the single place that decides whether spec should move
 // toward Running right now, and if so starts it -- called for a freshly
 // queued request, after a backoff/drain/idle completion frees something up,
@@ -1710,8 +1812,7 @@ func (o *owner) admitAndStart(specID string) {
 	// before one: a spec nobody wants up, or one force-stopped, is no RAM waiter,
 	// and a stale true must never be able to select it for a sample wake.
 	st.waitingOnRAM = false
-	wantUp := len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
-	if !wantUp {
+	if !o.wantsUp(st) {
 		return
 	}
 	if st.spec.AdminState == "force_stopped" {
@@ -2032,8 +2133,62 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		// rule, so a cycle of zeros leaves a previous real number in place.
 		if mb := realRAM(c.ramByPID[t.pid]); mb > 0 {
 			st.measuredRAM = mb
+			// Task 4.4: a successful RAM measurement RESOLVES the cold-start
+			// bootstrap -- the RAM twin of vramBootstrapDone above. It resets
+			// BOTH bounds: the memory-pressure escalation counter (so a later,
+			// unrelated pressure event can earn the one guarded retry again) and
+			// the no-measurement termination counter (the interlock will clear on
+			// its own now that a number has landed).
+			st.ramBootstrapRetries = 0
+			st.ramBootstrapBeats = 0
+		} else if o.healthyBootstrapAwaitingMeasurement(st) {
+			// Task 4.4 TERMINATION: a bootstrap that is healthy but still
+			// unmeasured holds the RAMBootstrapInFlight interlock (task 4.1), and
+			// that interlock makes every OTHER RAM admission on the host Wait. If
+			// the measurement never arrives the interlock would hold forever, so
+			// this beat counter bounds it: after ramBootstrapMeasureBeats fruitless
+			// beats the spec is forced to a bounded StateStartFailed, releasing the
+			// interlock. It advances only while a RAM measurer is installed (else
+			// there is no beat to resolve it and P4a's interlock is already bounded
+			// by Starting), so a measurer-less host never reaches this.
+			st.ramBootstrapBeats++
+			if st.ramBootstrapBeats >= ramBootstrapMeasureBeats {
+				o.failBootstrapUnmeasured(st)
+			}
 		}
 	}
+}
+
+// healthyBootstrapAwaitingMeasurement reports whether st is a live, healthy
+// cold-start bootstrap still waiting for its first RAM measurement WHILE a RAM
+// measurer is installed -- the exact condition under which the
+// RAMBootstrapInFlight interlock holds past Starting (buildSnapshot). It gates
+// the no-measurement termination beat counter so that counter never advances for
+// a spec that is still loading, has already been measured, has a known demand, or
+// runs on a host with no RAM measurer to resolve it.
+func (o *owner) healthyBootstrapAwaitingMeasurement(st *specState) bool {
+	return o.m.ramMeasurer.Load() != nil &&
+		st.proc != nil && st.proc.everHealthy &&
+		st.state == StateRunning &&
+		needsRAMBootstrap(st.spec, st.measuredRAM)
+}
+
+// failBootstrapUnmeasured forces a healthy-but-never-measured bootstrap to a
+// bounded StateStartFailed (task 4.4 termination), mirroring handleStartResult's
+// start-timeout path exactly: record the failure, fail any queued waiter,
+// terminate the live process, and enter backoff. terminateNow marks the stop
+// intentional, so the eventual exit rests the spec in backoff via onProcExited's
+// deferred-backoff branch rather than being re-read as a crash -- and it never
+// reaches the memory-pressure classifier, which is correct: an unmeasured healthy
+// process is a measurement failure, not a memory-pressure death.
+func (o *owner) failBootstrapUnmeasured(st *specState) {
+	proc := st.proc
+	st.ramBootstrapBeats = 0
+	o.setState(st, StateStartFailed)
+	o.recordFailure(st, "runtime: RAM cold-start bootstrap never produced a measurement within the bootstrap deadline", -1, proc.log.Tail(2048))
+	o.failPending(st, ErrStartFailed)
+	o.terminateNow(st, proc)
+	o.enterBackoff(st)
 }
 
 // buildSnapshot assembles the pure PolicySnapshot Admit needs from current
@@ -2725,6 +2880,23 @@ func (o *owner) handleChildExited(c cmdChildExited) {
 
 func (o *owner) onProcExited(st *specState, exitErr error) {
 	proc := st.proc
+	// Task 4.4: capture the cold-start RAM bootstrap's memory-pressure
+	// classification inputs BEFORE the lines below clear them -- st.measuredRAM
+	// (the last RSS) is zeroed a few lines down, and the host-RAM budget is read
+	// off the LIVE process set, which still includes this one only while st.proc
+	// is non-nil. Classification reads the EXIT SIGNATURE and the LAST
+	// MEASUREMENT, never free text (bootstrapDiedOfMemoryPressure). The escalation
+	// itself fires only on a non-intentional, non-removed exit, far below.
+	bootstrapSpec := specHasUnknownRAM(st.spec)
+	oomSignaled := killedBySIGKILL(exitErr)
+	lastMeasuredRAM := st.measuredRAM
+	ramBudgetAtDeath := 0
+	if bootstrapSpec {
+		// Only the bootstrap classifier reads this, and it loops the spec set, so
+		// skip it for every ordinary (known-RAM) exit.
+		ramBudgetAtDeath = o.hostRAMBudgetSnapshot()
+	}
+
 	cancelTimer(o.m, &proc.killTimer)
 	cancelTimer(o.m, &proc.drainTimer)
 	cancelTimer(o.m, &proc.stableTimer)
@@ -2862,6 +3034,26 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 
 	exitCode := extractExitCode(exitErr)
 	tail := proc.log.Tail(2048)
+
+	// Task 4.4: a cold-start RAM bootstrap (unknown declared RAM) whose child
+	// died of memory pressure gets the guarded, single evict-and-retry
+	// escalation -- bounded so it can never become a fork-exec storm. Any other
+	// bootstrap death, and every non-bootstrap death, falls through to the
+	// unchanged crash / start-failure handling below. The classification is read
+	// from the exit signature and the last measurement captured at the top.
+	//
+	// Gated on the spec WANTING to be up: evicting an idle process to free RAM is
+	// worth something only when a retry is actually coming (a queued request, or a
+	// pinned / force_running spec). A bootstrap that served its request and then
+	// OOM'd with nothing waiting on it has no retry to help, so evicting an
+	// innocent neighbour for it would be pure harm -- it falls through to the
+	// ordinary crash path, which records the failure and does not restart it.
+	if bootstrapSpec && o.wantsUp(st) && bootstrapDiedOfMemoryPressure(oomSignaled, lastMeasuredRAM, ramBudgetAtDeath) {
+		o.handleBootstrapMemoryPressure(st, exitCode, tail)
+		o.wakeAdmissionCandidates()
+		return
+	}
+
 	if wasHealthy {
 		o.setState(st, StateCrashed)
 		o.recordFailure(st, fmt.Sprintf("runtime: process exited unexpectedly (exit code %d)", exitCode), exitCode, tail)
@@ -2878,6 +3070,122 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		o.enterBackoff(st)
 	}
 	o.wakeAdmissionCandidates()
+}
+
+// handleBootstrapMemoryPressure is task 4.4's escalation, and its ENTIRE design
+// goal is that it is BOUNDED -- it can never become a fork-exec / evict-and-retry
+// storm (the "C3" anti-goal). It is reached only from onProcExited, only for a
+// cold-start bootstrap (unknown declared RAM) whose death was classified as
+// memory pressure, and only on a non-intentional exit.
+//
+// The bound is a per-spec counter (st.ramBootstrapRetries) capped at
+// ramBootstrapMaxRetries == 1:
+//
+//   - FIRST memory-pressure death (counter below the cap): spend the one shot.
+//     Evict a single idle process to free real host RAM -- more than the
+//     guess-based admission arithmetic alone would free, since the OOM is
+//     evidence the real footprint exceeds the guess -- and retry the bootstrap
+//     ONCE. The retry itself is the ordinary crash-loop backoff (recordFailure +
+//     StateStartFailed + enterBackoff), so it composes with the existing backoff
+//     discipline and the queued request is kept for it. Exactly ONE idle process
+//     is evicted, however many idle processes exist.
+//
+//   - SECOND consecutive memory-pressure death (counter at the cap): do NOT
+//     escalate again. No eviction, no second shot. Fall back to the ordinary
+//     bounded StateStartFailed crash-loop backoff and fail the queued request.
+//     The counter is NOT reset here -- only a successful measurement resets it
+//     (applyMeasurement) -- so every further memory-pressure death keeps taking
+//     this branch, and no additional idle process is ever evicted for this stuck
+//     bootstrap. That is what makes the escalation un-loopable.
+//
+// Because the counter survives restarts and is cleared only by a real
+// measurement, a bootstrap that eventually comes up and is measured earns the
+// one shot again for a genuinely new, later pressure event -- while one that
+// keeps dying escalates at most once.
+func (o *owner) handleBootstrapMemoryPressure(st *specState, exitCode int, tail string) {
+	if st.ramBootstrapRetries >= ramBootstrapMaxRetries {
+		// Shot already spent on this stuck bootstrap: the ordinary bounded path,
+		// no eviction, no escalation.
+		o.setState(st, StateStartFailed)
+		o.recordFailure(st, fmt.Sprintf(
+			"runtime: RAM cold-start bootstrap died of memory pressure again (exit code %d); escalation already spent, backing off",
+			exitCode), exitCode, tail)
+		o.failPending(st, ErrStartFailed)
+		o.enterBackoff(st)
+		return
+	}
+
+	st.ramBootstrapRetries++
+	evicted := o.evictOneIdleForBootstrap(st.spec.ID)
+	o.setState(st, StateStartFailed)
+	msg := fmt.Sprintf(
+		"runtime: RAM cold-start bootstrap died of memory pressure (exit code %d); evicting an idle process and retrying once",
+		exitCode)
+	if !evicted {
+		msg = fmt.Sprintf(
+			"runtime: RAM cold-start bootstrap died of memory pressure (exit code %d); no idle process to evict, retrying once",
+			exitCode)
+	}
+	o.recordFailure(st, msg, exitCode, tail)
+	// Deliberately NOT failPending here: the queued request is the reason to
+	// retry, and the retry is exactly what this escalation grants it. The retry
+	// rides the backoff below; if it, too, dies of memory pressure the second
+	// death takes the branch above and fails the request then.
+	o.enterBackoff(st)
+}
+
+// evictOneIdleForBootstrap drain-stops ONE idle process to free host RAM for a
+// bootstrap retry, and returns whether it found one. It is the single eviction
+// the memory-pressure escalation is allowed; the caller's counter is what keeps
+// it to one per stuck bootstrap.
+//
+// It picks the oldest idle, unpinned, non-starting victim -- the same
+// isEvictable contract Admit uses (never a busy, pinned or still-loading
+// process, never the fork-exec-storm victim that clause exists to prevent) and
+// the same oldest-LastUsed, lowest-id tie-break Admit's sortOldestFirst uses, so
+// the choice is deterministic over a map-ordered spec set. It records the
+// beneficiary (drainedFor) so the victim's exit offers the freed slot to the
+// bootstrap first, exactly like an admission eviction.
+func (o *owner) evictOneIdleForBootstrap(beneficiaryID string) bool {
+	var victim *specState
+	for id, st := range o.specs {
+		if id == beneficiaryID || st.proc == nil || st.state != StateRunning {
+			continue
+		}
+		if !isEvictable(RunningProc{Pinned: st.spec.Pinned, Starting: st.state == StateStarting, InFlight: st.inFlight}) {
+			continue
+		}
+		if victim == nil ||
+			st.lastUsed.Before(victim.lastUsed) ||
+			(st.lastUsed.Equal(victim.lastUsed) && st.spec.ID < victim.spec.ID) {
+			victim = st
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	victim.drainedFor = appendUnique(victim.drainedFor, beneficiaryID)
+	o.beginDrain(victim.spec.ID)
+	return true
+}
+
+// hostRAMBudgetSnapshot computes the current host-RAM pool exactly as
+// buildSnapshot does -- the live MemAvailable plus the RAM the managed processes
+// are MEASURED to hold, minus the operator reserve (hostRAMBudgetMB) -- so the
+// memory-pressure classifier compares a dying bootstrap's last RSS against the
+// same pool admission weighs demand against. It must be read while the dying
+// process is still in the live set (st.proc non-nil), so onProcExited calls it
+// before clearing that. Returns 0 (unconstrained) before the first hardware
+// sample, which makes the RSS-near-budget signature a no-op there.
+func (o *owner) hostRAMBudgetSnapshot() int {
+	residentRAMMB := 0
+	for _, st := range o.specs {
+		if st.proc == nil {
+			continue
+		}
+		residentRAMMB += realRAM(st.measuredRAM)
+	}
+	return hostRAMBudgetMB(o.hostInfo(), residentRAMMB, o.hostRAMReserveMB)
 }
 
 // enterBackoff puts st into the crash-loop wait and schedules the retry.
