@@ -15,8 +15,16 @@ import (
 // else the spec's estimate. Admit trusts this number exactly as given; it
 // never re-derives or looks up an estimate elsewhere.
 type RunningProc struct {
-	SpecID   string
-	GPUs     map[int]int // gpu index -> effective VRAM MB
+	SpecID string
+	GPUs   map[int]int // gpu index -> effective VRAM MB
+	// RAMMB is the EFFECTIVE host RAM the process occupies, in MB: the live
+	// measurement when the agent has one, floored at the spec's pushed demand.
+	// It is host-scoped -- one number per process, not per GPU -- and Admit
+	// sums it against PolicySnapshot.HostRAMBudgetMB exactly as given. 0 means
+	// UNKNOWN (neither a demand nor a measurement), never "uses none": such a
+	// process contributes nothing to the sum and is not drawn as a victim for
+	// it, since evicting it would free nothing the arithmetic can count.
+	RAMMB    int
 	InFlight int
 	Pinned   bool
 	LastUsed time.Time // idle-victim ordering: oldest evicted first
@@ -53,6 +61,17 @@ type PolicySnapshot struct {
 	// SpecGPU.VRAMMB -- where 0 means unbounded, automatic, or unknown,
 	// never "off".
 	Budgets map[int]int
+	// HostRAMBudgetMB is the host-RAM pool in MB that every running process's
+	// RAMMB plus the candidate's own demand must fit under: the capacity
+	// available to the MANAGED set, a total like a per-GPU budget rather than a
+	// free-memory figure. It is ONE host-wide figure -- RAM is not per-GPU -- and
+	// 0 is UNCONSTRAINED, the same sentinel a per-GPU budget uses: Admit skips
+	// the RAM rule when it is <= 0, and that check lives there rather than in the
+	// builder for the same reason (see Budgets). owner.buildSnapshot sets it to
+	// the host's LIVE available memory plus the RAM the managed processes
+	// already hold, minus the operator's reserve (see hostRAMBudgetMB for why
+	// they are added back), and leaves it 0 before the first hardware sample.
+	HostRAMBudgetMB int
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --

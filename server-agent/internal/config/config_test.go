@@ -1547,3 +1547,54 @@ func TestVRAMHeadroomMBFromEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestHostRAMReserveMBFromEnv covers OP_AGENT_HOST_RAM_RESERVE_MB, the MB of
+// live-available host RAM the agent keeps out of the host-RAM pool it admits
+// runtime specs against. It is an env-only knob (no flag, no config-file key)
+// with a conservative built-in default of 2048 MB: unlike the VRAM headroom,
+// whose zero default holds nothing back, an agent that has not been told
+// otherwise must leave the host's other tenants some room. 0 is a legal,
+// meaningful value (reserve nothing) and is taken as itself, not as "unset";
+// anything that is not a non-negative base-10 integer degrades to the default
+// rather than failing the load -- a fat-fingered tuning knob must not take the
+// agent, and every model on the host, down with it. A negative value is never
+// honoured: it would inflate the budget past what the host has available.
+func TestHostRAMReserveMBFromEnv(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(env string, set bool) int {
+		t.Helper()
+		getenv := func(k string) string {
+			if set && k == "OP_AGENT_HOST_RAM_RESERVE_MB" {
+				return env
+			}
+			return ""
+		}
+		cfg, err := Load(base, getenv)
+		if err != nil {
+			t.Fatalf("Load(OP_AGENT_HOST_RAM_RESERVE_MB=%q): %v", env, err)
+		}
+		return cfg.HostRAMReserveMB
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want int
+	}{
+		{"unset defaults to 2048", "", false, 2048},
+		{"blank defaults to 2048", "   ", true, 2048},
+		{"explicit 0 is allowed", "0", true, 0},
+		{"a positive value is taken", "4096", true, 4096},
+		{"surrounding space is trimmed", " 512 ", true, 512},
+		{"negative is not honoured", "-5", true, 2048},
+		{"non-numeric falls back to the default", "lots", true, 2048},
+		{"a fractional value falls back to the default", "1.5", true, 2048},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := load(tc.env, tc.set); got != tc.want {
+				t.Errorf("HostRAMReserveMB for OP_AGENT_HOST_RAM_RESERVE_MB=%q = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}

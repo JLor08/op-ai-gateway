@@ -186,6 +186,18 @@ type ManagerOptions struct {
 	// here. Zero (the default) holds nothing back; a negative value is treated
 	// as zero, since it would inflate the budget past the device.
 	VRAMHeadroomMB int
+	// HostRAMReserveMB is the amount of memory, in MB, that is held back from
+	// the host-RAM pool admission budgets managed processes against (the pool
+	// is the host's live available memory plus what the managed processes
+	// already hold, minus this -- see hostRAMBudgetMB): room for the OS, the
+	// agent itself and whatever else shares the machine. It is OPERATOR
+	// configuration from the agent's own local settings
+	// (OP_AGENT_HOST_RAM_RESERVE_MB) -- the gateway never supplies it. Fixed
+	// for the process lifetime, like the other options here. The agent's config
+	// defaults it to 2048; zero here (the default of a caller that sets
+	// nothing, such as most tests) holds nothing back, and a negative value is
+	// treated as zero, since it would inflate the pool past what the host has.
+	HostRAMReserveMB int
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -215,9 +227,10 @@ type Manager struct {
 	// discipline: the owner only reads it, SetRAMMeasurer's caller only writes
 	// it, and an atomic swap needs no owner round-trip. nil (the default, and
 	// every host whose collector.NewRAMMeasurer returns nil) means no RAM is
-	// measured. It is read only by the off-owner dispatchMeasurement: in this
-	// phase measured RAM flows to Status/telemetry alone, so buildSnapshot,
-	// which feeds admission, does not consult it.
+	// measured. It is read only by the off-owner dispatchMeasurement;
+	// buildSnapshot, which feeds admission, never calls it -- it reads the last
+	// result the beat stored (specState.measuredRAM), so the admission path pays
+	// no measurement.
 	ramMeasurer atomic.Pointer[ramMeasurerFunc]
 
 	// hostInfo is the latest hardware figures the agent's collect loop pushed
@@ -266,6 +279,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		specsFromLocalFile: opts.SpecsFromLocalFile,
 		configFilesDir:     opts.ConfigFilesDir,
 		vramHeadroomMB:     max(0, opts.VRAMHeadroomMB),
+		hostRAMReserveMB:   max(0, opts.HostRAMReserveMB),
 		specs:              make(map[string]*specState),
 		allowedPairs:       map[[2]string]bool{},
 		logs:               m.logs,
@@ -527,10 +541,11 @@ func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 // It is SetMeasurer's twin and carries the same obligations, with one
 // difference in where it is called from. f is called ONLY from the recurring,
 // OFF-owner measurement (dispatchMeasurement) -- never from buildSnapshot,
-// because measured RAM is reported through Status but not yet read by
-// admission -- so it never runs on the owner goroutine. It must still be safe
-// for concurrent use (it is stateless in practice) and MUST BOUND ITS OWN
-// RUNTIME: it is tracked in the Manager's WaitGroup, so Close waits for it.
+// which only READS the last stored result (specState.measuredRAM) and so never
+// pays a measurement on the admission path -- so it never runs on the owner
+// goroutine. It must still be safe for concurrent use (it is stateless in
+// practice) and MUST BOUND ITS OWN RUNTIME: it is tracked in the Manager's
+// WaitGroup, so Close waits for it.
 //
 // The answer maps pid -> MB for the pids it could read; a pid it could not
 // read is simply absent. A value <= 0 is not a measurement (see realRAM).
@@ -887,8 +902,9 @@ type specState struct {
 	// SPEC'S CURRENT PROCESS, from the recurring measurement beat
 	// (applyMeasurement). 0 means UNKNOWN -- never measured, no RAM measurer
 	// installed, or only non-measurements (<= 0, see realRAM) seen -- and is
-	// never "this process needs no RAM". Reported via Status.MeasuredRAMMB;
-	// not read by admission in this phase.
+	// never "this process needs no RAM". Reported via Status.MeasuredRAMMB and
+	// read by buildSnapshot, where it is floored at the spec's pushed demand
+	// to become the process's RunningProc.RAMMB.
 	//
 	// ONE PROCESS PER SPEC, so this is a scalar: there is nothing to sum, and
 	// unlike measuredVRAM there is no per-GPU key to re-key. Cleared by
@@ -945,6 +961,10 @@ type owner struct {
 	// for the process lifetime, so a plain field like gpuVendor above; read
 	// only by buildSnapshot's auto-detected budgets.
 	vramHeadroomMB int
+	// hostRAMReserveMB is ManagerOptions.HostRAMReserveMB, never negative.
+	// Fixed for the process lifetime, so a plain field like vramHeadroomMB
+	// above; read only by buildSnapshot's host-RAM budget.
+	hostRAMReserveMB int
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.
@@ -1880,6 +1900,14 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 // admission is occasional, so the cost stays occasional; the recurring cost
 // is what had to move off the owner, and it did.
 func (o *owner) buildSnapshot() PolicySnapshot {
+	// The hardware sample is loaded ONCE and that one value feeds everything
+	// below that derives from it -- the detected per-GPU budgets and the
+	// host-RAM budget. The collect loop replaces the whole sample from another
+	// goroutine about once a second, so two separate loads could straddle a
+	// push and give one snapshot a VRAM budget from one sample and a RAM
+	// budget from the next.
+	hi := o.hostInfo()
+
 	pids := make([]int, 0, len(o.specs))
 	for _, st := range o.specs {
 		if st.proc != nil {
@@ -1892,6 +1920,10 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	}
 
 	running := make([]RunningProc, 0, len(o.specs))
+	// residentRAMMB is the host RAM the managed processes ACTUALLY hold right
+	// now -- their live measurements only, zero-guarded, never a pushed demand
+	// -- summed for the host-RAM budget below.
+	residentRAMMB := 0
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
@@ -1922,9 +1954,24 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		if byGPU != nil {
 			st.measuredVRAM = byGPU
 		}
+		// Host RAM follows the same rule as the VRAM charge above, spec-level
+		// instead of per GPU: max(live, pushed demand), the demand a FLOOR. The
+		// live figure is st.measuredRAM, which the recurring off-owner beat
+		// already stores zero-guarded; realRAM is applied again here because
+		// this is where "0 is unknown, never needs-none" is relied on -- a
+		// non-positive value must fall through to the demand floor rather than
+		// win over it. With neither, RAMMB stays 0 = unknown, which Admit treats
+		// as contributing nothing (see rule 6).
+		//
+		// The same live figure, WITHOUT the demand floor, is what this process
+		// is really holding, and it is what the host-RAM budget adds back (see
+		// hostRAMBudgetMB): the floor is a reservation, not residency.
+		liveRAM := realRAM(st.measuredRAM)
+		residentRAMMB += liveRAM
 		running = append(running, RunningProc{
 			SpecID:   id,
 			GPUs:     gpus,
+			RAMMB:    max(liveRAM, st.spec.RAMMB),
 			InFlight: st.inFlight,
 			Pinned:   st.spec.Pinned,
 			LastUsed: st.lastUsed,
@@ -1952,18 +1999,63 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	for _, b := range o.cfg.GPUBudgets {
 		budgets[b.Index] = b.BudgetMB
 	}
-	o.fillDetectedBudgets(budgets)
+	o.fillDetectedBudgets(budgets, hi)
 
 	return PolicySnapshot{
-		Running:      running,
-		MaxProcesses: o.cfg.MaxProcesses,
-		Budgets:      budgets,
-		Allowed:      o.allowedPairs,
+		Running:         running,
+		MaxProcesses:    o.cfg.MaxProcesses,
+		Budgets:         budgets,
+		HostRAMBudgetMB: hostRAMBudgetMB(hi, residentRAMMB, o.hostRAMReserveMB),
+		Allowed:         o.allowedPairs,
 	}
 }
 
+// hostRAMBudgetMB is the host-RAM pool admission budgets managed processes
+// against: the capacity available to the MANAGED set, i.e. the host's LIVE
+// available memory (the sample's MemAvailable) PLUS the RAM the managed
+// processes already hold (residentMB, their summed live measurements), minus
+// the operator's reserve.
+//
+// Why the add-back. MemAvailable is what the host can still hand out, so it
+// already EXCLUDES every byte a managed process holds. Rule 6 then sums those
+// same processes' RAM into its left-hand side, so a pool of plain
+// MemAvailable-minus-reserve would charge them twice and cap the managed set
+// at roughly half of what the host can really hold -- evicting, or Waiting, for
+// starts that fit. Adding the held RAM back makes the pool a TOTAL for the
+// managed set, the host-wide analogue of the per-GPU VRAM budget (a device
+// total, not device-available); in steady state the add-back and the sum's
+// running terms cancel, and a candidate is charged against genuinely free RAM.
+// Only the live MEASUREMENT is added back, never a process's demand: the demand
+// is a floor on what is reserved, not on what is resident, so a floored process
+// that has not (yet) grown into it keeps charging the difference and a process
+// with no reading adds back nothing (the conservative direction).
+//
+// Live-available rather than total-minus-reserve is still the self-correcting
+// choice on a shared host: a co-located workload that grows lowers MemAvailable
+// and so the pool on the next sample, with nothing to reconfigure.
+//
+// Two cases deliberately look alike and are not:
+//
+//   - No reading (MemAvailableMB <= 0: no sample yet, or the read failed) is
+//     UNKNOWN, not an exhausted host, and yields 0 -- the UNCONSTRAINED
+//     sentinel, same as an undetected GPU's budget -- so RAM admission is a
+//     no-op until the host has actually been looked at. What the managed
+//     processes hold cannot turn that into a constraint.
+//   - A real reading whose pool is at or below zero is the tightest host there
+//     is and yields 1, never 0. A plain max(0, ...) would hand the most
+//     RAM-starved host the one value that means "admit anything", the opposite
+//     of keeping everything back; fillDetectedBudgets floors its VRAM budget at
+//     1 for the identical reason. 1 MB is a real ceiling, so Admit refuses
+//     every spec with a known RAM demand until the host recovers.
+func hostRAMBudgetMB(hi HostInfo, residentMB, reserveMB int) int {
+	if hi.MemAvailableMB <= 0 {
+		return 0
+	}
+	return max(1, hi.MemAvailableMB+residentMB-reserveMB)
+}
+
 // fillDetectedBudgets makes VRAM accounting default-on: for every GPU the
-// hardware sample reported, a budget the operator did not set is filled in from
+// hardware sample hi reported, a budget the operator did not set is filled in from
 // the detected device total, minus the optional headroom. It edits budgets in
 // place, after the operator's rows have been copied verbatim.
 //
@@ -1992,11 +2084,11 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 // "total" its collector reports is the system memory the GPU has allocated at
 // that instant, which moves with load and is not a ceiling. Budgeting against
 // it would refuse a spec larger than whatever is allocated right now.
-func (o *owner) fillDetectedBudgets(budgets map[int]int) {
+func (o *owner) fillDetectedBudgets(budgets map[int]int, hi HostInfo) {
 	if o.gpuVendor == GPUVendorApple {
 		return
 	}
-	for idx, total := range o.hostInfo().GPUTotalsMB {
+	for idx, total := range hi.GPUTotalsMB {
 		if total <= 0 || budgets[idx] > 0 {
 			continue
 		}

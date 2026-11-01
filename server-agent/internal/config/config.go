@@ -301,7 +301,27 @@ type Config struct {
 	// and portal hand out. Operator-owned like every runtime setting here; the
 	// gateway can never supply it.
 	VRAMHeadroomMB int
+	// HostRAMReserveMB is how much memory, in MB, the agent keeps out of the
+	// host-RAM pool it admits runtime specs against: the pool is the host's LIVE
+	// available memory (MemAvailable) plus what the managed processes already
+	// hold, minus this reserve, so it is room for the OS, the agent and whatever
+	// else shares the machine, and the pool follows what the host has right now
+	// rather than a static total. One
+	// agent runs per host, so this single knob IS the per-host reserve. Unlike
+	// VRAMHeadroomMB it defaults to a conservative non-zero value
+	// (DefaultHostRAMReserveMB): an agent that has not been told otherwise must
+	// still leave the host's other tenants some room. 0 is a real value (reserve
+	// nothing); a negative one is not honoured, since it would inflate the pool
+	// past what the host has.
+	//
+	// Env-only (OP_AGENT_HOST_RAM_RESERVE_MB), for the same reason as
+	// VRAMHeadroomMB: a host-tuning escape hatch the gateway can never supply.
+	HostRAMReserveMB int
 }
+
+// DefaultHostRAMReserveMB is the host-RAM reserve, in MB, an agent holds back
+// when OP_AGENT_HOST_RAM_RESERVE_MB is unset or unusable.
+const DefaultHostRAMReserveMB = 2048
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
 // by an env var or flag overrides the file. TLSInsecure is a pointer so an
@@ -465,7 +485,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
 		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
 
-		VRAMHeadroomMB: resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
+		VRAMHeadroomMB:   resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
+		HostRAMReserveMB: resolveHostRAMReserveMB(getenv("OP_AGENT_HOST_RAM_RESERVE_MB")),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket
@@ -529,6 +550,24 @@ func resolveVRAMHeadroomMB(envVal string) int {
 		}
 	}
 	return 0
+}
+
+// resolveHostRAMReserveMB parses the env-only OP_AGENT_HOST_RAM_RESERVE_MB: a
+// non-negative base-10 integer number of MB, default DefaultHostRAMReserveMB.
+// 0 is a real value (reserve nothing), so it is accepted as itself rather than
+// treated as "unset". An absent, blank, malformed, fractional or negative value
+// yields the default instead of failing the whole load, for the same reason
+// resolveVRAMHeadroomMB does: refusing to start an agent -- taking every model
+// on the host down with it -- over a mistyped tuning knob would be out of
+// proportion. A negative reserve is specifically not honoured because it would
+// raise the host-RAM pool above the memory the host has available.
+func resolveHostRAMReserveMB(envVal string) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return DefaultHostRAMReserveMB
 }
 
 // resolveStringList applies env(if non-empty, comma-separated) > file for a

@@ -2832,9 +2832,10 @@ func TestManagerWithNoMeasurerInstalledIsUnaffected(t *testing.T) {
 // The RAM measurer is the host-RAM twin of the VRAM one: installed through its
 // own SetRAMMeasurer, dispatched by the same off-owner measurement beat, applied
 // through the same generation guard, and reported through Status. It has no GPU
-// axis, so its answer is one number per pid and Status carries one scalar. In
-// this phase the number flows to Status/telemetry ONLY -- admission does not
-// read it yet.
+// axis, so its answer is one number per pid and Status carries one scalar. The
+// number flows to Status/telemetry and, floored at the spec's pushed demand,
+// becomes the process's RunningProc.RAMMB that host-RAM admission sums; the
+// same live figure, without the floor, is what the host-RAM budget adds back.
 
 // TestRAMMeasurementReachesStatus is the headline case: a running spec's own
 // child pid is handed to the RAM measurer by the recurring beat, and the answer
@@ -4359,4 +4360,289 @@ func TestManagerEnforcesAutoDetectedBudget(t *testing.T) {
 			t.Fatalf("EnsureRunning(6000 MB, 4000 MB headroom on an 8000 MB GPU) = %v, want ErrNotPermitted", err)
 		}
 	})
+}
+
+// snapshotHostRAMBudget builds a snapshot on an owner holding hi as its latest
+// hardware sample (nil = none pushed yet) and reserveMB as its host-RAM
+// reserve, and returns the HostRAMBudgetMB Admit will decide on. The owner's one
+// live generation has no RAM measurement, so nothing managed is resident as far
+// as the budget is concerned.
+func snapshotHostRAMBudget(t *testing.T, hi *HostInfo, reserveMB int) int {
+	t.Helper()
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.hostRAMReserveMB = reserveMB
+	if hi != nil {
+		o.m.SetHostInfo(*hi)
+	}
+	return o.buildSnapshot().HostRAMBudgetMB
+}
+
+// TestSnapshotHostRAMBudgetFromLiveAvailable pins the basis of the host-RAM
+// pool: it is built from the host's LIVE available memory (the sample's
+// MemAvailable), so it follows what is obtainable right now rather than a
+// static total-minus-reserve. That is the point on a shared host -- a
+// co-located docker stack that grows shrinks the budget on the very next
+// sample, with no configuration change. With nothing managed resident the pool
+// is exactly MemAvailable minus the operator's reserve; what the managed
+// processes hold is added back on top (see
+// TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold).
+func TestSnapshotHostRAMBudgetFromLiveAvailable(t *testing.T) {
+	const reserve = 2048
+
+	if got, want := snapshotHostRAMBudget(t, &HostInfo{MemAvailableMB: 30000}, reserve), 27952; got != want {
+		t.Errorf("HostRAMBudgetMB with MemAvailable 30000 and reserve %d = %d, want %d", reserve, got, want)
+	}
+
+	// The budget tracks the LIVE sample: the same owner, a newer push.
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.hostRAMReserveMB = reserve
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 30000})
+	if got, want := o.buildSnapshot().HostRAMBudgetMB, 27952; got != want {
+		t.Fatalf("HostRAMBudgetMB before the host shrank = %d, want %d", got, want)
+	}
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 12000})
+	if got, want := o.buildSnapshot().HostRAMBudgetMB, 9952; got != want {
+		t.Errorf("HostRAMBudgetMB after MemAvailable fell to 12000 = %d, want %d -- the budget must follow live available memory, not a total that never moves", got, want)
+	}
+
+	t.Run("a zero reserve holds nothing back", func(t *testing.T) {
+		if got, want := snapshotHostRAMBudget(t, &HostInfo{MemAvailableMB: 30000}, 0), 30000; got != want {
+			t.Errorf("HostRAMBudgetMB with reserve 0 = %d, want %d", got, want)
+		}
+	})
+}
+
+// TestSnapshotHostRAMBudgetWithoutASampleIsUnconstrained: before the first
+// hardware sample (or when the read failed) MemAvailableMB is 0, which means "no
+// reading", not "an exhausted host". The budget then stays 0 -- the same
+// UNCONSTRAINED sentinel every per-GPU budget uses -- so RAM admission is a
+// no-op until the host has actually been looked at, instead of refusing every
+// spec on an agent that has not sampled yet.
+func TestSnapshotHostRAMBudgetWithoutASampleIsUnconstrained(t *testing.T) {
+	for name, hi := range map[string]*HostInfo{
+		"no sample pushed yet":     nil,
+		"a sample with no RAM":     {GPUTotalsMB: map[int]int{0: 24000}},
+		"an explicit zero reading": {MemAvailableMB: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := snapshotHostRAMBudget(t, hi, 2048); got != 0 {
+				t.Errorf("HostRAMBudgetMB = %d without a MemAvailable reading, want 0 (unconstrained)", got)
+			}
+		})
+	}
+}
+
+// TestSnapshotHostRAMBudgetReserveAtOrAboveAvailableStaysConstrained: a host
+// that has LESS available memory than the reserve asks to keep back is the
+// tightest host there is, and its budget must not collapse to 0 -- 0 is the
+// UNCONSTRAINED sentinel, so a naive max(0, available-reserve) would turn the
+// most RAM-starved host into one that admits anything (the opposite of keeping
+// everything back), exactly the hazard fillDetectedBudgets floors its VRAM
+// budget at 1 MB for. 1 MB is a real ceiling: Admit then refuses (Wait) every
+// spec with a known RAM demand until the host recovers.
+func TestSnapshotHostRAMBudgetReserveAtOrAboveAvailableStaysConstrained(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		available int
+		reserve   int
+	}{
+		{"reserve above available", 1500, 2048},
+		{"reserve exactly available", 2048, 2048},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, want := snapshotHostRAMBudget(t, &HostInfo{MemAvailableMB: tc.available}, tc.reserve), 1; got != want {
+				t.Errorf("HostRAMBudgetMB with MemAvailable %d and reserve %d = %d, want %d -- 0 would mean unconstrained", tc.available, tc.reserve, got, want)
+			}
+		})
+	}
+}
+
+// TestRunningProcRAMEffectiveIsMax pins the RAM a running process is charged
+// to the host pool: max(live measurement, the pushed spec demand). The demand
+// (Spec.RAMMB) is already the gateway's max(persisted measurement, estimate), so
+// it is a FLOOR here -- a fresher, higher live reading raises the charge, a
+// reading below it (a transient dip) never lowers it, and a reading that is not
+// a real measurement (<= 0, see realRAM) is absent and charges the demand. The
+// charge is never "this process needs no RAM": with neither a demand nor a
+// reading it stays 0 = unknown, which Admit treats as contributing nothing.
+func TestRunningProcRAMEffectiveIsMax(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		demand int
+		live   int
+		want   int
+	}{
+		{"live above the demand raises it", 4096, 5000, 5000},
+		{"live below the demand is floored at the demand", 4096, 3000, 4096},
+		{"live equal to the demand charges the demand", 4096, 4096, 4096},
+		{"live zero is unknown and charges the demand", 4096, 0, 4096},
+		{"a negative live reading is not a credit either", 4096, -1, 4096},
+		{"a live reading alone is charged when no demand is known", 0, 3000, 3000},
+		{"neither a demand nor a reading stays unknown", 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.RAMMB = tc.demand
+			o, st := newSnapshotOwner(spec, 4242, nil)
+			st.measuredRAM = tc.live
+
+			snap := o.buildSnapshot()
+
+			if len(snap.Running) != 1 {
+				t.Fatalf("Running = %+v, want exactly the one live generation", snap.Running)
+			}
+			if got := snap.Running[0].RAMMB; got != tc.want {
+				t.Errorf("RunningProc.RAMMB = %d for demand %d and live reading %d, want %d -- the charge is max(live, demand), the demand a floor and a non-positive reading no measurement at all", got, tc.demand, tc.live, tc.want)
+			}
+		})
+	}
+}
+
+// addRunningRAMSpec puts a second live generation on o, with the given pushed
+// RAM demand and live RAM measurement, so a test can sum several of them.
+func addRunningRAMSpec(o *owner, id string, demandMB, measuredMB int) {
+	spec := baseSpec(id, "model-"+id)
+	spec.RAMMB = demandMB
+	o.specs[id] = &specState{
+		spec:        spec,
+		state:       StateRunning,
+		proc:        &runningProc{specID: id, pid: 5000 + len(o.specs)},
+		measuredRAM: measuredMB,
+	}
+}
+
+// TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold pins the other half
+// of the pool's basis. MemAvailable already EXCLUDES the RAM the managed
+// processes hold, and rule 6 sums those same processes into its left-hand side,
+// so a pool of plain MemAvailable - reserve would charge them twice and cap the
+// managed set at about half the host. The pool therefore adds back the RAM the
+// managed processes actually hold: their LIVE MEASUREMENTS, zero-guarded, and
+// never a pushed demand -- the demand is a reservation floor, not residency.
+func TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold(t *testing.T) {
+	const (
+		reserve   = 2048
+		available = 30000
+	)
+	budget := func(t *testing.T, mutate func(o *owner)) int {
+		t.Helper()
+		spec := baseSpec("spec-a", "model-a")
+		spec.RAMMB = 4096
+		o, _ := newSnapshotOwner(spec, 4242, nil)
+		o.hostRAMReserveMB = reserve
+		o.m.SetHostInfo(HostInfo{MemAvailableMB: available})
+		if mutate != nil {
+			mutate(o)
+		}
+		return o.buildSnapshot().HostRAMBudgetMB
+	}
+
+	t.Run("nothing measured adds back nothing, whatever the demand", func(t *testing.T) {
+		// spec-a has a 4096 MB demand and no reading: the demand is charged by
+		// Admit's sum, but it is not residency, so the pool is untouched.
+		if got, want := budget(t, nil), available-reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with an unmeasured 4096 MB-demand process, want %d", got, want)
+		}
+	})
+	t.Run("a measured process is added back", func(t *testing.T) {
+		got := budget(t, func(o *owner) { o.specs["spec-a"].measuredRAM = 6000 })
+		if want := available + 6000 - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with 6000 MB resident, want %d", got, want)
+		}
+	})
+	t.Run("every managed process is added back", func(t *testing.T) {
+		got := budget(t, func(o *owner) {
+			o.specs["spec-a"].measuredRAM = 6000
+			addRunningRAMSpec(o, "spec-b", 0, 4000)
+			addRunningRAMSpec(o, "spec-c", 9000, 0) // demand only: nothing resident to add back
+		})
+		if want := available + 6000 + 4000 - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with 6000 + 4000 MB resident, want %d", got, want)
+		}
+	})
+	t.Run("a non-positive reading is no measurement", func(t *testing.T) {
+		got := budget(t, func(o *owner) { o.specs["spec-a"].measuredRAM = -500 })
+		if want := available - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with a negative reading, want %d -- it must not be subtracted", got, want)
+		}
+	})
+	t.Run("a process that is not running holds nothing", func(t *testing.T) {
+		got := budget(t, func(o *owner) {
+			addRunningRAMSpec(o, "spec-b", 0, 4000)
+			o.specs["spec-b"].proc = nil // exited: no live generation, nothing resident
+		})
+		if want := available - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with an exited process holding a stale 4000 MB, want %d", got, want)
+		}
+	})
+	t.Run("what the managed set holds cannot make a missing sample a constraint", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, 4242, nil)
+		o.hostRAMReserveMB = reserve
+		st.measuredRAM = 6000
+		if got := o.buildSnapshot().HostRAMBudgetMB; got != 0 {
+			t.Errorf("HostRAMBudgetMB = %d with no hardware sample, want 0 (unconstrained)", got)
+		}
+	})
+	t.Run("a starved host stays constrained however little the managed set holds", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, 4242, nil)
+		o.hostRAMReserveMB = reserve
+		o.m.SetHostInfo(HostInfo{MemAvailableMB: 1000})
+		st.measuredRAM = 500 // 1000 + 500 - 2048 < 0: floored at 1, never the 0 sentinel
+		if got, want := o.buildSnapshot().HostRAMBudgetMB, 1; got != want {
+			t.Errorf("HostRAMBudgetMB = %d, want %d -- 0 would mean unconstrained", got, want)
+		}
+	})
+}
+
+// TestBuildSnapshotReadsHostInfoOnce pins that one snapshot is built from ONE
+// hardware sample. buildSnapshot derives two things from HostInfo -- the
+// detected per-GPU budgets and the host-RAM budget -- and the collect loop
+// replaces the whole sample (SetHostInfo) about once a second, concurrently.
+// Reading it twice lets a push land between the two reads, handing Admit a VRAM
+// budget from one sample and a RAM budget from the next.
+//
+// The pusher alternates between two samples whose figures are tied together
+// (GPU total and available RAM move as a pair); every snapshot must carry the
+// pair of ONE of them, never half of each.
+func TestBuildSnapshotReadsHostInfoOnce(t *testing.T) {
+	const reserve = 1000
+	a := HostInfo{GPUTotalsMB: map[int]int{0: 8000}, MemAvailableMB: 11000}
+	b := HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 31000}
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.hostRAMReserveMB = reserve
+	o.m.SetHostInfo(a)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for flip := false; ; flip = !flip {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if flip {
+				o.m.SetHostInfo(a)
+			} else {
+				o.m.SetHostInfo(b)
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	for i := 0; i < 20000; i++ {
+		snap := o.buildSnapshot()
+		vram, ram := snap.Budgets[0], snap.HostRAMBudgetMB
+		fromA := vram == 8000 && ram == 11000-reserve
+		fromB := vram == 24000 && ram == 31000-reserve
+		if !fromA && !fromB {
+			t.Fatalf("snapshot %d mixed two hardware samples: VRAM budget %d with host-RAM budget %d -- load HostInfo once per snapshot", i, vram, ram)
+		}
+	}
 }
