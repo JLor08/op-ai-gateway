@@ -74,12 +74,12 @@ var (
 	// spec is Starting.
 	healthPollInterval = 500 * time.Millisecond
 	// idleTickInterval is the owner's housekeeping beat: how often it scans
-	// for idle-timeout unloads AND how often it dispatches a VRAM
+	// for idle-timeout unloads AND how often it dispatches a VRAM and a RAM
 	// measurement of the live managed processes (dispatchMeasurement). One
 	// beat rather than two because both are "sweep the current process set
 	// and act on what has changed", and because neither does any real work
-	// on the owner goroutine -- the measurement's subprocess runs elsewhere
-	// and posts its answer back.
+	// on the owner goroutine -- the measurement (a subprocess for VRAM,
+	// in-process reads for RAM) runs elsewhere and posts its answer back.
 	idleTickInterval = 15 * time.Second
 	// notPermittedRetryInterval bounds how often StateNotPermitted /
 	// StatePendingVRAMUnknown are re-evaluated (fix round 2 / R2-1). A
@@ -1600,9 +1600,11 @@ func (o *owner) admitAndStart(specID string) {
 	}
 }
 
-// dispatchMeasurement asks the installed measurer for the real per-GPU VRAM
-// of every live managed process, OFF the owner goroutine, and has the answer
-// posted back as cmdMeasured.
+// dispatchMeasurement asks the installed measurers for the real per-GPU VRAM
+// (SetMeasurer) and the real resident host RAM (SetRAMMeasurer) of every live
+// managed process, OFF the owner goroutine, and has both answers posted back
+// together as one cmdMeasured. The paragraphs below were written for the VRAM
+// measurer and are about it unless they say otherwise.
 //
 // THIS IS THE ONLY PATH THAT EVER MEASURES A SPEC THAT IS MERELY RUNNING, and
 // its absence was the F1 defect. buildSnapshot (below) also consults the

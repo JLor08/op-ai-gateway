@@ -2888,46 +2888,104 @@ func TestRAMMeasurementReachesStatus(t *testing.T) {
 	}
 }
 
-// TestRAMMeasuredZeroIgnored is the zero-guard (realRAM), the RAM twin of
-// realMeasurement. A measured 0 means "unknown", never "this process needs no
-// RAM": admitted as a measurement it would charge the spec nothing once
-// admission reads it. Here the measurer answers 0 for every beat, so the field
-// must stay at its unknown value.
+// TestApplyMeasurementRAMZeroGuardAndGeneration is the zero-guard (realRAM), the
+// RAM twin of realMeasurement, and the generation guard that scopes a reading to
+// the process it was taken for. A measured 0 means "unknown", never "this
+// process needs no RAM": admitted as a measurement it would charge the spec
+// nothing once admission reads it, and stored it would make Status() report a 0
+// the portal cannot tell apart from "never measured". So a value <= 0 must leave
+// st.measuredRAM exactly as it was -- which also keeps a previous real number
+// from being erased by one unknown cycle.
 //
-// It waits for several full measure-and-apply cycles before asserting. At most
-// one measurement is ever outstanding, so the measurer being called a second
-// time proves the first one's result was already applied -- an assertion made
-// before that would pass for the wrong reason.
-func TestRAMMeasuredZeroIgnored(t *testing.T) {
-	skipOnWindows(t)
-	shrinkTimings(t)
-	m := newTestManager(t, allowlistPolicy())
+// It drives applyMeasurement directly, like
+// TestApplyMeasurementNeverStoresANonPositiveMeasurement for VRAM, and asserts on
+// st.measuredRAM and the Status snapshot rather than on run state. An earlier
+// shape of this test ran a real child and waited for several measurement beats
+// before asserting the spec was Running; three beats can elapse while the stub
+// child is still `starting` (the health poll races the 30 ms beat), so that
+// assertion was flaky and proved nothing about the guard.
+func TestApplyMeasurementRAMZeroGuardAndGeneration(t *testing.T) {
+	const pid = 4242
+	cases := []struct {
+		name     string
+		previous int
+		ramByPID map[int]int
+		want     int
+	}{
+		{name: "a measured zero does not become a measurement", previous: 0, ramByPID: map[int]int{pid: 0}, want: 0},
+		{name: "a measured zero does not erase a previous real value", previous: 1500, ramByPID: map[int]int{pid: 0}, want: 1500},
+		{name: "a negative value is not a measurement", previous: 0, ramByPID: map[int]int{pid: -5}, want: 0},
+		{name: "a negative value does not erase a previous real value", previous: 1500, ramByPID: map[int]int{pid: -5}, want: 1500},
+		{name: "a real measurement is stored", previous: 0, ramByPID: map[int]int{pid: 1500}, want: 1500},
+		{name: "a newer real measurement replaces the previous one", previous: 1500, ramByPID: map[int]int{pid: 2000}, want: 2000},
+		{name: "a pid the measurer did not answer keeps the previous value", previous: 1500, ramByPID: map[int]int{pid + 1: 9999}, want: 1500},
+		{name: "no answer at all keeps the previous value", previous: 1500, ramByPID: nil, want: 1500},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			o, st := newSnapshotOwner(spec, pid, nil)
+			st.measuredRAM = tc.previous
 
-	var calls atomic.Int64
-	m.SetRAMMeasurer(func(pids []int) map[int]int {
-		out := make(map[int]int, len(pids))
-		for _, p := range pids {
-			out[p] = 0
+			o.applyMeasurement(cmdMeasured{
+				targets:  []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+				ramByPID: tc.ramByPID,
+			})
+
+			if st.measuredRAM != tc.want {
+				t.Errorf("st.measuredRAM = %d after measuring %v (previously %d), want %d -- a value <= 0 is not a measurement", st.measuredRAM, tc.ramByPID, tc.previous, tc.want)
+			}
+			if got := o.snapshotStatus()[0].MeasuredRAMMB; got != tc.want {
+				t.Errorf("Status.MeasuredRAMMB = %d, want %d (the same value st.measuredRAM holds)", got, tc.want)
+			}
+		})
+	}
+
+	// The generation guard, for RAM. A measurement is in flight for as long as
+	// the measurer takes, and in that window the spec can restart: pids are
+	// recycled, so the pid alone cannot say whose reading it is. The target
+	// names the PROCESS it was taken for; a reading taken for a generation that
+	// is no longer current must not be written onto its successor -- even when
+	// the new process has the very same pid.
+	t.Run("a superseded generation is not written onto its successor", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, pid, nil)
+		old := st.proc
+		st.proc = &runningProc{specID: spec.ID, pid: pid} // restarted: new generation, recycled pid
+
+		o.applyMeasurement(cmdMeasured{
+			targets:  []measureTarget{{specID: spec.ID, proc: old, pid: pid}},
+			ramByPID: map[int]int{pid: 1500},
+		})
+
+		if st.measuredRAM != 0 {
+			t.Fatalf("st.measuredRAM = %d after a measurement taken for the PREVIOUS process, want 0 -- one process's RAM attributed to another", st.measuredRAM)
 		}
-		calls.Add(1)
-		return out
+
+		// And the current generation is still measurable: the guard rejects the
+		// stale reading, not the spec.
+		o.applyMeasurement(cmdMeasured{
+			targets:  []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+			ramByPID: map[int]int{pid: 1800},
+		})
+		if st.measuredRAM != 1800 {
+			t.Fatalf("st.measuredRAM = %d after a measurement for the current process, want 1800", st.measuredRAM)
+		}
 	})
 
-	spec := baseSpec("spec-a", "model-a")
-	spec.Pinned = true
-	m.Apply(Config{Specs: []Spec{spec}})
+	t.Run("a measurement for a spec that no longer exists is dropped", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, pid, nil)
 
-	waitUntil(t, 5*time.Second, "the RAM measurer has run for several beats", func() bool {
-		return calls.Load() >= 3
+		o.applyMeasurement(cmdMeasured{
+			targets:  []measureTarget{{specID: "spec-gone", proc: st.proc, pid: pid}},
+			ramByPID: map[int]int{pid: 1500},
+		})
+
+		if st.measuredRAM != 0 {
+			t.Fatalf("st.measuredRAM = %d after a measurement for a different (removed) spec, want 0", st.measuredRAM)
+		}
 	})
-
-	st := statusFor(m, "spec-a")
-	if st == nil || st.State != StateRunning {
-		t.Fatalf("Status()[spec-a] = %+v, want a running spec", st)
-	}
-	if st.MeasuredRAMMB != 0 {
-		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d after the measurer answered 0, want 0 (unknown) -- a measured 0 must be dropped, not recorded", st.MeasuredRAMMB)
-	}
 }
 
 // TestRAMMeasuredZeroDoesNotOverwriteARealValue is the other half of the
