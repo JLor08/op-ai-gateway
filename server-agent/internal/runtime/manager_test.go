@@ -4646,3 +4646,288 @@ func TestBuildSnapshotReadsHostInfoOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestRAMOnlyHostAdmission is the host-RAM pool proved end to end on a host with
+// NO GPU: no GPU total in the hardware sample, no VRAM measurer, and specs that
+// declare no GPU at all -- only a spec-level RAM demand. It drives the real
+// Apply -> EnsureRunning -> buildSnapshot -> Admit -> drain-stop chain, so what
+// is pinned is that RAM alone admits, evicts and holds back, with every VRAM
+// mechanism absent rather than merely idle.
+//
+// No RAM measurer is installed either, so nothing running has a live reading and
+// the pool adds nothing back for the managed set: it is exactly MemAvailable
+// minus the reserve, 20000 - 2000 = 18000 MB, and every running process is
+// charged at its demand floor. (The measured regime, where what the managed
+// processes hold is added back, is TestRAMOnlyHostPoolAddsBackMeasuredRAM.) The
+// co-residency matrix is opened for every pair so the RAM pool is the ONLY thing
+// that can refuse or evict anything below.
+//
+//  1. spec-a (10000) starts and goes idle.
+//  2. spec-b (6000) starts and stays busy: 16000 fits 18000, so a is left alone
+//     -- a fitting start evicts nobody.
+//  3. spec-c (8000) overflows (24000 > 18000). The one idle process, a, is drained
+//     -- the only victim, host-wide, though no card is involved -- and b, busy,
+//     is untouched. 14000 fits.
+//  4. a is asked for again while b and c are both busy: 24000 > 18000 and nothing
+//     idle can be drained, so it waits out its admission timeout and nobody is
+//     evicted.
+//  5. spec-d declares 20000, more than the whole 18000 pool: no eviction could
+//     ever make it fit, so it is refused (ErrNotPermitted) rather than left to
+//     wait, and nobody is evicted for it. The refusal is a durable verdict, so it
+//     is only issued against a pool consistent with the running set: spec-a exited
+//     in step 3 and the host has not yet reported its memory back, so the request
+//     first waits, and it is refused once two samples have landed that show what b
+//     and c actually hold (6000 left of 20000). The sample wake delivers it.
+func TestRAMOnlyHostAdmission(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.RAMMB = 10000
+	specA.AdmissionWaitTimeoutSeconds = 1 // step 4 must give up quickly
+	specB := baseSpec("spec-b", "model-b")
+	specB.RAMMB = 6000
+	specC := baseSpec("spec-c", "model-c")
+	specC.RAMMB = 8000
+	specD := baseSpec("spec-d", "model-d")
+	specD.RAMMB = 20000
+	for _, s := range []Spec{specA, specB, specC, specD} {
+		if len(s.GPUs) != 0 {
+			t.Fatalf("premise: %s declares GPUs %v, this test is about a spec with RAM alone", s.ID, s.GPUs)
+		}
+	}
+
+	m := NewManager(ManagerOptions{
+		Policy:           allowlistPolicy(),
+		Getenv:           func(string) string { return "" },
+		HostRAMReserveMB: 2000,
+	})
+	t.Cleanup(m.Close)
+	if m.measurer.Load() != nil {
+		t.Fatal("premise: a VRAM measurer is installed, this test is about a host that has none")
+	}
+	if m.ramMeasurer.Load() != nil {
+		t.Fatal("premise: a RAM measurer is installed, this test is about the regime where nothing is measured")
+	}
+	// A hardware sample with host RAM and nothing else: no GPU total at all.
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000})
+	m.Apply(Config{
+		Specs: []Spec{specA, specB, specC, specD},
+		Coresident: [][2]string{
+			{"spec-a", "spec-b"}, {"spec-a", "spec-c"}, {"spec-b", "spec-c"},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	running := func(id string) bool {
+		st := statusFor(m, id)
+		return st != nil && st.State == StateRunning
+	}
+
+	// 1. spec-a starts, then goes idle (evictable).
+	_, releaseA, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-a) = %v, want it admitted: 10000 MB fits an 18000 MB pool", err)
+	}
+	releaseA()
+
+	// 2. spec-b fits beside it and stays busy; spec-a must not be touched.
+	_, releaseB, err := m.EnsureRunning(ctx, "model-b")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-b) = %v, want it admitted: 10000 + 6000 MB fits an 18000 MB pool", err)
+	}
+	defer releaseB()
+	if !running("spec-a") || !running("spec-b") {
+		t.Fatalf("spec-a = %+v, spec-b = %+v, want both running: a start that fits the pool must evict nobody", statusFor(m, "spec-a"), statusFor(m, "spec-b"))
+	}
+
+	// 3. spec-c overflows the pool: the idle spec-a is the one victim.
+	_, releaseC, err := m.EnsureRunning(ctx, "model-c")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-c) = %v, want it admitted after draining the idle spec-a", err)
+	}
+	defer releaseC()
+	waitUntil(t, 3*time.Second, "spec-a drained to make room in the RAM pool", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStopped
+	})
+	if !running("spec-b") || !running("spec-c") {
+		t.Fatalf("spec-b = %+v, spec-c = %+v, want both running: only the idle process may be drained, never the busy one", statusFor(m, "spec-b"), statusFor(m, "spec-c"))
+	}
+
+	// 4. spec-a again, with the only two holders busy: it must wait, not evict.
+	if _, release, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrAdmissionBlocked) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("EnsureRunning(model-a) with both holders busy = %v, want ErrAdmissionBlocked (a Wait that timed out, nothing evictable)", err)
+	}
+	if !running("spec-b") || !running("spec-c") {
+		t.Fatalf("spec-b = %+v, spec-c = %+v, want both still running: a blocked admission must not evict", statusFor(m, "spec-b"), statusFor(m, "spec-c"))
+	}
+
+	// 5. spec-d is larger than the whole pool: terminal, and nobody is drained.
+	// The sample has said 20000 available throughout, which is no longer true
+	// (b and c hold 14000), and spec-a's exit is too recent for the pool to be
+	// trusted for a durable verdict, so deliver the samples a real collect loop
+	// would: two that show what is actually left.
+	resultD := make(chan error, 1)
+	go func() {
+		_, release, err := m.EnsureRunning(ctx, "model-d")
+		if err == nil {
+			release()
+		}
+		resultD <- err
+	}()
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000 - 14000})
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000 - 14000})
+	select {
+	case err := <-resultD:
+		if !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning(model-d) = %v, want ErrNotPermitted: 20000 MB cannot fit an 18000 MB pool whatever is evicted", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("EnsureRunning(model-d) was neither refused nor admitted within 4s of two samples consistent with the running set, want the terminal ErrNotPermitted")
+	}
+	if st := statusFor(m, "spec-d"); st == nil || st.State != StateNotPermitted || st.LastError == nil {
+		t.Fatalf("Status()[spec-d] = %+v, want not_permitted with the reason recorded", st)
+	}
+	if !running("spec-b") || !running("spec-c") {
+		t.Fatalf("spec-b = %+v, spec-c = %+v, want both still running: a terminal refusal must not evict", statusFor(m, "spec-b"), statusFor(m, "spec-c"))
+	}
+}
+
+// TestRAMOnlyHostPoolAddsBackMeasuredRAM is the measured regime of the same
+// no-GPU host, end to end, and the reason the pool adds back what the managed
+// processes hold. A RAM measurer reports spec-a at 10000 MB and spec-b at 6000
+// MB; the host sample then says only 4000 MB is available (they hold the other
+// 16000 of a 20000 MB host), with a reserve of 2000. MemAvailable already
+// excludes what a and b hold, so the pool is 4000 + 16000 - 2000 = 18000 MB --
+// and the genuinely free headroom is 4000 - 2000 = 2000 MB.
+//
+//   - A 2000 MB spec-c fits that headroom exactly and is admitted with nothing
+//     evicted. A pool of plain MemAvailable - reserve (2000) would charge a
+//     and b's 16000 on top of it and refuse it.
+//   - A 2001 MB spec-d is one MB over the headroom; with every holder busy it
+//     waits out its admission timeout and nobody is evicted.
+//
+// Everything is held busy and the sample never has to change, so no step depends
+// on the next hardware sample arriving: the admission outcomes are
+// deterministic.
+func TestRAMOnlyHostPoolAddsBackMeasuredRAM(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.RAMMB = 10000
+	specB := baseSpec("spec-b", "model-b")
+	specB.RAMMB = 6000
+	specC := baseSpec("spec-c", "model-c")
+	specC.RAMMB = 2000
+	specD := baseSpec("spec-d", "model-d")
+	specD.RAMMB = 2001
+	specD.AdmissionWaitTimeoutSeconds = 1
+	specs := []Spec{specA, specB, specC, specD}
+	var pairs [][2]string
+	for i := range specs {
+		for j := i + 1; j < len(specs); j++ {
+			pairs = append(pairs, [2]string{specs[i].ID, specs[j].ID})
+		}
+	}
+
+	m := NewManager(ManagerOptions{
+		Policy:           allowlistPolicy(),
+		Getenv:           func(string) string { return "" },
+		HostRAMReserveMB: 2000,
+	})
+	t.Cleanup(m.Close)
+	var heldMB sync.Map // child pid -> MB it holds, filled in as children start
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			if mb, ok := heldMB.Load(p); ok {
+				out[p] = mb.(int)
+			}
+		}
+		return out
+	})
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000}) // an idle host: nothing is running yet
+	m.Apply(Config{Specs: specs, Coresident: pairs})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start := func(model, specID string, holdsMB int) {
+		t.Helper()
+		_, release, err := m.EnsureRunning(ctx, model)
+		if err != nil {
+			t.Fatalf("EnsureRunning(%s) = %v, want it admitted", model, err)
+		}
+		t.Cleanup(release) // held busy for the whole test
+		st := statusFor(m, specID)
+		if st == nil || st.PID == 0 {
+			t.Fatalf("Status()[%s] = %+v, want a live child", specID, st)
+		}
+		heldMB.Store(st.PID, holdsMB)
+		waitUntil(t, 5*time.Second, specID+" reports the RAM it holds", func() bool {
+			st := statusFor(m, specID)
+			return st != nil && st.MeasuredRAMMB == holdsMB
+		})
+	}
+	start("model-a", "spec-a", 10000)
+	start("model-b", "spec-b", 6000)
+
+	// The host now reports what is left once a and b hold their 16000 MB.
+	m.SetHostInfo(HostInfo{MemAvailableMB: 4000})
+
+	_, releaseC, err := m.EnsureRunning(ctx, "model-c")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-c) = %v, want it admitted: 2000 MB fits the 2000 MB of genuinely free headroom (4000 available - 2000 reserve) once what a and b hold is added back to the pool", err)
+	}
+	defer releaseC()
+	for _, id := range []string{"spec-a", "spec-b", "spec-c"} {
+		if st := statusFor(m, id); st == nil || st.State != StateRunning {
+			t.Fatalf("Status()[%s] = %+v, want running: a start that fits the free headroom must evict nobody", id, st)
+		}
+	}
+
+	if _, release, err := m.EnsureRunning(ctx, "model-d"); !errors.Is(err, ErrAdmissionBlocked) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("EnsureRunning(model-d) = %v, want ErrAdmissionBlocked: 2001 MB is one over the free headroom and every holder is busy", err)
+	}
+	for _, id := range []string{"spec-a", "spec-b", "spec-c"} {
+		if st := statusFor(m, id); st == nil || st.State != StateRunning {
+			t.Fatalf("Status()[%s] = %+v, want still running: a blocked admission must not evict", id, st)
+		}
+	}
+}
+
+// TestRAMOnlyHostWithoutASampleIsUnconstrained is the paired case: before the
+// first hardware sample there is no MemAvailable reading, the host-RAM pool is
+// the UNCONSTRAINED 0, and a spec declaring an absurd RAM demand starts exactly
+// as it did before RAM was an admission axis. Without it the test above could
+// pass against an implementation that simply refuses every RAM-bearing spec.
+func TestRAMOnlyHostWithoutASampleIsUnconstrained(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.RAMMB = 1_000_000
+	m := NewManager(ManagerOptions{
+		Policy:           allowlistPolicy(),
+		Getenv:           func(string) string { return "" },
+		HostRAMReserveMB: 2000,
+	})
+	t.Cleanup(m.Close)
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-a) before any hardware sample = %v, want nil: no MemAvailable reading means an unconstrained pool", err)
+	}
+	release()
+}
