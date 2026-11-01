@@ -2152,6 +2152,12 @@ func TestNeedsTranscriptionErrorRelay(t *testing.T) {
 		{"transcription 400", endpointTranscription, 400, true},
 		{"transcription 500, audio.cpp's answer to a client error", endpointTranscription, 500, true},
 		{"transcription 502", endpointTranscription, 502, true},
+		{"details 200", endpointTranscriptionDetails, 200, false},
+		{"details 299", endpointTranscriptionDetails, 299, false},
+		{"details 199 is outside the 2xx window", endpointTranscriptionDetails, 199, true},
+		{"details 300 is outside the 2xx window", endpointTranscriptionDetails, 300, true},
+		{"details 400", endpointTranscriptionDetails, 400, true},
+		{"details 500, audio.cpp's answer to a client error", endpointTranscriptionDetails, 500, true},
 		{"speech 500 has its own relay", endpointSpeech, 500, false},
 		{"images 500 has its own relay", endpointImages, 500, false},
 		{"chat 500", endpointChat, 500, false},
@@ -2163,6 +2169,126 @@ func TestNeedsTranscriptionErrorRelay(t *testing.T) {
 			}
 		})
 	}
+}
+
+// isTranscriptionEndpoint is the one place that says which endpoints are the
+// transcription family: the plain one and its one-shot diarized twin. Every other
+// endpoint, speech first (it shares the openai_audio flavor), is outside it.
+func TestIsTranscriptionEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint sessionEndpoint
+		want     bool
+	}{
+		{"transcription", endpointTranscription, true},
+		{"transcription details", endpointTranscriptionDetails, true},
+		{"speech shares the flavor but is no transcription", endpointSpeech, false},
+		{"chat", endpointChat, false},
+		{"responses", endpointResponses, false},
+		{"messages", endpointMessages, false},
+		{"images", endpointImages, false},
+		{"image edits", endpointImagesEdit, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTranscriptionEndpoint(tc.endpoint); got != tc.want {
+				t.Fatalf("isTranscriptionEndpoint(%v) = %v, want %v", tc.endpoint, got, tc.want)
+			}
+		})
+	}
+}
+
+// The details endpoint is a new, distinct session endpoint: it must not collide with
+// any other member of the enum (the endpoint, not the flavor, picks the upstream path),
+// and it is appended LAST so no existing member's value moves.
+func TestTranscriptionDetailsEndpointIsADistinctAppendedMember(t *testing.T) {
+	if endpointTranscriptionDetails != endpointTranscription+1 {
+		t.Fatalf("endpointTranscriptionDetails = %d, want it appended right after endpointTranscription (%d)", endpointTranscriptionDetails, endpointTranscription)
+	}
+	for _, other := range []sessionEndpoint{endpointChat, endpointResponses, endpointMessages, endpointImages, endpointImagesEdit, endpointSpeech, endpointTranscription} {
+		if endpointTranscriptionDetails == other {
+			t.Fatalf("endpointTranscriptionDetails collides with endpoint %d", other)
+		}
+	}
+}
+
+// The details relay is reached through proxyNative with the real response side: a
+// buffered 2xx is metered from the timing block and written verbatim, and a non-2xx is
+// normalised as the TRANSCRIPTION's error (transcription.upstream_error), never as
+// speech's -- the endpoint differs from endpointTranscription, and a negative
+// speech-versus-transcription test would otherwise file it under speech. Every row
+// names the details path on both path columns and is billed in audio seconds.
+func TestProxyNativeRelaysTheDetailsEndpointLikeATranscription(t *testing.T) {
+	const detailsPath = "/v1/audio/transcriptions/details"
+	relay := func(srv *Server, rec *httptest.ResponseRecorder) {
+		target := routing.Target{Provider: routing.ProviderVLLM, ServerID: "srv-sd-turbo-fake", Model: "asr-model"}
+		req := httptest.NewRequest(http.MethodPost, detailsPath, strings.NewReader(`{}`))
+		srv.proxyNative(rec, req, nativeRelay{
+			token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true},
+			target:   target,
+			path:     upstreamPath(target, apiFlavorSpeech, endpointTranscriptionDetails),
+			raw:      []byte(`{}`),
+			pfReq:    inference.Request{Model: "asr-model", RequestedModel: "asr-model", APIFlavor: apiFlavorSpeech},
+			endpoint: endpointTranscriptionDetails,
+		})
+	}
+	t.Run("a 2xx is buffered, metered from timing and written verbatim", func(t *testing.T) {
+		buf, restore := withCapturedSlog(t)
+		t.Cleanup(restore)
+		body := `{"text":"hello there","speaker_turns":[{"start_sample":0,"end_sample":16000,"speaker_id":"0","text":"hello there"}],"sample_rate":16000,"timing":{"audio_duration_ms":3000}}`
+		srv := newImageCapableTestServerWithProvider(t, plainTextErrorProxyProvider{status: http.StatusOK, contentType: "application/json", body: body})
+		rec := httptest.NewRecorder()
+
+		relay(srv, rec)
+
+		if rec.Code != http.StatusOK || rec.Body.String() != body {
+			t.Fatalf("status/body = %d/%q, want 200 and the upstream's document byte for byte", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Length"); got != fmt.Sprint(len(body)) {
+			t.Fatalf("Content-Length = %q, want %d: only the buffered relay declares the body's length, so the details relay did not take it", got, len(body))
+		}
+		ev := lastUsageEvent(t, srv)
+		if ev.Status != "success" || ev.ErrorCode != "" {
+			t.Fatalf("row = %q/%q, want success with no error code", ev.Status, ev.ErrorCode)
+		}
+		if ev.BillingQuantity != 3 {
+			t.Errorf("BillingQuantity = %v, want 3 (timing.audio_duration_ms is milliseconds)", ev.BillingQuantity)
+		}
+		if ev.ReqPath != detailsPath || ev.ProviderPath != detailsPath {
+			t.Errorf("ReqPath/ProviderPath = %q/%q, want %s for both", ev.ReqPath, ev.ProviderPath, detailsPath)
+		}
+		requireSpeechNonTokenRow(t, ev)
+		if errs := errorLogs(buf); len(errs) != 0 {
+			t.Errorf("a well-formed details relay logged at Error: %+v (the speech setter must not run for it)", errs)
+		}
+	})
+	t.Run("a non-2xx is normalised as a transcription error", func(t *testing.T) {
+		srv := newImageCapableTestServerWithProvider(t, plainTextErrorProxyProvider{status: http.StatusBadRequest, contentType: "application/json", body: `{"error":"model not loaded"}`})
+		rec := httptest.NewRecorder()
+
+		relay(srv, rec)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want the upstream's 400; body = %s", rec.Code, rec.Body.String())
+		}
+		var doc struct {
+			Error struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+				Code    string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("body %q is no OpenAI error object: %v", rec.Body.String(), err)
+		}
+		if doc.Error.Code != transcriptionUpstreamErrorCode || doc.Error.Type != transcriptionUpstreamErrorType || doc.Error.Message != "model not loaded" {
+			t.Fatalf("error = %+v, want the transcription's normalised object around the upstream's message", doc.Error)
+		}
+		ev := lastUsageEvent(t, srv)
+		if ev.Status != "error" || ev.ReqPath != detailsPath || ev.ProviderPath != detailsPath || ev.BillingQuantity != 0 {
+			t.Fatalf("row = %q/%q/%q/%v, want an error row on %s with no quantity", ev.Status, ev.ReqPath, ev.ProviderPath, ev.BillingQuantity, detailsPath)
+		}
+		requireSpeechNonTokenRow(t, ev)
+	})
 }
 
 // The gateway's own classification of a normalised transcription error is API

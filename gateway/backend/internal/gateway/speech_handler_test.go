@@ -844,6 +844,8 @@ func TestNeedsSpeechErrorRelay(t *testing.T) {
 		{"the openai_audio flavor with the zero-value endpoint is still speech", apiFlavorSpeech, endpointChat, 500, true},
 		{"transcription shares the flavor but has its own relay", apiFlavorSpeech, endpointTranscription, 500, false},
 		{"transcription 400", apiFlavorSpeech, endpointTranscription, 400, false},
+		{"details shares the flavor but has the transcription's relay", apiFlavorSpeech, endpointTranscriptionDetails, 500, false},
+		{"details 400", apiFlavorSpeech, endpointTranscriptionDetails, 400, false},
 		{"images 500 has its own relay", apiFlavorImages, endpointImages, 500, false},
 		{"openai chat 500", "openai", endpointChat, 500, false},
 		{"openai_responses 500", "openai_responses", endpointResponses, 500, false},

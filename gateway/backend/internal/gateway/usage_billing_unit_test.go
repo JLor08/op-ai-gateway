@@ -615,6 +615,18 @@ func TestSetTranscriptionBillingQuantity(t *testing.T) {
 			t.Fatalf("Error logs = %+v, want none", errs)
 		}
 	})
+	t.Run("a clean details success sets the quantity from the same timing block", func(t *testing.T) {
+		buf, restore := withCapturedSlog(t)
+		t.Cleanup(restore)
+		meta := usageMeta{ReqPath: "/v1/audio/transcriptions/details"}
+		setTranscriptionBillingQuantity(&meta, exchange(endpointTranscriptionDetails), body, "success")
+		if meta.BillingQuantity != 3 {
+			t.Fatalf("BillingQuantity = %v, want 3", meta.BillingQuantity)
+		}
+		if errs := errorLogs(buf); len(errs) != 0 {
+			t.Fatalf("Error logs = %+v, want none", errs)
+		}
+	})
 	for _, tc := range []struct {
 		name     string
 		endpoint sessionEndpoint
@@ -622,6 +634,7 @@ func TestSetTranscriptionBillingQuantity(t *testing.T) {
 	}{
 		{"a speech exchange is not a transcription", endpointSpeech, "success"},
 		{"a failed relay bills nothing", endpointTranscription, "error"},
+		{"a failed details relay bills nothing", endpointTranscriptionDetails, "error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := withCapturedSlog(t)
@@ -660,6 +673,19 @@ func TestSetSpeechBillingQuantityIgnoresATranscriptionExchange(t *testing.T) {
 		}
 		if errs := errorLogs(buf); len(errs) != 0 {
 			t.Fatalf("Error logs = %+v, want none: no duration HEADER is expected on a transcription", errs)
+		}
+	})
+	t.Run("a details exchange is left alone and silent too", func(t *testing.T) {
+		buf, restore := withCapturedSlog(t)
+		t.Cleanup(restore)
+		meta := usageMeta{ReqPath: "/v1/audio/transcriptions/details"}
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscriptionDetails), http.Header{}, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscriptionDetails), header, "success")
+		if meta.BillingQuantity != 0 {
+			t.Fatalf("BillingQuantity = %v, want 0", meta.BillingQuantity)
+		}
+		if errs := errorLogs(buf); len(errs) != 0 {
+			t.Fatalf("Error logs = %+v, want none: no duration HEADER is expected on a details transcription", errs)
 		}
 	})
 	for _, endpoint := range []sessionEndpoint{endpointSpeech, endpointChat} {

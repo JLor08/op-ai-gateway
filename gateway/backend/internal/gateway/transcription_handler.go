@@ -935,6 +935,19 @@ func peekStreamingRefusal(resp *provider.ProxyResponse, sentence string) bool {
 	return err == nil && bytes.Contains(head, []byte(sentence))
 }
 
+// isTranscriptionEndpoint reports whether endpoint belongs to the transcription family:
+// the plain transcription and its one-shot diarized twin (the details endpoint). Both
+// share the openai_audio flavor with speech and both answer with the same JSON document
+// shape (a transcript and a timing block), so everything on the response side that must
+// tell a transcription from a speech request -- the buffered success relay, the billing
+// quantity, the upstream-error relay, the capture's binary-body test -- asks this
+// instead of comparing against one endpoint, and a later member of the family is one
+// line here rather than a hunt through the relays. What stays exact is whatever only
+// the plain transcription does, streaming above all: see isStreamedTranscription.
+func isTranscriptionEndpoint(endpoint sessionEndpoint) bool {
+	return endpoint == endpointTranscription || endpoint == endpointTranscriptionDetails
+}
+
 // isStreamedTranscription reports whether a transcription's 2xx answer is relayed as
 // a stream rather than buffered: the request asked for one (the relay's pfReq.Stream)
 // AND the upstream answered with an event stream. Either alone is not enough. An
@@ -942,6 +955,11 @@ func peekStreamingRefusal(resp *provider.ProxyResponse, sentence string) bool {
 // and its document is buffered, read for its timing block and written verbatim like
 // any one-shot transcription; and an event stream nobody asked for is no stream this
 // relay was set up for.
+//
+// The match on endpoint is EXACT, not isTranscriptionEndpoint: only the plain
+// transcription streams. The details endpoint is one-shot (audio.cpp refuses a stream
+// there), so it is never relayed as one, whatever the request carried and whatever
+// the upstream answered with -- its 2xx is always buffered.
 func isStreamedTranscription(endpoint sessionEndpoint, streamRequested bool, header http.Header) bool {
 	if endpoint != endpointTranscription || !streamRequested {
 		return false
@@ -982,8 +1000,9 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 }
 
 // setTranscriptionBillingQuantity records, on meta, how many seconds of audio a
-// finished transcription relay transcribed -- and does nothing at all for any other
-// endpoint or a relay that did not finish cleanly, leaving BillingQuantity at 0 so
+// finished transcription relay transcribed (the plain endpoint's and the details
+// endpoint's alike: both answer with the same timing block) -- and does nothing at all
+// for any other endpoint or a relay that did not finish cleanly, leaving BillingQuantity at 0 so
 // nothing is asserted about what was transcribed. It is setSpeechBillingQuantity's
 // twin and shares its reasoning: the quantity is the RESPONSE's own statement (never
 // the request's), and is only trusted once the full body reached the client
@@ -1001,7 +1020,7 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 // Only the body's size is logged: the body is the transcript, which is the user's
 // content and has no business in a log line.
 func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, status string) {
-	if ex.endpoint != endpointTranscription || status != "success" {
+	if !isTranscriptionEndpoint(ex.endpoint) || status != "success" {
 		return
 	}
 	seconds, ok := transcriptionDurationSeconds(body)
@@ -1025,11 +1044,11 @@ const (
 
 // needsTranscriptionErrorRelay reports whether a native-passthrough response must go
 // through relayTranscriptionUpstreamError instead of the buffered success path: a
-// transcription whose upstream answered a non-2xx status. It is needsSpeechErrorRelay's
-// twin and is keyed on the endpoint, not the flavor string the two share; the status
-// test is the 2xx window proxyNative's own success path uses.
+// transcription (plain or details) whose upstream answered a non-2xx status. It is
+// needsSpeechErrorRelay's twin and is keyed on the endpoint, not the flavor string the
+// two share; the status test is the 2xx window proxyNative's own success path uses.
 func needsTranscriptionErrorRelay(endpoint sessionEndpoint, statusCode int) bool {
-	return endpoint == endpointTranscription && (statusCode < 200 || statusCode >= 300)
+	return isTranscriptionEndpoint(endpoint) && (statusCode < 200 || statusCode >= 300)
 }
 
 // normalizeTranscriptionUpstreamError turns a transcription upstream's non-2xx body

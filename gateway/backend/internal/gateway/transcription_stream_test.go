@@ -747,6 +747,8 @@ func TestIsStreamedTranscription(t *testing.T) {
 		{"asked, answered with no type", endpointTranscription, true, http.Header{}, false},
 		{"not asked, answered with an event stream", endpointTranscription, false, sse, false},
 		{"speech never", endpointSpeech, true, sse, false},
+		{"the details endpoint never streams, whatever was asked", endpointTranscriptionDetails, true, sse, false},
+		{"the details endpoint, not asked, answered with an event stream", endpointTranscriptionDetails, false, sse, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isStreamedTranscription(tc.endpoint, tc.requested, tc.header); got != tc.want {

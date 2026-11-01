@@ -226,14 +226,14 @@ func isAudioContentType(contentType string) bool {
 // is missing or wrong. It is narrow on purpose: a speech request answered with an
 // error, and every other flavor, are decided by the Content-Type alone.
 //
-// The flavor alone cannot say "speech": a transcription shares openai_audio, and
-// its 2xx answer is a JSON document -- the transcript -- that the capture exists to
-// keep. The endpoint carves it out (captureInput.Endpoint). The carve-out is
+// The flavor alone cannot say "speech": a transcription (the plain one and the details
+// one) shares openai_audio, and its 2xx answer is a JSON document -- the transcript --
+// that the capture exists to keep. The endpoint carves it out (captureInput.Endpoint). The carve-out is
 // negative, as needsSpeechErrorRelay's is, so a speech capture built without an
 // endpoint (the zero value is endpointChat) is still redacted: the failure that
 // would leave is a transcript lost to a summary, never a WAV in the envelope.
 func isBinarySpeechResponse(in *captureInput) bool {
-	return in.APIFlavor == apiFlavorSpeech && in.Endpoint != endpointTranscription && in.HTTPStatus >= 200 && in.HTTPStatus < 300
+	return in.APIFlavor == apiFlavorSpeech && !isTranscriptionEndpoint(in.Endpoint) && in.HTTPStatus >= 200 && in.HTTPStatus < 300
 }
 
 // captureResponseBody returns what the envelope stores as the response body, and
