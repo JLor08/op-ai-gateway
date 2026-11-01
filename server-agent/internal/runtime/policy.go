@@ -72,6 +72,21 @@ type PolicySnapshot struct {
 	// already hold, minus the operator's reserve (see hostRAMBudgetMB for why
 	// they are added back), and leaves it 0 before the first hardware sample.
 	HostRAMBudgetMB int
+	// HostRAMCeilingMB is the MOST the host-RAM pool could possibly offer, and it
+	// exists for one reader: the terminal own-demand refusal (ramOwnDemandRefusal),
+	// which must never call a candidate hopeless on the strength of a budget that
+	// is merely UNDERSTATED. HostRAMBudgetMB deliberately is conservative -- it
+	// adds back only what the managed processes have been MEASURED to hold, and
+	// follows a sample that lags the running set -- which is right for the
+	// admission arithmetic (it can only refuse or evict, never over-admit) but
+	// wrong for a durable verdict, because the budget is transiently too low while
+	// a process is still loading or unmeasured, and for a sample or two after one
+	// has exited (the victim of the eviction that was just done for this very
+	// candidate). The ceiling is the generous reading of the same quantity; the
+	// builder documents exactly how (owner.buildSnapshot). 0 means no ceiling was
+	// computed: Admit then falls back to HostRAMBudgetMB, and a ceiling BELOW the
+	// budget is ignored, so a caller that sets only the budget gets the plain rule.
+	HostRAMCeilingMB int
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
@@ -109,7 +124,7 @@ type PolicySnapshot struct {
 //     outcomes would be actively misleading (Wait would hang the caller
 //     until its admission-wait timeout on every single request; Evict
 //     would ask for a drain-stop that can never restore a fit). Two
-//     States share this shape, carrying three distinct causes between
+//     States share this shape, carrying four distinct causes between
 //     them, and Message is what tells those causes apart:
 //   - StatePendingVRAMUnknown: a VRAM demand on one of the contested
 //     GPUs is unknown -- the CANDIDATE's own (rule 4) or a running
@@ -128,7 +143,7 @@ type PolicySnapshot struct {
 //     clears with nothing evicted, but measurement is NVIDIA-only
 //     (§5.3), so on an AMD, Apple-silicon or GPU-less host nothing
 //     clears it except an operator filling the estimate in.
-//   - StateNotPermitted: a durable operator-configuration block. Two
+//   - StateNotPermitted: a durable operator-configuration block. Three
 //     causes reach it from here. (1) Spec's own declared demand on
 //     some GPU exceeds that GPU's budget all by itself, whatever else
 //     is running -- an over-estimated VRAM demand, or a budget shrunk
@@ -137,11 +152,14 @@ type PolicySnapshot struct {
 //     (2) A pinned occupant of unknown demand holds one of spec's
 //     GPUs AND the co-residency pair is not permitted, where the
 //     closed matrix cell -- not the missing VRAM number -- is what
-//     actually blocks. Neither resolves by eviction or by waiting.
-//     Both carry the same "configuration error, visible in the
-//     portal, not transient" meaning the design doc already assigns
-//     StateNotPermitted for a refused binary/directory, so Message is
-//     the only thing separating all three.
+//     actually blocks. (3) Spec's own known RAM demand exceeds the
+//     whole host-RAM budget all by itself -- the host-wide twin of (1),
+//     evaluated just after it for the same reason (ramOwnDemandRefusal).
+//     None resolves by eviction or by waiting. All carry the same
+//     "configuration error, visible in the portal, not transient"
+//     meaning the design doc already assigns StateNotPermitted for a
+//     refused binary/directory, so Message is the only thing separating
+//     all four.
 type Decision struct {
 	OK     bool
 	Reason State // "" unless a terminal case above applies
@@ -153,6 +171,16 @@ type Decision struct {
 	Message string
 	Evict   []string // spec IDs to drain-stop first, oldest LastUsed first; never nil
 	Wait    bool
+	// WaitOnRAM is set only together with Wait, and only when rule 6 (the
+	// host-RAM pool) was among what blocked: the idle processes could not free
+	// enough. It tells the caller this particular Wait can end by itself the
+	// moment the hardware sample refreshes -- the pool is built from the host's
+	// live MemAvailable, and the sample that follows a victim's exit is the one
+	// that finally shows its freed RAM -- unlike a Wait on the matrix, the
+	// process limit or a VRAM budget, which no new sample can change. The
+	// manager re-asks a WaitOnRAM spec when a sample lands, and nothing else
+	// (see owner.wakeOnHostSample).
+	WaitOnRAM bool
 }
 
 // PairKey canonicalizes an (a, b) spec-ID pair to lexical a<=b order, so an
@@ -388,6 +416,64 @@ func ownDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
 	return Decision{}, false
 }
 
+// ramOwnDemandRefusal is rule 6's own-demand terminal, the host-wide twin of
+// ownDemandRefusal: spec's KNOWN RAM demand exceeds the whole host-RAM pool all
+// by itself. It returns the refusal, or ok == false when the rule does not
+// apply or the demand fits.
+//
+// The pool is a TOTAL for the managed set (see PolicySnapshot.HostRAMBudgetMB),
+// so the smallest sum rule 6 can ever compute is the candidate alone -- every
+// other process evicted. A demand above the pool therefore cannot be made to
+// fit by any eviction, and waiting cannot help either (nothing the managed set
+// does changes the pool; only a non-managed workload releasing memory, or the
+// operator lowering the estimate or the reserve, can). Answering Wait would
+// hang the caller to its admission timeout on every request with nothing in the
+// portal to explain it, so it is the same durable "configuration error, not
+// transient" block as the per-GPU case. Like that one it is a report, not a
+// permanent verdict: the manager re-evaluates after notPermittedRetryInterval
+// and the spec starts on its own once the pool has grown back.
+//
+// WHAT IT COMPARES AGAINST IS THE CEILING, NOT THE BUDGET, and that is the
+// difference from the per-GPU rule it otherwise mirrors. A GPU budget is a fixed
+// device total; this pool is rebuilt from a live sample, so the budget can be
+// transiently too LOW -- a process still loading or not yet measured has not
+// been added back, and for a sample or two after a process exits the pool has
+// already lost it while MemAvailable has not yet gained it. That last case is
+// not an edge: it is exactly the state the beneficiary of an eviction is
+// re-admitted in, and refusing it here turned a legitimate eviction into a
+// durable ErrNotPermitted (its pending request failed, with a message about a
+// budget it did not actually exceed) that no later sample could take back,
+// because a refused spec is not a waiter. Against the ceiling -- the most the
+// pool could be offering -- a candidate is refused only when it could not fit
+// even then; anything between the budget and the ceiling falls through to the
+// arithmetic, which Waits (and so is woken by the next sample) instead of
+// refusing or evicting for a start that cannot yet be shown to fit.
+//
+// IT READS ONLY spec AND the snapshot's two RAM figures, which is why it may run
+// before every rule that looks at the running set, for the reason
+// ownDemandRefusal does: no ordering can change its verdict.
+//
+// It is skipped for both sentinels. A budget <= 0 is unconstrained, and
+// spec.RAMMB == 0 is an UNKNOWN demand, never "needs none" -- not gated here,
+// since routing it to a first measurement is the cold-start bootstrap's job.
+func ramOwnDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
+	if snap.HostRAMBudgetMB <= 0 || spec.RAMMB <= 0 {
+		return Decision{}, false
+	}
+	limit := max(snap.HostRAMCeilingMB, snap.HostRAMBudgetMB)
+	if spec.RAMMB <= limit {
+		return Decision{}, false
+	}
+	return Decision{
+		Reason: StateNotPermitted,
+		Message: fmt.Sprintf(
+			"spec %s: RAM demand %d MB exceeds the host RAM budget %d MB on its own",
+			spec.ID, spec.RAMMB, limit,
+		),
+		Evict: []string{},
+	}, true
+}
+
 // pinnedUnknownOccupantRefusal is step 2's occupant half -- rule 5 against a
 // PINNED occupant -- returning the terminal refusal to report, or ok == false
 // when no pinned occupant of unknown demand holds any card spec wants.
@@ -491,11 +577,11 @@ func sortOldestFirst(procs []RunningProc) {
 
 // Admit answers: may spec start next to the processes already running in
 // snap? It applies the design doc's §5 admission rule -- matrix
-// compatibility, the process-count limit, and per-GPU VRAM arithmetic --
-// plus the unknown-VRAM-alone rule, which is applied to BOTH sides of the
-// pair (rule 4 for the candidate's own unknown demand, rule 5 for a running
-// occupant's), and computes the idle-victim set that would unblock the start
-// if one exists.
+// compatibility, the process-count limit, per-GPU VRAM arithmetic and the
+// host-wide RAM pool (rule 6) -- plus the unknown-VRAM-alone rule, which is
+// applied to BOTH sides of the pair (rule 4 for the candidate's own unknown
+// demand, rule 5 for a running occupant's), and computes the idle-victim set
+// that would unblock the start if one exists.
 //
 // The two unknown-VRAM rules are symmetric in SUBJECT and asymmetric in
 // OUTCOME, and the asymmetry is the point: an unknown demand makes a card
@@ -524,7 +610,10 @@ func sortOldestFirst(procs []RunningProc) {
 //     eviction and no wait can change that verdict. It reads only spec
 //     and snap.Budgets, so running it first cannot disturb another rule's
 //     inputs -- and running it LAST let the resolvable cause in step 2
-//     shadow this permanent one (see ownDemandRefusal).
+//     shadow this permanent one (see ownDemandRefusal). Its host-wide
+//     twin follows it: a KNOWN RAM demand that exceeds the whole
+//     host-RAM budget by itself refuses terminally for the same reason
+//     (see ramOwnDemandRefusal).
 //  2. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
 //     EITHER side of the pair. Neither eviction nor waiting can resolve
 //     it, so it is checked, and returned, before any rule that proposes
@@ -553,9 +642,19 @@ func sortOldestFirst(procs []RunningProc) {
 //     only, oldest LastUsed first, until it fits or idle candidates run
 //     out. Spec's own demand is already known to fit each budget by
 //     itself: step 1 refused it otherwise.
-//  5. Process-count limit (rule 2), evaluated last so it only asks for as
-//     many ADDITIONAL evictions as steps 3-4 have not already supplied.
-//  6. Build the Decision: any non-evictable blocker anywhere makes the
+//  5. Host-RAM pool (rule 6), the host-scoped twin of step 4, evaluated with
+//     steps 3-4's queued evictions notionally already gone: spec's own RAM
+//     demand plus every remaining process's RAM, against the one
+//     PolicySnapshot.HostRAMBudgetMB. A budget <= 0 (no sample yet) and an
+//     unknown candidate demand (RAMMB 0, left to the cold-start bootstrap)
+//     skip it, and a demand that exceeds the whole budget by itself was
+//     already refused in step 1. Overflow evicts idle processes HOST-WIDE --
+//     any of them, not one GPU's occupants -- oldest LastUsed first, until it
+//     fits; if the idle ones cannot make it fit, step 7 answers Wait. A still-loading process is never
+//     a victim, so it reserves its RAM.
+//  6. Process-count limit (rule 2), evaluated last so it only asks for as
+//     many ADDITIONAL evictions as steps 3-5 have not already supplied.
+//  7. Build the Decision: any non-evictable blocker anywhere makes the
 //     answer Wait -- never a partial Evict list, since evicting only some
 //     of the blockers would not actually unblock a retry. Otherwise an
 //     empty evict set means OK; a non-empty one means Evict-then-retry,
@@ -577,6 +676,13 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// rule that inspects it. See ownDemandRefusal for the misreport that
 	// came of evaluating it last.
 	if dec, refuse := ownDemandRefusal(snap, spec); refuse {
+		return dec
+	}
+	// Its host-wide twin, for the same reason and in the same place: a known
+	// RAM demand above the whole host-RAM budget cannot be fixed by anything in
+	// the running set. Behind the per-GPU one so that a spec over BOTH budgets
+	// keeps reporting the VRAM cause it always has.
+	if dec, refuse := ramOwnDemandRefusal(snap, spec); refuse {
 		return dec
 	}
 
@@ -610,6 +716,11 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 
 	toEvict := make(map[string]RunningProc)
 	blocked := false
+	// ramBlocked records that rule 6 was among the causes of `blocked`, which
+	// is what Decision.WaitOnRAM reports. It is deliberately separate from
+	// blocked: a start waiting on a busy matrix neighbour must not be woken by
+	// every hardware sample, and only the RAM verdict depends on one.
+	ramBlocked := false
 	// waitMessage is set by rule 4 alone, and only ever reaches a Wait: rule 4
 	// setting it also sets blocked, and blocked always answers Wait. See rule
 	// 4 for why that one Wait is the only one that explains itself.
@@ -826,8 +937,78 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 		}
 	}
 
+	// Rule 6: the host-wide RAM pool. RAM is a host resource, so unlike rule 3
+	// there is ONE sum, over every running process, and victims are drawn from
+	// ALL of them rather than from one GPU's occupants.
+	//
+	// It runs after rules 1, 3, 4 and 5 for the reason rule 3 runs after 1, 4
+	// and 5: a process one of them already queued is guaranteed to be gone, so
+	// its RAM is skipped here rather than charged twice, and it is not drawn
+	// again -- a VRAM victim that also holds the RAM we need must not be joined
+	// by a second, innocent one. It runs before rule 2 for the reason rules 1-5
+	// do: the process-count limit asks only for the victims still missing.
+	//
+	// Both ends of the pool follow the 0 sentinels used everywhere else:
+	//
+	//   - HostRAMBudgetMB <= 0 is unconstrained (no hardware sample yet), skipped
+	//     outright, and the check lives HERE rather than in buildSnapshot for the
+	//     reason given on PolicySnapshot.Budgets.
+	//   - spec.RAMMB == 0 is an UNKNOWN demand, never "needs none", and it is NOT
+	//     gated here: sending an unknown demand to a first measurement is the
+	//     cold-start bootstrap's job. Until it exists such a spec starts as it
+	//     always has. An occupant's unknown RAMMB is the same 0 and contributes
+	//     nothing; it is not a RAM victim either, since draining it frees
+	//     nothing this arithmetic can count.
+	//
+	// A process that is still loading is in running with its RAMMB and is never
+	// evictable (isEvictable), so it reserves what it occupies: a second
+	// admission sees the first one's headroom already spoken for and cannot
+	// double-commit it. That is the interlock for a KNOWN demand; the interlock
+	// for an unknown one belongs to the bootstrap.
+	//
+	// The candidate's own demand against the whole pool is NOT decided here:
+	// it is rule 6's own-demand half, hoisted to step 1 like rule 3's (see
+	// ramOwnDemandRefusal), so by this point spec.RAMMB fits the budget alone
+	// and every Wait below is behind holders that cannot be evicted right now:
+	// a busy or still-loading one resolves by itself when it finishes, a pinned
+	// one is the operator's own choice.
+	if snap.HostRAMBudgetMB > 0 && spec.RAMMB > 0 {
+		sum := spec.RAMMB
+		var holders []RunningProc
+		for _, r := range running {
+			if _, already := toEvict[r.SpecID]; already {
+				continue // already guaranteed to be gone
+			}
+			if r.RAMMB <= 0 {
+				continue // unknown occupancy: nothing to charge, nothing to free
+			}
+			sum += r.RAMMB
+			holders = append(holders, r)
+		}
+		if sum > snap.HostRAMBudgetMB {
+			var idleHolders []RunningProc
+			for _, r := range holders {
+				if isEvictable(r) {
+					idleHolders = append(idleHolders, r)
+				}
+			}
+			sortOldestFirst(idleHolders)
+			for _, r := range idleHolders {
+				if sum <= snap.HostRAMBudgetMB {
+					break
+				}
+				toEvict[r.SpecID] = r
+				sum -= r.RAMMB
+			}
+			if sum > snap.HostRAMBudgetMB {
+				blocked = true
+				ramBlocked = true
+			}
+		}
+	}
+
 	// Rule 2: process-count limit, asking only for as many ADDITIONAL
-	// evictions as rules 1, 3, 4 and 5 have not already provided.
+	// evictions as rules 1, 3, 4, 5 and 6 have not already provided.
 	if snap.MaxProcesses > 0 {
 		remaining := len(running) - len(toEvict)
 		deficit := remaining + 1 - snap.MaxProcesses
@@ -852,7 +1033,7 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	}
 
 	if blocked {
-		return Decision{Wait: true, Message: waitMessage, Evict: []string{}}
+		return Decision{Wait: true, WaitOnRAM: ramBlocked, Message: waitMessage, Evict: []string{}}
 	}
 	if len(toEvict) == 0 {
 		return Decision{OK: true, Evict: []string{}}

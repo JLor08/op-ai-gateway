@@ -242,6 +242,33 @@ type Manager struct {
 	// detected" (owner.hostInfo).
 	hostInfo atomic.Pointer[HostInfo]
 
+	// hostWake is the collect loop's way of telling the owner that a fresh
+	// hardware sample has landed (SetHostInfo), so it can re-ask a start whose
+	// admission verdict depends on it. It is buffered(1) and posted with a
+	// non-blocking send, which is the whole point of it being a channel of its
+	// own rather than a command on cmds: cmds is unbuffered and postCmd blocks
+	// until the owner reads, and the collect loop must never wait on the owner
+	// (it samples hardware about once a second and does nothing else).
+	// dispatchMeasurement solves the same problem with a goroutine per post, but
+	// that goroutine would be started from a foreign goroutine, where a
+	// WaitGroup.Add can race Close's Wait; a coalescing token needs neither. A
+	// wake that finds one already pending is simply dropped -- "a sample landed,
+	// re-read the latest" is all it says, and the owner re-reads hostInfo itself
+	// -- so a burst of samples is one wake, and none is ever lost while the owner
+	// is busy. The owner reads it in run() and does all the work there, on its
+	// own goroutine, so the serialized-owner invariant holds. nil on a bare
+	// Manager{} built by a test that never runs an owner; a send on it falls
+	// through the select's default.
+	hostWake chan struct{}
+
+	// hostSeq counts the samples SetHostInfo has stored. The owner reads it to
+	// tell how many samples have landed since a managed process exited (see
+	// owner.noteRAMFreed): the sample that is current at an exit may predate it,
+	// so what the host has freed shows up in the pool only a sample or two later.
+	// Written by the collect loop, read by the owner; an atomic counter needs no
+	// owner round-trip, like hostInfo beside it.
+	hostSeq atomic.Uint64
+
 	// wg tracks EVERY goroutine the owner spawns (health pollers, exit
 	// waiters, the owner goroutine itself, every scheduleAfter timer
 	// callback) so Close can block until none of them can touch shared state
@@ -269,6 +296,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		cmds:        make(chan command),
 		done:        make(chan struct{}),
 		transitions: make(chan struct{}, 1),
+		hostWake:    make(chan struct{}, 1),
 		logs:        NewLogStore(opts.LogBufferBytes, opts.LogBufferTotalBytes),
 	}
 	o := &owner{
@@ -586,6 +614,16 @@ type HostInfo struct {
 // The manager keeps its own copy of the GPUTotalsMB map. The caller is a
 // different goroutine from the owner that reads it, so retaining the caller's
 // map would let a caller that goes on to reuse or edit it race that read.
+//
+// Storing is not the whole job. The host-RAM pool is built from the live
+// MemAvailable, so the sample that follows a victim's exit is the one that
+// finally shows its freed memory -- and admission is otherwise re-attempted only
+// on a release, an exit, an Apply or a finished start, so a start that was
+// refused on the PREVIOUS sample would keep waiting for one of those. Every call
+// therefore also posts a coalescing, non-blocking wake the owner turns into a
+// re-evaluation of exactly the starts a new sample can change (see
+// owner.wakeOnHostSample). It never blocks this caller, and costs the owner
+// nothing when no such start is waiting.
 func (m *Manager) SetHostInfo(hi HostInfo) {
 	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB}
 	if len(hi.GPUTotalsMB) > 0 {
@@ -595,6 +633,11 @@ func (m *Manager) SetHostInfo(hi HostInfo) {
 		}
 	}
 	m.hostInfo.Store(&cp)
+	m.hostSeq.Add(1)
+	select {
+	case m.hostWake <- struct{}{}:
+	default: // a wake is already pending; it will see this value too
+	}
 }
 
 // hostInfo returns the latest pushed hardware figures, or the zero HostInfo
@@ -912,6 +955,15 @@ type specState struct {
 	// process, and stops being true when that process exits.
 	measuredRAM int
 
+	// waitingOnRAM is true while this spec's most recent admission verdict was a
+	// Wait the host-RAM pool contributed to (Decision.WaitOnRAM). It is the one
+	// kind of Wait a new hardware sample can end by itself, so it is what
+	// wakeOnHostSample selects on: a start waiting on the matrix, the process
+	// limit or a VRAM budget is never re-asked because a sample landed.
+	// admitAndStart rewrites it on every verdict, so it never outlives the Wait
+	// it describes.
+	waitingOnRAM bool
+
 	// notPermittedAt is stamped to now() every time admitAndStart (re)confirms
 	// StateNotPermitted or StatePendingVRAMUnknown -- deliberately NOT the
 	// same as `since`, because setState is a no-op (and so never touches
@@ -965,6 +1017,13 @@ type owner struct {
 	// Fixed for the process lifetime, so a plain field like vramHeadroomMB
 	// above; read only by buildSnapshot's host-RAM budget.
 	hostRAMReserveMB int
+	// ramFreedMB is the host RAM that managed processes held when they exited
+	// and that the hardware sample has not necessarily caught up with yet, valid
+	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
+	// loosens the terminal own-demand refusal's ceiling, never the admission
+	// arithmetic. Owner-goroutine state, like specs.
+	ramFreedMB       int
+	ramFreedUntilSeq uint64
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.
@@ -1004,6 +1063,10 @@ func (o *owner) run() {
 			if !o.closing {
 				o.scanIdle()
 				o.dispatchMeasurement()
+			}
+		case <-o.m.hostWake:
+			if !o.closing {
+				o.wakeOnHostSample()
 			}
 		}
 		if o.stopped {
@@ -1577,6 +1640,10 @@ func (o *owner) admitAndStart(specID string) {
 	if st == nil || st.proc != nil || st.state == StateBackoff {
 		return
 	}
+	// Every verdict below rewrites this from scratch, and so does every return
+	// before one: a spec nobody wants up, or one force-stopped, is no RAM waiter,
+	// and a stale true must never be able to select it for a sample wake.
+	st.waitingOnRAM = false
 	wantUp := len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
 	if !wantUp {
 		return
@@ -1592,6 +1659,7 @@ func (o *owner) admitAndStart(specID string) {
 	}
 
 	dec := Admit(o.buildSnapshot(), st.spec)
+	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
 	switch {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
@@ -1924,6 +1992,10 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// now -- their live measurements only, zero-guarded, never a pushed demand
 	// -- summed for the host-RAM budget below.
 	residentRAMMB := 0
+	// ramBoundMB is the same sum read generously, for the ceiling the terminal
+	// RAM refusal compares against (see below): a process with no live reading
+	// is taken to hold its whole demand floor instead of nothing.
+	ramBoundMB := 0
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
@@ -1968,6 +2040,11 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// hostRAMBudgetMB): the floor is a reservation, not residency.
 		liveRAM := realRAM(st.measuredRAM)
 		residentRAMMB += liveRAM
+		if liveRAM > 0 {
+			ramBoundMB += liveRAM
+		} else {
+			ramBoundMB += st.spec.RAMMB
+		}
 		running = append(running, RunningProc{
 			SpecID:   id,
 			GPUs:     gpus,
@@ -2006,7 +2083,16 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		MaxProcesses:    o.cfg.MaxProcesses,
 		Budgets:         budgets,
 		HostRAMBudgetMB: hostRAMBudgetMB(hi, residentRAMMB, o.hostRAMReserveMB),
-		Allowed:         o.allowedPairs,
+		// The ceiling is the budget's generous twin, for the terminal
+		// own-demand refusal only: the same pool, except that a process with no
+		// reading counts at its demand floor and the RAM of processes that have
+		// exited since the sample was taken is counted as already back. Each
+		// of those is a way the budget is understated for a moment without the
+		// host being short of anything -- a model still loading, a victim that
+		// just made room for this very candidate -- and a durable refusal must
+		// not be issued on the strength of either.
+		HostRAMCeilingMB: hostRAMBudgetMB(hi, ramBoundMB+o.pendingRAMFreedMB(), o.hostRAMReserveMB),
+		Allowed:          o.allowedPairs,
 	}
 }
 
@@ -2047,11 +2133,67 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 //     of keeping everything back; fillDetectedBudgets floors its VRAM budget at
 //     1 for the identical reason. 1 MB is a real ceiling, so Admit refuses
 //     every spec with a known RAM demand until the host recovers.
+//
+// The same arithmetic builds PolicySnapshot.HostRAMCeilingMB, with a generous
+// held figure in place of the measured one (see buildSnapshot): residentMB is
+// then "what the managed processes could be holding", not "what they have been
+// measured to hold".
 func hostRAMBudgetMB(hi HostInfo, residentMB, reserveMB int) int {
 	if hi.MemAvailableMB <= 0 {
 		return 0
 	}
 	return max(1, hi.MemAvailableMB+residentMB-reserveMB)
+}
+
+// ramFreedSettlePushes is how many samples must land after a managed process
+// exits before the pool is trusted to show the memory it freed: the one that is
+// current at the exit may have been taken before it, and the next one may have
+// been in flight; only the second is certain to have been taken afterwards,
+// because the collect loop takes a sample only after pushing the previous one.
+const ramFreedSettlePushes = 2
+
+// noteRAMFreed records, as a managed process exits, the host RAM it held: its
+// last live reading, or its demand floor when it was never measured (the
+// generous reading is the point -- see below). Admission can only learn that the
+// memory is back from the next hardware samples, and until then the pool is
+// understated by exactly this much: the process has already left the running
+// set, so its add-back is gone, while MemAvailable has not yet risen. That is
+// the state in which the beneficiary of an eviction is re-admitted, and it is
+// why the terminal own-demand refusal compares against a ceiling that counts
+// this credit (HostRAMCeilingMB) rather than against the budget.
+//
+// The credit lives until ramFreedSettlePushes samples have landed (hostSeq), and
+// further exits inside that window add to it and extend it. It is never part of
+// the admission arithmetic -- the budget does not get it -- so a stale credit can
+// make a durable refusal less eager, never admit something that does not fit.
+// Nothing is recorded before the first sample: with no MemAvailable reading
+// there is no pool to understate.
+func (o *owner) noteRAMFreed(st *specState) {
+	if o.m.hostInfo.Load() == nil {
+		return
+	}
+	mb := realRAM(st.measuredRAM)
+	if mb == 0 {
+		mb = st.spec.RAMMB
+	}
+	if mb <= 0 {
+		return
+	}
+	seq := o.m.hostSeq.Load()
+	if seq >= o.ramFreedUntilSeq {
+		o.ramFreedMB = 0 // the previous credit has already settled
+	}
+	o.ramFreedMB += mb
+	o.ramFreedUntilSeq = seq + ramFreedSettlePushes
+}
+
+// pendingRAMFreedMB is the unsettled credit noteRAMFreed has recorded, 0 once
+// enough samples have landed to have absorbed it.
+func (o *owner) pendingRAMFreedMB() int {
+	if o.ramFreedMB > 0 && o.m.hostSeq.Load() >= o.ramFreedUntilSeq {
+		o.ramFreedMB = 0
+	}
+	return o.ramFreedMB
 }
 
 // fillDetectedBudgets makes VRAM accounting default-on: for every GPU the
@@ -2489,6 +2631,9 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	st.measuredVRAM = nil
 	// Same reasoning, and the same F2 cost, for the host-RAM figure: it
 	// describes this generation's process and is untrue the moment it exits.
+	// What it held is recorded first, though: the hardware sample has not seen
+	// the memory come back yet (noteRAMFreed).
+	o.noteRAMFreed(st)
 	st.measuredRAM = 0
 
 	wasIntentional := st.intentionalStop
@@ -2845,6 +2990,41 @@ func (o *owner) wakeAfterStart() {
 // to a spec with a queued request or a pinned one. See wakeAfterStart.
 func wantsWakeAfterStart(st *specState) bool {
 	return wantsWake(st) && (len(st.pending) > 0 || st.spec.Pinned)
+}
+
+// wakeOnHostSample is the admission wake for a fresh hardware sample
+// (Manager.SetHostInfo posts it, the owner's run loop calls it). Of every
+// admission input, the host-RAM pool is the one that moves with the sample
+// alone: it is built from the live MemAvailable, so a start refused for lack of
+// RAM can fit on the very next sample with no release, exit or Apply in between
+// -- most importantly the beneficiary of a RAM eviction, which is re-admitted on
+// its victim's exit against the previous sample, before the freed memory shows.
+// Until this wake existed it then waited for an unrelated event or its whole
+// admission timeout.
+//
+// It re-asks only the specs wantsHostSampleWake selects, so it is a cheap no-op
+// (one pass over the spec table, nothing evaluated) whenever nothing is waiting
+// on RAM, which is nearly always. That is also what keeps it from being a storm:
+// a sample lands about once a second for the life of the agent, and evaluating
+// admission is not free -- buildSnapshot calls the installed VRAM measurer, a
+// subprocess on a real host -- so a wake on every sample for every queued start
+// would run it once a second for as long as anything queued behind a busy
+// neighbour. Even a start that IS waiting on RAM costs one evaluation per
+// sample, and no more.
+func (o *owner) wakeOnHostSample() {
+	o.wakeAdmission(wantsHostSampleWake)
+}
+
+// wantsHostSampleWake is wakeOnHostSample's selection rule: a spec whose last
+// verdict was a Wait the RAM pool contributed to, narrowed to the same set
+// wakeAfterStart may retry (a queued request, or pinned). That narrowing is the
+// part that matters for safety: a force_running spec with no waiter is
+// deliberately left to the next release, exit or Apply, because retrying it on
+// anything but a real change lets two that cannot run together evict each other
+// at load speed (see wakeAfterStart). A sample is such an event no more than a
+// finished start is.
+func wantsHostSampleWake(st *specState) bool {
+	return st.waitingOnRAM && wantsWakeAfterStart(st)
 }
 
 // wakeAdmission retries admission for every spec that want selects, oldest

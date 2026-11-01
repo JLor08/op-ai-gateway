@@ -56,6 +56,9 @@ func assertDecision(t *testing.T, name string, got, want Decision) {
 	if got.Wait != want.Wait {
 		t.Errorf("%s: Wait = %v, want %v", name, got.Wait, want.Wait)
 	}
+	if got.WaitOnRAM != want.WaitOnRAM {
+		t.Errorf("%s: WaitOnRAM = %v, want %v", name, got.WaitOnRAM, want.WaitOnRAM)
+	}
 	if got.Reason != want.Reason {
 		t.Errorf("%s: Reason = %q, want %q", name, got.Reason, want.Reason)
 	}
@@ -1626,4 +1629,583 @@ func TestAdmitUnknownTieStillEvictsBothWays(t *testing.T) {
 	assertDecision(t, "unknown b evicts unknown occupant a",
 		Admit(PolicySnapshot{Running: []RunningProc{runA}, Allowed: allowed}, specB),
 		Decision{Evict: []string{"a"}})
+}
+
+// --- Rule 6: the host-wide RAM pool --------------------------------------
+//
+// RAM is a host resource, not a per-card one, so unlike rule 3 (one sum per
+// GPU, victims drawn only from that GPU's occupants) rule 6 keeps ONE sum over
+// every running process and draws victims from ALL of them. The pool is
+// PolicySnapshot.HostRAMBudgetMB -- the capacity of the managed set, a total
+// like a per-GPU budget that the running processes' RAM is summed INTO -- and 0
+// is unconstrained; a candidate's RAMMB of 0 is an UNKNOWN demand that this rule
+// does not gate (cold-start bootstrap owns it), and a known demand above the
+// whole pool is refused terminally before any of the arithmetic.
+//
+// Every test opens the co-residency pair, leaves Budgets nil and MaxProcesses 0,
+// so rules 1, 2 and 3 all pass on their own and the ONLY thing that can produce
+// a non-OK decision is rule 6 -- except where a test is explicitly about how
+// rule 6 composes with one of them.
+
+// TestAdmitRAMFitsWithinHostBudget: the candidate plus everything running fits
+// the pool, so nothing is evicted and the start proceeds.
+func TestAdmitRAMFitsWithinHostBudget(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "resident", RAMMB: 10000, LastUsed: t0},
+		},
+		HostRAMBudgetMB: 30000,
+		Allowed:         allowPairs("cand", "resident"),
+	}
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+	assertDecision(t, "10000 running + 8000 candidate fits 30000", got, Decision{OK: true, Evict: []string{}})
+
+	// The boundary is inclusive: summing to exactly the pool still fits.
+	snap.HostRAMBudgetMB = 18000
+	got = Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+	assertDecision(t, "a sum equal to the pool fits", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitRAMEvictsIdleOldestHostWide: the sum overflows the pool, so idle
+// processes are drained oldest-LastUsed first until it fits. The occupants here
+// sit on GPU 1 while the candidate wants GPU 0 (with a generous VRAM budget), so
+// rule 3 has nothing to say: only a HOST-wide pool can name them as victims.
+func TestAdmitRAMEvictsIdleOldestHostWide(t *testing.T) {
+	running := func() []RunningProc {
+		return []RunningProc{
+			// Listed newest-first on purpose: the order victims are drawn in
+			// must come from LastUsed, never from slice order.
+			{SpecID: "new", GPUs: map[int]int{1: 1000}, RAMMB: 4000, LastUsed: t1},
+			{SpecID: "old", GPUs: map[int]int{1: 1000}, RAMMB: 10000, LastUsed: t0},
+		}
+	}
+	cand := Spec{ID: "cand", RAMMB: 8000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
+
+	t.Run("the oldest idle process is drained and that is enough", func(t *testing.T) {
+		// 8000 + 10000 + 4000 = 22000 > 16000; draining "old" leaves 12000.
+		snap := PolicySnapshot{
+			Running:         running(),
+			Budgets:         map[int]int{0: 24000, 1: 24000},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "old", "new"),
+		}
+		assertDecision(t, "oldest drained first", Admit(snap, cand), Decision{Evict: []string{"old"}})
+	})
+
+	t.Run("victims keep being drawn, oldest first, until it fits", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "c", RAMMB: 6000, LastUsed: t2},
+				{SpecID: "a", RAMMB: 6000, LastUsed: t0},
+				{SpecID: "b", RAMMB: 6000, LastUsed: t1},
+			},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "a", "b", "c"),
+		}
+		// 8000 + 18000 = 26000; drain a -> 20000 (still over); drain b -> 14000.
+		assertDecision(t, "two victims", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"a", "b"}})
+	})
+
+	t.Run("oldest first, not the best fit", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "small-old", RAMMB: 1000, LastUsed: t0},
+				{SpecID: "big-new", RAMMB: 12000, LastUsed: t1},
+			},
+			HostRAMBudgetMB: 14000,
+			Allowed:         allowPairs("cand", "small-old", "big-new"),
+		}
+		// 8000 + 13000 = 21000 > 14000: draining the oldest alone (-> 20000) is
+		// not enough, so the newer one goes too, in LastUsed order.
+		assertDecision(t, "order is LastUsed, not size", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"small-old", "big-new"}})
+	})
+}
+
+// TestAdmitRAMWaitsWhenAllBusy: the same overflow as above, but nothing that
+// could free the RAM may be evicted. That is a Wait with an EMPTY evict list --
+// never a partial one, since draining only some of the processes would not
+// unblock a retry and would cost a cold load for nothing.
+func TestAdmitRAMWaitsWhenAllBusy(t *testing.T) {
+	cases := []struct {
+		name    string
+		running []RunningProc
+	}{
+		{
+			name: "every holder is busy",
+			running: []RunningProc{
+				{SpecID: "old", RAMMB: 10000, InFlight: 1, LastUsed: t0},
+				{SpecID: "new", RAMMB: 4000, InFlight: 2, LastUsed: t1},
+			},
+		},
+		{
+			name: "the only idle holder is pinned",
+			running: []RunningProc{
+				{SpecID: "old", RAMMB: 10000, Pinned: true, LastUsed: t0},
+				{SpecID: "new", RAMMB: 4000, InFlight: 1, LastUsed: t1},
+			},
+		},
+		{
+			// 8000 + 10000 + 4000 = 22000 > 16000. Draining the idle 4000 would
+			// leave 18000, still over, because the 10000 is busy -- so no victim
+			// is named at all.
+			name: "the idle holder alone cannot make it fit",
+			running: []RunningProc{
+				{SpecID: "busy", RAMMB: 10000, InFlight: 1, LastUsed: t0},
+				{SpecID: "idle", RAMMB: 4000, LastUsed: t1},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running:         tc.running,
+				HostRAMBudgetMB: 16000,
+				Allowed:         allowPairs("cand", "old", "new", "busy", "idle"),
+			}
+			assertDecision(t, tc.name, Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+		})
+	}
+}
+
+// TestAdmitRAMUnconstrainedWhenBudgetZero: HostRAMBudgetMB 0 is the same
+// UNCONSTRAINED sentinel a per-GPU budget uses (the host has not produced a
+// MemAvailable reading yet), and a negative value is no ceiling either. Admit is
+// the one place that interprets it, so both skip the rule outright: an enormous
+// occupant is neither summed against nor evicted.
+func TestAdmitRAMUnconstrainedWhenBudgetZero(t *testing.T) {
+	for name, budget := range map[string]int{"zero": 0, "negative": -1} {
+		t.Run(name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "huge", RAMMB: 999999, LastUsed: t0},
+				},
+				HostRAMBudgetMB: budget,
+				Allowed:         allowPairs("cand", "huge"),
+			}
+			got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+			assertDecision(t, name+" budget is unconstrained", got, Decision{OK: true, Evict: []string{}})
+		})
+	}
+}
+
+// TestAdmitRAMUnknownDemandNotGatedYet: a candidate whose own RAM demand is 0 is
+// UNKNOWN, never "needs none", and this rule does not gate it -- routing an
+// unknown demand to a first measurement is the cold-start bootstrap's job. Until
+// that exists it starts exactly as it did before RAM was an admission axis,
+// however tight the pool looks, and it evicts nobody.
+func TestAdmitRAMUnknownDemandNotGatedYet(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "resident", RAMMB: 10000, LastUsed: t0},
+		},
+		HostRAMBudgetMB: 4000, // already overflowed by the resident alone
+		Allowed:         allowPairs("cand", "resident"),
+	}
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+	assertDecision(t, "unknown candidate demand is not gated", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitRAMUnknownOccupantContributesNothingAndIsNotAVictim: the occupant
+// side of the same sentinel. A running process with RAMMB 0 has no known
+// occupancy, so it adds 0 to the sum -- and, because draining it frees nothing
+// the arithmetic can count, it is never named as a victim for RAM, even when it
+// is the oldest idle process on the host.
+func TestAdmitRAMUnknownOccupantContributesNothingAndIsNotAVictim(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "unknown", RAMMB: 0, LastUsed: t0},
+			{SpecID: "big", RAMMB: 10000, LastUsed: t1},
+		},
+		HostRAMBudgetMB: 16000,
+		Allowed:         allowPairs("cand", "unknown", "big"),
+	}
+	// 8000 + 10000 = 18000 > 16000; only "big" can help.
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+	assertDecision(t, "only the holder that frees RAM is drained", got, Decision{Evict: []string{"big"}})
+
+	// And with nothing but the unknown occupant running there is nothing to
+	// charge and nothing to drain: it fits.
+	snap.Running = snap.Running[:1]
+	got = Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+	assertDecision(t, "an unknown occupant alone charges nothing", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitStartingProcReservesRAM is the known-demand interlock. A process
+// that is still loading is already in Running with its RAMMB, so it counts
+// toward the pool exactly like a settled one -- and it is never an eviction
+// victim, so a second admission cannot reclaim, or double-commit, the headroom
+// the first one is in the middle of filling.
+func TestAdmitStartingProcReservesRAM(t *testing.T) {
+	t.Run("a starting process counts toward the sum", func(t *testing.T) {
+		// 10000 + 8000 = 18000 fits 20000, but only 2000 is left once the
+		// loading process is counted -- a second 8000 candidate does not.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "loading-a", RAMMB: 10000, Starting: true, LastUsed: t0},
+				{SpecID: "loading-b", RAMMB: 8000, Starting: true, LastUsed: t1},
+			},
+			HostRAMBudgetMB: 20000,
+			Allowed:         allowPairs("cand", "loading-a", "loading-b"),
+		}
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+		assertDecision(t, "second admission sees the reservation", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+
+	t.Run("a starting process is never the victim", func(t *testing.T) {
+		starting := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "loading", RAMMB: 10000, Starting: true, LastUsed: t0},
+			},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "loading"),
+		}
+		assertDecision(t, "starting holder waits", Admit(starting, Spec{ID: "cand", RAMMB: 8000}), Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+
+		// The identical snapshot with the process settled is evicted, which is
+		// what proves it is Starting -- not the numbers -- that spared it.
+		settled := starting
+		settled.Running = []RunningProc{{SpecID: "loading", RAMMB: 10000, LastUsed: t0}}
+		assertDecision(t, "settled holder is drained", Admit(settled, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"loading"}})
+	})
+
+	t.Run("a starting process still leaves room when there is room", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "loading", RAMMB: 10000, Starting: true, LastUsed: t0},
+			},
+			HostRAMBudgetMB: 20000,
+			Allowed:         allowPairs("cand", "loading"),
+		}
+		assertDecision(t, "fits beside a loading process", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{OK: true, Evict: []string{}})
+	})
+}
+
+// TestAdmitWaitOnRAMOnlyWhenTheRAMPoolBlocked pins what Decision.WaitOnRAM
+// means: rule 6 was among the causes of a Wait. It is what lets the manager
+// re-ask a waiter when the hardware sample refreshes -- and ONLY then, because a
+// Wait on the co-residency matrix, the process limit or a VRAM budget cannot be
+// changed by a new sample, and re-asking those once a second would run the
+// admission path (and its VRAM measurement) for nothing.
+func TestAdmitWaitOnRAMOnlyWhenTheRAMPoolBlocked(t *testing.T) {
+	t.Run("a matrix wait with RAM fitting is not a RAM wait", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "busy", RAMMB: 1000, InFlight: 1, LastUsed: t0},
+			},
+			HostRAMBudgetMB: 16000,
+			// the (cand, busy) pair is closed
+		}
+		assertDecision(t, "matrix only", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Wait: true, Evict: []string{}})
+	})
+
+	t.Run("a process-limit wait with RAM fitting is not a RAM wait", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "busy", RAMMB: 1000, InFlight: 1, LastUsed: t0},
+			},
+			MaxProcesses:    1,
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "busy"),
+		}
+		assertDecision(t, "process limit only", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Wait: true, Evict: []string{}})
+	})
+
+	t.Run("a wait the RAM pool contributed to is flagged even when another rule also blocks", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "busy-closed", RAMMB: 100, InFlight: 1, LastUsed: t0},
+				{SpecID: "busy-holder", RAMMB: 10000, InFlight: 1, LastUsed: t1},
+			},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "busy-holder"),
+		}
+		assertDecision(t, "matrix and RAM", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+
+	t.Run("an eviction or an admission is never flagged", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "idle", RAMMB: 10000, LastUsed: t0},
+			},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "idle"),
+		}
+		assertDecision(t, "evict", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"idle"}})
+		assertDecision(t, "admit", Admit(snap, Spec{ID: "cand", RAMMB: 1000}), Decision{OK: true, Evict: []string{}})
+	})
+}
+
+// TestAdmitRAMOwnDemandExceedsBudgetIsTerminal is rule 6's own-demand half, the
+// host-wide twin of TestAdmitCandidateAloneExceedsBudgetIsNotPermitted. The pool
+// is a TOTAL for the managed set, so the smallest sum the arithmetic can ever
+// reach is the candidate alone, with every other process gone: a known demand
+// above the whole budget cannot be made to fit by any eviction, and waiting
+// cannot help. It must therefore be a durable not_permitted carrying a Message,
+// not a silent Wait that hangs the caller to its admission timeout on every
+// request -- and not a mass eviction of the idle set for a start that still
+// could not fit.
+func TestAdmitRAMOwnDemandExceedsBudgetIsTerminal(t *testing.T) {
+	const message = "spec cand: RAM demand 9000 MB exceeds the host RAM budget 8000 MB on its own"
+	terminal := Decision{Reason: StateNotPermitted, Message: message, Evict: []string{}}
+
+	t.Run("with nothing running", func(t *testing.T) {
+		snap := PolicySnapshot{HostRAMBudgetMB: 8000}
+		assertDecision(t, "candidate alone exceeds the budget", Admit(snap, Spec{ID: "cand", RAMMB: 9000}), terminal)
+	})
+
+	t.Run("idle holders are not drained for a start that cannot fit", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "idle-a", RAMMB: 3000, LastUsed: t0},
+				{SpecID: "idle-b", RAMMB: 3000, LastUsed: t1},
+			},
+			HostRAMBudgetMB: 8000,
+			Allowed:         allowPairs("cand", "idle-a", "idle-b"),
+		}
+		assertDecision(t, "no eviction offered", Admit(snap, Spec{ID: "cand", RAMMB: 9000}), terminal)
+	})
+
+	t.Run("the boundary is inclusive", func(t *testing.T) {
+		snap := PolicySnapshot{HostRAMBudgetMB: 9000}
+		assertDecision(t, "a demand equal to the budget fits", Admit(snap, Spec{ID: "cand", RAMMB: 9000}), Decision{OK: true, Evict: []string{}})
+	})
+
+	t.Run("an unknown demand is not refused", func(t *testing.T) {
+		snap := PolicySnapshot{HostRAMBudgetMB: 8000}
+		assertDecision(t, "RAMMB 0 is unknown, not gated", Admit(snap, Spec{ID: "cand", RAMMB: 0}), Decision{OK: true, Evict: []string{}})
+	})
+
+	t.Run("an unconstrained budget refuses nothing", func(t *testing.T) {
+		snap := PolicySnapshot{HostRAMBudgetMB: 0}
+		assertDecision(t, "budget 0 is unconstrained", Admit(snap, Spec{ID: "cand", RAMMB: 1_000_000}), Decision{OK: true, Evict: []string{}})
+	})
+
+	t.Run("it is reported ahead of a pinned unknown-VRAM occupant", func(t *testing.T) {
+		// Without the hoist the candidate's unknown VRAM demand against a pinned
+		// occupant on its card would answer pending_vram_unknown, inviting the
+		// operator to fill in a number that cannot make 9000 MB fit under 8000.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "pinned", GPUs: map[int]int{0: 4000}, Pinned: true, LastUsed: t0},
+			},
+			HostRAMBudgetMB: 8000,
+			Allowed:         allowPairs("cand", "pinned"),
+		}
+		spec := Spec{ID: "cand", RAMMB: 9000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+		assertDecision(t, "durable cause wins over the resolvable one", Admit(snap, spec), terminal)
+	})
+
+	t.Run("a VRAM own-demand refusal keeps reporting first", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Budgets:         map[int]int{0: 4000},
+			HostRAMBudgetMB: 8000,
+		}
+		spec := Spec{ID: "cand", RAMMB: 9000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}}
+		want := Decision{
+			Reason:  StateNotPermitted,
+			Message: "spec cand: gpu 0 demand 5000 MB exceeds budget 4000 MB on its own",
+			Evict:   []string{},
+		}
+		assertDecision(t, "a spec over both budgets reports the VRAM cause", Admit(snap, spec), want)
+	})
+}
+
+// TestAdmitRAMOwnDemandRefusalComparesAgainstTheCeiling: the terminal refusal is
+// measured against the most the pool could be offering (HostRAMCeilingMB), not
+// against the budget, because the budget is transiently understated -- by a
+// process still loading, and for a sample or two after a victim exits, which is
+// exactly when the beneficiary of its eviction is re-admitted. A demand between
+// the budget and the ceiling is a RAM Wait (re-asked on the next sample), never a
+// refusal and never an eviction of everything for a start that cannot yet be shown
+// to fit; only a demand above the ceiling is terminal.
+func TestAdmitRAMOwnDemandRefusalComparesAgainstTheCeiling(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle", RAMMB: 3000, LastUsed: t0},
+			{SpecID: "busy", RAMMB: 3000, InFlight: 1, LastUsed: t1},
+		},
+		HostRAMBudgetMB:  8000,
+		HostRAMCeilingMB: 18000,
+		Allowed:          allowPairs("cand", "idle", "busy"),
+	}
+
+	t.Run("between the budget and the ceiling it waits", func(t *testing.T) {
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 9000})
+		assertDecision(t, "9000 MB is over the budget but within the ceiling", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+	t.Run("the ceiling boundary is inclusive", func(t *testing.T) {
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 18000})
+		assertDecision(t, "a demand equal to the ceiling is not refused", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+	t.Run("above the ceiling it is terminal and names the ceiling", func(t *testing.T) {
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 18001})
+		assertDecision(t, "18001 MB exceeds even the ceiling", got, Decision{
+			Reason:  StateNotPermitted,
+			Message: "spec cand: RAM demand 18001 MB exceeds the host RAM budget 18000 MB on its own",
+			Evict:   []string{},
+		})
+	})
+	t.Run("a ceiling below the budget is ignored", func(t *testing.T) {
+		low := snap
+		low.HostRAMCeilingMB = 100
+		got := Admit(low, Spec{ID: "cand", RAMMB: 8000})
+		assertDecision(t, "the budget is the floor of the limit", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+	t.Run("no ceiling falls back to the budget", func(t *testing.T) {
+		plain := snap
+		plain.HostRAMCeilingMB = 0
+		got := Admit(plain, Spec{ID: "cand", RAMMB: 8001})
+		assertDecision(t, "only the budget is known", got, Decision{
+			Reason:  StateNotPermitted,
+			Message: "spec cand: RAM demand 8001 MB exceeds the host RAM budget 8000 MB on its own",
+			Evict:   []string{},
+		})
+	})
+}
+
+// TestAdmitRAMSelfIsNotCountedAgainstThePool: a running process sharing the
+// candidate's ID is the same physical process (a double-start race, a snapshot
+// taken a moment late), so the self-filter must keep it out of the sum --
+// charging it on top of the candidate's own demand books one process as two.
+func TestAdmitRAMSelfIsNotCountedAgainstThePool(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "cand", RAMMB: 9000, LastUsed: t0},
+		},
+		HostRAMBudgetMB: 10000,
+	}
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 9000})
+	assertDecision(t, "self RAM is not double-counted", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestAdmitRAMComposesWithOtherRules: rule 6 runs after rules 1, 3, 4 and 5 and
+// before rule 2, against the SAME toEvict set, so a victim another rule already
+// queued is treated as gone -- its RAM is not charged again and it is not
+// evicted twice -- and the process-count rule runs last and asks only for the
+// victims still missing.
+func TestAdmitRAMComposesWithOtherRules(t *testing.T) {
+	t.Run("a VRAM victim's RAM already counts as freed", func(t *testing.T) {
+		// Rule 3: GPU 0 holds 8000 + 8000 against 10000, so "gpu-hog" goes. Its
+		// 10000 of RAM is then gone too: 8000 + 6000 = 14000 fits 16000, so the
+		// idle "bystander" must NOT also be evicted for RAM. The bystander is
+		// the OLDER of the two on purpose: charged the hog's RAM again, rule 6
+		// would reach for the oldest idle process first and take it too.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "gpu-hog", GPUs: map[int]int{0: 8000}, RAMMB: 10000, LastUsed: t1},
+				{SpecID: "bystander", RAMMB: 6000, LastUsed: t0},
+			},
+			Budgets:         map[int]int{0: 10000},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "gpu-hog", "bystander"),
+		}
+		spec := Spec{ID: "cand", RAMMB: 8000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 8000}}}
+		assertDecision(t, "no double eviction", Admit(snap, spec), Decision{Evict: []string{"gpu-hog"}})
+	})
+
+	t.Run("a matrix victim's RAM already counts as freed", func(t *testing.T) {
+		// "closed" is not allowed beside the candidate (rule 1) and is idle, so it
+		// is queued; with its 10000 gone, 8000 + 4000 fits 16000 and the OLDER
+		// "open" process is left alone.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "closed", RAMMB: 10000, LastUsed: t1},
+				{SpecID: "open", RAMMB: 4000, LastUsed: t0},
+			},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "open"),
+		}
+		assertDecision(t, "matrix victim frees RAM", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"closed"}})
+	})
+
+	t.Run("RAM and VRAM victims are merged oldest first", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "ram-victim", RAMMB: 12000, LastUsed: t2},
+				{SpecID: "gpu-victim", GPUs: map[int]int{0: 9000}, RAMMB: 100, LastUsed: t0},
+			},
+			Budgets:         map[int]int{0: 10000},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "ram-victim", "gpu-victim"),
+		}
+		spec := Spec{ID: "cand", RAMMB: 8000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}}
+		// Rule 3 drains gpu-victim (frees 100 RAM); rule 6 still overflows
+		// (8000 + 12000 = 20000 > 16000) and drains ram-victim.
+		assertDecision(t, "both rules contribute", Admit(snap, spec), Decision{Evict: []string{"gpu-victim", "ram-victim"}})
+	})
+
+	t.Run("the process limit asks only for what RAM did not already free", func(t *testing.T) {
+		// MaxProcesses 3 with three running needs ONE eviction for the new start.
+		// Rule 6 drains "a" for RAM ("unknown" holds nothing it can count, so it
+		// is not a RAM victim even though it is older), which already makes room
+		// in the process count: rule 2 must see that and add nothing.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "unknown", RAMMB: 0, LastUsed: t0},
+				{SpecID: "a", RAMMB: 10000, LastUsed: t1},
+				{SpecID: "b", RAMMB: 4000, LastUsed: t2},
+			},
+			MaxProcesses:    3,
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "unknown", "a", "b"),
+		}
+		assertDecision(t, "limit satisfied by the RAM victim", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"a"}})
+	})
+
+	t.Run("the process limit still evicts when RAM fits", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "a", RAMMB: 1000, LastUsed: t0},
+				{SpecID: "b", RAMMB: 1000, LastUsed: t1},
+			},
+			MaxProcesses:    2,
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "a", "b"),
+		}
+		assertDecision(t, "rule 2 unaffected", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Evict: []string{"a"}})
+	})
+
+	t.Run("a blocked rule elsewhere still makes the whole decision a Wait", func(t *testing.T) {
+		// RAM could be satisfied by draining the idle holder, but the busy
+		// matrix-incompatible process blocks the start: Wait, no partial evict.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "busy-closed", RAMMB: 100, InFlight: 1, LastUsed: t0},
+				{SpecID: "idle-holder", RAMMB: 10000, LastUsed: t1},
+			},
+			HostRAMBudgetMB: 16000,
+			Allowed:         allowPairs("cand", "idle-holder"),
+		}
+		assertDecision(t, "no partial eviction", Admit(snap, Spec{ID: "cand", RAMMB: 8000}), Decision{Wait: true, Evict: []string{}})
+	})
+}
+
+// TestHostRAMPoolChargesACandidateAgainstGenuinelyFreeRAM is the reason the pool
+// adds back what the managed set holds, proved through the snapshot builder AND
+// Admit together. Two managed processes hold 10000 + 6000 MB, the host reports
+// 12000 MB available and the reserve is 2000, so 10000 MB is genuinely free: a
+// 10000 MB candidate fits without evicting anything, and a 10001 MB one needs
+// exactly one victim. A pool of plain MemAvailable - reserve (also 10000) would
+// charge the 16000 MB the managed set holds on top of it and evict both
+// processes for the 10000 MB start that fits.
+func TestHostRAMPoolChargesACandidateAgainstGenuinelyFreeRAM(t *testing.T) {
+	o, st := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	st.spec.RAMMB = 10000
+	st.measuredRAM = 10000
+	addRunningRAMSpec(o, "spec-b", 6000, 6000)
+	o.hostRAMReserveMB = 2000
+	o.allowedPairs = allowPairs("cand", "spec-a", "spec-b")
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 12000})
+
+	snap := o.buildSnapshot()
+	if got, want := snap.HostRAMBudgetMB, 26000; got != want {
+		t.Fatalf("HostRAMBudgetMB = %d, want %d (12000 available + 16000 held - 2000 reserve)", got, want)
+	}
+
+	cand := baseSpec("cand", "model-cand")
+	cand.RAMMB = 10000
+	assertDecision(t, "10000 MB candidate against 10000 MB genuinely free", Admit(snap, cand), Decision{OK: true, Evict: []string{}})
+
+	cand.RAMMB = 10001
+	assertDecision(t, "one MB more than is free", Admit(snap, cand), Decision{Evict: []string{"spec-a"}})
 }
