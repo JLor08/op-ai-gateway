@@ -220,8 +220,11 @@ func main() {
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
 	// private working set on it, and returns nil on a host that cannot read
 	// process memory, where SetRAMMeasurer(nil) is NewManager's own default.
-	// Measured RAM is reported through Status/telemetry only for now; admission
-	// does not read it yet.
+	// Measured RAM is both reported (Status/telemetry, and the gateway's
+	// spec write-back) and read by admission: the host-RAM pool charges every
+	// running process max(live measurement, the spec's pushed demand), and the
+	// cold-start RAM bootstrap decides on it whether a spec still has an unknown
+	// demand. With no measurer installed, operator RAM demands stand unmeasured.
 	mgr.SetRAMMeasurer(collector.NewRAMMeasurer())
 
 	var src runtimectl.Source
