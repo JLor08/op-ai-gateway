@@ -351,11 +351,12 @@ func validateTranscriptionRequest(form transcriptionForm) *inference.Error {
 // validateTranscriptionDetailsRequest is validateTranscriptionRequest for the details
 // endpoint: every refusal of the plain endpoint's validation, in the plain endpoint's
 // order and with its codes, and ONE more -- a request to stream. audio.cpp answers a
-// stream on /details with an HTTP 500, which the relay would have to pass on as a
-// server failure for what is a client error, and the details endpoint has no streaming
-// relay to hand the request to, so a `stream` that reads as true (anything
-// strconv.ParseBool reads as such; wantsStream) is refused here with
-// transcriptionStreamUnsupported, before the request is routed or anything is sent. A
+// stream on /details with an HTTP 400 of its own ("streaming is not supported on
+// /v1/audio/transcriptions/details"), and the details endpoint has no streaming relay
+// to hand the request to, so a `stream` that reads as true (anything
+// strconv.ParseBool reads as such; wantsStream) is refused here, by the gateway's own
+// 400 transcriptionStreamUnsupported, before the request is routed or any upstream
+// call is made, rather than left to the upstream's refusal. A
 // stream that reads as false, or is absent or empty, is the one-shot request the
 // endpoint is and is accepted. The check runs AFTER the shared validation, so a form
 // that is invalid in another way is refused for that, and a `stream` that is no boolean
@@ -389,8 +390,8 @@ var errTranscriptionUnavailable = errors.New(codeTranscriptionUnavailable)
 // errImageEditTooLarge's twin, mapped in the same three places.
 var errTranscriptionTooLarge = errors.New(codeRequestBodyTooLarge)
 
-// transcriptionInferenceShape is the shape handleOpenAITranscription hands the ONE
-// preflight gate (inferencePreflight). It is a function, not an inline literal, so
+// transcriptionInferenceShape is the shape serveTranscription hands the ONE
+// preflight gate (inferencePreflight) for the plain transcription endpoint. It is a function, not an inline literal, so
 // the exact values the handler uses are the ones its test pins:
 //
 //   - apiFlavor is exactly routing.APIFlavorOpenAIAudio (the string apiFlavorSpeech

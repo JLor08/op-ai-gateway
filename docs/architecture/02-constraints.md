@@ -63,8 +63,9 @@ several architectural decisions exist specifically to satisfy them.
   its four run kinds (text, image, speech, transcription), since the image kind covers
   both image generation and edits. No
   inference endpoint other than those five
-  accepts the loopback pair, and none accepts the session cookie other than
-  `/v1/chat/completions`.
+  accepts the loopback pair (the `/details` route is not a sixth: it is served by the
+  transcription endpoint's own loopback-admitting handler), and none accepts the
+  session cookie other than `/v1/chat/completions`.
 - **The public listener and the mesh (agent) listener are separate enforcement
   surfaces** with independent TLS and authorization.
 

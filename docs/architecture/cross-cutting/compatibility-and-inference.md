@@ -1254,8 +1254,8 @@ spoke when**: `{"text", "segments", "speaker_turns": [{"start_sample", "end_samp
 seconds. The gateway serves it as the transcription relay's **second route** (`handleOpenAITranscriptionDetails`, with an
 `/openai/v1/audio/transcriptions/details` alias), through the **same** `serveTranscription` as the plain one, so items 2 to
 4 and 6 to 10 hold for it unchanged: the same auth leg, the same body cap and form checks (a `model` and exactly one
-non-empty `file`, `response_format` `json` or absent, WAV only), the same `transcription` gate, `multipart_proxy` check
-and model-name rewrite, the same buffered read of the response up to the cap, the same error normalisation, the same
+non-empty `file`, `response_format` `json` or absent; the upstream reads WAV only, which the gateway does not check), the
+same `transcription` gate, `multipart_proxy` check and model-name rewrite, the same buffered read of the response up to the cap, the same error normalisation, the same
 capture (the form, and the transcript) and the same `audio_second` billing from the document's own
 `timing.audio_duration_ms`. What differs:
 

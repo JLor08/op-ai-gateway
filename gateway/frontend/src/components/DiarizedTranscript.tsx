@@ -59,7 +59,7 @@ export function diarizedTranscriptText(t: Translation, part: SpeakerTranscriptPa
   if (part.turns.length === 0) return part.text;
   const numbers = speakerNumbers(part.turns);
   return part.turns
-    .map((turn) => `${t.chatTranscriptionSpeaker(numbers.get(turn.speaker) ?? 0)}: ${turn.text}`)
+    .map((turn) => `${t.chatTranscriptionSpeaker(numbers.get(turn.speaker) ?? 1)}: ${turn.text}`)
     .join('\n');
 }
 
@@ -96,6 +96,8 @@ export function DiarizedTranscript({
   return (
     <Box
       component="ol"
+      // listStyle: 'none' drops the list semantics in Safari/VoiceOver, so the role puts them back.
+      role="list"
       aria-label={t.chatTranscriptionSpeakerView}
       sx={{ listStyle: 'none', m: 0, mt: 1.25, p: 0, display: 'grid', gap: 1 }}
     >

@@ -667,9 +667,8 @@ type usageMeta struct {
 	// /v1/audio/transcriptions/details. So the images call sites and the audio ones
 	// set it, and must: left at its zero value (endpointChat) a row records the
 	// generations path for an edit and the speech path for a transcription. Every
-	// other call site leaves it zero, which
-	// changes nothing for them -- upstreamPath ignores the endpoint for every
-	// flavor but those two.
+	// other call site leaves it zero, which changes nothing for them --
+	// upstreamPath ignores the endpoint for every flavor but those two.
 	Endpoint sessionEndpoint
 	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
 	// requestProgress first-token stamp); the zero time means "no generation

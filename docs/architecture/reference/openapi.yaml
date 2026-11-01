@@ -513,8 +513,9 @@ paths:
         issue #295): the same handler, so auth (scope `gateway:use` or
         `llm:invoke`, a bearer token OR the internal trusted-loopback header
         pair, never a portal session cookie), the multipart form and its
-        refusals (a non-empty `model`, exactly one non-empty `file`, only WAV
-        audio, `response_format` `json` or absent), the `transcription`
+        refusals (a non-empty `model`, exactly one non-empty `file`,
+        `response_format` `json` or absent; the upstream reads WAV audio only,
+        and the gateway does not check it), the `transcription`
         capability gate, the `multipart_proxy` requirement for an
         agent-launched model, the upload cap
         (`OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`), the error codes
@@ -4206,7 +4207,8 @@ components:
                 type: string
                 format: binary
                 description: >
-                  The audio to transcribe, WAV only. Exactly one non-empty part
+                  The audio to transcribe. The upstream reads WAV only (the
+                  gateway does not check or convert it). Exactly one non-empty part
                   with this name is required (400
                   `transcription.file_required` for none, 400
                   `transcription.invalid` for more than one).

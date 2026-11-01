@@ -144,7 +144,7 @@ type ServerDeps struct {
 	// in New to defaultMaxImageEditBodyBytes.
 	MaxImageEditBodyBytes int
 	// MaxAudioTranscriptionBodyBytes caps the multipart body POST
-	// /v1/audio/transcriptions reads into memory (config
+	// /v1/audio/transcriptions (and its /details twin) reads into memory (config
 	// OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES). <= 0 defaults in New to
 	// defaultMaxAudioTranscriptionBodyBytes.
 	MaxAudioTranscriptionBodyBytes int
@@ -441,8 +441,8 @@ type Server struct {
 	AppHealth                *AppHealthRegistry
 	AppImageOptions          *AppImageOptionsRegistry
 	// maxAudioTranscriptionBodyBytes is the multipart read cap of POST
-	// /v1/audio/transcriptions, defaulted in New; a bare &Server{} leaves it 0,
-	// which transcriptionBodyLimit reads as the default.
+	// /v1/audio/transcriptions and of its /details twin, defaulted in New; a bare
+	// &Server{} leaves it 0, which transcriptionBodyLimit reads as the default.
 	maxAudioTranscriptionBodyBytes int64
 	// maxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
 	// WAV headers) one chat run may store across its audio blobs, and
@@ -1090,7 +1090,7 @@ func New(deps ServerDeps) *Server {
 		edgeScheme:                  edgeScheme,
 		certEdgeRequireHTTPSDisable: deps.CertEdgeRequireHTTPSDisable,
 		certMeshRequireTLSDisable:   deps.CertMeshRequireTLSDisable,
-		// multipart read cap of POST /v1/audio/transcriptions (defaulted above)
+		// multipart read cap of POST /v1/audio/transcriptions and /details (defaulted above)
 		maxAudioTranscriptionBodyBytes: maxAudioTranscriptionBodyBytes,
 		maxChatAudioBytes:              maxChatAudioBytes,
 		maxChatBlobBytes:               maxChatBlobBytes,
