@@ -36,11 +36,13 @@ import (
 // raw-JSON passthrough, with the keys the run owns refused. The turn is speech's
 // opposite: the input is audio and the output is text, the answer's `text` committed
 // as an ordinary {"type":"text"} part, so nothing downstream (the history that
-// carries the turn forward, the renderer) learns a new shape.
+// carries the turn forward, the renderer) learns a new shape. (The one exception is a
+// diarized run whose answer names several speakers, see below.)
 //
 // The run always ASKS for a stream (stream=true); whether it gets one is the gateway's
 // decision, made from what it knows of the mapped model (a model loaded with
-// mode=streaming streams, any other answers one-shot), so the run reads either answer:
+// mode=streaming streams, any other answers one-shot), so the run reads either answer
+// -- unless the thread's Diarize setting is on, see below:
 //
 //   - a one-shot JSON document ({"text":...}), read whole and committed once -- there is
 //     nothing to checkpoint and no rate that could be measured rather than invented,
@@ -49,6 +51,17 @@ import (
 //     chat-completions shape consumeRunStream parses, so consumeTranscriptionStream
 //     parses it): each delta is published into the run as it is read, so the turn fills
 //     in, and the done frame's text is committed as the turn.
+//
+// A DIARIZED run (the thread's Diarize setting, see isDiarizedRun) asks for who said
+// what instead, and is the one-shot twin of the above: it makes its one request to the
+// gateway's /v1/audio/transcriptions/details, which audio.cpp refuses a stream on, so
+// the run states no stream and reads one JSON document -- {"text":...,"speaker_turns":
+// [...],"sample_rate":...} -- whole, whatever the answer's content type. What it commits
+// is decided by the ANSWER, not by the setting: a document naming at least two distinct
+// speakers is committed as a speaker_transcript part, and anything else -- one speaker,
+// no speaker_turns at all because the mapped model does not diarize -- is the ordinary
+// text part of a plain run, so asking for diarization of a model that cannot is never an
+// error and never a blank turn.
 //
 // transcriptionTextPart is THE content part a transcription turn emits:
 //
@@ -61,6 +74,39 @@ type transcriptionTextPart struct {
 	Text string `json:"text"`
 }
 
+// speakerTranscriptPart is the content part a diarized transcription turn emits when the
+// answer names at least two distinct speakers (speakerTranscriptOf):
+//
+//	{"type":"speaker_transcript","text":"<the transcript>","turns":[
+//	  {"speaker":"0","start":0,"end":1.5,"text":"<what that speaker said>"}, ...]}
+//
+// `type` first, then the whole transcript (the answer's `text`, verbatim) and the turns in
+// the order they were spoken. It is the turn's ONLY part -- no text part is committed
+// beside it -- so the speaker view owns the whole turn body. These names are the
+// contract with the portal: the `speaker_transcript` variant of its ChatContentPart union
+// (components/shared/chatContent.ts) mirrors them exactly. A declared type for the same
+// reason as transcriptionTextPart's.
+type speakerTranscriptPart struct {
+	Type  string            `json:"type"`
+	Text  string            `json:"text"`
+	Turns []speakerTurnPart `json:"turns"`
+}
+
+// speakerTurnPart is one turn of a speakerTranscriptPart: who spoke -- the audio.cpp
+// speaker_id, a free-form STRING that is committed verbatim ("0", "1" today, but never
+// assumed to be a number, an order or a count) -- when, and what. Start and End are
+// SECONDS from the start of the clip (audio.cpp states offsets in samples; the run
+// converts them with the answer's sample_rate so the stored turn carries seconds). They
+// are pointers, omitted when unknown, so that a turn without times is told apart from
+// one that starts at 0: the first turn of a clip legitimately starts there, and a plain
+// float64 with omitempty would drop that one.
+type speakerTurnPart struct {
+	Speaker string   `json:"speaker"`
+	Start   *float64 `json:"start,omitempty"`
+	End     *float64 `json:"end,omitempty"`
+	Text    string   `json:"text"`
+}
+
 // transcriptionResponse is what the run reads of the endpoint's 2xx answer, the
 // document audio.cpp sends -- {"text":"...","timing":{...}}. Only the transcript is
 // read: the timing is the relay's business (it meters the billed audio duration from
@@ -69,15 +115,58 @@ type transcriptionResponse struct {
 	Text string `json:"text"`
 }
 
+// transcriptionDetailsResponse is what a DIARIZED run reads of the details endpoint's 2xx
+// answer, the document audio.cpp sends -- {"text":"...","speaker_turns":[...],
+// "sample_rate":16000,"timing":{...}} plus members (segments, words, ...) nothing here is
+// made of. The timing is the relay's business, as for the plain document. It is a type of
+// its own, decoded ONLY by a diarized run, so a plain run keeps reading the plain document
+// whatever speaker_turns it happens to carry.
+//
+// A model that does not diarize answers a document without speaker_turns, which decodes
+// to none (as does null): the fallback to the plain transcript, not a failure. A
+// speaker_turns of any other shape, like a text that is no string, is a document this run
+// cannot read.
+//
+// The sample counts and the rate are decoded as NUMBERS, not integers, so a spelling such
+// as 16000.0 is still read; they are whole samples and Hz in practice.
+type transcriptionDetailsResponse struct {
+	Text         string                     `json:"text"`
+	SpeakerTurns []transcriptionSpeakerTurn `json:"speaker_turns"`
+	SampleRate   float64                    `json:"sample_rate"`
+}
+
+// transcriptionSpeakerTurn is one entry of the details document's speaker_turns: the
+// turn's span in samples of the document's sample_rate, the speaker's id and the text.
+// (A confidence member rides along in the document; nothing here is made of it.)
+type transcriptionSpeakerTurn struct {
+	StartSample float64 `json:"start_sample"`
+	EndSample   float64 `json:"end_sample"`
+	SpeakerID   string  `json:"speaker_id"`
+	Text        string  `json:"text"`
+}
+
+// minSpeakersForSpeakerTranscript is how many DISTINCT speaker ids an answer must name for
+// the run to commit a speaker_transcript: a single speaker's "speaker view" would be one
+// labelled block around the ordinary transcript, so below it the ordinary text part is
+// the better turn.
+const minSpeakersForSpeakerTranscript = 2
+
+// The paths of the two gateway endpoints a transcription run posts to: the plain one and
+// the diarized run's one-shot twin.
+const (
+	transcriptionRunPath        = "/v1/audio/transcriptions"
+	transcriptionRunDetailsPath = "/v1/audio/transcriptions/details"
+)
+
 // The terminal codes this path adds. Like the image and speech paths' they are CODES,
 // not prose: the portal maps a run's error to a localized label, and each names a
 // condition a user has to be able to tell apart from an ordinary failure.
 const (
 	// transcriptionRunDispatchFailedMessage: the run never got its request to the
-	// gateway's own /v1/audio/transcriptions at all -- building our own form failed
-	// (a passthrough entry that cannot be written into it, a clip of a type with no
-	// file name), the request could not be constructed, or the loopback round trip
-	// failed outright. The third one's Go error embeds the request URL, so showing it
+	// gateway's own /v1/audio/transcriptions (or its diarized twin, .../details) at
+	// all -- building our own form failed (a passthrough entry that cannot be written
+	// into it, a clip of a type with no file name), the request could not be
+	// constructed, or the loopback round trip failed outright. The third one's Go error embeds the request URL, so showing it
 	// would put an internal address and a transport detail in a portal bubble about a
 	// condition no user can act on; the operator's signal is the log line at the call
 	// site, which keeps the full Go error. NOT used for a context that ended:
@@ -97,7 +186,8 @@ const (
 	// transcriptionRunResponseUnreadableMessage: a 2xx the run cannot treat as the
 	// transcription's answer -- the body could not be read to its end (a truncated body,
 	// a connection the upstream dropped mid-write), or it is not the {"text":...}
-	// document (an HTML error page, a proxy's own body, a JSON of another shape), or it
+	// document (an HTML error page, a proxy's own body, a JSON of another shape -- for a
+	// diarized run that includes a speaker_turns that is no list of turns), or it
 	// is an event stream that ended before its transcript.text.done frame (cut by the
 	// upstream's death or the gateway's idle timeout: what arrived is not the whole
 	// transcript, and is never committed as one). A context that ended (deadline/cancel)
@@ -126,7 +216,9 @@ const (
 // any other format). Rejecting them here turns what would be an opaque upstream
 // refusal, or worse an override of the run's own value, into a refusal that names its
 // cause. "Reserved" is the run's ownership of a field, not a refusal to stream: the
-// run does request one, and always through this value of its own.
+// run does request one, and always through this value of its own. A DIARIZED run states
+// no stream (its endpoint is one-shot), but the field stays reserved there all the same:
+// a passthrough stream would be forwarded to an endpoint that refuses it.
 //
 // stream_format is deliberately not listed, for speechReservedFields' reason: the
 // endpoint already refuses any non-empty one with transcription.stream_unsupported,
@@ -152,8 +244,9 @@ var transcriptionFilenames = map[string]string{
 }
 
 // executeTranscriptionRun is executeRun's transcription branch: one multipart request to
-// the gateway's own /v1/audio/transcriptions and one terminal commit carrying the
-// transcript as the assistant turn's structured content.
+// the gateway's own /v1/audio/transcriptions (/v1/audio/transcriptions/details for a
+// diarized run) and one terminal commit carrying the transcript as the assistant turn's
+// structured content.
 //
 // It calls finishRunWithParts EXACTLY ONCE, on every path, because the work is split
 // into a function that only COMPUTES the outcome (generateTranscriptionTurn, below)
@@ -166,12 +259,13 @@ var transcriptionFilenames = map[string]string{
 //
 // The deadline IS applied here, and not by executeRun as it is for the other bounded
 // kinds, because it is not the run's end-to-end bound: it is the budget for the wait for
-// the first thing to show, and it is lifted once there is one. A one-shot answer never
-// has one, so it is bounded to its end, exactly as before; a stream that delivers a
-// delta is no longer bounded by it (the gateway's idle timeout watches it from there on),
-// and one that never does ends at the deadline as a timeout, not a cancel. The deadline
-// is a timer that cancels the run's context WITH the cause context.DeadlineExceeded,
-// which is what runContextOutcome reads, so a lifted deadline is simply a stopped timer.
+// the first thing to show, and it is lifted once there is one. A one-shot answer (a
+// diarized run's always) never has one, so it is bounded to its end, exactly as before;
+// a stream that delivers a delta is no longer bounded by it (the gateway's idle timeout
+// watches it from there on), and one that never does ends at the deadline as a timeout,
+// not a cancel. The deadline is a timer that cancels the run's context WITH the cause
+// context.DeadlineExceeded, which is what runContextOutcome reads, so a lifted deadline
+// is simply a stopped timer.
 func (s *Server) executeTranscriptionRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -203,11 +297,18 @@ func armRunDeadline(kind string, cancel context.CancelCauseFunc) (lift func()) {
 // is the only thing it does to the run before returning -- and calls liftDeadline when
 // the first one arrives; a one-shot answer publishes nothing.
 //
-// The request is a POST of buildTranscriptionBody to /v1/audio/transcriptions under
-// the shared loopback header set (setRunLoopbackHeaders), whose Content-Type states
-// application/json: transcription is multipart-in, so that one header is replaced
-// afterwards by the form's own, which carries its boundary -- the edit hop's
+// The request is a POST of buildTranscriptionBody to /v1/audio/transcriptions -- to
+// /v1/audio/transcriptions/details when the run is diarized (isDiarizedRun), the one
+// thing that setting changes about the request besides the form's stream field --
+// under the shared loopback header set (setRunLoopbackHeaders), whose Content-Type
+// states application/json: transcription is multipart-in, so that one header is
+// replaced afterwards by the form's own, which carries its boundary -- the edit hop's
 // override (generateImageTurn).
+//
+// A diarized run is one-shot, and is read as one: whatever the answer's content type
+// (the gateway never relays the details endpoint as a stream, see
+// isStreamedTranscription), its body is read whole and decoded as the details document
+// (transcriptionTurnFromDetails).
 //
 // A turn whose clip is unusable fails before anything is built or sent, and a
 // reserved passthrough key fails before anything is sent: neither is retried or
@@ -228,7 +329,12 @@ func (s *Server) generateTranscriptionTurn(ctx context.Context, owner auth.Token
 		}
 		return nil, "error", transcriptionRunDispatchFailedMessage
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/audio/transcriptions", bytes.NewReader(body))
+	diarized := isDiarizedRun(prep)
+	path, endpoint := transcriptionRunPath, endpointTranscription
+	if diarized {
+		path, endpoint = transcriptionRunDetailsPath, endpointTranscriptionDetails
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+path, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("chat run %s: build transcription request failed: %v", run.ID, err)
 		return nil, "error", transcriptionRunDispatchFailedMessage
@@ -253,8 +359,9 @@ func (s *Server) generateTranscriptionTurn(ctx context.Context, owner auth.Token
 
 	// The gateway answered the stream request with an event stream: read it as it
 	// comes. (Only a 2xx can be one; anything else, and a one-shot document, is read
-	// whole below.)
-	if resp.StatusCode >= 200 && resp.StatusCode <= 299 && isStreamedTranscription(endpointTranscription, true, resp.Header) {
+	// whole below.) A diarized run asked for no stream and its endpoint never streams,
+	// so for it this is false whatever the answer says it is.
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 && isStreamedTranscription(endpoint, !diarized, resp.Header) {
 		return s.consumeTranscriptionStream(ctx, owner, run, resp, dispatchedAt, liftDeadline)
 	}
 
@@ -273,7 +380,7 @@ func (s *Server) generateTranscriptionTurn(ctx context.Context, owner auth.Token
 		log.Printf("chat run %s: transcription response unreadable: %v", run.ID, err)
 		return nil, "error", transcriptionRunResponseUnreadableMessage
 	}
-	return transcriptionTurnFromResponse(run, resp, payload)
+	return transcriptionTurnFromResponse(run, resp, payload, diarized)
 }
 
 // transcriptionLineKind classifies one line of the transcription event stream, as
@@ -404,7 +511,15 @@ func transcriptionTurnFromStreamText(run *ChatRun, doneText string) (json.RawMes
 	if strings.TrimSpace(text) == "" {
 		return nil, "error", transcriptionRunNoTranscriptMessage
 	}
-	parts, err := json.Marshal([]transcriptionTextPart{{Type: "text", Text: text}})
+	return transcriptionPartOutcome(run, transcriptionTextPart{Type: "text", Text: text})
+}
+
+// transcriptionPartOutcome is the outcome (parts, status, terminal message) of a turn
+// that produced a transcript: part as the turn's ONE content part, completed. The part
+// is a transcriptionTextPart or a speakerTranscriptPart; a part that cannot be marshalled
+// is a failure to dispatch (the operator's log keeps the cause).
+func transcriptionPartOutcome(run *ChatRun, part any) (json.RawMessage, string, string) {
+	parts, err := json.Marshal([]any{part})
 	if err != nil {
 		log.Printf("chat run %s: marshal transcription parts failed: %v", run.ID, err)
 		return nil, "error", transcriptionRunDispatchFailedMessage
@@ -417,12 +532,16 @@ func transcriptionTurnFromStreamText(run *ChatRun, doneText string) (json.RawMes
 // generateTranscriptionTurn returns: a non-2xx answer is the upstream's own error
 // code, a 2xx that is not the {"text":...} document is "response unreadable", one
 // that holds no transcript is "no transcript", and anything else is the transcript
-// as one ordinary text part. It is split out of generateTranscriptionTurn, which
-// keeps the request and the read, the way speechPartFrom is split out of
-// generateSpeechTurn.
-func transcriptionTurnFromResponse(run *ChatRun, resp *http.Response, payload []byte) (json.RawMessage, string, string) {
+// as one ordinary text part. A diarized run's answer is the details document instead
+// and is read by transcriptionTurnFromDetails, after the same refusal of a non-2xx. It
+// is split out of generateTranscriptionTurn, which keeps the request and the read, the
+// way speechPartFrom is split out of generateSpeechTurn.
+func transcriptionTurnFromResponse(run *ChatRun, resp *http.Response, payload []byte, diarized bool) (json.RawMessage, string, string) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, "error", upstreamErrorCode(payload, resp.Status)
+	}
+	if diarized {
+		return transcriptionTurnFromDetails(run, resp, payload)
 	}
 
 	// A pointer, so that a body of JSON null -- which decodes into a struct without
@@ -438,12 +557,69 @@ func transcriptionTurnFromResponse(run *ChatRun, resp *http.Response, payload []
 	if strings.TrimSpace(decoded.Text) == "" {
 		return nil, "error", transcriptionRunNoTranscriptMessage
 	}
-	parts, err := json.Marshal([]transcriptionTextPart{{Type: "text", Text: decoded.Text}})
-	if err != nil {
-		log.Printf("chat run %s: marshal transcription parts failed: %v", run.ID, err)
-		return nil, "error", transcriptionRunDispatchFailedMessage
+	return transcriptionPartOutcome(run, transcriptionTextPart{Type: "text", Text: decoded.Text})
+}
+
+// transcriptionTurnFromDetails is transcriptionTurnFromResponse for a diarized run's 2xx
+// answer (the non-2xx case is refused by its caller): a body that is not the details
+// document is "response unreadable", a transcript that is empty is "no transcript" -- the
+// turns beside it do not make a blank speaker view of one -- and otherwise the turn is
+// the speaker transcript when the answer names at least two distinct speakers
+// (speakerTranscriptOf) and the ordinary text part of a plain run when it does not.
+func transcriptionTurnFromDetails(run *ChatRun, resp *http.Response, payload []byte) (json.RawMessage, string, string) {
+	// A pointer, for the plain document's reason: a body of JSON null is not a document.
+	var decoded *transcriptionDetailsResponse
+	if err := json.Unmarshal(payload, &decoded); err != nil || decoded == nil {
+		// Neither the body nor the error is logged: the transcript may be in either.
+		log.Printf("chat run %s: transcription details response is not the {\"text\":...,\"speaker_turns\":...} document (status %s, content type %q, %d bytes)", run.ID, resp.Status, resp.Header.Get(contentTypeHeader), len(payload))
+		return nil, "error", transcriptionRunResponseUnreadableMessage
 	}
-	return parts, "completed", ""
+	if strings.TrimSpace(decoded.Text) == "" {
+		return nil, "error", transcriptionRunNoTranscriptMessage
+	}
+	if part, ok := speakerTranscriptOf(*decoded); ok {
+		return transcriptionPartOutcome(run, part)
+	}
+	return transcriptionPartOutcome(run, transcriptionTextPart{Type: "text", Text: decoded.Text})
+}
+
+// speakerTranscriptOf builds the speaker transcript of a details answer and reports
+// whether the answer is one: it is when its turns name at least
+// minSpeakersForSpeakerTranscript distinct speaker ids, counted over the ids as audio.cpp
+// wrote them (a speaker who speaks again is the same speaker, whatever the turn count).
+// With fewer -- one speaker, or no turns because the model does not diarize -- it
+// reports false and the answer is the ordinary transcript.
+//
+// The turns are kept whole and in order, the speaker id verbatim and the text untouched;
+// only the offsets change, from samples to seconds (turnSeconds).
+func speakerTranscriptOf(doc transcriptionDetailsResponse) (speakerTranscriptPart, bool) {
+	speakers := make(map[string]struct{}, minSpeakersForSpeakerTranscript)
+	for _, turn := range doc.SpeakerTurns {
+		speakers[turn.SpeakerID] = struct{}{}
+	}
+	if len(speakers) < minSpeakersForSpeakerTranscript {
+		return speakerTranscriptPart{}, false
+	}
+	turns := make([]speakerTurnPart, 0, len(doc.SpeakerTurns))
+	for _, turn := range doc.SpeakerTurns {
+		start, end := turnSeconds(turn.StartSample, turn.EndSample, doc.SampleRate)
+		turns = append(turns, speakerTurnPart{Speaker: turn.SpeakerID, Start: start, End: end, Text: turn.Text})
+	}
+	return speakerTranscriptPart{Type: "speaker_transcript", Text: doc.Text, Turns: turns}, true
+}
+
+// turnSeconds converts a turn's span, stated in samples of sampleRate, to seconds. It
+// answers nil, nil -- no times, which the part omits rather than invents -- when the rate
+// is not a positive number (absent from the document, zero or negative: there is nothing
+// to divide by, and a guess would put a wrong time on every turn) or when the span is no
+// span (a negative start, or an end before its start): a time that is nonsense is worse
+// than none, and the turn's speaker and text are still good.
+func turnSeconds(startSample, endSample, sampleRate float64) (start, end *float64) {
+	if sampleRate <= 0 || startSample < 0 || endSample < startSample {
+		return nil, nil
+	}
+	startSeconds, endSeconds := startSample/sampleRate, endSample/sampleRate
+	return &startSeconds, &endSeconds
 }
 
 // transcriptionInputOf reads the clip of the LAST user message in the prepared
@@ -482,15 +658,27 @@ func transcriptionInputOf(history []portal.ChatAPIMessage) (string, []byte, erro
 	return mediaType, audio, nil
 }
 
+// isDiarizedRun reports whether the run is diarized: the thread's Diarize setting is on.
+// It is the ONE place that is decided, so the endpoint the run posts to
+// (generateTranscriptionTurn), the form it builds (buildTranscriptionBody) and the way it
+// reads the answer cannot disagree about it. A prepared run with no transcription
+// settings at all is a plain one.
+func isDiarizedRun(prep PrepareRunResult) bool {
+	return prep.Settings.Transcription != nil && prep.Settings.Transcription.Diarize
+}
+
 // buildTranscriptionBody is the transcription endpoint's own request: a
 // multipart/form-data body of the run's form fields and the clip as the `file`
 // part. It returns the body and the Content-Type to send it under (which carries the
 // boundary).
 //
 // model is the run's own: the thread's pinned model. stream is the run's own too, and
-// always the literal true: the run asks for a stream and the gateway decides whether
-// the mapped model gets one (see the file's header). response_format is NOT stated --
-// the endpoint answers JSON when it is absent and refuses every other value
+// the literal true: the run asks for a stream and the gateway decides whether the
+// mapped model gets one (see the file's header) -- EXCEPT for a diarized run
+// (isDiarizedRun), which states none at all: its endpoint is one-shot and refuses a
+// stream. The setting that makes the run diarized is not a form field either; it chose
+// the endpoint and says nothing more to it. response_format is NOT stated -- the
+// endpoint answers JSON when it is absent and refuses every other value
 // (validateTranscriptionRequest, ADR-062 g), so there is nothing to choose and an
 // unset field is omitted, the discipline buildSpeechBody keeps. The set first-class
 // settings (language and prompt when non-empty, temperature when set, in its shortest
@@ -521,7 +709,10 @@ func buildTranscriptionBody(prep PrepareRunResult, mediaType string, audio []byt
 	if !ok {
 		return nil, "", fmt.Errorf("no file name for media type %q", mediaType)
 	}
-	fields := map[string]any{"model": prep.Settings.Model, "stream": "true"}
+	fields := map[string]any{"model": prep.Settings.Model}
+	if !isDiarizedRun(prep) {
+		fields["stream"] = "true"
+	}
 	if settings := prep.Settings.Transcription; settings != nil {
 		if err := mergeTranscriptionSettings(fields, settings); err != nil {
 			return nil, "", err
