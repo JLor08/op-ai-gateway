@@ -169,6 +169,26 @@ const RuntimeRAMMeasurementFeature = "runtime_ram_measurement"
 // equal; TestRuntimeRAMAccountingFeatureName pins this side.
 const RuntimeRAMAccountingFeature = "runtime_ram_accounting"
 
+// RuntimeRoleEvictionFeature is the agent-declared capability naming that the
+// agent captures each spec's pushed model role (AgentRuntimeSpecDTO.Role) and
+// protects a model used within its eviction grace window from being evicted,
+// ordering the remaining victims by role. It is on the agent's list only, not on
+// gatewayAgentFeatures: it states a fact about the agent alone, and it is
+// declared for VISIBILITY only -- the portal reads it off the agent's declared
+// set (AgentFeatures.Has, fail-closed) to show that a connected agent evicts this
+// way. Unlike the other agent-declared names it gates nothing on the gateway: the
+// runtime-config document is one shared document per server, the role is an
+// additive field an older agent ignores (falling back to least-recently-used
+// eviction), and co-residency rides the unchanged coresident list, so every agent
+// gets a correct config without it. It is exported, like RuntimeRAMAccountingFeature,
+// for the portal service that reads the connected agent's features.
+//
+// The agent module cannot import this package, so the agent names the identical
+// string in its own registry (server-agent/internal/agent/features.go) -- the
+// same arrangement as RuntimeRAMAccountingFeature. The two spellings must stay
+// equal; TestRuntimeRoleEvictionFeatureName pins this side.
+const RuntimeRoleEvictionFeature = "runtime_role_eviction"
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio

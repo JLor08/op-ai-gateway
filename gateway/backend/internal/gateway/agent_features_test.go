@@ -283,3 +283,27 @@ func TestRuntimeRAMAccountingFeatureName(t *testing.T) {
 		t.Fatalf("a server that declared %q must read as having it", RuntimeRAMAccountingFeature)
 	}
 }
+
+// TestRuntimeRoleEvictionFeatureName pins the literal the agent declares for its
+// role-aware, grace-protected eviction (its features.go; the agent module cannot
+// import this one), and that the name stays off the gateway's own list: it states
+// a fact about the agent alone -- that it captures each spec's pushed role and
+// protects a recently used model from eviction -- and the gateway only reads it
+// off the agent's declared set (AgentFeatures.Has, fail-closed), for display. It
+// gates nothing: the runtime-config document is the same for every agent.
+func TestRuntimeRoleEvictionFeatureName(t *testing.T) {
+	if RuntimeRoleEvictionFeature != "runtime_role_eviction" {
+		t.Fatalf("RuntimeRoleEvictionFeature = %q, want the agent's literal %q", RuntimeRoleEvictionFeature, "runtime_role_eviction")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeRoleEvictionFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeRoleEvictionFeature)
+	}
+	srv := NewTestServer()
+	if srv.AgentFeatures.Has("role-eviction-host", RuntimeRoleEvictionFeature) {
+		t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", RuntimeRoleEvictionFeature)
+	}
+	srv.AgentFeatures.Set("role-eviction-host", []string{RuntimeRoleEvictionFeature})
+	if !srv.AgentFeatures.Has("role-eviction-host", RuntimeRoleEvictionFeature) {
+		t.Fatalf("a server that declared %q must read as having it", RuntimeRoleEvictionFeature)
+	}
+}

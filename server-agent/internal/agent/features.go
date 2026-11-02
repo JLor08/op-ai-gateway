@@ -291,6 +291,24 @@ var Features = []Feature{
 	// runtime_ram_measurement, whose single MINOR bump to 0.14.0 covers both
 	// entries (see agent.go's Version block).
 	{Name: "runtime_ram_accounting", Since: "0.14.0"},
+	// runtime_role_eviction: this agent captures each spec's pushed model role
+	// (the runtime-config document's per-spec role, runtime.Spec.Role) onto its
+	// admission snapshot, and keeps a model used within the eviction grace window
+	// (OP_AGENT_EVICTION_GRACE_SECONDS) off the victim list however hard the
+	// pressure -- role-aware, grace-protected eviction.
+	//
+	// Unlike the capability flags above that the gateway negotiates on, this one
+	// is declared for TELEMETRY AND VISIBILITY only: it lets the portal show that
+	// a connected agent evicts this way. It gates nothing, on either side. The
+	// runtime-config document stays one shared, non-feature-gated document per
+	// server, the role field is additive and an agent that ignores it falls back
+	// to least-recently-used eviction (a safe degradation, never an OOM), and
+	// co-residency stays on the existing coresident wire field, so an agent
+	// without the flag still gets a correct allow-list.
+	//
+	// Since is 0.15.0: agent.Features gains an entry, so the rule is a MINOR bump
+	// (see agent.go's Version block).
+	{Name: "runtime_role_eviction", Since: "0.15.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.
