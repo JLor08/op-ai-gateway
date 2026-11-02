@@ -367,3 +367,68 @@ func TestAdmitSiblingVRAMSummed(t *testing.T) {
 	snap.Running = append(snap.Running, instanceProc("S", 1, 4000))
 	assertNoCapacity(t, "S#2 beside S and S#1", Admit(snap, instanceSpec("S", 2, 4000)), "wait")
 }
+
+// TestAdmitEvictsSiblingsHighestIndexFirst: the ordering invariant discounts a
+// sibling already queued to go, so when the start needs several idle instances
+// of one spec gone, ONE decision evicts all of them -- drawn, and reported in
+// Decision.Evict, highest index first. Without the discount only the highest
+// would be evictable, the rest would block, and the Wait would carry no
+// eviction at all: nothing would drain S#2, so the start would sit until idle
+// unload happened to run. LastUsed is set so the oldest-first drain order alone
+// would put the lower index first; the expected lists pin the override.
+func TestAdmitEvictsSiblingsHighestIndexFirst(t *testing.T) {
+	sBusy := RunningProc{SpecID: "S", Spec: "S", InFlight: 1, GPUs: map[int]int{0: 3000}, RAMMB: 3000}
+	s1 := RunningProc{SpecID: "S#1", Spec: "S", Instance: 1, Surplus: true, LastUsed: t0, GPUs: map[int]int{0: 3000}, RAMMB: 3000}
+	s2 := RunningProc{SpecID: "S#2", Spec: "S", Instance: 2, Surplus: true, LastUsed: t1, GPUs: map[int]int{0: 3000}, RAMMB: 3000}
+	sIdle := RunningProc{SpecID: "S", Spec: "S", LastUsed: t0}
+	s1Idle := RunningProc{SpecID: "S#1", Spec: "S", Instance: 1, Surplus: true, LastUsed: t1}
+	s2Idle := RunningProc{SpecID: "S#2", Spec: "S", Instance: 2, Surplus: true, LastUsed: t2}
+
+	cases := []struct {
+		name string
+		snap PolicySnapshot
+		spec Spec
+		want []string
+	}{
+		{
+			name: "per-GPU VRAM",
+			snap: PolicySnapshot{
+				Running: []RunningProc{sBusy, s1, s2}, Budgets: map[int]int{0: 10000}, Allowed: allowPairs("X", "S"),
+			},
+			spec: Spec{ID: "X", GPUs: []SpecGPU{{Index: 0, VRAMMB: 7000}}},
+			want: []string{"S#2", "S#1"},
+		},
+		{
+			name: "host RAM",
+			snap: PolicySnapshot{
+				Running: []RunningProc{sBusy, s1, s2}, HostRAMBudgetMB: 10000, Allowed: allowPairs("X", "S"),
+			},
+			spec: Spec{ID: "X", RAMMB: 7000},
+			want: []string{"S#2", "S#1"},
+		},
+		{
+			name: "process count",
+			snap: PolicySnapshot{
+				Running: []RunningProc{sBusy, s1, s2}, MaxProcesses: 2, Allowed: allowPairs("X", "S"),
+			},
+			spec: Spec{ID: "X"},
+			want: []string{"S#2", "S#1"},
+		},
+		{
+			// Every instance of a closed pair must go, instance 0 included; the
+			// running set lists the lowest first, so an unordered walk would
+			// meet S while S#1 and S#2 still look like staying siblings.
+			name: "matrix, all instances",
+			snap: PolicySnapshot{Running: []RunningProc{sIdle, s1Idle, s2Idle}, Allowed: map[[2]string]bool{}},
+			spec: Spec{ID: "X"},
+			want: []string{"S#2", "S#1", "S"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Admit(tc.snap, tc.spec)
+			assertDecision(t, tc.name, got, Decision{Evict: tc.want})
+			assertNotNoCapacity(t, tc.name, got)
+		})
+	}
+}
