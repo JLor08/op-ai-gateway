@@ -2714,16 +2714,16 @@ type CoResidencyRule struct {
 // <= 0 precisely to honour it. That Admit-side rule is unchanged, but on a
 // host whose GPU total the agent can read it rarely sees a 0 any more: the
 // agent's budget auto-detect (ADR-083) replaces a 0 or absent row with the
-// detected device total before Admit runs, so 0 stays truly unconstrained
-// only for a GPU-less host, an Apple GPU, or before the first hardware sample
-// (a positive operator budget always wins verbatim). The two comments are a
-// matched pair — changing what 0 means here without changing it there gives
-// every model on a zero-budget GPU a permanent not_permitted, which is exactly
-// the bug that pairing them documents. ExpectedUUID /
-// ExpectedName are a purely descriptive drift detector: snapshotted when the
-// row is created (by the portal, Task 6) and later compared against live
-// telemetry to WARN that a card was renumbered — they never block anything;
-// the store just persists them.
+// detected device total (minus any configured VRAM headroom) before Admit
+// runs, so 0 stays truly unconstrained only for a GPU-less host, an Apple
+// GPU, or before the first hardware sample (a positive operator budget always
+// wins verbatim). The two comments are a matched pair — changing what 0 means
+// here without changing it there gives every model on a zero-budget GPU a
+// permanent not_permitted, which is exactly the bug that pairing them
+// documents. ExpectedUUID / ExpectedName are a purely descriptive drift
+// detector: snapshotted when the row is created (by the portal, Task 6) and
+// later compared against live telemetry to WARN that a card was renumbered —
+// they never block anything; the store just persists them.
 type ServerGPUBudget struct {
 	ServerID     string
 	GPUIndex     int

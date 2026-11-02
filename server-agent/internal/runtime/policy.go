@@ -64,10 +64,11 @@ type PolicySnapshot struct {
 	// That <= 0 rule is unchanged, but owner.buildSnapshot rarely feeds it a
 	// 0 for a GPU the agent can read: its budget auto-detect (ADR-083,
 	// fillDetectedBudgets) replaces a 0 or absent index with the detected
-	// device total before Admit runs, so a 0 stays truly unconstrained only for
-	// a GPU-less host, an Apple GPU, or before the first hardware sample (a
-	// positive operator budget always wins verbatim). The gateway-side
-	// comment on routing.ServerGPUBudget.BudgetMB states the same.
+	// device total (minus any configured VRAM headroom) before Admit runs, so a
+	// 0 stays truly unconstrained only for a GPU-less host, an Apple GPU, or
+	// before the first hardware sample (a positive operator budget always wins
+	// verbatim). The gateway-side comment on routing.ServerGPUBudget.BudgetMB
+	// states the same.
 	Budgets map[int]int
 	// HostRAMBudgetMB is the host-RAM pool in MB that every running process's
 	// RAMMB plus the candidate's own demand must fit under: the capacity
