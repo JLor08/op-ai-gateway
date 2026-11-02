@@ -53,7 +53,6 @@ Non-goals
 - Autonomous placement of models onto hosts (the north star above).
 - A cluster-wide `max` across hosts (bounds are per spec = per host).
 - Cross-organisation / external scaling.
-- A bundled audio clip in the repository (see §8.3).
 
 Anti-goals (would be a failure even if it "works")
 - A spec that did not opt in behaves in any way differently from today.
@@ -91,6 +90,12 @@ Anti-goals (would be a failure even if it "works")
    additional scale-up ceiling next to VRAM, RAM and `max`.
 9. All four phases in **one PR**; after approval of this document the work runs
    autonomously to the finished PR.
+10. **Audio benchmarks run like the text benchmarks** and their results —
+    including the under-load figure — are **stored on the model mapping like the
+    text results**, so reference values exist before a model is loaded (§8.1,
+    §8.5).
+11. **The ASR benchmark uses real, freely licensed speech that ships in the
+    repository** (§8.3).
 
 ## 4. Vocabulary
 
@@ -450,20 +455,33 @@ stored. Changing it never restarts a child.
 
 ## 8. Part D — audio performance benchmark (Phase 3)
 
-### 8.1 Mode and triggers
+### 8.1 Same modes, same buttons, same storage as the text benchmarks
 
-- New benchmark mode **`audio`** (portal button "Audio" next to the existing
-  ones; `BenchType` gains it). The existing `speech` mode (byte-rate cache,
-  health-loop trigger) stays as it is.
-- Targets: mappings with the speech (TTS) or transcription (ASR) capability, on
-  agent-managed or direct audio upstreams. Clone models need a preset voice
-  (reuse `speechBenchmarkSkip`).
-- Triggers: manual (server / mapping); **automatic once** when an audio mapping on
-  an idle server has no audio metrics yet, or is replicable and has no measured
+User requirement: audio benchmarks are run **exactly like the text-model
+benchmarks**, and their results are stored **on the model mapping like the text
+results — including the under-load figure** — so reference values exist before
+a model is ever loaded.
+
+- **No new mode.** The existing modes apply to audio mappings: `speed` = the
+  single-stream audio measurement (§8.2, §8.3), `capacity` = the under-load ramp
+  (§8.4), `both` = both. `runBenchmark` dispatches per mapping: a mapping with the
+  speech (TTS) or transcription (ASR) capability gets the audio measurement, a
+  chat mapping the text one; a server/application run covers both kinds. The same
+  portal buttons, endpoints (`/api/portal/{servers|applications|mappings}/{id}/benchmark?mode=`),
+  SSE progress, history and reservation apply. `BenchType` gains nothing; the
+  audio-only skip in the text paths becomes the audio dispatch.
+- **Scheduler**: like text mappings, audio mappings take part in the per-app
+  scheduled `speed` run (the audio-only skip there is removed for `speed`).
+- **Automatic first run**: additionally, once, when an audio mapping on an idle
+  server has no audio metrics yet, or is replicable and has no measured
   real-time concurrency yet (health-loop trigger, same gating style as the
-  speech-rate trigger; it includes the ramp). That is normally right after the
-  operator set the model up, before real use; it only starts on an idle server.
-  Re-runs are manual.
+  speech-rate trigger; mode `both`). Normally right after the operator set the
+  model up, before real use.
+- The existing `speech` mode (byte-rate cache, health-loop speech-rate trigger)
+  stays as it is.
+- Targets: mappings with the speech or transcription capability, on agent-managed
+  or direct audio upstreams. Clone models need a preset voice (reuse
+  `speechBenchmarkSkip`).
 - The usual reservation applies (one run per server, idle gate, `ServerBusy`
   excludes the server from routing during the run).
 - Each measurement goes **directly to a specific instance** (like the speech
@@ -485,15 +503,14 @@ stored. Changing it never restarts a child.
 
 ### 8.3 ASR
 
-- Source audio: speech **synthesized at run time** (non-streamed WAV of the same
-  passage) — no audio file is bundled in the repository (no licensing question,
-  no binary in git). Source order: (1) the gateway's in-memory clip cache from an
-  earlier run; (2) a TTS target measured earlier in **this** run (within one
-  server's run, TTS targets are measured first, ASR targets after); (3) any other
-  TTS mapping on a server **not** under test, through normal routing; (4) none →
-  the ASR part is skipped with reason `no_speech_source`. Every ASR measurement
-  starts with its own warm-up, so a TTS load that displaced the ASR model on a
-  single audio host is never inside the measured window.
+- Source audio: a **bundled clip** of real speech, embedded in the gateway
+  binary (`go:embed`): six sentences from the **Thorsten-Voice** dataset
+  (German, single speaker, **CC0 1.0**; `Thorsten-Voice/TV-44kHz-Full`, subset
+  `TV-2022.10-Neutral`), joined with short pauses into one ≈ 22.6 s clip,
+  converted to 16 kHz mono s16le WAV (≈ 0.7 MB). The transcript ships next to it;
+  the asset directory carries a source/licence note and
+  `docs/architecture/cross-cutting/licensing.md` records it. The ASR request
+  passes `language=de`.
 - Buffered transcription: `rate_x = audio_s / wall`.
 - Live transcription (`transcription_streaming` = yes): the PCM is sent unpaced
   over the live endpoint; `ttft_ms = t(first transcript.text.delta) − t(send)`;
@@ -502,10 +519,12 @@ stored. Changing it never restarts a child.
 
 ### 8.4 Concurrency ramp
 
-For replicable specs on a `runtime_instances` agent: k = 1, 2, 3, …:
-ensure instances 0 … k−1 (burst rules apply — only free resources, nothing is
-evicted), run k simultaneous measurements, one per instance, and record each
-stream's `rate_x`. Level k is good if the **slowest** stream's `rate_x ≥
+k = 1, 2, 3, …: run k simultaneous measurements and record each stream's
+`rate_x`. For a replicable spec on a `runtime_instances` agent each stream gets
+its own instance (ensure instances 0 … k−1 first; burst rules apply — only free
+resources, nothing is evicted). For any other audio mapping all k streams go to
+its single process (the same "concurrency inside one process" a text capacity
+run measures; audio.cpp serializes, so this normally yields 1). Level k is good if the **slowest** stream's `rate_x ≥
 threshold`. Stop at the first bad level, a refused ensure, `max_instances`, or
 `OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX` (default 8).
 `realtime_concurrency` = the last good k (0 = not real-time even alone), stored
@@ -514,9 +533,8 @@ threshold), `resources` (an ensure was refused: neighbours held the room at that
 moment) or `cap` (`max_instances` or the ramp cap reached). Only a
 `performance` stop is a measured ceiling; `resources` / `cap` make k a lower
 bound ("≥ k" in the portal) and the scaler does not treat it as a ceiling.
-Non-replicable specs: `realtime_concurrency` = 1 if the single stream is good,
-else 0. Instances started by the ramp are ordinary burst instances afterwards
-and idle-unload normally.
+Instances started by the ramp are ordinary burst instances afterwards and
+idle-unload normally.
 
 Threshold: `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR`, default **1.2** (20 %
 safety margin over real time).
@@ -530,8 +548,12 @@ safety margin over real time).
   (bigint), `audio_realtime_concurrency` (integer),
   `audio_concurrency_limit` (text: `performance` / `resources` / `cap`),
   `audio_metrics_updated_at`.
-  Written by the audio benchmark under the existing `metrics_locked` guard. 0 /
-  NULL = unknown.
+  Written by the audio `speed` / `capacity` runs exactly like the text metrics:
+  under the existing `metrics_locked` guard, stamping `metrics_source` /
+  `metrics_updated_at` the same way. Like the text metrics they are also
+  **editable in the mapping editor** (an operator may enter reference values by
+  hand and lock them). 0 / NULL = unknown. Routing and the scaler read them from
+  the mapping, so they apply whether or not the model is currently loaded.
 
 ## 9. Part E — routing uses the audio metrics (Phase 3)
 
@@ -599,7 +621,11 @@ Non-replicable mappings: unchanged.
   · max ∞").
 - Models catalog (`ModelServersSection`): per mapping the running instance count;
   audio columns (× real time, time to first audio/text, real-time concurrency).
-- Benchmark panel: the "Audio" type, a live result line and history rows.
+- Benchmark panel: no new type — the existing speed / capacity / both buttons
+  run the audio measurement on audio mappings (§8.1); an audio result line in
+  the live panel and audio history rows.
+- Mapping editor: the audio metrics are shown and editable next to the text
+  metrics, under the same lock (§8.5).
 - German and English keys together.
 
 ## 12. Data model and wire summary
@@ -667,14 +693,17 @@ Then: architecture docs folded, working files removed, full verification, PR.
   pinned server; when none is free, non-live requests overflow onto the
   preferred instance (pins never queue, as today) and live requests park; both
   signal demand restricted to that server.
+- **Audio benchmarks reuse the text modes** (speed = single stream, capacity =
+  under load, both), dispatched per mapping; results land on the mapping like
+  text metrics (lock, source, editable) — the user's requirement, the mode
+  mapping is my call. The TTS passage stays English (like today's speech
+  benchmark); the bundled ASR clip is German (Thorsten-Voice, CC0).
 - **The concurrency ramp records why it stopped**; only a performance stop is a
   scale-up ceiling (a resource refusal or a cap makes the number a lower bound).
   The automatic first run includes the ramp, only on an idle server.
 - **No scale-up next to a starting sibling**; an `instance_demand_unknown`
   refusal only delays 5 s (not the 60 s cooldown), and the agent measures a new
   instance immediately at its first healthy probe.
-- **ASR benchmark audio source order**: clip cache → a TTS target measured
-  earlier in the same run → a TTS on another server via routing → skip.
 - **An instance k ≥ 1 never starts with an unknown demand** — it inherits its
   running sibling's measurement or waits/refuses. Avoids two unmeasured
   siblings bootstrapping on the same card.
@@ -690,8 +719,6 @@ Then: architecture docs folded, working files removed, full verification, PR.
 - Idle factor 5, floor 120 s; refusal cooldown 60 s; real-time threshold 1.2×;
   ramp cap 8; instance-index cap 64.
 - Audio Score bonus +10 per × real time, at most 50.
-- ASR benchmark audio is synthesized by an available TTS model at run time; no
-  bundled clip.
 - `idle_timeout_seconds = 0` on a *replicable* spec means "no manual override"
   (the automatic value applies), while on a non-replicable spec it keeps meaning
   "never idle-unload".
