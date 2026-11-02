@@ -849,7 +849,8 @@ func (a *admission) evictable(r RunningProc) bool {
 
 // evictableOf returns the subset of procs that may be drained now (evictable),
 // preserving input order. It is the idle-victim filter rule 3 (chargeGPUBudget)
-// and rule 6 (ruleHostRAM) share before ordering victims oldest-first.
+// and rule 6 (ruleHostRAM) share before ordering victims with orderVictims
+// (the candidate's own role first, then least-recently-used).
 func (a *admission) evictableOf(procs []RunningProc) []RunningProc {
 	var out []RunningProc
 	for _, r := range procs {
