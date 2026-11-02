@@ -206,6 +206,16 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // "transcription" and shows only on a `yes` -- the one-shot model (`no`) and the unknown
   // (no row) both render no chip, as for every other known capability.
   { capability: 'transcription_streaming', label: (t) => t.capabilityTranscriptionStreaming },
+  // "embedding" and "rerank" name the model's ROLE (a vector encoder / a reranker, not a
+  // text generator) rather than an endpoint it serves. Unlike the audio chips they are
+  // operator-stated -- nothing probes either one, the mapping form is where they are set --
+  // but they are vetted names all the same, so a `yes` reads as a translated chip here
+  // instead of the raw string in the open-vocabulary bucket below (which is where an
+  // Ollama-declared "embedding" row would otherwise land). A `no` and an absent row render
+  // no chip, as for every other known capability. They sit with the declared traits, ahead
+  // of the observed "speculation_observed".
+  { capability: 'embedding', label: (t) => t.capabilityEmbedding },
+  { capability: 'rerank', label: (t) => t.capabilityRerank },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
 const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));
@@ -243,9 +253,9 @@ type CapabilityChip = { status: 'success' | 'standby'; label: string; row: Model
 
 // capabilityChips returns one chip per DETERMINED `yes` verdict, in a fixed
 // order (Vision, Video, Audio, Tools, Image, Speech, Transcription, Streaming
-// transcription, Speculation observed -- KNOWN_CAPABILITY_ORDER) so the
-// column reads the same on every row regardless of which verdicts happen to
-// be set, followed by every OTHER
+// transcription, Embedding, Reranker, Speculation observed --
+// KNOWN_CAPABILITY_ORDER) so the column reads the same on every row
+// regardless of which verdicts happen to be set, followed by every OTHER
 // capability name this build has no dedicated column for, VERBATIM
 // (including a string this portal build doesn't recognize -- the vocabulary
 // is open-ended upstream, e.g. Ollama passes manifest-declared capabilities

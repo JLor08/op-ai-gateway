@@ -1155,6 +1155,64 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText('transcription_streaming')).not.toBeInTheDocument();
     });
 
+    // `embedding` and `rerank` are the operator-stated role capabilities (the
+    // mapping form's own controls). Vetted names like every other known
+    // capability, so a `yes` must read as a translated "success" chip in the
+    // fixed order, never as the raw string in the neutral open-vocabulary
+    // standby bucket -- which is exactly where an Ollama-declared "embedding"
+    // row used to land.
+    it('renders embedding and rerank as translated chips in fixed order, not raw standby chips', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [capRow('rerank', 'yes'), capRow('embedding', 'yes')],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).queryByText('embedding')).not.toBeInTheDocument();
+      expect(within(cell).queryByText('rerank')).not.toBeInTheDocument();
+      expect(within(cell).getByText(t.capabilityEmbedding)).toHaveAttribute(
+        'data-status',
+        'active',
+      );
+      expect(within(cell).getByText(t.capabilityRerank)).toHaveAttribute('data-status', 'active');
+      // Fixed order, whatever order the rows arrive in.
+      const labels = within(cell)
+        .getAllByText((_, el) => el?.getAttribute('data-status') === 'active')
+        .map((el) => el.textContent);
+      expect(labels).toEqual([t.capabilityEmbedding, t.capabilityRerank]);
+    });
+
+    it('renders no embedding or rerank chip for a `no` verdict, and never a raw one', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [capRow('embedding', 'no'), capRow('rerank', 'no')],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).queryByText(t.capabilityEmbedding)).not.toBeInTheDocument();
+      expect(within(cell).queryByText(t.capabilityRerank)).not.toBeInTheDocument();
+      expect(within(cell).queryByText('embedding')).not.toBeInTheDocument();
+      expect(within(cell).queryByText('rerank')).not.toBeInTheDocument();
+    });
+
     it('renders speech_clone as a translated chip after Speech, not a raw standby chip', async () => {
       const rows = makeRows().map((r) =>
         r.mapping_id === 'map-a'

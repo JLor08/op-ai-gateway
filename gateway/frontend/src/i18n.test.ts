@@ -3289,6 +3289,34 @@ describe('speech capability i18n key', () => {
   });
 });
 
+describe('embedding and rerank capability i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has the mapping control and chip keys in ${locale}`, () => {
+      const t = messages[locale];
+      for (const key of [
+        'mappingEmbeddingCapable',
+        'mappingEmbeddingCapableUnknownHint',
+        'mappingRerankCapable',
+        'mappingRerankCapableUnknownHint',
+        'capabilityEmbedding',
+        'capabilityRerank',
+      ] as const) {
+        expect(t[key], key).toBeTruthy();
+      }
+      // The two roles read as two different things, in the form and in the chip column.
+      expect(t.mappingEmbeddingCapable).not.toBe(t.mappingRerankCapable);
+      expect(t.capabilityEmbedding).not.toBe(t.capabilityRerank);
+    });
+  }
+
+  it('labels the two roles in de and en', () => {
+    expect(messages.en.capabilityEmbedding).toBe('Embedding');
+    expect(messages.en.capabilityRerank).toBe('Reranker');
+    expect(messages.de.capabilityEmbedding).toBe('Embedding');
+    expect(messages.de.capabilityRerank).toBe('Reranker');
+  });
+});
+
 // Responses live-timings (issue #81 part 2, design D10): the shared
 // API-variant block's own checkbox strings plus the three backend refusals
 // part 1 introduced. The codes are read verbatim from the Go errRow tables in

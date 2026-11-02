@@ -532,6 +532,112 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     }
 
+    // embedding and rerank mark a model's ROLE (a vector encoder / a reranker,
+    // not a text generator). Unlike the audio and image controls above, nothing
+    // probes either one and neither pair is reserved, so there is no automated
+    // writer a manual verdict could mask: the control offers the full three
+    // states exactly like vision, and the operator's verdict is the source of
+    // truth.
+    for (const control of [
+      {
+        capability: 'embedding',
+        label: t.mappingEmbeddingCapable,
+        hint: t.mappingEmbeddingCapableUnknownHint,
+      },
+      {
+        capability: 'rerank',
+        label: t.mappingRerankCapable,
+        hint: t.mappingRerankCapableUnknownHint,
+      },
+    ] as const) {
+      const { capability, label, hint } = control;
+
+      it(`offers unknown, yes and no for ${capability}`, async () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+        await screen.findByRole('option', { name: t.mappingCapabilityUnknown });
+        expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual([
+          t.mappingCapabilityUnknown,
+          t.mappingCapabilityYes,
+          t.mappingCapabilityNo,
+        ]);
+        fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+      });
+
+      it(`seeds ${capability} from the capability ROW`, () => {
+        renderForm({ row: makeMapping({ capabilities: [capRow(capability, 'yes')] }) });
+        expect(screen.getByRole('combobox', { name: label }).textContent).toBe(
+          t.mappingCapabilityYes,
+        );
+      });
+
+      it(`sends the ${capability} verdict when the control is moved to yes`, async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await pickOption(label, t.mappingCapabilityYes);
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ [capability]: 'yes' });
+      });
+
+      it(`sends an explicit ${capability} no, which no probe could ever contradict`, async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await pickOption(label, t.mappingCapabilityNo);
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ [capability]: 'no' });
+      });
+
+      it(`sends an empty ${capability} verdict when a stored yes is reset to unknown`, async () => {
+        const { submitted } = renderForm({
+          row: makeMapping({ capabilities: [capRow(capability, 'yes')] }),
+        });
+        await pickOption(label, t.mappingCapabilityUnknown);
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ [capability]: '' });
+      });
+
+      it(`sends nothing for an untouched ${capability} control`, async () => {
+        const { submitted } = renderForm({
+          row: makeMapping({ capabilities: [capRow(capability, 'yes')] }),
+        });
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+      });
+
+      it(`shows a ${capability} unknown hint of its own, and only while it is unknown`, async () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        expect(screen.getByText(hint)).toBeInTheDocument();
+        expect(hint).not.toBe(t.mappingVisionCapableUnknownHint);
+        expect(hint).not.toBe(t.mappingImageCapableUnknownHint);
+        expect(hint).not.toBe(t.mappingSpeechCapableUnknownHint);
+        expect(hint).not.toBe(t.mappingTranscriptionCapableUnknownHint);
+
+        await pickOption(label, t.mappingCapabilityYes);
+        expect(screen.queryByText(hint)).not.toBeInTheDocument();
+      });
+    }
+
+    it('gives embedding and rerank hints that differ from one another', () => {
+      expect(t.mappingEmbeddingCapableUnknownHint).not.toBe(t.mappingRerankCapableUnknownHint);
+      expect(t.mappingEmbeddingCapable).not.toBe(t.mappingRerankCapable);
+    });
+
+    it('sends both role verdicts together when both controls are moved', async () => {
+      const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+      await pickOption(t.mappingEmbeddingCapable, t.mappingCapabilityYes);
+      await pickOption(t.mappingRerankCapable, t.mappingCapabilityYes);
+      await save();
+
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0].capability_verdicts).toEqual({ embedding: 'yes', rerank: 'yes' });
+    });
+
     it('leaves metrics_locked a CHECKBOX', () => {
       // A policy flag over the numeric metrics, not a capability -- ADR-039 is
       // explicit that it does not guard the capability table any more, so it

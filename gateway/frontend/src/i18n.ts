@@ -1051,6 +1051,17 @@ const de = {
   mappingTranscriptionCapable: 'Transkription',
   mappingTranscriptionCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Audio transkribiert. Das wird automatisch aus dem Feld „task“ in /v1/models des audio.cpp-Servers erkannt („asr“ steht für Transkription): durch das Gateway mit dem nächsten Health-Check bei einem statischen Server, den es direkt erreicht, und durch den Server-Agent (ab Version 0.9.1) bei einem Modell, das er startet. Wo das noch kein Ergebnis geliefert hat, etwa bei einem älteren Agent oder einem Modell, das die Auflistung nicht nennt, setze es auf Ja, um die Transkription freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
+  // Embedding und Reranker sind keine erkannten Merkmale: Nichts im Gateway
+  // prüft sie, und kein Paar ist reserviert -- darum bieten beide Steuerungen,
+  // wie Vision, alle drei Zustände an, und das Urteil des Betreibers ist die
+  // einzige Quelle. Sie legen die Rolle des Modells fest (Vektor-Encoder bzw.
+  // Reranker statt Textgenerator), siehe DeriveRole im Backend.
+  mappingEmbeddingCapable: 'Embedding-Modell',
+  mappingEmbeddingCapableUnknownHint:
+    'Unbekannt = keine Festlegung. Das Gateway erkennt Embedding-Modelle nicht selbst; automatisch gesetzt wird es nur bei einem Ollama-Modell, das der Server-Agent startet und für das Ollama die Fähigkeit „embedding“ meldet. Überall sonst setze es auf Ja, um das Modell als Embedding-Modell (Vektor-Encoder, kein Textgenerator) zu kennzeichnen. Das Gateway leitet daraus die Rolle des Modells ab.',
+  mappingRerankCapable: 'Reranker-Modell',
+  mappingRerankCapableUnknownHint:
+    'Unbekannt = keine Festlegung. Das Gateway erkennt Reranker-Modelle nicht; sie werden ausschließlich vom Betreiber gekennzeichnet. Setze es auf Ja, um das Modell als Reranker (bewertet Anfrage-Dokument-Paare, kein Textgenerator) zu kennzeichnen. Das Gateway leitet daraus die Rolle des Modells ab.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1773,6 +1784,10 @@ const de = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
+  // Embedding und Reranker kennzeichnen die ROLLE des Modells (Vektor-Encoder
+  // bzw. Reranker); beide stammen vom Betreiber, siehe das Zuordnungsformular.
+  capabilityEmbedding: 'Embedding',
+  capabilityRerank: 'Reranker',
   capabilityTranscription: 'Transkription',
   // Refines "Transkription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
@@ -4409,6 +4424,17 @@ const en: PortalMessages = {
   mappingTranscriptionCapable: 'Transcription',
   mappingTranscriptionCapableUnknownHint:
     'Unknown: whether this mapping transcribes audio is not on file. It is detected automatically from the "task" field of the audio.cpp server\'s /v1/models ("asr" means transcription): by the gateway on the next health check for a static server it reaches directly, and by the server agent (version 0.9.1 or later) for a model it launches. Where that has not produced a verdict yet, for example with an older agent or a model the listing does not name, set it to Yes to enable transcription. A Yes set here takes precedence over the automatic detection.',
+  // Embedding and reranker are not detected traits: nothing in the gateway
+  // probes either one and neither pair is reserved, so both controls offer all
+  // three states like vision and the operator's verdict is the only source.
+  // They set the model's ROLE (a vector encoder / a reranker rather than a text
+  // generator), see DeriveRole in the backend.
+  mappingEmbeddingCapable: 'Embedding model',
+  mappingEmbeddingCapableUnknownHint:
+    'Unknown = no verdict on file. The gateway does not detect embedding models itself; it is set automatically only for an Ollama model the server agent launches and for which Ollama declares the "embedding" capability. Anywhere else, set it to Yes to mark the model as an embedding model (a vector encoder, not a text generator). The gateway derives the model\'s role from it.',
+  mappingRerankCapable: 'Reranker model',
+  mappingRerankCapableUnknownHint:
+    "Unknown = no verdict on file. The gateway does not detect reranker models; only an operator marks them. Set it to Yes to mark the model as a reranker (it scores query/document pairs, it does not generate text). The gateway derives the model's role from it.",
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -5070,6 +5096,10 @@ const en: PortalMessages = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
+  // Embedding and reranker mark the model's ROLE (a vector encoder / a
+  // reranker); both are operator-stated, see the mapping form.
+  capabilityEmbedding: 'Embedding',
+  capabilityRerank: 'Reranker',
   capabilityTranscription: 'Transcription',
   // Refines "Transcription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
