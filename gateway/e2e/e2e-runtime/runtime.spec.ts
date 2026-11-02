@@ -560,6 +560,13 @@ test("1 — an AI server and a server_agent application, created through the por
       OP_AGENT_GATEWAY_URL: GW,
       OP_AGENT_TOKEN: agentToken,
       OP_AGENT_INTERVAL: "500ms",
+      // Eviction grace OFF. Scenarios 5/6 assert admission ARITHMETIC (the
+      // per-GPU VRAM sum): each poll round drives a start for both specs every
+      // ~500ms, so a victim is always a just-used idle model. The default 30s
+      // grace would keep that victim un-evictable, so B could never evict A and
+      // the arithmetic could never be observed. 0 disables the window; the grace
+      // behaviour itself is covered by the agent's unit tests.
+      OP_AGENT_EVICTION_GRACE_SECONDS: "0",
       OP_AGENT_RUNTIME_SOURCE: "gateway",
       OP_AGENT_RUNTIME_ALLOWED_BINARIES: RUNTIME_STUB_BIN,
       OP_AGENT_RUNTIME_ALLOWED_DIRS: workDir,
