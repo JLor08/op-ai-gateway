@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useState } from 'react';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CoResidencyEditor,
@@ -549,6 +549,96 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // After the drop a move no longer resizes.
       fireEvent.pointerMove(separator(), { clientX: 250, pointerId: 1 });
       expect(Number(separator().getAttribute('aria-valuenow'))).toBe(400);
+    });
+
+    // The detail pane holds the pinned Allowed / Default / Forbidden control (up
+    // to ~380px in German under opt-in) plus its row's padding and a name, so the
+    // list may only grow until the detail pane has 620px left (and the divider's
+    // own 6px). With the list at its static 560 maximum on a ~990px container the
+    // detail pane was ~74px and the control scrolled out of view.
+    describe('against the container width', () => {
+      const SEPARATOR = 6;
+      const DETAIL_MIN = 620;
+
+      function stubContainerWidth(width: number) {
+        const rect = () =>
+          ({
+            x: 0,
+            y: 0,
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: 400,
+            width,
+            height: 400,
+            toJSON: () => ({}),
+          }) as DOMRect;
+        return vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(rect);
+      }
+      const valueNow = () => Number(separator().getAttribute('aria-valuenow'));
+      const valueMax = () => Number(separator().getAttribute('aria-valuemax'));
+
+      afterEach(() => vi.restoreAllMocks());
+
+      it('caps the upper bound so the detail pane keeps room for its control', () => {
+        installPointerEvent();
+        stubContainerWidth(1000);
+        renderEditor(empty());
+        expect(valueMax()).toBe(1000 - SEPARATOR - DETAIL_MIN);
+
+        fireEvent.pointerDown(separator(), { clientX: 300, pointerId: 1 });
+        fireEvent.pointerMove(separator(), { clientX: 99999, pointerId: 1 });
+        expect(valueNow()).toBe(valueMax());
+        expect(1000 - SEPARATOR - valueNow()).toBeGreaterThanOrEqual(DETAIL_MIN);
+        fireEvent.pointerUp(separator(), { clientX: 99999, pointerId: 1 });
+
+        fireEvent.keyDown(separator(), { key: 'Home' });
+        fireEvent.keyDown(separator(), { key: 'End' });
+        expect(valueNow()).toBe(1000 - SEPARATOR - DETAIL_MIN);
+        fireEvent.keyDown(separator(), { key: 'ArrowRight' });
+        expect(valueNow()).toBe(1000 - SEPARATOR - DETAIL_MIN);
+      });
+
+      it('shows a remembered width that no longer fits clamped, without forgetting it', () => {
+        stubContainerWidth(1000);
+        window.localStorage.setItem(CORESIDENCY_LIST_WIDTH_KEY, '560');
+        renderEditor(empty());
+
+        expect(valueNow()).toBe(1000 - SEPARATOR - DETAIL_MIN);
+        // Merely viewing on a narrow window does not overwrite the remembered
+        // width a wide one chose.
+        expect(window.localStorage.getItem(CORESIDENCY_LIST_WIDTH_KEY)).toBe('560');
+      });
+
+      it('re-clamps when the container shrinks, and gives the width back when it grows', () => {
+        const rects = stubContainerWidth(1400);
+        let notify: () => void = () => {};
+        vi.stubGlobal(
+          'ResizeObserver',
+          class {
+            constructor(callback: () => void) {
+              notify = callback;
+            }
+            observe() {}
+            disconnect() {}
+          },
+        );
+        window.localStorage.setItem(CORESIDENCY_LIST_WIDTH_KEY, '400');
+        renderEditor(empty());
+        expect(valueMax()).toBe(560); // 1400 - 626 = 774, capped by the static bound
+        expect(valueNow()).toBe(400);
+
+        rects.mockRestore();
+        stubContainerWidth(900);
+        act(() => notify());
+        expect(valueMax()).toBe(900 - SEPARATOR - DETAIL_MIN);
+        expect(valueNow()).toBe(900 - SEPARATOR - DETAIL_MIN);
+
+        vi.restoreAllMocks();
+        stubContainerWidth(1400);
+        act(() => notify());
+        expect(valueNow()).toBe(400);
+      });
     });
 
     it('ignores a corrupt or out-of-range remembered width', () => {

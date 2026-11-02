@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
 import {
   Box,
   Chip,
@@ -143,9 +143,32 @@ const LIST_WIDTH_MIN = 160;
 const LIST_WIDTH_MAX = 560;
 const LIST_WIDTH_DEFAULT = 280;
 const LIST_WIDTH_STEP = 16;
+const SEPARATOR_WIDTH = 6;
+// What the detail pane must keep. Its rows are a name, an optional "from group"
+// note and the tri-state control, and the control never shrinks: measured at
+// 13px it is 333px wide under opt-out and 378px in German under opt-in, to which
+// a row adds its indent and the pane's padding and a few words of name. Below
+// this the control scrolls out of view, which is exactly the thing the pane
+// exists to prevent -- so the list may only take what is left over.
+const DETAIL_WIDTH_MIN = 620;
+// The whole split view never gets narrower than its three parts at their minima;
+// a narrower viewport scrolls the view sideways instead.
+const SPLIT_MIN_WIDTH = LIST_WIDTH_MIN + SEPARATOR_WIDTH + DETAIL_WIDTH_MIN;
 
-function clampWidth(px: number): number {
-  return Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, Math.round(px)));
+/**
+ * The widest the list may be inside a container `containerWidth` wide: the
+ * static cap, or what leaves the detail pane its minimum, whichever is less --
+ * and never below the list's own minimum. An unmeasured container (0: before
+ * layout, or no layout engine) falls back to the static cap.
+ */
+function maxListWidth(containerWidth: number): number {
+  if (!(containerWidth > 0)) return LIST_WIDTH_MAX;
+  const room = Math.floor(containerWidth) - SEPARATOR_WIDTH - DETAIL_WIDTH_MIN;
+  return Math.max(LIST_WIDTH_MIN, Math.min(LIST_WIDTH_MAX, room));
+}
+
+function clampWidth(px: number, max: number): number {
+  return Math.min(max, Math.max(LIST_WIDTH_MIN, Math.round(px)));
 }
 
 // Storage is a convenience: it can be missing, blocked, full or hold anything
@@ -265,17 +288,38 @@ export function CoResidencyEditor({
   const [selectedId, setSelectedId] = useState('');
   const [query, setQuery] = useState('');
   const [collapsed, setCollapsed] = useState<ReadonlySet<ModelRole>>(new Set());
+  // The width the operator chose (and storage remembers). What is shown is that
+  // width held within what the container leaves room for, so a width picked on a
+  // wide window survives a visit from a narrow one without being rewritten.
   const [listWidth, setListWidthState] = useState(readListWidth);
+  const [containerWidth, setContainerWidth] = useState(0);
   const [dragging, setDragging] = useState(false);
   // The drag handlers read the latest width synchronously (a pointer-up must
   // persist the value the last move set, before React re-renders).
   const widthRef = useRef(listWidth);
   const draggingRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const maxWidth = maxListWidth(containerWidth);
+  const shownWidth = Math.min(listWidth, maxWidth);
 
   const sorted = useMemo(() => [...items].sort(compareItems), [items]);
   // A selection that vanished (a mapping was deleted) falls back to the first.
   const selected = sorted.find((item) => item.id === selectedId) ?? sorted[0];
+  const hasPanes = items.length >= 2 && selected !== undefined;
+
+  // Tracks the split view's width so the divider's upper bound follows it. A
+  // ResizeObserver where there is one (every browser); one measurement where
+  // there is not (jsdom), which then reports 0 and leaves the static bounds.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!hasPanes || !el) return undefined;
+    const measure = () => setContainerWidth(el.getBoundingClientRect().width);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasPanes]);
 
   const verdicts = useMemo(() => {
     const byPair = new Map<string, CoResidencyVerdict>();
@@ -332,8 +376,14 @@ export function CoResidencyEditor({
   }
 
   // ---- divider ----
+  // Read live, not from state: a pointer or key event must clamp against the
+  // container as it is now, not as the last render saw it.
+  function liveMaxWidth(): number {
+    return maxListWidth(containerRef.current?.getBoundingClientRect().width ?? 0);
+  }
+
   function setListWidth(px: number, persist: boolean) {
-    const next = clampWidth(px);
+    const next = clampWidth(px, liveMaxWidth());
     widthRef.current = next;
     setListWidthState(next);
     if (persist) writeListWidth(next);
@@ -371,11 +421,15 @@ export function CoResidencyEditor({
 
   function onDividerKeyDown(event: KeyboardEvent<HTMLElement>) {
     const step = event.shiftKey ? LIST_WIDTH_STEP * 4 : LIST_WIDTH_STEP;
+    const max = liveMaxWidth();
+    // Steps start from what is SHOWN, which a narrow container may have clamped
+    // below the width the operator chose.
+    const shown = Math.min(widthRef.current, max);
     let next: number | null = null;
-    if (event.key === 'ArrowLeft') next = widthRef.current - step;
-    else if (event.key === 'ArrowRight') next = widthRef.current + step;
+    if (event.key === 'ArrowLeft') next = shown - step;
+    else if (event.key === 'ArrowRight') next = shown + step;
     else if (event.key === 'Home') next = LIST_WIDTH_MIN;
-    else if (event.key === 'End') next = LIST_WIDTH_MAX;
+    else if (event.key === 'End') next = max;
     if (next === null) return;
     event.preventDefault();
     setListWidth(next, true);
@@ -415,7 +469,7 @@ export function CoResidencyEditor({
         )}
       </Box>
 
-      {items.length < 2 || !selected ? (
+      {!hasPanes || !selected ? (
         <Typography color="text.secondary">{t.coresidencyNeedTwo}</Typography>
       ) : (
         // Narrow viewports scroll sideways instead of stacking: a fixed layout
@@ -426,7 +480,7 @@ export function CoResidencyEditor({
             sx={{
               display: 'flex',
               alignItems: 'stretch',
-              minWidth: 640,
+              minWidth: SPLIT_MIN_WIDTH,
               minHeight: 360,
               maxHeight: '70vh',
               border: 1,
@@ -437,7 +491,7 @@ export function CoResidencyEditor({
           >
             <Box
               sx={{
-                width: listWidth,
+                width: shownWidth,
                 flexShrink: 0,
                 display: 'flex',
                 flexDirection: 'column',
@@ -504,9 +558,9 @@ export function CoResidencyEditor({
               role="separator"
               aria-orientation="vertical"
               aria-label={t.coresidencyResize}
-              aria-valuenow={listWidth}
+              aria-valuenow={shownWidth}
               aria-valuemin={LIST_WIDTH_MIN}
-              aria-valuemax={LIST_WIDTH_MAX}
+              aria-valuemax={maxWidth}
               tabIndex={0}
               data-dragging={dragging}
               onPointerDown={onDividerPointerDown}
@@ -515,7 +569,7 @@ export function CoResidencyEditor({
               onPointerCancel={endDividerDrag}
               onKeyDown={onDividerKeyDown}
               sx={{
-                width: 6,
+                width: SEPARATOR_WIDTH,
                 flexShrink: 0,
                 cursor: 'col-resize',
                 touchAction: 'none',
@@ -565,28 +619,49 @@ export function CoResidencyEditor({
                       >
                         {isCollapsed ? <ChevronRightIcon /> : <ExpandMoreIcon />}
                       </IconButton>
-                      <Typography
-                        component="h4"
-                        variant="subtitle1"
-                        noWrap
-                        sx={{ flex: '1 1 auto', minWidth: 0 }}
+                      {/* The one flexible part of the header: the name, its size
+                          and the "mixed" marker. The control beside it never
+                          shrinks, so what is left over is all this block gets;
+                          the chips WRAP under the name when it is cramped (the
+                          name itself gives way last, with an ellipsis and its
+                          full text on hover) instead of squeezing the name to
+                          nothing. Measured: German under opt-in, a mixed group
+                          and the list at its widest leave ~160px. */}
+                      <Box
+                        sx={{
+                          flex: '1 1 0',
+                          minWidth: 0,
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          alignItems: 'center',
+                          columnGap: 1,
+                          rowGap: 0.25,
+                        }}
                       >
-                        {roleLabel}
-                      </Typography>
-                      <Chip
-                        size="small"
-                        variant="outlined"
-                        label={t.coresidencyGroupSize(members.length)}
-                        sx={{ flexShrink: 0 }}
-                      />
-                      {mixed && (
+                        <Typography
+                          component="h4"
+                          variant="subtitle1"
+                          noWrap
+                          title={roleLabel}
+                          sx={{ minWidth: 0, maxWidth: '100%' }}
+                        >
+                          {roleLabel}
+                        </Typography>
                         <Chip
                           size="small"
-                          color="warning"
-                          label={t.coresidencyGroupMixed}
+                          variant="outlined"
+                          label={t.coresidencyGroupSize(members.length)}
                           sx={{ flexShrink: 0 }}
                         />
-                      )}
+                        {mixed && (
+                          <Chip
+                            size="small"
+                            color="warning"
+                            label={t.coresidencyGroupMixed}
+                            sx={{ flexShrink: 0 }}
+                          />
+                        )}
+                      </Box>
                       <VerdictControl
                         t={t}
                         mode={mode}
