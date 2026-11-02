@@ -971,6 +971,10 @@ func TestParseConfigInstanceCountsSanitized(t *testing.T) {
 		{"min above max is clamped to max", `"replicable":true,"min_instances":5,"max_instances":3`, 3, 3, true},
 		{"min below max is kept", `"replicable":true,"min_instances":2,"max_instances":3`, 2, 3, false},
 		{"min with no cap is kept", `"replicable":true,"min_instances":5`, 5, 0, false},
+		// The protected floor can never reach past the addressable range:
+		// instances 0..MaxInstanceIndex are all there is.
+		{"min above the index range is clamped to it", `"replicable":true,"min_instances":100`, MaxInstanceIndex + 1, 0, true},
+		{"min at the index range is kept", `"replicable":true,"min_instances":64`, MaxInstanceIndex + 1, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := withCountedLogs(t)

@@ -25,7 +25,21 @@
 // the generation identity, so a delayed exit-report for a process that has
 // already been superseded (map entry replaced or removed) is a no-op. Every
 // place below that reacts to an asynchronous report about a *runningProc
-// checks "is this still the CURRENT generation for this spec?" first.
+// checks "is this still the CURRENT generation for this instance?" first.
+//
+// ONE PROCESS PER INSTANCE (#340). A replicable spec may run several
+// instances of itself, so the owner's state is keyed by INSTANCE KEY (S for
+// instance 0, S#k for k >= 1 -- InstanceKey), not by spec ID: each instance
+// has its own specState, its own generation, its own lifecycle, backoff,
+// drain and measurement, and everything above applies to it unchanged. A
+// spec that never replicates has exactly one instance, instance 0, whose key
+// is its spec ID -- so for every such spec the owner is exactly what it was
+// before instances existed. The few places that treat instances of one spec
+// differently from unrelated specs (siblings) say so where they do it:
+// address resolution (resolveAddress), demand inheritance (demandSpec), the
+// burst/baseline split (admitAndStart), the protected floor (protected), the
+// "highest index leaves first" invariant (scanIdle,
+// evictOneIdleForBootstrap) and retirement (retireIfSpent).
 package runtime
 
 import (
@@ -180,6 +194,22 @@ var (
 	// whole process) -- but a stable sentinel is cheap and lets a caller
 	// distinguish "shutting down" from "genuinely blocked" if it ever cares.
 	ErrManagerClosed = errors.New("runtime.manager_closed")
+	// ErrInstanceNoCapacity refuses a BURST instance (#340, IsBurst) that does
+	// not fit into the room that is free right now: its admission is
+	// all-or-nothing (PolicySnapshot.NoEvict), so where a baseline start would
+	// evict an idle neighbour, queue behind a busy one or spend a bootstrap
+	// shot, a burst start is refused at once -- no waiter is queued, no state is
+	// left behind -- and the gateway tries another host. Wire code
+	// runtime.instance_no_capacity (409).
+	ErrInstanceNoCapacity = errors.New("runtime.instance_no_capacity")
+	// ErrInstanceDemandUnknown refuses a BURST instance whose VRAM or RAM
+	// demand is still unknown after inheriting the largest live measurement of
+	// every running sibling (owner.demandSpec): an instance k >= 1 is never
+	// admitted blind. It is the fast twin of the baseline instance's wait for a
+	// measured sibling; the gateway retries shortly, by which time the first
+	// instance has usually been measured (§5.2's measurement at the first
+	// healthy probe). Wire code runtime.instance_demand_unknown (409).
+	ErrInstanceDemandUnknown = errors.New("runtime.instance_demand_unknown")
 )
 
 // measurerFunc mirrors SetMeasurer's function parameter, named so it can be
@@ -234,7 +264,8 @@ type ManagerOptions struct {
 	SpecsFromLocalFile bool
 	// ConfigFilesDir is the agent-owned, writable base directory under which
 	// the config files a spec's config_files facet asks for are written, one
-	// per-spec subdirectory (<ConfigFilesDir>/<spec-id>/<name>). It is
+	// per-spec subdirectory (<ConfigFilesDir>/<spec-id>/<name>) -- per
+	// instance for a replicable spec (<ConfigFilesDir>/<spec-id>#<k>, #340). It is
 	// OPERATOR configuration from the agent's own local config (the
 	// config_files_dir setting) -- the gateway names a file's relative name and
 	// content, never where on the host it lands. Fixed for the process
@@ -474,6 +505,13 @@ func (m *Manager) Apply(cfg Config) {
 // timeout. release must be called exactly once, when the caller is done
 // proxying to endpoint; it decrements the in-flight counter, stamps
 // LastUsed, and wakes any request queued behind this spec's resources.
+//
+// upstreamModel may be an INSTANCE ADDRESS (#340): "m#k" names instance k of
+// the spec whose upstream model is m, resolved by the same rule as
+// ResolveAddress, and an allowed instance that does not exist yet is created
+// on demand. A burst instance answers at once -- it starts into free room or
+// is refused with ErrInstanceNoCapacity / ErrInstanceDemandUnknown, and is
+// never queued behind anything but its own start.
 func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
 	reply := make(chan ensureOutcome, 1)
 	select {
@@ -522,7 +560,10 @@ func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endp
 	return out.endpoint, release, nil
 }
 
-// Status returns a snapshot of every managed spec's current status.
+// Status returns a snapshot of every managed instance's current status: one
+// row per instance, each carrying its BASE spec ID, its Instance index and its
+// instance address as Model (so a spec that never replicates has its one row
+// exactly as before instances existed).
 func (m *Manager) Status() []Status {
 	reply := make(chan []Status, 1)
 	m.postCmd(cmdStatus{reply: reply})
@@ -534,9 +575,10 @@ func (m *Manager) Status() []Status {
 	}
 }
 
-// LoadedModels returns the upstream model names of every spec CURRENTLY in
-// StateRunning -- Starting does not count (a cold/loading model must not be
-// selected by prefer-loaded routing logic upstream).
+// LoadedModels returns the instance address (InstanceAddress: the upstream
+// model name for instance 0, "m#k" for instance k) of every instance
+// CURRENTLY in StateRunning -- Starting does not count (a cold/loading model
+// must not be selected by prefer-loaded routing logic upstream).
 func (m *Manager) LoadedModels() []string {
 	reply := make(chan []string, 1)
 	m.postCmd(cmdLoadedModels{reply: reply})
@@ -545,6 +587,33 @@ func (m *Manager) LoadedModels() []string {
 		return s
 	case <-m.done:
 		return nil
+	}
+}
+
+// ResolveAddress resolves a model name as the router receives it to the base
+// upstream model and the instance index it addresses (#340, Ruling R1): ok is
+// false for anything that is not a managed address. It is the one resolution
+// rule the router and EnsureRunning share (owner.resolveAddress):
+//
+//   - an EXACT match on a managed upstream model wins first and is instance 0,
+//     so a real model whose name merely contains '#' ("foo#2") keeps routing
+//     literally, even when "foo" is a replicable spec;
+//   - otherwise ParseInstanceAddress splits off an instance index, and the
+//     address is managed only when the base is a managed upstream model whose
+//     spec allows that instance (InstanceAllowed: replicable, within
+//     max_instances and MaxInstanceIndex).
+//
+// It answers from the owner's current index and creates nothing; a later
+// EnsureRunning re-resolves on its own, so an Apply landing in between is
+// harmless.
+func (m *Manager) ResolveAddress(model string) (base string, k int, ok bool) {
+	reply := make(chan resolvedAddress, 1)
+	m.postCmd(cmdResolve{model: model, reply: reply})
+	select {
+	case r := <-reply:
+		return r.base, r.k, r.ok
+	case <-m.done:
+		return "", 0, false
 	}
 }
 
@@ -886,6 +955,22 @@ type cmdLoadedModels struct{ reply chan []string }
 
 func (cmdLoadedModels) isCommand() {}
 
+// cmdResolve asks the owner to resolve a model name (Manager.ResolveAddress).
+// A command because byUpstream and the spec table are owner state.
+type cmdResolve struct {
+	model string
+	reply chan resolvedAddress
+}
+
+func (cmdResolve) isCommand() {}
+
+// resolvedAddress is cmdResolve's answer.
+type resolvedAddress struct {
+	base string
+	k    int
+	ok   bool
+}
+
 // cmdAppliedETag asks the owner for o.cfg.ETag. A COMMAND rather than an
 // atomic field written by applyConfig, and that is the whole point: only a
 // value served from the owner's own event loop is guaranteed to name a
@@ -983,9 +1068,40 @@ type runningProc struct {
 	stableTimer *time.Timer // pending "this run has been stable long enough" callback
 }
 
-// specState is one spec's complete owner-side bookkeeping.
+// specState is one INSTANCE's complete owner-side bookkeeping (#340): a spec
+// that never replicates has exactly one, keyed by its spec ID; a replicable
+// spec has one per instance that exists, keyed by InstanceKey.
 type specState struct {
+	// spec is what this instance launches and is admitted as: the pushed spec
+	// itself for instance 0, and for k >= 1 the per-instance copy
+	// specForInstance derives from it (ID = instance key, InstanceOf = base ID,
+	// Instance = k; every pushed field identical). applyConfig re-derives the
+	// copy from each new push, so a copy never drifts from its base -- and two
+	// copies of one unchanged base are DeepEqual, which is what keeps an
+	// unchanged push from restarting instances.
 	spec Spec
+
+	// instance is this state's instance index k: 0 for the spec's own process
+	// (and for every spec that never replicates), k >= 1 for a further
+	// instance. Fixed for the state's lifetime; spec.Instance carries the same
+	// number.
+	instance int
+
+	// startupMS is the wall time, in milliseconds, from this instance's most
+	// recent SUCCESSFUL start (exec) to its first passing health probe -- the
+	// measured cold-start figure Status.StartupMS reports (§5.6). 0 = unknown:
+	// never started successfully. It describes the last successful start, not
+	// the live process, so unlike the measurements it survives the exit.
+	startupMS int
+
+	// waitingOnDemand is true while this BASELINE instance k >= 1 is held back
+	// because its demand is still unknown after inheriting its siblings' live
+	// measurements (§5.4 rule 5): it waits for a sibling to be measured rather
+	// than starting blind. A measurement landing is the event that can end
+	// that wait and nothing else announces it, so applyMeasurement re-asks
+	// exactly these instances (wantsDemandWake). admitAndStart rewrites it on
+	// every verdict, like waitingOnRAM, so it never outlives the wait.
+	waitingOnDemand bool
 
 	state State
 	since time.Time
@@ -1046,8 +1162,8 @@ type specState struct {
 	// read by buildSnapshot, where it is floored at the spec's pushed demand
 	// to become the process's RunningProc.RAMMB.
 	//
-	// ONE PROCESS PER SPEC, so this is a scalar: there is nothing to sum, and
-	// unlike measuredVRAM there is no per-GPU key to re-key. Cleared by
+	// ONE PROCESS PER INSTANCE, so this is a scalar: there is nothing to sum,
+	// and unlike measuredVRAM there is no per-GPU key to re-key. Cleared by
 	// onProcExited for exactly the reason measuredVRAM is (F2): it describes a
 	// process, and stops being true when that process exits.
 	measuredRAM int
@@ -1229,6 +1345,17 @@ type owner struct {
 	// slower than the beat must not accumulate goroutines and subprocesses,
 	// and a skipped beat costs nothing but freshness.
 	measuring bool
+
+	// remeasure records that a process became healthy while a measurement was
+	// already out (measuring), so the measurement its first health probe asks
+	// for (handleStartResult) could not be dispatched. applyMeasurement
+	// dispatches it as soon as the outstanding one returns, instead of leaving
+	// the new process unmeasured for a whole housekeeping beat: a burst
+	// instance inherits its siblings' measured demand, and a fresh sibling's
+	// figure is what lets the next one start (§5.2). Only a start sets it --
+	// a skipped housekeeping beat stays skipped -- so a measurer slower than
+	// the beat still never runs back to back.
+	remeasure bool
 }
 
 // run is the owner's single event loop. Every state mutation in this
@@ -1294,6 +1421,9 @@ func (o *owner) handle(cmd command) {
 		c.reply <- o.snapshotStatus()
 	case cmdLoadedModels:
 		c.reply <- o.loadedModels()
+	case cmdResolve:
+		_, base, k, ok := o.resolveAddress(c.model)
+		c.reply <- resolvedAddress{base: base, k: k, ok: ok}
 	case cmdAppliedETag:
 		c.reply <- o.cfg.ETag
 	case cmdClose:
@@ -1306,6 +1436,22 @@ func (o *owner) handle(cmd command) {
 
 // applyConfig reconciles owner state to cfg. See Manager.Apply's doc for the
 // externally-visible contract.
+//
+// Instances (#340, design §5.2) are reconciled alongside their spec:
+//
+//   - every spec in cfg has its instance 0 (created here when the spec is new)
+//     and its protected instances 1..P-1 (ProtectedCount), which are created
+//     here and started below like a pinned spec;
+//   - a further instance that already exists -- created earlier on demand --
+//     is reconciled exactly like instance 0, against the per-instance copy
+//     re-derived from the new push (so a launch-shape change drains and
+//     relaunches every instance, and an unchanged push touches none);
+//   - an instance the new push no longer allows (replicable turned off,
+//     max_instances lowered) drains and is removed like a removed spec, its
+//     in-flight requests finishing first; a removed spec takes all of its
+//     instances with it;
+//   - a BURST instance with no process left -- one resting at a failure,
+//     kept for the operator only until the next Apply -- is retired here.
 func (o *owner) applyConfig(cfg Config) {
 	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag {
 		return
@@ -1314,93 +1460,81 @@ func (o *owner) applyConfig(cfg Config) {
 	o.allowedPairs = cfg.AllowedPairs()
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
+	bases := make(map[string]Spec, len(cfg.Specs))
 	for _, spec := range cfg.Specs {
 		newIDs[spec.ID] = true
+		bases[spec.ID] = spec
 		st, exists := o.specs[spec.ID]
 		if !exists {
 			o.specs[spec.ID] = &specState{spec: spec, state: StateStopped, since: time.Now()}
 			continue
 		}
-		// M1 fix: only reset a resting terminal/backoff state when THIS
-		// spec's own definition actually changed, not merely because the
-		// overall Config's ETag changed (which happens on ANY edit,
-		// including one to a completely different spec). Before this, an
-		// operator editing spec B could let spec A's active crash-backoff
-		// skip its remaining wait for no reason connected to A at all.
-		//
-		// StateNotPermitted/StatePendingVRAMUnknown are deliberately NOT
-		// reset here any more (I6): handleEnsure no longer short-circuits
-		// them, so every fresh request already re-evaluates Permit/Admit
-		// on its own; forcing them back to Stopped here without a request
-		// to actually re-check would just be a cosmetic, potentially
-		// misleading flip.
-		changed := !reflect.DeepEqual(st.spec, spec)
-		prevSpec := st.spec
-		st.spec = spec
-		switch {
-		case changed && st.proc == nil:
-			switch st.state {
-			case StateStartFailed, StateCrashed:
-				o.setState(st, StateStopped)
-			case StateBackoff:
-				cancelTimer(o.m, &st.backoffTimer)
+		o.reconcileSpec(st, spec)
+	}
+
+	// Further instances that already exist, against their spec's new push.
+	// Deleting the entry being visited is safe in a Go range.
+	for id, st := range o.specs {
+		if st.instance == 0 {
+			continue
+		}
+		base, desired := bases[st.spec.InstanceOf]
+		if !desired {
+			continue // the whole spec is gone: the removal loop below takes it
+		}
+		if !InstanceAllowed(base, st.instance) {
+			// Not "drop it now": a disallowed instance may be serving, and a
+			// push must never cut a request off mid-response. removeState
+			// drains a live one (in-flight requests finish, bounded by
+			// drainGrace) and deletes it on exit.
+			o.removeState(id, st)
+			continue
+		}
+		// Allowed again (a cap raised back while it was still draining): it
+		// is no longer on its way out.
+		st.removed = false
+		if IsBurst(base, st.instance) && st.proc == nil {
+			// Burst capacity is never retried, so a crash-loop wait is
+			// meaningless for it -- reachable only for an instance that was
+			// PROTECTED when it crashed and is burst under this push.
+			cancelTimer(o.m, &st.backoffTimer)
+			if st.state == StateBackoff {
 				o.setState(st, StateStopped)
 			}
-		case changed && st.proc != nil && spec.AdminState != "force_stopped" && !sameLaunchShape(prevSpec, spec):
-			// I7 fix (issue #63): a LIVE child whose LAUNCH SHAPE changed must
-			// be relaunched with it. Before this, applyConfig stored the new
-			// spec (above) but acted only on a STOPPED child, so a running
-			// child kept the old binary/args/env/GPUs/visible-devices/port
-			// until it restarted for some unrelated reason -- the edit
-			// silently had no effect. Drain it exactly like a removed spec,
-			// but WITHOUT st.removed: onProcExited's clean-stop branch then
-			// re-admits this same spec, so a pinned/force_running child comes
-			// back immediately with the new shape and an on-demand one on its
-			// next request; either way in-flight requests drain rather than
-			// being killed. A metadata-only edit (idle timeout, pinned,
-			// admin_state, health/probe paths, model name) leaves the launch
-			// shape equal, so sameLaunchShape skips it and it takes effect in
-			// place from the stored st.spec. force_stopped is excluded: its
-			// own drain is handled by the force loop below, and it must not
-			// relaunch.
-			o.beginDrain(spec.ID)
+			if len(st.pending) == 0 {
+				delete(o.specs, id) // retired: see retireIfSpent
+				continue
+			}
+			// A queued request is re-asked by the wake below, as the burst
+			// instance this push makes it: started into free room, or refused.
+		}
+		o.reconcileSpec(st, specForInstance(base, st.instance))
+	}
+
+	// The protected floor: instances 1..P-1 always exist (the start loop below
+	// brings them up). Bounded by InstanceAllowed, so a floor a document could
+	// set above max_instances or past MaxInstanceIndex (ParseConfig clamps
+	// both; Apply is also reachable without it) never loops past the
+	// addressable range.
+	for _, spec := range cfg.Specs {
+		for k := 1; k < ProtectedCount(spec) && InstanceAllowed(spec, k); k++ {
+			key := InstanceKey(spec.ID, k)
+			if existing, taken := o.specs[key]; taken {
+				if specBase(existing.spec) != spec.ID {
+					slog.Warn("runtime: an instance key of a replicable spec is another spec's ID; that instance cannot exist",
+						"spec", spec.ID, "instance", k, "conflicting_spec", key)
+				}
+				continue
+			}
+			o.specs[key] = &specState{spec: specForInstance(spec, k), instance: k, state: StateStopped, since: time.Now()}
 		}
 	}
 
 	for id, st := range o.specs {
-		if newIDs[id] {
+		if newIDs[specBase(st.spec)] {
 			continue
 		}
-		if st.proc != nil {
-			st.removed = true
-			o.beginDrain(id)
-		} else {
-			// G2 fix (fix round 2, and PRE-EXISTING rather than a defect of
-			// this batch): A BACKOFF TIMER MUST NEVER OUTLIVE ITS SPEC. It is
-			// registered in m.wg, which Close() ends by waiting on, and
-			// handleClose can only cancel the timers of specs still IN
-			// o.specs -- so deleting a spec that is waiting out a crash
-			// backoff (proc == nil, StateBackoff) orphaned its retry timer and
-			// made the NEXT Close block for the whole remaining delay (up to
-			// backoffCap, 60s with production defaults) with nothing left to
-			// retry: delete a crash-looping spec in the portal, then stop the
-			// agent, and shutdown hangs for a minute. Sibling of
-			// enterBackoff's own closing guard -- same invariant, the other
-			// way for a spec to stop existing.
-			//
-			// Only this deletion site needs it. onProcExited's removed branch
-			// deletes a spec whose proc was live, and a spec with a live proc
-			// never has a backoff timer (enterBackoff defers to backoffOnExit
-			// while st.proc != nil, and handleBackoffFire clears the timer
-			// before admitAndStart can start anything).
-			cancelTimer(o.m, &st.backoffTimer)
-			// C2 fix: resolve any queued waiter before dropping the spec --
-			// otherwise it (and even its own admission_wait_timeout, since
-			// handleWaiterTimeout is itself a no-op once the spec is gone)
-			// would never be resolved at all.
-			o.failPending(st, ErrModelNotManaged)
-			delete(o.specs, id)
-		}
+		o.removeState(id, st)
 	}
 
 	o.rebuildUpstreamIndex()
@@ -1411,14 +1545,23 @@ func (o *owner) applyConfig(cfg Config) {
 	// that no longer exists. Driven from newIDs (the DESIRED set), not from
 	// o.specs, because a removed-but-still-draining spec is still in o.specs
 	// and its output stops being reachable the moment the spec is gone.
-	retained := make([]string, 0, len(newIDs))
+	//
+	// The same holds per instance (#340): a further instance's buffer is
+	// kept while the instance exists and is still allowed, so a burst
+	// instance retired since the last Apply releases its buffer here.
+	retained := make([]string, 0, len(o.specs))
 	for id := range newIDs {
 		retained = append(retained, id)
+	}
+	for id, st := range o.specs {
+		if st.instance > 0 && !st.removed && newIDs[st.spec.InstanceOf] {
+			retained = append(retained, id)
+		}
 	}
 	o.logs.Retain(retained)
 
 	for id, st := range o.specs {
-		if !newIDs[id] {
+		if st.removed || !newIDs[specBase(st.spec)] {
 			continue
 		}
 		if st.spec.AdminState == "force_stopped" {
@@ -1427,11 +1570,103 @@ func (o *owner) applyConfig(cfg Config) {
 			}
 			continue
 		}
-		if (st.spec.Pinned || st.spec.AdminState == "force_running") && st.proc == nil && st.state != StateBackoff {
+		// protected() is the pre-instance "pinned || force_running" for
+		// instance 0 of a spec that never replicates, and folds the
+		// min_instances floor in for a replicable one.
+		if st.protected() && st.proc == nil && st.state != StateBackoff {
 			o.admitAndStart(id)
 		}
 	}
 	o.wakeAdmissionCandidates()
+}
+
+// reconcileSpec stores spec -- the newly pushed spec for instance 0, or the
+// per-instance copy re-derived from it -- on st and acts on what changed. The
+// comparison is between two values of the SAME kind (a pushed spec against the
+// previously pushed one, a derived copy against the previously derived one), so
+// an unchanged push compares equal for every instance and restarts none.
+func (o *owner) reconcileSpec(st *specState, spec Spec) {
+	// M1 fix: only reset a resting terminal/backoff state when THIS
+	// spec's own definition actually changed, not merely because the
+	// overall Config's ETag changed (which happens on ANY edit,
+	// including one to a completely different spec). Before this, an
+	// operator editing spec B could let spec A's active crash-backoff
+	// skip its remaining wait for no reason connected to A at all.
+	//
+	// StateNotPermitted/StatePendingVRAMUnknown are deliberately NOT
+	// reset here any more (I6): handleEnsure no longer short-circuits
+	// them, so every fresh request already re-evaluates Permit/Admit
+	// on its own; forcing them back to Stopped here without a request
+	// to actually re-check would just be a cosmetic, potentially
+	// misleading flip.
+	changed := !reflect.DeepEqual(st.spec, spec)
+	prevSpec := st.spec
+	st.spec = spec
+	switch {
+	case changed && st.proc == nil:
+		switch st.state {
+		case StateStartFailed, StateCrashed:
+			o.setState(st, StateStopped)
+		case StateBackoff:
+			cancelTimer(o.m, &st.backoffTimer)
+			o.setState(st, StateStopped)
+		}
+	case changed && st.proc != nil && spec.AdminState != "force_stopped" && !sameLaunchShape(prevSpec, spec):
+		// I7 fix (issue #63): a LIVE child whose LAUNCH SHAPE changed must
+		// be relaunched with it. Before this, applyConfig stored the new
+		// spec (above) but acted only on a STOPPED child, so a running
+		// child kept the old binary/args/env/GPUs/visible-devices/port
+		// until it restarted for some unrelated reason -- the edit
+		// silently had no effect. Drain it exactly like a removed spec,
+		// but WITHOUT st.removed: onProcExited's clean-stop branch then
+		// re-admits this same spec, so a pinned/force_running child comes
+		// back immediately with the new shape and an on-demand one on its
+		// next request; either way in-flight requests drain rather than
+		// being killed. A metadata-only edit (idle timeout, pinned,
+		// admin_state, health/probe paths, model name) leaves the launch
+		// shape equal, so sameLaunchShape skips it and it takes effect in
+		// place from the stored st.spec. force_stopped is excluded: its
+		// own drain is handled by the force loop below, and it must not
+		// relaunch.
+		o.beginDrain(spec.ID)
+	}
+}
+
+// removeState takes one instance out of the desired set: a spec removed from
+// the config, or an instance its spec no longer allows (#340). A live one
+// drains -- its in-flight requests finish first -- and is deleted on exit
+// (specState.removed, onProcExited); one with no process is deleted now.
+func (o *owner) removeState(id string, st *specState) {
+	if st.proc != nil {
+		st.removed = true
+		o.beginDrain(id)
+		return
+	}
+	// G2 fix (fix round 2, and PRE-EXISTING rather than a defect of
+	// this batch): A BACKOFF TIMER MUST NEVER OUTLIVE ITS SPEC. It is
+	// registered in m.wg, which Close() ends by waiting on, and
+	// handleClose can only cancel the timers of specs still IN
+	// o.specs -- so deleting a spec that is waiting out a crash
+	// backoff (proc == nil, StateBackoff) orphaned its retry timer and
+	// made the NEXT Close block for the whole remaining delay (up to
+	// backoffCap, 60s with production defaults) with nothing left to
+	// retry: delete a crash-looping spec in the portal, then stop the
+	// agent, and shutdown hangs for a minute. Sibling of
+	// enterBackoff's own closing guard -- same invariant, the other
+	// way for a spec to stop existing.
+	//
+	// Only this deletion site needs it. onProcExited's removed branch
+	// deletes a spec whose proc was live, and a spec with a live proc
+	// never has a backoff timer (enterBackoff defers to backoffOnExit
+	// while st.proc != nil, and handleBackoffFire clears the timer
+	// before admitAndStart can start anything).
+	cancelTimer(o.m, &st.backoffTimer)
+	// C2 fix: resolve any queued waiter before dropping the spec --
+	// otherwise it (and even its own admission_wait_timeout, since
+	// handleWaiterTimeout is itself a no-op once the spec is gone)
+	// would never be resolved at all.
+	o.failPending(st, ErrModelNotManaged)
+	delete(o.specs, id)
 }
 
 // sameLaunchShape reports whether two revisions of a spec would exec the
@@ -1506,9 +1741,17 @@ func sameLaunchShape(a, b Spec) bool {
 	return reflect.DeepEqual(strip(a), strip(b))
 }
 
+// rebuildUpstreamIndex maps each spec's upstream model to its spec ID. Only
+// instance 0 is indexed: a further instance shares its spec's upstream model
+// (the child is always launched with the base name) and is reached through
+// its instance address instead (resolveAddress), so indexing it would only
+// collide with its own instance 0.
 func (o *owner) rebuildUpstreamIndex() {
 	o.byUpstream = make(map[string]string, len(o.specs))
 	for id, st := range o.specs {
+		if st.instance != 0 {
+			continue
+		}
 		// M4 fix: this used to collapse silently, with map iteration order
 		// (unspecified, and different on every run) deciding which spec
 		// wins EnsureRunning's upstream_model lookup -- an undiagnosable
@@ -1554,15 +1797,22 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
 		return
 	}
-	specID, ok := o.byUpstream[c.model]
-	st := o.specs[specID]
-	if !ok || st == nil {
+	specID, _, k, ok := o.resolveAddress(c.model)
+	if !ok {
 		c.reply <- ensureOutcome{err: ErrModelNotManaged}
 		return
 	}
+	st := o.specs[specID]
+	// force_stopped applies to every instance of the spec (§5.2), and is read
+	// off instance 0 -- the pushed spec itself -- before a further instance
+	// could be created for nothing.
 	if st.spec.AdminState == "force_stopped" {
 		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 		return
+	}
+	if k > 0 {
+		st = o.instanceForRequest(st, k)
+		specID = st.spec.ID
 	}
 	if st.state == StateRunning && st.proc != nil {
 		st.inFlight++
@@ -1578,6 +1828,16 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 		return
 	}
+	// A burst instance is never queued behind anything but its own start
+	// (§5.4 rule 6). Starting: its admission already happened, so the request
+	// waits for that start like any other. Draining: it is on its way out, and
+	// burst capacity does not wait for a slot -- the gateway places the request
+	// elsewhere. With no process at all, admitAndStart below answers at once:
+	// it starts the instance or refuses it, never leaving the waiter queued.
+	if st.burst() && st.proc != nil && st.state != StateStarting {
+		c.reply <- ensureOutcome{err: ErrInstanceNoCapacity}
+		return
+	}
 
 	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now()}
 	if st.spec.AdmissionWaitTimeoutSeconds > 0 {
@@ -1589,6 +1849,59 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	}
 	st.pending = append(st.pending, w)
 	o.admitAndStart(specID)
+}
+
+// resolveAddress is Manager.ResolveAddress on the owner, and the rule
+// handleEnsure resolves a request with (#340, Ruling R1). specID is the BASE
+// spec's ID (instance 0's key); base is the base upstream model; k the
+// instance index. An exact byUpstream match always wins and is instance 0 --
+// even when its state has since gone, in which case the name is simply not
+// managed rather than re-read as an instance address of some other spec.
+// Otherwise the name must parse as an instance address of a managed spec that
+// is still desired (not removed) and allows instance k, and the instance key
+// must not be held by an unrelated spec (a file-mode spec ID may contain '#').
+func (o *owner) resolveAddress(model string) (specID, base string, k int, ok bool) {
+	if id, found := o.byUpstream[model]; found {
+		if o.specs[id] == nil {
+			return "", "", 0, false
+		}
+		return id, model, 0, true
+	}
+	b, n := ParseInstanceAddress(model)
+	if n == 0 {
+		return "", "", 0, false
+	}
+	id, found := o.byUpstream[b]
+	st := o.specs[id]
+	if !found || st == nil || st.removed || !InstanceAllowed(st.spec, n) {
+		return "", "", 0, false
+	}
+	if other := o.specs[InstanceKey(id, n)]; other != nil && specBase(other.spec) != id {
+		return "", "", 0, false
+	}
+	return id, b, n, true
+}
+
+// instanceForRequest returns the state of instance k of base's spec for a
+// request that names it, creating it on demand (§5.2): an allowed instance that
+// does not exist yet starts life Stopped and is admitted like any other. A
+// burst instance resting at a crash or a failed start is "named again" here,
+// which retires that row and starts over with a fresh one: burst capacity is
+// never retried on its own, so a request asking for it again IS the retry.
+// resolveAddress has already established that the key is free or held by an
+// instance of this very spec.
+func (o *owner) instanceForRequest(base *specState, k int) *specState {
+	key := InstanceKey(base.spec.ID, k)
+	st := o.specs[key]
+	if st != nil && st.burst() && st.proc == nil && (st.state == StateCrashed || st.state == StateStartFailed) {
+		delete(o.specs, key)
+		st = nil
+	}
+	if st == nil {
+		st = &specState{spec: specForInstance(base.spec, k), instance: k, state: StateStopped, since: time.Now()}
+		o.specs[key] = st
+	}
+	return st
 }
 
 // handleCancelEnsure resolves and removes the queued waiter matching
@@ -1845,17 +2158,191 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 // It is the per-candidate grant admitAndStart copies into
 // PolicySnapshot.VRAMBootstrapEligible, the one input that turns rule 4 from a
 // block into a single eviction.
+//
+// "Unknown" is read off the instance's admission demand (demandSpec), so an
+// instance 0 whose sibling has been measured is no longer a bootstrap: it has a
+// number, inherited (#340).
 func (o *owner) vramBootstrapEligible(st *specState) bool {
-	return o.m.measurer.Load() != nil && !st.vramBootstrapDone && specHasUnknownVRAM(st.spec)
+	return o.m.measurer.Load() != nil && !st.vramBootstrapDone && specHasUnknownVRAM(o.demandSpec(st))
 }
 
-// wantsUp reports whether anything wants st running right now: a queued request,
-// or an operator pin / force_running. It is admitAndStart's own admission
-// precondition, factored out so the cold-start bootstrap memory-pressure
-// escalation (onProcExited, task 4.4) can ask the identical question -- an
-// eviction to free RAM for a retry is worth nothing if no retry is coming.
+// wantsUp reports whether anything wants st running right now: a queued
+// request, or its being protected -- an operator pin / force_running on
+// instance 0, or an instance inside the min_instances floor (protected). It is
+// admitAndStart's own admission precondition, factored out so the cold-start
+// bootstrap memory-pressure escalation (onProcExited, task 4.4) can ask the
+// identical question -- an eviction to free RAM for a retry is worth nothing if
+// no retry is coming.
 func (o *owner) wantsUp(st *specState) bool {
-	return len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
+	return len(st.pending) > 0 || st.protected()
+}
+
+// specForInstance returns the Spec instance k of base runs as (#340): base
+// itself for instance 0, and for k >= 1 a copy that differs only in identity.
+// ID becomes the instance key S#k -- which is what gives the instance its own
+// admission identity, ${CONFIG_DIR} and config-file directory, and log buffer,
+// all of which are keyed by spec.ID -- InstanceOf names the base spec, and
+// Instance is k. Everything pushed is shared, UpstreamModel included, so
+// ${MODEL} expands to the BASE model name: the child never sees an instance
+// address (the router rewrites the request's model to match, §5.3). The copy
+// shares base's slices and maps; nothing in the owner writes through them
+// (demandSpec copies the GPU list before it raises a demand).
+func specForInstance(base Spec, k int) Spec {
+	if k == 0 {
+		return base
+	}
+	s := base
+	s.ID = InstanceKey(base.ID, k)
+	s.InstanceOf = base.ID
+	s.Instance = k
+	return s
+}
+
+// protected reports whether this instance is inside its spec's protected
+// floor (ProtectedCount, design §4): instances 0..P-1, where P folds
+// min_instances together with the one instance a pinned or force_running spec
+// has always kept. A protected instance is wanted up with no request at all
+// (started on Apply, restarted after a crash with backoff) and is never
+// idle-unloaded. For a spec that never replicates, P is 1 exactly when it is
+// pinned or force_running, so this is the pre-instance "pinned ||
+// force_running" rule unchanged. st.spec carries the base's own
+// Pinned/AdminState/min_instances (copied for k >= 1), so no lookup of the
+// base is needed.
+func (st *specState) protected() bool {
+	return st.instance < ProtectedCount(st.spec)
+}
+
+// pinnedForAdmission is the Pinned flag this instance carries into admission
+// (RunningProc.Pinned), and the flag every other "never a victim" check the
+// owner makes must agree with (evictOneIdleForBootstrap, earliestGraceExpiry,
+// wantsWakeAfterStart). For a spec that never replicates it is spec.Pinned,
+// exactly as before instances -- a force_running spec stays evictable as it
+// always was. For a replicable spec it is protected() (§5.4 rule 7): the
+// min_instances promise is worth nothing if an admission may evict a protected
+// instance, and a further instance of a pinned spec must not read as pinned
+// merely because its copy carries the field.
+func (st *specState) pinnedForAdmission() bool {
+	if !st.spec.Replicable {
+		return st.spec.Pinned
+	}
+	return st.protected()
+}
+
+// burst reports whether this instance is burst capacity (IsBurst): above the
+// protected floor, started on demand into free room only, never retried after
+// a failure, and retired once it is gone. Instance 0 never is.
+func (st *specState) burst() bool {
+	return IsBurst(st.spec, st.instance)
+}
+
+// higherSiblingRuns reports whether an instance of st's spec with a HIGHER
+// index still has a process (starting, running or draining). That is the
+// design's ordering invariant, "highest index leaves first" (§4): while one
+// does, st may be neither idle-unloaded (scanIdle) nor picked by the owner's
+// own victim choice (evictOneIdleForBootstrap), so instance 0 is always the
+// last of a spec to go. Admit enforces the same rule for its victims
+// (policy.go's higherSiblingStays); this is its owner-side twin. Siblings are
+// matched by base spec ID, never by parsing a name.
+func (o *owner) higherSiblingRuns(st *specState) bool {
+	base := specBase(st.spec)
+	for _, sib := range o.specs {
+		if sib.proc != nil && sib.instance > st.instance && specBase(sib.spec) == base {
+			return true
+		}
+	}
+	return false
+}
+
+// demandSpec returns the Spec admission charges st as (#340, design §5.4 rule
+// 5): st.spec with each GPU's VRAM demand and the host-RAM demand raised to the
+// largest LIVE measurement of any running sibling -- per GPU for VRAM,
+// host-wide for RAM. Siblings run the same model with the same arguments, so a
+// measured sibling is the best estimate there is of what another instance will
+// hold, and the pushed demand stays a floor, exactly like the live-measurement
+// rule in buildSnapshot.
+//
+// It applies to EVERY instance -- instance 0 included, and occupants as well as
+// the candidate. Instance 0 restarting next to a protected (hence pinned),
+// measured sibling would otherwise be charged its unknown declared demand and
+// hit the pinned-unknown terminal (policy step 2); a starting sibling with no
+// measurement of its own would otherwise be charged nothing at all. A spec that
+// never replicates is returned untouched: the Replicable gate makes that
+// structural rather than a consequence of an empty sibling set.
+//
+// The result never aliases st.spec's GPU list: a raised demand is written into
+// a fresh copy, because the list is shared with the pushed config.
+func (o *owner) demandSpec(st *specState) Spec {
+	spec := st.spec
+	if !spec.Replicable {
+		return spec
+	}
+	vram, ram := o.siblingPeak(st)
+	if len(vram) > 0 && len(spec.GPUs) > 0 {
+		gpus := make([]SpecGPU, len(spec.GPUs))
+		for i, g := range spec.GPUs {
+			if v := vram[g.Index]; v > g.VRAMMB {
+				g.VRAMMB = v
+			}
+			gpus[i] = g
+		}
+		spec.GPUs = gpus
+	}
+	spec.RAMMB = max(spec.RAMMB, ram)
+	return spec
+}
+
+// siblingPeak returns the largest live measurement among st's running
+// siblings: per GPU index for VRAM, one figure for host RAM. A sibling's
+// measurement describes its CURRENT process (cleared on exit), so only
+// siblings with a process count, and st's own figures never do.
+func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
+	base := specBase(st.spec)
+	for _, sib := range o.specs {
+		if sib == st || sib.proc == nil || specBase(sib.spec) != base {
+			continue
+		}
+		for idx, mb := range sib.measuredVRAM {
+			if mb <= vram[idx] {
+				continue
+			}
+			if vram == nil {
+				vram = make(map[int]int, len(sib.measuredVRAM))
+			}
+			vram[idx] = mb
+		}
+		ram = max(ram, realRAM(sib.measuredRAM))
+	}
+	return vram, ram
+}
+
+// demandUnknown reports whether spec -- an instance's demandSpec -- still has
+// an unknown demand on either axis: a declared GPU at VRAM 0, or host RAM 0 (0
+// is "unknown", never "needs none", on both). An instance k >= 1 with such a
+// demand is never admitted (§5.4 rule 5): a baseline one waits for a measured
+// sibling, a burst one is refused with ErrInstanceDemandUnknown.
+func demandUnknown(spec Spec) bool {
+	return specHasUnknownVRAM(spec) || specHasUnknownRAM(spec)
+}
+
+// retireIfSpent deletes a burst instance's state once nothing is left of it
+// (#340, design §5.2): no process, no queued request, and no failure to show.
+// Burst capacity exists only while it serves -- left in place, the row would
+// read "stopped" forever. A burst instance resting at a FAILURE (crashed,
+// start_failed, not_permitted) is kept so an operator can read why, until it is
+// named again (instanceForRequest) or the next Apply retires it. Instance 0 and
+// the protected instances are never retired, and neither is a removed state,
+// which onProcExited deletes on its own path.
+func (o *owner) retireIfSpent(id string) {
+	st := o.specs[id]
+	if st == nil || !st.burst() || st.removed || st.proc != nil || len(st.pending) > 0 {
+		return
+	}
+	switch st.state {
+	case StateCrashed, StateStartFailed, StateNotPermitted:
+		return
+	}
+	cancelTimer(o.m, &st.backoffTimer)
+	delete(o.specs, id)
 }
 
 // admitAndStart is the single place that decides whether spec should move
@@ -1864,6 +2351,14 @@ func (o *owner) wantsUp(st *specState) bool {
 // or from Apply for a pinned/force_running spec. Always a fast, synchronous,
 // non-blocking call: any real work (exec, health polling) is handed to a
 // goroutine before this returns.
+//
+// specID is an INSTANCE key (#340). Instance 0 and every protected instance --
+// the baseline -- are admitted by the rules above unchanged, charged their
+// sibling-inherited demand (demandSpec). A burst instance is admitted only into
+// room that is free right now (PolicySnapshot.NoEvict) and is otherwise
+// refused at once (ErrInstanceNoCapacity, or ErrInstanceDemandUnknown before
+// Admit is even asked), never queued; and an instance k >= 1 is never admitted
+// with an unknown demand.
 func (o *owner) admitAndStart(specID string) {
 	if o.closing {
 		// Never start (or restart) anything once shutdown has begun -- a
@@ -1878,6 +2373,12 @@ func (o *owner) admitAndStart(specID string) {
 	// different (or gone). rescheduleGraceWake is a cheap no-op whenever nothing is
 	// grace-blocked (the common case), so the defer costs nothing on the hot path.
 	defer o.rescheduleGraceWake()
+	// A burst instance this admission leaves with nothing -- refused, or simply
+	// no longer wanted (the exit of a drained one comes through here) -- is
+	// retired on the way out. Deferred so every return below is covered, and
+	// registered after the grace defer so it runs first: the grace scan then
+	// sees the final spec table.
+	defer o.retireIfSpent(specID)
 	st := o.specs[specID]
 	if st == nil || st.proc != nil || st.state == StateBackoff {
 		return
@@ -1888,6 +2389,7 @@ func (o *owner) admitAndStart(specID string) {
 	// sample or grace wake.
 	st.waitingOnRAM = false
 	st.waitingOnGrace = false
+	st.waitingOnDemand = false
 	if !o.wantsUp(st) {
 		return
 	}
@@ -1905,12 +2407,56 @@ func (o *owner) admitAndStart(specID string) {
 	// set on the snapshot here (which buildSnapshot, being candidate-agnostic,
 	// cannot know) rather than inside the builder -- the same shape every other
 	// snapshot field keeps: the owner decides, Admit interprets.
+	//
+	// The snapshot is built FIRST: it refreshes the live measurements, and the
+	// candidate's own demand (demandSpec) inherits its siblings' -- so the
+	// demand Admit is asked about is as fresh as the occupants it is weighed
+	// against.
 	snap := o.buildSnapshot()
+	demand := o.demandSpec(st)
+	burst := st.burst()
+	// An instance k >= 1 is never admitted blind (§5.4 rule 5). Instance 0
+	// keeps today's unknown-demand handling -- the bootstraps, the one-shot
+	// eviction -- because something has to run first to be measured; every
+	// further instance can wait for that measurement instead, and does.
+	if st.instance > 0 && demandUnknown(demand) {
+		if burst {
+			// Refused fast, with nothing queued and no state left behind (the
+			// deferred retireIfSpent): the gateway retries shortly, by which time
+			// the sibling started for the same model has usually been measured.
+			slog.Debug("runtime: burst instance refused: its demand is unknown", "spec", specID)
+			o.failPending(st, ErrInstanceDemandUnknown)
+			return
+		}
+		// A baseline (protected) instance waits, the same silent-but-diagnosed
+		// way as rule 4's precedence wait: queued, state untouched, the reason on
+		// its row. A sibling's measurement landing is what ends it
+		// (applyMeasurement -> wantsDemandWake).
+		st.waitingOnDemand = true
+		o.noteAdmissionWait(st, fmt.Sprintf(
+			"spec %s: its demand is unknown (no declared estimate and no measured sibling yet), so it waits for a sibling to be measured instead of starting blind",
+			specID))
+		return
+	}
+	// A burst instance's admission is all-or-nothing and immediate (§5.4 rule
+	// 6): NoEvict makes Admit answer OK or NoCapacity and nothing else.
+	snap.NoEvict = burst
 	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
-	dec := Admit(snap, st.spec)
+	dec := Admit(snap, demand)
 	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
 	st.waitingOnGrace = dec.Wait && dec.WaitOnGrace
 	switch {
+	case dec.NoCapacity:
+		// FIRST, and it must stay first: NoCapacity carries Reason "", Wait
+		// false and an empty Evict, so every case below would read it as an OK
+		// and START the process -- the one thing it refuses. A burst instance
+		// that does not fit into free room is refused at once: every queued
+		// waiter fails now, nothing waits, the state does not move (so no
+		// not_permitted row, no pending_vram_unknown), no victim is drained and
+		// no bootstrap shot is burned. The deferred retireIfSpent removes the
+		// state a request created for it.
+		slog.Debug("runtime: burst instance refused: no free capacity", "spec", specID, "reason", dec.Message)
+		o.failPending(st, ErrInstanceNoCapacity)
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
 	case dec.Reason == StatePendingVRAMUnknown:
@@ -2189,8 +2735,14 @@ func realRAM(v int) int {
 // as saying nothing -- see realMeasurement, which is what makes a cycle of
 // zeros leave a previous real number in place instead of overwriting it with
 // an "unknown" the portal cannot tell apart from a measured zero.
+//
+// A measurement that lands is also the one event that can end a baseline
+// instance's wait for a measured sibling (#340, specState.waitingOnDemand), so
+// such instances are re-asked afterwards; and a measurement a start asked for
+// while this one was out (remeasure) is dispatched now.
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
+	landed := false
 	for _, t := range c.targets {
 		st := o.specs[t.specID]
 		if st == nil || st.proc != t.proc {
@@ -2202,8 +2754,9 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 			// has a number now, so it must never spend (or keep holding) the
 			// one-shot eviction. See specState.vramBootstrapDone.
 			st.vramBootstrapDone = true
+			landed = true
 		}
-		// ONE process per spec, so the pid's figure is the spec's figure:
+		// ONE process per instance, so the pid's figure is the instance's figure:
 		// nothing to sum and no key to re-key. The same generation guard
 		// above is what keeps a recycled pid's reading off a different
 		// process, and realRAM is the same "a non-measurement says nothing"
@@ -2218,6 +2771,7 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 			// its own now that a number has landed).
 			st.ramBootstrapRetries = 0
 			st.ramBootstrapBeats = 0
+			landed = true
 		} else if o.healthyBootstrapAwaitingMeasurement(st) {
 			// Task 4.4 TERMINATION: a bootstrap that is healthy but still
 			// unmeasured holds the RAMBootstrapInFlight interlock (task 4.1), and
@@ -2234,6 +2788,26 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 			}
 		}
 	}
+	if landed {
+		o.wakeAdmission(wantsDemandWake)
+	}
+	if o.remeasure {
+		o.remeasure = false
+		o.dispatchMeasurement()
+	}
+}
+
+// measureSoon asks for a measurement of the live processes now, or -- when one
+// is already out, and dispatchMeasurement allows only one -- the moment that one
+// returns (owner.remeasure). It is what a process's first passing health probe
+// calls (handleStartResult): see remeasure for why that measurement must not
+// wait for the next housekeeping beat.
+func (o *owner) measureSoon() {
+	if o.measuring {
+		o.remeasure = true
+		return
+	}
+	o.dispatchMeasurement()
 }
 
 // healthyBootstrapAwaitingMeasurement reports whether st is a live, healthy
@@ -2243,11 +2817,14 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 // the no-measurement termination beat counter so that counter never advances for
 // a spec that is still loading, has already been measured, has a known demand, or
 // runs on a host with no RAM measurer to resolve it.
+//
+// The demand is read through demandSpec, exactly as buildSnapshot's interlock
+// reads it, so the beat counter and the interlock it bounds always agree.
 func (o *owner) healthyBootstrapAwaitingMeasurement(st *specState) bool {
 	return o.m.ramMeasurer.Load() != nil &&
 		st.proc != nil && st.proc.everHealthy &&
 		st.state == StateRunning &&
-		needsRAMBootstrap(st.spec, st.measuredRAM)
+		needsRAMBootstrap(o.demandSpec(st), st.measuredRAM)
 }
 
 // failBootstrapUnmeasured forces a healthy-but-never-measured bootstrap to a
@@ -2327,6 +2904,12 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// RAM refusal compares against (see below): a process with no live reading
 	// is taken to hold its whole demand floor instead of nothing.
 	ramBoundMB := 0
+	// Two passes over the live processes. The first records this call's
+	// measurements; the second charges every process. They are separate
+	// because an instance's demand inherits its siblings' live measurements
+	// (demandSpec, #340): charging in the same pass would let map order decide
+	// whether a sibling's figure is this call's or the previous beat's.
+	fresh := make(map[string]map[int]int, len(o.specs))
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
@@ -2337,23 +2920,8 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// like an index it never mentioned. Without it a measured 0 WON, and
 		// "unknown" became "this model needs no VRAM" -- see realMeasurement
 		// for what that costs admission.
-		//
-		// The charge is max(live, pushed demand). The pushed demand is
-		// already max(persisted measurement, operator estimate) -- the
-		// gateway builds it that way -- so it is a FLOOR here: a fresher live
-		// reading raises it when the process has grown, but a reading below
-		// it (a transient dip between allocations) must not lower the
-		// reservation. Replacing the demand with the live value is how a
-		// co-resident start got admitted into that gap.
 		byGPU := realMeasurement(measured[st.proc.pid])
-		gpus := make(map[int]int, len(st.spec.GPUs))
-		for _, g := range st.spec.GPUs {
-			charge := g.VRAMMB
-			if v, ok := byGPU[g.Index]; ok && v > charge {
-				charge = v
-			}
-			gpus[g.Index] = charge
-		}
+		fresh[id] = byGPU
 		if byGPU != nil {
 			st.measuredVRAM = byGPU
 			// A real measurement resolves the VRAM bootstrap durably, the same as
@@ -2361,6 +2929,34 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			// never spend (or keep holding) the one-shot. See
 			// specState.vramBootstrapDone.
 			st.vramBootstrapDone = true
+		}
+	}
+	for id, st := range o.specs {
+		if st.proc == nil {
+			continue
+		}
+		// The charge is max(live, pushed demand). The pushed demand is
+		// already max(persisted measurement, operator estimate) -- the
+		// gateway builds it that way -- so it is a FLOOR here: a fresher live
+		// reading raises it when the process has grown, but a reading below
+		// it (a transient dip between allocations) must not lower the
+		// reservation. Replacing the demand with the live value is how a
+		// co-resident start got admitted into that gap.
+		//
+		// The demand is the instance's demandSpec: for an instance of a
+		// replicable spec the pushed demand raised to its siblings' largest
+		// live measurement, so a sibling that has not been measured itself yet
+		// is charged what its siblings hold rather than nothing. For a spec
+		// that never replicates it is the pushed spec itself.
+		demand := o.demandSpec(st)
+		byGPU := fresh[id]
+		gpus := make(map[int]int, len(demand.GPUs))
+		for _, g := range demand.GPUs {
+			charge := g.VRAMMB
+			if v, ok := byGPU[g.Index]; ok && v > charge {
+				charge = v
+			}
+			gpus[g.Index] = charge
 		}
 		// Host RAM follows the same rule as the VRAM charge above, spec-level
 		// instead of per GPU: max(live, pushed demand), the demand a FLOOR. The
@@ -2379,21 +2975,32 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		if liveRAM > 0 {
 			ramBoundMB += liveRAM
 		} else {
-			ramBoundMB += st.spec.RAMMB
+			ramBoundMB += demand.RAMMB
 		}
 		// The cold-start interlock (task 4.1): this process is still unaccounted
-		// if its declared RAM is unknown and nothing has measured it yet. It holds
+		// if its RAM demand is unknown and nothing has measured it yet. It holds
 		// until measured when a measurer will deliver that measurement, else only
-		// while it is Starting -- see ramMeasurerInstalled above for why.
-		if needsRAMBootstrap(st.spec, st.measuredRAM) && (st.state == StateStarting || ramMeasurerInstalled) {
+		// while it is Starting -- see ramMeasurerInstalled above for why. A
+		// sibling's inherited measurement accounts for it as surely as its own.
+		if needsRAMBootstrap(demand, st.measuredRAM) && (st.state == StateStarting || ramMeasurerInstalled) {
 			ramBootstrapInFlight = true
 		}
 		running = append(running, RunningProc{
-			SpecID:   id,
+			SpecID: id,
+			// The instance fields (#340) make siblings siblings to admission:
+			// they co-reside, are never one another's victims, and leave
+			// highest index first. A running burst instance is Surplus, the
+			// cheapest victim there is; a protected one is Pinned (see
+			// pinnedForAdmission). For a spec that never replicates they read
+			// exactly as a pre-instance process: its own base, instance 0, not
+			// surplus, Pinned = spec.Pinned.
+			Spec:     specBase(st.spec),
+			Instance: st.instance,
+			Surplus:  st.burst(),
 			GPUs:     gpus,
-			RAMMB:    max(liveRAM, st.spec.RAMMB),
+			RAMMB:    max(liveRAM, demand.RAMMB),
 			InFlight: st.inFlight,
-			Pinned:   st.spec.Pinned,
+			Pinned:   st.pinnedForAdmission(),
 			Role:     roleOf(st.spec.Role),
 			LastUsed: st.lastUsed,
 			// A process that has been exec'd but never passed a health
@@ -2528,7 +3135,10 @@ func (o *owner) noteRAMFreed(st *specState) {
 	}
 	mb := realRAM(st.measuredRAM)
 	if mb == 0 {
-		mb = st.spec.RAMMB
+		// The instance's demand floor, sibling-inherited (#340) exactly as
+		// buildSnapshot charged it; the pushed spec for one that never
+		// replicates.
+		mb = o.demandSpec(st).RAMMB
 	}
 	if mb <= 0 {
 		return
@@ -2901,6 +3511,11 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 			st.restarts++
 		}
 		st.hasRunBefore = true
+		// The measured cold start (§5.6): exec to the first passing probe of
+		// THIS start, recorded before the transition so the status it wakes a
+		// reader for already carries it. Floored at 1 so a start faster than a
+		// millisecond still reads as measured -- 0 is "unknown".
+		st.startupMS = max(1, int(time.Since(c.proc.startedAt).Milliseconds()))
 		o.setState(st, StateRunning)
 		st.lastError = nil
 		// I1 fix: do NOT reset st.failures here. Resetting it on every
@@ -2921,8 +3536,11 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// time it answers a health probe, so the first measurement is
 		// already the meaningful one instead of catching the middle of a
 		// load. The housekeeping beat then keeps it current as the KV cache
-		// grows. Non-blocking -- see dispatchMeasurement.
-		o.dispatchMeasurement()
+		// grows. Non-blocking -- see dispatchMeasurement -- and never skipped:
+		// with a measurement already out it follows that one (measureSoon),
+		// because a sibling's first figure is what lets the next instance of
+		// its spec start (#340).
+		o.measureSoon()
 		// After succeedPending on purpose: a start that served waiters is
 		// busy for this wake, so a request queued for another spec Waits for
 		// their release instead of evicting the process just handed out.
@@ -2971,7 +3589,13 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// is non-nil. Classification reads the EXIT SIGNATURE and the LAST
 	// MEASUREMENT, never free text (bootstrapDiedOfMemoryPressure). The escalation
 	// itself fires only on a non-intentional, non-removed exit, far below.
-	bootstrapSpec := specHasUnknownRAM(st.spec)
+	//
+	// Read off the instance's admission demand (demandSpec): an instance whose
+	// running sibling has been measured was admitted with that figure and is no
+	// bootstrap (#340). A burst instance never is one either -- it is never
+	// admitted with an unknown demand, and it never evicts anything, which is
+	// all the escalation does.
+	bootstrapSpec := !st.burst() && specHasUnknownRAM(o.demandSpec(st))
 	oomSignaled := killedBySIGKILL(exitErr)
 	lastMeasuredRAM := st.measuredRAM
 	ramBudgetAtDeath := 0
@@ -3070,6 +3694,12 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		return
 	}
 
+	// A BURST instance (#340) leaves through the same branches as any other
+	// process, with two differences that live elsewhere: it never enters a
+	// crash-loop wait (enterBackoff), so a crash or failed start rests it at
+	// crashed/start_failed for the operator; and once a clean stop leaves it
+	// with nothing to do, admitAndStart's deferred retireIfSpent deletes it.
+
 	if wasIntentional {
 		if deferredBackoff && st.spec.AdminState != "force_stopped" {
 			// The failure was already recorded (handleStartResult's
@@ -3110,6 +3740,8 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 			for _, id := range drainedFor {
 				o.admitAndStart(id)
 			}
+			// For a burst instance with nobody waiting this is also where it
+			// is retired (admitAndStart's deferred retireIfSpent).
 			o.admitAndStart(st.spec.ID)
 		}
 		o.wakeAdmissionCandidates()
@@ -3234,24 +3866,39 @@ func (o *owner) handleBootstrapMemoryPressure(st *specState, exitCode int, tail 
 // "no idle process to evict" and still retries once. It records the beneficiary
 // (drainedFor) so the victim's exit offers the freed slot to the bootstrap
 // first, exactly like an admission eviction.
+//
+// It is the owner's own victim choice, so it keeps Admit's instance rules too
+// (#340, design §5.4 rules 3, 4 and 7): never a sibling of the beneficiary
+// (evicting a warm copy of the very model being started frees nothing useful),
+// never an instance while a higher-index sibling of it still runs (the ordering
+// invariant, higherSiblingRuns), never a protected instance (pinnedForAdmission
+// is what isEvictable sees as Pinned), and SURPLUS first -- a running burst
+// instance is the cheapest thing on the host to give up -- ahead of the oldest
+// LastUsed. A spec that never replicates has no siblings and is never surplus,
+// so for it the choice is exactly the pre-instance one.
 func (o *owner) evictOneIdleForBootstrap(beneficiaryID string) bool {
+	beneficiaryBase := beneficiaryID
+	if b := o.specs[beneficiaryID]; b != nil {
+		beneficiaryBase = specBase(b.spec)
+	}
 	var victim *specState
 	now := time.Now()
 	for id, st := range o.specs {
 		if id == beneficiaryID || st.proc == nil || st.state != StateRunning {
 			continue
 		}
+		if specBase(st.spec) == beneficiaryBase || o.higherSiblingRuns(st) {
+			continue
+		}
 		if !isEvictable(RunningProc{
-			Pinned:   st.spec.Pinned,
+			Pinned:   st.pinnedForAdmission(),
 			Starting: st.state == StateStarting,
 			InFlight: st.inFlight,
 			LastUsed: st.lastUsed,
 		}, now, o.evictionGrace) {
 			continue
 		}
-		if victim == nil ||
-			st.lastUsed.Before(victim.lastUsed) ||
-			(st.lastUsed.Equal(victim.lastUsed) && st.spec.ID < victim.spec.ID) {
+		if victim == nil || betterBootstrapVictim(st, victim) {
 			victim = st
 		}
 	}
@@ -3261,6 +3908,19 @@ func (o *owner) evictOneIdleForBootstrap(beneficiaryID string) bool {
 	victim.drainedFor = appendUnique(victim.drainedFor, beneficiaryID)
 	o.beginDrain(victim.spec.ID)
 	return true
+}
+
+// betterBootstrapVictim is evictOneIdleForBootstrap's total order: a surplus
+// (running burst) instance before anything else, then the oldest LastUsed, then
+// the lowest instance key -- never left to map iteration.
+func betterBootstrapVictim(a, b *specState) bool {
+	if a.burst() != b.burst() {
+		return a.burst()
+	}
+	if !a.lastUsed.Equal(b.lastUsed) {
+		return a.lastUsed.Before(b.lastUsed)
+	}
+	return a.spec.ID < b.spec.ID
 }
 
 // hostRAMBudgetSnapshot computes the current host-RAM pool exactly as
@@ -3325,9 +3985,20 @@ func (o *owner) hostRAMBudgetSnapshot() int {
 // spec whose child CRASHES on its way out is still a crash (I4), and
 // short-circuiting it here would report "stopped" for it and erase that from
 // the status table.
+//
+// A BURST instance (#340) never enters it: burst capacity is opportunistic and
+// is not retried on its own -- the gateway asks for it again when it wants it
+// (instanceForRequest retires the failed row then). Its caller has already set
+// the failure state, which it keeps for the operator until it is named again
+// or the next Apply; any waiter still queued on it would never be served, so it
+// is failed here.
 func (o *owner) enterBackoff(st *specState) {
 	if o.closing {
 		o.setState(st, StateStopped)
+		return
+	}
+	if st.burst() {
+		o.failPending(st, ErrStartFailed)
 		return
 	}
 	if st.proc != nil {
@@ -3505,8 +4176,19 @@ func (o *owner) wakeAfterStart() {
 
 // wantsWakeAfterStart is wakeAfterStart's selection rule: wantsWake, narrowed
 // to a spec with a queued request or a pinned one. See wakeAfterStart.
+// "Pinned" is pinnedForAdmission: a protected instance of a replicable spec is
+// never a victim either, so it cannot take part in the eviction storm the
+// narrowing guards against.
 func wantsWakeAfterStart(st *specState) bool {
-	return wantsWake(st) && (len(st.pending) > 0 || st.spec.Pinned)
+	return wantsWake(st) && (len(st.pending) > 0 || st.pinnedForAdmission())
+}
+
+// wantsDemandWake is the selection rule for the wake a landed measurement
+// causes (applyMeasurement): a baseline instance waiting for a measured sibling
+// (specState.waitingOnDemand), narrowed like the other event wakes. It is a
+// cheap no-op whenever no such instance waits, which is nearly always.
+func wantsDemandWake(st *specState) bool {
+	return st.waitingOnDemand && wantsWakeAfterStart(st)
 }
 
 // wakeOnHostSample is the admission wake for a fresh hardware sample
@@ -3616,7 +4298,7 @@ func (o *owner) earliestGraceExpiry(now time.Time) (time.Time, bool) {
 	var earliest time.Time
 	found := false
 	for _, st := range o.specs {
-		if st.proc == nil || st.spec.Pinned || st.state == StateStarting || st.inFlight != 0 {
+		if st.proc == nil || st.pinnedForAdmission() || st.state == StateStarting || st.inFlight != 0 {
 			continue
 		}
 		if st.lastUsed.IsZero() {
@@ -3736,7 +4418,7 @@ type wakeCandidate struct {
 // wantsWake is wakeAdmissionCandidates' selection rule, and it is exactly
 // admitAndStart's own two early returns read as one predicate: idle (no live
 // process, not in a crash-backoff wait) AND wantUp (a queued request, or
-// pinned, or force_running).
+// protected: pinned, force_running, or inside min_instances).
 //
 // It is deliberately only a PRE-FILTER: admitAndStart re-checks both
 // conditions itself and returns early, so a spec this predicate lets through
@@ -3747,7 +4429,7 @@ func wantsWake(st *specState) bool {
 	if st.proc != nil || st.state == StateBackoff {
 		return false
 	}
-	return len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
+	return len(st.pending) > 0 || st.protected()
 }
 
 // lessByQueueAge is wakeAdmission's wake order: oldest queued
@@ -3777,18 +4459,29 @@ func appendUnique(list []string, v string) []string {
 	return append(list, v)
 }
 
-// scanIdle drain-stops every Running, unpinned, non-force_running spec whose
-// idle timeout has elapsed with zero in-flight requests.
+// scanIdle drain-stops every Running, unprotected instance whose idle timeout
+// has elapsed with zero in-flight requests. Unprotected is the pre-instance
+// "unpinned and not force_running" for a spec that never replicates, and keeps
+// the min_instances floor for a replicable one (§5.5).
+//
+// The ordering invariant (§4) holds here too: an instance is not unloaded
+// while a higher-index sibling still has a process, so a spec's idle instances
+// leave one per scan, highest index first, and instance 0 last. A sibling this
+// very scan has begun draining still has its process, so map order cannot let
+// two of one spec's instances go in the same pass.
 func (o *owner) scanIdle() {
 	now := time.Now()
 	for id, st := range o.specs {
 		if st.proc == nil || st.state != StateRunning {
 			continue
 		}
-		if st.spec.Pinned || st.spec.AdminState == "force_running" {
+		if st.protected() {
 			continue
 		}
 		if st.spec.IdleTimeoutSeconds <= 0 || st.inFlight != 0 {
+			continue
+		}
+		if o.higherSiblingRuns(st) {
 			continue
 		}
 		idle := time.Duration(st.spec.IdleTimeoutSeconds) * time.Second
@@ -3800,10 +4493,16 @@ func (o *owner) scanIdle() {
 
 func (o *owner) snapshotStatus() []Status {
 	out := make([]Status, 0, len(o.specs))
-	for id, st := range o.specs {
+	for _, st := range o.specs {
 		s := Status{
-			SpecID:    id,
-			Model:     st.spec.UpstreamModel,
+			// One row per instance (#340): the BASE spec ID, so an older
+			// gateway sees exactly the rows it always did for a spec that never
+			// replicates and a newer one folds instance rows by spec; the
+			// instance address as the model; and the instance index.
+			SpecID:    specBase(st.spec),
+			Instance:  st.instance,
+			Model:     InstanceAddress(st.spec.UpstreamModel, st.instance),
+			StartupMS: st.startupMS,
 			State:     st.state,
 			Since:     st.since,
 			InFlight:  st.inFlight,
@@ -3842,7 +4541,7 @@ func (o *owner) loadedModels() []string {
 	var out []string
 	for _, st := range o.specs {
 		if st.state == StateRunning {
-			out = append(out, st.spec.UpstreamModel)
+			out = append(out, InstanceAddress(st.spec.UpstreamModel, st.instance))
 		}
 	}
 	return out

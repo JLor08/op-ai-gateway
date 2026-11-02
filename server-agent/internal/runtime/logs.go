@@ -420,10 +420,12 @@ func (s *LogStore) Capacity() (perSpec, total int) {
 	return s.perSpec, s.perSpec * s.maxSpecs
 }
 
-// newProc opens a fresh generation for specID and returns the io.Writer that
-// startProcess assigns to BOTH exec.Cmd.Stdout and .Stderr. The requirement
-// says stdout and stderr both, and they deliberately share one writer so the
-// interleaving an operator reads is the interleaving the process produced.
+// newProc opens a fresh generation for specID -- the manager's instance key
+// (#340), so every instance of a replicable spec has a buffer of its own --
+// and returns the io.Writer that startProcess assigns to BOTH
+// exec.Cmd.Stdout and .Stderr. The requirement says stdout and stderr both,
+// and they deliberately share one writer so the interleaving an operator
+// reads is the interleaving the process produced.
 func (s *LogStore) newProc(specID string) *procLog {
 	if s == nil {
 		return &procLog{}
@@ -695,7 +697,10 @@ func (s *LogStore) Watching() []string {
 // from the manager's own config reconciliation: a spec removed from the
 // desired configuration has no row left in the portal to open a log view on,
 // so keeping its output would be memory held for something that no longer
-// exists.
+// exists. The keys are the manager's INSTANCE keys (#340): a spec that never
+// replicates is keyed by its spec ID as ever, a further instance of a
+// replicable spec by S#k, and the manager passes the instances that currently
+// exist -- so a retired burst instance's buffer is released at the next Apply.
 func (s *LogStore) Retain(specIDs []string) {
 	if s == nil {
 		return

@@ -447,6 +447,9 @@ func ParseConfig(raw []byte) (Config, error) {
 //     process.
 //   - A negative min_instances or max_instances reads as unset (0).
 //   - A min_instances above a set max_instances is clamped to max_instances.
+//   - A min_instances above the addressable range (MaxInstanceIndex+1
+//     instances, 0..MaxInstanceIndex) is clamped to it, so the protected floor
+//     (ProtectedCount) can never name an instance that cannot exist.
 func sanitizeInstanceFields(spec *Spec) {
 	if spec.Replicable && spec.ListenPort != 0 {
 		slog.Warn("runtime: spec is replicable but pins a fixed listen_port; treating it as non-replicable (every instance needs its own port)",
@@ -463,6 +466,11 @@ func sanitizeInstanceFields(spec *Spec) {
 		slog.Warn("runtime: spec has min_instances above max_instances; clamping min_instances to max_instances",
 			"spec", spec.ID, "min_instances", spec.MinInstances, "max_instances", spec.MaxInstances)
 		spec.MinInstances = spec.MaxInstances
+	}
+	if limit := MaxInstanceIndex + 1; spec.MinInstances > limit {
+		slog.Warn("runtime: spec has min_instances above the instance limit; clamping it to the limit",
+			"spec", spec.ID, "min_instances", spec.MinInstances, "limit", limit)
+		spec.MinInstances = limit
 	}
 }
 
@@ -602,12 +610,12 @@ type Status struct {
 	InFlight     int         `json:"in_flight"`
 	Restarts     int         `json:"restarts"`
 	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
-	// MeasuredRAMMB is the spec's current process's resident host RAM in MB, as
+	// MeasuredRAMMB is the row's current process's resident host RAM in MB, as
 	// the recurring RAM measurement last observed it; 0 means unknown (never
 	// measured, no RAM measurer, or the process has exited) and is never "needs
-	// no RAM". A spec-level scalar -- RAM has no per-GPU axis, and one process
-	// backs one spec -- carried to the wire as RuntimeSample.RAMMeasuredMB under
-	// the same JSON key.
+	// no RAM". A per-row scalar -- RAM has no per-GPU axis, and one process
+	// backs one row (one instance, #340) -- carried to the wire as
+	// RuntimeSample.RAMMeasuredMB under the same JSON key.
 	MeasuredRAMMB int        `json:"ram_measured_mb,omitempty"`
 	LastError     *LastError `json:"last_error,omitempty"`
 	// Instance is this row's instance index within its spec (#340): 0 for the
