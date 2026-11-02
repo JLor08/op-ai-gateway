@@ -995,6 +995,13 @@ type measureTarget struct {
 	specID string
 	proc   *runningProc
 	pid    int
+	// ready is whether proc had already passed a health probe when this
+	// measurement was dispatched. Every reading the measurement takes happens
+	// after the dispatch, so a ready target's reading is of the loaded model;
+	// one dispatched while the process was still loading may have caught the
+	// load at any point, even if the process is healthy by the time the answer
+	// lands. Only a ready reading is one a sibling inherits (specState.readyVRAM).
+	ready bool
 }
 
 // cmdMeasured carries a completed off-owner measurement back to the owner.
@@ -1095,12 +1102,13 @@ type specState struct {
 	startupMS int
 
 	// waitingOnDemand is true while this BASELINE instance k >= 1 is held back
-	// because its demand is still unknown after inheriting its siblings' live
-	// measurements (§5.4 rule 5): it waits for a sibling to be measured rather
-	// than starting blind. A measurement landing is the event that can end
-	// that wait and nothing else announces it, so applyMeasurement re-asks
-	// exactly these instances (wantsDemandWake). admitAndStart rewrites it on
-	// every verdict, like waitingOnRAM, so it never outlives the wait.
+	// because its demand is still unknown after inheriting its siblings' ready
+	// measurements (§5.4 rule 5): it waits for a sibling to be measured once
+	// ready rather than starting blind. A ready measurement landing is the
+	// event that can end that wait and nothing else announces it, so
+	// applyMeasurement re-asks exactly these instances (wantsDemandWake).
+	// admitAndStart rewrites it on every verdict, like waitingOnRAM, so it never
+	// outlives the wait.
 	waitingOnDemand bool
 
 	state State
@@ -1167,6 +1175,25 @@ type specState struct {
 	// onProcExited for exactly the reason measuredVRAM is (F2): it describes a
 	// process, and stops being true when that process exits.
 	measuredRAM int
+
+	// readyVRAM and readyRAM are the latest real measurements of THIS
+	// instance's current process that were taken after it first passed a
+	// health probe: what the loaded model holds, not a load in progress. They
+	// are the only figures a sibling inherits (siblingPeak, #340 design §5.4
+	// rule 5), because measuredVRAM/measuredRAM above may hold a reading caught
+	// mid-load -- buildSnapshot and the housekeeping beat measure a starting
+	// process too. That reading is right for charging the loading process itself
+	// (max(live, demand) only ever raises its own charge), but it is a fraction
+	// of what another copy of the model will hold: inherited, it would make a
+	// further instance's unknown demand count as known and admit it against that
+	// fraction. A reading is ready when the process had passed its probe before
+	// the reading was taken: at dispatch for the off-owner beat
+	// (measureTarget.ready), at the call for buildSnapshot's synchronous VRAM
+	// read. Cleared by onProcExited with the measurements themselves, for the
+	// same reason (F2). readyVRAM may share its map with measuredVRAM; nothing
+	// writes through either.
+	readyVRAM map[int]int
+	readyRAM  int
 
 	// vramBootstrapDone is the DURABLE guard on the one-shot VRAM bootstrap
 	// eviction (task 4.3). It means the spec's unknown-VRAM bootstrap is resolved
@@ -1450,8 +1477,16 @@ func (o *owner) handle(cmd command) {
 //     max_instances lowered) drains and is removed like a removed spec, its
 //     in-flight requests finishing first; a removed spec takes all of its
 //     instances with it;
+//   - an instance that can no longer be reached because its address is now
+//     another spec's literal upstream model (instanceAddressHolder) drains and
+//     is removed the same way, and the protected floor never creates one;
 //   - a BURST instance with no process left -- one resting at a failure,
 //     kept for the operator only until the next Apply -- is retired here.
+//
+// Order matters in one place: the routing index (rebuildUpstreamIndex) is
+// rebuilt once the removed specs are out and BEFORE the further instances and
+// the floor are reconciled, because which addresses are another spec's literal
+// model is read off that index.
 func (o *owner) applyConfig(cfg Config) {
 	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag {
 		return
@@ -1472,6 +1507,23 @@ func (o *owner) applyConfig(cfg Config) {
 		o.reconcileSpec(st, spec)
 	}
 
+	// A spec gone from the config takes every one of its instances with it.
+	// Keyed by the BASE spec, so a further instance of an absent spec leaves by
+	// this same path: drained if it is serving, its in-flight requests finishing
+	// first, and deleted on exit (removeState).
+	for id, st := range o.specs {
+		if newIDs[specBase(st.spec)] {
+			continue
+		}
+		o.removeState(id, st)
+	}
+
+	// The literal model names as resolveAddress sees them from now on. Rebuilt
+	// before any further instance is looked at, because an instance whose
+	// address is one of them cannot be reached (instanceAddressHolder) -- and
+	// it only indexes instance 0, so nothing below changes it.
+	o.rebuildUpstreamIndex()
+
 	// Further instances that already exist, against their spec's new push.
 	// Deleting the entry being visited is safe in a Go range.
 	for id, st := range o.specs {
@@ -1480,13 +1532,25 @@ func (o *owner) applyConfig(cfg Config) {
 		}
 		base, desired := bases[st.spec.InstanceOf]
 		if !desired {
-			continue // the whole spec is gone: the removal loop below takes it
+			continue // the whole spec is gone: removed above, still draining
 		}
 		if !InstanceAllowed(base, st.instance) {
 			// Not "drop it now": a disallowed instance may be serving, and a
 			// push must never cut a request off mid-response. removeState
 			// drains a live one (in-flight requests finish, bounded by
 			// drainGrace) and deletes it on exit.
+			o.removeState(id, st)
+			continue
+		}
+		if holder, held := o.instanceAddressHolder(base, st.instance); held {
+			// The push made this instance's address another spec's literal
+			// model, so from now on every request for it reaches that spec
+			// (Ruling R1): the instance is out of reach, and leaves the way a
+			// disallowed one does, draining first.
+			if !st.removed {
+				slog.Warn("runtime: an instance address of a replicable spec is now another spec's upstream model, which it routes to; that instance drains and is removed",
+					"spec", base.ID, "instance", st.instance, "address", InstanceAddress(base.UpstreamModel, st.instance), "conflicting_spec", holder)
+			}
 			o.removeState(id, st)
 			continue
 		}
@@ -1515,7 +1579,10 @@ func (o *owner) applyConfig(cfg Config) {
 	// brings them up). Bounded by InstanceAllowed, so a floor a document could
 	// set above max_instances or past MaxInstanceIndex (ParseConfig clamps
 	// both; Apply is also reachable without it) never loops past the
-	// addressable range.
+	// addressable range. An instance that could never be reached is skipped
+	// rather than started: its key is another spec's ID, or its address is
+	// another spec's literal upstream model (instanceAddressHolder). The rest of
+	// the floor still comes up -- gaps in the index range are allowed (§4).
 	for _, spec := range cfg.Specs {
 		for k := 1; k < ProtectedCount(spec) && InstanceAllowed(spec, k); k++ {
 			key := InstanceKey(spec.ID, k)
@@ -1526,18 +1593,14 @@ func (o *owner) applyConfig(cfg Config) {
 				}
 				continue
 			}
+			if holder, held := o.instanceAddressHolder(spec, k); held {
+				slog.Warn("runtime: an instance address of a replicable spec is another spec's upstream model, which it routes to; that instance cannot exist",
+					"spec", spec.ID, "instance", k, "address", InstanceAddress(spec.UpstreamModel, k), "conflicting_spec", holder)
+				continue
+			}
 			o.specs[key] = &specState{spec: specForInstance(spec, k), instance: k, state: StateStopped, since: time.Now()}
 		}
 	}
-
-	for id, st := range o.specs {
-		if newIDs[specBase(st.spec)] {
-			continue
-		}
-		o.removeState(id, st)
-	}
-
-	o.rebuildUpstreamIndex()
 
 	// Retained output follows the SPEC, so a spec the operator deleted takes
 	// its history with it: there is no row left in the portal to open a log
@@ -1880,6 +1943,21 @@ func (o *owner) resolveAddress(model string) (specID, base string, k int, ok boo
 		return "", "", 0, false
 	}
 	return id, b, n, true
+}
+
+// instanceAddressHolder reports whether the address of instance k >= 1 of spec
+// is another spec's literal upstream model, and names that spec. resolveAddress
+// routes an exact upstream match first (Ruling R1), so every request for such an
+// address reaches the other spec and the instance could never be reached: a
+// protected one would hold its resources for nothing, and its status row would
+// claim the other spec's model name -- in LoadedModels, and in the router's
+// /upstream relay, which answers from the first running row of that name. It
+// reads byUpstream, the routing index itself, so it agrees with resolveAddress
+// by construction; instance 0's address is its spec's own upstream model, never
+// another spec's.
+func (o *owner) instanceAddressHolder(spec Spec, k int) (holder string, held bool) {
+	holder, held = o.byUpstream[InstanceAddress(spec.UpstreamModel, k)]
+	return holder, held && holder != spec.ID
 }
 
 // instanceForRequest returns the state of instance k of base's spec for a
@@ -2259,7 +2337,10 @@ func (o *owner) higherSiblingRuns(st *specState) bool {
 // host-wide for RAM. Siblings run the same model with the same arguments, so a
 // measured sibling is the best estimate there is of what another instance will
 // hold, and the pushed demand stays a floor, exactly like the live-measurement
-// rule in buildSnapshot.
+// rule in buildSnapshot. "Running" is meant strictly: only a reading taken
+// after the sibling passed its health probe counts (siblingPeak), so a sibling
+// still loading leaves the demand where it was -- unknown, if nothing was
+// declared -- rather than lending it a fraction of the model.
 //
 // It applies to EVERY instance -- instance 0 included, and occupants as well as
 // the candidate. Instance 0 restarting next to a protected (hence pinned),
@@ -2292,25 +2373,30 @@ func (o *owner) demandSpec(st *specState) Spec {
 }
 
 // siblingPeak returns the largest live measurement among st's running
-// siblings: per GPU index for VRAM, one figure for host RAM. A sibling's
-// measurement describes its CURRENT process (cleared on exit), so only
-// siblings with a process count, and st's own figures never do.
+// siblings: per GPU index for VRAM, one figure for host RAM. Only READY
+// readings count (specState.readyVRAM/readyRAM: taken after the sibling's
+// process first passed a health probe), never one caught while it was still
+// loading -- that is a fraction of the model, and inheriting it would make an
+// unknown demand count as known and admit a further instance against the
+// fraction (§5.4 rule 5 waits for a measured running sibling). A ready reading
+// describes its sibling's CURRENT process (cleared on exit), so only siblings
+// with a process count, and st's own figures never do.
 func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
 	base := specBase(st.spec)
 	for _, sib := range o.specs {
 		if sib == st || sib.proc == nil || specBase(sib.spec) != base {
 			continue
 		}
-		for idx, mb := range sib.measuredVRAM {
+		for idx, mb := range sib.readyVRAM {
 			if mb <= vram[idx] {
 				continue
 			}
 			if vram == nil {
-				vram = make(map[int]int, len(sib.measuredVRAM))
+				vram = make(map[int]int, len(sib.readyVRAM))
 			}
 			vram[idx] = mb
 		}
-		ram = max(ram, realRAM(sib.measuredRAM))
+		ram = max(ram, realRAM(sib.readyRAM))
 	}
 	return vram, ram
 }
@@ -2430,11 +2516,11 @@ func (o *owner) admitAndStart(specID string) {
 		}
 		// A baseline (protected) instance waits, the same silent-but-diagnosed
 		// way as rule 4's precedence wait: queued, state untouched, the reason on
-		// its row. A sibling's measurement landing is what ends it
+		// its row. A ready measurement of a sibling landing is what ends it
 		// (applyMeasurement -> wantsDemandWake).
 		st.waitingOnDemand = true
 		o.noteAdmissionWait(st, fmt.Sprintf(
-			"spec %s: its demand is unknown (no declared estimate and no measured sibling yet), so it waits for a sibling to be measured instead of starting blind",
+			"spec %s: its demand is unknown (no declared estimate, and no sibling measured since it became ready), so it waits for a ready sibling to be measured instead of starting blind",
 			specID))
 		return
 	}
@@ -2649,7 +2735,7 @@ func (o *owner) measurementTargets() (targets []measureTarget, declaresGPU bool)
 		if len(st.spec.GPUs) > 0 {
 			declaresGPU = true
 		}
-		targets = append(targets, measureTarget{specID: id, proc: st.proc, pid: st.proc.pid})
+		targets = append(targets, measureTarget{specID: id, proc: st.proc, pid: st.proc.pid, ready: st.proc.everHealthy})
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].specID < targets[j].specID })
 	return targets, declaresGPU
@@ -2736,10 +2822,13 @@ func realRAM(v int) int {
 // zeros leave a previous real number in place instead of overwriting it with
 // an "unknown" the portal cannot tell apart from a measured zero.
 //
-// A measurement that lands is also the one event that can end a baseline
-// instance's wait for a measured sibling (#340, specState.waitingOnDemand), so
-// such instances are re-asked afterwards; and a measurement a start asked for
-// while this one was out (remeasure) is dispatched now.
+// A READY reading that lands -- one dispatched after its process passed a
+// health probe (measureTarget.ready) -- is also the one event that can end a
+// baseline instance's wait for a measured sibling (#340,
+// specState.waitingOnDemand), so such instances are re-asked afterwards; a
+// reading of a load in progress cannot end that wait and wakes nobody. And a
+// measurement a start asked for while this one was out (remeasure) is
+// dispatched now.
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
 	landed := false
@@ -2754,7 +2843,10 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 			// has a number now, so it must never spend (or keep holding) the
 			// one-shot eviction. See specState.vramBootstrapDone.
 			st.vramBootstrapDone = true
-			landed = true
+			if t.ready {
+				st.readyVRAM = byGPU
+				landed = true
+			}
 		}
 		// ONE process per instance, so the pid's figure is the instance's figure:
 		// nothing to sum and no key to re-key. The same generation guard
@@ -2771,7 +2863,10 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 			// its own now that a number has landed).
 			st.ramBootstrapRetries = 0
 			st.ramBootstrapBeats = 0
-			landed = true
+			if t.ready {
+				st.readyRAM = mb
+				landed = true
+			}
 		} else if o.healthyBootstrapAwaitingMeasurement(st) {
 			// Task 4.4 TERMINATION: a bootstrap that is healthy but still
 			// unmeasured holds the RAMBootstrapInFlight interlock (task 4.1), and
@@ -2929,6 +3024,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			// never spend (or keep holding) the one-shot. See
 			// specState.vramBootstrapDone.
 			st.vramBootstrapDone = true
+			// Taken now, on the owner: it is of the loaded model exactly when the
+			// process has already passed a health probe, and only then may a
+			// sibling inherit it (specState.readyVRAM). A starting process's
+			// reading still charges the process itself, below.
+			if st.proc.everHealthy {
+				st.readyVRAM = byGPU
+			}
 		}
 	}
 	for id, st := range o.specs {
@@ -3630,6 +3732,10 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// the memory come back yet (noteRAMFreed).
 	o.noteRAMFreed(st)
 	st.measuredRAM = 0
+	// And for what a sibling inherits from this process (#340): an exited
+	// process holds nothing, so its figures must not raise anyone's demand.
+	st.readyVRAM = nil
+	st.readyRAM = 0
 
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false
@@ -4183,7 +4289,7 @@ func wantsWakeAfterStart(st *specState) bool {
 	return wantsWake(st) && (len(st.pending) > 0 || st.pinnedForAdmission())
 }
 
-// wantsDemandWake is the selection rule for the wake a landed measurement
+// wantsDemandWake is the selection rule for the wake a landed ready measurement
 // causes (applyMeasurement): a baseline instance waiting for a measured sibling
 // (specState.waitingOnDemand), narrowed like the other event wakes. It is a
 // cheap no-op whenever no such instance waits, which is nearly always.

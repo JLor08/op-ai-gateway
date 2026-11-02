@@ -6,6 +6,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -325,6 +326,119 @@ func TestProtectedInstanceWaitsForSiblingMeasurement(t *testing.T) {
 	})
 }
 
+// TestFurtherInstanceWaitsForASiblingThatIsReady: while instance 0 is still
+// loading, every measurement of it -- the housekeeping beat's, and each
+// admission's own synchronous one -- catches the load in progress, a fraction of
+// what the loaded model holds. A further instance with an unknown demand must not
+// inherit that: it would count as known, and the instance would start against
+// the fraction (two copies of a model that settles at 6000 MB, admitted at
+// 1200 each onto an 8000 MB GPU). It inherits only a figure taken once its
+// sibling passed the health probe (§5.2, §5.4 rule 5): until then a protected
+// instance waits and a burst one is refused as demand-unknown; afterwards both
+// start on the loaded figure.
+func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
+	const loadingMB, loadedMB = 1200, 3000
+	for _, tc := range []struct {
+		name  string
+		vram  bool // the unknown demand is per-GPU VRAM (else host RAM)
+		burst bool // min_instances 1, so instance 1 is burst (else 2: protected)
+	}{
+		{"protected, vram unknown", true, false},
+		{"protected, ram unknown", false, false},
+		{"burst, vram unknown", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			skipOnWindows(t)
+			shrinkTimings(t)
+			m := newTestManager(t, allowlistPolicy())
+
+			var loaded atomic.Bool
+			reading := func() int {
+				if loaded.Load() {
+					return loadedMB
+				}
+				return loadingMB
+			}
+			spec, openGate := gatedSpec(t, "S", "m") // every instance shares the gate
+			spec.Replicable = true
+			spec.MinInstances = 2
+			if tc.burst {
+				spec.MinInstances = 1
+			}
+			cfg := Config{}
+			if tc.vram {
+				spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+				spec.RAMMB = 64
+				cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 8000}}
+				m.SetMeasurer(func(pids []int) map[int]map[int]int {
+					out := make(map[int]map[int]int, len(pids))
+					for _, p := range pids {
+						out[p] = map[int]int{0: reading()}
+					}
+					return out
+				})
+			} else {
+				spec.RAMMB = 0
+				m.SetRAMMeasurer(func(pids []int) map[int]int {
+					out := make(map[int]int, len(pids))
+					for _, p := range pids {
+						out[p] = reading()
+					}
+					return out
+				})
+			}
+			cfg.Specs = []Spec{spec}
+			m.Apply(cfg)
+
+			waitUntil(t, 5*time.Second, "instance 0 loading, with a mid-load measurement of it recorded", func() bool {
+				st := instanceStatus(m, "S", 0)
+				if st == nil || st.State != StateStarting {
+					return false
+				}
+				if tc.vram {
+					return st.MeasuredVRAM[0] == loadingMB
+				}
+				return st.MeasuredRAMMB == loadingMB
+			})
+			if tc.burst {
+				took, err := ensureErr(t, m, "m#1")
+				if !errors.Is(err, ErrInstanceDemandUnknown) {
+					t.Fatalf("EnsureRunning(m#1) while instance 0 loads = %v, want ErrInstanceDemandUnknown: a mid-load reading is no demand", err)
+				}
+				if took > 2*time.Second {
+					t.Errorf("the refusal took %s, want it immediate", took)
+				}
+			} else {
+				// Ten housekeeping beats (30ms each) land while instance 0 loads; not
+				// one of their readings may start instance 1.
+				deadline := time.Now().Add(300 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					if s1 := instanceStatus(m, "S", 1); s1 == nil || s1.State != StateStopped || s1.PID != 0 {
+						t.Fatalf("instance 1 = %+v while instance 0 is still loading, want it stopped and waiting: it would start against a mid-load reading", s1)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+
+			loaded.Store(true)
+			openGate()
+			waitUntil(t, 5*time.Second, "instance 0 ready", func() bool {
+				st := instanceStatus(m, "S", 0)
+				return st != nil && st.State == StateRunning
+			})
+			if tc.burst {
+				_, release := ensureModel(t, m, "m#1")
+				release()
+				return
+			}
+			waitUntil(t, 5*time.Second, "instance 1 started once its sibling was measured ready", func() bool {
+				s1 := instanceStatus(m, "S", 1)
+				return s1 != nil && s1.State == StateRunning
+			})
+		})
+	}
+}
+
 func TestIdleUnloadHighestIndexFirst(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -378,32 +492,68 @@ func TestIdleUnloadHighestIndexFirst(t *testing.T) {
 	}
 }
 
+// TestIdleUnloadKeepsProtected: an instance inside the min_instances floor is
+// never idle-unloaded, however long it sits idle (§5.5: only k >= P unloads).
+//
+// The positive control is an UNRELATED spec on the same idle timeout, used
+// after every protected instance, so its unload proves the scans ran past
+// their idle windows too. It must not be a burst instance of the same spec: a
+// running higher-index sibling shields every lower instance from idle unload
+// (the ordering invariant), so it would keep instance 0 up whatever the
+// min_instances guard said. The protected instances are then watched through a
+// further whole idle period. min=2 covers a protected instance k >= 1, the one
+// a broken guard reaches first (highest index leaves first).
 func TestIdleUnloadKeepsProtected(t *testing.T) {
-	skipOnWindows(t)
-	shrinkTimings(t)
-	m := newTestManager(t, allowlistPolicy())
+	for _, minInstances := range []int{1, 2} {
+		t.Run(fmt.Sprintf("min_%d", minInstances), func(t *testing.T) {
+			skipOnWindows(t)
+			shrinkTimings(t)
+			m := newTestManager(t, allowlistPolicy())
 
-	spec := replicableSpec("S", "m")
-	spec.MinInstances = 1
-	spec.IdleTimeoutSeconds = 1
-	m.Apply(Config{Specs: []Spec{spec}})
+			spec := replicableSpec("S", "m")
+			spec.MinInstances = minInstances
+			spec.IdleTimeoutSeconds = 1
+			control := baseSpec("U", "u")
+			control.IdleTimeoutSeconds = 1
+			m.Apply(Config{Specs: []Spec{spec, control}, Coresident: [][2]string{{"S", "U"}}})
 
-	waitUntil(t, 5*time.Second, "the protected instance 0 started on Apply", func() bool {
-		st := instanceStatus(m, "S", 0)
-		return st != nil && st.State == StateRunning
-	})
-	pid := instanceStatus(m, "S", 0).PID
+			waitUntil(t, 5*time.Second, "every protected instance started on Apply", func() bool {
+				for k := 0; k < minInstances; k++ {
+					if st := instanceStatus(m, "S", k); st == nil || st.State != StateRunning {
+						return false
+					}
+				}
+				return true
+			})
+			pids := make([]int, minInstances)
+			for k := range pids {
+				_, release := ensureModel(t, m, InstanceAddress("m", k)) // a real last use, before the control's
+				release()
+				pids[k] = instanceStatus(m, "S", k).PID
+			}
 
-	// Positive control on the same idle timeout: the burst instance IS
-	// unloaded, which proves the idle scans ran past the timeout.
-	_, release := ensureModel(t, m, "m#1")
-	release()
-	waitUntil(t, 5*time.Second, "the burst instance idle-unloaded and retired", func() bool {
-		return instanceStatus(m, "S", 1) == nil
-	})
+			_, release := ensureModel(t, m, "u")
+			release()
+			waitUntil(t, 5*time.Second, "the unrelated control idle-unloaded on the same timeout", func() bool {
+				st := statusFor(m, "U")
+				return st != nil && st.State == StateStopped && st.PID == 0
+			})
 
-	if st := instanceStatus(m, "S", 0); st == nil || st.State != StateRunning || st.PID != pid {
-		t.Fatalf("instance 0 = %+v, want still running as pid %d: min_instances protects it from idle unload", st, pid)
+			// One more whole idle timeout (1s) plus ten idle scans (30ms each).
+			hold := time.Now().Add(1300 * time.Millisecond)
+			for {
+				for k, pid := range pids {
+					if st := instanceStatus(m, "S", k); st == nil || st.State != StateRunning || st.PID != pid {
+						t.Fatalf("protected instance %d = %+v, want still running as pid %d: min_instances=%d protects it from idle unload",
+							k, st, pid, minInstances)
+					}
+				}
+				if time.Now().After(hold) {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }
 
@@ -513,9 +663,14 @@ func TestApplyReplicableOffDrainsInstancesGracefully(t *testing.T) {
 	}
 }
 
+// TestApplyMaxLoweredDrainsDisallowed: lowering max_instances drains the
+// instances the new cap no longer allows, an idle one at once and one serving a
+// request only once that request has finished (Review Focus 2: a push never
+// cuts a response off); the instances still allowed are untouched.
 func TestApplyMaxLoweredDrainsDisallowed(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
 	m := newTestManager(t, allowlistPolicy())
 
 	spec := replicableSpec("S", "m")
@@ -524,22 +679,97 @@ func TestApplyMaxLoweredDrainsDisallowed(t *testing.T) {
 
 	_, rel1 := ensureModel(t, m, "m#1")
 	rel1()
-	_, rel3 := ensureModel(t, m, "m#3")
-	rel3()
+	_, rel2 := ensureModel(t, m, "m#2")
+	rel2()
+	ep3, rel3 := ensureModel(t, m, "m#3") // one request in flight on instance 3 across the push
+	defer rel3()
 	pid1 := instanceStatus(m, "S", 1).PID
 
 	lowered := spec
 	lowered.MaxInstances = 2
 	m.Apply(Config{Specs: []Spec{lowered}, ETag: "v2"})
 
+	if st := instanceStatus(m, "S", 3); st == nil || st.State != StateDraining {
+		t.Fatalf("instance 3 = %+v right after max_instances was lowered, want draining (its request is still in flight)", st)
+	}
+	if code, body := httpEcho(t, ep3, "still here"); code != 200 || body != "still here" {
+		t.Fatalf("echo through the draining instance 3 = (%d, %q), want it served", code, body)
+	}
+	waitUntil(t, 5*time.Second, "the idle instance 2 drained and removed", func() bool {
+		return instanceStatus(m, "S", 2) == nil
+	})
+	if st := instanceStatus(m, "S", 3); st == nil || st.State != StateDraining {
+		t.Fatalf("instance 3 = %+v once instance 2 is gone, want still draining for its request", st)
+	}
+	for _, model := range []string{"m#2", "m#3"} {
+		if _, err := ensureErr(t, m, model); !errors.Is(err, ErrModelNotManaged) {
+			t.Errorf("EnsureRunning(%s) = %v, want ErrModelNotManaged under max_instances=2", model, err)
+		}
+	}
+
+	rel3()
 	waitUntil(t, 5*time.Second, "instance 3 drained and removed", func() bool {
 		return instanceStatus(m, "S", 3) == nil
+	})
+	waitUntil(t, 5*time.Second, "instance 3's child gone", func() bool {
+		return !httpGetOK(ep3, "/health")
 	})
 	if st := instanceStatus(m, "S", 1); st == nil || st.State != StateRunning || st.PID != pid1 {
 		t.Errorf("instance 1 = %+v, want untouched (still allowed under max 2)", st)
 	}
-	if _, err := ensureErr(t, m, "m#3"); !errors.Is(err, ErrModelNotManaged) {
-		t.Errorf("EnsureRunning(m#3) = %v, want ErrModelNotManaged under max_instances=2", err)
+}
+
+// TestApplySpecRemovedDrainsInstancesGracefully: a push without the spec takes
+// every instance with it, and an instance serving a request finishes it first
+// (Review Focus 2). A removed spec reaches its instances k >= 1 by a route of
+// its own -- the removal loop keys by BASE spec, and the further-instances loop
+// leaves an instance of an absent spec to it -- so this is the one test that
+// drives that route: the instance must drain rather than be cut off, dropped
+// from the table while its child keeps running, or left behind.
+func TestApplySpecRemovedDrainsInstancesGracefully(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := replicableSpec("S", "m")
+	other := baseSpec("T", "t")
+	m.Apply(Config{Specs: []Spec{spec, other}, ETag: "v1"})
+
+	ep0, rel0 := ensureModel(t, m, "m")
+	rel0()
+	ep1, rel1 := ensureModel(t, m, "m#1") // one request in flight on instance 1 across the push
+	defer rel1()
+
+	m.Apply(Config{Specs: []Spec{other}, ETag: "v2"})
+
+	if st := instanceStatus(m, "S", 1); st == nil || st.State != StateDraining {
+		t.Fatalf("instance 1 = %+v right after its spec was removed, want draining (its request is still in flight)", st)
+	}
+	if code, body := httpEcho(t, ep1, "still here"); code != 200 || body != "still here" {
+		t.Fatalf("echo through the draining instance 1 = (%d, %q), want it served", code, body)
+	}
+	waitUntil(t, 5*time.Second, "the idle instance 0 drained and removed", func() bool {
+		return instanceStatus(m, "S", 0) == nil
+	})
+	if st := instanceStatus(m, "S", 1); st == nil || st.State != StateDraining {
+		t.Fatalf("instance 1 = %+v once instance 0 is gone, want still draining for its request", st)
+	}
+	for _, model := range []string{"m", "m#1", "m#2"} {
+		if _, err := ensureErr(t, m, model); !errors.Is(err, ErrModelNotManaged) {
+			t.Errorf("EnsureRunning(%s) after its spec was removed = %v, want ErrModelNotManaged", model, err)
+		}
+	}
+
+	rel1()
+	waitUntil(t, 5*time.Second, "instance 1 drained and removed", func() bool {
+		return instanceStatus(m, "S", 1) == nil
+	})
+	waitUntil(t, 5*time.Second, "both children of the removed spec gone", func() bool {
+		return !httpGetOK(ep0, "/health") && !httpGetOK(ep1, "/health")
+	})
+	if rows := m.Status(); len(rows) != 1 || rows[0].SpecID != "T" {
+		t.Fatalf("Status() = %+v, want only T's row", rows)
 	}
 }
 
@@ -697,6 +927,106 @@ func TestResolveAddress(t *testing.T) {
 	}
 }
 
+// assertFooHash2IsL checks that the address foo#2 is spec L's literal model
+// and nothing else: it resolves to L, no instance 2 of F exists, no other row
+// reports the model foo#2, and it is not listed as loaded while L is stopped.
+func assertFooHash2IsL(t *testing.T, m *Manager) {
+	t.Helper()
+	if base, k, ok := m.ResolveAddress("foo#2"); !ok || base != "foo#2" || k != 0 {
+		t.Errorf("ResolveAddress(foo#2) = (%q, %d, %v), want (foo#2, 0, true): L's literal model", base, k, ok)
+	}
+	if st := instanceStatus(m, "F", 2); st != nil {
+		t.Errorf("F instance 2 = %+v, want none: its address foo#2 always routes to L, so nothing could ever reach it", st)
+	}
+	var rows []Status
+	for _, r := range m.Status() {
+		if r.Model == "foo#2" {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) != 1 || rows[0].SpecID != "L" {
+		t.Errorf("rows reporting the model foo#2 = %+v, want L's alone", rows)
+	}
+	if loaded := m.LoadedModels(); contains(loaded, "foo#2") {
+		t.Errorf("LoadedModels() = %v, want no foo#2 while L is stopped", loaded)
+	}
+}
+
+// TestProtectedFloorSkipsAnAddressThatIsAnotherSpecsModel: foo#2 is the
+// literal upstream model of L, so it routes to L however F (upstream foo)
+// replicates (Ruling R1) -- instance 2 of F can never be addressed. F's floor
+// (min_instances 3) therefore stops short of that instance instead of starting
+// a protected process nobody can reach whose row claims L's model name (in
+// LoadedModels, and in the router's /upstream relay, which answers from the
+// first running row of that name).
+func TestProtectedFloorSkipsAnAddressThatIsAnotherSpecsModel(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	f := replicableSpec("F", "foo")
+	f.MinInstances = 3
+	m.Apply(Config{Specs: []Spec{baseSpec("L", "foo#2"), f}, ETag: "v1"})
+
+	waitUntil(t, 5*time.Second, "F's reachable protected instances 0 and 1 running", func() bool {
+		s0, s1 := instanceStatus(m, "F", 0), instanceStatus(m, "F", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	})
+	assertFooHash2IsL(t, m)
+	if st := statusFor(m, "L"); st == nil || st.State != StateStopped {
+		t.Errorf("L = %+v, want stopped: nothing asked for it", st)
+	}
+}
+
+// TestApplyDrainsAnInstanceWhoseAddressBecameAnotherSpecsModel: the same
+// collision arriving with a push. F's protected instance 2 is serving a request
+// when a push adds L, whose literal model is foo#2: from then on that address
+// reaches L, so F's instance 2 drains -- its request finishing first -- is
+// removed, and the floor does not bring it back on a later push.
+func TestApplyDrainsAnInstanceWhoseAddressBecameAnotherSpecsModel(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
+	m := newTestManager(t, allowlistPolicy())
+
+	f := replicableSpec("F", "foo")
+	f.MinInstances = 3
+	m.Apply(Config{Specs: []Spec{f}, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "F's protected instances 0, 1 and 2 running", func() bool {
+		for k := 0; k < 3; k++ {
+			if st := instanceStatus(m, "F", k); st == nil || st.State != StateRunning {
+				return false
+			}
+		}
+		return true
+	})
+	pid0, pid1 := instanceStatus(m, "F", 0).PID, instanceStatus(m, "F", 1).PID
+	ep2, rel2 := ensureModel(t, m, "foo#2") // F's instance 2 while no spec claims the name
+	defer rel2()
+
+	withL := Config{Specs: []Spec{baseSpec("L", "foo#2"), f}, ETag: "v2"}
+	m.Apply(withL)
+	if st := instanceStatus(m, "F", 2); st == nil || st.State != StateDraining {
+		t.Fatalf("F instance 2 = %+v right after L claimed foo#2, want draining (its request is still in flight)", st)
+	}
+	if code, body := httpEcho(t, ep2, "still here"); code != 200 || body != "still here" {
+		t.Fatalf("echo through the draining F instance 2 = (%d, %q), want it served", code, body)
+	}
+
+	rel2()
+	waitUntil(t, 5*time.Second, "F instance 2 drained and removed", func() bool {
+		return instanceStatus(m, "F", 2) == nil
+	})
+	withL.ETag = "v3" // a further push: the floor still stops short of instance 2
+	m.Apply(withL)
+	assertFooHash2IsL(t, m)
+	for k, pid := range []int{pid0, pid1} {
+		if st := instanceStatus(m, "F", k); st == nil || st.State != StateRunning || st.PID != pid {
+			t.Errorf("F instance %d = %+v, want untouched (running as pid %d)", k, st, pid)
+		}
+	}
+}
+
 // TestFirstHealthyProbeMeasuresEvenWhileAMeasurementIsInFlight: a start that
 // becomes healthy while another measurement is still out is measured as soon as
 // that one returns, not a whole housekeeping beat later -- the sibling demand a
@@ -773,7 +1103,10 @@ func waitUntilChildIsServingInstance(t *testing.T, m *Manager, specID string, k 
 // returns at once), so a victim choice can be read off the state it leaves.
 // ---------------------------------------------------------------------------
 
-// liveInstance builds one live instance state of base for an owner-level test.
+// liveInstance builds one live, Running instance state of base for an
+// owner-level test. Running means its process has passed a health probe
+// (everHealthy), so a reading taken of it is a ready one a sibling inherits; a
+// test about a process still loading sets StateStarting and clears everHealthy.
 func liveInstance(base Spec, k int, pid int) *specState {
 	exited := make(chan struct{})
 	close(exited)
@@ -782,7 +1115,7 @@ func liveInstance(base Spec, k int, pid int) *specState {
 		spec:     spec,
 		instance: k,
 		state:    StateRunning,
-		proc:     &runningProc{specID: spec.ID, pid: pid, exited: exited},
+		proc:     &runningProc{specID: spec.ID, pid: pid, exited: exited, everHealthy: true},
 	}
 }
 
@@ -798,14 +1131,14 @@ func TestDemandSpecInheritsLargestSiblingMeasurement(t *testing.T) {
 	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, GPUs: []SpecGPU{{Index: 0}, {Index: 1, VRAMMB: 5000}}}
 	s0 := liveInstance(s, 0, 100)
 	s0.measuredVRAM = map[int]int{0: 3000, 1: 4000}
-	s0.measuredRAM = 2000
+	s0.readyVRAM, s0.measuredRAM, s0.readyRAM = s0.measuredVRAM, 2000, 2000
 	s1 := liveInstance(s, 1, 101)
 	s1.measuredVRAM = map[int]int{0: 3500}
-	s1.measuredRAM = 1500
+	s1.readyVRAM, s1.measuredRAM, s1.readyRAM = s1.measuredVRAM, 1500, 1500
 	s2 := &specState{spec: specForInstance(s, 2), instance: 2, state: StateStopped}
 	other := liveInstance(Spec{ID: "T", UpstreamModel: "t", GPUs: []SpecGPU{{Index: 0}}}, 0, 200)
 	other.measuredVRAM = map[int]int{0: 9000}
-	other.measuredRAM = 9000
+	other.readyVRAM, other.measuredRAM, other.readyRAM = other.measuredVRAM, 9000, 9000
 	o := instanceOwner(s0, s1, s2, other)
 
 	d := o.demandSpec(s2)
@@ -883,6 +1216,133 @@ func TestInstanceZeroInheritsProtectedSiblingMeasurement(t *testing.T) {
 	}
 	if dec := Admit(snap, o.demandSpec(s0)); !dec.OK {
 		t.Fatalf("Admit(instance 0 with inherited demand) = %+v, want OK", dec)
+	}
+}
+
+// TestSiblingInheritanceIgnoresALoadInProgress: buildSnapshot measures every
+// live process, a starting one included, and that reading rightly charges the
+// loading process itself. But it is a fraction of what the model holds once
+// loaded, so a further instance must not inherit it: its demand would count as
+// known, and Admit would let it start against the fraction (§5.4 rule 5 waits
+// for a measured running sibling). Once the sibling is ready, a reading counts.
+func TestSiblingInheritanceIgnoresALoadInProgress(t *testing.T) {
+	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, MinInstances: 1, RAMMB: 64, GPUs: []SpecGPU{{Index: 0}}}
+	s0 := liveInstance(s, 0, 100)
+	s0.state = StateStarting
+	s0.proc.everHealthy = false
+	s1 := &specState{spec: specForInstance(s, 1), instance: 1, state: StateStopped}
+	o := instanceOwner(s0, s1)
+	o.cfg = Config{GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 8000}}}
+	var reading atomic.Int64
+	reading.Store(1200)
+	o.m.SetMeasurer(func([]int) map[int]map[int]int {
+		return map[int]map[int]int{100: {0: int(reading.Load())}}
+	})
+
+	snap := o.buildSnapshot()
+	if c := gpusChargedFor(t, snap, "S"); c[0] != 1200 {
+		t.Fatalf("premise: the loading instance 0 is charged %v, want its own mid-load reading 1200", c)
+	}
+	if d := o.demandSpec(s1); !demandUnknown(d) {
+		snap.NoEvict = true
+		t.Fatalf("instance 1 inherits gpus %+v from a sibling still loading (Admit with NoEvict: %+v); want its demand unknown until the sibling is ready",
+			d.GPUs, Admit(snap, d))
+	}
+
+	s0.state = StateRunning
+	s0.proc.everHealthy = true
+	reading.Store(6000)
+	o.buildSnapshot()
+	if d := o.demandSpec(s1); d.GPUs[0].VRAMMB != 6000 {
+		t.Fatalf("instance 1 demand once its sibling is ready = %+v, want gpu0 6000 (the loaded reading)", d.GPUs)
+	}
+}
+
+// TestSiblingInheritanceNeedsAMeasurementTakenOnceReady: what makes a
+// sibling's reading inheritable is WHEN it was taken, not the sibling's state
+// by the time it lands. A housekeeping measurement dispatched while instance 0
+// was still loading can land after its first passing probe, and is still the
+// load in progress; only one dispatched once the process was ready counts --
+// such as the one its first healthy probe asks for (§5.2). buildSnapshot never
+// reads host RAM itself, so for RAM this is the only path there is.
+func TestSiblingInheritanceNeedsAMeasurementTakenOnceReady(t *testing.T) {
+	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, MinInstances: 2, GPUs: []SpecGPU{{Index: 0}}}
+	s0 := liveInstance(s, 0, 100)
+	s0.state = StateStarting
+	s0.proc.everHealthy = false
+	s1 := &specState{spec: specForInstance(s, 1), instance: 1, state: StateStopped}
+	o := instanceOwner(s0, s1)
+	o.m.cmds = make(chan command, 1) // the dispatched measurement posts its answer here
+	o.m.done = make(chan struct{})
+	var reading atomic.Int64
+	reading.Store(1200)
+	o.m.SetMeasurer(func([]int) map[int]map[int]int {
+		return map[int]map[int]int{100: {0: int(reading.Load())}}
+	})
+	o.m.SetRAMMeasurer(func([]int) map[int]int {
+		return map[int]int{100: int(reading.Load())}
+	})
+	land := func() {
+		t.Helper()
+		select {
+		case c := <-o.m.cmds:
+			o.applyMeasurement(c.(cmdMeasured))
+		case <-time.After(5 * time.Second):
+			t.Fatal("the dispatched measurement never came back")
+		}
+	}
+
+	o.dispatchMeasurement() // taken while instance 0 is still loading ...
+	s0.state = StateRunning // ... and landing after its first passing probe
+	s0.proc.everHealthy = true
+	land()
+	if s0.measuredVRAM[0] != 1200 || s0.measuredRAM != 1200 {
+		t.Fatalf("premise: instance 0's own figures = vram %v, ram %d, want the reading recorded (1200 each)", s0.measuredVRAM, s0.measuredRAM)
+	}
+	if d := o.demandSpec(s1); !demandUnknown(d) || d.GPUs[0].VRAMMB != 0 || d.RAMMB != 0 {
+		t.Fatalf("instance 1 inherits gpus %+v, ram %d from a reading taken mid-load; want both still unknown", d.GPUs, d.RAMMB)
+	}
+
+	reading.Store(6000)
+	o.dispatchMeasurement() // taken once instance 0 is ready
+	land()
+	if d := o.demandSpec(s1); d.GPUs[0].VRAMMB != 6000 || d.RAMMB != 6000 {
+		t.Fatalf("instance 1 demand after a reading taken once ready = gpus %+v, ram %d, want 6000 each", d.GPUs, d.RAMMB)
+	}
+}
+
+// TestReadyMeasurementClearedOnExit: a ready reading describes one process,
+// exactly like the measurement it is taken from (F2), so it goes when the
+// process does. Kept, it would raise a sibling's demand on behalf of the
+// instance's NEXT generation while that one is still loading -- possibly with a
+// different launch shape, and so a different footprint.
+func TestReadyMeasurementClearedOnExit(t *testing.T) {
+	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, GPUs: []SpecGPU{{Index: 0}}}
+	logs := NewLogStore(0, 0)
+	s0 := &specState{
+		spec:            s,
+		state:           StateDraining,
+		intentionalStop: true, // a clean stop: onProcExited rests it at Stopped
+		measuredVRAM:    map[int]int{0: 6000},
+		readyVRAM:       map[int]int{0: 6000},
+		measuredRAM:     3000,
+		readyRAM:        3000,
+		proc:            &runningProc{specID: "S", pid: 4242, log: logs.newProc("S"), exited: make(chan struct{}), everHealthy: true},
+	}
+	s1 := &specState{spec: specForInstance(s, 1), instance: 1, state: StateStopped}
+	o := instanceOwner(s0, s1)
+
+	o.onProcExited(s0, nil)
+	if s0.readyVRAM != nil || s0.readyRAM != 0 {
+		t.Fatalf("after the exit instance 0 still holds ready figures vram %v, ram %d; want them cleared with the process", s0.readyVRAM, s0.readyRAM)
+	}
+
+	// Its next generation is still loading: nothing of the last one may count.
+	exited := make(chan struct{})
+	close(exited)
+	s0.state, s0.proc = StateStarting, &runningProc{specID: "S", pid: 4343, exited: exited}
+	if d := o.demandSpec(s1); !demandUnknown(d) {
+		t.Fatalf("instance 1 inherits gpus %+v, ram %d from instance 0's previous process; want its demand unknown", d.GPUs, d.RAMMB)
 	}
 }
 
