@@ -10446,11 +10446,15 @@ describe('RuntimeAdminSection spec-level RAM estimate', () => {
     expect(putSpecs[0].body.ram_estimate_mb).toBe(4096);
   });
 
-  it('never sends the agent-owned measurement', async () => {
+  it('shows the agent-owned measurement read-only and never sends it', async () => {
     const { putSpecs } = await openApiTokenSpecEdit({
       ram_estimate_mb: 4096,
       ram_measured_mb: 6000,
     });
+    // The last measured RAM is shown under the estimate field (the host-scoped
+    // analogue of each GPU row's measured VRAM), so the override is set against
+    // a visible number -- but it is agent-owned and must never ride the PUT.
+    expect(screen.getByText(`${t.runtimeSpecRamMeasured}: 6000 MB`)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect('ram_measured_mb' in putSpecs[0].body).toBe(false);

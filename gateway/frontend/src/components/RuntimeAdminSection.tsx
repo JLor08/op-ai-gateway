@@ -2515,6 +2515,10 @@ export function RuntimeAdminSection({
   // PUT is a full-document upsert, and an absent estimate is applied as 0,
   // clearing one set through the API.
   const [ramEstimateMb, setRamEstimateMb] = useState(0);
+  // Last measured host RAM (agent-reported, persisted on the spec), shown
+  // read-only under the estimate field the way each GPU row shows its own
+  // measured VRAM — so the operator sees what the override is being set against.
+  const [ramMeasuredMb, setRamMeasuredMb] = useState(0);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   // Runtime-Spec API Token: mode + its per-mode write-only state.
@@ -2667,6 +2671,7 @@ export function RuntimeAdminSection({
     setPinned(false);
     setAdminState('');
     setRamEstimateMb(0);
+    setRamMeasuredMb(0);
     setSetVisibleDevices(false);
     setVisibleDevicesMode('env');
     setApiTokenMode('app');
@@ -2701,6 +2706,7 @@ export function RuntimeAdminSection({
     setPinned(spec.pinned);
     setAdminState(spec.admin_state);
     setRamEstimateMb(spec.ram_estimate_mb);
+    setRamMeasuredMb(spec.ram_measured_mb);
     setSetVisibleDevices(spec.set_visible_devices);
     setVisibleDevicesMode(spec.visible_devices_mode);
     setApiTokenMode(spec.api_token_mode);
@@ -5018,6 +5024,9 @@ export function RuntimeAdminSection({
             />
             <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
               {t.runtimeSpecRamEstimateHint}
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {t.runtimeSpecRamMeasured}: {ramMeasuredMb} MB
             </Typography>
 
             <Box sx={{ display: 'grid', gap: 1 }}>
