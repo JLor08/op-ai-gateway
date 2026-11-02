@@ -643,7 +643,8 @@ Conventions worth stating, because each is a judgement call a client depends on:
 
 - **Every write is a full-document replace, not a delta** — the spec PUT applies
   the whole spec verbatim (never merged against the stored row), and the two list
-  PUTs replace the entire list. See
+  PUTs replace the entire list (the co-residency PUT also carries a mode; an
+  empty one leaves the stored mode unchanged). See
   [ADR-029](../09-architecture-decisions.md#adr-029--runtime-domain-writes-are-full-document-replaces-gated-on-their-own-get).
 - **There is no bulk "list runtime specs for an application" endpoint.** The spec
   is mapping-scoped, so a client fans out one GET per mapping.

@@ -124,8 +124,8 @@ carries exceptions, which that section's own introduction enumerates (and
 example, `OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are
 list-valued with **no flag form** (env, comma-separated, > file > default),
 `OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key** — necessarily,
-since it names the file to read — and the three resource-accounting knobs are
-**env-only**, with neither. An unqualified exhaustiveness or
+since it names the file to read — and the four env-only settings (the three
+resource-accounting knobs and `OP_AGENT_EVICTION_GRACE_SECONDS`) have neither. An unqualified exhaustiveness or
 parity claim silently becomes false with the next setting; stating that the claim
 is load-bearing is what keeps it true.
 

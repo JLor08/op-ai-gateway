@@ -1971,9 +1971,10 @@ two unknown-VRAM halves of §5.3**, and **6 the host-RAM pool**.
    know how that was decided: the gateway computes the effective allowed-pair
    list from the server's co-residency mode and the operator's explicit verdicts
    ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role),
-   [ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)) and pushes it as `coresident`, and a pair that is not on
-   it is not permitted. Under the default `opt_out` mode that is nearly every
-   pair, so this rule rarely fires and the arithmetic below does the work; under
+   [ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in))
+   and pushes it as `coresident`, and a pair that is not on it is not permitted.
+   Under the default `opt_out` mode that is nearly every pair, so this rule
+   rarely fires and the arithmetic below does the work; under
    `opt_in` it is the original default-deny list (a pair is co-resident only
    when an operator opened it, exactly llama-swap's behaviour); under either, an
    explicit `forbid` takes a pair off the list. The code keeps its old names for
@@ -2024,7 +2025,9 @@ CPU contention, plus the operator's own view of which models belong on one host 
 none of which is per-GPU, which is exactly why the rule is not per-GPU either.
 (It used to name system RAM here as the thing nobody can compute, and that
 justification is **superseded**: host RAM is now computed and vetoed by rule 6,
-and since [ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in) the rule's default follows it. A new server is
+and since
+[ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)
+the rule's default follows it. A new server is
 `opt_out`, so resource fit is the primary gate and the list is the exception,
 where it used to be the primary gate behind a default of "forbidden".) The
 arithmetic is the *veto*: an allowed pair, however it came to be allowed, is not
@@ -2661,7 +2664,8 @@ currently serving no request, not still loading and not used within the grace
 window, never a `pinned` spec** (`!Pinned && !Starting && InFlight == 0 &&
 now − LastUsed > grace`), and among those **the candidate's own role first, then
 oldest-`last_used`**, both described below
-([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)). Ties break on ascending spec id — not determinism
+([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).
+Ties break on ascending spec id — not determinism
 theatre: the victim set is accumulated in a map (Go randomises map iteration
 order per run) and `sort.Slice` is not stable, so without the tie-break the
 same snapshot evicts different processes on different runs, a non-reproducible
@@ -3050,8 +3054,8 @@ capability verdicts and its effective runtime type, **first match wins**:
 | 3 | `image` or `image_edit` is yes | `image` |
 | 4 | `embedding` is yes | `embedding` |
 | 5 | `rerank` is yes | `reranker` |
-| 6 | none of the above, and the type is `stable_diffusion_cpp` | `image` |
-| 6 | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
+| 6a | none of the above, and the type is `stable_diffusion_cpp` | `image` |
+| 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
 | 7 | any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) is yes | `chat` |
 | 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server) | `other` |
 
@@ -3572,7 +3576,9 @@ bump for the change, `server-agent`'s `Version` `0.13.0` → `0.14.0`, MINOR per
 same rule — the second flag does not move it again, because a bump is per shipped
 change.
 
-`runtime_role_eviction` ([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)) is the third agent-only name of this
+`runtime_role_eviction`
+([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct))
+is the third agent-only name of this
 shape and, like the RAM pair, **gates nothing on either side**: it is declared for
 the portal's visibility, to say that a connected agent captures each spec's pushed
 `role` and keeps a recently used model off the eviction victim list
@@ -3896,7 +3902,9 @@ branch.** `agent.Features` gained `runtime_role_eviction`, and the same change a
 what the agent does in ways an operator observes: it reads each spec's pushed `role`,
 keeps a model used within the eviction grace window out of the victim set, prefers a
 same-role victim over the least-recently-used one, and wakes a start the grace window
-alone blocked ([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)). It also gained one env-only setting,
+alone blocked
+([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).
+It also gained one env-only setting,
 `OP_AGENT_EVICTION_GRACE_SECONDS`, and logs its resolved value at startup
 (`eviction_grace_seconds`). The `Version` assertion lives in the newest feature's test,
 `TestFeaturesDeclareRuntimeRoleEviction`, beside the presence and `Since` checks of the
@@ -4139,8 +4147,9 @@ true on every tab. The report still carries the file's `coresident` list upward
 and the gateway still stores it, but the portal no longer reads it: the
 gateway-side mode and verdicts the live editor writes are not what is in force
 for a file-mode agent, and a read-only grid drawn from the file's list invited
-the opposite reading. Live status, badges and `last_error` still work unchanged, because they ride
-the telemetry sample rather than the config document.
+the opposite reading. Live status, badges and `last_error` still work
+unchanged, because they ride the telemetry sample rather than the config
+document.
 
 Start/stop buttons are **hidden rather than disabled**: the admin override lives
 in the gateway document that file mode does not consume, and a dead button is
@@ -4370,10 +4379,10 @@ passes through):
 See [ADR-028](../09-architecture-decisions.md#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field).
 
 Checking a new write path against it is mechanical: does the path write one of
-the six document-input rows, and does its own signature confine it to columns
-outside the document? Row yes and confinement no → it notifies.
+one of the seven document-input rows, and does its own signature confine it to
+columns outside the document? Row yes and confinement no → it notifies.
 
-**The six document-input rows.** `AgentRuntimeConfig` derives the entire
+**The seven document-input rows.** `AgentRuntimeConfig` derives the entire
 document from exactly these:
 
 1. the **AI server row** → `max_processes`;
@@ -4383,8 +4392,12 @@ document from exactly these:
    mapping's `gateway_model_name` / `app_model_name`, for which the agent has no
    other source);
 4. those mappings' **runtime specs** and per-spec GPU rows → `specs[]`;
-5. that application's **co-residency rules** → `coresident[]`;
-6. the server's **per-GPU VRAM budgets** → `gpu_budgets[]`.
+5. that application's **co-residency mode and explicit pair rows** → the
+   effective `coresident[]` list ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role));
+6. the server's **per-GPU VRAM budgets** → `gpu_budgets[]`;
+7. those mappings' **capability verdicts** (one batched read) → each spec's
+   `role`. The role is a document field like any other, so a verdict write moves
+   the document and its ETag.
 
 This closed list is what makes the rule checkable, and it shows why an
 application row or a mapping *rename* is a runtime-config change at all —
@@ -4396,7 +4409,9 @@ non-obvious, since neither looks like a runtime object.
 `DeleteMapping` / `reconcileApplicationModels` (3, via
 `notifyRuntimeChangedForMapping`); `PutRuntimeSpec` / `DeleteRuntimeSpec` and
 the benchmark run's own three launch-spec writers (4); `SetCoResidency` (5);
-`SetServerGPUBudgets` (6). Of the benchmark writers,
+`SetServerGPUBudgets` (6). Row 7 adds no call site of its own: the operator
+writes verdicts through `CreateMapping` / `UpdateMapping`, which are already row 3's
+call sites and notify after the capability write has landed. Of the benchmark writers,
 `SetBenchmarkRuntimeSpecAdminState` notifies once per stored write, through
 `putRuntimeSpec`, the shared write `PutRuntimeSpec` uses too, and the batched
 `SetBenchmarkRuntimeSpecsPinned` and `SetBenchmarkRuntimeSpecsAdminState`
@@ -4480,10 +4495,11 @@ which is what keeps them from being the rejected allow-list:
 | `AgentProxyRoutes`' proxy-listen-port assignment | Confined to `ProxyListenPort` — and it is itself an agent poll **read** path, so notifying from it would push in response to the agent's own fetch. |
 | `SetServerEnergyConfig` | Confined to the five energy columns. |
 | Telemetry ingest's `UpdateAIServer` | Read-modify-writes the server row but sets only `LastSeenAt`/`UpdatedAt`. |
-| `UpdateRuntimeSpecGPUMeasured` (the agent's own VRAM write-back) | The **only** deliberate exclusion of a real document change. A measured value does win over the operator's estimate — but it arrives *from* the agent, so a push would echo the agent its own measurement once per telemetry sample for a value that keeps moving. |
+| The **automated capability writers**: the agent's telemetry ingest (`agent_ingest.go`), the benchmark runner, the health probe and the relay's observation row | They write row 7, so they can move a spec's `role` and the document's ETag, but they are background probes and observations and not an operator action, and nothing safety-relevant waits on them: the role only *orders* eviction victims that are already evictable and never decides whether one is, so the agent's 60 s poll reconciles it. |
+| `UpdateRuntimeSpecGPUMeasured` (the agent's own VRAM write-back) | Together with the capability writers above, one of the two deliberate exclusions of a **real** document change. A measured value does win over the operator's estimate — but it arrives *from* the agent, so a push would echo the agent its own measurement once per telemetry sample for a value that keeps moving. |
 | `DeleteServer` | It also deletes the agent's token and tears the WS connection down, so there is no agent left to tell, and the derive would race the row deletion. This is the one path that looks like a gap in the rule and has no code comment, because the argument is about a notification that does not exist. |
 
-An auditor applying the rule without this list finds five apparent violations
+An auditor applying the rule without this list finds six apparent violations
 and either "fixes" them — the VRAM one would create a push storm at telemetry
 cadence — or concludes the rule is not real.
 
@@ -7346,9 +7362,9 @@ loop would write history rows.
 load time from a cold start. For a `server_agent` application the cold pass
 never unloads and never swaps: the router has no unload route, and a swap would
 load an unrelated model and evict the target only under a closed co-residency
-pair (one that is not effectively allowed, §5.2). A manual speed or both run stops the server's running models instead,
-before each agent target's cold pass, and measures the target's own load on the
-emptied server
+pair (one that is not effectively allowed, §5.2). A manual speed or both run
+stops the server's running models instead, before each agent target's cold
+pass, and measures the target's own load on the emptied server
 ([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)).
 A run that does not stop — a scheduled run, or a manual one whose stops are
 off — asks whether the target is resident, through the router's `/running` (or

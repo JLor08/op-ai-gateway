@@ -382,8 +382,11 @@ are **not** masked in the upward report, so secrets belong in `env` only.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-028 — Runtime-config notifications are gated by write scope, not by changed field
-**Context:** the agent's runtime-config document is derived from six kinds of
-row, and a portal write that changes any of them must reach the agent promptly.
+**Context:** the agent's runtime-config document is derived from seven kinds of
+row (the seventh, the capability verdicts behind each spec's `role`, joined the
+six with [ADR-088](#adr-088--a-model-has-one-derived-role-one-value-is-both-the-editor-group-and-the-eviction-type);
+the automated verdict writers deliberately do not notify), and a portal write
+that changes any of them must reach the agent promptly.
 **Decision:** any successful write that **can** change a server's document
 notifies that server's agent, and the decision is taken from the **write path's
 own scope** — which row it writes, and for an application-owned row whether that
@@ -10971,7 +10974,8 @@ should be the rare exception, not the primary gate. Two things stood in the way.
 server without editing every cell, and the table could not record a *forbid* at all (an absent row and an explicit "no" were the
 same thing), so there was nowhere to put the one statement an operator still wants to make under an open default: never these two.
 
-**Decision — six choices, taken together. Migrations 98 and 99; no wire change (the effective list is
+**Decision — six choices, taken together. Migrations 98 and 99; no agent-wire change (the portal's co-residency document
+changes shape, the pushed list does not; the effective list is
 [ADR-089](#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).**
 
 - **(a) A per-server mode, `opt_out` by default.** `applications.coresidency_mode`
@@ -11000,8 +11004,9 @@ same thing), so there was nowhere to put the one statement an operator still wan
   allowed, absent → forbidden). A running, matrix-restricted server therefore does not start co-locating everything the moment it is
   upgraded; it moves only when its operator flips the mode, and its pushed `coresident` list is what it was. That `UPDATE` is
   unguarded and so, unlike migration 98, not replay-safe: a guard is impossible because the new value is also the DDL default
-  (never-backfilled and explicitly-chosen cannot be told apart by value), and it is harmless for the argument migration 80 documents,
-  that the runner applies a pending migration once per database in the transaction that records its version. On a fresh install the
+  (never-backfilled and explicitly-chosen cannot be told apart by value), and it is harmless because the runner applies a pending
+  migration once per database, in the transaction that records its version
+  ([Persistence §3](cross-cutting/persistence.md#3-the-migration-runner)). On a fresh install the
   table is empty when it runs, so every application created afterwards is `opt_out`.
 - **(e) Anything not unmistakably permissive resolves to "not allowed".** When the gateway builds the effective list a mode other
   than `opt_out` behaves as `opt_in` and a verdict other than `allow` as `forbid`, because default-allow is the direction that can put

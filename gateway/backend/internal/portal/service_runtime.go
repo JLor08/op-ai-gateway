@@ -2307,7 +2307,7 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //	request happened to change.
 //
 // A new write path can be checked against that one sentence, because
-// AgentRuntimeConfig (below) derives the whole document from exactly six
+// AgentRuntimeConfig (below) derives the whole document from exactly seven
 // kinds of row. A path needs a notification if and only if it writes one of
 // them:
 //
@@ -2320,6 +2320,10 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //  5. that application's CO-RESIDENCY mode and explicit pair rows ->
 //     coresident[] (the effective allowed-pair list, effectiveAllowedPairs)
 //  6. the server's per-GPU VRAM BUDGETS -> gpu_budgets[]
+//  7. those mappings' CAPABILITY VERDICTS (model_mapping_capabilities, one
+//     batched read) -> each spec's role (routing.DeriveRole). The role is a
+//     document field like any other, so a verdict write moves the document
+//     and its ETag
 //
 // Call sites, by row: (1) UpdateServer; (2) CreateApplication /
 // UpdateApplication / DeleteApplication, via
@@ -2330,7 +2334,9 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // once per stored write, through putRuntimeSpec, and
 // SetBenchmarkRuntimeSpecsPinned / SetBenchmarkRuntimeSpecsAdminState from
 // setBenchmarkRuntimeSpecs, after the batch's last write, once for each server
-// a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets.
+// a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets; (7) the
+// operator's verdicts are written by CreateMapping / UpdateMapping, which are
+// already row 3's call sites and notify after the capability write has landed.
 //
 // The "never which field" half is the load-bearing half. A "relevant fields"
 // allow-list inside a write path would be a second, uncompiled copy of
@@ -2342,8 +2348,8 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // the agent then re-fetches and its driver applies only on a real ETag
 // change). Under-notifying is the actual bug.
 //
-// Only two kinds of write to rows 1-6 deliberately do NOT notify, and both
-// are exemptions of a whole write PATH rather than of a field:
+// Only three kinds of write to rows 1-7 deliberately do NOT notify, and each
+// is an exemption of a whole write PATH rather than of a field:
 //
 //   - A writer whose own signature confines it to columns OUTSIDE the
 //     document, so there is no field inspection that could rot:
@@ -2357,6 +2363,13 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     it changes it FROM the agent, so a push would echo the agent its own
 //     measurement -- once per telemetry sample, for a value that keeps
 //     moving. The agent already has it; its poll reconciles the rest.
+//   - The AUTOMATED capability writers (the agent's telemetry ingest in
+//     agent_ingest.go, the benchmark runner, the health probe and the relay's
+//     observation row). They write row 7, so they can move a spec's role and
+//     the document's ETag, but they are background probes and observations,
+//     not an operator action, and nothing safety-relevant waits on them: the
+//     role only ORDERS eviction victims that are already evictable, it never
+//     decides whether one is. The agent's poll reconciles the new role.
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)

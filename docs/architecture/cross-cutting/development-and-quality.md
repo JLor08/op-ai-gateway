@@ -373,24 +373,29 @@ listener down promptly, so eviction and force-stop steps measure the admission
 machinery rather than the SIGKILL grace period.
 
 **The two admission scenarios are one assertion, and neither may be deleted as
-redundant.** With the co-residency pair permitted, an eviction produced by the
-VRAM-sum arithmetic is observationally identical to one produced by the pair
-rule's veto; the second scenario — raise the GPU-0 budget from 1000 MB to 2000 MB
-and change *nothing else*, so the same two specs become co-resident — is what pins
-the first on the arithmetic. The scenario **explicitly allows** the pair in the
-co-residency editor (the one Allowed control of the selected model's single
-relationship; the button is matched exactly, because the German "Erlaubt" is also
-a substring of the Default segment's "Standard (erlaubt)") even though a new
-application defaults to `opt_out`, where the pair would be allowed anyway: the
-scenario must not lean on that default, and the save it asserts is the whole
-document (one explicit `allow`, plus a mode). The mutation that pins the first half
-on the arithmetic is unchanged: widening the tight budget fails only scenario 5.
-The other half used to be "remove the co-residency toggle", which left scenarios
-1–5 green and failed only scenario 6 under the old default-deny matrix; under the
-`opt_out` default the pair is allowed with or without the explicit allow, so that
-removal no longer discriminates by itself, and the explicit allow is kept as a
-statement of intent that survives a change of default, not as a mutation-sensitive
-step.
+redundant.** Scenario 5 shows an eviction: with a 1000 MB GPU-0 budget and two 700
+MB specs, an inference for B evicts the idle A. On its own that is ambiguous, because
+an eviction by the VRAM-sum arithmetic is observationally identical to one by any
+other rule (the process limit, the pair rule). Scenario 6 raises the budget to 2000
+MB and changes *nothing else*, and the same two specs become co-resident: that is what
+pins scenario 5's eviction on the arithmetic, and it is the headline the feature
+exists for, several models on one host under a real agent. Widening the tight budget
+fails only scenario 5, which is the mutation that pins this half.
+
+What scenario 6 **no longer** proves is delivery of the pair. Under the old
+default-deny matrix an undelivered pair gave exactly scenario 5's outcome, so
+scenario 6 doubled as the proof that the pair had reached the agent (removing the
+co-residency toggle left scenarios 1–5 green and failed only scenario 6). Under the
+`opt_out` default the pair is allowed with or without an explicit entry, so an
+undelivered pair would now leave both scenarios green, and the pair rule is excluded
+from scenario 5's explanation by construction and not by evidence. The scenario still
+**explicitly allows** the pair in the co-residency editor, so that it does not lean on
+the default and survives a change of it (the one Allowed control of the selected
+model's single relationship, matched exactly because the German "Erlaubt" is also a
+substring of the Default segment's "Standard (erlaubt)"), and it asserts the save is
+the whole document (one explicit `allow`, plus a mode). That the effective list
+actually reaches the agent is covered in process, by the portal's runtime-config
+assembly tests and the agent's policy tests, and not by this suite.
 
 Three determinism rules the suite follows, each of which looks like a stylistic
 quirk and is not:
