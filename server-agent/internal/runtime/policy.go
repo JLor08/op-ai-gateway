@@ -28,9 +28,11 @@ type RunningProc struct {
 	InFlight int
 	Pinned   bool
 	// Role is the process's model role, normalized by roleOf (never empty): the
-	// spec's pushed role, or RoleOther when it has none. It is carried onto the
-	// snapshot so the policy can compare an occupant's role with the candidate's;
-	// nothing in Admit reads it yet, so it changes no decision.
+	// spec's pushed role, or RoleOther when it has none. Admit compares it with
+	// the candidate's own role (roleOf(spec.Role)) to order the eviction victims:
+	// an idle model of the candidate's role is drawn before one of another role
+	// (orderVictims, task 3.3). It changes only WHICH idle victim is chosen first,
+	// never WHETHER one is evictable -- the grace gate (isEvictable) is unchanged.
 	Role string
 	// LastUsed is when the process last served, started serving or finished a
 	// request. It does two jobs: the idle-victim ordering (oldest evicted first)
@@ -720,14 +722,51 @@ func outranksAsBlocker(closed bool, id string, bestClosed bool, bestID string) b
 	return id < bestID
 }
 
-// sortOldestFirst orders procs by LastUsed ascending: the eviction order
-// Admit always uses (oldest idle victim first). Ties in LastUsed break on
-// SpecID so the output is fully deterministic -- sort.Slice is not stable,
-// and map iteration order (toEvict, in Admit) is randomized per run, so
-// without a total order a tie would otherwise pick a different victim on
-// every run.
+// sortOldestFirst orders procs by LastUsed ascending (ties on SpecID): the order
+// decide reports the final Decision.Evict list in -- oldest idle victim first.
+// That is only the DRAIN order of a set every member of which is already going;
+// WHICH victims are in the set is decided by orderVictims below, the role-aware
+// order the resource rules draw them in. Ties in LastUsed break on SpecID so the
+// output is fully deterministic -- sort.Slice is not stable, and map iteration
+// order (toEvict, in decide) is randomized per run, so without a total order a
+// tie would otherwise pick a different victim on every run.
 func sortOldestFirst(procs []RunningProc) {
 	sort.Slice(procs, func(i, j int) bool {
+		if !procs[i].LastUsed.Equal(procs[j].LastUsed) {
+			return procs[i].LastUsed.Before(procs[j].LastUsed)
+		}
+		return procs[i].SpecID < procs[j].SpecID
+	})
+}
+
+// orderVictims sorts an admission's evictable candidates into the order they are
+// DRAWN in when a resource rule needs room (task 3.3): a victim of the
+// candidate's OWN role before one of any other role, and within a role band the
+// least-recently-used first (ties on SpecID for a total, deterministic order,
+// exactly as sortOldestFirst). Same-role-first is the role swap of design doc
+// §4.3 -- a new ASR prefers to evict the idle ASR, not the TTS a voice chat still
+// needs between turns, keeping one model of each role alive -- and it crosses
+// into another role only when its own-role peers do not free enough, so cross-
+// role eviction stays available under real pressure.
+//
+// It changes only WHICH idle victim is chosen first, never WHETHER one may be
+// evicted: isEvictable (incl. the grace window) is the gate every candidate has
+// already passed through before it reaches here (evictableOf), and rules 1-6 and
+// the resource arithmetic are otherwise untouched. The three victim-drawing
+// loops (chargeGPUBudget, ruleHostRAM, ruleProcessCount) all call this in place
+// of the plain oldest-first sort; decide then reports the resulting set oldest-
+// first, which is only the drain order (see sortOldestFirst).
+//
+// The candidate's role is a.candidateRole (roleOf(spec.Role)), normalized once in
+// newAdmission so this comparison matches the already-normalized
+// RunningProc.Role every occupant carries (buildSnapshot sets it through roleOf).
+func (a *admission) orderVictims(procs []RunningProc) {
+	sort.Slice(procs, func(i, j int) bool {
+		iSame := procs[i].Role == a.candidateRole
+		jSame := procs[j].Role == a.candidateRole
+		if iSame != jSame {
+			return iSame // the candidate's own role is drawn first
+		}
 		if !procs[i].LastUsed.Equal(procs[j].LastUsed) {
 			return procs[i].LastUsed.Before(procs[j].LastUsed)
 		}
@@ -755,6 +794,12 @@ type admission struct {
 	running     []RunningProc // self-filtered: never a RunningProc sharing spec.ID
 	unknownVRAM bool
 	gpuIdx      []int
+	// candidateRole is roleOf(spec.Role): the candidate's model role, normalized
+	// once here so orderVictims can compare it against each occupant's already-
+	// normalized RunningProc.Role (buildSnapshot sets that through the same roleOf).
+	// Normalizing once, up front, is what keeps the comparison from reading a
+	// cased or absent role as a role of its own. See orderVictims.
+	candidateRole string
 
 	toEvict map[string]RunningProc
 	blocked bool
@@ -811,12 +856,13 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 		}
 	}
 	return &admission{
-		snap:        snap,
-		spec:        spec,
-		running:     running,
-		unknownVRAM: specHasUnknownVRAM(spec),
-		gpuIdx:      specGPUIndexes(spec),
-		toEvict:     make(map[string]RunningProc),
+		snap:          snap,
+		spec:          spec,
+		running:       running,
+		unknownVRAM:   specHasUnknownVRAM(spec),
+		gpuIdx:        specGPUIndexes(spec),
+		candidateRole: roleOf(spec.Role),
+		toEvict:       make(map[string]RunningProc),
 	}
 }
 
@@ -1253,7 +1299,7 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 	}
 
 	idleTouchers := a.evictableOf(touchers)
-	sortOldestFirst(idleTouchers)
+	a.orderVictims(idleTouchers)
 	for _, r := range idleTouchers {
 		if sum <= budget {
 			break
@@ -1356,7 +1402,7 @@ func (a *admission) ruleHostRAM() {
 	}
 
 	idleHolders := a.evictableOf(holders)
-	sortOldestFirst(idleHolders)
+	a.orderVictims(idleHolders)
 	for _, r := range idleHolders {
 		if sum <= a.snap.HostRAMBudgetMB {
 			break
@@ -1391,7 +1437,7 @@ func (a *admission) ruleProcessCount() {
 			candidates = append(candidates, r)
 		}
 	}
-	sortOldestFirst(candidates)
+	a.orderVictims(candidates)
 	if len(candidates) < deficit {
 		a.blocked = true
 	}

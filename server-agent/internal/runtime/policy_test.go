@@ -2876,3 +2876,162 @@ func TestAdmitGraceDoesNotChangeWhatIsAlreadyProtected(t *testing.T) {
 		})
 	}
 }
+
+// --- role-aware victim ordering (Task 3.3) -----------------------------------
+//
+// When admitting a candidate needs room, the idle, evictable victims are drawn
+// in the order (role == candidate.role ? 0 : 1, LastUsed ascending): a victim of
+// the candidate's OWN role before one of another role, then least-recently-used
+// within a band. That is the role swap of design doc §4.3 -- a new ASR evicts
+// the idle ASR, not the TTS a voice chat still needs between turns -- while
+// cross-role eviction stays available under real pressure. The grace gate
+// (isEvictable) is unchanged by any of this: a within-grace or in-use model is
+// never a victim whatever its role, which the last two tests here pin.
+
+// TestAdmitEvictsSameRoleBeforeAnotherRole is the voice-chat protection: a new
+// ASR, with an idle ASR and an idle TTS both evictable, evicts the ASR. The TTS
+// is the OLDEST here on purpose, so plain least-recently-used would wrongly take
+// it; role-aware ordering keeps it for the voice chat and takes the same-role
+// ASR instead.
+func TestAdmitEvictsSameRoleBeforeAnotherRole(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle-tts", Role: "tts", LastUsed: t0}, // oldest
+			{SpecID: "idle-asr", Role: "asr", LastUsed: t3}, // newest
+		},
+		MaxProcesses: 2, // two running + candidate = three, so one must go
+		Allowed:      allowPairs("new-asr", "idle-tts", "idle-asr"),
+	}
+	assertDecision(t, "same-role victim first", Admit(snap, Spec{ID: "new-asr", Role: "asr"}),
+		Decision{Evict: []string{"idle-asr"}})
+}
+
+// TestAdmitSameRoleFirstThenOtherRolesOldestUnderPressure: when pressure needs
+// TWO victims, the candidate's own-role peer goes first (even though it is the
+// most-recently-used), then the oldest of the OTHER roles; the newer other-role
+// model is spared. Cross-role eviction is normal under real pressure -- the role
+// preference only orders victims, it never protects another role absolutely.
+func TestAdmitSameRoleFirstThenOtherRolesOldestUnderPressure(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle-asr", Role: "asr", LastUsed: t3},       // newest, same role as candidate
+			{SpecID: "idle-tts", Role: "tts", LastUsed: t1},       // newer other role, spared
+			{SpecID: "idle-emb", Role: "embedding", LastUsed: t0}, // oldest other role
+		},
+		MaxProcesses: 2, // three running + candidate = four, so two must go
+		Allowed:      allowPairs("new-asr", "idle-asr", "idle-tts", "idle-emb"),
+	}
+	// Selected: idle-asr (same role) + idle-emb (oldest other role). The Evict
+	// list is reported oldest LastUsed first (decide), which is only the drain
+	// order.
+	assertDecision(t, "same role then oldest other role", Admit(snap, Spec{ID: "new-asr", Role: "asr"}),
+		Decision{Evict: []string{"idle-emb", "idle-asr"}})
+}
+
+// TestAdmitOtherRoleCandidateIsPureLRU: a candidate of role "other" has no
+// same-role peer among asr/tts victims, so every victim falls in the other-role
+// band and the ordering is pure least-recently-used.
+func TestAdmitOtherRoleCandidateIsPureLRU(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle-asr", Role: "asr", LastUsed: t1},
+			{SpecID: "idle-tts", Role: "tts", LastUsed: t0}, // oldest
+		},
+		MaxProcesses: 2, // one must go
+		Allowed:      allowPairs("new-other", "idle-asr", "idle-tts"),
+	}
+	assertDecision(t, "pure LRU for an other-role candidate", Admit(snap, Spec{ID: "new-other", Role: RoleOther}),
+		Decision{Evict: []string{"idle-tts"}})
+}
+
+// TestAdmitRoleComparisonIsNormalized: the candidate's role is normalized
+// (roleOf) before it is compared, exactly as buildSnapshot normalizes each
+// occupant's role, so a differently-cased or whitespace-padded candidate role
+// still groups with its own kind, and an absent role folds to RoleOther and
+// matches an occupant whose role is "other". In both cases the same-role peer is
+// drawn ahead of the OLDER other-role model -- which plain LRU would have taken.
+func TestAdmitRoleComparisonIsNormalized(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		candidateRole string
+		peerRole      string
+	}{
+		{"cased and padded candidate matches", "  ASR ", "asr"},
+		{"empty candidate folds to other and matches an other peer", "", RoleOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "idle-old", Role: "tts", LastUsed: t0}, // oldest, a different role
+					{SpecID: "idle-peer", Role: tc.peerRole, LastUsed: t3},
+				},
+				MaxProcesses: 2, // one must go
+				Allowed:      allowPairs("cand", "idle-old", "idle-peer"),
+			}
+			assertDecision(t, tc.name, Admit(snap, Spec{ID: "cand", Role: tc.candidateRole}),
+				Decision{Evict: []string{"idle-peer"}})
+		})
+	}
+}
+
+// TestAdmitRoleOrderingSpansEveryVictimRule pins that the role-aware order is
+// applied by EVERY rule that draws a victim, not only the process-count limit:
+// the per-GPU VRAM budget (rule 3) and the host-RAM pool (rule 6) draw the same
+// same-role-first victim. Each case has an idle same-role peer (newest) and an
+// idle other-role model (oldest) on the contested resource, with room for only
+// one to stay; role-aware ordering evicts the same-role peer and spares the
+// other role, where plain LRU would take the oldest.
+func TestAdmitRoleOrderingSpansEveryVictimRule(t *testing.T) {
+	t.Run("rule 3 per-GPU VRAM", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "idle-tts", Role: "tts", GPUs: map[int]int{0: 400}, LastUsed: t0}, // oldest
+				{SpecID: "idle-asr", Role: "asr", GPUs: map[int]int{0: 400}, LastUsed: t3},
+			},
+			Budgets: map[int]int{0: 1000}, // 500 + 400 + 400 = 1300 > 1000; one 400 must go
+			Allowed: allowPairs("new-asr", "idle-tts", "idle-asr"),
+		}
+		assertDecision(t, "same-role VRAM victim first",
+			Admit(snap, Spec{ID: "new-asr", Role: "asr", GPUs: []SpecGPU{{Index: 0, VRAMMB: 500}}}),
+			Decision{Evict: []string{"idle-asr"}})
+	})
+	t.Run("rule 6 host RAM", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "idle-tts", Role: "tts", RAMMB: 400, LastUsed: t0}, // oldest
+				{SpecID: "idle-asr", Role: "asr", RAMMB: 400, LastUsed: t3},
+			},
+			HostRAMBudgetMB: 1000, // 500 + 400 + 400 = 1300 > 1000; one 400 must go
+			Allowed:         allowPairs("new-asr", "idle-tts", "idle-asr"),
+		}
+		assertDecision(t, "same-role RAM victim first",
+			Admit(snap, Spec{ID: "new-asr", Role: "asr", RAMMB: 500}),
+			Decision{Evict: []string{"idle-asr"}, WaitOnRAM: false})
+	})
+}
+
+// TestAdmitWaitsWhenOnlyProtectedVictimsRemain: when the only model that could
+// make room is in use (InFlight>0) or within the grace window, the admission
+// waits -- no eviction, no OOM -- regardless of role. The role-aware ordering
+// never widens the victim set; isEvictable is still the gate.
+func TestAdmitWaitsWhenOnlyProtectedVictimsRemain(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		occ  RunningProc
+	}{
+		{"within grace", RunningProc{SpecID: "occ", Role: "asr", LastUsed: graceNow.Add(-time.Second)}},
+		{"in use", RunningProc{SpecID: "occ", Role: "asr", InFlight: 1, LastUsed: graceNow.Add(-time.Hour)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running:       []RunningProc{tc.occ},
+				MaxProcesses:  1, // the one occupant would have to go, but cannot
+				Now:           graceNow,
+				EvictionGrace: graceWindow,
+				Allowed:       allowPairs("new-asr", "occ"),
+			}
+			assertDecision(t, tc.name, Admit(snap, Spec{ID: "new-asr", Role: "asr"}),
+				Decision{Wait: true, Evict: []string{}})
+		})
+	}
+}
