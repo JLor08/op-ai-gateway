@@ -26,7 +26,7 @@ import { RUNTIME_AGENT_BIN, RUNTIME_ROUTER_PORT, RUNTIME_STUB_BIN } from "../pla
 //      past.
 //   2. THE ADMISSION ARITHMETIC with real processes -- which model may run,
 //      and what happens when the per-GPU VRAM budget fits only one of two.
-//      Scenario 5 shrinks nothing and changes no matrix: with a 1000 MB budget
+//      Scenario 5 shrinks nothing and changes no co-residency setting: with a 1000 MB budget
 //      and two 700 MB specs, an inference for B evicts the IDLE A. Scenario 6
 //      then raises the budget to 2000 MB, changing NOTHING else, and the same
 //      two specs become co-resident. Neither scenario alone would isolate the
@@ -751,28 +751,38 @@ test("5 — admission arithmetic: with a budget for one, an inference for B evic
     vramMb: VRAM_PER_SPEC_MB
   });
 
-  // Allow the pair in the co-residency matrix, so rule 1 (matrix) is OFF and
-  // only the arithmetic can block. With exactly two specs the strictly-lower
-  // triangle holds exactly one cell, so this locator is unambiguous without
-  // depending on which spec the matrix happens to render as row vs column.
-  await openRuntimeTab(t.runtimeMatrix);
-  // role=checkbox, not button: the cell is a real Checkbox. It was an
-  // IconButton with aria-pressed until the off state was made readable as
-  // "you may tick this" rather than as a prohibition, and this locator was
-  // not updated with it -- CI runs no Playwright suite, so nothing caught it.
-  const cell = page.getByRole("checkbox", { name: new RegExp(`^${escapeRegExp(t.runtimeMatrixCell)}: `) });
-  await expect(cell).toHaveCount(1);
-  await expect(cell).not.toBeChecked();
+  // Explicitly allow the pair, so rule 1 (co-residency) is OFF whatever the
+  // server's mode is and only the arithmetic can block. The editor is per model:
+  // it shows the selected model's relationships, one control per OTHER model, so
+  // with exactly two specs the selected model has exactly one such row and this
+  // locator is unambiguous without depending on which spec is selected. (The
+  // group-level controls are named differently and do not match.) The explicit
+  // allow is the point: a new application defaults to opt-out, where the pair
+  // would be allowed anyway, but the scenario must not lean on that default.
+  await openRuntimeTab(t.runtimeCoresidency);
+  const pairControl = page.getByRole("group", {
+    name: new RegExp(`^${escapeRegExp(t.coresidencyMemberControl(""))}`)
+  });
+  await expect(pairControl).toHaveCount(1);
+  const allowed = pairControl.getByRole("button", { name: t.coresidencyVerdictAllow });
+  await expect(allowed).toHaveAttribute("aria-pressed", "false");
   const [paired] = await Promise.all([
     page.waitForResponse(
       (r) =>
         new URL(r.url()).pathname === `/api/portal/applications/${applicationId}/runtime/coresidency` &&
         r.request().method() === "PUT"
     ),
-    cell.click()
+    allowed.click()
   ]);
   expect(paired.ok(), `allowing the co-residency pair: ${paired.status()} ${await paired.text()}`).toBe(true);
-  await expect(cell).toBeChecked();
+  // The save is a full document: the one explicit pair, as an allow, and a mode.
+  const saved = JSON.parse(paired.request().postData() ?? "{}") as {
+    mode: string;
+    pairs: { verdict: string }[];
+  };
+  expect(saved.pairs.map((p) => p.verdict)).toEqual(["allow"]);
+  expect(["opt_in", "opt_out"]).toContain(saved.mode);
+  await expect(allowed).toHaveAttribute("aria-pressed", "true");
 
   // 700 + 700 > 1000: exactly one of the two may hold GPU 0. Each round drives
   // BOTH inferences, so whichever spec is currently stopped genuinely goes
@@ -804,9 +814,9 @@ test("5 — admission arithmetic: with a budget for one, an inference for B evic
 
 test("6 — raise the budget and nothing else, and the same two models become co-resident", async () => {
   // This scenario is what makes scenario 5 an assertion about the ARITHMETIC.
-  // On its own, scenario 5's eviction is ambiguous: an un-delivered matrix pair
+  // On its own, scenario 5's eviction is ambiguous: an un-delivered co-residency pair
   // (rule 1) produces the identical outcome. Two models running side by side
-  // here -- same specs, same matrix pair, only the budget number changed --
+  // here -- same specs, same pair, only the budget number changed --
   // can only happen if the agent really holds that pair, which retroactively
   // pins scenario 5's eviction on the VRAM sum. It is also the headline the
   // feature exists for: several models, and operator control over which may

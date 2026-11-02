@@ -91,14 +91,12 @@ import {
 } from './shared/vram';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
-import { RuntimeMatrix } from './RuntimeMatrix';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 
-// Area 1 (Task 20) is "Launch specs"; areas 2-3 (this task, Task 21) are the
-// co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
-// still a stub rendered from the same tab strip so the whole section's
-// navigation is visible/testable now.
+// Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
+// server limits; area 4 (Task 22) is "Live status". One tab strip carries them
+// all, next to the model-mapping tab.
 type Tab = 'mapping' | 'specs' | 'coresidency' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
@@ -448,7 +446,6 @@ type ReportConfig = {
   maxProcesses: number | null;
   budgets: { index: number; budgetMb: number }[];
   specs: ReportSpec[];
-  coresident: [string, string][];
   /** Something, at some level, did not have the shape we expected. */
   unrecognised: boolean;
 };
@@ -459,7 +456,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // A spec entry with no usable identity cannot be rendered as a row at all
 // (it would collide with every other identity-less entry as a React key and
-// could not be addressed in the co-residency matrix) -- those are reported as
+// could not be told apart from the others) -- those are reported as
 // unrecognised by the caller. Everything else degrades field by field.
 function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): ReportSpec | null {
   if (!isRecord(value)) return null;
@@ -518,7 +515,6 @@ function narrowReportConfig(config: unknown): ReportConfig {
     maxProcesses: null,
     budgets: [],
     specs: [],
-    coresident: [],
     unrecognised: false,
   };
   if (!isRecord(config)) {
@@ -555,23 +551,6 @@ function narrowReportConfig(config: unknown): ReportConfig {
       else out.unrecognised = true;
     }
   } else if (specs !== undefined && specs !== null) {
-    out.unrecognised = true;
-  }
-  const coresident = config.coresident;
-  if (Array.isArray(coresident)) {
-    for (const entry of coresident) {
-      if (
-        Array.isArray(entry) &&
-        entry.length === 2 &&
-        typeof entry[0] === 'string' &&
-        typeof entry[1] === 'string'
-      ) {
-        out.coresident.push([entry[0], entry[1]]);
-      } else {
-        out.unrecognised = true;
-      }
-    }
-  } else if (coresident !== undefined && coresident !== null) {
     out.unrecognised = true;
   }
   return out;
@@ -1252,10 +1231,9 @@ export function RuntimeAdminSection({
   t,
   api,
   // Area 1 doesn't read this (server context already folds into `trail`
-  // before this component ever mounts, same as MappingSection); areas 2-3
-  // (this task) are server-scoped -- the matrix's budget-sum tooltip and the
-  // "server limits" tab both need server.id, and the latter also reads/writes
-  // server.runtime_max_processes. Live status (Task 22) will need it too.
+  // before this component ever mounts, same as MappingSection); the later
+  // areas are server-scoped -- the "server limits" tab needs server.id and
+  // reads/writes server.runtime_max_processes, and so does live status.
   server,
   application,
   trail = [],
@@ -1280,7 +1258,7 @@ export function RuntimeAdminSection({
     | 'subscribeRuntimeStatus'
     // T3: the live-status tab's per-row log view.
     | 'subscribeRuntimeLogs'
-    // Task 21 (matrix + server limits): the process-limit field is saved
+    // Task 21 (server limits): the process-limit field is saved
     // through the general server PATCH, and a new budget row is prefilled
     // from the same live-telemetry hardware report the Hardware tab reads.
     | 'updateServer'
@@ -1360,7 +1338,7 @@ export function RuntimeAdminSection({
   // its actions cell blank and its `Unmatched` chip suppressed -- the silent
   // blank the chip exists to prevent.
   //
-  // This resource feeds all four tabs (the list, the matrix's spec set, the
+  // This resource feeds all four tabs (the list, the co-residency model list, the
   // status table's spec_id -> mapping join and with it every override action),
   // so its failure is a screen-wide fact and its banner sits above the tab
   // strip rather than in one tab.
@@ -1727,7 +1705,7 @@ export function RuntimeAdminSection({
     reload: reloadGpuBudgets,
   } = useResource(() => api.gpuBudgets(server.id).then((r) => r.budgets), [api, server.id, t], t);
   // Same "null (not loaded) vs. [] (loaded, empty)" distinction as the
-  // co-residency matrix above: `budgetRows` starts `[]` and would look
+  // co-residency document above: `budgetRows` starts `[]` and would look
   // exactly like "no budgets configured" if Save were reachable before this
   // GET settles -- and Save PUTs whatever `budgetRows` holds as the FULL
   // replacement set, so that would erase every previously configured
@@ -5195,7 +5173,7 @@ export function RuntimeAdminSection({
             />
           )}
           {/* Also screen-wide: the mappings are what every tab joins against
-              (the list itself, the matrix's spec set, and the status table's
+              (the list itself, the co-residency model list, and the status table's
               spec_id -> mapping resolution, without which no row can be
               named or overridden). Left as the old two-state test this said
               "loading" forever and every status row went quietly blank.
@@ -5403,42 +5381,14 @@ export function RuntimeAdminSection({
           subtitle={t.runtimeCoresidencyHint}
         >
           {fileMode ? (
-            parseError ? (
-              <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>
-            ) : (
-              <Box sx={{ display: 'grid', gap: 1.5 }}>
-                {reportConfig?.unrecognised && (
-                  <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
-                )}
-                {/* Task 21 built and tested `disabled` but deliberately left
-                    it unwired: this is the signal it was waiting for. The
-                    onToggle can never fire, but a no-op stays honest about
-                    the prop's contract. */}
-                <RuntimeMatrix
-                  t={t}
-                  specs={(reportConfig?.specs ?? []).map((s) => ({
-                    id: s.id,
-                    model: s.model,
-                    gpus: s.gpus,
-                  }))}
-                  pairs={reportConfig?.coresident ?? []}
-                  onToggle={() => {}}
-                  budgets={Object.fromEntries(
-                    (reportConfig?.budgets ?? []).map((b) => [b.index, b.budgetMb]),
-                  )}
-                  disabled
-                  // A disabled cell must say why (the RowActionsCell /
-                  // IconAction rule): "read-only" and "not allowed yet" look
-                  // alike otherwise, and this one is permanently disabled for
-                  // as long as the agent owns its own config file.
-                  disabledReason={t.runtimeMatrixDisabledFileMode}
-                />
-              </Box>
-            )
+            // The agent owns its own config file, which is where its co-residency
+            // is kept: there is nothing here to edit, and the gateway-side mode
+            // and verdicts the live editor writes are not what is in force.
+            <Typography color="text.secondary">{t.coresidencyFileMode}</Typography>
           ) : reportStatus !== 'ready' ? (
-            // Deliberately NOT the matrix with an empty pair list: the report
+            // Deliberately NOT the editor with an empty document: the report
             // GET (which decides whether this screen is writable at all) has
-            // not settled, so there is nothing to toggle from. A FAILED report
+            // not settled, so there is nothing to edit from. A FAILED report
             // GET is a different fact from a pending one and must not read as
             // "loading" -- the screen-wide banner above carries the
             // explanation and the retry.
@@ -5451,12 +5401,12 @@ export function RuntimeAdminSection({
             // The pairs GET itself (task-21 review's Critical finding), now
             // with its failures named instead of shown as an endless
             // "loading…": on a hard failure there is nothing to render, on a
-            // failed reload there is a payload we could not refresh and a
-            // toggle would PUT the full replacement list computed from it.
-            // Neither may be clicked, and both get the retry this tab never
+            // failed reload there is a payload we could not refresh and an
+            // edit would PUT the full replacement document computed from it.
+            // Neither may be edited, and both get the retry this tab never
             // had -- the resource's `reload()` was not even destructured.
             //
-            // Both states hide the matrix, but they are not the same sentence
+            // Both states hide the editor, but they are not the same sentence
             // (fix round 1, M7): "could not be loaded" is false once a payload
             // is in hand and only the refresh failed.
             <ResourceFallback

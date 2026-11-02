@@ -4627,7 +4627,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(await screen.findByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
   });
 
-  it('turns every edit affordance off: no spec form, a disabled matrix, no budget form, no overrides', async () => {
+  it('turns every edit affordance off: no spec form, no co-residency editor, no budget form, no overrides', async () => {
     const { stream } = renderFileMode();
     await screen.findByText(t.runtimeManagedLocally);
 
@@ -4636,19 +4636,17 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeSpecEditAction })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeSpecDelete })).not.toBeInTheDocument();
 
-    // Matrix: rendered (from the report) but every cell disabled -- this is
-    // exactly the `disabled` prop Task 21 built and deliberately left unwired.
+    // Co-residency: no editor at all -- the agent keeps its co-residency in its
+    // own file, and what the live editor writes (the gateway-side mode and
+    // verdicts) is not what is in force -- and the tab says why instead of
+    // showing an empty or greyed-out one.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
-    const cell = await screen.findByRole('checkbox', {
-      name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
-    });
-    expect(cell).toBeDisabled();
-    // ...and it says WHY it is disabled. "Read-only in file mode" and "pair
-    // not allowed yet" are different facts; a greyed cell with no explanation
-    // leaves the operator to guess which one they are looking at.
-    fireEvent.mouseOver(cell);
-    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeMatrixDisabledFileMode);
-    fireEvent.mouseOut(cell);
+    expect(await screen.findByText(t.coresidencyFileMode)).toBeInTheDocument();
+    expect(screen.queryByRole('option')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.coresidencyModeOptIn })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('group', { name: t.coresidencyMemberControl('File-Alpha') }),
+    ).toBeNull();
 
     // Limits: read-only, no Save, no fields.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
@@ -4666,7 +4664,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
   });
 
-  it('renders specs and the matrix from the report config, not from the gateway CRUD data', async () => {
+  it('renders specs from the report config, not from the gateway CRUD data, and offers no co-residency editor', async () => {
     renderFileMode();
     await screen.findByText(t.runtimeManagedLocally);
 
@@ -4675,12 +4673,12 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     // The gateway-side mapping is NOT what file mode shows.
     expect(screen.queryByText('Gateway-Alpha')).not.toBeInTheDocument();
 
+    // The gateway's own mapping is no more offered for pairing than shown: the
+    // co-residency tab is the file-mode sentence, not an editor over CRUD data.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
-    const cell = await screen.findByRole('checkbox', {
-      name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
-    });
-    // The reported coresident pair renders as set.
-    expect(cell).toBeChecked();
+    expect(await screen.findByText(t.coresidencyFileMode)).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Gateway-Alpha/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('Gateway-Alpha')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
     expect(await screen.findByText('3')).toBeInTheDocument();
@@ -4706,11 +4704,8 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
-    await waitFor(() =>
-      expect(
-        screen.queryByLabelText(`${t.runtimeMatrixCell}: File-Bravo + File-Alpha`),
-      ).not.toBeInTheDocument(),
-    );
+    expect(await screen.findByText(t.coresidencyFileMode)).toBeInTheDocument();
+    expect(screen.queryByText('File-Bravo')).not.toBeInTheDocument();
   });
 
   it('maps the duplicate_spec_id code to its own sentence', async () => {
@@ -4810,7 +4805,6 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
         'garbage',
         { id: 42 },
       ],
-      coresident: [['rs1', 'rs2'], 'not-a-pair'],
     });
 
     expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();

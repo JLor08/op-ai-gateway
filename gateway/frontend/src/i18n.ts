@@ -469,7 +469,7 @@ const de = {
   // Why a conversation could not start or ended, by the gateway's portal.voice_chat_* code (the
   // gate that refuses the ticket) or by the kind of failure. A refusal is the gateway's answer to
   // the very same request, so it is repeated until the configuration changes: the operator's to
-  // fix for the co-load one (co-residency matrix and GPU budgets), the user's for the stored
+  // fix for the co-load one (co-residency settings and GPU budgets), the user's for the stored
   // speech settings (a text thread carries none of its own, so a new chat gets past it).
   chatVoiceErrorAsrUnavailable:
     'Das Transkriptionsmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Live-Streaming oder nicht startbar).',
@@ -478,7 +478,7 @@ const de = {
   chatVoiceErrorTtsUnavailable:
     'Das Sprachmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Streaming oder nicht startbar).',
   chatVoiceErrorCoLoad:
-    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz-Matrix und GPU-VRAM-Budgets): Wählen Sie andere Transkriptions- oder Sprachmodelle oder wenden Sie sich an Ihren Administrator.',
+    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz und GPU-VRAM-Budgets): Wählen Sie andere Transkriptions- oder Sprachmodelle oder wenden Sie sich an Ihren Administrator.',
   chatVoiceErrorAudioSettings:
     'Die zu diesem Chat gespeicherten Spracheinstellungen sind ungültig oder zu umfangreich. Nutzen Sie den Sprachchat in einem neuen Chat.',
   chatVoiceErrorTicket:
@@ -1112,29 +1112,7 @@ const de = {
   runtimeSpecStartupTimeout: 'Start-Timeout (s)',
   runtimeSpecPinned: 'Angeheftet (nie beenden)',
   runtimeSpecEnabled: 'Aktiviert',
-  runtimeMatrix: 'Koresidenz-Matrix',
-  runtimeMatrixHint:
-    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen.',
-  runtimeMatrixCell: 'Koresidenz umschalten',
-  runtimeMatrixNeedTwo:
-    'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz-Matrix zu verwalten.',
-  // The lead line of every cell tooltip. It answers the question the operator
-  // actually has ("dürfen diese zwei zusammen laufen?") and names the rule
-  // that surprised a real one: the matrix is checked over the whole running
-  // set, GPUs do not enter into it.
-  runtimeMatrixConsequence:
-    'Erlaubt diesen beiden Modellen, gleichzeitig zu laufen. Die Matrix gilt unabhängig von den GPUs: Solange dieses Paar nicht angehakt ist, verdrängt der Start des einen das andere – auch auf getrennten Karten.',
-  runtimeMatrixNoSharedGpu:
-    'Keine gemeinsame GPU – diese beiden Modelle konkurrieren um kein VRAM.',
-  runtimeMatrixAdvisory:
-    'Nur ein Hinweis: Die endgültige Entscheidung trifft der Agent zur Laufzeit anhand der tatsächlich laufenden Prozesse.',
-  runtimeMatrixOverBudget: 'über Budget',
-  runtimeMatrixDisabledFileMode:
-    'Schreibgeschützt: Der Agent verwaltet seine Prozesse aus seiner eigenen lokalen Datei. Die Koresidenz wird dort gepflegt, nicht hier.',
-  runtimeMatrixDisabledSaving:
-    'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Matrix wieder Klicks an.',
-  // The role-grouped co-residency editor (replaces the matrix above, which
-  // stays only until its file-mode read-only render is retired).
+  // The role-grouped co-residency editor.
   runtimeCoresidency: 'Koresidenz',
   runtimeCoresidencyHint:
     'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen. Was Sie nicht festlegen, folgt dem Standard des Servers.',
@@ -1174,6 +1152,8 @@ const de = {
   coresidencyResize: 'Breite der Modellliste ändern',
   coresidencySaving:
     'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Ansicht wieder Änderungen an.',
+  coresidencyFileMode:
+    'Schreibgeschützt: Der Agent verwaltet seine Prozesse aus seiner eigenen lokalen Datei. Die Koresidenz wird dort gepflegt, nicht hier.',
   runtimeLimits: 'Runtime-Limits',
   runtimeLimitsIntro:
     'Pro-GPU-VRAM-Budgets und die maximale Zahl gleichzeitig laufender Prozesse für diesen Server festlegen.',
@@ -1469,7 +1449,7 @@ const de = {
   runtimeMappingsUnavailable:
     'Die Modell-Zuordnungen dieser Anwendung konnten nicht geladen werden. Solange das so ist, lässt sich kein gemeldeter Prozess einem Modell zuordnen, und im Reiter „Live-Status“ stehen keine Übersteuerungen zur Verfügung.',
   runtimeCoresidencyUnavailable:
-    'Die Co-Residency-Regeln konnten nicht geladen werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Paare löschen.',
+    'Die Co-Residency-Regeln konnten nicht geladen werden. Der Editor bleibt deshalb ausgeblendet: Eine Änderung schreibt das vollständige Dokument (Modus und alle Paare), und aus einem nicht geladenen würde sie bereits gespeicherte Paare löschen.',
   runtimeBudgetsUnavailable:
     'Die GPU-Budgets konnten nicht geladen werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Budgets löschen.',
   runtimeWarningsUnavailable:
@@ -1481,7 +1461,7 @@ const de = {
   runtimeMappingsStale:
     'Die Modell-Zuordnungen konnten nicht aktualisiert werden. Angezeigt wird — und zugeordnet wird gegen — die zuletzt geladene Liste; sie kann veraltet sein.',
   runtimeCoresidencyStale:
-    'Die Co-Residency-Regeln konnten nicht aktualisiert werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
+    'Die Co-Residency-Regeln konnten nicht aktualisiert werden. Der Editor bleibt deshalb ausgeblendet: Eine Änderung schreibt das vollständige Dokument (Modus und alle Paare), und das zuletzt geladene ist möglicherweise nicht mehr aktuell.',
   runtimeBudgetsStale:
     'Die GPU-Budgets konnten nicht aktualisiert werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
   runtimeWarningsStale:
@@ -3992,7 +3972,7 @@ const en: PortalMessages = {
   chatVoiceErrorTtsUnavailable:
     'The speech model cannot be used for Voice Chat (unreachable, no streaming, or it could not be started).',
   chatVoiceErrorCoLoad:
-    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency matrix and GPU VRAM budgets): pick other transcription or speech models, or contact your administrator.',
+    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency settings and GPU VRAM budgets): pick other transcription or speech models, or contact your administrator.',
   chatVoiceErrorAudioSettings:
     'The speech settings stored with this chat are invalid or too large. Use Voice Chat in a new chat.',
   chatVoiceErrorTicket: 'Voice Chat could not be started. Try again in a moment.',
@@ -4525,21 +4505,6 @@ const en: PortalMessages = {
   runtimeSpecStartupTimeout: 'Startup timeout (s)',
   runtimeSpecPinned: 'Pinned (never stop)',
   runtimeSpecEnabled: 'Enabled',
-  runtimeMatrix: 'Co-residency matrix',
-  runtimeMatrixHint:
-    'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy.',
-  runtimeMatrixCell: 'Toggle co-residency',
-  runtimeMatrixNeedTwo: 'At least two launch specs are needed to manage the co-residency matrix.',
-  runtimeMatrixConsequence:
-    'Allows these two models to run at the same time. The matrix applies regardless of GPUs: while this pair is unticked, starting one evicts the other — even on separate cards.',
-  runtimeMatrixNoSharedGpu: 'No shared GPU — these two models never compete for VRAM.',
-  runtimeMatrixAdvisory:
-    'Advisory only — the agent makes the final call at runtime based on the processes actually running.',
-  runtimeMatrixOverBudget: 'over budget',
-  runtimeMatrixDisabledFileMode:
-    'Read-only: the agent manages its processes from its own local file. Co-residency is maintained there, not here.',
-  runtimeMatrixDisabledSaving:
-    'The previous change is still saving — the matrix accepts clicks again in a moment.',
   runtimeCoresidency: 'Co-residency',
   runtimeCoresidencyHint:
     'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy. Anything you leave unset follows the server default.',
@@ -4577,6 +4542,8 @@ const en: PortalMessages = {
   coresidencyResize: 'Resize the model list',
   coresidencySaving:
     'The previous change is still saving — the editor accepts changes again in a moment.',
+  coresidencyFileMode:
+    'Read-only: the agent manages its processes from its own local file. Co-residency is maintained there, not here.',
   runtimeLimits: 'Runtime limits',
   runtimeLimitsIntro:
     'Set per-GPU VRAM budgets and the maximum number of concurrently running processes for this server.',
@@ -4853,7 +4820,7 @@ const en: PortalMessages = {
   runtimeMappingsUnavailable:
     'The model mappings of this application could not be loaded. Until they do, no reported process can be matched to a model and no override actions are available on the "Live status" tab.',
   runtimeCoresidencyUnavailable:
-    'The co-residency rules could not be loaded, so the matrix stays hidden: a toggle writes the complete pair list, and computing it from a list we could not load would delete pairs that are already saved.',
+    'The co-residency rules could not be loaded, so the editor stays hidden: an edit writes the complete document (mode and every pair), and computing it from one we could not load would delete pairs that are already saved.',
   runtimeBudgetsUnavailable:
     'The GPU budgets could not be loaded, so the form stays hidden: saving writes the complete budget list, and computing it from a list we could not load would delete budgets that are already saved.',
   runtimeWarningsUnavailable:
@@ -4865,7 +4832,7 @@ const en: PortalMessages = {
   runtimeMappingsStale:
     'The model mappings could not be refreshed. What is shown — and what every reported process is matched against — is the last list loaded, which may be out of date.',
   runtimeCoresidencyStale:
-    'The co-residency rules could not be refreshed, so the matrix stays hidden: a toggle writes the complete pair list, and the last one loaded may no longer be current.',
+    'The co-residency rules could not be refreshed, so the editor stays hidden: an edit writes the complete document (mode and every pair), and the last one loaded may no longer be current.',
   runtimeBudgetsStale:
     'The GPU budgets could not be refreshed, so the form stays hidden: saving writes the complete budget list, and the last one loaded may no longer be current.',
   runtimeWarningsStale:

@@ -2385,7 +2385,7 @@ describe('certificates i18n keys', () => {
 });
 
 describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
-  it('defines every runtime admin/spec/matrix/limits/status key in de and en', () => {
+  it('defines every runtime admin/spec/limits/status key in de and en', () => {
     const keys = [
       'runtimeAdmin',
       'runtimeSpecs',
@@ -2402,8 +2402,8 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'runtimeSpecStartupTimeout',
       'runtimeSpecPinned',
       'runtimeSpecEnabled',
-      'runtimeMatrix',
-      'runtimeMatrixHint',
+      'runtimeCoresidency',
+      'runtimeCoresidencyHint',
       'runtimeLimits',
       'runtimeGpuBudget',
       'runtimeMaxProcesses',
@@ -2599,17 +2599,9 @@ describe('agent-managed runtime i18n keys (task 22 live status + file mode)', ()
   });
 });
 
-describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
-  it('defines every co-residency-matrix and server-limits key in de and en', () => {
+describe('agent-managed runtime i18n keys (task 21 limits)', () => {
+  it('defines every server-limits key in de and en', () => {
     const keys = [
-      'runtimeMatrixCell',
-      'runtimeMatrixNeedTwo',
-      'runtimeMatrixConsequence',
-      'runtimeMatrixNoSharedGpu',
-      'runtimeMatrixAdvisory',
-      'runtimeMatrixOverBudget',
-      'runtimeMatrixDisabledFileMode',
-      'runtimeMatrixDisabledSaving',
       'runtimeLimitsIntro',
       'runtimeGpuDriftWarning',
       'runtimeGpuDriftIconLabel',
@@ -2654,6 +2646,7 @@ describe('co-residency editor i18n keys', () => {
     'coresidencyNoMatch',
     'coresidencyResize',
     'coresidencySaving',
+    'coresidencyFileMode',
   ] as const;
 
   it('defines every string key in de and en', () => {
@@ -4173,7 +4166,7 @@ describe('Voice Chat (#312) i18n keys', () => {
     expect(messages.de.chatVoiceLlmNote('m')).not.toBe(messages.en.chatVoiceLlmNote('m'));
   });
 
-  // A co-load refusal is the operator's to fix (the co-residency matrix and the GPU budgets), so
+  // A co-load refusal is the operator's to fix (the co-residency settings and the GPU budgets), so
   // the user is sent to the administrator rather than told to retry.
   it('sends the user to the administrator when the three models cannot be loaded together', () => {
     expect(messages.de.chatVoiceErrorCoLoad).toMatch(/Administrator/);
