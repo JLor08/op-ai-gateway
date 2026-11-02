@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -2258,7 +2259,8 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //  3. that application's MAPPINGS -> each spec's model / upstream_model
 //     (gateway_model_name / app_model_name -- the agent has no other source)
 //  4. those mappings' RUNTIME SPECS and per-spec GPU rows -> specs[]
-//  5. that application's CO-RESIDENCY rules -> coresident[]
+//  5. that application's CO-RESIDENCY mode and explicit pair rows ->
+//     coresident[] (the effective allowed-pair list, effectiveAllowedPairs)
 //  6. the server's per-GPU VRAM BUDGETS -> gpu_budgets[]
 //
 // Call sites, by row: (1) UpdateServer; (2) CreateApplication /
@@ -2514,11 +2516,12 @@ type AgentRuntimeConfigDTO struct {
 // posture as AgentProxyRoutes' out-of-scope case.
 //
 // Only ENABLED specs are included (a disabled spec is nothing the agent
-// should ever run). Coresidency pairs are stored as MAPPING id pairs
-// (CoResidencyRule); this method translates each to a SPEC id pair, dropping
-// any pair whose either side has no enabled spec -- a pair pointing at a
-// disabled or missing spec is meaningless to the agent, which only ever sees
-// spec ids, never mapping ids.
+// should ever run). Coresident is the EFFECTIVE allowed-pair list: the
+// application's co-residency mode and its explicit pair rows (stored as MAPPING
+// id pairs, each allow or forbid) resolve to the SPEC id pairs that may be
+// resident together -- see effectiveAllowedPairs. A pair whose either side has
+// no enabled spec is dropped: it is meaningless to the agent, which only ever
+// sees spec ids, never mapping ids, modes or verdicts.
 //
 // Per-GPU VRAMMB: max(measured, estimate) -- see agentRuntimeSpecDTO. 0 means
 // unknown (both source fields are 0).
@@ -2679,20 +2682,76 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}
+	// The co-residency setting is two inputs, the application's mode and its
+	// explicit pair rows, read here like every other input (a failed read is an
+	// error, never a guessed mode -- see the C1 note above). The agent still gets
+	// ONE plain list of allowed pairs, computed from both.
+	mode, err := s.routes.GetCoResidencyMode(ctx, agentApp.ID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
 	rules, err := s.routes.CoResidencyRulesByApplication(ctx, agentApp.ID)
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
-	coresident := make([][2]string, 0, len(rules))
-	for _, rule := range rules {
-		specA, okA := specIDByMapping[rule.MappingAID]
-		specB, okB := specIDByMapping[rule.MappingBID]
-		if !okA || !okB {
-			continue
-		}
-		coresident = append(coresident, [2]string{specA, specB})
-	}
+	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
 	return agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses), nil
+}
+
+// effectiveAllowedPairs computes the list of spec-id pairs the agent may keep
+// resident together -- the existing `coresident` wire field, whose shape
+// ([][2]string of spec ids) is unchanged.
+//
+// The effective verdict of a pair of ENABLED specs is the design's tri-state
+// rule: an explicit rule row decides (allow -> allowed, forbid -> not); a pair
+// with no row follows the application's mode (opt_out -> allowed, opt_in ->
+// not). Every pair that comes out allowed is ENUMERATED here, including all the
+// opt_out defaults, rather than the mode being sent to the agent: an agent that
+// predates the mode only reads this plain list, and an opt_out it could not see
+// would degrade to "nothing may co-locate". An agent that does know about
+// modes gets the same list, so neither needs the mode or the verdicts.
+//
+// specIDByMapping holds exactly the ENABLED specs, mapping id -> spec id, and is
+// both the set of pairs considered and the translation out of the mapping-id
+// space the rules are stored in: a rule that names a mapping with no enabled
+// spec matches nothing, and a pair touching such a mapping is never emitted.
+// Anything that is not unmistakably permissive resolves to "not allowed": a mode
+// other than opt_out behaves as opt_in, a verdict other than allow behaves as
+// forbid, because default-allow is the direction that can put two models on one
+// GPU that do not fit. (The store validates both, so this only matters for a
+// value the store should never return.)
+//
+// The result is deterministic -- pairs run over the mapping ids in ascending
+// order -- and so is its orientation: each pair is [spec of the lower mapping
+// id, spec of the higher], exactly what the former per-row translation emitted
+// for a canonical row, so an opt_in application's document (and its ETag) is
+// byte-identical to what it was before modes existed. The result is never nil.
+func effectiveAllowedPairs(mode routing.CoResidencyMode, specIDByMapping map[string]string, rules []routing.CoResidencyRule) [][2]string {
+	explicit := make(map[[2]string]bool, len(rules))
+	for _, r := range rules {
+		a, b := r.MappingAID, r.MappingBID
+		if a > b {
+			a, b = b, a
+		}
+		verdict, ok := routing.NormalizeCoResidencyVerdict(r.Verdict)
+		explicit[[2]string{a, b}] = ok && verdict == routing.CoResidencyVerdictAllow
+	}
+	defaultAllowed := mode == routing.CoResidencyModeOptOut
+
+	mappingIDs := slices.Sorted(maps.Keys(specIDByMapping))
+	pairs := make([][2]string, 0)
+	for i, a := range mappingIDs {
+		for _, b := range mappingIDs[i+1:] {
+			allowed, isExplicit := explicit[[2]string{a, b}]
+			if !isExplicit {
+				allowed = defaultAllowed
+			}
+			if allowed {
+				pairs = append(pairs, [2]string{specIDByMapping[a], specIDByMapping[b]})
+			}
+		}
+	}
+	return pairs
 }
 
 // resolvePushToken returns the DECRYPTED upstream token to inject into the child
