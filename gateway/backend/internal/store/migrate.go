@@ -130,6 +130,8 @@ var migrations = []migration{
 	{version: 95, name: "model_mapping_benchmarks_audio_perf", up: migration95Up},
 	{version: 96, name: "runtime_spec_ram", up: migration96Up},
 	{version: 97, name: "drop_vram_locked", up: migration97Up},
+	{version: 98, name: "coresidency_rule_verdict", up: migration98Up},
+	{version: 99, name: "application_coresidency_mode", up: migration99Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4331,4 +4333,87 @@ func migration96Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // holds on its own via max().
 func migration97Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return dropColumnIfPresent(ctx, tx, dl, "agent_runtime_specs", "vram_locked")
+}
+
+// migration98Up adds agent_coresidency_rules.verdict, turning the co-residency
+// pair table from "a row means allowed" into a per-pair tri-state: an explicit
+// row now carries a verdict ('allow' or 'forbid'), and the ABSENCE of a row is
+// the third state, "default", whose meaning the application's coresidency_mode
+// decides (migration 99).
+//
+// `text not null default 'allow'`, and the default is the whole of the upgrade
+// story: until now a row's presence was the only signal and meant exactly
+// "allowed", so every pre-existing row must read back 'allow'. ADD COLUMN with
+// a constant default materialises that value for the rows already in the table
+// on both dialects (SQLite reads the default for rows written before the
+// column existed; PostgreSQL stores it as the column's missing-value default),
+// so there is no separate UPDATE to run and nothing a replay could re-flip --
+// a replay is addColumnIfMissing's no-op and an operator's later 'forbid' is
+// never touched. TestMigration98And99UpgradeAnExistingCoResidencyDeployment
+// pins the backfill against a genuine v97 database on both dialects rather
+// than trusting that argument.
+//
+// Text, not a boolean or an integer: the vocabulary is a closed set that is
+// meant to read in a raw query, and a third verdict would then be a new value,
+// not a new column. The store writes the verdict explicitly (an empty
+// CoResidencyRule.Verdict is normalised to 'allow'), so the DDL default is the
+// upgrade backfill, not a way for a caller to say "unspecified".
+//
+// Append-only: migration 65's create-table and the v60-frozen baseline are NOT
+// touched, so a fresh install gets the column by replaying this migration over
+// the empty table.
+func migration98Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_coresidency_rules",
+		"verdict text not null default 'allow'")
+}
+
+// migration99Up adds applications.coresidency_mode, the per-server switch that
+// decides how a pair with NO explicit row resolves: 'opt_in' (the old
+// behaviour -- an unlisted pair is forbidden, only allowed pairs are listed) or
+// 'opt_out' (an unlisted pair is allowed, only forbidden pairs are listed). The
+// explicit rows (migration 98) are untouched by a mode change, which is what
+// makes switching it lossless.
+//
+// It lives on `applications` because that is where every other per-application
+// setting lives, and because the pair table it qualifies is already keyed by
+// the server_agent application's id. It is deliberately not a field of the Go
+// Application struct: nothing in the application create/update/list path reads
+// it, so those statements stay exactly as they are and cannot clobber it --
+// the mode has its own accessor pair (GetCoResidencyMode / SetCoResidencyMode).
+//
+// The two defaults are different on purpose, and that is the migration's one
+// judgement call (design 2026-11-02, section 4.5):
+//
+//   - the DDL default 'opt_out' is what every application created from now on
+//     gets, because opt-out is the new standard;
+//   - every application that exists at upgrade time is set to 'opt_in' by the
+//     UPDATE, because that reproduces today's exact semantics (present row ->
+//     allowed, absent row -> forbidden). A running server therefore does not
+//     change behaviour until its operator flips the mode.
+//
+// The UPDATE is unconditional and covers every application, not only
+// server_agent ones: the column exists on the whole table, and the pair table
+// can only ever name a server_agent application, so the other rows' value is
+// inert -- but 'opt_in' is the value that is true to what they have always
+// done. It has no `where` guard, so unlike migration98Up it is NOT replay-safe:
+// a second run would flip an operator's explicit 'opt_out' back. That is
+// harmless here for the reason migration80Up documents for its own backfill --
+// the runner applies a pending migration exactly once per database, in the same
+// transaction that records its version -- and a guard is not possible, because
+// the new value ('opt_out') is also the DDL default, so "never backfilled" and
+// "explicitly chosen" are indistinguishable by value. On a fresh install the
+// table is empty when this runs, so the UPDATE touches nothing and every
+// application created later is 'opt_out'.
+//
+// It ABORTS the boot on failure rather than skipping, following migration70Up:
+// a deterministic UPDATE with no possibly-dirty pre-check to fail, and
+// skipping it would leave existing servers on the new default and silently
+// change which models may share their host. Append-only: the baseline
+// (frozen v60) is not edited.
+func migration99Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := addColumnIfMissing(ctx, tx, dl, "applications",
+		"coresidency_mode text not null default 'opt_out'"); err != nil {
+		return err
+	}
+	return execTx(ctx, tx, dl, `update applications set coresidency_mode = 'opt_in'`)
 }

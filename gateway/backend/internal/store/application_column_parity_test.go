@@ -369,6 +369,13 @@ func TestApplicationsSchemaColumnsAllCovered(t *testing.T) {
 				// one, move it to bools (it is an integer-boolean) and seed it.
 				"native_responses": "inert orphan: replaced by responses_mode (migration 72), never read",
 				"native_messages":  "inert orphan: replaced by messages_mode (migration 72), never read",
+				// migration 99. Deliberately NOT a routing.Application field: it
+				// qualifies the agent_coresidency_rules pair table, has its own
+				// dedicated accessor pair (added with the store methods), and is
+				// not a routing input -- no reader in the ActiveMappingsForModel
+				// / ApplicationByID family selects it, and none should, so no
+				// parity fixture row can seed it.
+				"coresidency_mode": "per-server co-residency mode, read and written only by its own accessors; not a routing.Application field and not a routing input (migration 99)",
 			},
 		})
 	})
