@@ -229,3 +229,34 @@ func TestBuildReportZeroConfigNeverEmitsNull(t *testing.T) {
 		t.Errorf("expected coresident:[] in nested config: %s", decoded.Config)
 	}
 }
+
+// TestBuildReportCarriesTheSpecRole: a file-mode spec's role rides the upward
+// report (so the portal's report view shows it) and an absent role stays absent
+// rather than appearing as an empty string. Config.Specs[].Role is omitempty, the
+// same convention the gateway's report mirror uses.
+func TestBuildReportCarriesTheSpecRole(t *testing.T) {
+	cfg := Config{Specs: []Spec{{ID: "with-role", Role: "tts"}, {ID: "no-role"}}}
+	raw, err := BuildReport(cfg, "file", "", time.Now())
+	if err != nil {
+		t.Fatalf("BuildReport: %v", err)
+	}
+	var decoded Report
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode report: %v", err)
+	}
+	var got struct {
+		Specs []map[string]any `json:"specs"`
+	}
+	if err := json.Unmarshal(decoded.Config, &got); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if len(got.Specs) != 2 {
+		t.Fatalf("len(specs) = %d, want 2: %s", len(got.Specs), decoded.Config)
+	}
+	if role, ok := got.Specs[0]["role"]; !ok || role != "tts" {
+		t.Errorf("specs[0] role = %v (present=%v), want \"tts\": %s", role, ok, decoded.Config)
+	}
+	if role, ok := got.Specs[1]["role"]; ok {
+		t.Errorf("specs[1] role = %v, want the key absent for a spec with no role: %s", role, decoded.Config)
+	}
+}

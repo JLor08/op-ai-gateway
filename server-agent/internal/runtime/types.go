@@ -117,6 +117,39 @@ type Spec struct {
 	// path).
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+	// Role is the model's derived functional role, as the gateway pushes it
+	// (AgentRuntimeSpecDTO.Role): "asr", "tts", "image", "embedding",
+	// "reranker", "chat" or "other". It is carried verbatim -- no vocabulary
+	// check here, so a role a newer gateway invents decodes and groups with its
+	// own kind -- and an older gateway, or a hand-written file-mode spec, simply
+	// omits it, which decodes to "" and is backward-safe. Read it through
+	// roleOf, never raw: that is what folds the absent role into RoleOther.
+	//
+	// Like RAMMB it is an admission input, not a launch input (sameLaunchShape
+	// ignores it): the policy reads it to choose WHICH idle model to evict, and
+	// it changes nothing about how a process is exec'd.
+	Role string `json:"role,omitempty"`
+}
+
+// RoleOther is the role of a spec that has none the agent recognises: the value
+// the gateway derives for a model with no recognisable function (its
+// routing.RoleOther), and the value an absent role is read as (roleOf). The
+// agent module cannot import the gateway's vocabulary, so this literal is the
+// agent's own spelling of it and TestRoleOfNormalizesTheCapturedRole pins it.
+const RoleOther = "other"
+
+// roleOf is the one place a spec's captured Role becomes the role the admission
+// policy compares: trimmed, lower-cased, and an empty result folded into
+// RoleOther. Without the fold, an absent role on one spec next to a pushed
+// "other" on another -- a hand-written file-mode document can mix the two --
+// would read as two different roles, and the policy compares roles for equality.
+// Every other value passes through, so an unknown role is simply its own group.
+func roleOf(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		return RoleOther
+	}
+	return role
 }
 
 // VisibleDevicesMode wire values. The agent distinguishes only "args" from

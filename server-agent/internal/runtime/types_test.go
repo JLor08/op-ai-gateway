@@ -249,6 +249,71 @@ func TestConfigDecodeReadsRAMMB(t *testing.T) {
 	}
 }
 
+// TestConfigDecodeReadsRole pins the wire tag of the per-spec model role the
+// gateway pushes (AgentRuntimeSpecDTO.Role,
+// gateway/backend/internal/portal/service_runtime.go): ParseConfig must land
+// "role" on Spec.Role, or the agent's role-aware eviction has nothing to read.
+// The decode is deliberately verbatim -- no vocabulary check, so a role a newer
+// gateway invents rides through and groups with its own kind -- and a document
+// that omits the key (every document an older gateway sends, and any
+// hand-written file-mode spec) decodes to "" with no error: backward-safe, the
+// agent simply has no role for that spec.
+func TestConfigDecodeReadsRole(t *testing.T) {
+	const raw = `{
+  "router_listen": 9000,
+  "max_processes": 2,
+  "gpu_budgets": [],
+  "specs": [
+    {"id": "rspec_asr", "model": "a", "upstream_model": "a-up", "binary": "/bin/a",
+     "args": [], "env": {}, "gpus": [], "role": "asr"},
+    {"id": "rspec_none", "model": "b", "upstream_model": "b-up", "binary": "/bin/b",
+     "args": [], "env": {}, "gpus": []},
+    {"id": "rspec_future", "model": "c", "upstream_model": "c-up", "binary": "/bin/c",
+     "args": [], "env": {}, "gpus": [], "role": "vision"}
+  ],
+  "coresident": [],
+  "etag": "e"
+}`
+	cfg, err := ParseConfig([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseConfig() error = %v (a role key, or its absence, must never fail the document)", err)
+	}
+	if len(cfg.Specs) != 3 {
+		t.Fatalf("len(Specs) = %d, want 3", len(cfg.Specs))
+	}
+	for i, want := range []string{"asr", "", "vision"} {
+		if got := cfg.Specs[i].Role; got != want {
+			t.Errorf("Specs[%d].Role = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestRoleOfNormalizesTheCapturedRole: a spec with no role compares as
+// RoleOther, not as a separate "" role. The eviction policy compares roles for
+// equality, and an absent role on one spec next to a pushed "other" on another
+// (a hand-written file-mode document can mix them) must not read as two
+// different roles. The capture is otherwise verbatim apart from trimming and
+// lower-casing, since a hand-authored value may be "ASR" or carry stray
+// whitespace.
+func TestRoleOfNormalizesTheCapturedRole(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", RoleOther},
+		{"   ", RoleOther},
+		{RoleOther, RoleOther},
+		{"asr", "asr"},
+		{"tts", "tts"},
+		{" ASR ", "asr"},
+		{"vision", "vision"},
+	} {
+		if got := roleOf(tc.in); got != tc.want {
+			t.Errorf("roleOf(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if RoleOther != "other" {
+		t.Errorf("RoleOther = %q, want the gateway's routing.RoleOther literal %q", RoleOther, "other")
+	}
+}
+
 // TestParseConfigEmptyDocumentCollectionsAreNeverNil covers the
 // fully-empty document a server with no server_agent application yet
 // produces (docs/architecture/reference/api-surface.md §5.1, "a fully zeroed

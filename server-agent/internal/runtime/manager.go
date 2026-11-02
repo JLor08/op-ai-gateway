@@ -1415,6 +1415,12 @@ func sameLaunchShape(a, b Spec) bool {
 		// leaving it in the comparison would relaunch every freshly measured
 		// healthy child.
 		s.RAMMB = 0
+		// Role is the eviction policy's input (which idle model to evict), never
+		// baked into the child. The gateway derives it on every build from the
+		// spec's capability verdicts, so an operator's verdict change moves it
+		// with the process untouched, and the first document that carries it
+		// would otherwise relaunch every healthy child.
+		s.Role = ""
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
@@ -2317,6 +2323,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			RAMMB:    max(liveRAM, st.spec.RAMMB),
 			InFlight: st.inFlight,
 			Pinned:   st.spec.Pinned,
+			Role:     roleOf(st.spec.Role),
 			LastUsed: st.lastUsed,
 			// A process that has been exec'd but never passed a health
 			// probe. It occupies its resources exactly like a running one

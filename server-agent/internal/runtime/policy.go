@@ -27,6 +27,11 @@ type RunningProc struct {
 	RAMMB    int
 	InFlight int
 	Pinned   bool
+	// Role is the process's model role, normalized by roleOf (never empty): the
+	// spec's pushed role, or RoleOther when it has none. It is carried onto the
+	// snapshot so the policy can compare an occupant's role with the candidate's;
+	// nothing in Admit reads it yet, so it changes no decision.
+	Role     string
 	LastUsed time.Time // idle-victim ordering: oldest evicted first
 	// Starting is true while this process is still loading -- it has been
 	// exec'd but has never passed a health probe, so it is serving nothing

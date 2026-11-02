@@ -3479,6 +3479,32 @@ func gpusChargedFor(t *testing.T, snap PolicySnapshot, specID string) map[int]in
 	return nil
 }
 
+// TestBuildSnapshotCarriesTheSpecRole: the role a spec was pushed with reaches
+// the policy on its RunningProc row, normalized by roleOf, so Admit can compare
+// an occupant's role with the candidate's. A spec with no role (an older gateway,
+// a hand-written file-mode document) reads as RoleOther -- never as a separate
+// empty role.
+func TestBuildSnapshotCarriesTheSpecRole(t *testing.T) {
+	for _, tc := range []struct{ name, role, want string }{
+		{"a pushed role is carried", "asr", "asr"},
+		{"an absent role is other", "", RoleOther},
+		{"a hand-written role is normalized", " TTS ", "tts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.Role = tc.role
+			o, _ := newSnapshotOwner(spec, 4242, nil)
+			snap := o.buildSnapshot()
+			if len(snap.Running) != 1 {
+				t.Fatalf("Running = %d rows, want the one live spec", len(snap.Running))
+			}
+			if got := snap.Running[0].Role; got != tc.want {
+				t.Errorf("RunningProc.Role = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate is the
 // zero-guard. The defect is the absence of one rule that the OTHER end of
 // this very loop already has: the gateway's telemetry ingest skips any
@@ -4059,6 +4085,11 @@ func TestSameLaunchShape(t *testing.T) {
 		// measured-RAM write-back moves it, and it must not bounce a healthy
 		// child either.
 		"RAMMB": func(s *Spec) { s.RAMMB = 9000 },
+		// role is the eviction policy's input, derived by the gateway on every
+		// build, so an operator's capability verdict moves it (and the document)
+		// without any change to what the child is. It must not bounce a healthy
+		// child, nor may the first push that carries it relaunch the fleet.
+		"Role": func(s *Spec) { s.Role = "asr" },
 	}
 	for name, mut := range meta {
 		b := base
