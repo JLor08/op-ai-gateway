@@ -1432,6 +1432,21 @@ type ModelDTO struct {
 	// speechCloneVoicesByName's result and gates NO route; no request ever
 	// requires it.
 	SpeechCloneVoices bool `json:"speech_clone_voices"`
+	// Embedding is true only when EVERY offering mapping (or, for a group, every
+	// offerable member) has an "embedding" capability row whose verdict is yes
+	// (AND aggregation, fail-closed), exactly like Image. It is INDEPENDENT of
+	// every other flag: Embedding means the model produces vector embeddings, and
+	// another capability's yes verdict never sets it. It is verdictYesFlagsByName's
+	// result and, unlike Speech and Transcription, has no flavor half -- the
+	// gateway serves no embeddings endpoint, so there is nothing for an
+	// application's flavors to gate. It gates NO route; no request ever requires
+	// it, and what it feeds is the UI (the operator's capability controls and the
+	// model-role grouping) and the role derivation behind Role.
+	Embedding bool `json:"embedding"`
+	// Rerank is Embedding's twin for the "rerank" capability: true only when EVERY
+	// offering mapping (or, for a group, every offerable member) has a (rerank,
+	// yes) verdict. Same fold, same independence, same absence of any route.
+	Rerank bool `json:"rerank"`
 	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
 	// claude_model_aliases setting): the real gateway model/group id the
 	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
@@ -2591,9 +2606,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
 			if capErr != nil {
 				// LOUDLY: this degrade withholds vision, image, image_edit,
-				// speech AND transcription from EVERY model in the listing
-				// gateway-wide (the folds below AND a missing row in as false
-				// for each), which the portal renders as a perfectly normal page
+				// speech, transcription, embedding AND rerank from EVERY model in
+				// the listing gateway-wide (the folds below AND a missing row in as
+				// false for each), which the portal renders as a perfectly normal page
 				// whose image-ATTACH affordance (gated on vision),
 				// image-GENERATION affordance (gated on image), speech-synthesis
 				// affordance (gated on speech) and transcription affordance
@@ -2601,7 +2616,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// outage with no diagnostic trail unless it is logged. Every
 				// sibling best-effort read in this package logs for exactly
 				// that reason.
-				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit, speech and transcription withheld for every model",
+				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit, speech, transcription, embedding and rerank withheld for every model",
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
@@ -2673,6 +2688,13 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// above and the same clone rows and runtime-spec index. It gates NO
 			// route either.
 			speechCloneVoicesOn := speechCloneVoicesByName(views, speechCloneRows, hasVoicesByMapping, idx)
+			// embedding and rerank are verdictYesFlagsByName over the same
+			// capability batch: a plain fail-closed AND of the (capability, yes)
+			// verdict, with no flavor half and no runtime-spec read, because the
+			// gateway serves no endpoint for either and so has no flavor to gate.
+			// Neither is a ModelOffering.Capable fold (nothing requires them).
+			embeddingOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityEmbedding))
+			rerankOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityRerank))
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2830,6 +2852,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// speech_clone_voices is the AND again (it OFFERS, so one member
 				// without presets keeps the whole group hidden).
 				groupSpeechCloneVoices := groupCapabilityFlags(entries, speechCloneVoicesOn)
+				// embedding and rerank are the AND again, like every serve-style flag.
+				groupEmbedding := groupCapabilityFlags(entries, embeddingOn)
+				groupRerank := groupCapabilityFlags(entries, rerankOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2871,6 +2896,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					transcriptionOn[e.Name] = groupTranscription[e.Name]
 					speechCloneOn[e.Name] = groupSpeechClone[e.Name]
 					speechCloneVoicesOn[e.Name] = groupSpeechCloneVoices[e.Name]
+					embeddingOn[e.Name] = groupEmbedding[e.Name]
+					rerankOn[e.Name] = groupRerank[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2953,6 +2980,12 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := speechCloneVoicesOn[target]; ok {
 						speechCloneVoicesOn[name] = v
 					}
+					if v, ok := embeddingOn[target]; ok {
+						embeddingOn[name] = v
+					}
+					if v, ok := rerankOn[target]; ok {
+						rerankOn[name] = v
+					}
 					if _, ok := isGroup[target]; ok {
 						isGroup[name] = struct{}{}
 					}
@@ -3021,6 +3054,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.Transcription = transcriptionOn[id]
 				dto.SpeechClone = speechCloneOn[id]
 				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
+				dto.Embedding = embeddingOn[id]
+				dto.Rerank = rerankOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -3190,6 +3225,22 @@ func speechCloneVoicesByName(views []mappingView, speechCloneRows map[string]rou
 	return foldMappingFlags(views, func(view mappingView) bool {
 		clone := speechCloneRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesAudio(view, idx)
 		return !clone || hasVoices[view.mapping.ID]
+	})
+}
+
+// verdictYesFlagsByName is the fold for a capability that has no endpoint behind
+// it: per gateway model name among views, true only when EVERY one of its
+// mappings has a yes verdict in rows (keyed by mapping id). It backs the
+// listing's ModelDTO.Embedding and ModelDTO.Rerank. It is the image fold
+// (imageFlagsByName) minus the flavor half: embedding and rerank are served
+// through no gateway flavor, so there is nothing for viewServesImages /
+// viewServesAudio's counterpart to check, and the runtime-spec index is not
+// read. Fail-closed exactly as the others are: a "no" row and a MISSING row
+// (never probed) both AND in as false, and a name starts true on its first
+// mapping and is only ever ANDed down, never up.
+func verdictYesFlagsByName(views []mappingView, rows map[string]routing.CapabilityRow) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return rows[view.mapping.ID].Verdict == routing.CapabilityYes
 	})
 }
 

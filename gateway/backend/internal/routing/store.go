@@ -1676,6 +1676,40 @@ const (
 	// Like CapabilitySpeech the string does not coincide with the billable unit
 	// (usage.BillingUnitAudioSecond).
 	CapabilitySpeechStreaming = "speech_streaming"
+
+	// CapabilityEmbedding means the model produces text EMBEDDINGS: it is a
+	// vector encoder, not a generator. It is orthogonal to every name above (an
+	// embedding model neither accepts images nor synthesises speech), and it is
+	// one of the two names -- CapabilityRerank is the other -- that exist for the
+	// model ROLE (DeriveRole): an embedding model is a distinct, protected role,
+	// so that a chat model asking for room is not allowed to push the encoder a
+	// RAG pipeline is waiting on out of memory.
+	//
+	// Unlike the audio names above it has NO dedicated writer: nothing here probes
+	// for it. The verdict is the OPERATOR's, stated on the mapping form (a manual
+	// row, rank 3), and it is deliberately on no reserved list -- neither the
+	// portal's reservedManualVerdicts nor the agent ingest's
+	// reservedAgentCapabilityNames -- because the open capability vocabulary
+	// already stores it and there is no dedicated probe whose answer a manual "no"
+	// could outrank. The one incidental source is Ollama: its /api/show capability
+	// array names "embedding" for an embedding model, and the open Extra-name
+	// pass-through writes any declared name verbatim as a yes row, so such a model
+	// carries the verdict without the operator doing anything. It gates NO route:
+	// the gateway serves no embeddings endpoint, so no request declares it
+	// required, and what reads it is the listing's ModelDTO.Embedding and the role
+	// derivation (DeriveRole).
+	CapabilityEmbedding = "embedding"
+
+	// CapabilityRerank means the model RERANKS: it scores query/document pairs
+	// rather than generating text. It is CapabilityEmbedding's twin in every
+	// respect above -- operator-stated (no dedicated probe, no reserved pair),
+	// gating no route, read by ModelDTO.Rerank and by the role derivation, where
+	// it makes the "reranker" role -- except that no upstream document this
+	// codebase reads declares it the way Ollama declares "embedding", so in
+	// practice it is operator-stated alone. The string is "rerank", the verb, to match the
+	// capability names beside it ("transcription", "speech", "embedding"), which
+	// name what a model DOES; the role it yields is the noun "reranker".
+	CapabilityRerank = "rerank"
 )
 
 // Capability verdicts.
