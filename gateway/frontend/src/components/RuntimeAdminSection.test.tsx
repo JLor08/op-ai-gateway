@@ -907,6 +907,213 @@ describe('RuntimeAdminSection launch specs list', () => {
     });
   });
 
+  // The live status frame carries the process's measured RAM
+  // (RuntimeStatus.ram_measured_mb). For a spec whose live row carries it, the
+  // RAM column prefers it: max(live, durable measured, estimate). Each spec
+  // joins its status row through its own `id`, the key the stream carries as
+  // spec_id. Its own describe, not more rows in the one above: the list pages
+  // at 10 rows.
+  describe('live RAM in the RAM column', () => {
+    // Durable figures are 5000 measured / 4000 estimated unless stated.
+    const liveSpecs = {
+      map_live_over: makeSpec({
+        configured: true,
+        mapping_id: 'map_live_over',
+        id: 'spec_live_over',
+        ram_estimate_mb: 4000,
+        ram_measured_mb: 5000,
+      }),
+      map_live_under: makeSpec({
+        configured: true,
+        mapping_id: 'map_live_under',
+        id: 'spec_live_under',
+        ram_estimate_mb: 4000,
+        ram_measured_mb: 5000,
+      }),
+      map_live_only: makeSpec({
+        configured: true,
+        mapping_id: 'map_live_only',
+        id: 'spec_live_only',
+        ram_estimate_mb: 0,
+        ram_measured_mb: 0,
+      }),
+      map_live_unmeasured: makeSpec({
+        configured: true,
+        mapping_id: 'map_live_unmeasured',
+        id: 'spec_live_unmeasured',
+        ram_estimate_mb: 4000,
+        ram_measured_mb: 5000,
+      }),
+      map_live_zero: makeSpec({
+        configured: true,
+        mapping_id: 'map_live_zero',
+        id: 'spec_live_zero',
+        ram_estimate_mb: 4000,
+        ram_measured_mb: 5000,
+      }),
+      map_live_allzero: makeSpec({
+        configured: true,
+        mapping_id: 'map_live_allzero',
+        id: 'spec_live_allzero',
+        ram_estimate_mb: 0,
+        ram_measured_mb: 0,
+      }),
+      // It has an id, but the stream carries no row for it at all (before the
+      // first frame, or after a gateway restart).
+      map_no_live: makeSpec({
+        configured: true,
+        mapping_id: 'map_no_live',
+        id: 'spec_no_live',
+        ram_estimate_mb: 4000,
+        ram_measured_mb: 5000,
+      }),
+    };
+
+    const liveFrame = [
+      makeStatus({ spec_id: 'spec_live_over', ram_measured_mb: 7000 }),
+      makeStatus({ spec_id: 'spec_live_under', ram_measured_mb: 3000 }),
+      makeStatus({ spec_id: 'spec_live_only', ram_measured_mb: 2500 }),
+      makeStatus({ spec_id: 'spec_live_unmeasured' }),
+      makeStatus({ spec_id: 'spec_live_zero', ram_measured_mb: 0 }),
+      makeStatus({ spec_id: 'spec_live_allzero' }),
+    ];
+
+    function renderLive(statusRows: RuntimeStatus[] = liveFrame) {
+      return renderSection({
+        mappings: Object.keys(liveSpecs).map((id) =>
+          makeMapping({ id, gateway_model_name: `gw-${id}` }),
+        ),
+        specsByMappingId: liveSpecs,
+        statusRows,
+      });
+    }
+
+    async function expectRam(rowKey: string, text: string) {
+      await waitFor(() =>
+        expect(cellForColumn(`gw-${rowKey}`, t.runtimeSpecRam)).toHaveTextContent(
+          new RegExp(`^${text}$`),
+        ),
+      );
+    }
+
+    it('prefers a live measurement above the persisted figures', async () => {
+      renderLive();
+      // live 7000 over persisted 5000 and estimate 4000.
+      await expectRam('map_live_over', '7000 MB');
+      // A spec whose durable figures are both unknown still shows the live one.
+      await expectRam('map_live_only', '2500 MB');
+    });
+
+    it('keeps the max rule when the live figure is the smaller one', async () => {
+      renderLive();
+      // live 3000 below persisted 5000: the larger durable figure stands.
+      await expectRam('map_live_under', '5000 MB');
+    });
+
+    it('falls back to the durable value when the live status carries no RAM (absent or 0)', async () => {
+      renderLive();
+      // A frame without the key (an unmeasured process) and one carrying 0
+      // (UNKNOWN, never "needs no RAM") both leave the durable max of 5000/4000.
+      await expectRam('map_live_unmeasured', '5000 MB');
+      await expectRam('map_live_zero', '5000 MB');
+    });
+
+    it('falls back to the durable value for a spec with no live status row', async () => {
+      renderLive();
+      await expectRam('map_no_live', '5000 MB');
+    });
+
+    it('renders an em-dash when the live status and both durable figures are 0', async () => {
+      renderLive();
+      await expectRam('map_live_allzero', '—');
+    });
+
+    it('follows each live frame, and drops back to the durable value when a frame stops carrying RAM', async () => {
+      const { stream } = renderLive();
+      await expectRam('map_live_over', '7000 MB');
+
+      stream.push([makeStatus({ spec_id: 'spec_live_over', ram_measured_mb: 8200 })]);
+      await expectRam('map_live_over', '8200 MB');
+
+      // The process exited: the next frame has no RAM, so the column falls back
+      // to the persisted 5000 instead of keeping the last live number.
+      stream.push([makeStatus({ spec_id: 'spec_live_over', state: 'stopped' })]);
+      await expectRam('map_live_over', '5000 MB');
+    });
+
+    it('sorts the column by the live-aware figure it displays, not the durable one', async () => {
+      // Four specs whose order by the DISPLAYED figure (max of live, durable
+      // measured and estimate) is different from their order by the durable
+      // figures alone, and from the input order, and whose displayed figures are
+      // all distinct so no assertion leans on a tie. A sort value that dropped
+      // the live operand -- or let the live figure replace the durable one
+      // instead of joining the max() -- would order these differently:
+      //   spec  durable  live  displayed
+      //   a     5000     --    5000
+      //   b     4000     9000  9000   (live raises it)
+      //   c     6000     --    6000
+      //   d     8000     3000  8000   (a smaller live figure does not shrink it)
+      // ascending by displayed: a, c, d, b   (durable only would give b, a, c, d;
+      // live-replaces-durable would give d, a, c, b)
+      const sortSpec = (key: string, measured: number) =>
+        makeSpec({
+          configured: true,
+          mapping_id: `map_sort_${key}`,
+          id: `spec_sort_${key}`,
+          ram_estimate_mb: 0,
+          ram_measured_mb: measured,
+        });
+      const sortSpecs = {
+        map_sort_d: sortSpec('d', 8000),
+        map_sort_a: sortSpec('a', 5000),
+        map_sort_b: sortSpec('b', 4000),
+        map_sort_c: sortSpec('c', 6000),
+      };
+      renderSection({
+        mappings: Object.keys(sortSpecs).map((id) =>
+          makeMapping({ id, gateway_model_name: `gw-${id}` }),
+        ),
+        specsByMappingId: sortSpecs,
+        statusRows: [
+          makeStatus({ spec_id: 'spec_sort_b', ram_measured_mb: 9000 }),
+          makeStatus({ spec_id: 'spec_sort_d', ram_measured_mb: 3000 }),
+        ],
+      });
+      // Wait for every cell to carry its displayed figure before sorting.
+      await expectRam('map_sort_b', '9000 MB');
+      await expectRam('map_sort_d', '8000 MB');
+      await expectRam('map_sort_a', '5000 MB');
+      await expectRam('map_sort_c', '6000 MB');
+
+      const rowOrder = () =>
+        screen
+          .getAllByRole('row')
+          .map((row) => /gw-map_sort_[a-d]/.exec(row.textContent ?? '')?.[0])
+          .filter((name): name is string => name !== undefined);
+
+      // First click: ascending by the displayed figure.
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecRam }));
+      await waitFor(() =>
+        expect(rowOrder()).toEqual([
+          'gw-map_sort_a',
+          'gw-map_sort_c',
+          'gw-map_sort_d',
+          'gw-map_sort_b',
+        ]),
+      );
+      // Second click: descending.
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecRam }));
+      await waitFor(() =>
+        expect(rowOrder()).toEqual([
+          'gw-map_sort_b',
+          'gw-map_sort_d',
+          'gw-map_sort_c',
+          'gw-map_sort_a',
+        ]),
+      );
+    });
+  });
+
   it('reads the GPU-assignment column as off / arguments / environment variable per spec', async () => {
     renderSection({
       mappings: [

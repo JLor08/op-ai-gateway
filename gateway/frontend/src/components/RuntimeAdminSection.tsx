@@ -690,8 +690,21 @@ function totalGpuVram(spec: RuntimeSpec | undefined): number {
 // operator's estimate, the same max() rule as the VRAM above. `|| 0` also
 // covers a document from a gateway that predates the fields, which would
 // otherwise surface as NaN.
-function effectiveRam(spec: RuntimeSpec | undefined): number {
-  return Math.max(spec?.ram_measured_mb || 0, spec?.ram_estimate_mb || 0);
+//
+// `live` is the spec's row on the live status stream, when it has one: its
+// ram_measured_mb is the running process's CURRENT resident RAM, which is
+// fresher than the durable spec.ram_measured_mb (that one is only re-read when
+// the specs are next fetched). It joins the same max() as a third operand, so a
+// live figure below a larger durable one does not shrink the cell, and an
+// absent or 0 live figure (UNKNOWN: no measurer, or no live process) simply
+// drops out, leaving the durable value -- which is also all a spec with no live
+// row (a stopped one) ever has.
+function effectiveRam(spec: RuntimeSpec | undefined, live?: RuntimeStatus): number {
+  return Math.max(
+    live?.ram_measured_mb || 0,
+    spec?.ram_measured_mb || 0,
+    spec?.ram_estimate_mb || 0,
+  );
 }
 
 function formatGpus(spec: RuntimeSpec | undefined): string {
@@ -3589,10 +3602,10 @@ export function RuntimeAdminSection({
       id: 'ram',
       label: t.runtimeSpecRam,
       value: (m) => {
-        const ram = effectiveRam(specsById[m.id]);
+        const ram = effectiveRam(specsById[m.id], statusForMapping(m));
         return ram > 0 ? String(ram) : '—';
       },
-      render: (m) => formatMb(effectiveRam(specsById[m.id])),
+      render: (m) => formatMb(effectiveRam(specsById[m.id], statusForMapping(m))),
       filter: 'text',
       searchable: false,
       numeric: true,
