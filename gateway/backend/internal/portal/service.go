@@ -1447,6 +1447,19 @@ type ModelDTO struct {
 	// offering mapping (or, for a group, every offerable member) has a (rerank,
 	// yes) verdict. Same fold, same independence, same absence of any route.
 	Rerank bool `json:"rerank"`
+	// Role is the model's single derived role -- one of the routing.ModelRole
+	// values ("asr", "tts", "image", "embedding", "reranker", "chat", "other"),
+	// never empty: routing.DeriveRole over each offering mapping's runtime type
+	// and yes verdicts (roleByName), so it is the same derivation the agent's
+	// pushed AgentRuntimeSpecDTO.Role carries and the editor's grouping and the
+	// agent's eviction cannot diverge. Unlike the capability flags above it is
+	// NOT an AND: a name offered by several mappings takes the best-ranked of their
+	// roles (routing.RoleRank), and a group the best-ranked of its offerable
+	// members', because a role is established by evidence and a mapping that knows
+	// nothing is not evidence against one that does. An alias carries its target's
+	// role; a name no mapping offers (a vendor-only model) and the unconfigured
+	// seed list are "other". It gates nothing.
+	Role string `json:"role"`
 	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
 	// claude_model_aliases setting): the real gateway model/group id the
 	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
@@ -2608,7 +2621,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// LOUDLY: this degrade withholds vision, image, image_edit,
 				// speech, transcription, embedding AND rerank from EVERY model in
 				// the listing gateway-wide (the folds below AND a missing row in as
-				// false for each), which the portal renders as a perfectly normal page
+				// false for each) and leaves every role to its runtime type alone
+				// (a model whose role a verdict established reads as its type's
+				// role, or "other"), which the portal renders as a perfectly normal page
 				// whose image-ATTACH affordance (gated on vision),
 				// image-GENERATION affordance (gated on image), speech-synthesis
 				// affordance (gated on speech) and transcription affordance
@@ -2616,7 +2631,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// outage with no diagnostic trail unless it is logged. Every
 				// sibling best-effort read in this package logs for exactly
 				// that reason.
-				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit, speech, transcription, embedding and rerank withheld for every model",
+				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit, speech, transcription, embedding and rerank withheld for every model, and every role falls back to its runtime type",
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
@@ -2695,6 +2710,10 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// Neither is a ModelOffering.Capable fold (nothing requires them).
 			embeddingOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityEmbedding))
 			rerankOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityRerank))
+			// role is roleByName: routing.DeriveRole per mapping from the same
+			// capability batch and runtime-spec index, reconciled per name. NOT an
+			// AND, and not fail-closed: see ModelDTO.Role.
+			roleOn := roleByName(views, capsByMapping, idx)
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2855,6 +2874,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// embedding and rerank are the AND again, like every serve-style flag.
 				groupEmbedding := groupCapabilityFlags(entries, embeddingOn)
 				groupRerank := groupCapabilityFlags(entries, rerankOn)
+				// A group's role is the best-ranked role of its offerable members.
+				groupRole := groupRoleByName(entries, roleOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2898,6 +2919,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					speechCloneVoicesOn[e.Name] = groupSpeechCloneVoices[e.Name]
 					embeddingOn[e.Name] = groupEmbedding[e.Name]
 					rerankOn[e.Name] = groupRerank[e.Name]
+					roleOn[e.Name] = groupRole[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2986,6 +3008,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := rerankOn[target]; ok {
 						rerankOn[name] = v
 					}
+					if v, ok := roleOn[target]; ok {
+						roleOn[name] = v
+					}
 					if _, ok := isGroup[target]; ok {
 						isGroup[name] = struct{}{}
 					}
@@ -3056,6 +3081,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
 				dto.Embedding = embeddingOn[id]
 				dto.Rerank = rerankOn[id]
+				dto.Role = string(roleOrOther(roleOn[id]))
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -3069,7 +3095,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 	}
 	out := make([]ModelDTO, 0, len(seedModelNames))
 	for _, name := range seedModelNames {
-		out = append(out, ModelDTO{ID: name, DisplayName: name, Flavors: seedFlavorsSorted(), Visibility: "shown"})
+		out = append(out, ModelDTO{ID: name, DisplayName: name, Flavors: seedFlavorsSorted(), Visibility: "shown", Role: string(routing.RoleOther)})
 	}
 	return ModelsResponse{Data: out}
 }
@@ -3242,6 +3268,82 @@ func verdictYesFlagsByName(views []mappingView, rows map[string]routing.Capabili
 	return foldMappingFlags(views, func(view mappingView) bool {
 		return rows[view.mapping.ID].Verdict == routing.CapabilityYes
 	})
+}
+
+// roleByName is THE role fold: per gateway model name among views, the
+// routing.ModelRole of the name, backing ModelDTO.Role. Each mapping's role is
+// routing.DeriveRole over its runtime type (viewRuntimeType) and its yes
+// verdicts (capsByMapping, keyed by mapping id, from the listing's one batch
+// read; a nil map -- a failed read -- leaves the type alone to decide). A name
+// takes the BEST-ranked role among its mappings (routing.RoleRank), whatever
+// their order: the role is established by evidence, so a mapping with no
+// verdict and no recognised type (role "other") never overrules a sibling that
+// shows what the model is. A name with no mapping is simply absent.
+func roleByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]routing.ModelRole {
+	out := make(map[string]routing.ModelRole)
+	for _, view := range views {
+		name := view.mapping.GatewayModelName
+		role := routing.DeriveRole(viewRuntimeType(view, idx), routing.YesCapabilities(capsByMapping[view.mapping.ID]))
+		if best, seen := out[name]; !seen || routing.RoleRank(role) < routing.RoleRank(best) {
+			out[name] = role
+		}
+	}
+	return out
+}
+
+// groupRoleByName is roleByName's group half: each group's role is the
+// best-ranked role among its offerable members (roles keyed by member name), and
+// "other" for a group with no offerable member, or none whose role is known.
+func groupRoleByName(entries []groupOverlayEntry, roles map[string]routing.ModelRole) map[string]routing.ModelRole {
+	out := make(map[string]routing.ModelRole, len(entries))
+	for _, e := range entries {
+		best := routing.RoleOther
+		for _, member := range e.OrderedOfferableMembers {
+			if role, ok := roles[member]; ok && routing.RoleRank(role) < routing.RoleRank(best) {
+				best = role
+			}
+		}
+		out[e.Name] = best
+	}
+	return out
+}
+
+// roleOrOther is a role, or routing.RoleOther for the empty one: a name no
+// mapping offers (a vendor-only model, whose row the assembly renders with zero
+// listing data) has no entry in the role fold, and ModelDTO.Role is never empty.
+func roleOrOther(role routing.ModelRole) routing.ModelRole {
+	if role == "" {
+		return routing.RoleOther
+	}
+	return role
+}
+
+// viewRuntimeType is the runtime server kind a mapping is served by, the type
+// half of its role: the EFFECTIVE type of its runtime spec when it has one (the
+// explicit spec type, else the one detected from the binary -- the same value the
+// agent is pushed), else the kind its application declares when that is one of the
+// kinds the type vocabulary names, else "" (no type signal). The application
+// fallback exists for mappings no agent manages, which have no spec: a plain vLLM
+// application is a chat server whether or not an agent launched it. A proxy
+// application (litellm, llama_swap) and a server_agent application with no spec
+// row host anything and so say nothing.
+func viewRuntimeType(view mappingView, idx runtimeSpecIndex) routing.RuntimeSpecType {
+	if spec, ok := idx.specs[view.mapping.ID]; ok {
+		return routing.EffectiveRuntimeSpecType(spec)
+	}
+	switch view.app.Type {
+	case routing.ProviderVLLM:
+		return routing.RuntimeSpecTypeVLLM
+	case routing.ProviderLlamaCPP:
+		return routing.RuntimeSpecTypeLlamaCpp
+	case routing.ProviderOllama:
+		return routing.RuntimeSpecTypeOllama
+	case routing.ProviderStableDiffusionCpp:
+		return routing.RuntimeSpecTypeStableDiffusionCpp
+	case routing.ProviderAudioCpp:
+		return routing.RuntimeSpecTypeAudioCpp
+	}
+	return ""
 }
 
 // foldMappingFlags is the per-name AND shared by the capability folds: for each

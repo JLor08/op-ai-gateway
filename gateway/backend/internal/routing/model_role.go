@@ -121,6 +121,34 @@ func DeriveRole(specType RuntimeSpecType, caps map[string]bool) ModelRole {
 	return RoleOther
 }
 
+// RoleRank orders the roles by DeriveRole's priority, most specific first, with
+// RoleOther -- the absence of evidence -- last. A role outside the list ranks
+// after RoleOther. It exists for the callers that have several derivations to
+// reconcile for one name: a gateway model name offered by several mappings, each
+// with its own capability rows and runtime spec, and a model group of several
+// members, take the best-ranked of the roles, so one that establishes a role is
+// not overruled by another that merely knows nothing.
+func RoleRank(role ModelRole) int {
+	switch role {
+	case RoleASR:
+		return 0
+	case RoleTTS:
+		return 1
+	case RoleImage:
+		return 2
+	case RoleEmbedding:
+		return 3
+	case RoleReranker:
+		return 4
+	case RoleChat:
+		return 5
+	case RoleOther:
+		return 6
+	default:
+		return 7
+	}
+}
+
 // YesCapabilities projects a mapping's stored capability rows onto the map
 // DeriveRole consumes: the names whose verdict is yes, each mapped to true. A no
 // row, a row with no verdict and an absent name are all simply not in the map,

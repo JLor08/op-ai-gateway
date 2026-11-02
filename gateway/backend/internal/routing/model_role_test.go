@@ -148,3 +148,21 @@ func TestYesCapabilities(t *testing.T) {
 		t.Errorf("YesCapabilities(nil) = %#v, want a non-nil empty map", got)
 	}
 }
+
+// RoleRank is DeriveRole's priority order as a number, most specific first and
+// other (no evidence) last: the ranks must be strictly increasing along that
+// order, and a value outside the list must rank after other, so a stray string
+// can never outrank a real role in a fold.
+func TestRoleRank(t *testing.T) {
+	ordered := []ModelRole{RoleASR, RoleTTS, RoleImage, RoleEmbedding, RoleReranker, RoleChat, RoleOther}
+	for i := 1; i < len(ordered); i++ {
+		if RoleRank(ordered[i-1]) >= RoleRank(ordered[i]) {
+			t.Errorf("RoleRank(%q) = %d is not below RoleRank(%q) = %d", ordered[i-1], RoleRank(ordered[i-1]), ordered[i], RoleRank(ordered[i]))
+		}
+	}
+	for _, stray := range []ModelRole{"", "no-such-role"} {
+		if RoleRank(stray) <= RoleRank(RoleOther) {
+			t.Errorf("RoleRank(%q) = %d, want it after other (%d)", stray, RoleRank(stray), RoleRank(RoleOther))
+		}
+	}
+}

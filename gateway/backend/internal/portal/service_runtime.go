@@ -2377,6 +2377,16 @@ type AgentRuntimeSpecDTO struct {
 	// spec.Type, which may be "" -- the agent always receives a concrete
 	// kind it can act on directly.
 	Type string `json:"type"`
+	// Role is the spec's derived model role -- one of the routing.ModelRole
+	// values ("asr", "tts", "image", "embedding", "reranker", "chat", "other"),
+	// never empty: routing.DeriveRole over the RESOLVED Type above and the yes
+	// verdicts of the spec's mapping. It is the ONE derivation the portal's
+	// ModelDTO.Role also uses, shipped here so the agent's role-aware eviction
+	// and the editor's role grouping read the same value rather than each
+	// re-deriving it. It is derived on every build, never stored, so an
+	// operator's verdict change moves it (and the document's ETag) on the next
+	// push.
+	Role string `json:"role"`
 	// MetricsPath and ContextProbePath are the RESOLVED effective probe
 	// paths for Type -- routing.DeriveProbePaths(Type, spec.MetricsPath,
 	// spec.ContextProbePath): the stored per-spec override when set, else
@@ -2546,6 +2556,21 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
+	// One batch capability read for every enabled spec's mapping, for the role
+	// each spec is pushed with (no per-spec N+1). A store error is PROPAGATED like
+	// every other read here: the agent keeps its last known-good config for one
+	// skipped poll, where a role guessed from the type alone would flip, say, an
+	// embedding model to chat for one push.
+	mappingIDs := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		if _, ok := mappingByID[spec.MappingID]; ok && spec.Enabled {
+			mappingIDs = append(mappingIDs, spec.MappingID)
+		}
+	}
+	capsByMapping, err := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
 	specIDByMapping := make(map[string]string, len(specs))
 	specDTOs := make([]AgentRuntimeSpecDTO, 0, len(specs))
 	for _, spec := range specs {
@@ -2578,6 +2603,7 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		et := routing.EffectiveRuntimeSpecType(spec)
 		mp, cp := routing.DeriveProbePaths(et, spec.MetricsPath, spec.ContextProbePath)
 		specDTO.Type = string(et)
+		specDTO.Role = string(routing.DeriveRole(et, routing.YesCapabilities(capsByMapping[spec.MappingID])))
 		specDTO.MetricsPath = mp
 		specDTO.ContextProbePath = cp
 		specIDByMapping[spec.MappingID] = spec.ID
