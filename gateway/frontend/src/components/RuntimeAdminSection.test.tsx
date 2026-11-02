@@ -16,6 +16,7 @@ import { messages } from '../i18n';
 import type {
   BenchmarkRunDTO,
   BenchmarkStatus,
+  CoResidency,
   CreateMappingRequest,
   EndpointMode,
   GPUBudget,
@@ -176,6 +177,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
+    role: 'other',
     ...overrides,
   };
 }
@@ -320,7 +322,9 @@ function renderSection(
     // newest applicable VRAM measurement for its per-GPU apply affordance.
     mappingBenchmarks?: PortalApi['mappingBenchmarks'];
     warnings?: string[];
-    coresidencyPairs?: [string, string][];
+    // The stored co-residency document (mode + explicit pairs); defaults to
+    // opt_out with no pairs, what a fresh application starts as.
+    coresidency?: CoResidency;
     // Never resolves -- simulates the GET still being in flight, for the
     // "must not write before the fetch settles" regression tests.
     coresidencyPending?: boolean;
@@ -342,6 +346,18 @@ function renderSection(
     warningsFailsOnCall?: number;
     coresidencyFailing?: boolean;
     coresidencyFailsOnCall?: number;
+    // The editor groups by each spec's role, so it waits for every per-mapping
+    // spec GET to SETTLE: these two hold one back forever / fail it, to pin that
+    // wait and the "failed read lands in the other group" rule.
+    specPendingIds?: string[];
+    specFailingIds?: string[];
+    // The role is DERIVED server-side from state this screen changes (a mapping's
+    // capability verdicts, a spec's presence) and from state it does not (a
+    // probe's verdicts). The fake backend has no verdict-to-role logic, so these
+    // say what the server's derived role BECOMES once that mapping is updated or
+    // its spec is deleted; every later spec GET answers it.
+    roleAfterMappingUpdate?: Record<string, RuntimeSpec['role']>;
+    roleAfterSpecDelete?: Record<string, RuntimeSpec['role']>;
     gpuBudgetsFailing?: boolean;
     gpuBudgetsFailsOnCall?: number;
     hardware?: HardwareResponse;
@@ -376,6 +392,9 @@ function renderSection(
   // unconfigured document, where the real backend answers 404 for a mapping
   // it no longer has.
   const storedSpecs: Record<string, RuntimeSpec> = { ...specsByMappingId };
+  // Role changes the server made behind the stored documents' backs; see the
+  // two `roleAfter*` options.
+  const liveRoles: Record<string, RuntimeSpec['role']> = {};
   // One value for the initial render AND both rerender helpers: a helper that
   // silently swapped the application back to the module default would make a
   // mid-flow rerender change a fact the test did not mean to change.
@@ -385,7 +404,7 @@ function renderSection(
   const putSpecs: { mappingId: string; body: PutRuntimeSpecRequest }[] = [];
   const deletedSpecIds: string[] = [];
   const deletedMappingIds: string[] = [];
-  const putCoresidencyBodies: [string, string][][] = [];
+  const putCoresidencyBodies: CoResidency[] = [];
   const putBudgets: GPUBudget[][] = [];
   const updatedServers: { id: string; body: UpdateServerRequest }[] = [];
   const serverForTest: PortalServer = {
@@ -424,6 +443,8 @@ function renderSection(
     }),
     updateMapping: vi.fn(async (id: string, body: UpdateMappingRequest) => {
       updatedMappings.push({ id, body });
+      const roleNow = opts.roleAfterMappingUpdate?.[id];
+      if (roleNow) liveRoles[id] = roleNow;
       // Models the real PATCH: every field is a pointer, so an ABSENT key
       // leaves the stored value alone. Merging onto makeMapping()'s DEFAULTS
       // instead made an omitted `status` come back as 'active' -- the fake
@@ -437,9 +458,13 @@ function renderSection(
       delete storedSpecs[id];
       return { ok: true };
     }),
-    runtimeSpec: vi.fn(
-      async (mappingId: string) => storedSpecs[mappingId] ?? unconfiguredSpec(mappingId),
-    ),
+    runtimeSpec: vi.fn(async (mappingId: string) => {
+      if (opts.specPendingIds?.includes(mappingId)) return new Promise<RuntimeSpec>(() => {});
+      if (opts.specFailingIds?.includes(mappingId)) throw new Error('spec unavailable');
+      const spec = storedSpecs[mappingId] ?? unconfiguredSpec(mappingId);
+      const live = liveRoles[mappingId];
+      return live ? { ...spec, role: live } : spec;
+    }),
     putRuntimeSpec: vi.fn(async (mappingId: string, body: PutRuntimeSpecRequest) => {
       putSpecs.push({ mappingId, body });
       // `id` (the SPEC id, the join key against the live status stream) is
@@ -452,6 +477,9 @@ function renderSection(
         configured: true,
         mapping_id: mappingId,
         id: specsByMappingId[mappingId]?.id,
+        // The derived role is a read-only echo the backend recomputes on every
+        // read (the PUT response included); the fake keeps what was stored.
+        role: storedSpecs[mappingId]?.role ?? 'other',
         ...body,
         api_flavors: body.api_flavors.length > 0 ? body.api_flavors : ['openai', 'anthropic'],
         responses_mode: body.responses_mode || 'passthrough',
@@ -463,22 +491,26 @@ function renderSection(
     deleteRuntimeSpec: vi.fn(async (id: string) => {
       deletedSpecIds.push(id);
       delete storedSpecs[id];
+      const roleNow = opts.roleAfterSpecDelete?.[id];
+      if (roleNow) liveRoles[id] = roleNow;
       return { ok: true };
     }),
     runtimeCoresidency: vi.fn(() => {
       coresidencyCalls += 1;
-      if (opts.coresidencyPending) return new Promise<{ pairs: [string, string][] }>(() => {});
+      if (opts.coresidencyPending) return new Promise<CoResidency>(() => {});
       if (
         (opts.coresidencyFailing && coresidencyCalls === 1) ||
         opts.coresidencyFailsOnCall === coresidencyCalls
       ) {
         return Promise.reject(new Error('coresidency unavailable'));
       }
-      return Promise.resolve({ pairs: opts.coresidencyPairs ?? [] });
+      // A FRESH document per call, like a real JSON response.
+      const stored = opts.coresidency ?? { mode: 'opt_out', pairs: [] };
+      return Promise.resolve({ mode: stored.mode, pairs: stored.pairs.map((p) => ({ ...p })) });
     }),
-    putRuntimeCoresidency: vi.fn(async (_appId: string, body: { pairs: [string, string][] }) => {
-      putCoresidencyBodies.push(body.pairs);
-      return { pairs: body.pairs };
+    putRuntimeCoresidency: vi.fn(async (_appId: string, body: CoResidency) => {
+      putCoresidencyBodies.push(body);
+      return body;
     }),
     runtimeWarnings: vi.fn(() => {
       warningsCalls += 1;
@@ -739,12 +771,12 @@ async function waitForEnabledButton(name: string): Promise<void> {
 afterEach(cleanup);
 
 describe('RuntimeAdminSection tab strip', () => {
-  it('renders the specs/matrix/limits/status tabs, all four wired to real data', async () => {
+  it('renders the specs/co-residency/limits/status tabs, all four wired to real data', async () => {
     const { stream } = renderSection();
     // "specs" is the active tab, so its Tab label AND its Panel title render
     // at once (both say "Runtime-Spezifikationen") -- scope to the tab role.
     expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
-    expect(screen.getByText(t.runtimeMatrix)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeCoresidency)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
     // Scoped to the tab role like `runtimeSpecs` above, because the specs
     // table's live-state column now carries this label too and a bare text
@@ -754,11 +786,11 @@ describe('RuntimeAdminSection tab strip', () => {
     // status columns with two different words" below.
     expect(screen.getByRole('tab', { name: t.runtimeLiveStatus })).toBeInTheDocument();
 
-    // Matrix: with zero launch specs (default renderSection), the "need two"
-    // hint renders instead of a table -- proves this tab is wired to real
+    // Co-residency: with zero launch specs (default renderSection), the "need
+    // two" hint renders instead of the editor -- proves this tab is wired to real
     // data, not the old placeholder.
-    fireEvent.click(screen.getByText(t.runtimeMatrix));
-    expect(await screen.findByText(t.runtimeMatrixNeedTwo)).toBeInTheDocument();
+    fireEvent.click(screen.getByText(t.runtimeCoresidency));
+    expect(await screen.findByText(t.coresidencyNeedTwo)).toBeInTheDocument();
 
     // Limits: the GPU-budget/process-limit form renders (also no longer a
     // placeholder).
@@ -1464,8 +1496,8 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         throw new Error('boom');
       }),
       deleteRuntimeSpec: vi.fn(async () => ({ ok: true })),
-      runtimeCoresidency: vi.fn(async () => ({ pairs: [] })),
-      putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+      runtimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
+      putRuntimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
       runtimeWarnings: vi.fn(async () => ({ warnings: [] })),
       gpuBudgets: vi.fn(async () => ({ budgets: [] })),
       putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
@@ -2641,12 +2673,13 @@ describe('RuntimeAdminSection edit-without-changes round trip', () => {
   });
 });
 
-// Task 21: the matrix tab is wired to real co-residency data (see
-// RuntimeMatrix.test.tsx for the component's own rendering/canonicalisation/
-// tooltip unit tests) -- these tests pin the SECTION's data flow: computing
-// the full replaced pair list and PUTting it as a full replace, never a
-// delta.
-describe('RuntimeAdminSection co-residency matrix wiring', () => {
+// The co-residency tab is the role-grouped editor over real data (see
+// CoResidencyEditor.test.tsx for the component's own behaviour). These tests pin
+// the SECTION's data flow: every write is the COMPLETE document -- all explicit
+// pairs plus the mode, never a delta and never a mode-only update -- the editor
+// is not usable until the data it writes from and groups by has settled, and it
+// groups by each spec's role, not by the mapping's capabilities.
+describe('RuntimeAdminSection co-residency editor wiring', () => {
   function threeMappings() {
     return [
       makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' }),
@@ -2654,132 +2687,379 @@ describe('RuntimeAdminSection co-residency matrix wiring', () => {
       makeMapping({ id: 'map_3', gateway_model_name: 'Charlie' }),
     ];
   }
+  // One configured spec per mapping, carrying the backend's derived role.
+  function specsWithRoles(roles: Record<string, RuntimeSpec['role']>) {
+    return Object.fromEntries(
+      Object.entries(roles).map(([mappingId, role]) => [
+        mappingId,
+        makeSpec({
+          configured: true,
+          id: `spec_${mappingId}`,
+          mapping_id: mappingId,
+          binary: '/usr/bin/llama-server',
+          role,
+        }),
+      ]),
+    );
+  }
+  const chatSpecs = () => specsWithRoles({ map_1: 'chat', map_2: 'chat', map_3: 'chat' });
 
-  it('toggling a new cell persists the FULL replaced pair list, not just the toggled pair', async () => {
+  async function openTab() {
+    fireEvent.click(await screen.findByRole('tab', { name: t.runtimeCoresidency }));
+  }
+  async function pick(name: string) {
+    fireEvent.click(await screen.findByRole('option', { name: new RegExp(name) }));
+  }
+  async function memberControl(name: string) {
+    return screen.findByRole('group', { name: t.coresidencyMemberControl(name) });
+  }
+  async function setVerdict(member: string, label: string) {
+    fireEvent.click(within(await memberControl(member)).getByRole('button', { name: label }));
+  }
+
+  it('forbidding a pair PUTs the FULL document: the new verdict, every stored explicit pair, and the mode', async () => {
     const { putCoresidencyBodies } = renderSection({
       mappings: threeMappings(),
-      coresidencyPairs: [['map_1', 'map_2']],
+      specsByMappingId: chatSpecs(),
+      coresidency: { mode: 'opt_in', pairs: [{ a: 'map_1', b: 'map_2', verdict: 'allow' }] },
     });
-
-    fireEvent.click(await screen.findByText(t.runtimeMatrix));
-    fireEvent.click(
-      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
-    );
+    await openTab();
+    await pick('Charlie');
+    await setVerdict('Alpha', t.coresidencyVerdictForbid);
 
     await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
-    // The pre-existing pair survives AND the newly toggled one is added -- a
-    // delta-only (buggy) implementation would send just [["map_1","map_3"]].
-    expect(putCoresidencyBodies[0]).toHaveLength(2);
-    expect(putCoresidencyBodies[0]).toEqual(
+    // The pre-existing allow survives AND the forbid is added, in canonical
+    // order, under the stored mode -- a delta-only (buggy) implementation would
+    // send just the forbid.
+    expect(putCoresidencyBodies[0].mode).toBe('opt_in');
+    expect(putCoresidencyBodies[0].pairs).toHaveLength(2);
+    expect(putCoresidencyBodies[0].pairs).toEqual(
       expect.arrayContaining([
-        ['map_1', 'map_2'],
-        ['map_1', 'map_3'],
+        { a: 'map_1', b: 'map_2', verdict: 'allow' },
+        { a: 'map_1', b: 'map_3', verdict: 'forbid' },
       ]),
     );
   });
 
-  it('un-toggling an already-allowed pair removes only that pair from the persisted list', async () => {
+  it('CRITICAL: switching the mode PUTs the new mode WITH every explicit pair, never a mode-only document', async () => {
+    const stored: CoResidency = {
+      mode: 'opt_out',
+      pairs: [
+        { a: 'map_1', b: 'map_2', verdict: 'forbid' },
+        { a: 'map_2', b: 'map_3', verdict: 'allow' },
+      ],
+    };
     const { putCoresidencyBodies } = renderSection({
       mappings: threeMappings(),
-      coresidencyPairs: [
-        ['map_1', 'map_2'],
-        ['map_1', 'map_3'],
-      ],
+      specsByMappingId: chatSpecs(),
+      coresidency: stored,
     });
-
-    fireEvent.click(await screen.findByText(t.runtimeMatrix));
-    fireEvent.click(
-      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Bravo + Alpha` }),
-    );
+    await openTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.coresidencyModeOptIn }));
 
     await waitFor(() => expect(putCoresidencyBodies).toHaveLength(1));
-    expect(putCoresidencyBodies[0]).toEqual([['map_1', 'map_3']]);
+    // The PUT is a full replacement: a body without the pairs would erase every
+    // explicit verdict the operator ever set.
+    expect(putCoresidencyBodies[0]).toEqual({ mode: 'opt_in', pairs: stored.pairs });
   });
 
-  // Review round 1, CRITICAL: `coresidencyData ?? []` collapses "GET still
-  // loading" and "GET resolved to genuinely empty" into the same value. If
-  // the matrix rendered (and accepted clicks) from that collapsed `[]`
-  // before the real GET settled, a single click would PUT a full-replace
-  // list containing ONLY the just-toggled pair -- silently erasing every
-  // pair a previous admin had already saved. The fix is to render nothing
-  // clickable until the fetch has actually resolved.
-  it('CRITICAL: shows a loading state and performs no write while the co-residency GET is still pending', async () => {
+  it("groups each model by its spec's ROLE, not by the mapping's capabilities", async () => {
+    // Alpha's mapping says vision + image, which would file it under image/chat
+    // by capability. Its spec's derived role is asr, and the role is what groups.
+    const mappings = [
+      makeMapping({
+        id: 'map_1',
+        gateway_model_name: 'Alpha',
+        vision_capable: true,
+        capabilities: [
+          { capability: 'image', verdict: 'yes', source: 'manual', checked_at: '' },
+          { capability: 'vision', verdict: 'yes', source: 'manual', checked_at: '' },
+        ],
+      }),
+      makeMapping({ id: 'map_2', gateway_model_name: 'Bravo' }),
+      makeMapping({ id: 'map_3', gateway_model_name: 'Charlie' }),
+    ];
+    renderSection({
+      mappings,
+      specsByMappingId: specsWithRoles({ map_1: 'asr', map_2: 'chat', map_3: 'embedding' }),
+    });
+    await openTab();
+    await pick('Bravo');
+
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleAsr })).getByRole('group', {
+        name: t.coresidencyMemberControl('Alpha'),
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole('region', { name: t.coresidencyRoleEmbedding })).getByRole('group', {
+        name: t.coresidencyMemberControl('Charlie'),
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: t.coresidencyRoleImage })).toBeNull();
+    expect(screen.queryByRole('region', { name: t.coresidencyRoleChat })).toBeNull();
+  });
+
+  // The role is derived server-side, and the per-mapping spec cache is filled
+  // once per mount. Marking a model embedding on the mapping tab (the main way a
+  // model acquires that role) changes its role without touching the cache, so an
+  // editor that grouped by the cache would keep filing it under chat until the
+  // page was reloaded -- and a chat bulk-set would then hit it. The editor reads
+  // each spec's role again every time it is shown.
+  it('IMPORTANT: a capability edit on the mapping tab moves the model to its new group', async () => {
+    const { updatedMappings } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      roleAfterMappingUpdate: { map_1: 'embedding' },
+    });
+    await openTab();
+    await pick('Bravo');
+    // Cached and shown as chat to begin with.
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleChat })).getByRole(
+        'group',
+        {
+          name: t.coresidencyMemberControl('Alpha'),
+        },
+      ),
+    ).toBeInTheDocument();
+
+    // Mark Alpha as an embedding model on the mapping tab.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    const alphaRow = (await screen.findByText('Alpha')).closest('tr') as HTMLElement;
+    fireEvent.click(within(alphaRow).getByRole('button', { name: t.mappingEdit }));
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.mappingEmbeddingCapable }));
+    fireEvent.click(await screen.findByRole('option', { name: t.mappingCapabilityYes }));
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+    await waitFor(() => expect(updatedMappings).toHaveLength(1));
+    expect(updatedMappings[0].body.capability_verdicts).toEqual({ embedding: 'yes' });
+
+    await openTab();
+    await pick('Bravo');
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleEmbedding })).getByRole(
+        'group',
+        { name: t.coresidencyMemberControl('Alpha') },
+      ),
+    ).toBeInTheDocument();
+    // Out of chat: only Charlie is left there.
+    const chat = screen.getByRole('region', { name: t.coresidencyRoleChat });
+    expect(
+      within(chat).queryByRole('group', { name: t.coresidencyMemberControl('Alpha') }),
+    ).toBeNull();
+    expect(
+      within(chat).getByRole('group', { name: t.coresidencyMemberControl('Charlie') }),
+    ).toBeInTheDocument();
+  });
+
+  // Deleting a spec leaves a mapping with verdicts and no spec, whose role the
+  // backend still derives (from the synthesized document's type and those
+  // verdicts). The cache used to be rewritten with a locally built empty
+  // document whose role was a hard-coded "other".
+  it('IMPORTANT: a deleted spec lands in the group its verdicts give the mapping, not in "other"', async () => {
+    const { deletedSpecIds } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      roleAfterSpecDelete: { map_1: 'asr' },
+    });
+    await screen.findByText('Alpha');
+    const alphaRow = screen.getByText('Alpha').closest('tr') as HTMLElement;
+    await waitFor(() =>
+      expect(within(alphaRow).getByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled(),
+    );
+    fireEvent.click(within(alphaRow).getByRole('button', { name: t.runtimeSpecDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
+
+    await openTab();
+    await pick('Bravo');
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleAsr })).getByRole('group', {
+        name: t.coresidencyMemberControl('Alpha'),
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: t.coresidencyRoleOther })).toBeNull();
+  });
+
+  it('re-reads every spec each time the editor is shown, not only once per mount', async () => {
     const { fakeApi } = renderSection({
       mappings: threeMappings(),
-      coresidencyPending: true,
+      specsByMappingId: chatSpecs(),
     });
+    await openTab();
+    await pick('Bravo');
+    await screen.findByRole('region', { name: t.coresidencyRoleChat });
+    const afterFirst = fakeApi.runtimeSpec.mock.calls.length;
+    // Once for the lazy fan-out and once for the editor's own read, three each.
+    expect(afterFirst).toBeGreaterThanOrEqual(6);
 
-    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+    await openTab();
+    await screen.findByRole('option', { name: /Alpha/ });
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(afterFirst + 3);
+  });
 
-    // The matrix must not exist yet -- there is nothing to click, so there
-    // is nothing that could PUT an empty replacement list.
-    await screen.findByText(t.loading);
+  it('a language switch re-GETs the mapping list but does not re-read every spec', async () => {
+    const { fakeApi, rerenderWithLocale } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+    });
+    await openTab();
+    await screen.findByRole('option', { name: /Alpha/ });
+    const specReads = fakeApi.runtimeSpec.mock.calls.length;
+    const mappingReads = fakeApi.mappings.mock.calls.length;
+
+    rerenderWithLocale(messages.en);
+    await waitFor(() => expect(fakeApi.mappings.mock.calls.length).toBeGreaterThan(mappingReads));
+
+    // Same mappings, so the roles already read are still the roles of this
+    // entry: the editor stays up and no spec is fetched again.
+    expect(await screen.findByRole('option', { name: /Alpha/ })).toBeInTheDocument();
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(specReads);
+  });
+
+  it('files a mapping whose spec GET failed under the "other" group', async () => {
+    renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      specFailingIds: ['map_3'],
+    });
+    await openTab();
+
+    const other = await screen.findByRole('region', { name: t.coresidencyRoleOther });
     expect(
-      screen.queryByLabelText(`${t.runtimeMatrixCell}: Charlie + Alpha`),
-    ).not.toBeInTheDocument();
+      within(other).getByRole('group', { name: t.coresidencyMemberControl('Charlie') }),
+    ).toBeInTheDocument();
+    // The two that loaded keep their role.
+    expect(
+      within(screen.getByRole('region', { name: t.coresidencyRoleChat })).getByRole('group', {
+        name: t.coresidencyMemberControl('Bravo'),
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('does not claim to be loading when the mappings GET failed for good', async () => {
+    const { fakeApi } = renderSection({ mappingsFailing: true });
+    await openTab();
+
+    // The screen-wide banner and this tab both name it; neither says "loading".
+    expect(await screen.findAllByText(t.runtimeMappingsUnavailable)).toHaveLength(2);
+    expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
+    expect(screen.queryByRole('option')).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
   });
 
-  // Review round 1, Important: two clicks in quick succession must not let a
-  // slow first response overwrite state a second toggle already advanced --
-  // that would silently drop the second pair on the next write. The chosen
-  // fix mirrors Area 3's `limitsBusy`: disable the whole matrix while a PUT
-  // is outstanding, so a second click physically cannot fire until the
-  // first response has been reconciled.
-  it('IMPORTANT: disables the matrix while a toggle PUT is in flight, so a second click cannot race a still-pending response', async () => {
-    let resolveFirst: (v: { pairs: [string, string][] }) => void = () => {};
-    const firstPut = new Promise<{ pairs: [string, string][] }>((resolve) => {
+  // The grouping reads data that arrives one GET per mapping. Rendered before
+  // they have all settled, a model whose spec is still in flight would sit in
+  // the wrong group, and a group bulk-set would then write verdicts for the
+  // wrong set of models. Nothing is offered until the fan-out is over.
+  it('IMPORTANT: shows a loading state and offers no control while a spec GET is still pending', async () => {
+    const { fakeApi } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      specPendingIds: ['map_3'],
+    });
+    await openTab();
+
+    await screen.findByText(t.loading);
+    expect(screen.queryByRole('option')).toBeNull();
+    expect(screen.queryByRole('button', { name: t.coresidencyModeOptIn })).toBeNull();
+    expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
+  });
+
+  // Review round 1, CRITICAL (carried over): "GET still loading" and "GET
+  // resolved to genuinely empty" must not look alike. An editor that rendered
+  // from a collapsed empty document before the real GET settled would PUT a full
+  // replacement containing ONLY the just-edited pair -- silently erasing every
+  // pair a previous admin had saved. Nothing is clickable until the GET settled.
+  it('CRITICAL: shows a loading state and performs no write while the co-residency GET is still pending', async () => {
+    const { fakeApi } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      coresidencyPending: true,
+    });
+    await openTab();
+
+    await screen.findByText(t.loading);
+    expect(screen.queryByRole('option')).toBeNull();
+    expect(screen.queryByRole('group', { name: t.coresidencyMemberControl('Bravo') })).toBeNull();
+    expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
+  });
+
+  // Review round 1, Important (carried over): two edits in quick succession must
+  // not let a slow first response overwrite state a second edit already
+  // advanced. The editor is disabled while a PUT is outstanding, so a second
+  // edit physically cannot fire until the first has been reconciled -- and it
+  // says why it is disabled.
+  it('IMPORTANT: disables the editor while a PUT is in flight, so a second edit cannot race a still-pending response', async () => {
+    let resolveFirst: (v: CoResidency) => void = () => {};
+    const firstPut = new Promise<CoResidency>((resolve) => {
       resolveFirst = resolve;
     });
     const { fakeApi, putCoresidencyBodies } = renderSection({
       mappings: threeMappings(),
-      coresidencyPairs: [],
+      specsByMappingId: chatSpecs(),
     });
     fakeApi.putRuntimeCoresidency.mockImplementationOnce(async () => firstPut);
+    await openTab();
+    await setVerdict('Bravo', t.coresidencyVerdictForbid);
 
-    fireEvent.click(await screen.findByText(t.runtimeMatrix));
-    const firstCell = await screen.findByRole('checkbox', {
-      name: `${t.runtimeMatrixCell}: Bravo + Alpha`,
+    const second = within(await memberControl('Charlie')).getByRole('button', {
+      name: t.coresidencyVerdictForbid,
     });
-    fireEvent.click(firstCell);
-
-    const secondCell = await screen.findByRole('checkbox', {
-      name: `${t.runtimeMatrixCell}: Charlie + Bravo`,
-    });
-    await waitFor(() => expect(secondCell).toBeDisabled());
-    fireEvent.click(secondCell); // disabled -- must be a no-op
+    await waitFor(() => expect(second).toBeDisabled());
+    fireEvent.click(second); // disabled -- must be a no-op
     expect(fakeApi.putRuntimeCoresidency).toHaveBeenCalledTimes(1);
-    // The busy window is short, but an unexplained dead grid is the same
-    // defect as an unexplained read-only one -- and it must NOT reuse the
-    // file-mode sentence, which would tell the operator the matrix is
-    // permanently read-only when it is about to accept clicks again.
-    fireEvent.mouseOver(secondCell);
-    const busyTip = await screen.findByRole('tooltip');
-    expect(busyTip).toHaveTextContent(t.runtimeMatrixDisabledSaving);
-    expect(busyTip).not.toHaveTextContent(t.runtimeMatrixDisabledFileMode);
-    fireEvent.mouseOut(secondCell);
+    expect(screen.getByText(t.coresidencySaving)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.coresidencyModeOptIn })).toBeDisabled();
 
-    resolveFirst({ pairs: [['map_1', 'map_2']] });
-    await waitFor(() => expect(secondCell).not.toBeDisabled());
-    // ...and the reason goes away with it: a live cell must not claim it is
-    // saving.
-    fireEvent.mouseOver(secondCell);
-    expect(await screen.findByRole('tooltip')).not.toHaveTextContent(t.runtimeMatrixDisabledSaving);
-    fireEvent.mouseOut(secondCell);
+    resolveFirst({ mode: 'opt_out', pairs: [{ a: 'map_1', b: 'map_2', verdict: 'forbid' }] });
+    await waitFor(() => expect(second).not.toBeDisabled());
+    // ...and the reason goes away with it: a live editor must not claim it is saving.
+    expect(screen.queryByText(t.coresidencySaving)).toBeNull();
 
-    fireEvent.click(secondCell);
+    fireEvent.click(second);
     await waitFor(() => expect(fakeApi.putRuntimeCoresidency).toHaveBeenCalledTimes(2));
-    // Only the second call reaches the default (pushing) mock implementation
-    // -- the first was overridden above -- so exactly one entry is expected,
-    // and it must contain BOTH the reconciled first pair and the new one.
+    // Only the second call reaches the default (pushing) mock -- the first was
+    // overridden above -- so exactly one entry is expected, and it must carry
+    // BOTH the reconciled first pair and the new one.
     expect(putCoresidencyBodies).toHaveLength(1);
-    expect(putCoresidencyBodies[0]).toHaveLength(2);
-    expect(putCoresidencyBodies[0]).toEqual(
+    expect(putCoresidencyBodies[0].pairs).toHaveLength(2);
+    expect(putCoresidencyBodies[0].pairs).toEqual(
       expect.arrayContaining([
-        ['map_1', 'map_2'],
-        ['map_2', 'map_3'],
+        { a: 'map_1', b: 'map_2', verdict: 'forbid' },
+        { a: 'map_1', b: 'map_3', verdict: 'forbid' },
       ]),
     );
+  });
+
+  it("rolls a rejected save back to the stored document and names the mode error in the operator's language", async () => {
+    const { fakeApi } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      coresidency: { mode: 'opt_out', pairs: [] },
+    });
+    fakeApi.putRuntimeCoresidency.mockRejectedValueOnce(
+      new PortalApiError(400, 'runtime_coresidency.mode_invalid', 'co-residency mode is invalid'),
+    );
+    await openTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.coresidencyModeOptIn }));
+
+    expect(
+      await screen.findByText(
+        `runtime_coresidency.mode_invalid: ${t.errorRuntimeCoresidencyModeInvalid}`,
+      ),
+    ).toBeInTheDocument();
+    // Back on the stored mode, and live again (not stuck disabled).
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.coresidencyModeOptOut })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      ),
+    );
+    expect(screen.getByRole('button', { name: t.coresidencyModeOptIn })).toBeEnabled();
   });
 });
 
@@ -4483,7 +4763,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(await screen.findByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
   });
 
-  it('turns every edit affordance off: no spec form, a disabled matrix, no budget form, no overrides', async () => {
+  it('turns every edit affordance off: no spec form, no co-residency editor, no budget form, no overrides', async () => {
     const { stream } = renderFileMode();
     await screen.findByText(t.runtimeManagedLocally);
 
@@ -4492,19 +4772,17 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeSpecEditAction })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeSpecDelete })).not.toBeInTheDocument();
 
-    // Matrix: rendered (from the report) but every cell disabled -- this is
-    // exactly the `disabled` prop Task 21 built and deliberately left unwired.
-    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
-    const cell = await screen.findByRole('checkbox', {
-      name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
-    });
-    expect(cell).toBeDisabled();
-    // ...and it says WHY it is disabled. "Read-only in file mode" and "pair
-    // not allowed yet" are different facts; a greyed cell with no explanation
-    // leaves the operator to guess which one they are looking at.
-    fireEvent.mouseOver(cell);
-    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeMatrixDisabledFileMode);
-    fireEvent.mouseOut(cell);
+    // Co-residency: no editor at all -- the agent keeps its co-residency in its
+    // own file, and what the live editor writes (the gateway-side mode and
+    // verdicts) is not what is in force -- and the tab says why instead of
+    // showing an empty or greyed-out one.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
+    expect(await screen.findByText(t.coresidencyFileMode)).toBeInTheDocument();
+    expect(screen.queryByRole('option')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.coresidencyModeOptIn })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('group', { name: t.coresidencyMemberControl('File-Alpha') }),
+    ).toBeNull();
 
     // Limits: read-only, no Save, no fields.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
@@ -4522,7 +4800,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
   });
 
-  it('renders specs and the matrix from the report config, not from the gateway CRUD data', async () => {
+  it('renders specs from the report config, not from the gateway CRUD data, and offers no co-residency editor', async () => {
     renderFileMode();
     await screen.findByText(t.runtimeManagedLocally);
 
@@ -4531,12 +4809,12 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     // The gateway-side mapping is NOT what file mode shows.
     expect(screen.queryByText('Gateway-Alpha')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
-    const cell = await screen.findByRole('checkbox', {
-      name: `${t.runtimeMatrixCell}: File-Bravo + File-Alpha`,
-    });
-    // The reported coresident pair renders as set.
-    expect(cell).toBeChecked();
+    // The gateway's own mapping is no more offered for pairing than shown: the
+    // co-residency tab is the file-mode sentence, not an editor over CRUD data.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
+    expect(await screen.findByText(t.coresidencyFileMode)).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Gateway-Alpha/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('Gateway-Alpha')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
     expect(await screen.findByText('3')).toBeInTheDocument();
@@ -4561,12 +4839,9 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByText('json_syntax', { exact: false })).not.toBeInTheDocument();
     expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
-    await waitFor(() =>
-      expect(
-        screen.queryByLabelText(`${t.runtimeMatrixCell}: File-Bravo + File-Alpha`),
-      ).not.toBeInTheDocument(),
-    );
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
+    expect(await screen.findByText(t.coresidencyFileMode)).toBeInTheDocument();
+    expect(screen.queryByText('File-Bravo')).not.toBeInTheDocument();
   });
 
   it('maps the duplicate_spec_id code to its own sentence', async () => {
@@ -4666,7 +4941,6 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
         'garbage',
         { id: 42 },
       ],
-      coresident: [['rs1', 'rs2'], 'not-a-pair'],
     });
 
     expect(await screen.findByText(t.runtimeManagedLocally)).toBeInTheDocument();
@@ -4686,7 +4960,6 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       specsByMappingId: { map_1: fullSpec() },
       reportPending: true,
       gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
-      coresidencyPairs: [],
     });
 
     await screen.findByText('gw-model');
@@ -5019,7 +5292,7 @@ describe('RuntimeAdminSection failing runtime report (fix round 1, I3)', () => {
     expect(screen.queryByRole('button', { name: t.runtimeSpecEditAction })).not.toBeInTheDocument();
 
     // And no tab pretends to still be loading.
-    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMatrix }));
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeCoresidency }));
     expect(await screen.findByText(t.runtimeModeUnknownShort)).toBeInTheDocument();
     expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
@@ -5424,57 +5697,51 @@ describe('RuntimeAdminSection failing co-residency GET (task 22b, C1)', () => {
       coresidencyFailing: true,
     });
 
-    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    fireEvent.click(await screen.findByText(t.runtimeCoresidency));
     expect(await screen.findByText(t.runtimeCoresidencyUnavailable)).toBeInTheDocument();
     // Not "still loading" -- that was the whole defect.
     expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
     // And the write gating is untouched: nothing clickable, so nothing can PUT
-    // a full-replace list built from pairs we never loaded.
-    expect(
-      screen.queryByLabelText(`${t.runtimeMatrixCell}: Charlie + Alpha`),
-    ).not.toBeInTheDocument();
+    // a full-replace document built from pairs we never loaded.
+    expect(screen.queryByRole('option')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.coresidencyModeOptIn })).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: t.resourceRetry }));
     await waitFor(() => expect(fakeApi.runtimeCoresidency).toHaveBeenCalledTimes(2));
-    expect(
-      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole('option', { name: /Charlie/ })).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeCoresidencyUnavailable)).not.toBeInTheDocument();
   });
 
   // The OTHER failure shape, and the one that is a write hazard rather than
   // only a rendering one: `!loading && data !== null` reports a failed RELOAD
-  // as ready, so the matrix stayed rendered and CLICKABLE off pairs we had
-  // just failed to refresh -- and a toggle PUTs the complete replacement list,
+  // as ready, so the editor stayed rendered and EDITABLE off pairs we had just
+  // failed to refresh -- and an edit PUTs the complete replacement document,
   // silently deleting whatever another admin added meanwhile. Reachable with
   // the component mounted through the language switch, since `t` is a dep of
   // every loader here.
-  it('stops accepting toggles when a RELOAD fails over an existing pair list', async () => {
+  it('stops accepting edits when a RELOAD fails over an existing document', async () => {
     const en = messages.en;
     const { fakeApi, rerenderWithLocale } = renderSection({
       mappings: threeMappings(),
-      coresidencyPairs: [['map_1', 'map_2']],
+      coresidency: { mode: 'opt_out', pairs: [{ a: 'map_1', b: 'map_2', verdict: 'forbid' }] },
       coresidencyFailsOnCall: 2,
     });
 
-    fireEvent.click(await screen.findByText(t.runtimeMatrix));
+    fireEvent.click(await screen.findByText(t.runtimeCoresidency));
     // Loaded and live to begin with.
-    expect(
-      await screen.findByRole('checkbox', { name: `${t.runtimeMatrixCell}: Charlie + Alpha` }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole('option', { name: /Charlie/ })).toBeInTheDocument();
 
     rerenderWithLocale(en);
     await waitFor(() => expect(fakeApi.runtimeCoresidency).toHaveBeenCalledTimes(2));
 
-    // The STALE text, not the hard-failure one (fix round 1, M7): the pairs
-    // were loaded and are still in hand, so "could not be loaded" is false --
-    // what failed is the refresh, and that is what hides the matrix.
+    // The STALE text, not the hard-failure one (fix round 1, M7): the document
+    // was loaded and is still in hand, so "could not be loaded" is false --
+    // what failed is the refresh, and that is what hides the editor.
     expect(await screen.findByText(en.runtimeCoresidencyStale)).toBeInTheDocument();
     expect(screen.queryByText(en.runtimeCoresidencyUnavailable)).not.toBeInTheDocument();
-    expect(
-      screen.queryByLabelText(`${en.runtimeMatrixCell}: Charlie + Alpha`),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('option')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: en.coresidencyModeOptIn })).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeCoresidency).not.toHaveBeenCalled();
   });
 });
@@ -7296,7 +7563,7 @@ describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
     expect(screen.getAllByRole('tab').map((el) => el.textContent)).toEqual([
       t.runtimeMappingTab,
       t.runtimeSpecs,
-      t.runtimeMatrix,
+      t.runtimeCoresidency,
       t.runtimeLimits,
       t.runtimeLiveStatus,
     ]);

@@ -162,6 +162,7 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
+    role: 'other',
     ...overrides,
   };
 }
@@ -234,8 +235,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       runtimeSpec: vi.fn(async () => makeRuntimeSpec()),
       putRuntimeSpec: vi.fn(async () => makeRuntimeSpec()),
       deleteRuntimeSpec: vi.fn(async () => ({ ok: true })),
-      runtimeCoresidency: vi.fn(async () => ({ pairs: [] })),
-      putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+      runtimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
+      putRuntimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
       runtimeWarnings: vi.fn(async () => ({ warnings: [] })),
       gpuBudgets: vi.fn(async () => ({ budgets: [] })),
       putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
@@ -1583,7 +1584,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // RuntimeAdminSection's tab strip, not MappingSection's list heading.
       expect(await screen.findByRole('tab', { name: t.runtimeSpecs })).toBeInTheDocument();
       expect(screen.getByRole('tab', { name: t.runtimeMappingTab })).toBeInTheDocument();
-      expect(screen.getByText(t.runtimeMatrix)).toBeInTheDocument();
+      expect(screen.getByText(t.runtimeCoresidency)).toBeInTheDocument();
       expect(screen.getByText(t.runtimeLimits)).toBeInTheDocument();
       // Scoped to the tab role because the specs table's live-state column
       // carries this label too, so a bare text query would match twice. NOT

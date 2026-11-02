@@ -469,7 +469,7 @@ const de = {
   // Why a conversation could not start or ended, by the gateway's portal.voice_chat_* code (the
   // gate that refuses the ticket) or by the kind of failure. A refusal is the gateway's answer to
   // the very same request, so it is repeated until the configuration changes: the operator's to
-  // fix for the co-load one (co-residency matrix and GPU budgets), the user's for the stored
+  // fix for the co-load one (co-residency settings and GPU budgets), the user's for the stored
   // speech settings (a text thread carries none of its own, so a new chat gets past it).
   chatVoiceErrorAsrUnavailable:
     'Das Transkriptionsmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Live-Streaming oder nicht startbar).',
@@ -478,7 +478,7 @@ const de = {
   chatVoiceErrorTtsUnavailable:
     'Das Sprachmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Streaming oder nicht startbar).',
   chatVoiceErrorCoLoad:
-    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz-Matrix und GPU-VRAM-Budgets): Wählen Sie andere Transkriptions- oder Sprachmodelle oder wenden Sie sich an Ihren Administrator.',
+    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz und GPU-VRAM-Budgets): Wählen Sie andere Transkriptions- oder Sprachmodelle oder wenden Sie sich an Ihren Administrator.',
   chatVoiceErrorAudioSettings:
     'Die zu diesem Chat gespeicherten Spracheinstellungen sind ungültig oder zu umfangreich. Nutzen Sie den Sprachchat in einem neuen Chat.',
   chatVoiceErrorTicket:
@@ -1051,6 +1051,17 @@ const de = {
   mappingTranscriptionCapable: 'Transkription',
   mappingTranscriptionCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Audio transkribiert. Das wird automatisch aus dem Feld „task“ in /v1/models des audio.cpp-Servers erkannt („asr“ steht für Transkription): durch das Gateway mit dem nächsten Health-Check bei einem statischen Server, den es direkt erreicht, und durch den Server-Agent (ab Version 0.9.1) bei einem Modell, das er startet. Wo das noch kein Ergebnis geliefert hat, etwa bei einem älteren Agent oder einem Modell, das die Auflistung nicht nennt, setze es auf Ja, um die Transkription freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
+  // Embedding und Reranker sind keine erkannten Merkmale: Nichts im Gateway
+  // prüft sie, und kein Paar ist reserviert -- darum bieten beide Steuerungen,
+  // wie Vision, alle drei Zustände an, und das Urteil des Betreibers ist die
+  // einzige Quelle. Sie legen die Rolle des Modells fest (Vektor-Encoder bzw.
+  // Reranker statt Textgenerator), siehe DeriveRole im Backend.
+  mappingEmbeddingCapable: 'Embedding-Modell',
+  mappingEmbeddingCapableUnknownHint:
+    'Unbekannt = keine Festlegung. Das Gateway erkennt Embedding-Modelle nicht selbst; automatisch gesetzt wird es nur bei einem Ollama-Modell, das der Server-Agent startet und für das Ollama die Fähigkeit „embedding“ meldet. Überall sonst setze es auf Ja, um das Modell als Embedding-Modell (Vektor-Encoder, kein Textgenerator) zu kennzeichnen. Das Gateway leitet daraus die Rolle des Modells ab.',
+  mappingRerankCapable: 'Reranker-Modell',
+  mappingRerankCapableUnknownHint:
+    'Unbekannt = keine Festlegung. Das Gateway erkennt Reranker-Modelle nicht; sie werden ausschließlich vom Betreiber gekennzeichnet. Setze es auf Ja, um das Modell als Reranker (bewertet Anfrage-Dokument-Paare, kein Textgenerator) zu kennzeichnen. Das Gateway leitet daraus die Rolle des Modells ab.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1101,27 +1112,48 @@ const de = {
   runtimeSpecStartupTimeout: 'Start-Timeout (s)',
   runtimeSpecPinned: 'Angeheftet (nie beenden)',
   runtimeSpecEnabled: 'Aktiviert',
-  runtimeMatrix: 'Koresidenz-Matrix',
-  runtimeMatrixHint:
-    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen.',
-  runtimeMatrixCell: 'Koresidenz umschalten',
-  runtimeMatrixNeedTwo:
-    'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz-Matrix zu verwalten.',
-  // The lead line of every cell tooltip. It answers the question the operator
-  // actually has ("dürfen diese zwei zusammen laufen?") and names the rule
-  // that surprised a real one: the matrix is checked over the whole running
-  // set, GPUs do not enter into it.
-  runtimeMatrixConsequence:
-    'Erlaubt diesen beiden Modellen, gleichzeitig zu laufen. Die Matrix gilt unabhängig von den GPUs: Solange dieses Paar nicht angehakt ist, verdrängt der Start des einen das andere – auch auf getrennten Karten.',
-  runtimeMatrixNoSharedGpu:
-    'Keine gemeinsame GPU – diese beiden Modelle konkurrieren um kein VRAM.',
-  runtimeMatrixAdvisory:
-    'Nur ein Hinweis: Die endgültige Entscheidung trifft der Agent zur Laufzeit anhand der tatsächlich laufenden Prozesse.',
-  runtimeMatrixOverBudget: 'über Budget',
-  runtimeMatrixDisabledFileMode:
+  // The role-grouped co-residency editor.
+  runtimeCoresidency: 'Koresidenz',
+  runtimeCoresidencyHint:
+    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen. Was Sie nicht festlegen, folgt dem Standard des Servers.',
+  coresidencyModeLabel: 'Standard für nicht festgelegte Paare',
+  coresidencyModeOptOut: 'Erlaubt (Opt-out)',
+  coresidencyModeOptIn: 'Nicht erlaubt (Opt-in)',
+  coresidencyDefaultAllowedHint:
+    'Standard = erlaubt: Zwei Modelle dürfen zusammen laufen, solange Sie das Paar nicht ausdrücklich verbieten. Ihre ausdrücklichen Einstellungen bleiben beim Umschalten erhalten.',
+  coresidencyDefaultDeniedHint:
+    'Standard = nicht erlaubt: Zwei Modelle laufen nur zusammen, wenn Sie das Paar ausdrücklich erlauben. Ihre ausdrücklichen Einstellungen bleiben beim Umschalten erhalten.',
+  coresidencyVerdictAllow: 'Erlaubt',
+  coresidencyVerdictForbid: 'Verboten',
+  coresidencyVerdictDefaultAllowed: 'Standard (erlaubt)',
+  coresidencyVerdictDefaultDenied: 'Standard (nicht erlaubt)',
+  coresidencySearch: 'Modelle suchen',
+  coresidencyModelList: 'Modelle',
+  coresidencyExceptions: (n: number) =>
+    n === 1 ? '1 ausdrückliche Einstellung' : `${n} ausdrückliche Einstellungen`,
+  coresidencyDetailHint:
+    'Mit welchen Modellen darf dieses Modell gleichzeitig laufen? Eine Gruppe setzt alle ihre Modelle auf einmal; einzelne Modelle können davon abweichen.',
+  coresidencyRoleAsr: 'Spracherkennung (ASR)',
+  coresidencyRoleTts: 'Sprachausgabe (TTS)',
+  coresidencyRoleImage: 'Bild',
+  coresidencyRoleEmbedding: 'Embedding',
+  coresidencyRoleReranker: 'Reranker',
+  coresidencyRoleChat: 'Chat',
+  coresidencyRoleOther: 'Sonstige',
+  coresidencyGroupSize: (n: number) => (n === 1 ? '1 Modell' : `${n} Modelle`),
+  coresidencyGroupMixed: 'gemischt',
+  coresidencyFromGroup: 'von Gruppe',
+  coresidencyGroupControl: (role: string) => `Alle Modelle der Gruppe ${role}`,
+  coresidencyMemberControl: (name: string) => `Koresidenz mit ${name}`,
+  coresidencyGroupToggle: (role: string) => `Gruppe ${role} ein- oder ausklappen`,
+  coresidencyNeedTwo:
+    'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz zu verwalten.',
+  coresidencyNoMatch: 'Kein Modell passt zur Suche.',
+  coresidencyResize: 'Breite der Modellliste ändern',
+  coresidencySaving:
+    'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Ansicht wieder Änderungen an.',
+  coresidencyFileMode:
     'Schreibgeschützt: Der Agent verwaltet seine Prozesse aus seiner eigenen lokalen Datei. Die Koresidenz wird dort gepflegt, nicht hier.',
-  runtimeMatrixDisabledSaving:
-    'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Matrix wieder Klicks an.',
   runtimeLimits: 'Runtime-Limits',
   runtimeLimitsIntro:
     'Pro-GPU-VRAM-Budgets und die maximale Zahl gleichzeitig laufender Prozesse für diesen Server festlegen.',
@@ -1417,7 +1449,7 @@ const de = {
   runtimeMappingsUnavailable:
     'Die Modell-Zuordnungen dieser Anwendung konnten nicht geladen werden. Solange das so ist, lässt sich kein gemeldeter Prozess einem Modell zuordnen, und im Reiter „Live-Status“ stehen keine Übersteuerungen zur Verfügung.',
   runtimeCoresidencyUnavailable:
-    'Die Co-Residency-Regeln konnten nicht geladen werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Paare löschen.',
+    'Die Co-Residency-Regeln konnten nicht geladen werden. Der Editor bleibt deshalb ausgeblendet: Eine Änderung schreibt das vollständige Dokument (Modus und alle Paare), und aus einem nicht geladenen würde sie bereits gespeicherte Paare löschen.',
   runtimeBudgetsUnavailable:
     'Die GPU-Budgets konnten nicht geladen werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und aus einer nicht geladenen Liste würde es bereits gespeicherte Budgets löschen.',
   runtimeWarningsUnavailable:
@@ -1429,7 +1461,7 @@ const de = {
   runtimeMappingsStale:
     'Die Modell-Zuordnungen konnten nicht aktualisiert werden. Angezeigt wird — und zugeordnet wird gegen — die zuletzt geladene Liste; sie kann veraltet sein.',
   runtimeCoresidencyStale:
-    'Die Co-Residency-Regeln konnten nicht aktualisiert werden. Die Matrix bleibt deshalb ausgeblendet: Ein Umschalten schreibt die vollständige Paarliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
+    'Die Co-Residency-Regeln konnten nicht aktualisiert werden. Der Editor bleibt deshalb ausgeblendet: Eine Änderung schreibt das vollständige Dokument (Modus und alle Paare), und das zuletzt geladene ist möglicherweise nicht mehr aktuell.',
   runtimeBudgetsStale:
     'Die GPU-Budgets konnten nicht aktualisiert werden. Das Formular bleibt deshalb ausgeblendet: Speichern schreibt die vollständige Budgetliste, und die zuletzt geladene ist möglicherweise nicht mehr aktuell.',
   runtimeWarningsStale:
@@ -1773,6 +1805,10 @@ const de = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
+  // Embedding und Reranker kennzeichnen die ROLLE des Modells (Vektor-Encoder
+  // bzw. Reranker); beide stammen vom Betreiber, siehe das Zuordnungsformular.
+  capabilityEmbedding: 'Embedding',
+  capabilityRerank: 'Reranker',
   capabilityTranscription: 'Transkription',
   // Refines "Transkription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
@@ -1901,6 +1937,7 @@ const de = {
   errorRuntimeSpecResponsesLiveTimingsUnsupported:
     'Live-Timings sind für die Art dieses Servers nicht verfügbar; nur llama.cpp kann sie liefern. Die Meldung nennt die erkannte Art.',
   errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
+  errorRuntimeCoresidencyModeInvalid: 'Ungültiger Koresidenz-Modus',
   errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
   errorServerRuntimeLimitInvalid: 'Ungültiges Prozess-Limit',
   errorApplicationManagedRuntimeOnly: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen',
@@ -3935,7 +3972,7 @@ const en: PortalMessages = {
   chatVoiceErrorTtsUnavailable:
     'The speech model cannot be used for Voice Chat (unreachable, no streaming, or it could not be started).',
   chatVoiceErrorCoLoad:
-    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency matrix and GPU VRAM budgets): pick other transcription or speech models, or contact your administrator.',
+    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency settings and GPU VRAM budgets): pick other transcription or speech models, or contact your administrator.',
   chatVoiceErrorAudioSettings:
     'The speech settings stored with this chat are invalid or too large. Use Voice Chat in a new chat.',
   chatVoiceErrorTicket: 'Voice Chat could not be started. Try again in a moment.',
@@ -4409,6 +4446,17 @@ const en: PortalMessages = {
   mappingTranscriptionCapable: 'Transcription',
   mappingTranscriptionCapableUnknownHint:
     'Unknown: whether this mapping transcribes audio is not on file. It is detected automatically from the "task" field of the audio.cpp server\'s /v1/models ("asr" means transcription): by the gateway on the next health check for a static server it reaches directly, and by the server agent (version 0.9.1 or later) for a model it launches. Where that has not produced a verdict yet, for example with an older agent or a model the listing does not name, set it to Yes to enable transcription. A Yes set here takes precedence over the automatic detection.',
+  // Embedding and reranker are not detected traits: nothing in the gateway
+  // probes either one and neither pair is reserved, so both controls offer all
+  // three states like vision and the operator's verdict is the only source.
+  // They set the model's ROLE (a vector encoder / a reranker rather than a text
+  // generator), see DeriveRole in the backend.
+  mappingEmbeddingCapable: 'Embedding model',
+  mappingEmbeddingCapableUnknownHint:
+    'Unknown = no verdict on file. The gateway does not detect embedding models itself; it is set automatically only for an Ollama model the server agent launches and for which Ollama declares the "embedding" capability. Anywhere else, set it to Yes to mark the model as an embedding model (a vector encoder, not a text generator). The gateway derives the model\'s role from it.',
+  mappingRerankCapable: 'Reranker model',
+  mappingRerankCapableUnknownHint:
+    "Unknown = no verdict on file. The gateway does not detect reranker models; only an operator marks them. Set it to Yes to mark the model as a reranker (it scores query/document pairs, it does not generate text). The gateway derives the model's role from it.",
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -4457,21 +4505,45 @@ const en: PortalMessages = {
   runtimeSpecStartupTimeout: 'Startup timeout (s)',
   runtimeSpecPinned: 'Pinned (never stop)',
   runtimeSpecEnabled: 'Enabled',
-  runtimeMatrix: 'Co-residency matrix',
-  runtimeMatrixHint:
-    'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy.',
-  runtimeMatrixCell: 'Toggle co-residency',
-  runtimeMatrixNeedTwo: 'At least two launch specs are needed to manage the co-residency matrix.',
-  runtimeMatrixConsequence:
-    'Allows these two models to run at the same time. The matrix applies regardless of GPUs: while this pair is unticked, starting one evicts the other — even on separate cards.',
-  runtimeMatrixNoSharedGpu: 'No shared GPU — these two models never compete for VRAM.',
-  runtimeMatrixAdvisory:
-    'Advisory only — the agent makes the final call at runtime based on the processes actually running.',
-  runtimeMatrixOverBudget: 'over budget',
-  runtimeMatrixDisabledFileMode:
+  runtimeCoresidency: 'Co-residency',
+  runtimeCoresidencyHint:
+    'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy. Anything you leave unset follows the server default.',
+  coresidencyModeLabel: 'Default for unset pairs',
+  coresidencyModeOptOut: 'Allowed (opt-out)',
+  coresidencyModeOptIn: 'Not allowed (opt-in)',
+  coresidencyDefaultAllowedHint:
+    'Default = allowed: two models may run together unless you explicitly forbid the pair. Your explicit settings are kept when you switch the mode.',
+  coresidencyDefaultDeniedHint:
+    'Default = not allowed: two models run together only if you explicitly allow the pair. Your explicit settings are kept when you switch the mode.',
+  coresidencyVerdictAllow: 'Allowed',
+  coresidencyVerdictForbid: 'Forbidden',
+  coresidencyVerdictDefaultAllowed: 'Default (allowed)',
+  coresidencyVerdictDefaultDenied: 'Default (not allowed)',
+  coresidencySearch: 'Search models',
+  coresidencyModelList: 'Models',
+  coresidencyExceptions: (n: number) => (n === 1 ? '1 explicit setting' : `${n} explicit settings`),
+  coresidencyDetailHint:
+    'Which models may this one run alongside? A group sets all of its models at once; individual models can deviate from it.',
+  coresidencyRoleAsr: 'Speech recognition (ASR)',
+  coresidencyRoleTts: 'Speech synthesis (TTS)',
+  coresidencyRoleImage: 'Image',
+  coresidencyRoleEmbedding: 'Embedding',
+  coresidencyRoleReranker: 'Reranker',
+  coresidencyRoleChat: 'Chat',
+  coresidencyRoleOther: 'Other',
+  coresidencyGroupSize: (n: number) => (n === 1 ? '1 model' : `${n} models`),
+  coresidencyGroupMixed: 'mixed',
+  coresidencyFromGroup: 'from group',
+  coresidencyGroupControl: (role: string) => `All models in group ${role}`,
+  coresidencyMemberControl: (name: string) => `Co-residency with ${name}`,
+  coresidencyGroupToggle: (role: string) => `Expand or collapse group ${role}`,
+  coresidencyNeedTwo: 'At least two launch specs are needed to manage co-residency.',
+  coresidencyNoMatch: 'No model matches the search.',
+  coresidencyResize: 'Resize the model list',
+  coresidencySaving:
+    'The previous change is still saving — the editor accepts changes again in a moment.',
+  coresidencyFileMode:
     'Read-only: the agent manages its processes from its own local file. Co-residency is maintained there, not here.',
-  runtimeMatrixDisabledSaving:
-    'The previous change is still saving — the matrix accepts clicks again in a moment.',
   runtimeLimits: 'Runtime limits',
   runtimeLimitsIntro:
     'Set per-GPU VRAM budgets and the maximum number of concurrently running processes for this server.',
@@ -4748,7 +4820,7 @@ const en: PortalMessages = {
   runtimeMappingsUnavailable:
     'The model mappings of this application could not be loaded. Until they do, no reported process can be matched to a model and no override actions are available on the "Live status" tab.',
   runtimeCoresidencyUnavailable:
-    'The co-residency rules could not be loaded, so the matrix stays hidden: a toggle writes the complete pair list, and computing it from a list we could not load would delete pairs that are already saved.',
+    'The co-residency rules could not be loaded, so the editor stays hidden: an edit writes the complete document (mode and every pair), and computing it from one we could not load would delete pairs that are already saved.',
   runtimeBudgetsUnavailable:
     'The GPU budgets could not be loaded, so the form stays hidden: saving writes the complete budget list, and computing it from a list we could not load would delete budgets that are already saved.',
   runtimeWarningsUnavailable:
@@ -4760,7 +4832,7 @@ const en: PortalMessages = {
   runtimeMappingsStale:
     'The model mappings could not be refreshed. What is shown — and what every reported process is matched against — is the last list loaded, which may be out of date.',
   runtimeCoresidencyStale:
-    'The co-residency rules could not be refreshed, so the matrix stays hidden: a toggle writes the complete pair list, and the last one loaded may no longer be current.',
+    'The co-residency rules could not be refreshed, so the editor stays hidden: an edit writes the complete document (mode and every pair), and the last one loaded may no longer be current.',
   runtimeBudgetsStale:
     'The GPU budgets could not be refreshed, so the form stays hidden: saving writes the complete budget list, and the last one loaded may no longer be current.',
   runtimeWarningsStale:
@@ -5070,6 +5142,10 @@ const en: PortalMessages = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
+  // Embedding and reranker mark the model's ROLE (a vector encoder / a
+  // reranker); both are operator-stated, see the mapping form.
+  capabilityEmbedding: 'Embedding',
+  capabilityRerank: 'Reranker',
   capabilityTranscription: 'Transcription',
   // Refines "Transcription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
@@ -5185,6 +5261,7 @@ const en: PortalMessages = {
   errorRuntimeSpecResponsesLiveTimingsUnsupported:
     'Live timings are not available for this runtime kind; only llama.cpp can report them. The message names the detected kind.',
   errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
+  errorRuntimeCoresidencyModeInvalid: 'Invalid co-residency mode',
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',
   errorServerRuntimeLimitInvalid: 'Invalid process limit',
   errorApplicationManagedRuntimeOnly: 'This server only accepts agent-managed applications',

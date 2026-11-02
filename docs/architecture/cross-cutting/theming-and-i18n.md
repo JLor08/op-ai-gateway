@@ -229,15 +229,16 @@ the probe states, and
 [§11.8](agent-runtime-manager.md#118-the-models-overviews-loading-count)
 for the count.
 
-Two portal behaviours on that screen are **advisory by design and must never
-block a write**: the co-residency matrix's per-cell VRAM tooltip (the agent's own
-arithmetic is the veto, so the portal must not pre-empt it) and the GPU
-UUID-drift warning. Its launch-spec form's client-side placeholder validation is
-different in kind — it mirrors the agent's real expansion rule exactly and is a
-convenience preview of a rule enforced agent-side, **not** a second source of
-truth. Turning either advisory into a hard client-side block makes the portal
-refuse configurations the agent would accept; duplicating the placeholder rule
-loosely lets the two drift.
+One portal behaviour on that screen is **advisory by design and must never
+block a write**: the GPU UUID-drift warning. (The co-residency matrix's per-cell
+VRAM tooltip was the other, and was dropped with the matrix: the agent's own
+arithmetic is the veto, so the portal must not pre-empt it, and a replacement
+editor that predicted it would only be a second copy that can drift.) Its
+launch-spec form's client-side placeholder validation is different in kind — it
+mirrors the agent's real expansion rule exactly and is a convenience preview of a
+rule enforced agent-side, **not** a second source of truth. Turning the advisory
+into a hard client-side block makes the portal refuse configurations the agent
+would accept; duplicating the placeholder rule loosely lets the two drift.
 
 ## 10. Backend error codes in the portal
 

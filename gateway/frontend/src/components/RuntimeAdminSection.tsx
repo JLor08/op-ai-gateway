@@ -38,6 +38,7 @@ import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import type {
   ApplicationStatus,
   BenchmarkRunDTO,
+  CoResidency,
   EndpointMode,
   GPUBudget,
   HardwareGPU,
@@ -56,7 +57,7 @@ import type {
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { formatPortalError, formatMetric, formatDate } from './shared/format';
 import { useResource } from './shared/useResource';
-import { ResourceFallback, resourceState } from './shared/ResourceFallback';
+import { ResourceFallback, resourceState, type ResourceState } from './shared/ResourceFallback';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { StatusChip } from './shared/StatusChip';
 import { runtimeStateBadge, runtimeStateLabel } from './shared/runtimeState';
@@ -90,14 +91,13 @@ import {
 } from './shared/vram';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
-import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
+import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 
-// Area 1 (Task 20) is "Launch specs"; areas 2-3 (this task, Task 21) are the
-// co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
-// still a stub rendered from the same tab strip so the whole section's
-// navigation is visible/testable now.
-type Tab = 'mapping' | 'specs' | 'matrix' | 'limits' | 'status';
+// Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
+// server limits; area 4 (Task 22) is "Live status". One tab strip carries them
+// all, next to the model-mapping tab.
+type Tab = 'mapping' | 'specs' | 'coresidency' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -261,6 +261,10 @@ function emptySpec(mappingId: string): RuntimeSpec {
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
+    // A placeholder, like effective_type: the role is derived server-side from
+    // verdicts this document does not carry, and nothing may group by it. The
+    // co-residency editor reads every spec again when it is shown.
+    role: 'other',
   };
 }
 
@@ -445,7 +449,6 @@ type ReportConfig = {
   maxProcesses: number | null;
   budgets: { index: number; budgetMb: number }[];
   specs: ReportSpec[];
-  coresident: [string, string][];
   /** Something, at some level, did not have the shape we expected. */
   unrecognised: boolean;
 };
@@ -456,7 +459,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // A spec entry with no usable identity cannot be rendered as a row at all
 // (it would collide with every other identity-less entry as a React key and
-// could not be addressed in the co-residency matrix) -- those are reported as
+// could not be told apart from the others) -- those are reported as
 // unrecognised by the caller. Everything else degrades field by field.
 function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): ReportSpec | null {
   if (!isRecord(value)) return null;
@@ -515,7 +518,6 @@ function narrowReportConfig(config: unknown): ReportConfig {
     maxProcesses: null,
     budgets: [],
     specs: [],
-    coresident: [],
     unrecognised: false,
   };
   if (!isRecord(config)) {
@@ -554,23 +556,6 @@ function narrowReportConfig(config: unknown): ReportConfig {
   } else if (specs !== undefined && specs !== null) {
     out.unrecognised = true;
   }
-  const coresident = config.coresident;
-  if (Array.isArray(coresident)) {
-    for (const entry of coresident) {
-      if (
-        Array.isArray(entry) &&
-        entry.length === 2 &&
-        typeof entry[0] === 'string' &&
-        typeof entry[1] === 'string'
-      ) {
-        out.coresident.push([entry[0], entry[1]]);
-      } else {
-        out.unrecognised = true;
-      }
-    }
-  } else if (coresident !== undefined && coresident !== null) {
-    out.unrecognised = true;
-  }
   return out;
 }
 
@@ -585,10 +570,11 @@ function narrowReportConfig(config: unknown): ReportConfig {
 // added to RuntimeSpec later carries through by itself instead of being
 // silently dropped here.
 function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
-  // api_token_set/app_api_token_set/app_api_token_header and the RuntimeSpec
+  // api_token_set/app_api_token_set/app_api_token_header, the RuntimeSpec
   // Type block's own effective_type/resolved_metrics_path/
-  // resolved_context_probe_path are READ-ONLY echoes (PutRuntimeSpecRequest
-  // excludes all six, same as configured/id/mapping_id) -- dropped here too
+  // resolved_context_probe_path and the derived `role` are READ-ONLY echoes
+  // (PutRuntimeSpecRequest excludes all seven, same as configured/id/
+  // mapping_id) -- dropped here too
   // so an override click never round-trips them back as if they were
   // writable. type/metrics_path/context_probe_path (the writable trio) DO
   // belong in `rest`: an override must preserve them unchanged, exactly like
@@ -618,6 +604,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     effective_type,
     resolved_metrics_path,
     resolved_context_probe_path,
+    role,
     responses_live_timings_enabled,
     ram_measured_mb,
     ...rest
@@ -1243,14 +1230,25 @@ const apiTokenBackendRows: {
   },
 ];
 
+// What the co-residency tab may say about the roles its editor groups by: the
+// mappings GET failing hard is `error` (nothing to read the specs of), the
+// spec fan-out not having settled is `loading`, anything else `ready`.
+function coresidencyRolesStateOf(
+  mappingsStatus: ResourceState,
+  rolesRead: { unreadable: ReadonlySet<string> } | null,
+): ResourceState {
+  if (mappingsStatus === 'error') return 'error';
+  if (rolesRead === null) return 'loading';
+  return 'ready';
+}
+
 export function RuntimeAdminSection({
   t,
   api,
   // Area 1 doesn't read this (server context already folds into `trail`
-  // before this component ever mounts, same as MappingSection); areas 2-3
-  // (this task) are server-scoped -- the matrix's budget-sum tooltip and the
-  // "server limits" tab both need server.id, and the latter also reads/writes
-  // server.runtime_max_processes. Live status (Task 22) will need it too.
+  // before this component ever mounts, same as MappingSection); the later
+  // areas are server-scoped -- the "server limits" tab needs server.id and
+  // reads/writes server.runtime_max_processes, and so does live status.
   server,
   application,
   trail = [],
@@ -1275,7 +1273,7 @@ export function RuntimeAdminSection({
     | 'subscribeRuntimeStatus'
     // T3: the live-status tab's per-row log view.
     | 'subscribeRuntimeLogs'
-    // Task 21 (matrix + server limits): the process-limit field is saved
+    // Task 21 (server limits): the process-limit field is saved
     // through the general server PATCH, and a new budget row is prefilled
     // from the same live-telemetry hardware report the Hardware tab reads.
     | 'updateServer'
@@ -1355,7 +1353,7 @@ export function RuntimeAdminSection({
   // its actions cell blank and its `Unmatched` chip suppressed -- the silent
   // blank the chip exists to prevent.
   //
-  // This resource feeds all four tabs (the list, the matrix's spec set, the
+  // This resource feeds all four tabs (the list, the co-residency model list, the
   // status table's spec_id -> mapping join and with it every override action),
   // so its failure is a screen-wide fact and its banner sits above the tab
   // strip rather than in one tab.
@@ -1605,86 +1603,140 @@ export function RuntimeAdminSection({
     return true;
   }
 
-  // ---- Area 2: co-residency matrix --------------------------------------
-  // Canonicalisation (which of the two mapping ids sorts first) is entirely
-  // the BACKEND's job (SetCoResidency sorts each pair before storing/
-  // comparing -- see service_runtime.go) -- RuntimeMatrix mirrors the same
-  // rule client-side purely so the UI never has to wait on a round trip to
-  // know which cell a click means. `pairs` is always the FULL current set;
-  // toggling computes the complete new set and PUTs it (full replace, never a
-  // delta -- this is how the backend models it and avoids lost updates
-  // between two admins editing concurrently).
+  // ---- Area 2: co-residency ----------------------------------------------
+  // The stored document is `{mode, pairs}`: the per-server mode and every
+  // EXPLICIT pair with its verdict. CoResidencyEditor is controlled and reports
+  // the COMPLETE next document on every edit (all explicit pairs + the mode); an
+  // edit is saved by PUTting exactly that -- a full replace, never a delta and
+  // never a mode-only update (that would erase every explicit verdict). That is
+  // how the backend models it, and it avoids lost updates between two admins
+  // editing concurrently. Canonicalisation (which of the two mapping ids sorts
+  // first) is the editor's job on the way out and the BACKEND's on the way in
+  // (SetCoResidency sorts each pair before storing/comparing).
   const {
     data: coresidencyData,
     setData: setCoresidencyData,
     error: coresidencyError,
     loading: coresidencyLoading,
     reload: reloadCoresidency,
-  } = useResource(
-    () => api.runtimeCoresidency(application.id).then((r) => r.pairs),
-    [api, application.id, t],
-    t,
-  );
-  // `null` (not loaded yet) and `[]` (loaded, genuinely empty) are DIFFERENT
-  // facts -- collapsing them with `coresidencyData ?? []` would make a click
-  // that lands before the GET settles compute its full-replace PUT from an
-  // empty list, wiping every pair a previous admin already saved. `ready`
-  // gates both rendering (a loading message instead of the matrix) and
-  // writing (see the missing-loading-state fix, task-21 review round 1).
+  } = useResource(() => api.runtimeCoresidency(application.id), [api, application.id, t], t);
+  // `null` (not loaded yet) and a document with no pairs (loaded, genuinely
+  // empty) are DIFFERENT facts -- collapsing them with a defaulted empty
+  // document would make an edit that lands before the GET settles compute its
+  // full-replace PUT from nothing, wiping every pair a previous admin already
+  // saved. `ready` gates both rendering (a loading message instead of the
+  // editor) and writing (see the missing-loading-state fix, task-21 review
+  // round 1).
   //
   // It is `resourceState`'s `ready` rather than the old
   // `!loading && data !== null`, which is STRICTLY LOOSER: that test reports a
   // failed RELOAD over an existing payload as ready
   // (shared/ResourceFallback.tsx), and this loader's deps include `t`, so a
   // language switch whose re-GET fails reaches exactly that state with the
-  // component still mounted. The matrix would then render, clickable, off
-  // pairs we just failed to refresh -- and a toggle PUTs the FULL replacement
-  // list, so a pair another admin added meanwhile would be silently deleted.
-  // That is task-21's Critical reached through a different door, so this gate
-  // gets tighter here, never looser.
+  // component still mounted. The editor would then render, editable, off a
+  // document we just failed to refresh -- and an edit PUTs the FULL replacement,
+  // so a pair another admin added meanwhile would be silently deleted. That is
+  // task-21's Critical reached through a different door, so this gate gets
+  // tighter here, never looser.
   const coresidencyStatus = resourceState({
     loading: coresidencyLoading,
     error: coresidencyError,
     data: coresidencyData,
   });
   const coresidencyReady = coresidencyStatus === 'ready';
-  const coresidencyPairs = coresidencyData ?? [];
   useEffect(() => {
     if (coresidencyError) showError(coresidencyError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [coresidencyError]);
 
-  const matrixSpecs: RuntimeMatrixSpec[] = mappings.map((m) => ({
-    id: m.id,
-    model: m.gateway_model_name,
-    gpus: (specsById[m.id]?.gpus ?? []).map((g) => ({
-      index: g.index,
-      vramMb: g.vram_estimate_mb,
-    })),
-  }));
+  // The editor groups by each spec's DERIVED role (RuntimeSpec.role -- the
+  // backend's routing.DeriveRole over the spec's effective type and its
+  // mapping's verdicts), read off the per-mapping spec cache. Not the mapping's
+  // capability flags: those are an AND across every mapping of a name and can
+  // disagree with the best-ranked role.
+  //
+  // The cache cannot be trusted for it as it stands, because that cache is
+  // filled once per mount (`loadedIdsRef` never re-fetches) and the role moves
+  // for reasons it never sees: an operator marks a model embedding on the
+  // mapping tab (`updateMapping`, which touches no spec), a spec is deleted
+  // (the cache is rewritten with a locally built document whose role is only a
+  // placeholder), or a probe writes a verdict in the background (an Ollama
+  // `embedding`, an audio.cpp `transcription`). A role read once and kept would
+  // file the model under its OLD group until the page was reloaded, and a group
+  // bulk-set would then write verdicts for the wrong set of models. So every
+  // time the editor is shown, every spec is read AGAIN and the editor waits for
+  // those reads: the role is read when it is needed instead of invalidated by
+  // each path that can change it (and a path added later cannot be missed).
+  //
+  // The reads go through the cache's ordered-read primitives (`beginSpecRead` /
+  // `commitSpecRead`), so one that overlaps a write of this section's own is
+  // refused exactly like the lazy one. A spec that cannot be read is filed under
+  // "other" -- never under a role this entry could not confirm.
+  const coresidencyMappingIds = mappings.map((m) => m.id).join('\u0000');
+  // Keyed on the list being IN HAND, not on its status: a reload (a language
+  // switch re-GETs it) passes through `loading` with the previous list intact,
+  // and that must not re-read every spec.
+  const rolesReadable = tab === 'coresidency' && mappingsData !== null;
+  const [rolesRead, setRolesRead] = useState<{ unreadable: ReadonlySet<string> } | null>(null);
+  useEffect(() => {
+    if (!rolesReadable) return undefined;
+    let cancelled = false;
+    (async () => {
+      const unreadable = new Set<string>();
+      await Promise.all(
+        mappings.map(async (m) => {
+          const seen = beginSpecRead(m.id);
+          try {
+            const spec = await api.runtimeSpec(m.id);
+            if (!cancelled) commitSpecRead(m.id, seen, spec);
+          } catch (err) {
+            unreadable.add(m.id);
+            if (!cancelled) showError(formatPortalError(err, t));
+          }
+        }),
+      );
+      if (!cancelled) setRolesRead({ unreadable });
+    })();
+    return () => {
+      cancelled = true;
+      // Leaving the tab (or the mapping set changing) ends this read's claim to
+      // be current: the next time the editor is shown starts from "not read".
+      setRolesRead(null);
+    };
+    // `mappings` is covered by its id key: a language switch re-GETs the list
+    // into a new array with the same ids and must not re-read every spec.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rolesReadable, coresidencyMappingIds, api]);
 
-  // Serializes toggles: while a PUT is in flight, the matrix is disabled
-  // (mirrors Area 3's limitsBusy) so a second click cannot compute its next
-  // full-replace list from state a still-outstanding first response might
-  // later overwrite. Chosen over a toggle QUEUE (buffering clicks and
-  // replaying them once the in-flight PUT settles) because every other
-  // full-replace write in this section (spec save, limits save) already
-  // uses the same "disable until the response lands" idiom, and a silently
-  // queued click is easy to mistake for a dropped one -- the operator sees
-  // the matrix visibly busy instead.
+  const coresidencyItems: CoResidencyItem[] = mappings.map((m) => ({
+    id: m.id,
+    name: m.gateway_model_name,
+    role: rolesRead?.unreadable.has(m.id) ? 'other' : (specsById[m.id]?.role ?? 'other'),
+  }));
+  // A hard-failed mappings GET never reaches the read above, and the
+  // screen-wide banner already says why; the tab must not claim to be loading.
+  const coresidencyRolesState = coresidencyRolesStateOf(mappingsStatus, rolesRead);
+
+  // Serializes edits: while a PUT is in flight, the editor is disabled (mirrors
+  // Area 3's limitsBusy) so a second edit cannot compute its next full-replace
+  // document from state a still-outstanding first response might later
+  // overwrite. Chosen over a queue (buffering edits and replaying them once the
+  // in-flight PUT settles) because every other full-replace write in this
+  // section (spec save, limits save) already uses the same "disable until the
+  // response lands" idiom, and a silently queued edit is easy to mistake for a
+  // dropped one -- the operator sees the editor visibly busy instead.
   const [coresidencyBusy, setCoresidencyBusy] = useState(false);
 
-  async function toggleCoresidency(a: string, b: string) {
-    const exists = coresidencyPairs.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
-    const next: [string, string][] = exists
-      ? coresidencyPairs.filter(([p, q]) => !((p === a && q === b) || (p === b && q === a)))
-      : [...coresidencyPairs, [a, b]];
-    const previous = coresidencyPairs;
+  async function saveCoresidency(next: CoResidency) {
+    // Unreachable while the editor is gated on `ready`; stated so the rollback
+    // below never has to restore a document that was never loaded.
+    if (coresidencyData === null) return;
+    const previous = coresidencyData;
     setCoresidencyData(next); // optimistic
     setCoresidencyBusy(true);
     try {
-      const stored = await api.putRuntimeCoresidency(application.id, { pairs: next });
-      setCoresidencyData(stored.pairs);
+      const stored = await api.putRuntimeCoresidency(application.id, next);
+      setCoresidencyData(stored);
     } catch (err) {
       setCoresidencyData(previous);
       showError(formatPortalError(err, t));
@@ -1717,7 +1769,7 @@ export function RuntimeAdminSection({
     reload: reloadGpuBudgets,
   } = useResource(() => api.gpuBudgets(server.id).then((r) => r.budgets), [api, server.id, t], t);
   // Same "null (not loaded) vs. [] (loaded, empty)" distinction as the
-  // co-residency matrix above: `budgetRows` starts `[]` and would look
+  // co-residency document above: `budgetRows` starts `[]` and would look
   // exactly like "no budgets configured" if Save were reachable before this
   // GET settles -- and Save PUTs whatever `budgetRows` holds as the FULL
   // replacement set, so that would erase every previously configured
@@ -1739,14 +1791,6 @@ export function RuntimeAdminSection({
     if (gpuBudgetsError) showError(gpuBudgetsError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gpuBudgetsError]);
-  // The matrix's advisory tooltip reflects the last SAVED budgets, never
-  // Area 3's possibly-unsaved edits below (budgetRows) -- an in-progress
-  // draft on another tab must not change what the matrix claims is "the
-  // budget".
-  const savedBudgetsByGpuIndex: Record<number, number> = Object.fromEntries(
-    (gpuBudgetsData ?? []).map((b) => [b.index, b.budget_mb]),
-  );
-
   type BudgetRow = {
     rowKey: string;
     index: number;
@@ -5161,6 +5205,83 @@ export function RuntimeAdminSection({
     );
   }
 
+  // The co-residency tab's body, one state at a time. Each early return is a
+  // distinct fact about what the tab may show, in the order they gate one
+  // another; none of them is the editor with an empty document.
+  function renderCoresidencyBody() {
+    if (fileMode) {
+      // The agent owns its own config file, which is where its co-residency
+      // is kept: there is nothing here to edit, and the gateway-side mode
+      // and verdicts the live editor writes are not what is in force.
+      return <Typography color="text.secondary">{t.coresidencyFileMode}</Typography>;
+    }
+    if (reportStatus !== 'ready') {
+      // Deliberately NOT the editor with an empty document: the report
+      // GET (which decides whether this screen is writable at all) has
+      // not settled, so there is nothing to edit from. A FAILED report
+      // GET is a different fact from a pending one and must not read as
+      // "loading" -- the screen-wide banner above carries the
+      // explanation and the retry.
+      return (
+        <ResourceFallback
+          state={reportFailed ? reportStatus : 'loading'}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeModeUnknownShort}
+        />
+      );
+    }
+    if (!coresidencyReady) {
+      // The pairs GET itself (task-21 review's Critical finding), now
+      // with its failures named instead of shown as an endless
+      // "loading…": on a hard failure there is nothing to render, on a
+      // failed reload there is a payload we could not refresh and an
+      // edit would PUT the full replacement document computed from it.
+      // Neither may be edited, and both get the retry this tab never
+      // had -- the resource's `reload()` was not even destructured.
+      //
+      // Both states hide the editor, but they are not the same sentence
+      // (fix round 1, M7): "could not be loaded" is false once a payload
+      // is in hand and only the refresh failed.
+      return (
+        <ResourceFallback
+          state={coresidencyStatus}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeCoresidencyUnavailable}
+          staleErrorLabel={t.runtimeCoresidencyStale}
+          errorDetail={coresidencyError}
+          retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
+        />
+      );
+    }
+    if (coresidencyRolesState !== 'ready' || coresidencyData === null) {
+      // The document is in hand but the roles it is grouped by are not
+      // (see `coresidencyItems`): nothing is offered until every spec GET
+      // has settled.
+      return (
+        <ResourceFallback
+          state={coresidencyRolesState}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeMappingsUnavailable}
+        />
+      );
+    }
+    return (
+      <CoResidencyEditor
+        t={t}
+        items={coresidencyItems}
+        mode={coresidencyData.mode}
+        pairs={coresidencyData.pairs}
+        onChange={(next) => void saveCoresidency(next)}
+        disabled={coresidencyBusy}
+        // Transient -- but for the few hundred milliseconds it lasts, an
+        // unexplained dead editor is the same defect as an unexplained
+        // read-only one. Undefined when not busy, so a live editor never
+        // carries a reason it does not have.
+        disabledReason={coresidencyBusy ? t.coresidencySaving : undefined}
+      />
+    );
+  }
+
   return (
     <>
       <Breadcrumbs
@@ -5193,7 +5314,7 @@ export function RuntimeAdminSection({
             />
           )}
           {/* Also screen-wide: the mappings are what every tab joins against
-              (the list itself, the matrix's spec set, and the status table's
+              (the list itself, the co-residency model list, and the status table's
               spec_id -> mapping resolution, without which no row can be
               named or overridden). Left as the old two-state test this said
               "loading" forever and every status row went quietly blank.
@@ -5278,7 +5399,7 @@ export function RuntimeAdminSection({
       >
         <Tab label={t.runtimeMappingTab} value="mapping" />
         <Tab label={t.runtimeSpecs} value="specs" />
-        <Tab label={t.runtimeMatrix} value="matrix" />
+        <Tab label={t.runtimeCoresidency} value="coresidency" />
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
@@ -5394,92 +5515,13 @@ export function RuntimeAdminSection({
           )}
         </Panel>
       )}
-      {tab === 'matrix' && (
+      {tab === 'coresidency' && (
         <Panel
-          titleId="runtime-matrix-heading"
-          title={t.runtimeMatrix}
-          subtitle={t.runtimeMatrixHint}
+          titleId="runtime-coresidency-heading"
+          title={t.runtimeCoresidency}
+          subtitle={t.runtimeCoresidencyHint}
         >
-          {fileMode ? (
-            parseError ? (
-              <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>
-            ) : (
-              <Box sx={{ display: 'grid', gap: 1.5 }}>
-                {reportConfig?.unrecognised && (
-                  <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
-                )}
-                {/* Task 21 built and tested `disabled` but deliberately left
-                    it unwired: this is the signal it was waiting for. The
-                    onToggle can never fire, but a no-op stays honest about
-                    the prop's contract. */}
-                <RuntimeMatrix
-                  t={t}
-                  specs={(reportConfig?.specs ?? []).map((s) => ({
-                    id: s.id,
-                    model: s.model,
-                    gpus: s.gpus,
-                  }))}
-                  pairs={reportConfig?.coresident ?? []}
-                  onToggle={() => {}}
-                  budgets={Object.fromEntries(
-                    (reportConfig?.budgets ?? []).map((b) => [b.index, b.budgetMb]),
-                  )}
-                  disabled
-                  // A disabled cell must say why (the RowActionsCell /
-                  // IconAction rule): "read-only" and "not allowed yet" look
-                  // alike otherwise, and this one is permanently disabled for
-                  // as long as the agent owns its own config file.
-                  disabledReason={t.runtimeMatrixDisabledFileMode}
-                />
-              </Box>
-            )
-          ) : reportStatus !== 'ready' ? (
-            // Deliberately NOT the matrix with an empty pair list: the report
-            // GET (which decides whether this screen is writable at all) has
-            // not settled, so there is nothing to toggle from. A FAILED report
-            // GET is a different fact from a pending one and must not read as
-            // "loading" -- the screen-wide banner above carries the
-            // explanation and the retry.
-            <ResourceFallback
-              state={reportFailed ? reportStatus : 'loading'}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeModeUnknownShort}
-            />
-          ) : !coresidencyReady ? (
-            // The pairs GET itself (task-21 review's Critical finding), now
-            // with its failures named instead of shown as an endless
-            // "loading…": on a hard failure there is nothing to render, on a
-            // failed reload there is a payload we could not refresh and a
-            // toggle would PUT the full replacement list computed from it.
-            // Neither may be clicked, and both get the retry this tab never
-            // had -- the resource's `reload()` was not even destructured.
-            //
-            // Both states hide the matrix, but they are not the same sentence
-            // (fix round 1, M7): "could not be loaded" is false once a payload
-            // is in hand and only the refresh failed.
-            <ResourceFallback
-              state={coresidencyStatus}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeCoresidencyUnavailable}
-              staleErrorLabel={t.runtimeCoresidencyStale}
-              errorDetail={coresidencyError}
-              retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
-            />
-          ) : (
-            <RuntimeMatrix
-              t={t}
-              specs={matrixSpecs}
-              pairs={coresidencyPairs}
-              onToggle={(a, b) => void toggleCoresidency(a, b)}
-              budgets={savedBudgetsByGpuIndex}
-              disabled={coresidencyBusy}
-              // Transient, unlike file mode above -- but for the few hundred
-              // milliseconds it lasts, an unexplained dead grid is the same
-              // defect. Undefined when not busy, so a live matrix never
-              // carries a reason it does not have.
-              disabledReason={coresidencyBusy ? t.runtimeMatrixDisabledSaving : undefined}
-            />
-          )}
+          {renderCoresidencyBody()}
         </Panel>
       )}
       {tab === 'limits' && (

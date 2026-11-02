@@ -898,11 +898,11 @@ func TestSetCoResidencyCanonicalizesPair(t *testing.T) {
 	if a > b {
 		a, b = b, a
 	}
-	dto, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: [][2]string{{b, a}}})
+	dto, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: []CoResidencyPairDTO{{A: b, B: a}}})
 	if err != nil {
 		t.Fatalf("SetCoResidency: %v", err)
 	}
-	if len(dto.Pairs) != 1 || dto.Pairs[0][0] != a || dto.Pairs[0][1] != b {
+	if len(dto.Pairs) != 1 || dto.Pairs[0].A != a || dto.Pairs[0].B != b {
 		t.Fatalf("pairs = %#v, want canonical [[%q,%q]]", dto.Pairs, a, b)
 	}
 
@@ -910,7 +910,7 @@ func TestSetCoResidencyCanonicalizesPair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCoResidency: %v", err)
 	}
-	if len(got.Pairs) != 1 || got.Pairs[0][0] != a || got.Pairs[0][1] != b {
+	if len(got.Pairs) != 1 || got.Pairs[0].A != a || got.Pairs[0].B != b {
 		t.Fatalf("GetCoResidency pairs = %#v, want canonical [[%q,%q]]", got.Pairs, a, b)
 	}
 }
@@ -943,7 +943,7 @@ func TestSetCoResidencyRejectsDuplicateAfterNormalization(t *testing.T) {
 	app, m1, m2 := seedTwoMappings(t, routeStore, server.ID, now)
 
 	_, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
-		Pairs: [][2]string{{m1.ID, m2.ID}, {m2.ID, m1.ID}},
+		Pairs: []CoResidencyPairDTO{{A: m1.ID, B: m2.ID}, {A: m2.ID, B: m1.ID}},
 	})
 	if !errors.Is(err, ErrCoResidencyPairInvalid) {
 		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
@@ -956,7 +956,7 @@ func TestSetCoResidencyRejectsDuplicateAfterNormalization(t *testing.T) {
 	// portal-level half of that pair of guards -- the one an operator
 	// actually sees, with the honest 400 code instead of a store conflict.
 	_, err = svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
-		Pairs: [][2]string{{m1.ID, m2.ID}, {m1.ID, m2.ID}},
+		Pairs: []CoResidencyPairDTO{{A: m1.ID, B: m2.ID}, {A: m1.ID, B: m2.ID}},
 	})
 	if !errors.Is(err, ErrCoResidencyPairInvalid) {
 		t.Fatalf("exact duplicate pair: err = %v, want ErrCoResidencyPairInvalid", err)
@@ -971,7 +971,7 @@ func TestSetCoResidencyRejectsSameMappingTwice(t *testing.T) {
 	app, m1, _ := seedTwoMappings(t, routeStore, server.ID, now)
 
 	_, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
-		Pairs: [][2]string{{m1.ID, m1.ID}},
+		Pairs: []CoResidencyPairDTO{{A: m1.ID, B: m1.ID}},
 	})
 	if !errors.Is(err, ErrCoResidencyPairInvalid) {
 		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
@@ -1001,7 +1001,7 @@ func TestSetCoResidencyRejectsForeignMapping(t *testing.T) {
 	}
 
 	_, err = svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
-		Pairs: [][2]string{{m1.ID, foreign.ID}},
+		Pairs: []CoResidencyPairDTO{{A: m1.ID, B: foreign.ID}},
 	})
 	if !errors.Is(err, ErrCoResidencyPairInvalid) {
 		t.Fatalf("err = %v, want ErrCoResidencyPairInvalid", err)
@@ -1032,7 +1032,7 @@ func TestSetCoResidencyFiresRuntimeChangedHookAndClearsOnEmpty(t *testing.T) {
 	server := createTestServer(t, svc, "S", "s.example.test")
 	app, m1, m2 := seedTwoMappings(t, routeStore, server.ID, now)
 
-	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: [][2]string{{m1.ID, m2.ID}}}); err != nil {
+	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{Pairs: []CoResidencyPairDTO{{A: m1.ID, B: m2.ID}}}); err != nil {
 		t.Fatalf("SetCoResidency: %v", err)
 	}
 	// Clearing the set (empty Pairs) is a valid write too and must also fire
@@ -1546,9 +1546,12 @@ func TestAgentRuntimeConfigAssembly(t *testing.T) {
 	}
 
 	// Coresidency: A+B is a real allowed pair; A+disabled must be dropped
-	// (its spec is disabled, hence absent from the wire document).
+	// (its spec is disabled, hence absent from the wire document). opt_in so the
+	// explicit allow rows are what put a pair on the wire: under the default
+	// opt_out the A+B pair would be enumerated whether or not it had a row.
 	if _, err := svc.SetCoResidency(ctx, ownerToken(), app.ID, SetCoResidencyRequest{
-		Pairs: [][2]string{{mappingA.ID, mappingB.ID}, {mappingA.ID, mappingDisabled.ID}},
+		Mode:  string(routing.CoResidencyModeOptIn),
+		Pairs: []CoResidencyPairDTO{{A: mappingA.ID, B: mappingB.ID, Verdict: routing.CoResidencyVerdictAllow}, {A: mappingA.ID, B: mappingDisabled.ID, Verdict: routing.CoResidencyVerdictAllow}},
 	}); err != nil {
 		t.Fatalf("SetCoResidency: %v", err)
 	}

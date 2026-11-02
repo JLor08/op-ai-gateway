@@ -363,8 +363,20 @@ import (
 // The same branch's later wire commit -- the runtime-config document gains a
 // spec-level ram_mb (runtime.Spec.RAMMB) carrying each spec's host-RAM demand --
 // adds "runtime_ram_accounting" to agent.Features with Since 0.14.0 and does NOT
-// bump again: a bump is per shipped change, and 0.14.0 has not shipped yet.
-const Version = "0.14.0"
+// bump again: a bump is per shipped change, and 0.14.0 had not yet shipped when
+// that commit landed, so it rode the same bump.
+//
+// 0.14.0 -> 0.15.0 is the single bump for the co-residency rework branch. The
+// agent now reads each spec's pushed model role (runtime.Spec.Role), keeps a
+// model used within the eviction grace window (OP_AGENT_EVICTION_GRACE_SECONDS,
+// default 30 s) out of the eviction victim set, and prefers a same-role victim
+// over the least-recently-used one. MINOR, and the rule decides it:
+// agent.Features gains "runtime_role_eviction", declared for the portal's
+// visibility only (it gates nothing; see its comment in features.go). It is also
+// a change to how the agent reads its own configuration (a new env setting) and
+// to observable runtime behaviour (what an admission may evict). This is the ONE
+// bump for the whole branch; later commits on it do not bump again.
+const Version = "0.15.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

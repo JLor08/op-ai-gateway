@@ -211,6 +211,7 @@ var portalApplicationErrRows = []errRow{
 	// rows below (:218-219) record having been fixed before (issue #85).
 	{err: capture.ErrKeyRequired, status: http.StatusBadRequest, code: "application.api_token_key_required", msg: "an encryption key is required to store an application api token on a disk-backed store"},
 	{err: portal.ErrCoResidencyPairInvalid, status: http.StatusBadRequest, code: "runtime_coresidency.pair_invalid", msg: "co-residency pair is invalid"},
+	{err: portal.ErrCoResidencyModeInvalid, status: http.StatusBadRequest, code: "runtime_coresidency.mode_invalid", msg: "co-residency mode is invalid"},
 	// ErrServerManagedRuntimeOnly is a 409 (a conflict with the target
 	// server's own configuration), not a 400 -- the request shape is fine,
 	// it is simply refused given the server's current state.

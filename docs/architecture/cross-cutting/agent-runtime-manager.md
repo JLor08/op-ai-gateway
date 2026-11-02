@@ -1966,18 +1966,30 @@ chapters link to it by that name.) Rule numbers in this chapter follow
 `Admit`'s own: 1 matrix, 2 process limit, 3 per-GPU arithmetic, **4 and 5 the
 two unknown-VRAM halves of §5.3**, and **6 the host-RAM pool**.
 
-1. **Co-residency matrix** — a permitted pair exists for every `(S, r)`,
-   `r ∈ R`. Row present means pair allowed; there is no `allowed` column, so
-   "not co-resident" is the structural default (exactly llama-swap's behaviour
-   until an operator opens a cell). **This rule is checked over every running
-   spec regardless of GPU overlap.** Two specs pinned to disjoint cards still
-   need their pair opened, and without it starting one evicts the other even
-   though they never share a GPU. Rule 3 below is the *only* rule that asks
-   which GPUs a spec touches; reading its "GPUs no common spec touches do not
-   compete" as a general exemption is the misreading this rule attracts, and a
-   real operator hit it — they concluded two models on separate GPUs needed no
-   permission and could not be granted one. The portal's cell tooltip now
-   states the consequence at the cell (§11.5).
+1. **Co-residency (the pair rule, still called "the matrix" in the code)** —
+   every pair `(S, r)`, `r ∈ R`, is **effectively allowed**. The agent does not
+   know how that was decided: the gateway computes the effective allowed-pair
+   list from the server's co-residency mode and the operator's explicit verdicts
+   ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role),
+   [ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in))
+   and pushes it as `coresident`, and a pair that is not on it is not permitted.
+   Under the default `opt_out` mode that is nearly every pair, so this rule
+   rarely fires and the arithmetic below does the work; under
+   `opt_in` it is the original default-deny list (a pair is co-resident only
+   when an operator opened it, exactly llama-swap's behaviour); under either, an
+   explicit `forbid` takes a pair off the list. The code keeps its old names for
+   it (`ruleMatrix`, `PolicySnapshot.Allowed`, the wire message `not permitted
+   by the co-residency matrix`), so a "closed cell" or "closed matrix" in this
+   chapter means *a pair that is not effectively allowed*. **This rule is
+   checked over every running spec regardless of GPU overlap.** Two specs pinned
+   to disjoint cards still need their pair allowed, and without it starting one
+   evicts the other even though they never share a GPU. Rule 3 below is the
+   *only* rule that asks which GPUs a spec touches; reading its "GPUs no common
+   spec touches do not compete" as a general exemption is the misreading this
+   rule attracts, and a real operator hit it — they concluded two models on
+   separate GPUs needed no permission and could not be granted one. (Under
+   `opt_out` the question rarely comes up, since no permission is needed; the
+   editor's hint states what *default* currently means, §11.5.)
 2. **Process limit** — `|R| + 1 ≤ runtime_max_processes` (`0` = unlimited).
 3. **Per-GPU arithmetic** — for every GPU `g` that `S` touches *and that has a
    budget* (`budget(g) > 0`; an absent row or a `0` is unconstrained and not
@@ -2007,19 +2019,26 @@ manage (a container stack on the same host) lowers it on the next sample with
 nothing to reconfigure. Its victims and its wake are
 [§5.4](#54-eviction-queueing-and-drain).
 
-**The matrix and the arithmetic are not redundant.** The matrix expresses
+**The pair rule and the arithmetic are not redundant.** The pair rule expresses
 operator *intent* and covers the constraints nobody computes — PCIe bandwidth and
 CPU contention, plus the operator's own view of which models belong on one host —
-none of which is per-GPU, which is exactly why the matrix is not per-GPU either.
+none of which is per-GPU, which is exactly why the rule is not per-GPU either.
 (It used to name system RAM here as the thing nobody can compute, and that
-justification is **partly superseded**: host RAM is now computed and vetoed by
-rule 6, so the matrix no longer stands in for it.) The arithmetic is the *veto*:
-the matrix alone cannot stop three pairwise-compatible models from jointly
-exceeding VRAM or host RAM. An open matrix cell is not a guarantee that the pair
-fits, and the portal's per-cell VRAM tooltip says so on every cell.
+justification is **superseded**: host RAM is now computed and vetoed by rule 6,
+and since
+[ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)
+the rule's default follows it. A new server is
+`opt_out`, so resource fit is the primary gate and the list is the exception,
+where it used to be the primary gate behind a default of "forbidden".) The
+arithmetic is the *veto*: an allowed pair, however it came to be allowed, is not
+a guarantee that the two fit (under `opt_out` it is not even something the
+operator said), so three pairwise-compatible models can still jointly exceed VRAM
+or host RAM, and the arithmetic is what stops them.
 
 Because an eviction looks the same whichever gate caused it, diagnosing "why did
-my model get evicted" requires checking both the matrix and the arithmetic. The
+my model get evicted" requires checking the pair rule and the arithmetic, and,
+for *which* of several idle models was chosen, the role order and the grace
+window ([§5.4](#54-eviction-queueing-and-drain)). The
 mirror-image question has one extra answer, and that one says so itself: a spec
 that sits waiting while an **idle** process occupies its card is not
 necessarily a stuck decision — if the waiting spec's own `vram_estimate_mb` is
@@ -2058,9 +2077,10 @@ zero turns an unconfigured field into a hard refusal of every start.
 > budget map is built, because `PolicySnapshot.Budgets` is an exported field any
 > caller can populate: filtering at one producer would leave every other
 > producer free to reintroduce the divergence, while filtering at the single
-> place that *interprets* a budget cannot be bypassed. The portal's advisory
-> matrix tooltip follows the same rule — it renders a `0` as a bare sum, never
-> as an over-budget warning for a ceiling the agent does not enforce.
+> place that *interprets* a budget cannot be bypassed. (The portal's matrix
+> once carried an advisory per-cell VRAM tooltip that followed the same rule, a
+> `0` rendering as a bare sum and never as an over-budget warning for a ceiling
+> the agent does not enforce; it was dropped with the matrix, §11.5.)
 >
 > **Do not "fix" a future recurrence by making the portal reject `0`.** That
 > would turn a row an operator cleared to zero into an error rather than a
@@ -2612,8 +2632,9 @@ arithmetic, in place of the nothing it would otherwise contribute:
   eviction**, so default-on accounting does not churn the host on every new spec's
   first start.
 - **When the host is too tight for the guess**, idle processes are drained
-  host-wide, oldest first, just enough to fit it; if nothing idle can make room
-  the start **waits**. It never blind-starts when tight.
+  host-wide, in the role-aware order of §5.4, just enough to fit it; if nothing
+  idle (and outside the grace window) can make room the start **waits**. It never
+  blind-starts when tight.
 - **The guess never refuses.** A *known* demand above the whole pool is terminal
   (§5.2); a number nobody measured cannot durably refuse a spec, so a guess larger
   than the pool simply waits until an operator supplies `ram_estimate_mb` or lowers
@@ -2639,19 +2660,70 @@ The failure and termination side of both bootstraps is
 ### 5.4 Eviction, queueing and drain
 
 When admission is blocked, the policy proposes victims: **only processes
-currently serving no request and not still loading, oldest-`last_used` first,
-never a `pinned` spec.** Ties break on ascending spec id — not determinism
+currently serving no request, not still loading and not used within the grace
+window, never a `pinned` spec** (`!Pinned && !Starting && InFlight == 0 &&
+now − LastUsed > grace`), and among those **the candidate's own role first, then
+oldest-`last_used`**, both described below
+([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).
+Ties break on ascending spec id — not determinism
 theatre: the victim set is accumulated in a map (Go randomises map iteration
 order per run) and `sort.Slice` is not stable, so without the tie-break the
 same snapshot evicts different processes on different runs, a non-reproducible
 failure single-run testing cannot detect.
 
+**A recently used model is not evictable: the grace window.** `InFlight == 0`
+says a process is idle this instant, not that it is finished, and a bursty
+pipeline leaves its models idle between requests: a voice chat's transcription
+and synthesis models both sit idle between turns, and a start that happens to
+need the room must not take one of them in the gap. A process whose `last_used`
+is within the grace window of now therefore counts as in use, never a victim
+however hard the pressure, and when the only way to make room is such a process
+the admission **waits**, exactly as it does behind a busy one (and, like it,
+never returns a partial eviction list). The window is
+`OP_AGENT_EVICTION_GRACE_SECONDS` (default **30**, `0` = off, at most `86400`,
+env-only, [§15](#15-configuration-reference)); it is operator-owned and the
+gateway never supplies it. It is applied at **one** place, `admission.evictable`,
+that every rule which can name a victim asks (the pair rule, the unknown-VRAM
+occupant rule and the one-shot VRAM bootstrap eviction, the per-GPU rule, the
+host-RAM rule, the process limit) and by the cold-start escalation's own pick
+([§6](#6-process-lifecycle)), so a rule added later inherits it. The comparison
+is strict (evictable only when `now − last_used` is *greater* than the window,
+so a process used exactly one window ago is still protected); a process that has
+never served has a zero `last_used` and carries no protection, because the window
+protects *use*, not mere residency; and a snapshot that sets a window but no
+clock fails closed, with nothing evictable. `last_used` is stamped when a request
+is admitted to a running spec, when one is released, and when a finished start
+serves its queued waiters. The window only ever delays an eviction and never
+adds one. It governs the agent's own admission eviction and nothing else:
+`force_stopped`, a benchmark's stop-all, the per-spec idle timeout
+(`idle_timeout_seconds`, a separate housekeeping unload) and a spec removed by
+`Apply` do not consult it.
+
+**Victims are ordered same-role first, then least recently used.** Where a
+resource rule draws victims to make room (the per-GPU rule, the host-RAM rule,
+the process limit), the evictable candidates are sorted by `(role == the
+candidate's role ? 0 : 1, last_used ascending, spec id)` (`orderVictims`). A new
+transcription model therefore evicts the idle transcription model before the
+synthesis model a voice chat still needs, keeping one model of each role alive
+(the role swap), and it reaches into another role only when its own kind does
+not free enough, so a large model can still displace idle speech and image
+models under real pressure. Both sides of the comparison are the spec's `role`
+([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)) after `roleOf` has
+folded an absent one into `other`; with no roles on the wire (an agent behind an
+older gateway, a hand-written file-mode document) every spec is `other`, the
+comparison is always "same role", and the order is exactly the plain oldest-first
+it replaced. The order changes only **which** idle victim comes first, never
+**whether** one is evictable. A victim the pair rule or an unknown-VRAM rule
+*requires* is not chosen and is not ordered, and the final `Evict` list is
+reported oldest-first, which is only the order the set is drained in.
+
 **RAM victims are drawn host-wide, by the same rule.** A per-GPU rule evicts only
 the processes that touch the contested card; the host-RAM pool (§5.2, rule 6) is
 one pool for the whole host, so when the candidate's charge plus every running
 process's RAM exceeds it, **any** idle process is a candidate victim — idle meaning
-the same thing as everywhere else: unpinned, not still loading, nothing in flight
-— taken **oldest `last_used` first** (lowest spec id on a tie) until the sum fits.
+the same thing as everywhere else: unpinned, not still loading, nothing in flight,
+outside the grace window — taken in the role-aware order above (same role first,
+then **oldest `last_used`**, lowest spec id on a tie) until the sum fits.
 A process an earlier rule has already queued is skipped rather than charged twice
 or drawn again, and one whose RAM is unknown contributes nothing and is not drawn
 (draining it would free nothing the arithmetic can count). If the idle ones cannot
@@ -2732,15 +2804,44 @@ RAM costs one evaluation per sample, and nothing else is woken. A *terminal*
 RAM refusal is not a waiter and is not woken: it is a report, re-evaluated every
 5 s (§5.2).
 
+**A start blocked only by the grace window is woken when the window expires, and
+that wake is the owner's own.** Every other `Wait` resolves because something
+happens: a release, an exit, an `Apply`, a finished start, a hardware sample. A
+wait caused by grace alone is the one that resolves with nothing happening to any
+process, by the mere passing of time, and nothing would wake it: the release that
+stamped the victim's `last_used` fired before the window opened, the housekeeping
+beat only scans and measures, and the host-sample wake re-asks RAM waiters only.
+At the production admission wait of `0` it would hang until its caller gave up.
+`Admit` therefore marks such a decision `WaitOnGrace`, and only when the window is
+the *sole* reason: it re-runs the same admission against the same snapshot with the
+window off and asks whether that would have proceeded (an `OK` or an `Evict`), so a
+hard blocker, or simply too little idle room even without grace, leaves it false and
+schedules nothing. The owner keeps **one** timer (`graceTimer`), armed at the
+earliest `last_used + grace` among the processes currently protected plus a 5 ms
+slack (the bound is strict, so a wake at the exact instant would find the victim
+still protected and merely reschedule), and on firing re-asks only the specs
+whose last verdict was `WaitOnGrace` **and** that the finished-start retry above
+could retry (a queued request, or pinned): the same storm guard as the RAM wake, so
+two `force_running` specs that may not run together cannot evict each other off a
+bare timer. One timer rather than one per spec, because every such start's next
+chance is the same earliest expiry. `admitAndStart` reconciles it on every path
+through a deferred call (a cheap one-scan no-op when nothing is grace-blocked),
+the fired handler clears the handle with `cancelTimer` so a replacement armed in
+between cannot be orphaned, and `handleClose` cancels it so it never outlives the
+owner. The cost is the one stated above: the start waits out the window while an
+idle victim is in plain sight. A spec that waits on the matrix, a busy
+neighbour, the process limit or a VRAM/RAM budget is never woken by a grace expiry.
+
 **`Admit` never returns a partial eviction list.** If any blocker anywhere in
 the pipeline is non-evictable — busy, or pinned outside the unknown-VRAM
 short-circuit — the whole decision becomes `Wait` with an empty evict set,
 because evicting only some blockers destroys running work for no admission gain.
 
-If everything blocking the candidate is busy, pinned or still loading, the
-request **queues** and is re-evaluated on every release, exit, config `Apply`
-and finished start — and, for a wait the host-RAM pool contributed to, on every
-hardware sample (below) — failing at the spec's
+If everything blocking the candidate is busy, pinned, still loading or used
+within the grace window, the request **queues** and is re-evaluated on every
+release, exit, config `Apply` and finished start — and, for a wait the host-RAM
+pool contributed to, on every hardware sample (below), and for a wait the grace
+window alone caused, when that window expires (below) — failing at the spec's
 `admission_wait_timeout_seconds` with `runtime.admission_blocked`. `0` means wait
 until the client disconnects — the same semantics as the gateway's
 `admission_queue_timeout_seconds`, and the reason `0` must not be read as "no
@@ -2846,9 +2947,9 @@ up. So:
 | Spec removed from the document | **Applied immediately** — the spec drains. |
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
 | A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
-| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **or a GPU row's `vram_mb` or the spec's `ram_mb`** — the admission demands, not launch inputs; the gateway pushes each as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
+| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **the spec's `role`, or a GPU row's `vram_mb` or the spec's `ram_mb`** — admission inputs (the role orders eviction), not launch inputs; the gateway pushes each demand as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child, and a verdict change that moves the derived role does the same) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
-| Removed co-residency pair | **Not retroactive.** Binds at the next start. |
+| Removed or newly forbidden co-residency pair (an explicit `forbid`, or a mode switch that closes pairs) | **Not retroactive.** Binds at the next start. |
 | Lowered `runtime_max_processes` | **Not retroactive.** Binds at the next start. |
 
 The launch-vs-metadata split is the complement of the fields the agent bakes
@@ -2875,6 +2976,112 @@ of the rows above have therefore taken effect and which are waiting for a next
 start. What the acknowledgement promises, and the three cases in which an agent
 acknowledges nothing, are
 [§7.2](#72-the-applied-document-acknowledgement).
+
+### 5.7 Co-residency mode, verdicts and the derived role
+
+The pair rule (§5.2, rule 1) reads exactly one thing, the **allowed-pair list** the
+agent is pushed. What that list *means* is decided gateway-side, from inputs the
+agent never sees
+([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in),
+[ADR-088](../09-architecture-decisions.md#adr-088--a-model-has-one-derived-role-one-value-is-both-the-editor-group-and-the-eviction-type),
+[ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).
+
+**The mode and the verdict.** Each `server_agent` application (so each server) has
+a **co-residency mode**, `opt_out` or `opt_in`, and each unordered pair of its
+mappings has at most one **explicit verdict**, `allow` or `forbid`. A pair with no
+row is in the third state, *default*. The effective co-residency of a pair is the
+explicit verdict when there is one, else `opt_out → allow`, `opt_in → deny`:
+
+| Mode | Pair with no row | Pair `allow` | Pair `forbid` |
+|---|---|---|---|
+| `opt_out` (a new application) | allowed | allowed | **not** allowed |
+| `opt_in` (every application that existed at the upgrade) | not allowed | allowed | not allowed |
+
+A mode switch changes only the first column, so it is **lossless**: no explicit row
+is read, rewritten or dropped. Storage is `applications.coresidency_mode`
+(migration 99) and `agent_coresidency_rules.verdict` (migration 98, every old row
+backfilled to `allow`), see
+[Data Model §4](../reference/data-model.md#co-residency-mode-and-per-pair-verdicts).
+Pairs are symmetric (stored once, `mapping_a_id < mapping_b_id`) and irreflexive.
+The upgrade moved every existing application to `opt_in`, which is the old
+behaviour exactly, so no running server changed until its operator flipped the
+mode; only an application created afterwards starts `opt_out`.
+
+**The effective list is computed, never stored, and travels on the old field.**
+`AgentRuntimeConfig` builds it on every document build
+(`effectiveAllowedPairs`): over the pairs of **enabled** specs only, an explicit row
+decides and a pair with no row follows the mode, and every pair that comes out
+allowed is *enumerated*, the `opt_out` defaults included. The result goes into the
+unchanged `coresident` field (spec ids, `[][2]string`), ordered by ascending
+mapping id with the spec of the lower mapping id first, which is the orientation
+the old per-row translation produced, so an `opt_in` application's list is what it
+was before modes existed. It is enumerated rather than signalled because of the
+mixed fleet: an agent that predates modes reads only the plain list, and an
+`opt_out` it could not see would degrade, on that agent, to "nothing may
+co-locate". A newer agent receives the same list, so neither needs the mode or the
+verdicts, which stay in the gateway database, and the runtime-config document stays
+one shared, non-feature-gated document per server. Anything not unmistakably
+permissive is not allowed (a mode other than `opt_out` acts as `opt_in`, a verdict
+other than `allow` as `forbid`), and a failed read of the mode or of the rows fails
+the whole build, so the agent keeps its last known-good document instead of acting
+on a guessed mode. The price of
+enumerating is that the list grows with the square of the enabled specs under
+`opt_out`: 190 pairs at twenty, 4,950 at a hundred.
+
+**The write.** The portal's co-residency document is `{mode, pairs:[{a, b,
+verdict}]}`. `SetCoResidency` validates everything before any store call (mode,
+every verdict, distinct ids, both ids this application's own mappings, duplicates
+after canonical sorting whatever their verdicts), then writes the mode when the
+request names one (an empty `mode` leaves the stored one alone) and replaces the
+whole set of explicit pairs. `SetCoResidencyMode` does not bump an `updated_at`, so
+the service notifies the agent itself after the writes
+([ADR-028](../09-architecture-decisions.md#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field)).
+Two properties are recorded as deliberate acceptances in
+[§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances): the mode
+and the pairs are two store writes and not one transaction, and the pairs are a
+**full replace**, so a mode-only PUT erases every explicit verdict and a client
+that wants to switch the mode must re-send the pairs it read. A changed pair binds
+at the next start (§5.6).
+
+**The derived role.** A model has one role, `asr`, `tts`, `image`, `embedding`,
+`reranker`, `chat` or `other`, derived by `routing.DeriveRole` from the model's
+capability verdicts and its effective runtime type, **first match wins**:
+
+| # | Evidence | Role |
+|---|---|---|
+| 1 | `transcription` is yes | `asr` |
+| 2 | `speech` is yes | `tts` |
+| 3 | `image` or `image_edit` is yes | `image` |
+| 4 | `embedding` is yes | `embedding` |
+| 5 | `rerank` is yes | `reranker` |
+| 6a | none of the above, and the type is `stable_diffusion_cpp` | `image` |
+| 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
+| 7 | any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) is yes | `chat` |
+| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server) | `other` |
+
+Capabilities outrank the type because they are specific and the type is not (an
+operator's `embedding` verdict on a `vllm` server is how that model becomes an
+embedding model); a model that both transcribes and synthesises is `asr`;
+`audio_cpp` is deliberately no type fallback, because one server hosts asr or tts
+and the type cannot say which. `embedding` and `rerank` are capabilities of their
+own, **operator-stated** on the mapping form (no probe; no reserved verdict, so a
+manual `no` is selectable), and gate no route, since the gateway serves no
+embeddings endpoint. The role is derived on every read and **never stored**, so a
+verdict change moves it with no migration and moves the pushed document's ETag.
+
+**One value, three carriers.** The portal's model catalog carries `ModelDTO.role`
+(per name: the best-ranked role among a name's mappings, a group's best-ranked
+offerable member, an alias's target); the runtime spec the portal reads and writes
+carries a read-only `RuntimeSpecDTO.role` (per spec, absent from the PUT request);
+and each spec in the pushed document carries `role`, derived from the **resolved**
+type and one batched capability read for every enabled spec. The editor groups by
+the per-spec value and the agent evicts by the pushed one, so the two cannot
+diverge. On the agent the role is `runtime.Spec.Role` (`role,omitempty`), read only
+through `roleOf` (trimmed, lower-cased, an empty one folded into `other`, any other
+string passing through as a group of its own), and it is an admission input, never a
+launch input (`sameLaunchShape` ignores it, so a role change relaunches nothing). A
+hand-written file-mode spec may declare it or omit it, and the upward report echoes
+it only when present.
 
 ## 6. Process lifecycle
 
@@ -2954,7 +3161,8 @@ takes the crash-loop backoff above unchanged.
   resident RAM of at least **90 %** of the host-RAM pool at death (a sample and a
   measurement are both needed for this one; with either missing only the signal
   can classify, the conservative direction). Such a death drain-stops **one** idle
-  process (the same eligibility and oldest-first order as every victim), records
+  process (the same eligibility, grace window included, as every victim, picked
+  oldest-first), records
   the failure, enters `start_failed` and the ordinary backoff and **keeps the
   queued request** for the retry. The spec's `ramBootstrapRetries` counter is
   capped at **one**: a **second** consecutive memory-pressure death evicts nothing
@@ -3053,12 +3261,13 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Twelve
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Thirteen
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
 `runtime_config_files`, `runtime_voices`, `fullduplex_proxy`,
-`runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`); two,
+`runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`,
+`runtime_role_eviction`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
@@ -3094,7 +3303,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_model_params` ([§4.1](#41-control-routes)), `Since: "0.13.0"`, and
 `runtime_ram_measurement` ([§5.1](#51-the-per-gpu-data-model),
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.14.0"`, and
-`runtime_ram_accounting` ([§5.2](#52-the-three-gates)), `Since: "0.14.0"`
+`runtime_ram_accounting` ([§5.2](#52-the-three-gates)), `Since: "0.14.0"`, and
+`runtime_role_eviction` ([§5.4](#54-eviction-queueing-and-drain)), `Since: "0.15.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -3365,6 +3575,28 @@ old" advisory is wired to them. Both carry `Since: "0.14.0"` and there was **one
 bump for the change, `server-agent`'s `Version` `0.13.0` → `0.14.0`, MINOR per the
 same rule — the second flag does not move it again, because a bump is per shipped
 change.
+
+`runtime_role_eviction`
+([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct))
+is the third agent-only name of this
+shape and, like the RAM pair, **gates nothing on either side**: it is declared for
+the portal's visibility, to say that a connected agent captures each spec's pushed
+`role` and keeps a recently used model off the eviction victim list
+([§5.4](#54-eviction-queueing-and-drain)). It could gate nothing without costing
+something real, because everything it concerns degrades safely without it: the
+`role` is an additive field an older agent ignores (it keeps least-recently-used
+eviction, never an OOM), the grace window is the agent's own local setting and
+not wire at all, and co-residency rides the existing `coresident` list in its
+unchanged shape, so **the runtime-config document stays one shared,
+non-feature-aware document per server**. That is the point of declaring it for
+visibility and not for negotiation: a feature-gated document would need a second
+shape per agent. It is on the agent's list alone, spelled identically on both sides
+because the agent module imports nothing from the gateway
+(`gateway.RuntimeRoleEvictionFeature` is exported for the portal service, as the
+RAM names are, and is deliberately **not** in `gatewayAgentFeatures`;
+`TestRuntimeRoleEvictionFeatureName` pins the gateway side and the agent's registry
+entry `TestFeaturesDeclareRuntimeRoleEviction`). **Nothing on the gateway or portal
+reads it yet**, the same recorded gap as the RAM names (§13).
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -3665,6 +3897,26 @@ and an upgraded agent behind an older gateway treats every spec as unknown RAM (
 start charged the bootstrap guess until its own first measurement), so the operator
 rule is "upgrade the gateway first".
 
+**`0.14.0` → `0.15.0` (the co-residency rework) is MINOR, and one bump for the whole
+branch.** `agent.Features` gained `runtime_role_eviction`, and the same change altered
+what the agent does in ways an operator observes: it reads each spec's pushed `role`,
+keeps a model used within the eviction grace window out of the victim set, prefers a
+same-role victim over the least-recently-used one, and wakes a start the grace window
+alone blocked
+([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).
+It also gained one env-only setting,
+`OP_AGENT_EVICTION_GRACE_SECONDS`, and logs its resolved value at startup
+(`eviction_grace_seconds`). The `Version` assertion lives in the newest feature's test,
+`TestFeaturesDeclareRuntimeRoleEviction`, beside the presence and `Since` checks of the
+earlier names. Mixed fleets degrade the safe way in both directions and **need no
+upgrade order**: an agent older than 0.15.0 behind this gateway receives the effective
+`coresident` list in the shape it always read (so `opt_out` co-locates correctly),
+ignores `role` and evicts least-recently-used with no grace; an upgraded agent behind an
+older gateway receives the older default-deny list, which is correct for that gateway,
+no roles (every spec reads as `other`, so the order is plain least-recently-used), and
+still applies the grace window. The gateway side of the rework changed no wire shape
+that an older agent reads.
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -3886,12 +4138,18 @@ travels upward in the report exactly as a parse error's does; see
 path records nothing at all.
 
 **In file mode the portal is read-only by design, and the treatment is total:**
-no create button, no spec row actions, the co-residency matrix disabled, no
-GPU-budget or process-limit form, no Save, and no override actions. Specs,
-matrix and limits render from the agent's upward report instead of the gateway's
-own rows, and the mode banner sits above the tab strip so it is true on every
-tab. Live status, badges and `last_error` still work unchanged, because they ride
-the telemetry sample rather than the config document.
+no create button, no spec row actions, no co-residency editor (the tab shows one
+sentence saying the agent keeps its co-residency in its own local file, not a
+disabled copy of it), no GPU-budget or process-limit form, no Save, and no
+override actions. Specs and limits render from the agent's upward report instead
+of the gateway's own rows, and the mode banner sits above the tab strip so it is
+true on every tab. The report still carries the file's `coresident` list upward
+and the gateway still stores it, but the portal no longer reads it: the
+gateway-side mode and verdicts the live editor writes are not what is in force
+for a file-mode agent, and a read-only grid drawn from the file's list invited
+the opposite reading. Live status, badges and `last_error` still work
+unchanged, because they ride the telemetry sample rather than the config
+document.
 
 Start/stop buttons are **hidden rather than disabled**: the admin override lives
 in the gateway document that file mode does not consume, and a dead button is
@@ -4121,10 +4379,10 @@ passes through):
 See [ADR-028](../09-architecture-decisions.md#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field).
 
 Checking a new write path against it is mechanical: does the path write one of
-the six document-input rows, and does its own signature confine it to columns
-outside the document? Row yes and confinement no → it notifies.
+one of the seven document-input rows, and does its own signature confine it to
+columns outside the document? Row yes and confinement no → it notifies.
 
-**The six document-input rows.** `AgentRuntimeConfig` derives the entire
+**The seven document-input rows.** `AgentRuntimeConfig` derives the entire
 document from exactly these:
 
 1. the **AI server row** → `max_processes`;
@@ -4134,8 +4392,12 @@ document from exactly these:
    mapping's `gateway_model_name` / `app_model_name`, for which the agent has no
    other source);
 4. those mappings' **runtime specs** and per-spec GPU rows → `specs[]`;
-5. that application's **co-residency rules** → `coresident[]`;
-6. the server's **per-GPU VRAM budgets** → `gpu_budgets[]`.
+5. that application's **co-residency mode and explicit pair rows** → the
+   effective `coresident[]` list ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role));
+6. the server's **per-GPU VRAM budgets** → `gpu_budgets[]`;
+7. those mappings' **capability verdicts** (one batched read) → each spec's
+   `role`. The role is a document field like any other, so a verdict write moves
+   the document and its ETag.
 
 This closed list is what makes the rule checkable, and it shows why an
 application row or a mapping *rename* is a runtime-config change at all —
@@ -4147,7 +4409,9 @@ non-obvious, since neither looks like a runtime object.
 `DeleteMapping` / `reconcileApplicationModels` (3, via
 `notifyRuntimeChangedForMapping`); `PutRuntimeSpec` / `DeleteRuntimeSpec` and
 the benchmark run's own three launch-spec writers (4); `SetCoResidency` (5);
-`SetServerGPUBudgets` (6). Of the benchmark writers,
+`SetServerGPUBudgets` (6). Row 7 adds no call site of its own: the operator
+writes verdicts through `CreateMapping` / `UpdateMapping`, which are already row 3's
+call sites and notify after the capability write has landed. Of the benchmark writers,
 `SetBenchmarkRuntimeSpecAdminState` notifies once per stored write, through
 `putRuntimeSpec`, the shared write `PutRuntimeSpec` uses too, and the batched
 `SetBenchmarkRuntimeSpecsPinned` and `SetBenchmarkRuntimeSpecsAdminState`
@@ -4231,10 +4495,11 @@ which is what keeps them from being the rejected allow-list:
 | `AgentProxyRoutes`' proxy-listen-port assignment | Confined to `ProxyListenPort` — and it is itself an agent poll **read** path, so notifying from it would push in response to the agent's own fetch. |
 | `SetServerEnergyConfig` | Confined to the five energy columns. |
 | Telemetry ingest's `UpdateAIServer` | Read-modify-writes the server row but sets only `LastSeenAt`/`UpdatedAt`. |
-| `UpdateRuntimeSpecGPUMeasured` (the agent's own VRAM write-back) | The **only** deliberate exclusion of a real document change. A measured value does win over the operator's estimate — but it arrives *from* the agent, so a push would echo the agent its own measurement once per telemetry sample for a value that keeps moving. |
+| The **automated capability writers**: the agent's telemetry ingest (`agent_ingest.go`), the benchmark runner, the health probe and the relay's observation row | They write row 7, so they can move a spec's `role` and the document's ETag, but they are background probes and observations and not an operator action, and nothing safety-relevant waits on them: the role only *orders* eviction victims that are already evictable and never decides whether one is, so the agent's 60 s poll reconciles it. |
+| `UpdateRuntimeSpecGPUMeasured` (the agent's own VRAM write-back) | Together with the capability writers above, one of the two deliberate exclusions of a **real** document change. A measured value does win over the operator's estimate — but it arrives *from* the agent, so a push would echo the agent its own measurement once per telemetry sample for a value that keeps moving. |
 | `DeleteServer` | It also deletes the agent's token and tears the WS connection down, so there is no agent left to tell, and the derive would race the row deletion. This is the one path that looks like a gap in the rule and has no code comment, because the argument is about a notification that does not exist. |
 
-An auditor applying the rule without this list finds five apparent violations
+An auditor applying the rule without this list finds six apparent violations
 and either "fixes" them — the VRAM one would create a push storm at telemetry
 cadence — or concludes the rule is not real.
 
@@ -4814,8 +5079,9 @@ Because that section replaces `MappingSection`, it also owns the plain mapping
 CRUD an agent-managed server needs — on a **dedicated tab**, and split from the
 launch-spec form by ownership rather than by convenience (§11.4).
 
-Five tabs: **model mapping**, **launch specs**, the **co-residency matrix**,
-**server limits**, and **live status**. The mapping tab is leftmost because a
+Five tabs: **model mapping**, **launch specs**, **co-residency** (a role-grouped
+editor, [§11.5](#115-what-each-remaining-tab-shows)), **server limits**, and
+**live status**. The mapping tab is leftmost because a
 mapping is the parent row: a spec's id IS its mapping's id, `mapping_id` is
 `unique` and `on delete cascade`, and a mapping can exist with no spec while a
 spec can never exist without a mapping. Authorization is exactly the model-mapping write rule and is
@@ -4976,14 +5242,17 @@ call `helperText` makes on the type field above and what issue #26 asks for.
 
 Every runtime-domain write is a **full replacement**: the spec PUT applies the
 whole spec verbatim, the co-residency PUT replaces the application's complete
-pair list, the GPU-budget PUT replaces the server's complete budget list.
+set of explicit pairs (and carries its mode), the GPU-budget PUT replaces the
+server's complete budget list.
 See [ADR-029](../09-architecture-decisions.md#adr-029--runtime-domain-writes-are-full-document-replaces-gated-on-their-own-get).
 
 The hard rule that follows: **a control that triggers such a write must not
 exist until its own GET has resolved.** `null` (not loaded yet) and `[]` (loaded
 and genuinely empty) are different facts, and the idiomatic `data ?? []`
-collapses them — a single matrix click landing before the pair list settled once
-PUT a one-pair list as the *entire* pair set, erasing every saved pair; a Save
+collapses them — a single click in the old co-residency matrix landing before the
+pair list settled once PUT a one-pair list as the *entire* pair set, erasing every
+saved pair (the editor that replaced it keeps the gate and sends the whole
+document); a Save
 click before the budgets settled PUT an empty list and erased every configured
 budget. Both produce a successful 200 with no error anywhere. While not ready
 the tab renders a loading line **instead of** the form, not a disabled form, so
@@ -4993,7 +5262,7 @@ Three refinements of that gate, each with its own silent data loss:
 
 - **`ready` must exclude a failed reload over an existing payload.** A reload
   failure leaves the previous payload in place, so a "data is present" test
-  reports ready; the co-residency toggle then computes the whole new list from
+  reports ready; a co-residency edit then computes the whole new document from
   pairs it just failed to refresh, and the budget form is worse because its rows
   are only re-seeded when the payload changes — on a failed reload it is still
   fully populated with pre-failure values and looks perfectly normal while Save
@@ -5007,7 +5276,8 @@ Three refinements of that gate, each with its own silent data loss:
 - **A full-replace write also needs an in-flight guard, not only a load guard.**
   Two quick matrix toggles each computed a correct list, but reconciling from a
   late first response overwrote state that already reflected the second, and the
-  next toggle PUT a list missing a pair. The fix is disable-while-in-flight, not
+  next toggle PUT a list missing a pair (the editor keeps the same fix for the
+  same reason, and shows why it is disabled). The fix is disable-while-in-flight, not
   a queued click: every other full-replace write on the screen already disables
   its trigger, and a silently queued click is easy to mistake for a dropped one.
 - **Writes are additionally gated on the runtime report having settled**
@@ -5209,7 +5479,7 @@ mapping is a gateway route and stays real on a file-mode server — the specs ar
 ineffective there, but taking a model out of service still matters.
 
 The rows are the screen's single copy of the mapping list, shared with the specs
-table, the matrix's spec set and the live-status `spec_id` → mapping join, so a
+table, the co-residency editor's model list and the live-status `spec_id` → mapping join, so a
 rename or a status flip here is immediately true on every other tab with no
 refetch.
 
@@ -5764,274 +6034,94 @@ or not (`targetFrom` ignores `Enabled`). Each check is a pure helper beside
 `RuntimeWarnings` already loads, so neither adds a store read. The launch-spec
 form mirrors both as inline hints while it is open (above).
 
-**Co-residency matrix.** A strict lower triangle: rows are specs `1..n-1`,
-columns `0..i-1` for row `i`, so `n` specs produce exactly `n(n-1)/2` toggle
-cells and neither the diagonal nor the upper triangle ever renders. Fewer than
-two specs renders a hint instead of a table. Every mapping of the application
-becomes a row and a column — including one with no spec configured, whose GPU
-list is then empty and which the tooltip renders as "no shared GPU"; that
-inclusion prevents a crash rather than being an oversight.
+**Co-residency editor.** The tab shows the application's co-residency document,
+`{mode, pairs:[{a, b, verdict}]}` ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)),
+in a role-grouped master-detail editor (`CoResidencyEditor`). It replaced a
+triangular matrix, one toggle per unordered pair of models, which was a workable
+control at a handful of models and an unusable one at twenty (190 cells), and
+which could say only "allowed" or "not"; the component, its tests and its
+translation keys were deleted with it
+([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)).
 
-**Both axes are ordered by model name**, with the spec id as tie-break, sorted
-once inside the component over the single array both slices are taken from.
-Sorting one slice alone is the one way to break "cell *k* sits under header
-*k*"; the triangle itself is permutation-invariant, so every unordered pair
-still appears exactly once for any order. Display order changes nothing that is
-stored or sent: a toggle still emits the pair canonicalised **by id**
-(`SetCoResidency` stores and compares pairs that way), and the backend's
-`order by id` is untouched. The comparator is an `Intl.Collator` at the runtime
-default locale with `numeric: true` — a deliberate deviation from the house's
-bare `localeCompare`, because model names are size and quantisation ladders and
-bare collation orders them `Llama-3.1-405B, Llama-3.1-70B, Llama-3.1-8B`, which
-an operator reads as broken. That option has one cosmetic edge: `numeric: true`
-parses digit runs as numbers, so `8 === 08` and the collator reports *equal* for
-two distinct names that differ only by a leading zero — measured,
-`compare('Qwen3-8B', 'Qwen3-08B')` and `compare('Llama-3.1-8B',
-'Llama-3.01-8B')` are both `0`, where the bare house collator returns `1`. A
-raw-code-unit comparison of the names runs before the id tie-break for exactly
-that case, so two distinct names are never ordered by opaque hex; it cannot fire
-for any pair the collator already separates. The id tie-break is required rather
-than decorative: two specs may legally carry the same `Model` string in file mode
-(the agent rejects duplicate spec *IDs*, and says nothing about `Model`), and
-without it those rows fall back to the store's id order, so a re-fetch could
-swap them and move a checkbox under the operator's cursor. The sort lives in
-the component and not at the callers because the same arrays also feed
-user-sortable list tables on that screen, whose order is the operator's own
-persisted choice.
-
-**Column headers are rotated to read bottom-to-top**, because the column count
-grows with the spec count and a dozen model names side by side needs more width
-than any viewport has — scrolling past headers you cannot see while hunting for
-a cell is how the matrix stops being usable. The mechanism is
-`writing-mode: vertical-rl` plus `transform: rotate(180deg)`, deliberately not a
-bare `rotate(-90deg)`: the writing-mode form gives the label a genuinely
-vertical layout *box*, where a bare transform leaves the box horizontal, which
-is what forces the explicit heights and absolute positioning that then drift a
-few pixels per column. That vertical box does **not**, by itself, make the table
-column reserve the right footprint — whether it does is an engine-by-engine
-fact, and an earlier revision of this paragraph asserted the opposite. See
-**The column has to be made to measure its own rotated header** below, which is
-the bug that assertion hid. Bottom-to-top is the Western
-data-table/chart-axis convention and it puts the *start* of the name next to the
-cells it labels. The rotation is
-CSS over intact text — never images or per-character markup — so the header's
-text content, its `scope="col"` association and the cells' own `aria-label`s are
-all unaffected. The header keeps a tooltip carrying the model name **and nothing
-else**, so it cannot be confused with the cell tooltip below — but what that
-tooltip reveals is the **orientation**, not hidden characters. Since both axes
-wrap (below), neither hides anything, and "reveal the truncated tail" is no
-longer a reason for either of them; what is left is that a rotated, two-line
-vertical label is harder to read than running text, and the tooltip renders the
-same string horizontally on one line. Only the column headers rotate: the corner
-and the row labels stay horizontal.
-
-**Long names on both axes are bounded by wrapping, never by an ellipsis**, and
-that corrects what shipped here first. One budget (160 px) governs both axes:
-`max-width` on the horizontal row labels, `max-height` on the vertical column
-headers, because `writing-mode: vertical-rl` makes the *height* the inline size.
-A name that exceeds the budget wraps onto a second line; no character is ever
-dropped. This is load-bearing rather than a preference, and the reason is the
-name sort above. The first implementation elided the headers with
-`text-overflow: ellipsis`, and the earlier claim here that "the height cap
-truncates away from the grid" was true only of where the ellipsis *glyph* sits:
-the inline axis is vertical, so the clip fell at the inline end — the end of the
-string — and `rotate(180deg)` is a paint-time transform that selects no
-different characters. The characters dropped were therefore the quantisation or
-context suffix, which is the *only* difference between two builds of one model,
-and sorting by name guarantees those two are neighbours. Measured in Chromium at
-the 160 px cap, `Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL` and
-`Qwen3-Coder-30B-A3B-Instruct-UD-Q8_0` both rendered as `Qwen3-Coder-30B-A3…` —
-two different facts drawn identically, in a grid whose only question is whether
-*these two* may run together. Wrapping removes that unconditionally, and it is
-cheap: re-measured with fourteen realistic specs at a 1100 px container, a
-header column is 46 px while its name fits one vertical line (up to ~20
-characters at this budget: `Qwen3-Embedding-8B` is 144 px of the 160 px cap) and
-56 px once it wraps to two, and the header row is 168.5 px — the column is
-sized by the checkbox far more than by the header, and a vertical line box is
-24 px wide. (An earlier revision of this paragraph claimed 46 px for a "36–40
-character name, rising to 56 px only past ~41 characters"; that is not what the
-component measures — a 39-character name wraps to two lines and its column is
-56 px.) A wrapped label spends row
-height, the abundant axis: re-measured at a 1100 px container, the label element
-is 20 px at one line, 40 px at two and 60 px at three, and the row it sits in is
-47 px (the checkbox cell, not the label, sets that floor), 53 px and 73 px.
-`overflow: hidden` is gone rather than kept as a backstop: with wrapping the
-inline size cannot exceed the cap, so it could only ever hide something
-silently. The row labels carry no tooltip — not because nothing is hidden (that
-is equally true of the headers, which keep theirs) but because a row label is
-already horizontal running text, so a tooltip would repeat the same characters
-in the same orientation.
-
-**The column has to be made to measure its own rotated header**, and one box
-shape is what makes every engine do it. A `vertical-rl` label is an *orthogonal
-flow*: its **block** size runs along the table's inline axis, so a column is
-wide enough for a wrapped header only if the layout asks the rotated box for
-that block size. Blink and Gecko ask. **WebKit does not** — Safari on macOS and
-iOS, and every WKWebView, which is where an operator reported column headers
-overprinting each other. Measured with the `<tbody>` removed, so the column is
-sized by its header alone (one 51-character name, three line boxes, rotated box
-72 px, cell padding 4 + 4 px): Chromium 80 px, Firefox 80 px, **WebKit 8 px** —
-the padding, and nothing from the rotated box at all. The column then falls back
-to its only other content, the 46 px checkbox cell, for *any* line count, and
-the rotated box hangs out of it to the right. Two extents cross the column edge
-at different line counts, and which one is meant matters: the label's border box
-is 24 px per line box, while its **ink** — the union of the text-run rects, what
-is actually painted — is 8 px narrower (4 px of half-leading each side).
-Measured in WebKit for a header of *L* ≥ 2 line boxes in a 46 px column, the box
-crosses into the next header's box by `24·L − 46` px (+2 / +26 / +50 / +74 at
-*L* = 2…5) and the ink over the next header's ink by `24·L − 54` px (−6 / +18 /
-+42 / +66), both constant at every container width from 1400 px down to 360 px
-and at 5, 8 and 14 specs. So the *box* crosses the boundary from two line boxes
-on and the *glyphs* first overprint at three — a 44-character name at this font
-and this cap. The fix is to wrap the label in a `display: grid` box, whose
-intrinsic sizing does derive an orthogonal child's block size in all three
-engines; `justify-content: center` on that wrapper replaces the `mx: 'auto'`
-that used to centre the label, and correcting that is why Gecko is *not*
-byte-identical before and after: a one-line header sat flush against its
-column's left edge in Firefox (0 px auto margins where Chromium and WebKit
-resolved 7 px) and now sits at 11 px from the cell edge in all three. Blink is
-byte-identical at all 54 configurations sampled. **Grid and not flex**: both are
-right on a freshly loaded page in all three engines, but only grid survives a
-re-render, which this component does on every telemetry poll — measured over 400
-randomised re-renders from one mount, grid failed 0 renders in WebKit and flex
-31 (Chromium and Firefox: 0 for both). Flex's failure is this same defect, not a
-worse one: `overflow` computes to `visible` throughout, every line box is still
-painted, no character is lost, and its ink-over-ink overlap measures identical
-to the unfixed component.
-
-**That fix trades horizontal room for correctness, and only WebKit pays.** Each
-column whose header wraps to *L* ≥ 2 line boxes grows by `24·L − 38` px — 10 px
-at two lines, 34 px at three, 58 px at four — and a single-line header costs
-nothing. Measured in WebKit with the same fourteen realistic specs the
-`width: auto` paragraph below uses (thirteen columns, eight of them two-line
-and five one-line, so 8 × 10 px = 80 px): at a 900 px container or wider the
-table goes from 790 px to 870 px wide with its height unchanged at 828 px; at an
-800 px container the table is pinned at 800 px, the row-label column gives up
-192 → 122 px and the table grows **828 → 1107 px tall** (nothing scrolls in
-either case — `scrollWidth` equals `clientWidth` at 800 px); at 700 px and below
-it goes 707 → 787 px and now overflows the enclosure, which scrolls, with the
-height unchanged at 1287 px. At five specs the same fix costs 376 → 396 px and
-at eight 514 → 564 px. `overflowX: auto` absorbs the growth only where the table
-already exceeds its container; between the two shrink-to-fit widths it is paid
-in row height instead, which is the lossless degradation described above.
-
-**The wrap mode is `overflow-wrap: break-word` on both axes, and specifically
-not `anywhere`.** Both wrap and neither drops a character; they differ only in
-the min-content size the box reports, and on the horizontal axis that difference
-is a defect. `anywhere` lowers min-content to **one character**, and under
-`table-layout: auto` the algorithm then always prefers squeezing the label
-column over letting the table overflow — which disarms the `overflowX: auto`
-below instead of using it. Measured in Chromium (14 realistic specs, default MUI
-theme, label column / tallest row / table height): at a 1100 px container both
-modes give 192 / 53 / 828 px; at 600 px `anywhere` gives **43.8 / 734 / 6,703
-px**, with every label rendering **one character per line** (36 line boxes:
-`Q`,`w`,`e`,`n`,`3`,`-`, …), while `break-word` gives 109 / 133 / 1,379 px. The
-`anywhere` figure is the wrapping defect all over again on a different axis: the
-three sorted-adjacent `Qwen3-Coder-…` siblings become identical for their first
-~26 lines and differ hundreds of pixels down a row taller than the viewport, so
-no two of them can be seen together. It is reachable on ordinary hardware — with
-the 264 px sidebar and the page's `clamp(20px, 4vw, 54px)` padding, a 1280 px
-window leaves ~866 px of content and a 1024 px window ~630 px. `break-word`
-reports the longest **unbreakable** run instead, so a hyphenated model name
-floors at its longest hyphen-free segment; a name with no hyphen at all is still
-bounded, by `max-width` clamping the min-content *contribution* rather than by
-the wrap mode (measured: a 43-character hyphen-free name holds at exactly 160 px
-at both 1100 px and 600 px inside a 15-spec grid). On the **vertical** header
-axis the choice is measurably free — `anywhere` and `break-word` give identical
-geometry there (header row 168.5 px, span 160 px, widest header column 56 px,
-two line boxes, at both 1100 px and 600 px), and re-measured after the grid
-wrapper landed: identical in Chromium, Firefox and WebKit over 48 comparisons
-(1 to 5 line boxes × 1100 px and 600 px containers × three engines), 0
-differences. That is what was measured, and the earlier gloss on it — "because
-table layout distributes *width* and a `vertical-rl` box's inline size is its
-height" — is dropped rather than kept: it reasons about the axis that was never
-at risk in order to conclude something about the axis that was, which is the
-same false premise the paragraphs above correct. One declaration is used for
-both axes so the component teaches one rule.
-
-**The table shrinks to its content (`width: auto`)**, overriding MUI's
-`width: 100%`, and that is what makes the row-label cap reach the *column*
-rather than only the text. Under `table-layout: auto` a full-width table hands
-its surplus back to the columns in proportion to their content, so a capped
-160 px label still sat inside a 491 px cell — measured on the real component,
-five realistic names at a 1100 px viewport, against 725 px (66 % of the table)
-before the cap — leaving roughly 330 px of empty gutter between a name and its
-own first checkbox. Shrink-to-fit makes the label column 192 px
-(160 + MUI's 2 × 16 px small padding) and the grid columns 46 px; with fourteen
-realistic specs the table then measures 870 px wide and 828 px tall.
-
-Those figures hold **while the container can afford that shrink-to-fit width** —
-here ~870 px. Below it the table has to give something up, and auto layout takes
-it from the widest column: measured with the same fourteen specs, the label
-column is still 192 px at a 900 px container, 182 px at 860 px and 122 px at
-800 px, with the rows growing taller as names wrap onto more lines. The
-degradation is lossless — no character is ever dropped — and `break-word` puts a
-floor under it (109 px for these names; 192 px again as soon as one name has no
-hyphen at all). It is **not** true that this only happens where the grid already
-scrolls: at an 800 px container the enclosure's `scrollWidth` equals its width
-(800 = 800, measured), so nothing is scrolling yet and the label has already
-given up 70 px. `overflowX: auto` is what absorbs the rest, and it does take
-over further down — at a 600 px container the box is 600 px around a 787 px
-table, which scrolls inside its own box rather than widening the page.
-
-**The cell is a checkbox, and its off state must not read as a prohibition.**
-This was a real defect: the cell rendered as an icon button whose off state was
-a crossed-circle "block" glyph, and an operator who wanted two models co-resident
-on *different* GPUs read that plus a tooltip about disjoint GPUs as a refusal and
-stopped — reporting that no tick could be made. Nothing in the stack prevented
-them (`SetCoResidency` rejects only empty, identical, foreign and duplicate
-pairs, and says nothing about GPUs), so the one configuration the matrix exists
-to express was the one the UI discouraged hardest. Four renderings, because
-"off" and "not editable" are different facts that used to share a glyph:
-
-| | editable | disabled |
-|---|---|---|
-| allowed | ticked box (success) | filled circle-check |
-| not allowed | empty box | crossed circle |
-
-The **square** family means "a control you can operate", the **circle** family
-"a read-out you cannot". The old `CheckCircleIcon`/`BlockIcon` pair was not
-discarded, only moved to the read-only state it actually describes — a crossed
-circle finally means prohibition. Keeping the allowed/off distinction visible in
-*both* columns is required, not cosmetic: a single "disabled glyph" would render
-a disabled **allowed** pair as forbidden. The matrix is disabled in file mode and
-while a toggle PUT is in flight, and each carries its own reason on hover (same
-rule as `RowActionsCell`/`IconAction`) — a permanent "the agent owns its own
-config file" and a transient "still saving", which must not be interchanged.
-
-Pairs are canonically ordered (`a < b`) and **the portal enforces that on both
-sides even though the backend is already tolerant**: the service sorts every
-incoming pair, so a non-canonical write would survive silently. The portal sorts
-before writing (regardless of which id is the visual row) and accepts either
-order when deciding whether a cell shows as allowed, so a pair that ever arrived
-non-canonical still renders correctly rather than making the matrix lie. Note the
-trap: a naive pass-through `onToggle(rowId, colId)` emits *position* order for
-every below-diagonal cell.
-
-**The cell tooltip leads with what the cell controls, and the VRAM arithmetic is
-the secondary detail.** It used to open with "no shared GPU — these two models
-never compete for VRAM", which sitting next to the old prohibition glyph read as
-the *reason* the pair was forbidden rather than as the unrelated informational
-note it is. The lead line is now the consequence of leaving the pair off,
-including the property that surprised the operator: the matrix applies
-**regardless of GPUs** (§5.2 rule 1), so without the pair one model evicts the
-other even on separate cards. When the cell is disabled the reason why leads
-ahead of even that, because an operator who does not know the grid is read-only
-will keep clicking a control that will never respond.
-
-The per-cell VRAM tooltip is **advisory and says so on every cell**. It sums each
-**shared** GPU's estimate across the two specs and compares against the **saved**
-budget — never the limits tab's in-progress draft, because an unsaved edit on
-another tab must not change what the matrix claims the budget is. Over-budget is
-conveyed by red text *and* an explicit text marker, since colour alone would be
-lost on a colour-blind operator. Because the tooltip's job is to *predict the
-agent*, it applies the agent's own zero rule (§5.2): a budget of `0` renders as a
-bare sum, exactly like a GPU with no budget row, never as `/ 0 MB (over budget)`
-for a ceiling admission does not enforce. Every tooltip ends by reminding the reader that
-the agent's own arithmetic at admission time is the actual veto, so a
-matrix-allowed pair can still be refused at runtime and vice versa. Turning
-either this or the drift warning below into a hard client-side block would make
-the portal refuse configurations the agent would accept.
+- **The mode is the first control and says what it means.** A two-way switch,
+  *Allowed (opt-out)* or *Not allowed (opt-in)*, labelled "Default for unset pairs",
+  with a hint under it that states the consequence for the current mode ("Default =
+  allowed: two models may run together unless you explicitly forbid the pair"), and
+  that explicit settings survive a switch. The tab's subtitle repeats the property
+  that surprised an operator of the matrix, that the rule applies **whichever GPUs
+  the two models occupy** (§5.2, rule 1).
+- **Left, a searchable model list; right, the selected model's relationships grouped
+  by role.** The list shows each model with the count of its **explicit** settings (a
+  pair counts only when both ends are listed, so the badge never shows an exception
+  nobody can find). The detail pane has one collapsible group per role present, in a
+  fixed order (asr, tts, image, embedding, reranker, chat, other: the specialised
+  kinds an operator carves exceptions for first, the general chat models and the
+  catch-all last), and every group has a bulk control and per-member rows beneath it.
+- **Every control is a three-way verdict: Allowed, Default, Forbidden.** The middle
+  segment is labelled with what it currently *means* ("Default (allowed)" under
+  `opt_out`, "Default (not allowed)" under `opt_in`), so the mode is never something
+  to remember. A group's control sets every member at once; a member can deviate; a
+  group whose members disagree shows a **mixed** marker and selects nothing, and while
+  they agree each member row says "from group". Choosing Default *removes* the
+  explicit entry (absence is the default; no default verdict is ever stored). Editing
+  A↔B from either model is the same single entry, written canonical (the smaller id
+  first; the backend sorts and rejects a collision regardless).
+- **The grouping reads the derived per-spec role and nothing else**
+  ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)): never a capability
+  flag, which is an AND across every mapping of a name and can disagree with the
+  best-ranked role. The per-mapping spec cache cannot be trusted for it, because it
+  is filled once per mount and a role moves for reasons it never sees (a verdict set
+  on the mapping tab, a spec deleted, a probe writing a verdict in the background), so
+  **every time the tab is shown every spec is read again** and the editor waits for
+  those reads, through the cache's ordered-read primitives so one that overlaps a
+  write of this section's own is refused. A spec that cannot be read is filed under
+  `other`; a role the build does not know lands in `other` too, so a model is never
+  unreachable.
+- **Every edit is a full document.** The editor is controlled and reports the
+  **complete** next document (the mode and every explicit pair, shown or not) on every
+  change, and the section saves exactly that with a PUT: a pair the editor did not touch
+  rides along, and a mode switch re-sends the pairs it read, because a mode-only
+  document would erase every explicit verdict
+  ([§11.1](#111-writes-are-full-document-replaces-gated-on-their-own-get),
+  [§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances) of the
+  risks chapter). The editor does not exist until its own GET has settled **and** the
+  roles have been read, is not shown after a failed refresh over an existing payload,
+  and is disabled while a PUT is in flight with the reason under the mode switch
+  ("still saving") rather than silently dead.
+- **Long names and many models.** Names are ordered with an `Intl.Collator` at the
+  runtime locale with `numeric: true` (model names are size and quantisation ladders,
+  and bare collation orders them `405B, 70B, 8B`), then by raw code units and finally
+  by id, so the order is total and stable for two mappings that legally share a
+  display name; `numeric: true` equates `8` with `08`, which is why the code-unit
+  step comes before the id. In the list and in the member rows a name is truncated
+  with an ellipsis and carries its full text as the hover title, the selected model is
+  shown in full above its groups (it wraps), and the three-way control **never
+  shrinks**, so the control an operator is there to use is always visible. Truncation
+  can still draw two builds of one model alike in a narrow list; the full name is one
+  hover or one selection away, and the divider widens the list.
+- **The divider between the list and the detail pane is draggable** (pointer, or
+  keyboard on the focused separator: arrow keys, `Home`, `End`, with `Shift` for a
+  larger step; an ARIA separator with value bounds). Its width is remembered per viewer
+  in `localStorage` under `op.coresidency.listWidth`, as a convenience only: every
+  access is guarded, the editor looks and works the same without storage, and a stored
+  value outside the bounds is ignored rather than clamped, since it is not a width this
+  editor wrote. The list may be 160 to 560 px but only what leaves the detail pane its
+  620 px minimum (measured: the pinned control is 333 px wide under `opt_out` and 378
+  px in German under `opt_in`); a narrower viewport scrolls the split view sideways
+  instead of stacking it, which would move the control and the divider. A width chosen
+  on a wide window survives a visit from a narrow one without being rewritten.
+- **What is gone.** The matrix's per-cell VRAM tooltip, an advisory sum of the two
+  models' estimates against the saved budget with a red text marker when over, was
+  dropped with it: the editor is per model and not per GPU pair, the arithmetic is the
+  agent's own veto (§5.2) and budgets are edited on the limits tab, so a prediction of
+  it here would only be a second copy that can drift. The rotated column headers, and
+  the WebKit defect that their `writing-mode` handling caused, went with the grid; that
+  history stays in
+  [Risks §11.3](../11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)
+  as the record of why a layout defect in one engine is invisible to every gate.
+- **File mode shows one sentence** ("Read-only: the agent manages its processes from its
+  own local file. Co-residency is maintained there, not here"), no editor and no grid
+  ([§8.2](#82-file-mode)).
 
 **Server limits.** Per-GPU budgets and the process limit. Budget rows prefill
 from the **existing** hardware telemetry path the hardware panel already uses —
@@ -6347,7 +6437,7 @@ validated by shape.
 **The digest covers the WHOLE document, which is the one trap this design has to
 answer.** Any write that reaches the derivation changes it, and the benchmark's
 reservation covers only the launch-spec `PUT` — deliberately not the per-GPU
-budgets, the co-residency matrix, `runtime_max_processes`, a mapping rename, the
+budgets, the co-residency mode and pairs, `runtime_max_processes`, a mapping rename, the
 agent application's router port, or **the agent's own measured-VRAM write-back**,
 which [§9's notification rule](#9-keeping-the-agent-current-the-notification-rule)
 exempts and which arrives at telemetry cadence. So the document really does move
@@ -7272,9 +7362,9 @@ loop would write history rows.
 load time from a cold start. For a `server_agent` application the cold pass
 never unloads and never swaps: the router has no unload route, and a swap would
 load an unrelated model and evict the target only under a closed co-residency
-matrix. A manual speed or both run stops the server's running models instead,
-before each agent target's cold pass, and measures the target's own load on the
-emptied server
+pair (one that is not effectively allowed, §5.2). A manual speed or both run
+stops the server's running models instead, before each agent target's cold
+pass, and measures the target's own load on the emptied server
 ([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)).
 A run that does not stop — a scheduled run, or a manual one whose stops are
 off — asks whether the target is resident, through the router's `/running` (or
@@ -7371,7 +7461,7 @@ first token minus the warm pass's ([Routing & Model Selection
 `server_agent` model that number is **the model's own load on an otherwise
 empty server**. The router has no unload route ([§4.1](#41-control-routes)),
 and a cold target's first request evicts every neighbour the co-residency
-matrix does not let it share the GPU with, so the neighbours' exits land in its
+rule or the resource arithmetic does not let it share the host with, so the neighbours' exits land in its
 time to first token: with a neighbour that took 2 s to exit, the cold pass
 measured 3.5 s for a model whose own load is 1.5 s. A pinned neighbour blocks
 the target outright, because the agent never evicts a pinned child. So a manual
@@ -7821,9 +7911,23 @@ operator meets first:
   ([§14.7](#147-the-resolved-command-what-actually-ran)).
 - **The router authenticates nothing and its shipped default binds all
   interfaces** (§4.6).
-- **A pairwise matrix plus per-GPU arithmetic cannot express every co-residency
-  constraint** — exotic interconnect contention, for instance. The matrix's
-  intent role covers the known non-VRAM cases.
+- **A pairwise list plus per-GPU arithmetic cannot express every co-residency
+  constraint** — exotic interconnect contention, for instance. The pair list's
+  intent role (an explicit `forbid`, or an `opt_in` allow) covers the known
+  non-VRAM cases.
+- **The co-residency write is two store writes, and a full replace.** The mode and
+  the explicit pairs are not one transaction (a failed pairs write after the mode
+  write notifies the agent with the new mode and the old pairs: consistent, and the
+  PUT is idempotent), and a PUT that omits the pairs erases every explicit verdict,
+  which is why the editor always sends the whole document. Both are recorded as
+  deliberate acceptances in
+  [§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+- **Role-aware eviction needs an agent from 0.15.0, and the grace window trades
+  latency for stability.** An older agent ignores the `role` and the window and
+  evicts least-recently-used ([§7.1](#71-agent-versioning)); on a current one a start
+  can wait out the window (default 30 s) while an idle victim is in plain sight
+  (§5.4), and `runtime_role_eviction` has no consumer yet, so the portal cannot
+  yet say which agents behave this way.
 - **Tightened limits are not retroactive** (§5.6).
 - **File mode offers no remote operations**, and while an agent is in file mode
   the portal offers no way to view or delete the gateway-side specs that have
@@ -8354,8 +8458,9 @@ markers.
 
 Agent settings on the agent's existing precedence — flag, then environment,
 then config file — except those marked **no flag form**, which resolve
-environment, then file, then default; the three resource-accounting settings at
-the end of the table are **env-only**: no flag, and no config-file key either. Passing a flag the agent does not register
+environment, then file, then default; the four resource-accounting and eviction
+settings at the end of the table are **env-only**: no flag, and no config-file key
+either. Passing a flag the agent does not register
 is a *startup error*, so that marking is load-bearing rather than editorial;
 `scripts/check-docs.sh` gates it against the flags `server-agent` actually
 registers, over the authoritative table in
@@ -8376,6 +8481,7 @@ registers, over the authoritative table in
 | `OP_AGENT_VRAM_HEADROOM_MB` (**no flag form**, env-only) | `0` | MB held back from each **auto-detected** per-GPU VRAM budget, for the driver, a display or another tenant; never applied to a budget the operator set ([§5.1](#51-the-per-gpu-data-model), [ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)). `0` is a real value; a negative or malformed one falls back to `0`. |
 | `OP_AGENT_HOST_RAM_RESERVE_MB` (**no flag form**, env-only) | `2048` | Host RAM held back from the host-RAM admission pool (`MemAvailable` + what managed processes hold − this), room for the OS, the agent and whatever else shares the host ([§5.2](#52-the-three-gates), [ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)). `0` is a real value (reserve nothing); a negative or malformed one falls back to the default. |
 | `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` (**no flag form**, env-only) | `4096` | Conservative host RAM charged to a spec of unknown RAM demand on its first start, until it is measured ([§5.3](#53-unknown-vram-resolves-itself-by-measurement), [ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)). Errs high on purpose; `0` turns the charge off (not the bootstrap interlock); a negative or malformed value falls back to the default. Raise it for a RAM-heavy model whose demand is not yet declared. |
+| `OP_AGENT_EVICTION_GRACE_SECONDS` (**no flag form**, env-only) | `30` | Seconds after a managed model was last used during which it is never an eviction victim, so a bursty pipeline (a voice chat's speech models, idle between turns) is not broken by a start that needs the room; a start that could only be made room for by evicting one waits, and is woken when the window expires ([§5.4](#54-eviction-queueing-and-drain), [ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)). `0` turns the window off (an idle model is evictable at once); a negative, fractional, malformed or above-`86400` value falls back to the default. |
 
 Gateway-side knobs are per-server and per-spec database columns, not environment
 variables: `ai_servers.runtime_max_processes`,
@@ -8408,4 +8514,5 @@ mechanics of the generated agent config document are in
 - [HTTP API Surface](../reference/api-surface.md) and
   [Data Model](../reference/data-model.md) — the wire contracts and the schema.
 - [Architecture Decisions](../09-architecture-decisions.md) — ADR-024 to
-  ADR-029, and ADR-031 to ADR-036.
+  ADR-029, ADR-031 to ADR-036, and ADR-087 to ADR-089 (the co-residency mode,
+  the derived role and role-aware eviction).

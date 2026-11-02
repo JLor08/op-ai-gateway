@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 97 migrations in order, same as
+- **Only-pending.** A fresh install runs all 99 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -238,6 +238,24 @@ Rules that keep this safe over time:
   CI conformance legs, so editing it would leave those at version 68 with no
   such column while a fresh install got one. "Not released yet" is not the
   test; "has any database already run it" is.
+- **A new standard for new rows and the old behaviour for existing ones are two
+  different defaults, and each has its own mechanism.** Migrations 98 and 99 are
+  the worked pair ([Data Model §4](../reference/data-model.md#co-residency-mode-and-per-pair-verdicts),
+  [ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)).
+  Where the old meaning is a constant (every existing co-residency row was an
+  *allowed* pair), the column default **is** the backfill (`verdict ... default
+  'allow'`), there is no data step and a replay is `addColumnIfMissing`'s no-op, so
+  it can never re-flip an operator's later value. Where new rows must differ from
+  existing ones (`applications.coresidency_mode` is `opt_out` for every application
+  created from now on and `opt_in` for every one that exists), the DDL default is
+  the new standard and an explicit `update` sets the old behaviour on what is
+  already there. That `update` cannot carry a `where` guard when the new value is
+  also the DDL default (never-backfilled and explicitly-chosen cannot be told apart
+  by value), so it is **not replay-safe**, and it is safe only because the runner
+  applies a pending migration once per database in the transaction that records its
+  version; on a fresh install the table is empty when it runs, so it touches
+  nothing. The store test builds a genuine pre-migration database and asserts both
+  halves on both dialects.
 
 ### A constraint added over possibly-dirty live data skips, it does not abort
 
@@ -594,7 +612,11 @@ helpers mirroring the FK graph hop by hop (server → applications → applicati
 mappings → mapping), so the server-delete path and the direct deletes cannot
 drift apart again. The mapping hop removes co-residency pairs **selectively** —
 only those naming the deleted mapping — which is what distinguishes it from the
-application hop's whole-set delete, and is easy to flatten by accident.
+application hop's whole-set delete, and is easy to flatten by accident. The
+application hop also drops that application's `coresidencyMode` entry: the
+co-residency mode is a map of its own in the memory driver (the SQL column dies
+with the `applications` row), so a re-created application under the same id reads
+the default `opt_out` instead of inheriting the old one's mode.
 
 > **This is a privilege/visibility property, not tidiness.** Dev and Playwright
 > fixtures reuse **fixed** server ids, so a per-server map that `DeleteAIServer`

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -176,6 +177,11 @@ var (
 	// invalid the same way), or two pairs colliding after canonical
 	// (mapping_a_id < mapping_b_id) normalization.
 	ErrCoResidencyPairInvalid = errors.New("runtime_coresidency.pair_invalid")
+	// ErrCoResidencyModeInvalid rejects a SetCoResidency whose mode is
+	// neither routing.CoResidencyModeOptIn nor routing.CoResidencyModeOptOut.
+	// (An EMPTY mode is not invalid: it means "leave the stored mode alone".)
+	// HTTP 400, checked before any store call like every other validation here.
+	ErrCoResidencyModeInvalid = errors.New("runtime_coresidency.mode_invalid")
 	// ErrGPUBudgetInvalid rejects a SetServerGPUBudgets entry with a negative
 	// index, a negative budget_mb, or an index repeated across entries.
 	ErrGPUBudgetInvalid = errors.New("server.gpu_budget_invalid")
@@ -527,6 +533,17 @@ type RuntimeSpecDTO struct {
 	EffectiveType            string `json:"effective_type"`
 	ResolvedMetricsPath      string `json:"resolved_metrics_path"`
 	ResolvedContextProbePath string `json:"resolved_context_probe_path"`
+	// Role is the spec's derived model role -- one of the routing.ModelRole
+	// values ("asr", "tts", "image", "embedding", "reranker", "chat", "other"),
+	// never empty: routing.DeriveRole over EffectiveType and the yes verdicts of
+	// this spec's mapping. It is the portal-facing twin of AgentRuntimeSpecDTO.Role
+	// -- the same derivation over the same two inputs -- so the co-residency
+	// editor's per-spec grouping and the agent's role-aware eviction read one
+	// value. A READ-ONLY echo like EffectiveType: derived on every read (GET and
+	// the PUT response), never stored, and deliberately absent from
+	// PutRuntimeSpecRequest. It is NOT ModelDTO.Role, which folds every mapping of
+	// a model NAME into its best-ranked role; this is the role of one spec.
+	Role string `json:"role"`
 }
 
 // ConfigFileDTO is one operator-supplied config file of a runtime spec: a
@@ -644,6 +661,10 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		emptySpec := routing.RuntimeSpec{}
 		effectiveType := routing.EffectiveRuntimeSpecType(emptySpec)
 		resolvedMetrics, resolvedContext := routing.DeriveProbePaths(effectiveType, emptySpec.MetricsPath, emptySpec.ContextProbePath)
+		role, err := s.runtimeSpecRole(ctx, mapping.ID, effectiveType)
+		if err != nil {
+			return RuntimeSpecDTO{}, err
+		}
 		return RuntimeSpecDTO{
 			MappingID:                mapping.ID,
 			Args:                     []string{},
@@ -659,13 +680,47 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			EffectiveType:            string(effectiveType),
 			ResolvedMetricsPath:      resolvedMetrics,
 			ResolvedContextProbePath: resolvedContext,
+			Role:                     role,
 		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return runtimeSpecDTO(spec, gpus, app)
+	dto, err := runtimeSpecDTO(spec, gpus, app)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	return s.withRuntimeSpecRole(ctx, dto)
+}
+
+// runtimeSpecRole is the derived role of the spec on mappingID whose effective
+// type is effectiveType: routing.DeriveRole over that type and the mapping's yes
+// verdicts -- the same call AgentRuntimeConfig makes for the pushed spec, here
+// for ONE mapping (one capability read) instead of a batch. A failed read is an
+// error, never a role guessed from the type alone: the editor groups -- and bulk
+// writes -- by this value, and a verdict-blind guess would file an embedding model
+// under chat.
+func (s *Service) runtimeSpecRole(ctx context.Context, mappingID string, effectiveType routing.RuntimeSpecType) (string, error) {
+	rows, err := s.routes.MappingCapabilities(ctx, mappingID)
+	if err != nil {
+		return "", err
+	}
+	return string(routing.DeriveRole(effectiveType, routing.YesCapabilities(rows))), nil
+}
+
+// withRuntimeSpecRole returns dto with its read-only Role filled in from its own
+// MappingID and EffectiveType. runtimeSpecDTO stays pure (it is also the
+// benchmark writers' read-modify-write input, which has no use for a role and
+// must not pay a store read for one); the two portal-facing responses -- GET and
+// the PUT/benchmark-admin-state write-back -- go through here.
+func (s *Service) withRuntimeSpecRole(ctx context.Context, dto RuntimeSpecDTO) (RuntimeSpecDTO, error) {
+	role, err := s.runtimeSpecRole(ctx, dto.MappingID, routing.RuntimeSpecType(dto.EffectiveType))
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	dto.Role = role
+	return dto, nil
 }
 
 // PutRuntimeSpec validates and upserts mappingID's runtime spec (create on
@@ -748,13 +803,22 @@ func (s *Service) serverIsBenchmarking(serverID string) bool {
 //
 // The notification fires exactly when writeRuntimeSpec reports stored: once
 // UpsertRuntimeSpec has succeeded, also when the GPU-row write or the
-// read-back after it fails.
+// read-back after it fails. The returned document carries the derived Role
+// (withRuntimeSpecRole), which writeRuntimeSpec's batch callers have no use for
+// and so never pay a read for.
 func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string) (RuntimeSpecDTO, error) {
 	dto, stored, err := s.writeRuntimeSpec(ctx, mapping, app, req, expectSpecID)
 	if stored {
 		s.notifyRuntimeChanged(server.ID)
 	}
-	return dto, err
+	if err != nil {
+		return dto, err
+	}
+	// The write-back is the document the portal commits into the same per-mapping
+	// cache a GET fills, so it carries the derived role like a GET does. Read AFTER
+	// the notification: a failed read reports the error but the row IS stored and
+	// announced, exactly like a failed GPU read-back inside writeRuntimeSpec.
+	return s.withRuntimeSpecRole(ctx, dto)
 }
 
 // writeRuntimeSpec is the one implementation of the full-document upsert:
@@ -1756,53 +1820,107 @@ func normalizeRuntimeAPITokenHeaderSource(source string) string {
 
 // --- Task 6: co-residency matrix --------------------------------------------
 
-// CoResidencyDTO is the portal-facing pairwise co-residency matrix for one
-// application: every ALLOWED pair of its own mappings that may be loaded on
-// the same AI server at the same time. Each pair is always canonical
-// (Pairs[i][0] < Pairs[i][1] lexicographically) -- see SetCoResidency.
-// Always a non-nil Pairs slice, even when empty.
+// CoResidencyPairDTO is one EXPLICIT co-residency setting on the wire: a pair
+// of mapping ids and the verdict an operator gave it. On input the two ids may
+// come in either order (SetCoResidency sorts them); the returned pair is always
+// canonical (A < B lexicographically).
+//
+// Verdict is routing.CoResidencyVerdictAllow or routing.CoResidencyVerdictForbid.
+// A pair with NO entry is not listed at all -- what it means is the DTO's Mode.
+// On input an empty Verdict is an allow (what a pair meant before verdicts
+// existed, and what the store normalises it to).
+type CoResidencyPairDTO struct {
+	A       string `json:"a"`
+	B       string `json:"b"`
+	Verdict string `json:"verdict"`
+}
+
+// CoResidencyDTO is the portal-facing co-residency setting of one application
+// (one server_agent, hence one server): its Mode, and every EXPLICIT pair of its
+// own mappings with its verdict -- the pairs an operator has actually set, both
+// allows and forbids, not the effective matrix. Mode says what a pair that is
+// NOT listed means: routing.CoResidencyModeOptOut allows it (only forbids need
+// listing), routing.CoResidencyModeOptIn forbids it (only allows need listing).
+// Switching the mode never touches the listed pairs. The effective pair list the
+// agent receives is derived from both (effectiveAllowedPairs) and is not part of
+// this DTO. Always a non-nil Pairs slice, even when empty.
 type CoResidencyDTO struct {
-	Pairs [][2]string `json:"pairs"`
+	Mode  string               `json:"mode"`
+	Pairs []CoResidencyPairDTO `json:"pairs"`
 }
 
 // SetCoResidencyRequest is a full-document replace (like
 // SetRuntimeSpecGPUs/SetServerGPUBudgets): every pair supplied here IS the
-// new set. Pair ordering within each element does not matter -- SetCoResidency
-// sorts each pair server-side before storing/comparing.
+// new set of explicit pairs. Pair ordering within each element does not matter --
+// SetCoResidency sorts each pair server-side before storing/comparing.
+//
+// Mode is routing.CoResidencyModeOptIn or routing.CoResidencyModeOptOut; an
+// empty Mode leaves the stored mode unchanged (a request that does not name a
+// mode must never flip it), anything else is ErrCoResidencyModeInvalid.
+//
+// Pairs is always the WHOLE set: a request that omits it, or sends [], removes
+// every explicit pair. A client that only wants to switch the mode therefore
+// re-sends the pairs it read -- the switch itself never touches them.
 type SetCoResidencyRequest struct {
-	Pairs [][2]string `json:"pairs"`
+	Mode  string               `json:"mode"`
+	Pairs []CoResidencyPairDTO `json:"pairs"`
 }
 
-// GetCoResidency returns appID's allowed co-residency pairs. authorizeApplication
-// gates it (404-no-leak, same collapse as every other application read).
+// GetCoResidency returns appID's co-residency mode and explicit pairs, each with
+// its verdict. authorizeApplication gates it (404-no-leak, same collapse as
+// every other application read).
 func (s *Service) GetCoResidency(ctx context.Context, principal auth.Token, appID string) (CoResidencyDTO, error) {
 	app, _, err := s.authorizeApplication(ctx, principal, appID)
 	if err != nil {
 		return CoResidencyDTO{}, err
 	}
-	rules, err := s.routes.CoResidencyRulesByApplication(ctx, app.ID)
+	return s.storedCoResidency(ctx, app.ID)
+}
+
+// storedCoResidency reads appID's stored mode and explicit pairs into the DTO.
+// It does no authorization: both callers have already run authorizeApplication.
+func (s *Service) storedCoResidency(ctx context.Context, appID string) (CoResidencyDTO, error) {
+	mode, err := s.routes.GetCoResidencyMode(ctx, appID)
 	if err != nil {
 		return CoResidencyDTO{}, err
 	}
-	return coResidencyDTO(rules), nil
+	rules, err := s.routes.CoResidencyRulesByApplication(ctx, appID)
+	if err != nil {
+		return CoResidencyDTO{}, err
+	}
+	return coResidencyDTO(mode, rules), nil
 }
 
-// SetCoResidency validates and atomically replaces appID's whole co-residency
-// set. Every pair is validated BEFORE any store call (validate-before-mutate):
-// the two ids must be distinct, both must name a mapping belonging to appID
+// SetCoResidency validates and atomically replaces appID's whole set of explicit
+// co-residency pairs, and sets its mode when the request names one. Everything
+// is validated BEFORE any store call (validate-before-mutate): the mode must be
+// a known one, every verdict must be a known one, the two ids of a pair must be
+// distinct, both must name a mapping belonging to appID
 // itself (checked against s.routes.MappingsByApplication, never a bare global
 // existence check -- a mapping id that exists but belongs to a DIFFERENT
 // application is exactly as invalid as one that does not exist at all), each
 // pair is canonicalized by sorting it (mapping_a_id < mapping_b_id
 // lexicographically) so the client never has to submit pairs in a particular
 // order, and duplicate pairs are rejected AFTER that normalization -- so
-// [["a","b"],["b","a"]] is a duplicate, not two distinct entries. The store
-// itself (SetCoResidencyRules) is a dumb pair table by design and performs
-// none of this; it is entirely this method's job.
+// [["a","b"],["b","a"]] is a duplicate, not two distinct entries (whatever
+// verdicts they carry). The store itself (SetCoResidencyRules) is a dumb pair
+// table by design and performs none of this beyond the verdict; it is
+// entirely this method's job.
+//
+// The mode and the pairs are two store writes, not one transaction. The
+// effective list the agent receives depends on both, and SetCoResidencyMode does
+// not bump updated_at, so the agent is notified after the writes -- and also when
+// the pairs write fails after the mode write landed, because the stored mode
+// (hence the effective list) HAS changed by then. A failure of the first write
+// leaves the pairs untouched, so nothing was changed and nothing is announced.
 func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appID string, req SetCoResidencyRequest) (CoResidencyDTO, error) {
 	app, server, err := s.authorizeApplication(ctx, principal, appID)
 	if err != nil {
 		return CoResidencyDTO{}, err
+	}
+	mode := routing.CoResidencyMode(req.Mode)
+	if req.Mode != "" && !mode.Valid() {
+		return CoResidencyDTO{}, ErrCoResidencyModeInvalid
 	}
 	ownMappings, err := s.routes.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -1812,47 +1930,71 @@ func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appI
 	for _, m := range ownMappings {
 		belongsToApp[m.ID] = true
 	}
-	seenPairs := make(map[[2]string]bool, len(req.Pairs))
-	rules := make([]routing.CoResidencyRule, 0, len(req.Pairs))
-	now := s.clock().UTC()
-	for _, pair := range req.Pairs {
-		a, b := strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
+	rules, err := coResidencyRulesFromPairs(app.ID, req.Pairs, belongsToApp, s.clock().UTC())
+	if err != nil {
+		return CoResidencyDTO{}, err
+	}
+	modeWritten := false
+	if req.Mode != "" {
+		if err := s.routes.SetCoResidencyMode(ctx, app.ID, mode); err != nil {
+			return CoResidencyDTO{}, err
+		}
+		modeWritten = true
+	}
+	if err := s.routes.SetCoResidencyRules(ctx, app.ID, rules); err != nil {
+		if modeWritten {
+			s.notifyRuntimeChanged(server.ID)
+		}
+		return CoResidencyDTO{}, err
+	}
+	s.notifyRuntimeChanged(server.ID)
+	return s.storedCoResidency(ctx, app.ID)
+}
+
+// coResidencyRulesFromPairs validates a SetCoResidency request's pairs and turns
+// them into the store's rules: each pair names two distinct mappings of the
+// application (belongsToApp), carries a known verdict (empty is allow), and is
+// stored in canonical order (a < b), so a duplicate is detected after that
+// normalization. Any violation is ErrCoResidencyPairInvalid and nothing is
+// returned, so the caller never writes from a half-validated set.
+func coResidencyRulesFromPairs(appID string, pairs []CoResidencyPairDTO, belongsToApp map[string]bool, createdAt time.Time) ([]routing.CoResidencyRule, error) {
+	seenPairs := make(map[[2]string]bool, len(pairs))
+	rules := make([]routing.CoResidencyRule, 0, len(pairs))
+	for _, pair := range pairs {
+		a, b := strings.TrimSpace(pair.A), strings.TrimSpace(pair.B)
 		if a == "" || b == "" || a == b {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
+			return nil, ErrCoResidencyPairInvalid
 		}
 		if !belongsToApp[a] || !belongsToApp[b] {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
+			return nil, ErrCoResidencyPairInvalid
+		}
+		verdict, ok := routing.NormalizeCoResidencyVerdict(pair.Verdict)
+		if !ok {
+			return nil, ErrCoResidencyPairInvalid
 		}
 		if a > b {
 			a, b = b, a
 		}
 		key := [2]string{a, b}
 		if seenPairs[key] {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
+			return nil, ErrCoResidencyPairInvalid
 		}
 		seenPairs[key] = true
-		rules = append(rules, routing.CoResidencyRule{ApplicationID: app.ID, MappingAID: a, MappingBID: b, CreatedAt: now})
+		rules = append(rules, routing.CoResidencyRule{ApplicationID: appID, MappingAID: a, MappingBID: b, Verdict: verdict, CreatedAt: createdAt})
 	}
-	if err := s.routes.SetCoResidencyRules(ctx, app.ID, rules); err != nil {
-		return CoResidencyDTO{}, err
-	}
-	s.notifyRuntimeChanged(server.ID)
-	stored, err := s.routes.CoResidencyRulesByApplication(ctx, app.ID)
-	if err != nil {
-		return CoResidencyDTO{}, err
-	}
-	return coResidencyDTO(stored), nil
+	return rules, nil
 }
 
-// coResidencyDTO builds the wire DTO from stored rules; always a non-nil
-// Pairs slice (a collection-shaped return must never serialize to JSON
-// null -- see SetRuntimeSpecGPUs's equivalent contract).
-func coResidencyDTO(rules []routing.CoResidencyRule) CoResidencyDTO {
-	pairs := make([][2]string, 0, len(rules))
+// coResidencyDTO builds the wire DTO from the stored mode and explicit rules;
+// always a non-nil Pairs slice (a collection-shaped return must never serialize
+// to JSON null -- see SetRuntimeSpecGPUs's equivalent contract). Every rule is
+// listed with its own verdict: a forbid is never folded into an allow.
+func coResidencyDTO(mode routing.CoResidencyMode, rules []routing.CoResidencyRule) CoResidencyDTO {
+	pairs := make([]CoResidencyPairDTO, 0, len(rules))
 	for _, r := range rules {
-		pairs = append(pairs, [2]string{r.MappingAID, r.MappingBID})
+		pairs = append(pairs, CoResidencyPairDTO{A: r.MappingAID, B: r.MappingBID, Verdict: r.Verdict})
 	}
-	return CoResidencyDTO{Pairs: pairs}
+	return CoResidencyDTO{Mode: string(mode), Pairs: pairs}
 }
 
 // --- Task 6: per-GPU VRAM budgets -------------------------------------------
@@ -2178,7 +2320,7 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //	request happened to change.
 //
 // A new write path can be checked against that one sentence, because
-// AgentRuntimeConfig (below) derives the whole document from exactly six
+// AgentRuntimeConfig (below) derives the whole document from exactly seven
 // kinds of row. A path needs a notification if and only if it writes one of
 // them:
 //
@@ -2188,8 +2330,13 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //  3. that application's MAPPINGS -> each spec's model / upstream_model
 //     (gateway_model_name / app_model_name -- the agent has no other source)
 //  4. those mappings' RUNTIME SPECS and per-spec GPU rows -> specs[]
-//  5. that application's CO-RESIDENCY rules -> coresident[]
+//  5. that application's CO-RESIDENCY mode and explicit pair rows ->
+//     coresident[] (the effective allowed-pair list, effectiveAllowedPairs)
 //  6. the server's per-GPU VRAM BUDGETS -> gpu_budgets[]
+//  7. those mappings' CAPABILITY VERDICTS (model_mapping_capabilities, one
+//     batched read) -> each spec's role (routing.DeriveRole). The role is a
+//     document field like any other, so a verdict write moves the document
+//     and its ETag
 //
 // Call sites, by row: (1) UpdateServer; (2) CreateApplication /
 // UpdateApplication / DeleteApplication, via
@@ -2200,7 +2347,9 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // once per stored write, through putRuntimeSpec, and
 // SetBenchmarkRuntimeSpecsPinned / SetBenchmarkRuntimeSpecsAdminState from
 // setBenchmarkRuntimeSpecs, after the batch's last write, once for each server
-// a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets.
+// a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets; (7) the
+// operator's verdicts are written by CreateMapping / UpdateMapping, which are
+// already row 3's call sites and notify after the capability write has landed.
 //
 // The "never which field" half is the load-bearing half. A "relevant fields"
 // allow-list inside a write path would be a second, uncompiled copy of
@@ -2212,8 +2361,8 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // the agent then re-fetches and its driver applies only on a real ETag
 // change). Under-notifying is the actual bug.
 //
-// Only two kinds of write to rows 1-6 deliberately do NOT notify, and both
-// are exemptions of a whole write PATH rather than of a field:
+// Only three kinds of write to rows 1-7 deliberately do NOT notify, and each
+// is an exemption of a whole write PATH rather than of a field:
 //
 //   - A writer whose own signature confines it to columns OUTSIDE the
 //     document, so there is no field inspection that could rot:
@@ -2227,6 +2376,13 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     it changes it FROM the agent, so a push would echo the agent its own
 //     measurement -- once per telemetry sample, for a value that keeps
 //     moving. The agent already has it; its poll reconciles the rest.
+//   - The AUTOMATED capability writers (the agent's telemetry ingest in
+//     agent_ingest.go, the benchmark runner, the health probe and the relay's
+//     observation row). They write row 7, so they can move a spec's role and
+//     the document's ETag, but they are background probes and observations,
+//     not an operator action, and nothing safety-relevant waits on them: the
+//     role only ORDERS eviction victims that are already evictable, it never
+//     decides whether one is. The agent's poll reconciles the new role.
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
@@ -2377,6 +2533,16 @@ type AgentRuntimeSpecDTO struct {
 	// spec.Type, which may be "" -- the agent always receives a concrete
 	// kind it can act on directly.
 	Type string `json:"type"`
+	// Role is the spec's derived model role -- one of the routing.ModelRole
+	// values ("asr", "tts", "image", "embedding", "reranker", "chat", "other"),
+	// never empty: routing.DeriveRole over the RESOLVED Type above and the yes
+	// verdicts of the spec's mapping. It is the ONE derivation the portal's
+	// ModelDTO.Role also uses, shipped here so the agent's role-aware eviction
+	// and the editor's role grouping read the same value rather than each
+	// re-deriving it. It is derived on every build, never stored, so an
+	// operator's verdict change moves it (and the document's ETag) on the next
+	// push.
+	Role string `json:"role"`
 	// MetricsPath and ContextProbePath are the RESOLVED effective probe
 	// paths for Type -- routing.DeriveProbePaths(Type, spec.MetricsPath,
 	// spec.ContextProbePath): the stored per-spec override when set, else
@@ -2434,11 +2600,12 @@ type AgentRuntimeConfigDTO struct {
 // posture as AgentProxyRoutes' out-of-scope case.
 //
 // Only ENABLED specs are included (a disabled spec is nothing the agent
-// should ever run). Coresidency pairs are stored as MAPPING id pairs
-// (CoResidencyRule); this method translates each to a SPEC id pair, dropping
-// any pair whose either side has no enabled spec -- a pair pointing at a
-// disabled or missing spec is meaningless to the agent, which only ever sees
-// spec ids, never mapping ids.
+// should ever run). Coresident is the EFFECTIVE allowed-pair list: the
+// application's co-residency mode and its explicit pair rows (stored as MAPPING
+// id pairs, each allow or forbid) resolve to the SPEC id pairs that may be
+// resident together -- see effectiveAllowedPairs. A pair whose either side has
+// no enabled spec is dropped: it is meaningless to the agent, which only ever
+// sees spec ids, never mapping ids, modes or verdicts.
 //
 // Per-GPU VRAMMB: max(measured, estimate) -- see agentRuntimeSpecDTO. 0 means
 // unknown (both source fields are 0).
@@ -2546,6 +2713,21 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
+	// One batch capability read for every enabled spec's mapping, for the role
+	// each spec is pushed with (no per-spec N+1). A store error is PROPAGATED like
+	// every other read here: the agent keeps its last known-good config for one
+	// skipped poll, where a role guessed from the type alone would flip, say, an
+	// embedding model to chat for one push.
+	mappingIDs := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		if _, ok := mappingByID[spec.MappingID]; ok && spec.Enabled {
+			mappingIDs = append(mappingIDs, spec.MappingID)
+		}
+	}
+	capsByMapping, err := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
 	specIDByMapping := make(map[string]string, len(specs))
 	specDTOs := make([]AgentRuntimeSpecDTO, 0, len(specs))
 	for _, spec := range specs {
@@ -2578,25 +2760,82 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		et := routing.EffectiveRuntimeSpecType(spec)
 		mp, cp := routing.DeriveProbePaths(et, spec.MetricsPath, spec.ContextProbePath)
 		specDTO.Type = string(et)
+		specDTO.Role = string(routing.DeriveRole(et, routing.YesCapabilities(capsByMapping[spec.MappingID])))
 		specDTO.MetricsPath = mp
 		specDTO.ContextProbePath = cp
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}
+	// The co-residency setting is two inputs, the application's mode and its
+	// explicit pair rows, read here like every other input (a failed read is an
+	// error, never a guessed mode -- see the C1 note above). The agent still gets
+	// ONE plain list of allowed pairs, computed from both.
+	mode, err := s.routes.GetCoResidencyMode(ctx, agentApp.ID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
 	rules, err := s.routes.CoResidencyRulesByApplication(ctx, agentApp.ID)
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
-	coresident := make([][2]string, 0, len(rules))
-	for _, rule := range rules {
-		specA, okA := specIDByMapping[rule.MappingAID]
-		specB, okB := specIDByMapping[rule.MappingBID]
-		if !okA || !okB {
-			continue
-		}
-		coresident = append(coresident, [2]string{specA, specB})
-	}
+	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
 	return agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses), nil
+}
+
+// effectiveAllowedPairs computes the list of spec-id pairs the agent may keep
+// resident together -- the existing `coresident` wire field, whose shape
+// ([][2]string of spec ids) is unchanged.
+//
+// The effective verdict of a pair of ENABLED specs is the design's tri-state
+// rule: an explicit rule row decides (allow -> allowed, forbid -> not); a pair
+// with no row follows the application's mode (opt_out -> allowed, opt_in ->
+// not). Every pair that comes out allowed is ENUMERATED here, including all the
+// opt_out defaults, rather than the mode being sent to the agent: an agent that
+// predates the mode only reads this plain list, and an opt_out it could not see
+// would degrade to "nothing may co-locate". An agent that does know about
+// modes gets the same list, so neither needs the mode or the verdicts.
+//
+// specIDByMapping holds exactly the ENABLED specs, mapping id -> spec id, and is
+// both the set of pairs considered and the translation out of the mapping-id
+// space the rules are stored in: a rule that names a mapping with no enabled
+// spec matches nothing, and a pair touching such a mapping is never emitted.
+// Anything that is not unmistakably permissive resolves to "not allowed": a mode
+// other than opt_out behaves as opt_in, a verdict other than allow behaves as
+// forbid, because default-allow is the direction that can put two models on one
+// GPU that do not fit. (The store validates both, so this only matters for a
+// value the store should never return.)
+//
+// The result is deterministic -- pairs run over the mapping ids in ascending
+// order -- and so is its orientation: each pair is [spec of the lower mapping
+// id, spec of the higher], exactly what the former per-row translation emitted
+// for a canonical row, so an opt_in application's document (and its ETag) is
+// byte-identical to what it was before modes existed. The result is never nil.
+func effectiveAllowedPairs(mode routing.CoResidencyMode, specIDByMapping map[string]string, rules []routing.CoResidencyRule) [][2]string {
+	explicit := make(map[[2]string]bool, len(rules))
+	for _, r := range rules {
+		a, b := r.MappingAID, r.MappingBID
+		if a > b {
+			a, b = b, a
+		}
+		verdict, ok := routing.NormalizeCoResidencyVerdict(r.Verdict)
+		explicit[[2]string{a, b}] = ok && verdict == routing.CoResidencyVerdictAllow
+	}
+	defaultAllowed := mode == routing.CoResidencyModeOptOut
+
+	mappingIDs := slices.Sorted(maps.Keys(specIDByMapping))
+	pairs := make([][2]string, 0)
+	for i, a := range mappingIDs {
+		for _, b := range mappingIDs[i+1:] {
+			allowed, isExplicit := explicit[[2]string{a, b}]
+			if !isExplicit {
+				allowed = defaultAllowed
+			}
+			if allowed {
+				pairs = append(pairs, [2]string{specIDByMapping[a], specIDByMapping[b]})
+			}
+		}
+	}
+	return pairs
 }
 
 // resolvePushToken returns the DECRYPTED upstream token to inject into the child

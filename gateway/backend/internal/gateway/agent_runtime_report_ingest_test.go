@@ -577,3 +577,42 @@ func TestIngestRuntimeReportPreservesMirrorFields(t *testing.T) {
 		t.Errorf("context_probe_path = %q, want \"/props\" (silently dropped before #64)", s.ContextProbePath)
 	}
 }
+
+// TestIngestRuntimeReportPreservesSpecRole: the report mirror carries a
+// file-mode spec's role (AgentRuntimeSpecDTO.Role), so the stored report shows
+// the role the agent evicts by, and a spec that reports none stays without one
+// -- the mirror's role is omitempty, so an absent role is not invented as "" on
+// the way through the sanitizer's re-parse. Revert-verified: removing the Role
+// field from agentRuntimeReportSpec fails the first half.
+func TestIngestRuntimeReportPreservesSpecRole(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	const body = `{"source":"file","collected_at":"2026-11-02T09:00:00Z","config":{"router_listen":8081,"max_processes":2,"gpu_budgets":[],"specs":[{"id":"with-role","model":"m","upstream_model":"u","binary":"/usr/bin/x","args":[],"env":{},"role":"tts","gpus":[]},{"id":"no-role","model":"m2","upstream_model":"u2","binary":"/usr/bin/x","args":[],"env":{},"gpus":[]}],"coresident":[]}}`
+	if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", json.RawMessage(body)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	report, ok, err := srv.Routes.ServerRuntimeReportByServer(ctx, "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("ServerRuntimeReportByServer ok=%v err=%v", ok, err)
+	}
+	var got agentRuntimeReport
+	if err := json.Unmarshal([]byte(report.ReportJSON), &got); err != nil {
+		t.Fatalf("canonical json not parseable: %v", err)
+	}
+	var cfg agentRuntimeReportConfig
+	if err := json.Unmarshal(got.Config, &cfg); err != nil {
+		t.Fatalf("config not parseable: %v", err)
+	}
+	if len(cfg.Specs) != 2 {
+		t.Fatalf("want 2 specs, got %d", len(cfg.Specs))
+	}
+	if cfg.Specs[0].Role != "tts" {
+		t.Errorf("role = %q, want \"tts\" (dropped by the mirror before it modelled the field)", cfg.Specs[0].Role)
+	}
+	if cfg.Specs[1].Role != "" {
+		t.Errorf("role = %q, want it absent for a spec that reported none", cfg.Specs[1].Role)
+	}
+	if strings.Contains(report.ReportJSON, `"role":""`) {
+		t.Errorf("an absent role must not be stored as an empty string: %s", report.ReportJSON)
+	}
+}

@@ -109,6 +109,12 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// vram_measured_mb above: the store keeps it across every upsert and a
 		// request never carries it, so it is a read-only echo here.
 		"ram_measured_mb": true,
+		// role is the derived model role (routing.DeriveRole over effective_type
+		// and the mapping's yes verdicts): a READ-ONLY echo like effective_type,
+		// recomputed on every read and never stored, so a request has nothing to
+		// carry. This guard also fails the other way round -- a request field
+		// named role would have no DTO counterpart to round-trip.
+		"role": true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only

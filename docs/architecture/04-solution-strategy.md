@@ -45,9 +45,11 @@ is how the gateway replaced llama-swap with first-party machinery. The split of
 authority is the strategic part: the gateway holds the launch specification and
 decides *when* a model runs, while the AI server's own operator holds a binary
 allowlist that decides *what may run at all* — and the agent, not the gateway,
-enforces admission (a co-residency matrix, a process limit, per-GPU VRAM budgets
-and a host-wide RAM pool, both budgets detected from the hardware by default)
-before it starts anything. The gateway sees one ordinary application per server,
+enforces admission (a co-residency rule that is open by default for a new server (servers that
+existed before the rework stay opt-in) and carved out per pair, a process limit, per-GPU VRAM budgets and a host-wide RAM pool, both
+budgets detected from the hardware by default) before it starts anything, and
+when it must make room it evicts an idle model of the same role first and never
+one used within a grace window. The gateway sees one ordinary application per server,
 so routing, TLS and the mesh surface are untouched, and the whole capability is
 negotiated by feature flag, so an agent without it behaves exactly as before.
 → [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md).

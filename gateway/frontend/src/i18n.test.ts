@@ -2385,7 +2385,7 @@ describe('certificates i18n keys', () => {
 });
 
 describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
-  it('defines every runtime admin/spec/matrix/limits/status key in de and en', () => {
+  it('defines every runtime admin/spec/limits/status key in de and en', () => {
     const keys = [
       'runtimeAdmin',
       'runtimeSpecs',
@@ -2402,8 +2402,8 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'runtimeSpecStartupTimeout',
       'runtimeSpecPinned',
       'runtimeSpecEnabled',
-      'runtimeMatrix',
-      'runtimeMatrixHint',
+      'runtimeCoresidency',
+      'runtimeCoresidencyHint',
       'runtimeLimits',
       'runtimeGpuBudget',
       'runtimeMaxProcesses',
@@ -2448,6 +2448,7 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'errorRuntimeSpecAdminStateInvalid',
       'errorRuntimeSpecApplicationNotServerAgent',
       'errorRuntimeCoresidencyPairInvalid',
+      'errorRuntimeCoresidencyModeInvalid',
       'errorServerGpuBudgetInvalid',
       'errorServerRuntimeLimitInvalid',
       'errorApplicationManagedRuntimeOnly',
@@ -2598,17 +2599,9 @@ describe('agent-managed runtime i18n keys (task 22 live status + file mode)', ()
   });
 });
 
-describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
-  it('defines every co-residency-matrix and server-limits key in de and en', () => {
+describe('agent-managed runtime i18n keys (task 21 limits)', () => {
+  it('defines every server-limits key in de and en', () => {
     const keys = [
-      'runtimeMatrixCell',
-      'runtimeMatrixNeedTwo',
-      'runtimeMatrixConsequence',
-      'runtimeMatrixNoSharedGpu',
-      'runtimeMatrixAdvisory',
-      'runtimeMatrixOverBudget',
-      'runtimeMatrixDisabledFileMode',
-      'runtimeMatrixDisabledSaving',
       'runtimeLimitsIntro',
       'runtimeGpuDriftWarning',
       'runtimeGpuDriftIconLabel',
@@ -2620,6 +2613,93 @@ describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
       expect(typeof messages.en[k]).toBe('string');
       expect(messages.de[k].length).toBeGreaterThan(0);
       expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('co-residency editor i18n keys', () => {
+  const stringKeys = [
+    'runtimeCoresidency',
+    'runtimeCoresidencyHint',
+    'coresidencyModeLabel',
+    'coresidencyModeOptOut',
+    'coresidencyModeOptIn',
+    'coresidencyDefaultAllowedHint',
+    'coresidencyDefaultDeniedHint',
+    'coresidencyVerdictAllow',
+    'coresidencyVerdictForbid',
+    'coresidencyVerdictDefaultAllowed',
+    'coresidencyVerdictDefaultDenied',
+    'coresidencySearch',
+    'coresidencyModelList',
+    'coresidencyDetailHint',
+    'coresidencyRoleAsr',
+    'coresidencyRoleTts',
+    'coresidencyRoleImage',
+    'coresidencyRoleEmbedding',
+    'coresidencyRoleReranker',
+    'coresidencyRoleChat',
+    'coresidencyRoleOther',
+    'coresidencyGroupMixed',
+    'coresidencyFromGroup',
+    'coresidencyNeedTwo',
+    'coresidencyNoMatch',
+    'coresidencyResize',
+    'coresidencySaving',
+    'coresidencyFileMode',
+  ] as const;
+
+  it('defines every string key in de and en', () => {
+    for (const k of stringKeys) {
+      for (const locale of ['de', 'en'] as const) {
+        expect(typeof messages[locale][k], `${locale}.${k}`).toBe('string');
+        expect(messages[locale][k].length, `${locale}.${k}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps the four verdict segments and the seven role labels distinct from one another', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      const verdicts = [
+        m.coresidencyVerdictAllow,
+        m.coresidencyVerdictForbid,
+        m.coresidencyVerdictDefaultAllowed,
+        m.coresidencyVerdictDefaultDenied,
+      ];
+      expect(new Set(verdicts).size, `${locale} verdicts`).toBe(verdicts.length);
+      const roles = [
+        m.coresidencyRoleAsr,
+        m.coresidencyRoleTts,
+        m.coresidencyRoleImage,
+        m.coresidencyRoleEmbedding,
+        m.coresidencyRoleReranker,
+        m.coresidencyRoleChat,
+        m.coresidencyRoleOther,
+      ];
+      expect(new Set(roles).size, `${locale} roles`).toBe(roles.length);
+    }
+  });
+
+  it('renders the parameterised labels with their argument in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      expect(m.coresidencyGroupControl('Chat')).toContain('Chat');
+      expect(m.coresidencyMemberControl('Qwen 32B')).toContain('Qwen 32B');
+      expect(m.coresidencyGroupToggle('Chat')).toContain('Chat');
+      expect(m.coresidencyExceptions(1)).not.toBe(m.coresidencyExceptions(2));
+      expect(m.coresidencyExceptions(3)).toContain('3');
+      expect(m.coresidencyGroupSize(1)).not.toBe(m.coresidencyGroupSize(2));
+      expect(m.coresidencyGroupSize(5)).toContain('5');
+    }
+  });
+
+  it('states what "default" means in the mode hints', () => {
+    // The two hints are the only place the active mode is spelled out; they must
+    // not collapse into one sentence.
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      expect(m.coresidencyDefaultAllowedHint).not.toBe(m.coresidencyDefaultDeniedHint);
     }
   });
 });
@@ -3286,6 +3366,34 @@ describe('speech capability i18n key', () => {
   it('keeps the speech chip label distinct from the audio modality label', () => {
     expect(messages.de.capabilitySpeech).not.toBe(messages.de.capabilityAudio);
     expect(messages.en.capabilitySpeech).not.toBe(messages.en.capabilityAudio);
+  });
+});
+
+describe('embedding and rerank capability i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has the mapping control and chip keys in ${locale}`, () => {
+      const t = messages[locale];
+      for (const key of [
+        'mappingEmbeddingCapable',
+        'mappingEmbeddingCapableUnknownHint',
+        'mappingRerankCapable',
+        'mappingRerankCapableUnknownHint',
+        'capabilityEmbedding',
+        'capabilityRerank',
+      ] as const) {
+        expect(t[key], key).toBeTruthy();
+      }
+      // The two roles read as two different things, in the form and in the chip column.
+      expect(t.mappingEmbeddingCapable).not.toBe(t.mappingRerankCapable);
+      expect(t.capabilityEmbedding).not.toBe(t.capabilityRerank);
+    });
+  }
+
+  it('labels the two roles in de and en', () => {
+    expect(messages.en.capabilityEmbedding).toBe('Embedding');
+    expect(messages.en.capabilityRerank).toBe('Reranker');
+    expect(messages.de.capabilityEmbedding).toBe('Embedding');
+    expect(messages.de.capabilityRerank).toBe('Reranker');
   });
 });
 
@@ -4058,7 +4166,7 @@ describe('Voice Chat (#312) i18n keys', () => {
     expect(messages.de.chatVoiceLlmNote('m')).not.toBe(messages.en.chatVoiceLlmNote('m'));
   });
 
-  // A co-load refusal is the operator's to fix (the co-residency matrix and the GPU budgets), so
+  // A co-load refusal is the operator's to fix (the co-residency settings and the GPU budgets), so
   // the user is sent to the administrator rather than told to retry.
   it('sends the user to the administrator when the three models cannot be loaded together', () => {
     expect(messages.de.chatVoiceErrorCoLoad).toMatch(/Administrator/);

@@ -2650,3 +2650,449 @@ func TestHostRAMPoolChargesACandidateAgainstGenuinelyFreeRAM(t *testing.T) {
 	cand.RAMMB = 10001
 	assertDecision(t, "one MB more than is free", Admit(snap, cand), Decision{Evict: []string{"spec-a"}})
 }
+
+// --- The eviction grace window -------------------------------------------
+//
+// A model used within the grace window counts as in use: it is never an
+// eviction victim, however hard the pressure, because a bursty pipeline (a voice
+// chat between turns) is idle for a moment without being finished. The window
+// is read off the snapshot (Now, EvictionGrace) -- Admit never reads a clock --
+// and every rule that draws victims goes through isEvictable, so each one is
+// pinned below. The answer when the only way to fit is a within-grace model is
+// Wait with an empty Evict list, never a partial eviction and never an OK that
+// would over-commit.
+
+const graceWindow = 30 * time.Second
+
+// graceNow is the fixed "now" of the grace tests; the LastUsed offsets are
+// relative to it.
+var graceNow = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+
+// graceRule is one victim-drawing rule of Admit, built so that the one occupant
+// "occ" is the ONLY way to make room for the candidate. mk takes the occupant's
+// LastUsed, so a case varies nothing but how recently it was used.
+type graceRule struct {
+	name string
+	mk   func(lastUsed time.Time) (PolicySnapshot, Spec)
+	// waitOnRAM is the Decision.WaitOnRAM of the Wait answer: only rule 6.
+	waitOnRAM bool
+	// bootstrap is whether the Evict answer spends the VRAM bootstrap shot.
+	bootstrap bool
+}
+
+func graceRules() []graceRule {
+	withGrace := func(s PolicySnapshot) PolicySnapshot {
+		s.Now = graceNow
+		s.EvictionGrace = graceWindow
+		return s
+	}
+	return []graceRule{
+		{
+			name: "rule 1 matrix",
+			mk: func(lu time.Time) (PolicySnapshot, Spec) {
+				// Allowed left empty: the (cand, occ) pair is not permitted.
+				return withGrace(PolicySnapshot{Running: []RunningProc{{SpecID: "occ", LastUsed: lu}}}), Spec{ID: "cand"}
+			},
+		},
+		{
+			name: "rule 2 process count",
+			mk: func(lu time.Time) (PolicySnapshot, Spec) {
+				return withGrace(PolicySnapshot{
+					Running:      []RunningProc{{SpecID: "occ", LastUsed: lu}},
+					MaxProcesses: 1,
+					Allowed:      allowPairs("cand", "occ"),
+				}), Spec{ID: "cand"}
+			},
+		},
+		{
+			name: "rule 3 per-GPU VRAM",
+			mk: func(lu time.Time) (PolicySnapshot, Spec) {
+				return withGrace(PolicySnapshot{
+					Running: []RunningProc{{SpecID: "occ", GPUs: map[int]int{0: 800}, LastUsed: lu}},
+					Budgets: map[int]int{0: 1000},
+					Allowed: allowPairs("cand", "occ"),
+				}), Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 500}}}
+			},
+		},
+		{
+			name: "rule 4 bootstrap one-shot",
+			mk: func(lu time.Time) (PolicySnapshot, Spec) {
+				return withGrace(PolicySnapshot{
+					Running:               []RunningProc{{SpecID: "occ", GPUs: map[int]int{0: 800}, LastUsed: lu}},
+					VRAMBootstrapEligible: true,
+					Allowed:               allowPairs("cand", "occ"),
+				}), Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+			},
+			bootstrap: true,
+		},
+		{
+			name: "rule 5 unknown-VRAM occupant",
+			mk: func(lu time.Time) (PolicySnapshot, Spec) {
+				return withGrace(PolicySnapshot{
+					Running: []RunningProc{{SpecID: "occ", GPUs: map[int]int{0: 0}, LastUsed: lu}},
+					Allowed: allowPairs("cand", "occ"),
+				}), Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
+			},
+		},
+		{
+			name: "rule 6 host RAM",
+			mk: func(lu time.Time) (PolicySnapshot, Spec) {
+				return withGrace(PolicySnapshot{
+					Running:         []RunningProc{{SpecID: "occ", RAMMB: 800, LastUsed: lu}},
+					HostRAMBudgetMB: 1000,
+					Allowed:         allowPairs("cand", "occ"),
+				}), Spec{ID: "cand", RAMMB: 500}
+			},
+			waitOnRAM: true,
+		},
+	}
+}
+
+// TestIsEvictable pins the whole gate -- !Pinned && !Starting && InFlight == 0 &&
+// now-LastUsed > grace -- one clause at a time, and the grace clause's edge
+// cases: strict at the boundary, off at 0 (or below), a never-used process is
+// evictable, and a positive grace with no clock fails closed.
+func TestIsEvictable(t *testing.T) {
+	idleFor := func(d time.Duration) RunningProc { return RunningProc{SpecID: "p", LastUsed: graceNow.Add(-d)} }
+	with := func(r RunningProc, f func(*RunningProc)) RunningProc { f(&r); return r }
+	for _, tc := range []struct {
+		name  string
+		proc  RunningProc
+		now   time.Time
+		grace time.Duration
+		want  bool
+	}{
+		{"idle past the grace", idleFor(time.Minute), graceNow, graceWindow, true},
+		{"idle for exactly the grace", idleFor(graceWindow), graceNow, graceWindow, false},
+		{"idle one nanosecond past it", idleFor(graceWindow + time.Nanosecond), graceNow, graceWindow, true},
+		{"used just now", idleFor(0), graceNow, graceWindow, false},
+		{"never used", RunningProc{SpecID: "p"}, graceNow, graceWindow, true},
+		{"a LastUsed in the future (clock step) is protected", idleFor(-time.Second), graceNow, graceWindow, false},
+		{"grace 0 is off", idleFor(0), graceNow, 0, true},
+		{"a negative grace is off", idleFor(0), graceNow, -time.Second, true},
+		{"grace off and no clock", idleFor(0), time.Time{}, 0, true},
+		{"grace on and no clock fails closed", idleFor(time.Hour), time.Time{}, graceWindow, false},
+		{"pinned, however long idle", with(idleFor(time.Hour), func(r *RunningProc) { r.Pinned = true }), graceNow, graceWindow, false},
+		{"starting, however long idle", with(idleFor(time.Hour), func(r *RunningProc) { r.Starting = true }), graceNow, graceWindow, false},
+		{"busy, however long idle", with(idleFor(time.Hour), func(r *RunningProc) { r.InFlight = 1 }), graceNow, graceWindow, false},
+		{"pinned with the grace off", with(idleFor(time.Hour), func(r *RunningProc) { r.Pinned = true }), graceNow, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isEvictable(tc.proc, tc.now, tc.grace); got != tc.want {
+				t.Errorf("isEvictable(%+v, now=%v, grace=%v) = %v, want %v", tc.proc, tc.now, tc.grace, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdmitNeverEvictsAWithinGraceModel: for every rule that draws a victim, an
+// occupant used within the window is NOT evicted -- the start waits, evicting
+// nothing -- and one used outside it is the ordinary victim. The boundary is
+// strict (evictable only when now-LastUsed is GREATER than the grace), a grace
+// of 0 turns the window off, and a process that was never used (zero LastUsed)
+// is the oldest thing there is. A bootstrap start the grace blocks must not
+// spend the candidate's one-shot.
+func TestAdmitNeverEvictsAWithinGraceModel(t *testing.T) {
+	for _, rule := range graceRules() {
+		for _, tc := range []struct {
+			name      string
+			lastUsed  time.Time
+			grace     time.Duration // overrides the rule's window; -1 keeps it
+			wantEvict bool
+		}{
+			{"used 5s ago is protected", graceNow.Add(-5 * time.Second), -1, false},
+			{"used just now is protected", graceNow, -1, false},
+			{"used exactly one grace ago is still protected", graceNow.Add(-graceWindow), -1, false},
+			{"used one nanosecond past the grace is evictable", graceNow.Add(-graceWindow - time.Nanosecond), -1, true},
+			{"used 45s ago is evictable", graceNow.Add(-45 * time.Second), -1, true},
+			{"never used is evictable", time.Time{}, -1, true},
+			{"a grace of 0 is off", graceNow.Add(-time.Second), 0, true},
+		} {
+			t.Run(rule.name+"/"+tc.name, func(t *testing.T) {
+				snap, spec := rule.mk(tc.lastUsed)
+				if tc.grace >= 0 {
+					snap.EvictionGrace = tc.grace
+				}
+				got := Admit(snap, spec)
+				if tc.wantEvict {
+					assertDecision(t, "outside the window", got, Decision{Evict: []string{"occ"}})
+					if got.VRAMBootstrap != rule.bootstrap {
+						t.Errorf("VRAMBootstrap = %v, want %v", got.VRAMBootstrap, rule.bootstrap)
+					}
+					return
+				}
+				assertDecision(t, "within the window", got, Decision{Wait: true, WaitOnRAM: rule.waitOnRAM, Evict: []string{}})
+				if got.VRAMBootstrap {
+					t.Error("a start the grace window blocked must not spend the one-shot VRAM bootstrap")
+				}
+			})
+		}
+	}
+}
+
+// TestAdmitGraceNeverYieldsAPartialEviction: when making room needs two victims
+// and only one of them is outside the window, the answer is Wait with NOTHING
+// evicted -- evicting the one that may go would not unblock a retry, and would
+// cost a model for no start. When one victim suffices, the outside-window one is
+// drawn and the protected one is left alone.
+func TestAdmitGraceNeverYieldsAPartialEviction(t *testing.T) {
+	running := []RunningProc{
+		{SpecID: "old", LastUsed: graceNow.Add(-5 * time.Minute)},
+		{SpecID: "recent", LastUsed: graceNow.Add(-3 * time.Second)},
+	}
+	snap := PolicySnapshot{
+		Running:       running,
+		Now:           graceNow,
+		EvictionGrace: graceWindow,
+		Allowed:       allowPairs("cand", "old", "recent"),
+	}
+
+	snap.MaxProcesses = 1 // two must go, one may
+	assertDecision(t, "two needed, one evictable", Admit(snap, Spec{ID: "cand"}),
+		Decision{Wait: true, Evict: []string{}})
+
+	snap.MaxProcesses = 2 // one must go
+	assertDecision(t, "one needed, the idle-long one", Admit(snap, Spec{ID: "cand"}),
+		Decision{Evict: []string{"old"}})
+}
+
+// TestAdmitGraceDoesNotChangeWhatIsAlreadyProtected: the grace window only ever
+// ADDS protection. Pinned, still-loading and busy processes stay unevictable at
+// any age, and a snapshot that carries no grace (the zero value) keeps the
+// behaviour every earlier test pins.
+func TestAdmitGraceDoesNotChangeWhatIsAlreadyProtected(t *testing.T) {
+	ancient := graceNow.Add(-24 * time.Hour)
+	for _, tc := range []struct {
+		name string
+		proc RunningProc
+	}{
+		{"pinned", RunningProc{SpecID: "occ", Pinned: true, LastUsed: ancient}},
+		{"starting", RunningProc{SpecID: "occ", Starting: true, LastUsed: ancient}},
+		{"busy", RunningProc{SpecID: "occ", InFlight: 1, LastUsed: ancient}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{Running: []RunningProc{tc.proc}, Now: graceNow, EvictionGrace: graceWindow}
+			assertDecision(t, tc.name, Admit(snap, Spec{ID: "cand"}), Decision{Wait: true, Evict: []string{}})
+		})
+	}
+}
+
+// --- role-aware victim ordering (Task 3.3) -----------------------------------
+//
+// When admitting a candidate needs room, the idle, evictable victims are drawn
+// in the order (role == candidate.role ? 0 : 1, LastUsed ascending): a victim of
+// the candidate's OWN role before one of another role, then least-recently-used
+// within a band. That is the role swap of design doc §4.3 -- a new ASR evicts
+// the idle ASR, not the TTS a voice chat still needs between turns -- while
+// cross-role eviction stays available under real pressure. The grace gate
+// (isEvictable) is unchanged by any of this: a within-grace or in-use model is
+// never a victim whatever its role, which the last two tests here pin.
+
+// TestAdmitEvictsSameRoleBeforeAnotherRole is the voice-chat protection: a new
+// ASR, with an idle ASR and an idle TTS both evictable, evicts the ASR. The TTS
+// is the OLDEST here on purpose, so plain least-recently-used would wrongly take
+// it; role-aware ordering keeps it for the voice chat and takes the same-role
+// ASR instead.
+func TestAdmitEvictsSameRoleBeforeAnotherRole(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle-tts", Role: "tts", LastUsed: t0}, // oldest
+			{SpecID: "idle-asr", Role: "asr", LastUsed: t3}, // newest
+		},
+		MaxProcesses: 2, // two running + candidate = three, so one must go
+		Allowed:      allowPairs("new-asr", "idle-tts", "idle-asr"),
+	}
+	assertDecision(t, "same-role victim first", Admit(snap, Spec{ID: "new-asr", Role: "asr"}),
+		Decision{Evict: []string{"idle-asr"}})
+}
+
+// TestAdmitSameRoleFirstThenOtherRolesOldestUnderPressure: when pressure needs
+// TWO victims, the candidate's own-role peer goes first (even though it is the
+// most-recently-used), then the oldest of the OTHER roles; the newer other-role
+// model is spared. Cross-role eviction is normal under real pressure -- the role
+// preference only orders victims, it never protects another role absolutely.
+func TestAdmitSameRoleFirstThenOtherRolesOldestUnderPressure(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle-asr", Role: "asr", LastUsed: t3},       // newest, same role as candidate
+			{SpecID: "idle-tts", Role: "tts", LastUsed: t1},       // newer other role, spared
+			{SpecID: "idle-emb", Role: "embedding", LastUsed: t0}, // oldest other role
+		},
+		MaxProcesses: 2, // three running + candidate = four, so two must go
+		Allowed:      allowPairs("new-asr", "idle-asr", "idle-tts", "idle-emb"),
+	}
+	// Selected: idle-asr (same role) + idle-emb (oldest other role). The Evict
+	// list is reported oldest LastUsed first (decide), which is only the drain
+	// order.
+	assertDecision(t, "same role then oldest other role", Admit(snap, Spec{ID: "new-asr", Role: "asr"}),
+		Decision{Evict: []string{"idle-emb", "idle-asr"}})
+}
+
+// TestAdmitOtherRoleCandidateIsPureLRU: a candidate of role "other" has no
+// same-role peer among asr/tts victims, so every victim falls in the other-role
+// band and the ordering is pure least-recently-used.
+func TestAdmitOtherRoleCandidateIsPureLRU(t *testing.T) {
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "idle-asr", Role: "asr", LastUsed: t1},
+			{SpecID: "idle-tts", Role: "tts", LastUsed: t0}, // oldest
+		},
+		MaxProcesses: 2, // one must go
+		Allowed:      allowPairs("new-other", "idle-asr", "idle-tts"),
+	}
+	assertDecision(t, "pure LRU for an other-role candidate", Admit(snap, Spec{ID: "new-other", Role: RoleOther}),
+		Decision{Evict: []string{"idle-tts"}})
+}
+
+// TestAdmitRoleComparisonIsNormalized: the candidate's role is normalized
+// (roleOf) before it is compared, exactly as buildSnapshot normalizes each
+// occupant's role, so a differently-cased or whitespace-padded candidate role
+// still groups with its own kind, and an absent role folds to RoleOther and
+// matches an occupant whose role is "other". In both cases the same-role peer is
+// drawn ahead of the OLDER other-role model -- which plain LRU would have taken.
+func TestAdmitRoleComparisonIsNormalized(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		candidateRole string
+		peerRole      string
+	}{
+		{"cased and padded candidate matches", "  ASR ", "asr"},
+		{"empty candidate folds to other and matches an other peer", "", RoleOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running: []RunningProc{
+					{SpecID: "idle-old", Role: "tts", LastUsed: t0}, // oldest, a different role
+					{SpecID: "idle-peer", Role: tc.peerRole, LastUsed: t3},
+				},
+				MaxProcesses: 2, // one must go
+				Allowed:      allowPairs("cand", "idle-old", "idle-peer"),
+			}
+			assertDecision(t, tc.name, Admit(snap, Spec{ID: "cand", Role: tc.candidateRole}),
+				Decision{Evict: []string{"idle-peer"}})
+		})
+	}
+}
+
+// TestAdmitRoleOrderingSpansEveryVictimRule pins that the role-aware order is
+// applied by EVERY rule that draws a victim, not only the process-count limit:
+// the per-GPU VRAM budget (rule 3) and the host-RAM pool (rule 6) draw the same
+// same-role-first victim. Each case has an idle same-role peer (newest) and an
+// idle other-role model (oldest) on the contested resource, with room for only
+// one to stay; role-aware ordering evicts the same-role peer and spares the
+// other role, where plain LRU would take the oldest.
+func TestAdmitRoleOrderingSpansEveryVictimRule(t *testing.T) {
+	t.Run("rule 3 per-GPU VRAM", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "idle-tts", Role: "tts", GPUs: map[int]int{0: 400}, LastUsed: t0}, // oldest
+				{SpecID: "idle-asr", Role: "asr", GPUs: map[int]int{0: 400}, LastUsed: t3},
+			},
+			Budgets: map[int]int{0: 1000}, // 500 + 400 + 400 = 1300 > 1000; one 400 must go
+			Allowed: allowPairs("new-asr", "idle-tts", "idle-asr"),
+		}
+		assertDecision(t, "same-role VRAM victim first",
+			Admit(snap, Spec{ID: "new-asr", Role: "asr", GPUs: []SpecGPU{{Index: 0, VRAMMB: 500}}}),
+			Decision{Evict: []string{"idle-asr"}})
+	})
+	t.Run("rule 6 host RAM", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "idle-tts", Role: "tts", RAMMB: 400, LastUsed: t0}, // oldest
+				{SpecID: "idle-asr", Role: "asr", RAMMB: 400, LastUsed: t3},
+			},
+			HostRAMBudgetMB: 1000, // 500 + 400 + 400 = 1300 > 1000; one 400 must go
+			Allowed:         allowPairs("new-asr", "idle-tts", "idle-asr"),
+		}
+		assertDecision(t, "same-role RAM victim first",
+			Admit(snap, Spec{ID: "new-asr", Role: "asr", RAMMB: 500}),
+			Decision{Evict: []string{"idle-asr"}, WaitOnRAM: false})
+	})
+}
+
+// TestAdmitWaitOnGraceOnlyWhenGraceIsTheSoleBlocker pins Decision.WaitOnGrace: it
+// is set exactly when the admission would have proceeded (an OK or an Evict) had
+// nothing been grace-protected -- a Wait blocked SOLELY by a within-grace victim,
+// which is the one the grace-expiry wake must re-ask. A hard blocker, an
+// already-evictable victim, or the window being off all leave it false.
+func TestAdmitWaitOnGraceOnlyWhenGraceIsTheSoleBlocker(t *testing.T) {
+	// Positive: for every victim-drawing rule, when the ONLY thing that could make
+	// room is a within-grace model, the Wait carries WaitOnGrace.
+	for _, rule := range graceRules() {
+		t.Run("solely grace/"+rule.name, func(t *testing.T) {
+			snap, spec := rule.mk(graceNow.Add(-time.Second)) // used 1s ago: inside the 30s window
+			got := Admit(snap, spec)
+			if !got.Wait || !got.WaitOnGrace {
+				t.Fatalf("Admit = %+v, want Wait && WaitOnGrace (only a within-grace victim blocks)", got)
+			}
+			if len(got.Evict) != 0 {
+				t.Errorf("Evict = %v, want empty on a grace Wait", got.Evict)
+			}
+		})
+	}
+
+	// Negative: the same victim OUTSIDE the window is evicted -- no Wait, so no
+	// WaitOnGrace.
+	t.Run("outside the window evicts, not a grace wait", func(t *testing.T) {
+		snap, spec := graceRules()[1].mk(graceNow.Add(-graceWindow - time.Second)) // rule 2, process count
+		if got := Admit(snap, spec); got.Wait || got.WaitOnGrace {
+			t.Fatalf("Admit = %+v, want an Evict with WaitOnGrace false", got)
+		}
+	})
+
+	// Negative: a hard blocker (a busy occupant) is not resolved by a grace expiry,
+	// so the Wait is not WaitOnGrace -- the counterfactual with grace off still
+	// blocks on the busy one.
+	t.Run("a busy blocker is not a grace wait", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running:       []RunningProc{{SpecID: "busy", InFlight: 1, LastUsed: graceNow.Add(-time.Second)}},
+			MaxProcesses:  1,
+			Now:           graceNow,
+			EvictionGrace: graceWindow,
+			Allowed:       allowPairs("cand", "busy"),
+		}
+		got := Admit(snap, Spec{ID: "cand"})
+		if !got.Wait {
+			t.Fatalf("Admit = %+v, want Wait", got)
+		}
+		if got.WaitOnGrace {
+			t.Error("WaitOnGrace = true, want false: a busy blocker is not resolved by a grace expiry")
+		}
+	})
+
+	// Negative: with the grace window off entirely, a blocked admission is never a
+	// grace wait (here the idle occupant is simply evicted).
+	t.Run("grace off is never a grace wait", func(t *testing.T) {
+		snap, spec := graceRules()[1].mk(graceNow.Add(-time.Second))
+		snap.EvictionGrace = 0
+		if got := Admit(snap, spec); got.WaitOnGrace {
+			t.Errorf("Admit = %+v, want WaitOnGrace false with the grace window off", got)
+		}
+	})
+}
+
+// TestAdmitWaitsWhenOnlyProtectedVictimsRemain: when the only model that could
+// make room is in use (InFlight>0) or within the grace window, the admission
+// waits -- no eviction, no OOM -- regardless of role. The role-aware ordering
+// never widens the victim set; isEvictable is still the gate.
+func TestAdmitWaitsWhenOnlyProtectedVictimsRemain(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		occ  RunningProc
+	}{
+		{"within grace", RunningProc{SpecID: "occ", Role: "asr", LastUsed: graceNow.Add(-time.Second)}},
+		{"in use", RunningProc{SpecID: "occ", Role: "asr", InFlight: 1, LastUsed: graceNow.Add(-time.Hour)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running:       []RunningProc{tc.occ},
+				MaxProcesses:  1, // the one occupant would have to go, but cannot
+				Now:           graceNow,
+				EvictionGrace: graceWindow,
+				Allowed:       allowPairs("new-asr", "occ"),
+			}
+			assertDecision(t, tc.name, Admit(snap, Spec{ID: "new-asr", Role: "asr"}),
+				Decision{Wait: true, Evict: []string{}})
+		})
+	}
+}

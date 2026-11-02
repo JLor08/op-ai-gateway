@@ -448,6 +448,18 @@ func (_d *RoutingStoreWithTracing) DeleteVendorAccount(ctx context.Context, id s
 	return _d.Store.DeleteVendorAccount(ctx, id)
 }
 
+func (_d *RoutingStoreWithTracing) GetCoResidencyMode(ctx context.Context, appID string) (c2 _sourceRouting.CoResidencyMode, err error) {
+	ctx, span := Start(ctx, "routing.Store.GetCoResidencyMode")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.GetCoResidencyMode(ctx, appID)
+}
+
 func (_d *RoutingStoreWithTracing) GroupMembersByGroup(ctx context.Context, groupID string) (ga1 []_sourceRouting.GroupMember, err error) {
 	ctx, span := Start(ctx, "routing.Store.GroupMembersByGroup")
 	defer span.End()
@@ -1130,6 +1142,18 @@ func (_d *RoutingStoreWithTracing) ServicesByDelegate(ctx context.Context, userI
 		}
 	}()
 	return _d.Store.ServicesByDelegate(ctx, userID)
+}
+
+func (_d *RoutingStoreWithTracing) SetCoResidencyMode(ctx context.Context, appID string, mode _sourceRouting.CoResidencyMode) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetCoResidencyMode")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetCoResidencyMode(ctx, appID, mode)
 }
 
 func (_d *RoutingStoreWithTracing) SetCoResidencyRules(ctx context.Context, appID string, rules []_sourceRouting.CoResidencyRule) (err error) {

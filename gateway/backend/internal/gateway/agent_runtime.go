@@ -394,6 +394,11 @@ type agentRuntimeReportSpec struct {
 	Type             string `json:"type"`
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+	// Role is the spec's derived model role (AgentRuntimeSpecDTO.Role). The live
+	// document always carries it; a file-mode agent echoes whatever its local
+	// file says, which may be nothing, so unlike the DTO it is omitempty here:
+	// an absent role stays absent in the stored report instead of becoming "".
+	Role string `json:"role,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

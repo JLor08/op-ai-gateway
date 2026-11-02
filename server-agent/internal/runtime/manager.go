@@ -274,6 +274,17 @@ type ManagerOptions struct {
 	// so an unknown-RAM spec starts unconstrained, and a negative value is treated
 	// as zero.
 	RAMBootstrapGuessMB int
+	// EvictionGrace is how long after a process was last used it stays off the
+	// eviction victim list: a model used within it counts as in use, never a
+	// victim however hard the admission pressure, so a bursty pipeline (a voice
+	// chat between turns) is not broken by a start that happens to need room. It
+	// is OPERATOR configuration from the agent's own local settings
+	// (OP_AGENT_EVICTION_GRACE_SECONDS) -- the gateway never supplies it. Fixed
+	// for the process lifetime, like the other options here. The agent's config
+	// defaults it to 30 seconds; zero here (the default of a caller that sets
+	// nothing, such as most tests) turns the protection off, so an idle process is
+	// evictable at once as before, and a negative value is treated as zero.
+	EvictionGrace time.Duration
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -385,6 +396,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		vramHeadroomMB:      max(0, opts.VRAMHeadroomMB),
 		hostRAMReserveMB:    max(0, opts.HostRAMReserveMB),
 		ramBootstrapGuessMB: max(0, opts.RAMBootstrapGuessMB),
+		evictionGrace:       max(0, opts.EvictionGrace),
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -837,6 +849,14 @@ type cmdBackoffFire struct{ specID string }
 
 func (cmdBackoffFire) isCommand() {}
 
+// cmdGraceExpiry is posted by the owner's single grace timer when the earliest
+// within-grace victim's window expires. It carries no spec: the handler re-asks
+// every spec blocked solely by the grace window (handleGraceExpiry), exactly as a
+// host-sample wake re-asks every RAM waiter. See owner.rescheduleGraceWake.
+type cmdGraceExpiry struct{}
+
+func (cmdGraceExpiry) isCommand() {}
+
 type cmdStableRun struct {
 	specID string
 	proc   *runningProc
@@ -1092,6 +1112,18 @@ type specState struct {
 	// it describes.
 	waitingOnRAM bool
 
+	// waitingOnGrace is true while this spec's most recent admission verdict was a
+	// Wait blocked SOLELY by a within-grace victim (Decision.WaitOnGrace). It is the
+	// grace twin of waitingOnRAM: a Wait that resolves with nothing happening to any
+	// process, this time by the mere passing of time as the earliest within-grace
+	// victim's window expires. It is the set wantsGraceWake selects, so only such a
+	// spec is re-asked by the grace-expiry wake (owner.rescheduleGraceWake /
+	// handleGraceExpiry) -- a start waiting on the matrix, a busy neighbour, the
+	// process limit or a VRAM/RAM budget is never woken by a grace expiry.
+	// admitAndStart rewrites it on every verdict, like waitingOnRAM, so it never
+	// outlives the Wait it describes.
+	waitingOnGrace bool
+
 	// notPermittedAt is stamped to now() every time admitAndStart (re)confirms
 	// StateNotPermitted or StatePendingVRAMUnknown -- deliberately NOT the
 	// same as `since`, because setState is a no-op (and so never touches
@@ -1150,6 +1182,12 @@ type owner struct {
 	// above; read only by buildSnapshot, which copies it into the snapshot's
 	// RAMBootstrapGuessMB for Admit (the one place that interprets it).
 	ramBootstrapGuessMB int
+	// evictionGrace is ManagerOptions.EvictionGrace, never negative. Fixed for
+	// the process lifetime, so a plain field like ramBootstrapGuessMB above; read
+	// by buildSnapshot (copied into the snapshot's EvictionGrace for Admit, the
+	// one place that interprets it) and by the bootstrap escalation's own victim
+	// pick, so the two never disagree about who is protected.
+	evictionGrace time.Duration
 	// ramFreedMB is the host RAM that managed processes held when they exited
 	// and that the hardware sample has not necessarily caught up with yet, valid
 	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
@@ -1166,6 +1204,21 @@ type owner struct {
 	allowedPairs map[[2]string]bool
 	specs        map[string]*specState
 	byUpstream   map[string]string // upstream_model -> spec ID
+
+	// graceTimer is a single owner-wide timer that fires when the EARLIEST
+	// within-grace victim's window is about to expire, so a start blocked solely by
+	// the grace window (specState.waitingOnGrace) is re-asked the moment its victim
+	// becomes evictable -- the one wake that no release, exit, sample or Apply
+	// provides (see Decision.WaitOnGrace). It is the grace analogue of the RAM
+	// waiter's hostWake, except that grace has no external beat, so the owner
+	// schedules the wake itself (rescheduleGraceWake). One timer, not one per spec:
+	// every grace-blocked start's next chance is the same earliest expiry, so a
+	// single timer wakes them all and cannot storm. graceTimerAt is the instant it
+	// is currently set for (zero when none), used to avoid rescheduling to an
+	// instant it is already armed for. Owner-goroutine state; cancelled by
+	// handleClose so it never outlives the owner (m.wg / Close).
+	graceTimer   *time.Timer
+	graceTimerAt time.Time
 
 	closing bool // true from the moment cmdClose is received
 	stopped bool // true once every live process has been confirmed gone during close
@@ -1227,6 +1280,8 @@ func (o *owner) handle(cmd command) {
 		o.handleStartResult(c)
 	case cmdBackoffFire:
 		o.handleBackoffFire(c.specID)
+	case cmdGraceExpiry:
+		o.handleGraceExpiry()
 	case cmdStableRun:
 		o.handleStableRun(c)
 	case cmdDrainGraceExpired:
@@ -1415,6 +1470,12 @@ func sameLaunchShape(a, b Spec) bool {
 		// leaving it in the comparison would relaunch every freshly measured
 		// healthy child.
 		s.RAMMB = 0
+		// Role is the eviction policy's input (which idle model to evict), never
+		// baked into the child. The gateway derives it on every build from the
+		// spec's capability verdicts, so an operator's verdict change moves it
+		// with the process untouched, and the first document that carries it
+		// would otherwise relaunch every healthy child.
+		s.Role = ""
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
@@ -1804,14 +1865,22 @@ func (o *owner) admitAndStart(specID string) {
 		// Close forever.
 		return
 	}
+	// Reconcile the owner's single grace timer against the verdict reached below,
+	// on every path out of here: whatever this admission does to its own
+	// waitingOnGrace, the earliest within-grace expiry worth waking for may now be
+	// different (or gone). rescheduleGraceWake is a cheap no-op whenever nothing is
+	// grace-blocked (the common case), so the defer costs nothing on the hot path.
+	defer o.rescheduleGraceWake()
 	st := o.specs[specID]
 	if st == nil || st.proc != nil || st.state == StateBackoff {
 		return
 	}
-	// Every verdict below rewrites this from scratch, and so does every return
-	// before one: a spec nobody wants up, or one force-stopped, is no RAM waiter,
-	// and a stale true must never be able to select it for a sample wake.
+	// Every verdict below rewrites these from scratch, and so does every return
+	// before one: a spec nobody wants up, or one force-stopped, is neither a RAM
+	// nor a grace waiter, and a stale true must never be able to select it for a
+	// sample or grace wake.
 	st.waitingOnRAM = false
+	st.waitingOnGrace = false
 	if !o.wantsUp(st) {
 		return
 	}
@@ -1833,6 +1902,7 @@ func (o *owner) admitAndStart(specID string) {
 	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
 	dec := Admit(snap, st.spec)
 	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
+	st.waitingOnGrace = dec.Wait && dec.WaitOnGrace
 	switch {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
@@ -2317,6 +2387,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			RAMMB:    max(liveRAM, st.spec.RAMMB),
 			InFlight: st.inFlight,
 			Pinned:   st.spec.Pinned,
+			Role:     roleOf(st.spec.Role),
 			LastUsed: st.lastUsed,
 			// A process that has been exec'd but never passed a health
 			// probe. It occupies its resources exactly like a running one
@@ -2345,8 +2416,14 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	o.fillDetectedBudgets(budgets, hi)
 
 	return PolicySnapshot{
-		Running:         running,
-		MaxProcesses:    o.cfg.MaxProcesses,
+		Running:      running,
+		MaxProcesses: o.cfg.MaxProcesses,
+		// The clock and the grace window travel together: Admit never reads a
+		// clock, so the snapshot is stamped here, once, and every LastUsed in
+		// Running is measured against this one instant. The grace is copied
+		// verbatim (0 = off); isEvictable is the one place that interprets it.
+		Now:             time.Now(),
+		EvictionGrace:   o.evictionGrace,
 		Budgets:         budgets,
 		HostRAMBudgetMB: hostRAMBudgetMB(hi, residentRAMMB, o.hostRAMReserveMB),
 		// The ceiling is the budget's generous twin, for the terminal
@@ -3141,18 +3218,28 @@ func (o *owner) handleBootstrapMemoryPressure(st *specState, exitCode int, tail 
 //
 // It picks the oldest idle, unpinned, non-starting victim -- the same
 // isEvictable contract Admit uses (never a busy, pinned or still-loading
-// process, never the fork-exec-storm victim that clause exists to prevent) and
-// the same oldest-LastUsed, lowest-id tie-break Admit's sortOldestFirst uses, so
-// the choice is deterministic over a map-ordered spec set. It records the
-// beneficiary (drainedFor) so the victim's exit offers the freed slot to the
-// bootstrap first, exactly like an admission eviction.
+// process, never the fork-exec-storm victim that clause exists to prevent, and
+// never one used within the eviction grace window, so the escalation cannot take
+// the model a pipeline is between requests on) and the same oldest-LastUsed,
+// lowest-id tie-break Admit's sortOldestFirst uses, so the choice is
+// deterministic over a map-ordered spec set. When every candidate is protected
+// it finds no victim, which handleBootstrapMemoryPressure already reports as
+// "no idle process to evict" and still retries once. It records the beneficiary
+// (drainedFor) so the victim's exit offers the freed slot to the bootstrap
+// first, exactly like an admission eviction.
 func (o *owner) evictOneIdleForBootstrap(beneficiaryID string) bool {
 	var victim *specState
+	now := time.Now()
 	for id, st := range o.specs {
 		if id == beneficiaryID || st.proc == nil || st.state != StateRunning {
 			continue
 		}
-		if !isEvictable(RunningProc{Pinned: st.spec.Pinned, Starting: st.state == StateStarting, InFlight: st.inFlight}) {
+		if !isEvictable(RunningProc{
+			Pinned:   st.spec.Pinned,
+			Starting: st.state == StateStarting,
+			InFlight: st.inFlight,
+			LastUsed: st.lastUsed,
+		}, now, o.evictionGrace) {
 			continue
 		}
 		if victim == nil ||
@@ -3450,6 +3537,163 @@ func wantsHostSampleWake(st *specState) bool {
 	return st.waitingOnRAM && wantsWakeAfterStart(st)
 }
 
+// graceWakeSlack is how far PAST a within-grace victim's computed expiry the grace
+// timer fires. The grace bound is strict -- a model is evictable only when
+// now-LastUsed is GREATER than the window (isEvictable/withinGrace) -- so a wake
+// at exactly the expiry would re-ask the admission one instant too early, find the
+// victim still protected, and merely reschedule. A small slack puts now past the
+// window on the first try; a timer firing a touch late only converges sooner, and
+// a re-ask that is still too early simply reschedules, so correctness never
+// depends on this value's precision.
+const graceWakeSlack = 5 * time.Millisecond
+
+// handleGraceExpiry is the owner's single grace timer's callback (cmdGraceExpiry):
+// the earliest within-grace victim's window has expired, so re-ask every start
+// blocked solely by the grace window. It is the grace analogue of wakeOnHostSample.
+//
+// It clears the handle with cancelTimer rather than a bare o.graceTimer = nil,
+// and that is deliberate: the owner is single-threaded, but this command races
+// other commands for the owner's attention, so an admitAndStart (via its deferred
+// rescheduleGraceWake) could have REPLACED the fired timer with a fresh one
+// between this timer firing and this handler running. cancelTimer clears the fired
+// timer (Stop reports it already fired, so no wg.Done -- the callback owns that)
+// AND cleanly cancels any such replacement (Stop reports it live, releasing its
+// wg.Add), so the handle is never left pointing at an orphaned timer that
+// handleClose could not reach -- the G2 invariant. rescheduleGraceWake then arms a
+// fresh timer for the next earliest expiry if any grace-blocked start remains --
+// reached here too via each re-asked admitAndStart's own deferred
+// rescheduleGraceWake, and once more explicitly so the case where the wake frees
+// everyone (or finds nobody) still reconciles the timer to "none".
+func (o *owner) handleGraceExpiry() {
+	cancelTimer(o.m, &o.graceTimer)
+	o.graceTimerAt = time.Time{}
+	if o.closing {
+		return
+	}
+	o.wakeOnGraceExpiry()
+	o.rescheduleGraceWake()
+}
+
+// wakeOnGraceExpiry re-asks exactly the starts a grace expiry can unblock -- those
+// blocked solely by a within-grace victim (wantsGraceWake) -- oldest queued
+// request first, exactly as wakeOnHostSample does for RAM waiters. A spec waiting
+// on anything a grace expiry cannot change (the matrix, a busy neighbour, the
+// process limit, a VRAM/RAM budget) is deliberately left alone.
+func (o *owner) wakeOnGraceExpiry() {
+	o.wakeAdmission(wantsGraceWake)
+}
+
+// wantsGraceWake is wakeOnGraceExpiry's selection rule: a spec whose last verdict
+// was a Wait blocked solely by the grace window, narrowed to the same set
+// wakeAfterStart may retry (a queued request, or pinned). The narrowing is the
+// storm guard, exactly as for wantsHostSampleWake: a force_running spec with no
+// waiter is left to a real event, never re-evaluated on a bare timer, so two that
+// cannot run together cannot evict each other at load speed off this wake.
+func wantsGraceWake(st *specState) bool {
+	return st.waitingOnGrace && wantsWakeAfterStart(st)
+}
+
+// earliestGraceExpiry returns the soonest instant at which some currently
+// grace-protected process becomes evictable -- the earliest (LastUsed + grace)
+// among the running processes that are idle, unpinned, past Starting and used
+// within the window -- and whether there is one. That set is exactly isEvictable's
+// grace clause read off owner state (a never-used process has a zero LastUsed and
+// is already evictable, not protected; a window that has already elapsed is past,
+// not pending), so the timer and the policy can never disagree about who is
+// protected. A draining process is included like any other idle one: counting it
+// only risks a harmless early wake, never a missed one.
+func (o *owner) earliestGraceExpiry(now time.Time) (time.Time, bool) {
+	if o.evictionGrace <= 0 {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	found := false
+	for _, st := range o.specs {
+		if st.proc == nil || st.spec.Pinned || st.state == StateStarting || st.inFlight != 0 {
+			continue
+		}
+		if st.lastUsed.IsZero() {
+			continue // never used: already evictable, not grace-protected
+		}
+		expiry := st.lastUsed.Add(o.evictionGrace)
+		if !expiry.After(now) {
+			continue // the window has already elapsed: already evictable
+		}
+		if !found || expiry.Before(earliest) {
+			earliest, found = expiry, true
+		}
+	}
+	return earliest, found
+}
+
+// rescheduleGraceWake reconciles the owner's single grace timer with the current
+// state. The invariant it keeps is simple and load-bearing: WHENEVER some start is
+// blocked solely by the grace window (wantsGraceWake), a wake is pending -- or that
+// start hangs, which is the very regression this machinery exists to close. With a
+// waiter it arms the timer at the earliest within-grace victim's expiry (plus
+// graceWakeSlack); with none it cancels any stray timer. Called via admitAndStart's
+// defer on every admission path and from handleGraceExpiry, so the timer tracks the
+// live set without any single call site having to get it right.
+//
+// The one subtlety is the fallback when a waiter exists but earliestGraceExpiry
+// finds no pending window. A within-grace victim is what makes WaitOnGrace true in
+// the first place, so this should not happen -- EXCEPT across the sub-instant skew
+// between the admission's own snapshot clock and this call's clock: a victim whose
+// window elapsed in that gap leaves a waiter whose last verdict was WaitOnGrace but
+// whose victim is already evictable. Cancelling here would strand it, so instead we
+// re-ask promptly (a graceWakeSlack catch-up wake); that re-admission resolves the
+// waiter (it evicts the now-evictable victim) and clears the flag. It cannot spin:
+// a fresh snapshot with no within-grace victim yields WaitOnGrace false.
+//
+// It is idempotent and cheap: with nothing grace-blocked (the common case) it
+// cancels any stray timer and returns after one scan; while a timer is already
+// armed for the same expiry it leaves it be, so a wake batch that re-asks several
+// grace waiters arms the timer once, not once per spec.
+func (o *owner) rescheduleGraceWake() {
+	// With the grace window off there is nothing to wake for: no admission can be
+	// WaitOnGrace, so there is no waiter and no expiry. Guard it up front so the
+	// fallback below can never arm on a stale flag, matching earliestGraceExpiry.
+	if o.evictionGrace <= 0 {
+		cancelTimer(o.m, &o.graceTimer)
+		o.graceTimerAt = time.Time{}
+		return
+	}
+	hasWaiter := false
+	for _, st := range o.specs {
+		if wantsGraceWake(st) {
+			hasWaiter = true
+			break
+		}
+	}
+	if !hasWaiter {
+		cancelTimer(o.m, &o.graceTimer)
+		o.graceTimerAt = time.Time{}
+		return
+	}
+	expiry, ok := o.earliestGraceExpiry(time.Now())
+	if ok && o.graceTimer != nil && o.graceTimerAt.Equal(expiry) {
+		return // already armed for exactly this instant
+	}
+	cancelTimer(o.m, &o.graceTimer)
+	var delay time.Duration
+	if ok {
+		o.graceTimerAt = expiry
+		delay = time.Until(expiry) + graceWakeSlack
+		if delay < 0 {
+			delay = 0
+		}
+	} else {
+		// The skew fallback above: a waiter with no pending window. Re-ask promptly
+		// rather than strand it; graceTimerAt stays zero, since this wake is not tied
+		// to a known expiry.
+		o.graceTimerAt = time.Time{}
+		delay = graceWakeSlack
+	}
+	o.graceTimer = o.m.scheduleAfter(delay, func() {
+		o.m.postCmd(cmdGraceExpiry{})
+	})
+}
+
 // wakeAdmission retries admission for every spec that want selects, oldest
 // queued request first (see wakeAdmissionCandidates).
 func (o *owner) wakeAdmission(want func(*specState) bool) {
@@ -3605,6 +3849,12 @@ func (o *owner) loadedModels() []string {
 // ever start again.
 func (o *owner) handleClose() {
 	o.closing = true
+	// The grace timer is registered in m.wg, which Close() ends by waiting on, so
+	// it must never outlive the owner -- the same invariant the backoff timers keep
+	// below (G2). Nothing will be admitted again, so there is nothing left for it to
+	// wake.
+	cancelTimer(o.m, &o.graceTimer)
+	o.graceTimerAt = time.Time{}
 	for id, st := range o.specs {
 		if st.state == StateBackoff {
 			cancelTimer(o.m, &st.backoffTimer)

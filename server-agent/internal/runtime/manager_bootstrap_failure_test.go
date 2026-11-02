@@ -172,6 +172,66 @@ func TestBootstrapMemoryPressureRetriesOnce(t *testing.T) {
 	}
 }
 
+// TestBootstrapMemoryPressureSparesWithinGraceVictims: the escalation's one
+// eviction obeys the same grace window as admission. Both idle neighbours were
+// used moments ago, so under a grace they are in use as far as eviction is
+// concerned: none is evicted, the bootstrap still gets its single retry (the
+// "no idle process to evict" path), and the second death fails the request
+// exactly as in TestBootstrapMemoryPressureRetriesOnce. Taking a protected model
+// here would break the very pipeline the window exists to keep intact.
+func TestBootstrapMemoryPressureSparesWithinGraceVictims(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := NewManager(ManagerOptions{
+		Policy:        allowlistPolicy(),
+		Getenv:        func(string) string { return "" },
+		EvictionGrace: time.Hour,
+	})
+	t.Cleanup(m.Close)
+
+	execs := newExecCounter(t)
+
+	victimA := baseSpec("victim-a", "model-victim-a")
+	victimA.RAMMB = 500
+	victimB := baseSpec("victim-b", "model-victim-b")
+	victimB.RAMMB = 500
+
+	boot := baseSpec("boot", "model-boot")
+	boot.RAMMB = 0 // unknown RAM: a cold-start bootstrap
+	boot.Args = oomArgs(10*time.Second, 40*time.Millisecond, "")
+	boot.StartupTimeoutSeconds = 5
+	boot.AdmissionWaitTimeoutSeconds = 10
+
+	m.Apply(Config{
+		Specs:      []Spec{victimA, victimB, boot},
+		Coresident: coresidentAllPairs("victim-a", "victim-b", "boot"),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, model := range []string{"model-victim-a", "model-victim-b"} {
+		_, rel, err := m.EnsureRunning(ctx, model)
+		if err != nil {
+			t.Fatalf("EnsureRunning(%s): %v", model, err)
+		}
+		rel() // idle, but used a moment ago: inside the hour-long grace
+	}
+
+	_, _, err := m.EnsureRunning(ctx, "model-boot")
+	if !errors.Is(err, ErrStartFailed) {
+		t.Fatalf("EnsureRunning(model-boot) = %v, want ErrStartFailed after the one retry and a bounded failure", err)
+	}
+	if got := execs.count("boot"); got != 2 {
+		t.Fatalf("boot exec count = %d, want exactly 2 (initial start + ONE retry)", got)
+	}
+	if got := stoppedCount(m, "victim-a", "victim-b"); got != 0 {
+		t.Fatalf("evicted victims = %d, want 0 -- both were used within the grace window and must be spared", got)
+	}
+	if got := runningCount(m, "victim-a", "victim-b"); got != 2 {
+		t.Fatalf("surviving running victims = %d, want both", got)
+	}
+}
+
 // TestBootstrapMemoryPressureEvictionBoundedUnderRepeatedOOM is the thorough
 // anti-storm proof: a PINNED bootstrap that SIGKILLs itself on EVERY generation
 // restarts forever (rate-limited by backoff), but the one guarded eviction is

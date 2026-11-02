@@ -382,8 +382,11 @@ are **not** masked in the upward report, so secrets belong in `env` only.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-028 — Runtime-config notifications are gated by write scope, not by changed field
-**Context:** the agent's runtime-config document is derived from six kinds of
-row, and a portal write that changes any of them must reach the agent promptly.
+**Context:** the agent's runtime-config document is derived from seven kinds of
+row (the seventh, the capability verdicts behind each spec's `role`, joined the
+six with [ADR-088](#adr-088--a-model-has-one-derived-role-one-value-is-both-the-editor-group-and-the-eviction-type);
+the automated verdict writers deliberately do not notify), and a portal write
+that changes any of them must reach the agent promptly.
 **Decision:** any successful write that **can** change a server's document
 notifies that server's agent, and the decision is taken from the **write path's
 own scope** — which row it writes, and for an application-owned row whether that
@@ -412,6 +415,10 @@ application's whole co-residency set, and a Save landing early erased a server's
 whole budget set. The canonical rendering is the four-state
 `loading | error | stale-error | ready` fallback, and a not-ready tab renders a
 loading line *instead of* the form rather than a disabled form.
+**Extended by [ADR-087](#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in):**
+the co-residency document is now `{mode, pairs:[{a, b, verdict}]}`. The rule is unchanged and sharper for it, because the PUT still
+replaces the whole set of explicit pairs, so a request that carries only a mode erases every explicit verdict; the editor therefore
+always sends the full document.
 → [Agent-Managed Model Runtime §11.1](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-030 — Proxy participation is an operator-owned flag with a port invariant, not an encoding
@@ -629,7 +636,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-99-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -685,7 +692,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-99-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -854,7 +861,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-99-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1049,7 +1056,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-99-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1264,7 +1271,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-97-migrations),
+[§4](reference/data-model.md#4-migration-history-99-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1490,7 +1497,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-97-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-99-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1637,7 +1644,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-97-migrations),
+[§4](reference/data-model.md#4-migration-history-99-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3601,7 +3608,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-97-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-99-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3825,7 +3832,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-97-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-99-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4857,7 +4864,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-99-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4983,7 +4990,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-99-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5126,7 +5133,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-97-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-99-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7622,7 +7629,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-97-migrations),
+[Data Model](reference/data-model.md#4-migration-history-99-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7845,7 +7852,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-97-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-99-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -7986,7 +7993,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-97-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-99-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8250,7 +8257,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-97-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-99-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -10802,7 +10809,10 @@ does not control, so a static "host total minus a reserve" goes stale the moment
   [ADR-086](#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path).
 - **(h) The matrix keeps its other jobs.** It still states the operator's co-residency *intent* and covers PCIe bandwidth and CPU
   contention, which nobody computes. Its old justification, that system RAM is not computable and so a matrix has to exist, is
-  partly superseded: RAM is now computed and vetoed.
+  partly superseded: RAM is now computed and vetoed. (**Superseded further by
+  [ADR-087](#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in):**
+  the default is no longer "forbidden unless ticked". A new server is opt-out, where every pair may share the host unless an operator
+  forbids it, and the list is the rare exception to the computed fit.)
 
 **Consequence:**
 
@@ -10952,3 +10962,267 @@ restart at a time). **Granting the VRAM shot where no measurer exists** (see (g)
 [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
 [§6](cross-cutting/agent-runtime-manager.md#6-process-lifecycle),
 [Configuration & Environment Variables](reference/config-env.md).
+
+## ADR-087 — Co-residency is a per-server mode plus a tri-state pair verdict: opt-out by default, existing servers stay opt-in
+**Context:** the co-residency control was an N×N allow-list with one default. A pair of managed models could share a host only if an
+operator had ticked it (`agent_coresidency_rules` held nothing but allowed pairs, a row's presence being the whole signal) and every
+other pair was forbidden. At a handful of models that is a small grid; at about twenty it is 190 pairs, which nobody can keep legible
+or correct. Its original justification, that system RAM could not be computed so an operator had to state compatibility pairwise,
+ended with [ADR-085](#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory): host RAM
+and per-GPU VRAM are measured and vetoed by `Admit` itself, so whether two models fit is now mostly a computed fact and the list
+should be the rare exception, not the primary gate. Two things stood in the way. The single default could not be inverted for one
+server without editing every cell, and the table could not record a *forbid* at all (an absent row and an explicit "no" were the
+same thing), so there was nowhere to put the one statement an operator still wants to make under an open default: never these two.
+
+**Decision — six choices, taken together. Migrations 98 and 99; no agent-wire change (the portal's co-residency document
+changes shape, the pushed list does not; the effective list is
+[ADR-089](#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)).**
+
+- **(a) A per-server mode, `opt_out` by default.** `applications.coresidency_mode`
+  (`text not null default 'opt_out'`, migration 99). It decides what a pair with **no explicit row** means: `opt_out` allows it (only
+  forbids need listing), `opt_in` forbids it (only allows need listing, the previous behaviour). It is a column on `applications`
+  because every other per-application setting lives there and the pair table it qualifies is keyed by the `server_agent`
+  application's id (at most one per server, so the mode is per server). It is deliberately **not** a field of `routing.Application`:
+  nothing in the application create/update/list path reads it, so those statements are untouched and cannot clobber it, and it has
+  its own accessor pair (`GetCoResidencyMode` / `SetCoResidencyMode`; the memory driver keeps it in a map of its own that dies with
+  the application).
+- **(b) A tri-state per pair.** `agent_coresidency_rules.verdict` (`text not null default 'allow'`, migration 98) turns a row into an
+  explicit statement, `allow` or `forbid`; the **absence** of a row is the third state, *default*, which the mode resolves. The
+  **effective co-residency** of a pair is the explicit verdict when there is a row, else `opt_out → allow`, `opt_in → deny`. Pairs
+  stay symmetric (stored once, `mapping_a_id < mapping_b_id`, canonicalised by the portal) and irreflexive. The store stays a dumb
+  pair table and validates only the verdict: an empty one is stored as `allow` (what a row meant before verdicts existed) and any
+  other value is rejected before the set is touched, on all three drivers through one `NormalizeCoResidencyVerdict`.
+- **(c) The mode switch is lossless.** Changing the mode changes only how *default* pairs resolve. No explicit row is read, rewritten
+  or dropped, so switching to `opt_in` and back restores the earlier behaviour exactly. The portal's co-residency document carries
+  `mode` and `pairs:[{a, b, verdict}]`: an empty `mode` on a PUT leaves the stored one alone (a request that names no mode can never
+  flip it), an unknown mode is `400 runtime_coresidency.mode_invalid`, an unknown verdict is `400 runtime_coresidency.pair_invalid`,
+  and the existing empty, identical, foreign and duplicate-pair checks are unchanged.
+- **(d) Existing servers do not change behaviour; new ones get the new standard.** Migration 98 relies on the column default to read
+  every pre-existing row back as `allow` (a constant default is materialised for old rows on both dialects, so there is no `UPDATE`
+  a replay could re-run, and an operator's later `forbid` is never re-flipped). Migration 99 adds the column with the `opt_out`
+  default and then sets every application that **already exists** to `opt_in`, which is today's exact semantics (row present →
+  allowed, absent → forbidden). A running, matrix-restricted server therefore does not start co-locating everything the moment it is
+  upgraded; it moves only when its operator flips the mode, and its pushed `coresident` list is what it was. That `UPDATE` is
+  unguarded and so, unlike migration 98, not replay-safe: a guard is impossible because the new value is also the DDL default
+  (never-backfilled and explicitly-chosen cannot be told apart by value), and it is harmless because the runner applies a pending
+  migration once per database, in the transaction that records its version
+  ([Persistence §3](cross-cutting/persistence.md#3-the-migration-runner)). On a fresh install the
+  table is empty when it runs, so every application created afterwards is `opt_out`.
+- **(e) Anything not unmistakably permissive resolves to "not allowed".** When the gateway builds the effective list a mode other
+  than `opt_out` behaves as `opt_in` and a verdict other than `allow` as `forbid`, because default-allow is the direction that can put
+  two models on a GPU they do not fit on. The store validates both values, so this matters only for one it should never return.
+- **(f) The agent is told by the write, not by a changed timestamp.** `SetCoResidencyMode` deliberately does not bump an
+  `updated_at`, so the portal service notifies the agent itself after the writes
+  ([ADR-028](#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field)): the mode changes the effective
+  list even when no pair row did.
+
+**Consequence:**
+
+- **Resource fit is the primary gate, the list is the exception.** Under `opt_out` a start is refused or made to wait by the
+  VRAM/RAM arithmetic and the process limit alone, and an explicit `forbid` still forces the partner's eviction (or a wait) exactly
+  as a closed cell did, because it removes the pair from the allowed set rule 1 reads
+  ([§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates)). An operator carves out the pairs that should never share a
+  host (PCIe or CPU contention nobody computes, or "never this ASR with that TTS") instead of enumerating the ones that may.
+- **The write is a full replace, and mode and pairs are two store writes.** [ADR-029](#adr-029--runtime-domain-writes-are-full-document-replaces-gated-on-their-own-get)
+  still holds: the PUT replaces the whole set of explicit pairs, so a request that omits `pairs` (or sends `[]`) erases every
+  explicit verdict, and a client that only wants to switch the mode must re-send the pairs it read, which is what the editor always
+  does. The mode and the pairs are not one transaction: when the pairs write fails after the mode write landed the agent is still
+  notified (the stored mode, hence the effective list, has changed), and the PUT is idempotent, so the retry converges. Both are
+  recorded in [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+- **The pushed list grows with the square of the model count under `opt_out`**, because every allowed pair is enumerated for the
+  agent (190 pairs at twenty enabled specs, 4,950 at a hundred), and it follows the enabled specs automatically: enabling a spec
+  adds its pairs without the operator touching anything.
+- **Portal.** The triangular matrix is retired for a role-grouped, per-model editor
+  ([§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
+  [ADR-088](#adr-088--a-model-has-one-derived-role-one-value-is-both-the-editor-group-and-the-eviction-type)). The matrix's advisory
+  per-cell VRAM tooltip went with it, and a server whose agent reads its own config file (file mode) shows one sentence where the
+  read-only matrix was: the gateway-side mode and verdicts are not what is in force there, and the portal no longer reads the report's
+  `coresident` list.
+- **Verification status.** The migrations are pinned against a genuine v97 database on SQLite and PostgreSQL, the effective-list
+  computation is table-tested (four specs under `opt_out` minus a forbid, `opt_in` as only the explicit allows, a forbid row adding
+  nothing under `opt_in`, disabled and unknown specs, reversed rule storage, unknown mode and verdict) and driven end to end with a
+  mode flip that must not change a stored verdict.
+
+**Rejected:** **Keeping default-deny only** (the 190-cell grid, and the reason it existed is gone). **Storing "default" as a third
+row value** (the table would have to hold every pair, and a mode switch would have to rewrite them; absence as the third state keeps
+the table to what the operator said). **Rewriting or dropping rows when the mode changes** (lossy: a switch could not be undone).
+**Moving existing servers to `opt_out`** (a running, matrix-restricted server would suddenly co-locate everything, the surprise the
+migration exists to avoid). **The mode on the pair table or in a table of its own** (one value per application belongs with the
+application's other settings, and a pair-table row would exist only to carry it). **A mode that is a field of `routing.Application`**
+(every application write would then own it and could overwrite an operator's choice with a stale struct).
+→ [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates),
+[§5.7](cross-cutting/agent-runtime-manager.md#57-co-residency-mode-verdicts-and-the-derived-role),
+[Data Model](reference/data-model.md#co-residency-mode-and-per-pair-verdicts), [HTTP API Surface](reference/api-surface.md),
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-088 — A model has one derived role: one value is both the editor group and the eviction type
+**Context:** two features needed to say what *kind* of model something is. The co-residency editor has to group twenty-odd models so
+an operator can set a rule for "all the speech-to-text models" at once, and eviction should prefer to replace a model with another of
+its own kind (a new transcription model should evict the idle one, not the speech synthesiser a voice chat still needs between
+turns). The codebase had no such field. `RuntimeSpec.Type` is the **server kind** (`vllm`, `llama_cpp`, `audio_cpp`, …), not the
+function: one `audio_cpp` server hosts a transcription model or a synthesis model, and a `vllm` server may host an embedding model.
+The function lives in the per-mapping capability verdicts, which are **overlapping** additive facts, not a classification:
+`speech`, `speech_clone` and `speech_streaming` are all true of one synthesis model, `image_edit` is a subset of `image`
+([ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
+and the portal's per-name boolean flags are fail-closed ANDs across every mapping of a name, so a name with mixed mappings can be in
+no group at all. Nothing at all stood for an embedding or a reranking model, though a retrieval pipeline (a chat model plus an
+encoder) is the next composite workload after voice chat.
+
+**Decision — five choices, taken together. No schema change.**
+
+- **(a) One role per model, seven values:** `asr`, `tts`, `image`, `embedding`, `reranker`, `chat`, `other`
+  (`routing.ModelRole`). It is **the same value for both jobs** (the editor's group and the eviction's "same type" rule), shipped
+  by the gateway so the two cannot diverge: the editor reads it off `RuntimeSpecDTO.role` and the agent receives it as the spec's
+  `role`; neither re-derives it.
+- **(b) Derived by `routing.DeriveRole`, first match wins, so the order is the tie-break and part of the contract:**
+  `transcription` → `asr`; `speech` → `tts`; `image` or `image_edit` → `image`; `embedding` → `embedding`; `rerank` → `reranker`;
+  then the **runtime type** as a coarse fallback (`stable_diffusion_cpp` → `image`; `vllm`, `llama_cpp`, `tgi`, `ollama` → `chat`);
+  then any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) → `chat`; else `other`. Capabilities outrank the type
+  because they are specific and the type is not: an operator's `embedding` verdict on a `vllm` server is how that model gets its
+  role. A model that both transcribes and synthesises resolves to `asr` (rule order; rare). `audio_cpp` is deliberately **not** a
+  type fallback: it cannot say asr from tts, so a bare one is `other` until a verdict (which the audio.cpp probe writes from the
+  model's task) says otherwise. `image` generation and editing collapse into one role, since for grouping and eviction "image evicts
+  image" is the whole rule.
+- **(c) Derived on every read and never stored.** A role is a pure function of the verdicts and the effective runtime type, so it
+  follows an operator's verdict change with no migration and cannot be stale; the pushed document's ETag moves with it. It is
+  reconciled **per name** only where a name has several mappings: the best-ranked role wins (`routing.RoleRank`, most specific
+  first, `other` last), because a mapping that knows nothing is not evidence against one that does; a group takes its best-ranked
+  offerable member's, an alias its target's, and a name no mapping offers (a vendor-only model) is `other`. `ModelDTO.role` is that
+  per-name value for the catalog; **the editor groups by the per-spec `RuntimeSpecDTO.role`**, never by a capability flag.
+- **(d) `embedding` and `rerank` are first-class capabilities, operator-stated.** Two new names in the open capability vocabulary
+  ([ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)); the verdict
+  write path already accepts any non-empty name, so nothing needed allow-listing. There is **no probe** (nothing reliably says a
+  model embeds or reranks; automatic detection is deferred), so the verdict is the operator's, set on two new controls of the
+  mapping form (all three states, including a selectable `no`, because there is no automated writer whose answer a manual `no` could
+  outrank, and neither is on the portal's or the agent ingest's reserved list). The one incidental source is Ollama, whose declared
+  `embedding` capability the open pass-through already writes as a `yes` row. They gate **no route** (the gateway serves no embeddings
+  endpoint); `ModelDTO.embedding` and `ModelDTO.rerank` are the usual fail-closed ANDs, there for the portal's capability display. The point
+  of building them in now, before any such model runs, is that they are then distinct, protected roles from the first day: a chat model
+  asking for room does not take the encoder a retrieval pipeline is waiting on.
+- **(e) The agent reads it as an opaque, normalised string.** `roleOf` trims and lower-cases it and folds an absent one into `other`,
+  so a hand-written file-mode spec with no role and one pushed as `other` are the same group, and a role a newer gateway invents is
+  simply its own group. The role is an admission input and not a launch input: `sameLaunchShape` ignores it, so a verdict change
+  moves it without relaunching a healthy child.
+
+**Consequence:**
+
+- **The derivation is only as good as the verdicts.** A `vllm` server hosting an embedding model with **no** verdict reads as `chat`,
+  and an `audio_cpp` model whose task the probe has not yet written reads as `other`; the operator's `embedding`/`rerank` verdict is
+  the remedy for the first, and the mapping form says so in its unknown hint. `other` is a real group with a real eviction rule, not an
+  error value: unclassified models group with their own kind.
+- **A failed capability read never guesses.** The pushed document and the per-spec role propagate the error (the agent keeps its last
+  known-good config for one skipped poll, where a type-only guess would flip an embedding model to `chat` for a push); only the
+  catalog listing, a display, degrades to the type alone and logs it loudly.
+- **The editor re-reads every spec's role each time it is shown.** The per-mapping spec cache is filled once per mount and a role moves
+  for reasons it never sees (a verdict set on the mapping tab, a spec deleted, a probe writing a verdict in the background), so a role
+  read once would file a model under its old group and a group bulk-set would then write verdicts for the wrong set of models; a spec
+  that cannot be read is filed under `other` rather than under a role the editor could not confirm.
+- **Mixed fleets.** The role is an additive `role` field on the pushed spec: an older agent ignores it
+  ([ADR-089](#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)),
+  and an agent behind an older gateway receives none, reads every spec as `other` and so orders eviction as plain least-recently-used.
+
+**Rejected:** **The capability booleans as groups, one group per flag** (they overlap: a synthesis model would sit in three groups and
+an image-editing one in two, and the fail-closed ANDs would leave a model with mixed mappings in none). **The runtime type as the
+role** (it names the server, not the function: it cannot tell asr from tts on `audio_cpp` or an embedding model on `vllm`). **A stored
+role** (a column to migrate, backfill and keep in step with verdicts it is a function of). **A separate eviction type beside the UI
+group** (the two would drift, and an operator grouping models one way while the agent evicts another is the defect this decision
+exists to prevent). **A model with several roles** (eviction needs one "same type" answer; the first-match order is the documented
+tie-break). **Probing for `embedding`/`rerank` now** (no reliable signal, and an unreliable probe's answer would outrank the operator's).
+→ [Agent-Managed Model Runtime §5.7](cross-cutting/agent-runtime-manager.md#57-co-residency-mode-verdicts-and-the-derived-role),
+[§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
+[Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).
+
+## ADR-089 — Eviction is role-aware and grace-protected, and co-residency rides the unchanged wire list so an older agent stays correct
+**Context:** when admission needs room it evicts idle models, and "idle" meant `InFlight == 0`, which says a process is idle *this
+instant*, not that it is finished. A voice chat leaves its transcription and synthesis models idle between turns, and a start that
+happened to need the space could take either one in the gap, which breaks the pipeline the models were loaded for
+([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)).
+The least-recently-used pick also knew nothing about kinds: a chat model asking for room could push out the idle encoder of a
+retrieval pipeline while an idle chat model sat next to it. With opt-out co-residency ([ADR-087](#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in))
+the resource arithmetic is the primary gate, so *which* model it evicts matters more than it did behind a closed list. And whatever
+changes on the wire must not break the agents already deployed: an older agent reads only the plain `coresident` pair list, and an
+opt-out that it could not see would degrade, on that agent, to "nothing may co-locate".
+
+**Decision — seven choices, taken together. Agent `0.15.0`; no migration.**
+
+- **(a) A recently used model is not evictable.** A process may be drawn as a victim only if
+  `!Pinned && !Starting && InFlight == 0 && now − LastUsed > grace`. The comparison is strict (a process used exactly one grace ago is
+  still protected), and a process that has never served has a zero `LastUsed`, the oldest thing there is, so the window protects
+  *use*, not mere residency. It is one gate, `admission.evictable`, asked by **every** rule that can name a victim (the pair rule, the
+  unknown-VRAM occupant rule and the one-shot VRAM bootstrap eviction, the per-GPU rule, the host-RAM rule, the process limit) and by
+  the bootstrap escalation's own pick, so no rule
+  can forget it and a rule added later inherits it. It stacks on the never-evict-a-busy-pinned-or-loading-model rules and loosens
+  nothing. A snapshot that sets a grace but no clock fails **closed**: nothing is evictable, never everything.
+- **(b) The window is operator-owned: `OP_AGENT_EVICTION_GRACE_SECONDS`, default 30, env-only.** A base-10 integer from `0` to `86400`;
+  `0` turns the window off (an idle model is evictable at once, as before); an absent, malformed, fractional, negative or larger value
+  falls back to the default, because a mistyped tuning knob must not take the agent and every model on the host down, and an unbounded
+  integer would overflow the `time.Duration` it becomes and silently flip a huge grace into a negative one, which means "off". Like
+  the three resource-accounting settings it has no flag and no config-file key, and the gateway can never supply it.
+- **(c) Victims are ordered same-role first, then least recently used.** In the three loops that draw victims to make room (the
+  per-GPU rule, the host-RAM rule, the process-count rule) the evictable candidates are sorted by `(role == candidate's role ? 0 : 1,
+  LastUsed ascending, spec id)`: the role swap keeps one model of each role alive, and a different role is taken only when its own
+  kind does not free enough, so cross-role eviction stays available under real pressure (a large model may legitimately displace idle
+  speech and image models). It changes only **which** idle victim comes first, never **whether** one is evictable. A pair-rule or
+  unknown-VRAM victim is forced rather than chosen and is not ordered. The final list is reported oldest-first, which is only the
+  drain order of a set that is already going. The bootstrap escalation's single victim honours the grace but is still plain
+  oldest-first.
+- **(d) When only protected victims remain the admission waits, and never OOMs.** The existing rule that `Admit` never returns a
+  partial eviction list covers it: a within-grace model is treated exactly like a busy one. `Decision.WaitOnGrace` is set only when the
+  grace window is the *sole* reason for the `Wait`, computed by re-running the same admission against the same snapshot with the
+  window off and asking whether that would have proceeded (a hard blocker, or simply not enough idle room even without grace, keeps it
+  false). The grace window only ever removes processes from the victim set and reads no clock inside `Admit`, so the counterfactual
+  differs in exactly that one way.
+- **(e) A grace-blocked start is woken when the window expires.** This is the one wake nothing else provides: the release that stamped
+  the victim's `LastUsed` fired before the window opened, the housekeeping beat only scans and measures, and the host-sample wake
+  re-asks only RAM waiters, so at the production admission wait of `0` a start blocked purely by grace would hang until its caller gave
+  up. The owner keeps **one** timer, armed at the earliest `LastUsed + grace` among the currently protected processes plus a 5 ms slack
+  (the bound is strict, so a wake at the exact instant would find the victim still protected), and on firing re-asks only the specs
+  whose last verdict was `WaitOnGrace` **and** that the finished-start retry could retry (a queued request, or pinned), the same
+  storm guard as the RAM wake. One timer rather than one per spec, because every such start's next chance is the same earliest
+  expiry. It is reconciled by a deferred call on every admission path and cancelled at close.
+- **(f) Co-residency rides the unchanged wire list; the role is the only new datum.** The gateway computes the **effective**
+  allowed-pair list from mode and verdicts (`effectiveAllowedPairs`: an explicit row decides, a pair with no row follows the mode,
+  over the pairs of **enabled** specs) and sends it in the existing `coresident` field, in the same spec-id space and the same
+  `[][2]string` shape, deterministic and with the old orientation. `opt_out` is therefore **enumerated** (every enabled pair minus
+  the explicit forbids) instead of left to a field an older agent would ignore, so an agent that predates modes co-locates correctly,
+  and a newer agent receives the identical list; neither needs the mode or the verdicts, which stay gateway-side. The one new datum
+  is each spec's `role`, additive: an agent that does not read it keeps least-recently-used eviction, a safe degradation, never an OOM.
+  The runtime-config document therefore stays **one shared, non-feature-gated document per server**.
+- **(g) Version and visibility.** One MINOR bump of `ServerAgent`, `0.14.0` → `0.15.0`, and one new agent feature,
+  `runtime_role_eviction` (`Since: "0.15.0"`), declared by the agent **for visibility only**: it says a connected agent captures the
+  role and protects recently used models, it is on the agent's list alone, it is **not** in `gatewayAgentFeatures`, and it gates
+  nothing on either side. Nothing on the gateway or portal reads it yet (the same recorded gap as the RAM flags).
+
+**Consequence:**
+
+- **A start can wait up to the grace window with an idle victim in plain sight.** That is the intended trade, and the operator's
+  lever is the knob: raising it protects slower pipelines, `0` restores the old behaviour. It applies to the agent's own admission
+  eviction only: a force-stop, a benchmark's stop-all, the per-spec idle timeout and a spec removed by `Apply` are separate paths and
+  untouched.
+- **The role decides ties between kinds, not safety.** The OOM anti-goal is carried by the arithmetic and the grace gate; role order
+  can only change which of several already-evictable models goes first.
+- **The pushed list is the effective list, so a mode or verdict change is a document change.** The agent is notified and the document's
+  ETag moves, but admission is not retroactive: a changed pair binds at the next start
+  ([§5.6](cross-cutting/agent-runtime-manager.md#56-what-a-pushed-config-applies-and-what-it-does-not)).
+- **Mixed fleets degrade the safe way in both directions.** An agent older than `0.15.0` behind this gateway gets a correct allow-list
+  (including `opt_out`) and evicts least-recently-used with no grace, ignoring `role`. A `0.15.0` agent behind an older gateway gets
+  the older default-deny list, which is correct for that gateway, no roles (every spec reads as `other`, so the order is plain
+  least-recently-used) and still applies the grace window.
+- **Verification status.** The gate, the order, the counterfactual and the wake are covered by table-driven policy tests and by manager
+  tests that reproduce the hang with a short real grace window (a start blocked only by grace, at an unbounded admission wait, is
+  admitted by the expiry wake alone), that the timer is armed only for a grace-blocked waiter and is cancelled at close.
+
+**Rejected:** **A feature-gated config document** (a second document shape per server chosen by each agent's declared features: the
+gateway would have to track which agent can read which shape, ETags and caches would diverge per agent, and an agent missing the flag
+would still silently degrade `opt_out` to deny). **Sending the mode and verdicts to the agent** (every older agent would misread
+them, which is the same gating problem and gains nothing the enumerated list does not already say). **A hard role partition that never
+evicts across roles** (a large model could then wait forever behind idle models of other kinds that it plainly needs the room of).
+**Grace as a soft score instead of a gate** (a bursty pipeline would still lose its model under enough pressure, which is the failure
+the window exists to prevent). **Evicting a protected model when nothing else remains** (that is the pipeline-break anti-goal; the
+start waits instead). **A timer per waiting spec, or a periodic tick that re-asks every waiter** (a storm of admission evaluations,
+each of which can run the VRAM measurer, for a wake that only ever needs the earliest expiry). **A gateway-supplied window** (a
+host-tuning knob the gateway cannot know, and a document field every agent version would have to understand).
+→ [Agent-Managed Model Runtime §5.4](cross-cutting/agent-runtime-manager.md#54-eviction-queueing-and-drain),
+[§5.7](cross-cutting/agent-runtime-manager.md#57-co-residency-mode-verdicts-and-the-derived-role),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Configuration & Environment Variables](reference/config-env.md), [HTTP API Surface](reference/api-surface.md).

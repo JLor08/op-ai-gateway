@@ -453,8 +453,8 @@ func TestFeaturesDeclareRuntimeRAMMeasurement(t *testing.T) {
 	// beside the newest feature (see the bump-rule note there).
 }
 
-// TestFeaturesDeclareRuntimeRAMAccounting pins the RAM-accounting capability and
-// the version assertion that ships with it. This agent receives each spec's
+// TestFeaturesDeclareRuntimeRAMAccounting pins the RAM-accounting capability.
+// This agent receives each spec's
 // host-RAM demand on the runtime-config wire as the spec-level ram_mb
 // (runtime.Spec.RAMMB) and accounts for it, so the GATEWAY/PORTAL read the name
 // to know a connected agent honours that figure -- an older agent ignores the
@@ -463,6 +463,38 @@ func TestFeaturesDeclareRuntimeRAMMeasurement(t *testing.T) {
 // gateway spells the same string in its own constant
 // (RuntimeRAMAccountingFeature, gateway/backend/internal/gateway/
 // agent_features.go); this module cannot import it.
+func TestFeaturesDeclareRuntimeRAMAccounting(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_ram_accounting" {
+			found = true
+			if f.Since != "0.14.0" {
+				t.Fatalf("runtime_ram_accounting Since = %q, want 0.14.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_ram_accounting")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_ram_accounting") {
+		t.Fatal("FeatureNames() does not carry runtime_ram_accounting, so it never reaches the gateway in capabilities.features")
+	}
+	// The Version assertion moved to TestFeaturesDeclareRuntimeRoleEviction,
+	// beside the newest feature (see the bump-rule note there).
+}
+
+// TestFeaturesDeclareRuntimeRoleEviction pins the role-aware eviction capability
+// and the version assertion that ships with it. This agent captures each spec's
+// pushed model role onto its admission snapshot and protects a model used within
+// the eviction grace window from being a victim. The flag is declared for
+// telemetry and visibility only (so the portal can show that a connected agent
+// evicts that way) and gates nothing: the runtime-config document stays one
+// shared, non-feature-gated document per server, the role field degrades safely
+// on an agent that ignores it, and co-residency stays on the existing wire
+// field. A rename here silently turns the portal's knowledge off. The gateway
+// spells the same string in its own constant (RuntimeRoleEvictionFeature,
+// gateway/backend/internal/gateway/agent_features.go); this module cannot
+// import it.
 //
 // The version assertion lives here, beside the newest feature, and it is the
 // forcing function for the repository's bump rule: a change that moves Version
@@ -488,29 +520,31 @@ func TestFeaturesDeclareRuntimeRAMMeasurement(t *testing.T) {
 // agent.Features gained runtime_ram_measurement AND runtime_ram_accounting --
 // one bump covers both, because a bump is per shipped change and the RunSpec
 // RAM-accounting branch is one change (AGENTS.md, ServerAgent Version Rule), so
-// the accounting flag declares Since 0.14.0 and Version did not move again. A
-// Since records the version a feature shipped in, so runtime_ensure's stays
-// 0.8.0, multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0,
+// the accounting flag declares Since 0.14.0 and Version did not move again;
+// 0.15.0 is MINOR because agent.Features gained runtime_role_eviction -- the one
+// bump for the co-residency rework branch, whatever its commit count. A Since
+// records the version a feature shipped in, so runtime_ensure's stays 0.8.0,
+// multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0,
 // runtime_voices' stays 0.11.0, fullduplex_proxy's stays 0.12.0,
-// runtime_model_params' stays 0.13.0 and runtime_ram_measurement's and
-// runtime_ram_accounting's stay 0.14.0.
-func TestFeaturesDeclareRuntimeRAMAccounting(t *testing.T) {
+// runtime_model_params' stays 0.13.0, runtime_ram_measurement's and
+// runtime_ram_accounting's stay 0.14.0 and runtime_role_eviction's is 0.15.0.
+func TestFeaturesDeclareRuntimeRoleEviction(t *testing.T) {
 	found := false
 	for _, f := range Features {
-		if f.Name == "runtime_ram_accounting" {
+		if f.Name == "runtime_role_eviction" {
 			found = true
-			if f.Since != "0.14.0" {
-				t.Fatalf("runtime_ram_accounting Since = %q, want 0.14.0", f.Since)
+			if f.Since != "0.15.0" {
+				t.Fatalf("runtime_role_eviction Since = %q, want 0.15.0", f.Since)
 			}
 		}
 	}
 	if !found {
-		t.Fatal("Features does not declare runtime_ram_accounting")
+		t.Fatal("Features does not declare runtime_role_eviction")
 	}
-	if !slices.Contains(FeatureNames(), "runtime_ram_accounting") {
-		t.Fatal("FeatureNames() does not carry runtime_ram_accounting, so it never reaches the gateway in capabilities.features")
+	if !slices.Contains(FeatureNames(), "runtime_role_eviction") {
+		t.Fatal("FeatureNames() does not carry runtime_role_eviction, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.14.0" {
-		t.Fatalf("Version = %q, want 0.14.0 (runtime_ram_accounting is a new agent.Features entry, so the rule is MINOR, but it rides this branch's single 0.14.0 bump)", Version)
+	if Version != "0.15.0" {
+		t.Fatalf("Version = %q, want 0.15.0 (runtime_role_eviction is a new agent.Features entry, so the rule is MINOR, and it is the co-residency rework branch's single bump from 0.14.0)", Version)
 	}
 }

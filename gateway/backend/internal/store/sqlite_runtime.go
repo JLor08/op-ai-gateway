@@ -243,13 +243,24 @@ func (s *SQLiteStore) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID s
 	return requireAffected(result)
 }
 
-// SetCoResidencyRules atomically REPLACES the whole set of allowed
-// co-residency pairs for appID (delete-then-insert in one transaction,
-// mirroring SetRuntimeSpecGPUs above / SetGroupMembers). appID must exist —
-// checked inside the transaction, before the delete — or ErrNotFound. The
-// store does not enforce or rewrite the MappingAID < MappingBID canonical
-// ordering; that is portal-level validation (Task 6).
+// SetCoResidencyRules atomically REPLACES the whole set of explicit
+// co-residency pair rows for appID (delete-then-insert in one transaction,
+// mirroring SetRuntimeSpecGPUs above / SetGroupMembers). Each rule's verdict is
+// checked up front -- an empty one is stored as allow, an unknown one fails the
+// call before the transaction opens, so a bad rule can never leave the set
+// half-replaced. appID must exist — checked inside the transaction, before the
+// delete — or ErrNotFound. The store does not enforce or rewrite the
+// MappingAID < MappingBID canonical ordering; that is portal-level validation
+// (Task 6).
 func (s *SQLiteStore) SetCoResidencyRules(ctx context.Context, appID string, rules []routing.CoResidencyRule) error {
+	verdicts := make([]string, len(rules))
+	for i, r := range rules {
+		v, ok := routing.NormalizeCoResidencyVerdict(r.Verdict)
+		if !ok {
+			return fmt.Errorf("coresidency rule (%s, %s): invalid verdict %q", r.MappingAID, r.MappingBID, r.Verdict)
+		}
+		verdicts[i] = v
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin set coresidency rules: %w", err)
@@ -265,30 +276,41 @@ func (s *SQLiteStore) SetCoResidencyRules(ctx context.Context, appID string, rul
 	if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from agent_coresidency_rules where application_id = ?`), appID); err != nil {
 		return fmt.Errorf("clear coresidency rules: %w", err)
 	}
-	for _, r := range rules {
-		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into agent_coresidency_rules (application_id, mapping_a_id, mapping_b_id, created_at)
-			values (?, ?, ?, ?)`), appID, r.MappingAID, r.MappingBID, r.CreatedAt); err != nil {
-			// FK before unique: sqlite's FK error text also matches the
-			// unique-violation substring (see UpsertRuntimeSpec above /
-			// sqlite_projects.go).
-			if s.dl.isForeignKeyViolation(err) {
-				return ErrNotFound
-			}
-			if s.dl.isUniqueViolation(err) {
-				return ErrConflict
-			}
-			return fmt.Errorf("insert coresidency rule: %w", err)
+	for i, r := range rules {
+		if err := s.insertCoResidencyRule(ctx, tx, appID, r, verdicts[i]); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// CoResidencyRulesByApplication lists appID's allowed co-residency pairs,
-// ordered by mapping_a_id then mapping_b_id. Always non-nil, empty when none.
+// insertCoResidencyRule inserts one explicit pair row inside SetCoResidencyRules'
+// transaction, with the already-normalised verdict, and maps the driver's
+// constraint failures onto the store's sentinel errors.
+func (s *SQLiteStore) insertCoResidencyRule(ctx context.Context, tx *sql.Tx, appID string, r routing.CoResidencyRule, verdict string) error {
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`
+		insert into agent_coresidency_rules (application_id, mapping_a_id, mapping_b_id, verdict, created_at)
+		values (?, ?, ?, ?, ?)`), appID, r.MappingAID, r.MappingBID, verdict, r.CreatedAt); err != nil {
+		// FK before unique: sqlite's FK error text also matches the
+		// unique-violation substring (see UpsertRuntimeSpec above /
+		// sqlite_projects.go).
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		if s.dl.isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("insert coresidency rule: %w", err)
+	}
+	return nil
+}
+
+// CoResidencyRulesByApplication lists appID's explicit co-residency pair rows
+// of both verdicts, ordered by mapping_a_id then mapping_b_id. Always non-nil,
+// empty when none.
 func (s *SQLiteStore) CoResidencyRulesByApplication(ctx context.Context, appID string) ([]routing.CoResidencyRule, error) {
 	rows, err := s.query(ctx, `
-		select application_id, mapping_a_id, mapping_b_id, created_at
+		select application_id, mapping_a_id, mapping_b_id, verdict, created_at
 		from agent_coresidency_rules where application_id = ? order by mapping_a_id, mapping_b_id`, appID)
 	if err != nil {
 		return nil, fmt.Errorf("list coresidency rules: %w", err)
@@ -297,7 +319,7 @@ func (s *SQLiteStore) CoResidencyRulesByApplication(ctx context.Context, appID s
 	out := make([]routing.CoResidencyRule, 0)
 	for rows.Next() {
 		var r routing.CoResidencyRule
-		if err := rows.Scan(&r.ApplicationID, &r.MappingAID, &r.MappingBID, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ApplicationID, &r.MappingAID, &r.MappingBID, &r.Verdict, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan coresidency rule: %w", err)
 		}
 		out = append(out, r)
@@ -306,6 +328,41 @@ func (s *SQLiteStore) CoResidencyRulesByApplication(ctx context.Context, appID s
 		return nil, fmt.Errorf("iterate coresidency rules: %w", err)
 	}
 	return out, nil
+}
+
+// GetCoResidencyMode returns appID's co-residency mode (applications.
+// coresidency_mode, migration 99): how a pair with no explicit rule resolves.
+// ErrNotFound when the application does not exist. It reads the column
+// directly rather than going through ApplicationByID because the mode is not a
+// field of routing.Application -- no application reader selects it.
+func (s *SQLiteStore) GetCoResidencyMode(ctx context.Context, appID string) (routing.CoResidencyMode, error) {
+	var mode string
+	err := s.queryRow(ctx, `select coresidency_mode from applications where id = ?`, appID).Scan(&mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read coresidency mode: %w", err)
+	}
+	return routing.CoResidencyMode(mode), nil
+}
+
+// SetCoResidencyMode writes appID's co-residency mode and nothing else: the
+// explicit pair rows are not touched (so switching is lossless) and neither is
+// the application's updated_at. A mode outside routing.CoResidencyMode.Valid is
+// rejected before any write; an unknown application is ErrNotFound
+// (requireAffected). It is a single-column UPDATE, which is also why
+// UpdateApplication -- whose statement does not name the column -- can never
+// clobber it.
+func (s *SQLiteStore) SetCoResidencyMode(ctx context.Context, appID string, mode routing.CoResidencyMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("invalid coresidency mode %q", mode)
+	}
+	result, err := s.exec(ctx, `update applications set coresidency_mode = ? where id = ?`, string(mode), appID)
+	if err != nil {
+		return fmt.Errorf("update coresidency mode: %w", err)
+	}
+	return requireAffected(result)
 }
 
 // SetServerGPUBudgets atomically REPLACES the whole set of per-GPU VRAM

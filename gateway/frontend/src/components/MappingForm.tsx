@@ -315,6 +315,10 @@ export function MappingForm({
   );
   const [transcriptionCapable, setTranscriptionCapable] =
     useState<CapabilityChoice>(transcriptionCapableSeed);
+  const [embeddingCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'embedding'));
+  const [embeddingCapable, setEmbeddingCapable] = useState<CapabilityChoice>(embeddingCapableSeed);
+  const [rerankCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'rerank'));
+  const [rerankCapable, setRerankCapable] = useState<CapabilityChoice>(rerankCapableSeed);
   const [metricsLocked, setMetricsLocked] = useState(() => row?.metrics_locked ?? false);
   const [maxConcurrency, setMaxConcurrency] = useState(() => text(row?.max_concurrency));
   const [recommendedConcurrency, setRecommendedConcurrency] = useState(() =>
@@ -439,6 +443,8 @@ export function MappingForm({
       { capability: 'image_edit', value: imageEdit, seed: imageEditSeed },
       { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
       { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
+      { capability: 'embedding', value: embeddingCapable, seed: embeddingCapableSeed },
+      { capability: 'rerank', value: rerankCapable, seed: rerankCapableSeed },
     ] as const) {
       if (control.value === control.seed) continue;
       verdicts[control.capability] = control.value;
@@ -717,6 +723,35 @@ export function MappingForm({
               {t.mappingCapabilityNo}
             </option>
           )}
+        </SelectField>
+        {/* embedding and rerank are the OPERATOR-stated role capabilities and
+            offer all three states, exactly like vision: nothing probes either
+            one (an Ollama-declared "embedding" is the only incidental source)
+            and neither (embedding, no) nor (rerank, no) is reserved, so no
+            automated writer exists for a manual verdict to mask. They name the
+            model's ROLE -- a vector encoder / a reranker rather than a text
+            generator -- which the backend derives (routing.DeriveRole). */}
+        <SelectField
+          id="mapping-embedding-capable"
+          label={t.mappingEmbeddingCapable}
+          value={embeddingCapable}
+          onChange={(e) => setEmbeddingCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(embeddingCapable, t.mappingEmbeddingCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          <option value="no">{t.mappingCapabilityNo}</option>
+        </SelectField>
+        <SelectField
+          id="mapping-rerank-capable"
+          label={t.mappingRerankCapable}
+          value={rerankCapable}
+          onChange={(e) => setRerankCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(rerankCapable, t.mappingRerankCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          <option value="no">{t.mappingCapabilityNo}</option>
         </SelectField>
         {/* metrics_locked stays a CHECKBOX: it is a policy flag over the
             numeric metrics, not a capability, and ADR-039 is explicit that it
