@@ -202,6 +202,78 @@ func TestRuntimeEventsSnapshotAndUpdate(t *testing.T) {
 	}
 }
 
+// TestRuntimeEventsFramesCarryMeasuredRAM proves BOTH SSE frame kinds carry the
+// spec-level ram_measured_mb: the initial `snapshot` and every later `update`
+// are the same RuntimeStatusDTO, so the live RAM figure must be on the wire of
+// each, and a row that measured nothing must not grow the key.
+func TestRuntimeEventsFramesCarryMeasuredRAM(t *testing.T) {
+	srv := newRuntimeEventsTestServer(t)
+	srv.RuntimeStatus.publish(runtimeEventsServerID, []RuntimeStatusDTO{
+		{SpecID: "spec-1", State: "running", RAMMeasuredMB: 6000},
+		{SpecID: "spec-unmeasured", State: "running"},
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/portal/servers/"+runtimeEventsServerID+"/runtime/events", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+runtimeEventsOwnerSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	reader := bufio.NewReader(resp.Body)
+
+	// decode reads one frame, asserts its kind, and returns its entries by spec
+	// id together with the raw payload (for the wire-level key assertions).
+	decode := func(wantEvent string) (map[string]RuntimeStatusDTO, string) {
+		t.Helper()
+		event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+		if event != wantEvent {
+			t.Fatalf("event = %q, want %q", event, wantEvent)
+		}
+		var frame runtimeStatusEventDTO
+		if err := json.Unmarshal([]byte(data), &frame); err != nil {
+			t.Fatalf("unmarshal %s: %v (%s)", wantEvent, err, data)
+		}
+		bySpec := make(map[string]RuntimeStatusDTO, len(frame.Runtimes))
+		for _, row := range frame.Runtimes {
+			bySpec[row.SpecID] = row
+		}
+		return bySpec, data
+	}
+
+	snap, raw := decode("snapshot")
+	if snap["spec-1"].RAMMeasuredMB != 6000 {
+		t.Fatalf("snapshot spec-1 RAMMeasuredMB = %d, want 6000 (%s)", snap["spec-1"].RAMMeasuredMB, raw)
+	}
+	if !strings.Contains(raw, `"ram_measured_mb":6000`) {
+		t.Fatalf("snapshot frame = %s, want ram_measured_mb:6000 on the wire", raw)
+	}
+	if n := strings.Count(raw, "ram_measured_mb"); n != 1 {
+		t.Fatalf("snapshot frame carries ram_measured_mb %d times, want once (the measured spec only): %s", n, raw)
+	}
+
+	srv.RuntimeStatus.publish(runtimeEventsServerID, []RuntimeStatusDTO{
+		{SpecID: "spec-1", State: "running", RAMMeasuredMB: 7000},
+		{SpecID: "spec-unmeasured", State: "running"},
+	})
+	upd, raw := decode("update")
+	if upd["spec-1"].RAMMeasuredMB != 7000 {
+		t.Fatalf("update spec-1 RAMMeasuredMB = %d, want the replaced 7000 (%s)", upd["spec-1"].RAMMeasuredMB, raw)
+	}
+	if n := strings.Count(raw, "ram_measured_mb"); n != 1 {
+		t.Fatalf("update frame carries ram_measured_mb %d times, want once (the measured spec only): %s", n, raw)
+	}
+}
+
 func TestRuntimeEventsForbidden(t *testing.T) {
 	srv := newRuntimeEventsTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/portal/servers/"+runtimeEventsServerID+"/runtime/events", nil)
