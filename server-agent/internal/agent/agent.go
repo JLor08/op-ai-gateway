@@ -363,7 +363,8 @@ import (
 // The same branch's later wire commit -- the runtime-config document gains a
 // spec-level ram_mb (runtime.Spec.RAMMB) carrying each spec's host-RAM demand --
 // adds "runtime_ram_accounting" to agent.Features with Since 0.14.0 and does NOT
-// bump again: a bump is per shipped change, and 0.14.0 has not shipped yet.
+// bump again: a bump is per shipped change, and 0.14.0 had not yet shipped when
+// that commit landed, so it rode the same bump.
 //
 // 0.14.0 -> 0.15.0 is the single bump for the co-residency rework branch. The
 // agent now reads each spec's pushed model role (runtime.Spec.Role), keeps a

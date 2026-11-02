@@ -277,6 +277,23 @@ type Decision struct {
 	// manager re-asks a WaitOnRAM spec when a sample lands, and nothing else
 	// (see owner.wakeOnHostSample).
 	WaitOnRAM bool
+	// WaitOnGrace is set only together with Wait, and only when this Wait would
+	// have been a non-Wait (an OK, or an Evict) had NOTHING been grace-protected:
+	// the admission is blocked SOLELY by one or more within-grace victims, each of
+	// which would otherwise be drawn. It is the grace twin of WaitOnRAM and the one
+	// other kind of Wait that resolves with nothing happening to any process -- not
+	// a sample this time but the mere passing of time, as the earliest within-grace
+	// victim's window expires and it becomes evictable. Nothing else wakes it: the
+	// release that stamped its victim's LastUsed fired before the window opened, the
+	// housekeeping beat only scans and measures, and wakeOnHostSample wakes only RAM
+	// waiters -- so at the production admission wait of 0 a start blocked purely by
+	// grace would hang until its caller gave up. The manager therefore schedules a
+	// wake at that expiry for a WaitOnGrace spec, and only for such a spec (see
+	// owner.rescheduleGraceWake / wantsGraceWake). It is computed by a counterfactual
+	// re-run of this admission with the grace window off (decide); when BOTH this and
+	// WaitOnRAM are set, either wake can end the Wait, and each is harmless if it
+	// fires first (the re-ask simply blocks again).
+	WaitOnGrace bool
 	// VRAMBootstrap is set only on an Evict decision, and only when that decision
 	// spent the candidate's one-shot VRAM bootstrap -- i.e. rule 4 evicted a
 	// known-demand occupant it would otherwise only have blocked (ADR-032),
@@ -1452,7 +1469,13 @@ func (a *admission) ruleProcessCount() {
 // Evict-then-retry, ordered oldest LastUsed first.
 func (a *admission) decide() Decision {
 	if a.blocked {
-		return Decision{Wait: true, WaitOnRAM: a.ramBlocked, Message: a.waitMessage, Evict: []string{}}
+		return Decision{
+			Wait:        true,
+			WaitOnRAM:   a.ramBlocked,
+			WaitOnGrace: a.blockedSolelyByGrace(),
+			Message:     a.waitMessage,
+			Evict:       []string{},
+		}
 	}
 	if len(a.toEvict) == 0 {
 		return Decision{OK: true, Evict: []string{}}
@@ -1472,4 +1495,41 @@ func (a *admission) decide() Decision {
 	// elsewhere), the function returned the Wait above with an empty Evict list
 	// and no shot was spent. The owner burns the one-shot only for this return.
 	return Decision{Evict: evict, VRAMBootstrap: a.bootstrapEvicted}
+}
+
+// blockedSolelyByGrace reports whether this blocked admission would NOT have
+// blocked -- an OK, or an Evict -- had nothing been grace-protected, i.e. the
+// ONLY thing keeping it from proceeding is one or more within-grace victims. It
+// is Decision.WaitOnGrace, and it exists because such a Wait is woken by nothing
+// else (see that field): the grace window is the sole reason, and it resolves by
+// itself when the window expires.
+//
+// It is computed by RE-RUNNING the whole admission against the same snapshot with
+// the grace window turned off, and asking whether that counterfactual proceeds.
+// The grace window only ever removes a process from the victim set (isEvictable);
+// it never changes the resource arithmetic, the matrix, the process limit or any
+// terminal (those read no clock), so a re-run with grace off differs from this
+// one in exactly one way -- which within-grace models may now be drawn -- and its
+// verdict is precisely "would this have gone through if grace were not
+// protecting anyone". A hard blocker (busy, still-loading, pinned, matrix-
+// incompatible, or simply not enough idle room even with grace off) still blocks
+// the counterfactual, so WaitOnGrace stays false and no grace wake is scheduled
+// for a Wait a grace expiry could not unblock.
+//
+// The re-run is cheap (Admit is pure -- no clock, store or measurement) and
+// bounded: the counterfactual snapshot has grace 0, so the EvictionGrace > 0
+// guard below stops it recursing a second time. It runs only on the already-rare
+// blocked path, and only when a grace window is actually configured.
+func (a *admission) blockedSolelyByGrace() bool {
+	if a.snap.EvictionGrace <= 0 {
+		return false
+	}
+	noGrace := a.snap
+	noGrace.EvictionGrace = 0
+	alt := Admit(noGrace, a.spec)
+	// Proceeds == not a Wait and not a terminal: an OK or an Evict. A terminal
+	// cannot actually arise here (no terminal fired on the grace-on run, and
+	// terminals are grace-independent), but requiring Reason == "" states the
+	// intent exactly and is robust to future terminals.
+	return !alt.Wait && alt.Reason == ""
 }

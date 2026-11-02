@@ -3010,6 +3010,67 @@ func TestAdmitRoleOrderingSpansEveryVictimRule(t *testing.T) {
 	})
 }
 
+// TestAdmitWaitOnGraceOnlyWhenGraceIsTheSoleBlocker pins Decision.WaitOnGrace: it
+// is set exactly when the admission would have proceeded (an OK or an Evict) had
+// nothing been grace-protected -- a Wait blocked SOLELY by a within-grace victim,
+// which is the one the grace-expiry wake must re-ask. A hard blocker, an
+// already-evictable victim, or the window being off all leave it false.
+func TestAdmitWaitOnGraceOnlyWhenGraceIsTheSoleBlocker(t *testing.T) {
+	// Positive: for every victim-drawing rule, when the ONLY thing that could make
+	// room is a within-grace model, the Wait carries WaitOnGrace.
+	for _, rule := range graceRules() {
+		t.Run("solely grace/"+rule.name, func(t *testing.T) {
+			snap, spec := rule.mk(graceNow.Add(-time.Second)) // used 1s ago: inside the 30s window
+			got := Admit(snap, spec)
+			if !got.Wait || !got.WaitOnGrace {
+				t.Fatalf("Admit = %+v, want Wait && WaitOnGrace (only a within-grace victim blocks)", got)
+			}
+			if len(got.Evict) != 0 {
+				t.Errorf("Evict = %v, want empty on a grace Wait", got.Evict)
+			}
+		})
+	}
+
+	// Negative: the same victim OUTSIDE the window is evicted -- no Wait, so no
+	// WaitOnGrace.
+	t.Run("outside the window evicts, not a grace wait", func(t *testing.T) {
+		snap, spec := graceRules()[1].mk(graceNow.Add(-graceWindow - time.Second)) // rule 2, process count
+		if got := Admit(snap, spec); got.Wait || got.WaitOnGrace {
+			t.Fatalf("Admit = %+v, want an Evict with WaitOnGrace false", got)
+		}
+	})
+
+	// Negative: a hard blocker (a busy occupant) is not resolved by a grace expiry,
+	// so the Wait is not WaitOnGrace -- the counterfactual with grace off still
+	// blocks on the busy one.
+	t.Run("a busy blocker is not a grace wait", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running:       []RunningProc{{SpecID: "busy", InFlight: 1, LastUsed: graceNow.Add(-time.Second)}},
+			MaxProcesses:  1,
+			Now:           graceNow,
+			EvictionGrace: graceWindow,
+			Allowed:       allowPairs("cand", "busy"),
+		}
+		got := Admit(snap, Spec{ID: "cand"})
+		if !got.Wait {
+			t.Fatalf("Admit = %+v, want Wait", got)
+		}
+		if got.WaitOnGrace {
+			t.Error("WaitOnGrace = true, want false: a busy blocker is not resolved by a grace expiry")
+		}
+	})
+
+	// Negative: with the grace window off entirely, a blocked admission is never a
+	// grace wait (here the idle occupant is simply evicted).
+	t.Run("grace off is never a grace wait", func(t *testing.T) {
+		snap, spec := graceRules()[1].mk(graceNow.Add(-time.Second))
+		snap.EvictionGrace = 0
+		if got := Admit(snap, spec); got.WaitOnGrace {
+			t.Errorf("Admit = %+v, want WaitOnGrace false with the grace window off", got)
+		}
+	})
+}
+
 // TestAdmitWaitsWhenOnlyProtectedVictimsRemain: when the only model that could
 // make room is in use (InFlight>0) or within the grace window, the admission
 // waits -- no eviction, no OOM -- regardless of role. The role-aware ordering
