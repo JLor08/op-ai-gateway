@@ -309,7 +309,31 @@ var Features = []Feature{
 	// Since is 0.15.0: agent.Features gains an entry, so the rule is a MINOR bump
 	// (see agent.go's Version block).
 	{Name: "runtime_role_eviction", Since: "0.15.0"},
+	// runtime_instances: this agent runs several instances (processes) of one
+	// runtime spec (#340). It reads the spec-level replicable/min_instances/
+	// max_instances fields of the runtime-config document, serves each extra
+	// instance under the model address "m#k" (k = 1...), and reports one status
+	// row per instance (runtime.Status.Instance, with the process's measured
+	// startup_ms).
+	//
+	// Unlike runtime_role_eviction, the GATEWAY gates real behavior on this flag,
+	// fail-closed: it expands a replicable model into "m#k" candidates, routes to
+	// them and starts one only on positive evidence the agent declared this name.
+	// An older agent decodes the document without error and silently ignores the
+	// unknown fields, which no probe of the agent can tell apart from one that
+	// honours them -- it would answer 404 runtime.model_not_managed for every
+	// "m#k", exactly the traffic a capability gate exists to prevent. The gateway
+	// spells the same string in its own constant for the reason
+	// runtimeManagerFeature is duplicated: this module cannot import it.
+	//
+	// Since is 0.16.0: agent.Features gains an entry, so the rule is a MINOR bump
+	// (see agent.go's Version block).
+	{Name: FeatureRuntimeInstances, Since: "0.16.0"},
 }
+
+// FeatureRuntimeInstances names the runtime_instances feature (see its registry
+// entry above): the agent runs several instances of one replicable runtime spec.
+const FeatureRuntimeInstances = "runtime_instances"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

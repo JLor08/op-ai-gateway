@@ -376,7 +376,16 @@ import (
 // a change to how the agent reads its own configuration (a new env setting) and
 // to observable runtime behaviour (what an admission may evict). This is the ONE
 // bump for the whole branch; later commits on it do not bump again.
-const Version = "0.15.0"
+//
+// 0.15.0 -> 0.16.0 is the single bump for the model-instance autoscaling branch
+// (#340). MINOR, and the rule decides it: agent.Features gains
+// "runtime_instances". The agent also accepts new spec-level wire fields
+// (replicable, min_instances, max_instances), reports new status fields
+// (instance, startup_ms) and runs several processes of one spec under the
+// instance address "m#k" -- a change to its wire contract and to observable
+// runtime behaviour. This is the ONE bump for the whole branch; later commits on
+// it do not bump again.
+const Version = "0.16.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -129,6 +130,25 @@ type Spec struct {
 	// ignores it): the policy reads it to choose WHICH idle model to evict, and
 	// it changes nothing about how a process is exec'd.
 	Role string `json:"role,omitempty"`
+	// Replicable opts the spec into running SEVERAL instances (processes) of
+	// itself (#340): instance 0 is the spec's one process as ever, and further
+	// instances (k = 1...) are started on demand as burst capacity. False -- the
+	// default, and every document an older gateway sends -- keeps exactly the
+	// single process of today. Every instance needs its own port, so ParseConfig
+	// demotes a spec that pins a fixed ListenPort to non-replicable.
+	Replicable bool `json:"replicable,omitempty"`
+	// MinInstances is the number of instances a replicable spec keeps up as its
+	// protected floor (never reclaimed by idle timeout or eviction); 0 = no
+	// floor beyond the pin/force_running baseline. MaxInstances caps how many
+	// instances the spec may have; 0 = no cap beyond MaxInstanceIndex. Read both
+	// through ProtectedCount and InstanceAllowed, never raw: ParseConfig only
+	// sanitises them (negative reads as 0, a floor above the cap is clamped to
+	// the cap) and they mean nothing for a non-replicable spec.
+	//
+	// Like Replicable they decide HOW MANY processes run, never what a process
+	// is, so sameLaunchShape ignores all three.
+	MinInstances int `json:"min_instances,omitempty"`
+	MaxInstances int `json:"max_instances,omitempty"`
 }
 
 // RoleOther is the role of a spec that has none the agent recognises: the value
@@ -395,9 +415,42 @@ func ParseConfig(raw []byte) (Config, error) {
 		if err := checkConfigFileNames(cfg.Specs[i]); err != nil {
 			return Config{}, err
 		}
+		sanitizeInstanceFields(&cfg.Specs[i])
 	}
 
 	return cfg, nil
+}
+
+// sanitizeInstanceFields normalises a spec's multi-instance opt-in (#340) so
+// nothing downstream has to defend against a contradictory document. It never
+// fails the document: every repair is a demotion to the safer, more
+// conservative reading, logged at Warn so the operator can learn why the spec
+// does not scale the way they wrote it (the gateway rejects the same inputs at
+// submit time; only a hand-written file-mode document, or a gateway that
+// predates the rule, can reach here).
+//
+//   - A replicable spec with a fixed listen_port is demoted to non-replicable:
+//     every instance needs its own port, and one pinned port can serve one
+//     process.
+//   - A negative min_instances or max_instances reads as unset (0).
+//   - A min_instances above a set max_instances is clamped to max_instances.
+func sanitizeInstanceFields(spec *Spec) {
+	if spec.Replicable && spec.ListenPort != 0 {
+		slog.Warn("runtime: spec is replicable but pins a fixed listen_port; treating it as non-replicable (every instance needs its own port)",
+			"spec", spec.ID, "listen_port", spec.ListenPort)
+		spec.Replicable = false
+	}
+	if spec.MinInstances < 0 || spec.MaxInstances < 0 {
+		slog.Warn("runtime: spec has a negative min_instances/max_instances; reading it as unset",
+			"spec", spec.ID, "min_instances", spec.MinInstances, "max_instances", spec.MaxInstances)
+		spec.MinInstances = max(spec.MinInstances, 0)
+		spec.MaxInstances = max(spec.MaxInstances, 0)
+	}
+	if spec.MaxInstances > 0 && spec.MinInstances > spec.MaxInstances {
+		slog.Warn("runtime: spec has min_instances above max_instances; clamping min_instances to max_instances",
+			"spec", spec.ID, "min_instances", spec.MinInstances, "max_instances", spec.MaxInstances)
+		spec.MinInstances = spec.MaxInstances
+	}
 }
 
 // checkConfigFileNames validates spec's config_files names: each one plain
@@ -544,6 +597,15 @@ type Status struct {
 	// the same JSON key.
 	MeasuredRAMMB int        `json:"ram_measured_mb,omitempty"`
 	LastError     *LastError `json:"last_error,omitempty"`
+	// Instance is this row's instance index within its spec (#340): 0 for the
+	// spec's one ordinary process, k >= 1 for a further (burst) instance. It is
+	// always on the wire, 0 included.
+	Instance int `json:"instance"`
+	// StartupMS is how long this process took to become healthy, in
+	// milliseconds, measured by the agent on its last successful start; 0 means
+	// unknown (never started, or a start that did not finish). It is the
+	// gateway's cold-start figure for the instance.
+	StartupMS int `json:"startup_ms,omitempty"`
 
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by

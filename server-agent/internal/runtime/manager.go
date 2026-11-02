@@ -1476,6 +1476,13 @@ func sameLaunchShape(a, b Spec) bool {
 		// with the process untouched, and the first document that carries it
 		// would otherwise relaunch every healthy child.
 		s.Role = ""
+		// Replicable/MinInstances/MaxInstances (#340) decide HOW MANY processes
+		// the spec may run and when they start -- the scaler's input, read live --
+		// never what a process IS, so editing them must not bounce a healthy
+		// child.
+		s.Replicable = false
+		s.MinInstances = 0
+		s.MaxInstances = 0
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy

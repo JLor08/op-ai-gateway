@@ -6,3 +6,5 @@ Execution: subagent-driven (fresh implementer + review per task).
 
 | Task | Status | Notes |
 |---|---|---|
+| 1 | done | agent wire fields (replicable/min/max, status instance/startup_ms), `runtime_instances` feature, agent 0.16.0; `Status.Instance/StartupMS` are declared but populated in Task 4 |
+| 2 | in progress | instance address/key helpers |

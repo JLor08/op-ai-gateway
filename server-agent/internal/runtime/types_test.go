@@ -899,3 +899,109 @@ func TestFileSourceReportsOnlyTheParseErrorCode(t *testing.T) {
 		t.Fatalf("report = %s, want the classification code on the wire", raw)
 	}
 }
+
+// parseOneSpec decodes a runtime-config document holding exactly one spec built
+// from specFields (the spec object's members, without braces) and returns that
+// spec, failing the test when the document does not parse.
+func parseOneSpec(t *testing.T, specFields string) Spec {
+	t.Helper()
+	raw := `{"router_listen":9000,"max_processes":2,"gpu_budgets":[],"specs":[` +
+		`{"id":"rspec_inst","model":"m","upstream_model":"m-up","binary":"/bin/m",` +
+		`"args":[],"env":{},"gpus":[],` + specFields + `}],"coresident":[],"etag":"e"}`
+	cfg, err := ParseConfig([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseConfig() error = %v (instance fields must never fail the document)", err)
+	}
+	if len(cfg.Specs) != 1 {
+		t.Fatalf("len(Specs) = %d, want 1", len(cfg.Specs))
+	}
+	return cfg.Specs[0]
+}
+
+// TestParseConfigReplicableFields pins the wire keys of the multi-instance opt-in
+// (#340): replicable, min_instances and max_instances decode verbatim for a spec
+// that takes an ephemeral port.
+func TestParseConfigReplicableFields(t *testing.T) {
+	spec := parseOneSpec(t, `"replicable":true,"min_instances":1,"max_instances":4`)
+	if !spec.Replicable || spec.MinInstances != 1 || spec.MaxInstances != 4 {
+		t.Fatalf("got replicable=%v min=%d max=%d, want true/1/4", spec.Replicable, spec.MinInstances, spec.MaxInstances)
+	}
+}
+
+// TestParseConfigReplicableDefaultsOff: a document that omits the three keys --
+// every document an older gateway sends -- decodes to the non-replicable
+// zero values, so a spec that did not opt in behaves exactly as before.
+func TestParseConfigReplicableDefaultsOff(t *testing.T) {
+	spec := parseOneSpec(t, `"listen_port":0`)
+	if spec.Replicable || spec.MinInstances != 0 || spec.MaxInstances != 0 {
+		t.Fatalf("got replicable=%v min=%d max=%d, want false/0/0", spec.Replicable, spec.MinInstances, spec.MaxInstances)
+	}
+}
+
+// TestParseConfigReplicableFixedPortDemoted: every instance of a replicable spec
+// needs its own port, and a fixed listen_port is one port. ParseConfig demotes
+// the spec to non-replicable (with a warning) instead of failing the document
+// or letting a second instance collide with the first on that port.
+func TestParseConfigReplicableFixedPortDemoted(t *testing.T) {
+	logs := withCountedLogs(t)
+	spec := parseOneSpec(t, `"replicable":true,"listen_port":9000`)
+	if spec.Replicable {
+		t.Fatal("Replicable = true on a spec with a fixed listen_port, want it demoted to false")
+	}
+	if spec.ListenPort != 9000 {
+		t.Fatalf("ListenPort = %d, want 9000 (only the opt-in is demoted, the launch shape is untouched)", spec.ListenPort)
+	}
+	if !logs.containsText("rspec_inst") {
+		t.Fatal("the demotion logged nothing naming the spec; an operator would never learn why the spec does not scale")
+	}
+}
+
+// TestParseConfigInstanceCountsSanitized: a negative count is meaningless and
+// reads as unset (0), and a floor above the cap is clamped to the cap, so the
+// scaler never has to defend against a contradictory pair.
+func TestParseConfigInstanceCountsSanitized(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		fields       string
+		wantMin      int
+		wantMax      int
+		wantLoggedID bool
+	}{
+		{"negative counts read as unset", `"replicable":true,"min_instances":-2,"max_instances":-1`, 0, 0, true},
+		{"min above max is clamped to max", `"replicable":true,"min_instances":5,"max_instances":3`, 3, 3, true},
+		{"min below max is kept", `"replicable":true,"min_instances":2,"max_instances":3`, 2, 3, false},
+		{"min with no cap is kept", `"replicable":true,"min_instances":5`, 5, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := withCountedLogs(t)
+			spec := parseOneSpec(t, tc.fields)
+			if spec.MinInstances != tc.wantMin || spec.MaxInstances != tc.wantMax {
+				t.Fatalf("got min=%d max=%d, want %d/%d", spec.MinInstances, spec.MaxInstances, tc.wantMin, tc.wantMax)
+			}
+			if !spec.Replicable {
+				t.Fatal("Replicable = false, want true (sanitising the counts must not touch the opt-in)")
+			}
+			if got := logs.containsText("rspec_inst"); got != tc.wantLoggedID {
+				t.Fatalf("a warning naming the spec was logged = %v, want %v", got, tc.wantLoggedID)
+			}
+		})
+	}
+}
+
+// TestSameLaunchShapeIgnoresInstanceFields: replicable, min_instances and
+// max_instances decide how MANY processes run and when they start, never what a
+// process is, so editing them must not bounce a healthy child.
+func TestSameLaunchShapeIgnoresInstanceFields(t *testing.T) {
+	base := Spec{ID: "s", Model: "m", UpstreamModel: "um", Binary: "/bin/x", Args: []string{"-p", "${PORT}"}}
+	changed := base
+	changed.Replicable = true
+	changed.MinInstances = 1
+	changed.MaxInstances = 4
+	if !sameLaunchShape(base, changed) {
+		t.Fatal("changing replicable/min_instances/max_instances must not change the launch shape, but sameLaunchShape returned false")
+	}
+	changed.Binary = "/bin/y"
+	if sameLaunchShape(base, changed) {
+		t.Fatal("sameLaunchShape ignored a real launch change next to the instance fields")
+	}
+}
