@@ -445,7 +445,8 @@ accepts, the scale-up ends; parked requests keep waiting for existing instances
 
 For replicable specs the gateway pushes
 
-`idle_timeout_seconds = max(manual, ceil(factor × startup_measured_ms / 1000), floor)`
+`idle_timeout_seconds = max(manual, ceil(factor × startup / 1000), floor)`,
+`startup = max(startup_measured_ms (agent, §5.6), load_time_ms (benchmark, §8.1))`
 
 with gateway env `OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR` (default **5**) and
 `OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS` (default **120**). A manual value of
@@ -487,6 +488,16 @@ a model is ever loaded.
 - Each measurement goes **directly to a specific instance** (like the speech
   benchmark bypasses routing), after one short warm-up request (cold start is not
   part of the throughput figure).
+- **Startup time, like the text benchmarks** (user requirement): a `speed` /
+  `both` run on an audio mapping also measures the cold start with the text
+  benchmark's technique — `ensureColdLoad` (the same stop / unpin / override-lease
+  mechanism; `benchmarkMayPreStop` marks audio targets like text ones), a cold
+  pass, then a warm pass, `load_time_ms = cold − warm` of the time to first
+  output (first `speech.audio.delta` for streaming TTS, first response byte for
+  non-streamed TTS, first `transcript.text.delta` for live ASR, the full response
+  for buffered ASR). Recorded only when the cold start was confirmed and
+  cold > warm, exactly the text rules, and stored in the mapping's existing
+  `load_time_ms` like a text result.
 
 ### 8.2 TTS
 
@@ -707,11 +718,10 @@ Then: architecture docs folded, working files removed, full verification, PR.
 - **An instance k ≥ 1 never starts with an unknown demand** — it inherits its
   running sibling's measurement or waits/refuses. Avoids two unmeasured
   siblings bootstrapping on the same card.
-- **Startup is measured by the agent** (process start → first healthy probe) on
-  every start, not by a cold-minus-warm benchmark. It needs no disruptive
-  stop-all and is refreshed on every real start. The issue suggested the
-  benchmark technique; the agent measurement serves the same purpose (idle
-  timeout) better.
+- **Startup has two sources and the idle timeout takes the larger**: the
+  benchmark's cold-minus-warm `load_time_ms` on the mapping (user requirement,
+  like text — a reference value before the model ever ran here) and the agent's
+  process-start → first-healthy time, refreshed for free on every real start.
 - **Per-instance parallelism is a new spec field** (default 1) rather than the
   mapping's benchmark-filled `max_concurrency` (chat-only, 0 for audio).
 - **Starting instances are not routing candidates**; a parked request takes
