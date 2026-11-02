@@ -2898,7 +2898,7 @@ describe('RuntimeAdminSection co-residency editor wiring', () => {
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
     await openTab();
     await screen.findByRole('option', { name: /Alpha/ });
-    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(afterFirst + 3);
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(afterFirst + 3);
   });
 
   it('a language switch re-GETs the mapping list but does not re-read every spec', async () => {
@@ -2917,7 +2917,7 @@ describe('RuntimeAdminSection co-residency editor wiring', () => {
     // Same mappings, so the roles already read are still the roles of this
     // entry: the editor stays up and no spec is fetched again.
     expect(await screen.findByRole('option', { name: /Alpha/ })).toBeInTheDocument();
-    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(specReads);
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(specReads);
   });
 
   it('files a mapping whose spec GET failed under the "other" group', async () => {

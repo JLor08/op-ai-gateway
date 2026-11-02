@@ -277,22 +277,32 @@ func (s *SQLiteStore) SetCoResidencyRules(ctx context.Context, appID string, rul
 		return fmt.Errorf("clear coresidency rules: %w", err)
 	}
 	for i, r := range rules {
-		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into agent_coresidency_rules (application_id, mapping_a_id, mapping_b_id, verdict, created_at)
-			values (?, ?, ?, ?, ?)`), appID, r.MappingAID, r.MappingBID, verdicts[i], r.CreatedAt); err != nil {
-			// FK before unique: sqlite's FK error text also matches the
-			// unique-violation substring (see UpsertRuntimeSpec above /
-			// sqlite_projects.go).
-			if s.dl.isForeignKeyViolation(err) {
-				return ErrNotFound
-			}
-			if s.dl.isUniqueViolation(err) {
-				return ErrConflict
-			}
-			return fmt.Errorf("insert coresidency rule: %w", err)
+		if err := s.insertCoResidencyRule(ctx, tx, appID, r, verdicts[i]); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// insertCoResidencyRule inserts one explicit pair row inside SetCoResidencyRules'
+// transaction, with the already-normalised verdict, and maps the driver's
+// constraint failures onto the store's sentinel errors.
+func (s *SQLiteStore) insertCoResidencyRule(ctx context.Context, tx *sql.Tx, appID string, r routing.CoResidencyRule, verdict string) error {
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`
+		insert into agent_coresidency_rules (application_id, mapping_a_id, mapping_b_id, verdict, created_at)
+		values (?, ?, ?, ?, ?)`), appID, r.MappingAID, r.MappingBID, verdict, r.CreatedAt); err != nil {
+		// FK before unique: sqlite's FK error text also matches the
+		// unique-violation substring (see UpsertRuntimeSpec above /
+		// sqlite_projects.go).
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		if s.dl.isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("insert coresidency rule: %w", err)
+	}
+	return nil
 }
 
 // CoResidencyRulesByApplication lists appID's explicit co-residency pair rows

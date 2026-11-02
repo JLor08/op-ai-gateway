@@ -1230,6 +1230,18 @@ const apiTokenBackendRows: {
   },
 ];
 
+// What the co-residency tab may say about the roles its editor groups by: the
+// mappings GET failing hard is `error` (nothing to read the specs of), the
+// spec fan-out not having settled is `loading`, anything else `ready`.
+function coresidencyRolesStateOf(
+  mappingsStatus: ResourceState,
+  rolesRead: { unreadable: ReadonlySet<string> } | null,
+): ResourceState {
+  if (mappingsStatus === 'error') return 'error';
+  if (rolesRead === null) return 'loading';
+  return 'ready';
+}
+
 export function RuntimeAdminSection({
   t,
   api,
@@ -1703,8 +1715,7 @@ export function RuntimeAdminSection({
   }));
   // A hard-failed mappings GET never reaches the read above, and the
   // screen-wide banner already says why; the tab must not claim to be loading.
-  const coresidencyRolesState: ResourceState =
-    mappingsStatus === 'error' ? 'error' : rolesRead === null ? 'loading' : 'ready';
+  const coresidencyRolesState = coresidencyRolesStateOf(mappingsStatus, rolesRead);
 
   // Serializes edits: while a PUT is in flight, the editor is disabled (mirrors
   // Area 3's limitsBusy) so a second edit cannot compute its next full-replace
@@ -5194,6 +5205,83 @@ export function RuntimeAdminSection({
     );
   }
 
+  // The co-residency tab's body, one state at a time. Each early return is a
+  // distinct fact about what the tab may show, in the order they gate one
+  // another; none of them is the editor with an empty document.
+  function renderCoresidencyBody() {
+    if (fileMode) {
+      // The agent owns its own config file, which is where its co-residency
+      // is kept: there is nothing here to edit, and the gateway-side mode
+      // and verdicts the live editor writes are not what is in force.
+      return <Typography color="text.secondary">{t.coresidencyFileMode}</Typography>;
+    }
+    if (reportStatus !== 'ready') {
+      // Deliberately NOT the editor with an empty document: the report
+      // GET (which decides whether this screen is writable at all) has
+      // not settled, so there is nothing to edit from. A FAILED report
+      // GET is a different fact from a pending one and must not read as
+      // "loading" -- the screen-wide banner above carries the
+      // explanation and the retry.
+      return (
+        <ResourceFallback
+          state={reportFailed ? reportStatus : 'loading'}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeModeUnknownShort}
+        />
+      );
+    }
+    if (!coresidencyReady) {
+      // The pairs GET itself (task-21 review's Critical finding), now
+      // with its failures named instead of shown as an endless
+      // "loading…": on a hard failure there is nothing to render, on a
+      // failed reload there is a payload we could not refresh and an
+      // edit would PUT the full replacement document computed from it.
+      // Neither may be edited, and both get the retry this tab never
+      // had -- the resource's `reload()` was not even destructured.
+      //
+      // Both states hide the editor, but they are not the same sentence
+      // (fix round 1, M7): "could not be loaded" is false once a payload
+      // is in hand and only the refresh failed.
+      return (
+        <ResourceFallback
+          state={coresidencyStatus}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeCoresidencyUnavailable}
+          staleErrorLabel={t.runtimeCoresidencyStale}
+          errorDetail={coresidencyError}
+          retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
+        />
+      );
+    }
+    if (coresidencyRolesState !== 'ready' || coresidencyData === null) {
+      // The document is in hand but the roles it is grouped by are not
+      // (see `coresidencyItems`): nothing is offered until every spec GET
+      // has settled.
+      return (
+        <ResourceFallback
+          state={coresidencyRolesState}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeMappingsUnavailable}
+        />
+      );
+    }
+    return (
+      <CoResidencyEditor
+        t={t}
+        items={coresidencyItems}
+        mode={coresidencyData.mode}
+        pairs={coresidencyData.pairs}
+        onChange={(next) => void saveCoresidency(next)}
+        disabled={coresidencyBusy}
+        // Transient -- but for the few hundred milliseconds it lasts, an
+        // unexplained dead editor is the same defect as an unexplained
+        // read-only one. Undefined when not busy, so a live editor never
+        // carries a reason it does not have.
+        disabledReason={coresidencyBusy ? t.coresidencySaving : undefined}
+      />
+    );
+  }
+
   return (
     <>
       <Breadcrumbs
@@ -5433,67 +5521,7 @@ export function RuntimeAdminSection({
           title={t.runtimeCoresidency}
           subtitle={t.runtimeCoresidencyHint}
         >
-          {fileMode ? (
-            // The agent owns its own config file, which is where its co-residency
-            // is kept: there is nothing here to edit, and the gateway-side mode
-            // and verdicts the live editor writes are not what is in force.
-            <Typography color="text.secondary">{t.coresidencyFileMode}</Typography>
-          ) : reportStatus !== 'ready' ? (
-            // Deliberately NOT the editor with an empty document: the report
-            // GET (which decides whether this screen is writable at all) has
-            // not settled, so there is nothing to edit from. A FAILED report
-            // GET is a different fact from a pending one and must not read as
-            // "loading" -- the screen-wide banner above carries the
-            // explanation and the retry.
-            <ResourceFallback
-              state={reportFailed ? reportStatus : 'loading'}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeModeUnknownShort}
-            />
-          ) : !coresidencyReady ? (
-            // The pairs GET itself (task-21 review's Critical finding), now
-            // with its failures named instead of shown as an endless
-            // "loading…": on a hard failure there is nothing to render, on a
-            // failed reload there is a payload we could not refresh and an
-            // edit would PUT the full replacement document computed from it.
-            // Neither may be edited, and both get the retry this tab never
-            // had -- the resource's `reload()` was not even destructured.
-            //
-            // Both states hide the editor, but they are not the same sentence
-            // (fix round 1, M7): "could not be loaded" is false once a payload
-            // is in hand and only the refresh failed.
-            <ResourceFallback
-              state={coresidencyStatus}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeCoresidencyUnavailable}
-              staleErrorLabel={t.runtimeCoresidencyStale}
-              errorDetail={coresidencyError}
-              retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
-            />
-          ) : coresidencyRolesState !== 'ready' || coresidencyData === null ? (
-            // The document is in hand but the roles it is grouped by are not
-            // (see `coresidencyItems`): nothing is offered until every spec GET
-            // has settled.
-            <ResourceFallback
-              state={coresidencyRolesState}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeMappingsUnavailable}
-            />
-          ) : (
-            <CoResidencyEditor
-              t={t}
-              items={coresidencyItems}
-              mode={coresidencyData.mode}
-              pairs={coresidencyData.pairs}
-              onChange={(next) => void saveCoresidency(next)}
-              disabled={coresidencyBusy}
-              // Transient -- but for the few hundred milliseconds it lasts, an
-              // unexplained dead editor is the same defect as an unexplained
-              // read-only one. Undefined when not busy, so a live editor never
-              // carries a reason it does not have.
-              disabledReason={coresidencyBusy ? t.coresidencySaving : undefined}
-            />
-          )}
+          {renderCoresidencyBody()}
         </Panel>
       )}
       {tab === 'limits' && (

@@ -125,14 +125,21 @@ function withVerdicts(
 // editor re-renders on every change.
 const nameCollator = new Intl.Collator(undefined, { numeric: true });
 
+/** Raw code-unit order of two strings: -1, 0 (equal) or 1. */
+function compareCodeUnits(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
 function compareItems(a: CoResidencyItem, b: CoResidencyItem): number {
   const byName = nameCollator.compare(a.name, b.name);
   if (byName !== 0) return byName;
   // `numeric: true` equates 8 with 08, so a collator tie is not a name tie; fall
   // back to raw code units and then to the id so the order is total and stable
   // (two mappings may legally carry the same display name).
-  if (a.name !== b.name) return a.name < b.name ? -1 : 1;
-  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  if (a.name !== b.name) return compareCodeUnits(a.name, b.name);
+  return compareCodeUnits(a.id, b.id);
 }
 
 // ---- the draggable divider --------------------------------------------------
@@ -162,7 +169,9 @@ const SPLIT_MIN_WIDTH = LIST_WIDTH_MIN + SEPARATOR_WIDTH + DETAIL_WIDTH_MIN;
  * layout, or no layout engine) falls back to the static cap.
  */
 function maxListWidth(containerWidth: number): number {
-  if (!(containerWidth > 0)) return LIST_WIDTH_MAX;
+  // NaN is as unmeasured as 0: it fails `> 0`, so it must take this exit too (a
+  // bare `containerWidth <= 0` would let it through to a NaN width).
+  if (Number.isNaN(containerWidth) || containerWidth <= 0) return LIST_WIDTH_MAX;
   const room = Math.floor(containerWidth) - SEPARATOR_WIDTH - DETAIL_WIDTH_MIN;
   return Math.max(LIST_WIDTH_MIN, Math.min(LIST_WIDTH_MAX, room));
 }
@@ -291,16 +300,16 @@ export function CoResidencyEditor({
   // The width the operator chose (and storage remembers). What is shown is that
   // width held within what the container leaves room for, so a width picked on a
   // wide window survives a visit from a narrow one without being rewritten.
-  const [listWidth, setListWidthState] = useState(readListWidth);
+  const [chosenWidth, setChosenWidth] = useState(readListWidth);
   const [containerWidth, setContainerWidth] = useState(0);
   const [dragging, setDragging] = useState(false);
   // The drag handlers read the latest width synchronously (a pointer-up must
   // persist the value the last move set, before React re-renders).
-  const widthRef = useRef(listWidth);
+  const widthRef = useRef(chosenWidth);
   const draggingRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const maxWidth = maxListWidth(containerWidth);
-  const shownWidth = Math.min(listWidth, maxWidth);
+  const shownWidth = Math.min(chosenWidth, maxWidth);
 
   const sorted = useMemo(() => [...items].sort(compareItems), [items]);
   // A selection that vanished (a mapping was deleted) falls back to the first.
@@ -385,7 +394,7 @@ export function CoResidencyEditor({
   function setListWidth(px: number, persist: boolean) {
     const next = clampWidth(px, liveMaxWidth());
     widthRef.current = next;
-    setListWidthState(next);
+    setChosenWidth(next);
     if (persist) writeListWidth(next);
   }
 

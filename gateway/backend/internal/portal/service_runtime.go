@@ -1930,30 +1930,9 @@ func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appI
 	for _, m := range ownMappings {
 		belongsToApp[m.ID] = true
 	}
-	seenPairs := make(map[[2]string]bool, len(req.Pairs))
-	rules := make([]routing.CoResidencyRule, 0, len(req.Pairs))
-	now := s.clock().UTC()
-	for _, pair := range req.Pairs {
-		a, b := strings.TrimSpace(pair.A), strings.TrimSpace(pair.B)
-		if a == "" || b == "" || a == b {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
-		}
-		if !belongsToApp[a] || !belongsToApp[b] {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
-		}
-		verdict, ok := routing.NormalizeCoResidencyVerdict(pair.Verdict)
-		if !ok {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
-		}
-		if a > b {
-			a, b = b, a
-		}
-		key := [2]string{a, b}
-		if seenPairs[key] {
-			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
-		}
-		seenPairs[key] = true
-		rules = append(rules, routing.CoResidencyRule{ApplicationID: app.ID, MappingAID: a, MappingBID: b, Verdict: verdict, CreatedAt: now})
+	rules, err := coResidencyRulesFromPairs(app.ID, req.Pairs, belongsToApp, s.clock().UTC())
+	if err != nil {
+		return CoResidencyDTO{}, err
 	}
 	modeWritten := false
 	if req.Mode != "" {
@@ -1970,6 +1949,40 @@ func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appI
 	}
 	s.notifyRuntimeChanged(server.ID)
 	return s.storedCoResidency(ctx, app.ID)
+}
+
+// coResidencyRulesFromPairs validates a SetCoResidency request's pairs and turns
+// them into the store's rules: each pair names two distinct mappings of the
+// application (belongsToApp), carries a known verdict (empty is allow), and is
+// stored in canonical order (a < b), so a duplicate is detected after that
+// normalization. Any violation is ErrCoResidencyPairInvalid and nothing is
+// returned, so the caller never writes from a half-validated set.
+func coResidencyRulesFromPairs(appID string, pairs []CoResidencyPairDTO, belongsToApp map[string]bool, createdAt time.Time) ([]routing.CoResidencyRule, error) {
+	seenPairs := make(map[[2]string]bool, len(pairs))
+	rules := make([]routing.CoResidencyRule, 0, len(pairs))
+	for _, pair := range pairs {
+		a, b := strings.TrimSpace(pair.A), strings.TrimSpace(pair.B)
+		if a == "" || b == "" || a == b {
+			return nil, ErrCoResidencyPairInvalid
+		}
+		if !belongsToApp[a] || !belongsToApp[b] {
+			return nil, ErrCoResidencyPairInvalid
+		}
+		verdict, ok := routing.NormalizeCoResidencyVerdict(pair.Verdict)
+		if !ok {
+			return nil, ErrCoResidencyPairInvalid
+		}
+		if a > b {
+			a, b = b, a
+		}
+		key := [2]string{a, b}
+		if seenPairs[key] {
+			return nil, ErrCoResidencyPairInvalid
+		}
+		seenPairs[key] = true
+		rules = append(rules, routing.CoResidencyRule{ApplicationID: appID, MappingAID: a, MappingBID: b, Verdict: verdict, CreatedAt: createdAt})
+	}
+	return rules, nil
 }
 
 // coResidencyDTO builds the wire DTO from the stored mode and explicit rules;
