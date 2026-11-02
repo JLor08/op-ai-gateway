@@ -2448,6 +2448,7 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'errorRuntimeSpecAdminStateInvalid',
       'errorRuntimeSpecApplicationNotServerAgent',
       'errorRuntimeCoresidencyPairInvalid',
+      'errorRuntimeCoresidencyModeInvalid',
       'errorServerGpuBudgetInvalid',
       'errorServerRuntimeLimitInvalid',
       'errorApplicationManagedRuntimeOnly',
@@ -2620,6 +2621,92 @@ describe('agent-managed runtime i18n keys (task 21 matrix + limits)', () => {
       expect(typeof messages.en[k]).toBe('string');
       expect(messages.de[k].length).toBeGreaterThan(0);
       expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('co-residency editor i18n keys', () => {
+  const stringKeys = [
+    'runtimeCoresidency',
+    'runtimeCoresidencyHint',
+    'coresidencyModeLabel',
+    'coresidencyModeOptOut',
+    'coresidencyModeOptIn',
+    'coresidencyDefaultAllowedHint',
+    'coresidencyDefaultDeniedHint',
+    'coresidencyVerdictAllow',
+    'coresidencyVerdictForbid',
+    'coresidencyVerdictDefaultAllowed',
+    'coresidencyVerdictDefaultDenied',
+    'coresidencySearch',
+    'coresidencyModelList',
+    'coresidencyDetailHint',
+    'coresidencyRoleAsr',
+    'coresidencyRoleTts',
+    'coresidencyRoleImage',
+    'coresidencyRoleEmbedding',
+    'coresidencyRoleReranker',
+    'coresidencyRoleChat',
+    'coresidencyRoleOther',
+    'coresidencyGroupMixed',
+    'coresidencyFromGroup',
+    'coresidencyNeedTwo',
+    'coresidencyNoMatch',
+    'coresidencyResize',
+    'coresidencySaving',
+  ] as const;
+
+  it('defines every string key in de and en', () => {
+    for (const k of stringKeys) {
+      for (const locale of ['de', 'en'] as const) {
+        expect(typeof messages[locale][k], `${locale}.${k}`).toBe('string');
+        expect(messages[locale][k].length, `${locale}.${k}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps the four verdict segments and the seven role labels distinct from one another', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      const verdicts = [
+        m.coresidencyVerdictAllow,
+        m.coresidencyVerdictForbid,
+        m.coresidencyVerdictDefaultAllowed,
+        m.coresidencyVerdictDefaultDenied,
+      ];
+      expect(new Set(verdicts).size, `${locale} verdicts`).toBe(verdicts.length);
+      const roles = [
+        m.coresidencyRoleAsr,
+        m.coresidencyRoleTts,
+        m.coresidencyRoleImage,
+        m.coresidencyRoleEmbedding,
+        m.coresidencyRoleReranker,
+        m.coresidencyRoleChat,
+        m.coresidencyRoleOther,
+      ];
+      expect(new Set(roles).size, `${locale} roles`).toBe(roles.length);
+    }
+  });
+
+  it('renders the parameterised labels with their argument in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      expect(m.coresidencyGroupControl('Chat')).toContain('Chat');
+      expect(m.coresidencyMemberControl('Qwen 32B')).toContain('Qwen 32B');
+      expect(m.coresidencyGroupToggle('Chat')).toContain('Chat');
+      expect(m.coresidencyExceptions(1)).not.toBe(m.coresidencyExceptions(2));
+      expect(m.coresidencyExceptions(3)).toContain('3');
+      expect(m.coresidencyGroupSize(1)).not.toBe(m.coresidencyGroupSize(2));
+      expect(m.coresidencyGroupSize(5)).toContain('5');
+    }
+  });
+
+  it('states what "default" means in the mode hints', () => {
+    // The two hints are the only place the active mode is spelled out; they must
+    // not collapse into one sentence.
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      expect(m.coresidencyDefaultAllowedHint).not.toBe(m.coresidencyDefaultDeniedHint);
     }
   });
 });

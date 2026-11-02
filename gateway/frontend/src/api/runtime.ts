@@ -36,6 +36,13 @@ export interface ConfigFile {
   content: string;
 }
 
+// A model's single derived role: the functional kind it plays, which is both the
+// co-residency editor's group and the agent's eviction "type". Mirrors the Go
+// routing.ModelRole values. The backend derives it (routing.DeriveRole over the
+// spec's effective type and its mapping's yes verdicts) and never sends an
+// empty one; the client never re-derives it.
+export type ModelRole = 'asr' | 'tts' | 'image' | 'embedding' | 'reranker' | 'chat' | 'other';
+
 // A mapping's agent-managed launch spec (GET/PUT/DELETE
 // /api/portal/mappings/{id}/runtime-spec). `configured: false` means the
 // mapping has no spec row yet -- the only signal for "not configured". The
@@ -161,6 +168,14 @@ export interface RuntimeSpec {
   effective_type: string;
   resolved_metrics_path: string;
   resolved_context_probe_path: string;
+  // The spec's derived model role (the Go RuntimeSpecDTO.Role, the portal-facing
+  // twin of the role pushed to the agent): routing.DeriveRole over
+  // `effective_type` and this mapping's yes verdicts. A READ-ONLY echo like
+  // effective_type -- recomputed on every read, carried by the PUT response too,
+  // and excluded from PutRuntimeSpecRequest. The co-residency editor groups by
+  // THIS per-spec value, never by capability booleans and never by the
+  // best-of-all-mappings ModelDTO.role.
+  role: ModelRole;
 }
 
 // A full-document upsert of a runtime spec: every field is applied verbatim
@@ -173,10 +188,10 @@ export interface RuntimeSpec {
 // so it is excluded from this shape below instead of being carried and
 // ignored; ram_estimate_mb is the operator's and is applied verbatim.
 //
-// The three api_token_set/app_api_token_set/app_api_token_header fields are
-// READ-ONLY echoes (server state, never client-writable) and are excluded
-// here; `api_token`/`api_token_rotate` are their WRITE-ONLY counterparts,
-// present only on this request shape.
+// The three api_token_set/app_api_token_set/app_api_token_header fields (and
+// the derived `role`) are READ-ONLY echoes (server state, never
+// client-writable) and are excluded here; `api_token`/`api_token_rotate` are
+// their WRITE-ONLY counterparts, present only on this request shape.
 export type PutRuntimeSpecRequest = Omit<
   RuntimeSpec,
   | 'configured'
@@ -188,6 +203,7 @@ export type PutRuntimeSpecRequest = Omit<
   | 'effective_type'
   | 'resolved_metrics_path'
   | 'resolved_context_probe_path'
+  | 'role'
   | 'responses_live_timings_enabled'
   | 'ram_measured_mb'
 > & {
@@ -208,11 +224,38 @@ export type PutRuntimeSpecRequest = Omit<
   responses_live_timings_enabled?: boolean;
 };
 
-// An application's allowed co-residency pairs (its own mappings only), each
-// pair canonically ordered (pairs[i][0] < pairs[i][1]). Always a non-nil
-// array, even when empty.
+// How a pair with NO explicit verdict resolves, per server (per server-agent
+// application): opt_out allows it (only forbids need listing), opt_in forbids it
+// (only allows need listing). Switching the mode never touches the explicit
+// pairs. Mirrors routing.CoResidencyMode.
+export type CoResidencyMode = 'opt_in' | 'opt_out';
+
+// An explicit setting on one pair. A pair with no entry is "default", which the
+// mode decides -- there is deliberately no 'default' verdict on the wire.
+export type CoResidencyVerdict = 'allow' | 'forbid';
+
+// One EXPLICIT pair of an application's own mappings and its verdict. The two
+// ids are canonically ordered (a < b, bytewise), symmetric (a<->b is the same
+// pair from either side) and never equal. On input the backend accepts either
+// order and sorts, but the client always sends canonical.
+export interface CoResidencyPair {
+  a: string;
+  b: string;
+  verdict: CoResidencyVerdict;
+}
+
+// An application's co-residency setting (GET/PUT
+// /api/portal/applications/{id}/runtime/coresidency): its mode and every
+// explicit pair -- allows AND forbids, not the effective matrix -- of its own
+// mappings. `pairs` is always a non-nil array, even when empty.
+//
+// A PUT is a FULL REPLACEMENT: `pairs` IS the new set of explicit pairs, so a
+// request that omits it or sends [] erases every explicit verdict. There is no
+// mode-only update; a client that only wants to switch the mode re-sends the
+// pairs it read (the switch itself never touches them).
 export interface CoResidency {
-  pairs: [string, string][];
+  mode: CoResidencyMode;
+  pairs: CoResidencyPair[];
 }
 
 // One per-GPU VRAM budget row on a server. expected_uuid/expected_name are a

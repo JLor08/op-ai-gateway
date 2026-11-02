@@ -78,6 +78,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.responses_live_timings_unsupported':
     'errorRuntimeSpecResponsesLiveTimingsUnsupported',
   'runtime_coresidency.pair_invalid': 'errorRuntimeCoresidencyPairInvalid',
+  'runtime_coresidency.mode_invalid': 'errorRuntimeCoresidencyModeInvalid',
   'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',
   'server.runtime_limit_invalid': 'errorServerRuntimeLimitInvalid',
   'application.managed_runtime_only': 'errorApplicationManagedRuntimeOnly',

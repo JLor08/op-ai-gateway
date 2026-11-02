@@ -267,6 +267,7 @@ function defaultRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
+    role: 'other',
     ...overrides,
   };
 }
@@ -337,11 +338,11 @@ function baseServerListApi(): ServerListApi {
     probeMappingContext: vi.fn(async () => idleBenchmarkStatus),
     probeMappingVram: vi.fn(async () => idleBenchmarkStatus),
     putGpuBudgets: vi.fn(async () => ({ budgets: [] })),
-    putRuntimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    putRuntimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
     putRuntimeSpec: vi.fn(async () => defaultRuntimeSpec()),
     regenerateNetbirdKey: vi.fn(async () => ({ setup_key: '' })),
     revokeAgentToken: vi.fn(async () => ({ ok: true })),
-    runtimeCoresidency: vi.fn(async () => ({ pairs: [] })),
+    runtimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
     runtimeReport: vi.fn(async () => ({ available: false, agent_version: '', agent_features: [] })),
     runtimeSpec: vi.fn(async () => defaultRuntimeSpec()),
     runtimeWarnings: vi.fn(async () => ({ warnings: [] })),

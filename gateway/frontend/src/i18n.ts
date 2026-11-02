@@ -1133,6 +1133,47 @@ const de = {
     'Schreibgeschützt: Der Agent verwaltet seine Prozesse aus seiner eigenen lokalen Datei. Die Koresidenz wird dort gepflegt, nicht hier.',
   runtimeMatrixDisabledSaving:
     'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Matrix wieder Klicks an.',
+  // The role-grouped co-residency editor (replaces the matrix above, which
+  // stays only until its file-mode read-only render is retired).
+  runtimeCoresidency: 'Koresidenz',
+  runtimeCoresidencyHint:
+    'Legen Sie fest, welche Modell-Prozesse gleichzeitig auf demselben Server laufen dürfen – unabhängig davon, welche GPUs sie belegen. Was Sie nicht festlegen, folgt dem Standard des Servers.',
+  coresidencyModeLabel: 'Standard für nicht festgelegte Paare',
+  coresidencyModeOptOut: 'Erlaubt (Opt-out)',
+  coresidencyModeOptIn: 'Nicht erlaubt (Opt-in)',
+  coresidencyDefaultAllowedHint:
+    'Standard = erlaubt: Zwei Modelle dürfen zusammen laufen, solange Sie das Paar nicht ausdrücklich verbieten. Ihre ausdrücklichen Einstellungen bleiben beim Umschalten erhalten.',
+  coresidencyDefaultDeniedHint:
+    'Standard = nicht erlaubt: Zwei Modelle laufen nur zusammen, wenn Sie das Paar ausdrücklich erlauben. Ihre ausdrücklichen Einstellungen bleiben beim Umschalten erhalten.',
+  coresidencyVerdictAllow: 'Erlaubt',
+  coresidencyVerdictForbid: 'Verboten',
+  coresidencyVerdictDefaultAllowed: 'Standard (erlaubt)',
+  coresidencyVerdictDefaultDenied: 'Standard (nicht erlaubt)',
+  coresidencySearch: 'Modelle suchen',
+  coresidencyModelList: 'Modelle',
+  coresidencyExceptions: (n: number) =>
+    n === 1 ? '1 ausdrückliche Einstellung' : `${n} ausdrückliche Einstellungen`,
+  coresidencyDetailHint:
+    'Mit welchen Modellen darf dieses Modell gleichzeitig laufen? Eine Gruppe setzt alle ihre Modelle auf einmal; einzelne Modelle können davon abweichen.',
+  coresidencyRoleAsr: 'Spracherkennung (ASR)',
+  coresidencyRoleTts: 'Sprachausgabe (TTS)',
+  coresidencyRoleImage: 'Bild',
+  coresidencyRoleEmbedding: 'Embedding',
+  coresidencyRoleReranker: 'Reranker',
+  coresidencyRoleChat: 'Chat',
+  coresidencyRoleOther: 'Sonstige',
+  coresidencyGroupSize: (n: number) => (n === 1 ? '1 Modell' : `${n} Modelle`),
+  coresidencyGroupMixed: 'gemischt',
+  coresidencyFromGroup: 'von Gruppe',
+  coresidencyGroupControl: (role: string) => `Alle Modelle der Gruppe ${role}`,
+  coresidencyMemberControl: (name: string) => `Koresidenz mit ${name}`,
+  coresidencyGroupToggle: (role: string) => `Gruppe ${role} ein- oder ausklappen`,
+  coresidencyNeedTwo:
+    'Mindestens zwei Startkonfigurationen werden benötigt, um die Koresidenz zu verwalten.',
+  coresidencyNoMatch: 'Kein Modell passt zur Suche.',
+  coresidencyResize: 'Breite der Modellliste ändern',
+  coresidencySaving:
+    'Die vorige Änderung wird gerade gespeichert – gleich nimmt die Ansicht wieder Änderungen an.',
   runtimeLimits: 'Runtime-Limits',
   runtimeLimitsIntro:
     'Pro-GPU-VRAM-Budgets und die maximale Zahl gleichzeitig laufender Prozesse für diesen Server festlegen.',
@@ -1916,6 +1957,7 @@ const de = {
   errorRuntimeSpecResponsesLiveTimingsUnsupported:
     'Live-Timings sind für die Art dieses Servers nicht verfügbar; nur llama.cpp kann sie liefern. Die Meldung nennt die erkannte Art.',
   errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
+  errorRuntimeCoresidencyModeInvalid: 'Ungültiger Koresidenz-Modus',
   errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
   errorServerRuntimeLimitInvalid: 'Ungültiges Prozess-Limit',
   errorApplicationManagedRuntimeOnly: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen',
@@ -4498,6 +4540,43 @@ const en: PortalMessages = {
     'Read-only: the agent manages its processes from its own local file. Co-residency is maintained there, not here.',
   runtimeMatrixDisabledSaving:
     'The previous change is still saving — the matrix accepts clicks again in a moment.',
+  runtimeCoresidency: 'Co-residency',
+  runtimeCoresidencyHint:
+    'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy. Anything you leave unset follows the server default.',
+  coresidencyModeLabel: 'Default for unset pairs',
+  coresidencyModeOptOut: 'Allowed (opt-out)',
+  coresidencyModeOptIn: 'Not allowed (opt-in)',
+  coresidencyDefaultAllowedHint:
+    'Default = allowed: two models may run together unless you explicitly forbid the pair. Your explicit settings are kept when you switch the mode.',
+  coresidencyDefaultDeniedHint:
+    'Default = not allowed: two models run together only if you explicitly allow the pair. Your explicit settings are kept when you switch the mode.',
+  coresidencyVerdictAllow: 'Allowed',
+  coresidencyVerdictForbid: 'Forbidden',
+  coresidencyVerdictDefaultAllowed: 'Default (allowed)',
+  coresidencyVerdictDefaultDenied: 'Default (not allowed)',
+  coresidencySearch: 'Search models',
+  coresidencyModelList: 'Models',
+  coresidencyExceptions: (n: number) => (n === 1 ? '1 explicit setting' : `${n} explicit settings`),
+  coresidencyDetailHint:
+    'Which models may this one run alongside? A group sets all of its models at once; individual models can deviate from it.',
+  coresidencyRoleAsr: 'Speech recognition (ASR)',
+  coresidencyRoleTts: 'Speech synthesis (TTS)',
+  coresidencyRoleImage: 'Image',
+  coresidencyRoleEmbedding: 'Embedding',
+  coresidencyRoleReranker: 'Reranker',
+  coresidencyRoleChat: 'Chat',
+  coresidencyRoleOther: 'Other',
+  coresidencyGroupSize: (n: number) => (n === 1 ? '1 model' : `${n} models`),
+  coresidencyGroupMixed: 'mixed',
+  coresidencyFromGroup: 'from group',
+  coresidencyGroupControl: (role: string) => `All models in group ${role}`,
+  coresidencyMemberControl: (name: string) => `Co-residency with ${name}`,
+  coresidencyGroupToggle: (role: string) => `Expand or collapse group ${role}`,
+  coresidencyNeedTwo: 'At least two launch specs are needed to manage co-residency.',
+  coresidencyNoMatch: 'No model matches the search.',
+  coresidencyResize: 'Resize the model list',
+  coresidencySaving:
+    'The previous change is still saving — the editor accepts changes again in a moment.',
   runtimeLimits: 'Runtime limits',
   runtimeLimitsIntro:
     'Set per-GPU VRAM budgets and the maximum number of concurrently running processes for this server.',
@@ -5215,6 +5294,7 @@ const en: PortalMessages = {
   errorRuntimeSpecResponsesLiveTimingsUnsupported:
     'Live timings are not available for this runtime kind; only llama.cpp can report them. The message names the detected kind.',
   errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
+  errorRuntimeCoresidencyModeInvalid: 'Invalid co-residency mode',
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',
   errorServerRuntimeLimitInvalid: 'Invalid process limit',
   errorApplicationManagedRuntimeOnly: 'This server only accepts agent-managed applications',

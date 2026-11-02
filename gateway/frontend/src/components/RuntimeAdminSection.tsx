@@ -38,6 +38,7 @@ import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import type {
   ApplicationStatus,
   BenchmarkRunDTO,
+  CoResidency,
   EndpointMode,
   GPUBudget,
   HardwareGPU,
@@ -56,7 +57,7 @@ import type {
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { formatPortalError, formatMetric, formatDate } from './shared/format';
 import { useResource } from './shared/useResource';
-import { ResourceFallback, resourceState } from './shared/ResourceFallback';
+import { ResourceFallback, resourceState, type ResourceState } from './shared/ResourceFallback';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { StatusChip } from './shared/StatusChip';
 import { runtimeStateBadge, runtimeStateLabel } from './shared/runtimeState';
@@ -90,14 +91,15 @@ import {
 } from './shared/vram';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
-import { RuntimeMatrix, type RuntimeMatrixSpec } from './RuntimeMatrix';
+import { RuntimeMatrix } from './RuntimeMatrix';
+import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (this task, Task 21) are the
 // co-residency matrix and server limits. Area 4 (Task 22, "Live status") is
 // still a stub rendered from the same tab strip so the whole section's
 // navigation is visible/testable now.
-type Tab = 'mapping' | 'specs' | 'matrix' | 'limits' | 'status';
+type Tab = 'mapping' | 'specs' | 'coresidency' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -261,6 +263,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
+    role: 'other',
   };
 }
 
@@ -585,10 +588,11 @@ function narrowReportConfig(config: unknown): ReportConfig {
 // added to RuntimeSpec later carries through by itself instead of being
 // silently dropped here.
 function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
-  // api_token_set/app_api_token_set/app_api_token_header and the RuntimeSpec
+  // api_token_set/app_api_token_set/app_api_token_header, the RuntimeSpec
   // Type block's own effective_type/resolved_metrics_path/
-  // resolved_context_probe_path are READ-ONLY echoes (PutRuntimeSpecRequest
-  // excludes all six, same as configured/id/mapping_id) -- dropped here too
+  // resolved_context_probe_path and the derived `role` are READ-ONLY echoes
+  // (PutRuntimeSpecRequest excludes all seven, same as configured/id/
+  // mapping_id) -- dropped here too
   // so an override click never round-trips them back as if they were
   // writable. type/metrics_path/context_probe_path (the writable trio) DO
   // belong in `rest`: an override must preserve them unchanged, exactly like
@@ -618,6 +622,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     effective_type,
     resolved_metrics_path,
     resolved_context_probe_path,
+    role,
     responses_live_timings_enabled,
     ram_measured_mb,
     ...rest
@@ -1605,86 +1610,91 @@ export function RuntimeAdminSection({
     return true;
   }
 
-  // ---- Area 2: co-residency matrix --------------------------------------
-  // Canonicalisation (which of the two mapping ids sorts first) is entirely
-  // the BACKEND's job (SetCoResidency sorts each pair before storing/
-  // comparing -- see service_runtime.go) -- RuntimeMatrix mirrors the same
-  // rule client-side purely so the UI never has to wait on a round trip to
-  // know which cell a click means. `pairs` is always the FULL current set;
-  // toggling computes the complete new set and PUTs it (full replace, never a
-  // delta -- this is how the backend models it and avoids lost updates
-  // between two admins editing concurrently).
+  // ---- Area 2: co-residency ----------------------------------------------
+  // The stored document is `{mode, pairs}`: the per-server mode and every
+  // EXPLICIT pair with its verdict. CoResidencyEditor is controlled and reports
+  // the COMPLETE next document on every edit (all explicit pairs + the mode); an
+  // edit is saved by PUTting exactly that -- a full replace, never a delta and
+  // never a mode-only update (that would erase every explicit verdict). That is
+  // how the backend models it, and it avoids lost updates between two admins
+  // editing concurrently. Canonicalisation (which of the two mapping ids sorts
+  // first) is the editor's job on the way out and the BACKEND's on the way in
+  // (SetCoResidency sorts each pair before storing/comparing).
   const {
     data: coresidencyData,
     setData: setCoresidencyData,
     error: coresidencyError,
     loading: coresidencyLoading,
     reload: reloadCoresidency,
-  } = useResource(
-    () => api.runtimeCoresidency(application.id).then((r) => r.pairs),
-    [api, application.id, t],
-    t,
-  );
-  // `null` (not loaded yet) and `[]` (loaded, genuinely empty) are DIFFERENT
-  // facts -- collapsing them with `coresidencyData ?? []` would make a click
-  // that lands before the GET settles compute its full-replace PUT from an
-  // empty list, wiping every pair a previous admin already saved. `ready`
-  // gates both rendering (a loading message instead of the matrix) and
-  // writing (see the missing-loading-state fix, task-21 review round 1).
+  } = useResource(() => api.runtimeCoresidency(application.id), [api, application.id, t], t);
+  // `null` (not loaded yet) and a document with no pairs (loaded, genuinely
+  // empty) are DIFFERENT facts -- collapsing them with a defaulted empty
+  // document would make an edit that lands before the GET settles compute its
+  // full-replace PUT from nothing, wiping every pair a previous admin already
+  // saved. `ready` gates both rendering (a loading message instead of the
+  // editor) and writing (see the missing-loading-state fix, task-21 review
+  // round 1).
   //
   // It is `resourceState`'s `ready` rather than the old
   // `!loading && data !== null`, which is STRICTLY LOOSER: that test reports a
   // failed RELOAD over an existing payload as ready
   // (shared/ResourceFallback.tsx), and this loader's deps include `t`, so a
   // language switch whose re-GET fails reaches exactly that state with the
-  // component still mounted. The matrix would then render, clickable, off
-  // pairs we just failed to refresh -- and a toggle PUTs the FULL replacement
-  // list, so a pair another admin added meanwhile would be silently deleted.
-  // That is task-21's Critical reached through a different door, so this gate
-  // gets tighter here, never looser.
+  // component still mounted. The editor would then render, editable, off a
+  // document we just failed to refresh -- and an edit PUTs the FULL replacement,
+  // so a pair another admin added meanwhile would be silently deleted. That is
+  // task-21's Critical reached through a different door, so this gate gets
+  // tighter here, never looser.
   const coresidencyStatus = resourceState({
     loading: coresidencyLoading,
     error: coresidencyError,
     data: coresidencyData,
   });
   const coresidencyReady = coresidencyStatus === 'ready';
-  const coresidencyPairs = coresidencyData ?? [];
   useEffect(() => {
     if (coresidencyError) showError(coresidencyError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [coresidencyError]);
 
-  const matrixSpecs: RuntimeMatrixSpec[] = mappings.map((m) => ({
+  // The editor groups by each spec's DERIVED role (RuntimeSpec.role -- the
+  // backend's routing.DeriveRole over the spec's effective type and its
+  // mapping's verdicts), read off the per-mapping spec cache. Not the mapping's
+  // capability flags: those are an AND across every mapping of a name and can
+  // disagree with the best-ranked role. A mapping whose spec GET failed has no
+  // entry here and is filed under "other" -- which is also why the editor waits
+  // for every one of those GETs to settle (`specsSettled`): rendered earlier, a
+  // model still in flight would sit in the wrong group and a group bulk-set
+  // would write verdicts for the wrong set of models.
+  const coresidencyItems: CoResidencyItem[] = mappings.map((m) => ({
     id: m.id,
-    model: m.gateway_model_name,
-    gpus: (specsById[m.id]?.gpus ?? []).map((g) => ({
-      index: g.index,
-      vramMb: g.vram_estimate_mb,
-    })),
+    name: m.gateway_model_name,
+    role: specsById[m.id]?.role ?? 'other',
   }));
+  // A hard-failed mappings GET leaves `specsSettled` false for good, and the
+  // screen-wide banner already says why; the tab must not claim to be loading.
+  const coresidencyRolesState: ResourceState =
+    mappingsStatus === 'error' ? 'error' : specsSettled ? 'ready' : 'loading';
 
-  // Serializes toggles: while a PUT is in flight, the matrix is disabled
-  // (mirrors Area 3's limitsBusy) so a second click cannot compute its next
-  // full-replace list from state a still-outstanding first response might
-  // later overwrite. Chosen over a toggle QUEUE (buffering clicks and
-  // replaying them once the in-flight PUT settles) because every other
-  // full-replace write in this section (spec save, limits save) already
-  // uses the same "disable until the response lands" idiom, and a silently
-  // queued click is easy to mistake for a dropped one -- the operator sees
-  // the matrix visibly busy instead.
+  // Serializes edits: while a PUT is in flight, the editor is disabled (mirrors
+  // Area 3's limitsBusy) so a second edit cannot compute its next full-replace
+  // document from state a still-outstanding first response might later
+  // overwrite. Chosen over a queue (buffering edits and replaying them once the
+  // in-flight PUT settles) because every other full-replace write in this
+  // section (spec save, limits save) already uses the same "disable until the
+  // response lands" idiom, and a silently queued edit is easy to mistake for a
+  // dropped one -- the operator sees the editor visibly busy instead.
   const [coresidencyBusy, setCoresidencyBusy] = useState(false);
 
-  async function toggleCoresidency(a: string, b: string) {
-    const exists = coresidencyPairs.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
-    const next: [string, string][] = exists
-      ? coresidencyPairs.filter(([p, q]) => !((p === a && q === b) || (p === b && q === a)))
-      : [...coresidencyPairs, [a, b]];
-    const previous = coresidencyPairs;
+  async function saveCoresidency(next: CoResidency) {
+    // Unreachable while the editor is gated on `ready`; stated so the rollback
+    // below never has to restore a document that was never loaded.
+    if (coresidencyData === null) return;
+    const previous = coresidencyData;
     setCoresidencyData(next); // optimistic
     setCoresidencyBusy(true);
     try {
-      const stored = await api.putRuntimeCoresidency(application.id, { pairs: next });
-      setCoresidencyData(stored.pairs);
+      const stored = await api.putRuntimeCoresidency(application.id, next);
+      setCoresidencyData(stored);
     } catch (err) {
       setCoresidencyData(previous);
       showError(formatPortalError(err, t));
@@ -1739,14 +1749,6 @@ export function RuntimeAdminSection({
     if (gpuBudgetsError) showError(gpuBudgetsError);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gpuBudgetsError]);
-  // The matrix's advisory tooltip reflects the last SAVED budgets, never
-  // Area 3's possibly-unsaved edits below (budgetRows) -- an in-progress
-  // draft on another tab must not change what the matrix claims is "the
-  // budget".
-  const savedBudgetsByGpuIndex: Record<number, number> = Object.fromEntries(
-    (gpuBudgetsData ?? []).map((b) => [b.index, b.budget_mb]),
-  );
-
   type BudgetRow = {
     rowKey: string;
     index: number;
@@ -5278,7 +5280,7 @@ export function RuntimeAdminSection({
       >
         <Tab label={t.runtimeMappingTab} value="mapping" />
         <Tab label={t.runtimeSpecs} value="specs" />
-        <Tab label={t.runtimeMatrix} value="matrix" />
+        <Tab label={t.runtimeCoresidency} value="coresidency" />
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
@@ -5394,11 +5396,11 @@ export function RuntimeAdminSection({
           )}
         </Panel>
       )}
-      {tab === 'matrix' && (
+      {tab === 'coresidency' && (
         <Panel
-          titleId="runtime-matrix-heading"
-          title={t.runtimeMatrix}
-          subtitle={t.runtimeMatrixHint}
+          titleId="runtime-coresidency-heading"
+          title={t.runtimeCoresidency}
+          subtitle={t.runtimeCoresidencyHint}
         >
           {fileMode ? (
             parseError ? (
@@ -5465,19 +5467,28 @@ export function RuntimeAdminSection({
               errorDetail={coresidencyError}
               retry={{ label: t.resourceRetry, onRetry: () => void reloadCoresidency() }}
             />
+          ) : coresidencyRolesState !== 'ready' || coresidencyData === null ? (
+            // The document is in hand but the roles it is grouped by are not
+            // (see `coresidencyItems`): nothing is offered until every spec GET
+            // has settled.
+            <ResourceFallback
+              state={coresidencyRolesState}
+              loadingLabel={t.loading}
+              errorLabel={t.runtimeMappingsUnavailable}
+            />
           ) : (
-            <RuntimeMatrix
+            <CoResidencyEditor
               t={t}
-              specs={matrixSpecs}
-              pairs={coresidencyPairs}
-              onToggle={(a, b) => void toggleCoresidency(a, b)}
-              budgets={savedBudgetsByGpuIndex}
+              items={coresidencyItems}
+              mode={coresidencyData.mode}
+              pairs={coresidencyData.pairs}
+              onChange={(next) => void saveCoresidency(next)}
               disabled={coresidencyBusy}
-              // Transient, unlike file mode above -- but for the few hundred
-              // milliseconds it lasts, an unexplained dead grid is the same
-              // defect. Undefined when not busy, so a live matrix never
+              // Transient -- but for the few hundred milliseconds it lasts, an
+              // unexplained dead editor is the same defect as an unexplained
+              // read-only one. Undefined when not busy, so a live editor never
               // carries a reason it does not have.
-              disabledReason={coresidencyBusy ? t.runtimeMatrixDisabledSaving : undefined}
+              disabledReason={coresidencyBusy ? t.coresidencySaving : undefined}
             />
           )}
         </Panel>
