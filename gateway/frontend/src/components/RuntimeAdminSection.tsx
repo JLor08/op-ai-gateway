@@ -261,6 +261,9 @@ function emptySpec(mappingId: string): RuntimeSpec {
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
+    // A placeholder, like effective_type: the role is derived server-side from
+    // verdicts this document does not carry, and nothing may group by it. The
+    // co-residency editor reads every spec again when it is shown.
     role: 'other',
   };
 }
@@ -1638,20 +1641,70 @@ export function RuntimeAdminSection({
   // backend's routing.DeriveRole over the spec's effective type and its
   // mapping's verdicts), read off the per-mapping spec cache. Not the mapping's
   // capability flags: those are an AND across every mapping of a name and can
-  // disagree with the best-ranked role. A mapping whose spec GET failed has no
-  // entry here and is filed under "other" -- which is also why the editor waits
-  // for every one of those GETs to settle (`specsSettled`): rendered earlier, a
-  // model still in flight would sit in the wrong group and a group bulk-set
-  // would write verdicts for the wrong set of models.
+  // disagree with the best-ranked role.
+  //
+  // The cache cannot be trusted for it as it stands, because that cache is
+  // filled once per mount (`loadedIdsRef` never re-fetches) and the role moves
+  // for reasons it never sees: an operator marks a model embedding on the
+  // mapping tab (`updateMapping`, which touches no spec), a spec is deleted
+  // (the cache is rewritten with a locally built document whose role is only a
+  // placeholder), or a probe writes a verdict in the background (an Ollama
+  // `embedding`, an audio.cpp `transcription`). A role read once and kept would
+  // file the model under its OLD group until the page was reloaded, and a group
+  // bulk-set would then write verdicts for the wrong set of models. So every
+  // time the editor is shown, every spec is read AGAIN and the editor waits for
+  // those reads: the role is read when it is needed instead of invalidated by
+  // each path that can change it (and a path added later cannot be missed).
+  //
+  // The reads go through the cache's ordered-read primitives (`beginSpecRead` /
+  // `commitSpecRead`), so one that overlaps a write of this section's own is
+  // refused exactly like the lazy one. A spec that cannot be read is filed under
+  // "other" -- never under a role this entry could not confirm.
+  const coresidencyMappingIds = mappings.map((m) => m.id).join('\u0000');
+  // Keyed on the list being IN HAND, not on its status: a reload (a language
+  // switch re-GETs it) passes through `loading` with the previous list intact,
+  // and that must not re-read every spec.
+  const rolesReadable = tab === 'coresidency' && mappingsData !== null;
+  const [rolesRead, setRolesRead] = useState<{ unreadable: ReadonlySet<string> } | null>(null);
+  useEffect(() => {
+    if (!rolesReadable) return undefined;
+    let cancelled = false;
+    (async () => {
+      const unreadable = new Set<string>();
+      await Promise.all(
+        mappings.map(async (m) => {
+          const seen = beginSpecRead(m.id);
+          try {
+            const spec = await api.runtimeSpec(m.id);
+            if (!cancelled) commitSpecRead(m.id, seen, spec);
+          } catch (err) {
+            unreadable.add(m.id);
+            if (!cancelled) showError(formatPortalError(err, t));
+          }
+        }),
+      );
+      if (!cancelled) setRolesRead({ unreadable });
+    })();
+    return () => {
+      cancelled = true;
+      // Leaving the tab (or the mapping set changing) ends this read's claim to
+      // be current: the next time the editor is shown starts from "not read".
+      setRolesRead(null);
+    };
+    // `mappings` is covered by its id key: a language switch re-GETs the list
+    // into a new array with the same ids and must not re-read every spec.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rolesReadable, coresidencyMappingIds, api]);
+
   const coresidencyItems: CoResidencyItem[] = mappings.map((m) => ({
     id: m.id,
     name: m.gateway_model_name,
-    role: specsById[m.id]?.role ?? 'other',
+    role: rolesRead?.unreadable.has(m.id) ? 'other' : (specsById[m.id]?.role ?? 'other'),
   }));
-  // A hard-failed mappings GET leaves `specsSettled` false for good, and the
+  // A hard-failed mappings GET never reaches the read above, and the
   // screen-wide banner already says why; the tab must not claim to be loading.
   const coresidencyRolesState: ResourceState =
-    mappingsStatus === 'error' ? 'error' : specsSettled ? 'ready' : 'loading';
+    mappingsStatus === 'error' ? 'error' : rolesRead === null ? 'loading' : 'ready';
 
   // Serializes edits: while a PUT is in flight, the editor is disabled (mirrors
   // Area 3's limitsBusy) so a second edit cannot compute its next full-replace

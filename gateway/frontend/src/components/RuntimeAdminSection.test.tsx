@@ -351,6 +351,13 @@ function renderSection(
     // wait and the "failed read lands in the other group" rule.
     specPendingIds?: string[];
     specFailingIds?: string[];
+    // The role is DERIVED server-side from state this screen changes (a mapping's
+    // capability verdicts, a spec's presence) and from state it does not (a
+    // probe's verdicts). The fake backend has no verdict-to-role logic, so these
+    // say what the server's derived role BECOMES once that mapping is updated or
+    // its spec is deleted; every later spec GET answers it.
+    roleAfterMappingUpdate?: Record<string, RuntimeSpec['role']>;
+    roleAfterSpecDelete?: Record<string, RuntimeSpec['role']>;
     gpuBudgetsFailing?: boolean;
     gpuBudgetsFailsOnCall?: number;
     hardware?: HardwareResponse;
@@ -385,6 +392,9 @@ function renderSection(
   // unconfigured document, where the real backend answers 404 for a mapping
   // it no longer has.
   const storedSpecs: Record<string, RuntimeSpec> = { ...specsByMappingId };
+  // Role changes the server made behind the stored documents' backs; see the
+  // two `roleAfter*` options.
+  const liveRoles: Record<string, RuntimeSpec['role']> = {};
   // One value for the initial render AND both rerender helpers: a helper that
   // silently swapped the application back to the module default would make a
   // mid-flow rerender change a fact the test did not mean to change.
@@ -433,6 +443,8 @@ function renderSection(
     }),
     updateMapping: vi.fn(async (id: string, body: UpdateMappingRequest) => {
       updatedMappings.push({ id, body });
+      const roleNow = opts.roleAfterMappingUpdate?.[id];
+      if (roleNow) liveRoles[id] = roleNow;
       // Models the real PATCH: every field is a pointer, so an ABSENT key
       // leaves the stored value alone. Merging onto makeMapping()'s DEFAULTS
       // instead made an omitted `status` come back as 'active' -- the fake
@@ -449,7 +461,9 @@ function renderSection(
     runtimeSpec: vi.fn(async (mappingId: string) => {
       if (opts.specPendingIds?.includes(mappingId)) return new Promise<RuntimeSpec>(() => {});
       if (opts.specFailingIds?.includes(mappingId)) throw new Error('spec unavailable');
-      return storedSpecs[mappingId] ?? unconfiguredSpec(mappingId);
+      const spec = storedSpecs[mappingId] ?? unconfiguredSpec(mappingId);
+      const live = liveRoles[mappingId];
+      return live ? { ...spec, role: live } : spec;
     }),
     putRuntimeSpec: vi.fn(async (mappingId: string, body: PutRuntimeSpecRequest) => {
       putSpecs.push({ mappingId, body });
@@ -477,6 +491,8 @@ function renderSection(
     deleteRuntimeSpec: vi.fn(async (id: string) => {
       deletedSpecIds.push(id);
       delete storedSpecs[id];
+      const roleNow = opts.roleAfterSpecDelete?.[id];
+      if (roleNow) liveRoles[id] = roleNow;
       return { ok: true };
     }),
     runtimeCoresidency: vi.fn(() => {
@@ -2782,6 +2798,126 @@ describe('RuntimeAdminSection co-residency editor wiring', () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: t.coresidencyRoleImage })).toBeNull();
     expect(screen.queryByRole('region', { name: t.coresidencyRoleChat })).toBeNull();
+  });
+
+  // The role is derived server-side, and the per-mapping spec cache is filled
+  // once per mount. Marking a model embedding on the mapping tab (the main way a
+  // model acquires that role) changes its role without touching the cache, so an
+  // editor that grouped by the cache would keep filing it under chat until the
+  // page was reloaded -- and a chat bulk-set would then hit it. The editor reads
+  // each spec's role again every time it is shown.
+  it('IMPORTANT: a capability edit on the mapping tab moves the model to its new group', async () => {
+    const { updatedMappings } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      roleAfterMappingUpdate: { map_1: 'embedding' },
+    });
+    await openTab();
+    await pick('Bravo');
+    // Cached and shown as chat to begin with.
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleChat })).getByRole(
+        'group',
+        {
+          name: t.coresidencyMemberControl('Alpha'),
+        },
+      ),
+    ).toBeInTheDocument();
+
+    // Mark Alpha as an embedding model on the mapping tab.
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    const alphaRow = (await screen.findByText('Alpha')).closest('tr') as HTMLElement;
+    fireEvent.click(within(alphaRow).getByRole('button', { name: t.mappingEdit }));
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.mappingEmbeddingCapable }));
+    fireEvent.click(await screen.findByRole('option', { name: t.mappingCapabilityYes }));
+    fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+    await waitFor(() => expect(updatedMappings).toHaveLength(1));
+    expect(updatedMappings[0].body.capability_verdicts).toEqual({ embedding: 'yes' });
+
+    await openTab();
+    await pick('Bravo');
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleEmbedding })).getByRole(
+        'group',
+        { name: t.coresidencyMemberControl('Alpha') },
+      ),
+    ).toBeInTheDocument();
+    // Out of chat: only Charlie is left there.
+    const chat = screen.getByRole('region', { name: t.coresidencyRoleChat });
+    expect(
+      within(chat).queryByRole('group', { name: t.coresidencyMemberControl('Alpha') }),
+    ).toBeNull();
+    expect(
+      within(chat).getByRole('group', { name: t.coresidencyMemberControl('Charlie') }),
+    ).toBeInTheDocument();
+  });
+
+  // Deleting a spec leaves a mapping with verdicts and no spec, whose role the
+  // backend still derives (from the synthesized document's type and those
+  // verdicts). The cache used to be rewritten with a locally built empty
+  // document whose role was a hard-coded "other".
+  it('IMPORTANT: a deleted spec lands in the group its verdicts give the mapping, not in "other"', async () => {
+    const { deletedSpecIds } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+      roleAfterSpecDelete: { map_1: 'asr' },
+    });
+    await screen.findByText('Alpha');
+    const alphaRow = screen.getByText('Alpha').closest('tr') as HTMLElement;
+    await waitFor(() =>
+      expect(within(alphaRow).getByRole('button', { name: t.runtimeSpecDelete })).toBeEnabled(),
+    );
+    fireEvent.click(within(alphaRow).getByRole('button', { name: t.runtimeSpecDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
+
+    await openTab();
+    await pick('Bravo');
+    expect(
+      within(await screen.findByRole('region', { name: t.coresidencyRoleAsr })).getByRole('group', {
+        name: t.coresidencyMemberControl('Alpha'),
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: t.coresidencyRoleOther })).toBeNull();
+  });
+
+  it('re-reads every spec each time the editor is shown, not only once per mount', async () => {
+    const { fakeApi } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+    });
+    await openTab();
+    await pick('Bravo');
+    await screen.findByRole('region', { name: t.coresidencyRoleChat });
+    const afterFirst = fakeApi.runtimeSpec.mock.calls.length;
+    // Once for the lazy fan-out and once for the editor's own read, three each.
+    expect(afterFirst).toBeGreaterThanOrEqual(6);
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeLimits }));
+    await openTab();
+    await screen.findByRole('option', { name: /Alpha/ });
+    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(afterFirst + 3);
+  });
+
+  it('a language switch re-GETs the mapping list but does not re-read every spec', async () => {
+    const { fakeApi, rerenderWithLocale } = renderSection({
+      mappings: threeMappings(),
+      specsByMappingId: chatSpecs(),
+    });
+    await openTab();
+    await screen.findByRole('option', { name: /Alpha/ });
+    const specReads = fakeApi.runtimeSpec.mock.calls.length;
+    const mappingReads = fakeApi.mappings.mock.calls.length;
+
+    rerenderWithLocale(messages.en);
+    await waitFor(() => expect(fakeApi.mappings.mock.calls.length).toBeGreaterThan(mappingReads));
+
+    // Same mappings, so the roles already read are still the roles of this
+    // entry: the editor stays up and no spec is fetched again.
+    expect(await screen.findByRole('option', { name: /Alpha/ })).toBeInTheDocument();
+    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(specReads);
   });
 
   it('files a mapping whose spec GET failed under the "other" group', async () => {
