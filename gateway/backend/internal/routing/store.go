@@ -2720,20 +2720,77 @@ type RuntimeSpecGPU struct {
 	VRAMMeasuredMB int
 }
 
-// CoResidencyRule is one ALLOWED pair of model mappings that may be loaded on
-// the same AI server at the same time (agent_coresidency_rules, migration
-// 65, composite primary key (application_id, mapping_a_id, mapping_b_id), all
-// three columns FK on delete cascade). A row's PRESENCE is the only
-// co-residency signal — there is no `allowed` column, so "not co-resident" is
-// the structural default and the table holds nothing but allowed pairs.
+// CoResidencyRule is one EXPLICIT co-residency setting for a pair of model
+// mappings on the same AI server (agent_coresidency_rules, migration 65 plus
+// the verdict column of migration 98), composite primary key (application_id,
+// mapping_a_id, mapping_b_id), all three columns FK on delete cascade.
+//
+// A pair is tri-state. A row carries a Verdict -- CoResidencyVerdictAllow
+// (the two may be loaded together) or CoResidencyVerdictForbid (they may not)
+// -- and the ABSENCE of a row is the third state, "default", which the
+// application's CoResidencyMode resolves: opt_in forbids it (only allowed
+// pairs are listed), opt_out allows it (only forbidden pairs are listed). The
+// table therefore holds only what the operator said explicitly, and switching
+// the mode never rewrites a row.
+//
 // Canonical ordering (MappingAID < MappingBID, so every unordered pair has
 // exactly one row) is validated by the caller (the portal, Task 6): the
 // store stays a dumb pair table and never sorts, rejects, or rewrites a pair.
+// The verdict is the one exception, because it is the column's whole
+// vocabulary: an empty Verdict is stored as allow (a rule written before the
+// verdict existed meant exactly that) and anything outside the two values is
+// rejected rather than persisted.
 type CoResidencyRule struct {
 	ApplicationID string
 	MappingAID    string // canonical: MappingAID < MappingBID, enforced by the caller (portal)
 	MappingBID    string
-	CreatedAt     time.Time
+	// Verdict is CoResidencyVerdictAllow or CoResidencyVerdictForbid. Empty on
+	// a write means allow; a read always returns one of the two.
+	Verdict   string
+	CreatedAt time.Time
+}
+
+// The two values of CoResidencyRule.Verdict and of agent_coresidency_rules.verdict.
+const (
+	CoResidencyVerdictAllow  = "allow"
+	CoResidencyVerdictForbid = "forbid"
+)
+
+// NormalizeCoResidencyVerdict maps a rule's Verdict to the value the store
+// persists: the empty string becomes CoResidencyVerdictAllow (the pre-verdict
+// meaning of a row) and the two vocabulary values pass through. ok is false for
+// anything else. It is the one implementation behind every store driver's write
+// check, so memory, sqlite and postgres cannot disagree about which strings are
+// a verdict.
+func NormalizeCoResidencyVerdict(v string) (normalized string, ok bool) {
+	switch v {
+	case "":
+		return CoResidencyVerdictAllow, true
+	case CoResidencyVerdictAllow, CoResidencyVerdictForbid:
+		return v, true
+	}
+	return "", false
+}
+
+// CoResidencyMode is the per-application (per-server) switch that decides what
+// a pair with NO explicit CoResidencyRule means: CoResidencyModeOptIn forbids
+// it (the original default-deny matrix: only allowed pairs are listed) and
+// CoResidencyModeOptOut allows it (only forbidden pairs are listed). Explicit
+// rows are untouched by a change of mode, so the switch is lossless. Stored as
+// text in applications.coresidency_mode (migration 99); an application that
+// existed before that migration is opt_in so nothing it already does changes,
+// a new one is opt_out.
+type CoResidencyMode string
+
+const (
+	CoResidencyModeOptIn  CoResidencyMode = "opt_in"
+	CoResidencyModeOptOut CoResidencyMode = "opt_out"
+)
+
+// Valid reports whether m is one of the two modes. The empty string is not
+// valid: a caller that has no mode to state must not call Set.
+func (m CoResidencyMode) Valid() bool {
+	return m == CoResidencyModeOptIn || m == CoResidencyModeOptOut
 }
 
 // ServerGPUBudget is a per-GPU VRAM budget for co-residency admission math
@@ -2834,19 +2891,31 @@ type RuntimeStore interface {
 	// Callers pass a strictly positive measurement: a zero is "unknown" and is
 	// dropped before it reaches the store.
 	UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error
-	// SetCoResidencyRules atomically REPLACES the whole set of allowed
-	// co-residency pairs for appID (delete-then-insert in one transaction,
-	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). An empty/nil rules
-	// clears the set. appID must exist (ErrNotFound, checked inside the
-	// transaction before the delete); a rule naming a mapping id that does
-	// not exist is also ErrNotFound (FK violation). The store does NOT
-	// enforce or rewrite the MappingAID < MappingBID canonical ordering —
-	// that validation belongs to the portal (Task 6).
+	// SetCoResidencyRules atomically REPLACES the whole set of EXPLICIT
+	// co-residency pair rows for appID (delete-then-insert in one transaction,
+	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). Each rule carries a verdict
+	// (allow or forbid; empty is stored as allow, anything else is rejected
+	// before the set is touched). An empty/nil rules clears the set. appID must
+	// exist (ErrNotFound, checked inside the transaction before the delete); a
+	// rule naming a mapping id that does not exist is also ErrNotFound (FK
+	// violation). The store does NOT enforce or rewrite the MappingAID <
+	// MappingBID canonical ordering — that validation belongs to the portal
+	// (Task 6).
 	SetCoResidencyRules(ctx context.Context, appID string, rules []CoResidencyRule) error
-	// CoResidencyRulesByApplication lists appID's allowed co-residency
-	// pairs, ordered by mapping_a_id then mapping_b_id. Always non-nil,
-	// empty when none.
+	// CoResidencyRulesByApplication lists appID's explicit co-residency pair
+	// rows of BOTH verdicts, ordered by mapping_a_id then mapping_b_id. A caller
+	// that wants only the allowed (or only the forbidden) pairs filters on
+	// Verdict. Always non-nil, empty when none.
 	CoResidencyRulesByApplication(ctx context.Context, appID string) ([]CoResidencyRule, error)
+	// GetCoResidencyMode returns appID's co-residency mode: how a pair with no
+	// explicit rule resolves. A new application is opt_out. ErrNotFound when
+	// appID does not exist.
+	GetCoResidencyMode(ctx context.Context, appID string) (CoResidencyMode, error)
+	// SetCoResidencyMode changes appID's co-residency mode and nothing else —
+	// the explicit pair rows are untouched, so the switch is lossless. A mode
+	// outside CoResidencyMode.Valid is rejected without writing. ErrNotFound
+	// when appID does not exist.
+	SetCoResidencyMode(ctx context.Context, appID string, mode CoResidencyMode) error
 	// SetServerGPUBudgets atomically REPLACES the whole set of per-GPU VRAM
 	// budgets for serverID (delete-then-insert in one transaction, mirroring
 	// SetRuntimeSpecGPUs/SetCoResidencyRules above). An empty/nil budgets

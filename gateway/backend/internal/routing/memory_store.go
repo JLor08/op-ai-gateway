@@ -112,16 +112,25 @@ type MemoryStore struct {
 	// spec cascades deletion of its entry here (mirrors the table's ON
 	// DELETE CASCADE).
 	runtimeSpecGPUs map[string][]RuntimeSpecGPU
-	// coresidency mirrors agent_coresidency_rules (migration 65, Task 2):
-	// applicationID -> its full set of allowed co-residency pairs. A row's
-	// PRESENCE is the "allowed" signal (there is no separate flag) — the
-	// SQL table's shape, mirrored here directly. SetCoResidencyRules
-	// atomically replaces the whole per-application set (delete-then-insert
-	// on the SQL side; a single map assignment here, already atomic under
-	// m.mu). Unordered on write; CoResidencyRulesByApplication sorts by
-	// (MappingAID, MappingBID) on read, mirroring the SQL `order by
-	// mapping_a_id, mapping_b_id` (same pattern as runtimeSpecGPUs above).
+	// coresidency mirrors agent_coresidency_rules (migration 65, Task 2, plus
+	// the verdict column of migration 98): applicationID -> its full set of
+	// EXPLICIT co-residency pair rows, each carrying an allow/forbid verdict
+	// (a pair with no row is the third, "default" state, resolved by
+	// coresidencyMode below). SetCoResidencyRules atomically replaces the
+	// whole per-application set (delete-then-insert on the SQL side; a single
+	// map assignment here, already atomic under m.mu). Unordered on write;
+	// CoResidencyRulesByApplication sorts by (MappingAID, MappingBID) on read,
+	// mirroring the SQL `order by mapping_a_id, mapping_b_id` (same pattern as
+	// runtimeSpecGPUs above).
 	coresidency map[string][]CoResidencyRule
+	// coresidencyMode mirrors applications.coresidency_mode (migration 99),
+	// keyed by application id. An application with no entry is opt_out, the
+	// SQL column's DDL default; an entry exists only after SetCoResidencyMode.
+	// It is its own map, not a field of Application, for the same reason the
+	// column is not a field of the Go type: no application reader reads it, and
+	// an application update must not be able to clobber it. Entries die with
+	// their application (deleteApplicationLocked), like the SQL column does.
+	coresidencyMode map[string]CoResidencyMode
 	// gpuBudgets mirrors ai_server_gpu_budgets (migration 66, Task 3): serverID
 	// -> its full set of per-GPU VRAM budgets. SetServerGPUBudgets atomically
 	// replaces the whole per-server set (delete-then-insert on the SQL side; a
@@ -207,6 +216,7 @@ func NewMemoryStore() *MemoryStore {
 		runtimeSpecs:             map[string]RuntimeSpec{},
 		runtimeSpecGPUs:          map[string][]RuntimeSpecGPU{},
 		coresidency:              map[string][]CoResidencyRule{},
+		coresidencyMode:          map[string]CoResidencyMode{},
 		gpuBudgets:               map[string][]ServerGPUBudget{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
@@ -984,6 +994,7 @@ func (m *MemoryStore) deleteApplicationLocked(applicationID string) {
 	m.deleteMappingsForApplicationLocked(applicationID)
 	delete(m.applications, applicationID)
 	delete(m.coresidency, applicationID)
+	delete(m.coresidencyMode, applicationID)
 	for key, aff := range m.affinities {
 		if aff.ApplicationID == applicationID {
 			delete(m.affinities, key)
@@ -2841,8 +2852,8 @@ func copyRuntimeSpecGPUs(gpus []RuntimeSpecGPU) []RuntimeSpecGPU {
 
 // --- RuntimeStore: co-residency matrix (agent-runtime-manager, Task 2) -----
 
-// SetCoResidencyRules atomically REPLACES appID's whole set of allowed
-// co-residency pairs (mirrors the SQL delete-then-insert transaction; the
+// SetCoResidencyRules atomically REPLACES appID's whole set of explicit
+// co-residency pair rows (mirrors the SQL delete-then-insert transaction; the
 // in-memory assignment below is already atomic under m.mu, so no separate
 // "delete" step is needed — a failed check leaves the previous set
 // untouched, same as a rolled-back SQL transaction). appID must exist
@@ -2853,6 +2864,17 @@ func copyRuntimeSpecGPUs(gpus []RuntimeSpecGPU) []RuntimeSpecGPU {
 // MappingAID < MappingBID canonical ordering — that is portal-level
 // validation (Task 6).
 func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules []CoResidencyRule) error {
+	// Verdicts are checked before anything else, like the SQL store does
+	// before it opens its transaction: an empty verdict is stored as allow,
+	// an unknown one fails the whole call and leaves the previous set intact.
+	verdicts := make([]string, len(rules))
+	for i, r := range rules {
+		v, ok := NormalizeCoResidencyVerdict(r.Verdict)
+		if !ok {
+			return fmt.Errorf("coresidency rule (%s, %s): invalid verdict %q", r.MappingAID, r.MappingBID, r.Verdict)
+		}
+		verdicts[i] = v
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.applications[appID]; !ok {
@@ -2870,7 +2892,7 @@ func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules
 	type pairKey struct{ a, b string }
 	seen := make(map[pairKey]struct{}, len(rules))
 	stored := make([]CoResidencyRule, 0, len(rules))
-	for _, r := range rules {
+	for i, r := range rules {
 		if _, ok := m.mappings[r.MappingAID]; !ok {
 			return storeerr.ErrNotFound
 		}
@@ -2883,17 +2905,19 @@ func (m *MemoryStore) SetCoResidencyRules(_ context.Context, appID string, rules
 		}
 		seen[key] = struct{}{}
 		r.ApplicationID = appID
+		r.Verdict = verdicts[i]
 		stored = append(stored, r)
 	}
 	m.coresidency[appID] = stored
 	return nil
 }
 
-// CoResidencyRulesByApplication returns appID's allowed co-residency pairs,
-// ordered by MappingAID then MappingBID (mirrors the SQL `order by
-// mapping_a_id, mapping_b_id`). Always non-nil, empty when none. The result
-// is a fresh copy (CoResidencyRule has no slice/pointer fields, so a plain
-// element copy suffices — mirrors copyRuntimeSpecGPUs' non-nil contract).
+// CoResidencyRulesByApplication returns appID's explicit co-residency pair
+// rows of both verdicts, ordered by MappingAID then MappingBID (mirrors the
+// SQL `order by mapping_a_id, mapping_b_id`). Always non-nil, empty when none.
+// The result is a fresh copy (CoResidencyRule has no slice/pointer fields, so
+// a plain element copy suffices — mirrors copyRuntimeSpecGPUs' non-nil
+// contract).
 func (m *MemoryStore) CoResidencyRulesByApplication(_ context.Context, appID string) ([]CoResidencyRule, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -2906,6 +2930,38 @@ func (m *MemoryStore) CoResidencyRulesByApplication(_ context.Context, appID str
 		return out[i].MappingBID < out[j].MappingBID
 	})
 	return out, nil
+}
+
+// GetCoResidencyMode returns appID's co-residency mode, opt_out until
+// SetCoResidencyMode says otherwise (the SQL column's DDL default). An unknown
+// application is ErrNotFound, like the SQL read of applications.coresidency_mode.
+func (m *MemoryStore) GetCoResidencyMode(_ context.Context, appID string) (CoResidencyMode, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.applications[appID]; !ok {
+		return "", storeerr.ErrNotFound
+	}
+	if mode, ok := m.coresidencyMode[appID]; ok {
+		return mode, nil
+	}
+	return CoResidencyModeOptOut, nil
+}
+
+// SetCoResidencyMode changes appID's co-residency mode and nothing else (the
+// explicit pair rows and the Application value are untouched). A mode outside
+// CoResidencyMode.Valid is rejected before any write; an unknown application is
+// ErrNotFound -- the same order and outcomes as the SQL single-column UPDATE.
+func (m *MemoryStore) SetCoResidencyMode(_ context.Context, appID string, mode CoResidencyMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("invalid coresidency mode %q", mode)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.applications[appID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	m.coresidencyMode[appID] = mode
+	return nil
 }
 
 // --- RuntimeStore: per-GPU VRAM budgets (agent-runtime-manager, Task 3) ----
