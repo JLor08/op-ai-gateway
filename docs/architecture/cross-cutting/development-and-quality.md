@@ -374,12 +374,23 @@ machinery rather than the SIGKILL grace period.
 
 **The two admission scenarios are one assertion, and neither may be deleted as
 redundant.** With the co-residency pair permitted, an eviction produced by the
-VRAM-sum arithmetic is observationally identical to one produced by the matrix
-veto; the second scenario — raise the GPU-0 budget from 1000 MB to 2000 MB and
-change *nothing else*, so the same two specs become co-resident — is what pins
-the first on the arithmetic. Two mutation runs establish it: removing the
-co-residency toggle leaves scenarios 1–5 green and fails only scenario 6;
-widening the tight budget fails only scenario 5.
+VRAM-sum arithmetic is observationally identical to one produced by the pair
+rule's veto; the second scenario — raise the GPU-0 budget from 1000 MB to 2000 MB
+and change *nothing else*, so the same two specs become co-resident — is what pins
+the first on the arithmetic. The scenario **explicitly allows** the pair in the
+co-residency editor (the one Allowed control of the selected model's single
+relationship; the button is matched exactly, because the German "Erlaubt" is also
+a substring of the Default segment's "Standard (erlaubt)") even though a new
+application defaults to `opt_out`, where the pair would be allowed anyway: the
+scenario must not lean on that default, and the save it asserts is the whole
+document (one explicit `allow`, plus a mode). The mutation that pins the first half
+on the arithmetic is unchanged: widening the tight budget fails only scenario 5.
+The other half used to be "remove the co-residency toggle", which left scenarios
+1–5 green and failed only scenario 6 under the old default-deny matrix; under the
+`opt_out` default the pair is allowed with or without the explicit allow, so that
+removal no longer discriminates by itself, and the explicit allow is kept as a
+statement of intent that survives a change of default, not as a mutation-sensitive
+step.
 
 Three determinism rules the suite follows, each of which looks like a stylistic
 quirk and is not:
@@ -398,11 +409,11 @@ quirk and is not:
 
 Two things the suite deliberately does *not* do:
 
-- **No matrix-veto negative control.** Making it deterministic requires forcing
+- **No pair-rule-veto negative control.** Making it deterministic requires forcing
   both specs to `stopped` inside the retry loop — four API writes plus two state
   waits per round — because once both processes are running no further inference
   re-runs admission and a "must be exactly one running" poll can never settle.
-  The matrix path is covered by the in-process policy tests; anyone adding the
+  The pair-rule path is covered by the in-process policy tests; anyone adding the
   e2e control must add the quiesce rather than assume the poll will converge.
 - **No assertion on a save toast.** The portal's save toasts stack and never
   disappear, so a `getByText` assertion on one is a strict-mode violation on the

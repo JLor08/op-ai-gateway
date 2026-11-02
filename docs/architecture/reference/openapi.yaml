@@ -2344,13 +2344,17 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
       tags: [portal]
-      summary: The application's co-residency pair list (canonical order)
+      summary: The application's co-residency document ({mode, pairs:[{a,b,verdict}]}), pairs canonical
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
     put:
       tags: [portal]
-      summary: Replace the application's complete co-residency pair list
+      summary: Replace the application's explicit co-residency pairs and set its mode
+      description: >
+        Full replace of the explicit pair verdicts (allow/forbid); an empty
+        mode leaves the stored mode unchanged. 400 runtime_coresidency.mode_invalid
+        for an unknown mode, runtime_coresidency.pair_invalid for a bad pair or verdict.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:

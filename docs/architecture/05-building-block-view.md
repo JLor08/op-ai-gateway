@@ -292,7 +292,7 @@ analysable at all:
 | File | Holds |
 |---|---|
 | `types.go` | The runtime-config wire types and their parser (tolerant of unknown fields, hard-fails a duplicate spec id, silently drops a dangling co-residency pair). |
-| `policy.go` | The admission decision — matrix, per-GPU budgets, the host-wide RAM pool, process limit, victim selection — as **pure functions over snapshots**: no clocks, no I/O, no goroutines, no logging. This is why it is the most heavily tested part, and why anything needing a clock or a syscall belongs in the manager instead. |
+| `policy.go` | The admission decision — the co-residency (pair) rule, per-GPU budgets, the host-wide RAM pool, process limit, victim selection with its grace window and role-aware order — as **pure functions over snapshots** (the snapshot carries the instant and the grace window, so the policy itself reads no clock): no clocks, no I/O, no goroutines, no logging. This is why it is the most heavily tested part, and why anything needing a clock or a syscall belongs in the manager instead. |
 | `policy_local.go` | The agent-operator boundary: the binary allowlist, permitted directories, and placeholder expansion. |
 | `manager.go` | Child processes, reconciled against desired state by a **single serialized owner goroutine** with the proxy manager's generation discipline, so a late process exit can never clobber its successor. |
 | `router.go` | The single HTTP listener and both proxy paths. |
