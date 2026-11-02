@@ -149,6 +149,19 @@ type Spec struct {
 	// is, so sameLaunchShape ignores all three.
 	MinInstances int `json:"min_instances,omitempty"`
 	MaxInstances int `json:"max_instances,omitempty"`
+	// InstanceOf and Instance mark the per-instance copy of a replicable spec
+	// the manager admits and starts for instance k >= 1 (#340): its ID is then
+	// the instance key S#k, InstanceOf the base spec's ID S, and Instance k.
+	// Instance 0 is the spec itself and keeps both at the zero value, which is
+	// also what every spec that never replicates has. Admission reads the base
+	// through InstanceOf -- an instance co-resides with its siblings, never
+	// evicts them, and inherits its spec's co-residency verdicts (see Admit) --
+	// so the copy needs no matrix entries of its own.
+	//
+	// The agent derives both; they are never on the wire, because the gateway
+	// pushes base specs only.
+	InstanceOf string `json:"-"`
+	Instance   int    `json:"-"`
 }
 
 // RoleOther is the role of a spec that has none the agent recognises: the value

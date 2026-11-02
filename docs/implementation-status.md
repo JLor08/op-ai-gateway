@@ -8,3 +8,4 @@ Execution: subagent-driven (fresh implementer + review per task).
 |---|---|---|
 | 1 | done | agent wire fields (replicable/min/max, status instance/startup_ms), `runtime_instances` feature, agent 0.16.0; `Status.Instance/StartupMS` are declared but populated in Task 4 |
 | 2 | done | `runtime/instance.go`: InstanceAddress/ParseInstanceAddress/InstanceKey, ProtectedCount, InstanceAllowed, IsBurst, `MaxInstanceIndex`=63 (pure, nothing calls them yet) |
+| 3 | done | `runtime/policy.go`: siblings co-reside + pair lookup by base (`pairAllowed`, `baseOf`/`specBase`), sibling and lower-index-under-higher never evictable (in `evictable`), surplus victims first, `PolicySnapshot.NoEvict` → `Decision.NoCapacity` for every non-OK answer incl. terminals (step 8); `Spec.InstanceOf/Instance`, `RunningProc.Spec/Instance/Surplus` declared, populated in Task 4 |
