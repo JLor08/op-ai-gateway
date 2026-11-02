@@ -1319,6 +1319,7 @@ const de = {
   runtimeSpecApiTokenBackendBannerLlamaSwapHint:
     'Diese Spec startet vermutlich llama-swap (laut Programmpfad) — siehe Hinweis oben.',
   runtimeSpecVramMeasured: 'Gemessenes VRAM (vom Agenten)',
+  runtimeSpecRamMeasured: 'Gemessenes RAM (vom Agenten)',
   // Die dritte Zahl in einer GPU-Zeile, und die einzige, die dieses Formular
   // nur ANBIETET: die VRAM-Messung des Benchmarks. „Übernehmen“ füllt damit
   // Ihr Schätzfeld, schreibt aber nichts – gespeichert wird erst mit
@@ -4701,6 +4702,7 @@ const en: PortalMessages = {
   runtimeSpecApiTokenBackendBannerLlamaSwapHint:
     'This spec looks like it launches llama-swap (based on the binary path) — see the note above.',
   runtimeSpecVramMeasured: 'Measured VRAM (agent-reported)',
+  runtimeSpecRamMeasured: 'Measured RAM (agent-reported)',
   runtimeSpecVramBenchmark: 'Benchmark measurement (MB)',
   runtimeSpecVramApply: 'Apply',
   runtimeSpecVramApplyHint:
