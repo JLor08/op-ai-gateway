@@ -58,3 +58,23 @@ func TestHostCollectorReal(t *testing.T) {
 		t.Errorf("Net[0].Name = %q, want %q", host.Net[0].Name, "total")
 	}
 }
+
+// TestCollectHostSetsMemAvailable pins that the host sample carries the live
+// available-RAM figure (gopsutil VirtualMemoryStat.Available -- MemAvailable on
+// Linux, free+inactive/purgeable on macOS, the standby+free pool on Windows),
+// not just used/total. RAM admission budgets against what is genuinely
+// obtainable right now, which is not total-minus-used on a host whose page
+// cache is large. It runs against the real collector on the CI hardware, like
+// TestHostCollectorReal.
+func TestCollectHostSetsMemAvailable(t *testing.T) {
+	host, err := NewHostCollector().Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if host.MemAvailableBytes <= 0 {
+		t.Errorf("MemAvailableBytes = %d, want > 0", host.MemAvailableBytes)
+	}
+	if host.MemAvailableBytes > host.MemTotalBytes {
+		t.Errorf("MemAvailableBytes = %d, want <= MemTotalBytes %d", host.MemAvailableBytes, host.MemTotalBytes)
+	}
+}

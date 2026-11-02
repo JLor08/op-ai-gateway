@@ -64,7 +64,6 @@ export interface RuntimeSpec {
   admission_wait_timeout_seconds: number;
   pinned: boolean;
   admin_state: string;
-  vram_locked: boolean;
   // Turns the spec's GPU list from a declaration into an enforcement: the
   // agent sets the vendor-appropriate visibility variable
   // (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on
@@ -80,6 +79,18 @@ export interface RuntimeSpec {
   // Go RuntimeSpecDTO.visible_devices_mode.
   visible_devices_mode: 'env' | 'args';
   gpus: RuntimeSpecGPU[];
+  // This spec's resident HOST RAM demand, in MB. RAM is host-scoped, so both
+  // numbers are single scalars on the spec -- not per-GPU rows like `gpus`
+  // above. ram_estimate_mb is operator-owned and round-tripped from a PUT
+  // verbatim: it is applied like every field of this full-document upsert, so
+  // a PUT that omits it clears a stored estimate. ram_measured_mb is
+  // agent-owned and read-only here -- the agent's telemetry write-back sets it
+  // once the process is running, and the backend has no request counterpart
+  // (the stored value survives every operator write). 0 on either is the
+  // UNKNOWN sentinel (no estimate / nothing measured yet), never "needs no
+  // RAM". Both keys are always present on the wire.
+  ram_estimate_mb: number;
+  ram_measured_mb: number;
   // How this mapping authenticates to its agent-managed process (Runtime-Spec
   // API Token feature). 'off' sends no auth; 'set' sends the operator's own
   // spec-level token (api_token_set says whether one is stored, never the
@@ -157,7 +168,10 @@ export interface RuntimeSpec {
 // row. The one exception is each GPU entry's vram_measured_mb, which the
 // backend ALWAYS ignores on write (agent-owned) even though the request
 // shape still carries the field -- see RuntimeSpec.gpus / PutRuntimeSpec's
-// VRAM ownership rule in service_runtime.go.
+// VRAM ownership rule in service_runtime.go. The spec-level ram_measured_mb is
+// agent-owned too, but the backend request has no counterpart for it at all,
+// so it is excluded from this shape below instead of being carried and
+// ignored; ram_estimate_mb is the operator's and is applied verbatim.
 //
 // The three api_token_set/app_api_token_set/app_api_token_header fields are
 // READ-ONLY echoes (server state, never client-writable) and are excluded
@@ -175,6 +189,7 @@ export type PutRuntimeSpecRequest = Omit<
   | 'resolved_metrics_path'
   | 'resolved_context_probe_path'
   | 'responses_live_timings_enabled'
+  | 'ram_measured_mb'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).
@@ -255,6 +270,17 @@ export interface RuntimeStatus {
   queue_depth: number;
   gpus?: RuntimeGPUStatus[];
   measured_at?: string;
+  // This process's measured resident host RAM in MB: the spec-level
+  // counterpart of the per-GPU `gpus[].vram_measured_mb` above (RAM has no GPU
+  // axis, so one scalar). Agent-owned and read-only. Optional because 0 is the
+  // UNKNOWN sentinel -- a host with no RAM measurer, or a spec with no live
+  // process -- and an unknown measurement is absent, never sent as a number.
+  // The durable value, and the one the admin table reads, is the spec's own
+  // RuntimeSpec.ram_measured_mb from the telemetry write-back. NOTE: the
+  // gateway's status frame (RuntimeStatusDTO) does not forward the key yet, so
+  // today this stays undefined; the type reserves it for when the frame does,
+  // and nothing may rely on it being populated.
+  ram_measured_mb?: number;
   last_error?: RuntimeError;
   // Whether the agent's last per-model probe of its `/metrics` and context
   // (e.g. llama.cpp `/props`) endpoints actually reached the server, mirroring

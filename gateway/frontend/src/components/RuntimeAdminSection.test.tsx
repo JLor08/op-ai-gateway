@@ -153,10 +153,11 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admission_wait_timeout_seconds: 0,
     pinned: false,
     admin_state: '',
-    vram_locked: false,
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -796,6 +797,114 @@ describe('RuntimeAdminSection launch specs list', () => {
     expect(screen.getByText('0: 22000 MB')).toBeInTheDocument();
     // The pinned column header AND the pinned-chip cell both carry this text.
     expect(screen.getAllByText(t.runtimeSpecPinned).length).toBeGreaterThanOrEqual(2);
+  });
+
+  // The per-GPU cell shows the EFFECTIVE VRAM, the number the admission
+  // arithmetic actually charges, not the operator's raw estimate: the larger of
+  // the agent's measurement and the operator's estimate, so the estimate is a
+  // floor and a higher measurement raises the charge. There is no lock.
+  describe('effective VRAM and RAM columns', () => {
+    const effectiveSpecs = {
+      // measured above the estimate: the measurement is effective.
+      map_measured_over: makeSpec({
+        configured: true,
+        mapping_id: 'map_measured_over',
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+      }),
+      // measured BELOW the estimate: the estimate stays as a floor (max), the
+      // lower measurement does not replace it.
+      map_estimate_floor: makeSpec({
+        configured: true,
+        mapping_id: 'map_estimate_floor',
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 5000 }],
+      }),
+      // never measured (0 = unknown): the estimate.
+      map_unmeasured: makeSpec({
+        configured: true,
+        mapping_id: 'map_unmeasured',
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+      }),
+      // two cards: 9000 (measured over estimate) + 3000 (never measured, so
+      // its estimate) = 12000.
+      map_pair: makeSpec({
+        configured: true,
+        mapping_id: 'map_pair',
+        gpus: [
+          { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
+          { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+        ],
+      }),
+      // no GPU rows at all: nothing to total.
+      map_nogpu: makeSpec({ configured: true, mapping_id: 'map_nogpu' }),
+      // RAM: measured over estimate, estimate over measured, and neither.
+      map_ram_measured: makeSpec({
+        configured: true,
+        mapping_id: 'map_ram_measured',
+        ram_estimate_mb: 4096,
+        ram_measured_mb: 6000,
+      }),
+      map_ram_estimate: makeSpec({
+        configured: true,
+        mapping_id: 'map_ram_estimate',
+        ram_estimate_mb: 4096,
+        ram_measured_mb: 2000,
+      }),
+      map_ram_unknown: makeSpec({
+        configured: true,
+        mapping_id: 'map_ram_unknown',
+        ram_estimate_mb: 0,
+        ram_measured_mb: 0,
+      }),
+    };
+
+    function renderEffective() {
+      renderSection({
+        mappings: Object.keys(effectiveSpecs).map((id) =>
+          makeMapping({ id, gateway_model_name: `gw-${id}` }),
+        ),
+        specsByMappingId: effectiveSpecs,
+      });
+    }
+
+    // A row's cells fill in only once THAT row's spec has loaded, so every
+    // assertion waits on the cell instead of reading it once.
+    async function expectCell(rowKey: string, column: string, text: string) {
+      await waitFor(() =>
+        expect(cellForColumn(`gw-${rowKey}`, column)).toHaveTextContent(new RegExp(`^${text}$`)),
+      );
+    }
+
+    it('shows the larger of the measurement and the estimate as the GPU VRAM', async () => {
+      renderEffective();
+      await expectCell('map_measured_over', t.runtimeSpecGpus, '0: 9000 MB');
+      await expectCell('map_estimate_floor', t.runtimeSpecGpus, '0: 8000 MB');
+      await expectCell('map_unmeasured', t.runtimeSpecGpus, '0: 8000 MB');
+      // The raw estimate of the measured-over row is not what the cell says.
+      expect(cellForColumn('gw-map_measured_over', t.runtimeSpecGpus)).not.toHaveTextContent(
+        '8000',
+      );
+    });
+
+    it('totals the effective VRAM of every GPU, with the same max rule', async () => {
+      renderEffective();
+      await expectCell('map_pair', t.runtimeSpecGpus, '0: 9000 MB, 1: 3000 MB');
+      await expectCell('map_pair', t.runtimeSpecVramTotal, '12000 MB');
+      await expectCell('map_measured_over', t.runtimeSpecVramTotal, '9000 MB');
+      await expectCell('map_estimate_floor', t.runtimeSpecVramTotal, '8000 MB');
+    });
+
+    it('renders an em-dash total for a spec with no GPU rows', async () => {
+      renderEffective();
+      await expectCell('map_nogpu', t.runtimeSpecGpus, '—');
+      await expectCell('map_nogpu', t.runtimeSpecVramTotal, '—');
+    });
+
+    it('shows the larger of measured and estimated RAM, and an em-dash when both are 0', async () => {
+      renderEffective();
+      await expectCell('map_ram_measured', t.runtimeSpecRam, '6000 MB');
+      await expectCell('map_ram_estimate', t.runtimeSpecRam, '4096 MB');
+      await expectCell('map_ram_unknown', t.runtimeSpecRam, '—');
+    });
   });
 
   it('reads the GPU-assignment column as off / arguments / environment variable per spec', async () => {
@@ -2602,12 +2711,16 @@ function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admission_wait_timeout_seconds: 45,
     pinned: true,
     admin_state: '',
-    vram_locked: true,
     // Non-default on purpose: the override actions build their PUT body by
     // spreading the LOADED spec, so a `false` here could not tell a preserved
     // value from a defaulted one.
     set_visible_devices: true,
     gpus: [{ index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 }],
+    // Non-default on purpose, both of them: a body that silently dropped the
+    // estimate would clear it on an override click, and one that echoed the
+    // measurement back would hand an agent-owned number to the PUT.
+    ram_estimate_mb: 4096,
+    ram_measured_mb: 3000,
     ...overrides,
   });
 }
@@ -2629,13 +2742,16 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     admission_wait_timeout_seconds: spec.admission_wait_timeout_seconds,
     pinned: spec.pinned,
     admin_state: adminState,
-    vram_locked: spec.vram_locked,
     set_visible_devices: spec.set_visible_devices,
     visible_devices_mode: spec.visible_devices_mode,
     api_token_mode: spec.api_token_mode,
     api_token_header_source: spec.api_token_header_source,
     api_token_header: spec.api_token_header,
     gpus: spec.gpus,
+    // The estimate is operator-owned and replayed verbatim; ram_measured_mb is
+    // agent-owned and deliberately absent from the request shape (toEqual
+    // fails if an override click echoes it back).
+    ram_estimate_mb: spec.ram_estimate_mb,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
     messages_mode: spec.messages_mode,
@@ -9817,5 +9933,90 @@ describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, (
       await waitFor(() => expect(putSpecs).toHaveLength(1));
       expect(putSpecs[0].body.config_files).toEqual(withFiles.config_files);
     });
+  });
+});
+
+// The spec's host-RAM estimate: ONE spec-level field (RAM is host-scoped, so it
+// is not a per-GPU row field). The form's PUT is a full-document upsert in
+// which an absent estimate is applied as 0 and clears a stored one, so what
+// this block pins above all is the ROUND TRIP: a save that never touched the
+// field must still carry the stored value.
+describe('RuntimeAdminSection spec-level RAM estimate', () => {
+  function ramField(): HTMLInputElement {
+    return screen.getByLabelText(t.runtimeSpecRamEstimate) as HTMLInputElement;
+  }
+
+  it('round-trips the estimate: shows the stored value and PUTs the edited one', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ ram_estimate_mb: 4096 });
+
+    expect(ramField().value).toBe('4096');
+    expect(ramField()).toHaveAttribute('type', 'number');
+    expect(ramField()).toHaveAttribute('min', '0');
+
+    fireEvent.change(ramField(), { target: { value: '8192' } });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(8192);
+  });
+
+  it('a save that never touched the field restates the stored estimate', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ ram_estimate_mb: 4096 });
+
+    // An unrelated edit, then save: the estimate must ride along or this save
+    // would clear one an operator set through the API.
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+      target: { value: '/opt/elsewhere' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(4096);
+  });
+
+  it('never sends the agent-owned measurement', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      ram_estimate_mb: 4096,
+      ram_measured_mb: 6000,
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect('ram_measured_mb' in putSpecs[0].body).toBe(false);
+  });
+
+  it('is a single spec-level field, however many GPU rows the spec has', async () => {
+    await openApiTokenSpecEdit({
+      ram_estimate_mb: 2048,
+      gpus: [
+        { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 },
+        { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+      ],
+    });
+
+    expect(screen.getAllByLabelText(t.runtimeSpecVram)).toHaveLength(2);
+    expect(screen.getAllByLabelText(t.runtimeSpecRamEstimate)).toHaveLength(1);
+    expect(screen.getByText(t.runtimeSpecRamEstimateHint)).toBeInTheDocument();
+  });
+
+  it('a cleared field saves as 0 (no estimate), like every other numeric field', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ ram_estimate_mb: 4096 });
+
+    fireEvent.change(ramField(), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(0);
+  });
+
+  it('starts a new spec at 0 and PUTs what was typed', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(ramField().value).toBe('0');
+
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.change(ramField(), { target: { value: '12288' } });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(12288);
   });
 });

@@ -208,6 +208,47 @@ func TestSpecUnmarshalsTypeAndProbePaths(t *testing.T) {
 	}
 }
 
+// TestConfigDecodeReadsRAMMB pins the wire tag of the spec-level host-RAM
+// demand the gateway pushes (AgentRuntimeSpecDTO.RAMMB,
+// gateway/backend/internal/portal/service_runtime.go): ParseConfig must land
+// "ram_mb" on Spec.RAMMB, or the agent silently drops the figure the gateway
+// computed as max(measured, estimate). RAM is host-scoped, so it is read off the
+// spec itself and never off a gpus[] row. A spec whose document omits the key --
+// every document an older gateway sends -- decodes to 0, which means "unknown
+// demand" and never "needs no RAM".
+func TestConfigDecodeReadsRAMMB(t *testing.T) {
+	const raw = `{
+  "router_listen": 9000,
+  "max_processes": 2,
+  "gpu_budgets": [],
+  "specs": [
+    {"id": "rspec_with_ram", "model": "a", "upstream_model": "a-up", "binary": "/bin/a",
+     "args": [], "env": {}, "gpus": [{"index": 0, "vram_mb": 8000}], "ram_mb": 5000},
+    {"id": "rspec_no_ram", "model": "b", "upstream_model": "b-up", "binary": "/bin/b",
+     "args": [], "env": {}, "gpus": [{"index": 0, "vram_mb": 4000}]}
+  ],
+  "coresident": [],
+  "etag": "e"
+}`
+	cfg, err := ParseConfig([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseConfig() error = %v", err)
+	}
+	if len(cfg.Specs) != 2 {
+		t.Fatalf("len(Specs) = %d, want 2", len(cfg.Specs))
+	}
+	if got := cfg.Specs[0].RAMMB; got != 5000 {
+		t.Errorf("Specs[0].RAMMB = %d, want 5000 decoded from ram_mb", got)
+	}
+	if got := cfg.Specs[1].RAMMB; got != 0 {
+		t.Errorf("Specs[1].RAMMB = %d, want 0 (unknown) for a document without ram_mb", got)
+	}
+	// The per-GPU VRAM figure is untouched by the new spec-level field.
+	if g := cfg.Specs[0].GPUs; len(g) != 1 || g[0] != (SpecGPU{Index: 0, VRAMMB: 8000}) {
+		t.Errorf("Specs[0].GPUs = %+v, want the untouched {0, 8000}", g)
+	}
+}
+
 // TestParseConfigEmptyDocumentCollectionsAreNeverNil covers the
 // fully-empty document a server with no server_agent application yet
 // produces (docs/architecture/reference/api-surface.md §5.1, "a fully zeroed
@@ -531,6 +572,26 @@ func TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM(t *testing.T) {
 	}
 	if vram["0"] != 21234 || vram["1"] != 8000 || len(vram) != 2 {
 		t.Errorf("measured_vram = %v, want {0:21234 1:8000}", vram)
+	}
+}
+
+// TestStatusMarshalJSONMeasuredRAM pins the scalar RAM figure's JSON shape: it
+// is absent while unknown (0 -- never "needs no RAM") and present, under the
+// key RuntimeSample carries on the wire, once measured.
+func TestStatusMarshalJSONMeasuredRAM(t *testing.T) {
+	raw, err := json.Marshal(Status{SpecID: "s1", State: StateRunning})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "ram_measured_mb") {
+		t.Errorf("raw = %s, want no ram_measured_mb while the RAM is unknown (0)", raw)
+	}
+	raw, err = json.Marshal(Status{SpecID: "s2", State: StateRunning, MeasuredRAMMB: 1500})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"ram_measured_mb":1500`) {
+		t.Errorf("raw = %s, want ram_measured_mb:1500", raw)
 	}
 }
 

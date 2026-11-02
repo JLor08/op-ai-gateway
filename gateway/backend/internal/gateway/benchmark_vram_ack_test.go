@@ -294,9 +294,12 @@ func TestVRAMIsolationAcceptsTheAcknowledgementAfterAMidWaitDocumentChange(t *te
 	// A third-party write the reservation does not gate, and the one that is
 	// GUARANTEED to land during a real run: the agent's own measured-VRAM
 	// write-back, which the notification rule deliberately exempts and which
-	// arrives at telemetry cadence.
+	// arrives at telemetry cadence. The value is deliberately ABOVE the
+	// fixture's 18000 MB estimate: the pushed demand is max(measured,
+	// estimate), so a measurement under the floor would leave the document
+	// byte-identical and this trap would never be driven.
 	change := time.AfterFunc(30*time.Millisecond, func() {
-		if err := f.mem.UpdateRuntimeSpecGPUMeasured(context.Background(), f.targetSpec, 0, 17123); err != nil {
+		if err := f.mem.UpdateRuntimeSpecGPUMeasured(context.Background(), f.targetSpec, 0, 19123); err != nil {
 			return
 		}
 		dto, err := f.srv.Portal.AgentRuntimeConfig(context.Background(), "srv1")
@@ -826,8 +829,10 @@ func TestVRAMIsolationGateKeepsEveryVerifiedDocument(t *testing.T) {
 
 	// Document 2: a third-party write the benchmark's reservation does not gate
 	// -- the agent's own measured-VRAM write-back -- which still force-stops
-	// every enumerated spec.
-	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 17123); err != nil {
+	// every enumerated spec. Above the fixture's 18000 MB estimate on purpose
+	// -- the pushed demand is max(measured, estimate), so a lower value would
+	// not change the document at all.
+	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 19123); err != nil {
 		t.Fatalf("UpdateRuntimeSpecGPUMeasured: %v", err)
 	}
 	second := f.vramDerivedETag(t)

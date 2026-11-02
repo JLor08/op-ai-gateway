@@ -239,10 +239,11 @@ function emptySpec(mappingId: string): RuntimeSpec {
     admission_wait_timeout_seconds: 0,
     pinned: false,
     admin_state: '',
-    vram_locked: false,
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -594,6 +595,11 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // every other field this full-document PUT carries verbatim. So does
   // config_files (#257): the PUT treats an absent list as "none", so dropping
   // it here would delete the operator's files on a Start/Stop/Clear click.
+  // ram_estimate_mb is the same kind of writable field and rides `rest` for
+  // the same reason: the PUT applies an absent estimate as 0 and clears the
+  // stored one, so an override click must restate it. ram_measured_mb is the
+  // opposite: agent-owned with no request counterpart (PutRuntimeSpecRequest
+  // excludes it), so it is dropped here rather than echoed back.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -613,6 +619,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     resolved_metrics_path,
     resolved_context_probe_path,
     responses_live_timings_enabled,
+    ram_measured_mb,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -659,10 +666,43 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-function formatGpus(gpus: RuntimeSpecGPU[]): string {
-  return gpus.length === 0
-    ? '—'
-    : gpus.map((g) => `${g.index}: ${g.vram_estimate_mb} MB`).join(', ');
+// The VRAM the admission arithmetic actually charges for one GPU row of a
+// spec, which is NOT always the operator's estimate: the larger of the agent's
+// measurement and the operator's estimate, so the estimate is a floor and a
+// higher measurement raises the charge. A missing measurement (0 = UNKNOWN,
+// never "needs none") therefore falls back to the estimate. The table shows this
+// number so it cannot disagree with what admission does with the same spec;
+// this is the one place the rule lives.
+function effectiveGpuVram(g: RuntimeSpecGPU): number {
+  return Math.max(g.vram_measured_mb, g.vram_estimate_mb);
+}
+
+// The sum of every GPU row's effective VRAM: what the spec demands across the
+// host's cards in total. A card whose demand is still unknown (0) adds nothing,
+// so the total of a partly unknown spec is a floor; 0 means every card is
+// unknown (or there is none).
+function totalGpuVram(spec: RuntimeSpec | undefined): number {
+  if (!spec) return 0;
+  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(g), 0);
+}
+
+// RAM has no per-card rows: the larger of the agent's measurement and the
+// operator's estimate, the same max() rule as the VRAM above. `|| 0` also
+// covers a document from a gateway that predates the fields, which would
+// otherwise surface as NaN.
+function effectiveRam(spec: RuntimeSpec | undefined): number {
+  return Math.max(spec?.ram_measured_mb || 0, spec?.ram_estimate_mb || 0);
+}
+
+function formatGpus(spec: RuntimeSpec | undefined): string {
+  if (!spec || spec.gpus.length === 0) return '—';
+  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g)} MB`).join(', ');
+}
+
+// A megabyte quantity for the two summary columns: the em-dash when nothing is
+// known (0 is the UNKNOWN sentinel throughout this feature, never a real zero).
+function formatMb(mb: number): string {
+  return mb > 0 ? `${mb} MB` : '—';
 }
 
 function renderBoolChip(active: boolean, label: string) {
@@ -2412,7 +2452,12 @@ export function RuntimeAdminSection({
   const [admissionWaitTimeoutSeconds, setAdmissionWaitTimeoutSeconds] = useState(0);
   const [pinned, setPinned] = useState(false);
   const [adminState, setAdminState] = useState('');
-  const [vramLocked, setVramLocked] = useState(false);
+  // The spec's operator RAM estimate in MB: ONE spec-level scalar (RAM is
+  // host-scoped, so it is not a GpuRow field). It must be bound to state and
+  // emitted by buildSpecBody even where the form shows no field for it: the
+  // PUT is a full-document upsert, and an absent estimate is applied as 0,
+  // clearing one set through the API.
+  const [ramEstimateMb, setRamEstimateMb] = useState(0);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   // Runtime-Spec API Token: mode + its per-mode write-only state.
@@ -2564,7 +2609,7 @@ export function RuntimeAdminSection({
     setAdmissionWaitTimeoutSeconds(0);
     setPinned(false);
     setAdminState('');
-    setVramLocked(false);
+    setRamEstimateMb(0);
     setSetVisibleDevices(false);
     setVisibleDevicesMode('env');
     setApiTokenMode('app');
@@ -2598,7 +2643,7 @@ export function RuntimeAdminSection({
     setAdmissionWaitTimeoutSeconds(spec.admission_wait_timeout_seconds);
     setPinned(spec.pinned);
     setAdminState(spec.admin_state);
-    setVramLocked(spec.vram_locked);
+    setRamEstimateMb(spec.ram_estimate_mb);
     setSetVisibleDevices(spec.set_visible_devices);
     setVisibleDevicesMode(spec.visible_devices_mode);
     setApiTokenMode(spec.api_token_mode);
@@ -2996,7 +3041,7 @@ export function RuntimeAdminSection({
       admission_wait_timeout_seconds: admissionWaitTimeoutSeconds,
       pinned,
       admin_state: adminState,
-      vram_locked: vramLocked,
+      ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,
       visible_devices_mode: visibleDevicesMode,
       api_token_mode: apiTokenMode,
@@ -3497,7 +3542,7 @@ export function RuntimeAdminSection({
     {
       id: 'gpus',
       label: t.runtimeSpecGpus,
-      value: (m) => formatGpus(specsById[m.id]?.gpus ?? []),
+      value: (m) => formatGpus(specsById[m.id]),
       filter: 'text',
       searchable: false,
     },
@@ -3523,6 +3568,34 @@ export function RuntimeAdminSection({
           ),
           t,
         ),
+    },
+    {
+      // The two resource summaries, one per axis the admission arithmetic
+      // budgets. The cell TEXT carries the unit, but `value` is the bare
+      // number (or the em-dash) so a numeric sort and the text filter work on
+      // the magnitude, and an unknown row sorts to the bottom.
+      id: 'vram_total',
+      label: t.runtimeSpecVramTotal,
+      value: (m) => {
+        const total = totalGpuVram(specsById[m.id]);
+        return total > 0 ? String(total) : '—';
+      },
+      render: (m) => formatMb(totalGpuVram(specsById[m.id])),
+      filter: 'text',
+      searchable: false,
+      numeric: true,
+    },
+    {
+      id: 'ram',
+      label: t.runtimeSpecRam,
+      value: (m) => {
+        const ram = effectiveRam(specsById[m.id]);
+        return ram > 0 ? String(ram) : '—';
+      },
+      render: (m) => formatMb(effectiveRam(specsById[m.id])),
+      filter: 'text',
+      searchable: false,
+      numeric: true,
     },
     {
       id: 'pinned',
@@ -4615,25 +4688,6 @@ export function RuntimeAdminSection({
               control={<Checkbox checked={pinned} onChange={(e) => setPinned(e.target.checked)} />}
               label={t.runtimeSpecPinned}
             />
-            {/* The label used to read "VRAM locked (not evictable)", which
-                described `pinned` (directly above) and not this flag at all --
-                two adjacent checkboxes both promising non-eviction, one of them
-                falsely. vram_locked decides which VRAM number the AGENT is
-                told: locked, the operator's estimate wins over the agent's
-                measurement, in the config document and in the write-back
-                alike. That is the operator's only lever when a measurement
-                above the GPU budget has made a spec terminally
-                `not_permitted`, so the hint has to say so where they are
-                looking. */}
-            <FormControlLabel
-              control={
-                <Checkbox checked={vramLocked} onChange={(e) => setVramLocked(e.target.checked)} />
-              }
-              label={t.runtimeSpecVramLocked}
-            />
-            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
-              {t.runtimeSpecVramLockedHint}
-            </Typography>
             {/* Without this, the GPU rows below are a DECLARATION: they drive
                 the admission arithmetic and the VRAM measurement mapping, and
                 nothing stops the process from landing on a different card --
@@ -4890,6 +4944,24 @@ export function RuntimeAdminSection({
                 </Alert>
               </Box>
             )}
+
+            {/* RAM is HOST-scoped, so this is ONE spec-level field and not a
+                column of the per-GPU rows below (GpuRow stays VRAM-only). It
+                has to stay bound to the form's state and to buildSpecBody
+                regardless of how it is laid out: the PUT is a full-document
+                upsert, and a save that omitted the estimate would clear one
+                set through the API. */}
+            <Field
+              id="runtime-spec-ram-estimate"
+              type="number"
+              label={t.runtimeSpecRamEstimate}
+              value={String(ramEstimateMb)}
+              onChange={(e) => setRamEstimateMb(e.target.value === '' ? 0 : Number(e.target.value))}
+              inputProps={{ min: 0 }}
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              {t.runtimeSpecRamEstimateHint}
+            </Typography>
 
             <Box sx={{ display: 'grid', gap: 1 }}>
               <Typography variant="subtitle2" component="h3">

@@ -187,6 +187,19 @@ func main() {
 		// like the allowlists: the gateway supplies a file's name and content,
 		// never the directory it lands in.
 		ConfigFilesDir: cfg.ConfigFilesDir,
+		// Room held back from each GPU's auto-detected VRAM budget.
+		// Operator-owned (OP_AGENT_VRAM_HEADROOM_MB), never gateway-supplied;
+		// it never touches a budget the operator configured explicitly.
+		VRAMHeadroomMB: cfg.VRAMHeadroomMB,
+		// Live-available host RAM held back from the host-RAM admission pool.
+		// Operator-owned (OP_AGENT_HOST_RAM_RESERVE_MB, default 2048), never
+		// gateway-supplied.
+		HostRAMReserveMB: cfg.HostRAMReserveMB,
+		// Conservative first-start host-RAM guess for a spec of unknown RAM demand,
+		// so its cold start is admitted against the pool instead of starting blind.
+		// Operator-owned (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB, default 4096), never
+		// gateway-supplied.
+		RAMBootstrapGuessMB: cfg.RAMBootstrapGuessMB,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
@@ -203,6 +216,16 @@ func main() {
 	// operator estimate with a measured zero. Do not call a specific measurer's
 	// constructor from here; that routes around the split.
 	mgr.SetMeasurer(collector.NewVRAMMeasurer())
+	// Per-process host-RAM measurement is the same kind of hardware capability
+	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
+	// private working set on it, and returns nil on a host that cannot read
+	// process memory, where SetRAMMeasurer(nil) is NewManager's own default.
+	// Measured RAM is both reported (Status/telemetry, and the gateway's
+	// spec write-back) and read by admission: the host-RAM pool charges every
+	// running process max(live measurement, the spec's pushed demand), and the
+	// cold-start RAM bootstrap decides on it whether a spec still has an unknown
+	// demand. With no measurer installed, operator RAM demands stand unmeasured.
+	mgr.SetRAMMeasurer(collector.NewRAMMeasurer())
 
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {
@@ -228,6 +251,12 @@ func main() {
 	drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter, runtimeBindHost)
 	defer drv.Close()
 	deps.RuntimeDriver = drv
+	// The collect loop already reads each GPU's total memory and the host's
+	// available RAM every cycle; this hands them to the manager so admission
+	// (which runs on the manager's own goroutine and must not poll hardware)
+	// decides on the latest sample. mgr is never nil here, so this is a real
+	// non-nil interface value (see agent.Deps.HostInfo).
+	deps.HostInfo = mgr
 	// The capability probe sends the sdcpp source only if the gateway declares it.
 	deps.GatewayFeatures = featuresClient
 	// The one wire that closes the cert_mode=proxy gap: the gateway publishes
@@ -299,7 +328,10 @@ func main() {
 		// clamps a too-small or absent value, and an operator who set one
 		// needs to see what it actually became rather than what they typed.
 		"runtime_log_buffer_bytes", logBufferPerSpec,
-		"runtime_log_buffer_total_bytes", logBufferTotal)
+		"runtime_log_buffer_total_bytes", logBufferTotal,
+		"vram_headroom_mb", cfg.VRAMHeadroomMB,
+		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
+		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB)
 	// A loopback runtime_router_bind under cert_mode=proxy is the workaround
 	// operators used to repair the proxied path before the in-process wiring
 	// above existed. It is no longer needed, and it is no longer free: it

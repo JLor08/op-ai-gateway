@@ -128,6 +128,8 @@ var migrations = []migration{
 	{version: 93, name: "runtime_spec_config_files", up: migration93Up},
 	{version: 94, name: "model_mapping_cache", up: migration94Up},
 	{version: 95, name: "model_mapping_benchmarks_audio_perf", up: migration95Up},
+	{version: 96, name: "runtime_spec_ram", up: migration96Up},
+	{version: 97, name: "drop_vram_locked", up: migration97Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -341,7 +343,7 @@ func addColumnIfMissing(ctx context.Context, tx *sql.Tx, dl dialect, table, colD
 // rewording which started quoting the column in a refusal would not
 // silently restore it from the other direction.
 //
-// migration79Up is the first and only caller. See
+// migration79Up is the first caller and migration97Up the second. See
 // TestDropColumnIfPresentSQLite for the present, the already-absent, the
 // nonexistent-table and four BLOCKED cases (index, view, trigger, and a
 // clause-less refusal).
@@ -4271,4 +4273,62 @@ func migration95Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration96Up adds the per-spec RAM pair to agent_runtime_specs: the
+// operator's estimate of the spec's resident host RAM (ram_estimate_mb) and the
+// agent's measurement of it (ram_measured_mb), both in MB.
+//
+// RAM is HOST-scoped -- one process backs one spec, whatever GPUs it spans -- so
+// the pair is two scalars on the spec row itself, not rows on the per-GPU
+// agent_runtime_spec_gpus table where the vram_* pair lives. The ownership split
+// is the same one: the estimate is operator-owned (UpsertRuntimeSpec writes it),
+// the measurement is agent-owned (UpdateRuntimeSpecRAMMeasured writes it, and an
+// operator re-save of the spec does not touch it).
+//
+// Both are `integer not null default 0`, declared exactly like vram_estimate_mb
+// and vram_measured_mb (ADR-005: a megabyte count fits int4 on PostgreSQL, the
+// same reasoning as the VRAM pair). The default 0 is load-bearing and is the
+// whole of the upgrade story: 0 is the "unknown" sentinel -- no estimate yet,
+// nothing measured yet, never "needs no RAM" -- so every pre-existing row reads
+// back as unknown and no running deployment's behaviour changes. There is no
+// backfill because there is no prior column either could be derived from.
+//
+// Append-only: migration 65's create-table and the v60-frozen baseline are not
+// touched, so a fresh install gets the columns by replaying this migration.
+// addColumnIfMissing makes the step replayable on both dialects (`add column if
+// not exists` on PostgreSQL, the duplicate-column tolerance on SQLite).
+func migration96Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"ram_estimate_mb integer not null default 0",
+		"ram_measured_mb integer not null default 0",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration97Up drops agent_runtime_specs.vram_locked, the per-spec operator
+// opt-out from being governed by an agent VRAM measurement. It is superseded by
+// the max(measured, estimate) precedence the gateway now applies wherever it
+// derives a spec's VRAM demand (the agent push in agentRuntimeSpecDTO and the
+// effective value the portal shows): the operator's estimate is a floor that a
+// larger measurement raises and a smaller one never lowers, so there is nothing
+// left for a lock to protect. The agent's measurement write-back therefore no
+// longer consults it either, and the flag has no reader or writer left anywhere
+// in the gateway.
+//
+// Forward-only and append-only, like every migration here: migration 65's
+// create-table is NOT edited, so a fresh install still creates the column there
+// and this step drops it again straight away -- an upgraded database and a fresh
+// one converge on the same schema. dropColumnIfPresent makes the step
+// replayable (`drop column if exists` on PostgreSQL, the swallowed "no such
+// column" on SQLite, and it refuses to swallow a drop BLOCKED by an index,
+// view or trigger -- vram_locked has none). The value is not preserved: a
+// locked spec simply reads as unlocked, and what the lock used to hold up now
+// holds on its own via max().
+func migration97Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return dropColumnIfPresent(ctx, tx, dl, "agent_runtime_specs", "vram_locked")
 }

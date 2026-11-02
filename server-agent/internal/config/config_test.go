@@ -1500,3 +1500,153 @@ func TestGeneratedAgentConfigFixtureResolvesMeshTrustDefaults(t *testing.T) {
 		t.Errorf("CAPEM = %q, want generated inline bootstrap", cfg.CAPEM)
 	}
 }
+
+// TestVRAMHeadroomMBFromEnv covers OP_AGENT_VRAM_HEADROOM_MB, the MB held back
+// from each GPU's auto-detected VRAM budget. It is an env-only knob (no flag,
+// no config-file key), default 0 = hold nothing back. 0 is a legal, meaningful
+// value; anything that is not a non-negative base-10 integer degrades to the
+// default rather than failing the load -- a fat-fingered tuning knob must not
+// take the agent, and every model on the host, down with it. A negative value
+// is never honoured: it would inflate the budget past the device.
+func TestVRAMHeadroomMBFromEnv(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(env string, set bool) int {
+		t.Helper()
+		getenv := func(k string) string {
+			if set && k == "OP_AGENT_VRAM_HEADROOM_MB" {
+				return env
+			}
+			return ""
+		}
+		cfg, err := Load(base, getenv)
+		if err != nil {
+			t.Fatalf("Load(OP_AGENT_VRAM_HEADROOM_MB=%q): %v", env, err)
+		}
+		return cfg.VRAMHeadroomMB
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want int
+	}{
+		{"unset defaults to 0", "", false, 0},
+		{"blank defaults to 0", "   ", true, 0},
+		{"explicit 0 is allowed", "0", true, 0},
+		{"a positive value is taken", "1024", true, 1024},
+		{"surrounding space is trimmed", " 512 ", true, 512},
+		{"negative is not honoured", "-5", true, 0},
+		{"non-numeric falls back to the default", "lots", true, 0},
+		{"a fractional value falls back to the default", "1.5", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := load(tc.env, tc.set); got != tc.want {
+				t.Errorf("VRAMHeadroomMB for OP_AGENT_VRAM_HEADROOM_MB=%q = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHostRAMReserveMBFromEnv covers OP_AGENT_HOST_RAM_RESERVE_MB, the MB of
+// live-available host RAM the agent keeps out of the host-RAM pool it admits
+// runtime specs against. It is an env-only knob (no flag, no config-file key)
+// with a conservative built-in default of 2048 MB: unlike the VRAM headroom,
+// whose zero default holds nothing back, an agent that has not been told
+// otherwise must leave the host's other tenants some room. 0 is a legal,
+// meaningful value (reserve nothing) and is taken as itself, not as "unset";
+// anything that is not a non-negative base-10 integer degrades to the default
+// rather than failing the load -- a fat-fingered tuning knob must not take the
+// agent, and every model on the host, down with it. A negative value is never
+// honoured: it would inflate the budget past what the host has available.
+func TestHostRAMReserveMBFromEnv(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(env string, set bool) int {
+		t.Helper()
+		getenv := func(k string) string {
+			if set && k == "OP_AGENT_HOST_RAM_RESERVE_MB" {
+				return env
+			}
+			return ""
+		}
+		cfg, err := Load(base, getenv)
+		if err != nil {
+			t.Fatalf("Load(OP_AGENT_HOST_RAM_RESERVE_MB=%q): %v", env, err)
+		}
+		return cfg.HostRAMReserveMB
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want int
+	}{
+		{"unset defaults to 2048", "", false, 2048},
+		{"blank defaults to 2048", "   ", true, 2048},
+		{"explicit 0 is allowed", "0", true, 0},
+		{"a positive value is taken", "4096", true, 4096},
+		{"surrounding space is trimmed", " 512 ", true, 512},
+		{"negative is not honoured", "-5", true, 2048},
+		{"non-numeric falls back to the default", "lots", true, 2048},
+		{"a fractional value falls back to the default", "1.5", true, 2048},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := load(tc.env, tc.set); got != tc.want {
+				t.Errorf("HostRAMReserveMB for OP_AGENT_HOST_RAM_RESERVE_MB=%q = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRAMBootstrapGuessMBFromEnv covers OP_AGENT_RAM_BOOTSTRAP_GUESS_MB, the
+// conservative first-guess host-RAM footprint the agent charges a spec of unknown
+// RAM demand on its FIRST start, until a real measurement replaces it. It is an
+// env-only knob (no flag, no config-file key) with a conservative built-in default
+// of DefaultRAMBootstrapGuessMB: erring high is the safe direction, because a
+// first start that under-estimates and then allocates more than the headroom is
+// how a cold start OOMs its neighbours. 0 is a legal, meaningful value (the knob
+// off: an unknown-RAM spec starts unconstrained, exactly as before RAM was an
+// admission axis) and is taken as itself, not as "unset"; anything that is not a
+// non-negative base-10 integer degrades to the default rather than failing the
+// load -- a fat-fingered tuning knob must not take the agent, and every model on
+// the host, down with it. A negative value is never honoured.
+func TestRAMBootstrapGuessMBFromEnv(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(env string, set bool) int {
+		t.Helper()
+		getenv := func(k string) string {
+			if set && k == "OP_AGENT_RAM_BOOTSTRAP_GUESS_MB" {
+				return env
+			}
+			return ""
+		}
+		cfg, err := Load(base, getenv)
+		if err != nil {
+			t.Fatalf("Load(OP_AGENT_RAM_BOOTSTRAP_GUESS_MB=%q): %v", env, err)
+		}
+		return cfg.RAMBootstrapGuessMB
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want int
+	}{
+		{"unset defaults", "", false, DefaultRAMBootstrapGuessMB},
+		{"blank defaults", "   ", true, DefaultRAMBootstrapGuessMB},
+		{"explicit 0 is allowed (knob off)", "0", true, 0},
+		{"a positive value is taken", "8192", true, 8192},
+		{"surrounding space is trimmed", " 2048 ", true, 2048},
+		{"negative is not honoured", "-5", true, DefaultRAMBootstrapGuessMB},
+		{"non-numeric falls back to the default", "lots", true, DefaultRAMBootstrapGuessMB},
+		{"a fractional value falls back to the default", "1.5", true, DefaultRAMBootstrapGuessMB},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := load(tc.env, tc.set); got != tc.want {
+				t.Errorf("RAMBootstrapGuessMB for OP_AGENT_RAM_BOOTSTRAP_GUESS_MB=%q = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}

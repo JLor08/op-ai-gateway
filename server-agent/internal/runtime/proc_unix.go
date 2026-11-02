@@ -11,6 +11,27 @@ import (
 	"syscall"
 )
 
+// killedBySIGKILL reports whether err -- a cmd.Wait() error -- describes a
+// process the kernel terminated with SIGKILL. That is the Linux OOM killer's
+// signature (and a `kill -9`), and it is the memory-pressure signal the
+// cold-start RAM bootstrap classifier reads (task 4.4, see
+// bootstrapDiedOfMemoryPressure). It is deliberately narrow -- SIGKILL only, not
+// any signal -- because a SIGTERM is a graceful stop, and the agent's OWN
+// SIGKILL escalation never reaches the classifier (it rides the intentional-stop
+// branch of onProcExited). A nil error (clean exit), a non-exec error, or a
+// plain non-zero exit code all return false: the process was not signal-killed.
+func killedBySIGKILL(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	if !ok {
+		return false
+	}
+	return ws.Signaled() && ws.Signal() == syscall.SIGKILL
+}
+
 // setProcGroup makes cmd (once started) the leader of its own process
 // group, so a single group-signal (see signalGroup) reaches the whole
 // tree a model server may spawn (helper processes, workers) rather than

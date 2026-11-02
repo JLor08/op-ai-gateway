@@ -668,11 +668,21 @@ Conventions worth stating, because each is a judgement call a client depends on:
   under the caller's control (`index`, `budget_mb`).
 - **`spec.vram_measured_mb` is agent-owned and always ignored on write**, even
   though the request shape carries it. The operator-owned figure is
-  `vram_estimate_mb`. `spec.vram_locked` is how an operator opts out of being
-  *governed* by the measurement without being able to forge it: locked, the
-  write-back stops **and** the agent is served `vram_estimate_mb` in its
-  runtime-config document. It is the documented recovery for a spec that a
-  measurement above its GPU budget has left permanently `not_permitted`.
+  `vram_estimate_mb`. **RAM follows the same split at spec level** (it is
+  host-scoped, so these are two scalars on the spec, not per-GPU rows):
+  `ram_estimate_mb` is operator-owned and writable, and `ram_measured_mb` is
+  agent-owned, **always present on the GET** (`RuntimeSpecDTO`, `0` = unknown) and
+  **absent from the PUT request** (`PutRuntimeSpecRequest` has no such member, and
+  the store keeps the stored value across every write). The PUT is a full document
+  like every other field, so an **absent `ram_estimate_mb` is applied as `0` and
+  clears a stored estimate**: a client that builds a body from a loaded spec must
+  carry it through and drop `ram_measured_mb`. A negative `ram_estimate_mb` is
+  `400 runtime_spec.tuning_invalid`. **There is no `vram_locked` any more**
+  (the field is gone from both DTOs and migration 97 drops the column; a stale
+  client that still sends it has the key ignored): the agent is served `max(measured, estimate)` for each GPU's
+  `vram_mb` and for the spec's `ram_mb` ([ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)),
+  so a measurement can only raise the operator's figure, and a measurement above a
+  GPU's budget leaves the spec `not_permitted` until the **budget** is raised.
 - **The VRAM benchmark writes neither of those two fields**, and its six
   refusals are all `409` — none of them is a malformed request; each is a
   conflict with the server's current state. They are checked **before** the
@@ -765,6 +775,15 @@ Conventions worth stating, because each is a judgement call a client depends on:
   although the registry holds them for that child: they are an in-process
   hand-off to `GET /api/portal/model-image-options` (above), kept off this
   frame on purpose, and a client wanting them reads that endpoint.
+- **The status row does not carry the measured RAM, although the sample does.**
+  The agent's runtime sample has a spec-level `ram_measured_mb` (beside `gpus[]`,
+  not inside it, `omitempty`, `0` = unknown), which the gateway writes back onto the
+  spec; the SSE row above has **no** such key today. The client type reserves an
+  optional `ram_measured_mb` on the row, and nothing may rely on it being populated:
+  the durable value is the spec's own `ram_measured_mb` on
+  `GET /api/portal/mappings/{id}/runtime-spec`. A deliberate, documented follow-up
+  ([Agent-Managed Model Runtime
+  §10](../cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
 - **`gpus`/`measured_at` are a watermark, and they are omitted together.**
   `measured_at` is the **gateway's** arrival time for the frame that carried the
   measurement, not the agent's self-reported `reported_at`; a frame that measured
@@ -852,9 +871,9 @@ portal) nor laxer (a spec the portal accepts and the agent then refuses becomes
 a terminal `not_permitted` instead of a form error). Every tuning integer
 (`listen_port`,
 `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
-`admission_wait_timeout_seconds`) must be `>= 0`; `admin_state` must be one of
-the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and env
-**keys** must match `^[A-Z_][A-Z0-9_]*$`.
+`admission_wait_timeout_seconds`, and the spec-level `ram_estimate_mb`) must be
+`>= 0`; `admin_state` must be one of the three valid values; GPU index `>= 0`,
+unique, `vram_estimate_mb >= 0`; and env **keys** must match `^[A-Z_][A-Z0-9_]*$`.
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `visible_devices_mode`
 (`"env"` | `"args"`, empty on the request defaults to `"env"` in
@@ -1476,7 +1495,11 @@ ingest accepts the `audiocpp_models` source, for the `speech`, `transcription`,
 `transcription_streaming` and `speech_clone` rows) are
 on the gateway's alone: the agent reads them here and does not declare them back
 ([Agent-Managed Model Runtime
-§7](../cross-cutting/agent-runtime-manager.md#7-feature-negotiation)). A **404 is
+§7](../cross-cutting/agent-runtime-manager.md#7-feature-negotiation)). The names that
+state a fact about the **agent** alone travel the other way, in the telemetry
+sample's `capabilities.features` and not in this document; the newest are
+`runtime_ram_measurement` (the agent reports each spec's `ram_measured_mb`) and
+`runtime_ram_accounting` (it honours the pushed `ram_mb`), both agent 0.14.0. A **404 is
 not an error** for an agent — it means an older gateway, and reads as the empty
 feature set.
 
@@ -1490,7 +1513,7 @@ independent implementations must agree on:
   `config_files[{name, content}]` (always an array, `[]` for none, never `null`;
   `content` still carries any `${PORT}`/`${MODEL}`/`${CONFIG_DIR}`-style
   placeholder, which the agent resolves locally — [§3.5](../cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)),
-  `work_dir`, `gpus[{index, vram_mb}]`, `listen_port`, `health_path`,
+  `work_dir`, `gpus[{index, vram_mb}]`, `ram_mb`, `listen_port`, `health_path`,
   `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
   `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
   `visible_devices_mode`, `admin_state`, `type`, `metrics_path`,
@@ -1510,8 +1533,16 @@ independent implementations must agree on:
   `runtime_config_applied_etag`, and therefore what makes that acknowledgement a
   proof rather than a shared counter
   ([agent-runtime-manager §7.2](../cross-cutting/agent-runtime-manager.md#72-the-applied-document-acknowledgement));
-- `gpus[].vram_mb` is the *measured* value if present, else the estimate, with
-  `0` meaning **unknown** — never omitted, never null;
+- `gpus[].vram_mb` is `max(measured, estimate)` of that GPU row's two stored
+  figures, and the spec-level `ram_mb` (beside `gpus`, **never inside it**: RAM is
+  host-scoped, one number per spec) is `max(ram_measured_mb, ram_estimate_mb)`.
+  The operator's figure is a floor and a measurement only raises it; `0` means
+  **unknown** (both sides `0`), never "needs none" — never omitted, never null. An
+  agent older than 0.14.0 decodes the document without error and ignores `ram_mb`
+  (the agent feature `runtime_ram_accounting` says whether it is honoured, [Agent-Managed Model Runtime
+  §7](../cross-cutting/agent-runtime-manager.md#7-feature-negotiation));
+  `ram_mb` is an admission demand, not a launch input, so a change in it relaunches
+  nothing;
 - only **enabled** specs appear, and a spec whose `mapping_id` no longer resolves
   is silently skipped;
 - `specs`, `gpu_budgets` and `coresident` are always present arrays.

@@ -1095,6 +1095,8 @@ const de = {
   runtimeSpecWorkDir: 'Arbeitsverzeichnis',
   runtimeSpecGpus: 'GPUs',
   runtimeSpecVram: 'VRAM (MB)',
+  runtimeSpecVramTotal: 'VRAM gesamt',
+  runtimeSpecRam: 'RAM',
   runtimeSpecIdleTimeout: 'Leerlauf-Timeout (s)',
   runtimeSpecStartupTimeout: 'Start-Timeout (s)',
   runtimeSpecPinned: 'Angeheftet (nie beenden)',
@@ -1206,9 +1208,9 @@ const de = {
   runtimeSpecHealthTimeout: 'Health-Timeout (s)',
   runtimeSpecAdmissionWaitTimeout: 'Wartezeit bis Zulassung (s)',
   runtimeSpecAdminState: 'Admin-Übersteuerung',
-  runtimeSpecVramLocked: 'VRAM-Schätzung fixieren (Messung des Agenten ignorieren)',
-  runtimeSpecVramLockedHint:
-    'Der Agent misst den tatsächlichen VRAM-Verbrauch seines Kindprozesses; diese Messung ersetzt normalerweise Ihre Schätzung – auch in der Budget-Berechnung, die über den Start entscheidet. Fixieren Sie die Schätzung, wenn eine Messung falsch ist oder wenn eine Messung oberhalb des GPU-Budgets den Start dauerhaft verhindert. Die Messung wird weiterhin erfasst und angezeigt, nur nicht mehr verwendet.',
+  runtimeSpecRamEstimate: 'RAM-Schätzung (MB)',
+  runtimeSpecRamEstimateHint:
+    'Ihre Schätzung des Arbeitsspeichers (RAM) auf dem Host, den dieser Prozess belegt, in MB. Ein Wert gilt für die ganze Spec, nicht pro GPU. 0 bedeutet „unbekannt“, nicht „braucht keinen RAM“. Der Agent misst den tatsächlichen RAM-Verbrauch, sobald der Prozess läuft; die Tabelle zeigt den größeren der beiden Werte.',
   runtimeSpecSetVisibleDevices: 'GPU-Zuweisung erzwingen',
   // The single-word states the table column shows, so an operator reads the
   // enforcement mechanism at a glance: off, or via arguments, or via env var.
@@ -1883,7 +1885,8 @@ const de = {
   errorRuntimeSpecArgsInvalid: 'Ungültige Argumente',
   errorRuntimeSpecEnvInvalid: 'Ungültige Umgebungsvariablen',
   errorRuntimeSpecGpuInvalid: 'Ungültige GPU-Konfiguration',
-  errorRuntimeSpecTuningInvalid: 'Zeitwerte müssen größer oder gleich null sein',
+  errorRuntimeSpecTuningInvalid:
+    'Zahlenwerte (Zeiten, Port, RAM-Schätzung) müssen größer oder gleich null sein',
   errorRuntimeSpecAdminStateInvalid: 'Ungültiger Admin-Status',
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Für „GPU-Zuweisung erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
@@ -4448,6 +4451,8 @@ const en: PortalMessages = {
   runtimeSpecWorkDir: 'Working directory',
   runtimeSpecGpus: 'GPUs',
   runtimeSpecVram: 'VRAM (MB)',
+  runtimeSpecVramTotal: 'VRAM total',
+  runtimeSpecRam: 'RAM',
   runtimeSpecIdleTimeout: 'Idle timeout (s)',
   runtimeSpecStartupTimeout: 'Startup timeout (s)',
   runtimeSpecPinned: 'Pinned (never stop)',
@@ -4546,9 +4551,9 @@ const en: PortalMessages = {
   runtimeSpecHealthTimeout: 'Health timeout (s)',
   runtimeSpecAdmissionWaitTimeout: 'Admission wait timeout (s)',
   runtimeSpecAdminState: 'Admin override',
-  runtimeSpecVramLocked: "Lock the VRAM estimate (ignore the agent's measurement)",
-  runtimeSpecVramLockedHint:
-    "The agent measures its child process's actual VRAM, and that measurement normally replaces your estimate — including in the budget arithmetic that decides whether the model may start. Lock the estimate when a measurement is wrong, or when one above the GPU budget has left the spec refusing to start. The measurement is still recorded and shown, only no longer used.",
+  runtimeSpecRamEstimate: 'RAM estimate (MB)',
+  runtimeSpecRamEstimateHint:
+    'Your estimate of the host RAM this process occupies, in MB. One value for the whole spec, not per GPU. 0 means "unknown", not "needs none". The agent also measures the process\'s actual RAM once it runs; the table shows the larger of the two.',
   runtimeSpecSetVisibleDevices: 'Enforce GPU assignment',
   // The single-word states the table column shows, so an operator reads the
   // enforcement mechanism at a glance: off, or via arguments, or via env var.
@@ -5165,7 +5170,8 @@ const en: PortalMessages = {
   errorRuntimeSpecArgsInvalid: 'Invalid arguments',
   errorRuntimeSpecEnvInvalid: 'Invalid environment variables',
   errorRuntimeSpecGpuInvalid: 'Invalid GPU configuration',
-  errorRuntimeSpecTuningInvalid: 'Timing values must be zero or greater',
+  errorRuntimeSpecTuningInvalid:
+    'Numeric values (timeouts, port, RAM estimate) must be zero or greater',
   errorRuntimeSpecAdminStateInvalid: 'Invalid admin state',
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Enforcing GPU assignment needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',

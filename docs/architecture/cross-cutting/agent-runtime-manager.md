@@ -9,8 +9,9 @@ to fix.
 This replaces [llama-swap](https://github.com/mostlygeek/llama-swap) with
 first-party machinery: the same on-demand behaviour (a request for a cold model
 starts it, waits for it to become healthy and then proxies), but with the launch
-command, the co-residency rules and the per-GPU VRAM budgets held in the gateway
-database and edited in the portal, and with authoritative loaded-state reported
+command, the co-residency rules and the per-GPU VRAM demands held in the gateway
+database and edited in the portal (VRAM budgets and a host-wide RAM pool are
+detected by the agent itself, §5.1), and with authoritative loaded-state reported
 back through telemetry instead of scraped out of a third-party status page.
 Classic non-managed applications keep working unchanged on the same server, so a
 fleet can migrate one server at a time.
@@ -1869,70 +1870,101 @@ flushed after the server has read about one header-sized buffer, not 256 KiB, of
 ### 5.1 The per-GPU data model
 
 VRAM demand is **per GPU, not per spec**, because a tensor-parallel model may
-span GPUs unevenly. Every VRAM figure in this feature is **megabytes**; live GPU
-telemetry reports bytes and must be converted at the boundary. Full column
-detail is in [Data Model](../reference/data-model.md); the semantics that matter
-here:
+span GPUs unevenly. **Host RAM is the opposite and a second axis:** one process
+backs one spec, whatever GPUs it spans, so RAM is a single spec-level scalar and
+a **host-scoped** quantity, never a column of the per-GPU rows
+([ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)).
+Every VRAM and RAM figure in this feature is **megabytes**; live GPU and host
+telemetry report bytes and must be converted at the boundary. Full column detail
+is in [Data Model](../reference/data-model.md); the semantics that matter here:
 
 | Field | Owner | Meaning |
 |---|---|---|
-| `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU index. |
+| `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU index. A **floor** (see below). |
 | `agent_runtime_spec_gpus.vram_measured_mb` | Agent | Measured actual usage, written back through telemetry. **Always ignored on a portal write** — `PutRuntimeSpec` copies each index's stored measured value forward. |
-| `agent_runtime_specs.vram_locked` | Operator | "My estimate is authoritative": stops the agent's write-back **and** makes the runtime-config document carry `vram_estimate_mb` instead of `vram_measured_mb`. Never consulted by the portal write path. |
-| `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **`0` means "no budget for this GPU" = unconstrained**, identical to an absent row — see §5.2. |
+| `agent_runtime_specs.ram_estimate_mb` | Operator (portal) | Declared host-RAM demand of the whole spec: one number, not per GPU. A **floor**; `0` = unknown. |
+| `agent_runtime_specs.ram_measured_mb` | Agent | The managed child's measured resident RAM (RSS; the private working set on Windows), written back through telemetry. **Never clobbered by an operator upsert** — the store's update list does not touch it, and the portal's own response keeps the stored value. |
+| `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **`0` means "no budget set" and is unconstrained**, identical to an absent row — see §5.2 — **except that the agent fills in a budget the operator did not set from the GPU's detected total memory** (below). |
 | `ai_servers.runtime_max_processes` | Operator | Concurrent managed processes; `0` = unlimited. |
 
-The split of VRAM ownership is the load-bearing rule of the whole budget
-feature: a future PUT handler that starts trusting `vram_measured_mb` from the
-request lets a UI round-trip erase real measurements, after which the agent's
-admission arithmetic uses estimates it has already disproved.
+The split of ownership is the load-bearing rule of the whole budget feature: a
+future PUT handler that starts trusting `vram_measured_mb` (or a RAM measurement)
+from the request lets a UI round-trip erase real measurements, after which the
+agent's admission arithmetic uses estimates it has already disproved.
 
-The document the agent receives carries, per GPU, the **measured** value if
-present and the estimate otherwise — unless the spec is `vram_locked`, in which
-case it carries the estimate — with `0` meaning *unknown* (never omitted, never
-null).
+**The effective value is `max(measured, manual)`, on both axes.** The operator's
+figure is a **floor**, the agent's measurement raises it when reality is higher,
+and nothing ever reserves less than the larger of the two
+([ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)).
+The document the agent receives carries, per GPU, `vram_mb = max(measured,
+estimate)` and, for the spec, `ram_mb = max(measured, estimate)`, with `0`
+meaning *unknown* (never omitted, never null): a measured `0` falls through to
+the estimate, an estimate of `0` yields the measurement, and both `0` stays `0`,
+which the agent routes to the cold-start bootstrap
+([§5.3](#53-unknown-vram-resolves-itself-by-measurement)). The agent applies the
+same rule once more to what it already has running: a process is charged
+`max(live reading, pushed demand)` per GPU and for RAM, so a transient dip of a
+live reading below the pushed demand never lowers a reservation. The portal's
+table applies the identical rule to the identical stored figures (the per-GPU
+cell, a **VRAM total** that sums them, and a **RAM** column), so it cannot show a
+number that disagrees with what admission used.
 
-> **`vram_locked` has to reach the config document, not only the write-back,
-> and that is what makes it an escape hatch instead of decoration.** The
-> measurement loop is closed and one-way: the agent measures its own child, the
-> write-back stores it, the document above prefers measured over estimate, the
-> agent reads it back **as the spec's own declared demand**, and §5.2's rule 3
-> answers a demand exceeding its GPU's budget *on its own* with a **terminal**
-> `not_permitted`. A 24 GB card budgeted at 20000 MB for headroom, an 18000 MB
-> estimate that served fine, and one 22000 MB measurement — llama.cpp with a
-> large KV cache — is the entire scenario: from then on every start of a model
-> that had been working is refused, with no operator action having occurred.
+**Budgets exist by default, detected from the hardware.** The per-GPU arithmetic
+used to run only for a GPU an operator had saved a budget for, which in practice
+meant it was off. The agent now derives each GPU's budget from the device's
+total memory (`sample.GPU.MemTotalBytes`, converted to MB), minus the optional
+`OP_AGENT_VRAM_HEADROOM_MB`, floored at 1 MB: a **positive operator budget wins
+verbatim** (no headroom, no clamp to the hardware), a row of `0` or less counts
+as "none set" and is replaced, and a GPU the agent cannot read keeps the old
+unconstrained behaviour. The `<= 0` interpretation itself still lives only in
+`Admit` (§5.2). Unified-memory GPUs are skipped (an Apple GPU's reported "total"
+is the memory it has allocated at that instant, not a ceiling), and the same
+risk applies to an AMD APU, whose reported VRAM may be a BIOS carve-out; a
+positive operator budget is the escape hatch for both
+([ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)).
+The collect loop **pushes** the totals and the live available RAM to the owner
+once per cycle, and `Run` seeds the totals from the hardware inventory before
+the first runtime reconciliation, so the specs admitted at boot already see
+them. Enabling this is a behavioural change on existing hosts (a spec larger than
+its card is now refused rather than started), and the boot window and the RAM
+pool's missing seed are recorded in
+[§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+> **The measurement loop is closed and one-way, and removing the lock that used
+> to break it moved the lever to the budget.** The agent measures its own child,
+> the write-back stores it, the document above serves `max(measured, estimate)`
+> back **as the spec's own declared demand**, and §5.2's rule 3 answers a demand
+> exceeding its GPU's budget *on its own* with a **terminal** `not_permitted`. A
+> 24 GB card budgeted at 20000 MB for headroom, an 18000 MB estimate that served
+> fine, and one 22000 MB measurement — llama.cpp with a large KV cache — is the
+> entire scenario: from then on every start of a model that had been working is
+> refused, with no operator action having occurred.
 >
-> It also could not be undone. `PutRuntimeSpec` deliberately copies the stored
-> measured value forward and ignores what the request sends, the write-back
-> skips values `<= 0`, and the spec never runs again so no newer measurement is
-> ever taken. Raising the budget past what the card physically holds is a
-> capitulation, not a lever, and deleting and re-adding the GPU row across two
-> saves is not something an operator can be expected to find.
->
-> Locking is that lever, and it is deliberately the *only* one: the operator
-> chooses whether to be **governed** by the measurement, never what it says, so
-> the agent stays the owner of the number and the measurement stays on file and
-> on screen as the evidence explaining why they had to intervene. Unlocking
-> hands it straight back. The portal states this at the checkbox — whose label
-> read "VRAM locked (not evictable)" until this was written, describing
-> `pinned` and not this flag at all.
->
-> **An operator-facing "reset the measured value to 0" button was rejected.**
-> It escapes the trap exactly once and then re-arms it within one measurement
-> beat: the spec starts on its estimate, is measured at the same 22000 MB, and
-> is refused again. It would need to be combined with locking to be durable, at
-> which point locking alone is the whole answer with one control instead of two.
-> **Treating a measured breach as non-terminal was rejected too** — the agent
-> cannot tell a measured demand from a declared one (the wire carries one
-> number by design), and inferring it would mean either running a process the
-> operator's budget says does not fit, or silently discarding the measurement.
-> Refusing and explaining is the honest behaviour; the defect was never the
-> refusal, it was the absent lever.
+> An earlier design gave the operator a per-spec `vram_locked` flag that served
+> the estimate instead of the measurement. It was removed
+> (migration 97, [ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired))
+> because it was also a way to **under-reserve**: an estimate below reality was
+> served in place of the measurement that disproved it, and two models that did
+> not fit together were admitted side by side. What an operator can no longer do
+> is cap the effective VRAM *below* a measurement; the lever is the **budget**,
+> which is used verbatim whether it is the detected one or an operator's, and
+> which may be set above the card. The refusal itself is unchanged and honest —
+> the defect was never the refusal, it was the absent lever. **Rejected, and
+> still rejected:** an operator-facing "reset the measured value to 0" button
+> (it escapes the trap exactly once and re-arms within one measurement beat), and
+> treating a measured breach as non-terminal (the agent cannot tell a measured
+> demand from a declared one — the wire carries one number by design — so
+> inferring it would mean either running a process the operator's budget says
+> does not fit, or silently discarding the measurement).
 
 ### 5.2 The three gates
 
-A spec `S` may start alongside the running set `R` only if **all three** hold:
+A spec `S` may start alongside the running set `R` only if **all three** hold,
+and — where the host's available RAM is known — a fourth veto that RAM accounting
+added after the list. (The section keeps its "three gates" title because other
+chapters link to it by that name.) Rule numbers in this chapter follow
+`Admit`'s own: 1 matrix, 2 process limit, 3 per-GPU arithmetic, **4 and 5 the
+two unknown-VRAM halves of §5.3**, and **6 the host-RAM pool**.
 
 1. **Co-residency matrix** — a permitted pair exists for every `(S, r)`,
    `r ∈ R`. Row present means pair allowed; there is no `allowed` column, so
@@ -1949,19 +1981,42 @@ A spec `S` may start alongside the running set `R` only if **all three** hold:
 2. **Process limit** — `|R| + 1 ≤ runtime_max_processes` (`0` = unlimited).
 3. **Per-GPU arithmetic** — for every GPU `g` that `S` touches *and that has a
    budget* (`budget(g) > 0`; an absent row or a `0` is unconstrained and not
-   gated at all), the sum of VRAM demand over `S` and every `r ∈ R` that also
-   touches `g` is within `budget(g)`. GPUs no common spec touches do not
-   compete, and a running process is charged only its usage **on the index being
-   checked** — never the sum of its whole GPU map, which would produce spurious
-   evictions on multi-GPU hosts.
+   gated at all — and since the agent fills in the detected device total for a
+   GPU whose budget the operator did not set, §5.1, most GPUs now have one), the
+   sum of VRAM demand over `S` and every `r ∈ R` that also touches `g` is within
+   `budget(g)`. GPUs no common spec touches do not compete, and a running
+   process is charged only its usage **on the index being checked** — never the
+   sum of its whole GPU map, which would produce spurious evictions on multi-GPU
+   hosts.
+
+**Rule 6, the host-RAM arithmetic, is the fourth veto** and the host-wide analogue
+of rule 3
+([ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)).
+RAM is a host resource, so there is **one** sum, not one per GPU: `S`'s RAM charge
+plus the RAM of every `r ∈ R` must fit the one **host-RAM budget**,
+`(MemAvailable + Σ running managed processes' measured RAM) − reserve`
+(`OP_AGENT_HOST_RAM_RESERVE_MB`, default 2048). A process is charged
+`max(live reading, pushed demand)`; a budget of `0` (no hardware sample yet) is
+unconstrained and the rule is skipped, exactly the sentinel a per-GPU budget
+uses. The add-back of what the managed processes already hold is not decoration:
+`MemAvailable` already excludes their resident memory, so the plain
+`MemAvailable − reserve` would charge them twice, capping the managed set at
+roughly half the host and evicting for starts that fit. Because the pool is built
+from the **live** available memory, a co-located workload the agent does not
+manage (a container stack on the same host) lowers it on the next sample with
+nothing to reconfigure. Its victims and its wake are
+[§5.4](#54-eviction-queueing-and-drain).
 
 **The matrix and the arithmetic are not redundant.** The matrix expresses
-operator *intent* and covers the non-VRAM constraints nobody can compute — PCIe
-bandwidth, system RAM, CPU contention — none of which is per-GPU, which is
-exactly why the matrix is not per-GPU either. The arithmetic is the *veto*: the
-matrix alone cannot stop three pairwise-compatible models from jointly exceeding VRAM.
-An open matrix cell is not a guarantee that the pair fits, and the portal's
-per-cell VRAM tooltip says so on every cell.
+operator *intent* and covers the constraints nobody computes — PCIe bandwidth and
+CPU contention, plus the operator's own view of which models belong on one host —
+none of which is per-GPU, which is exactly why the matrix is not per-GPU either.
+(It used to name system RAM here as the thing nobody can compute, and that
+justification is **partly superseded**: host RAM is now computed and vetoed by
+rule 6, so the matrix no longer stands in for it.) The arithmetic is the *veto*:
+the matrix alone cannot stop three pairwise-compatible models from jointly
+exceeding VRAM or host RAM. An open matrix cell is not a guarantee that the pair
+fits, and the portal's per-cell VRAM tooltip says so on every cell.
 
 Because an eviction looks the same whichever gate caused it, diagnosing "why did
 my model get evicted" requires checking both the matrix and the arithmetic. The
@@ -1974,12 +2029,16 @@ that writes a `last_error` (naming the occupant and the card, see §5.3); every
 other `Wait` leaves the spec queued silently, so a waiting spec with no reason
 string is waiting for something that resolves on its own.
 
-Three zero-values mean "no constraint", not "zero": `max_processes == 0` is
-unlimited, a spec GPU entry with `vram_mb == 0` means *unknown* demand and
-routes to §5.3 rather than to the arithmetic, and `budget_mb == 0` means "no
-budget for this GPU" — **unconstrained, identical to a GPU with no budget row
-at all**. Reading any of them as a literal zero turns an unconfigured field
-into a hard refusal of every start.
+Four zero-values mean "no constraint" or "unknown", not "zero": `max_processes
+== 0` is unlimited, a spec GPU entry with `vram_mb == 0` means *unknown* demand
+and routes to §5.3 rather than to the arithmetic, a spec's `ram_mb == 0` is the
+same *unknown* on the RAM axis (it routes to the cold-start bootstrap, never to
+"needs no RAM"), and `budget_mb == 0` means "no budget for this GPU" —
+**unconstrained, identical to a GPU with no budget row at all**, in `Admit`'s
+eyes (the agent's snapshot builder replaces such a row with the detected device
+total where it can read one, §5.1; the host-RAM budget has the same sentinel and
+is `0` only before the first hardware sample). Reading any of them as a literal
+zero turns an unconfigured field into a hard refusal of every start.
 
 > **A budget of `0` and an absent budget row must stay indistinguishable, and
 > that is easy to break.** `0` is reachable operator input, not a hypothetical:
@@ -1988,9 +2047,13 @@ into a hard refusal of every start.
 > figure, and clearing the MB field yields `0` too. The meaning is defined by
 > the data model — the doc comment on `routing.ServerGPUBudget.BudgetMB` — and
 > honoured on the far side of the wire by the agent: `Admit` skips any GPU index
-> whose budget is `<= 0`, so an operator who zeroes a budget gets a no-op, not
-> `not_permitted` for every model on that card. The two comments name each
-> other deliberately; change one and the other must change in the same commit.
+> whose budget is `<= 0`, so an operator who zeroes a budget gets what a card
+> with no row gets — the detected device total where the agent can read one
+> (§5.1), unconstrained where it cannot — and never `not_permitted` for every
+> model on that card. The two comments name each other deliberately; change one
+> and the other must change in the same commit (and the auto-detect that now
+> fills a budget the operator did not set belongs to that same pair, in
+> `owner.buildSnapshot`, never in `Admit`).
 > The check lives in `Admit` rather than in `owner.buildSnapshot`, where the
 > budget map is built, because `PolicySnapshot.Budgets` is an exported field any
 > caller can populate: filtering at one producer would leave every other
@@ -2011,7 +2074,11 @@ running set can change; then an unknown VRAM demand on *either* side of the pair
 (§5.3), contested with a *pinned* process, short-circuits; then matrix
 incompatibility and both unknown-VRAM rules are collected against the original
 running set; the per-GPU budget is evaluated with those evictions notionally
-already removed; **the process-count limit runs last** and asks only for as many
+already removed; **the host-RAM pool is evaluated next**, the same way, with the
+evictions already queued by every earlier rule notionally gone (so a victim that
+rule 3 or rule 5 already drains is neither charged twice nor drawn again, and a
+VRAM victim that also holds the RAM we need is not joined by a second, innocent
+one); **the process-count limit runs last** and asks only for as many
 *additional* victims as the earlier rules have not already supplied. Reversing
 the last two over-evicts, and the already-counted chaining is the only thing
 preventing double eviction.
@@ -2047,6 +2114,29 @@ Two guards read as trivial and are not:
   count it toward the limit and then offer it as a victim for the count it
   created. Removing this one line reintroduces the same destructive bug through
   four separate paths.
+- **A candidate whose own known RAM demand exceeds the whole host-RAM pool also
+  fails terminally**, with `not_permitted` and `spec X: RAM demand 70000 MB
+  exceeds the host RAM budget 52000 MB on its own` (the figure the message prints,
+  and the one the demand is compared with, is the generous **ceiling** described
+  below — the whole capacity the managed pool could offer — not the conservative
+  admission budget the arithmetic uses) — rule 3's own-demand refusal
+  on the host-wide axis, hoisted to the same early position behind the per-GPU
+  one (a spec over *both* keeps reporting the VRAM cause it always has). It
+  differs from the per-GPU rule in **what it compares against**: a GPU budget is
+  a fixed device total, but this pool is rebuilt from a live sample, so the
+  budget is transiently *too low* while a process is still loading and for a
+  sample or two after one exits — the state in which the beneficiary of an
+  eviction is re-admitted — and refusing there turned a legitimate eviction into
+  a durable error that no later sample could take back. The refusal therefore
+  compares against a **ceiling**, the same pool read generously (a process with
+  no reading counts at its demand floor, and the RAM of a process that exited
+  within the last two samples counts as already back). A demand between the
+  budget and the ceiling falls through to the arithmetic, which evicts idle
+  holders or `Wait`s and is re-asked on the next sample (§5.4). The ceiling's
+  credit never enters the budget, so it can make a refusal less eager and can
+  never admit something that does not fit. Like the per-GPU case it is a report,
+  not a verdict (re-evaluated every 5 s), and it is skipped for an *unknown*
+  demand (`ram_mb == 0`), which belongs to the cold-start bootstrap (§5.3).
 - **A candidate whose own demand on one GPU already exceeds that GPU's budget
   fails terminally**, with `not_permitted` plus a disambiguating message such as
   `spec X: gpu 0 demand 9000 MB exceeds budget 8000 MB on its own` — not `Wait`.
@@ -2055,7 +2145,8 @@ Two guards read as trivial and are not:
   *reused* rather than adding a new state, because a state value the portal does
   not know renders as nothing; the message is what tells this cause apart from
   the other two that share the state (a local-policy refusal of the
-  binary/directory, and the closed-matrix case in §5.3).
+  binary/directory, and the closed-matrix case in §5.3) — and, now, the
+  host-RAM refusal above.
   **This check runs before the unknown-VRAM short-circuit because it was being
   shadowed by it.** Executed on both revisions: candidate demand 9000 MB against
   an 8000 MB budget, plus a pinned occupant of unknown demand on the same card,
@@ -2135,6 +2226,42 @@ acceptance
 filling in either spec's estimate turns it into the mixed case, which
 converges.
 
+**One guarded exception: a spec that has never been measured may evict once, to
+be measured
+([ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)).**
+The order above is right in steady state and strands exactly one kind of spec:
+one that has *never* been measured. While any known-demand occupant holds its
+card it can never run alone, so it can never capture the first measurement that
+would move it out of the unknown class, and the `Wait` the order produces need
+not ever resolve. So the first time such a spec is admitted, rule 4 treats a
+known-demand occupant of its cards the way rule 5 treats an unknown one: **evict
+it if it is idle, block on it otherwise** (a pinned occupant already
+short-circuits earlier, and a toucher of unknown demand stays rule 5's
+subject), so the candidate gets its cards to itself and is measured. After that
+the spec has a number and everything above applies unchanged. Three properties
+keep the exception from reintroducing the thrash the order closed:
+
+- **It fires at most once per spec, and the marker is burned early.**
+  `specState.vramBootstrapDone` is set **when the eviction is issued**, before
+  the victim has drained (so a re-entrant admission cannot spend it twice), and
+  by **any** real measurement. It is deliberately **not cleared on exit** — the
+  opposite of the per-process measurement, which stops being true when the
+  process does — because a shot once spent must stay spent across restarts, or
+  every exit would re-arm it and the alternating cold loads would come back one
+  restart at a time. It resets only when the spec is removed and re-added; an
+  in-place config edit keeps it. A bootstrap blocked by a toucher that cannot be
+  evicted (busy, still loading) spends nothing: the decision is a plain `Wait`
+  and the shot is still there for when the neighbour is idle.
+- **It needs a measurer.** The exception exists only to capture a measurement,
+  and measurement is NVIDIA-only (below). On an AMD, Apple-silicon or GPU-less
+  host no number could ever arrive, and this section is explicit that an
+  unknown-demand spec there simply waits behind a busy or pinned holder;
+  evicting a working model for a spec that can never be measured is exactly the
+  regression the order exists to prevent. So a host with no VRAM measurer never
+  grants the shot.
+- **It only ever evicts what is evictable.** The same idle, unpinned,
+  not-still-loading, nothing-in-flight rule that governs every victim applies.
+
 On an NVIDIA host the agent then measures actual usage of **its own
 child PIDs** — exact because the agent knows which PIDs are its children — and
 writes the measurement back to the gateway. There "unknown" is a self-resolving
@@ -2158,8 +2285,8 @@ moment a child first passes a health probe — the point where a model server
 has finished mapping its weights, so the first number is already the
 meaningful one.
 
-**Measurement is NVIDIA-only, and which NVIDIA measurer runs is decided per
-platform.** `main.go` installs exactly one measurer,
+**VRAM measurement is NVIDIA-only (host RAM is measured on every platform, §5.1),
+and which NVIDIA measurer runs is decided per platform.** `main.go` installs exactly one measurer,
 `collector.NewVRAMMeasurer()` — a build-tag split (`measurer_other.go` /
 `measurer_windows.go`), not a `runtime.GOOS` branch — which yields the
 compute-apps measurer on every non-Windows host, the PDH measurer on Windows,
@@ -2473,6 +2600,42 @@ and two things follow from that.
 > the host, which is why the message has to name the spec whose estimate is
 > missing.
 
+**The RAM axis has the same unknown, and resolves it differently: it starts and
+measures, and pre-evicts only under pressure.** A spec of unknown RAM demand
+(`ram_mb == 0`, nothing measured) is not blocked behind an occupant, because RAM
+has no "alone on the card" rule to apply and its measurement needs no eviction.
+Instead the candidate is charged a **conservative first guess**
+(`OP_AGENT_RAM_BOOTSTRAP_GUESS_MB`, default 4096, `0` = off) in rule 6's host-RAM
+arithmetic, in place of the nothing it would otherwise contribute:
+
+- **With headroom** it fits, and the spec **starts and is measured with no
+  eviction**, so default-on accounting does not churn the host on every new spec's
+  first start.
+- **When the host is too tight for the guess**, idle processes are drained
+  host-wide, oldest first, just enough to fit it; if nothing idle can make room
+  the start **waits**. It never blind-starts when tight.
+- **The guess never refuses.** A *known* demand above the whole pool is terminal
+  (§5.2); a number nobody measured cannot durably refuse a spec, so a guess larger
+  than the pool simply waits until an operator supplies `ram_estimate_mb` or lowers
+  the knob.
+- **While a bootstrap is in flight, no other RAM admission proceeds.** A managed
+  process whose declared RAM is unknown and which has no measurement yet is
+  *unaccounted*: rule 6 charges it nothing and the host sample has not caught up
+  with what it is allocating, so a second admission that took the apparently free
+  RAM mid-window is exactly how the bootstrap would cause the host-level
+  out-of-memory it exists to prevent. `Admit` therefore answers every other RAM
+  admission `Wait` (evicting nothing; the next hardware sample re-asks it, §5.4)
+  until the bootstrap settles. The flag is computed fresh from authoritative owner
+  state on every snapshot, never stored, and **always clears**: with a RAM
+  measurer, when the process is measured (or exits, or an operator fills the
+  estimate in); on a host with none it is bounded by the `starting` state, since a
+  healthy process's resident RAM has already lowered the live available memory the
+  pool is built from. Setting the guess to `0` turns off the first-guess *charge*,
+  not this interlock.
+
+The failure and termination side of both bootstraps is
+[§6](#6-process-lifecycle).
+
 ### 5.4 Eviction, queueing and drain
 
 When admission is blocked, the policy proposes victims: **only processes
@@ -2482,6 +2645,17 @@ theatre: the victim set is accumulated in a map (Go randomises map iteration
 order per run) and `sort.Slice` is not stable, so without the tie-break the
 same snapshot evicts different processes on different runs, a non-reproducible
 failure single-run testing cannot detect.
+
+**RAM victims are drawn host-wide, by the same rule.** A per-GPU rule evicts only
+the processes that touch the contested card; the host-RAM pool (§5.2, rule 6) is
+one pool for the whole host, so when the candidate's charge plus every running
+process's RAM exceeds it, **any** idle process is a candidate victim — idle meaning
+the same thing as everywhere else: unpinned, not still loading, nothing in flight
+— taken **oldest `last_used` first** (lowest spec id on a tie) until the sum fits.
+A process an earlier rule has already queued is skipped rather than charged twice
+or drawn again, and one whose RAM is unknown contributes nothing and is not drawn
+(draining it would free nothing the arithmetic can count). If the idle ones cannot
+make the candidate fit, the whole decision is `Wait`, never a partial list.
 
 **A process that has not yet passed a health probe is never an eviction
 victim.** "Serving no request" alone reads a still-loading process as idle,
@@ -2535,6 +2709,29 @@ start without a waiter of its own waits for an unrelated release, exit or
 first, or waits until one comes or its caller gives up when that is `0`; a
 pinned spec behind such a start stays `stopped` until one comes.
 
+**A fresh hardware sample wakes the specs waiting on RAM, and only those.** The
+host-RAM pool is built from the live available memory, so a start refused for
+lack of RAM can fit on the very next sample with no release, exit or `Apply` in
+between. The case that matters most is the **beneficiary of a RAM eviction**: it
+is re-admitted when its victim exits, against the previous sample, which has not
+yet seen the freed memory (the victim's add-back is gone from the pool while
+`MemAvailable` has not yet risen), so its budget is still tight. Without a wake it
+then waited for an unrelated event or its whole admission timeout. The collect
+loop's `SetHostInfo` therefore posts a coalescing, non-blocking token on a
+buffered(1) channel of its own — the loop samples about once a second and must
+never wait on the owner, and a burst of samples is one wake — and the owner
+re-asks, on its own goroutine, the specs whose last verdict was a `Wait` the RAM
+pool contributed to (`Decision.WaitOnRAM`, recorded as `waitingOnRAM`) **and**
+that the finished-start retry above could retry (a queued request, or pinned). The
+selection is the point. Evaluating admission calls the installed VRAM measurer,
+a subprocess on an NVIDIA host, so waking every queued spec on every sample would
+run it once a second for as long as anything waits behind a busy neighbour; a
+`force_running` spec with no waiter stays with the next release, exit or `Apply`,
+for the reason the finished-start retry is narrowed. A spec that **is** waiting on
+RAM costs one evaluation per sample, and nothing else is woken. A *terminal*
+RAM refusal is not a waiter and is not woken: it is a report, re-evaluated every
+5 s (§5.2).
+
 **`Admit` never returns a partial eviction list.** If any blocker anywhere in
 the pipeline is non-evictable — busy, or pinned outside the unknown-VRAM
 short-circuit — the whole decision becomes `Wait` with an empty evict set,
@@ -2542,7 +2739,8 @@ because evicting only some blockers destroys running work for no admission gain.
 
 If everything blocking the candidate is busy, pinned or still loading, the
 request **queues** and is re-evaluated on every release, exit, config `Apply`
-and finished start, failing at the spec's
+and finished start — and, for a wait the host-RAM pool contributed to, on every
+hardware sample (below) — failing at the spec's
 `admission_wait_timeout_seconds` with `runtime.admission_blocked`. `0` means wait
 until the client disconnects — the same semantics as the gateway's
 `admission_queue_timeout_seconds`, and the reason `0` must not be read as "no
@@ -2606,7 +2804,12 @@ ordinary command carrying the `*runningProc` it was taken for, so a result for
 a superseded generation is discarded exactly like every other late report. That
 shape is what keeps `Status()` non-blocking — a deliberate property, since the
 telemetry loop reads it every second and a stalled owner makes the whole agent
-look wedged.
+look wedged. The hardware sample travels the other way by the same rule: the
+collect loop **pushes** the device totals and live available RAM through an atomic
+pointer (`SetHostInfo`) and a coalescing wake token, so the admission snapshot
+reads a cached value, never polls hardware, and the owner loads the sample
+**once** per snapshot so the VRAM and RAM budgets of one admission come from the
+same sample.
 
 The ordering that guarantees at most one process per spec: inside the owner,
 `admitAndStart` runs Permit → `Admit` → mark victims draining or the target
@@ -2643,7 +2846,7 @@ up. So:
 | Spec removed from the document | **Applied immediately** — the spec drains. |
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
 | A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
-| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **or a GPU row's `vram_mb`** — the admission demand, not a launch input) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` binds at the next start, per the not-retroactive rule below). |
+| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **or a GPU row's `vram_mb` or the spec's `ram_mb`** — the admission demands, not launch inputs; the gateway pushes each as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
 | Removed co-residency pair | **Not retroactive.** Binds at the next start. |
 | Lowered `runtime_max_processes` | **Not retroactive.** Binds at the next start. |
@@ -2686,10 +2889,10 @@ strings.
 | `running` | Loaded and serving. The only state counted as loaded. |
 | `draining` | No new requests routed; in-flight finishing before SIGTERM. |
 | `backoff` | Crash-loop wait. |
-| `start_failed` | Never became healthy — or never launched: the exec failed, or a config file could not be written to disk ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). |
+| `start_failed` | Never became healthy — or never launched: the exec failed, or a config file could not be written to disk ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)) — or a RAM cold-start bootstrap that died of memory pressure or was never measured (below). |
 | `crashed` | Died while running. |
 | `pending_vram_unknown` | Cannot start because its VRAM demand is unknown and the GPU is occupied (§5.3). |
-| `not_permitted` | Agent-local policy or placeholder expansion refused it — including a config file whose name or content can never be written (§3.5) — or its own demand exceeds a GPU budget outright. A configuration error. |
+| `not_permitted` | Agent-local policy or placeholder expansion refused it — including a config file whose name or content can never be written (§3.5) — or its own demand exceeds a GPU budget — or the host-RAM pool — outright. A configuration error. |
 
 A state transition rings the manager's buffered(1) `Transitions()` doorbell,
 which makes the agent take an immediate coalesced telemetry sample instead of
@@ -2731,6 +2934,46 @@ Three rules keep the backoff honest:
   nothing left to retry. Two guards enforce it: `enterBackoff` returns early
   while closing, and the config-apply removal loop cancels the timer before
   deleting a spec.
+
+**A cold-start bootstrap fails in two bounded ways, and neither can become a
+storm
+([ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)).**
+A *bootstrap* is a start of a spec whose declared RAM demand is unknown (§5.3):
+until a measurement has been written back and pushed, every start is one.
+Everything else here — a known-demand spec, a plain crash, a bad config —
+takes the crash-loop backoff above unchanged.
+
+- **A memory-pressure death earns one evict-and-retry.** When a bootstrap's
+  process exits **on its own** (not an intentional stop, not a removed spec) and
+  something wants the spec up (a queued request, or pinned or `force_running`;
+  evicting a neighbour for a retry nobody is waiting for is pure harm), the exit is
+  classified from its **signature and its last measurement, never from free
+  text**: killed by `SIGKILL` (the Linux OOM killer's signal — the agent's own
+  `SIGKILL` escalation is an intentional stop and never reaches the classifier;
+  Windows has no such signature and relies on the second), or a last-measured
+  resident RAM of at least **90 %** of the host-RAM pool at death (a sample and a
+  measurement are both needed for this one; with either missing only the signal
+  can classify, the conservative direction). Such a death drain-stops **one** idle
+  process (the same eligibility and oldest-first order as every victim), records
+  the failure, enters `start_failed` and the ordinary backoff and **keeps the
+  queued request** for the retry. The spec's `ramBootstrapRetries` counter is
+  capped at **one**: a **second** consecutive memory-pressure death evicts nothing
+  further, fails the queued request and backs off. The counter is reset **only by a
+  successful RAM measurement** (the bootstrap resolved), never by an exit, so a
+  stuck bootstrap evicts at most one process however often it dies, while a later,
+  unrelated pressure event can earn the shot again. That is what keeps it from
+  becoming the fork-exec and eviction storm the starting-process clause of §5.4
+  exists to prevent.
+- **A healthy-but-never-measured bootstrap is failed.** Such a process holds the
+  RAM-bootstrap interlock (§5.3), and with it every other RAM admission on the
+  host, for as long as it stays unmeasured. After **ten** fruitless measurement
+  beats (the beat is the 15 s housekeeping tick, so about two and a half minutes at
+  the production cadence) the owner records
+  `RAM cold-start bootstrap never produced a measurement within the bootstrap
+  deadline`, fails the queued requests, terminates the process and enters backoff.
+  The beat counter advances only while a RAM measurer is installed — on a host
+  with none there is nothing that could resolve it and the interlock is already
+  bounded by `starting` — and a real measurement resets it.
 
 **`last_error` is cleared only by the next successful start — never by a state
 change.** A spec can therefore be `stopped` and still show "last load attempt
@@ -2810,12 +3053,12 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Ten
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Twelve
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
 `runtime_config_files`, `runtime_voices`, `fullduplex_proxy`,
-`runtime_model_params`); two,
+`runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
@@ -2848,7 +3091,10 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_config_files` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), `Since: "0.10.0"`, and
 `runtime_voices` ([§4.1](#41-control-routes)), `Since: "0.11.0"`, and
 `fullduplex_proxy` ([§4.1](#41-control-routes)), `Since: "0.12.0"`, and
-`runtime_model_params` ([§4.1](#41-control-routes)), `Since: "0.13.0"`
+`runtime_model_params` ([§4.1](#41-control-routes)), `Since: "0.13.0"`, and
+`runtime_ram_measurement` ([§5.1](#51-the-per-gpu-data-model),
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.14.0"`, and
+`runtime_ram_accounting` ([§5.2](#52-the-three-gates)), `Since: "0.14.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -3088,6 +3334,37 @@ alone, spelled identically on both sides because the agent module imports nothin
 `TestRuntimeModelParamsFeatureName` pins this side, the agent's registry entry
 `TestFeaturesDeclareRuntimeModelParams`).
 `server-agent`'s `Version` moved `0.12.0` → `0.13.0` for this entry, MINOR per the same rule.
+
+`runtime_ram_measurement` and `runtime_ram_accounting`
+([ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory))
+are the two halves of one change and both have the `gpu_selection`/`runtime_api_token`
+shape, **declared for the gateway's and the portal's benefit and gating nothing on
+the agent**: the agent always measures what it can read and always accounts for the
+`ram_mb` it receives, whether or not anything has declared the names back.
+`runtime_ram_measurement` says the agent reports each managed child's resident RAM
+as the sample's spec-level `ram_measured_mb` (§10). An older agent sends no such key,
+which no probe can tell apart from a spec with no process, so the name is the only
+evidence that an absent figure means "this agent does not report it" rather than
+"not running"; and because an *unmeasured* spec also omits it (`omitempty`, `0` is
+unknown), the flag says the agent **can** report it, not that every spec carries one.
+`runtime_ram_accounting` says the agent receives each spec's host-RAM demand as the
+runtime-config document's spec-level `ram_mb` and honours it in admission. An older
+agent decodes the document without error and **silently ignores** the unknown key,
+which no probe of the agent can tell apart from one that accounts for it, so the
+name is the only evidence that a pushed RAM demand is enforced rather than dropped.
+Both are on the agent's list alone and spelled identically on both sides because the
+agent module imports nothing from the gateway (`gateway.RuntimeRAMMeasurementFeature`
+and `gateway.RuntimeRAMAccountingFeature` are exported for the portal service, as
+`RuntimeModelParamsFeature` is, and are deliberately **not** in
+`gatewayAgentFeatures`; `TestRuntimeRAMMeasurementFeatureName` and
+`TestRuntimeRAMAccountingFeatureName` pin the gateway side, and the agent's registry
+entries `TestFeaturesDeclareRuntimeRAMMeasurement` and
+`TestFeaturesDeclareRuntimeRAMAccounting`). **Nothing on the gateway or portal reads
+either name yet**, the same recorded gap as `runtime_api_token` (§13): no "agent too
+old" advisory is wired to them. Both carry `Since: "0.14.0"` and there was **one**
+bump for the change, `server-agent`'s `Version` `0.13.0` → `0.14.0`, MINOR per the
+same rule — the second flag does not move it again, because a bump is per shipped
+change.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -3365,6 +3642,28 @@ The agent's collector, telemetry sample and ingest are unchanged: the agent only
 There is no mixed-fleet hazard: a gateway that predates the name never asks, and an agent older than
 0.13.0 is never asked by a newer gateway, so its servers simply carry no language fact
 ([ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)).
+
+**`0.13.0` → `0.14.0` (host-RAM accounting) is MINOR, and it is one bump for two
+flags.** `agent.Features` gained `runtime_ram_measurement` and
+`runtime_ram_accounting` ([§7](#7-feature-negotiation)), and the same change altered
+what the agent does in ways an operator observes: it samples the host's available RAM
+(`mem_available_bytes` on the sample's host block, read by the agent itself and not
+ingested by the gateway), derives each GPU's VRAM budget from the device total
+([ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)),
+measures each child's resident RAM, accounts for the pushed `ram_mb`, and runs the
+cold-start bootstrap and its failure handling
+([ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)).
+It also gained three env-only settings (`OP_AGENT_VRAM_HEADROOM_MB`,
+`OP_AGENT_HOST_RAM_RESERVE_MB`, `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB`). The bump is **one
+for the whole change**: the second flag declares `Since: "0.14.0"` rather than a newer
+version, and the `Version` assertion lives in the newest feature's test,
+`TestFeaturesDeclareRuntimeRAMAccounting`, beside
+`TestFeaturesDeclareRuntimeRAMMeasurement` (which keeps its own presence and `Since`
+check). Mixed fleets degrade the safe way in both directions: a gateway that predates
+the names never asks, an agent older than 0.14.0 reports no RAM and ignores `ram_mb`,
+and an upgraded agent behind an older gateway treats every spec as unknown RAM (each
+start charged the bootstrap guess until its own first measurement), so the operator
+rule is "upgrade the gateway first".
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -4454,6 +4753,28 @@ Two honesty rules on those two fields, and both are contracts:
   means *unknown* throughout this feature, and publishing it would make an
   absent measurement look fresh.
 
+**Host RAM rides the sample as one spec-level scalar, `ram_measured_mb`, and the
+live status frame does not carry it (yet).** RAM has no GPU axis and one process
+backs one spec, so the figure sits **beside** `gpus[]` on the runtime entry, not
+inside it: the managed child's resident RAM in MB (RSS, the private working set on
+Windows), declared by the agent feature `runtime_ram_measurement` (§7), `omitempty`,
+and `0` is *unknown* — never measured, no measurer on this host, or the process has
+exited — so an unmeasured spec and every agent that predates the field send no key at
+all. The agent copies it from `Status.MeasuredRAMMB`, which is cleared when the
+process exits for the reason the VRAM figures are (a number that describes a process
+stops being true when the process does). The gateway's ingest writes it back onto
+`agent_runtime_specs.ram_measured_mb` with the VRAM write-back's discipline: a
+strictly positive value only, ownership checked once per distinct `spec_id`, an
+unchanged value not rewritten. **The gateway's live-status DTO (`RuntimeStatusDTO`,
+the SSE frame) does not forward `ram_measured_mb`**, so `RuntimeStatus.ram_measured_mb`
+on the portal client is a reserved optional field that stays `undefined` today and
+nothing may rely on it. The portal's table reads the **durable**
+`RuntimeSpec.ram_measured_mb` instead, the same pattern the VRAM display uses, so a
+new agent measurement reaches the table when the specs are next fetched, not on the
+next live frame, and there is no RAM counterpart of the `measured_at` watermark. This
+is a deliberate, documented follow-up (the status DTO would forward the key), not a
+defect, and no consumer needs the live figure today.
+
 For the wire shape of the stream and its unusual envelope key, see
 [HTTP API Surface](../reference/api-surface.md); for the sample's two additive
 keys, [Telemetry, Usage Analytics &
@@ -5055,14 +5376,30 @@ dropped and never opens. The wrapper element is the same
 `Tooltip > span > item` shape `RowActionsMenu` uses to explain a disabled
 menu item, and it keeps the shared chip's contract unchanged.
 
-Three field semantics the form encodes rather than leaving to guesswork:
+Four field semantics the form encodes rather than leaving to guesswork:
 `vram_measured_mb` is agent-owned and always ignored on write, so it renders as
-read-only text and never as an input; `vram_locked` is the operator's opt-out of
-being *governed* by that measurement — the label says so, and its hint names the
-case that sends people looking for it, a measurement above the GPU budget
-leaving the spec refusing to start (§5.1); and `listen_port: 0` means "the agent
+read-only text and never as an input; the **RAM estimate** is one spec-level
+field, not a column of the per-GPU rows (RAM is host-scoped, §5.1), whose hint
+says what `0` means (*unknown*, not "needs none") and that the agent also
+measures the process and the table shows the larger of the two — it has to stay
+bound to the form's state and to the request body even where the layout moves it,
+because the PUT is a full-document upsert and a save that omitted it would clear
+an estimate set through the API (the measurement has no request field at all, so
+the body drops it rather than echoing it back); there is **no VRAM-lock control**
+any more (§5.1, migration 97), so a measurement above the GPU budget is answered
+by the budget, not by a per-spec switch; and `listen_port: 0` means "the agent
 picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
+
+**The specs table shows the effective values admission uses**, never the bare
+estimate: the per-GPU cell is `max(measured, estimate)` of that row, a **VRAM
+total** column sums those across the spec's GPUs (a card whose demand is still
+unknown adds nothing, so a partly unknown total is a floor), and a **RAM** column
+shows `max(ram_measured_mb, ram_estimate_mb)`; an unknown value is an em dash,
+never a `0 MB`. Both summary columns sort by magnitude and the cell text carries
+the unit while the column `value` stays the bare number. The values are the
+durable spec figures the portal loaded (§10), so an agent's fresh measurement
+reaches them when the specs are next fetched.
 
 **Every launch spec also carries its own API-Varianten block** — the identical
 `openai`/`anthropic`/`openai_images`/`openai_audio` flavor checkboxes and Codex/Claude-Code
@@ -5678,8 +6015,12 @@ reading each GPU's index, name, optional UUID and total memory, seeding the
 budget from total memory — falling back to "lowest unused index, 0 MB" only when
 telemetry offers no further unconfigured GPU. Reusing that fetch is what prevents
 a second, divergent source of GPU inventory. That `0 MB` fallback is safe
-precisely because `0` means unconstrained (§5.2): a row the operator saves
-without filling in is a no-op, not a refusal of every model on that card.
+precisely because `0` is not read as a literal ceiling (§5.2): a row the operator
+saves without filling in is not a refusal of every model on that card — the agent
+treats it as "no budget set" and uses the detected device total in its place where
+it can read one (§5.1), and `Admit` itself reads it as unconstrained otherwise. The
+form still shows only the **saved** rows, never the detected budget the agent is
+actually enforcing, and a positive value is the operator overriding it.
 
 **Drift detection is descriptive and must never block.** A budget row's
 `expected_uuid` / `expected_name` are snapshotted server-side from live telemetry
@@ -6320,12 +6661,13 @@ reasoned rather than measured.
 spec's own declared demand, and a breach by a *measured* value is terminal — so
 a gateway-computed delta that overshot (a neighbour allocating inside the
 window) would refuse every future start of a model that had been working, with
-no operator action having occurred. `vram_locked` exists precisely so the
-operator can opt out of being governed by *the agent's* measurement, and a
-second differently-sourced writer of the same field makes that lever mean
-something else; the write-back's unchanged-value suppression would also start
-lying, and the agent's next differing measurement would overwrite the
-benchmark's number anyway. Not `vram_estimate_mb` either: it is operator-owned,
+no operator action having occurred. Under `max(measured, estimate)` that
+stored measurement is a **floor no operator control can lower** (§5.1; there is no
+lock to opt out with any more), so a second, differently-sourced writer of the
+same field would put a number the agent never observed under every future
+admission; the write-back's unchanged-value suppression would also start lying, and
+the agent's next differing measurement would overwrite the benchmark's number
+anyway. Not `vram_estimate_mb` either: it is operator-owned,
 and putting a machine number in a field whose whole meaning is "what the
 operator declares" takes the decision away from them. Exactly like the context
 probe, the run status carries the result and the launch-spec form offers an
@@ -7422,7 +7764,27 @@ operator meets first:
 - **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
   GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for
-  the agent to resolve.
+  the agent to resolve. Host RAM does not share the limit: it is measured on every
+  platform whose OS exposes per-process memory to the agent (a container without
+  `/proc` mounted is the realistic exception, and there the operator's
+  `ram_estimate_mb` is the only number there will be).
+- **The RAM axis is bounded by what it can see.** The pool follows the live
+  available memory, the measured figure is the managed child's *own* pid (workers a
+  server forks are not summed, which errs conservative), the first-start guess
+  cannot bound a model's true footprint, and the pool is unconstrained for the
+  moments before the first hardware sample. Each is a recorded acceptance, with its
+  mitigation, in
+  [§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances); so
+  is the boot-time window in which the detected VRAM budgets can be absent.
+- **`runtime_ram_measurement` and `runtime_ram_accounting` have no consumer yet**,
+  the same recorded gap as `runtime_api_token`'s flag: nothing on the gateway or
+  portal reads either name back today, so an operator who pairs an agent older than
+  0.14.0 with a newer gateway gets no portal warning that its pushed `ram_mb` is
+  silently ignored (§7).
+- **The live status frame does not carry the measured RAM.** The gateway's
+  runtime-status DTO does not forward `ram_measured_mb`, so the portal's RAM column
+  reads the durable spec value and a new measurement lands when the specs are next
+  fetched, not on the next frame (§10). A documented follow-up.
 - **A *literal* secret written into a spec reaches the gateway unmasked** — in
   `args` in either mode, or in an `env` value of a gateway-authored spec, where
   the gateway holds the plaintext document anyway. A resolved secret of either
@@ -7965,8 +8327,9 @@ markers.
 ## 15. Configuration reference
 
 Agent settings on the agent's existing precedence — flag, then environment,
-then config file — except the four marked **no flag form**, which resolve
-environment, then file, then default. Passing a flag the agent does not register
+then config file — except those marked **no flag form**, which resolve
+environment, then file, then default; the three resource-accounting settings at
+the end of the table are **env-only**: no flag, and no config-file key either. Passing a flag the agent does not register
 is a *startup error*, so that marking is load-bearing rather than editorial;
 `scripts/check-docs.sh` gates it against the flags `server-agent` actually
 registers, over the authoritative table in
@@ -7984,11 +8347,14 @@ registers, over the authoritative table in
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
 | `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
 | `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` (**no flag form**) | 16 MiB | Ceiling on that retention across all specs. |
+| `OP_AGENT_VRAM_HEADROOM_MB` (**no flag form**, env-only) | `0` | MB held back from each **auto-detected** per-GPU VRAM budget, for the driver, a display or another tenant; never applied to a budget the operator set ([§5.1](#51-the-per-gpu-data-model), [ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)). `0` is a real value; a negative or malformed one falls back to `0`. |
+| `OP_AGENT_HOST_RAM_RESERVE_MB` (**no flag form**, env-only) | `2048` | Host RAM held back from the host-RAM admission pool (`MemAvailable` + what managed processes hold − this), room for the OS, the agent and whatever else shares the host ([§5.2](#52-the-three-gates), [ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)). `0` is a real value (reserve nothing); a negative or malformed one falls back to the default. |
+| `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` (**no flag form**, env-only) | `4096` | Conservative host RAM charged to a spec of unknown RAM demand on its first start, until it is measured ([§5.3](#53-unknown-vram-resolves-itself-by-measurement), [ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)). Errs high on purpose; `0` turns the charge off (not the bootstrap interlock); a negative or malformed value falls back to the default. Raise it for a RAM-heavy model whose demand is not yet declared. |
 
 Gateway-side knobs are per-server and per-spec database columns, not environment
 variables: `ai_servers.runtime_max_processes`,
-`ai_servers.managed_runtime_only`, `ai_server_gpu_budgets.budget_mb`, and the
-per-spec timeouts. See [Data Model](../reference/data-model.md).
+`ai_servers.managed_runtime_only`, `ai_server_gpu_budgets.budget_mb`, the per-spec
+timeouts, and the per-spec `ram_estimate_mb` (the operator's RAM floor). See [Data Model](../reference/data-model.md).
 
 The full variable list is in
 [Configuration & Environment Variables](../reference/config-env.md); the

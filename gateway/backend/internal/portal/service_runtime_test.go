@@ -137,6 +137,129 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPutRuntimeSpecPersistsRAMEstimate pins the operator half of the per-spec
+// RAM pair: a PUT's ram_estimate_mb reaches the stored spec and the returned
+// DTO, and -- the PUT being a full-document upsert -- a later PUT that omits it
+// stores 0 ("no estimate", the unknown sentinel), not the previous value.
+func TestPutRuntimeSpecPersistsRAMEstimate(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", RAMEstimateMB: 4096,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if dto.RAMEstimateMB != 4096 || dto.RAMMeasuredMB != 0 {
+		t.Fatalf("dto ram = estimate %d measured %d, want 4096 and 0 (nothing measured yet)", dto.RAMEstimateMB, dto.RAMMeasuredMB)
+	}
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mapping.ID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+	}
+	if stored.RAMEstimateMB != 4096 {
+		t.Fatalf("stored RAMEstimateMB = %d, want 4096", stored.RAMEstimateMB)
+	}
+
+	// The agent measures; the operator then re-saves with a new estimate. The
+	// estimate moves, the agent-owned measurement survives.
+	if err := routeStore.UpdateRuntimeSpecRAMMeasured(ctx, dto.ID, 5000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	dto2, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", RAMEstimateMB: 8192,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (second): %v", err)
+	}
+	if dto2.ID != dto.ID || dto2.RAMEstimateMB != 8192 || dto2.RAMMeasuredMB != 5000 {
+		t.Fatalf("second PUT = id %q estimate %d measured %d, want the same id, 8192 and the preserved 5000", dto2.ID, dto2.RAMEstimateMB, dto2.RAMMeasuredMB)
+	}
+
+	// A full-document PUT that omits the estimate clears it; the measurement
+	// still survives.
+	dto3, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (third): %v", err)
+	}
+	if dto3.RAMEstimateMB != 0 || dto3.RAMMeasuredMB != 5000 {
+		t.Fatalf("third PUT = estimate %d measured %d, want 0 (cleared) and the preserved 5000", dto3.RAMEstimateMB, dto3.RAMMeasuredMB)
+	}
+}
+
+// TestGetRuntimeSpecReturnsRAMFields pins the read side: GET carries the
+// operator's estimate and the agent's measurement, and an unconfigured mapping
+// reports both as 0 (unknown) rather than omitting the keys.
+func TestGetRuntimeSpecReturnsRAMFields(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	empty, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec (unconfigured): %v", err)
+	}
+	if empty.Configured || empty.RAMEstimateMB != 0 || empty.RAMMeasuredMB != 0 {
+		t.Fatalf("unconfigured dto = %#v, want Configured:false with both RAM fields 0", empty)
+	}
+	raw, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("marshal unconfigured dto: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal unconfigured dto: %v", err)
+	}
+	for _, key := range []string{"ram_estimate_mb", "ram_measured_mb"} {
+		if string(keys[key]) != "0" {
+			t.Fatalf("unconfigured dto wire %s = %q, want the explicit 0 (the keys are never omitted)", key, keys[key])
+		}
+	}
+
+	put, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", RAMEstimateMB: 4096,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpdateRuntimeSpecRAMMeasured(ctx, put.ID, 5000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if got.RAMEstimateMB != 4096 || got.RAMMeasuredMB != 5000 {
+		t.Fatalf("GetRuntimeSpec ram = estimate %d measured %d, want 4096 and 5000", got.RAMEstimateMB, got.RAMMeasuredMB)
+	}
+	raw, err = json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal dto: %v", err)
+	}
+	if string(keys["ram_estimate_mb"]) != "4096" || string(keys["ram_measured_mb"]) != "5000" {
+		t.Fatalf("dto wire ram_estimate_mb = %q ram_measured_mb = %q, want 4096 and 5000", keys["ram_estimate_mb"], keys["ram_measured_mb"])
+	}
+}
+
 func TestPutRuntimeSpecValidation(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -182,6 +305,12 @@ func TestPutRuntimeSpecValidation(t *testing.T) {
 			name:      "negative idle timeout",
 			mappingID: agentMapping.ID,
 			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.IdleTimeoutSeconds = -1; return r },
+			wantErr:   ErrRuntimeSpecTuningInvalid,
+		},
+		{
+			name:      "negative ram estimate",
+			mappingID: agentMapping.ID,
+			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.RAMEstimateMB = -1; return r },
 			wantErr:   ErrRuntimeSpecTuningInvalid,
 		},
 		{
@@ -1323,7 +1452,7 @@ func TestRuntimeWarningsIgnoresDisabledSpecs(t *testing.T) {
 // wire contract (spec §11): RouterListen is the server_agent application's
 // Port, only ENABLED specs appear, coresidency pairs are translated from
 // mapping ids to spec ids (dropping any pair touching a disabled/missing
-// spec), per-GPU VRAMMB prefers the measured value over the estimate, and a
+// spec), per-GPU VRAMMB is max(measured, estimate), and a
 // server with no server_agent application yet gets the fully empty document
 // -- never an error.
 func TestAgentRuntimeConfigAssembly(t *testing.T) {
@@ -1793,114 +1922,182 @@ func TestAgentRuntimeConfigPropagatesTransientServerReadFailure(t *testing.T) {
 	}
 }
 
-// TestAgentRuntimeConfigVRAMLockedServesTheOperatorEstimate is the escape
-// hatch for the measurement ratchet, and the scenario is the one an operator
-// actually lands in.
+// TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate pins the precedence of
+// the VRAM demand the gateway pushes to the agent: max(measured, estimate).
 //
-// The loop is closed and one-way: the agent measures its own child, the
-// gateway stores it, this DTO prefers measured over estimate, the agent reads
-// it back as the spec's OWN DECLARED DEMAND, and Admit's rule 3 answers a
-// demand above the GPU's budget with a TERMINAL not_permitted. A 24 GB card
-// budgeted at 20000 MB for headroom, an 18000 MB estimate that served fine,
-// and one 22000 MB measurement (llama.cpp with a large KV cache) is enough:
-// from then on every start of a model that had been working is refused, with
-// no operator action having occurred anywhere.
+// The operator's estimate is a FLOOR and the agent's measurement raises it when
+// reality is higher -- never the other way round. That is the "never
+// under-reserve" rule, and it is load-bearing rather than cosmetic: this DTO is
+// not just what the portal displays, it is the spec's own declared demand that
+// the agent feeds into Admit, so a value that is too low here is a co-resident
+// pair that reaches an OOM.
 //
-// And it could not be undone. PutRuntimeSpec deliberately copies the stored
-// measured value forward and ignores what the request sends; the write-back
-// skips values <= 0; and the spec never runs again, so no newer measurement
-// is ever taken. Raising the budget above what the card physically has is a
-// capitulation, not a lever, and deleting and re-adding the GPU row across
-// two saves is not something an operator can be expected to discover.
+// It replaces the old "measured wins unless the spec's VRAM is locked" rule.
+// Under that rule a measurement BELOW the estimate silently lowered the
+// reservation, and the only way to hold it up was a separate per-spec lock
+// flag; max() makes the floor unconditional, so that flag no longer exists.
 //
-// vram_locked is that lever, and this is what makes it one: it must stop the
-// gateway SERVING the measurement, not merely stop the agent WRITING it.
-// Locked, the operator's own estimate is authoritative in both directions --
-// which is the plain meaning of "locked" and the only reading under which the
-// flag is any use to someone staring at a spec that will not start.
-func TestAgentRuntimeConfigVRAMLockedServesTheOperatorEstimate(t *testing.T) {
-	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	ctx := context.Background()
-	svc, routeStore := newServerTestService(t, now)
-	server := createTestServer(t, svc, "S", "s.example.test")
-	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+// A 0 on either side is "unknown", never "needs none": measured 0 (never
+// measured) yields the estimate, estimate 0 yields the measurement, and both 0
+// stays 0 so the agent still sees an unknown demand and bootstraps it.
+func TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate(t *testing.T) {
+	cases := []struct {
+		name     string
+		measured int
+		estimate int
+		want     int
+	}{
+		{name: "measured above estimate raises it", measured: 9000, estimate: 8000, want: 9000},
+		{name: "never measured yields the estimate", measured: 0, estimate: 8000, want: 8000},
+		{name: "measured below estimate is floored at the estimate", measured: 7000, estimate: 8000, want: 8000},
+		{name: "no estimate yields the measurement", measured: 9000, estimate: 0, want: 9000},
+		{name: "both unknown stays unknown", measured: 0, estimate: 0, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+			ctx := context.Background()
+			svc, routeStore := newServerTestService(t, now)
+			server := createTestServer(t, svc, "S", "s.example.test")
+			app := seedServerAgentApplication(t, routeStore, server.ID, now)
+			mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "llama", AppModelName: "llama-3-8b"})
+			if err != nil {
+				t.Fatalf("CreateMapping: %v", err)
+			}
+			spec, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+				Enabled: true,
+				Binary:  "/usr/bin/llama-server",
+				GPUs:    []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: tc.estimate}},
+			})
+			if err != nil {
+				t.Fatalf("PutRuntimeSpec: %v", err)
+			}
+			if tc.measured > 0 {
+				// The agent measured its own child and wrote it back.
+				if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, 0, tc.measured); err != nil {
+					t.Fatalf("seed measured value: %v", err)
+				}
+			}
 
-	// 20000 MB of a 24 GB card: the headroom is deliberate.
-	if _, err := svc.SetServerGPUBudgets(ctx, ownerToken(), server.ID, SetGPUBudgetsRequest{
-		Budgets: []GPUBudgetDTO{{Index: 0, BudgetMB: 20000}},
-	}); err != nil {
-		t.Fatalf("SetServerGPUBudgets: %v", err)
-	}
-	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "llama", AppModelName: "llama-3-8b"})
-	if err != nil {
-		t.Fatalf("CreateMapping: %v", err)
-	}
-	base := PutRuntimeSpecRequest{
-		Enabled: true,
-		Binary:  "/usr/bin/llama-server",
-		GPUs:    []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 18000}},
-	}
-	spec, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, base)
-	if err != nil {
-		t.Fatalf("PutRuntimeSpec: %v", err)
-	}
-	// The agent measured its own child at 22000 MB and wrote it back.
-	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, 0, 22000); err != nil {
-		t.Fatalf("seed measured value: %v", err)
-	}
+			dto, err := svc.AgentRuntimeConfig(ctx, server.ID)
+			if err != nil {
+				t.Fatalf("AgentRuntimeConfig: %v", err)
+			}
+			if len(dto.Specs) != 1 || len(dto.Specs[0].GPUs) != 1 {
+				t.Fatalf("dto.Specs = %#v, want one spec with one GPU", dto.Specs)
+			}
+			if got := dto.Specs[0].GPUs[0].VRAMMB; got != tc.want {
+				t.Fatalf("pushed vram_mb = %d for measured=%d estimate=%d, want max(measured, estimate) = %d", got, tc.measured, tc.estimate, tc.want)
+			}
 
-	// Precondition: the trap is armed. The agent is handed a declared demand
-	// of 22000 MB against its own 20000 MB budget -- terminal not_permitted.
-	dto, err := svc.AgentRuntimeConfig(ctx, server.ID)
-	if err != nil {
-		t.Fatalf("AgentRuntimeConfig: %v", err)
+			// Serving the larger of the two must not rewrite either stored
+			// figure: the estimate stays the operator's and the measurement
+			// stays the agent's.
+			gpus, err := routeStore.RuntimeSpecGPUs(ctx, spec.ID)
+			if err != nil || len(gpus) != 1 {
+				t.Fatalf("RuntimeSpecGPUs: gpus=%#v err=%v", gpus, err)
+			}
+			if gpus[0].VRAMMeasuredMB != tc.measured || gpus[0].VRAMEstimateMB != tc.estimate {
+				t.Fatalf("stored (measured, estimate) = (%d, %d), want (%d, %d) untouched", gpus[0].VRAMMeasuredMB, gpus[0].VRAMEstimateMB, tc.measured, tc.estimate)
+			}
+		})
 	}
-	if len(dto.Specs) != 1 || len(dto.Specs[0].GPUs) != 1 {
-		t.Fatalf("dto.Specs = %#v, want one spec with one GPU", dto.Specs)
-	}
-	if got := dto.Specs[0].GPUs[0].VRAMMB; got != 22000 {
-		t.Fatalf("unlocked vram_mb = %d, want the measured 22000 -- this test's premise (measured wins) does not hold", got)
-	}
+}
 
-	// The operator's lever: pin the VRAM numbers. Same estimate, same GPU row.
-	locked := base
-	locked.VRAMLocked = true
-	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, locked); err != nil {
-		t.Fatalf("PutRuntimeSpec (locked): %v", err)
+// TestAgentConfigCarriesRAMDemand pins the host-RAM demand the gateway pushes
+// to the agent as the spec-level ram_mb: max(ram_measured_mb, ram_estimate_mb),
+// the same "estimate is a floor, a larger measurement raises it" rule the
+// per-GPU VRAM figure follows (TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate).
+//
+// RAM is host-scoped, not per-card, so the figure rides on the spec itself and
+// never on a gpus[] row. A 0 on either side is "unknown", never "needs none": a
+// never-measured spec yields the estimate, an estimate of 0 yields the
+// measurement, and both 0 stays 0 so the agent still sees an unknown demand.
+// Neither stored figure is rewritten by serving the larger of the two.
+func TestAgentConfigCarriesRAMDemand(t *testing.T) {
+	cases := []struct {
+		name     string
+		measured int
+		estimate int
+		want     int
+	}{
+		{name: "measured above estimate raises it", measured: 5000, estimate: 4096, want: 5000},
+		{name: "never measured yields the estimate", measured: 0, estimate: 4096, want: 4096},
+		{name: "measured below estimate is floored at the estimate", measured: 3000, estimate: 4096, want: 4096},
+		{name: "no estimate yields the measurement", measured: 5000, estimate: 0, want: 5000},
+		{name: "both unknown stays unknown", measured: 0, estimate: 0, want: 0},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+			ctx := context.Background()
+			svc, routeStore := newServerTestService(t, now)
+			server := createTestServer(t, svc, "S", "s.example.test")
+			app := seedServerAgentApplication(t, routeStore, server.ID, now)
+			mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "llama", AppModelName: "llama-3-8b"})
+			if err != nil {
+				t.Fatalf("CreateMapping: %v", err)
+			}
+			spec, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+				Enabled:       true,
+				Binary:        "/usr/bin/llama-server",
+				GPUs:          []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 8000}},
+				RAMEstimateMB: tc.estimate,
+			})
+			if err != nil {
+				t.Fatalf("PutRuntimeSpec: %v", err)
+			}
+			if tc.measured > 0 {
+				// The agent measured its own child's resident RAM and wrote it back.
+				if err := routeStore.UpdateRuntimeSpecRAMMeasured(ctx, spec.ID, tc.measured); err != nil {
+					t.Fatalf("seed measured RAM: %v", err)
+				}
+			}
 
-	dto2, err := svc.AgentRuntimeConfig(ctx, server.ID)
-	if err != nil {
-		t.Fatalf("AgentRuntimeConfig (locked): %v", err)
-	}
-	if got := dto2.Specs[0].GPUs[0].VRAMMB; got != 18000 {
-		t.Fatalf("locked vram_mb = %d, want the operator's own estimate 18000 -- BUG F3: vram_locked stops the agent WRITING a measurement but the gateway keeps SERVING the stored one, so a spec made terminally not_permitted by a measurement has no operator lever at all", got)
-	}
+			dto, err := svc.AgentRuntimeConfig(ctx, server.ID)
+			if err != nil {
+				t.Fatalf("AgentRuntimeConfig: %v", err)
+			}
+			if len(dto.Specs) != 1 {
+				t.Fatalf("dto.Specs = %#v, want exactly one spec", dto.Specs)
+			}
+			if got := dto.Specs[0].RAMMB; got != tc.want {
+				t.Fatalf("pushed ram_mb = %d for measured=%d estimate=%d, want max(measured, estimate) = %d", got, tc.measured, tc.estimate, tc.want)
+			}
 
-	// The measurement itself stays on file: it is the evidence that tells the
-	// operator WHY they had to intervene, and the portal renders it.
-	gpus, err := routeStore.RuntimeSpecGPUs(ctx, spec.ID)
-	if err != nil || len(gpus) != 1 {
-		t.Fatalf("RuntimeSpecGPUs: gpus=%#v err=%v", gpus, err)
-	}
-	if gpus[0].VRAMMeasuredMB != 22000 {
-		t.Fatalf("stored vram_measured_mb = %d, want the measurement preserved at 22000 -- locking pins which number the agent is TOLD, it must not erase the observation", gpus[0].VRAMMeasuredMB)
-	}
-	if gpus[0].VRAMEstimateMB != 18000 {
-		t.Fatalf("stored vram_estimate_mb = %d, want 18000", gpus[0].VRAMEstimateMB)
-	}
+			// The wire key is the spec-level ram_mb, and it is not a per-GPU
+			// field: RAM is a host resource, so a gpus[] row must not carry it.
+			raw, err := json.Marshal(dto.Specs[0])
+			if err != nil {
+				t.Fatalf("marshal spec dto: %v", err)
+			}
+			var wire struct {
+				RAMMB *int             `json:"ram_mb"`
+				GPUs  []map[string]any `json:"gpus"`
+			}
+			if err := json.Unmarshal(raw, &wire); err != nil {
+				t.Fatalf("unmarshal wire spec: %v", err)
+			}
+			if wire.RAMMB == nil || *wire.RAMMB != tc.want {
+				t.Fatalf("wire ram_mb = %v, want an explicit %d on the spec (never omitted, so 0 stays 'unknown' on the wire)", wire.RAMMB, tc.want)
+			}
+			for _, g := range wire.GPUs {
+				if _, ok := g["ram_mb"]; ok {
+					t.Fatalf("a gpus[] row carries ram_mb (%v); RAM is host-scoped and belongs on the spec only", g)
+				}
+			}
 
-	// Unlocking hands the measurement back: the agent stays the owner of the
-	// number, the operator only chooses whether to be governed by it.
-	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, base); err != nil {
-		t.Fatalf("PutRuntimeSpec (unlocked again): %v", err)
-	}
-	dto3, err := svc.AgentRuntimeConfig(ctx, server.ID)
-	if err != nil {
-		t.Fatalf("AgentRuntimeConfig (unlocked again): %v", err)
-	}
-	if got := dto3.Specs[0].GPUs[0].VRAMMB; got != 22000 {
-		t.Fatalf("re-unlocked vram_mb = %d, want the measured 22000 back", got)
+			// Serving the larger of the two must not rewrite either stored
+			// figure: the estimate stays the operator's and the measurement
+			// stays the agent's.
+			stored, ok, err := routeStore.RuntimeSpecByID(ctx, spec.ID)
+			if err != nil || !ok {
+				t.Fatalf("RuntimeSpecByID: ok=%v err=%v", ok, err)
+			}
+			if stored.RAMMeasuredMB != tc.measured || stored.RAMEstimateMB != tc.estimate {
+				t.Fatalf("stored (measured, estimate) = (%d, %d), want (%d, %d) untouched", stored.RAMMeasuredMB, stored.RAMEstimateMB, tc.measured, tc.estimate)
+			}
+		})
 	}
 }
 

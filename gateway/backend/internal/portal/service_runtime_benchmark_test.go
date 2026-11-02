@@ -40,8 +40,12 @@ func benchmarkSpecFixture(t *testing.T) (*Service, func() []string, string, Runt
 		IdleTimeoutSeconds:          900,
 		AdmissionWaitTimeoutSeconds: 45,
 		Pinned:                      true,
-		VRAMLocked:                  true,
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 18000}, {Index: 1, VRAMEstimateMB: 18000}},
+		// The operator's RAM estimate (migration 96), non-zero for the same
+		// reason as the fields below: the benchmark writers spread this loaded
+		// document back through PutRuntimeSpec, so a mapper that forgot the
+		// field would silently reset it to 0 (unknown).
+		RAMEstimateMB: 6144,
 		// Deliberately non-default, so a full-document write that quietly
 		// re-defaulted these (rather than spreading the loaded document) would
 		// be caught by TestSetBenchmarkRuntimeSpecAdminStateIsAFullDocumentWriteThatNotifies.
@@ -101,6 +105,10 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		"effective_type":              true,
 		"resolved_metrics_path":       true,
 		"resolved_context_probe_path": true,
+		// ram_measured_mb is agent-owned (migration 96), the spec-level twin of
+		// vram_measured_mb above: the store keeps it across every upsert and a
+		// request never carries it, so it is a read-only echo here.
+		"ram_measured_mb": true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only
@@ -156,10 +164,11 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		AdmissionWaitTimeoutSeconds: 30,
 		Pinned:                      true,
 		AdminState:                  "force_running",
-		VRAMLocked:                  true,
 		SetVisibleDevices:           true,
 		VisibleDevicesMode:          string(routing.VisibleDevicesModeArgs),
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 3, VRAMEstimateMB: 12000, VRAMMeasuredMB: 11500}},
+		RAMEstimateMB:               4096,
+		RAMMeasuredMB:               3900, // read-only; must NOT appear in want below
 		ConfigFiles:                 []ConfigFileDTO{{Name: "server.json", Content: `{"threads":8}`}},
 		APIFlavors:                  []string{routing.APIFlavorOpenAI},
 		ResponsesMode:               string(routing.EndpointModeDisabled),
@@ -191,10 +200,10 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		AdmissionWaitTimeoutSeconds: dto.AdmissionWaitTimeoutSeconds,
 		Pinned:                      dto.Pinned,
 		AdminState:                  dto.AdminState,
-		VRAMLocked:                  dto.VRAMLocked,
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
+		RAMEstimateMB:               dto.RAMEstimateMB,
 		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
@@ -323,9 +332,7 @@ func TestSetBenchmarkRuntimeSpecAdminStateRefusesAnOverrideOnAMissingSpec(t *tes
 // test-plan item 11 at the layer that would actually do the damage, and it is
 // named after the rule it protects: vram_estimate_mb is operator-owned and
 // vram_measured_mb is agent-owned, so a benchmark's own write path must move
-// neither. It also covers the field that made the ratchet dangerous:
-// vram_locked survives, because it is the operator's only escape from being
-// governed by a measurement.
+// neither.
 func TestSetBenchmarkRuntimeSpecAdminStateNeverWritesTheVRAMFields(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _, spec := benchmarkSpecFixture(t)
@@ -355,13 +362,6 @@ func TestSetBenchmarkRuntimeSpecAdminStateNeverWritesTheVRAMFields(t *testing.T)
 	}
 	if !reflect.DeepEqual(gpus, want) {
 		t.Fatalf("a full VRAM run's own writes moved a VRAM number:\n got %#v\nwant %#v", gpus, want)
-	}
-	current, err := svc.GetRuntimeSpec(ctx, ownerToken(), spec.MappingID)
-	if err != nil {
-		t.Fatalf("GetRuntimeSpec: %v", err)
-	}
-	if !current.VRAMLocked {
-		t.Fatal("vram_locked was cleared by a benchmark write")
 	}
 }
 

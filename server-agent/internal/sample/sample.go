@@ -179,7 +179,17 @@ type RuntimeSample struct {
 	// means "the document was read and states no options".
 	ImageOptions *RuntimeImageOptions `json:"image_options,omitempty"`
 	GPUs         []RuntimeGPUSample   `json:"gpus,omitempty"`
-	LastError    *RuntimeErrorSample  `json:"last_error,omitempty"`
+	// RAMMeasuredMB is the spec's current process's resident host RAM in MB,
+	// as the agent's own RAM measurer last observed it (RSS off Windows, the
+	// private working set on it). A spec-level scalar beside GPUs, not inside
+	// it: RAM has no per-GPU axis, and one process backs one spec. 0 means
+	// UNKNOWN -- never measured, no measurer on this host, or the process has
+	// exited -- and is never "needs no RAM", which is why it is omitempty: an
+	// unmeasured spec, and every agent that predates the field, sends no key at
+	// all and stays byte-neutral for the gateway's decoder. Declared by the
+	// runtime_ram_measurement feature; Status.MeasuredRAMMB is its source.
+	RAMMeasuredMB int                 `json:"ram_measured_mb,omitempty"`
+	LastError     *RuntimeErrorSample `json:"last_error,omitempty"`
 }
 
 // RuntimeImageOptions is one stable_diffusion_cpp child's image-generation
@@ -351,16 +361,22 @@ type ProxyRouteSample struct {
 
 // Host is the host portion of a Sample (CPU/memory/swap/load/network).
 type Host struct {
-	CPUUtilPct     float64   `json:"cpu_util_pct"`
-	CPUCores       []float64 `json:"cpu_cores"` // per-core utilization %, aligned to core index
-	MemUsedBytes   int64     `json:"mem_used_bytes"`
-	MemTotalBytes  int64     `json:"mem_total_bytes"`
-	SwapUsedBytes  int64     `json:"swap_used_bytes"`
-	SwapTotalBytes int64     `json:"swap_total_bytes"`
-	Load1          float64   `json:"load1"`
-	Load5          float64   `json:"load5"`
-	Load15         float64   `json:"load15"`
-	Net            []Net     `json:"net"`
+	CPUUtilPct    float64   `json:"cpu_util_pct"`
+	CPUCores      []float64 `json:"cpu_cores"` // per-core utilization %, aligned to core index
+	MemUsedBytes  int64     `json:"mem_used_bytes"`
+	MemTotalBytes int64     `json:"mem_total_bytes"`
+	// MemAvailableBytes is the RAM obtainable right now without swapping
+	// (gopsutil VirtualMemoryStat.Available: MemAvailable on Linux). It is NOT
+	// total minus used -- reclaimable page cache counts as available -- and it
+	// is what RAM admission budgets against. 0 means "not measured" (a failed
+	// read), never "no RAM free".
+	MemAvailableBytes int64   `json:"mem_available_bytes"`
+	SwapUsedBytes     int64   `json:"swap_used_bytes"`
+	SwapTotalBytes    int64   `json:"swap_total_bytes"`
+	Load1             float64 `json:"load1"`
+	Load5             float64 `json:"load5"`
+	Load15            float64 `json:"load15"`
+	Net               []Net   `json:"net"`
 	// CPUPowerW / SystemPowerW are best-effort, NULLABLE host-level power draw in
 	// watts (CPU package + total system). A nil pointer = "not measured" (omitted
 	// from the wire), distinct from a real 0 W. Collected by a PowerCollector; the

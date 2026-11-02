@@ -69,6 +69,9 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. **Under `cert_mode: "proxy"` it is the other way round** — that mode makes `cert_dir` mandatory, so the empty default resolves to the leaf's mesh address, never all interfaces and never loopback. **Resolved once at process start**, so a boot before the first certificate install binds all interfaces until the agent restarts. See [Managed model runtime](#managed-model-runtime). |
 | `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` | — (file/env only) | `runtime_log_buffer_bytes` | `1048576` (1 MiB) | How much of each managed model process's stdout+stderr the agent keeps **in memory**, in bytes, so an operator can read it after the fact. The buffer belongs to the **spec**, not the process, so a crashed model's output survives it, and a restart appends after a visible boundary marker rather than wiping the history. Below `65536` is raised to it. Operator-only, like the allowlists: memory on this host is the operator's tradeoff and the gateway can never raise it. **Never written to disk** — this content can include prompt text. |
 | `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` | — (file/env only) | `runtime_log_buffer_total_bytes` | `16777216` (16 MiB) | Ceiling on the **sum** of those buffers across every spec, so a server with twenty specs is not twenty times the per-spec number. The agent keeps at most `total / per-spec` buffers, evicting the least-recently-written one nobody is watching. This is the number to reason about when sizing the agent's memory. |
+| `OP_AGENT_VRAM_HEADROOM_MB` | — (env only) | — (env only) | `0` | MB held back from each GPU's **auto-detected** VRAM budget, for the driver, a display or another tenant. The agent derives a budget for every GPU it can read from that GPU's total memory, so VRAM admission is enforced by default; a positive per-GPU budget set in the portal wins verbatim and gets no headroom subtracted. `0` is a real value. Operator-only: the gateway can never supply it. |
+| `OP_AGENT_HOST_RAM_RESERVE_MB` | — (env only) | — (env only) | `2048` | Host RAM (MB) held back from the pool managed models are admitted against. The pool is the host's live available memory plus what the managed processes already hold, minus this reserve, so it follows what the host has right now (a co-located container stack that grows lowers it). `0` is a real value (reserve nothing). Operator-only. |
+| `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` | — (env only) | — (env only) | `4096` | Conservative host RAM (MB) charged to a model of unknown RAM demand on its first start, until its real footprint has been measured. It errs high on purpose: with headroom the model starts and is measured, on a tight host idle models are evicted (or the start waits) rather than the new one starting blind. `0` turns the charge off. Raise it for a RAM-heavy model whose demand you have not yet entered in the portal. Operator-only. |
 | `OP_AGENT_VERBOSE`      | `-v` / `-verbose`| `verbose`      | `false` | Verbose mode: emit detailed **debug** logs to stderr — resolved config (token never logged), each collect cycle, and every telemetry POST with URL, HTTP status, duration, and retry/backoff. Use this to diagnose why the agent can't reach the gateway. |
 
 ### Config file
@@ -387,6 +390,33 @@ Three things worth knowing before you turn it on:
 
 Each spec gets its own value; one model on three cards and another on two do not
 interfere. Leaving it off changes nothing about how a spec launches.
+
+#### Memory budgets: VRAM and host RAM are enforced by default
+
+Before it starts a model the agent checks that the models already running, plus the
+new one, fit in **GPU memory** (per card) and in **host RAM** (one pool for the whole
+machine). Both limits exist without any configuration:
+
+- **VRAM.** Each GPU's budget is its total memory as the agent reads it, minus
+  `OP_AGENT_VRAM_HEADROOM_MB` (default `0`). A per-GPU budget you saved in the portal
+  wins exactly as you typed it, even above the card; a saved budget of `0` means "none
+  set" and is replaced by the detected total. Apple GPUs are skipped (their reported
+  "total" is the memory currently allocated, not a ceiling), and on an AMD APU the
+  reported VRAM may be a BIOS carve-out smaller than what the GPU can really use: set a
+  positive budget there.
+- **Host RAM.** The pool is the host's live available memory plus what the managed models
+  already hold, minus `OP_AGENT_HOST_RAM_RESERVE_MB` (default `2048`), so a co-located
+  container stack that grows tightens it on the next sample with nothing to configure.
+  A model is charged the larger of what the agent measured (resident set size; the private
+  working set on Windows) and the RAM estimate you entered; with neither it is charged
+  `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` (default `4096`) on its first start, which then runs
+  and is measured. Idle models are evicted, oldest first, to make room; other starts wait
+  while a first start is still being measured.
+
+This is a behaviour change on existing hosts: a model whose demand is larger than its
+card (or than the host's RAM pool) is now refused with `not_permitted` instead of being
+started and failing at load. Enter a RAM estimate in the portal for a RAM-heavy model, or
+adjust the budget, the reserve or the guess described above.
 
 #### What environment a model process gets
 

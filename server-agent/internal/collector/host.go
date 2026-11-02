@@ -55,6 +55,7 @@ func (c *hostCollector) Collect(ctx context.Context) (*sample.Host, error) {
 	if vm, err := mem.VirtualMemoryWithContext(ctx); err == nil && vm != nil {
 		h.MemUsedBytes = int64(vm.Used)
 		h.MemTotalBytes = int64(vm.Total)
+		h.MemAvailableBytes = int64(vm.Available)
 	}
 
 	if sw, err := mem.SwapMemoryWithContext(ctx); err == nil && sw != nil {

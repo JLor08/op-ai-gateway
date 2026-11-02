@@ -2677,6 +2677,10 @@ func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) err
 		if existing.MappingID == spec.MappingID {
 			spec.ID = existingID
 			spec.CreatedAt = existing.CreatedAt
+			// RAMMeasuredMB is agent-owned: the SQL update set list never
+			// touches ram_measured_mb, so an operator re-save (which always
+			// arrives with 0) must not erase the measurement here either.
+			spec.RAMMeasuredMB = existing.RAMMeasuredMB
 			m.runtimeSpecs[existingID] = spec
 			return nil
 		}
@@ -2803,6 +2807,22 @@ func (m *MemoryStore) UpdateRuntimeSpecGPUMeasured(_ context.Context, specID str
 		}
 	}
 	return storeerr.ErrNotFound
+}
+
+// UpdateRuntimeSpecRAMMeasured writes back the agent's measured host RAM for
+// the spec, touching only RAMMeasuredMB (RAMEstimateMB, operator-owned, is
+// never written here). ErrNotFound when the spec does not exist. Spec-level --
+// the in-memory mirror of the one-column SQL update.
+func (m *MemoryStore) UpdateRuntimeSpecRAMMeasured(_ context.Context, specID string, measuredMB int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	spec, ok := m.runtimeSpecs[specID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	spec.RAMMeasuredMB = measuredMB
+	m.runtimeSpecs[specID] = spec
+	return nil
 }
 
 // copyRuntimeSpecGPUs returns an ALWAYS-non-nil copy of gpus: RuntimeSpecGPUs'

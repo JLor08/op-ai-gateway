@@ -45,7 +45,8 @@ is how the gateway replaced llama-swap with first-party machinery. The split of
 authority is the strategic part: the gateway holds the launch specification and
 decides *when* a model runs, while the AI server's own operator holds a binary
 allowlist that decides *what may run at all* — and the agent, not the gateway,
-enforces admission (a co-residency matrix, a process limit, per-GPU VRAM budgets)
+enforces admission (a co-residency matrix, a process limit, per-GPU VRAM budgets
+and a host-wide RAM pool, both budgets detected from the hardware by default)
 before it starts anything. The gateway sees one ordinary application per server,
 so routing, TLS and the mesh surface are untouched, and the whole capability is
 negotiated by feature flag, so an agent without it behaves exactly as before.

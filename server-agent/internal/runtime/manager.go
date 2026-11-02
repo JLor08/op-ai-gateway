@@ -74,12 +74,12 @@ var (
 	// spec is Starting.
 	healthPollInterval = 500 * time.Millisecond
 	// idleTickInterval is the owner's housekeeping beat: how often it scans
-	// for idle-timeout unloads AND how often it dispatches a VRAM
+	// for idle-timeout unloads AND how often it dispatches a VRAM and a RAM
 	// measurement of the live managed processes (dispatchMeasurement). One
 	// beat rather than two because both are "sweep the current process set
 	// and act on what has changed", and because neither does any real work
-	// on the owner goroutine -- the measurement's subprocess runs elsewhere
-	// and posts its answer back.
+	// on the owner goroutine -- the measurement (a subprocess for VRAM,
+	// in-process reads for RAM) runs elsewhere and posts its answer back.
 	idleTickInterval = 15 * time.Second
 	// notPermittedRetryInterval bounds how often StateNotPermitted /
 	// StatePendingVRAMUnknown are re-evaluated (fix round 2 / R2-1). A
@@ -96,6 +96,71 @@ var (
 	// magnitude as backoffBase's own default.
 	notPermittedRetryInterval = 5 * time.Second
 )
+
+// Cold-start RAM bootstrap failure-handling knobs (task 4.4). These bound the
+// one escalation a stuck bootstrap is allowed, so that responding to memory
+// pressure can NEVER become an unbounded evict-and-retry ("C3") storm. They are
+// consts, not tunable vars: the whole point is a hard, non-configurable ceiling.
+const (
+	// ramBootstrapMaxRetries is the number of guarded evict-and-retry
+	// escalations a single stuck bootstrap may trigger before it falls back to
+	// the ordinary StateStartFailed crash-loop backoff. ONE: the first
+	// memory-pressure death evicts an idle process and retries once; a SECOND
+	// consecutive memory-pressure death does NOT escalate again (no further
+	// eviction), it goes straight to StateStartFailed. The per-spec counter it
+	// bounds (specState.ramBootstrapRetries) is reset only by a successful RAM
+	// measurement, so a later, unrelated pressure event can earn the one shot
+	// again -- but a bootstrap that keeps dying escalates at most once, and the
+	// eviction count stays bounded however many times the child OOMs.
+	ramBootstrapMaxRetries = 1
+	// ramBootstrapMeasureBeats bounds the TERMINATION case: a bootstrap that
+	// comes up healthy but is never measured would hold the RAMBootstrapInFlight
+	// interlock (task 4.1) forever -- and that interlock makes every OTHER RAM
+	// admission on the host Wait. After this many fruitless measurement beats
+	// (idleTickInterval each, so ~10 beats on the production cadence) the owner
+	// forces the spec to StateStartFailed so the interlock cannot hang the host
+	// indefinitely. The counter (specState.ramBootstrapBeats) only advances while
+	// a RAM measurer is installed and the spec is a healthy, still-unmeasured
+	// bootstrap; a real measurement resets it.
+	ramBootstrapMeasureBeats = 10
+	// ramPressureBudgetNum / ramPressureBudgetDen define "the last-measured RSS
+	// was near the host RAM budget at death" as a fraction (9/10 = 90%). A
+	// bootstrap whose own final RSS reached at least this share of the whole
+	// host-RAM pool is treated as having died of memory pressure even without a
+	// readable kill signal: one process alone that large was crowding the pool.
+	// Integer math (measuredRAM*Den >= budget*Num) avoids floating point. The
+	// fraction is deliberately high: the signature must not fire for a process
+	// that merely used a healthy slice of the pool, only for one that all but
+	// filled it.
+	ramPressureBudgetNum = 9
+	ramPressureBudgetDen = 10
+)
+
+// bootstrapDiedOfMemoryPressure classifies a bootstrap process's death from its
+// EXIT SIGNATURE and its LAST MEASUREMENT -- never free text (task 4.4). It
+// returns true for the two memory-pressure signatures and false for everything
+// else (a plain non-zero exit, a config/binary error), which is the genuine
+// crash the existing crash-loop backoff already handles unchanged.
+//
+//   - oomSignaled: the kernel killed the process with SIGKILL (the Linux OOM
+//     killer's signal; see killedBySIGKILL). The agent's OWN SIGKILL escalation
+//     never reaches here -- it rides the intentional-stop branch of
+//     onProcExited -- so a SIGKILL seen on the crash path is an external kill,
+//     overwhelmingly an OOM for a model mid-load.
+//   - the RSS-near-budget signature: the process's last measured resident RAM
+//     reached ramPressureBudgetNum/Den of the host-RAM budget at death. Needs a
+//     real budget (a hardware sample) and a real measurement; with either
+//     missing only the signal can classify, which is the conservative direction
+//     (fall through to a genuine crash rather than evict on a guess).
+func bootstrapDiedOfMemoryPressure(oomSignaled bool, measuredRAMMB, hostRAMBudgetMB int) bool {
+	if oomSignaled {
+		return true
+	}
+	if hostRAMBudgetMB > 0 && measuredRAMMB > 0 {
+		return measuredRAMMB*ramPressureBudgetDen >= hostRAMBudgetMB*ramPressureBudgetNum
+	}
+	return false
+}
 
 // Typed errors the router maps to HTTP
 // (docs/architecture/cross-cutting/agent-runtime-manager.md §4.3 "Stable
@@ -120,6 +185,11 @@ var (
 // measurerFunc mirrors SetMeasurer's function parameter, named so it can be
 // held behind an atomic.Pointer.
 type measurerFunc func(pids []int) map[int]map[int]int
+
+// ramMeasurerFunc mirrors SetRAMMeasurer's function parameter, named so it can
+// be held behind an atomic.Pointer. It is deliberately not measurerFunc: host
+// RAM has no per-GPU axis, so its answer is one MB figure per pid.
+type ramMeasurerFunc func(pids []int) map[int]int
 
 // ManagerOptions configures a new Manager.
 type ManagerOptions struct {
@@ -171,6 +241,39 @@ type ManagerOptions struct {
 	// lifetime, like the other options here. Empty (every test that does not
 	// exercise config files) means no base directory was configured.
 	ConfigFilesDir string
+	// VRAMHeadroomMB is the amount of each GPU's DETECTED total memory, in MB,
+	// that is held back from the auto-detected VRAM budget (see
+	// owner.buildSnapshot): room for the driver, a display, other tenants. It
+	// is OPERATOR configuration from the agent's own local settings
+	// (OP_AGENT_VRAM_HEADROOM_MB) -- the gateway never supplies it. It applies
+	// only to a detected budget; an operator-configured per-GPU budget is used
+	// exactly as given. Fixed for the process lifetime, like the other options
+	// here. Zero (the default) holds nothing back; a negative value is treated
+	// as zero, since it would inflate the budget past the device.
+	VRAMHeadroomMB int
+	// HostRAMReserveMB is the amount of memory, in MB, that is held back from
+	// the host-RAM pool admission budgets managed processes against (the pool
+	// is the host's live available memory plus what the managed processes
+	// already hold, minus this -- see hostRAMBudgetMB): room for the OS, the
+	// agent itself and whatever else shares the machine. It is OPERATOR
+	// configuration from the agent's own local settings
+	// (OP_AGENT_HOST_RAM_RESERVE_MB) -- the gateway never supplies it. Fixed
+	// for the process lifetime, like the other options here. The agent's config
+	// defaults it to 2048; zero here (the default of a caller that sets
+	// nothing, such as most tests) holds nothing back, and a negative value is
+	// treated as zero, since it would inflate the pool past what the host has.
+	HostRAMReserveMB int
+	// RAMBootstrapGuessMB is the conservative host-RAM footprint, in MB, charged to
+	// a spec of unknown RAM demand on its FIRST start so that cold start is admitted
+	// against the host-RAM pool instead of starting blind -- replaced by the real
+	// measurement once one lands. It is OPERATOR configuration from the agent's own
+	// local settings (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB) -- the gateway never supplies
+	// it. Fixed for the process lifetime, like the other options here. The agent's
+	// config defaults it to 4096 (erring high is the safe direction); zero here (the
+	// default of a caller that sets nothing, such as most tests) turns the guess off
+	// so an unknown-RAM spec starts unconstrained, and a negative value is treated
+	// as zero.
+	RAMBootstrapGuessMB int
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -195,6 +298,52 @@ type Manager struct {
 	// owner round-trip and keeps the owner loop's per-admission read
 	// lock-free, mirroring proxy.certHolder's atomic.Pointer pattern.
 	measurer atomic.Pointer[measurerFunc]
+
+	// ramMeasurer is the host-RAM twin of measurer above, under the same
+	// discipline: the owner only reads it, SetRAMMeasurer's caller only writes
+	// it, and an atomic swap needs no owner round-trip. nil (the default, and
+	// every host whose collector.NewRAMMeasurer returns nil) means no RAM is
+	// measured. It is read only by the off-owner dispatchMeasurement;
+	// buildSnapshot, which feeds admission, never calls it -- it reads the last
+	// result the beat stored (specState.measuredRAM), so the admission path pays
+	// no measurement.
+	ramMeasurer atomic.Pointer[ramMeasurerFunc]
+
+	// hostInfo is the latest hardware figures the agent's collect loop pushed
+	// (SetHostInfo): device totals and live available RAM. Same discipline as
+	// measurer above -- the owner only reads it, the collect loop only writes
+	// it, and an atomic pointer swap needs no owner round-trip, so the
+	// admission path reads a cached value and never shells out. nil until the
+	// first sample has been pushed, which the owner reads as "nothing
+	// detected" (owner.hostInfo).
+	hostInfo atomic.Pointer[HostInfo]
+
+	// hostWake is the collect loop's way of telling the owner that a fresh
+	// hardware sample has landed (SetHostInfo), so it can re-ask a start whose
+	// admission verdict depends on it. It is buffered(1) and posted with a
+	// non-blocking send, which is the whole point of it being a channel of its
+	// own rather than a command on cmds: cmds is unbuffered and postCmd blocks
+	// until the owner reads, and the collect loop must never wait on the owner
+	// (it samples hardware about once a second and does nothing else).
+	// dispatchMeasurement solves the same problem with a goroutine per post, but
+	// that goroutine would be started from a foreign goroutine, where a
+	// WaitGroup.Add can race Close's Wait; a coalescing token needs neither. A
+	// wake that finds one already pending is simply dropped -- "a sample landed,
+	// re-read the latest" is all it says, and the owner re-reads hostInfo itself
+	// -- so a burst of samples is one wake, and none is ever lost while the owner
+	// is busy. The owner reads it in run() and does all the work there, on its
+	// own goroutine, so the serialized-owner invariant holds. nil on a bare
+	// Manager{} built by a test that never runs an owner; a send on it falls
+	// through the select's default.
+	hostWake chan struct{}
+
+	// hostSeq counts the samples SetHostInfo has stored. The owner reads it to
+	// tell how many samples have landed since a managed process exited (see
+	// owner.noteRAMFreed): the sample that is current at an exit may predate it,
+	// so what the host has freed shows up in the pool only a sample or two later.
+	// Written by the collect loop, read by the owner; an atomic counter needs no
+	// owner round-trip, like hostInfo beside it.
+	hostSeq atomic.Uint64
 
 	// wg tracks EVERY goroutine the owner spawns (health pollers, exit
 	// waiters, the owner goroutine itself, every scheduleAfter timer
@@ -223,18 +372,22 @@ func NewManager(opts ManagerOptions) *Manager {
 		cmds:        make(chan command),
 		done:        make(chan struct{}),
 		transitions: make(chan struct{}, 1),
+		hostWake:    make(chan struct{}, 1),
 		logs:        NewLogStore(opts.LogBufferBytes, opts.LogBufferTotalBytes),
 	}
 	o := &owner{
-		m:                  m,
-		policy:             opts.Policy,
-		getenv:             getenv,
-		gpuVendor:          opts.GPUVendor,
-		specsFromLocalFile: opts.SpecsFromLocalFile,
-		configFilesDir:     opts.ConfigFilesDir,
-		specs:              make(map[string]*specState),
-		allowedPairs:       map[[2]string]bool{},
-		logs:               m.logs,
+		m:                   m,
+		policy:              opts.Policy,
+		getenv:              getenv,
+		gpuVendor:           opts.GPUVendor,
+		specsFromLocalFile:  opts.SpecsFromLocalFile,
+		configFilesDir:      opts.ConfigFilesDir,
+		vramHeadroomMB:      max(0, opts.VRAMHeadroomMB),
+		hostRAMReserveMB:    max(0, opts.HostRAMReserveMB),
+		ramBootstrapGuessMB: max(0, opts.RAMBootstrapGuessMB),
+		specs:               make(map[string]*specState),
+		allowedPairs:        map[[2]string]bool{},
+		logs:                m.logs,
 	}
 	m.wg.Add(1)
 	go func() {
@@ -484,6 +637,99 @@ func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 	m.measurer.Store(&fn)
 }
 
+// SetRAMMeasurer installs f, which is called with every currently-live managed
+// PID to get its real resident host RAM in MB (main.go wires this to
+// collector.NewRAMMeasurer: RSS off Windows, the private working set on
+// Windows). f may be nil to go back to no RAM measurement, which is also
+// NewManager's default.
+//
+// It is SetMeasurer's twin and carries the same obligations, with one
+// difference in where it is called from. f is called ONLY from the recurring,
+// OFF-owner measurement (dispatchMeasurement) -- never from buildSnapshot,
+// which only READS the last stored result (specState.measuredRAM) and so never
+// pays a measurement on the admission path -- so it never runs on the owner
+// goroutine. It must still be safe for concurrent use (it is stateless in
+// practice) and MUST BOUND ITS OWN RUNTIME: it is tracked in the Manager's
+// WaitGroup, so Close waits for it.
+//
+// The answer maps pid -> MB for the pids it could read; a pid it could not
+// read is simply absent. A value <= 0 is not a measurement (see realRAM).
+func (m *Manager) SetRAMMeasurer(f func(pids []int) map[int]int) {
+	if f == nil {
+		m.ramMeasurer.Store(nil)
+		return
+	}
+	fn := ramMeasurerFunc(f)
+	m.ramMeasurer.Store(&fn)
+}
+
+// HostInfo is the latest hardware sample as far as admission is concerned: the
+// figures the owner cannot get from a managed process's own measurement.
+//
+// GPUTotalsMB maps a GPU index (the same index spec.GPUs and GPUBudget use) to
+// that device's total memory in MB, as the GPU collector last reported it. An
+// index the collector did not report, or reported as 0, is simply absent --
+// there is nothing detected for it, which is never the same as "a device with
+// no memory".
+//
+// MemAvailableMB is the host RAM obtainable right now (the sample's
+// MemAvailable, not total-minus-used), in MB. 0 means "no reading": either no
+// sample has arrived yet or the read failed, and a consumer must treat it as
+// unknown rather than as an exhausted host.
+type HostInfo struct {
+	GPUTotalsMB    map[int]int
+	MemAvailableMB int
+}
+
+// SetHostInfo records the newest hardware figures for the owner's next
+// admission. The agent's collect loop calls it once per sample (about once a
+// second): it is a cheap atomic store, and PUSHING the value is the point --
+// buildSnapshot runs on the owner on the admission path and must read a cached
+// number, never poll hardware or shell out. Each call replaces the previous one
+// wholesale.
+//
+// The manager keeps its own copy of the GPUTotalsMB map. The caller is a
+// different goroutine from the owner that reads it, so retaining the caller's
+// map would let a caller that goes on to reuse or edit it race that read.
+//
+// Storing is not the whole job. The host-RAM pool is built from the live
+// MemAvailable, so the sample that follows a victim's exit is the one that
+// finally shows its freed memory -- and admission is otherwise re-attempted only
+// on a release, an exit, an Apply or a finished start, so a start that was
+// refused on the PREVIOUS sample would keep waiting for one of those. Every call
+// therefore also posts a coalescing, non-blocking wake the owner turns into a
+// re-evaluation of exactly the starts a new sample can change (see
+// owner.wakeOnHostSample). It never blocks this caller, and costs the owner
+// nothing when no such start is waiting.
+func (m *Manager) SetHostInfo(hi HostInfo) {
+	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB}
+	if len(hi.GPUTotalsMB) > 0 {
+		cp.GPUTotalsMB = make(map[int]int, len(hi.GPUTotalsMB))
+		for i, mb := range hi.GPUTotalsMB {
+			cp.GPUTotalsMB[i] = mb
+		}
+	}
+	m.hostInfo.Store(&cp)
+	m.hostSeq.Add(1)
+	select {
+	case m.hostWake <- struct{}{}:
+	default: // a wake is already pending; it will see this value too
+	}
+}
+
+// hostInfo returns the latest pushed hardware figures, or the zero HostInfo
+// when nothing has been pushed yet: no detected GPU totals and MemAvailableMB
+// 0 (unknown). It is the ONE place the "no sample yet" case is interpreted, so
+// every consumer in buildSnapshot reads the same answer. The returned maps are
+// shared and read-only -- SetHostInfo replaces the whole value, it never edits
+// one in place.
+func (o *owner) hostInfo() HostInfo {
+	if hi := o.m.hostInfo.Load(); hi != nil {
+		return *hi
+	}
+	return HostInfo{}
+}
+
 // Close drain-stops every managed process (bounded: every spec's drain runs
 // concurrently, so the total bound is drainGrace+killGrace regardless of how
 // many specs are running, not their sum) and blocks until the owner
@@ -647,11 +893,14 @@ type measureTarget struct {
 }
 
 // cmdMeasured carries a completed off-owner measurement back to the owner.
-// byPID is exactly what the installed measurer returned (pid -> gpu index ->
-// MB), possibly nil.
+// byPID is exactly what the installed VRAM measurer returned (pid -> gpu index
+// -> MB) and ramByPID what the installed RAM measurer returned (pid -> MB);
+// either is nil when that measurer is not installed, was not consulted this
+// cycle, or answered nothing.
 type cmdMeasured struct {
-	targets []measureTarget
-	byPID   map[int]map[int]int
+	targets  []measureTarget
+	byPID    map[int]map[int]int
+	ramByPID map[int]int
 }
 
 func (cmdMeasured) isCommand() {}
@@ -769,6 +1018,80 @@ type specState struct {
 	// second per (spec, gpu) forever -- on a server doing nothing at all.
 	measuredVRAM map[int]int
 
+	// measuredRAM is the last real resident host-RAM measurement (MB) of THIS
+	// SPEC'S CURRENT PROCESS, from the recurring measurement beat
+	// (applyMeasurement). 0 means UNKNOWN -- never measured, no RAM measurer
+	// installed, or only non-measurements (<= 0, see realRAM) seen -- and is
+	// never "this process needs no RAM". Reported via Status.MeasuredRAMMB and
+	// read by buildSnapshot, where it is floored at the spec's pushed demand
+	// to become the process's RunningProc.RAMMB.
+	//
+	// ONE PROCESS PER SPEC, so this is a scalar: there is nothing to sum, and
+	// unlike measuredVRAM there is no per-GPU key to re-key. Cleared by
+	// onProcExited for exactly the reason measuredVRAM is (F2): it describes a
+	// process, and stops being true when that process exits.
+	measuredRAM int
+
+	// vramBootstrapDone is the DURABLE guard on the one-shot VRAM bootstrap
+	// eviction (task 4.3). It means the spec's unknown-VRAM bootstrap is resolved
+	// -- either a real VRAM measurement has landed for it at least once this
+	// lifetime (so it has a number now and never needs the shot), or the owner has
+	// already spent the one guarded eviction on it. While it is false AND the
+	// spec's declared VRAM demand is unknown, vramBootstrapEligible offers the
+	// shot; once it is true the spec is back to pure ADR-032 steady state (rule 4
+	// blocks, never evicts a known-demand occupant).
+	//
+	// Set in exactly two places: wherever a real measurement is recorded
+	// (applyMeasurement and buildSnapshot, beside st.measuredVRAM), and in
+	// admitAndStart when Admit returns a bootstrap eviction (Decision.VRAMBootstrap).
+	//
+	// IT IS DELIBERATELY NOT CLEARED ON EXIT, and that is the whole anti-thrash
+	// guarantee -- the opposite rule from measuredVRAM/measuredRAM above, which
+	// describe the live process and so are cleared the moment it exits (F2). This
+	// marker describes the SPEC's lifetime, not its current process: a shot once
+	// spent must stay spent across restarts, or every exit would re-arm the
+	// one-shot and the ADR-032 bidirectional thrash would return one restart at a
+	// time. It resets only when the spec itself is removed and re-added (a fresh
+	// specState); an in-place config edit keeps the same specState and the marker.
+	vramBootstrapDone bool
+
+	// ramBootstrapRetries is the anti-storm counter for the cold-start RAM
+	// bootstrap's memory-pressure escalation (task 4.4). It counts the guarded
+	// evict-and-retry escalations THIS spec has spent on a stuck bootstrap, and is
+	// bounded by ramBootstrapMaxRetries: the first memory-pressure death
+	// increments it from 0 to 1 and escalates (evict an idle process, retry once);
+	// a death while it is already at the ceiling does NOT escalate again (no
+	// further eviction) and goes straight to StateStartFailed.
+	//
+	// It is RESET TO 0 ONLY BY A SUCCESSFUL RAM MEASUREMENT (applyMeasurement),
+	// which is the signal that the bootstrap resolved -- the RAM twin of
+	// vramBootstrapDone's resolve-on-measurement rule. That is what lets a later,
+	// unrelated pressure event earn the one shot again while still guaranteeing a
+	// bootstrap that keeps dying before it is ever measured escalates at most
+	// once. It is owner-goroutine state (§5.5), never cleared on exit: a stuck
+	// bootstrap's streak must survive its own restarts, exactly like
+	// vramBootstrapDone and unlike the per-process measurement.
+	ramBootstrapRetries int
+
+	// ramBootstrapBeats is the anti-hang counter for the TERMINATION case (task
+	// 4.4). A bootstrap that comes up HEALTHY but is never measured would hold the
+	// RAMBootstrapInFlight interlock (task 4.1) forever, and that interlock makes
+	// every other RAM admission on the host Wait. applyMeasurement advances this
+	// once per fruitless measurement beat while a RAM measurer is installed and
+	// the spec is still a healthy, unmeasured bootstrap; at ramBootstrapMeasureBeats
+	// the owner forces the spec to StateStartFailed so the interlock is bounded. A
+	// real measurement resets it to 0. Owner-goroutine state, like the counter above.
+	ramBootstrapBeats int
+
+	// waitingOnRAM is true while this spec's most recent admission verdict was a
+	// Wait the host-RAM pool contributed to (Decision.WaitOnRAM). It is the one
+	// kind of Wait a new hardware sample can end by itself, so it is what
+	// wakeOnHostSample selects on: a start waiting on the matrix, the process
+	// limit or a VRAM budget is never re-asked because a sample landed.
+	// admitAndStart rewrites it on every verdict, so it never outlives the Wait
+	// it describes.
+	waitingOnRAM bool
+
 	// notPermittedAt is stamped to now() every time admitAndStart (re)confirms
 	// StateNotPermitted or StatePendingVRAMUnknown -- deliberately NOT the
 	// same as `since`, because setState is a no-op (and so never touches
@@ -814,6 +1137,26 @@ type owner struct {
 	// the owner writes a spec's config files under. Fixed for the process
 	// lifetime, so a plain field like gpuVendor above.
 	configFilesDir string
+	// vramHeadroomMB is ManagerOptions.VRAMHeadroomMB, never negative. Fixed
+	// for the process lifetime, so a plain field like gpuVendor above; read
+	// only by buildSnapshot's auto-detected budgets.
+	vramHeadroomMB int
+	// hostRAMReserveMB is ManagerOptions.HostRAMReserveMB, never negative.
+	// Fixed for the process lifetime, so a plain field like vramHeadroomMB
+	// above; read only by buildSnapshot's host-RAM budget.
+	hostRAMReserveMB int
+	// ramBootstrapGuessMB is ManagerOptions.RAMBootstrapGuessMB, never negative.
+	// Fixed for the process lifetime, so a plain field like hostRAMReserveMB
+	// above; read only by buildSnapshot, which copies it into the snapshot's
+	// RAMBootstrapGuessMB for Admit (the one place that interprets it).
+	ramBootstrapGuessMB int
+	// ramFreedMB is the host RAM that managed processes held when they exited
+	// and that the hardware sample has not necessarily caught up with yet, valid
+	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
+	// loosens the terminal own-demand refusal's ceiling, never the admission
+	// arithmetic. Owner-goroutine state, like specs.
+	ramFreedMB       int
+	ramFreedUntilSeq uint64
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.
@@ -853,6 +1196,10 @@ func (o *owner) run() {
 			if !o.closing {
 				o.scanIdle()
 				o.dispatchMeasurement()
+			}
+		case <-o.m.hostWake:
+			if !o.closing {
+				o.wakeOnHostSample()
 			}
 		}
 		if o.stopped {
@@ -1061,6 +1408,13 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Type = ""                       // reported for probes, read live
 		s.MetricsPath = ""                // "
 		s.ContextProbePath = ""           // "
+		// RAMMB is the host-RAM admission DEMAND, the spec-level twin of
+		// SpecGPU.VRAMMB below: consumed only by admission arithmetic, never
+		// baked into the child. The gateway pushes max(measured, estimate), and
+		// the measurement is written back from the agent's own reports, so
+		// leaving it in the comparison would relaunch every freshly measured
+		// healthy child.
+		s.RAMMB = 0
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
@@ -1401,6 +1755,41 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 	}
 }
 
+// vramBootstrapEligible reports whether st may use its ONE guarded VRAM
+// bootstrap eviction on this admission (task 4.3). Three conditions, all
+// required:
+//
+//   - A VRAM measurer is installed. The exception exists only to CAPTURE a first
+//     measurement, so where none can be taken it must not fire. Measurement is
+//     NVIDIA-only (§5.3): on an AMD, Apple-silicon or GPU-less host "waiting for
+//     the measurement to arrive is waiting for something that will not happen",
+//     and there §5.3 is explicit that an unknown-demand spec simply WAITS behind
+//     a busy/pinned holder. Evicting a working known-demand model on such a host
+//     for an unknown spec that can never be measured is exactly the ADR-032
+//     regression the order exists to prevent -- so the bootstrap is gated on the
+//     measurer, the VRAM twin of P4a's ramMeasurerInstalled gate.
+//   - The declared VRAM demand is unknown. A known-demand candidate never runs
+//     rule 4 at all, so the grant would be meaningless.
+//   - The bootstrap is still unresolved: no measurement captured and the one shot
+//     unspent (specState.vramBootstrapDone). This is what keeps the exception
+//     from repeating -- the thrash guard.
+//
+// It is the per-candidate grant admitAndStart copies into
+// PolicySnapshot.VRAMBootstrapEligible, the one input that turns rule 4 from a
+// block into a single eviction.
+func (o *owner) vramBootstrapEligible(st *specState) bool {
+	return o.m.measurer.Load() != nil && !st.vramBootstrapDone && specHasUnknownVRAM(st.spec)
+}
+
+// wantsUp reports whether anything wants st running right now: a queued request,
+// or an operator pin / force_running. It is admitAndStart's own admission
+// precondition, factored out so the cold-start bootstrap memory-pressure
+// escalation (onProcExited, task 4.4) can ask the identical question -- an
+// eviction to free RAM for a retry is worth nothing if no retry is coming.
+func (o *owner) wantsUp(st *specState) bool {
+	return len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
+}
+
 // admitAndStart is the single place that decides whether spec should move
 // toward Running right now, and if so starts it -- called for a freshly
 // queued request, after a backoff/drain/idle completion frees something up,
@@ -1419,8 +1808,11 @@ func (o *owner) admitAndStart(specID string) {
 	if st == nil || st.proc != nil || st.state == StateBackoff {
 		return
 	}
-	wantUp := len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
-	if !wantUp {
+	// Every verdict below rewrites this from scratch, and so does every return
+	// before one: a spec nobody wants up, or one force-stopped, is no RAM waiter,
+	// and a stale true must never be able to select it for a sample wake.
+	st.waitingOnRAM = false
+	if !o.wantsUp(st) {
 		return
 	}
 	if st.spec.AdminState == "force_stopped" {
@@ -1433,7 +1825,14 @@ func (o *owner) admitAndStart(specID string) {
 		return
 	}
 
-	dec := Admit(o.buildSnapshot(), st.spec)
+	// The one-shot VRAM bootstrap grant is per-candidate owner state, so it is
+	// set on the snapshot here (which buildSnapshot, being candidate-agnostic,
+	// cannot know) rather than inside the builder -- the same shape every other
+	// snapshot field keeps: the owner decides, Admit interprets.
+	snap := o.buildSnapshot()
+	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
+	dec := Admit(snap, st.spec)
+	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
 	switch {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
@@ -1449,6 +1848,14 @@ func (o *owner) admitAndStart(specID string) {
 		// noteAdmissionWait.
 		o.noteAdmissionWait(st, dec.Message)
 	case len(dec.Evict) > 0:
+		if dec.VRAMBootstrap {
+			// This Evict spent the candidate's one-shot VRAM bootstrap (rule 4
+			// evicted a known-demand occupant it would otherwise only have
+			// blocked). Burn the shot NOW, before the victim even drains, so the
+			// marker is durable against a re-entrant admission and the exception
+			// fires at most once per spec -- the ADR-032 anti-thrash guarantee.
+			st.vramBootstrapDone = true
+		}
 		for _, victimID := range dec.Evict {
 			// Record WHO this eviction is for before asking for it: the
 			// victim's exit path gives these specs their admission attempt
@@ -1469,9 +1876,11 @@ func (o *owner) admitAndStart(specID string) {
 	}
 }
 
-// dispatchMeasurement asks the installed measurer for the real per-GPU VRAM
-// of every live managed process, OFF the owner goroutine, and has the answer
-// posted back as cmdMeasured.
+// dispatchMeasurement asks the installed measurers for the real per-GPU VRAM
+// (SetMeasurer) and the real resident host RAM (SetRAMMeasurer) of every live
+// managed process, OFF the owner goroutine, and has both answers posted back
+// together as one cmdMeasured. The paragraphs below were written for the VRAM
+// measurer and are about it unless they say otherwise.
 //
 // THIS IS THE ONLY PATH THAT EVER MEASURES A SPEC THAT IS MERELY RUNNING, and
 // its absence was the F1 defect. buildSnapshot (below) also consults the
@@ -1511,7 +1920,9 @@ func (o *owner) admitAndStart(specID string) {
 // Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
 // NewManager's default). Those hosts take the first branch,
 // spawn nothing, allocate nothing, and behave exactly as they did before this
-// function existed.
+// function existed. "No measurer" now means neither of the two: the host-RAM
+// measurer (SetRAMMeasurer) rides this same beat, and a host that has only that
+// one still measures RAM -- see the note on the two gates below.
 //
 // GATED ON A SPEC DECLARING A GPU, NOT ON BUDGETS EXISTING. Skipping the
 // measurement when no GPU budget is configured was considered and rejected:
@@ -1524,24 +1935,44 @@ func (o *owner) admitAndStart(specID string) {
 // estimate at 0 is safe. A GPU-declaring spec is the honest gate: with no
 // GPUs declared anywhere there is no index the measurement could be attached
 // to, no admission arithmetic it could inform, and no portal row it could
-// fill.
+// fill. That gate belongs to the VRAM measurer alone: the RAM measurer has no
+// GPU index to need, so it is gated only on a live process existing.
 func (o *owner) dispatchMeasurement() {
 	if o.closing || o.measuring {
 		return
 	}
 	mp := o.m.measurer.Load()
-	if mp == nil {
+	rp := o.m.ramMeasurer.Load()
+	if mp == nil && rp == nil {
 		return
 	}
-	targets := o.measurementTargets()
+	targets, declaresGPU := o.measurementTargets()
 	if len(targets) == 0 {
 		return
+	}
+	// The two measurers are gated independently, and the asymmetry is the
+	// point. The VRAM one keeps the declares-a-GPU gate described above, so a
+	// host with nvidia-smi but no GPU-declaring spec still spawns nothing. The
+	// RAM one is NOT gated on a GPU: host RAM has no GPU index to attach to,
+	// costs one in-process read per pid rather than a subprocess, and the specs
+	// whose RAM footprint matters most are exactly the CPU-only ones. Both
+	// answers return in ONE cmdMeasured, so there is still at most one
+	// measurement outstanding.
+	var vramMeasure measurerFunc
+	if mp != nil && declaresGPU {
+		vramMeasure = *mp
+	}
+	var ramMeasure ramMeasurerFunc
+	if rp != nil {
+		ramMeasure = *rp
+	}
+	if vramMeasure == nil && ramMeasure == nil {
+		return // only a VRAM measurer, and no spec declares a GPU
 	}
 	pids := make([]int, len(targets))
 	for i, t := range targets {
 		pids[i] = t.pid
 	}
-	measure := *mp
 	o.measuring = true
 	// Tracked in m.wg like every other goroutine the owner spawns, so Close
 	// cannot return while a measurer is still running (which would let a
@@ -1559,18 +1990,35 @@ func (o *owner) dispatchMeasurement() {
 		// wedge the flag. (postCmd drops the command once the owner has
 		// stopped, which only happens during Close, where the flag no longer
 		// matters.)
-		o.m.postCmd(cmdMeasured{targets: targets, byPID: measure(pids)})
+		//
+		// Both measurers run here, one after the other, and their answers
+		// travel together. Each bounds its own runtime (the RAM one is a few
+		// in-process reads and returns at once), so the pair costs no more than
+		// the VRAM measurer alone did, and one cmdMeasured keeps the
+		// one-measurement-outstanding invariant.
+		c := cmdMeasured{targets: targets}
+		if ramMeasure != nil {
+			c.ramByPID = ramMeasure(pids)
+		}
+		if vramMeasure != nil {
+			c.byPID = vramMeasure(pids)
+		}
+		o.m.postCmd(c)
 	}()
 }
 
 // measurementTargets lists the live generations worth measuring right now, or
-// nil when there is nothing to measure. Ordered by spec ID so the pid list
-// handed to an external command does not depend on Go's randomized map
-// iteration -- the measurer treats it as a set, but a stable order keeps logs
-// and test expectations reproducible.
-func (o *owner) measurementTargets() []measureTarget {
-	targets := make([]measureTarget, 0, len(o.specs))
-	declaresGPU := false
+// nil when there are none. Ordered by spec ID so the pid list handed to an
+// external command does not depend on Go's randomized map iteration -- the
+// measurer treats it as a set, but a stable order keeps logs and test
+// expectations reproducible.
+//
+// declaresGPU reports whether any live spec declares a GPU. It is NOT applied
+// here: it is the VRAM measurer's gate (see dispatchMeasurement's gating
+// paragraph), and the RAM measurer, which has no GPU axis, must still see every
+// live process on a host where no spec declares one.
+func (o *owner) measurementTargets() (targets []measureTarget, declaresGPU bool) {
+	targets = make([]measureTarget, 0, len(o.specs))
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
@@ -1580,11 +2028,8 @@ func (o *owner) measurementTargets() []measureTarget {
 		}
 		targets = append(targets, measureTarget{specID: id, proc: st.proc, pid: st.proc.pid})
 	}
-	if !declaresGPU {
-		return nil // see dispatchMeasurement's gating paragraph
-	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].specID < targets[j].specID })
-	return targets
+	return targets, declaresGPU
 }
 
 // realMeasurement keeps only the entries of byGPU that are an actual
@@ -1633,6 +2078,22 @@ func realMeasurement(byGPU map[int]int) map[int]int {
 	return out
 }
 
+// realRAM is realMeasurement's scalar twin: a measured RAM figure is real only
+// when strictly positive, and anything else comes back as 0, "unknown".
+//
+// The meaning of 0 is the same load-bearing one: a spec's RAM demand of 0 is
+// UNKNOWN, never "needs none", so a measured 0 must not be allowed to win over
+// an operator's estimate or to be reported as a measurement. A process that has
+// not (yet) been read, a pid the measurer could not open, or a platform that
+// answered 0 all land here, and the caller treats the result exactly like "not
+// measured this cycle": the previous value stays.
+func realRAM(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	return v
+}
+
 // applyMeasurement records a completed measurement against the generations it
 // was actually taken for, and re-arms the next dispatch.
 //
@@ -1660,13 +2121,80 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		}
 		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil {
 			st.measuredVRAM = byGPU
+			// A real measurement resolves the VRAM bootstrap durably: the spec
+			// has a number now, so it must never spend (or keep holding) the
+			// one-shot eviction. See specState.vramBootstrapDone.
+			st.vramBootstrapDone = true
+		}
+		// ONE process per spec, so the pid's figure is the spec's figure:
+		// nothing to sum and no key to re-key. The same generation guard
+		// above is what keeps a recycled pid's reading off a different
+		// process, and realRAM is the same "a non-measurement says nothing"
+		// rule, so a cycle of zeros leaves a previous real number in place.
+		if mb := realRAM(c.ramByPID[t.pid]); mb > 0 {
+			st.measuredRAM = mb
+			// Task 4.4: a successful RAM measurement RESOLVES the cold-start
+			// bootstrap -- the RAM twin of vramBootstrapDone above. It resets
+			// BOTH bounds: the memory-pressure escalation counter (so a later,
+			// unrelated pressure event can earn the one guarded retry again) and
+			// the no-measurement termination counter (the interlock will clear on
+			// its own now that a number has landed).
+			st.ramBootstrapRetries = 0
+			st.ramBootstrapBeats = 0
+		} else if o.healthyBootstrapAwaitingMeasurement(st) {
+			// Task 4.4 TERMINATION: a bootstrap that is healthy but still
+			// unmeasured holds the RAMBootstrapInFlight interlock (task 4.1), and
+			// that interlock makes every OTHER RAM admission on the host Wait. If
+			// the measurement never arrives the interlock would hold forever, so
+			// this beat counter bounds it: after ramBootstrapMeasureBeats fruitless
+			// beats the spec is forced to a bounded StateStartFailed, releasing the
+			// interlock. It advances only while a RAM measurer is installed (else
+			// there is no beat to resolve it and P4a's interlock is already bounded
+			// by Starting), so a measurer-less host never reaches this.
+			st.ramBootstrapBeats++
+			if st.ramBootstrapBeats >= ramBootstrapMeasureBeats {
+				o.failBootstrapUnmeasured(st)
+			}
 		}
 	}
 }
 
+// healthyBootstrapAwaitingMeasurement reports whether st is a live, healthy
+// cold-start bootstrap still waiting for its first RAM measurement WHILE a RAM
+// measurer is installed -- the exact condition under which the
+// RAMBootstrapInFlight interlock holds past Starting (buildSnapshot). It gates
+// the no-measurement termination beat counter so that counter never advances for
+// a spec that is still loading, has already been measured, has a known demand, or
+// runs on a host with no RAM measurer to resolve it.
+func (o *owner) healthyBootstrapAwaitingMeasurement(st *specState) bool {
+	return o.m.ramMeasurer.Load() != nil &&
+		st.proc != nil && st.proc.everHealthy &&
+		st.state == StateRunning &&
+		needsRAMBootstrap(st.spec, st.measuredRAM)
+}
+
+// failBootstrapUnmeasured forces a healthy-but-never-measured bootstrap to a
+// bounded StateStartFailed (task 4.4 termination), mirroring handleStartResult's
+// start-timeout path exactly: record the failure, fail any queued waiter,
+// terminate the live process, and enter backoff. terminateNow marks the stop
+// intentional, so the eventual exit rests the spec in backoff via onProcExited's
+// deferred-backoff branch rather than being re-read as a crash -- and it never
+// reaches the memory-pressure classifier, which is correct: an unmeasured healthy
+// process is a measurement failure, not a memory-pressure death.
+func (o *owner) failBootstrapUnmeasured(st *specState) {
+	proc := st.proc
+	st.ramBootstrapBeats = 0
+	o.setState(st, StateStartFailed)
+	o.recordFailure(st, "runtime: RAM cold-start bootstrap never produced a measurement within the bootstrap deadline", -1, proc.log.Tail(2048))
+	o.failPending(st, ErrStartFailed)
+	o.terminateNow(st, proc)
+	o.enterBackoff(st)
+}
+
 // buildSnapshot assembles the pure PolicySnapshot Admit needs from current
 // owner state, consulting the installed measurer (if any) for real per-GPU
-// VRAM instead of each spec's static estimate.
+// VRAM that can raise each spec's pushed demand (never lower it: the demand
+// is a floor, the charge is max(live, demand)).
 //
 // It measures SYNCHRONOUSLY, on the owner, and that is deliberate even though
 // dispatchMeasurement (above) now keeps st.measuredVRAM continuously fresh.
@@ -1679,6 +2207,14 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 // admission is occasional, so the cost stays occasional; the recurring cost
 // is what had to move off the owner, and it did.
 func (o *owner) buildSnapshot() PolicySnapshot {
+	// The hardware sample is loaded ONCE and that one value feeds everything
+	// below that derives from it -- the detected per-GPU budgets and the
+	// host-RAM budget. The collect loop replaces the whole sample from another
+	// goroutine about once a second, so two separate loads could straddle a
+	// push and give one snapshot a VRAM budget from one sample and a RAM
+	// budget from the next.
+	hi := o.hostInfo()
+
 	pids := make([]int, 0, len(o.specs))
 	for _, st := range o.specs {
 		if st.proc != nil {
@@ -1689,35 +2225,96 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	if mp := o.m.measurer.Load(); mp != nil {
 		measured = (*mp)(pids)
 	}
+	// Whether host RAM is MEASURABLE at all decides how long the cold-start
+	// interlock below can safely hold. With a RAM measurer a bootstrapping
+	// process's first measurement will arrive, so the interlock can hold from
+	// Starting until it does (the brief's "healthy+measured"). WITHOUT one no
+	// measurement ever arrives, so holding past Starting would never clear and
+	// would hang every other RAM admission on the host; there the interlock is
+	// bounded by Starting, and once the process is healthy the conservative budget
+	// (its RAM is resident, so MemAvailable has dropped and nothing was added back)
+	// accounts for it without an interlock.
+	ramMeasurerInstalled := o.m.ramMeasurer.Load() != nil
 
 	running := make([]RunningProc, 0, len(o.specs))
+	// residentRAMMB is the host RAM the managed processes ACTUALLY hold right
+	// now -- their live measurements only, zero-guarded, never a pushed demand
+	// -- summed for the host-RAM budget below.
+	residentRAMMB := 0
+	// ramBootstrapInFlight is the cold-start RAM interlock (task 4.1), true once
+	// any managed process is still in its unaccounted bootstrap window (unknown
+	// declared RAM and no measurement -- needsRAMBootstrap), bounded as above. It
+	// is recomputed every call from owner state, so it is never a stale flag.
+	ramBootstrapInFlight := false
+	// ramBoundMB is the same sum read generously, for the ceiling the terminal
+	// RAM refusal compares against (see below): a process with no live reading
+	// is taken to hold its whole demand floor instead of nothing.
+	ramBoundMB := 0
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
 		}
 		// realMeasurement is the zero-guard: only a strictly positive value
 		// is a measurement, so an index the measurer answered with 0 (or
-		// less) is absent here and falls through to the operator's estimate
-		// below, exactly like an index it never mentioned. Without it a
-		// measured 0 WON, and "unknown" became "this model needs no VRAM" --
-		// see realMeasurement for what that costs admission.
+		// less) is absent here and charges the pushed demand below, exactly
+		// like an index it never mentioned. Without it a measured 0 WON, and
+		// "unknown" became "this model needs no VRAM" -- see realMeasurement
+		// for what that costs admission.
+		//
+		// The charge is max(live, pushed demand). The pushed demand is
+		// already max(persisted measurement, operator estimate) -- the
+		// gateway builds it that way -- so it is a FLOOR here: a fresher live
+		// reading raises it when the process has grown, but a reading below
+		// it (a transient dip between allocations) must not lower the
+		// reservation. Replacing the demand with the live value is how a
+		// co-resident start got admitted into that gap.
 		byGPU := realMeasurement(measured[st.proc.pid])
 		gpus := make(map[int]int, len(st.spec.GPUs))
 		for _, g := range st.spec.GPUs {
-			if byGPU != nil {
-				if v, ok := byGPU[g.Index]; ok {
-					gpus[g.Index] = v
-					continue
-				}
+			charge := g.VRAMMB
+			if v, ok := byGPU[g.Index]; ok && v > charge {
+				charge = v
 			}
-			gpus[g.Index] = g.VRAMMB
+			gpus[g.Index] = charge
 		}
 		if byGPU != nil {
 			st.measuredVRAM = byGPU
+			// A real measurement resolves the VRAM bootstrap durably, the same as
+			// the beat's applyMeasurement: the spec has a number now and must
+			// never spend (or keep holding) the one-shot. See
+			// specState.vramBootstrapDone.
+			st.vramBootstrapDone = true
+		}
+		// Host RAM follows the same rule as the VRAM charge above, spec-level
+		// instead of per GPU: max(live, pushed demand), the demand a FLOOR. The
+		// live figure is st.measuredRAM, which the recurring off-owner beat
+		// already stores zero-guarded; realRAM is applied again here because
+		// this is where "0 is unknown, never needs-none" is relied on -- a
+		// non-positive value must fall through to the demand floor rather than
+		// win over it. With neither, RAMMB stays 0 = unknown, which Admit treats
+		// as contributing nothing (see rule 6).
+		//
+		// The same live figure, WITHOUT the demand floor, is what this process
+		// is really holding, and it is what the host-RAM budget adds back (see
+		// hostRAMBudgetMB): the floor is a reservation, not residency.
+		liveRAM := realRAM(st.measuredRAM)
+		residentRAMMB += liveRAM
+		if liveRAM > 0 {
+			ramBoundMB += liveRAM
+		} else {
+			ramBoundMB += st.spec.RAMMB
+		}
+		// The cold-start interlock (task 4.1): this process is still unaccounted
+		// if its declared RAM is unknown and nothing has measured it yet. It holds
+		// until measured when a measurer will deliver that measurement, else only
+		// while it is Starting -- see ramMeasurerInstalled above for why.
+		if needsRAMBootstrap(st.spec, st.measuredRAM) && (st.state == StateStarting || ramMeasurerInstalled) {
+			ramBootstrapInFlight = true
 		}
 		running = append(running, RunningProc{
 			SpecID:   id,
 			GPUs:     gpus,
+			RAMMB:    max(liveRAM, st.spec.RAMMB),
 			InFlight: st.inFlight,
 			Pinned:   st.spec.Pinned,
 			LastUsed: st.lastUsed,
@@ -1736,16 +2333,178 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// rule because it is the only code that interprets a budget, whereas a
 	// snapshot can be built by any caller. A second copy of the rule here
 	// would be one more place for the two to drift apart.
+	//
+	// Budgets the operator did not set are then filled in from the detected
+	// device totals (fillDetectedBudgets), which is what makes VRAM accounting
+	// default-on. That is a different thing from filtering: it adds a value,
+	// it never removes or reinterprets a row.
 	budgets := make(map[int]int, len(o.cfg.GPUBudgets))
 	for _, b := range o.cfg.GPUBudgets {
 		budgets[b.Index] = b.BudgetMB
 	}
+	o.fillDetectedBudgets(budgets, hi)
 
 	return PolicySnapshot{
-		Running:      running,
-		MaxProcesses: o.cfg.MaxProcesses,
-		Budgets:      budgets,
-		Allowed:      o.allowedPairs,
+		Running:         running,
+		MaxProcesses:    o.cfg.MaxProcesses,
+		Budgets:         budgets,
+		HostRAMBudgetMB: hostRAMBudgetMB(hi, residentRAMMB, o.hostRAMReserveMB),
+		// The ceiling is the budget's generous twin, for the terminal
+		// own-demand refusal only: the same pool, except that a process with no
+		// reading counts at its demand floor and the RAM of processes that have
+		// exited since the sample was taken is counted as already back. Each
+		// of those is a way the budget is understated for a moment without the
+		// host being short of anything -- a model still loading, a victim that
+		// just made room for this very candidate -- and a durable refusal must
+		// not be issued on the strength of either.
+		HostRAMCeilingMB:     hostRAMBudgetMB(hi, ramBoundMB+o.pendingRAMFreedMB(), o.hostRAMReserveMB),
+		RAMBootstrapInFlight: ramBootstrapInFlight,
+		// Copied verbatim; Admit is the one place that interprets it (0 = off),
+		// like every budget. It applies only to an unknown-RAM candidate.
+		RAMBootstrapGuessMB: o.ramBootstrapGuessMB,
+		Allowed:             o.allowedPairs,
+	}
+}
+
+// hostRAMBudgetMB is the host-RAM pool admission budgets managed processes
+// against: the capacity available to the MANAGED set, i.e. the host's LIVE
+// available memory (the sample's MemAvailable) PLUS the RAM the managed
+// processes already hold (residentMB, their summed live measurements), minus
+// the operator's reserve.
+//
+// Why the add-back. MemAvailable is what the host can still hand out, so it
+// already EXCLUDES every byte a managed process holds. Rule 6 then sums those
+// same processes' RAM into its left-hand side, so a pool of plain
+// MemAvailable-minus-reserve would charge them twice and cap the managed set
+// at roughly half of what the host can really hold -- evicting, or Waiting, for
+// starts that fit. Adding the held RAM back makes the pool a TOTAL for the
+// managed set, the host-wide analogue of the per-GPU VRAM budget (a device
+// total, not device-available); in steady state the add-back and the sum's
+// running terms cancel, and a candidate is charged against genuinely free RAM.
+// Only the live MEASUREMENT is added back, never a process's demand: the demand
+// is a floor on what is reserved, not on what is resident, so a floored process
+// that has not (yet) grown into it keeps charging the difference and a process
+// with no reading adds back nothing (the conservative direction).
+//
+// Live-available rather than total-minus-reserve is still the self-correcting
+// choice on a shared host: a co-located workload that grows lowers MemAvailable
+// and so the pool on the next sample, with nothing to reconfigure.
+//
+// Two cases deliberately look alike and are not:
+//
+//   - No reading (MemAvailableMB <= 0: no sample yet, or the read failed) is
+//     UNKNOWN, not an exhausted host, and yields 0 -- the UNCONSTRAINED
+//     sentinel, same as an undetected GPU's budget -- so RAM admission is a
+//     no-op until the host has actually been looked at. What the managed
+//     processes hold cannot turn that into a constraint.
+//   - A real reading whose pool is at or below zero is the tightest host there
+//     is and yields 1, never 0. A plain max(0, ...) would hand the most
+//     RAM-starved host the one value that means "admit anything", the opposite
+//     of keeping everything back; fillDetectedBudgets floors its VRAM budget at
+//     1 for the identical reason. 1 MB is a real ceiling, so Admit refuses
+//     every spec with a known RAM demand until the host recovers.
+//
+// The same arithmetic builds PolicySnapshot.HostRAMCeilingMB, with a generous
+// held figure in place of the measured one (see buildSnapshot): residentMB is
+// then "what the managed processes could be holding", not "what they have been
+// measured to hold".
+func hostRAMBudgetMB(hi HostInfo, residentMB, reserveMB int) int {
+	if hi.MemAvailableMB <= 0 {
+		return 0
+	}
+	return max(1, hi.MemAvailableMB+residentMB-reserveMB)
+}
+
+// ramFreedSettlePushes is how many samples must land after a managed process
+// exits before the pool is trusted to show the memory it freed: the one that is
+// current at the exit may have been taken before it, and the next one may have
+// been in flight; only the second is certain to have been taken afterwards,
+// because the collect loop takes a sample only after pushing the previous one.
+const ramFreedSettlePushes = 2
+
+// noteRAMFreed records, as a managed process exits, the host RAM it held: its
+// last live reading, or its demand floor when it was never measured (the
+// generous reading is the point -- see below). Admission can only learn that the
+// memory is back from the next hardware samples, and until then the pool is
+// understated by exactly this much: the process has already left the running
+// set, so its add-back is gone, while MemAvailable has not yet risen. That is
+// the state in which the beneficiary of an eviction is re-admitted, and it is
+// why the terminal own-demand refusal compares against a ceiling that counts
+// this credit (HostRAMCeilingMB) rather than against the budget.
+//
+// The credit lives until ramFreedSettlePushes samples have landed (hostSeq), and
+// further exits inside that window add to it and extend it. It is never part of
+// the admission arithmetic -- the budget does not get it -- so a stale credit can
+// make a durable refusal less eager, never admit something that does not fit.
+// Nothing is recorded before the first sample: with no MemAvailable reading
+// there is no pool to understate.
+func (o *owner) noteRAMFreed(st *specState) {
+	if o.m.hostInfo.Load() == nil {
+		return
+	}
+	mb := realRAM(st.measuredRAM)
+	if mb == 0 {
+		mb = st.spec.RAMMB
+	}
+	if mb <= 0 {
+		return
+	}
+	seq := o.m.hostSeq.Load()
+	if seq >= o.ramFreedUntilSeq {
+		o.ramFreedMB = 0 // the previous credit has already settled
+	}
+	o.ramFreedMB += mb
+	o.ramFreedUntilSeq = seq + ramFreedSettlePushes
+}
+
+// pendingRAMFreedMB is the unsettled credit noteRAMFreed has recorded, 0 once
+// enough samples have landed to have absorbed it.
+func (o *owner) pendingRAMFreedMB() int {
+	if o.ramFreedMB > 0 && o.m.hostSeq.Load() >= o.ramFreedUntilSeq {
+		o.ramFreedMB = 0
+	}
+	return o.ramFreedMB
+}
+
+// fillDetectedBudgets makes VRAM accounting default-on: for every GPU the
+// hardware sample hi reported, a budget the operator did not set is filled in from
+// the detected device total, minus the optional headroom. It edits budgets in
+// place, after the operator's rows have been copied verbatim.
+//
+// Per GPU index the rule is:
+//
+//   - an operator budget > 0 WINS and is left exactly as configured (no
+//     headroom, no clamp to the hardware -- it is the operator's word);
+//   - otherwise, a detected total > 0 gives max(1, total - headroom);
+//   - otherwise the index is left as it is: absent, or a verbatim 0 row, i.e.
+//     unconstrained -- the pre-feature behaviour, which is what a host with no
+//     GPU, or one that has not produced its first sample, gets.
+//
+// A configured row of 0 (or less) is "no budget set", not an override -- the
+// portal seeds a fresh row at 0 -- so the detected value replaces it. This is
+// NOT a "skip BudgetMB == 0" filter on the operator's rows (see the caller):
+// the row is still copied verbatim whenever nothing was detected, and Admit
+// remains the only code that interprets a budget <= 0 as unconstrained.
+//
+// The floor of 1 on the detected value is not cosmetic. A headroom at or above
+// the device total would otherwise yield 0, and 0 means UNCONSTRAINED -- the
+// opposite of "keep all of it back". 1 MB is a real ceiling, so Admit refuses
+// any spec with a known VRAM demand on that GPU, which is what reserving the
+// whole device means.
+//
+// An Apple GPU is skipped entirely: it has no dedicated VRAM, and the
+// "total" its collector reports is the system memory the GPU has allocated at
+// that instant, which moves with load and is not a ceiling. Budgeting against
+// it would refuse a spec larger than whatever is allocated right now.
+func (o *owner) fillDetectedBudgets(budgets map[int]int, hi HostInfo) {
+	if o.gpuVendor == GPUVendorApple {
+		return
+	}
+	for idx, total := range hi.GPUTotalsMB {
+		if total <= 0 || budgets[idx] > 0 {
+			continue
+		}
+		budgets[idx] = max(1, total-o.vramHeadroomMB)
 	}
 }
 
@@ -2121,6 +2880,23 @@ func (o *owner) handleChildExited(c cmdChildExited) {
 
 func (o *owner) onProcExited(st *specState, exitErr error) {
 	proc := st.proc
+	// Task 4.4: capture the cold-start RAM bootstrap's memory-pressure
+	// classification inputs BEFORE the lines below clear them -- st.measuredRAM
+	// (the last RSS) is zeroed a few lines down, and the host-RAM budget is read
+	// off the LIVE process set, which still includes this one only while st.proc
+	// is non-nil. Classification reads the EXIT SIGNATURE and the LAST
+	// MEASUREMENT, never free text (bootstrapDiedOfMemoryPressure). The escalation
+	// itself fires only on a non-intentional, non-removed exit, far below.
+	bootstrapSpec := specHasUnknownRAM(st.spec)
+	oomSignaled := killedBySIGKILL(exitErr)
+	lastMeasuredRAM := st.measuredRAM
+	ramBudgetAtDeath := 0
+	if bootstrapSpec {
+		// Only the bootstrap classifier reads this, and it loops the spec set, so
+		// skip it for every ordinary (known-RAM) exit.
+		ramBudgetAtDeath = o.hostRAMBudgetSnapshot()
+	}
+
 	cancelTimer(o.m, &proc.killTimer)
 	cancelTimer(o.m, &proc.drainTimer)
 	cancelTimer(o.m, &proc.stableTimer)
@@ -2140,6 +2916,12 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// rows. Cleared for EVERY kind of exit (crash, drain, idle unload,
 	// force_stopped, shutdown): none of them leaves the number true.
 	st.measuredVRAM = nil
+	// Same reasoning, and the same F2 cost, for the host-RAM figure: it
+	// describes this generation's process and is untrue the moment it exits.
+	// What it held is recorded first, though: the hardware sample has not seen
+	// the memory come back yet (noteRAMFreed).
+	o.noteRAMFreed(st)
+	st.measuredRAM = 0
 
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false
@@ -2252,6 +3034,26 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 
 	exitCode := extractExitCode(exitErr)
 	tail := proc.log.Tail(2048)
+
+	// Task 4.4: a cold-start RAM bootstrap (unknown declared RAM) whose child
+	// died of memory pressure gets the guarded, single evict-and-retry
+	// escalation -- bounded so it can never become a fork-exec storm. Any other
+	// bootstrap death, and every non-bootstrap death, falls through to the
+	// unchanged crash / start-failure handling below. The classification is read
+	// from the exit signature and the last measurement captured at the top.
+	//
+	// Gated on the spec WANTING to be up: evicting an idle process to free RAM is
+	// worth something only when a retry is actually coming (a queued request, or a
+	// pinned / force_running spec). A bootstrap that served its request and then
+	// OOM'd with nothing waiting on it has no retry to help, so evicting an
+	// innocent neighbour for it would be pure harm -- it falls through to the
+	// ordinary crash path, which records the failure and does not restart it.
+	if bootstrapSpec && o.wantsUp(st) && bootstrapDiedOfMemoryPressure(oomSignaled, lastMeasuredRAM, ramBudgetAtDeath) {
+		o.handleBootstrapMemoryPressure(st, exitCode, tail)
+		o.wakeAdmissionCandidates()
+		return
+	}
+
 	if wasHealthy {
 		o.setState(st, StateCrashed)
 		o.recordFailure(st, fmt.Sprintf("runtime: process exited unexpectedly (exit code %d)", exitCode), exitCode, tail)
@@ -2268,6 +3070,122 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		o.enterBackoff(st)
 	}
 	o.wakeAdmissionCandidates()
+}
+
+// handleBootstrapMemoryPressure is task 4.4's escalation, and its ENTIRE design
+// goal is that it is BOUNDED -- it can never become a fork-exec / evict-and-retry
+// storm (the "C3" anti-goal). It is reached only from onProcExited, only for a
+// cold-start bootstrap (unknown declared RAM) whose death was classified as
+// memory pressure, and only on a non-intentional exit.
+//
+// The bound is a per-spec counter (st.ramBootstrapRetries) capped at
+// ramBootstrapMaxRetries == 1:
+//
+//   - FIRST memory-pressure death (counter below the cap): spend the one shot.
+//     Evict a single idle process to free real host RAM -- more than the
+//     guess-based admission arithmetic alone would free, since the OOM is
+//     evidence the real footprint exceeds the guess -- and retry the bootstrap
+//     ONCE. The retry itself is the ordinary crash-loop backoff (recordFailure +
+//     StateStartFailed + enterBackoff), so it composes with the existing backoff
+//     discipline and the queued request is kept for it. Exactly ONE idle process
+//     is evicted, however many idle processes exist.
+//
+//   - SECOND consecutive memory-pressure death (counter at the cap): do NOT
+//     escalate again. No eviction, no second shot. Fall back to the ordinary
+//     bounded StateStartFailed crash-loop backoff and fail the queued request.
+//     The counter is NOT reset here -- only a successful measurement resets it
+//     (applyMeasurement) -- so every further memory-pressure death keeps taking
+//     this branch, and no additional idle process is ever evicted for this stuck
+//     bootstrap. That is what makes the escalation un-loopable.
+//
+// Because the counter survives restarts and is cleared only by a real
+// measurement, a bootstrap that eventually comes up and is measured earns the
+// one shot again for a genuinely new, later pressure event -- while one that
+// keeps dying escalates at most once.
+func (o *owner) handleBootstrapMemoryPressure(st *specState, exitCode int, tail string) {
+	if st.ramBootstrapRetries >= ramBootstrapMaxRetries {
+		// Shot already spent on this stuck bootstrap: the ordinary bounded path,
+		// no eviction, no escalation.
+		o.setState(st, StateStartFailed)
+		o.recordFailure(st, fmt.Sprintf(
+			"runtime: RAM cold-start bootstrap died of memory pressure again (exit code %d); escalation already spent, backing off",
+			exitCode), exitCode, tail)
+		o.failPending(st, ErrStartFailed)
+		o.enterBackoff(st)
+		return
+	}
+
+	st.ramBootstrapRetries++
+	evicted := o.evictOneIdleForBootstrap(st.spec.ID)
+	o.setState(st, StateStartFailed)
+	msg := fmt.Sprintf(
+		"runtime: RAM cold-start bootstrap died of memory pressure (exit code %d); evicting an idle process and retrying once",
+		exitCode)
+	if !evicted {
+		msg = fmt.Sprintf(
+			"runtime: RAM cold-start bootstrap died of memory pressure (exit code %d); no idle process to evict, retrying once",
+			exitCode)
+	}
+	o.recordFailure(st, msg, exitCode, tail)
+	// Deliberately NOT failPending here: the queued request is the reason to
+	// retry, and the retry is exactly what this escalation grants it. The retry
+	// rides the backoff below; if it, too, dies of memory pressure the second
+	// death takes the branch above and fails the request then.
+	o.enterBackoff(st)
+}
+
+// evictOneIdleForBootstrap drain-stops ONE idle process to free host RAM for a
+// bootstrap retry, and returns whether it found one. It is the single eviction
+// the memory-pressure escalation is allowed; the caller's counter is what keeps
+// it to one per stuck bootstrap.
+//
+// It picks the oldest idle, unpinned, non-starting victim -- the same
+// isEvictable contract Admit uses (never a busy, pinned or still-loading
+// process, never the fork-exec-storm victim that clause exists to prevent) and
+// the same oldest-LastUsed, lowest-id tie-break Admit's sortOldestFirst uses, so
+// the choice is deterministic over a map-ordered spec set. It records the
+// beneficiary (drainedFor) so the victim's exit offers the freed slot to the
+// bootstrap first, exactly like an admission eviction.
+func (o *owner) evictOneIdleForBootstrap(beneficiaryID string) bool {
+	var victim *specState
+	for id, st := range o.specs {
+		if id == beneficiaryID || st.proc == nil || st.state != StateRunning {
+			continue
+		}
+		if !isEvictable(RunningProc{Pinned: st.spec.Pinned, Starting: st.state == StateStarting, InFlight: st.inFlight}) {
+			continue
+		}
+		if victim == nil ||
+			st.lastUsed.Before(victim.lastUsed) ||
+			(st.lastUsed.Equal(victim.lastUsed) && st.spec.ID < victim.spec.ID) {
+			victim = st
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	victim.drainedFor = appendUnique(victim.drainedFor, beneficiaryID)
+	o.beginDrain(victim.spec.ID)
+	return true
+}
+
+// hostRAMBudgetSnapshot computes the current host-RAM pool exactly as
+// buildSnapshot does -- the live MemAvailable plus the RAM the managed processes
+// are MEASURED to hold, minus the operator reserve (hostRAMBudgetMB) -- so the
+// memory-pressure classifier compares a dying bootstrap's last RSS against the
+// same pool admission weighs demand against. It must be read while the dying
+// process is still in the live set (st.proc non-nil), so onProcExited calls it
+// before clearing that. Returns 0 (unconstrained) before the first hardware
+// sample, which makes the RSS-near-budget signature a no-op there.
+func (o *owner) hostRAMBudgetSnapshot() int {
+	residentRAMMB := 0
+	for _, st := range o.specs {
+		if st.proc == nil {
+			continue
+		}
+		residentRAMMB += realRAM(st.measuredRAM)
+	}
+	return hostRAMBudgetMB(o.hostInfo(), residentRAMMB, o.hostRAMReserveMB)
 }
 
 // enterBackoff puts st into the crash-loop wait and schedules the retry.
@@ -2497,6 +3415,41 @@ func wantsWakeAfterStart(st *specState) bool {
 	return wantsWake(st) && (len(st.pending) > 0 || st.spec.Pinned)
 }
 
+// wakeOnHostSample is the admission wake for a fresh hardware sample
+// (Manager.SetHostInfo posts it, the owner's run loop calls it). Of every
+// admission input, the host-RAM pool is the one that moves with the sample
+// alone: it is built from the live MemAvailable, so a start refused for lack of
+// RAM can fit on the very next sample with no release, exit or Apply in between
+// -- most importantly the beneficiary of a RAM eviction, which is re-admitted on
+// its victim's exit against the previous sample, before the freed memory shows.
+// Until this wake existed it then waited for an unrelated event or its whole
+// admission timeout.
+//
+// It re-asks only the specs wantsHostSampleWake selects, so it is a cheap no-op
+// (one pass over the spec table, nothing evaluated) whenever nothing is waiting
+// on RAM, which is nearly always. That is also what keeps it from being a storm:
+// a sample lands about once a second for the life of the agent, and evaluating
+// admission is not free -- buildSnapshot calls the installed VRAM measurer, a
+// subprocess on a real host -- so a wake on every sample for every queued start
+// would run it once a second for as long as anything queued behind a busy
+// neighbour. Even a start that IS waiting on RAM costs one evaluation per
+// sample, and no more.
+func (o *owner) wakeOnHostSample() {
+	o.wakeAdmission(wantsHostSampleWake)
+}
+
+// wantsHostSampleWake is wakeOnHostSample's selection rule: a spec whose last
+// verdict was a Wait the RAM pool contributed to, narrowed to the same set
+// wakeAfterStart may retry (a queued request, or pinned). That narrowing is the
+// part that matters for safety: a force_running spec with no waiter is
+// deliberately left to the next release, exit or Apply, because retrying it on
+// anything but a real change lets two that cannot run together evict each other
+// at load speed (see wakeAfterStart). A sample is such an event no more than a
+// finished start is.
+func wantsHostSampleWake(st *specState) bool {
+	return st.waitingOnRAM && wantsWakeAfterStart(st)
+}
+
 // wakeAdmission retries admission for every spec that want selects, oldest
 // queued request first (see wakeAdmissionCandidates).
 func (o *owner) wakeAdmission(want func(*specState) bool) {
@@ -2623,6 +3576,8 @@ func (o *owner) snapshotStatus() []Status {
 			}
 			s.MeasuredVRAM = cp
 		}
+		// A scalar: copied by value, so nothing aliases owner state.
+		s.MeasuredRAMMB = st.measuredRAM
 		if st.proc != nil {
 			s.PID = st.proc.pid
 			s.Port = st.proc.port

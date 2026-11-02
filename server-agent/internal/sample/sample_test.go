@@ -382,6 +382,43 @@ func TestSampleCarriesRuntimes(t *testing.T) {
 	}
 }
 
+// TestRuntimeSampleRAMMeasuredWireShape pins the spec-level RAM figure's wire
+// key and its omitempty rule. ram_measured_mb is a scalar beside the per-GPU
+// gpus[] (RAM has no GPU axis), present only when measured: 0 is the "unknown"
+// sentinel, never "needs no RAM", so an unmeasured spec -- and every agent that
+// predates the field -- sends no key at all and stays byte-neutral for the
+// gateway's decoder. It decodes through a generic map on purpose: the gateway's
+// ingest does not read the key yet, so wireRuntimeSample (a mirror of that
+// ingest's DTO) does not carry it.
+func TestRuntimeSampleRAMMeasuredWireShape(t *testing.T) {
+	s := Sample{
+		Runtimes: []RuntimeSample{
+			{SpecID: "measured", Model: "m", State: "running", RAMMeasuredMB: 1500},
+			{SpecID: "unknown", Model: "m", State: "running"},
+		},
+	}
+	s.Normalize()
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got struct {
+		Runtimes []map[string]json.RawMessage `json:"runtimes"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Runtimes) != 2 {
+		t.Fatalf("runtimes len = %d, want 2", len(got.Runtimes))
+	}
+	if v, ok := got.Runtimes[0]["ram_measured_mb"]; !ok || string(v) != "1500" {
+		t.Errorf("runtimes[0].ram_measured_mb = %s (present %v), want 1500", v, ok)
+	}
+	if v, ok := got.Runtimes[1]["ram_measured_mb"]; ok {
+		t.Errorf("runtimes[1].ram_measured_mb = %s, want the key omitted for an unmeasured spec", v)
+	}
+}
+
 // TestRuntimeSampleContextAndMetricsFieldsRoundTrip is the sample half of
 // Task 7: ContextSize/ActiveRequests/QueueDepth mirror the gateway ingest's
 // exact tags (context_size/active_requests/queue_depth) and, like

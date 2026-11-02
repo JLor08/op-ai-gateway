@@ -286,7 +286,7 @@ func TestIngestDropsAnAgentReportedSpeculationVerdict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			if tc.seedObservation {
 				seedCapabilityRow(t, srv, mappingID, routing.CapabilitySpeculationObserved,

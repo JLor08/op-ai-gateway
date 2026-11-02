@@ -24,18 +24,17 @@ import (
 // existing "mock-host-qwen" test server (seedGatewayTestRoutes seeds it with
 // no application/mapping of its own, so this never collides) and a runtime
 // spec with one GPU row (index 0, a 20000 MB operator estimate, measured
-// starting at 0). vramLocked controls the spec's VRAMLocked flag, the input
-// the write-back path under test consults.
-func seedRuntimeIngestSpec(t *testing.T, srv *Server, specID string, vramLocked bool) {
+// starting at 0).
+func seedRuntimeIngestSpec(t *testing.T, srv *Server, specID string) {
 	t.Helper()
-	seedRuntimeIngestSpecForServer(t, srv, "mock-host-qwen", specID, vramLocked)
+	seedRuntimeIngestSpecForServer(t, srv, "mock-host-qwen", specID)
 }
 
 // seedRuntimeIngestSpecForServer is seedRuntimeIngestSpec parameterized by
 // owning server id, so a test can seed a spec belonging to a DIFFERENT
 // server than the one it later ingests a sample as (the cross-server
 // authorization tests below).
-func seedRuntimeIngestSpecForServer(t *testing.T, srv *Server, serverID, specID string, vramLocked bool) {
+func seedRuntimeIngestSpecForServer(t *testing.T, srv *Server, serverID, specID string) {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -54,7 +53,7 @@ func seedRuntimeIngestSpecForServer(t *testing.T, srv *Server, serverID, specID 
 	}
 	spec := routing.RuntimeSpec{
 		ID: specID, MappingID: mappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
-		VRAMLocked: vramLocked, CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := srv.Routes.UpsertRuntimeSpec(ctx, spec); err != nil {
 		t.Fatalf("upsert runtime spec: %v", err)
@@ -72,7 +71,7 @@ func seedRuntimeIngestSpecForServer(t *testing.T, srv *Server, serverID, specID 
 // serves.
 func TestIngestTelemetrySamplePublishesRuntimeStatus(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_status", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_status")
 
 	_, ch, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
 	defer unsub()
@@ -130,7 +129,7 @@ func TestIngestTelemetrySampleRuntimesAbsentPublishesEmptySnapshot(t *testing.T)
 // it reaches the volatile status registry.
 func TestIngestTelemetrySampleRuntimeClampsStderrTail(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_stderr", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_stderr")
 
 	long := strings.Repeat("x", maxRuntimeStderrTail+500)
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_stderr","state":"crashed",` +
@@ -158,7 +157,7 @@ func TestIngestTelemetrySampleRuntimeClampsStderrTail(t *testing.T) {
 // the operator's own VRAMEstimateMB.
 func TestIngestTelemetrySampleRuntimeVRAMWriteBack(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_vram", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_vram")
 
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_vram","state":"running","gpus":[{"index":0,"vram_measured_mb":21234}]}]}`
 	req, raw := ingestReq(t, body)
@@ -175,28 +174,6 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBack(t *testing.T) {
 	}
 	if gpus[0].VRAMEstimateMB != 20000 {
 		t.Fatalf("VRAMEstimateMB = %d, want untouched 20000", gpus[0].VRAMEstimateMB)
-	}
-}
-
-// TestIngestTelemetrySampleRuntimeVRAMWriteBackSkippedWhenLocked proves a
-// VRAMLocked spec's GPU rows are left alone even when the sample carries a
-// measured value -- the operator's pinned numbers win.
-func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkippedWhenLocked(t *testing.T) {
-	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_locked", true)
-
-	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_locked","state":"running","gpus":[{"index":0,"vram_measured_mb":99999}]}]}`
-	req, raw := ingestReq(t, body)
-	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
-		t.Fatalf("ingest: %v", err)
-	}
-
-	gpus, err := srv.Routes.RuntimeSpecGPUs(context.Background(), "rspec_locked")
-	if err != nil || len(gpus) != 1 {
-		t.Fatalf("RuntimeSpecGPUs: gpus=%#v err=%v", gpus, err)
-	}
-	if gpus[0].VRAMMeasuredMB != 0 {
-		t.Fatalf("VRAMMeasuredMB = %d, want untouched 0 (spec is VRAMLocked)", gpus[0].VRAMMeasuredMB)
 	}
 }
 
@@ -230,8 +207,8 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackToleratesUnknownSpec(t *testin
 // by spec_id actually belongs to THAT server. An agent authenticated for
 // "mock-host-qwen" naming a spec_id that belongs to a DIFFERENT server must
 // leave that other server's spec untouched. This test FAILS against the
-// pre-fix writeBackRuntimeVRAM, which resolved only RuntimeSpecByID +
-// VRAMLocked and wrote unconditionally.
+// pre-fix writeBackRuntimeVRAM, which resolved only RuntimeSpecByID and wrote
+// unconditionally.
 func TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec(t *testing.T) {
 	srv := NewTestServer()
 	ctx := context.Background()
@@ -245,7 +222,7 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec(t *test
 		t.Fatalf("create other server: %v", err)
 	}
 	// rspec_cross_tenant belongs to otherServerID, NOT mock-host-qwen.
-	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_tenant", false)
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_tenant")
 
 	// Authenticated as "mock-host-qwen" (the token-derived serverID), the
 	// sample names otherServerID's spec_id with a forged measured VRAM.
@@ -270,7 +247,7 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackRejectsCrossServerSpec(t *test
 // not become a blanket rejection.
 func TestIngestTelemetrySampleRuntimeVRAMWriteBackAcceptsOwnServerSpec(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_own_tenant", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_own_tenant")
 
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_own_tenant","state":"running","gpus":[{"index":0,"vram_measured_mb":22222}]}]}`
 	req, raw := ingestReq(t, body)
@@ -370,21 +347,17 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackBoundsSampleCount(t *testing.T
 	}
 }
 
-// --- Task 9 review round 2: audit trail must not depend on lock status ----
+// --- Task 9 review round 2: the cross-server attempt must leave an audit trail
 
-// TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServerEvenWhenLocked
-// is the audit-trail regression guard: resolveRuntimeSpecWritable used to
-// check VRAMLocked BEFORE the cross-server ownership check, so a naming
-// attempt against a spec that happened to be locked returned false with NO
-// Warn logged -- the write was still correctly blocked, but the audit trail
-// for exactly the attack the previous round fixed was silently incomplete.
-// Ownership is now checked UNCONDITIONALLY, so the Warn fires whether or
-// not the targeted spec is locked.
-func TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServerEvenWhenLocked(t *testing.T) {
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServer is the
+// audit-trail regression guard: a naming attempt against another server's spec
+// is not only blocked (RejectsCrossServerSpec above) but logged at Warn, so the
+// record of exactly the attack the ownership check exists to catch is complete.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServer(t *testing.T) {
 	srv := NewTestServer()
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const otherServerID = "mock-host-other-tenant-locked"
+	const otherServerID = "mock-host-other-tenant-audit"
 	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
 		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
 		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
@@ -392,28 +365,27 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackWarnsOnCrossServerEvenWhenLock
 	}); err != nil {
 		t.Fatalf("create other server: %v", err)
 	}
-	// rspec_cross_locked is BOTH owned by a different server AND VRAMLocked.
-	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_locked", true)
+	// rspec_cross_audit is owned by a different server.
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_audit")
 
 	buf, restore := withCapturedSlog(t)
 	defer restore()
 
-	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_cross_locked","state":"running","gpus":[{"index":0,"vram_measured_mb":99999}]}]}`
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_cross_audit","state":"running","gpus":[{"index":0,"vram_measured_mb":99999}]}]}`
 	req, raw := ingestReq(t, body)
 	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
 
-	// The write is still correctly blocked (cross-server wins regardless of
-	// lock status).
-	gpus, err := srv.Routes.RuntimeSpecGPUs(ctx, "rspec_cross_locked")
+	// The write is blocked as well as logged.
+	gpus, err := srv.Routes.RuntimeSpecGPUs(ctx, "rspec_cross_audit")
 	if err != nil || len(gpus) != 1 || gpus[0].VRAMMeasuredMB != 0 {
 		t.Fatalf("gpus = %#v, err = %v, want untouched", gpus, err)
 	}
 
 	recs := buf.Snapshot()
 	if !findLogRecord(recs, "WARN", "spec belongs to a different server") {
-		t.Fatal("a cross-server naming attempt against a LOCKED spec must still log a Warn -- the audit trail must not depend on lock status")
+		t.Fatal("a cross-server naming attempt must log a Warn -- the audit trail for the attack the ownership check catches")
 	}
 }
 
@@ -448,7 +420,7 @@ func (c *countingMeasuredWriteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Co
 // stored converges no matter what happened to the row.
 func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_unchanged", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_unchanged")
 	counting := &countingMeasuredWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 	srv.Routes = counting
 
@@ -482,6 +454,212 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue(t *testing
 	}
 }
 
+// --- Measured host RAM write-back (spec-level, agent-owned) -----------------
+
+// countingRAMWriteStore counts the agent-owned RAM write-back's own UPDATE, so
+// a test can assert that an unchanged, non-positive or absent measurement costs
+// no write at all.
+type countingRAMWriteStore struct {
+	*routing.MemoryStore
+	updateCalls atomic.Int32
+}
+
+func (c *countingRAMWriteStore) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error {
+	c.updateCalls.Add(1)
+	return c.MemoryStore.UpdateRuntimeSpecRAMMeasured(ctx, specID, measuredMB)
+}
+
+// ramIngestBody is a one-runtime telemetry body for specID carrying the given
+// raw spec-level fragment (e.g. `"ram_measured_mb":6000,`, or "" for an agent
+// that predates the field). The fragment sits BEFORE state so it can be empty
+// without leaving a dangling comma.
+func ramIngestBody(specID, fragment string) string {
+	return `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"` + specID + `",` + fragment + `"state":"running"}]}`
+}
+
+func ingestRAMSample(t *testing.T, srv *Server, serverID, body string) {
+	t.Helper()
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), serverID, req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+}
+
+func storedRAM(t *testing.T, srv *Server, specID string) routing.RuntimeSpec {
+	t.Helper()
+	spec, ok, err := srv.Routes.RuntimeSpecByID(context.Background(), specID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByID(%s): ok=%v err=%v", specID, ok, err)
+	}
+	return spec
+}
+
+// TestIngestWritesMeasuredRAM proves a runtime sample's spec-level
+// ram_measured_mb is written back onto the spec (RAMMeasuredMB) without
+// disturbing the operator's own RAMEstimateMB. The sample carries NO gpus array
+// on purpose: RAM is host-scoped, so a CPU-only spec -- which has nothing for the
+// per-GPU VRAM write-back to do -- must still land its measurement.
+func TestIngestWritesMeasuredRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram")
+	seeded := storedRAM(t, srv, "rspec_ram")
+	seeded.RAMEstimateMB = 4096
+	if err := srv.Routes.UpsertRuntimeSpec(context.Background(), seeded); err != nil {
+		t.Fatalf("seed ram estimate: %v", err)
+	}
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram", `"ram_measured_mb":6000,`))
+
+	got := storedRAM(t, srv, "rspec_ram")
+	if got.RAMMeasuredMB != 6000 {
+		t.Fatalf("RAMMeasuredMB = %d, want 6000", got.RAMMeasuredMB)
+	}
+	if got.RAMEstimateMB != 4096 {
+		t.Fatalf("RAMEstimateMB = %d, want the operator's 4096 untouched", got.RAMEstimateMB)
+	}
+}
+
+// TestIngestWritesMeasuredRAMAndVRAMFromOneSample pins that the two
+// write-backs are independent and both unconditional for an owned spec: one
+// sample carrying a GPU measurement AND a spec-level ram_measured_mb lands
+// BOTH. VRAM (per GPU row) and RAM (one scalar on the spec) are separate
+// stores behind separate code paths, so a regression that let either one
+// short-circuit the other -- or gated either behind an operator opt-out -- would
+// silently stop measuring a spec.
+func TestIngestWritesMeasuredRAMAndVRAMFromOneSample(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_vram")
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_ram_vram","state":"running",` +
+		`"ram_measured_mb":6000,"gpus":[{"index":0,"vram_measured_mb":21234}]}]}`
+	ingestRAMSample(t, srv, "mock-host-qwen", body)
+
+	if got := storedRAM(t, srv, "rspec_ram_vram"); got.RAMMeasuredMB != 6000 {
+		t.Fatalf("RAMMeasuredMB = %d, want 6000", got.RAMMeasuredMB)
+	}
+	gpus, err := srv.Routes.RuntimeSpecGPUs(context.Background(), "rspec_ram_vram")
+	if err != nil || len(gpus) != 1 || gpus[0].VRAMMeasuredMB != 21234 {
+		t.Fatalf("gpus = %#v err = %v, want the sample's 21234 MB VRAM measurement written back", gpus, err)
+	}
+}
+
+// TestIngestSkipsNonPositiveRAM proves a measured 0 -- or a negative number a
+// buggy agent could send -- is UNKNOWN, never "needs no RAM": it is dropped
+// before it reaches the store, so a previously stored real measurement survives.
+func TestIngestSkipsNonPositiveRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_zero")
+	if err := srv.Routes.UpdateRuntimeSpecRAMMeasured(context.Background(), "rspec_ram_zero", 7000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	counting := &countingRAMWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	for _, fragment := range []string{`"ram_measured_mb":0,`, `"ram_measured_mb":-5,`} {
+		ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_zero", fragment))
+	}
+
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d for non-positive measurements, want 0", got)
+	}
+	if got := storedRAM(t, srv, "rspec_ram_zero"); got.RAMMeasuredMB != 7000 {
+		t.Fatalf("RAMMeasuredMB = %d, want the stored 7000 untouched by a non-positive sample", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestSkipsUnchangedRAM is the RAM twin of the VRAM change-detection
+// test: telemetry arrives once per second and every sample is a full snapshot,
+// so a stable measurement must cost one write, not one per second forever. The
+// comparison is against what is STORED, so a changed value must still land.
+func TestIngestSkipsUnchangedRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_same")
+	counting := &countingRAMWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	for i := 0; i < 3; i++ {
+		ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_same", `"ram_measured_mb":6000,`))
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d across three samples carrying the SAME measurement, want exactly 1", got)
+	}
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_same", `"ram_measured_mb":6500,`))
+	if got := counting.updateCalls.Load(); got != 2 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d after a CHANGED measurement, want 2", got)
+	}
+	if got := storedRAM(t, srv, "rspec_ram_same"); got.RAMMeasuredMB != 6500 {
+		t.Fatalf("RAMMeasuredMB = %d, want the changed 6500", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestAbsentRAMLeavesColumnAlone is the old-agent case. An agent that
+// predates the measurement sends no ram_measured_mb key at all (the agent's
+// field is omitempty, so an unmeasured spec sends none either); that must be a
+// no-op -- the stored value is neither zeroed nor rewritten.
+func TestIngestAbsentRAMLeavesColumnAlone(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_absent")
+	if err := srv.Routes.UpdateRuntimeSpecRAMMeasured(context.Background(), "rspec_ram_absent", 7000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	counting := &countingRAMWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_absent", ""))
+
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d for a sample with no ram_measured_mb key, want 0", got)
+	}
+	if got := storedRAM(t, srv, "rspec_ram_absent"); got.RAMMeasuredMB != 7000 {
+		t.Fatalf("RAMMeasuredMB = %d, want the stored 7000 left alone", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestRAMWriteBackRejectsCrossServerSpec is the authorization guard the
+// VRAM write-back carries, applied to RAM: spec_id is an agent-supplied body
+// field and only the token-derived server id binds a sample to a server, so an
+// agent naming ANOTHER server's spec must neither write that spec's RAM nor go
+// unrecorded -- a cross-server naming attempt is logged at Warn.
+func TestIngestRAMWriteBackRejectsCrossServerSpec(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const otherServerID = "mock-host-other-tenant-ram"
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_ram_cross")
+
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_cross", `"ram_measured_mb":99999,`))
+
+	if got := storedRAM(t, srv, "rspec_ram_cross"); got.RAMMeasuredMB != 0 {
+		t.Fatalf("RAMMeasuredMB = %d, want untouched 0: another server's spec must not be written", got.RAMMeasuredMB)
+	}
+	if !findLogRecord(buf.Snapshot(), "WARN", "spec belongs to a different server") {
+		t.Fatal("a cross-server naming attempt on the RAM write-back must log a Warn")
+	}
+}
+
+// TestIngestRAMWriteBackToleratesUnknownSpec proves a sample naming a spec id
+// with no row never rejects the sample: the RAM write-back is best-effort.
+func TestIngestRAMWriteBackToleratesUnknownSpec(t *testing.T) {
+	srv := NewTestServer()
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_ghost", `"ram_measured_mb":5000,`))
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 || snap[0].SpecID != "rspec_ram_ghost" {
+		t.Fatalf("snapshot = %#v, want the runtime status published regardless", snap)
+	}
+}
+
 // TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredVRAMWatermark proves
 // the live status stream carries this sample's per-GPU measured VRAM together
 // with the GATEWAY's own arrival time for the frame that carried it. The
@@ -492,7 +670,7 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue(t *testing
 // self-reported reported_at.
 func TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredVRAMWatermark(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_watermark", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_watermark")
 
 	// A deliberately stale agent-reported timestamp: the watermark must NOT
 	// come from it.
@@ -547,7 +725,7 @@ func TestIngestTelemetrySampleRuntimeStatusOmitsWatermarkWithoutAMeasurement(t *
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, "rspec_nomeasure", false)
+			seedRuntimeIngestSpec(t, srv, "rspec_nomeasure")
 			body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_nomeasure","state":"running"` + tc.gpus + `}]}`
 			req, raw := ingestReq(t, body)
 			if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
@@ -587,7 +765,7 @@ func TestIngestTelemetrySampleRuntimeStatusOmitsWatermarkWithoutAMeasurement(t *
 // already exists).
 func TestIngestTelemetrySampleRuntimeContextWriteBack(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_ctx_on", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_on")
 
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
 		`"runtimes":[{"spec_id":"rspec_ctx_on","state":"running","context_size":8192}]}`
@@ -615,7 +793,7 @@ func TestIngestTelemetrySampleRuntimeContextWriteBack(t *testing.T) {
 // once true.
 func TestIngestTelemetrySampleRuntimeContextWriteBackGuardedByCapability(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_ctx_off", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_off")
 
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_ctx_off","state":"running","context_size":8192}]}`
 	req, raw := ingestReq(t, body)
@@ -650,7 +828,7 @@ func TestIngestTelemetrySampleRuntimeContextWriteBackRejectsCrossServerSpec(t *t
 		t.Fatalf("create other server: %v", err)
 	}
 	// rspec_cross_ctx belongs to otherServerID, NOT mock-host-qwen.
-	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_ctx", false)
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_ctx")
 
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
 		`"runtimes":[{"spec_id":"rspec_cross_ctx","state":"running","context_size":8192}]}`
@@ -676,7 +854,7 @@ func TestIngestTelemetrySampleRuntimeContextWriteBackRejectsCrossServerSpec(t *t
 // value + provenance are genuinely left alone end to end.
 func TestIngestTelemetrySampleRuntimeContextWriteBackSkipsLockedMapping(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_ctx_locked", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_locked")
 	ctx := context.Background()
 
 	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_ctx_locked")
@@ -731,7 +909,7 @@ func (c *countingContextWriteStore) UpdateMappingContextProbe(ctx context.Contex
 // storedContext), not against what this same spec_id reported last sample.
 func TestIngestTelemetrySampleRuntimeContextWriteBackSkipsUnchangedValue(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_ctx_unchanged", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_ctx_unchanged")
 	counting := &countingContextWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 	srv.Routes = counting
 
@@ -881,7 +1059,7 @@ func TestIngestTelemetrySamplePerServerAggregateClampsNegativeRuntimeValue(t *te
 // correctly populates the RuntimeStatusDTO with those exact values.
 func TestIngestTelemetrySampleRuntimeProbeReachability(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_probes", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_probes")
 
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_probes","model":"qwen-coder","state":"running","since":"2026-08-20T10:00:00Z","pid":4242,"port":9001,"in_flight":2,"restarts":1,"context_size":8192,"active_requests":3,"queue_depth":5,"metrics_probe":"ok","context_probe":"unreachable"}]}`
 	req, raw := ingestReq(t, body)
@@ -1040,7 +1218,7 @@ func liveProgressBody(specID, support string) string {
 // that can never change short of an operator swapping the upstream binary.
 func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_row", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_row")
 	counting := countingRowStore(srv)
 
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
@@ -1102,7 +1280,7 @@ func TestIngestLiveProgressLandsAsARow(t *testing.T) {
 func TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_dup", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_dup")
 	counting := countingRowStore(srv)
 
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
@@ -1163,7 +1341,7 @@ func TestIngestDropsReservedCapabilityNamesFromAnAgentProbe(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			seedCapabilityRow(t, srv, mappingID, routing.CapabilityMTP, routing.CapabilityNo, routing.CapabilitySourceLegacy)
 			counting := countingRowStore(srv)
@@ -1197,7 +1375,7 @@ func TestIngestDropsReservedCapabilityNamesFromAnAgentProbe(t *testing.T) {
 // could not tell apart from "never probed", and the row model can.
 func TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_once", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_once")
 	counting := countingRowStore(srv)
 
 	body := liveProgressBody("rspec_lp_once", "unsupported")
@@ -1222,7 +1400,7 @@ func TestIngestTelemetrySampleLiveProgressWriteBackPersistsOnce(t *testing.T) {
 // merely because both sides happen to be empty.
 func TestIngestTelemetrySampleLiveProgressWriteBackSkipsEmptySample(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_empty", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_empty")
 	ctx := context.Background()
 	seedCapabilityRow(t, srv, "map_rspec_lp_empty", routing.CapabilityLiveProgress, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -1250,7 +1428,7 @@ func TestIngestTelemetrySampleLiveProgressWriteBackSkipsEmptySample(t *testing.T
 // capability write is unlocked.
 func TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_locked", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_locked")
 	ctx := context.Background()
 
 	mapping, err := srv.Routes.MappingByID(ctx, "map_rspec_lp_locked")
@@ -1290,7 +1468,7 @@ func TestIngestTelemetrySampleLiveProgressWriteBackUpdatesLockedMapping(t *testi
 // build) must still be written.
 func TestIngestTelemetrySampleLiveProgressWriteBackWritesOnChange(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_change", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_change")
 	counting := countingRowStore(srv)
 	ctx := context.Background()
 
@@ -1336,7 +1514,7 @@ func manyLiveProgressSamples(n int, specID, support string) []agentRuntimeSample
 // value, so only the call count distinguishes them.
 func TestIngestTelemetrySampleLiveProgressWriteBackMemoizesRepeatedSpecID(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_memo", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_memo")
 	counting := &countingRuntimeSpecStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
 	srv.Routes = counting
 
@@ -1388,8 +1566,8 @@ func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *tes
 		t.Fatalf("create other server: %v", err)
 	}
 	// rspec_cross_lp belongs to otherServerID; rspec_own_lp to the reporting one.
-	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_lp", false)
-	seedRuntimeIngestSpec(t, srv, "rspec_own_lp", false)
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_lp")
+	seedRuntimeIngestSpec(t, srv, "rspec_own_lp")
 	seedCapabilityRow(t, srv, "map_rspec_cross_lp", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 
 	counting := countingRowStore(srv)
@@ -1430,7 +1608,7 @@ func TestIngestTelemetrySampleLiveProgressWriteBackRejectsCrossServerSpec(t *tes
 // assertion can pass off an empty-equals-empty coincidence.
 func TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_nocap", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_nocap")
 	ctx := context.Background()
 	seedCapabilityRow(t, srv, "map_rspec_lp_nocap", routing.CapabilityLiveProgress, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -1457,7 +1635,7 @@ func TestIngestTelemetrySampleLiveProgressWriteBackGuardedByCapability(t *testin
 // -- it is not gated on the runtime_model_probe capability.
 func TestIngestTelemetrySampleLiveProgressCarriedOnStatusDTO(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_dto", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_dto")
 
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_lp_dto","state":"running","live_progress_support":"unsupported"}]}`
 	req, raw := ingestReq(t, body)
@@ -1503,7 +1681,7 @@ func capabilitiesBody(specID, capsJSON string) string {
 // only change if an operator swaps the upstream binary.
 func TestIngestWritesBackCapabilities(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_once", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_once")
 	counting := countingRowStore(srv)
 
 	body := capabilitiesBody("rspec_caps_once", `{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"no"}]}`)
@@ -1536,7 +1714,7 @@ func TestIngestWritesBackCapabilities(t *testing.T) {
 // two unknown ones, one "yes" and one "no", and requires all three rows.
 func TestIngestProbeWritesANoVerdictOnAnUnknownCapabilityName(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_unknown", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_unknown")
 	counting := countingRowStore(srv)
 
 	body := capabilitiesBody("rspec_caps_unknown", `{"verdicts":[`+
@@ -1575,7 +1753,7 @@ func TestIngestProbeWritesANoVerdictOnAnUnknownCapabilityName(t *testing.T) {
 // stopped working altogether.
 func TestIngestProbeDoesNotOverwriteAManualVerdict(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_manual", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_manual")
 	seedCapabilityRow(t, srv, "map_rspec_caps_manual", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceManual)
 	counting := countingRowStore(srv)
 
@@ -1609,7 +1787,7 @@ func TestIngestProbeDoesNotOverwriteAManualVerdict(t *testing.T) {
 // only that row.
 func TestIngestProbeDoesNotOverwriteABenchmarkVerdict(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_bench", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_bench")
 	seedCapabilityRow(t, srv, "map_rspec_caps_bench", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceVisionBenchmark)
 	counting := countingRowStore(srv)
 
@@ -1645,7 +1823,7 @@ func TestIngestProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
 
 	t.Run("a differing llama_cpp_props row is replaced", func(t *testing.T) {
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_caps_own", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_caps_own")
 		seedCapabilityRow(t, srv, "map_rspec_caps_own", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 		counting := countingRowStore(srv)
 
@@ -1661,7 +1839,7 @@ func TestIngestProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
 
 	t.Run("a differing legacy row is replaced", func(t *testing.T) {
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_caps_legacy", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_caps_legacy")
 		seedCapabilityRow(t, srv, "map_rspec_caps_legacy", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLegacy)
 		counting := countingRowStore(srv)
 
@@ -1677,7 +1855,7 @@ func TestIngestProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
 
 	t.Run("an agreeing probe row is not rewritten", func(t *testing.T) {
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_caps_agree", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_caps_agree")
 		seedCapabilityRow(t, srv, "map_rspec_caps_agree", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 		counting := countingRowStore(srv)
 
@@ -1716,7 +1894,7 @@ func TestIngestStampsTheSourceTheAgentReported(t *testing.T) {
 
 	t.Run("an ollama-probed sample lands ollama_api_show rows", func(t *testing.T) {
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_src_ollama", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_src_ollama")
 		counting := countingRowStore(srv)
 
 		req, raw := ingestReq(t, capabilitiesBody("rspec_src_ollama",
@@ -1733,7 +1911,7 @@ func TestIngestStampsTheSourceTheAgentReported(t *testing.T) {
 
 	t.Run("a llama_cpp-probed sample lands llama_cpp_props rows", func(t *testing.T) {
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_src_props", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_src_props")
 		counting := countingRowStore(srv)
 
 		req, raw := ingestReq(t, capabilitiesBody("rspec_src_props",
@@ -1749,7 +1927,7 @@ func TestIngestStampsTheSourceTheAgentReported(t *testing.T) {
 
 	t.Run("no source key keeps the historical default", func(t *testing.T) {
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_src_absent", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_src_absent")
 		counting := countingRowStore(srv)
 
 		req, raw := ingestReq(t, capabilitiesBody("rspec_src_absent",
@@ -1770,7 +1948,7 @@ func TestIngestStampsTheSourceTheAgentReported(t *testing.T) {
 		// attributed exactly as before. Without this case the nil branch of
 		// rowSource was pinned only incidentally, by a routing e2e test.
 		srv := NewTestServer()
-		seedRuntimeIngestSpec(t, srv, "rspec_src_nilobj", false)
+		seedRuntimeIngestSpec(t, srv, "rspec_src_nilobj")
 		counting := countingRowStore(srv)
 
 		body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
@@ -1817,7 +1995,7 @@ func TestIngestRejectsAnUnclaimableCapabilitySource(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			seedCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 			counting := countingRowStore(srv)
@@ -1870,7 +2048,7 @@ func TestIngestWarnsWhenACapabilitySourceCannotBeAttributed(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_src_warn", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_src_warn")
 	counting := countingRowStore(srv)
 
 	req, raw := ingestReq(t, capabilitiesBody("rspec_src_warn",
@@ -1958,7 +2136,7 @@ func TestIngestOllamaSourcedVerdictRespectsThePrecedenceRank(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			seedCapabilityRow(t, srv, mappingID, routing.CapabilityVision, routing.CapabilityNo, tc.storedSource)
 			counting := countingRowStore(srv)
@@ -2010,7 +2188,7 @@ func TestIngestOllamaSourcedVerdictRespectsThePrecedenceRank(t *testing.T) {
 func TestIngestRefusesALiveProgressRowFromTheOllamaProbe(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_lp_src", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_lp_src")
 	counting := countingRowStore(srv)
 
 	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
@@ -2071,7 +2249,7 @@ func TestIngestRefusesALiveProgressRowFromTheOllamaProbe(t *testing.T) {
 func TestIngestRefusesANegativeVerdictFromTheOllamaProbe(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_ollama_no", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_ollama_no")
 	seedCapabilityRow(t, srv, "map_rspec_ollama_no", routing.CapabilityVision,
 		routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -2141,7 +2319,7 @@ func TestIngestLandsTheSdcppProbesImageVerdictInBothDirections(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			counting := countingRowStore(srv)
 
@@ -2179,7 +2357,7 @@ func TestIngestLandsTheSdcppProbesImageVerdictInBothDirections(t *testing.T) {
 func TestIngestDropsNonImageRowsFromTheSdcppProbe(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_foreign", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_foreign")
 	seedCapabilityRow(t, srv, "map_rspec_sdcpp_foreign", routing.CapabilityVision,
 		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -2233,7 +2411,7 @@ func TestIngestRefusesALiveProgressRowFromTheSdcppProbe(t *testing.T) {
 		t.Run(support, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_lp", false)
+			seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_lp")
 			counting := countingRowStore(srv)
 
 			body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
@@ -2279,7 +2457,7 @@ func TestIngestRefusesALiveProgressRowFromTheSdcppProbe(t *testing.T) {
 func TestIngestSdcppImageVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
 	ctx := context.Background()
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_manual", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_manual")
 	now := time.Now().UTC()
 	if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{
 		ID: "map_rspec_sdcpp_manual_ctl", ApplicationID: "app_rspec_sdcpp_manual",
@@ -2355,7 +2533,7 @@ func TestIngestLandsTheAudioCppProbesSpeechAndTranscriptionVerdicts(t *testing.T
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			counting := countingRowStore(srv)
 
@@ -2423,7 +2601,7 @@ func TestAgentIngestAdmitsTranscriptionStreaming(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			counting := countingRowStore(srv)
 
@@ -2471,7 +2649,7 @@ func TestAgentIngestAdmitsSpeechClone(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			counting := countingRowStore(srv)
 
@@ -2543,7 +2721,7 @@ func TestAgentIngestAdmitsSpeechStreaming(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			mappingID := "map_" + tc.spec
 			counting := countingRowStore(srv)
 
@@ -2585,7 +2763,7 @@ func TestAgentIngestAdmitsSpeechStreaming(t *testing.T) {
 func TestIngestRefusesSpeechCloneFromTheSdcppProbe(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_clone", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_clone")
 	counting := countingRowStore(srv)
 
 	req, raw := ingestReq(t, capabilitiesBody("rspec_sdcpp_clone",
@@ -2643,7 +2821,7 @@ func TestAgentIngestNoWarnForKnownOrAbsentCapability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			seedRuntimeIngestSpec(t, srv, tc.spec)
 			counting := countingRowStore(srv)
 
 			req, raw := ingestReq(t, capabilitiesBody(tc.spec, `{"verdicts":[`+tc.verdicts+`],"source":"audiocpp_models"}`))
@@ -2687,7 +2865,7 @@ func TestAgentIngestNoWarnForKnownOrAbsentCapability(t *testing.T) {
 func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_foreign", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_foreign")
 	seedCapabilityRow(t, srv, "map_rspec_audiocpp_foreign", routing.CapabilityVision,
 		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -2750,7 +2928,7 @@ func TestAgentIngestAdmitsTranscriptionStreamingBesideAForeignRow(t *testing.T) 
 	const specID = "rspec_audiocpp_stream_foreign"
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, specID, false)
+	seedRuntimeIngestSpec(t, srv, specID)
 	seedCapabilityRow(t, srv, "map_"+specID, routing.CapabilityVision,
 		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -2789,7 +2967,7 @@ func TestAgentIngestAdmitsTranscriptionStreamingBesideAForeignRow(t *testing.T) 
 func TestIngestDropsAVisionVerdictFromTheAudioCppProbeAlone(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_vision", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_vision")
 	counting := countingRowStore(srv)
 
 	req, raw := ingestReq(t, capabilitiesBody("rspec_audiocpp_vision",
@@ -2823,7 +3001,7 @@ func TestIngestRefusesALiveProgressRowFromTheAudioCppProbe(t *testing.T) {
 		t.Run(support, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)
 			srv := NewTestServer()
-			seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_lp", false)
+			seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_lp")
 			counting := countingRowStore(srv)
 
 			body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
@@ -2866,7 +3044,7 @@ func TestIngestRefusesALiveProgressRowFromTheAudioCppProbe(t *testing.T) {
 // satisfied by a write path that had simply stopped working.
 func TestIngestAudioCppVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_manual", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_manual")
 	seedCapabilityRow(t, srv, "map_rspec_audiocpp_manual", routing.CapabilitySpeech,
 		routing.CapabilityYes, routing.CapabilitySourceManual)
 	counting := countingRowStore(srv)
@@ -2911,7 +3089,7 @@ func TestAudioCppRowsAreNotReservedAgentCapabilityNames(t *testing.T) {
 // assertion cannot pass merely because both sides happen to be empty.
 func TestIngestCapabilitiesEmptyNeverClears(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_empty", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_empty")
 	ctx := context.Background()
 	seedCapabilityRow(t, srv, "map_rspec_caps_empty", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -2937,7 +3115,7 @@ func TestIngestCapabilitiesEmptyNeverClears(t *testing.T) {
 // they are indistinguishable internally.
 func TestIngestCapabilitiesNilIsNotAClear(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_nil", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_nil")
 	ctx := context.Background()
 	seedCapabilityRow(t, srv, "map_rspec_caps_nil", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 	counting := countingRowStore(srv)
@@ -2965,7 +3143,7 @@ func TestIngestCapabilitiesNilIsNotAClear(t *testing.T) {
 // is present and definitive.
 func TestIngestCapabilitiesWithoutFeatureNeverWrites(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_caps_nocap", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_caps_nocap")
 	ctx := context.Background()
 	counting := countingRowStore(srv)
 
@@ -3009,8 +3187,8 @@ func TestIngestCapabilitiesCrossServerRejected(t *testing.T) {
 	}
 	// rspec_cross_caps belongs to otherServerID; rspec_own_caps to the
 	// reporting one.
-	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_caps", false)
-	seedRuntimeIngestSpec(t, srv, "rspec_own_caps", false)
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_cross_caps")
+	seedRuntimeIngestSpec(t, srv, "rspec_own_caps")
 	seedCapabilityRow(t, srv, "map_rspec_cross_caps", routing.CapabilityVision, routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 
 	counting := countingRowStore(srv)
@@ -3214,7 +3392,7 @@ func TestAgentRuntimeImageOptionsDecodeShapes(t *testing.T) {
 // options are not a verdict, so the image row is still the ONLY row written.
 func TestIngestTelemetrySamplePublishesImageOptions(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_imgopts", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_imgopts")
 	counting := countingRowStore(srv)
 
 	req, raw := ingestReq(t, imageOptionsBody("rspec_imgopts", imageOptionsWireJSON))
@@ -3246,7 +3424,7 @@ func TestIngestTelemetrySamplePublishesImageOptions(t *testing.T) {
 // so stale options never outlive the frame that carried them.
 func TestIngestTelemetrySampleWithoutImageOptionsLeavesThemNil(t *testing.T) {
 	srv := NewTestServer()
-	seedRuntimeIngestSpec(t, srv, "rspec_noimgopts", false)
+	seedRuntimeIngestSpec(t, srv, "rspec_noimgopts")
 
 	for i, optionsJSON := range []string{"", imageOptionsWireJSON, ""} {
 		req, raw := ingestReq(t, imageOptionsBody("rspec_noimgopts", optionsJSON))

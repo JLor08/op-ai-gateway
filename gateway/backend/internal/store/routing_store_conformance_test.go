@@ -1304,7 +1304,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			ConfigFiles: `[{"name":"server.json","content":"id ${MODEL}"}]`,
 			HealthPath:  "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
 			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
-			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
+			AdminState: "force_running", SetVisibleDevices: true,
 			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
 			ResponsesMode: routing.EndpointModeTranslate, MessagesMode: routing.EndpointModeDisabled,
 			Type:                        string(routing.RuntimeSpecTypeOllama),
@@ -1355,7 +1355,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("config_files round-trip mismatch: got %q, want %q", got.ConfigFiles, spec.ConfigFiles)
 		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
-			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
+			!got.Enabled || !got.Pinned || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}
@@ -1413,14 +1413,14 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		//
 		// (2) agent_runtime_specs has NO applicationParityBools-style parity
 		// fixture (application_column_parity_test.go); this round trip is the
-		// whole guard for its five integer-boolean columns. Both column-order
+		// whole guard for its four integer-boolean columns. Both column-order
 		// consts have fixed arity, so an OMITTED column errors at Scan, but
 		// two same-typed columns SWAPPED read each other's values in silence
-		// -- and the fixture above seeds enabled, pinned, vram_locked,
-		// set_visible_devices AND responses_live_timings_enabled all true, so
-		// while that holds a swap among them is invisible. One row in which
-		// this column differs from all four of its same-typed neighbours is
-		// what makes such a reorder observable.
+		// -- and the fixture above seeds enabled, pinned, set_visible_devices
+		// AND responses_live_timings_enabled all true, so while that holds a
+		// swap among them is invisible. One row in which this column differs
+		// from all three of its same-typed neighbours is what makes such a
+		// reorder observable.
 		flipped := spec
 		flipped.ResponsesLiveTimingsEnabled = false
 		flipped.UpdatedAt = now.Add(2 * time.Minute)
@@ -1431,7 +1431,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		if got.ResponsesLiveTimingsEnabled {
 			t.Fatalf("re-saving a spec with responses_live_timings_enabled cleared read back true: the upsert's do-update list writes the column on the first insert only: %+v", got)
 		}
-		if !got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices {
+		if !got.Enabled || !got.Pinned || !got.SetVisibleDevices {
 			t.Fatalf("clearing responses_live_timings_enabled disturbed another integer boolean, so two same-typed columns are transposed in a column list: %+v", got)
 		}
 		// Back on, so the list read below still describes a true row.
@@ -1605,6 +1605,115 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		}
 		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_rt2"); err != nil || ok {
 			t.Fatalf("RuntimeSpecByID after delete: ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+// TestRoutingStoreRuntimeSpecRAM proves memory, sqlite and postgres agree on
+// the per-spec RAM pair (migration 96): RAMEstimateMB is operator-owned and
+// written by UpsertRuntimeSpec, RAMMeasuredMB is agent-owned and written ONLY by
+// UpdateRuntimeSpecRAMMeasured -- the two never clobber each other, which is the
+// RuntimeSpecGPU contract carried over to a spec-level, host-scoped column.
+//
+// The case that earns its keep is the re-upsert. The portal's runtime-spec write
+// is a full-document upsert that builds the RuntimeSpec from the request alone,
+// so it always arrives with RAMMeasuredMB == 0; if the upsert wrote that zero
+// through, every operator save would erase the agent's measurement.
+func TestRoutingStoreRuntimeSpecRAM(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_ram", Name: "RAM", Domain: "ram.example.test", Provider: routing.ProviderMock,
+			Endpoint: "mock://ram", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_ram", ServerID: "srv_ram", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_ram", ApplicationID: "app_ram", GatewayModelName: "map-ram-model",
+			AppModelName: "map-ram-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		read := func(t *testing.T) (byMapping, byID routing.RuntimeSpec) {
+			t.Helper()
+			byMapping, ok, err := s.RuntimeSpecByMapping(ctx, "map_ram")
+			if err != nil || !ok {
+				t.Fatalf("RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+			}
+			byID, ok, err = s.RuntimeSpecByID(ctx, "rspec_ram")
+			if err != nil || !ok {
+				t.Fatalf("RuntimeSpecByID: ok=%v err=%v", ok, err)
+			}
+			return byMapping, byID
+		}
+
+		// An unknown spec id is ErrNotFound -- the write never invents a row.
+		if err := s.UpdateRuntimeSpecRAMMeasured(ctx, "rspec_ram_missing", 5000); err != ErrNotFound {
+			t.Fatalf("measured RAM on an absent spec: want ErrNotFound, got %v", err)
+		}
+
+		spec := routing.RuntimeSpec{
+			ID: "rspec_ram", MappingID: "map_ram", Enabled: true,
+			Binary: "/usr/bin/llama-server", RAMEstimateMB: 4096,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		byMapping, byID := read(t)
+		for name, got := range map[string]routing.RuntimeSpec{"RuntimeSpecByMapping": byMapping, "RuntimeSpecByID": byID} {
+			if got.RAMEstimateMB != 4096 || got.RAMMeasuredMB != 0 {
+				t.Fatalf("%s after the first upsert: estimate %d measured %d, want 4096 and 0 (nothing measured yet)", name, got.RAMEstimateMB, got.RAMMeasuredMB)
+			}
+		}
+
+		// The agent's measurement lands on the spec and leaves the estimate alone.
+		if err := s.UpdateRuntimeSpecRAMMeasured(ctx, "rspec_ram", 5000); err != nil {
+			t.Fatalf("UpdateRuntimeSpecRAMMeasured: %v", err)
+		}
+		byMapping, byID = read(t)
+		for name, got := range map[string]routing.RuntimeSpec{"RuntimeSpecByMapping": byMapping, "RuntimeSpecByID": byID} {
+			if got.RAMMeasuredMB != 5000 || got.RAMEstimateMB != 4096 {
+				t.Fatalf("%s after the measurement: estimate %d measured %d, want 4096 and 5000 (the measurement must not clobber the estimate)", name, got.RAMEstimateMB, got.RAMMeasuredMB)
+			}
+		}
+		byApp, err := s.RuntimeSpecsByApplication(ctx, "app_ram")
+		if err != nil || len(byApp) != 1 || byApp[0].RAMEstimateMB != 4096 || byApp[0].RAMMeasuredMB != 5000 {
+			t.Fatalf("RuntimeSpecsByApplication: err=%v specs=%+v, want one spec with 4096/5000", err, byApp)
+		}
+
+		// The operator saves again: a full-document upsert with a new estimate
+		// and, as the portal always sends it, RAMMeasuredMB == 0. The estimate
+		// moves; the measurement survives.
+		spec.RAMEstimateMB = 8192
+		spec.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("re-upsert: %v", err)
+		}
+		byMapping, byID = read(t)
+		for name, got := range map[string]routing.RuntimeSpec{"RuntimeSpecByMapping": byMapping, "RuntimeSpecByID": byID} {
+			if got.RAMEstimateMB != 8192 || got.RAMMeasuredMB != 5000 {
+				t.Fatalf("%s after the operator re-saved: estimate %d measured %d, want 8192 and 5000 (an operator save must not erase the agent's measurement)", name, got.RAMEstimateMB, got.RAMMeasuredMB)
+			}
+		}
+
+		// And the other direction: a later measurement keeps the new estimate.
+		if err := s.UpdateRuntimeSpecRAMMeasured(ctx, "rspec_ram", 5200); err != nil {
+			t.Fatalf("UpdateRuntimeSpecRAMMeasured (second): %v", err)
+		}
+		if got, _ := read(t); got.RAMMeasuredMB != 5200 || got.RAMEstimateMB != 8192 {
+			t.Fatalf("second measurement: estimate %d measured %d, want 8192 and 5200", got.RAMEstimateMB, got.RAMMeasuredMB)
 		}
 	})
 }

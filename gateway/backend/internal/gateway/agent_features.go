@@ -131,6 +131,44 @@ const RuntimeVoicesFeature = "runtime_voices"
 // TestRuntimeModelParamsFeatureName pins this side.
 const RuntimeModelParamsFeature = "runtime_model_params"
 
+// RuntimeRAMMeasurementFeature is the agent-declared capability naming that the
+// agent measures each managed child's resident host RAM (RSS off Windows, the
+// private working set on it) and reports it as the runtime sample's spec-level
+// ram_measured_mb, beside the per-GPU gpus[].vram_measured_mb. It is on the
+// agent's list only, not on gatewayAgentFeatures: it states a fact about the
+// agent alone, and the gateway reads it off the agent's declared set
+// (AgentFeatures.Has, fail-closed) because an older agent sends no
+// ram_measured_mb, which no probe can tell apart from a spec with no process --
+// the name is the only evidence that an absent figure means "this agent does not
+// report it". The agent gates nothing on it. It is exported, like
+// RuntimeModelParamsFeature, for the portal service that reads the connected
+// agent's features.
+//
+// The agent module cannot import this package, so the agent names the identical
+// string in its own registry (server-agent/internal/agent/features.go) -- the
+// same arrangement as RuntimeModelParamsFeature. The two spellings must stay
+// equal; TestRuntimeRAMMeasurementFeatureName pins this side.
+const RuntimeRAMMeasurementFeature = "runtime_ram_measurement"
+
+// RuntimeRAMAccountingFeature is the agent-declared capability naming that the
+// agent receives each spec's host-RAM demand as the runtime-config document's
+// spec-level ram_mb (the gateway pushes max(measured, estimate), 0 = unknown)
+// and accounts for it when admitting a spec. It is on the agent's list only, not
+// on gatewayAgentFeatures: it states a fact about the agent alone, and the
+// gateway reads it off the agent's declared set (AgentFeatures.Has, fail-closed)
+// because an older agent decodes the document without error and silently ignores
+// the unknown ram_mb key, which no probe can tell apart from one that honours it
+// -- the name is the only evidence that a pushed RAM demand is enforced rather
+// than dropped. The agent gates nothing on it. It is exported, like
+// RuntimeRAMMeasurementFeature, for the portal service that reads the connected
+// agent's features.
+//
+// The agent module cannot import this package, so the agent names the identical
+// string in its own registry (server-agent/internal/agent/features.go) -- the
+// same arrangement as RuntimeRAMMeasurementFeature. The two spellings must stay
+// equal; TestRuntimeRAMAccountingFeatureName pins this side.
+const RuntimeRAMAccountingFeature = "runtime_ram_accounting"
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio

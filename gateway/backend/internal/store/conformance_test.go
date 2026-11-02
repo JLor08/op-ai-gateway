@@ -8341,7 +8341,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			ListenPort: 0, HealthPath: "/health", HealthTimeoutSeconds: 5,
 			StartupTimeoutSeconds: 180, IdleTimeoutSeconds: 900,
 			AdmissionWaitTimeoutSeconds: 30, Pinned: true,
-			AdminState: "force_running", VRAMLocked: true,
+			AdminState:           "force_running",
 			SetVisibleDevices:    true,
 			VisibleDevicesMode:   routing.VisibleDevicesModeArgs,
 			APITokenMode:         "set",
@@ -8351,6 +8351,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			Type:                 "vllm",
 			MetricsPath:          "/m",
 			ContextProbePath:     "/c",
+			RAMEstimateMB:        4096,
 			CreatedAt:            now, UpdatedAt: now,
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
@@ -8361,7 +8362,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			t.Fatalf("read back: ok=%v err=%v", ok, err)
 		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
-			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
+			!got.Enabled || !got.Pinned || !got.SetVisibleDevices ||
 			got.VisibleDevicesMode != routing.VisibleDevicesModeArgs ||
 			got.AdminState != "force_running" || got.AdmissionWaitTimeoutSeconds != 30 ||
 			got.APITokenMode != spec.APITokenMode || got.APIToken != spec.APIToken ||
@@ -8369,6 +8370,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			got.APITokenHeader != spec.APITokenHeader ||
 			got.Type != spec.Type || got.MetricsPath != spec.MetricsPath ||
 			got.ContextProbePath != spec.ContextProbePath ||
+			got.RAMEstimateMB != 4096 || got.RAMMeasuredMB != 0 ||
 			!got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}
@@ -8456,6 +8458,11 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			gotDefault.APITokenHeaderSource != "app" || gotDefault.APITokenHeader != "" ||
 			gotDefault.Type != "" || gotDefault.MetricsPath != "" || gotDefault.ContextProbePath != "" {
 			t.Fatalf("api-token/runtime-spec-type columns must default to app/''/app/''/''/''/'' , got %+v", gotDefault)
+		}
+		// The RAM pair (migration 96) defaults to 0, the "unknown" sentinel --
+		// never a zero-cost claim -- for a row written without naming them.
+		if gotDefault.RAMEstimateMB != 0 || gotDefault.RAMMeasuredMB != 0 {
+			t.Fatalf("ram_estimate_mb/ram_measured_mb must default to 0 (unknown), got %+v", gotDefault)
 		}
 		if err := s.DeleteRuntimeSpec(ctx, "rspec_default"); err != nil {
 			t.Fatalf("delete default-column spec: %v", err)

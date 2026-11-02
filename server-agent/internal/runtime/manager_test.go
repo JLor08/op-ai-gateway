@@ -2827,6 +2827,368 @@ func TestManagerWithNoMeasurerInstalledIsUnaffected(t *testing.T) {
 	}
 }
 
+// --- per-process RAM measurement ---------------------------------------------
+//
+// The RAM measurer is the host-RAM twin of the VRAM one: installed through its
+// own SetRAMMeasurer, dispatched by the same off-owner measurement beat, applied
+// through the same generation guard, and reported through Status. It has no GPU
+// axis, so its answer is one number per pid and Status carries one scalar. The
+// number flows to Status/telemetry and, floored at the spec's pushed demand,
+// becomes the process's RunningProc.RAMMB that host-RAM admission sums; the
+// same live figure, without the floor, is what the host-RAM budget adds back.
+
+// TestRAMMeasurementReachesStatus is the headline case: a running spec's own
+// child pid is handed to the RAM measurer by the recurring beat, and the answer
+// lands in Status().MeasuredRAMMB. The VRAM measurer is installed alongside, on
+// purpose: both answers ride the same cmdMeasured, and neither may disturb the
+// other.
+func TestRAMMeasurementReachesStatus(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	var ramPIDs sync.Map // pid -> struct{}
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			ramPIDs.Store(p, struct{}{})
+			out[p] = 1500
+		}
+		return out
+	})
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[int]int{0: 4242}
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true // Apply alone starts it; no request ever arrives
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a reports measured RAM", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB > 0
+	})
+
+	st := statusFor(m, "spec-a")
+	if st.PID == 0 {
+		t.Fatalf("Status()[spec-a].PID = 0 with state %v -- the test's own premise (a live child) does not hold", st.State)
+	}
+	if _, ok := ramPIDs.Load(st.PID); !ok {
+		t.Fatalf("the RAM measurer was never asked about spec-a's own child pid %d", st.PID)
+	}
+	if st.MeasuredRAMMB != 1500 {
+		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d, want 1500 (the measurer's own answer for this child)", st.MeasuredRAMMB)
+	}
+	if got := st.MeasuredVRAM[0]; got != 4242 {
+		t.Fatalf("Status()[spec-a].MeasuredVRAM[0] = %d, want 4242 -- the RAM answer must ride beside the VRAM one, not replace it", got)
+	}
+}
+
+// TestApplyMeasurementRAMZeroGuardAndGeneration is the zero-guard (realRAM), the
+// RAM twin of realMeasurement, and the generation guard that scopes a reading to
+// the process it was taken for. A measured 0 means "unknown", never "this
+// process needs no RAM": admitted as a measurement it would charge the spec
+// nothing once admission reads it, and stored it would make Status() report a 0
+// the portal cannot tell apart from "never measured". So a value <= 0 must leave
+// st.measuredRAM exactly as it was -- which also keeps a previous real number
+// from being erased by one unknown cycle.
+//
+// It drives applyMeasurement directly, like
+// TestApplyMeasurementNeverStoresANonPositiveMeasurement for VRAM, and asserts on
+// st.measuredRAM and the Status snapshot rather than on run state. An earlier
+// shape of this test ran a real child and waited for several measurement beats
+// before asserting the spec was Running; three beats can elapse while the stub
+// child is still `starting` (the health poll races the 30 ms beat), so that
+// assertion was flaky and proved nothing about the guard.
+func TestApplyMeasurementRAMZeroGuardAndGeneration(t *testing.T) {
+	const pid = 4242
+	cases := []struct {
+		name     string
+		previous int
+		ramByPID map[int]int
+		want     int
+	}{
+		{name: "a measured zero does not become a measurement", previous: 0, ramByPID: map[int]int{pid: 0}, want: 0},
+		{name: "a measured zero does not erase a previous real value", previous: 1500, ramByPID: map[int]int{pid: 0}, want: 1500},
+		{name: "a negative value is not a measurement", previous: 0, ramByPID: map[int]int{pid: -5}, want: 0},
+		{name: "a negative value does not erase a previous real value", previous: 1500, ramByPID: map[int]int{pid: -5}, want: 1500},
+		{name: "a real measurement is stored", previous: 0, ramByPID: map[int]int{pid: 1500}, want: 1500},
+		{name: "a newer real measurement replaces the previous one", previous: 1500, ramByPID: map[int]int{pid: 2000}, want: 2000},
+		{name: "a pid the measurer did not answer keeps the previous value", previous: 1500, ramByPID: map[int]int{pid + 1: 9999}, want: 1500},
+		{name: "no answer at all keeps the previous value", previous: 1500, ramByPID: nil, want: 1500},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			o, st := newSnapshotOwner(spec, pid, nil)
+			st.measuredRAM = tc.previous
+
+			o.applyMeasurement(cmdMeasured{
+				targets:  []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+				ramByPID: tc.ramByPID,
+			})
+
+			if st.measuredRAM != tc.want {
+				t.Errorf("st.measuredRAM = %d after measuring %v (previously %d), want %d -- a value <= 0 is not a measurement", st.measuredRAM, tc.ramByPID, tc.previous, tc.want)
+			}
+			if got := o.snapshotStatus()[0].MeasuredRAMMB; got != tc.want {
+				t.Errorf("Status.MeasuredRAMMB = %d, want %d (the same value st.measuredRAM holds)", got, tc.want)
+			}
+		})
+	}
+
+	// The generation guard, for RAM. A measurement is in flight for as long as
+	// the measurer takes, and in that window the spec can restart: pids are
+	// recycled, so the pid alone cannot say whose reading it is. The target
+	// names the PROCESS it was taken for; a reading taken for a generation that
+	// is no longer current must not be written onto its successor -- even when
+	// the new process has the very same pid.
+	t.Run("a superseded generation is not written onto its successor", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, pid, nil)
+		old := st.proc
+		st.proc = &runningProc{specID: spec.ID, pid: pid} // restarted: new generation, recycled pid
+
+		o.applyMeasurement(cmdMeasured{
+			targets:  []measureTarget{{specID: spec.ID, proc: old, pid: pid}},
+			ramByPID: map[int]int{pid: 1500},
+		})
+
+		if st.measuredRAM != 0 {
+			t.Fatalf("st.measuredRAM = %d after a measurement taken for the PREVIOUS process, want 0 -- one process's RAM attributed to another", st.measuredRAM)
+		}
+
+		// And the current generation is still measurable: the guard rejects the
+		// stale reading, not the spec.
+		o.applyMeasurement(cmdMeasured{
+			targets:  []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+			ramByPID: map[int]int{pid: 1800},
+		})
+		if st.measuredRAM != 1800 {
+			t.Fatalf("st.measuredRAM = %d after a measurement for the current process, want 1800", st.measuredRAM)
+		}
+	})
+
+	t.Run("a measurement for a spec that no longer exists is dropped", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, pid, nil)
+
+		o.applyMeasurement(cmdMeasured{
+			targets:  []measureTarget{{specID: "spec-gone", proc: st.proc, pid: pid}},
+			ramByPID: map[int]int{pid: 1500},
+		})
+
+		if st.measuredRAM != 0 {
+			t.Fatalf("st.measuredRAM = %d after a measurement for a different (removed) spec, want 0", st.measuredRAM)
+		}
+	})
+}
+
+// TestRAMMeasuredZeroDoesNotOverwriteARealValue is the other half of the
+// zero-guard: a real measurement already on the spec must survive later beats
+// in which the measurer says 0 (or says nothing). Overwriting it would turn a
+// transient "unknown" into a reported 0 that the portal cannot tell apart from
+// a measured one -- the same reason applyMeasurement leaves a VRAM value alone
+// when a cycle returns zeros.
+func TestRAMMeasuredZeroDoesNotOverwriteARealValue(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	var calls atomic.Int64
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		n := calls.Add(1)
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			if n == 1 {
+				out[p] = 1500
+			} else {
+				out[p] = 0
+			}
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a reports the first (real) measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB == 1500
+	})
+	waitUntil(t, 5*time.Second, "the measurer has answered 0 on several later beats", func() bool {
+		return calls.Load() >= 4
+	})
+
+	if st := statusFor(m, "spec-a"); st == nil || st.MeasuredRAMMB != 1500 {
+		t.Fatalf("Status()[spec-a] = %+v after later beats answered 0, want MeasuredRAMMB to stay 1500", st)
+	}
+}
+
+// TestRAMMeasuredClearedOnExit is the RAM twin of
+// TestManagerClearsMeasuredVRAMWhenTheProcessExits (F2): a measurement
+// describes ONE process and stops being true the instant it exits. Left in
+// place, a force-stopped spec would keep reporting a dead process's RAM in
+// every Status() and, once the gateway persists it, rewrite it forever.
+func TestRAMMeasuredClearedOnExit(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 1500
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+
+	waitUntil(t, 5*time.Second, "spec-a carries a measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB > 0
+	})
+
+	// force_stopped rather than a crash so the stop is unambiguous and nothing
+	// restarts it (applyConfig checks force_stopped ahead of the pinned restart).
+	stopped := spec
+	stopped.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{stopped}, ETag: "v2"})
+
+	waitUntil(t, 5*time.Second, "spec-a's process is gone", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.PID == 0 && st.State != StateRunning && st.State != StateDraining
+	})
+
+	if st := statusFor(m, "spec-a"); st.MeasuredRAMMB != 0 {
+		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d after the process exited (state %v, pid %d), want 0 -- a dead process's RAM is still reported", st.MeasuredRAMMB, st.State, st.PID)
+	}
+}
+
+// TestRAMMeasuredForASpecWithoutGPUs pins the one place the RAM beat is
+// deliberately NOT gated like the VRAM one. dispatchMeasurement skips the
+// measurement entirely when no spec declares a GPU, because a VRAM number needs
+// a GPU index to attach to and the measurer spawns a subprocess. RAM has no such
+// axis and costs one in-process read, and a CPU-only spec is exactly the kind
+// whose host-RAM footprint matters, so it must be measured -- and measuring it
+// must not wake the VRAM measurer, which stays gated on a declared GPU.
+func TestRAMMeasuredForASpecWithoutGPUs(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 900
+		}
+		return out
+	})
+	// admission's own buildSnapshot call has an empty pid list by design (the
+	// spec being admitted has no process yet); only a NON-empty list can be the
+	// recurring beat this test is about.
+	var vramBeats atomic.Int64
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		if len(pids) > 0 {
+			vramBeats.Add(1)
+		}
+		return nil
+	})
+
+	spec := baseSpec("spec-cpu", "model-cpu")
+	spec.Pinned = true // no GPUs declared
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "the GPU-less spec reports measured RAM", func() bool {
+		st := statusFor(m, "spec-cpu")
+		return st != nil && st.MeasuredRAMMB == 900
+	})
+	// Past several more beats, so a VRAM beat that was merely slow to arrive
+	// would still be caught.
+	time.Sleep(200 * time.Millisecond)
+	if n := vramBeats.Load(); n != 0 {
+		t.Fatalf("the VRAM measurer was called %d time(s) with a live pid although no spec declares a GPU -- the RAM beat must not lift the VRAM measurer's own gate", n)
+	}
+}
+
+// TestRAMMeasurerAloneMeasuresWithoutAVRAMMeasurer: dispatchMeasurement used to
+// return at once when no VRAM measurer was installed. A host with no NVIDIA
+// tooling (AMD, Apple, CPU-only) installs none but still has a RAM measurer, so
+// the RAM beat must run on its own.
+func TestRAMMeasurerAloneMeasuresWithoutAVRAMMeasurer(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy()) // no SetMeasurer, ever
+
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 2048
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}} // a GPU spec, but no VRAM measurer
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a reports measured RAM with no VRAM measurer installed", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB == 2048
+	})
+	if st := statusFor(m, "spec-a"); st.MeasuredVRAM != nil {
+		t.Fatalf("Status()[spec-a].MeasuredVRAM = %v with NO VRAM measurer installed, want nil", st.MeasuredVRAM)
+	}
+}
+
+// TestManagerWithNoRAMMeasurerReportsNoRAM is the non-regression for every host
+// whose collector.NewRAMMeasurer returns nil: SetRAMMeasurer(nil) is also
+// NewManager's default, and nothing must be measured or reported.
+func TestManagerWithNoRAMMeasurerReportsNoRAM(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.SetRAMMeasurer(func(pids []int) map[int]int { return map[int]int{} })
+	m.SetRAMMeasurer(nil) // installing nil must go back to "no measurer"
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a is running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if st := statusFor(m, "spec-a"); st == nil || st.MeasuredRAMMB != 0 {
+			t.Fatalf("Status()[spec-a] = %+v with no RAM measurer installed, want MeasuredRAMMB 0", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestRealRAMIsAZeroGuard pins the helper itself: strictly positive MB is a
+// measurement, anything else is "unknown" and comes back as 0.
+func TestRealRAMIsAZeroGuard(t *testing.T) {
+	for _, c := range []struct{ in, want int }{{1500, 1500}, {1, 1}, {0, 0}, {-1, 0}, {-1500, 0}} {
+		if got := realRAM(c.in); got != c.want {
+			t.Errorf("realRAM(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 // --- set_visible_devices, through the real two-process path -----------------
 
 // readEnvLog reads a stubchild -env-log file, polling until it appears (the
@@ -3208,6 +3570,111 @@ func TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate(t *tes
 	}
 }
 
+// TestBuildSnapshotEffectiveVRAMIsMax pins how a live measurement combines
+// with the demand the gateway pushed: the charge is max(live, pushed), so the
+// pushed demand is a FLOOR and a fresher live reading can only RAISE it.
+//
+// The pushed demand (SpecGPU.VRAMMB) already is max(persisted measurement,
+// operator estimate) -- the gateway applies the same rule when it builds the
+// document. Before this rule buildSnapshot let a present live value REPLACE
+// that number, so a transient dip (a reading taken while the child is between
+// allocations, or while a KV cache is being resized) lowered the reservation
+// below the floor for exactly as long as it lasted, and a co-resident start
+// admitted into the gap is how an OOM happens. "Never under-reserve" means the
+// live reading has no authority to lower anything.
+//
+// A reading that is not a real measurement (<= 0, dropped by realMeasurement)
+// is absent here and so lands on the pushed demand, like an index the
+// measurer never mentioned. And what is REPORTED is untouched by any of this:
+// st.measuredVRAM keeps the raw live reading (the portal's evidence), only the
+// admission charge is floored.
+func TestBuildSnapshotEffectiveVRAMIsMax(t *testing.T) {
+	const (
+		demand = 8000
+		pid    = 4242
+	)
+	cases := []struct {
+		name string
+		// measured is what the installed measurer answers for this pid; nil
+		// means the measurer has no row for the pid at all.
+		measured map[int]int
+		// wantCharged is what admission must be charged per GPU index.
+		wantCharged map[int]int
+		// wantReported is what st.measuredVRAM must hold: the raw real
+		// readings, never the floored charge. nil = nothing stored.
+		wantReported map[int]int
+	}{
+		{
+			name:         "live above the demand raises it",
+			measured:     map[int]int{0: 9000},
+			wantCharged:  map[int]int{0: 9000},
+			wantReported: map[int]int{0: 9000},
+		},
+		{
+			name:         "live below the demand is floored at the demand",
+			measured:     map[int]int{0: 7000},
+			wantCharged:  map[int]int{0: demand},
+			wantReported: map[int]int{0: 7000},
+		},
+		{
+			name:         "live equal to the demand charges the demand",
+			measured:     map[int]int{0: demand},
+			wantCharged:  map[int]int{0: demand},
+			wantReported: map[int]int{0: demand},
+		},
+		{
+			name:         "live absent charges the demand",
+			measured:     nil,
+			wantCharged:  map[int]int{0: demand},
+			wantReported: nil,
+		},
+		{
+			name:         "live zero is unknown and charges the demand",
+			measured:     map[int]int{0: 0},
+			wantCharged:  map[int]int{0: demand},
+			wantReported: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: demand}}
+			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
+				if tc.measured == nil {
+					return map[int]map[int]int{}
+				}
+				return map[int]map[int]int{pid: tc.measured}
+			})
+
+			snap := o.buildSnapshot()
+
+			if got := gpusChargedFor(t, snap, "spec-a"); !reflect.DeepEqual(got, tc.wantCharged) {
+				t.Errorf("admission is charged %v for the live reading %v against a pushed demand of %d MB, want %v -- the charge is max(live, pushed demand): the demand is a floor a live reading may raise but never lower", got, tc.measured, demand, tc.wantCharged)
+			}
+			if !reflect.DeepEqual(st.measuredVRAM, tc.wantReported) {
+				t.Errorf("st.measuredVRAM = %v for the live reading %v, want %v -- what is reported is the raw real reading, not the floored admission charge", st.measuredVRAM, tc.measured, tc.wantReported)
+			}
+		})
+	}
+
+	// Per GPU index, like the zero-guard: one index raised by its live reading
+	// while a sibling is floored by a lower one in the same snapshot.
+	t.Run("applied per GPU index", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: demand}, {Index: 1, VRAMMB: demand}}
+		o, _ := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
+			return map[int]map[int]int{pid: {0: 9000, 1: 7000}}
+		})
+
+		snap := o.buildSnapshot()
+
+		want := map[int]int{0: 9000, 1: demand}
+		if got := gpusChargedFor(t, snap, "spec-a"); !reflect.DeepEqual(got, want) {
+			t.Errorf("admission is charged %v, want %v -- max() is decided per GPU index, never per pid", got, want)
+		}
+	})
+}
+
 // TestApplyMeasurementNeverStoresANonPositiveMeasurement closes the second
 // door onto st.measuredVRAM. buildSnapshot is the admission path; this is the
 // recurring off-owner one (dispatchMeasurement -> cmdMeasured), and it is the
@@ -3535,6 +4002,7 @@ func TestSameLaunchShape(t *testing.T) {
 		Args: []string{"-p", "${PORT}"}, Env: map[string]string{"A": "1"},
 		WorkDir: "/w", ListenPort: 8080,
 		GPUs:               []SpecGPU{{Index: 0, VRAMMB: 8000}},
+		RAMMB:              4096,
 		SetVisibleDevices:  true,
 		VisibleDevicesMode: "env",
 		APIToken:           "tok",
@@ -3586,6 +4054,11 @@ func TestSameLaunchShape(t *testing.T) {
 		// gateway churns it via measured-VRAM write-back, so an edit to it alone
 		// must not bounce a running child (issue #63 review finding).
 		"GPU vram_mb": func(s *Spec) { s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 9000}} },
+		// ram_mb is the host-RAM admission DEMAND, the spec-level twin of the
+		// row above: the gateway pushes max(measured, estimate), so each
+		// measured-RAM write-back moves it, and it must not bounce a healthy
+		// child either.
+		"RAMMB": func(s *Spec) { s.RAMMB = 9000 },
 	}
 	for name, mut := range meta {
 		b := base
@@ -3653,4 +4126,1009 @@ func TestApplyRelaunchesOnDemandChildOnNextRequest(t *testing.T) {
 	if n := countInvocations(t, logA); n != 1 {
 		t.Errorf("old-args invocation count (logA) = %d, want 1: the child must not re-run with stale args", n)
 	}
+}
+
+// TestSetHostInfoVisibleInSnapshot pins the push half of the hardware plumbing:
+// whatever the agent's collect loop last handed SetHostInfo is what the owner
+// sees on its next admission, with no polling and no shelling out on that path.
+//
+// It asserts through owner.hostInfo, the single reader buildSnapshot uses, on
+// an owner built the same way the snapshot tests build theirs. Three things are
+// pinned: nothing is detected before the first sample (the pre-feature state,
+// which must read as "unknown", not as a zero-capacity host), the newest push
+// replaces the previous one wholesale, and the manager keeps its OWN copy of the
+// per-GPU map -- the collect loop is a different goroutine from the owner, so a
+// caller that went on to mutate the map it passed in would otherwise race the
+// owner's read.
+func TestSetHostInfoVisibleInSnapshot(t *testing.T) {
+	spec := baseSpec("spec-a", "model-a")
+	o, _ := newSnapshotOwner(spec, 4242, nil)
+
+	if got := o.hostInfo(); len(got.GPUTotalsMB) != 0 || got.MemAvailableMB != 0 {
+		t.Fatalf("hostInfo() before any SetHostInfo = %+v, want the zero HostInfo (no detected GPUs, MemAvailableMB 0 = unknown)", got)
+	}
+
+	pushed := HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 32000}
+	o.m.SetHostInfo(pushed)
+	if got := o.hostInfo(); !reflect.DeepEqual(got, pushed) {
+		t.Fatalf("hostInfo() after SetHostInfo(%+v) = %+v, want the pushed value", pushed, got)
+	}
+	// The snapshot path that reads it must keep working with a sample present.
+	_ = o.buildSnapshot()
+
+	// The caller mutating its own map afterwards must not reach the owner.
+	pushed.GPUTotalsMB[0] = 1
+	pushed.GPUTotalsMB[7] = 99
+	if got := o.hostInfo().GPUTotalsMB; !reflect.DeepEqual(got, map[int]int{0: 24000}) {
+		t.Errorf("hostInfo().GPUTotalsMB = %v after the caller mutated the map it pushed, want {0: 24000} -- SetHostInfo must copy, the collect loop and the owner are different goroutines", got)
+	}
+
+	// The newest push replaces the old one: both fields, wholesale.
+	next := HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}, MemAvailableMB: 1500}
+	o.m.SetHostInfo(next)
+	if got := o.hostInfo(); !reflect.DeepEqual(got, next) {
+		t.Errorf("hostInfo() after a second SetHostInfo = %+v, want %+v (the latest sample wins)", got, next)
+	}
+}
+
+// snapshotBudgets builds a snapshot on an owner that has been handed cfgBudgets
+// as its operator config, hi as the latest hardware sample (nil = none pushed
+// yet) and headroomMB as its VRAM headroom knob, and returns the Budgets map
+// Admit will decide on.
+func snapshotBudgets(t *testing.T, cfgBudgets []GPUBudget, hi *HostInfo, headroomMB int) map[int]int {
+	t.Helper()
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.cfg.GPUBudgets = cfgBudgets
+	o.vramHeadroomMB = headroomMB
+	if hi != nil {
+		o.m.SetHostInfo(*hi)
+	}
+	return o.buildSnapshot().Budgets
+}
+
+// TestBudgetsAutoDetectedFromGPUTotals is the default-on half of the feature:
+// with no operator budget at all, a GPU the hardware sample reported gets a
+// budget equal to its detected total -- so VRAM admission is enforced where it
+// used to be effectively off (an absent budget is "unconstrained").
+func TestBudgetsAutoDetectedFromGPUTotals(t *testing.T) {
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}}, 0)
+	if want := map[int]int{0: 24000, 1: 12000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (detected total, one per sampled GPU)", got, want)
+	}
+}
+
+// TestExplicitGPUBudgetOverridesDetected pins the precedence: an operator's
+// positive budget for a GPU wins over what was detected, per GPU index -- a
+// GPU the operator did not mention still gets its detected value.
+func TestExplicitGPUBudgetOverridesDetected(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 8000}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}}, 0)
+	if want := map[int]int{0: 8000, 1: 12000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (operator's 8000 wins on GPU 0, detected 12000 stands on GPU 1)", got, want)
+	}
+}
+
+// TestOperatorBudgetAboveDetectedStillWins: the override is the operator's
+// word, not a value clamped to the hardware -- a deliberate over-subscription
+// (or a detected total that is wrong for their setup) is theirs to make.
+func TestOperatorBudgetAboveDetectedStillWins(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 30000}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 0)
+	if want := map[int]int{0: 30000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v", got, want)
+	}
+}
+
+// TestNonPositiveOperatorBudgetFallsThroughToDetected: a `budget_mb: 0` row is
+// "no budget set" (the portal seeds fresh rows at 0), not an explicit override,
+// so the detected value replaces it. Without a detected value the row is still
+// copied verbatim -- buildSnapshot must not filter zeros, Admit owns that rule
+// (see TestManagerZeroGPUBudgetIsUnconstrained).
+func TestNonPositiveOperatorBudgetFallsThroughToDetected(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 0}, {Index: 1, BudgetMB: 0}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 0)
+	if want := map[int]int{0: 24000, 1: 0}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (GPU 0: 0 row replaced by the detected total; GPU 1: nothing detected, the 0 row is copied verbatim)", got, want)
+	}
+}
+
+// TestVRAMHeadroomSubtracted: the optional headroom is held back from every
+// AUTO budget, so the card keeps room for the driver, display and other
+// tenants.
+func TestVRAMHeadroomSubtracted(t *testing.T) {
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 1024)
+	if want := map[int]int{0: 22976}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (24000 detected - 1024 headroom)", got, want)
+	}
+}
+
+// TestVRAMHeadroomDoesNotTouchAnExplicitBudget: headroom belongs to the
+// detected value; an operator who typed a budget has already decided how much
+// to hold back.
+func TestVRAMHeadroomDoesNotTouchAnExplicitBudget(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 8000}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 1024)
+	if want := map[int]int{0: 8000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v", got, want)
+	}
+}
+
+// TestVRAMHeadroomAtOrAboveTheDeviceReservesTheWholeGPU: a headroom that eats
+// the entire device must not become a 0 budget, because a 0 budget means
+// UNCONSTRAINED -- the exact opposite of "reserve everything". It is floored at
+// 1 MB so Admit refuses any spec with a known VRAM demand on that GPU.
+func TestVRAMHeadroomAtOrAboveTheDeviceReservesTheWholeGPU(t *testing.T) {
+	for _, headroom := range []int{8000, 9000} {
+		got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 8000}}, headroom)
+		if want := map[int]int{0: 1}; !reflect.DeepEqual(got, want) {
+			t.Errorf("headroom %d on an 8000 MB GPU: Budgets = %v, want %v (never 0: that would read as unconstrained)", headroom, got, want)
+		}
+	}
+}
+
+// TestNoGPUSampleLeavesBudgetsEmpty is the no-GPU-host case: nothing detected
+// and nothing configured must leave Budgets empty (every GPU unconstrained, the
+// pre-feature behaviour) and must not panic on the nil sample, the nil map or a
+// GPU-less sample.
+func TestNoGPUSampleLeavesBudgetsEmpty(t *testing.T) {
+	for name, hi := range map[string]*HostInfo{
+		"no sample pushed yet": nil,
+		"nil totals map":       {MemAvailableMB: 8000},
+		"empty totals map":     {GPUTotalsMB: map[int]int{}},
+		"a zero total":         {GPUTotalsMB: map[int]int{0: 0}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := snapshotBudgets(t, nil, hi, 1024); len(got) != 0 {
+				t.Errorf("Budgets = %v, want empty (nothing detected, nothing configured)", got)
+			}
+		})
+	}
+}
+
+// TestUnifiedMemoryGPUIsNotAutoBudgeted: an Apple GPU has no dedicated VRAM.
+// Its collector's "total" is the system memory the GPU has allocated at that
+// instant (ioreg "Alloc system memory") -- a figure that moves with load, not a
+// ceiling -- so turning it into a budget would refuse a spec larger than
+// whatever happens to be allocated right now. Apple hosts keep the pre-feature
+// behaviour: unconstrained unless the operator sets a budget.
+func TestUnifiedMemoryGPUIsNotAutoBudgeted(t *testing.T) {
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.gpuVendor = GPUVendorApple
+	o.m.SetHostInfo(HostInfo{GPUTotalsMB: map[int]int{0: 14000}})
+	if got := o.buildSnapshot().Budgets; len(got) != 0 {
+		t.Errorf("Budgets = %v on an Apple host, want empty", got)
+	}
+	o.cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 20000}}
+	if got, want := o.buildSnapshot().Budgets, map[int]int{0: 20000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v on an Apple host with an operator budget, want %v", got, want)
+	}
+}
+
+// TestManagerEnforcesAutoDetectedBudget drives the new default through the real
+// Manager -> owner -> Admit chain: a spec whose known VRAM demand exceeds the
+// detected device total is refused, with no operator budget configured anywhere;
+// the paired case without a sample keeps starting it (the pre-feature
+// behaviour). The headroom option, which arrives via ManagerOptions, turns a
+// spec that fits the device into one that does not.
+func TestManagerEnforcesAutoDetectedBudget(t *testing.T) {
+	ensure := func(t *testing.T, opts ManagerOptions, hi *HostInfo, vramMB int) error {
+		t.Helper()
+		skipOnWindows(t)
+		shrinkTimings(t)
+		opts.Policy = allowlistPolicy()
+		opts.Getenv = func(string) string { return "" }
+		m := NewManager(opts)
+		t.Cleanup(m.Close)
+		if hi != nil {
+			m.SetHostInfo(*hi)
+		}
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: vramMB}}
+		m.Apply(Config{Specs: []Spec{spec}})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		if err == nil {
+			release()
+		}
+		return err
+	}
+	device := &HostInfo{GPUTotalsMB: map[int]int{0: 8000}}
+
+	t.Run("a spec larger than the detected device is refused", func(t *testing.T) {
+		if err := ensure(t, ManagerOptions{}, device, 12000); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning(12000 MB on an 8000 MB GPU, no operator budget) = %v, want ErrNotPermitted", err)
+		}
+	})
+	t.Run("a spec that fits the detected device starts", func(t *testing.T) {
+		if err := ensure(t, ManagerOptions{}, device, 6000); err != nil {
+			t.Fatalf("EnsureRunning(6000 MB on an 8000 MB GPU) = %v, want nil", err)
+		}
+	})
+	t.Run("without a hardware sample the GPU stays unconstrained", func(t *testing.T) {
+		if err := ensure(t, ManagerOptions{}, nil, 12000); err != nil {
+			t.Fatalf("EnsureRunning before any sample = %v, want nil (unconstrained, as before this feature)", err)
+		}
+	})
+	t.Run("ManagerOptions.VRAMHeadroomMB shrinks the detected budget", func(t *testing.T) {
+		// 6000 fits 8000 on its own, but not 8000 - 4000.
+		if err := ensure(t, ManagerOptions{VRAMHeadroomMB: 4000}, device, 6000); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning(6000 MB, 4000 MB headroom on an 8000 MB GPU) = %v, want ErrNotPermitted", err)
+		}
+	})
+}
+
+// snapshotHostRAMBudget builds a snapshot on an owner holding hi as its latest
+// hardware sample (nil = none pushed yet) and reserveMB as its host-RAM
+// reserve, and returns the HostRAMBudgetMB Admit will decide on. The owner's one
+// live generation has no RAM measurement, so nothing managed is resident as far
+// as the budget is concerned.
+func snapshotHostRAMBudget(t *testing.T, hi *HostInfo, reserveMB int) int {
+	t.Helper()
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.hostRAMReserveMB = reserveMB
+	if hi != nil {
+		o.m.SetHostInfo(*hi)
+	}
+	return o.buildSnapshot().HostRAMBudgetMB
+}
+
+// TestSnapshotHostRAMBudgetFromLiveAvailable pins the basis of the host-RAM
+// pool: it is built from the host's LIVE available memory (the sample's
+// MemAvailable), so it follows what is obtainable right now rather than a
+// static total-minus-reserve. That is the point on a shared host -- a
+// co-located docker stack that grows shrinks the budget on the very next
+// sample, with no configuration change. With nothing managed resident the pool
+// is exactly MemAvailable minus the operator's reserve; what the managed
+// processes hold is added back on top (see
+// TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold).
+func TestSnapshotHostRAMBudgetFromLiveAvailable(t *testing.T) {
+	const reserve = 2048
+
+	if got, want := snapshotHostRAMBudget(t, &HostInfo{MemAvailableMB: 30000}, reserve), 27952; got != want {
+		t.Errorf("HostRAMBudgetMB with MemAvailable 30000 and reserve %d = %d, want %d", reserve, got, want)
+	}
+
+	// The budget tracks the LIVE sample: the same owner, a newer push.
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.hostRAMReserveMB = reserve
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 30000})
+	if got, want := o.buildSnapshot().HostRAMBudgetMB, 27952; got != want {
+		t.Fatalf("HostRAMBudgetMB before the host shrank = %d, want %d", got, want)
+	}
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 12000})
+	if got, want := o.buildSnapshot().HostRAMBudgetMB, 9952; got != want {
+		t.Errorf("HostRAMBudgetMB after MemAvailable fell to 12000 = %d, want %d -- the budget must follow live available memory, not a total that never moves", got, want)
+	}
+
+	t.Run("a zero reserve holds nothing back", func(t *testing.T) {
+		if got, want := snapshotHostRAMBudget(t, &HostInfo{MemAvailableMB: 30000}, 0), 30000; got != want {
+			t.Errorf("HostRAMBudgetMB with reserve 0 = %d, want %d", got, want)
+		}
+	})
+}
+
+// TestSnapshotHostRAMBudgetWithoutASampleIsUnconstrained: before the first
+// hardware sample (or when the read failed) MemAvailableMB is 0, which means "no
+// reading", not "an exhausted host". The budget then stays 0 -- the same
+// UNCONSTRAINED sentinel every per-GPU budget uses -- so RAM admission is a
+// no-op until the host has actually been looked at, instead of refusing every
+// spec on an agent that has not sampled yet.
+func TestSnapshotHostRAMBudgetWithoutASampleIsUnconstrained(t *testing.T) {
+	for name, hi := range map[string]*HostInfo{
+		"no sample pushed yet":     nil,
+		"a sample with no RAM":     {GPUTotalsMB: map[int]int{0: 24000}},
+		"an explicit zero reading": {MemAvailableMB: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := snapshotHostRAMBudget(t, hi, 2048); got != 0 {
+				t.Errorf("HostRAMBudgetMB = %d without a MemAvailable reading, want 0 (unconstrained)", got)
+			}
+		})
+	}
+}
+
+// TestSnapshotHostRAMBudgetReserveAtOrAboveAvailableStaysConstrained: a host
+// that has LESS available memory than the reserve asks to keep back is the
+// tightest host there is, and its budget must not collapse to 0 -- 0 is the
+// UNCONSTRAINED sentinel, so a naive max(0, available-reserve) would turn the
+// most RAM-starved host into one that admits anything (the opposite of keeping
+// everything back), exactly the hazard fillDetectedBudgets floors its VRAM
+// budget at 1 MB for. 1 MB is a real ceiling: Admit then refuses (Wait) every
+// spec with a known RAM demand until the host recovers.
+func TestSnapshotHostRAMBudgetReserveAtOrAboveAvailableStaysConstrained(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		available int
+		reserve   int
+	}{
+		{"reserve above available", 1500, 2048},
+		{"reserve exactly available", 2048, 2048},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, want := snapshotHostRAMBudget(t, &HostInfo{MemAvailableMB: tc.available}, tc.reserve), 1; got != want {
+				t.Errorf("HostRAMBudgetMB with MemAvailable %d and reserve %d = %d, want %d -- 0 would mean unconstrained", tc.available, tc.reserve, got, want)
+			}
+		})
+	}
+}
+
+// TestRunningProcRAMEffectiveIsMax pins the RAM a running process is charged
+// to the host pool: max(live measurement, the pushed spec demand). The demand
+// (Spec.RAMMB) is already the gateway's max(persisted measurement, estimate), so
+// it is a FLOOR here -- a fresher, higher live reading raises the charge, a
+// reading below it (a transient dip) never lowers it, and a reading that is not
+// a real measurement (<= 0, see realRAM) is absent and charges the demand. The
+// charge is never "this process needs no RAM": with neither a demand nor a
+// reading it stays 0 = unknown, which Admit treats as contributing nothing.
+func TestRunningProcRAMEffectiveIsMax(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		demand int
+		live   int
+		want   int
+	}{
+		{"live above the demand raises it", 4096, 5000, 5000},
+		{"live below the demand is floored at the demand", 4096, 3000, 4096},
+		{"live equal to the demand charges the demand", 4096, 4096, 4096},
+		{"live zero is unknown and charges the demand", 4096, 0, 4096},
+		{"a negative live reading is not a credit either", 4096, -1, 4096},
+		{"a live reading alone is charged when no demand is known", 0, 3000, 3000},
+		{"neither a demand nor a reading stays unknown", 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.RAMMB = tc.demand
+			o, st := newSnapshotOwner(spec, 4242, nil)
+			st.measuredRAM = tc.live
+
+			snap := o.buildSnapshot()
+
+			if len(snap.Running) != 1 {
+				t.Fatalf("Running = %+v, want exactly the one live generation", snap.Running)
+			}
+			if got := snap.Running[0].RAMMB; got != tc.want {
+				t.Errorf("RunningProc.RAMMB = %d for demand %d and live reading %d, want %d -- the charge is max(live, demand), the demand a floor and a non-positive reading no measurement at all", got, tc.demand, tc.live, tc.want)
+			}
+		})
+	}
+}
+
+// addRunningRAMSpec puts a second live generation on o, with the given pushed
+// RAM demand and live RAM measurement, so a test can sum several of them.
+func addRunningRAMSpec(o *owner, id string, demandMB, measuredMB int) {
+	spec := baseSpec(id, "model-"+id)
+	spec.RAMMB = demandMB
+	o.specs[id] = &specState{
+		spec:        spec,
+		state:       StateRunning,
+		proc:        &runningProc{specID: id, pid: 5000 + len(o.specs)},
+		measuredRAM: measuredMB,
+	}
+}
+
+// TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold pins the other half
+// of the pool's basis. MemAvailable already EXCLUDES the RAM the managed
+// processes hold, and rule 6 sums those same processes into its left-hand side,
+// so a pool of plain MemAvailable - reserve would charge them twice and cap the
+// managed set at about half the host. The pool therefore adds back the RAM the
+// managed processes actually hold: their LIVE MEASUREMENTS, zero-guarded, and
+// never a pushed demand -- the demand is a reservation floor, not residency.
+func TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold(t *testing.T) {
+	const (
+		reserve   = 2048
+		available = 30000
+	)
+	budget := func(t *testing.T, mutate func(o *owner)) int {
+		t.Helper()
+		spec := baseSpec("spec-a", "model-a")
+		spec.RAMMB = 4096
+		o, _ := newSnapshotOwner(spec, 4242, nil)
+		o.hostRAMReserveMB = reserve
+		o.m.SetHostInfo(HostInfo{MemAvailableMB: available})
+		if mutate != nil {
+			mutate(o)
+		}
+		return o.buildSnapshot().HostRAMBudgetMB
+	}
+
+	t.Run("nothing measured adds back nothing, whatever the demand", func(t *testing.T) {
+		// spec-a has a 4096 MB demand and no reading: the demand is charged by
+		// Admit's sum, but it is not residency, so the pool is untouched.
+		if got, want := budget(t, nil), available-reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with an unmeasured 4096 MB-demand process, want %d", got, want)
+		}
+	})
+	t.Run("a measured process is added back", func(t *testing.T) {
+		got := budget(t, func(o *owner) { o.specs["spec-a"].measuredRAM = 6000 })
+		if want := available + 6000 - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with 6000 MB resident, want %d", got, want)
+		}
+	})
+	t.Run("every managed process is added back", func(t *testing.T) {
+		got := budget(t, func(o *owner) {
+			o.specs["spec-a"].measuredRAM = 6000
+			addRunningRAMSpec(o, "spec-b", 0, 4000)
+			addRunningRAMSpec(o, "spec-c", 9000, 0) // demand only: nothing resident to add back
+		})
+		if want := available + 6000 + 4000 - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with 6000 + 4000 MB resident, want %d", got, want)
+		}
+	})
+	t.Run("a non-positive reading is no measurement", func(t *testing.T) {
+		got := budget(t, func(o *owner) { o.specs["spec-a"].measuredRAM = -500 })
+		if want := available - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with a negative reading, want %d -- it must not be subtracted", got, want)
+		}
+	})
+	t.Run("a process that is not running holds nothing", func(t *testing.T) {
+		got := budget(t, func(o *owner) {
+			addRunningRAMSpec(o, "spec-b", 0, 4000)
+			o.specs["spec-b"].proc = nil // exited: no live generation, nothing resident
+		})
+		if want := available - reserve; got != want {
+			t.Errorf("HostRAMBudgetMB = %d with an exited process holding a stale 4000 MB, want %d", got, want)
+		}
+	})
+	t.Run("what the managed set holds cannot make a missing sample a constraint", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, 4242, nil)
+		o.hostRAMReserveMB = reserve
+		st.measuredRAM = 6000
+		if got := o.buildSnapshot().HostRAMBudgetMB; got != 0 {
+			t.Errorf("HostRAMBudgetMB = %d with no hardware sample, want 0 (unconstrained)", got)
+		}
+	})
+	t.Run("a starved host stays constrained however little the managed set holds", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		o, st := newSnapshotOwner(spec, 4242, nil)
+		o.hostRAMReserveMB = reserve
+		o.m.SetHostInfo(HostInfo{MemAvailableMB: 1000})
+		st.measuredRAM = 500 // 1000 + 500 - 2048 < 0: floored at 1, never the 0 sentinel
+		if got, want := o.buildSnapshot().HostRAMBudgetMB, 1; got != want {
+			t.Errorf("HostRAMBudgetMB = %d, want %d -- 0 would mean unconstrained", got, want)
+		}
+	})
+}
+
+// TestBuildSnapshotReadsHostInfoOnce pins that one snapshot is built from ONE
+// hardware sample. buildSnapshot derives two things from HostInfo -- the
+// detected per-GPU budgets and the host-RAM budget -- and the collect loop
+// replaces the whole sample (SetHostInfo) about once a second, concurrently.
+// Reading it twice lets a push land between the two reads, handing Admit a VRAM
+// budget from one sample and a RAM budget from the next.
+//
+// The pusher alternates between two samples whose figures are tied together
+// (GPU total and available RAM move as a pair); every snapshot must carry the
+// pair of ONE of them, never half of each.
+func TestBuildSnapshotReadsHostInfoOnce(t *testing.T) {
+	const reserve = 1000
+	a := HostInfo{GPUTotalsMB: map[int]int{0: 8000}, MemAvailableMB: 11000}
+	b := HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 31000}
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.hostRAMReserveMB = reserve
+	o.m.SetHostInfo(a)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for flip := false; ; flip = !flip {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if flip {
+				o.m.SetHostInfo(a)
+			} else {
+				o.m.SetHostInfo(b)
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	for i := 0; i < 20000; i++ {
+		snap := o.buildSnapshot()
+		vram, ram := snap.Budgets[0], snap.HostRAMBudgetMB
+		fromA := vram == 8000 && ram == 11000-reserve
+		fromB := vram == 24000 && ram == 31000-reserve
+		if !fromA && !fromB {
+			t.Fatalf("snapshot %d mixed two hardware samples: VRAM budget %d with host-RAM budget %d -- load HostInfo once per snapshot", i, vram, ram)
+		}
+	}
+}
+
+// TestRAMOnlyHostAdmission is the host-RAM pool proved end to end on a host with
+// NO GPU: no GPU total in the hardware sample, no VRAM measurer, and specs that
+// declare no GPU at all -- only a spec-level RAM demand. It drives the real
+// Apply -> EnsureRunning -> buildSnapshot -> Admit -> drain-stop chain, so what
+// is pinned is that RAM alone admits, evicts and holds back, with every VRAM
+// mechanism absent rather than merely idle.
+//
+// No RAM measurer is installed either, so nothing running has a live reading and
+// the pool adds nothing back for the managed set: it is exactly MemAvailable
+// minus the reserve, 20000 - 2000 = 18000 MB, and every running process is
+// charged at its demand floor. (The measured regime, where what the managed
+// processes hold is added back, is TestRAMOnlyHostPoolAddsBackMeasuredRAM.) The
+// co-residency matrix is opened for every pair so the RAM pool is the ONLY thing
+// that can refuse or evict anything below.
+//
+//  1. spec-a (10000) starts and goes idle.
+//  2. spec-b (6000) starts and stays busy: 16000 fits 18000, so a is left alone
+//     -- a fitting start evicts nobody.
+//  3. spec-c (8000) overflows (24000 > 18000). The one idle process, a, is drained
+//     -- the only victim, host-wide, though no card is involved -- and b, busy,
+//     is untouched. 14000 fits.
+//  4. a is asked for again while b and c are both busy: 24000 > 18000 and nothing
+//     idle can be drained, so it waits out its admission timeout and nobody is
+//     evicted.
+//  5. spec-d declares 20000, more than the whole 18000 pool: no eviction could
+//     ever make it fit, so it is refused (ErrNotPermitted) rather than left to
+//     wait, and nobody is evicted for it. The refusal is a durable verdict, so it
+//     is only issued against a pool consistent with the running set: spec-a exited
+//     in step 3 and the host has not yet reported its memory back, so the request
+//     first waits, and it is refused once two samples have landed that show what b
+//     and c actually hold (6000 left of 20000). The sample wake delivers it.
+func TestRAMOnlyHostAdmission(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.RAMMB = 10000
+	specA.AdmissionWaitTimeoutSeconds = 1 // step 4 must give up quickly
+	specB := baseSpec("spec-b", "model-b")
+	specB.RAMMB = 6000
+	specC := baseSpec("spec-c", "model-c")
+	specC.RAMMB = 8000
+	specD := baseSpec("spec-d", "model-d")
+	specD.RAMMB = 20000
+	for _, s := range []Spec{specA, specB, specC, specD} {
+		if len(s.GPUs) != 0 {
+			t.Fatalf("premise: %s declares GPUs %v, this test is about a spec with RAM alone", s.ID, s.GPUs)
+		}
+	}
+
+	m := NewManager(ManagerOptions{
+		Policy:           allowlistPolicy(),
+		Getenv:           func(string) string { return "" },
+		HostRAMReserveMB: 2000,
+	})
+	t.Cleanup(m.Close)
+	if m.measurer.Load() != nil {
+		t.Fatal("premise: a VRAM measurer is installed, this test is about a host that has none")
+	}
+	if m.ramMeasurer.Load() != nil {
+		t.Fatal("premise: a RAM measurer is installed, this test is about the regime where nothing is measured")
+	}
+	// A hardware sample with host RAM and nothing else: no GPU total at all.
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000})
+	m.Apply(Config{
+		Specs: []Spec{specA, specB, specC, specD},
+		Coresident: [][2]string{
+			{"spec-a", "spec-b"}, {"spec-a", "spec-c"}, {"spec-b", "spec-c"},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	running := func(id string) bool {
+		st := statusFor(m, id)
+		return st != nil && st.State == StateRunning
+	}
+
+	// 1. spec-a starts, then goes idle (evictable).
+	_, releaseA, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-a) = %v, want it admitted: 10000 MB fits an 18000 MB pool", err)
+	}
+	releaseA()
+
+	// 2. spec-b fits beside it and stays busy; spec-a must not be touched.
+	_, releaseB, err := m.EnsureRunning(ctx, "model-b")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-b) = %v, want it admitted: 10000 + 6000 MB fits an 18000 MB pool", err)
+	}
+	defer releaseB()
+	if !running("spec-a") || !running("spec-b") {
+		t.Fatalf("spec-a = %+v, spec-b = %+v, want both running: a start that fits the pool must evict nobody", statusFor(m, "spec-a"), statusFor(m, "spec-b"))
+	}
+
+	// 3. spec-c overflows the pool: the idle spec-a is the one victim.
+	_, releaseC, err := m.EnsureRunning(ctx, "model-c")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-c) = %v, want it admitted after draining the idle spec-a", err)
+	}
+	defer releaseC()
+	waitUntil(t, 3*time.Second, "spec-a drained to make room in the RAM pool", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStopped
+	})
+	if !running("spec-b") || !running("spec-c") {
+		t.Fatalf("spec-b = %+v, spec-c = %+v, want both running: only the idle process may be drained, never the busy one", statusFor(m, "spec-b"), statusFor(m, "spec-c"))
+	}
+
+	// 4. spec-a again, with the only two holders busy: it must wait, not evict.
+	if _, release, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrAdmissionBlocked) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("EnsureRunning(model-a) with both holders busy = %v, want ErrAdmissionBlocked (a Wait that timed out, nothing evictable)", err)
+	}
+	if !running("spec-b") || !running("spec-c") {
+		t.Fatalf("spec-b = %+v, spec-c = %+v, want both still running: a blocked admission must not evict", statusFor(m, "spec-b"), statusFor(m, "spec-c"))
+	}
+
+	// 5. spec-d is larger than the whole pool: terminal, and nobody is drained.
+	// The sample has said 20000 available throughout, which is no longer true
+	// (b and c hold 14000), and spec-a's exit is too recent for the pool to be
+	// trusted for a durable verdict, so deliver the samples a real collect loop
+	// would: two that show what is actually left.
+	resultD := make(chan error, 1)
+	go func() {
+		_, release, err := m.EnsureRunning(ctx, "model-d")
+		if err == nil {
+			release()
+		}
+		resultD <- err
+	}()
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000 - 14000})
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000 - 14000})
+	select {
+	case err := <-resultD:
+		if !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning(model-d) = %v, want ErrNotPermitted: 20000 MB cannot fit an 18000 MB pool whatever is evicted", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("EnsureRunning(model-d) was neither refused nor admitted within 4s of two samples consistent with the running set, want the terminal ErrNotPermitted")
+	}
+	if st := statusFor(m, "spec-d"); st == nil || st.State != StateNotPermitted || st.LastError == nil {
+		t.Fatalf("Status()[spec-d] = %+v, want not_permitted with the reason recorded", st)
+	}
+	if !running("spec-b") || !running("spec-c") {
+		t.Fatalf("spec-b = %+v, spec-c = %+v, want both still running: a terminal refusal must not evict", statusFor(m, "spec-b"), statusFor(m, "spec-c"))
+	}
+}
+
+// TestRAMOnlyHostPoolAddsBackMeasuredRAM is the measured regime of the same
+// no-GPU host, end to end, and the reason the pool adds back what the managed
+// processes hold. A RAM measurer reports spec-a at 10000 MB and spec-b at 6000
+// MB; the host sample then says only 4000 MB is available (they hold the other
+// 16000 of a 20000 MB host), with a reserve of 2000. MemAvailable already
+// excludes what a and b hold, so the pool is 4000 + 16000 - 2000 = 18000 MB --
+// and the genuinely free headroom is 4000 - 2000 = 2000 MB.
+//
+//   - A 2000 MB spec-c fits that headroom exactly and is admitted with nothing
+//     evicted. A pool of plain MemAvailable - reserve (2000) would charge a
+//     and b's 16000 on top of it and refuse it.
+//   - A 2001 MB spec-d is one MB over the headroom; with every holder busy it
+//     waits out its admission timeout and nobody is evicted.
+//
+// Everything is held busy and the sample never has to change, so no step depends
+// on the next hardware sample arriving: the admission outcomes are
+// deterministic.
+func TestRAMOnlyHostPoolAddsBackMeasuredRAM(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	specA := baseSpec("spec-a", "model-a")
+	specA.RAMMB = 10000
+	specB := baseSpec("spec-b", "model-b")
+	specB.RAMMB = 6000
+	specC := baseSpec("spec-c", "model-c")
+	specC.RAMMB = 2000
+	specD := baseSpec("spec-d", "model-d")
+	specD.RAMMB = 2001
+	specD.AdmissionWaitTimeoutSeconds = 1
+	specs := []Spec{specA, specB, specC, specD}
+	var pairs [][2]string
+	for i := range specs {
+		for j := i + 1; j < len(specs); j++ {
+			pairs = append(pairs, [2]string{specs[i].ID, specs[j].ID})
+		}
+	}
+
+	m := NewManager(ManagerOptions{
+		Policy:           allowlistPolicy(),
+		Getenv:           func(string) string { return "" },
+		HostRAMReserveMB: 2000,
+	})
+	t.Cleanup(m.Close)
+	var heldMB sync.Map // child pid -> MB it holds, filled in as children start
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			if mb, ok := heldMB.Load(p); ok {
+				out[p] = mb.(int)
+			}
+		}
+		return out
+	})
+	m.SetHostInfo(HostInfo{MemAvailableMB: 20000}) // an idle host: nothing is running yet
+	m.Apply(Config{Specs: specs, Coresident: pairs})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start := func(model, specID string, holdsMB int) {
+		t.Helper()
+		_, release, err := m.EnsureRunning(ctx, model)
+		if err != nil {
+			t.Fatalf("EnsureRunning(%s) = %v, want it admitted", model, err)
+		}
+		t.Cleanup(release) // held busy for the whole test
+		st := statusFor(m, specID)
+		if st == nil || st.PID == 0 {
+			t.Fatalf("Status()[%s] = %+v, want a live child", specID, st)
+		}
+		heldMB.Store(st.PID, holdsMB)
+		waitUntil(t, 5*time.Second, specID+" reports the RAM it holds", func() bool {
+			st := statusFor(m, specID)
+			return st != nil && st.MeasuredRAMMB == holdsMB
+		})
+	}
+	start("model-a", "spec-a", 10000)
+	start("model-b", "spec-b", 6000)
+
+	// The host now reports what is left once a and b hold their 16000 MB.
+	m.SetHostInfo(HostInfo{MemAvailableMB: 4000})
+
+	_, releaseC, err := m.EnsureRunning(ctx, "model-c")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-c) = %v, want it admitted: 2000 MB fits the 2000 MB of genuinely free headroom (4000 available - 2000 reserve) once what a and b hold is added back to the pool", err)
+	}
+	defer releaseC()
+	for _, id := range []string{"spec-a", "spec-b", "spec-c"} {
+		if st := statusFor(m, id); st == nil || st.State != StateRunning {
+			t.Fatalf("Status()[%s] = %+v, want running: a start that fits the free headroom must evict nobody", id, st)
+		}
+	}
+
+	if _, release, err := m.EnsureRunning(ctx, "model-d"); !errors.Is(err, ErrAdmissionBlocked) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("EnsureRunning(model-d) = %v, want ErrAdmissionBlocked: 2001 MB is one over the free headroom and every holder is busy", err)
+	}
+	for _, id := range []string{"spec-a", "spec-b", "spec-c"} {
+		if st := statusFor(m, id); st == nil || st.State != StateRunning {
+			t.Fatalf("Status()[%s] = %+v, want still running: a blocked admission must not evict", id, st)
+		}
+	}
+}
+
+// TestRAMOnlyHostWithoutASampleIsUnconstrained is the paired case: before the
+// first hardware sample there is no MemAvailable reading, the host-RAM pool is
+// the UNCONSTRAINED 0, and a spec declaring an absurd RAM demand starts exactly
+// as it did before RAM was an admission axis. Without it the test above could
+// pass against an implementation that simply refuses every RAM-bearing spec.
+func TestRAMOnlyHostWithoutASampleIsUnconstrained(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.RAMMB = 1_000_000
+	m := NewManager(ManagerOptions{
+		Policy:           allowlistPolicy(),
+		Getenv:           func(string) string { return "" },
+		HostRAMReserveMB: 2000,
+	})
+	t.Cleanup(m.Close)
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-a) before any hardware sample = %v, want nil: no MemAvailable reading means an unconstrained pool", err)
+	}
+	release()
+}
+
+// --- VRAM bootstrap: the one-shot guard lives on the owner ----------------
+//
+// The one-shot VRAM bootstrap eviction (task 4.3) is granted by the owner and
+// guarded by a single durable marker, specState.vramBootstrapDone. These tests
+// pin the owner half of the guard: who the grant is offered to, what sets the
+// marker, that the marker outlives the process it was earned under (the whole
+// point -- a marker cleared on exit would let the exception thrash), and that
+// admitAndStart burns it on the eviction and then reverts to the ADR-032 wait.
+
+// TestVRAMBootstrapEligibility pins the grant predicate: the owner offers the
+// one-shot only to an unknown-VRAM spec that has not yet resolved its bootstrap
+// (no measurement captured, shot unspent) AND only on a host where a VRAM
+// measurer is installed -- the exception exists to capture a measurement, so it
+// never fires where none can be taken (§5.3). A known-demand spec is never
+// offered it (rule 4 does not even apply to it), and neither is one already
+// marked.
+func TestVRAMBootstrapEligibility(t *testing.T) {
+	unknown := func() Spec {
+		s := baseSpec("spec-a", "model-a")
+		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		return s
+	}
+	known := func() Spec {
+		s := baseSpec("spec-a", "model-a")
+		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 5000}}
+		return s
+	}
+	cases := []struct {
+		name     string
+		st       *specState
+		measurer bool
+		want     bool
+	}{
+		{"unknown, unresolved, measurer installed: offered the shot", &specState{spec: unknown(), vramBootstrapDone: false}, true, true},
+		{"unknown and unresolved but NO measurer: not offered (nothing to measure)", &specState{spec: unknown(), vramBootstrapDone: false}, false, false},
+		{"unknown but already resolved: not offered", &specState{spec: unknown(), vramBootstrapDone: true}, true, false},
+		{"known demand: never offered (rule 4 does not apply)", &specState{spec: known(), vramBootstrapDone: false}, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &owner{m: &Manager{}}
+			if tc.measurer {
+				o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+			}
+			if got := o.vramBootstrapEligible(tc.st); got != tc.want {
+				t.Errorf("vramBootstrapEligible = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVRAMBootstrapMarkerSetWhenMeasured: a real VRAM measurement resolves the
+// bootstrap -- the spec has a number now, so it must never spend the eviction
+// shot. Both places that record a measurement (the off-owner beat via
+// applyMeasurement, and the synchronous admission-time read in buildSnapshot)
+// set the durable marker; a non-measurement (a measured 0, which realMeasurement
+// drops) does not.
+func TestVRAMBootstrapMarkerSetWhenMeasured(t *testing.T) {
+	const pid = 4242
+
+	t.Run("applyMeasurement marks a real measurement", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		o, st := newSnapshotOwner(spec, pid, nil)
+		o.applyMeasurement(cmdMeasured{
+			targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+			byPID:   map[int]map[int]int{pid: {0: 7000}},
+		})
+		if !st.vramBootstrapDone {
+			t.Error("a real VRAM measurement must resolve the bootstrap (set vramBootstrapDone)")
+		}
+	})
+
+	t.Run("applyMeasurement does not mark a measured zero", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		o, st := newSnapshotOwner(spec, pid, nil)
+		o.applyMeasurement(cmdMeasured{
+			targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+			byPID:   map[int]map[int]int{pid: {0: 0}}, // not a measurement (realMeasurement drops it)
+		})
+		if st.vramBootstrapDone {
+			t.Error("a measured 0 is not a measurement and must not resolve the bootstrap")
+		}
+	})
+
+	t.Run("buildSnapshot marks a measured live occupant", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		measurer := func([]int) map[int]map[int]int { return map[int]map[int]int{pid: {0: 7000}} }
+		o, st := newSnapshotOwner(spec, pid, measurer)
+		_ = o.buildSnapshot()
+		if !st.vramBootstrapDone {
+			t.Error("buildSnapshot's synchronous measurement must also resolve the bootstrap")
+		}
+	})
+}
+
+// TestVRAMBootstrapMarkerSurvivesProcessExit is the backbone of the anti-thrash
+// guarantee. The marker is DURABLE: unlike the per-process measurement (which
+// onProcExited clears, F2), a spent/resolved bootstrap must outlive the process
+// it was earned under, or every restart would re-arm the one-shot and the
+// ADR-032 thrash would be back one exit at a time. onProcExited clears the
+// measurement and leaves the marker standing.
+func TestVRAMBootstrapMarkerSurvivesProcessExit(t *testing.T) {
+	spec := baseSpec("spec-a", "model-a")
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+	logs := NewLogStore(0, 0)
+	o := &owner{
+		m:     &Manager{},
+		cfg:   Config{Specs: []Spec{spec}},
+		specs: map[string]*specState{},
+	}
+	st := &specState{
+		spec:              spec,
+		state:             StateDraining,
+		intentionalStop:   true, // a clean stop, so onProcExited rests it at Stopped
+		measuredVRAM:      map[int]int{0: 7000},
+		measuredRAM:       5000,
+		vramBootstrapDone: true, // the shot was spent (or a measurement had landed)
+		proc:              &runningProc{specID: spec.ID, pid: 4242, log: logs.newProc(spec.ID), exited: make(chan struct{})},
+	}
+	o.specs[spec.ID] = st
+
+	o.onProcExited(st, nil)
+
+	if !st.vramBootstrapDone {
+		t.Error("vramBootstrapDone was cleared on exit: the one-shot would re-arm and the ADR-032 thrash would return")
+	}
+	// Sanity: the exit path really ran -- the per-process measurement IS cleared,
+	// which is exactly what the durable marker is contrasted against.
+	if st.measuredVRAM != nil || st.measuredRAM != 0 {
+		t.Errorf("the per-process measurement should be cleared on exit: measuredVRAM=%v measuredRAM=%d", st.measuredVRAM, st.measuredRAM)
+	}
+}
+
+// TestVRAMBootstrapOneShotBurnsMarkerThenWaits drives the whole guard through
+// the owner: the first admission of a never-measured unknown-VRAM spec spends
+// its one shot to evict the idle known occupant (burning the marker), and the
+// very next admission against the same host is back to the ADR-032 wait -- no
+// second eviction, ever.
+func TestVRAMBootstrapOneShotBurnsMarkerThenWaits(t *testing.T) {
+	cand := baseSpec("cand", "model-cand")
+	cand.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}} // unknown demand
+	cand.Pinned = true                           // wantUp without a queued waiter
+
+	victim := baseSpec("victim", "model-victim")
+	victim.GPUs = []SpecGPU{{Index: 0, VRAMMB: 5000}} // known demand
+
+	o := &owner{
+		m:            &Manager{},
+		policy:       allowlistPolicy(),
+		cfg:          Config{Specs: []Spec{cand, victim}},
+		allowedPairs: allowPairs("cand", "victim"), // open pair: only rule 4 can act
+		specs:        map[string]*specState{},
+	}
+	// A measurer must be installed for the bootstrap to be eligible at all: the
+	// one-shot exists to capture a measurement, so it never fires where none can
+	// be taken. Its return value is irrelevant here (no candidate pid is live).
+	o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+	candSt := &specState{spec: cand, state: StateStopped}
+	// The victim is already Draining, so admitAndStart's beginDrain is a no-op --
+	// the test needs no live child or SIGTERM, only a row in the running set.
+	victimSt := &specState{spec: victim, state: StateDraining, proc: &runningProc{specID: "victim", pid: 5555}}
+	o.specs["cand"] = candSt
+	o.specs["victim"] = victimSt
+
+	// First admission: the one shot fires.
+	o.admitAndStart("cand")
+	if !candSt.vramBootstrapDone {
+		t.Fatal("the one-shot eviction must burn the marker (vramBootstrapDone)")
+	}
+	if candSt.proc != nil {
+		t.Fatal("an Evict decision must not start the candidate")
+	}
+	if !contains(victimSt.drainedFor, "cand") {
+		t.Errorf("the victim must record the candidate as the beneficiary of its drain, got %v", victimSt.drainedFor)
+	}
+
+	// Second admission against the same (still-draining) host: the grant is gone,
+	// so rule 4 is back to the ADR-032 precedence wait -- the candidate records it
+	// as its last_error and does NOT evict the occupant again.
+	candSt.lastError = nil
+	o.admitAndStart("cand")
+	if candSt.proc != nil {
+		t.Fatal("the candidate must still Wait, not start, after the shot is spent")
+	}
+	if candSt.lastError == nil || !strings.Contains(candSt.lastError.Message, "waits for spec victim to leave") {
+		t.Errorf("after the shot the candidate must revert to the ADR-032 precedence wait, got lastError=%v", candSt.lastError)
+	}
+}
+
+func contains(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }

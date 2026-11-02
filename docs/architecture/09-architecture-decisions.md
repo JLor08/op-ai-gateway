@@ -557,6 +557,17 @@ itself**: `Admit` gives it a message and the manager records it as the blocked
 spec's own `last_error`, naming the occupant and the card, which the portal
 shows in an always-visible column. Every other `Wait` stays silent, since a
 spec queued behind a busy neighbour is ordinary operation.
+
+**Amended by [ADR-086](#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)
+(one guarded exception, once per spec).** The total order above is unchanged in
+steady state, and so is everything it rejects. What it could not distinguish is a
+spec that has **never been measured**: while a known-demand occupant holds its
+card it can never run alone, so it can never capture the measurement that would
+end its wait, and the wait need not resolve. Such a spec is now granted exactly
+one eviction of the known-demand occupants of its cards, only where a VRAM
+measurer exists to capture the number, and the grant is burned when the eviction
+is issued and by any measurement, never re-armed by an exit, so the alternating
+cold-load thrash this decision closes cannot return.
 → [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
 
 ## ADR-033 — Endpoint modes replace the `native_*` booleans: independent per-endpoint disable, per-spec snapshot
@@ -618,7 +629,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -674,7 +685,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -843,7 +854,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1038,7 +1049,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1253,7 +1264,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-95-migrations),
+[§4](reference/data-model.md#4-migration-history-97-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1479,7 +1490,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-95-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-97-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1626,7 +1637,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-95-migrations),
+[§4](reference/data-model.md#4-migration-history-97-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3590,7 +3601,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-95-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-97-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3814,7 +3825,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-95-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-97-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4846,7 +4857,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4972,7 +4983,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-97-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5115,7 +5126,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-95-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-97-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7611,7 +7622,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-95-migrations),
+[Data Model](reference/data-model.md#4-migration-history-97-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7834,7 +7845,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-95-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-97-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -7975,7 +7986,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-95-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-97-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8239,7 +8250,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-95-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-97-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -10581,3 +10592,362 @@ flag or a `ServerAgent` bump** (the path-blind multipart proxy already carries t
 [Runtime View §6.1.2](06-runtime-view.md#612-transcription-relay-post-v1audiotranscriptions),
 [§6.1.4](06-runtime-view.md#614-portal-transcription-chat-turn-through-loopback-from-a-chat-blob),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints).
+
+## ADR-083 — Resource accounting is on by default: VRAM budgets auto-detect from device totals and an operator budget overrides
+**Context:** the agent admitted a managed model against a per-GPU VRAM budget only, and that budget was effectively off unless an
+operator set it. `ai_server_gpu_budgets.budget_mb` is operator data, `0` and an absent row both mean *unconstrained*
+([§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates)), and the portal seeds a brand-new row at `0` when telemetry offers
+no total. A host whose operator never saved the limits form therefore ran no per-GPU arithmetic at all: two models that cannot share
+a card were co-admitted until one of them hit an out-of-memory error at load. Host RAM had no accounting whatever (no demand, no
+measurement, no budget), so a CPU-only model, or a partial-offload model whose spilled remainder lives in host RAM, was invisible
+to admission ([ADR-085](#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)).
+The agent already reads every GPU's total memory each collect cycle for telemetry (`sample.GPU.MemTotalBytes`), so the number a
+safe default needs was in hand and unused.
+
+**Decision — five choices, taken together. No schema change, no gateway change and no new wire field for the budgets themselves.**
+
+- **(a) Default-on, derived from what the agent reads.** `owner.buildSnapshot` still copies the operator's budget rows verbatim, then
+  `fillDetectedBudgets` fills in what the operator did not say, per GPU index: an operator budget **greater than 0 wins exactly as
+  configured** (no headroom subtracted, no clamp to the hardware: it is the operator's word); otherwise a detected total greater than 0
+  gives `max(1, total - headroom)`; otherwise the index is left alone (absent, or a verbatim `0` row, which is *unconstrained*: the
+  pre-feature behaviour of a GPU-less host and of a host that has not produced its first sample). A configured row of `0` or less
+  means "no budget set", not an override, so the detected value replaces it.
+- **(b) The `<= 0` interpretation still lives in `Admit` and nowhere else.** Auto-detect adds a value; it never filters or
+  reinterprets a row, and it stops feeding `0` for a GPU it can read. The floor of **1 MB** on the detected value is not cosmetic: a
+  headroom at or above the device total would otherwise produce `0`, which `Admit` reads as *unconstrained*, the opposite of "keep it
+  all back". 1 MB is a real ceiling, so every spec with a known demand on that card is refused, which is what reserving the whole
+  device means.
+- **(c) Headroom is an operator knob, env-only.** `OP_AGENT_VRAM_HEADROOM_MB` (default `0`) is subtracted from a *detected* budget
+  only, for the driver, a display or another tenant on the card. Like every agent-local setting that bounds what the host does, the
+  gateway can never supply it ([ADR-024](#adr-024--managed-runtime-the-gateway-specifies-the-launch-the-ai-server-permits-it)). It has
+  no config-file key, because a file key would have to be mirrored into the generated agent config, the portal template and the
+  golden test for a host-tuning escape hatch.
+- **(d) Totals are pushed, never polled, and the boot order is explicit.** The collect loop hands the runtime owner the device totals
+  and the live `MemAvailable` once per cycle (`Manager.SetHostInfo`, an atomic store), so admission, which runs on the serialized
+  owner goroutine ([§5.5](cross-cutting/agent-runtime-manager.md#55-one-serialized-owner)), reads a cached value and no hardware call
+  joins the admission path. Device totals are **last-known-good**: a total is static, `nvidia-smi` is a subprocess that does time
+  out, and one failed cycle must not erase every budget and silently return the host to unconstrained. Available RAM is the
+  opposite, live or nothing, because a stale figure is worse than an honest `0`. The owner loads the sample **once** per snapshot so
+  the VRAM and RAM budgets of one admission come from the same sample. `Run` also **seeds the totals from the static hardware
+  inventory before it triggers the first runtime reconciliation**, so the pinned and `force_running` specs that reconciliation
+  admits at boot already see their budgets.
+- **(e) Unified-memory GPUs are skipped.** An Apple GPU has no dedicated VRAM: the "total" its collector reports is the system memory
+  the GPU has allocated at that instant, which moves with load and is not a ceiling, so budgeting against it would refuse a spec
+  larger than whatever happens to be allocated now. Apple GPUs stay VRAM-unconstrained and only the RAM axis applies to them. **The
+  same risk exists for an AMD APU**: `rocm-smi`'s VRAM total there may be a BIOS carve-out rather than the memory the integrated GPU
+  can actually use, and nothing in the agent's sample tells such a carve-out from a discrete card's dedicated memory. It is **not**
+  guarded, because the distinction is unverified, and the escape hatch is the one that always works: a positive operator budget wins
+  verbatim.
+
+**Consequence:**
+
+- **This is a behavioural change for every existing deployment, not a refactor.** On any host where a GPU's total is readable, a
+  budget that was absent or `0` is now the card's total. A spec whose declared or measured demand on one GPU exceeds the card is
+  terminally `not_permitted` (`spec X: gpu 0 demand 24000 MB exceeds budget 16000 MB on its own`) where it used to start and fail at
+  load; a pair or triple that cannot fit together now evicts or waits where it used to co-load; and a portal budget row of `0` no
+  longer means "unconstrained" **in effect** on a GPU host (`Admit`'s own rule is unchanged, the agent just no longer hands it a `0`
+  for a GPU it can read). An operator who needs the old behaviour for a spilling model sets a positive budget above the card.
+- **The boot gap, stated.** The seed comes from the hardware inventory read at start-up. If that read fails or times out, the
+  inventory carries no totals and the specs the first reconciliation admits see an unconstrained VRAM budget until the first sample
+  publishes them (about a second); a host with no readable GPU has no budget anywhere, which is the same fallback. The RAM pool has
+  **no seed at all**: the inventory carries no available-RAM figure, so a spec admitted before the first collect cycle publishes
+  `MemAvailable` is admitted against an unconstrained RAM pool. Both windows are bounded by the first collect cycle and are recorded
+  in [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+- **Nothing is persisted and nothing is shown.** The detected budget exists only in the agent's snapshot: the portal's limits form
+  still shows only the rows an operator saved, and a saved row is an override. The sentinel pair that
+  [§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates) documents (`routing.ServerGPUBudget.BudgetMB` on the gateway,
+  `PolicySnapshot.Budgets` on the agent) keeps its meaning at both ends.
+- **Verification status.** Policy, snapshot, boot-ordering and sample-publishing behaviour are covered by unit tests. The Apple and
+  AMD cases and a real GPU's `memory.total` are not exercised on hardware by CI.
+
+**Rejected:** **Leaving the default off and telling operators to set budgets** (that is the defect: the protection exists only
+after an operator has been bitten, and the portal's own seed row is `0`). **A `BudgetMB == 0` filter in `buildSnapshot`** (the
+sentinel is interpreted in exactly one place on purpose, §5.2: a second copy is one more place for the two to drift apart).
+**`max(0, total - headroom)`** (a headroom at or above the total would silently mean "unconstrained"). **Budgeting an Apple GPU
+against its reported total** (it is not a ceiling). **Guarding AMD APUs now** (the carve-out claim is unverified, and a wrong guard
+would leave a discrete card unprotected). **A JSON config-file key for the headroom** (it would force the generated config, the
+portal template and the reflection golden to change for an escape hatch).
+→ [Agent-Managed Model Runtime §5.1](cross-cutting/agent-runtime-manager.md#51-the-per-gpu-data-model),
+[§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates),
+[Configuration & Environment Variables](reference/config-env.md).
+
+## ADR-084 — The effective resource value is max(measured, manual): the manual figure is a floor, and the per-spec VRAM lock is retired
+**Context:** a spec's VRAM demand reached the agent through two selectors that could each under-reserve. The gateway pushed the
+agent's **measurement** when there was one and the operator's **estimate** otherwise, unless the operator had set `vram_locked`, in
+which case it pushed the estimate even where a larger measurement existed; and the agent's own snapshot charged a *running* process
+its live reading **in place of** the pushed demand. The first made a lock an escape hatch from a one-way loop (the agent measures its
+child, the write-back stores it, the push serves it back as the spec's own declared demand, and a demand above its GPU's budget is a
+terminal `not_permitted`, [§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates)) and, in the same breath, a way to
+under-reserve: an estimate below reality was served instead of the measurement that disproved it, and two models that did not fit
+together were admitted side by side. The second let a transient dip of a live reading below the pushed demand *lower* the
+reservation, the gap a co-resident start was admitted into. The portal's table, meanwhile, showed the operator's estimate alone (`0`
+until typed), a number that could disagree with what admission used. RAM
+([ADR-085](#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)) adds a second axis
+to which the same question applies.
+
+**Decision — four choices, taken together. Migration 97 drops `agent_runtime_specs.vram_locked`.**
+
+- **(a) The effective value is `max(measured, manual)`.** The operator's figure is a **floor**: reserve at least this much. The
+  agent's measurement raises it when reality is higher and never lowers it. `0` is *unknown* on either side and never "needs none":
+  a measured `0` falls through to the estimate, an estimate of `0` yields the measurement, and both `0` stays `0`, which the agent
+  reads as unknown and routes to the cold-start bootstrap ([ADR-086](#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)).
+  Nothing is stored for it: the estimate stays the operator's, the measurement stays the agent's, and `max` is derived.
+- **(b) One rule, applied at the three places that use the number.** The gateway's push (`agentRuntimeSpecDTO`: each GPU's `vram_mb`
+  and the spec-level `ram_mb`), the agent's `buildSnapshot` (a running process is charged `max(live reading, pushed demand)`), and
+  the portal's table (`effectiveGpuVram` and `effectiveRam`; **VRAM total** is the sum of the per-GPU effective values). The table
+  cannot disagree with admission because it applies the same rule to the same two stored figures.
+- **(c) `vram_locked` is removed everywhere.** The column (migration 97, `dropColumnIfPresent`), `routing.RuntimeSpec`, both
+  runtime-spec DTOs, the agent push's selection, the ingest's write-back gate, the portal checkbox and its hint and labels. The VRAM
+  write-back is gated on **ownership only** now (`resolveRuntimeSpecOwned`: the spec exists and belongs to the reporting server, with
+  the cross-server `Warn`), the same gate the RAM write-back uses, so a spec that used to be locked has its measurement recorded.
+  The value is not carried over: a locked spec simply reads as unlocked.
+- **(d) A measured breach stays terminal.** A measurement above the spec's GPU budget is a genuine `not_permitted` ("demand exceeds
+  budget on its own"), exactly as a declared one is: the agent cannot tell a measured demand from a declared one (the wire carries
+  one number by design), and inferring it would mean either running a process the budget says does not fit or silently discarding
+  the measurement.
+
+**Consequence:**
+
+- **An operator can no longer cap the effective VRAM below a measurement, which was the lock's job, and that is intended.** The
+  lever is now the budget, the auto-detected one ([ADR-083](#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides))
+  or an operator's, which is used verbatim with no clamp to the hardware. A 24 GB card budgeted at 20000 MB, an 18000 MB estimate
+  that served fine and one 22000 MB measurement is still the scenario to know: from then on that spec is refused, and the way out is
+  a larger operator budget (or a smaller real footprint, which the next measurement records, because the write-back stores any
+  changed positive figure, up or down). An operator who had locked a spec to hold its estimate *below* a measurement will see that
+  spec's demand rise to the measurement after upgrade, and may find it refused if that exceeds the budget.
+- **The push can only grow, and a bigger push relaunches nothing.** A fresh measurement changes the document the gateway serves, but
+  `vram_mb` and `ram_mb` are admission demands, not launch inputs (`sameLaunchShape` strips both), so a healthy child is not
+  relaunched for one and the new number binds at the next start ([§5.6](cross-cutting/agent-runtime-manager.md#56-what-a-pushed-config-applies-and-what-it-does-not)).
+- **The ownership split is unchanged.** The portal's runtime-spec write still ignores `vram_measured_mb` and never accepts a RAM
+  measurement, and an operator upsert never clobbers either; a benchmark's admin-state write carries `ram_estimate_mb` through so it
+  does not reset it.
+
+**Rejected:** **Keeping the lock as a measured/estimate selector** (it is the under-reservation: an estimate below reality served in
+place of the measurement that disproved it). **Measured-wins with no lock** (it rebuilds the one-way loop with no lever at all, and
+replaces a floor with a possibly transient reading). **Replacing the pushed demand with the live reading** (a dip lowers the
+reservation). **An operator "reset the measured value to 0" button** (it escapes the trap exactly once: the spec starts, is
+measured at the same figure within one beat and is refused again). **Treating a measured breach as non-terminal** (see (d)).
+**Leaving the column in place, ignored** (a column no code reads or writes misdescribes the schema, and the lock's removal is what
+makes the rule above checkable).
+→ [Agent-Managed Model Runtime §5.1](cross-cutting/agent-runtime-manager.md#51-the-per-gpu-data-model),
+[Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).
+
+## ADR-085 — RAM is a co-equal, host-scoped admission axis: one host-wide pool on live-available memory
+**Context:** two real workloads are invisible to a VRAM-only scheduler. A **CPU-only** model consumes host RAM and no VRAM, and a
+**partial-offload** model occupies some VRAM *and* the spilled remainder in host RAM, so a RAM-tight host can be chosen although the
+VRAM fits, and the host swaps or the kernel kills something. There was no per-spec RAM figure anywhere: not declared, not measured,
+not sent to the agent, not shown. And hosts are shared: a co-located container stack consumes memory the agent does not manage and
+does not control, so a static "host total minus a reserve" goes stale the moment a neighbour grows.
+
+**Decision — eight choices, taken together. Migration 96; agent `0.14.0`.**
+
+- **(a) RAM is spec-level, not per-GPU.** One process backs one spec, whatever GPUs it spans, so RAM is two scalars on the spec row
+  (`agent_runtime_specs.ram_estimate_mb`, operator-owned, and `ram_measured_mb`, agent-owned and never clobbered by an operator
+  upsert; migration 96), carried to the agent as the spec-level `ram_mb` of the runtime-config document (`max(measured, estimate)`,
+  [ADR-084](#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired))
+  beside `gpus[]` and never inside it. `0` is *unknown*, never "needs none". The agent's per-GPU maps stay keyed by GPU index; RAM is
+  a new host-scoped dimension and is not shoehorned into them.
+- **(b) It is measured per process.** On every platform except Windows the measurer reads the child's **RSS** (gopsutil), which
+  counts resident mmap'd weights: for a model server that is where most of the footprint is, and the accepted caveat is that such
+  pages are reclaimable page cache, so RSS can overstate what a process strictly needs, which errs in the safe direction. On Windows
+  it reads the **private working set** (`GetProcessMemoryInfo`, `PROCESS_MEMORY_COUNTERS_EX2`, Windows 10 1809 and later) because the
+  plain working set also counts every shareable DLL page once per process that maps it. A pid it cannot read is absent, never `0`;
+  a measured `0` is dropped. It is one in-process read per pid on the recurring, off-owner measurement beat, and **not gated on the
+  spec declaring a GPU**: the specs whose RAM matters most are the CPU-only ones. The figure rides the runtime sample as the
+  spec-level `ram_measured_mb` (`omitempty`) and the gateway writes it back with the VRAM write-back's discipline (ownership check,
+  `<= 0` dropped, an unchanged value not rewritten).
+- **(c) The pool is `(MemAvailable + Σ running managed measured RAM) − reserve`.** Not a plain `MemAvailable − reserve`, and the
+  difference is deliberate: `MemAvailable` already **excludes** every byte a managed process
+  holds, and rule 6 then sums those same processes into its left-hand side, so the plain form charges them twice and caps the
+  managed set at roughly half of what the host can hold, evicting or waiting for starts that fit. Adding the held RAM back makes the
+  pool a **total for the managed set**, the host-wide analogue of the per-GPU budget (a device total, not device-available); in
+  steady state the add-back and the running terms cancel and a candidate is charged against genuinely free memory. Only the live
+  **measurement** is added back, never a demand floor: a floor is a reservation, not residency, so a process that has not grown into
+  it keeps charging the difference and a process with no reading adds nothing (the conservative direction). The reserve is
+  `OP_AGENT_HOST_RAM_RESERVE_MB`, default **2048**, env-only; one agent runs per host, so that single knob is the per-host reserve.
+  **No reading** (no sample yet, or the read failed) is *unknown*, not an exhausted host, and yields `0`, **unconstrained**, so RAM
+  admission is a no-op until the host has been looked at; a real reading whose pool is at or below zero yields **1**, never `0`, for
+  the reason the VRAM floor is 1.
+- **(d) Rule 6 is the host-wide twin of the per-GPU rule.** The candidate's charge plus every running process's `RAMMB`
+  (`max(live reading, pushed demand)`, over the processes not already queued for eviction by an earlier rule) must fit the pool.
+  Over it, `Admit` evicts idle victims **host-wide**, any process and not one card's occupants: unpinned, not still loading, no
+  request in flight, **oldest `LastUsed` first**, lowest spec id on a tie, until it fits; if the idle ones cannot make it fit the
+  whole decision is `Wait`, never a partial list. It runs after the matrix and both unknown-VRAM rules and the per-GPU arithmetic,
+  and before the process limit, with the same chaining that keeps those from double-evicting. An occupant of unknown RAM contributes
+  nothing and is not a RAM victim (draining it frees nothing the arithmetic can count).
+- **(e) A known demand larger than the whole pool is terminal, judged against a ceiling, not the budget.** The own-demand refusal
+  (`not_permitted`, `spec X: RAM demand N MB exceeds the host RAM budget M MB on its own`, where M is the **ceiling** below, the
+  whole capacity the managed pool could offer, and not the conservative admission budget) is hoisted to the front for the reason
+  the per-GPU one is, but it compares against `HostRAMCeilingMB`: the same pool read generously (a process with no reading counts at
+  its demand floor, and the RAM of processes that exited within the last two samples is counted as already back). The budget is
+  deliberately conservative and is **transiently too low** while a process is loading, and for a sample or two after an eviction's
+  victim exits: its add-back is gone while `MemAvailable` has not yet risen. That is the state the beneficiary of an eviction is
+  re-admitted in, and refusing it there turned a legitimate eviction into a durable error that no later sample could take back. A
+  demand between the budget and the ceiling falls through to the arithmetic, which evicts idle holders or waits. The ceiling's credit
+  never enters the budget, so it can make a refusal less eager and can never admit something that does not fit. A refusal is a
+  report, not a verdict: it is re-evaluated every `notPermittedRetryInterval` (5 s).
+- **(f) A fresh host sample wakes the RAM waiters, and only them.** The pool follows the live `MemAvailable`, so a start refused for
+  lack of RAM can fit on the very next sample with no release, exit or `Apply` in between, above all the beneficiary of a RAM
+  eviction, which is re-admitted on its victim's exit against the previous sample. `SetHostInfo` therefore posts a coalescing,
+  non-blocking token (a buffered(1) channel of its own, because the collect loop must never wait on the owner) and the owner
+  re-asks the specs whose last verdict was a RAM-contributed `Wait` (`Decision.WaitOnRAM`) that `wakeAfterStart` could retry (a
+  queued request, or pinned). The gate is the point: evaluating admission runs the installed VRAM measurer, a subprocess on an
+  NVIDIA host, so waking every queued spec on every sample would run `nvidia-smi` once a second for as long as anything waits behind
+  a busy neighbour, and a `force_running` spec with no waiter stays with the next release, exit or `Apply` for the reason
+  `wakeAfterStart` documents. Without this wake the eviction's beneficiary waited for an unrelated event or its whole admission
+  timeout.
+- **(g) A starting process reserves its RAM.** A process still loading is in the running set with its charge and is never a victim
+  (the starting-process clause of [§5.4](cross-cutting/agent-runtime-manager.md#54-eviction-queueing-and-drain)), so a second
+  admission sees the first one's headroom already spoken for. The matching interlock for an *unknown* demand is
+  [ADR-086](#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path).
+- **(h) The matrix keeps its other jobs.** It still states the operator's co-residency *intent* and covers PCIe bandwidth and CPU
+  contention, which nobody computes. Its old justification, that system RAM is not computable and so a matrix has to exist, is
+  partly superseded: RAM is now computed and vetoed.
+
+**Consequence:**
+
+- **A shared host self-corrects.** A co-located workload that grows lowers `MemAvailable` and so the pool at the next sample, with
+  nothing to reconfigure; the agent never sees that workload and does not need to.
+- **Two figures are approximations, and they err the safe way.** RSS may overstate (reclaimable mmap'd pages), and the measurement is
+  the managed child's **own pid**: workers a server forks are not summed, so their memory counts against the pool through
+  `MemAvailable` without being added back, which is conservative. The operator's `ram_estimate_mb` is the floor under both.
+- **A waiting spec has a cost.** A spec waiting on RAM is re-evaluated once per hardware sample (about one a second), and on an
+  NVIDIA host each evaluation runs the VRAM measurer. That is the minimum the wake can cost while something genuinely waits, and
+  nothing else is woken.
+- **Wire and negotiation.** Two agent-only feature names, `runtime_ram_measurement` (the agent reports `ram_measured_mb`) and
+  `runtime_ram_accounting` (the agent honours the pushed `ram_mb`), both `Since: "0.14.0"`, one MINOR bump of `ServerAgent`
+  `0.13.0` → `0.14.0` for the whole change. Both are on the agent's list only and the gateway reads them off its declared set,
+  fail-closed, because an older agent decodes the document without error and silently ignores the unknown `ram_mb`, which no probe
+  can tell apart from one that honours it. Nothing in the gateway or portal consumes either name yet (the constants are exported for
+  the portal service, like `RuntimeModelParamsFeature`). The sample's host block also gained `mem_available_bytes`, read by the agent
+  itself and not ingested by the gateway.
+- **The live status frame does not yet carry the measurement.** The gateway's runtime-status DTO (the SSE frame) does not forward
+  `ram_measured_mb`; the portal's table reads the durable `RuntimeSpec.ram_measured_mb` instead, the same pattern the VRAM display
+  uses, and `RuntimeStatus.ram_measured_mb` is a reserved optional field on the client. A deliberate, documented follow-up, not a
+  defect ([§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
+- **Portal.** The launch-spec form gains one spec-level RAM estimate field, and the runtime table shows the effective per-GPU VRAM,
+  a **VRAM total** and a **RAM** column. A negative estimate is refused with `runtime_spec.tuning_invalid`.
+- **Mixed fleets.** An agent older than 0.14.0 reports no RAM and ignores `ram_mb`; a gateway older than this change sends none and
+  never stores the agent's measurement, so a 0.14.0 agent behind it treats every spec as unknown RAM. Upgrade the gateway first.
+
+**Rejected:** **A static `host total − reserve` pool** (a shared host's neighbours move it, and nothing would notice). **A plain
+`MemAvailable − reserve` pool** (it double-counts the managed processes, above). **RAM as a per-GPU quantity, or inside the per-GPU
+maps** (RAM has no GPU axis, and those maps are keyed by GPU index). **Refusing against the conservative budget** (it is understated
+in exactly the states an eviction's beneficiary is admitted in). **Waking every waiter on every sample** (`nvidia-smi` once a
+second). **The plain Windows working set** (shared pages counted once per process). **Gating the RAM measurement on a declared GPU**
+(it would skip the CPU-only specs the axis exists for). **Seeding `MemAvailable` from the hardware inventory** (the inventory carries no such figure,
+and a stale reading would be worse than an honest `0`).
+→ [Agent-Managed Model Runtime §5.1](cross-cutting/agent-runtime-manager.md#51-the-per-gpu-data-model),
+[§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates),
+[§5.4](cross-cutting/agent-runtime-manager.md#54-eviction-queueing-and-drain),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md),
+[Telemetry §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core).
+
+## ADR-086 — Cold-start bootstrap: measure first, safely, with a guarded RAM start, a one-shot VRAM eviction and a bounded failure path
+**Context:** a spec whose effective demand is unknown (`max(measured, manual) == 0` on an axis, [ADR-084](#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired))
+has to run once before anything can be known about it, and default-on accounting
+([ADR-083](#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides),
+[ADR-085](#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)) must neither churn
+the host on every new spec's first start nor start it blind. The two axes fail differently. **RAM:** a model allocates gigabytes
+*after* admission and the host sample lags it, so an unknown-RAM start that takes the apparently free headroom, or lets a second
+spec take it, causes the host-level out-of-memory that takes neighbours or the agent down, the one outcome the feature exists to
+prevent. **VRAM:** [ADR-032](#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts) makes a candidate of
+unknown VRAM demand *block* on a known-demand occupant instead of evicting it, which is what stops a mixed pair cold-loading each
+other forever, but it strands a spec that has **never** been measured: while any known-demand occupant holds its card it can never
+run alone, so it can never capture the first measurement that would move it out of the unknown class, and that wait need not ever
+resolve.
+
+**Decision — three groups of choices. No schema change; the knob is env-only.**
+
+- **RAM: measure first, pre-evict only under pressure.**
+  - **(a) A conservative first guess is charged to the candidate.** `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` (default **4096**, `0` turns
+    it off, env-only) stands in for the unknown demand in rule 6 only, only for the candidate (an occupant is always its own
+    `RAMMB`), and only while RAM is accounted at all. It errs **high** on purpose: the cost of a high guess is that a first start
+    waits or evicts an idle neighbour on a host too tight for it, never a lost running model, while a low guess is how a cold start
+    overruns the headroom it was admitted into. With headroom the spec **starts and measures with no eviction**; only when the host
+    is genuinely too tight does it pre-evict idle processes host-wide, oldest first, just enough to fit the guess; and if nothing idle
+    can make room it **waits, it never blind-starts when tight**. Setting the guess to `0` restores the pre-bootstrap behaviour of
+    an unconstrained first start, and does not switch off the interlock below.
+  - **(b) The guess never refuses terminally.** The own-demand refusal skips a spec of unknown demand, so a number nobody measured
+    cannot durably refuse a spec; a guess larger than the whole pool waits until an operator supplies a `ram_estimate_mb` (accounted
+    exactly) or lowers the knob.
+  - **(c) An interlock keeps a second spec off the headroom mid-window.** While any managed process is in its unaccounted bootstrap
+    window (declared RAM unknown, no measurement yet), `Admit` makes **every other RAM admission `Wait`** (`WaitOnRAM`, evicting
+    nothing). The flag is computed fresh from authoritative owner state on every snapshot (never stored, so it cannot go stale),
+    and it **always clears**: with a RAM measurer, when the process is measured (or exits, or an operator fills the estimate in);
+    on a host with none, it is bounded by the `starting` state, because once the process is healthy its resident RAM has already
+    lowered `MemAvailable` and the conservative pool accounts for it without an interlock. A known-demand start needs none, since a
+    starting process already reserves its charge.
+  - **(d) The bootstrap is bounded in time.** A bootstrap that comes up healthy but is never measured would hold that interlock, and
+    with it every other RAM admission on the host, indefinitely. After **ten** fruitless measurement beats (`idleTickInterval` is
+    15 s, so about two and a half minutes at the production cadence) the owner forces the spec to `start_failed`, records why, fails
+    its waiters, terminates the process and enters the ordinary crash-loop backoff. The counter advances **only while a RAM measurer
+    is installed**; a measurer-less host has nothing that could resolve it, and the interlock is already bounded there.
+- **VRAM: one guarded eviction, then ADR-032 again.**
+  - **(e)** When a spec of unknown VRAM demand that has **never been measured** is admitted, a **VRAM measurer is installed** and
+    its one shot is unspent, rule 4 treats a known-demand occupant of its cards the way rule 5 treats an unknown one: evict it if it
+    is idle, block on it otherwise (a pinned one already short-circuits earlier), so the candidate gets its cards to itself and is
+    measured. Anything else, and every later admission of that spec, is [ADR-032](#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts)
+    verbatim.
+  - **(f) The shot cannot repeat, and that is the anti-thrash guarantee.** `specState.vramBootstrapDone` is burned **when the
+    eviction is issued**, before the victim has drained (so a re-entrant admission cannot spend it twice), and by **any** real
+    measurement; it is **never cleared on exit**, the opposite of the per-process measurement, because a shot once spent must stay
+    spent across restarts or every exit would re-arm it and the bidirectional thrash would return one restart at a time. It resets
+    only when the spec is removed and re-added; an in-place edit keeps it. A bootstrap blocked by a non-evictable toucher spends
+    nothing (the flag rides only an `Evict` decision). At most one mixed pair, once, ever cold-loads the other.
+  - **(g) Measurer-gated.** Measurement is NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
+    on an AMD, Apple or GPU-less host nothing could capture the number, and §5.3 is explicit that an unknown-demand spec there simply
+    waits. Evicting a working model for a spec that can never be measured is the ADR-032 regression, so a measurer-less host never
+    gets the shot.
+- **Failure: classify, then retry once.**
+  - **(h) Only a memory-pressure death escalates.** For a bootstrap (declared RAM unknown) whose process died on its own, with
+    something wanting it up (a queued request, pinned or `force_running`: evicting a neighbour for a retry nobody wants is pure harm),
+    the classifier reads the **exit signature and the last measurement, never free text**: a `SIGKILL` exit (the Linux OOM killer's
+    signal; the agent's own `SIGKILL` escalation rides the intentional-stop path and never arrives here; Windows has no such
+    signature and relies on the second), or a last-measured RSS of at least **90 %** of the host-RAM pool at death (which needs a sample and a measurement; with either
+    missing only the signal can classify, the conservative direction). A plain non-zero
+    exit, a config error or a missing binary is a genuine crash and keeps the existing crash-loop backoff **unchanged**.
+  - **(i) One bounded evict-and-retry.** The first memory-pressure death spends the spec's single shot: it drain-stops **one** idle
+    process (the same `isEvictable` contract and oldest-first, lowest-id order `Admit` uses), records the failure, enters
+    `start_failed` and the ordinary backoff, keeping the queued request for the retry. A **second** consecutive memory-pressure death
+    evicts nothing further: it fails the queued request and backs off. The counter (`ramBootstrapRetries`, cap 1) is reset **only by a
+    successful RAM measurement**, the signal that the bootstrap resolved, so a later, unrelated pressure event can earn the shot again
+    while a bootstrap that keeps dying escalates at most once and evicts at most one process however often it dies. That is why it
+    cannot become a fork-exec and eviction storm.
+
+**Consequence:**
+
+- **The anti-goal holds on every path:** a bootstrap never OOM-kills neighbours or the agent by being admitted into headroom that is
+  not there, and the guess, the interlock, the deadline and the single retry are each bounded by something other than a timeout
+  somebody has to tune.
+- **The guess cannot bound a model's true footprint.** A model that allocates more than the headroom it was admitted into can still
+  pressure the host. Mitigations, not guarantees: the guess errs high, the reserve is a cushion, the first measurement lands within a
+  beat of the first health pass, and an operator's estimate replaces the guess exactly. An operator of a RAM-heavy model whose demand
+  is not yet declared raises `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB`. Recorded in [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+- **A measurer that is installed but cannot read one pid** holds the interlock for at most the ten-beat deadline and then costs that
+  spec a forced `start_failed` and a backoff. Not realistic today, since a healthy child's RSS is readable, and recorded for the day
+  a measurer returns `0` for a live pid.
+- **The VRAM shot can be spent by another rule's eviction of the same occupant** (harmless: the spec is still measured), and an
+  in-place re-zeroing of a resolved spec's estimate does not re-arm it (deliberate and conservative).
+- **Mixed fleets.** Behind a gateway that never sends `ram_mb`, an upgraded agent sees every spec as unknown RAM, so each start of
+  each spec is charged the guess and takes the interlock until its own first measurement; nothing breaks and nothing is learned.
+  Upgrade the gateway first.
+- **Verification status.** The classifier, the single-retry bound and the deadline are covered by unit and manager tests, including
+  an anti-storm case that counts the evictions a repeatedly dying bootstrap causes. The Windows RAM measurer and the Windows
+  classifier branch compile and vet under `GOOS=windows` but are not executed by CI.
+
+**Amends:** [ADR-032](#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts) (its steady state is
+untouched; it gains one guarded, once-per-spec exception). **Rejected:** **A blind, optimistic RAM start** (it is the OOM).
+**Pre-evicting to the guess on every first start** (default-on would churn the host on every new spec). **Charging the guess to a
+running occupant** (a measured process is charged its measurement, and the guess would double-count it). **A terminal refusal on the
+guess** (see (b)). **Re-arming the VRAM shot on exit, or granting it to a spec that has been measured** (the ADR-032 thrash, one
+restart at a time). **Granting the VRAM shot where no measurer exists** (see (g)). **Clearing the RAM interlock only on
+"healthy and measured"** without a measurer to deliver the measurement (it would hang every other RAM admission on the host).
+**Classifying a death from the child's stderr text** (free text is not a contract; the exit signature and the last measurement are).
+**An unbounded evict-and-retry** (the fork-exec storm the starting-process clause of
+[§5.4](cross-cutting/agent-runtime-manager.md#54-eviction-queueing-and-drain) was written to prevent).
+→ [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates),
+[§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
+[§6](cross-cutting/agent-runtime-manager.md#6-process-lifecycle),
+[Configuration & Environment Variables](reference/config-env.md).

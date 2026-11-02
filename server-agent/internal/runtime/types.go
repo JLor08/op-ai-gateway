@@ -54,6 +54,14 @@ type ConfigFile struct {
 // everything the agent needs to exec and supervise a model process. Mirrors
 // the gateway's AgentRuntimeSpecDTO
 // (gateway/backend/internal/portal/service_runtime.go) field-for-field.
+//
+// RAMMB is the spec's effective host-RAM demand in MB, the gateway's
+// max(measured, estimate). It is spec-level because RAM is a host resource, not
+// a per-card one: it sits beside GPUs and never inside a SpecGPU row. 0 means
+// UNKNOWN demand -- the gateway holds neither a measurement nor an estimate, or
+// it is an older gateway that never sends the field -- and never "needs no RAM".
+// Like SpecGPU.VRAMMB it is an admission DEMAND, not a launch input
+// (sameLaunchShape ignores it).
 type Spec struct {
 	ID                          string            `json:"id"`
 	Model                       string            `json:"model"`
@@ -64,6 +72,7 @@ type Spec struct {
 	ConfigFiles                 []ConfigFile      `json:"config_files"` // #257; non-nil after ParseConfig, names validated there
 	WorkDir                     string            `json:"work_dir"`
 	GPUs                        []SpecGPU         `json:"gpus"`
+	RAMMB                       int               `json:"ram_mb"` // host-RAM demand (max(measured, estimate)); 0 = unknown, never "needs none"
 	ListenPort                  int               `json:"listen_port"`
 	HealthPath                  string            `json:"health_path"`
 	HealthTimeoutSeconds        int               `json:"health_timeout_seconds"`
@@ -481,7 +490,9 @@ type LastError struct {
 // does not put them on RuntimeSample itself -- only the PROBE RESULTS
 // (ContextSize/ActiveRequests/QueueDepth) land there. This is a second,
 // documented exception to the "mirrors sample.RuntimeSample field-for-field"
-// contract, alongside MeasuredVRAM above.
+// contract, alongside MeasuredVRAM above. MeasuredRAMMB, by contrast, IS part of
+// the mirror: it is a spec-level scalar that rides RuntimeSample.RAMMeasuredMB
+// under the same JSON key (internal/agent copies it across).
 type Status struct {
 	SpecID       string      `json:"spec_id"`
 	Model        string      `json:"model"` // upstream model name
@@ -492,7 +503,14 @@ type Status struct {
 	InFlight     int         `json:"in_flight"`
 	Restarts     int         `json:"restarts"`
 	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
-	LastError    *LastError  `json:"last_error,omitempty"`
+	// MeasuredRAMMB is the spec's current process's resident host RAM in MB, as
+	// the recurring RAM measurement last observed it; 0 means unknown (never
+	// measured, no RAM measurer, or the process has exited) and is never "needs
+	// no RAM". A spec-level scalar -- RAM has no per-GPU axis, and one process
+	// backs one spec -- carried to the wire as RuntimeSample.RAMMeasuredMB under
+	// the same JSON key.
+	MeasuredRAMMB int        `json:"ram_measured_mb,omitempty"`
+	LastError     *LastError `json:"last_error,omitempty"`
 
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by

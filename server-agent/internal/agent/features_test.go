@@ -392,16 +392,77 @@ func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 	// beside the newest feature (see the bump-rule note there).
 }
 
-// TestFeaturesDeclareRuntimeModelParams pins the model-params-route capability
-// and the version bump that ships it. This agent's runtime router serves GET
-// /upstream/{model}/v1/models, a Status-only passthrough to a RUNNING audio.cpp
-// child's model listing relayed with the inbound query (so ?include_params=true
-// reaches the child), and the GATEWAY pulls each model's declared request params
-// (e.g. language) only from an agent that declares this exact name, fail-closed
-// -- an older router answers a 404 (runtime.upstream_endpoint_not_allowed) for
-// the route -- so a rename here silently stops every agent child's declared
-// params from being read. The gateway spells the same string in its own constant;
-// this module cannot import it.
+// TestFeaturesDeclareRuntimeModelParams pins the model-params-route capability.
+// This agent's runtime router serves GET /upstream/{model}/v1/models, a
+// Status-only passthrough to a RUNNING audio.cpp child's model listing relayed
+// with the inbound query (so ?include_params=true reaches the child), and the
+// GATEWAY pulls each model's declared request params (e.g. language) only from
+// an agent that declares this exact name, fail-closed -- an older router answers
+// a 404 (runtime.upstream_endpoint_not_allowed) for the route -- so a rename here
+// silently stops every agent child's declared params from being read. The
+// gateway spells the same string in its own constant; this module cannot import
+// it.
+func TestFeaturesDeclareRuntimeModelParams(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_model_params" {
+			found = true
+			if f.Since != "0.13.0" {
+				t.Fatalf("runtime_model_params Since = %q, want 0.13.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_model_params")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_model_params") {
+		t.Fatal("FeatureNames() does not carry runtime_model_params, so it never reaches the gateway in capabilities.features")
+	}
+	// The Version assertion moved to TestFeaturesDeclareRuntimeRAMMeasurement,
+	// beside the newest feature (see the bump-rule note there).
+}
+
+// TestFeaturesDeclareRuntimeRAMMeasurement pins the RAM-measurement capability.
+// This agent measures each managed child's resident host RAM (RSS off Windows,
+// the private working set on it) and reports it as the runtime sample's
+// spec-level ram_measured_mb (sample.RuntimeSample.RAMMeasuredMB), and the
+// GATEWAY/PORTAL read the name to know a connected agent reports it -- an older
+// agent sends no such field, which no probe of the agent can tell apart from a
+// spec that simply has no process -- so a rename here silently turns that
+// knowledge off. The agent gates nothing on the name. The gateway spells the
+// same string in its own constant (RuntimeRAMMeasurementFeature,
+// gateway/backend/internal/gateway/agent_features.go); this module cannot
+// import it.
+func TestFeaturesDeclareRuntimeRAMMeasurement(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_ram_measurement" {
+			found = true
+			if f.Since != "0.14.0" {
+				t.Fatalf("runtime_ram_measurement Since = %q, want 0.14.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_ram_measurement")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_ram_measurement") {
+		t.Fatal("FeatureNames() does not carry runtime_ram_measurement, so it never reaches the gateway in capabilities.features")
+	}
+	// The Version assertion moved to TestFeaturesDeclareRuntimeRAMAccounting,
+	// beside the newest feature (see the bump-rule note there).
+}
+
+// TestFeaturesDeclareRuntimeRAMAccounting pins the RAM-accounting capability and
+// the version assertion that ships with it. This agent receives each spec's
+// host-RAM demand on the runtime-config wire as the spec-level ram_mb
+// (runtime.Spec.RAMMB) and accounts for it, so the GATEWAY/PORTAL read the name
+// to know a connected agent honours that figure -- an older agent ignores the
+// field entirely, which no probe of the agent can tell apart from one that
+// accounts for it -- so a rename here silently turns that knowledge off. The
+// gateway spells the same string in its own constant
+// (RuntimeRAMAccountingFeature, gateway/backend/internal/gateway/
+// agent_features.go); this module cannot import it.
 //
 // The version assertion lives here, beside the newest feature, and it is the
 // forcing function for the repository's bump rule: a change that moves Version
@@ -422,28 +483,34 @@ func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 // audio_cpp child's /v1/models mode on the same gateway-declared
 // capability_source_audiocpp source, which is not an agent.Features entry: an
 // absent verdict already means the correct default, buffered); 0.12.0 was MINOR
-// because agent.Features gained fullduplex_proxy; 0.13.0 is MINOR because
-// agent.Features gained runtime_model_params. A Since records the version a
-// feature shipped in, so runtime_ensure's stays 0.8.0, multipart_proxy's stays
-// 0.9.0, runtime_config_files' stays 0.10.0, runtime_voices' stays 0.11.0,
-// fullduplex_proxy's stays 0.12.0 and runtime_model_params' stays 0.13.0.
-func TestFeaturesDeclareRuntimeModelParams(t *testing.T) {
+// because agent.Features gained fullduplex_proxy; 0.13.0 was MINOR because
+// agent.Features gained runtime_model_params; 0.14.0 is MINOR because
+// agent.Features gained runtime_ram_measurement AND runtime_ram_accounting --
+// one bump covers both, because a bump is per shipped change and the RunSpec
+// RAM-accounting branch is one change (AGENTS.md, ServerAgent Version Rule), so
+// the accounting flag declares Since 0.14.0 and Version did not move again. A
+// Since records the version a feature shipped in, so runtime_ensure's stays
+// 0.8.0, multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0,
+// runtime_voices' stays 0.11.0, fullduplex_proxy's stays 0.12.0,
+// runtime_model_params' stays 0.13.0 and runtime_ram_measurement's and
+// runtime_ram_accounting's stay 0.14.0.
+func TestFeaturesDeclareRuntimeRAMAccounting(t *testing.T) {
 	found := false
 	for _, f := range Features {
-		if f.Name == "runtime_model_params" {
+		if f.Name == "runtime_ram_accounting" {
 			found = true
-			if f.Since != "0.13.0" {
-				t.Fatalf("runtime_model_params Since = %q, want 0.13.0", f.Since)
+			if f.Since != "0.14.0" {
+				t.Fatalf("runtime_ram_accounting Since = %q, want 0.14.0", f.Since)
 			}
 		}
 	}
 	if !found {
-		t.Fatal("Features does not declare runtime_model_params")
+		t.Fatal("Features does not declare runtime_ram_accounting")
 	}
-	if !slices.Contains(FeatureNames(), "runtime_model_params") {
-		t.Fatal("FeatureNames() does not carry runtime_model_params, so it never reaches the gateway in capabilities.features")
+	if !slices.Contains(FeatureNames(), "runtime_ram_accounting") {
+		t.Fatal("FeatureNames() does not carry runtime_ram_accounting, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.13.0" {
-		t.Fatalf("Version = %q, want 0.13.0 (runtime_model_params is a new agent.Features entry, so the bump is MINOR)", Version)
+	if Version != "0.14.0" {
+		t.Fatalf("Version = %q, want 0.14.0 (runtime_ram_accounting is a new agent.Features entry, so the rule is MINOR, but it rides this branch's single 0.14.0 bump)", Version)
 	}
 }

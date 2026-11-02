@@ -2583,7 +2583,23 @@ type RuntimeSpec struct {
 	AdmissionWaitTimeoutSeconds int // 0 = wait until the client disconnects
 	Pinned                      bool
 	AdminState                  string // "" | "force_running" | "force_stopped"
-	VRAMLocked                  bool
+	// RAMEstimateMB is the operator's estimate of this spec's resident host
+	// RAM, in MB (agent_runtime_specs.ram_estimate_mb, migration 96). RAM is
+	// HOST-scoped -- one process backs one spec, whatever GPUs it spans -- so
+	// unlike VRAM (per-GPU rows in RuntimeSpecGPU) this is a single scalar on
+	// the spec itself. 0 = no estimate / UNKNOWN demand, never "needs no RAM".
+	// Operator-owned: written by UpsertRuntimeSpec.
+	RAMEstimateMB int
+	// RAMMeasuredMB is the agent's measured resident host RAM for this spec's
+	// process, in MB (agent_runtime_specs.ram_measured_mb, migration 96). 0 =
+	// nothing measured yet (an unmeasured spec, or an agent that predates the
+	// measurement), never "uses no RAM". Agent-owned: written ONLY by
+	// UpdateRuntimeSpecRAMMeasured. UpsertRuntimeSpec stores it on a fresh
+	// insert and PRESERVES it on every later update, because the portal's
+	// runtime-spec write is a full-document upsert built from the request alone
+	// and would otherwise erase the measurement with a zero on each save --
+	// the same never-clobber split as RuntimeSpecGPU's two VRAM fields.
+	RAMMeasuredMB int
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
@@ -2695,10 +2711,15 @@ type CoResidencyRule struct {
 // consumed on the far side of the wire by the agent's admission policy:
 // runtime.Admit / PolicySnapshot.Budgets in
 // server-agent/internal/runtime/policy.go skips any index whose budget is
-// <= 0 precisely to honour it. The two comments are a matched pair —
-// changing what 0 means here without changing it there gives every model on
-// a zero-budget GPU a permanent not_permitted, which is exactly the bug that
-// pairing them documents. ExpectedUUID /
+// <= 0 precisely to honour it. That Admit-side rule is unchanged, but on a
+// host whose GPU total the agent can read it rarely sees a 0 any more: the
+// agent's budget auto-detect (ADR-083) replaces a 0 or absent row with the
+// detected device total before Admit runs, so 0 stays truly unconstrained
+// only for a GPU-less host, an Apple GPU, or before the first hardware sample
+// (a positive operator budget always wins verbatim). The two comments are a
+// matched pair — changing what 0 means here without changing it there gives
+// every model on a zero-budget GPU a permanent not_permitted, which is exactly
+// the bug that pairing them documents. ExpectedUUID /
 // ExpectedName are a purely descriptive drift detector: snapshotted when the
 // row is created (by the portal, Task 6) and later compared against live
 // telemetry to WARN that a card was renumbered — they never block anything;
@@ -2748,12 +2769,11 @@ type RuntimeStore interface {
 	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
 	// RuntimeSpecByID returns the spec for id, keyed by its own primary key
 	// rather than its owning mapping (RuntimeSpecByMapping's key). Added for
-	// the telemetry VRAM write-back path (agent-runtime-manager Task 9): a
-	// runtime sample carries only spec_id, and resolving whether the operator
-	// has pinned vram_locked requires a point read by that id. ok is false
-	// when no spec has that id (e.g. deleted out from under an in-flight
-	// sample) -- not an error, mirroring RuntimeSpecByMapping's absent-read
-	// contract.
+	// the telemetry write-back paths (agent-runtime-manager Task 9): a runtime
+	// sample carries only spec_id, and resolving which server owns the spec
+	// requires a point read by that id. ok is false when no spec has that id
+	// (e.g. deleted out from under an in-flight sample) -- not an error,
+	// mirroring RuntimeSpecByMapping's absent-read contract.
 	RuntimeSpecByID(ctx context.Context, id string) (RuntimeSpec, bool, error)
 	// RuntimeSpecsByApplication lists every spec belonging to a mapping of
 	// appID, ordered by spec id. Always non-nil, empty when none.
@@ -2770,8 +2790,16 @@ type RuntimeStore interface {
 	// (the operator order). Always non-nil, empty when none.
 	RuntimeSpecGPUs(ctx context.Context, specID string) ([]RuntimeSpecGPU, error)
 	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
-	// when the (spec,gpu) row does not exist. Callers skip specs with VRAMLocked.
+	// when the (spec,gpu) row does not exist. Callers pass a strictly positive
+	// measurement: a zero is "unknown" and is dropped before it reaches the store.
 	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error
+	// UpdateRuntimeSpecRAMMeasured writes back the agent's measured host RAM
+	// for the spec, touching only RAMMeasuredMB (RAMEstimateMB, operator-owned,
+	// is never written here); ErrNotFound when the spec does not exist. Spec-
+	// level, so unlike UpdateRuntimeSpecGPUMeasured it takes no GPU index.
+	// Callers pass a strictly positive measurement: a zero is "unknown" and is
+	// dropped before it reaches the store.
+	UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error
 	// SetCoResidencyRules atomically REPLACES the whole set of allowed
 	// co-residency pairs for appID (delete-then-insert in one transaction,
 	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). An empty/nil rules

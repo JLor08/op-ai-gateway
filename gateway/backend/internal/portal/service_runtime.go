@@ -457,12 +457,20 @@ type RuntimeSpecDTO struct {
 	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool              `json:"pinned"`
 	AdminState                  string            `json:"admin_state"`
-	VRAMLocked                  bool              `json:"vram_locked"`
 	// SetVisibleDevices turns this spec's GPU list from a declaration into
 	// an enforcement — see routing.RuntimeSpec.SetVisibleDevices, and
 	// PutRuntimeSpec for the two combinations this API refuses.
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
+	// RAMEstimateMB is the operator's estimate of this spec's resident host
+	// RAM in MB; RAMMeasuredMB is the agent's measurement of it (read-only on
+	// the wire: PutRuntimeSpecRequest has no counterpart, the store keeps the
+	// stored value across every write). RAM is host-scoped, so both are single
+	// scalars on the spec rather than per-GPU rows like the VRAM pair above. 0
+	// is the UNKNOWN sentinel -- no estimate, nothing measured yet -- never
+	// "needs no RAM", and both keys are always present on the wire.
+	RAMEstimateMB int `json:"ram_estimate_mb"`
+	RAMMeasuredMB int `json:"ram_measured_mb"`
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of
 	// the three-state endpoint control (mirrors the same trio on
 	// ApplicationDTO), stored explicitly on this spec rather than inherited
@@ -549,12 +557,17 @@ type PutRuntimeSpecRequest struct {
 	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool              `json:"pinned"`
 	AdminState                  string            `json:"admin_state"`
-	VRAMLocked                  bool              `json:"vram_locked"`
 	// SetVisibleDevices turns this spec's GPU list from a declaration into
 	// an enforcement — see routing.RuntimeSpec.SetVisibleDevices, and
 	// PutRuntimeSpec for the two combinations this API refuses.
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
+	// RAMEstimateMB is the operator's estimate of this spec's resident host
+	// RAM in MB (see RuntimeSpecDTO). Applied verbatim like every field of this
+	// full-document request: absent means 0, "no estimate", and clears a stored
+	// one. Negative is refused (ErrRuntimeSpecTuningInvalid). The measurement
+	// has no request field: it is agent-owned, and the store keeps it.
+	RAMEstimateMB int `json:"ram_estimate_mb"`
 	// APIFlavors / ResponsesMode / MessagesMode: see RuntimeSpecDTO's doc.
 	// Absent (empty/"") defaults to both/passthrough — see validateRuntimeSpecRequest;
 	// the backend does NOT inherit the parent server_agent application's
@@ -663,10 +676,10 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 // agent-owned — only the telemetry write-back (a later task) writes it, so
 // this method PRESERVES the stored measured values verbatim for every GPU
 // index that already had a row, regardless of what the request carries, and
-// starts a brand-new index at 0. vram_locked never blocks this write: it
-// decides which of the two numbers the AGENT is told (agentRuntimeSpecDTO)
-// and whether the write-back may replace the measured one, not what the
-// operator may store.
+// starts a brand-new index at 0. Which number the AGENT is told is not decided
+// here: agentRuntimeSpecDTO pushes max(measured, estimate), so the operator may
+// store any estimate and a measurement can only ever raise the demand, never
+// lower it.
 func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string, req PutRuntimeSpecRequest) (RuntimeSpecDTO, error) {
 	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
@@ -967,8 +980,13 @@ func validateRuntimeSpecShape(req PutRuntimeSpecRequest) (runtimeSpecFields, err
 	if !runtimeSpecBinaryIsAbsolute(binary) {
 		return runtimeSpecFields{}, ErrRuntimeSpecBinaryRequired
 	}
+	// ram_estimate_mb joins the non-negative tuning values: a negative RAM
+	// estimate has no meaning (0 is "no estimate"), and the later admission
+	// arithmetic must never be handed a negative demand. Same refusal as a
+	// negative vram_estimate_mb earns on a GPU row, in the sentinel this block
+	// already owns.
 	if req.ListenPort < 0 || req.HealthTimeoutSeconds < 0 || req.StartupTimeoutSeconds < 0 ||
-		req.IdleTimeoutSeconds < 0 || req.AdmissionWaitTimeoutSeconds < 0 {
+		req.IdleTimeoutSeconds < 0 || req.AdmissionWaitTimeoutSeconds < 0 || req.RAMEstimateMB < 0 {
 		return runtimeSpecFields{}, ErrRuntimeSpecTuningInvalid
 	}
 	adminState := strings.TrimSpace(req.AdminState)
@@ -1041,8 +1059,9 @@ func runtimeSpecEndpointModes(req PutRuntimeSpecRequest) (responses, messages ro
 }
 
 // runtimeSpecPrior is what a runtime-spec write keeps from the mapping's
-// stored spec: the row itself (ok is false when there is none) and its
-// measured VRAM per GPU index.
+// stored spec: the row itself (ok is false when there is none -- its id,
+// created_at and measured RAM carry forward) and its measured VRAM per GPU
+// index.
 type runtimeSpecPrior struct {
 	spec            routing.RuntimeSpec
 	ok              bool
@@ -1158,7 +1177,7 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		AdmissionWaitTimeoutSeconds: req.AdmissionWaitTimeoutSeconds,
 		Pinned:                      req.Pinned,
 		AdminState:                  f.adminState,
-		VRAMLocked:                  req.VRAMLocked,
+		RAMEstimateMB:               req.RAMEstimateMB,
 		SetVisibleDevices:           req.SetVisibleDevices,
 		VisibleDevicesMode:          f.visibleMode,
 		APITokenMode:                mode,
@@ -1178,6 +1197,14 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 	if prior.ok {
 		spec.ID = prior.spec.ID
 		spec.CreatedAt = prior.spec.CreatedAt
+		// The agent's RAM measurement is the stored value, never the request's
+		// (the request has no such field -- the VRAM ownership rule, spec-level).
+		// The store's upsert already keeps ram_measured_mb across a conflict, so
+		// this is not what protects the column; it keeps the row this method
+		// hands back honest, because writeRuntimeSpec builds its response DTO
+		// from this row rather than re-reading the store, and a bare 0 here
+		// would report "nothing measured" for a spec that is measured.
+		spec.RAMMeasuredMB = prior.spec.RAMMeasuredMB
 	}
 	return spec, nil
 }
@@ -1681,9 +1708,10 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
 		Pinned:                      spec.Pinned,
 		AdminState:                  spec.AdminState,
-		VRAMLocked:                  spec.VRAMLocked,
 		SetVisibleDevices:           spec.SetVisibleDevices,
 		GPUs:                        gpuDTOs,
+		RAMEstimateMB:               spec.RAMEstimateMB,
+		RAMMeasuredMB:               spec.RAMMeasuredMB,
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
@@ -2286,9 +2314,9 @@ func (s *Service) notifyRuntimeChangedForMapping(serverID, owningApplicationType
 
 // AgentRuntimeSpecGPUDTO is one per-GPU VRAM row inside a runtime-config spec
 // (GET /api/agent/v1/runtime-config). VRAMMB is the single number the agent
-// needs: the MEASURED value when known, else the operator's ESTIMATE -- see
-// AgentRuntimeConfig's VRAM-selection rule. 0 means unknown either way,
-// mirroring RuntimeSpecGPUDTO's two source fields.
+// needs: max(measured, estimate) of the row's two stored figures -- see
+// agentRuntimeSpecDTO. 0 means unknown (both source fields are 0), never
+// "needs no VRAM", mirroring RuntimeSpecGPUDTO's two source fields.
 type AgentRuntimeSpecGPUDTO struct {
 	Index  int `json:"index"`
 	VRAMMB int `json:"vram_mb"`
@@ -2296,6 +2324,9 @@ type AgentRuntimeSpecGPUDTO struct {
 
 // AgentRuntimeSpecDTO is one ENABLED launch spec inside the runtime-config
 // document -- everything the agent needs to exec and supervise the process.
+// RAMMB is the spec's host-RAM demand: spec-level (RAM is a host resource, so
+// it sits beside GPUs and never on a per-GPU row) and, like each GPU's VRAMMB,
+// max(measured, estimate) -- see agentRuntimeSpecDTO. 0 is unknown demand.
 // Model/UpstreamModel fold in the owning ModelMapping's two model-name
 // fields (gateway_model_name / app_model_name), since the agent has no other
 // way to learn them. Env values legitimately carry ${AGENT_ENV:NAME}/${PORT}/
@@ -2311,6 +2342,7 @@ type AgentRuntimeSpecDTO struct {
 	Env                         map[string]string        `json:"env"`
 	WorkDir                     string                   `json:"work_dir,omitempty"`
 	GPUs                        []AgentRuntimeSpecGPUDTO `json:"gpus"`
+	RAMMB                       int                      `json:"ram_mb"` // host-RAM demand, max(measured, estimate); 0 = unknown, never "needs none"
 	ListenPort                  int                      `json:"listen_port"`
 	HealthPath                  string                   `json:"health_path"`
 	HealthTimeoutSeconds        int                      `json:"health_timeout_seconds"`
@@ -2408,8 +2440,8 @@ type AgentRuntimeConfigDTO struct {
 // disabled or missing spec is meaningless to the agent, which only ever sees
 // spec ids, never mapping ids.
 //
-// Per-GPU VRAMMB: the measured value when known (non-zero), else the
-// operator's estimate -- see agentRuntimeSpecDTO. 0 means unknown either way.
+// Per-GPU VRAMMB: max(measured, estimate) -- see agentRuntimeSpecDTO. 0 means
+// unknown (both source fields are 0).
 //
 // The empty document means exactly one thing: "this server is genuinely not
 // running anything managed" -- an empty serverID, no such AIServer row
@@ -2611,32 +2643,23 @@ func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Applica
 // stored Args/Env/ConfigFiles is a store-data problem, not a client-input one, but still
 // surfaces as the matching domain sentinel rather than a raw JSON error.
 //
-// VRAM_LOCKED IS THE OPERATOR'S ESCAPE FROM THE MEASUREMENT RATCHET, and the
-// per-GPU choice below is what makes it one. Read that loop first, because it
-// is closed and one-way: the agent measures its own child, the write-back
-// stores it, this function prefers measured over estimate, the agent reads it
-// back AS THE SPEC'S OWN DECLARED DEMAND, and Admit's rule 3 answers a demand
-// that exceeds its GPU's budget on its own with a TERMINAL not_permitted.
+// The per-GPU VRAM demand it pushes is max(measured, estimate): the operator's
+// estimate is a FLOOR and the agent's measurement raises it when reality is
+// higher, never the other way round. That is the "never under-reserve" rule,
+// and it matters here more than anywhere else because this value is not just
+// displayed -- the agent reads it back AS THE SPEC'S OWN DECLARED DEMAND and
+// feeds it into Admit, so a number that is too low is a co-resident pair that
+// reaches an OOM.
 //
-// A 24 GB card budgeted at 20000 MB for headroom, an 18000 MB estimate that
-// served fine, and one 22000 MB measurement (llama.cpp with a large KV cache)
-// is the whole scenario: from then on every start of a model that had been
-// working is refused, with no operator action having occurred anywhere. And it
-// could not be undone -- PutRuntimeSpec deliberately copies the stored measured
-// value forward and ignores what the request sends, the write-back skips
-// values <= 0, and the spec never runs again so no newer measurement is ever
-// taken. Raising the budget past what the card physically holds is a
-// capitulation rather than a lever, and deleting and re-adding the GPU row
-// across two saves is not something an operator can be expected to find.
+// A 0 on either side is UNKNOWN, never "needs none": a measured 0 (never
+// measured) yields the estimate, an estimate of 0 yields the measurement, and
+// both 0 stays 0 so the agent still sees an unknown demand and bootstraps it.
+// Neither stored figure is rewritten by this -- the estimate stays the
+// operator's and the measurement stays the agent's.
 //
-// So vram_locked stops the gateway SERVING the measurement, not merely the
-// agent WRITING it: locked, the operator's own estimate is authoritative in
-// both directions. That is the plain reading of "locked", it is the only
-// reading under which the flag helps someone staring at a spec that will not
-// start, and it keeps the agent the owner of the measured number -- the
-// operator chooses whether to be GOVERNED by it, never what it says. The
-// measurement itself stays on file and stays visible in the portal, because it
-// is the evidence that explains why the operator had to intervene.
+// The spec's host-RAM demand (RAMMB) follows the identical rule over the spec's
+// own two figures, RAMMeasuredMB and RAMEstimateMB: RAM is host-scoped, so it is
+// ONE number on the spec rather than one per GPU row.
 func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping, gpus []routing.RuntimeSpecGPU) (AgentRuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
@@ -2658,15 +2681,18 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 	}
 	gpuDTOs := make([]AgentRuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
-		// Measured wins -- unless the operator locked the spec's VRAM, in
-		// which case their estimate does. See the doc above for why the lock
-		// has to reach this line and not only the write-back.
+		// max(measured, estimate): the estimate is the floor, a larger
+		// measurement raises it. A measured 0 is below any positive estimate
+		// so it falls through to the estimate, and both 0 stays 0 (unknown).
 		vram := g.VRAMMeasuredMB
-		if spec.VRAMLocked || vram == 0 {
+		if vram < g.VRAMEstimateMB {
 			vram = g.VRAMEstimateMB
 		}
 		gpuDTOs = append(gpuDTOs, AgentRuntimeSpecGPUDTO{Index: g.GPUIndex, VRAMMB: vram})
 	}
+	// Host-RAM demand: the same max(measured, estimate) floor as the VRAM above,
+	// over the spec-level pair. Both 0 stays 0 (unknown).
+	ram := max(spec.RAMMeasuredMB, spec.RAMEstimateMB)
 	return AgentRuntimeSpecDTO{
 		ID:                          spec.ID,
 		Model:                       mapping.GatewayModelName,
@@ -2676,6 +2702,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		Env:                         env,
 		WorkDir:                     spec.WorkDir,
 		GPUs:                        gpuDTOs,
+		RAMMB:                       ram,
 		ListenPort:                  spec.ListenPort,
 		HealthPath:                  spec.HealthPath,
 		HealthTimeoutSeconds:        spec.HealthTimeoutSeconds,

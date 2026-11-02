@@ -37,9 +37,19 @@ reading can coexist with an LHM-sourced system reading.
 `server-agent/internal/collector/host.go` reads gopsutil (`cpu`, `load`, `mem`,
 `net`) once per tick: per-core CPU utilization (`cpu.PercentWithContext`, one call
 seeded at startup so the first real tick is not a zero reading), memory/swap
-used+total, 1/5/15 load averages (0 on platforms without load-average support), and
+used+total, **available memory** (`mem_available_bytes`, gopsutil's `Available`:
+`MemAvailable` on Linux — not total minus used, because reclaimable page cache counts as
+available), 1/5/15 load averages (0 on platforms without load-average support), and
 one aggregated network-interface counter. Every sub-metric degrades independently to
-its zero value on error — a missing subsystem never fails the whole `Collect`.
+its zero value on error — a missing subsystem never fails the whole `Collect`, and for
+`mem_available_bytes` that `0` means *not measured*, never "no RAM free".
+`mem_available_bytes` is consumed by the **agent itself**, not the gateway: each cycle
+the collect loop pushes it, with the GPUs' total memory, to the runtime manager, which
+builds the host-RAM admission pool from it and derives the default VRAM budgets from
+the totals ([Agent-Managed Model Runtime
+§5.1](agent-runtime-manager.md#51-the-per-gpu-data-model), [§5.2](agent-runtime-manager.md#52-the-three-gates)).
+The gateway's ingest does not read the key and the routing summary's `ram_*` columns
+are unchanged.
 
 ### 8.2.2 GPU metrics
 
@@ -52,6 +62,12 @@ than one GPU vendor active, e.g. none in practice, but the composition allows it
 | NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
 | AMD | `amd.go` | `rocm-smi --json` (`--showid --showuse --showmemuse --showtemp --showpower --showdriverversion`) | Parses the `cardN`-keyed JSON object; a `"system"` entry supplies the driver version for every card |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
+
+The per-GPU `MemTotalBytes` these collectors report is also what the runtime manager's
+**default VRAM budgets** are derived from, so it is now an admission input and not only a
+display ([ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)):
+the agent keeps the last good total per GPU (a failed `nvidia-smi` cycle does not erase
+it), and **skips Apple**, whose "total" is allocated memory rather than a ceiling.
 
 ### 8.2.3 Power draw (watts)
 
@@ -288,7 +304,12 @@ evidence is not stamped on a failed write:
   Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
   for the exact rules), `gpus[]` of `{index, vram_measured_mb}` (omitted when
   nothing was measured this cycle, and explicitly sorted by index because it is
-  built from a Go map), `image_options` of `{samplers, schedulers,
+  built from a Go map), `ram_measured_mb` (the spec's managed child's resident host
+  RAM in MB, **one spec-level scalar beside `gpus[]` and never inside it** — RAM has
+  no GPU axis; RSS off Windows, the private working set on it; `omitempty`, so an
+  unmeasured spec, a host with no RAM measurer, an exited process and every agent that
+  predates the field send no key, and `0` means *unknown*, never "needs no RAM";
+  declared by the agent feature `runtime_ram_measurement`, 0.14.0), `image_options` of `{samplers, schedulers,
   output_formats, limits, defaults}` (a `stable_diffusion_cpp` child's own
   image options, read from the same `/sdcpp/v1/capabilities` document as its
   `image` verdict and riding the same `capability_source_sdcpp` gate; a nil
@@ -374,6 +395,22 @@ nothing carries neither `gpus[]` nor `measured_at`, so no timestamp is ever
 published with nothing to be fresh about. See [Agent-Managed Model
 Runtime](agent-runtime-manager.md) §10.
 
+**`ram_measured_mb` is persisted like `gpus[]` and published like it is not.** The
+write-back (`writeBackRuntimeRAM`, run beside `writeBackRuntimeVRAM` after every store
+write in the ingest has succeeded) writes a strictly positive value onto
+`agent_runtime_specs.ram_measured_mb` for a spec the reporting server **owns** (the
+same `RuntimeSpecByID` → `MappingByID` → `ApplicationByID` chain, with the cross-server
+`Warn`), memoised per distinct `spec_id`, bounded by the same runtimes cap, and an
+unchanged value is **not rewritten** (the stored value is read once with the ownership
+check and compared). There is no per-axis lock on it or on the VRAM write-back any
+more ([ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)):
+ownership is the only gate. **The live status stream does not republish it yet**
+(`RuntimeStatusDTO` has no such key), so there is no RAM counterpart of `measured_at`;
+the durable spec value is what the portal reads
+([Agent-Managed Model Runtime
+§10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
+A measured `0` or an absent key is dropped and never zeroes a stored value.
+
 **`context_size`/`active_requests`/`queue_depth` split the same way `gpus[]`
 does, but each field picks only one of the two homes — never both.**
 
@@ -390,8 +427,9 @@ does, but each field picks only one of the two homes — never both.**
   `"opportunistic"` — see [Routing & Model Selection
   §7](routing-and-model-selection.md#7-model-selection-metrics) — there is no
   separate `"agent"` value), and `metrics_updated_at`. A `metrics_locked`
-  mapping is left untouched, exactly like the VRAM write-back's own
-  `vram_locked` gate. Comparing against the mapping's **currently stored**
+  mapping is left untouched (the VRAM and RAM write-backs have no such lock: they
+  are gated on ownership alone, [ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)).
+  Comparing against the mapping's **currently stored**
   `context_size` — not against what this spec id reported last sample — is
   what keeps a stable context window from costing one write per second per
   mapping forever, the identical write-amplification argument
@@ -453,7 +491,7 @@ snapshot, so a spec whose measurement was merely stable cost one write per
 second per `(spec, gpu)` indefinitely, which on an idle overnight server with a
 handful of measured specs is of the order of a million identical `UPDATE`s a day
 against a table with a dozen rows. `writeBackRuntimeVRAM` now reads the stored
-rows once per distinct writable `spec_id` and writes only what differs.
+rows once per distinct owned `spec_id` and writes only what differs.
 Comparing against the **store** rather than against what the agent last sent is
 what makes it converge: the stored value can change out from under a
 long-running agent (deleting and re-adding a GPU row resets it to `0`), and an
@@ -1674,7 +1712,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-95-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-97-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2178,7 +2216,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-95-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-97-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

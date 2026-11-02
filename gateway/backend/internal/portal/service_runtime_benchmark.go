@@ -30,6 +30,11 @@ import (
 // pure spread with no opinion of its own -- the ownership rule lives in one
 // place, and a reader of this function is not invited to think it lives in
 // two.
+//
+// RAMEstimateMB is operator-owned and spreads like any other field: leaving it
+// out would let a benchmark's admin-state write reset the operator's estimate
+// to 0 (unknown). The DTO's RAMMeasuredMB has no request counterpart at all --
+// the store keeps the agent's measurement across the upsert.
 func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 	liveTimings := dto.ResponsesLiveTimingsEnabled
 	return PutRuntimeSpecRequest{
@@ -46,10 +51,10 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		AdmissionWaitTimeoutSeconds: dto.AdmissionWaitTimeoutSeconds,
 		Pinned:                      dto.Pinned,
 		AdminState:                  dto.AdminState,
-		VRAMLocked:                  dto.VRAMLocked,
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
+		RAMEstimateMB:               dto.RAMEstimateMB,
 		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
