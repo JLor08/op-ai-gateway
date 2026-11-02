@@ -1650,3 +1650,61 @@ func TestRAMBootstrapGuessMBFromEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestEvictionGraceSecondsFromEnv covers OP_AGENT_EVICTION_GRACE_SECONDS, the
+// window after a managed model was last used during which the admission policy
+// will not evict it, so a bursty pipeline (a voice chat between turns) is not
+// broken by a start that needs room. It is an env-only knob (no flag, no
+// config-file key) with a built-in default of DefaultEvictionGraceSeconds. 0 is a
+// legal, meaningful value (the protection off: an idle model is evictable at
+// once, as before the window existed) and is taken as itself, not as "unset";
+// anything that is not a non-negative base-10 integer within
+// MaxEvictionGraceSeconds degrades to the default rather than failing the load --
+// a fat-fingered tuning knob must not take the agent, and every model on the
+// host, down with it. A negative value is never honoured, and neither is one so
+// large it would overflow the nanosecond duration it becomes.
+func TestEvictionGraceSecondsFromEnv(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(env string, set bool) int {
+		t.Helper()
+		getenv := func(k string) string {
+			if set && k == "OP_AGENT_EVICTION_GRACE_SECONDS" {
+				return env
+			}
+			return ""
+		}
+		cfg, err := Load(base, getenv)
+		if err != nil {
+			t.Fatalf("Load(OP_AGENT_EVICTION_GRACE_SECONDS=%q): %v", env, err)
+		}
+		return cfg.EvictionGraceSeconds
+	}
+
+	if DefaultEvictionGraceSeconds != 30 {
+		t.Errorf("DefaultEvictionGraceSeconds = %d, want 30", DefaultEvictionGraceSeconds)
+	}
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want int
+	}{
+		{"unset defaults", "", false, DefaultEvictionGraceSeconds},
+		{"blank defaults", "   ", true, DefaultEvictionGraceSeconds},
+		{"explicit 0 is allowed (protection off)", "0", true, 0},
+		{"a positive value is taken", "120", true, 120},
+		{"surrounding space is trimmed", " 45 ", true, 45},
+		{"the maximum is taken", "86400", true, MaxEvictionGraceSeconds},
+		{"above the maximum falls back to the default", "86401", true, DefaultEvictionGraceSeconds},
+		{"an overflowing value falls back to the default", "9223372036854775807", true, DefaultEvictionGraceSeconds},
+		{"negative is not honoured", "-5", true, DefaultEvictionGraceSeconds},
+		{"non-numeric falls back to the default", "soon", true, DefaultEvictionGraceSeconds},
+		{"a fractional value falls back to the default", "1.5", true, DefaultEvictionGraceSeconds},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := load(tc.env, tc.set); got != tc.want {
+				t.Errorf("EvictionGraceSeconds for OP_AGENT_EVICTION_GRACE_SECONDS=%q = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}

@@ -274,6 +274,17 @@ type ManagerOptions struct {
 	// so an unknown-RAM spec starts unconstrained, and a negative value is treated
 	// as zero.
 	RAMBootstrapGuessMB int
+	// EvictionGrace is how long after a process was last used it stays off the
+	// eviction victim list: a model used within it counts as in use, never a
+	// victim however hard the admission pressure, so a bursty pipeline (a voice
+	// chat between turns) is not broken by a start that happens to need room. It
+	// is OPERATOR configuration from the agent's own local settings
+	// (OP_AGENT_EVICTION_GRACE_SECONDS) -- the gateway never supplies it. Fixed
+	// for the process lifetime, like the other options here. The agent's config
+	// defaults it to 30 seconds; zero here (the default of a caller that sets
+	// nothing, such as most tests) turns the protection off, so an idle process is
+	// evictable at once as before, and a negative value is treated as zero.
+	EvictionGrace time.Duration
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -385,6 +396,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		vramHeadroomMB:      max(0, opts.VRAMHeadroomMB),
 		hostRAMReserveMB:    max(0, opts.HostRAMReserveMB),
 		ramBootstrapGuessMB: max(0, opts.RAMBootstrapGuessMB),
+		evictionGrace:       max(0, opts.EvictionGrace),
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -1150,6 +1162,12 @@ type owner struct {
 	// above; read only by buildSnapshot, which copies it into the snapshot's
 	// RAMBootstrapGuessMB for Admit (the one place that interprets it).
 	ramBootstrapGuessMB int
+	// evictionGrace is ManagerOptions.EvictionGrace, never negative. Fixed for
+	// the process lifetime, so a plain field like ramBootstrapGuessMB above; read
+	// by buildSnapshot (copied into the snapshot's EvictionGrace for Admit, the
+	// one place that interprets it) and by the bootstrap escalation's own victim
+	// pick, so the two never disagree about who is protected.
+	evictionGrace time.Duration
 	// ramFreedMB is the host RAM that managed processes held when they exited
 	// and that the hardware sample has not necessarily caught up with yet, valid
 	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
@@ -2352,8 +2370,14 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	o.fillDetectedBudgets(budgets, hi)
 
 	return PolicySnapshot{
-		Running:         running,
-		MaxProcesses:    o.cfg.MaxProcesses,
+		Running:      running,
+		MaxProcesses: o.cfg.MaxProcesses,
+		// The clock and the grace window travel together: Admit never reads a
+		// clock, so the snapshot is stamped here, once, and every LastUsed in
+		// Running is measured against this one instant. The grace is copied
+		// verbatim (0 = off); isEvictable is the one place that interprets it.
+		Now:             time.Now(),
+		EvictionGrace:   o.evictionGrace,
 		Budgets:         budgets,
 		HostRAMBudgetMB: hostRAMBudgetMB(hi, residentRAMMB, o.hostRAMReserveMB),
 		// The ceiling is the budget's generous twin, for the terminal
@@ -3148,18 +3172,28 @@ func (o *owner) handleBootstrapMemoryPressure(st *specState, exitCode int, tail 
 //
 // It picks the oldest idle, unpinned, non-starting victim -- the same
 // isEvictable contract Admit uses (never a busy, pinned or still-loading
-// process, never the fork-exec-storm victim that clause exists to prevent) and
-// the same oldest-LastUsed, lowest-id tie-break Admit's sortOldestFirst uses, so
-// the choice is deterministic over a map-ordered spec set. It records the
-// beneficiary (drainedFor) so the victim's exit offers the freed slot to the
-// bootstrap first, exactly like an admission eviction.
+// process, never the fork-exec-storm victim that clause exists to prevent, and
+// never one used within the eviction grace window, so the escalation cannot take
+// the model a pipeline is between requests on) and the same oldest-LastUsed,
+// lowest-id tie-break Admit's sortOldestFirst uses, so the choice is
+// deterministic over a map-ordered spec set. When every candidate is protected
+// it finds no victim, which handleBootstrapMemoryPressure already reports as
+// "no idle process to evict" and still retries once. It records the beneficiary
+// (drainedFor) so the victim's exit offers the freed slot to the bootstrap
+// first, exactly like an admission eviction.
 func (o *owner) evictOneIdleForBootstrap(beneficiaryID string) bool {
 	var victim *specState
+	now := time.Now()
 	for id, st := range o.specs {
 		if id == beneficiaryID || st.proc == nil || st.state != StateRunning {
 			continue
 		}
-		if !isEvictable(RunningProc{Pinned: st.spec.Pinned, Starting: st.state == StateStarting, InFlight: st.inFlight}) {
+		if !isEvictable(RunningProc{
+			Pinned:   st.spec.Pinned,
+			Starting: st.state == StateStarting,
+			InFlight: st.inFlight,
+			LastUsed: st.lastUsed,
+		}, now, o.evictionGrace) {
 			continue
 		}
 		if victim == nil ||

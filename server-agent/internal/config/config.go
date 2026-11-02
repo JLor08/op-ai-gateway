@@ -338,6 +338,21 @@ type Config struct {
 	// (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB), for the same reason as the two above: a
 	// host-tuning escape hatch the gateway can never supply.
 	RAMBootstrapGuessMB int
+	// EvictionGraceSeconds is how long, in seconds, after a managed model was last
+	// used the admission policy keeps it off the eviction victim list: a model
+	// used within the window counts as in use, never a victim however hard the
+	// pressure, and a start that could only be made room for by evicting one waits
+	// instead. It protects a bursty pipeline -- a voice chat leaves its speech
+	// models idle between turns -- from a new start that happens to need the room.
+	// It stacks on top of the existing never-evict-a-busy-or-pinned-model rules and
+	// loosens nothing.
+	//
+	// 0 turns the window OFF: an idle model is evictable at once, as before the
+	// window existed. Env-only (OP_AGENT_EVICTION_GRACE_SECONDS), for the same
+	// reason as the three settings above: a host-tuning escape hatch the gateway
+	// can never supply, and a file key would have to be mirrored into the generated
+	// agent config.
+	EvictionGraceSeconds int
 }
 
 // DefaultHostRAMReserveMB is the host-RAM reserve, in MB, an agent holds back
@@ -352,6 +367,21 @@ const DefaultHostRAMReserveMB = 2048
 // host-RAM pool of any host with a few GB free, so it does not make a legitimate
 // small model's first start wait on a modest host.
 const DefaultRAMBootstrapGuessMB = 4096
+
+// DefaultEvictionGraceSeconds is the eviction grace window, in seconds, an agent
+// applies when OP_AGENT_EVICTION_GRACE_SECONDS is unset or unusable. Thirty
+// seconds covers the pause between turns of an interactive pipeline (a voice
+// chat's gap between transcribing and speaking) without keeping an abandoned
+// model resident for long: it only delays an eviction, never prevents one.
+const DefaultEvictionGraceSeconds = 30
+
+// MaxEvictionGraceSeconds bounds OP_AGENT_EVICTION_GRACE_SECONDS at one day. The
+// value becomes a time.Duration of nanoseconds, so an unbounded integer would
+// overflow it and silently flip a huge grace into a negative one, which means
+// "off" -- the opposite of what the operator asked for. A day is already far
+// beyond any pause worth protecting, so a larger value is treated like any other
+// unusable one.
+const MaxEvictionGraceSeconds = 86400
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
 // by an env var or flag overrides the file. TLSInsecure is a pointer so an
@@ -518,6 +548,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		VRAMHeadroomMB:      resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
 		HostRAMReserveMB:    resolveHostRAMReserveMB(getenv("OP_AGENT_HOST_RAM_RESERVE_MB")),
 		RAMBootstrapGuessMB: resolveRAMBootstrapGuessMB(getenv("OP_AGENT_RAM_BOOTSTRAP_GUESS_MB")),
+
+		EvictionGraceSeconds: resolveEvictionGraceSeconds(getenv("OP_AGENT_EVICTION_GRACE_SECONDS")),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket
@@ -618,6 +650,25 @@ func resolveRAMBootstrapGuessMB(envVal string) int {
 		}
 	}
 	return DefaultRAMBootstrapGuessMB
+}
+
+// resolveEvictionGraceSeconds parses the env-only OP_AGENT_EVICTION_GRACE_SECONDS:
+// a base-10 integer number of seconds from 0 to MaxEvictionGraceSeconds, default
+// DefaultEvictionGraceSeconds. 0 is a real value (the grace window off, so an idle
+// model is evictable at once), so it is accepted as itself rather than treated as
+// "unset". An absent, blank, malformed, fractional, negative or too-large value
+// yields the default instead of failing the whole load, for the same reason
+// resolveRAMBootstrapGuessMB does: a mistyped tuning knob must not take the agent,
+// and every model on the host, down with it. A negative grace is not honoured --
+// it would read as "off" while looking like a setting -- and neither is one past
+// MaxEvictionGraceSeconds, which would overflow the duration it becomes.
+func resolveEvictionGraceSeconds(envVal string) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= MaxEvictionGraceSeconds {
+			return n
+		}
+	}
+	return DefaultEvictionGraceSeconds
 }
 
 // resolveStringList applies env(if non-empty, comma-separated) > file for a

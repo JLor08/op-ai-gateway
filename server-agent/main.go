@@ -200,6 +200,12 @@ func main() {
 		// Operator-owned (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB, default 4096), never
 		// gateway-supplied.
 		RAMBootstrapGuessMB: cfg.RAMBootstrapGuessMB,
+		// How long after a model was last used it stays off the eviction victim
+		// list, so a bursty pipeline is not broken by a start that needs room.
+		// Operator-owned (OP_AGENT_EVICTION_GRACE_SECONDS, default 30, 0 = off),
+		// never gateway-supplied. config.Load bounds it, so the multiplication
+		// cannot overflow a Duration.
+		EvictionGrace: time.Duration(cfg.EvictionGraceSeconds) * time.Second,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
@@ -332,7 +338,8 @@ func main() {
 		"runtime_log_buffer_total_bytes", logBufferTotal,
 		"vram_headroom_mb", cfg.VRAMHeadroomMB,
 		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
-		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB)
+		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB,
+		"eviction_grace_seconds", cfg.EvictionGraceSeconds)
 	// A loopback runtime_router_bind under cert_mode=proxy is the workaround
 	// operators used to repair the proxied path before the in-process wiring
 	// above existed. It is no longer needed, and it is no longer free: it

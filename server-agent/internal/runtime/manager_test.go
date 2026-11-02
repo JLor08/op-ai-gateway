@@ -3505,6 +3505,64 @@ func TestBuildSnapshotCarriesTheSpecRole(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshotCarriesTheGraceWindowAndClock: the owner's configured grace
+// (OP_AGENT_EVICTION_GRACE_SECONDS, plumbed to o.evictionGrace) reaches Admit
+// through the snapshot verbatim, stamped with the instant the snapshot was
+// assembled, so the one place that interprets it is isEvictable. The default of a
+// caller that sets nothing (most tests) is 0: the window off.
+func TestBuildSnapshotCarriesTheGraceWindowAndClock(t *testing.T) {
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.evictionGrace = 30 * time.Second
+	before := time.Now()
+	snap := o.buildSnapshot()
+	after := time.Now()
+	if snap.EvictionGrace != 30*time.Second {
+		t.Errorf("EvictionGrace = %v, want the configured 30s", snap.EvictionGrace)
+	}
+	if snap.Now.Before(before) || snap.Now.After(after) {
+		t.Errorf("Now = %v, want the assembly instant within [%v, %v]", snap.Now, before, after)
+	}
+
+	o2, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	if got := o2.buildSnapshot().EvictionGrace; got != 0 {
+		t.Errorf("EvictionGrace = %v with nothing configured, want 0 (off)", got)
+	}
+}
+
+// TestSnapshotAdmitSparesARecentlyUsedModel runs the real owner's snapshot
+// through Admit: a running model the candidate's pair is not permitted with is
+// the ordinary victim once it has been idle past the grace, and untouchable --
+// the start waits -- while it was used within it. This is the end-to-end seam
+// the pure policy tests cannot see: that st.lastUsed and the owner's clock are
+// what reach isEvictable.
+func TestSnapshotAdmitSparesARecentlyUsedModel(t *testing.T) {
+	candidate := baseSpec("cand", "model-cand")
+	for _, tc := range []struct {
+		name     string
+		idleFor  time.Duration
+		grace    time.Duration
+		wantWait bool
+	}{
+		{"used 2s ago, 30s grace: protected", 2 * time.Second, 30 * time.Second, true},
+		{"used 2m ago, 30s grace: evictable", 2 * time.Minute, 30 * time.Second, false},
+		{"used 2s ago, grace off: evictable", 2 * time.Second, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, st := newSnapshotOwner(baseSpec("occ", "model-occ"), 4242, nil)
+			o.evictionGrace = tc.grace
+			st.lastUsed = time.Now().Add(-tc.idleFor)
+			// o.allowedPairs is empty: (cand, occ) is not permitted, so the
+			// occupant must go for the candidate to start.
+			got := Admit(o.buildSnapshot(), candidate)
+			if tc.wantWait {
+				assertDecision(t, tc.name, got, Decision{Wait: true, Evict: []string{}})
+				return
+			}
+			assertDecision(t, tc.name, got, Decision{Evict: []string{"occ"}})
+		})
+	}
+}
+
 // TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate is the
 // zero-guard. The defect is the absence of one rule that the OTHER end of
 // this very loop already has: the gateway's telemetry ingest skips any

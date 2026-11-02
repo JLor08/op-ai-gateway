@@ -31,8 +31,13 @@ type RunningProc struct {
 	// spec's pushed role, or RoleOther when it has none. It is carried onto the
 	// snapshot so the policy can compare an occupant's role with the candidate's;
 	// nothing in Admit reads it yet, so it changes no decision.
-	Role     string
-	LastUsed time.Time // idle-victim ordering: oldest evicted first
+	Role string
+	// LastUsed is when the process last served, started serving or finished a
+	// request. It does two jobs: the idle-victim ordering (oldest evicted first)
+	// and, against PolicySnapshot.Now and EvictionGrace, the grace window that
+	// keeps a recently used process out of the victim set altogether
+	// (isEvictable). Zero means never used.
+	LastUsed time.Time
 	// Starting is true while this process is still loading -- it has been
 	// exec'd but has never passed a health probe, so it is serving nothing
 	// and its InFlight is necessarily 0. Such a process is NEVER an eviction
@@ -47,6 +52,21 @@ type RunningProc struct {
 type PolicySnapshot struct {
 	Running      []RunningProc
 	MaxProcesses int // 0 = unlimited
+	// Now is the instant this snapshot was assembled at, the clock isEvictable
+	// reads the grace window against. Admit is pure -- it never reads the wall
+	// clock itself -- so the one caller that owns a clock (owner.buildSnapshot)
+	// stamps it here, exactly as it hands over every other time-dependent input.
+	Now time.Time
+	// EvictionGrace is the hard protection window after a process was last used:
+	// a process whose LastUsed is within it of Now is never an eviction victim,
+	// whatever the pressure (OP_AGENT_EVICTION_GRACE_SECONDS,
+	// owner.evictionGrace, copied through verbatim). 0 is the sentinel for OFF --
+	// the pre-grace behaviour, idle means evictable -- and is what a snapshot
+	// built without it (every table test, a caller that sets nothing) gets.
+	// isEvictable is the one place that interprets it. A snapshot that sets a
+	// grace but no Now is a caller bug and fails CLOSED: nothing is evictable,
+	// rather than everything.
+	EvictionGrace time.Duration
 	// Budgets maps a GPU index to its VRAM budget in MB. An index that is
 	// ABSENT and an index whose budget is 0 are the SAME thing:
 	// unconstrained. That is the gateway data model's own definition --
@@ -178,7 +198,8 @@ type PolicySnapshot struct {
 //     to help right now, so the caller queues the request and re-asks on the
 //     next completion. Two different situations reach that, and only the
 //     first is "nothing CAN be evicted": every remaining blocker is busy,
-//     still loading, or (outside the unknown-VRAM case below) pinned. In the
+//     still loading, used within the eviction grace window, or (outside the
+//     unknown-VRAM case below) pinned. In the
 //     second, a blocker plainly could be evicted and deliberately is not --
 //     rule 4's known-demand occupant, which an unknown-demand candidate is no
 //     longer allowed to drain-stop (see rule 4 in Admit). Wait is still the
@@ -278,8 +299,28 @@ func PairKey(a, b string) [2]string {
 }
 
 // isEvictable reports whether r may ever appear in a Decision.Evict list:
-// never a pinned process, never one that is still loading, and only when it
-// is serving no request right now.
+// never a pinned process, never one that is still loading, only when it is
+// serving no request right now, and only once it has also been idle for longer
+// than the grace window:
+//
+//	!Pinned && !Starting && InFlight == 0 && now - LastUsed > grace
+//
+// THE GRACE CLAUSE is the hard protection for a bursty pipeline. InFlight == 0
+// says a process is idle THIS instant, not that it is finished: a voice chat
+// leaves its speech-to-text and text-to-speech models idle between turns, and a
+// new start must not take one of them in the gap. A process used within grace
+// of now therefore counts as in use -- never a victim, regardless of pressure --
+// and when the only way to make room is such a process the admission Waits
+// (decide), exactly as it does behind a busy one. The comparison is strict:
+// evictable only when now-LastUsed is GREATER than grace, so a process used
+// exactly one grace ago is still protected, and one that was never used (zero
+// LastUsed) is the oldest thing there is.
+//
+// grace <= 0 turns the clause off -- the pre-grace behaviour, which every
+// snapshot built without PolicySnapshot.EvictionGrace keeps. A positive grace
+// with a zero now fails CLOSED (now.Sub(LastUsed) is then hugely negative, so
+// everything reads as within grace): a caller that configured protection and
+// forgot the clock gets no evictions, never unprotected ones.
 //
 // THE Starting CLAUSE IS THE C3 FIX, and it is load-bearing rather than a
 // refinement. InFlight == 0 was meant to mean "idle, so nothing is lost by
@@ -313,8 +354,16 @@ func PairKey(a, b string) [2]string {
 // permanently unevictable, whereas Starting is a state every process passes
 // through exactly once per generation, and always leaves (healthy, start
 // timeout, or exit).
-func isEvictable(r RunningProc) bool {
-	return !r.Pinned && !r.Starting && r.InFlight == 0
+func isEvictable(r RunningProc, now time.Time, grace time.Duration) bool {
+	return !r.Pinned && !r.Starting && r.InFlight == 0 && !withinGrace(r.LastUsed, now, grace)
+}
+
+// withinGrace reports whether a process last used at lastUsed is still inside
+// the grace window at now: grace is on (> 0) and now-lastUsed has not exceeded
+// it. See isEvictable for why the bound is inclusive and a zero now reads as
+// inside.
+func withinGrace(lastUsed, now time.Time, grace time.Duration) bool {
+	return grace > 0 && now.Sub(lastUsed) <= grace
 }
 
 // firstSharedGPU returns the first index in idx that r occupies, and whether
@@ -729,6 +778,26 @@ type admission struct {
 	bootstrapEvicted bool
 }
 
+// evictable is isEvictable against this admission's snapshot: the one gate every
+// rule asks, so the grace window (snap.Now, snap.EvictionGrace) is applied to
+// each of them identically and cannot be forgotten by a rule added later.
+func (a *admission) evictable(r RunningProc) bool {
+	return isEvictable(r, a.snap.Now, a.snap.EvictionGrace)
+}
+
+// evictableOf returns the subset of procs that may be drained now (evictable),
+// preserving input order. It is the idle-victim filter rule 3 (chargeGPUBudget)
+// and rule 6 (ruleHostRAM) share before ordering victims oldest-first.
+func (a *admission) evictableOf(procs []RunningProc) []RunningProc {
+	var out []RunningProc
+	for _, r := range procs {
+		if a.evictable(r) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // newAdmission builds the pipeline state for one admission decision. Step 0, the
 // self-filter: a RunningProc sharing spec.ID -- e.g. a double-start race, or a
 // snapshot assembled a moment too early or late -- is never a blocker or a
@@ -921,7 +990,7 @@ func (a *admission) ruleMatrix() {
 		if a.snap.Allowed[PairKey(a.spec.ID, r.SpecID)] {
 			continue
 		}
-		if isEvictable(r) {
+		if a.evictable(r) {
 			a.toEvict[r.SpecID] = r
 		} else {
 			a.blocked = true
@@ -979,7 +1048,7 @@ func (a *admission) bootstrapEvictTouchers() {
 		if !touchesAnyGPU(r, a.gpuIdx) || procHasUnknownVRAM(r) {
 			continue
 		}
-		if isEvictable(r) {
+		if a.evictable(r) {
 			a.toEvict[r.SpecID] = r
 			a.bootstrapEvicted = true
 		} else {
@@ -1123,7 +1192,7 @@ func (a *admission) ruleUnknownVRAMOccupant() {
 		if !procHasUnknownVRAM(r) || !touchesAnyGPU(r, a.gpuIdx) {
 			continue
 		}
-		if isEvictable(r) {
+		if a.evictable(r) {
 			a.toEvict[r.SpecID] = r
 		} else {
 			a.blocked = true
@@ -1183,7 +1252,7 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 		return
 	}
 
-	idleTouchers := evictableOf(touchers)
+	idleTouchers := a.evictableOf(touchers)
 	sortOldestFirst(idleTouchers)
 	for _, r := range idleTouchers {
 		if sum <= budget {
@@ -1286,7 +1355,7 @@ func (a *admission) ruleHostRAM() {
 		return
 	}
 
-	idleHolders := evictableOf(holders)
+	idleHolders := a.evictableOf(holders)
 	sortOldestFirst(idleHolders)
 	for _, r := range idleHolders {
 		if sum <= a.snap.HostRAMBudgetMB {
@@ -1318,7 +1387,7 @@ func (a *admission) ruleProcessCount() {
 		if _, already := a.toEvict[r.SpecID]; already {
 			continue
 		}
-		if isEvictable(r) {
+		if a.evictable(r) {
 			candidates = append(candidates, r)
 		}
 	}
@@ -1357,18 +1426,4 @@ func (a *admission) decide() Decision {
 	// elsewhere), the function returned the Wait above with an empty Evict list
 	// and no shot was spent. The owner burns the one-shot only for this return.
 	return Decision{Evict: evict, VRAMBootstrap: a.bootstrapEvicted}
-}
-
-// evictableOf returns the subset of procs that may be drained now
-// (isEvictable), preserving input order. It is the idle-victim filter rule 3
-// (chargeGPUBudget) and rule 6 (ruleHostRAM) share before ordering victims
-// oldest-first.
-func evictableOf(procs []RunningProc) []RunningProc {
-	var out []RunningProc
-	for _, r := range procs {
-		if isEvictable(r) {
-			out = append(out, r)
-		}
-	}
-	return out
 }
