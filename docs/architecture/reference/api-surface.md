@@ -749,7 +749,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   operator-facing names itself via `spec_id → spec.mapping_id → mapping`. Row
   shape: `{spec_id, model, state, since, pid?, port?, in_flight, restarts,
   context_size, active_requests, queue_depth, metrics_probe, context_probe,
-  live_progress_support, gpus?, measured_at?, last_error?}` with `last_error =
+  live_progress_support, gpus?, measured_at?, ram_measured_mb?, last_error?}` with `last_error =
   {message, at, exit_code, failures, stderr_tail?}` and `gpus = [{index,
   vram_measured_mb}]`. Unlike `gpus`/`measured_at` (below),
   `context_size`/`active_requests`/`queue_depth`/`metrics_probe`/
@@ -775,14 +775,17 @@ Conventions worth stating, because each is a judgement call a client depends on:
   although the registry holds them for that child: they are an in-process
   hand-off to `GET /api/portal/model-image-options` (above), kept off this
   frame on purpose, and a client wanting them reads that endpoint.
-- **The status row does not carry the measured RAM, although the sample does.**
-  The agent's runtime sample has a spec-level `ram_measured_mb` (beside `gpus[]`,
-  not inside it, `omitempty`, `0` = unknown), which the gateway writes back onto the
-  spec; the SSE row above has **no** such key today. The client type reserves an
-  optional `ram_measured_mb` on the row, and nothing may rely on it being populated:
-  the durable value is the spec's own `ram_measured_mb` on
-  `GET /api/portal/mappings/{id}/runtime-spec`. A deliberate, documented follow-up
-  ([Agent-Managed Model Runtime
+- **The status row carries the live measured RAM as `ram_measured_mb`, omitted when
+  unknown.** The agent's runtime sample has a spec-level `ram_measured_mb` (beside
+  `gpus[]`, not inside it, `omitempty`, `0` = unknown); the gateway writes it back onto
+  the spec **and** forwards it on this row, on both the `snapshot` and the `update`
+  frame. It is the LIVE figure for that process: a strictly positive number, absent
+  (never `0`) when nothing is measured, and — every frame being a full snapshot —
+  absent again on the first frame after the process stops measuring. It is **not**
+  covered by `measured_at`, which stays the per-GPU watermark below. The durable value
+  is still the spec's own `ram_measured_mb` on
+  `GET /api/portal/mappings/{id}/runtime-spec`, which a spec with no live row falls
+  back to ([Agent-Managed Model Runtime
   §10](../cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
 - **`gpus`/`measured_at` are a watermark, and they are omitted together.**
   `measured_at` is the **gateway's** arrival time for the frame that carried the

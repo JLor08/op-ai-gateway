@@ -10821,10 +10821,11 @@ does not control, so a static "host total minus a reserve" goes stale the moment
   can tell apart from one that honours it. Nothing in the gateway or portal consumes either name yet (the constants are exported for
   the portal service, like `RuntimeModelParamsFeature`). The sample's host block also gained `mem_available_bytes`, read by the agent
   itself and not ingested by the gateway.
-- **The live status frame does not yet carry the measurement.** The gateway's runtime-status DTO (the SSE frame) does not forward
-  `ram_measured_mb`; the portal's table reads the durable `RuntimeSpec.ram_measured_mb` instead, the same pattern the VRAM display
-  uses, and `RuntimeStatus.ram_measured_mb` is a reserved optional field on the client. A deliberate, documented follow-up, not a
-  defect ([§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
+- **The live status frame carries the measurement (a follow-up to this decision).** The gateway's runtime-status DTO (the SSE frame)
+  forwards `ram_measured_mb`, strictly positive only and omitted when unknown, without stamping the per-GPU `measured_at` watermark;
+  the portal's RAM column prefers it for a spec whose live status row carries measured RAM, as `max(live, durable measured, estimate)`,
+  and falls back to the durable `RuntimeSpec.ram_measured_mb` for a spec with no live figure. This landed after the decision itself, which first shipped the
+  durable path only ([§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
 - **Portal.** The launch-spec form gains one spec-level RAM estimate field, and the runtime table shows the effective per-GPU VRAM,
   a **VRAM total** and a **RAM** column. A negative estimate is refused with `runtime_spec.tuning_invalid`.
 - **Mixed fleets.** An agent older than 0.14.0 reports no RAM and ignores `ram_mb`; a gateway older than this change sends none and

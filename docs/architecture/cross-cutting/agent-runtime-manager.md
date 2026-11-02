@@ -4754,7 +4754,7 @@ Two honesty rules on those two fields, and both are contracts:
   absent measurement look fresh.
 
 **Host RAM rides the sample as one spec-level scalar, `ram_measured_mb`, and the
-live status frame does not carry it (yet).** RAM has no GPU axis and one process
+live status frame forwards it.** RAM has no GPU axis and one process
 backs one spec, so the figure sits **beside** `gpus[]` on the runtime entry, not
 inside it: the managed child's resident RAM in MB (RSS, the private working set on
 Windows), declared by the agent feature `runtime_ram_measurement` (§7), `omitempty`,
@@ -4765,15 +4765,36 @@ process exits for the reason the VRAM figures are (a number that describes a pro
 stops being true when the process does). The gateway's ingest writes it back onto
 `agent_runtime_specs.ram_measured_mb` with the VRAM write-back's discipline: a
 strictly positive value only, ownership checked once per distinct `spec_id`, an
-unchanged value not rewritten. **The gateway's live-status DTO (`RuntimeStatusDTO`,
-the SSE frame) does not forward `ram_measured_mb`**, so `RuntimeStatus.ram_measured_mb`
-on the portal client is a reserved optional field that stays `undefined` today and
-nothing may rely on it. The portal's table reads the **durable**
-`RuntimeSpec.ram_measured_mb` instead, the same pattern the VRAM display uses, so a
-new agent measurement reaches the table when the specs are next fetched, not on the
-next live frame, and there is no RAM counterpart of the `measured_at` watermark. This
-is a deliberate, documented follow-up (the status DTO would forward the key), not a
-defect, and no consumer needs the live figure today.
+unchanged value not rewritten.
+
+**The gateway's live-status DTO (`RuntimeStatusDTO`, the SSE frame) forwards it** as
+`ram_measured_mb`, set in `runtimeStatusDTOsFromSamples` from the sample's own
+figure under the same honesty rules as `gpus[]`: a strictly positive value only (`0`,
+an absent key and a negative number all leave the field zero), and `omitempty`, so an
+unknown figure is absent from the wire rather than a `0` that reads as a measurement.
+The `snapshot` and `update` frames share the DTO, so both carry it, and every frame is
+a full snapshot: a frame that measured nothing (the process exited, or an agent that
+predates the field) carries no key and clears the live figure rather than leaving the
+last number standing. The durable write-back is unchanged and is still what survives a
+restart; the live figure is volatile like the rest of the row. **It does not stamp
+`measured_at`.** That field is the watermark of a *per-GPU* measurement — the VRAM
+benchmark reads a non-zero `measured_at` as "this frame carries VRAM evidence" — so a
+frame that measured only RAM (a CPU-only spec, or a host with no VRAM measurer) leaves
+it zero, and there is deliberately no RAM counterpart of the watermark.
+
+The portal's RAM column therefore prefers the **live** figure for a spec whose live
+status row carries measured RAM: the cell is `max(RuntimeStatus.ram_measured_mb,
+RuntimeSpec.ram_measured_mb, RuntimeSpec.ram_estimate_mb)`, with the status row joined
+through the spec's own `id` (the stream's `spec_id`), so a fresh measurement reaches
+the table on the next frame instead of when the specs are next fetched. The rule is
+gated on the row *carrying* the figure, not on the row's `state`: the agent clears the
+figure when the process exits, so the two coincide today, but it is the figure that
+decides. The live figure joins the same `max()` as the durable measurement and the
+estimate, so a live value below a larger durable one does not shrink the cell. A spec
+with no live row (before the first frame, or after a gateway restart) or whose row
+carries no RAM (a stopped or never-measured one) falls back to the **durable**
+persisted value, which is why the write-back stays. (The per-GPU VRAM cells keep
+reading only the durable spec figures; only the RAM column consults the live frame.)
 
 For the wire shape of the stream and its unusual envelope key, see
 [HTTP API Surface](../reference/api-surface.md); for the sample's two additive
@@ -5395,11 +5416,14 @@ like an error.
 estimate: the per-GPU cell is `max(measured, estimate)` of that row, a **VRAM
 total** column sums those across the spec's GPUs (a card whose demand is still
 unknown adds nothing, so a partly unknown total is a floor), and a **RAM** column
-shows `max(ram_measured_mb, ram_estimate_mb)`; an unknown value is an em dash,
-never a `0 MB`. Both summary columns sort by magnitude and the cell text carries
-the unit while the column `value` stays the bare number. The values are the
-durable spec figures the portal loaded (§10), so an agent's fresh measurement
-reaches them when the specs are next fetched.
+shows `max(live ram_measured_mb, ram_measured_mb, ram_estimate_mb)`, where the live
+figure is the spec's row on the status stream when it has one carrying a RAM
+measurement (§10) and drops out of the `max()` otherwise; an unknown value is an em
+dash, never a `0 MB`. Both summary columns sort by magnitude and the cell text carries
+the unit while the column `value` stays the bare number. The VRAM figures are the
+durable spec values the portal loaded, so an agent's fresh VRAM measurement reaches
+them when the specs are next fetched; the RAM column additionally follows the live
+frame, so the RAM of a spec whose live row carries it updates with the stream.
 
 **Every launch spec also carries its own API-Varianten block** — the identical
 `openai`/`anthropic`/`openai_images`/`openai_audio` flavor checkboxes and Codex/Claude-Code
@@ -7781,10 +7805,12 @@ operator meets first:
   portal reads either name back today, so an operator who pairs an agent older than
   0.14.0 with a newer gateway gets no portal warning that its pushed `ram_mb` is
   silently ignored (§7).
-- **The live status frame does not carry the measured RAM.** The gateway's
-  runtime-status DTO does not forward `ram_measured_mb`, so the portal's RAM column
-  reads the durable spec value and a new measurement lands when the specs are next
-  fetched, not on the next frame (§10). A documented follow-up.
+- **Only the RAM column follows the live frame; the VRAM cells do not.** The
+  gateway's runtime-status DTO forwards `ram_measured_mb` (§10), so the RAM cell of a
+  spec whose live row carries it updates with the stream, but the per-GPU cells and the
+  VRAM total still read the durable spec values and pick up a new VRAM measurement when
+  the specs are next fetched. The live row is an in-RAM snapshot, so a stopped spec or a gateway restart
+  falls back to the durable value until the next frame.
 - **A *literal* secret written into a spec reaches the gateway unmasked** — in
   `args` in either mode, or in an `env` value of a gateway-authored spec, where
   the gateway holds the plaintext document anyway. A resolved secret of either

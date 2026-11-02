@@ -395,7 +395,7 @@ nothing carries neither `gpus[]` nor `measured_at`, so no timestamp is ever
 published with nothing to be fresh about. See [Agent-Managed Model
 Runtime](agent-runtime-manager.md) §10.
 
-**`ram_measured_mb` is persisted like `gpus[]` and published like it is not.** The
+**`ram_measured_mb` is persisted like `gpus[]` and published like it, without the watermark.** The
 write-back (`writeBackRuntimeRAM`, run beside `writeBackRuntimeVRAM` after every store
 write in the ingest has succeeded) writes a strictly positive value onto
 `agent_runtime_specs.ram_measured_mb` for a spec the reporting server **owns** (the
@@ -404,12 +404,17 @@ same `RuntimeSpecByID` → `MappingByID` → `ApplicationByID` chain, with the c
 unchanged value is **not rewritten** (the stored value is read once with the ownership
 check and compared). There is no per-axis lock on it or on the VRAM write-back any
 more ([ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)):
-ownership is the only gate. **The live status stream does not republish it yet**
-(`RuntimeStatusDTO` has no such key), so there is no RAM counterpart of `measured_at`;
-the durable spec value is what the portal reads
+ownership is the only gate. **The live status stream republishes it** as
+`RuntimeStatusDTO.ram_measured_mb` (`omitempty`), on the same strictly-positive rule,
+so a spec's live figure reaches the portal on the next frame and a frame that
+measured nothing clears it; it does **not** stamp `measured_at`, which stays the
+per-GPU watermark, so there is no RAM counterpart of it. The portal's RAM column takes
+`max(live, durable, estimate)` and falls back to the durable spec value when there is no
+live figure
 ([Agent-Managed Model Runtime
 §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
-A measured `0` or an absent key is dropped and never zeroes a stored value.
+A measured `0` or an absent key is dropped from both homes and never zeroes a stored
+value.
 
 **`context_size`/`active_requests`/`queue_depth` split the same way `gpus[]`
 does, but each field picks only one of the two homes — never both.**
