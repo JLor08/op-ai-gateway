@@ -223,8 +223,9 @@ func main() {
 	// Measured RAM is both reported (Status/telemetry, and the gateway's
 	// spec write-back) and read by admission: the host-RAM pool charges every
 	// running process max(live measurement, the spec's pushed demand), and the
-	// cold-start RAM bootstrap decides on it whether a spec still has an unknown
-	// demand. With no measurer installed, operator RAM demands stand unmeasured.
+	// cold-start RAM bootstrap path applies only while a spec's RAM demand is
+	// still unknown: its declared demand is 0 AND no measurement has landed yet.
+	// With no measurer installed, operator RAM demands stand unmeasured.
 	mgr.SetRAMMeasurer(collector.NewRAMMeasurer())
 
 	var src runtimectl.Source

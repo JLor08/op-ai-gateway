@@ -438,7 +438,9 @@ type agentRuntimeSample struct {
 	// key, which is what an agent that predates the field, or a spec with no
 	// process measured yet, sends (the agent's field is omitempty) -- is the
 	// UNKNOWN sentinel, never "needs no RAM": writeBackRuntimeRAM drops it, so
-	// the stored measurement is neither zeroed nor rewritten by it.
+	// the stored measurement is neither zeroed nor rewritten by it, and
+	// runtimeStatusDTOsFromSamples drops it from the live status frame on the
+	// same `> 0` rule (RuntimeStatusDTO.RAMMeasuredMB).
 	RAMMeasuredMB int                     `json:"ram_measured_mb,omitempty"`
 	GPUs          []agentRuntimeGPUSample `json:"gpus,omitempty"`
 	LastError     *agentRuntimeError      `json:"last_error,omitempty"`
@@ -615,6 +617,12 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 		}
 		if len(dto.GPUs) > 0 {
 			dto.MeasuredAt = receivedAt
+		}
+		// The spec-level RAM figure rides the frame on the same `> 0` rule: 0 (and
+		// an absent key, which decodes to 0) is UNKNOWN and stays off the wire. It
+		// deliberately does not stamp MeasuredAt -- that is the per-GPU watermark.
+		if rt.RAMMeasuredMB > 0 {
+			dto.RAMMeasuredMB = rt.RAMMeasuredMB
 		}
 		if rt.LastError != nil {
 			dto.LastError = &RuntimeErrorDTO{

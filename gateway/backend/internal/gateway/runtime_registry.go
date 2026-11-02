@@ -94,7 +94,29 @@ type RuntimeStatusDTO struct {
 	// (very stale) measurement instead of as no measurement.
 	GPUs       []RuntimeGPUStatusDTO `json:"gpus,omitempty"`
 	MeasuredAt time.Time             `json:"measured_at,omitzero"`
-	LastError  *RuntimeErrorDTO      `json:"last_error,omitempty"`
+	// RAMMeasuredMB is this frame's measured resident host RAM for the
+	// process, in MB (mirrors agentRuntimeSample.RAMMeasuredMB, key for key):
+	// the spec-level analogue of GPUs[].VRAMMeasuredMB, so the portal can show
+	// the LIVE figure for a running spec instead of only the durable one the
+	// write-back stores on agent_runtime_specs.ram_measured_mb. It is a
+	// scalar beside GPUs, not inside it, because RAM has no GPU axis and one
+	// process backs one spec.
+	//
+	// 0 is UNKNOWN, never "needs no RAM": only a strictly positive measurement
+	// is forwarded (the same `<= 0` rule as GPUs above and as the store
+	// write-back), and `omitempty` keeps an unknown figure off the wire
+	// entirely rather than sending a number that reads as a real zero. Every
+	// frame is a full snapshot, so a frame that measured nothing -- the
+	// process exited, or an agent that predates the field -- clears it.
+	//
+	// It does NOT stamp MeasuredAt: that field is the watermark of a PER-GPU
+	// measurement (vramMeasuredFromFrame reads a non-zero MeasuredAt as "this
+	// frame carries VRAM evidence"), and a frame that measured only RAM -- a
+	// CPU-only spec, or a host with no VRAM measurer -- must not claim one.
+	// So there is no RAM counterpart of the watermark. The durable write-back
+	// is unchanged and remains the persisted path.
+	RAMMeasuredMB int              `json:"ram_measured_mb,omitempty"`
+	LastError     *RuntimeErrorDTO `json:"last_error,omitempty"`
 	// ImageOptions is the image-generation options this stable_diffusion_cpp
 	// child's capability document states (sampler/scheduler names, output
 	// formats, size and batch limits, the server's own defaults), as the agent

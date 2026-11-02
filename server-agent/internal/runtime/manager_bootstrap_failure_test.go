@@ -6,6 +6,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -361,6 +362,161 @@ func TestBootstrapNoMeasurementWithinDeadlineFails(t *testing.T) {
 		return (st.State == StateStartFailed || st.State == StateBackoff) &&
 			st.LastError != nil
 	})
+}
+
+// TestBootstrapNoMeasurementCounterNeverAdvancesWithoutARAMMeasurer is the
+// measurer-less counterpart of TestBootstrapNoMeasurementWithinDeadlineFails. The
+// no-measurement termination exists to release the RAMBootstrapInFlight
+// interlock, and that interlock holds past Starting only while a RAM measurer is
+// installed (buildSnapshot); without one nothing could ever resolve the
+// bootstrap, so a spec of unknown RAM that is healthy and Running is simply left
+// running -- a measurer-less host cannot measure, it just runs. The gate that
+// guarantees it is healthyBootstrapAwaitingMeasurement's measurer check, and this
+// pins it: with no RAM measurer the beat counter must NEVER advance, however many
+// beats arrive, so the spec is never forced to StateStartFailed.
+//
+// It drives applyMeasurement directly (the same beat the owner feeds it) rather
+// than running a child and sleeping through beats: a real-child shape races the
+// stub's startup against the beat (see TestApplyMeasurementRAMZeroGuardAndGeneration)
+// and would prove nothing about the gate. The counter is asserted after EVERY
+// beat, so a regression fails on beat 1 with a clear message instead of at the
+// deadline beat, where failBootstrapUnmeasured would run against a bare owner.
+//
+// The two cases are the two ways a host lacks a RAM measurer. With no measurer
+// at all the owner never dispatches a beat in production, so this is the
+// strongest form of "never advances". With only a VRAM measurer the beat IS
+// delivered every cycle -- carrying a VRAM answer and no RAM one -- which is the
+// path the gate actually has to hold against.
+func TestBootstrapNoMeasurementCounterNeverAdvancesWithoutARAMMeasurer(t *testing.T) {
+	const pid = 7777
+	cases := []struct {
+		name string
+		// vramMeasurer is installed (or not) beside the absent RAM measurer.
+		vramMeasurer func(pids []int) map[int]map[int]int
+		// beat is the measurement answer delivered each cycle.
+		beat func(targets []measureTarget) cmdMeasured
+	}{
+		{
+			name:         "no measurer at all",
+			vramMeasurer: nil,
+			beat: func(targets []measureTarget) cmdMeasured {
+				return cmdMeasured{targets: targets}
+			},
+		},
+		{
+			name: "a VRAM measurer only, answering without a RAM reading",
+			vramMeasurer: func(pids []int) map[int]map[int]int {
+				return map[int]map[int]int{}
+			},
+			beat: func(targets []measureTarget) cmdMeasured {
+				return cmdMeasured{targets: targets, byPID: map[int]map[int]int{pid: {0: 0}}}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("boot", "model-boot")
+			spec.RAMMB = 0 // unknown RAM: a cold-start bootstrap
+
+			o, st := newSnapshotOwner(spec, pid, tc.vramMeasurer)
+			st.proc.everHealthy = true // healthy; newSnapshotOwner already has it Running
+
+			// Every other condition of the gate holds, so the absent RAM
+			// measurer is the ONLY thing that can keep the counter at 0.
+			if o.m.ramMeasurer.Load() != nil {
+				t.Fatal("a RAM measurer is installed -- the test's own premise (a measurer-less host) does not hold")
+			}
+			if st.state != StateRunning || !needsRAMBootstrap(st.spec, st.measuredRAM) {
+				t.Fatalf("spec is state %v, needsRAMBootstrap=%v -- the premise (a healthy, unmeasured, unknown-RAM spec) does not hold",
+					st.state, needsRAMBootstrap(st.spec, st.measuredRAM))
+			}
+
+			beat := tc.beat([]measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}})
+			// Well past the deadline: five times the bound that would fail a
+			// measured host.
+			for i := 1; i <= 5*ramBootstrapMeasureBeats; i++ {
+				o.applyMeasurement(beat)
+				if st.ramBootstrapBeats != 0 {
+					t.Fatalf("beat %d: st.ramBootstrapBeats = %d, want 0 -- the no-measurement counter advanced with no RAM measurer installed", i, st.ramBootstrapBeats)
+				}
+				if st.state != StateRunning {
+					t.Fatalf("beat %d: state = %v, want running -- a measurer-less host's bootstrap must never be failed by the beat counter", i, st.state)
+				}
+			}
+			if st.measuredRAM != 0 {
+				t.Fatalf("st.measuredRAM = %d, want 0 -- nothing measured RAM, so the spec must still be an unresolved bootstrap", st.measuredRAM)
+			}
+
+			// Control: install a RAM measurer and deliver one beat. The counter
+			// now advances, which proves the gate was held shut by the missing
+			// measurer alone -- not by some other condition the test left unmet.
+			o.m.SetRAMMeasurer(func(pids []int) map[int]int { return map[int]int{} })
+			o.applyMeasurement(beat)
+			if st.ramBootstrapBeats != 1 {
+				t.Fatalf("after installing a RAM measurer, st.ramBootstrapBeats = %d, want 1 -- the measurer check is not the only thing keeping the counter at 0, so the loop above proved nothing", st.ramBootstrapBeats)
+			}
+		})
+	}
+}
+
+// TestBootstrapMeasurerlessHostStaysRunning is the end-to-end form of the pin
+// above, through the real owner: a healthy unknown-RAM spec on a host with a VRAM
+// measurer but no RAM measurer keeps running while the recurring beat is
+// delivered many times over. The beats are counted off the VRAM measurer itself
+// (the owner never has two outstanding), so the wait is on an observed number of
+// delivered beats -- not on elapsed time -- and the assertion only runs once the
+// spec has been through well more than ramBootstrapMeasureBeats of them AFTER it
+// came up healthy.
+func TestBootstrapMeasurerlessHostStaysRunning(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	// The only measurer: it makes the owner dispatch a beat every tick (the spec
+	// declares a GPU, which is the VRAM measurer's gate) and answers with nothing.
+	// No RAM measurer is installed.
+	var beats atomic.Int64
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		beats.Add(1)
+		return map[int]map[int]int{}
+	})
+
+	boot := baseSpec("boot", "model-boot")
+	boot.RAMMB = 0 // unknown RAM: a cold-start bootstrap
+	boot.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	// Healthy immediately, never crashes -- the only thing missing is a RAM
+	// measurement, which this host cannot take.
+	boot.Args = stubArgs(0, 0, 0, "")
+	m.Apply(Config{Specs: []Spec{boot}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, rel, err := m.EnsureRunning(ctx, "model-boot")
+	if err != nil {
+		t.Fatalf("EnsureRunning(model-boot) = %v, want it to come up healthy first", err)
+	}
+	defer rel()
+
+	// From here the spec is healthy and Running. Let the owner deliver three
+	// times the failing deadline's worth of beats to it.
+	want := beats.Load() + 3*ramBootstrapMeasureBeats
+	// Failing fast on any state but running: a spec forced to StateStartFailed has
+	// its process terminated, which would stop the beats and turn the regression
+	// into an opaque timeout.
+	waitUntil(t, 10*time.Second, "the recurring beat is delivered well past the bootstrap deadline", func() bool {
+		if st := statusFor(m, "boot"); st == nil || st.State != StateRunning {
+			t.Fatalf("Status()[boot] = %+v before the beat deadline passed, want running -- the beat counter must not fail a measurer-less host", st)
+		}
+		return beats.Load() >= want
+	})
+
+	st := statusFor(m, "boot")
+	if st == nil || st.State != StateRunning {
+		t.Fatalf("Status()[boot] = %+v after %d beats with no RAM measurer, want running -- the beat counter must not fail a measurer-less host", st, 3*ramBootstrapMeasureBeats)
+	}
+	if st.LastError != nil {
+		t.Fatalf("Status()[boot].LastError = %+v, want nil -- nothing failed", st.LastError)
+	}
 }
 
 // TestBootstrapRetryCounterResetsOnMeasurement: a successful RAM measurement

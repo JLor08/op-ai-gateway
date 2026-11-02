@@ -754,6 +754,140 @@ func TestIngestTelemetrySampleRuntimeStatusOmitsWatermarkWithoutAMeasurement(t *
 	}
 }
 
+// TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredRAM proves the live
+// status stream republishes a sample's spec-level ram_measured_mb on the
+// runtime's own row, so the portal can show the LIVE figure for a running spec
+// instead of only the durable one the write-back stores. It is the spec-level
+// analogue of the per-GPU vram_measured_mb on gpus[]; the write-back itself is a
+// separate path and is untouched.
+func TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_live_ram")
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_live_ram", `"ram_measured_mb":6000,`))
+
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot = %#v, want one entry", snap)
+	}
+	if snap[0].RAMMeasuredMB != 6000 {
+		t.Fatalf("status RAMMeasuredMB = %d, want the sample's 6000", snap[0].RAMMeasuredMB)
+	}
+	payload, err := json.Marshal(snap[0])
+	if err != nil {
+		t.Fatalf("marshal status: %v", err)
+	}
+	if !strings.Contains(string(payload), `"ram_measured_mb":6000`) {
+		t.Fatalf("status JSON = %s, want ram_measured_mb:6000 on the wire", payload)
+	}
+	// The durable write-back is a separate path and still lands.
+	if got := storedRAM(t, srv, "rspec_live_ram"); got.RAMMeasuredMB != 6000 {
+		t.Fatalf("stored RAMMeasuredMB = %d, want the write-back's 6000 unchanged", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeStatusRAMFollowsEachFrame proves a status
+// frame is a full snapshot for RAM too: a later frame replaces the figure, and a
+// frame that measured nothing (the process exited, or the agent stopped
+// reporting RAM) clears it instead of leaving the last number on screen as if it
+// were still true. The durable value is deliberately NOT cleared by the same
+// frame -- that is the write-back's own `> 0` rule.
+func TestIngestTelemetrySampleRuntimeStatusRAMFollowsEachFrame(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_live_ram_seq")
+
+	liveRAM := func() int {
+		t.Helper()
+		snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+		defer unsub()
+		if len(snap) != 1 {
+			t.Fatalf("snapshot = %#v, want one entry", snap)
+		}
+		return snap[0].RAMMeasuredMB
+	}
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_live_ram_seq", `"ram_measured_mb":6000,`))
+	if got := liveRAM(); got != 6000 {
+		t.Fatalf("live RAM = %d after the first frame, want 6000", got)
+	}
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_live_ram_seq", `"ram_measured_mb":7500,`))
+	if got := liveRAM(); got != 7500 {
+		t.Fatalf("live RAM = %d after a changed frame, want 7500", got)
+	}
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_live_ram_seq", ""))
+	if got := liveRAM(); got != 0 {
+		t.Fatalf("live RAM = %d after a frame with no measurement, want 0 (unknown)", got)
+	}
+	if got := storedRAM(t, srv, "rspec_live_ram_seq"); got.RAMMeasuredMB != 7500 {
+		t.Fatalf("stored RAMMeasuredMB = %d, want the durable 7500 kept by a frame that measured nothing", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeStatusOmitsUnknownRAM proves the stream never
+// publishes a RAM figure it has no measurement for: an absent key (an agent that
+// predates the field, or a spec with no process yet), a measured 0 -- UNKNOWN
+// throughout this feature, never "needs no RAM" -- and a negative number a buggy
+// agent could send all leave the field zero and OFF the wire, on the same `> 0`
+// rule the store write-back applies to the same field.
+func TestIngestTelemetrySampleRuntimeStatusOmitsUnknownRAM(t *testing.T) {
+	cases := []struct {
+		name     string
+		fragment string
+	}{
+		{name: "no ram_measured_mb key at all", fragment: ""},
+		{name: "a measured 0 means unknown", fragment: `"ram_measured_mb":0,`},
+		{name: "a negative measurement is not a measurement", fragment: `"ram_measured_mb":-5,`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, "rspec_live_ram_unknown")
+			ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_live_ram_unknown", tc.fragment))
+			snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+			defer unsub()
+			if len(snap) != 1 {
+				t.Fatalf("snapshot = %#v, want one entry", snap)
+			}
+			if snap[0].RAMMeasuredMB != 0 {
+				t.Fatalf("status RAMMeasuredMB = %d, want 0 (unknown)", snap[0].RAMMeasuredMB)
+			}
+			payload, err := json.Marshal(snap[0])
+			if err != nil {
+				t.Fatalf("marshal status: %v", err)
+			}
+			if strings.Contains(string(payload), "ram_measured_mb") {
+				t.Fatalf("status JSON = %s, want no ram_measured_mb key", payload)
+			}
+		})
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeStatusRAMIsNotAVRAMWatermark pins that the
+// RAM figure does not borrow the VRAM measurement's freshness stamp: MeasuredAt
+// is the watermark of the per-GPU frame the VRAM benchmark accepts evidence from
+// (vramMeasuredFromFrame treats a non-zero MeasuredAt as "this frame carries a
+// GPU measurement"), so a frame that measured only RAM -- a CPU-only spec, or a
+// host with no VRAM measurer -- must not stamp it.
+func TestIngestTelemetrySampleRuntimeStatusRAMIsNotAVRAMWatermark(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_live_ram_only")
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_live_ram_only", `"ram_measured_mb":6000,`))
+
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 {
+		t.Fatalf("snapshot = %#v, want one entry", snap)
+	}
+	if len(snap[0].GPUs) != 0 || !snap[0].MeasuredAt.IsZero() {
+		t.Fatalf("status gpus = %#v measured_at = %v, want neither for a RAM-only frame", snap[0].GPUs, snap[0].MeasuredAt)
+	}
+	if got := vramMeasuredFromFrame(snap, "rspec_live_ram_only"); len(got) != 0 {
+		t.Fatalf("vramMeasuredFromFrame = %#v, want nothing from a RAM-only frame", got)
+	}
+}
+
 // --- Task 12: per-mapping context probe write-back ------------------------
 
 // TestIngestTelemetrySampleRuntimeContextWriteBack proves a sample's

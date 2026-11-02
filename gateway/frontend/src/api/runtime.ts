@@ -270,16 +270,19 @@ export interface RuntimeStatus {
   queue_depth: number;
   gpus?: RuntimeGPUStatus[];
   measured_at?: string;
-  // This process's measured resident host RAM in MB: the spec-level
-  // counterpart of the per-GPU `gpus[].vram_measured_mb` above (RAM has no GPU
-  // axis, so one scalar). Agent-owned and read-only. Optional because 0 is the
-  // UNKNOWN sentinel -- a host with no RAM measurer, or a spec with no live
-  // process -- and an unknown measurement is absent, never sent as a number.
-  // The durable value, and the one the admin table reads, is the spec's own
-  // RuntimeSpec.ram_measured_mb from the telemetry write-back. NOTE: the
-  // gateway's status frame (RuntimeStatusDTO) does not forward the key yet, so
-  // today this stays undefined; the type reserves it for when the frame does,
-  // and nothing may rely on it being populated.
+  // This process's measured resident host RAM in MB, as carried on THIS
+  // frame: the spec-level counterpart of the per-GPU `gpus[].vram_measured_mb`
+  // above (RAM has no GPU axis, so one scalar). Agent-owned and read-only.
+  // Optional because 0 is the UNKNOWN sentinel -- a host with no RAM measurer,
+  // an agent that predates the field, or a spec with no live process -- and the
+  // gateway omits an unknown measurement rather than sending it as a number.
+  // This is the LIVE figure: every frame is a full snapshot, so a frame
+  // without the key means nothing is measured right now. The admin table's RAM
+  // column prefers it whenever a spec's live row carries it, as max(live, the
+  // spec's durable RuntimeSpec.ram_measured_mb, RuntimeSpec.ram_estimate_mb),
+  // and falls back to the durable values when a spec has no live row or its row
+  // carries none.
+  // It does not stamp `measured_at`, which is the per-GPU watermark.
   ram_measured_mb?: number;
   last_error?: RuntimeError;
   // Whether the agent's last per-model probe of its `/metrics` and context
