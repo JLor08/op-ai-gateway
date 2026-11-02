@@ -764,7 +764,11 @@ test("5 — admission arithmetic: with a budget for one, an inference for B evic
     name: new RegExp(`^${escapeRegExp(t.coresidencyMemberControl(""))}`)
   });
   await expect(pairControl).toHaveCount(1);
-  const allowed = pairControl.getByRole("button", { name: t.coresidencyVerdictAllow });
+  // exact: Playwright's name match is a case-insensitive SUBSTRING by default, and
+  // the German "Erlaubt" is also inside the Default segment's "Standard (erlaubt)",
+  // so the bare name matches two buttons and every action on it is a strict-mode
+  // violation.
+  const allowed = pairControl.getByRole("button", { name: t.coresidencyVerdictAllow, exact: true });
   await expect(allowed).toHaveAttribute("aria-pressed", "false");
   const [paired] = await Promise.all([
     page.waitForResponse(
