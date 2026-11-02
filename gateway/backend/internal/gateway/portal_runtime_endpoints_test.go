@@ -556,7 +556,7 @@ func TestHandlePortalApplicationCoResidencyPutCanonicalizesAndRoundTrips(t *test
 		a, b = b, a
 	}
 	// Submit the pair reversed -- the endpoint must canonicalize server-side.
-	body := `{"pairs":[["` + b + `","` + a + `"]]}`
+	body := `{"pairs":[{"a":"` + b + `","b":"` + a + `","verdict":"allow"}]}`
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/applications/"+appID+"/runtime/coresidency", body))
 	if rec.Code != http.StatusOK {
@@ -566,8 +566,8 @@ func TestHandlePortalApplicationCoResidencyPutCanonicalizesAndRoundTrips(t *test
 	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
 		t.Fatalf("unmarshal: %v, body = %s", err, rec.Body.String())
 	}
-	if len(dto.Pairs) != 1 || dto.Pairs[0][0] != a || dto.Pairs[0][1] != b {
-		t.Fatalf("pairs = %#v, want canonical [[%q,%q]]", dto.Pairs, a, b)
+	if len(dto.Pairs) != 1 || dto.Pairs[0].A != a || dto.Pairs[0].B != b || dto.Pairs[0].Verdict != "allow" {
+		t.Fatalf("pairs = %#v, want canonical allow [%q,%q]", dto.Pairs, a, b)
 	}
 
 	getRec := httptest.NewRecorder()
@@ -579,15 +579,72 @@ func TestHandlePortalApplicationCoResidencyPutCanonicalizesAndRoundTrips(t *test
 	if err := json.Unmarshal(getRec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v, body = %s", err, getRec.Body.String())
 	}
-	if len(got.Pairs) != 1 || got.Pairs[0][0] != a || got.Pairs[0][1] != b {
-		t.Fatalf("GET pairs = %#v, want canonical [[%q,%q]]", got.Pairs, a, b)
+	if len(got.Pairs) != 1 || got.Pairs[0].A != a || got.Pairs[0].B != b || got.Pairs[0].Verdict != "allow" {
+		t.Fatalf("GET pairs = %#v, want canonical allow [%q,%q]", got.Pairs, a, b)
+	}
+}
+
+// TestHandlePortalApplicationCoResidencyModeAndVerdictOnTheWire pins the JSON
+// shape the editor relies on: a PUT of {"mode","pairs":[{"a","b","verdict"}]}
+// answers with, and a later GET returns, the same mode and the same per-pair
+// verdicts -- a forbid is not collapsed into an allow on the way back out.
+func TestHandlePortalApplicationCoResidencyModeAndVerdictOnTheWire(t *testing.T) {
+	srv := NewTestServer()
+	appID, m1, m2 := seedCoResidencyApp(t, srv)
+	a, b := m1, m2
+	if a > b {
+		a, b = b, a
+	}
+	body := `{"mode":"opt_out","pairs":[{"a":"` + b + `","b":"` + a + `","verdict":"forbid"}]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/applications/"+appID+"/runtime/coresidency", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	want := `{"mode":"opt_out","pairs":[{"a":"` + a + `","b":"` + b + `","verdict":"forbid"}]}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Fatalf("PUT body = %s, want %s", got, want)
+	}
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, newJSONRequest(http.MethodGet, "/api/portal/applications/"+appID+"/runtime/coresidency", ""))
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200, body = %s", getRec.Code, getRec.Body.String())
+	}
+	if got := strings.TrimSpace(getRec.Body.String()); got != want {
+		t.Fatalf("GET body = %s, want %s", got, want)
+	}
+}
+
+// TestHandlePortalApplicationCoResidencyPutUnknownModeOrVerdictReturns400 pins
+// the two new 400 codes: an unknown mode has its own, an unknown verdict is an
+// invalid pair.
+func TestHandlePortalApplicationCoResidencyPutUnknownModeOrVerdictReturns400(t *testing.T) {
+	srv := NewTestServer()
+	appID, m1, m2 := seedCoResidencyApp(t, srv)
+	cases := []struct {
+		name, body, wantCode string
+	}{
+		{"unknown mode", `{"mode":"sometimes","pairs":[]}`, "runtime_coresidency.mode_invalid"},
+		{"unknown verdict", `{"mode":"opt_out","pairs":[{"a":"` + m1 + `","b":"` + m2 + `","verdict":"maybe"}]}`, "runtime_coresidency.pair_invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/applications/"+appID+"/runtime/coresidency", tc.body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+			if code := errorBodyOf(t, rec); code != tc.wantCode {
+				t.Fatalf("error code = %q, want %q", code, tc.wantCode)
+			}
+		})
 	}
 }
 
 func TestHandlePortalApplicationCoResidencyPutDuplicateAfterNormalizationReturns400(t *testing.T) {
 	srv := NewTestServer()
 	appID, m1, m2 := seedCoResidencyApp(t, srv)
-	body := `{"pairs":[["` + m1 + `","` + m2 + `"],["` + m2 + `","` + m1 + `"]]}`
+	body := `{"pairs":[{"a":"` + m1 + `","b":"` + m2 + `","verdict":"allow"},{"a":"` + m2 + `","b":"` + m1 + `","verdict":"forbid"}]}`
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/applications/"+appID+"/runtime/coresidency", body))
 	if rec.Code != http.StatusBadRequest {

@@ -176,6 +176,11 @@ var (
 	// invalid the same way), or two pairs colliding after canonical
 	// (mapping_a_id < mapping_b_id) normalization.
 	ErrCoResidencyPairInvalid = errors.New("runtime_coresidency.pair_invalid")
+	// ErrCoResidencyModeInvalid rejects a SetCoResidency whose mode is
+	// neither routing.CoResidencyModeOptIn nor routing.CoResidencyModeOptOut.
+	// (An EMPTY mode is not invalid: it means "leave the stored mode alone".)
+	// HTTP 400, checked before any store call like every other validation here.
+	ErrCoResidencyModeInvalid = errors.New("runtime_coresidency.mode_invalid")
 	// ErrGPUBudgetInvalid rejects a SetServerGPUBudgets entry with a negative
 	// index, a negative budget_mb, or an index repeated across entries.
 	ErrGPUBudgetInvalid = errors.New("server.gpu_budget_invalid")
@@ -1756,53 +1761,107 @@ func normalizeRuntimeAPITokenHeaderSource(source string) string {
 
 // --- Task 6: co-residency matrix --------------------------------------------
 
-// CoResidencyDTO is the portal-facing pairwise co-residency matrix for one
-// application: every ALLOWED pair of its own mappings that may be loaded on
-// the same AI server at the same time. Each pair is always canonical
-// (Pairs[i][0] < Pairs[i][1] lexicographically) -- see SetCoResidency.
-// Always a non-nil Pairs slice, even when empty.
+// CoResidencyPairDTO is one EXPLICIT co-residency setting on the wire: a pair
+// of mapping ids and the verdict an operator gave it. On input the two ids may
+// come in either order (SetCoResidency sorts them); the returned pair is always
+// canonical (A < B lexicographically).
+//
+// Verdict is routing.CoResidencyVerdictAllow or routing.CoResidencyVerdictForbid.
+// A pair with NO entry is not listed at all -- what it means is the DTO's Mode.
+// On input an empty Verdict is an allow (what a pair meant before verdicts
+// existed, and what the store normalises it to).
+type CoResidencyPairDTO struct {
+	A       string `json:"a"`
+	B       string `json:"b"`
+	Verdict string `json:"verdict"`
+}
+
+// CoResidencyDTO is the portal-facing co-residency setting of one application
+// (one server_agent, hence one server): its Mode, and every EXPLICIT pair of its
+// own mappings with its verdict -- the pairs an operator has actually set, both
+// allows and forbids, not the effective matrix. Mode says what a pair that is
+// NOT listed means: routing.CoResidencyModeOptOut allows it (only forbids need
+// listing), routing.CoResidencyModeOptIn forbids it (only allows need listing).
+// Switching the mode never touches the listed pairs. The effective pair list the
+// agent receives is derived from both (effectiveAllowedPairs) and is not part of
+// this DTO. Always a non-nil Pairs slice, even when empty.
 type CoResidencyDTO struct {
-	Pairs [][2]string `json:"pairs"`
+	Mode  string               `json:"mode"`
+	Pairs []CoResidencyPairDTO `json:"pairs"`
 }
 
 // SetCoResidencyRequest is a full-document replace (like
 // SetRuntimeSpecGPUs/SetServerGPUBudgets): every pair supplied here IS the
-// new set. Pair ordering within each element does not matter -- SetCoResidency
-// sorts each pair server-side before storing/comparing.
+// new set of explicit pairs. Pair ordering within each element does not matter --
+// SetCoResidency sorts each pair server-side before storing/comparing.
+//
+// Mode is routing.CoResidencyModeOptIn or routing.CoResidencyModeOptOut; an
+// empty Mode leaves the stored mode unchanged (a request that does not name a
+// mode must never flip it), anything else is ErrCoResidencyModeInvalid.
+//
+// Pairs is always the WHOLE set: a request that omits it, or sends [], removes
+// every explicit pair. A client that only wants to switch the mode therefore
+// re-sends the pairs it read -- the switch itself never touches them.
 type SetCoResidencyRequest struct {
-	Pairs [][2]string `json:"pairs"`
+	Mode  string               `json:"mode"`
+	Pairs []CoResidencyPairDTO `json:"pairs"`
 }
 
-// GetCoResidency returns appID's allowed co-residency pairs. authorizeApplication
-// gates it (404-no-leak, same collapse as every other application read).
+// GetCoResidency returns appID's co-residency mode and explicit pairs, each with
+// its verdict. authorizeApplication gates it (404-no-leak, same collapse as
+// every other application read).
 func (s *Service) GetCoResidency(ctx context.Context, principal auth.Token, appID string) (CoResidencyDTO, error) {
 	app, _, err := s.authorizeApplication(ctx, principal, appID)
 	if err != nil {
 		return CoResidencyDTO{}, err
 	}
-	rules, err := s.routes.CoResidencyRulesByApplication(ctx, app.ID)
+	return s.storedCoResidency(ctx, app.ID)
+}
+
+// storedCoResidency reads appID's stored mode and explicit pairs into the DTO.
+// It does no authorization: both callers have already run authorizeApplication.
+func (s *Service) storedCoResidency(ctx context.Context, appID string) (CoResidencyDTO, error) {
+	mode, err := s.routes.GetCoResidencyMode(ctx, appID)
 	if err != nil {
 		return CoResidencyDTO{}, err
 	}
-	return coResidencyDTO(rules), nil
+	rules, err := s.routes.CoResidencyRulesByApplication(ctx, appID)
+	if err != nil {
+		return CoResidencyDTO{}, err
+	}
+	return coResidencyDTO(mode, rules), nil
 }
 
-// SetCoResidency validates and atomically replaces appID's whole co-residency
-// set. Every pair is validated BEFORE any store call (validate-before-mutate):
-// the two ids must be distinct, both must name a mapping belonging to appID
+// SetCoResidency validates and atomically replaces appID's whole set of explicit
+// co-residency pairs, and sets its mode when the request names one. Everything
+// is validated BEFORE any store call (validate-before-mutate): the mode must be
+// a known one, every verdict must be a known one, the two ids of a pair must be
+// distinct, both must name a mapping belonging to appID
 // itself (checked against s.routes.MappingsByApplication, never a bare global
 // existence check -- a mapping id that exists but belongs to a DIFFERENT
 // application is exactly as invalid as one that does not exist at all), each
 // pair is canonicalized by sorting it (mapping_a_id < mapping_b_id
 // lexicographically) so the client never has to submit pairs in a particular
 // order, and duplicate pairs are rejected AFTER that normalization -- so
-// [["a","b"],["b","a"]] is a duplicate, not two distinct entries. The store
-// itself (SetCoResidencyRules) is a dumb pair table by design and performs
-// none of this; it is entirely this method's job.
+// [["a","b"],["b","a"]] is a duplicate, not two distinct entries (whatever
+// verdicts they carry). The store itself (SetCoResidencyRules) is a dumb pair
+// table by design and performs none of this beyond the verdict; it is
+// entirely this method's job.
+//
+// The mode and the pairs are two store writes, not one transaction. The
+// effective list the agent receives depends on both, and SetCoResidencyMode does
+// not bump updated_at, so the agent is notified after the writes -- and also when
+// the pairs write fails after the mode write landed, because the stored mode
+// (hence the effective list) HAS changed by then. A failure of the first write
+// leaves the pairs untouched, so nothing was changed and nothing is announced.
 func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appID string, req SetCoResidencyRequest) (CoResidencyDTO, error) {
 	app, server, err := s.authorizeApplication(ctx, principal, appID)
 	if err != nil {
 		return CoResidencyDTO{}, err
+	}
+	mode := routing.CoResidencyMode(req.Mode)
+	if req.Mode != "" && !mode.Valid() {
+		return CoResidencyDTO{}, ErrCoResidencyModeInvalid
 	}
 	ownMappings, err := s.routes.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -1816,11 +1875,15 @@ func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appI
 	rules := make([]routing.CoResidencyRule, 0, len(req.Pairs))
 	now := s.clock().UTC()
 	for _, pair := range req.Pairs {
-		a, b := strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
+		a, b := strings.TrimSpace(pair.A), strings.TrimSpace(pair.B)
 		if a == "" || b == "" || a == b {
 			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
 		}
 		if !belongsToApp[a] || !belongsToApp[b] {
+			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
+		}
+		verdict, ok := routing.NormalizeCoResidencyVerdict(pair.Verdict)
+		if !ok {
 			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
 		}
 		if a > b {
@@ -1831,28 +1894,35 @@ func (s *Service) SetCoResidency(ctx context.Context, principal auth.Token, appI
 			return CoResidencyDTO{}, ErrCoResidencyPairInvalid
 		}
 		seenPairs[key] = true
-		rules = append(rules, routing.CoResidencyRule{ApplicationID: app.ID, MappingAID: a, MappingBID: b, CreatedAt: now})
+		rules = append(rules, routing.CoResidencyRule{ApplicationID: app.ID, MappingAID: a, MappingBID: b, Verdict: verdict, CreatedAt: now})
+	}
+	modeWritten := false
+	if req.Mode != "" {
+		if err := s.routes.SetCoResidencyMode(ctx, app.ID, mode); err != nil {
+			return CoResidencyDTO{}, err
+		}
+		modeWritten = true
 	}
 	if err := s.routes.SetCoResidencyRules(ctx, app.ID, rules); err != nil {
+		if modeWritten {
+			s.notifyRuntimeChanged(server.ID)
+		}
 		return CoResidencyDTO{}, err
 	}
 	s.notifyRuntimeChanged(server.ID)
-	stored, err := s.routes.CoResidencyRulesByApplication(ctx, app.ID)
-	if err != nil {
-		return CoResidencyDTO{}, err
-	}
-	return coResidencyDTO(stored), nil
+	return s.storedCoResidency(ctx, app.ID)
 }
 
-// coResidencyDTO builds the wire DTO from stored rules; always a non-nil
-// Pairs slice (a collection-shaped return must never serialize to JSON
-// null -- see SetRuntimeSpecGPUs's equivalent contract).
-func coResidencyDTO(rules []routing.CoResidencyRule) CoResidencyDTO {
-	pairs := make([][2]string, 0, len(rules))
+// coResidencyDTO builds the wire DTO from the stored mode and explicit rules;
+// always a non-nil Pairs slice (a collection-shaped return must never serialize
+// to JSON null -- see SetRuntimeSpecGPUs's equivalent contract). Every rule is
+// listed with its own verdict: a forbid is never folded into an allow.
+func coResidencyDTO(mode routing.CoResidencyMode, rules []routing.CoResidencyRule) CoResidencyDTO {
+	pairs := make([]CoResidencyPairDTO, 0, len(rules))
 	for _, r := range rules {
-		pairs = append(pairs, [2]string{r.MappingAID, r.MappingBID})
+		pairs = append(pairs, CoResidencyPairDTO{A: r.MappingAID, B: r.MappingBID, Verdict: r.Verdict})
 	}
-	return CoResidencyDTO{Pairs: pairs}
+	return CoResidencyDTO{Mode: string(mode), Pairs: pairs}
 }
 
 // --- Task 6: per-GPU VRAM budgets -------------------------------------------
