@@ -533,6 +533,17 @@ type RuntimeSpecDTO struct {
 	EffectiveType            string `json:"effective_type"`
 	ResolvedMetricsPath      string `json:"resolved_metrics_path"`
 	ResolvedContextProbePath string `json:"resolved_context_probe_path"`
+	// Role is the spec's derived model role -- one of the routing.ModelRole
+	// values ("asr", "tts", "image", "embedding", "reranker", "chat", "other"),
+	// never empty: routing.DeriveRole over EffectiveType and the yes verdicts of
+	// this spec's mapping. It is the portal-facing twin of AgentRuntimeSpecDTO.Role
+	// -- the same derivation over the same two inputs -- so the co-residency
+	// editor's per-spec grouping and the agent's role-aware eviction read one
+	// value. A READ-ONLY echo like EffectiveType: derived on every read (GET and
+	// the PUT response), never stored, and deliberately absent from
+	// PutRuntimeSpecRequest. It is NOT ModelDTO.Role, which folds every mapping of
+	// a model NAME into its best-ranked role; this is the role of one spec.
+	Role string `json:"role"`
 }
 
 // ConfigFileDTO is one operator-supplied config file of a runtime spec: a
@@ -650,6 +661,10 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 		emptySpec := routing.RuntimeSpec{}
 		effectiveType := routing.EffectiveRuntimeSpecType(emptySpec)
 		resolvedMetrics, resolvedContext := routing.DeriveProbePaths(effectiveType, emptySpec.MetricsPath, emptySpec.ContextProbePath)
+		role, err := s.runtimeSpecRole(ctx, mapping.ID, effectiveType)
+		if err != nil {
+			return RuntimeSpecDTO{}, err
+		}
 		return RuntimeSpecDTO{
 			MappingID:                mapping.ID,
 			Args:                     []string{},
@@ -665,13 +680,47 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			EffectiveType:            string(effectiveType),
 			ResolvedMetricsPath:      resolvedMetrics,
 			ResolvedContextProbePath: resolvedContext,
+			Role:                     role,
 		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return runtimeSpecDTO(spec, gpus, app)
+	dto, err := runtimeSpecDTO(spec, gpus, app)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	return s.withRuntimeSpecRole(ctx, dto)
+}
+
+// runtimeSpecRole is the derived role of the spec on mappingID whose effective
+// type is effectiveType: routing.DeriveRole over that type and the mapping's yes
+// verdicts -- the same call AgentRuntimeConfig makes for the pushed spec, here
+// for ONE mapping (one capability read) instead of a batch. A failed read is an
+// error, never a role guessed from the type alone: the editor groups -- and bulk
+// writes -- by this value, and a verdict-blind guess would file an embedding model
+// under chat.
+func (s *Service) runtimeSpecRole(ctx context.Context, mappingID string, effectiveType routing.RuntimeSpecType) (string, error) {
+	rows, err := s.routes.MappingCapabilities(ctx, mappingID)
+	if err != nil {
+		return "", err
+	}
+	return string(routing.DeriveRole(effectiveType, routing.YesCapabilities(rows))), nil
+}
+
+// withRuntimeSpecRole returns dto with its read-only Role filled in from its own
+// MappingID and EffectiveType. runtimeSpecDTO stays pure (it is also the
+// benchmark writers' read-modify-write input, which has no use for a role and
+// must not pay a store read for one); the two portal-facing responses -- GET and
+// the PUT/benchmark-admin-state write-back -- go through here.
+func (s *Service) withRuntimeSpecRole(ctx context.Context, dto RuntimeSpecDTO) (RuntimeSpecDTO, error) {
+	role, err := s.runtimeSpecRole(ctx, dto.MappingID, routing.RuntimeSpecType(dto.EffectiveType))
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	dto.Role = role
+	return dto, nil
 }
 
 // PutRuntimeSpec validates and upserts mappingID's runtime spec (create on
@@ -754,13 +803,22 @@ func (s *Service) serverIsBenchmarking(serverID string) bool {
 //
 // The notification fires exactly when writeRuntimeSpec reports stored: once
 // UpsertRuntimeSpec has succeeded, also when the GPU-row write or the
-// read-back after it fails.
+// read-back after it fails. The returned document carries the derived Role
+// (withRuntimeSpecRole), which writeRuntimeSpec's batch callers have no use for
+// and so never pay a read for.
 func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string) (RuntimeSpecDTO, error) {
 	dto, stored, err := s.writeRuntimeSpec(ctx, mapping, app, req, expectSpecID)
 	if stored {
 		s.notifyRuntimeChanged(server.ID)
 	}
-	return dto, err
+	if err != nil {
+		return dto, err
+	}
+	// The write-back is the document the portal commits into the same per-mapping
+	// cache a GET fills, so it carries the derived role like a GET does. Read AFTER
+	// the notification: a failed read reports the error but the row IS stored and
+	// announced, exactly like a failed GPU read-back inside writeRuntimeSpec.
+	return s.withRuntimeSpecRole(ctx, dto)
 }
 
 // writeRuntimeSpec is the one implementation of the full-document upsert:
