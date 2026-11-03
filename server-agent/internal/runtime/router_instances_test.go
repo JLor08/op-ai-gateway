@@ -118,10 +118,11 @@ func formParts(t *testing.T, contentType string, body []byte) []formPart {
 
 // TestRouterRewritesInstanceModelJSON: a JSON request for m#1 reaches instance 1
 // with its top-level model rewritten to m -- on the plain path and the
-// streaming one -- and every other byte exactly as sent: the keys in their
-// order, the spacing, the HTML-sensitive characters and the escapes unchanged,
-// and the numbers with their digits (1.50 stays 1.50, 1e3 stays 1e3), so a child
-// that hashes, signs or caches the body sees what instance 0 would have seen.
+// streaming one, and under a model key written with an escape -- and every other
+// byte exactly as sent: the keys in their order, the spacing, the HTML-sensitive
+// characters and the escapes unchanged, and the numbers with their digits (1.50
+// stays 1.50, 1e3 stays 1e3), so a child that hashes, signs or caches the body
+// sees what instance 0 would have seen.
 func TestRouterRewritesInstanceModelJSON(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -133,8 +134,8 @@ func TestRouterRewritesInstanceModelJSON(t *testing.T) {
 		{"streaming", `{"model":"m#1","stream":true,"n":1.50}`, `{"model":"m","stream":true,"n":1.50}`},
 		{
 			"every other byte",
-			`{ "z": "<&>", "model" : "m#1",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "tools": [{"model":"m#1"}] }`,
-			`{ "z": "<&>", "model" : "m",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "tools": [{"model":"m#1"}] }`,
+			`{ "z": "<&>", "\u006dodel" : "m#1",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "v": "caf\u00e9", "q": "say \"hi\"", "tools": [{"model":"m#1"}] }`,
+			`{ "z": "<&>", "\u006dodel" : "m",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "v": "caf\u00e9", "q": "say \"hi\"", "tools": [{"model":"m#1"}] }`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -974,7 +975,17 @@ func TestRewriteModelFieldKeepsEveryOtherByte(t *testing.T) {
 		},
 		{"the model key last", `{"n":1.50,"model":"m#1"}`, "m", `{"n":1.50,"model":"m"}`},
 		{"a key in another case", `{"Model":"m#1","n":1}`, "m", `{"Model":"m","n":1}`},
-		{"an escaped key", `{"model":"m#1"}`, "m", `{"model":"m"}`},
+		{
+			// The key is read after unescaping, as encoding/json routes on it, and
+			// every escape around the model's value -- in the key itself and in
+			// the other strings -- is kept exactly as it was written.
+			"an escaped key",
+			`{"u":"caf\u00e9","q":"say \"hi\"","\u006dodel":"m#1","p":"a\/b\\c"}`,
+			"m",
+			`{"u":"caf\u00e9","q":"say \"hi\"","\u006dodel":"m","p":"a\/b\\c"}`,
+		},
+		{"an escaped model value", `{"model":"m\u00231","n":1}`, "m", `{"model":"m","n":1}`},
+		{"an escaped value that already names the base", `{"model":"m#1","Model":"\u006d"}`, "m", `{"model":"m","Model":"\u006d"}`},
 		{"every key that reads as the model", `{"model":"m#1","MODEL":"m#1"}`, "m", `{"model":"m","MODEL":"m"}`},
 		{"a null model beside a string one", `{"model":null,"Model":"m#1"}`, "m", `{"model":null,"Model":"m"}`},
 		{"already the base", `{ "model" : "m" }`, "m", `{ "model" : "m" }`},
