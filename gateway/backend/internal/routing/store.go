@@ -956,18 +956,24 @@ type ModelMapping struct {
 	RecommendedConcurrency       int     // recommended concurrent requests before throughput degrades; 0 = unknown
 	GenTokensPerSecondAtCapacity float64 // aggregate generation throughput at MaxConcurrency (tokens/s); 0 = unknown
 
-	// Per-mapping AUDIO performance metrics (migration 101; #340 design section
-	// 8.5), the audio counterpart of the text metrics above, for a mapping with
-	// the speech (TTS) or transcription (ASR) capability. The audio benchmark's
-	// speed and capacity runs write them through UpdateMappingAudioMetrics,
-	// under the same MetricsLocked guard and stamping the same MetricsSource /
+	// Per-mapping AUDIO performance metrics (migration 101, #340), the audio
+	// counterpart of the text metrics above, for a mapping with the speech
+	// (TTS) or transcription (ASR) capability. The audio benchmark's speed and
+	// capacity runs write them through UpdateMappingAudioMetrics, under the
+	// same MetricsLocked guard and stamping the same MetricsSource /
 	// MetricsUpdatedAt as the text writers. They live on the mapping, not on a
 	// running process, so routing and the scaler can read them whether or not
-	// the model is loaded. 0 / "" / nil = unknown everywhere.
+	// the model is loaded. 0 / "" / nil = unknown, except for the concurrency
+	// ramp's count: it and AudioConcurrencyLimit are one result -- the last
+	// level whose slowest stream still met the real-time threshold, and why
+	// the ramp stopped there -- so they read together. With no limit, no ramp
+	// has run and the count is unknown; with a limit, the count is measured,
+	// and 0 means not real-time even with a single stream: under
+	// "performance" a ceiling of 0, which the scaler honours like any other.
 	AudioRateX               float64    // audio seconds produced (TTS) or transcribed (ASR) per wall second, one stream; 0 = unknown
 	AudioTTFAMS              int64      // time to the first audio (TTS) or first transcript text (ASR), ms; 0 = unknown
-	AudioRealtimeConcurrency int        // most concurrent streams whose slowest still met the real-time threshold; 0 = unknown
-	AudioConcurrencyLimit    string     // why that ramp stopped: "performance" | "resources" | "cap"; "" = unknown
+	AudioRealtimeConcurrency int        // the ramp's last good level: most concurrent streams whose slowest still met the real-time threshold; unknown only while AudioConcurrencyLimit is ""
+	AudioConcurrencyLimit    string     // why that ramp stopped: "performance" (a measured ceiling) | "resources" | "cap" (the count is a lower bound); "" = no ramp yet
 	AudioMetricsUpdatedAt    *time.Time // when an audio benchmark last wrote these; nil = never
 	CreatedAt                time.Time
 	UpdatedAt                time.Time
@@ -2208,25 +2214,45 @@ func (m MappingMetricsMask) Any() bool {
 }
 
 // AudioMetrics is what one audio benchmark run measured, for
-// UpdateMappingAudioMetrics (#340 design section 8.5): a speed run yields RateX
-// and TTFAMS (and LoadTimeMS from a confirmed cold start), a capacity ramp
-// yields RealtimeConcurrency and ConcurrencyLimit. A zero value means "this
-// run did not measure it" and keeps the stored column, so a speed-only run
-// never erases the capacity figures and a capacity-only run never erases the
-// speed ones.
+// UpdateMappingAudioMetrics: a speed run yields RateX and TTFAMS (and
+// LoadTimeMS from a confirmed cold start), a capacity ramp yields
+// RealtimeConcurrency and ConcurrencyLimit. A rate, TTFA or load time of 0 or
+// below means "this run did not measure it" and keeps the stored column, so a
+// speed-only run never erases the capacity figures and a capacity-only run
+// never erases the speed ones.
+//
+// The ramp's two fields are one result and follow their own rule
+// (RampMeasured): the level and the reason the ramp stopped there are written
+// together or not at all. A ramp always reports why it stopped, so a
+// non-empty ConcurrencyLimit is what marks a ramp result, and its
+// RealtimeConcurrency is measured even at 0 -- the ramp found no good level,
+// the model is not real-time even with one stream. Judging the count by its
+// own sign instead would keep a stored count next to the new limit and stamp:
+// a fresh-looking ceiling the latest ramp contradicts.
 type AudioMetrics struct {
 	RateX               float64 // -> ModelMapping.AudioRateX
 	TTFAMS              int64   // -> ModelMapping.AudioTTFAMS
-	RealtimeConcurrency int     // -> ModelMapping.AudioRealtimeConcurrency
-	ConcurrencyLimit    string  // -> ModelMapping.AudioConcurrencyLimit
+	RealtimeConcurrency int     // -> ModelMapping.AudioRealtimeConcurrency, only together with ConcurrencyLimit
+	ConcurrencyLimit    string  // -> ModelMapping.AudioConcurrencyLimit; non-empty marks a ramp result
 	LoadTimeMS          int64   // -> ModelMapping.LoadTimeMS, the cold-start figure a text benchmark writes too
 }
 
+// RampMeasured reports whether the run carries a concurrency-ramp result: a
+// stop reason together with the level the ramp stopped at, 0 or more. Only
+// then are the two written, and always as a pair, so the stored count and
+// limit always come from the same ramp. A count without its reason, or a
+// reason with a negative level no ramp can end on, is no ramp result and
+// keeps both stored fields.
+func (m AudioMetrics) RampMeasured() bool {
+	return m.ConcurrencyLimit != "" && m.RealtimeConcurrency >= 0
+}
+
 // Measured reports whether the run measured anything at all -- a positive
-// number or a non-empty limit. A run that did not writes nothing, provenance
-// included, the rule UpdateMappingBenchmarkMetrics applies to a text run.
+// rate, TTFA or load time, or a ramp result (RampMeasured). A run that did not
+// writes nothing, provenance included, the rule UpdateMappingBenchmarkMetrics
+// applies to a text run.
 func (m AudioMetrics) Measured() bool {
-	return m.RateX > 0 || m.TTFAMS > 0 || m.RealtimeConcurrency > 0 || m.ConcurrencyLimit != "" || m.LoadTimeMS > 0
+	return m.RateX > 0 || m.TTFAMS > 0 || m.RampMeasured() || m.LoadTimeMS > 0
 }
 
 type MappingStore interface {
@@ -2275,10 +2301,13 @@ type MappingStore interface {
 	// UpdateMappingAudioMetrics writes one audio benchmark run's measurements
 	// (migration 101), the audio counterpart of UpdateMappingBenchmarkMetrics:
 	// atomically and ONLY when metrics_locked is false (a no-op, non-error, when
-	// the mapping is missing or locked). A run writes only what it measured --
-	// a number of 0 or below, or an empty ConcurrencyLimit, keeps the stored
-	// column -- and a positive LoadTimeMS also writes load_time_ms. A write is
-	// stamped with metrics_source = source and with one store-taken time in both
+	// the mapping is missing or locked). A run writes only what it measured: a
+	// rate, TTFA or load time of 0 or below keeps the stored column, and a
+	// positive LoadTimeMS also writes load_time_ms. The ramp's count and limit
+	// are one result, written together -- a measured 0 included -- when the run
+	// carries one (AudioMetrics.RampMeasured) and both kept otherwise, so the
+	// stored pair never mixes two ramps. A write is stamped with
+	// metrics_source = source and with one store-taken time in both
 	// metrics_updated_at and audio_metrics_updated_at; a call that measured
 	// nothing (AudioMetrics.Measured) writes nothing, provenance included. It
 	// touches only those columns, so it cannot clobber a concurrent edit of

@@ -4461,15 +4461,15 @@ func migration100Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return nil
 }
 
-// migration101Up adds the audio performance metrics to model_mappings (#340,
-// design section 8.5): audio_rate_x, audio_ttfa_ms,
-// audio_realtime_concurrency, audio_concurrency_limit and
-// audio_metrics_updated_at -- what the audio benchmark's speed and capacity
-// runs measure, stored on the mapping like the text metrics so routing and the
-// scaler can use them whether or not the model is loaded. They are part of the
-// metrics_locked group: UpdateMappingAudioMetrics writes them only while the
-// mapping is unlocked and stamps metrics_source / metrics_updated_at as the
-// text writers do, plus the audio-only stamp.
+// migration101Up adds the audio performance metrics to model_mappings (#340):
+// audio_rate_x, audio_ttfa_ms, audio_realtime_concurrency,
+// audio_concurrency_limit and audio_metrics_updated_at -- what the audio
+// benchmark's speed and capacity runs measure, stored on the mapping like the
+// text metrics so routing and the scaler can use them whether or not the
+// model is loaded. They are part of the metrics_locked group:
+// UpdateMappingAudioMetrics writes them only while the mapping is unlocked
+// and stamps metrics_source / metrics_updated_at as the text writers do, plus
+// the audio-only stamp.
 //
 // The two wide columns follow migration 95, the audio columns of the
 // benchmark history: ADR-005's double precision for the factor (a Go float64)
@@ -4480,9 +4480,12 @@ func migration100Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // `integer not null default 0` like max_concurrency, the limit -- why the
 // concurrency ramp stopped: performance, resources or cap -- is text, not
 // null, defaulting to the empty string like metrics_source, and the stamp is
-// the dialect's nullable timestamp like metrics_updated_at. 0, the empty
-// string and NULL are "unknown" in every one of them, so every pre-existing
-// mapping reads back unmeasured and there is nothing to backfill.
+// the dialect's nullable timestamp like metrics_updated_at. NULL, 0 and the
+// empty string read as "unknown" -- the count only while the limit is empty:
+// the ramp stores the two together, and its measured 0 (not real-time even
+// with one stream) always comes with the reason the ramp stopped, so the count
+// needs no NULL of its own. Every pre-existing mapping, at 0 and the empty
+// string, reads back unmeasured, and there is nothing to backfill.
 //
 // Append-only: the v60-frozen baseline is not touched, so a fresh install gets
 // the columns by replaying this migration; addColumnIfMissing makes the step

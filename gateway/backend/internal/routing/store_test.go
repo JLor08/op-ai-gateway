@@ -521,3 +521,37 @@ func mergeTimePtrEqual(a, b *time.Time) bool {
 	}
 	return a.Equal(*b)
 }
+
+// TestAudioMetricsRampMeasured pins what UpdateMappingAudioMetrics treats as
+// measured. The concurrency ramp's count and limit are one result: a stop
+// reason marks it, its level counts even at 0 (the model is not real-time even
+// with one stream), and either half alone -- a count with no reason, or a
+// reason with a negative level -- is no ramp result. The other figures count
+// only when positive.
+func TestAudioMetricsRampMeasured(t *testing.T) {
+	cases := []struct {
+		name              string
+		m                 AudioMetrics
+		ramp, anyMeasured bool
+	}{
+		{"nothing", AudioMetrics{}, false, false},
+		{"a ramp that found no good level", AudioMetrics{ConcurrencyLimit: "performance"}, true, true},
+		{"a ramp whose first ensure was refused", AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: "resources"}, true, true},
+		{"a ramp that reached its cap", AudioMetrics{RealtimeConcurrency: 8, ConcurrencyLimit: "cap"}, true, true},
+		{"a count without the reason the ramp stopped", AudioMetrics{RealtimeConcurrency: 3}, false, false},
+		{"a reason with a negative level", AudioMetrics{RealtimeConcurrency: -1, ConcurrencyLimit: "cap"}, false, false},
+		{"a speed run", AudioMetrics{RateX: 2.5, TTFAMS: 380}, false, true},
+		{"a load time alone", AudioMetrics{LoadTimeMS: 4800}, false, true},
+		{"only negatives", AudioMetrics{RateX: -1, TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.m.RampMeasured(); got != tc.ramp {
+				t.Fatalf("RampMeasured(%+v) = %v, want %v", tc.m, got, tc.ramp)
+			}
+			if got := tc.m.Measured(); got != tc.anyMeasured {
+				t.Fatalf("Measured(%+v) = %v, want %v", tc.m, got, tc.anyMeasured)
+			}
+		})
+	}
+}

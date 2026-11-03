@@ -1466,10 +1466,12 @@ func (m *MemoryStore) UpdateMappingCapacityMetrics(_ context.Context, id string,
 }
 
 // UpdateMappingAudioMetrics writes one audio benchmark run's measurements, only
-// while the mapping is unlocked: a number of 0 or below, or an empty limit, is
-// not measured and keeps the stored field, a positive LoadTimeMS also writes
-// LoadTimeMS, and whatever is written is stamped with source and one time in
-// both MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that measured nothing
+// while the mapping is unlocked: a rate, TTFA or load time of 0 or below is not
+// measured and keeps the stored field, a positive LoadTimeMS also writes
+// LoadTimeMS, the ramp's count and limit are written as a pair, 0 included,
+// exactly when the run carries a ramp result (AudioMetrics.RampMeasured), and
+// whatever is written is stamped with source and one time in both
+// MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that measured nothing
 // writes nothing, provenance included. A missing or locked mapping is a benign
 // no-op (mirrors the SQL metrics_locked = 0 guard).
 func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID string, am AudioMetrics, source string) error {
@@ -1485,10 +1487,8 @@ func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID str
 	if am.TTFAMS > 0 {
 		mapping.AudioTTFAMS = am.TTFAMS
 	}
-	if am.RealtimeConcurrency > 0 {
+	if am.RampMeasured() {
 		mapping.AudioRealtimeConcurrency = am.RealtimeConcurrency
-	}
-	if am.ConcurrencyLimit != "" {
 		mapping.AudioConcurrencyLimit = am.ConcurrencyLimit
 	}
 	if am.LoadTimeMS > 0 {

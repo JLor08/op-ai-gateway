@@ -803,17 +803,19 @@ func TestRoutingStoreUpdateMappingBenchmarkMetricsKeepsUnmeasured(t *testing.T) 
 // --- Audio metrics: write-what-was-measured + locked/missing no-op ---------
 
 // TestRoutingStoreMappingAudioMetrics proves memory, sqlite and postgres agree
-// on UpdateMappingAudioMetrics (migration 101, #340 design section 8.5), the
-// audio benchmark's writer and the audio analogue of
-// UpdateMappingBenchmarkMetrics: it writes only what a run measured -- a zero
-// or negative number, or an empty limit, is "not measured" and keeps the
-// stored column -- writes load_time_ms only from a positive LoadTimeMS, stamps
-// metrics_source, metrics_updated_at and audio_metrics_updated_at with one
-// time, writes nothing at all (provenance included) for a call that measured
-// nothing, never touches the text metrics, and leaves a mapping whose metrics
-// are LOCKED exactly as it was. Routing and the scaler read the figures from
-// the candidate, so the ActiveMappingsForModel join is held to MappingByID on
-// every step.
+// on UpdateMappingAudioMetrics (migration 101), the audio benchmark's writer
+// and the audio analogue of UpdateMappingBenchmarkMetrics: it writes only what
+// a run measured -- a zero or negative rate, TTFA or load time is "not
+// measured" and keeps the stored column -- writes load_time_ms only from a
+// positive LoadTimeMS, and writes the concurrency ramp's count and limit as
+// the one result they are: together, a measured 0 included, whenever the run
+// carries a ramp result (a stop reason with a level of 0 or more), and
+// neither half otherwise. It stamps metrics_source, metrics_updated_at and
+// audio_metrics_updated_at with one time, writes nothing at all (provenance
+// included) for a call that measured nothing, never touches the text metrics,
+// and leaves a mapping whose metrics are LOCKED exactly as it was. Routing and
+// the scaler read the figures from the candidate, so the
+// ActiveMappingsForModel join is held to MappingByID on every step.
 func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
@@ -913,25 +915,50 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 		check(t, "a speed-only write", audio{2.5, 380, 2, "performance", 5100}, "audio_speed", from, to)
 
 		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 3, ConcurrencyLimit: "resources"}, "audio_capacity")
-		last := check(t, "a capacity-only write", audio{2.5, 380, 3, "resources", 5100}, "audio_capacity", from, to)
+		check(t, "a capacity-only write", audio{2.5, 380, 3, "resources", 5100}, "audio_capacity", from, to)
 
-		// A call that measured nothing -- all zero, or only negatives -- writes
-		// nothing, provenance included.
-		for _, nothing := range []routing.AudioMetrics{{}, {RateX: -1, TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3}} {
+		// The ramp's count and limit are one result, written as a pair, and a
+		// ramp that found no good level measured 0: the model is not real-time
+		// even with one stream. That 0 replaces a stored count like any other
+		// level. Kept, the old count would sit next to the new limit and stamp
+		// and claim what the latest ramp contradicts: a "performance" ceiling of
+		// 3, under which the scaler would keep starting instances of a model that
+		// cannot serve one stream in real time, or a ">= 2" lower bound from a
+		// ramp whose very first ensure was refused.
+		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: "performance"}, "audio_benchmark")
+		check(t, "a ramp that measured 0 over a stored count", audio{2.5, 380, 0, "performance", 5100}, "audio_benchmark", from, to)
+
+		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 2, ConcurrencyLimit: "cap"}, "audio_capacity")
+		check(t, "a ramp that reached its cap", audio{2.5, 380, 2, "cap", 5100}, "audio_capacity", from, to)
+
+		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: "resources"}, "audio_benchmark")
+		last := check(t, "a ramp refused at its first level, over a stored count", audio{2.5, 380, 0, "resources", 5100}, "audio_benchmark", from, to)
+
+		// A call that measured nothing writes nothing, provenance included: all
+		// zero, only negatives, and either half of a ramp result alone -- a count
+		// without the reason the ramp stopped, or a reason with a negative level
+		// no ramp can end on -- since writing it would pair it with the other
+		// half of an older ramp.
+		for _, nothing := range []routing.AudioMetrics{
+			{},
+			{RateX: -1, TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3},
+			{RealtimeConcurrency: 4},
+			{RealtimeConcurrency: -1, ConcurrencyLimit: "cap"},
+		} {
 			write(t, nothing, "audio_nothing")
 			got := read(t)
-			if audioOf(got) != audioOf(last) || got.MetricsSource != "audio_capacity" ||
+			if audioOf(got) != audioOf(last) || got.MetricsSource != last.MetricsSource ||
 				!sameTimePtr(got.MetricsUpdatedAt, last.MetricsUpdatedAt) || !sameTimePtr(got.AudioMetricsUpdatedAt, last.AudioMetricsUpdatedAt) {
-				t.Fatalf("a write that measured nothing (%+v) changed the mapping: %+v (source %q, stamps %v / %v), want %+v (source audio_capacity, stamps %v / %v)",
+				t.Fatalf("a write that measured nothing (%+v) changed the mapping: %+v (source %q, stamps %v / %v), want %+v (source %q, stamps %v / %v)",
 					nothing, audioOf(got), got.MetricsSource, got.MetricsUpdatedAt, got.AudioMetricsUpdatedAt,
-					audioOf(last), last.MetricsUpdatedAt, last.AudioMetricsUpdatedAt)
+					audioOf(last), last.MetricsSource, last.MetricsUpdatedAt, last.AudioMetricsUpdatedAt)
 			}
 		}
 
 		// A load time alone is a measurement: it writes load_time_ms and the
-		// provenance, and keeps every audio figure.
+		// provenance, and keeps every audio figure, a measured 0 included.
 		from, to = write(t, routing.AudioMetrics{LoadTimeMS: 4800}, "audio_speed")
-		check(t, "a write that measured only the load time", audio{2.5, 380, 3, "resources", 4800}, "audio_speed", from, to)
+		check(t, "a write that measured only the load time", audio{2.5, 380, 0, "resources", 4800}, "audio_speed", from, to)
 
 		// A lock-only operator save keeps the audio figures, and a locked
 		// mapping keeps its figures and provenance against the benchmark.
@@ -945,7 +972,7 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 			t.Fatalf("lock mapping: %v", err)
 		}
 		lockedBefore := read(t)
-		if audioOf(lockedBefore) != (audio{2.5, 380, 3, "resources", 4800}) || lockedBefore.MetricsSource != "audio_speed" {
+		if audioOf(lockedBefore) != (audio{2.5, 380, 0, "resources", 4800}) || lockedBefore.MetricsSource != "audio_speed" {
 			t.Fatalf("a lock-only save changed the audio figures: %+v (source %q)", audioOf(lockedBefore), lockedBefore.MetricsSource)
 		}
 		write(t, routing.AudioMetrics{RateX: 9, TTFAMS: 1, RealtimeConcurrency: 8, ConcurrencyLimit: "cap", LoadTimeMS: 1}, "audio_benchmark")

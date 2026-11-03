@@ -522,14 +522,16 @@ func (s *SQLiteStore) UpdateMappingCapacityMetrics(ctx context.Context, id strin
 // UpdateMappingAudioMetrics writes one audio benchmark run's measurements +
 // provenance (routing.MappingStore carries the contract). A run that measured
 // nothing returns before any statement, so it writes nothing, provenance
-// included. Otherwise the SET list names only the columns the run measured,
-// assembled from fixed column names with every value a bound parameter (the
-// UpdateVendorAccountOperateFields shape): "keep the stored value unless
-// measured" spans five columns of four types here, and deciding it on the Go
-// value avoids the typed-cast pair per column a CASE needs on PostgreSQL
-// (UpdateMappingBenchmarkMetrics). The metrics_locked = 0 guard stays in SQL,
-// so the lock is still atomic: a locked (or missing) row matches 0 rows and is
-// left untouched, a benign no-op (not an error).
+// included. Otherwise the SET list names only the columns the run measured --
+// the ramp's count and limit always as a pair
+// (routing.AudioMetrics.RampMeasured), so a measured 0 replaces a stored
+// count -- assembled from fixed column names with every value a bound
+// parameter (the UpdateVendorAccountOperateFields shape): "keep the stored
+// value unless measured" spans five columns of four types here, and deciding
+// it on the Go value avoids the typed-cast pair per column a CASE needs on
+// PostgreSQL (UpdateMappingBenchmarkMetrics). The metrics_locked = 0 guard
+// stays in SQL, so the lock is still atomic: a locked (or missing) row
+// matches 0 rows and is left untouched, a benign no-op (not an error).
 func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m routing.AudioMetrics, source string) error {
 	if !m.Measured() {
 		return nil
@@ -542,11 +544,9 @@ func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID s
 	if m.TTFAMS > 0 {
 		sets, args = append(sets, "audio_ttfa_ms = ?"), append(args, m.TTFAMS)
 	}
-	if m.RealtimeConcurrency > 0 {
-		sets, args = append(sets, "audio_realtime_concurrency = ?"), append(args, m.RealtimeConcurrency)
-	}
-	if m.ConcurrencyLimit != "" {
-		sets, args = append(sets, "audio_concurrency_limit = ?"), append(args, m.ConcurrencyLimit)
+	if m.RampMeasured() {
+		sets = append(sets, "audio_realtime_concurrency = ?", "audio_concurrency_limit = ?")
+		args = append(args, m.RealtimeConcurrency, m.ConcurrencyLimit)
 	}
 	if m.LoadTimeMS > 0 {
 		sets, args = append(sets, "load_time_ms = ?"), append(args, m.LoadTimeMS)
