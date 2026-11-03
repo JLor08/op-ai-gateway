@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -460,12 +461,13 @@ func TestRouterModelsListsBaseNamesRunningListsInstances(t *testing.T) {
 
 // instanceStatusManager is a managerPort fake for the /upstream relay over
 // instance rows: Status is fixed, ResolveAddress answers from a fixed table the
-// way the manager resolves, and an ensure is only counted -- the relay never
-// asks for one.
+// way the manager resolves (and counts the calls), and an ensure is only
+// counted -- the relay never asks for one.
 type instanceStatusManager struct {
 	statuses  []Status
 	addresses map[string]resolvedAddress
 	ensures   atomic.Int64
+	resolves  atomic.Int64
 }
 
 func (m *instanceStatusManager) EnsureRunning(context.Context, string) (string, func(), error) {
@@ -478,6 +480,7 @@ func (m *instanceStatusManager) EnsureServing(ctx context.Context, model string)
 }
 
 func (m *instanceStatusManager) ResolveAddress(model string) (string, int, bool) {
+	m.resolves.Add(1)
 	r := m.addresses[model]
 	return r.base, r.k, r.ok
 }
@@ -612,35 +615,171 @@ func TestUpstreamChildQuery(t *testing.T) {
 	}
 }
 
-// TestRouterInstanceBase pins the rewrite decision every route shares: only an
+// shiftingAddressManager is a managerPort fake whose address rule changes its
+// answer while a request is inside the router -- the effect of a config push
+// landing between two owner turns: ResolveAddress answers from answers in
+// order, the last one repeating. Every ensure succeeds with endpoint and counts
+// each call of its release; Status reports statuses.
+type shiftingAddressManager struct {
+	endpoint string
+	statuses []Status
+	answers  []resolvedAddress
+
+	mu       sync.Mutex
+	resolves int
+	releases atomic.Int64
+}
+
+func (m *shiftingAddressManager) ResolveAddress(string) (string, int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a := m.answers[min(m.resolves, len(m.answers)-1)]
+	m.resolves++
+	return a.base, a.k, a.ok
+}
+
+func (m *shiftingAddressManager) EnsureServing(context.Context, string) (string, func(), error) {
+	return m.endpoint, func() { m.releases.Add(1) }, nil
+}
+
+func (m *shiftingAddressManager) EnsureRunning(ctx context.Context, model string) (string, func(), error) {
+	return m.EnsureServing(ctx, model)
+}
+func (m *shiftingAddressManager) LoadedModels() []string { return nil }
+func (m *shiftingAddressManager) Status() []Status       { return m.statuses }
+
+// TestRouterRefusesARequestWhoseAddressMovedDuringAdmission: the router reads
+// an address before admission, to choose the name the child receives, and the
+// admission resolves it again in a later owner turn. A push landing in between
+// can make the two readings disagree -- an instance address becomes another
+// spec's literal model, or the reverse -- and the child would then receive the
+// wrong name: the base name of one spec, or an address no child knows. So the
+// router reads the address again once the request is admitted and, when the
+// reading moved, releases the admission and answers 409
+// runtime.instance_no_capacity, the gateway's cue to select again: on every
+// route that forwards a request, and on /upstream, whose probe reads a running
+// row in between. The child is never reached. With nothing moved, the request
+// is served.
+func TestRouterRefusesARequestWhoseAddressMovedDuringAdmission(t *testing.T) {
+	child := newRecordingChild(t, `{"ok":true}`)
+	port := childPort(t, child.srv.URL)
+	form, formType := editBody(t, "m#1", "")
+	routes := []struct {
+		name      string
+		req       func() *http.Request
+		probe     bool // /upstream: nothing is admitted, so nothing is released
+		unmanaged bool // also run for a name that was not managed at first
+	}{
+		{name: "json", unmanaged: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m#1"}`))
+		}},
+		{name: "streaming json", unmanaged: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m#1","stream":true}`))
+		}},
+		{name: "multipart", unmanaged: true, req: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(form))
+			r.Header.Set("Content-Type", formType)
+			return r
+		}},
+		{name: "live", unmanaged: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/live/m%231?sample_rate=16000", strings.NewReader("pcm"))
+		}},
+		{name: "upstream", probe: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodGet, "/upstream/m%231/props", nil)
+		}},
+	}
+	instance := resolvedAddress{base: "m", k: 1, ok: true}
+	literal := resolvedAddress{base: "m#1", k: 0, ok: true}
+	for _, tc := range []struct {
+		name          string
+		first, second resolvedAddress
+		unmanaged     bool
+	}{
+		{name: "an instance address became another spec's model", first: instance, second: literal},
+		{name: "a model became an instance address", first: literal, second: instance},
+		{name: "an unmanaged name became an instance address", first: resolvedAddress{}, second: instance, unmanaged: true},
+	} {
+		for _, route := range routes {
+			if tc.unmanaged && !route.unmanaged {
+				continue // /upstream answers an unmanaged name 404 at once, reaching nothing
+			}
+			t.Run(tc.name+"/"+route.name, func(t *testing.T) {
+				m := &shiftingAddressManager{
+					endpoint: child.srv.URL,
+					answers:  []resolvedAddress{tc.first, tc.second},
+					statuses: []Status{ // a running row for either reading of m#1
+						{SpecID: "S", Instance: 1, Model: "m#1", State: StateRunning, Port: port},
+						{SpecID: "L", Instance: 0, Model: "m#1", State: StateRunning, Port: port},
+					},
+				}
+				hitsBefore, _, _, _ := child.snapshot()
+				rec := httptest.NewRecorder()
+				newRouter(m).ServeHTTP(rec, route.req())
+
+				assertConflict(t, rec.Code, rec.Body, "runtime.instance_no_capacity")
+				if hits, _, _, _ := child.snapshot(); hits != hitsBefore {
+					t.Errorf("the child was reached %d times, want never", hits-hitsBefore)
+				}
+				wantReleases := int64(1)
+				if route.probe {
+					wantReleases = 0
+				}
+				if n := m.releases.Load(); n != wantReleases {
+					t.Errorf("release called %d times, want %d: the admission is given back when the address moved", n, wantReleases)
+				}
+			})
+		}
+	}
+	for _, route := range routes {
+		t.Run("nothing moved/"+route.name, func(t *testing.T) {
+			m := &shiftingAddressManager{
+				endpoint: child.srv.URL,
+				answers:  []resolvedAddress{instance},
+				statuses: []Status{{SpecID: "S", Instance: 1, Model: "m#1", State: StateRunning, Port: port}},
+			}
+			rec := httptest.NewRecorder()
+			newRouter(m).ServeHTTP(rec, route.req())
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d %s, want 200: the address read the same both times", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestRouterReadAddress pins the rewrite decision every route shares: only an
 // address the manager resolves to an instance k >= 1 is rewritten, to its base
 // name; instance 0 -- a literal name with '#' in it included -- an unmanaged
-// name and a nil manager are left alone. The live relay depends on it although
-// its end-to-end test cannot show it: appended to the child's query unrewritten,
-// "m#1" would reach the child as model=m anyway, because the '#' starts a URL
-// fragment that is never sent.
-func TestRouterInstanceBase(t *testing.T) {
+// name and a nil manager are left alone. A name that cannot parse as an
+// instance address is read without asking the manager at all, so a request of a
+// spec that never replicates costs no extra owner round trip.
+func TestRouterReadAddress(t *testing.T) {
 	m := &instanceStatusManager{addresses: map[string]resolvedAddress{
 		"m":     {base: "m", k: 0, ok: true},
 		"m#1":   {base: "m", k: 1, ok: true},
 		"foo#2": {base: "foo#2", k: 0, ok: true}, // a literal upstream model
 	}}
 	for _, tc := range []struct {
-		model  string
-		base   string
-		rewrit bool
+		model   string
+		base    string
+		rewrite bool
+		asked   bool
 	}{
-		{"m#1", "m", true},
-		{"m", "", false},
-		{"foo#2", "", false},
-		{"nope#1", "", false},
+		{model: "m#1", base: "m", rewrite: true, asked: true},
+		{model: "m"},
+		{model: "foo#2", asked: true},
+		{model: "nope#1", asked: true},
+		{model: "m#01"}, // a leading zero: not an instance address
 	} {
-		if base, ok := newRouter(m).instanceBase(tc.model); base != tc.base || ok != tc.rewrit {
-			t.Errorf("instanceBase(%q) = (%q, %v), want (%q, %v)", tc.model, base, ok, tc.base, tc.rewrit)
+		before := m.resolves.Load()
+		if base, ok := newRouter(m).readAddress(tc.model).childModel(); base != tc.base || ok != tc.rewrite {
+			t.Errorf("readAddress(%q).childModel() = (%q, %v), want (%q, %v)", tc.model, base, ok, tc.base, tc.rewrite)
+		}
+		if asked := m.resolves.Load() != before; asked != tc.asked {
+			t.Errorf("readAddress(%q) asked the manager: %v, want %v", tc.model, asked, tc.asked)
 		}
 	}
-	if base, ok := newRouter(nil).instanceBase("m#1"); ok || base != "" {
-		t.Errorf("instanceBase with no manager = (%q, %v), want nothing rewritten", base, ok)
+	if base, ok := newRouter(nil).readAddress("m#1").childModel(); ok || base != "" {
+		t.Errorf("readAddress with no manager = (%q, %v), want nothing rewritten", base, ok)
 	}
 }
 

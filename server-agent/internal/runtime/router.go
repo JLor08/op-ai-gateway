@@ -523,21 +523,33 @@ func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, mo
 			"no active launch spec for this model")
 		return
 	}
-	base, k, ok := rt.m.ResolveAddress(model)
-	if !ok {
+	// Every name is resolved here, an instance-0 one included: whether it is
+	// managed at all decides between the two 404s below. Only a name that
+	// parses as an instance address is read again (addressMoved).
+	_, parsed := ParseInstanceAddress(model)
+	addr := modelAddress{name: model, resolved: parsed > 0}
+	addr.base, addr.k, addr.managed = rt.m.ResolveAddress(model)
+	if !addr.managed {
 		writeError(w, http.StatusNotFound, codeModelNotManaged,
 			"no active launch spec for this model")
 		return
 	}
-	port := runningPort(rt.m.Status(), model, k)
+	port := runningPort(rt.m.Status(), model, addr.k)
 	if port == 0 {
 		writeError(w, http.StatusNotFound, "runtime.model_not_running",
 			"model is managed but not running; this probe never starts a child")
 		return
 	}
+	// The row was read in an owner turn of its own: a probe whose address moved
+	// meanwhile is refused like a forwarded request, rather than handed to the
+	// process the earlier reading named.
+	if rt.addressMoved(addr) {
+		writeSentinelError(w, errAddressMoved(model))
+		return
+	}
 	target := "http://127.0.0.1:" + strconv.Itoa(port) + ep.path
 	if ep.forwardQuery && r.URL.RawQuery != "" {
-		target += "?" + upstreamChildQuery(r.URL.RawQuery, base, k)
+		target += "?" + upstreamChildQuery(r.URL.RawQuery, addr.base, addr.k)
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
@@ -698,7 +710,9 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 //     manager is 404 runtime.model_not_managed, exactly as serveEnsure answers.
 //   - It is a plain request, so it is admitted with EnsureServing: an instance
 //     address (#340) reaches a burst instance only while one is up, and is
-//     refused with 409 runtime.instance_no_capacity otherwise.
+//     refused with 409 runtime.instance_no_capacity otherwise. The address is
+//     read again once admitted, and a request whose address moved meanwhile is
+//     refused the same way (ensureServing, addressMoved).
 //   - release() is deferred AFTER a successful EnsureServing and runs exactly
 //     once on every exit path (clean completion, upstream error, client
 //     disconnect) -- unlike serveEnsure, which releases immediately because it
@@ -722,8 +736,12 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 //     the inbound RawQuery plus model=<decoded path model> (audio.cpp reads the
 //     model from its query), forwarding the inbound sample_rate/channels/
 //     sample_format/language params unchanged. For an instance address the
-//     model in the query is the base name (instanceBase), the only name the
-//     instance's child knows.
+//     model in the query is the base name (modelAddress.childModel), the only
+//     name the instance's child knows. Any other model is appended exactly as
+//     named, since audio.cpp reads the value verbatim -- so a literal model
+//     whose name contains '#' reaches the child cut at that '#', which starts
+//     the URL's fragment, and no escaping can deliver it to a reader that does
+//     not decode.
 //   - A RoundTrip failure (child unreachable) is 502 runtime.upstream_gone, the
 //     same code the other proxy paths use for a failure reaching an admitted
 //     child.
@@ -743,11 +761,12 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 		writeSentinelError(w, ErrModelNotManaged)
 		return
 	}
+	addr := rt.readAddress(model)
 	childModel := model
-	if base, ok := rt.instanceBase(model); ok {
+	if base, ok := addr.childModel(); ok {
 		childModel = base
 	}
-	endpoint, release, err := rt.m.EnsureServing(r.Context(), model)
+	endpoint, release, err := rt.ensureServing(r.Context(), addr)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
@@ -843,7 +862,8 @@ type modelStreamPeek struct {
 // running, models, and the /upstream/{model}/props probe) and POST
 // /ensure/{model}. It buffers the body (bounded), extracts the model (and, for
 // JSON, stream), hands the child the base model when the model is an instance
-// address (instanceBase), and hands off to the plain or streaming path.
+// address (readAddress, then rewriteModelField or rebuildMultipartModel), and
+// hands off to the plain or streaming path.
 //
 // The body is read as a multipart form when the request's Content-Type is
 // multipart/form-data (an image edit or an audio transcription) and as JSON
@@ -876,8 +896,9 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 			writeModelNotNamed(w)
 			return
 		}
+		addr := rt.readAddress(model)
 		contentType := ""
-		if base, ok := rt.instanceBase(model); ok {
+		if base, ok := addr.childModel(); ok {
 			rebuilt, rebuiltType, err := rebuildMultipartModel(body, params["boundary"], base)
 			if err != nil {
 				// Not expected: peekMultipartModel has walked this very body to
@@ -889,7 +910,7 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			body, contentType = rebuilt, rebuiltType
 		}
-		rt.servePlainProxy(w, r, model, body, contentType)
+		rt.servePlainProxy(w, r, addr, body, contentType)
 		return
 	}
 
@@ -898,7 +919,8 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 		writeModelNotNamed(w)
 		return
 	}
-	if base, ok := rt.instanceBase(peek.Model); ok {
+	addr := rt.readAddress(peek.Model)
+	if base, ok := addr.childModel(); ok {
 		rewritten, err := rewriteModelField(body, base)
 		if err != nil {
 			// Not expected: the body has just been decoded, and its model routed
@@ -913,43 +935,105 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if peek.Stream {
-		rt.serveStreamProxy(w, r, peek.Model, body)
+		rt.serveStreamProxy(w, r, addr, body)
 		return
 	}
-	rt.servePlainProxy(w, r, peek.Model, body, "")
+	rt.servePlainProxy(w, r, addr, body, "")
 }
 
-// instanceBase returns the base upstream model the child must see in place of
-// model, and whether model is an INSTANCE ADDRESS at all (#340, design §5.3):
-// "m#k", instance k >= 1 of a managed replicable spec. Every instance's child is
-// launched with the base name (${MODEL} expands to it, specForInstance) and knows
-// nothing of "m#k", so a request for one is handed to it with the base name
-// instead. For instance 0 -- the address of every request a spec that never
-// replicates gets -- ok is false and the request passes byte for byte as it
-// always has.
+// modelAddress is the router's reading of the model a request names, taken by
+// the manager's own rule (Manager.ResolveAddress: an exact upstream match wins
+// first, so a real model whose name merely contains '#' stays itself) before
+// the request is admitted. It decides the name the child receives: an INSTANCE
+// ADDRESS, "m#k" naming instance k >= 1 of a managed replicable spec, is handed
+// to the child with the base name m instead -- every instance's child is
+// launched with the base name (${MODEL} expands to it, specForInstance) and
+// knows nothing of "m#k" -- while any other name reaches the child exactly as
+// sent.
 //
-// The address is read by the manager's own rule (ResolveAddress: an exact
-// upstream match wins first, so a real model whose name merely contains '#'
-// stays itself). It decides the rewrite only: the ensure that follows resolves
-// the name again on its own, in a later owner turn, and decides admission -- a
-// push that removes the address in between makes that ensure refuse the
-// request. A name that does not even parse as an instance address can never be
-// one -- the rule reads it as an exact name or as nothing -- so it is answered
-// here, without an owner round trip: a request for instance 0, which is every
-// request of a spec that never replicates, costs the owner exactly what it did
-// before instances existed.
-func (rt *router) instanceBase(model string) (base string, ok bool) {
+// A name that does not even parse as an instance address can never be one --
+// the rule reads it as an exact name or as nothing, instance 0 either way -- so
+// it is read without an owner round trip (resolved false): a request for
+// instance 0, which is every request of a spec that never replicates, costs the
+// owner exactly what it did before instances existed, and nothing about it is
+// rewritten or read again.
+type modelAddress struct {
+	name     string // the model as the request names it
+	base     string // ResolveAddress's base upstream model, when resolved
+	k        int    // ResolveAddress's instance index, when resolved
+	managed  bool   // ResolveAddress's ok, when resolved
+	resolved bool   // ResolveAddress was asked: name parses as an instance address
+}
+
+// readAddress reads model by the manager's rule; see modelAddress.
+func (rt *router) readAddress(model string) modelAddress {
+	a := modelAddress{name: model}
 	if rt.m == nil {
-		return "", false
+		return a
 	}
 	if _, k := ParseInstanceAddress(model); k == 0 {
+		return a
+	}
+	a.base, a.k, a.managed = rt.m.ResolveAddress(model)
+	a.resolved = true
+	return a
+}
+
+// childModel returns the base name the child must see in place of the
+// requested name, and whether it must -- only for an instance address k >= 1.
+func (a modelAddress) childModel() (base string, ok bool) {
+	if !a.resolved || !a.managed || a.k == 0 {
 		return "", false
 	}
-	b, k, managed := rt.m.ResolveAddress(model)
-	if !managed || k == 0 {
-		return "", false
+	return a.base, true
+}
+
+// addressMoved reports whether a's name reads differently now than when a was
+// taken. Reading the address and admitting the request are two owner turns
+// (ResolveAddress, then the ensure, which resolves the name again on its own),
+// and a config push can land between them: it can make an instance address
+// another spec's literal model, turn a literal model containing '#' into an
+// instance address of another spec (its own spec removed), or make an unknown
+// name an address. The request would then be admitted under one reading and
+// carry the name the other one chose -- a child receiving the base name of a
+// different spec, or an address it does not know. So once the request is
+// admitted the name is read again, and a reading that moved refuses it
+// (errAddressMoved). Only a resolved reading can move: a name that does not
+// parse as an instance address is instance 0 or nothing under any push.
+//
+// What is left is a push in that window together with a second push that puts
+// the reading back before it is taken again: the request was then admitted
+// under the reading in between, which this cannot see. Closing that too would
+// take the ensure itself to report the reading it admitted under.
+func (rt *router) addressMoved(a modelAddress) bool {
+	if !a.resolved {
+		return false
 	}
-	return b, true
+	base, k, managed := rt.m.ResolveAddress(a.name)
+	return base != a.base || k != a.k || managed != a.managed
+}
+
+// errAddressMoved is the refusal of a request whose address moved while it was
+// admitted (addressMoved). It is a 409 runtime.instance_no_capacity, like a
+// plain request for a burst instance that is not serving: the gateway selects
+// again, and its next request reads the address as it is now.
+func errAddressMoved(model string) error {
+	return fmt.Errorf("runtime: %q names something else than when the request was read; select again: %w", model, ErrInstanceNoCapacity)
+}
+
+// ensureServing admits a request the router forwards (EnsureServing) for the
+// model a names, and gives the admission back -- release, then errAddressMoved
+// -- when the address moved meanwhile (addressMoved).
+func (rt *router) ensureServing(ctx context.Context, a modelAddress) (endpoint string, release func(), err error) {
+	endpoint, release, err = rt.m.EnsureServing(ctx, a.name)
+	if err != nil {
+		return "", nil, err
+	}
+	if rt.addressMoved(a) {
+		release()
+		return "", nil, errAddressMoved(a.name)
+	}
+	return endpoint, release, nil
 }
 
 // rewriteModelField returns raw with the value of its top-level model replaced
@@ -1156,17 +1240,18 @@ func peekMultipartModel(body []byte, boundary string) string {
 // EVERY proxied response, streaming or not: TestRouterNoResponseBuffering
 // exercises exactly this path).
 //
-// model is the name the request was routed on (an instance address included),
-// body what the child receives -- already carrying the base model when model
-// is an instance address (serveProxy). contentType, when not empty, replaces
-// the request's own: a multipart body rebuilt with the base model has a
-// boundary of its own.
-func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model string, body []byte, contentType string) {
+// addr is the router's reading of the name the request was routed on (an
+// instance address included), body what the child receives -- already
+// carrying the base model when that name is an instance address (serveProxy).
+// contentType, when not empty, replaces the request's own: a multipart body
+// rebuilt with the base model has a boundary of its own.
+func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, addr modelAddress, body []byte, contentType string) {
+	model := addr.name
 	if rt.m == nil {
 		writeSentinelError(w, ErrModelNotManaged)
 		return
 	}
-	endpoint, release, err := rt.m.EnsureServing(r.Context(), model)
+	endpoint, release, err := rt.ensureServing(r.Context(), addr)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
@@ -1261,7 +1346,11 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 // managed, a policy refusal, a synchronously failing exec, an immediate
 // non-2xx from an already-admitted child -- is still a genuine HTTP status,
 // exactly like the non-streaming path.
-func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model string, body []byte) {
+//
+// addr and body are servePlainProxy's. The address is read again once the
+// request is admitted (ensureServing) inside the ensure phase, so a heartbeat
+// keeps covering that owner round trip too.
+func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr modelAddress, body []byte) {
 	flusher, _ := w.(http.Flusher)
 	fw := flushWriter{w: w, f: flusher}
 
@@ -1308,7 +1397,7 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 	}
 	ensureCh := make(chan ensureResult, 1)
 	go func() {
-		endpoint, release, err := rt.m.EnsureServing(r.Context(), model)
+		endpoint, release, err := rt.ensureServing(r.Context(), addr)
 		ensureCh <- ensureResult{endpoint: endpoint, release: release, err: err}
 	}()
 	eres := heartbeatWait(ticker, ensureCh, w, flusher, commit)
