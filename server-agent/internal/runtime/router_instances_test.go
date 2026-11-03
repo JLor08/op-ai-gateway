@@ -115,8 +115,10 @@ func formParts(t *testing.T, contentType string, body []byte) []formPart {
 
 // TestRouterRewritesInstanceModelJSON: a JSON request for m#1 reaches instance 1
 // with its top-level model rewritten to m -- on the plain path and the
-// streaming one -- and every other value intact, numbers included: 1.50 stays
-// 1.50, never re-read as the float 1.5.
+// streaming one -- and every other byte exactly as sent: the keys in their
+// order, the spacing, the HTML-sensitive characters and the escapes unchanged,
+// and the numbers with their digits (1.50 stays 1.50, 1e3 stays 1e3), so a child
+// that hashes, signs or caches the body sees what instance 0 would have seen.
 func TestRouterRewritesInstanceModelJSON(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -125,7 +127,12 @@ func TestRouterRewritesInstanceModelJSON(t *testing.T) {
 
 	for _, tc := range []struct{ name, body, want string }{
 		{"plain", `{"model":"m#1","n":1.50}`, `{"model":"m","n":1.50}`},
-		{"streaming", `{"model":"m#1","stream":true,"n":1.50}`, `{"model":"m","n":1.50,"stream":true}`},
+		{"streaming", `{"model":"m#1","stream":true,"n":1.50}`, `{"model":"m","stream":true,"n":1.50}`},
+		{
+			"every other byte",
+			`{ "z": "<&>", "model" : "m#1",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "tools": [{"model":"m#1"}] }`,
+			`{ "z": "<&>", "model" : "m",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "tools": [{"model":"m#1"}] }`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if rec := postJSON(t, h, tc.body); rec.Code != http.StatusOK {
@@ -552,6 +559,59 @@ func TestRouterUpstreamTargetsTheInstance(t *testing.T) {
 	}
 }
 
+// TestRouterUpstreamRewritesOnlyTheModelParameter: an /upstream probe of an
+// instance address reaches the instance's child with the value of its model
+// parameter replaced by the base name, query-escaped, and every other parameter
+// exactly as sent -- its place, its encoding, a '+' and a bare key included.
+func TestRouterUpstreamRewritesOnlyTheModelParameter(t *testing.T) {
+	queries := make(chan string, 1)
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries <- r.URL.RawQuery
+	}))
+	t.Cleanup(child.Close)
+	m := &instanceStatusManager{
+		statuses:  []Status{{SpecID: "S", Instance: 1, Model: "org/m:q4#1", State: StateRunning, Port: childPort(t, child.URL)}},
+		addresses: map[string]resolvedAddress{"org/m:q4#1": {base: "org/m:q4", k: 1, ok: true}},
+	}
+
+	rec := httptest.NewRecorder()
+	newRouter(m).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/org/m:q4%231/props?b=2&model=org%2Fm%3Aq4%231&a=x%20y+z&c", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	want := "b=2&model=" + url.QueryEscape("org/m:q4") + "&a=x%20y+z&c"
+	select {
+	case got := <-queries:
+		if got != want {
+			t.Errorf("the child received the query %q, want %q", got, want)
+		}
+	default:
+		t.Fatal("the child was not reached")
+	}
+}
+
+// TestUpstreamChildQuery pins the /upstream relay's query rule: only the value
+// of a model parameter changes, and only for an instance address.
+func TestUpstreamChildQuery(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, base string
+		k               int
+		want            string
+	}{
+		{"instance 0 is untouched", "model=m&x=%2F", "m", 0, "model=m&x=%2F"},
+		{"no model parameter", "include_params=true&x=%2F", "m", 1, "include_params=true&x=%2F"},
+		{"only the model value", "b=2&model=m%231&a=x%20y+z&c", "org/m:q4", 1, "b=2&model=org%2Fm%3Aq4&a=x%20y+z&c"},
+		{"every model parameter, its key as written", "mod%65l=m%231&x=1&model=y", "m", 1, "mod%65l=m&x=1&model=m"},
+		{"a model parameter without a value", "model&x=1", "m", 1, "model=m&x=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstreamChildQuery(tc.raw, tc.base, tc.k); got != tc.want {
+				t.Errorf("upstreamChildQuery(%q, %q, %d) = %q, want %q", tc.raw, tc.base, tc.k, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRouterInstanceBase pins the rewrite decision every route shares: only an
 // address the manager resolves to an instance k >= 1 is rewritten, to its base
 // name; instance 0 -- a literal name with '#' in it included -- an unmanaged
@@ -584,25 +644,40 @@ func TestRouterInstanceBase(t *testing.T) {
 	}
 }
 
-// TestRewriteModelFieldKeepsEveryOtherValue: only the top-level model changes,
-// every other value -- a nested "model", a number's exact digits, a big integer
-// -- survives, and a body with nothing to rewrite comes back as the very bytes
-// it was.
-func TestRewriteModelFieldKeepsEveryOtherValue(t *testing.T) {
-	for _, tc := range []struct{ name, in, want string }{
+// TestRewriteModelFieldKeepsEveryOtherByte: only the value of the top-level
+// model changes; every other byte -- the key order, the spacing, a nested
+// "model", HTML-sensitive characters, escapes, a number's exact digits, a big
+// integer -- is exactly as it was. Every top-level key json.Unmarshal reads as
+// the model (any letter case, after unescaping) gets the base name, a value
+// that already names it keeps its bytes, and a body with no top-level model
+// string is an error rather than a body forwarded with the address in it.
+func TestRewriteModelFieldKeepsEveryOtherByte(t *testing.T) {
+	for _, tc := range []struct{ name, in, base, want string }{
 		{
-			"top level only", `{"model":"m#1","tools":[{"model":"m#1"}],"n":1.50,"seed":12345678901234567890}`,
-			`{"model":"m","n":1.50,"seed":12345678901234567890,"tools":[{"model":"m#1"}]}`,
+			"top level only",
+			`{ "z":"<&>" , "model" : "m#1",` + "\n" + `"tools":[{"model":"m#1"}], "n":1.50, "e":1e3, "seed":12345678901234567890, "u":"é" }`,
+			"m",
+			`{ "z":"<&>" , "model" : "m",` + "\n" + `"tools":[{"model":"m#1"}], "n":1.50, "e":1e3, "seed":12345678901234567890, "u":"é" }`,
 		},
-		{"already the base", `{ "model" : "m" }`, `{ "model" : "m" }`},
-		{"not an object", `["m#1"]`, `["m#1"]`},
-		{"null", `null`, `null`},
+		{"the model key last", `{"n":1.50,"model":"m#1"}`, "m", `{"n":1.50,"model":"m"}`},
+		{"a key in another case", `{"Model":"m#1","n":1}`, "m", `{"Model":"m","n":1}`},
+		{"an escaped key", `{"model":"m#1"}`, "m", `{"model":"m"}`},
+		{"every key that reads as the model", `{"model":"m#1","MODEL":"m#1"}`, "m", `{"model":"m","MODEL":"m"}`},
+		{"a null model beside a string one", `{"model":null,"Model":"m#1"}`, "m", `{"model":null,"Model":"m"}`},
+		{"already the base", `{ "model" : "m" }`, "m", `{ "model" : "m" }`},
+		{"a base with HTML-sensitive characters", `{"model":"a<b>&c#1"}`, "a<b>&c", `{"model":"a<b>&c"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := string(rewriteModelField([]byte(tc.in), "m")); got != tc.want {
-				t.Errorf("rewriteModelField(%s) = %s, want %s", tc.in, got, tc.want)
+			got, err := rewriteModelField([]byte(tc.in), tc.base)
+			if err != nil || string(got) != tc.want {
+				t.Errorf("rewriteModelField(%s, %q) = %s, %v; want %s", tc.in, tc.base, got, err, tc.want)
 			}
 		})
+	}
+	for _, in := range []string{`["m#1"]`, `null`, `{"n":1}`, `{"model":5}`, `{"tools":[{"model":"m#1"}]}`, `{"model":"m#1"`} {
+		if got, err := rewriteModelField([]byte(in), "m"); err == nil {
+			t.Errorf("rewriteModelField(%s) = %s, want an error: there is no top-level model string to replace", in, got)
+		}
 	}
 }
 

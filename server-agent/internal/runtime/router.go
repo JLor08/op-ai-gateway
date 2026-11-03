@@ -578,17 +578,25 @@ func runningPort(statuses []Status, model string, k int) int {
 }
 
 // upstreamChildQuery is the query the /upstream relay forwards: the inbound one
-// verbatim, except that for an instance address (k >= 1) a model= it carries
-// becomes the base name, the only name the instance's child knows -- set the way
-// liveChildQuery sets the live relay's model.
+// byte for byte, except that for an instance address (k >= 1) the value of each
+// model parameter becomes the base name -- the only name the instance's child
+// knows -- query-escaped. Every other parameter keeps its place and its
+// encoding, and the model parameter its key as written: a parameter is a model
+// one when its key, unescaped as url.ParseQuery would, is "model". A model
+// parameter with no '=' (a model that is empty) gets the base as well.
 func upstreamChildQuery(raw, base string, k int) string {
-	if k == 0 {
+	if k == 0 || raw == "" {
 		return raw
 	}
-	if values, _ := url.ParseQuery(raw); !values.Has("model") { // a partial parse is enough to find the key
-		return raw
+	params := strings.Split(raw, "&")
+	for i, param := range params {
+		key, _, _ := strings.Cut(param, "=")
+		if name, err := url.QueryUnescape(key); err != nil || name != "model" {
+			continue
+		}
+		params[i] = key + "=" + url.QueryEscape(base)
 	}
-	return liveChildQuery(raw, base)
+	return strings.Join(params, "&")
 }
 
 // ensurePathPrefix is the path prefix of POST /ensure/{model}; everything
@@ -787,8 +795,9 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 // what the route was dispatched on and what EnsureServing admitted (its base
 // name, for an instance address) -- so a stray inbound model= is overwritten
 // rather than appended, which would otherwise leave two model params and let
-// Query().Get("model") read the inbound one. upstreamChildQuery sets an
-// /upstream probe's model the same way.
+// Query().Get("model") read the inbound one. (The /upstream relay keeps its
+// query as sent instead and replaces only a model parameter's value,
+// upstreamChildQuery: a probe's other parameters are the child's business.)
 func liveChildQuery(inbound, model string) string {
 	values, _ := url.ParseQuery(inbound) // partial parse on error is fine; model is set authoritatively below
 	values.Del("model")                  // drop any inbound model= so the authoritative path model is the only one
@@ -819,8 +828,11 @@ func writeBodyReadError(w http.ResponseWriter, err error) {
 
 // modelStreamPeek is the minimal shape the router reads out of a proxied
 // request body: just enough to route it and decide whether to heartbeat.
-// Every other field of the real request (OpenAI/Anthropic-shaped or
-// otherwise) passes through untouched, byte for byte.
+// encoding/json fills Model from a top-level key "model" in any letter case.
+// The body itself (OpenAI/Anthropic-shaped or otherwise) is forwarded byte for
+// byte, with one exception: when Model is an instance address, the value of
+// each top-level key read as the model is replaced by the base name in place
+// (rewriteModelField), and every other byte still passes through as sent.
 type modelStreamPeek struct {
 	Model  string `json:"model"`
 	Stream bool   `json:"stream"`
@@ -887,7 +899,17 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if base, ok := rt.instanceBase(peek.Model); ok {
-		body = rewriteModelField(body, base)
+		rewritten, err := rewriteModelField(body, base)
+		if err != nil {
+			// Not expected: the body has just been decoded, and its model routed
+			// on. The request cannot be forwarded with the instance address in
+			// it, so it is refused rather than relayed as is -- exactly like a
+			// multipart body that cannot be rebuilt.
+			slog.Error("runtime: rewriting the model of a JSON body failed", "model", peek.Model, "error", err)
+			writeSentinelError(w, fmt.Errorf("runtime: rewrite the model of a JSON body: %w", err))
+			return
+		}
+		body = rewritten
 	}
 
 	if peek.Stream {
@@ -930,35 +952,89 @@ func (rt *router) instanceBase(model string) (base string, ok bool) {
 	return b, true
 }
 
-// rewriteModelField returns raw with its top-level "model" field set to model:
-// the gateway's rewriteModelField (gateway/backend/internal/gateway/
-// native_passthrough.go) on this side of the module boundary, which is why it is
-// a copy. The body is re-serialized, so it is VALUE-lossless -- every other field
-// is kept, numbers with full precision via json.Number (1.50 stays 1.50) -- but
-// not byte-identical: keys come back sorted and <>& HTML-escaped, which any JSON
-// parser reads identically. When model is empty, the body is not a JSON object,
-// or it already names model, raw comes back unchanged.
-func rewriteModelField(raw []byte, model string) []byte {
-	if model == "" {
-		return raw
+// rewriteModelField returns raw with the value of its top-level model replaced
+// by model, and every other byte exactly as it was. The new value is spliced
+// into the place of the old one, so the keys keep their order, the numbers
+// their digits (1.50 stays 1.50, 1e3 stays 1e3), the strings their escapes and
+// the body its spacing, and nothing is HTML-escaped: a child that hashes, signs
+// or caches a request body sees, for instance k, the bytes instance 0 would
+// have seen. (Re-serializing the body would keep every VALUE but reorder the
+// keys and rewrite the escapes.)
+//
+// The value is found by a token walk over the top-level object: the decoder
+// hands each value to valueLen, and its InputOffset is the end of that value.
+// Every top-level key that encoding/json reads into modelStreamPeek.Model --
+// "model" in any letter case, read after unescaping -- whose value is a string
+// gets the new value, so whichever of them the router routed on, the instance
+// address is never left standing for the child to read. A value that already
+// names model keeps its bytes. It is an error for raw not to be a JSON object
+// with such a key, which serveProxy has already established by routing on it.
+func rewriteModelField(raw []byte, model string) ([]byte, error) {
+	literal, err := jsonString(model)
+	if err != nil {
+		return nil, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var obj map[string]any
-	// obj == nil is a bare null, which decodes without an error into a map
-	// nothing can be assigned to.
-	if err := dec.Decode(&obj); err != nil || obj == nil {
-		return raw
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, errors.New("the body is not a JSON object")
 	}
-	if cur, _ := obj["model"].(string); cur == model {
-		return raw
+	out := make([]byte, 0, len(raw)+len(literal))
+	copied, found := 0, false // copied: raw[:copied] is in out already
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("read a key: %w", err)
+		}
+		key, _ := tok.(string)
+		var n valueLen
+		if err := dec.Decode(&n); err != nil {
+			return nil, fmt.Errorf("read the value of %q: %w", key, err)
+		}
+		end := int(dec.InputOffset())
+		start := end - int(n)
+		if !strings.EqualFold(key, "model") || raw[start] != '"' {
+			continue
+		}
+		found = true
+		var current string
+		if err := json.Unmarshal(raw[start:end], &current); err != nil || current == model {
+			continue
+		}
+		out = append(append(out, raw[copied:start]...), literal...)
+		copied = end
 	}
-	obj["model"] = model
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return raw
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, errors.New("the body's top-level object does not end")
 	}
-	return out
+	if !found {
+		return nil, errors.New("the body has no top-level model string")
+	}
+	if copied == 0 {
+		return raw, nil
+	}
+	return append(out, raw[copied:]...), nil
+}
+
+// valueLen records the length of the JSON value it is decoded from, and keeps
+// none of it: rewriteModelField's token walk steps over every top-level value
+// without copying it (a body may carry megabytes of base64 media).
+type valueLen int
+
+func (n *valueLen) UnmarshalJSON(b []byte) error {
+	*n = valueLen(len(b))
+	return nil
+}
+
+// jsonString returns s as a JSON string literal, with <, > and & left as they
+// are, like the rest of a body rewriteModelField splices it into.
+func jsonString(s string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 // rebuildMultipartModel returns raw as a new multipart body, and its
