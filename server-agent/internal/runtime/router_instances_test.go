@@ -412,6 +412,10 @@ func TestRouterLiteralHashModelWins(t *testing.T) {
 	})
 
 	t.Run("upstream", func(t *testing.T) {
+		// A probe starts nothing, so L is brought up here -- by its literal
+		// name, through the router's own /ensure -- rather than relied on from
+		// an earlier subtest: run alone, this one must find L running too.
+		ensureThroughRouter(t, h, "foo#2")
 		ph := newRouter(m)
 		sent := &recordingTransport{} // answers itself: the stub child serves no /props
 		ph.transport = sent
