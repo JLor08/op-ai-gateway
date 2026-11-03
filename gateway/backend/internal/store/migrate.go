@@ -3356,9 +3356,9 @@ func migration72Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 //   - agent_runtime_spec_gpus.position: the operator-chosen GPU order. Backfilled
 //     to the ascending-gpu_index rank per spec, so NO existing spec's env var /
 //     ${…} placeholder order changes on upgrade — the order only moves when an
-//     operator actively reorders (design §3.4).
-//   - agent_runtime_specs.visible_devices_mode: the env/args visibility mechanism
-//     (design §4.1), default 'env' = today's behaviour. [OWNED BY AREA B.]
+//     operator actively reorders.
+//   - agent_runtime_specs.visible_devices_mode: the env/args visibility
+//     mechanism, default 'env' = today's behaviour.
 //
 // Append-only: it does NOT touch migration65Up's create-table or the v60-frozen
 // baseline (a fresh install replays this; the backfill is a no-op on empty

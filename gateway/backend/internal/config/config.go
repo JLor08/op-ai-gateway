@@ -82,10 +82,10 @@ type Config struct {
 	// Default 120s; junk or <= 0 uses the default. The reverse proxy's read timeout for
 	// that route must be at least this long.
 	VoiceCoLoadTimeout time.Duration
-	// The Voice Chat turn-detection and half-duplex timings (voice-chat design
-	// §6.1/§6.2), each a Go duration string (e.g. "900ms"); junk or <= 0 uses the
-	// default. The defaults are the literals of gateway.VoiceSilenceTimeoutMs and its
-	// siblings (this package cannot import gateway):
+	// The Voice Chat turn-detection and half-duplex timings, each a Go duration
+	// string (e.g. "900ms"); junk or <= 0 uses the default. The defaults are the
+	// literals of gateway.VoiceSilenceTimeoutMs and its siblings (this package
+	// cannot import gateway):
 	//   - VoiceSilenceTimeout:    silence after a voiced partial that ends a chunk (900ms).
 	//   - VoiceMinUtterance:      a voiced span shorter than this is a blip, not a chunk (300ms).
 	//   - VoiceMaxUtterance:      hard cap on one chunk's voiced span (30s).

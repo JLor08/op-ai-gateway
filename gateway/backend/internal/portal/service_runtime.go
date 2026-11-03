@@ -531,7 +531,8 @@ type RuntimeSpecDTO struct {
 	// VisibleDevicesMode is "env" | "args": how set_visible_devices is
 	// enforced. Only meaningful when SetVisibleDevices is on; default "env".
 	VisibleDevicesMode string `json:"visible_devices_mode"`
-	// APITokenMode is "app"|"set"|"random"|"off" (design §2). Default "app".
+	// APITokenMode is "app"|"set"|"random"|"off": where the upstream API token
+	// of this spec's child comes from. Default "app" (the application's token).
 	APITokenMode string `json:"api_token_mode"`
 	// APITokenSet reports presence of a per-spec token (set/random); the VALUE
 	// is never on the wire.
@@ -1357,7 +1358,7 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 	return spec, nil
 }
 
-// runtimeSpecAPIToken resolves the per-spec API token (design §2): the mode,
+// runtimeSpecAPIToken resolves the per-spec API token: the mode,
 // "app" when absent, and the SEALED value to persist, computed STRICTLY
 // BEFORE the store write, so a keyless-disk seal rejection
 // (capture.ErrKeyRequired) returns without persisting anything -- no
