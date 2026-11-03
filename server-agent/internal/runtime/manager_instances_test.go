@@ -2537,9 +2537,12 @@ func answered(reply chan ensureOutcome) (ensureOutcome, bool) {
 // TestEnsureServingNeverStartsABurstInstance: a plain request (EnsureServing)
 // naming a burst instance is served by it while it runs and waits for it while
 // it starts -- its admission has already happened. In every other state it is
-// refused at once with ErrInstanceNoCapacity, and nothing is created, started,
-// retired or replaced: starting burst capacity is an ensure's decision (§5.4
-// rule 6), and the gateway re-selects a running instance for the request.
+// refused at once with ErrInstanceNoCapacity, and nothing is created or
+// started: starting burst capacity is an ensure's decision, and the gateway
+// re-selects a running instance for the request. A burst instance resting at a
+// failure -- kept only so an operator can read why, until it is named again --
+// is retired by the request that names it, which creates and starts nothing; a
+// draining one is left to its exit, which retires it.
 func TestEnsureServingNeverStartsABurstInstance(t *testing.T) {
 	spec := replicableSpec("S", "m")
 	spec.AdmissionWaitTimeoutSeconds = 0 // no admission timer on a bare owner
@@ -2551,16 +2554,17 @@ func TestEnsureServingNeverStartsABurstInstance(t *testing.T) {
 		return st
 	}
 	for _, tc := range []struct {
-		name   string
-		burst  *specState // nil: instance 1 has no state at all
-		want   error      // nil: served (running) or queued (starting)
-		queued bool
+		name    string
+		burst   *specState // nil: instance 1 has no state at all
+		want    error      // nil: served (running) or queued (starting)
+		retired bool       // the refusal retires the row
+		queued  bool
 	}{
 		{name: "no state", want: ErrInstanceNoCapacity},
 		{name: "stopped", burst: restingInstance(spec, 1, StateStopped), want: ErrInstanceNoCapacity},
-		{name: "crashed", burst: restingInstance(spec, 1, StateCrashed), want: ErrInstanceNoCapacity},
-		{name: "start failed", burst: restingInstance(spec, 1, StateStartFailed), want: ErrInstanceNoCapacity},
-		{name: "not permitted", burst: restingInstance(spec, 1, StateNotPermitted), want: ErrInstanceNoCapacity},
+		{name: "crashed", burst: restingInstance(spec, 1, StateCrashed), want: ErrInstanceNoCapacity, retired: true},
+		{name: "start failed", burst: restingInstance(spec, 1, StateStartFailed), want: ErrInstanceNoCapacity, retired: true},
+		{name: "not permitted", burst: restingInstance(spec, 1, StateNotPermitted), want: ErrInstanceNoCapacity, retired: true},
 		{name: "draining", burst: live(StateDraining), want: ErrInstanceNoCapacity},
 		{name: "starting", burst: live(StateStarting), queued: true},
 		{name: "running", burst: live(StateRunning)},
@@ -2583,8 +2587,14 @@ func TestEnsureServingNeverStartsABurstInstance(t *testing.T) {
 				if !ok || !errors.Is(out.err, tc.want) {
 					t.Fatalf("EnsureServing(m#1) answered %v (answered at once: %v), want %v at once", out.err, ok, tc.want)
 				}
+				if tc.retired {
+					if got := o.specs["S#1"]; got != nil {
+						t.Errorf("instance 1 = %s after the refusal, want its %s row retired: it was named again", got.state, before)
+					}
+					break
+				}
 				if got := o.specs["S#1"]; got != tc.burst {
-					t.Errorf("instance 1 state is %p after the refusal, want %p: a plain request creates, retires and replaces nothing", got, tc.burst)
+					t.Errorf("instance 1 state is %p after the refusal, want %p: a plain request creates and replaces nothing", got, tc.burst)
 				}
 				if tc.burst != nil && (tc.burst.state != before || len(tc.burst.pending) != 0) {
 					t.Errorf("instance 1 = %s with %d queued, want it left at %s with nothing queued", tc.burst.state, len(tc.burst.pending), before)

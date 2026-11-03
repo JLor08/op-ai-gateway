@@ -552,6 +552,42 @@ func TestRouterPlainRequestNeverStartsABurstInstance(t *testing.T) {
 	}
 }
 
+// TestRouterPlainRequestRetiresACrashedBurstInstance: a burst instance that
+// crashed rests at crashed -- it is never restarted on its own -- until it is
+// named again. A plain request naming it is refused with 409
+// runtime.instance_no_capacity like for any burst instance that is not up, and
+// the crashed row is retired in the same turn: retiring creates and starts
+// nothing, and without it a row the gateway keeps naming (its telemetry lags a
+// moment) would stay crashed until the next config push. The next ensure then
+// starts a fresh instance.
+func TestRouterPlainRequestRetiresACrashedBurstInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}})
+	h := NewRouter(m)
+	ensureThroughRouter(t, h, "m#1")
+	pid := killInstance(t, m, "S", 1)
+	waitUntil(t, 5*time.Second, "instance 1 crashed", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateCrashed
+	})
+
+	rec := postJSON(t, h, `{"model":"m#1"}`)
+	assertConflict(t, rec.Code, rec.Body, "runtime.instance_no_capacity")
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Fatalf("instance 1 = %+v after a plain request named it, want the crashed row retired", st)
+	}
+	if st := mustInstance(t, m, "S", 0); st.PID != 0 {
+		t.Errorf("instance 0 = %+v, want it never started: the request named instance 1", st)
+	}
+
+	ensureThroughRouter(t, h, "m#1")
+	if st := mustInstance(t, m, "S", 1); st.State != StateRunning || st.PID == 0 || st.PID == pid || st.LastError != nil {
+		t.Errorf("instance 1 after the ensure = %+v, want a fresh instance running (not pid %d, no crash on record)", st, pid)
+	}
+}
+
 // TestRouterModelsListsBaseNamesRunningListsInstances: /v1/models names each
 // managed spec once, by its base name, whatever instances it runs -- it is the
 // gateway's model sync, and an instance is not a model -- while /running lists

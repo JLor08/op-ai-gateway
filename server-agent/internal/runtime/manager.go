@@ -516,22 +516,31 @@ func (m *Manager) Apply(cfg Config) {
 //
 // upstreamModel may be an INSTANCE ADDRESS (#340): "m#k" names instance k of
 // the spec whose upstream model is m, resolved by the same rule as
-// ResolveAddress, and an allowed instance that does not exist yet is created
-// on demand. A burst instance answers at once -- it starts into free room or
-// is refused with ErrInstanceNoCapacity / ErrInstanceDemandUnknown, and is
-// never queued behind anything but its own start.
+// ResolveAddress. An allowed instance that does not exist yet is created on
+// demand, and a burst instance resting at a crash or a failed start is retired
+// and created afresh: burst capacity is never retried on its own, so an ensure
+// naming it again is the retry. A burst instance answers at once -- it starts
+// into free room or is refused with ErrInstanceNoCapacity /
+// ErrInstanceDemandUnknown, a draining one is refused with
+// ErrInstanceNoCapacity, and it is never queued behind anything but its own
+// start. This is the ensure behind the router's POST /ensure/{model}, which is
+// how the gateway adds capacity; a request the router forwards is admitted with
+// EnsureServing instead, which never starts a burst instance.
 func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
 	return m.ensure(ctx, upstreamModel, false)
 }
 
 // EnsureServing is EnsureRunning for a PLAIN request -- one the router forwards
-// to the child (a proxied or live request), not an ensure (#340, design §5.4
-// rule 6). It is EnsureRunning with one exception: a request naming a BURST
-// instance (IsBurst) is served only by a process that is already there. A
-// running one serves it, and a starting one -- admitted already -- has it wait
-// for that start. In any other state (no state at all, stopped, draining, or
-// resting at a failure) the request is refused at once with
-// ErrInstanceNoCapacity, and nothing is created, started, retired or replaced.
+// to the child (a proxied or live request), not an ensure (#340). It is
+// EnsureRunning with one exception: a request naming a BURST instance (IsBurst)
+// is served only by a process that is already there. A running one serves it,
+// and a starting one -- admitted already -- has it wait for that start. In any
+// other state (no state at all, stopped, draining, or resting at a failure) the
+// request is refused at once with ErrInstanceNoCapacity, and nothing is created
+// or started. A burst instance resting at a failure (crashed, start_failed,
+// not_permitted) is retired by that refusal: its row is kept only until the
+// instance is named again, and retiring it creates and starts nothing. A
+// draining one is left to its exit, which retires it.
 //
 // Burst capacity is started on purpose: the gateway's scaler asks for it with an
 // ensure (EnsureRunning, the router's /ensure/{model}) once it has decided that
@@ -2000,7 +2009,8 @@ func (o *owner) rebuildUpstreamIndex() {
 // A plain request (EnsureServing, cmdEnsure.serving) differs in one place: it
 // is refused with ErrInstanceNoCapacity, creating and starting nothing, when it
 // names a burst instance that is neither running nor starting
-// (plainRequestRefused).
+// (plainRequestRefused) -- and when that instance rests at a failure
+// (spentBurst), the refusal retires its row.
 func (o *owner) handleEnsure(c cmdEnsure) {
 	if o.closing {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
@@ -2021,9 +2031,17 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	}
 	if k > 0 {
 		// Decided before instanceForRequest, which would create the instance, or
-		// retire a failed one and start over -- exactly what a plain request must
-		// not do to a burst instance (EnsureServing).
+		// retire a failed one and start a fresh one -- the start is exactly what
+		// a plain request must not cause for a burst instance (EnsureServing).
+		// The retirement it may cause: a burst instance resting at a failure
+		// stays only until it is named again, and deleting it creates and starts
+		// nothing. Left in place, a row the gateway keeps naming for a moment
+		// (its telemetry lags) would read crashed until the next Apply.
 		if c.serving && o.plainRequestRefused(st, k) {
+			key := InstanceKey(st.spec.ID, k)
+			if failed := o.specs[key]; failed != nil && failed.spentBurst() {
+				o.retire(key, failed)
+			}
 			c.reply <- ensureOutcome{err: ErrInstanceNoCapacity}
 			return
 		}
@@ -2118,6 +2136,7 @@ func (o *owner) instanceAddressHolder(spec Spec, k int) (holder string, held boo
 // an instance with no state at all is classified too. A running burst instance
 // serves the request, a starting one has been admitted already and the request
 // waits for its start, and a protected instance is admitted as for any request.
+// (handleEnsure retires a refused one that rests at a failure.)
 func (o *owner) plainRequestRefused(base *specState, k int) bool {
 	if !IsBurst(base.spec, k) {
 		return false
@@ -2134,11 +2153,16 @@ func (o *owner) plainRequestRefused(base *specState, k int) bool {
 }
 
 // instanceForRequest returns the state of instance k of base's spec for a
-// request that names it, creating it on demand (§5.2): an allowed instance that
-// does not exist yet starts life Stopped and is admitted like any other. A
-// burst instance resting at a crash or a failed start is "named again" here,
-// which retires that row and starts over with a fresh one: burst capacity is
-// never retried on its own, so a request asking for it again IS the retry.
+// request that names it, creating it on demand: an allowed instance that does
+// not exist yet starts life Stopped and is admitted like any other. A burst
+// instance resting at a crash or a failed start is "named again" here, which
+// retires that row and starts over with a fresh one: burst capacity is never
+// retried on its own, so an ensure asking for it again IS the retry. (One
+// resting at not_permitted is re-evaluated in place instead, behind the same
+// rate limit as any refusal.) Only an ensure (EnsureRunning) reaches this for a
+// burst instance that is neither running nor starting: handleEnsure refuses a
+// plain request (EnsureServing) for one first, and retires a failed row itself,
+// starting nothing.
 // A state found under the key is always an instance of this very spec: no spec
 // ID contains '#' (reservedSpecID), so no other spec's state can hold it.
 func (o *owner) instanceForRequest(base *specState, k int) *specState {
@@ -2639,22 +2663,46 @@ func demandUnknown(spec Spec) bool {
 }
 
 // retireIfSpent deletes a burst instance's state once nothing is left of it
-// (#340, design §5.2): no process, no queued request, and no failure to show.
-// Burst capacity exists only while it serves -- left in place, the row would
-// read "stopped" forever. A burst instance resting at a FAILURE (crashed,
+// (#340): no process, no queued request, and no failure to show. Burst capacity
+// exists only while it serves -- left in place, the row would read "stopped"
+// forever. A burst instance resting at a FAILURE (spentBurst: crashed,
 // start_failed, not_permitted) is kept so an operator can read why, until it is
-// named again (instanceForRequest) or the next Apply retires it. Instance 0 and
-// the protected instances are never retired, and neither is a removed state,
-// which onProcExited deletes on its own path.
+// named again -- by an ensure, which starts a fresh one (instanceForRequest),
+// or by a plain request, which only retires it (handleEnsure) -- or the next
+// Apply retires it. Instance 0 and the protected instances are never retired,
+// and neither is a removed state, which onProcExited deletes on its own path.
 func (o *owner) retireIfSpent(id string) {
 	st := o.specs[id]
-	if st == nil || !st.burst() || st.removed || st.proc != nil || len(st.pending) > 0 {
+	if st == nil || !st.burstLeftNothing() || restsAtFailure(st.state) {
 		return
 	}
-	switch st.state {
-	case StateCrashed, StateStartFailed, StateNotPermitted:
-		return
-	}
+	o.retire(id, st)
+}
+
+// burstLeftNothing reports whether st is a burst instance with nothing left of
+// it: no process, no queued request, and not removed (a removed state is
+// deleted on its own path).
+func (st *specState) burstLeftNothing() bool {
+	return st.burst() && !st.removed && st.proc == nil && len(st.pending) == 0
+}
+
+// restsAtFailure reports whether s is a state a burst instance rests at after
+// a failure: crashed, start_failed or not_permitted.
+func restsAtFailure(s State) bool {
+	return s == StateCrashed || s == StateStartFailed || s == StateNotPermitted
+}
+
+// spentBurst reports whether st is a burst instance with nothing left of it but
+// a failure to show -- a burst instance is never retried on its own, so that
+// row only waits to be named again or the next Apply.
+func (st *specState) spentBurst() bool {
+	return st.burstLeftNothing() && restsAtFailure(st.state)
+}
+
+// retire deletes the state of a burst instance that is gone, and cancels any
+// crash-loop timer with it: a timer must never outlive its state (handleClose
+// can only cancel the timers of the states still in the table).
+func (o *owner) retire(id string, st *specState) {
 	cancelTimer(o.m, &st.backoffTimer)
 	delete(o.specs, id)
 }
@@ -4448,9 +4496,10 @@ func (o *owner) hostRAMBudgetSnapshot() int {
 // the status table.
 //
 // A BURST instance (#340) never enters it: burst capacity is opportunistic and
-// is not retried on its own -- the gateway asks for it again when it wants it
-// (instanceForRequest retires the failed row then). Its caller has already set
-// the failure state, which it keeps for the operator until it is named again
+// is not retried on its own -- the gateway asks for it again when it wants it.
+// Its caller has already set the failure state, which it keeps for the operator
+// until it is named again (an ensure then retires the row and starts a fresh
+// instance, instanceForRequest; a plain request only retires it, handleEnsure)
 // or the next Apply; any waiter still queued on it would never be served, so it
 // is failed here.
 func (o *owner) enterBackoff(st *specState) {
