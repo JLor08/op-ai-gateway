@@ -2982,3 +2982,134 @@ func TestHeldInstanceIsReaskedWhenItsLowerSiblingIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// rang reports whether a transitions doorbell has a signal waiting, and
+// consumes it.
+func rang(doorbell <-chan struct{}) bool {
+	select {
+	case <-doorbell:
+		return true
+	default:
+		return false
+	}
+}
+
+// TestDeletingARowSignalsTransitions: a row leaving the state table rings the
+// transitions doorbell exactly like a state change does, on every path that
+// deletes one. The agent sends the gateway a fresh sample when it rings, and the
+// gateway routes requests to the instance addresses it read off those rows: a
+// deletion it learns of only at the next periodic sample leaves a retired
+// instance a routing candidate meanwhile, and every request sent to it is
+// refused and re-selected for nothing. The retirements of a failed burst row by
+// a plain request and by an ensure move no state at all, so without their own
+// signal nothing would ring; neither would a push or an exit that deletes a
+// row.
+func TestDeletingARowSignalsTransitions(t *testing.T) {
+	spec := replicableSpec("S", "m")
+	spec.AdmissionWaitTimeoutSeconds = 0 // no admission timer on a bare owner
+
+	t.Run("a plain request retires a crashed burst row", func(t *testing.T) {
+		o := servingOwner(spec, restingInstance(spec, 1, StateCrashed))
+		o.m.transitions = make(chan struct{}, 1)
+		reply := make(chan ensureOutcome, 1)
+
+		o.handleEnsure(cmdEnsure{model: "m#1", reply: reply, serving: true})
+
+		if out, ok := answered(reply); !ok || !errors.Is(out.err, ErrInstanceNoCapacity) {
+			t.Fatalf("EnsureServing(m#1) = %v (answered at once: %v), want ErrInstanceNoCapacity at once", out.err, ok)
+		}
+		if st := o.specs["S#1"]; st != nil {
+			t.Fatalf("instance 1 = %s, want its crashed row retired: the premise of this case", st.state)
+		}
+		if !rang(o.m.transitions) {
+			t.Error("the crashed row was retired and the transitions doorbell did not ring, want it rung: the row left Status()")
+		}
+	})
+
+	t.Run("an ensure retires a crashed burst row it cannot restart", func(t *testing.T) {
+		// The ensure retires the crashed row to start a fresh instance, which
+		// does not fit -- the one process slot is U's, and a burst instance never
+		// evicts -- so the fresh row is refused and retired in the same turn.
+		o, _ := startOrderOwner(1, restingInstance(spec, 0, StateStopped), restingInstance(spec, 1, StateCrashed))
+		o.rebuildUpstreamIndex()
+		o.m.transitions = make(chan struct{}, 1)
+		reply := make(chan ensureOutcome, 1)
+
+		o.handleEnsure(cmdEnsure{model: "m#1", reply: reply})
+
+		if out, ok := answered(reply); !ok || !errors.Is(out.err, ErrInstanceNoCapacity) {
+			t.Fatalf("EnsureRunning(m#1) = %v (answered at once: %v), want ErrInstanceNoCapacity at once", out.err, ok)
+		}
+		if st := o.specs["S#1"]; st != nil {
+			t.Fatalf("instance 1 = %s, want no row: the crashed one retired, the fresh one refused", st.state)
+		}
+		if !rang(o.m.transitions) {
+			t.Error("the crashed row was retired and the transitions doorbell did not ring, want it rung: the row left Status()")
+		}
+	})
+
+	t.Run("a push removes a spec with no process", func(t *testing.T) {
+		skipOnWindows(t)
+		shrinkTimings(t)
+		m := newTestManager(t, allowlistPolicy())
+		m.Apply(Config{Specs: []Spec{baseSpec("S", "m"), baseSpec("T", "t")}})
+		rang(m.Transitions())
+
+		m.Apply(Config{Specs: []Spec{baseSpec("T", "t")}})
+
+		if st := statusFor(m, "S"); st != nil {
+			t.Fatalf("S = %+v, want no row: the push removed it, and it had no process", st)
+		}
+		if !rang(m.Transitions()) {
+			t.Error("S's row was deleted and the transitions doorbell did not ring, want it rung")
+		}
+	})
+
+	t.Run("a push makes a stopped protected instance burst", func(t *testing.T) {
+		skipOnWindows(t)
+		shrinkTimings(t)
+		m := newTestManager(t, allowlistPolicy())
+		s := replicableSpec("S", "m")
+		s.MinInstances = 2
+		s.AdminState = "force_stopped" // nothing starts: instance 1 rests at stopped
+		m.Apply(Config{Specs: []Spec{s}})
+		if st := mustInstance(t, m, "S", 1); st.State != StateStopped {
+			t.Fatalf("instance 1 = %+v, want stopped: the premise of this case", st)
+		}
+		rang(m.Transitions())
+
+		s.MinInstances = 1 // instance 1 is burst capacity now, with nothing left of it
+		m.Apply(Config{Specs: []Spec{s}})
+
+		if st := instanceStatus(m, "S", 1); st != nil {
+			t.Fatalf("instance 1 = %+v, want no row: the push retired it", st)
+		}
+		if !rang(m.Transitions()) {
+			t.Error("instance 1's row was retired and the transitions doorbell did not ring, want it rung")
+		}
+	})
+
+	t.Run("a removed spec's process exits", func(t *testing.T) {
+		skipOnWindows(t)
+		shrinkTimings(t)
+		setDrainGrace(t, 10*time.Second) // the request in flight decides when it exits
+		m := newTestManager(t, allowlistPolicy())
+		m.Apply(Config{Specs: []Spec{baseSpec("S", "m")}})
+		_, release := ensureModel(t, m, "m")
+		m.Apply(Config{}) // S is removed: it drains, its request still in flight
+		if st := statusFor(m, "S"); st == nil || st.State != StateDraining {
+			release()
+			t.Fatalf("S = %+v, want draining: the premise of this case", st)
+		}
+		rang(m.Transitions())
+
+		release() // the drain ends, the process exits, the row is deleted
+		waitUntil(t, 5*time.Second, "the removed spec's row deleted on its exit", func() bool {
+			return statusFor(m, "S") == nil
+		})
+
+		if !rang(m.Transitions()) {
+			t.Error("S's row was deleted on its exit and the transitions doorbell did not ring, want it rung")
+		}
+	})
+}

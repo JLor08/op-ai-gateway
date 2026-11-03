@@ -547,7 +547,8 @@ type runtimeWaker interface {
 
 // runtimeTransitionsWaker is the optional interface a runtimeDriver may
 // additionally implement to expose an immediate-resample doorbell: a spec
-// state transition (design spec §7: "reverse direction latency" -- a
+// state transition, or a row leaving the runtime status (a retired burst
+// instance, a removed spec) (design spec §7: "reverse direction latency" -- a
 // portal click should feel like network latency, not the next 1s telemetry
 // tick... let alone the 60s runtime-config poll). *runtimectl.Driver
 // implements it (delegating to its Manager's own Transitions() channel).
@@ -1116,9 +1117,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-logTickerC:
 			a.flushRuntimeLogs(ctx)
 		case <-a.runtimeTransitions:
-			// Immediate coalesced sample on a spec state transition (design
-			// spec §7): a portal click should feel like network latency, not
-			// the next 1s telemetry tick.
+			// Immediate coalesced sample on a spec state transition or a row
+			// leaving the runtime status (design spec §7): a portal click
+			// should feel like network latency, not the next 1s telemetry
+			// tick, and the gateway must not keep routing to a retired
+			// instance until then.
 			a.collectOnce(ctx)
 		}
 	}

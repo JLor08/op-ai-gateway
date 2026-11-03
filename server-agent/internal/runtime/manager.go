@@ -347,7 +347,8 @@ type Manager struct {
 
 	// transitions is buffered(1): a state-change notification a consumer has
 	// not yet drained is never queued twice, it just stays pending -- "some
-	// state changed, go re-read Status()" coalesces naturally.
+	// state changed, or a row left the table, go re-read Status()" coalesces
+	// naturally.
 	transitions chan struct{}
 
 	// measurer is read (never written) by the owner goroutine and written
@@ -729,9 +730,10 @@ func (m *Manager) AppliedETag() string {
 }
 
 // Transitions returns a channel that receives a signal on any spec state
-// change. Buffered(1): a burst of transitions between two reads of this
-// channel coalesces into a single pending wake, exactly like
-// client.WSSender's certUpdates/trustUpdates doorbells.
+// change, and whenever a row leaves the state table (deleteState: a burst
+// instance retired, a removed spec gone). Buffered(1): a burst of transitions
+// between two reads of this channel coalesces into a single pending wake,
+// exactly like client.WSSender's certUpdates/trustUpdates doorbells.
 func (m *Manager) Transitions() <-chan struct{} {
 	return m.transitions
 }
@@ -1696,7 +1698,7 @@ func (o *owner) applyConfig(cfg Config) {
 				o.setState(st, StateStopped)
 			}
 			if len(st.pending) == 0 {
-				delete(o.specs, id) // retired: see retireIfSpent
+				o.retire(id, st) // see retireIfSpent
 				continue
 			}
 			// A queued request is re-asked by the wake below, as the burst
@@ -1916,7 +1918,7 @@ func (o *owner) removeState(id string, st *specState) {
 	// handleWaiterTimeout is itself a no-op once the spec is gone)
 	// would never be resolved at all.
 	o.failPending(st, ErrModelNotManaged)
-	delete(o.specs, id)
+	o.deleteState(id)
 }
 
 // sameLaunchShape reports whether two revisions of a spec would exec the
@@ -2208,7 +2210,7 @@ func (o *owner) instanceForRequest(base *specState, k int) *specState {
 	key := InstanceKey(base.spec.ID, k)
 	st := o.specs[key]
 	if st != nil && st.burst() && st.proc == nil && (st.state == StateCrashed || st.state == StateStartFailed) {
-		delete(o.specs, key)
+		o.retire(key, st)
 		st = nil
 	}
 	if st == nil {
@@ -2366,10 +2368,32 @@ func (o *owner) setState(st *specState, s State) {
 	}
 	st.state = s
 	st.since = time.Now()
+	o.signalTransition()
+}
+
+// signalTransition rings the transitions doorbell (Manager.Transitions): a row
+// of Status() changed, or left the table. It never blocks -- a signal nobody has
+// read yet already stands for this one.
+func (o *owner) signalTransition() {
 	select {
 	case o.m.transitions <- struct{}{}:
 	default:
 	}
+}
+
+// deleteState takes the state of instance id out of the table, and rings the
+// transitions doorbell for it exactly as a state change does: the row leaves
+// Status(), and the agent's next telemetry sample, with it. The gateway routes
+// requests to the instance addresses it read off those rows, so it has to learn
+// of a deletion as promptly as of a change -- not at the next periodic sample,
+// while it keeps naming an address that is gone and every request sent there is
+// refused and re-selected. Some deletions move no state at all on their way --
+// a request retiring a burst row that rests at a failure, a push removing a
+// state with no process, a removed state's exit -- so the doorbell is rung
+// here, and every deletion of a state goes through here.
+func (o *owner) deleteState(id string) {
+	delete(o.specs, id)
+	o.signalTransition()
 }
 
 // setNotPermitted records the not_permitted refusal and fails st's queued
@@ -2738,12 +2762,13 @@ func (st *specState) spentBurst() bool {
 	return st.burstLeftNothing() && restsAtFailure(st.state)
 }
 
-// retire deletes the state of a burst instance that is gone, and cancels any
-// crash-loop timer with it: a timer must never outlive its state (handleClose
-// can only cancel the timers of the states still in the table).
+// retire deletes the state of a burst instance that is gone (deleteState, which
+// rings the transitions doorbell), and cancels any crash-loop timer with it: a
+// timer must never outlive its state (handleClose can only cancel the timers of
+// the states still in the table).
 func (o *owner) retire(id string, st *specState) {
 	cancelTimer(o.m, &st.backoffTimer)
-	delete(o.specs, id)
+	o.deleteState(id)
 }
 
 // admitAndStart is the single place that decides whether spec should move
@@ -4223,7 +4248,8 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// lingered for one config-poll interval.
 	//
 	// No recordFailure and no state transition: the spec is about to cease to
-	// exist, so there is nowhere for either to be read from.
+	// exist, so there is nowhere for either to be read from. The row leaving
+	// the table rings the transitions doorbell instead (deleteState).
 	//
 	// C2 fix: resolve any queued waiter before dropping the spec -- otherwise
 	// it (and even its own admission_wait_timeout, since handleWaiterTimeout
@@ -4238,7 +4264,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// wake below starts it.
 	if removed {
 		o.failPending(st, ErrModelNotManaged)
-		delete(o.specs, st.spec.ID)
+		o.deleteState(st.spec.ID)
 		o.rebuildUpstreamIndex()
 		if !o.closing {
 			o.ensureProtectedFloor()
