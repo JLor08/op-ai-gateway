@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -191,8 +192,46 @@ func TestRouterRewritesInstanceModelMultipart(t *testing.T) {
 	}
 }
 
+// recordingTransport is a router transport that records the URL of every
+// request the router sends a child -- the whole URL, fragment included, as the
+// router built it -- and hands the request on to next, or, with next nil,
+// answers it 200 itself without reaching any process.
+type recordingTransport struct {
+	next http.RoundTripper
+	mu   sync.Mutex
+	urls []url.URL
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	rt.urls = append(rt.urls, *req.URL)
+	rt.mu.Unlock()
+	if rt.next != nil {
+		return rt.next.RoundTrip(req)
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+}
+
+// sent returns the URLs recorded so far.
+func (rt *recordingTransport) sent() []url.URL {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return append([]url.URL(nil), rt.urls...)
+}
+
+// recordTransport swaps rt's transport for a recording one in front of it.
+func recordTransport(rt *router) *recordingTransport {
+	rec := &recordingTransport{next: rt.transport}
+	rt.transport = rec
+	return rec
+}
+
 // TestRouterLiveInstanceQueryUsesBase: a live transcription for m#1 reaches
 // instance 1's child with model=m in its query, the inbound params unchanged.
+// The request is read off the router's transport, where the whole URL the
+// router built is still visible: appended unrewritten, "m#1" would parse as
+// model=m with the URL fragment "1", and as a fragment is never sent, the child
+// alone could not tell that apart from the base name.
 func TestRouterLiveInstanceQueryUsesBase(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -200,6 +239,7 @@ func TestRouterLiveInstanceQueryUsesBase(t *testing.T) {
 	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}})
 	child, capCh := newLiveChild(t)
 	h := newRouter(redirectManager{managerPort: m, endpoint: child.URL})
+	sent := recordTransport(h)
 	ensureThroughRouter(t, h, "m#1")
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -227,6 +267,14 @@ func TestRouterLiveInstanceQueryUsesBase(t *testing.T) {
 	}
 	if got.sampleRate != "16000" || got.language != "de" {
 		t.Errorf("forwarded params = {sample_rate:%q language:%q}, want {16000 de}", got.sampleRate, got.language)
+	}
+	urls := sent.sent()
+	if len(urls) != 1 {
+		t.Fatalf("the router sent %d requests to a child, want the one live relay", len(urls))
+	}
+	if u := urls[0]; u.RawQuery != "language=de&sample_rate=16000&model=m" || u.Fragment != "" {
+		t.Errorf("the router sent the child %s (query %q, fragment %q), want the query language=de&sample_rate=16000&model=m and no fragment: the base name in place of the address",
+			u.String(), u.RawQuery, u.Fragment)
 	}
 	if st := mustInstance(t, m, "S", 1); st.State != StateRunning {
 		t.Errorf("instance 1 = %+v, want running", st)
@@ -273,29 +321,114 @@ func TestRouterInstanceZeroUntouched(t *testing.T) {
 
 // TestRouterLiteralHashModelWins: foo#2 is the literal upstream model of L,
 // while F (upstream foo) is replicable, so foo#2 also parses as F's instance 2.
-// The literal name wins: the request reaches L, unchanged, and F has no
-// instance 2 (Review Focus 1).
+// The literal name wins on every route -- a real model whose name merely
+// contains '#' keeps reaching its own spec: a JSON request and a multipart one
+// reach L byte for byte, a live relay reaches L with the name as named in its
+// query, and an /upstream probe reaches L's running process with its query as
+// sent. F gets no instance 2, and F's instance 0 is never started.
 func TestRouterLiteralHashModelWins(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	m, h, child := instanceRouter(t, Config{Specs: []Spec{replicableSpec("F", "foo"), baseSpec("L", "foo#2")}})
+	onlyLServes := func(t *testing.T) {
+		t.Helper()
+		if st := statusFor(m, "L"); st == nil || st.State != StateRunning {
+			t.Errorf("L = %+v, want running: it served the request", st)
+		}
+		if st := instanceStatus(m, "F", 2); st != nil {
+			t.Errorf("F instance 2 = %+v, want none", st)
+		}
+		if st := mustInstance(t, m, "F", 0); st.PID != 0 {
+			t.Errorf("F instance 0 = %+v, want it never started", st)
+		}
+	}
 
-	const body = `{"model":"foo#2","n":1.50}`
-	if rec := postJSON(t, h, body); rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	if _, _, _, got := child.snapshot(); string(got) != body {
-		t.Fatalf("the child received %s, want %s unchanged: foo#2 is L's own name, not an address to rewrite", got, body)
-	}
-	if st := statusFor(m, "L"); st == nil || st.State != StateRunning {
-		t.Errorf("L = %+v, want running: it served the request", st)
-	}
-	if st := instanceStatus(m, "F", 2); st != nil {
-		t.Errorf("F instance 2 = %+v, want none", st)
-	}
-	if st := mustInstance(t, m, "F", 0); st.PID != 0 {
-		t.Errorf("F instance 0 = %+v, want it never started", st)
-	}
+	t.Run("json", func(t *testing.T) {
+		const body = `{"model":"foo#2","n":1.50}`
+		if rec := postJSON(t, h, body); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if _, _, _, got := child.snapshot(); string(got) != body {
+			t.Fatalf("the child received %s, want %s unchanged: foo#2 is L's own name, not an address to rewrite", got, body)
+		}
+		onlyLServes(t)
+	})
+
+	t.Run("multipart", func(t *testing.T) {
+		form, contentType := editBody(t, "foo#2", "")
+		req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(form))
+		req.Header.Set("Content-Type", contentType)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if _, _, gotType, gotBody := child.snapshot(); gotType != contentType || !bytes.Equal(gotBody, form) {
+			t.Fatalf("the child received Content-Type %q and %q, want the form exactly as sent: %q and %q", gotType, gotBody, contentType, form)
+		}
+		onlyLServes(t)
+	})
+
+	t.Run("live", func(t *testing.T) {
+		liveChild, capCh := newLiveChild(t)
+		lh := newRouter(redirectManager{managerPort: m, endpoint: liveChild.URL})
+		sent := recordTransport(lh)
+		srv := httptest.NewServer(lh)
+		defer srv.Close()
+		resp, err := srv.Client().Post(srv.URL+"/live/foo%232?sample_rate=16000", "application/octet-stream", strings.NewReader("pcm"))
+		if err != nil {
+			t.Fatalf("POST /live/foo%%232: %v", err)
+		}
+		defer resp.Body.Close()
+		if _, err := io.ReadAll(resp.Body); err != nil {
+			t.Fatalf("read the relayed stream: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		select {
+		case <-capCh:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the live child was never reached")
+		}
+		// The name the router put in the child's query, read back whole: a '#'
+		// in it starts the URL's fragment, so the query alone holds "foo". What
+		// must not happen is a rewrite to F's base name foo, which leaves no
+		// fragment at all. (The fragment is never sent, so audio.cpp, reading the
+		// query verbatim, receives such a name cut at its '#' -- see serveLive.)
+		urls := sent.sent()
+		if len(urls) != 1 {
+			t.Fatalf("the router sent %d requests to a child, want the one live relay", len(urls))
+		}
+		named := urls[0].Query().Get("model")
+		if urls[0].Fragment != "" {
+			named += "#" + urls[0].Fragment
+		}
+		if named != "foo#2" {
+			t.Errorf("the router named the model %q in the child's query (%s), want foo#2 as named: L's own name, not F's base", named, urls[0].String())
+		}
+		onlyLServes(t)
+	})
+
+	t.Run("upstream", func(t *testing.T) {
+		ph := newRouter(m)
+		sent := &recordingTransport{} // answers itself: the stub child serves no /props
+		ph.transport = sent
+		rec := httptest.NewRecorder()
+		ph.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/foo%232/props?model=foo%232&x=1", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d %s, want 200", rec.Code, rec.Body.String())
+		}
+		lPort := mustInstance(t, m, "L", 0).Port
+		urls := sent.sent()
+		if len(urls) != 1 {
+			t.Fatalf("the router sent %d requests to a child, want the one probe", len(urls))
+		}
+		if u := urls[0]; u.Host != "127.0.0.1:"+strconv.Itoa(lPort) || u.Path != "/props" || u.RawQuery != "model=foo%232&x=1" {
+			t.Errorf("the probe went to %s, want L's process (port %d) at /props with the query as sent", u.String(), lPort)
+		}
+		onlyLServes(t)
+	})
 }
 
 // assertConflict fails the test unless rec is a 409 carrying code.

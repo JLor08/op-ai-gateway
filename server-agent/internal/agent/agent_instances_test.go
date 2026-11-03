@@ -70,6 +70,41 @@ func TestRuntimeSampleCarriesInstanceAndStartup(t *testing.T) {
 	}
 }
 
+// TestLoadedModelsListsRunningInstanceAddresses: with the runtime driver
+// active, the sample's loaded_models is the manager's own list -- one entry per
+// RUNNING instance, by its address: m for instance 0, m#2 for instance 2 -- so
+// the gateway sees which instances it can route to right now. An instance that
+// is still starting is not listed; the runtime rows carry every instance.
+func TestLoadedModelsListsRunningInstanceAddresses(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{SpecID: "rspec_m", Model: "m", State: runtimectl.StateRunning, PID: 100},
+		{SpecID: "rspec_m", Model: "m#1", Instance: 1, State: runtimectl.StateStarting, PID: 101},
+		{SpecID: "rspec_m", Model: "m#2", Instance: 2, State: runtimectl.StateRunning, PID: 102},
+	})
+
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil || len(got.Runtimes) != 3 {
+		t.Fatalf("sample = %+v, want the three instance rows", got)
+	}
+	if want := []string{"m", "m#2"}; !reflect.DeepEqual(got.LoadedModels, want) {
+		t.Fatalf("LoadedModels = %q, want %q: every running instance by its address", got.LoadedModels, want)
+	}
+	got.Normalize()
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"loaded_models":["m","m#2"]`) {
+		t.Errorf("marshaled sample lacks \"loaded_models\":[\"m\",\"m#2\"]: %s", raw)
+	}
+}
+
 // ollamaInstanceChild is a fake `ollama serve` for one instance: every POST
 // /api/show is answered with a context length and a capability list, and the
 // model each one asked about is recorded.
