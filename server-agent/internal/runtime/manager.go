@@ -1175,6 +1175,13 @@ type specState struct {
 	// rewrites it on every verdict, like waitingOnDemand.
 	waitingOnSibling bool
 
+	// decidedTurn is the owner turn (owner.turn) of this instance's latest FULL
+	// admission decision -- one that went on to build a snapshot, whatever its
+	// verdict -- and 0 once a later ask only held it back behind a lower
+	// sibling (waitingOnSibling), which decides nothing. reask reads it to
+	// skip a decision this very turn has already taken.
+	decidedTurn uint64
+
 	state State
 	since time.Time
 
@@ -1443,10 +1450,25 @@ type owner struct {
 	// dispatches it as soon as the outstanding one returns, instead of leaving
 	// the new process unmeasured for a whole housekeeping beat: a burst
 	// instance inherits its siblings' measured demand, and a fresh sibling's
-	// figure is what lets the next one start (§5.2). Only a start sets it --
-	// a skipped housekeeping beat stays skipped -- so a measurer slower than
-	// the beat still never runs back to back.
+	// figure is what lets the next one start. Only a start sets it -- a
+	// skipped housekeeping beat stays skipped -- so a measurer slower than the
+	// beat still never runs back to back.
 	remeasure bool
+
+	// turn numbers the owner's turns -- one per command handled, housekeeping
+	// beat or host-sample wake -- from 1. A full admission decision records the
+	// turn it was taken in (specState.decidedTurn), and a loop that asks a list
+	// of candidates it collected before asking any of them skips one whose
+	// decision from this very turn still stands (reask). Nothing an admission
+	// reads moves within a turn except through the turn's own decisions -- an
+	// exit, a measurement, a request and a host sample each arrive as a turn
+	// of their own -- and those only take room (a start) or begin to free it
+	// (a drain, which frees it at the exit), so asking again would repeat the
+	// decision, and each one builds a snapshot, which calls the VRAM measurer
+	// (a subprocess on a real host). 0 is an owner driven by hand rather than
+	// by run (the package's owner-level tests): no decision is fresh then, and
+	// every ask is a full one.
+	turn uint64
 }
 
 // run is the owner's single event loop. Every state mutation in this
@@ -1464,11 +1486,13 @@ func (o *owner) run() {
 		case cmd := <-o.m.cmds:
 			o.handle(cmd)
 		case <-idleTick.C:
+			o.turn++
 			if !o.closing {
 				o.scanIdle()
 				o.dispatchMeasurement()
 			}
 		case <-o.m.hostWake:
+			o.turn++
 			if !o.closing {
 				o.wakeOnHostSample()
 			}
@@ -1480,6 +1504,7 @@ func (o *owner) run() {
 }
 
 func (o *owner) handle(cmd command) {
+	o.turn++ // every command is a turn of its own (owner.turn)
 	switch c := cmd.(type) {
 	case cmdApply:
 		o.applyConfig(c.cfg)
@@ -1708,10 +1733,12 @@ func (o *owner) applyConfig(cfg Config) {
 			start = append(start, id)
 		}
 	}
-	// Never in map order: see the order note in this function's doc.
+	// Never in map order: see the order note in this function's doc. An
+	// instance a cascade from an earlier one has already decided is not asked
+	// again (reask).
 	o.sortInstanceOrder(start)
 	for _, id := range start {
-		o.admitAndStart(id)
+		o.reask(id)
 	}
 	o.wakeAdmissionCandidates()
 }
@@ -2782,9 +2809,14 @@ func (o *owner) admitAndStart(specID string) {
 	// costs no measurement.
 	if lower, waits := o.lowerSiblingWaiting(st); waits {
 		st.waitingOnSibling = true
+		st.decidedTurn = 0 // held back, not decided: the next ask decides (reask)
 		slog.Debug("runtime: protected instance waits for a lower instance of its spec to start first", "spec", specID, "lower_instance", lower)
 		return
 	}
+	// Everything from here on is a full decision, whatever its verdict, and it
+	// stands for the rest of this turn (owner.turn): a wake loop that reaches st
+	// again in this turn does not repeat it (reask).
+	st.decidedTurn = o.turn
 
 	// The one-shot VRAM bootstrap grant is per-candidate owner state, so it is
 	// set on the snapshot here (which buildSnapshot, being candidate-agnostic,
@@ -4247,7 +4279,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 			// would also reach the victim, and only this explicit step
 			// guarantees the ordering between the two.
 			for _, id := range drainedFor {
-				o.admitAndStart(id)
+				o.reask(id)
 			}
 			// For a burst instance with nobody waiting this is also where it
 			// is retired (admitAndStart's deferred retireIfSpent).
@@ -4913,8 +4945,34 @@ func (o *owner) wakeAdmission(want func(*specState) bool) {
 		return lessByQueueAge(candidates[i], candidates[j])
 	})
 	for _, c := range candidates {
-		o.admitAndStart(c.id)
+		o.reask(c.id)
 	}
+}
+
+// reask is admitAndStart for a loop that asks a list of candidates it collected
+// before asking any of them -- the wakes (wakeAdmission), the Apply start loop,
+// an exit's beneficiaries -- and skips a candidate whose full decision from
+// this very turn still stands (decidedThisTurn). Such a candidate was decided
+// by an earlier ask in the same turn, above all by a cascade: a sibling that
+// started or was refused re-asks the instances held back behind it
+// (wakeSiblingsWaitingFor), which a list collected before then still names.
+// Asking it again would repeat the decision -- nothing it reads has moved in
+// between (owner.turn) -- and every decision builds a snapshot, which calls
+// the VRAM measurer: eight protected instances behind a refused instance 0
+// would otherwise be decided almost twice over in one wake. An instance only
+// held back since (waitingOnSibling) has no standing decision and is asked.
+func (o *owner) reask(id string) {
+	if st := o.specs[id]; st != nil && o.decidedThisTurn(st) {
+		return
+	}
+	o.admitAndStart(id)
+}
+
+// decidedThisTurn reports whether st's latest full admission decision was taken
+// in the current owner turn (owner.turn; never on an owner driven by hand,
+// whose turn is 0).
+func (o *owner) decidedThisTurn(st *specState) bool {
+	return o.turn != 0 && st.decidedTurn == o.turn
 }
 
 // wakeCandidate is one spec wakeAdmission has selected for a retry,

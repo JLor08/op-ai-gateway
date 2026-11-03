@@ -2749,11 +2749,11 @@ func TestEnsureServingQueuesBehindAStartingBurstInstance(t *testing.T) {
 // room for three of them once the busy neighbour U is gone. Instances 1-3 are
 // held back behind instance 0 (lowerSiblingWaiting). When instance 0 starts,
 // the cascade re-asks them: each one that starts re-asks those above it in
-// turn. Instance 3, which does not fit, must be asked by the cascade ONCE --
-// not once more at every level the cascade unwinds through -- because every ask
-// is a full admission decision, and each decision calls the VRAM measurer (a
-// subprocess on a real host). The only other ask in that turn is the exit's own
-// wake, so instance 3 is decided twice in all.
+// turn. Instance 3, which does not fit, must be decided ONCE in that turn --
+// not once more at every level the cascade unwinds through, and not once more
+// by the wake that U's exit runs after the cascade -- because every ask is a
+// full admission decision, and each decision calls the VRAM measurer (a
+// subprocess on a real host).
 func TestSiblingCascadeAsksEachHeldInstanceOnce(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -2812,8 +2812,56 @@ func TestSiblingCascadeAsksEachHeldInstanceOnce(t *testing.T) {
 		}
 	}
 	mu.Unlock()
-	if asked != 2 {
-		t.Fatalf("instance 3 was decided %d times, want 2 (once by the cascade, once by the exit's own wake): the cascade re-asked it at every level it unwound through", asked)
+	if asked != 1 {
+		t.Fatalf("instance 3 was decided %d times, want once: by the cascade, and neither again at each level it unwound through nor by the exit's own wake in the same turn", asked)
+	}
+}
+
+// TestAWakeDecidesEachInstanceOnceInATurn: eight protected instances, seven of
+// them held back behind instance 0, which a pinned neighbour of unknown demand
+// refuses. One release -- one owner turn -- wakes them all: instance 0 is asked
+// and refused, its refusal re-asks the held instances (a refused sibling holds
+// no room to wait for), and each of those is refused in turn. Every decision
+// builds a snapshot, which calls the VRAM measurer (a subprocess on a real
+// host), so each instance must be decided once in that turn: the wake's own
+// candidate list, collected before the cascade ran, still names instances 1-7,
+// and asking them again would only repeat decisions whose inputs nothing in the
+// turn has changed. Each keeps its own verdict.
+func TestAWakeDecidesEachInstanceOnceInATurn(t *testing.T) {
+	const instances = 8
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = instances
+	spec.AdmissionWaitTimeoutSeconds = 0 // no admission timer on a bare owner
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	pinned := baseSpec("P", "p")
+	pinned.Pinned = true
+	pinned.GPUs = []SpecGPU{{Index: 0}} // its demand on gpu 0 is unknown
+	p := liveInstance(pinned, 0, 50)
+	states := []*specState{p}
+	for k := 0; k < instances; k++ {
+		st := restingInstance(spec, k, StateStopped)
+		st.waitingOnSibling = k > 0 // held back behind instance 0, which waits to start
+		states = append(states, st)
+	}
+	o := instanceOwner(states...)
+	o.policy = allowlistPolicy()
+	o.allowedPairs = allowPairs("S", "P")
+	o.rebuildUpstreamIndex()
+	decisions := 0
+	o.m.SetMeasurer(func([]int) map[int]map[int]int {
+		decisions++ // the owner calls it synchronously, once per snapshot
+		return nil
+	})
+
+	o.handle(cmdRelease{specID: "P", proc: p.proc}) // P idles on: the release wakes every waiting start
+
+	if decisions != instances {
+		t.Fatalf("%d admission decisions in one turn, want %d: one per instance", decisions, instances)
+	}
+	for k := 0; k < instances; k++ {
+		if st := o.specs[InstanceKey("S", k)]; st.state != StatePendingVRAMUnknown || st.waitingOnSibling {
+			t.Errorf("instance %d = %s (waitingOnSibling %v), want pending_vram_unknown, its own verdict", k, st.state, st.waitingOnSibling)
+		}
 	}
 }
 
