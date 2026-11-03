@@ -39,7 +39,8 @@
 // address resolution (resolveAddress), demand inheritance (demandSpec for a
 // candidate, chargeSpec for an occupant), the burst/baseline split
 // (admitAndStart), the protected floor (protected, ensureProtectedFloor), the
-// order instances are asked in (instanceLess), the "highest index leaves
+// order instances are asked in (instanceLess) and started in -- lowest index
+// first, whatever asks (lowerSiblingWaiting) -- the "highest index leaves
 // first" invariant (scanIdle, evictOneIdleForBootstrap), retirement
 // (retireIfSpent) and output (one log buffer per spec, a further instance's
 // lines prefixed "[#k] ").
@@ -1116,6 +1117,14 @@ type specState struct {
 	// outlives the wait.
 	waitingOnDemand bool
 
+	// waitingOnSibling is true while this PROTECTED instance k >= 1 is held
+	// back because a lower-index sibling still waits to start (lowerSiblingWaiting):
+	// the instances of a spec start lowest index first (§4). It is what
+	// wakeSiblingsWaitingFor selects when that sibling gets its process, so the
+	// two load side by side rather than one after the other. admitAndStart
+	// rewrites it on every verdict, like waitingOnDemand.
+	waitingOnSibling bool
+
 	state State
 	since time.Time
 
@@ -1496,11 +1505,14 @@ func (o *owner) handle(cmd command) {
 // Order matters in two places. The routing index (rebuildUpstreamIndex) is
 // rebuilt once the removed specs are out and BEFORE the further instances and
 // the floor are reconciled, because which addresses are another spec's literal
-// model is read off that index. And the protected instances are started in
+// model is read off that index. And the protected instances are asked in
 // instance order (sortInstanceOrder), instance 0 of a spec first: when the room
 // holds fewer instances than the floor asks for, the ones it holds are the
 // lowest, never a further instance that instance 0 could not get the room back
-// from (a sibling is never a victim, §5.4 rule 3).
+// from (a sibling is never a victim, §5.4 rule 3). Asked in that order, each
+// further instance finds its lower siblings already started; admitAndStart's
+// start-order rule (lowerSiblingWaiting) is what keeps the order on the paths
+// that ask in event order instead, here included.
 //
 // A spec whose ID is reserved for instance keys (reservedSpecID: it contains
 // '#') is ignored with a Warn, as ParseConfig already drops it from every
@@ -2568,8 +2580,10 @@ func (o *owner) retireIfSpent(id string) {
 // sibling-inherited demand (demandSpec). A burst instance is admitted only into
 // room that is free right now (PolicySnapshot.NoEvict) and is otherwise
 // refused at once (ErrInstanceNoCapacity, or ErrInstanceDemandUnknown before
-// Admit is even asked), never queued; and an instance k >= 1 is never admitted
-// with an unknown demand.
+// Admit is even asked), never queued; an instance k >= 1 is never admitted
+// with an unknown demand; and a protected instance k >= 1 is not admitted while
+// a lower sibling still waits to start (lowerSiblingWaiting), whichever of them
+// is asked first.
 func (o *owner) admitAndStart(specID string) {
 	if o.closing {
 		// Never start (or restart) anything once shutdown has begun -- a
@@ -2601,6 +2615,7 @@ func (o *owner) admitAndStart(specID string) {
 	st.waitingOnRAM = false
 	st.waitingOnGrace = false
 	st.waitingOnDemand = false
+	st.waitingOnSibling = false
 	if !o.wantsUp(st) {
 		return
 	}
@@ -2611,6 +2626,24 @@ func (o *owner) admitAndStart(specID string) {
 
 	if err := o.policy.Permit(st.spec); err != nil {
 		o.setNotPermitted(st, err.Error())
+		return
+	}
+
+	// The instances of a spec start lowest index first (§4), on every path that
+	// asks: Apply and the wakes ask in that order already, but a crash-loop
+	// timer, a request naming m#k, and an instance's own re-admission on exit
+	// ask in the order events happen to arrive. A protected instance admitted
+	// ahead of a lower sibling that is still waiting would keep the room it
+	// took -- a sibling is never a victim (§5.4 rule 3), and a protected
+	// instance is never idle-unloaded -- so that sibling, instance 0 above all,
+	// would stay down for as long as it runs. It waits instead: silently, with
+	// nothing evicted for it, because the lower sibling's own row says why that
+	// one is not up, and the wait ends as soon as it has a process
+	// (wakeSiblingsWaitingFor). Ahead of the snapshot, so a held-back instance
+	// costs no measurement.
+	if lower, waits := o.lowerSiblingWaiting(st); waits {
+		st.waitingOnSibling = true
+		slog.Debug("runtime: protected instance waits for a lower instance of its spec to start first", "spec", specID, "lower_instance", lower)
 		return
 	}
 
@@ -2707,6 +2740,75 @@ func (o *owner) admitAndStart(specID string) {
 		// wakeAdmissionCandidates).
 	default: // dec.OK
 		o.startProcess(st)
+		if st.proc != nil {
+			// The further instances that waited for this one to start may go
+			// now, side by side with it.
+			o.wakeSiblingsWaitingFor(st)
+		}
+	}
+}
+
+// lowerSiblingWaiting reports whether st, a PROTECTED instance k >= 1, has to
+// wait for a lower-index sibling to start first (admitAndStart's start-order
+// rule, §4), and names the lowest such sibling's index. A sibling waits to start
+// when it has no process and rests at Stopped -- waiting for room, for a
+// sibling's measurement, or for its own turn -- or at Backoff, waiting out a
+// crash-loop delay it will retry after. One resting at a refusal
+// (not_permitted, pending_vram_unknown) is not waiting for room: the siblings
+// of one spec are admitted against the same demand, budgets and verdicts, so
+// st does not start where that sibling was refused either -- it is refused the
+// same way, or waits for a measured sibling when its demand is unknown (§5.4
+// rule 5) -- and holding it back would only hide its own verdict: a request
+// naming it would wait out its admission timeout instead of being answered
+// with that refusal. Every lower sibling of a protected instance is
+// protected itself, so it always wants up; a missing one (a gap: the floor
+// skipped an instance whose address another spec holds) holds nothing back.
+//
+// Instance 0 never waits here, and neither does a burst instance: burst
+// capacity only ever takes room that is free right now and is refused at once
+// otherwise (§5.4 rule 6), and it leaves again by idle unload, so a lower
+// sibling it shares the spec with is kept down only transiently -- the case §4
+// allows.
+func (o *owner) lowerSiblingWaiting(st *specState) (lower int, waits bool) {
+	if st.instance == 0 || !st.protected() {
+		return 0, false
+	}
+	base := specBase(st.spec)
+	lower = st.instance
+	for _, sib := range o.specs {
+		if sib.instance >= lower || sib.proc != nil || specBase(sib.spec) != base {
+			continue
+		}
+		if sib.state != StateStopped && sib.state != StateBackoff {
+			continue
+		}
+		if !o.wantsUp(sib) {
+			continue
+		}
+		lower, waits = sib.instance, true
+	}
+	return lower, waits
+}
+
+// wakeSiblingsWaitingFor re-asks, lowest index first, the further instances of
+// st's spec that the start-order rule held back (specState.waitingOnSibling),
+// now that st has just been given a process. Each is admitted on its own merits
+// again -- it may still find no room, or wait for another lower sibling -- and
+// one that does start re-asks those above it in turn. Without this they would be
+// asked again only when st's start finishes (wakeAfterStart), so two instances
+// whose crash-loop retries fell due in the wrong order would load one after
+// the other instead of side by side.
+func (o *owner) wakeSiblingsWaitingFor(st *specState) {
+	base := specBase(st.spec)
+	var ids []string
+	for id, sib := range o.specs {
+		if sib.waitingOnSibling && sib.instance > st.instance && specBase(sib.spec) == base {
+			ids = append(ids, id)
+		}
+	}
+	o.sortInstanceOrder(ids)
+	for _, id := range ids {
+		o.admitAndStart(id)
 	}
 }
 
@@ -4696,11 +4798,12 @@ func wantsWake(st *specState) bool {
 // For instances (#340) the tiebreak is instanceLess -- the base spec ID, then
 // the instance index NUMERICALLY -- not the instance key as a string, which
 // would put S#10 before S#2. Equal queue times are the protected instances
-// with no waiter above all, and for them the order decides who gets the room
-// first: instance 0 ahead of every further instance of its spec, which never
-// gives the room back (a sibling is never a victim). The key itself breaks
-// what is left, which for a spec that never replicates is the whole tiebreak:
-// its base is its ID and its index 0.
+// with no waiter above all, and for them the order asks instance 0 ahead of
+// every further instance of its spec, so a further one finds its lower siblings
+// started rather than being held back for them (admitAndStart's start-order
+// rule keeps the order whichever is asked first). The key itself breaks what
+// is left, which for a spec that never replicates is the whole tiebreak: its
+// base is its ID and its index 0.
 func lessByQueueAge(a, b wakeCandidate) bool {
 	if a.queuedAt.IsZero() != b.queuedAt.IsZero() {
 		return b.queuedAt.IsZero() // a real queue time sorts before "no waiter"

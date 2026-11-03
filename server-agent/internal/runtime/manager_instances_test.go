@@ -1572,8 +1572,9 @@ func killInstance(t *testing.T, m *Manager, specID string, k int) int {
 // TestLessByQueueAgeOrdersInstancesNumerically: equal queue times -- above all
 // the protected instances with no waiter at all -- are ordered by spec, then by
 // instance index as a NUMBER. As strings S#10 sorts before S#2, and S#1 after
-// nothing that would keep instance 0 first; the wake order decides which
-// instance gets room it never gives back to a sibling.
+// nothing that would keep instance 0 first; the wake order asks the lowest
+// index first, so a further instance finds its lower siblings started instead
+// of being held back for them (TestProtectedInstanceStartsOnlyAfterItsLowerSiblings).
 func TestLessByQueueAgeOrdersInstancesNumerically(t *testing.T) {
 	t0 := time.Now()
 	c := func(base string, k int, queuedAt time.Time) wakeCandidate {
@@ -2185,4 +2186,313 @@ func TestEvictOneIdleForBootstrapSparesSiblingsOfAnInstanceAndProtected(t *testi
 	if o.evictOneIdleForBootstrap("S#2") {
 		t.Fatalf("found a victim: S#1 %s, Q %s -- want none", sib.state, q0.state)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Start order on every path: a protected further instance starts only once its
+// lower siblings have (§4). The Apply start loop and the wake order ask the
+// lowest index first, but crash-loop timers, a request naming a further
+// instance, and an instance's own re-admission on exit ask in event order; the
+// admission itself is what has to keep the order.
+// ---------------------------------------------------------------------------
+
+// startOrderOwner builds an owner for the start-order tests: the given states
+// plus an idle, unrelated occupant U, co-resident with S, under a limit of
+// limit processes. A candidate admitted past the start-order rule needs U's
+// slot, so it EVICTS U -- beginDrain is a pure state change for U's
+// already-exited generation, and nothing is ever exec'd -- while one the rule
+// holds back leaves U running and untouched.
+func startOrderOwner(limit int, states ...*specState) (*owner, *specState) {
+	u := liveInstance(baseSpec("U", "u"), 0, 30)
+	o := instanceOwner(append(states, u)...)
+	o.policy = allowlistPolicy()
+	o.cfg = Config{MaxProcesses: limit}
+	o.allowedPairs = allowPairs("S", "U") // only the process limit makes room scarce
+	return o, u
+}
+
+// restingInstance is instance k of spec with no process, resting in state.
+func restingInstance(spec Spec, k int, state State) *specState {
+	return &specState{spec: specForInstance(spec, k), instance: k, state: state}
+}
+
+// TestProtectedInstanceStartsOnlyAfterItsLowerSiblings: a protected instance
+// k >= 1 is not admitted while a lower sibling still waits to start -- for room,
+// or for its crash-loop retry -- because the room it took would never come back
+// (a sibling is never a victim, §5.4 rule 3) and instance 0 would stay down while
+// it runs, against §4. It waits instead, silently and with no victim drained,
+// and goes as soon as every lower sibling has a process. Gaps below it (an
+// instance that cannot exist) hold nothing back.
+func TestProtectedInstanceStartsOnlyAfterItsLowerSiblings(t *testing.T) {
+	min2 := replicableSpec("S", "m")
+	min2.MinInstances = 2
+	min3 := replicableSpec("S", "m")
+	min3.MinInstances = 3
+	starting := func(spec Spec, k int) *specState {
+		st := liveInstance(spec, k, 100+k)
+		st.state = StateStarting
+		st.proc.everHealthy = false
+		return st
+	}
+	for _, tc := range []struct {
+		name      string
+		candidate *specState
+		siblings  []*specState
+		limit     int
+		held      bool
+	}{
+		{
+			name:      "instance 0 still waiting for room",
+			candidate: restingInstance(min2, 1, StateStopped),
+			siblings:  []*specState{restingInstance(min2, 0, StateStopped)},
+			limit:     1,
+			held:      true,
+		},
+		{
+			name:      "instance 0 waiting out a crash backoff",
+			candidate: restingInstance(min2, 1, StateStopped),
+			siblings:  []*specState{restingInstance(min2, 0, StateBackoff)},
+			limit:     1,
+			held:      true,
+		},
+		{
+			name:      "instance 1 still waiting while instance 0 runs",
+			candidate: restingInstance(min3, 2, StateStopped),
+			siblings:  []*specState{liveInstance(min3, 0, 100), restingInstance(min3, 1, StateStopped)},
+			limit:     2,
+			held:      true,
+		},
+		{
+			name:      "instance 0 already starting",
+			candidate: restingInstance(min2, 1, StateStopped),
+			siblings:  []*specState{starting(min2, 0)},
+			limit:     2,
+		},
+		{
+			name:      "a gap below holds nothing back",
+			candidate: restingInstance(min3, 2, StateStopped),
+			siblings:  []*specState{liveInstance(min3, 0, 100)},
+			limit:     2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, u := startOrderOwner(tc.limit, append(tc.siblings, tc.candidate)...)
+			tc.candidate.waitingOnSibling = !tc.held // rewritten by every verdict
+
+			o.admitAndStart(tc.candidate.spec.ID)
+
+			if tc.held {
+				if u.state != StateRunning || len(u.drainedFor) != 0 || tc.candidate.proc != nil {
+					t.Fatalf("U = %s, drained for %v: instance %d claimed room while a lower sibling still waits to start; want it held back, nothing evicted",
+						u.state, u.drainedFor, tc.candidate.instance)
+				}
+				if !tc.candidate.waitingOnSibling {
+					t.Error("waitingOnSibling = false, want true: the start of the lower sibling is what re-asks it")
+				}
+				return
+			}
+			if u.state != StateDraining || len(u.drainedFor) != 1 || u.drainedFor[0] != tc.candidate.spec.ID {
+				t.Fatalf("U = %s, drained for %v; want U evicted for %s: every lower sibling it has holds a process, so its admission runs",
+					u.state, u.drainedFor, tc.candidate.spec.ID)
+			}
+			if tc.candidate.waitingOnSibling {
+				t.Error("waitingOnSibling = true, want false: the verdict was not the start-order wait")
+			}
+		})
+	}
+}
+
+// TestStartOrderHoldsOnlyAProtectedInstanceBehindAWaitingSibling: the rule is
+// about room a lower sibling is waiting to start in. A further instance that is
+// burst capacity is never held back by it -- it only ever takes room that is
+// free right now, and is refused at once otherwise (§5.4 rule 6) -- and a lower
+// sibling resting at a refusal is not waiting for room: the further instance
+// reaches the same verdict on its own, and a request naming it is answered
+// with it at once instead of waiting out its admission timeout.
+func TestStartOrderHoldsOnlyAProtectedInstanceBehindAWaitingSibling(t *testing.T) {
+	queued := func(st *specState) chan ensureOutcome {
+		reply := make(chan ensureOutcome, 1)
+		st.pending = []*ensureWaiter{{reply: reply, queuedAt: time.Now()}}
+		return reply
+	}
+	answer := func(t *testing.T, reply chan ensureOutcome) error {
+		t.Helper()
+		select {
+		case out := <-reply:
+			return out.err
+		default:
+			t.Fatal("the queued request is still waiting; want it answered at once")
+			return nil
+		}
+	}
+
+	t.Run("a burst instance", func(t *testing.T) {
+		spec := replicableSpec("S", "m")
+		spec.Pinned = true // instance 0 protected, instance 1 burst
+		burst := restingInstance(spec, 1, StateStopped)
+		reply := queued(burst)
+		o, u := startOrderOwner(1, restingInstance(spec, 0, StateBackoff), burst)
+
+		o.admitAndStart("S#1")
+
+		if err := answer(t, reply); !errors.Is(err, ErrInstanceNoCapacity) {
+			t.Fatalf("burst m#1 = %v, want ErrInstanceNoCapacity: burst capacity is refused at once, never held back", err)
+		}
+		if u.state != StateRunning || o.specs["S#1"] != nil {
+			t.Errorf("U = %s, S#1 state kept = %v; want U untouched and the refused burst instance retired", u.state, o.specs["S#1"] != nil)
+		}
+	})
+
+	t.Run("a lower sibling refused on its own demand", func(t *testing.T) {
+		spec := replicableSpec("S", "m")
+		spec.MinInstances = 2
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 9000}}
+		s0 := restingInstance(spec, 0, StateNotPermitted)
+		s1 := restingInstance(spec, 1, StateStopped)
+		reply := queued(s1)
+		o, u := startOrderOwner(1, s0, s1)
+		o.cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 8000}}
+
+		o.admitAndStart("S#1")
+
+		if err := answer(t, reply); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("m#1 = %v, want ErrNotPermitted: instance 1's own verdict, the one instance 0 rests at", err)
+		}
+		if s1.state != StateNotPermitted || s1.waitingOnSibling || u.state != StateRunning {
+			t.Errorf("instance 1 = %s (waitingOnSibling %v), U = %s; want instance 1 not_permitted on its own verdict and U untouched",
+				s1.state, s1.waitingOnSibling, u.state)
+		}
+	})
+}
+
+// TestAQueuedFurtherInstanceDoesNotClaimRoomAheadOfInstanceZero: the wake order
+// is oldest queued request first, so a request naming m#1 puts instance 1 ahead
+// of instance 0, which has no waiter of its own. Instance 1 must still not claim
+// the room: the one idle neighbour is evicted for instance 0 alone, and the
+// request waits for instance 1's turn.
+func TestAQueuedFurtherInstanceDoesNotClaimRoomAheadOfInstanceZero(t *testing.T) {
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	s0 := restingInstance(spec, 0, StateStopped)
+	s1 := restingInstance(spec, 1, StateStopped)
+	s1.pending = []*ensureWaiter{{reply: make(chan ensureOutcome, 1), queuedAt: time.Now().Add(-time.Second)}}
+	o, u := startOrderOwner(1, s0, s1)
+
+	o.wakeAdmissionCandidates()
+
+	if u.state != StateDraining || len(u.drainedFor) != 1 || u.drainedFor[0] != "S" {
+		t.Fatalf("U = %s, drained for %v; want it drained for S alone: the freed room goes to instance 0 first",
+			u.state, u.drainedFor)
+	}
+	if s1.proc != nil || len(s1.pending) != 1 {
+		t.Errorf("instance 1 = %s with %d queued, want it still waiting with its request queued", s1.state, len(s1.pending))
+	}
+}
+
+// TestInstanceZeroCrashDoesNotHandItsRoomToAFurtherInstance: min_instances=2
+// with room for one process. Instance 0 runs and instance 1 waits. When instance
+// 0 crashes, its room is free while it waits out its crash backoff -- and the
+// wake that crash causes must not hand it to instance 1, which would keep it
+// for good: instance 0 restarts into its room, and instance 1 keeps waiting.
+func TestInstanceZeroCrashDoesNotHandItsRoomToAFurtherInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	m.Apply(Config{Specs: []Spec{spec}, MaxProcesses: 1, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "instance 0 running and instance 1 waiting for room", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.PID == 0
+	})
+
+	killed := killInstance(t, m, "S", 0)
+	instance1Waits := func() {
+		t.Helper()
+		if s1 := mustInstance(t, m, "S", 1); s1.PID != 0 {
+			t.Fatalf("instance 1 = %+v took the only room after instance 0 (%+v) crashed; want the room kept for instance 0 -- a sibling never gives room back",
+				s1, mustInstance(t, m, "S", 0))
+		}
+	}
+	waitUntil(t, 5*time.Second, "instance 0 back after its crash backoff", func() bool {
+		instance1Waits()
+		s0 := mustInstance(t, m, "S", 0)
+		return s0.State == StateRunning && s0.PID != killed
+	})
+	// And it stays that way across further backoff windows and housekeeping beats.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		instance1Waits()
+		if s0 := mustInstance(t, m, "S", 0); s0.State != StateRunning {
+			t.Fatalf("instance 0 = %+v, want it running", s0)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestFurtherInstanceStartsAlongsideTheSiblingItWaitedFor: instance 1's
+// crash-loop retry falls due while instance 0 is still waiting out a longer
+// one, so instance 1 waits for instance 0 (the start order). It must then
+// start the moment instance 0 does -- the two load side by side when the room
+// holds both -- not only once instance 0 is ready, which the shut health gate
+// here postpones for as long as the test needs.
+func TestFurtherInstanceStartsAlongsideTheSiblingItWaitedFor(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	// Crash-loop waits that order the two retries: instance 0's second failure
+	// in a row waits 500ms, instance 1's first 250ms. Failure streaks are not
+	// reset by a stable run within the test.
+	origBase, origCap, origStable := backoffBase, backoffCap, stableRunThreshold
+	backoffBase, backoffCap, stableRunThreshold = 250*time.Millisecond, 2*time.Second, time.Minute
+	t.Cleanup(func() { backoffBase, backoffCap, stableRunThreshold = origBase, origCap, origStable })
+	m := newTestManager(t, allowlistPolicy())
+
+	gate := filepath.Join(t.TempDir(), "S.healthy")
+	setGate := func(open bool) {
+		t.Helper()
+		var err error
+		if open {
+			err = os.WriteFile(gate, nil, 0o644)
+		} else {
+			err = os.Remove(gate)
+		}
+		if err != nil {
+			t.Fatalf("set the health gate open=%v: %v", open, err)
+		}
+	}
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	spec.Args = []string{"-port", "${PORT}", "-health-gate", gate}
+	bothRunning := func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	}
+
+	setGate(true)
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "both protected instances running", bothRunning)
+	first := killInstance(t, m, "S", 0) // a first failure, so the next one waits twice as long
+	waitUntil(t, 5*time.Second, "instance 0 back after its first crash", func() bool {
+		st := instanceStatus(m, "S", 0)
+		return st != nil && st.State == StateRunning && st.PID != first
+	})
+
+	setGate(false)
+	k0 := killInstance(t, m, "S", 0) // second failure: 500ms
+	k1 := killInstance(t, m, "S", 1) // first failure: 250ms
+	waitUntil(t, 5*time.Second, "instance 1's retry held back while instance 0 still waits out its longer backoff", func() bool {
+		s0, s1 := mustInstance(t, m, "S", 0), mustInstance(t, m, "S", 1)
+		return s0.State == StateBackoff && s1.State == StateStopped && s1.PID == 0
+	})
+	waitUntil(t, 3*time.Second, "both instances starting again", func() bool {
+		s0, s1 := mustInstance(t, m, "S", 0), mustInstance(t, m, "S", 1)
+		return s0.PID != 0 && s0.PID != k0 && s1.PID != 0 && s1.PID != k1
+	})
+	if s0 := mustInstance(t, m, "S", 0); s0.State != StateStarting {
+		t.Fatalf("instance 0 = %+v, want it still loading behind its shut health gate: instance 1 started alongside it, not after it", s0)
+	}
+
+	setGate(true)
+	waitUntil(t, 5*time.Second, "both instances running once the gate opens", bothRunning)
 }
