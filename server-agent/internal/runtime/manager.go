@@ -529,7 +529,9 @@ func (m *Manager) Apply(cfg Config) {
 // ResolveAddress. An allowed instance that does not exist yet is created on
 // demand, and a burst instance resting at a crash or a failed start is retired
 // and created afresh: burst capacity is never retried on its own, so an ensure
-// naming it again is the retry. A burst instance answers at once -- it starts
+// naming it again is the retry. (One resting at not_permitted is re-evaluated
+// in place instead, behind the same rate limit as any refusal,
+// notPermittedRetryInterval.) A burst instance answers at once -- it starts
 // into free room or is refused with ErrInstanceNoCapacity /
 // ErrInstanceDemandUnknown, a draining one is refused with
 // ErrInstanceNoCapacity, and it is never queued behind anything but its own
@@ -2070,8 +2072,9 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	}
 	if k > 0 {
 		// Decided before instanceForRequest, which would create the instance, or
-		// retire a failed one and start a fresh one -- the start is exactly what
-		// a plain request must not cause for a burst instance (EnsureServing).
+		// retire a crashed or start_failed one and start a fresh one -- the start
+		// is exactly what a plain request must not cause for a burst instance
+		// (EnsureServing).
 		// The retirement it may cause: a burst instance resting at a failure
 		// stays only until it is named again, and deleting it creates and starts
 		// nothing. Left in place, a row the gateway keeps naming for a moment
@@ -2730,9 +2733,14 @@ func demandUnknown(spec Spec) bool {
 // exists only while it serves -- left in place, the row would read "stopped"
 // forever. A burst instance resting at a FAILURE (spentBurst: crashed,
 // start_failed, not_permitted) is kept so an operator can read why, until it is
-// named again -- by an ensure, which starts a fresh one (instanceForRequest),
-// or by a plain request, which only retires it (handleEnsure) -- or the next
-// Apply retires it. Instance 0 and the protected instances are never retired,
+// named again or the next Apply retires it. Named by a plain request, the row
+// is retired whichever of the three failures it shows, and nothing is started
+// (handleEnsure). Named by an ensure, a crashed or start_failed row is retired
+// and a fresh instance started in its place (instanceForRequest), while a
+// not_permitted row is not retired: it is re-evaluated in place like any
+// refusal -- within notPermittedRetryInterval of the refusal the ensure is
+// answered ErrNotPermitted at once, after it the ensure runs admission again
+// on that same row. Instance 0 and the protected instances are never retired,
 // and neither is a removed state, which onProcExited deletes on its own path.
 func (o *owner) retireIfSpent(id string) {
 	st := o.specs[id]

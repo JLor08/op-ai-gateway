@@ -335,12 +335,12 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 
 // TestFeaturesDeclareRuntimeVoices pins the voices-route capability: this
 // agent's runtime router serves GET /upstream/{model}/v1/audio/voices (#251), a
-// Status-only passthrough to a RUNNING audio.cpp child's voice listing, and the
-// GATEWAY fetches a child's voices only from an agent that declares this exact
-// name, fail-closed -- an older router never serves the route and answers a 404
-// (runtime.upstream_endpoint_not_allowed from 0.7.0 on, runtime.model_not_managed
-// before 0.7.0) for every such read -- so a rename here silently stops every
-// agent child's voices from being cached.
+// read-only, never-start passthrough to a RUNNING audio.cpp child's voice
+// listing, and the GATEWAY fetches a child's voices only from an agent that
+// declares this exact name, fail-closed -- an older router never serves the
+// route and answers a 404 (runtime.upstream_endpoint_not_allowed from 0.7.0 on,
+// runtime.model_not_managed before 0.7.0) for every such read -- so a rename
+// here silently stops every agent child's voices from being cached.
 // The gateway spells the same string in its own constant
 // (RuntimeVoicesFeature, gateway/backend/internal/gateway/agent_features.go);
 // this module cannot import it.
@@ -394,14 +394,14 @@ func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 
 // TestFeaturesDeclareRuntimeModelParams pins the model-params-route capability.
 // This agent's runtime router serves GET /upstream/{model}/v1/models, a
-// Status-only passthrough to a RUNNING audio.cpp child's model listing relayed
-// with the inbound query (so ?include_params=true reaches the child), and the
-// GATEWAY pulls each model's declared request params (e.g. language) only from
-// an agent that declares this exact name, fail-closed -- an older router answers
-// a 404 (runtime.upstream_endpoint_not_allowed) for the route -- so a rename here
-// silently stops every agent child's declared params from being read. The
-// gateway spells the same string in its own constant; this module cannot import
-// it.
+// read-only, never-start passthrough to a RUNNING audio.cpp child's model
+// listing relayed with the inbound query (so ?include_params=true reaches the
+// child), and the GATEWAY pulls each model's declared request params (e.g.
+// language) only from an agent that declares this exact name, fail-closed -- an
+// older router answers a 404 (runtime.upstream_endpoint_not_allowed) for the
+// route -- so a rename here silently stops every agent child's declared params
+// from being read. The gateway spells the same string in its own constant; this
+// module cannot import it.
 func TestFeaturesDeclareRuntimeModelParams(t *testing.T) {
 	found := false
 	for _, f := range Features {

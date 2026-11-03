@@ -305,7 +305,7 @@ import (
 //
 // 0.10.2 -> 0.11.0 is the single bump for the voices-model-cache branch (issue
 // #251): the runtime router gains GET /upstream/{model}/v1/audio/voices, a
-// Status-only, never-start passthrough to a running audio.cpp child's voice
+// read-only, never-start passthrough to a running audio.cpp child's voice
 // listing, so the gateway can cache the voices an agent-launched TTS model offers
 // (the gateway talks to the router, never to the child). MINOR, and the rule
 // decides it: agent.Features gains "runtime_voices", the name the gateway checks,
@@ -339,7 +339,7 @@ import (
 // through 0.11.0 (runtime_voices) MINOR.
 //
 // 0.12.0 -> 0.13.0 is the single bump for the speech-language branch. The runtime
-// router gains GET /upstream/{model}/v1/models, a Status-only, never-start
+// router gains GET /upstream/{model}/v1/models, a read-only, never-start
 // passthrough to a running audio.cpp child's model listing that relays the inbound
 // query (so ?include_params=true reaches the child), which the gateway reads to
 // learn the request params -- notably language -- each model declares. MINOR, and
