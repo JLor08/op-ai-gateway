@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// Manager-level tests for model instances (#340, design §5.2-§5.6): one
+// Manager-level tests for model instances (#340): one
 // specState per instance, burst instances created on demand and refused at once
 // when there is no free room, protected instances started on Apply and never
 // idle-unloaded, highest index first on the way down, and the per-instance
@@ -359,7 +359,7 @@ func TestProtectedInstanceWaitsForSiblingMeasurement(t *testing.T) {
 // inherit that: it would count as known, and the instance would start against
 // the fraction (two copies of a model that settles at 6000 MB, admitted at
 // 1200 each onto an 8000 MB GPU). It inherits only a figure taken once its
-// sibling passed the health probe (§5.2, §5.4 rule 5): until then a protected
+// sibling passed the health probe: until then a protected
 // instance waits and a burst one is refused as demand-unknown; afterwards both
 // start on the loaded figure.
 //
@@ -585,7 +585,8 @@ func TestIdleUnloadHighestIndexFirst(t *testing.T) {
 }
 
 // TestIdleUnloadKeepsProtected: an instance inside the min_instances floor is
-// never idle-unloaded, however long it sits idle (§5.5: only k >= P unloads).
+// never idle-unloaded, however long it sits idle: only an instance k >= P,
+// above the protected floor, unloads.
 //
 // The positive control is an UNRELATED spec on the same idle timeout, used
 // after every protected instance, so its unload proves the scans ran past
@@ -757,8 +758,8 @@ func TestApplyReplicableOffDrainsInstancesGracefully(t *testing.T) {
 
 // TestApplyMaxLoweredDrainsDisallowed: lowering max_instances drains the
 // instances the new cap no longer allows, an idle one at once and one serving a
-// request only once that request has finished (Review Focus 2: a push never
-// cuts a response off); the instances still allowed are untouched.
+// request only once that request has finished (a push never cuts a response
+// off); the instances still allowed are untouched.
 func TestApplyMaxLoweredDrainsDisallowed(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -813,11 +814,12 @@ func TestApplyMaxLoweredDrainsDisallowed(t *testing.T) {
 
 // TestApplySpecRemovedDrainsInstancesGracefully: a push without the spec takes
 // every instance with it, and an instance serving a request finishes it first
-// (Review Focus 2). A removed spec reaches its instances k >= 1 by a route of
-// its own -- the removal loop keys by BASE spec, and the further-instances loop
-// leaves an instance of an absent spec to it -- so this is the one test that
-// drives that route: the instance must drain rather than be cut off, dropped
-// from the table while its child keeps running, or left behind.
+// (a push never cuts a response off). A removed spec reaches its instances
+// k >= 1 by a route of its own -- the removal loop keys by BASE spec, and the
+// further-instances loop leaves an instance of an absent spec to it -- so this
+// is the one test that drives that route: the instance must drain rather than
+// be cut off, dropped from the table while its child keeps running, or left
+// behind.
 func TestApplySpecRemovedDrainsInstancesGracefully(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -1123,7 +1125,7 @@ func TestApplyDrainsAnInstanceWhoseAddressBecameAnotherSpecsModel(t *testing.T) 
 // TestFirstHealthyProbeMeasuresEvenWhileAMeasurementIsInFlight: a start that
 // becomes healthy while another measurement is still out is measured as soon as
 // that one returns, not a whole housekeeping beat later -- the sibling demand a
-// burst instance inherits must become known within seconds (§5.2).
+// burst instance inherits must become known within seconds.
 func TestFirstHealthyProbeMeasuresEvenWhileAMeasurementIsInFlight(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -1316,8 +1318,8 @@ func TestInstanceZeroInheritsProtectedSiblingMeasurement(t *testing.T) {
 // live process, a starting one included, and that reading rightly charges the
 // loading process itself. But it is a fraction of what the model holds once
 // loaded, so a further instance must not inherit it: its demand would count as
-// known, and Admit would let it start against the fraction (§5.4 rule 5 waits
-// for a measured running sibling). Once the sibling is ready, a reading counts.
+// known, and Admit would let it start against the fraction instead of waiting
+// for a measured running sibling. Once the sibling is ready, a reading counts.
 func TestSiblingInheritanceIgnoresALoadInProgress(t *testing.T) {
 	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, MinInstances: 1, RAMMB: 64, GPUs: []SpecGPU{{Index: 0}}}
 	s0 := liveInstance(s, 0, 100)
@@ -1356,7 +1358,7 @@ func TestSiblingInheritanceIgnoresALoadInProgress(t *testing.T) {
 // by the time it lands. A housekeeping measurement dispatched while instance 0
 // was still loading can land after its first passing probe, and is still the
 // load in progress; only one dispatched once the process was ready counts --
-// such as the one its first healthy probe asks for (§5.2). buildSnapshot never
+// such as the one its first healthy probe asks for. buildSnapshot never
 // reads host RAM itself, so for RAM this is the only path there is.
 func TestSiblingInheritanceNeedsAMeasurementTakenOnceReady(t *testing.T) {
 	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, MinInstances: 2, GPUs: []SpecGPU{{Index: 0}}}
@@ -1405,7 +1407,7 @@ func TestSiblingInheritanceNeedsAMeasurementTakenOnceReady(t *testing.T) {
 }
 
 // TestReadyMeasurementClearedOnExit: a ready reading describes one process,
-// exactly like the measurement it is taken from (F2), so it goes when the
+// exactly like the measurement it is taken from, so it goes when the
 // process does. Kept, it would raise a sibling's demand on behalf of the
 // instance's NEXT generation while that one is still loading -- possibly with a
 // different launch shape, and so a different footprint.
@@ -1625,8 +1627,9 @@ func TestSortInstanceOrder(t *testing.T) {
 // than min_instances asks for, the instance that gets it is instance 0. A
 // further instance never gives its room back to a sibling (a sibling is never a
 // victim), so one started first in map order would keep instance 0 down for as
-// long as it runs -- contradicting §4, where instance 0 is the last of a spec to
-// go. Eight protected instances and a process limit of one, a few rounds over:
+// long as it runs -- contradicting the ordering invariant, under which instance
+// 0 is the last of a spec to go. Eight protected instances and a process limit
+// of one, a few rounds over:
 // a start order left to the map would pick a random one of the eight.
 func TestProtectedFloorComesUpLowestIndexFirst(t *testing.T) {
 	skipOnWindows(t)
@@ -1805,11 +1808,11 @@ func ramChargedFor(t *testing.T, snap PolicySnapshot, specID string) int {
 	return 0
 }
 
-// TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement: siblings are summed
-// (§5.4 rule 1), each at what it holds. A running instance with its own ready
-// measurement is charged that -- floored at its declared demand, never raised to
-// a sibling's peak; only what an occupant has not measured of itself (a sibling
-// still loading) inherits the peak. Raised to the peak, siblings measured at
+// TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement: siblings are
+// ordinary occupants and summed, each at what it holds. A running instance with
+// its own ready measurement is charged that -- floored at its declared demand,
+// never raised to a sibling's peak; only what an occupant has not measured of
+// itself (a sibling still loading) inherits the peak. Raised to the peak, siblings measured at
 // 3000 and 3500 would count as 7000, and a third copy that fits next to their
 // real 6500 on a 10000 MB GPU would be refused.
 func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
@@ -1898,7 +1901,7 @@ func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
 }
 
 // TestForceStoppedDrainsEveryInstance: force_stopped applies to all of a spec's
-// instances (§5.2) -- the protected ones and a running burst one drain, nothing
+// instances -- the protected ones and a running burst one drain, nothing
 // restarts, and an ensure of any instance address is refused, creating nothing.
 func TestForceStoppedDrainsEveryInstance(t *testing.T) {
 	skipOnWindows(t)
@@ -1952,8 +1955,8 @@ func TestForceStoppedDrainsEveryInstance(t *testing.T) {
 }
 
 // TestProtectedInstanceRestartsAfterACrash: a protected instance k >= 1 is
-// restarted after a crash, after a crash-loop backoff, like a pinned spec
-// (§5.4 rule 7) -- unlike a burst instance, which is not.
+// restarted after a crash, after a crash-loop backoff, like a pinned spec --
+// unlike a burst instance, which is not.
 func TestProtectedInstanceRestartsAfterACrash(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -1991,7 +1994,7 @@ func TestProtectedInstanceRestartsAfterACrash(t *testing.T) {
 
 // TestEnsureBurstInstanceWhileStarting: a request for a burst instance that is
 // still starting waits for that start -- the one thing burst capacity is ever
-// queued behind (§5.4 rule 6) -- and both requests are served by one process.
+// queued behind -- and both requests are served by one process.
 func TestEnsureBurstInstanceWhileStarting(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -2033,7 +2036,7 @@ func TestEnsureBurstInstanceWhileStarting(t *testing.T) {
 }
 
 // TestEnsureBurstInstanceWhileDraining: a burst instance on its way out is not
-// waited for -- burst capacity never queues behind a slot (§5.4 rule 6) -- so a
+// waited for -- burst capacity never queues behind a slot -- so a
 // request for it is refused with ErrInstanceNoCapacity at once, while the
 // request it is still serving finishes.
 func TestEnsureBurstInstanceWhileDraining(t *testing.T) {
@@ -2191,7 +2194,7 @@ func TestEvictOneIdleForBootstrapSparesSiblingsOfAnInstanceAndProtected(t *testi
 
 // ---------------------------------------------------------------------------
 // Start order on every path: a protected further instance starts only once its
-// lower siblings have (§4). The Apply start loop and the wake order ask the
+// lower siblings have. The Apply start loop and the wake order ask the
 // lowest index first, but crash-loop timers, a request naming a further
 // instance, and an instance's own re-admission on exit ask in event order; the
 // admission itself is what has to keep the order.
@@ -2220,10 +2223,10 @@ func restingInstance(spec Spec, k int, state State) *specState {
 // TestProtectedInstanceStartsOnlyAfterItsLowerSiblings: a protected instance
 // k >= 1 is not admitted while a lower sibling still waits to start -- for room,
 // or for its crash-loop retry -- because the room it took would never come back
-// (a sibling is never a victim, §5.4 rule 3) and instance 0 would stay down while
-// it runs, against §4. It waits instead, silently and with no victim drained,
-// and goes as soon as every lower sibling has a process. Gaps below it (an
-// instance that cannot exist) hold nothing back.
+// (a sibling is never a victim) and instance 0 would stay down while it runs,
+// against the ordering invariant. It waits instead, silently and with no
+// victim drained, and goes as soon as every lower sibling has a process. Gaps
+// below it (an instance that cannot exist) hold nothing back.
 func TestProtectedInstanceStartsOnlyAfterItsLowerSiblings(t *testing.T) {
 	min2 := replicableSpec("S", "m")
 	min2.MinInstances = 2
@@ -2306,7 +2309,7 @@ func TestProtectedInstanceStartsOnlyAfterItsLowerSiblings(t *testing.T) {
 // TestStartOrderHoldsOnlyAProtectedInstanceBehindAWaitingSibling: the rule is
 // about room a lower sibling is waiting to start in. A further instance that is
 // burst capacity is never held back by it -- it only ever takes room that is
-// free right now, and is refused at once otherwise (§5.4 rule 6) -- and a lower
+// free right now, and is refused at once otherwise -- and a lower
 // sibling resting at a refusal is not waiting for room: the further instance
 // reaches the same verdict on its own, and a request naming it is answered
 // with it at once instead of waiting out its admission timeout.

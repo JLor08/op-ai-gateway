@@ -859,10 +859,10 @@ func sortOldestFirst(procs []RunningProc) {
 // newAdmission so this comparison matches the already-normalized
 // RunningProc.Role every occupant carries (buildSnapshot sets it through roleOf).
 //
-// SURPLUS INSTANCES COME FIRST, ahead of the role band (#340, design §5.4 rule
-// 4): a running burst instance is the cheapest victim there is, because its
-// spec keeps serving from a lower sibling -- so it also never strands a role,
-// which is what the role band protects. Within the surplus band the existing
+// SURPLUS INSTANCES COME FIRST, ahead of the role band (#340): a running burst
+// instance is the cheapest victim there is, because its spec keeps serving
+// from a lower sibling -- so it also never strands a role, which is what the
+// role band protects. Within the surplus band the existing
 // keys apply. Within ONE spec the instances then go highest index first
 // (siblingsHighestFirst): the draw loops ask evictable as they go, and a lower
 // instance only qualifies once every higher running sibling is queued.
@@ -982,7 +982,7 @@ type admission struct {
 // rule asks, so the grace window (snap.Now, snap.EvictionGrace) is applied to
 // each of them identically and cannot be forgotten by a rule added later.
 //
-// Two instance clauses (#340, design §5.4 rule 3) live here for the same reason.
+// Two instance clauses (#340) live here for the same reason.
 // A SIBLING is never a victim for a candidate of its own spec: evicting a warm
 // instance to start a cold one of the same model is never useful. And an
 // instance is not evictable while a HIGHER-INDEX sibling runs -- the "highest

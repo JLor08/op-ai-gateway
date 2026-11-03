@@ -212,7 +212,7 @@ var Features = []Feature{
 	// bump (see agent.go's Version block).
 	{Name: "runtime_config_files", Since: "0.10.0"},
 	// runtime_voices: this agent's runtime router serves
-	// GET /upstream/{model}/v1/audio/voices -- a Status-only passthrough to a
+	// GET /upstream/{model}/v1/audio/voices -- a read-only passthrough to a
 	// RUNNING audio.cpp child's voice listing (issue #251; it never starts a
 	// child, and the outbound path is exactly /v1/audio/voices, relayed
 	// byte-verbatim with the spec's token forwarded). Like runtime_upstream_props,
@@ -241,7 +241,7 @@ var Features = []Feature{
 	// bump (see agent.go's Version block).
 	{Name: "fullduplex_proxy", Since: "0.12.0"},
 	// runtime_model_params: this agent's runtime router serves
-	// GET /upstream/{model}/v1/models -- a Status-only passthrough to a
+	// GET /upstream/{model}/v1/models -- a read-only passthrough to a
 	// RUNNING audio.cpp child's model listing, relayed with the inbound query
 	// so ?include_params=true reaches the child and the gateway reads each
 	// model's declared request params (e.g. language); it never starts a child.

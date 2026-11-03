@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Admission of model instances (#340, design §5.4): siblings co-reside and are
+// Admission of model instances (#340): siblings co-reside and are
 // never each other's victims, an instance inherits its spec's co-residency
 // verdicts, an instance is not evictable while a higher-index sibling runs,
 // surplus instances are drawn first, and a NoEvict (burst) admission answers

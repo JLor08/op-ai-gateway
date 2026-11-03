@@ -1881,7 +1881,7 @@ func TestServeUpstreamModelsRelaysIncludeParams(t *testing.T) {
 	}
 }
 
-// TestServeUpstreamModelsNeverStartsAndKeepsSentinels: the Status-only,
+// TestServeUpstreamModelsNeverStartsAndKeepsSentinels: the read-only,
 // never-start contract is unchanged for the models read -- a managed child that
 // is not running answers 404 runtime.model_not_running with ZERO hits on its
 // port, and an unknown model, an empty model or a nil manager answers 404

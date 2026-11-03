@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// Telemetry for model instances (#340, design §5.6): one runtime sample per
+// Telemetry for model instances (#340): one runtime sample per
 // instance, carrying its index and its measured startup; and the per-child
 // probes, which must ask an instance's child about the base model -- the only
 // name it knows -- and cache what they learn per instance, never per spec.

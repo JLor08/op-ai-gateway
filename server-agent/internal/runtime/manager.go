@@ -200,21 +200,30 @@ var (
 	// whole process) -- but a stable sentinel is cheap and lets a caller
 	// distinguish "shutting down" from "genuinely blocked" if it ever cares.
 	ErrManagerClosed = errors.New("runtime.manager_closed")
-	// ErrInstanceNoCapacity refuses a BURST instance (#340, IsBurst) that does
-	// not fit into the room that is free right now: its admission is
-	// all-or-nothing (PolicySnapshot.NoEvict), so where a baseline start would
-	// evict an idle neighbour, queue behind a busy one or spend a bootstrap
-	// shot, a burst start is refused at once -- no waiter is queued, no state is
-	// left behind -- and the gateway tries another host. Wire code
-	// runtime.instance_no_capacity (409).
+	// ErrInstanceNoCapacity refuses a BURST instance (#340, IsBurst) that cannot
+	// serve right now, at once and with no waiter queued -- the gateway then
+	// selects another instance or another host:
+	//   - an ensure (EnsureRunning) of one that does not fit into the room that
+	//     is free right now: its admission is all-or-nothing
+	//     (PolicySnapshot.NoEvict), so where a baseline start would evict an
+	//     idle neighbour, queue behind a busy one or spend a bootstrap shot, a
+	//     burst start is refused, and no state is left behind;
+	//   - an ensure of one that is draining: burst capacity does not wait for a
+	//     slot;
+	//   - a plain request (EnsureServing) for one that is neither running nor
+	//     starting: a request the router forwards never starts burst capacity
+	//     (a row resting at a failure is retired by it, handleEnsure).
+	// The router answers a request whose address moved while it was admitted
+	// with it as well. Wire code runtime.instance_no_capacity (409).
 	ErrInstanceNoCapacity = errors.New("runtime.instance_no_capacity")
 	// ErrInstanceDemandUnknown refuses a BURST instance whose VRAM or RAM
 	// demand is still unknown after inheriting the largest live measurement of
 	// every running sibling (owner.demandSpec): an instance k >= 1 is never
 	// admitted blind. It is the fast twin of the baseline instance's wait for a
 	// measured sibling; the gateway retries shortly, by which time the first
-	// instance has usually been measured (§5.2's measurement at the first
-	// healthy probe). Wire code runtime.instance_demand_unknown (409).
+	// instance has usually been measured (a process is measured as soon as its
+	// first health probe passes). Wire code runtime.instance_demand_unknown
+	// (409).
 	ErrInstanceDemandUnknown = errors.New("runtime.instance_demand_unknown")
 )
 
@@ -1152,15 +1161,15 @@ type specState struct {
 
 	// startupMS is the wall time, in milliseconds, from this instance's most
 	// recent SUCCESSFUL start (exec) to its first passing health probe -- the
-	// measured cold-start figure Status.StartupMS reports (§5.6). 0 = unknown:
+	// measured cold-start figure Status.StartupMS reports. 0 = unknown:
 	// never started successfully. It describes the last successful start, not
 	// the live process, so unlike the measurements it survives the exit.
 	startupMS int
 
 	// waitingOnDemand is true while this BASELINE instance k >= 1 is held back
 	// because its demand is still unknown after inheriting its siblings' ready
-	// measurements (§5.4 rule 5): it waits for a sibling to be measured once
-	// ready rather than starting blind. A ready measurement landing is the
+	// measurements: an instance k >= 1 is never admitted blind, so it waits for
+	// a sibling to be measured once ready. A ready measurement landing is the
 	// event that can end that wait and nothing else announces it, so
 	// applyMeasurement re-asks exactly these instances (wantsDemandWake).
 	// admitAndStart rewrites it on every verdict, like waitingOnRAM, so it never
@@ -1169,7 +1178,7 @@ type specState struct {
 
 	// waitingOnSibling is true while this PROTECTED instance k >= 1 is held
 	// back because a lower-index sibling still waits to start (lowerSiblingWaiting):
-	// the instances of a spec start lowest index first (§4). It is what
+	// the protected instances of a spec start lowest index first. It is what
 	// wakeSiblingsWaitingFor selects when that sibling gets its process, so the
 	// two load side by side rather than one after the other. admitAndStart
 	// rewrites it on every verdict, like waitingOnDemand.
@@ -1243,17 +1252,16 @@ type specState struct {
 	//
 	// ONE PROCESS PER INSTANCE, so this is a scalar: there is nothing to sum,
 	// and unlike measuredVRAM there is no per-GPU key to re-key. Cleared by
-	// onProcExited for exactly the reason measuredVRAM is (F2): it describes a
+	// onProcExited for exactly the reason measuredVRAM is: it describes a
 	// process, and stops being true when that process exits.
 	measuredRAM int
 
 	// readyVRAM and readyRAM are the latest real measurements of THIS
 	// instance's current process that were taken after it first passed a
 	// health probe: what the loaded model holds, not a load in progress. They
-	// are the only figures a sibling inherits (siblingPeak, #340 design §5.4
-	// rule 5), because measuredVRAM/measuredRAM above may hold a reading caught
-	// mid-load -- buildSnapshot and the housekeeping beat measure a starting
-	// process too. That reading is right for charging the loading process itself
+	// are the only figures a sibling inherits (siblingPeak, #340), because
+	// measuredVRAM/measuredRAM above may hold a reading caught mid-load --
+	// buildSnapshot and the housekeeping beat measure a starting process too. That reading is right for charging the loading process itself
 	// (max(live, demand) only ever raises its own charge), but it is a fraction
 	// of what another copy of the model will hold: inherited, it would make a
 	// further instance's unknown demand count as known and admit it against that
@@ -1261,7 +1269,7 @@ type specState struct {
 	// the reading was taken: at dispatch for the off-owner beat
 	// (measureTarget.ready), at the call for buildSnapshot's synchronous VRAM
 	// read. Cleared by onProcExited with the measurements themselves, for the
-	// same reason (F2). readyVRAM may share its map with measuredVRAM; nothing
+	// same reason. readyVRAM may share its map with measuredVRAM; nothing
 	// writes through either.
 	readyVRAM map[int]int
 	readyRAM  int
@@ -1281,7 +1289,7 @@ type specState struct {
 	//
 	// IT IS DELIBERATELY NOT CLEARED ON EXIT, and that is the whole anti-thrash
 	// guarantee -- the opposite rule from measuredVRAM/measuredRAM above, which
-	// describe the live process and so are cleared the moment it exits (F2). This
+	// describe the live process and so are cleared the moment it exits. This
 	// marker describes the SPEC's lifetime, not its current process: a shot once
 	// spent must stay spent across restarts, or every exit would re-arm the
 	// one-shot and the ADR-032 bidirectional thrash would return one restart at a
@@ -1553,7 +1561,7 @@ func (o *owner) handle(cmd command) {
 // applyConfig reconciles owner state to cfg. See Manager.Apply's doc for the
 // externally-visible contract.
 //
-// Instances (#340, design §5.2) are reconciled alongside their spec:
+// Instances (#340) are reconciled alongside their spec:
 //
 //   - every spec in cfg has its instance 0 (created here when the spec is new)
 //     and its protected instances 1..P-1 (ProtectedCount), which are created
@@ -1584,10 +1592,11 @@ func (o *owner) handle(cmd command) {
 // instance order (sortInstanceOrder), instance 0 of a spec first: when the room
 // holds fewer instances than the floor asks for, the ones it holds are the
 // lowest, never a further instance that instance 0 could not get the room back
-// from (a sibling is never a victim, §5.4 rule 3). Asked in that order, each
-// further instance finds its lower siblings already started; admitAndStart's
-// start-order rule (lowerSiblingWaiting) is what keeps the order on the paths
-// that ask in event order instead, here included.
+// from (a sibling is never a victim: evicting a warm copy of a model to start a
+// cold one frees nothing). Asked in that order, each further instance finds its
+// lower siblings already started; admitAndStart's start-order rule
+// (lowerSiblingWaiting) is what keeps the order on the paths that ask in event
+// order instead, here included.
 //
 // A spec whose ID is reserved for instance keys (reservedSpecID: it contains
 // '#') is ignored with a Warn, as ParseConfig already drops it from every
@@ -1755,9 +1764,10 @@ func (o *owner) applyConfig(cfg Config) {
 // instance that could never be reached is skipped rather than created: its
 // address is another spec's literal upstream model (instanceAddressHolder),
 // which every request for it reaches instead. The rest of the floor still
-// comes up -- gaps in the index range are allowed (§4). An existing state is
-// always this spec's own instance: no spec ID contains '#' (reservedSpecID), so
-// no other spec's state can hold the key.
+// comes up -- a gap in the index range is harmless: every instance is
+// addressed by its own index, and none needs the ones below it. An existing
+// state is always this spec's own instance: no spec ID contains '#'
+// (reservedSpecID), so no other spec's state can hold the key.
 func (o *owner) ensureProtectedFloor() {
 	for _, spec := range o.cfg.Specs {
 		for k := 1; k < ProtectedCount(spec) && InstanceAllowed(spec, k); k++ {
@@ -1802,8 +1812,8 @@ func sameReplicableOptIn(a, b []Spec) bool {
 // which one is asked first: by base spec ID, then by instance index
 // NUMERICALLY -- S, S#2, S#10, never the string order S, S#10, S#2 -- so
 // instance 0 of a spec always comes before its further instances, and they
-// come in index order (§4: highest index leaves first, so lowest index comes
-// up first). For a spec that never replicates it is plain spec-ID order.
+// come in index order: the highest index leaves first, so the lowest comes up
+// first. For a spec that never replicates it is plain spec-ID order.
 func instanceLess(aBase string, aK int, bBase string, bK int) bool {
 	if aBase != bBase {
 		return aBase < bBase
@@ -2049,7 +2059,7 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 	st := o.specs[specID]
-	// force_stopped applies to every instance of the spec (§5.2), and is read
+	// force_stopped applies to every instance of the spec, and is read
 	// off instance 0 -- the pushed spec itself -- before a further instance
 	// could be created for nothing.
 	if st.spec.AdminState == "force_stopped" {
@@ -2089,12 +2099,14 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 		return
 	}
-	// A burst instance is never queued behind anything but its own start
-	// (§5.4 rule 6). Starting: its admission already happened, so the request
-	// waits for that start like any other. Draining: it is on its way out, and
-	// burst capacity does not wait for a slot -- the gateway places the request
-	// elsewhere. With no process at all, admitAndStart below answers at once:
-	// it starts the instance or refuses it, never leaving the waiter queued.
+	// A burst instance is never queued behind anything but its own start: its
+	// admission is all-or-nothing and immediate, so that the gateway can place
+	// the request elsewhere at once. Starting: its admission already happened,
+	// so the request waits for that start like any other. Draining: it is on its
+	// way out, and burst capacity does not wait for a slot -- the gateway places
+	// the request elsewhere. With no process at all, admitAndStart below answers
+	// at once: it starts the instance or refuses it, never leaving the waiter
+	// queued.
 	if st.burst() && st.proc != nil && st.state != StateStarting {
 		c.reply <- ensureOutcome{err: ErrInstanceNoCapacity}
 		return
@@ -2503,7 +2515,7 @@ func (o *owner) wantsUp(st *specState) bool {
 // prefixed "[#k] " -- see startProcess and LogStore.newInstanceProc.)
 // Everything pushed is shared, UpstreamModel included, so
 // ${MODEL} expands to the BASE model name: the child never sees an instance
-// address (the router rewrites the request's model to match, §5.3). The copy
+// address (the router rewrites the request's model to match). The copy
 // shares base's slices and maps; nothing in the owner writes through them
 // (raisedDemand copies the GPU list before it raises a demand).
 func specForInstance(base Spec, k int) Spec {
@@ -2518,7 +2530,7 @@ func specForInstance(base Spec, k int) Spec {
 }
 
 // protected reports whether this instance is inside its spec's protected
-// floor (ProtectedCount, design §4): instances 0..P-1, where P folds
+// floor (ProtectedCount): instances 0..P-1, where P folds
 // min_instances together with the one instance a pinned or force_running spec
 // has always kept. A protected instance is wanted up with no request at all
 // (started on Apply, restarted after a crash with backoff) and is never
@@ -2536,10 +2548,10 @@ func (st *specState) protected() bool {
 // owner makes must agree with (evictOneIdleForBootstrap, earliestGraceExpiry,
 // wantsWakeAfterStart). For a spec that never replicates it is spec.Pinned,
 // exactly as before instances -- a force_running spec stays evictable as it
-// always was. For a replicable spec it is protected() (§5.4 rule 7): the
-// min_instances promise is worth nothing if an admission may evict a protected
-// instance, and a further instance of a pinned spec must not read as pinned
-// merely because its copy carries the field.
+// always was. For a replicable spec it is protected(): the min_instances
+// promise is worth nothing if an admission may evict a protected instance, and
+// a further instance of a pinned spec must not read as pinned merely because
+// its copy carries the field.
 func (st *specState) pinnedForAdmission() bool {
 	if !st.spec.Replicable {
 		return st.spec.Pinned
@@ -2556,10 +2568,11 @@ func (st *specState) burst() bool {
 
 // higherSiblingRuns reports whether an instance of st's spec with a HIGHER
 // index still has a process (starting, running or draining). That is the
-// design's ordering invariant, "highest index leaves first" (§4): while one
-// does, st may be neither idle-unloaded (scanIdle) nor picked by the owner's
-// own victim choice (evictOneIdleForBootstrap), so instance 0 is always the
-// last of a spec to go. Admit enforces the same rule for its victims
+// ordering invariant of a spec's instances, "highest index leaves first", which
+// keeps the instances that run the lowest ones: while one does, st may be
+// neither idle-unloaded (scanIdle) nor picked by the owner's own victim choice
+// (evictOneIdleForBootstrap), so instance 0 is always the last of a spec to
+// go. Admit enforces the same rule for its victims
 // (policy.go's higherSiblingStays); this is its owner-side twin. Siblings are
 // matched by base spec ID, never by parsing a name.
 func (o *owner) higherSiblingRuns(st *specState) bool {
@@ -2572,10 +2585,9 @@ func (o *owner) higherSiblingRuns(st *specState) bool {
 	return false
 }
 
-// demandSpec returns the Spec admission charges st as (#340, design §5.4 rule
-// 5): st.spec with each GPU's VRAM demand and the host-RAM demand raised to the
-// largest LIVE measurement of any running sibling -- per GPU for VRAM,
-// host-wide for RAM. Siblings run the same model with the same arguments, so a
+// demandSpec returns the Spec admission charges st as (#340): st.spec with each
+// GPU's VRAM demand and the host-RAM demand raised to the largest LIVE
+// measurement of any running sibling -- per GPU for VRAM, host-wide for RAM. Siblings run the same model with the same arguments, so a
 // measured sibling is the best estimate there is of what another instance will
 // hold, and the pushed demand stays a floor, exactly like the live-measurement
 // rule in buildSnapshot. "Running" is meant strictly: only a reading taken
@@ -2602,8 +2614,8 @@ func (o *owner) demandSpec(st *specState) Spec {
 }
 
 // chargeSpec is the demand buildSnapshot charges a LIVE instance st with as an
-// occupant (#340). Siblings' demand is summed (§5.4 rule 1), so each
-// occupant counts for what it holds: an instance with its own READY measurement
+// occupant (#340). Siblings are ordinary occupants whose demand is summed, so
+// each occupant counts for what it holds: an instance with its own READY measurement
 // (readyVRAM per GPU, readyRAM -- taken after its first passing probe) is
 // charged that figure, floored at its declared demand and never raised to a
 // sibling's peak. Raising it would over-charge every measured sibling at once:
@@ -2657,9 +2669,9 @@ func raisedDemand(spec Spec, vram map[int]int, ram int) Spec {
 // process first passed a health probe), never one caught while it was still
 // loading -- that is a fraction of the model, and inheriting it would make an
 // unknown demand count as known and admit a further instance against the
-// fraction (§5.4 rule 5 waits for a measured running sibling). A ready reading
-// describes its sibling's CURRENT process (cleared on exit), so only siblings
-// with a process count, and st's own figures never do.
+// fraction, where it is meant to wait for a measured running sibling. A ready
+// reading describes its sibling's CURRENT process (cleared on exit), so only
+// siblings with a process count, and st's own figures never do.
 func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
 	base := specBase(st.spec)
 	for _, sib := range o.specs {
@@ -2683,8 +2695,8 @@ func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
 // demandUnknown reports whether spec -- an instance's demandSpec -- still has
 // an unknown demand on either axis: a declared GPU at VRAM 0, or host RAM 0 (0
 // is "unknown", never "needs none", on both). An instance k >= 1 with such a
-// demand is never admitted (§5.4 rule 5): a baseline one waits for a measured
-// sibling, a burst one is refused with ErrInstanceDemandUnknown.
+// demand is never admitted: a baseline one waits for a measured sibling, a
+// burst one is refused with ErrInstanceDemandUnknown.
 func demandUnknown(spec Spec) bool {
 	return specHasUnknownVRAM(spec) || specHasUnknownRAM(spec)
 }
@@ -2795,13 +2807,13 @@ func (o *owner) admitAndStart(specID string) {
 		return
 	}
 
-	// The instances of a spec start lowest index first (§4), on every path that
-	// asks: Apply and the wakes ask in that order already, but a crash-loop
-	// timer, a request naming m#k, and an instance's own re-admission on exit
-	// ask in the order events happen to arrive. A protected instance admitted
-	// ahead of a lower sibling that is still waiting would keep the room it
-	// took -- a sibling is never a victim (§5.4 rule 3), and a protected
-	// instance is never idle-unloaded -- so that sibling, instance 0 above all,
+	// The protected instances of a spec start lowest index first, on every path
+	// that asks: Apply and the wakes ask in that order already, but a
+	// crash-loop timer, a request naming m#k, and an instance's own re-admission
+	// on exit ask in the order events happen to arrive. A protected instance
+	// admitted ahead of a lower sibling that is still waiting would keep the
+	// room it took -- a sibling is never a victim, and a protected instance is
+	// never idle-unloaded -- so that sibling, instance 0 above all,
 	// would stay down for as long as it runs. It waits instead: silently, with
 	// nothing evicted for it, because the lower sibling's own row says why that
 	// one is not up, and the wait ends as soon as it has a process
@@ -2830,10 +2842,10 @@ func (o *owner) admitAndStart(specID string) {
 	snap := o.buildSnapshot()
 	demand := o.demandSpec(st)
 	burst := st.burst()
-	// An instance k >= 1 is never admitted blind (§5.4 rule 5). Instance 0
-	// keeps today's unknown-demand handling -- the bootstraps, the one-shot
-	// eviction -- because something has to run first to be measured; every
-	// further instance can wait for that measurement instead, and does.
+	// An instance k >= 1 is never admitted blind. Instance 0 keeps today's
+	// unknown-demand handling -- the bootstraps, the one-shot eviction --
+	// because something has to run first to be measured; every further
+	// instance can wait for that measurement instead, and does.
 	if st.instance > 0 && demandUnknown(demand) {
 		if burst {
 			// Refused fast, with nothing queued and no state left behind (the
@@ -2853,8 +2865,9 @@ func (o *owner) admitAndStart(specID string) {
 			specID))
 		return
 	}
-	// A burst instance's admission is all-or-nothing and immediate (§5.4 rule
-	// 6): NoEvict makes Admit answer OK or NoCapacity and nothing else.
+	// A burst instance's admission is all-or-nothing and immediate -- it is
+	// extra capacity, worth a start only into room that is free right now:
+	// NoEvict makes Admit answer OK or NoCapacity and nothing else.
 	snap.NoEvict = burst
 	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
 	dec := Admit(snap, demand)
@@ -2921,25 +2934,24 @@ func (o *owner) admitAndStart(specID string) {
 
 // lowerSiblingWaiting reports whether st, a PROTECTED instance k >= 1, has to
 // wait for a lower-index sibling to start first (admitAndStart's start-order
-// rule, §4), and names the lowest such sibling's index. A sibling waits to start
+// rule), and names the lowest such sibling's index. A sibling waits to start
 // when it has no process and rests at Stopped -- waiting for room, for a
 // sibling's measurement, or for its own turn -- or at Backoff, waiting out a
 // crash-loop delay it will retry after. One resting at a refusal
 // (not_permitted, pending_vram_unknown) is not waiting for room: the siblings
 // of one spec are admitted against the same demand, budgets and verdicts, so
 // st does not start where that sibling was refused either -- it is refused the
-// same way, or waits for a measured sibling when its demand is unknown (§5.4
-// rule 5) -- and holding it back would only hide its own verdict: a request
-// naming it would wait out its admission timeout instead of being answered
-// with that refusal. Every lower sibling of a protected instance is
+// same way, or waits for a measured sibling when its demand is unknown -- and
+// holding it back would only hide its own verdict: a request naming it would
+// wait out its admission timeout instead of being answered with that refusal. Every lower sibling of a protected instance is
 // protected itself, so it always wants up; a missing one (a gap: the floor
 // skipped an instance whose address another spec holds) holds nothing back.
 //
 // Instance 0 never waits here, and neither does a burst instance: burst
 // capacity only ever takes room that is free right now and is refused at once
-// otherwise (§5.4 rule 6), and it leaves again by idle unload, so a lower
-// sibling it shares the spec with is kept down only transiently -- the case §4
-// allows.
+// otherwise, and it leaves again by idle unload, so a lower sibling it shares
+// the spec with is kept down only transiently, never for as long as a
+// protected instance would run.
 func (o *owner) lowerSiblingWaiting(st *specState) (lower int, waits bool) {
 	if st.instance == 0 || !st.protected() {
 		return 0, false
@@ -4036,7 +4048,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 			st.restarts++
 		}
 		st.hasRunBefore = true
-		// The measured cold start (§5.6): exec to the first passing probe of
+		// The measured cold start: exec to the first passing probe of
 		// THIS start, recorded before the transition so the status it wakes a
 		// reader for already carries it. Floored at 1 so a start faster than a
 		// millisecond still reads as measured -- 0 is "unknown".
@@ -4409,8 +4421,8 @@ func (o *owner) handleBootstrapMemoryPressure(st *specState, exitCode int, tail 
 // first, exactly like an admission eviction.
 //
 // It is the owner's own victim choice, so it keeps Admit's instance rules too
-// (#340, design §5.4 rules 3, 4 and 7): never a sibling of the beneficiary
-// (evicting a warm copy of the very model being started frees nothing useful),
+// (#340): never a sibling of the beneficiary (evicting a warm copy of the very
+// model being started frees nothing useful),
 // never an instance while a higher-index sibling of it still runs (the ordering
 // invariant, higherSiblingRuns), never a protected instance (pinnedForAdmission
 // is what isEvictable sees as Pinned), and SURPLUS first -- a running burst
@@ -5047,13 +5059,13 @@ func appendUnique(list []string, v string) []string {
 // scanIdle drain-stops every Running, unprotected instance whose idle timeout
 // has elapsed with zero in-flight requests. Unprotected is the pre-instance
 // "unpinned and not force_running" for a spec that never replicates, and keeps
-// the min_instances floor for a replicable one (§5.5).
+// the min_instances floor for a replicable one.
 //
-// The ordering invariant (§4) holds here too: an instance is not unloaded
-// while a higher-index sibling still has a process, so a spec's idle instances
-// leave one per scan, highest index first, and instance 0 last. A sibling this
-// very scan has begun draining still has its process, so map order cannot let
-// two of one spec's instances go in the same pass.
+// The ordering invariant (higherSiblingRuns) holds here too: an instance is not
+// unloaded while a higher-index sibling still has a process, so a spec's idle
+// instances leave one per scan, highest index first, and instance 0 last. A
+// sibling this very scan has begun draining still has its process, so map
+// order cannot let two of one spec's instances go in the same pass.
 func (o *owner) scanIdle() {
 	now := time.Now()
 	for id, st := range o.specs {

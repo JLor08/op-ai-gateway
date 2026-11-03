@@ -22,13 +22,14 @@ import (
 	"time"
 )
 
-// Router tests for instance addresses (#340, design §5.3): a request naming
-// "m#k" reaches instance k, and the child -- launched with the base name m --
-// sees m in its place, in a JSON body, in a multipart form and in a live
-// transcription's query alike. Instance 0, which is every request a spec that
-// never replicates ever gets, passes byte for byte as it always has. A plain
-// request never starts a burst instance (§5.4 rule 6), and the two burst
-// refusals are 409s.
+// Router tests for instance addresses (#340): a request naming "m#k" reaches
+// instance k, and the child -- launched with the base name m -- sees m in its
+// place, in a JSON body, in a multipart form, in a live transcription's query
+// and in an /upstream probe's query alike. Instance 0, which is every request
+// a spec that never replicates ever gets, passes byte for byte as it always
+// has. A plain request never starts a burst instance -- burst capacity is
+// started by an ensure, which is how the gateway decides to add it -- and the
+// two burst refusals are 409s.
 
 // redirectManager is a REAL manager whose admitted endpoint is swapped for a
 // recording child's: resolution, admission and refusals are the manager's own

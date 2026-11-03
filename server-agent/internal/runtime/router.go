@@ -20,13 +20,15 @@
 //   - GET /upstream/{model}/props -- the GET-only, allowlisted passthrough
 //     to a RUNNING managed child's /props (issue #58): model from the PATH
 //     (prefix/suffix decomposition, so ids containing "/" work), resolved
-//     via Status() only -- NEVER EnsureRunning, a probe must not start or
-//     keep alive a child -- and relayed byte-verbatim so the gateway's
-//     evidence rule reads the child's own document. The allowlist is
-//     /props, GET /upstream/{model}/v1/audio/voices (issue #251, the
-//     "runtime_voices" feature: an audio.cpp child's voice listing, same
-//     Status-only never-start shape, outbound path /v1/audio/voices with
-//     no query) and GET /upstream/{model}/v1/models (the
+//     by the manager's address rule (ResolveAddress) to the instance it
+//     names and then to that instance's running row in Status() -- NEVER an
+//     ensure, a probe must not start or keep alive a child -- and relayed
+//     byte-verbatim so the gateway's evidence rule reads the child's own
+//     document. The allowlist is /props, GET
+//     /upstream/{model}/v1/audio/voices (issue #251, the "runtime_voices"
+//     feature: an audio.cpp child's voice listing, same never-start shape,
+//     outbound path /v1/audio/voices with no query) and GET
+//     /upstream/{model}/v1/models (the
 //     "runtime_model_params" feature: an audio.cpp child's model listing
 //     with each model's declared request params, outbound path /v1/models
 //     with the inbound query, so ?include_params=true reaches the child);
@@ -47,21 +49,25 @@
 //     gateway reads it (peekMultipartModel). A multipart request is always a
 //     plain relay, and the router is blind to the path it was sent to.
 //
-// INSTANCE ADDRESSES (#340, design §5.3). A model may name one instance of a
-// replicable spec: "m" is instance 0, "m#k" instance k, read by the manager's
-// own rule (Manager.ResolveAddress -- an exact upstream match wins first, so a
-// real model whose name merely contains '#' stays itself). Every route reaches
-// the instance the address names, and the child -- every instance is launched
-// with the base name m -- sees m in its place: the top-level JSON model
-// (rewriteModelField, number-preserving), the multipart model field
-// (rebuildMultipartModel, every other part as sent), a live relay's model= and
-// an /upstream probe's model=. Instance 0, which is every request of a spec
-// that never replicates, is never rewritten and passes byte for byte. A
-// request the router forwards is admitted with EnsureServing, which never
-// starts a burst instance (409 runtime.instance_no_capacity when none is up);
-// only POST /ensure/{model} (EnsureRunning) may start one, which is how the
-// gateway adds capacity. /running lists running instances by address,
-// /v1/models every spec once, by its base name.
+// INSTANCE ADDRESSES (#340). A model may name one instance of a replicable
+// spec: "m" is instance 0, "m#k" instance k, read by the manager's own rule
+// (Manager.ResolveAddress -- an exact upstream match wins first, so a real
+// model whose name merely contains '#' stays itself). Every route reaches the
+// instance the address names, and the child -- every instance is launched with
+// the base name m -- sees m in its place: the top-level JSON model
+// (rewriteModelField, spliced in place, every other byte as sent), the
+// multipart model field (rebuildMultipartModel, every other part as sent), a
+// live relay's model= and the value of an /upstream probe's model parameter.
+// Instance 0, which is every request of a spec that never replicates, is never
+// rewritten and passes byte for byte. A request the router forwards is
+// admitted with EnsureServing, which never starts a burst instance (409
+// runtime.instance_no_capacity when none is up); only POST /ensure/{model}
+// (EnsureRunning) may start one, which is how the gateway adds capacity. The
+// address is read before admission and again after it (addressMoved): a
+// config push between the two would otherwise hand the child a name chosen
+// for another reading, so such a request is refused with the same 409.
+// /running lists running instances by address, /v1/models every spec once, by
+// its base name.
 //
 // STREAMING ASYMMETRY (the whole point of this design): request bodies are
 // buffered (bounded by maxBodyBytes) because `model`/`stream` must be read
@@ -478,10 +484,12 @@ var upstreamEndpoints = []upstreamEndpoint{
 // are not hop-by-hop).
 //
 // Deliberate properties, each one a guardrail from the issue:
-//   - Status() only, never EnsureRunning: llama-swap's own /upstream route
-//     boots a cold model on contact -- a probe that starts children is a
-//     hazard, not a feature. No inFlight/lastUsed touch either, so the
-//     probe never keeps an idle child alive.
+//   - Read-only, never an ensure: the model is resolved by the manager's
+//     address rule (ResolveAddress) and its running process found in
+//     Status(), and nothing else is asked of the manager. llama-swap's own
+//     /upstream route boots a cold model on contact -- a probe that starts
+//     children is a hazard, not a feature. No inFlight/lastUsed touch either,
+//     so the probe never keeps an idle child alive.
 //   - Prefix/suffix decomposition, not segment matching: upstream model ids
 //     are only TrimSpace-validated and may contain "/" (HF-style
 //     "org/model"); everything between "/upstream/" and the trailing
@@ -493,7 +501,16 @@ var upstreamEndpoints = []upstreamEndpoint{
 //     voice listing must reach the gateway's parser as the child wrote it.
 //   - Managed-but-cold gets its own sentinel (runtime.model_not_running):
 //     §4.3's error codes are never collapsed, and "no spec" vs "not
-//     running right now" are different diagnoses.
+//     running right now" are different diagnoses. An instance address its
+//     spec allows but no process serves (a burst instance not started, or
+//     retired) is managed and not running, the same 404
+//     runtime.model_not_running; an address its spec does not allow is 404
+//     runtime.model_not_managed, like an unknown model.
+//   - An instance address reaches exactly the process of the instance it
+//     names, and a model parameter in the forwarded query carries the base
+//     name instead (upstreamChildQuery). An address whose reading moved while
+//     the running row was looked up is refused with 409
+//     runtime.instance_no_capacity (addressMoved).
 func (rt *router) serveUpstream(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/upstream/")
 	for _, ep := range upstreamEndpoints {
@@ -506,17 +523,22 @@ func (rt *router) serveUpstream(w http.ResponseWriter, r *http.Request) {
 		"only /props, /v1/audio/voices and /v1/models may be requested through /upstream/{model}")
 }
 
-// relayToRunningChild is the Status-only relay behind serveUpstream: resolve
+// relayToRunningChild is the read-only relay behind serveUpstream: resolve
 // model to a RUNNING child's port and GET ep.path on it, never starting one.
 //
-// The model is resolved by the manager's own rule (ResolveAddress), so whether
-// it is managed at all is the same answer every other route gets, and the
-// probe reaches exactly the process the address names (#340): an instance
-// address the row of that instance, a literal name that merely contains '#'
-// its own spec's instance-0 row -- never the row of an instance whose address
-// collided with it while that instance drains. An address its spec allows but
-// no process serves (a burst instance not started, or retired) is managed but
-// not running.
+// The model is resolved first, by the manager's own rule (ResolveAddress), so
+// whether it is managed at all is the same answer every other route gets --
+// 404 runtime.model_not_managed when it is not -- and then to the running row
+// of the instance it names in Status(), so the probe reaches exactly the
+// process the address names (#340): an instance address the row of that
+// instance, a literal name that merely contains '#' its own spec's instance-0
+// row -- never the row of an instance whose address collided with it while that
+// instance drains. An address its spec allows but no process serves (a burst
+// instance not started, or retired) is managed but not running: 404
+// runtime.model_not_running. The two reads are two owner turns, so an instance
+// address is read again before anything is relayed, and one whose reading
+// moved in between is refused with 409 runtime.instance_no_capacity
+// (addressMoved).
 func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, model string, ep upstreamEndpoint) {
 	if model == "" || rt.m == nil {
 		writeError(w, http.StatusNotFound, codeModelNotManaged,
@@ -636,7 +658,10 @@ type ensureResponse struct {
 // {"status":"running"} -- forwarding nothing to the child. It is how the
 // gateway loads a child whose server answers no chat completion (an
 // images-only model), which the model-routed proxy can only reach by
-// forwarding a request that child cannot serve.
+// forwarding a request that child cannot serve. It is also how the gateway
+// adds capacity (#340): an instance address "m#k" ensures that instance,
+// creating it when its spec allows it -- the one route that may start a
+// burst instance.
 //
 // Deliberate properties:
 //   - The model is the decoded PATH after "/ensure/", so an id containing
@@ -653,16 +678,24 @@ type ensureResponse struct {
 //     an older agent never starts a child for it.
 //   - One long call, no heartbeats. EnsureRunning bounds the wait (the
 //     spec's startup timeout, plus its admission wait when that is above 0;
-//     an admission wait of 0 lasts until the client leaves). None of the
+//     an admission wait of 0 lasts until the client leaves). A burst instance
+//     never waits for admission: it starts into room that is free right now,
+//     and the call lasts its startup, or it is refused at once. None of the
 //     bundled hops between the gateway and this handler (the gateway's
 //     transport, the agent's TLS proxy, this router's server) has an idle
 //     timer; a proxy an operator adds in between must allow the whole wait,
 //     or it cuts the call. Through the bundled hops a failure therefore stays
-//     a genuine HTTP status from sentinelCode: 404 model_not_managed, 503
+//     a genuine HTTP status from sentinelCode: 404 model_not_managed (an
+//     unknown model, or an instance address its spec does not allow), 503
 //     admission_blocked (a force-stopped spec, or admission refused), 504
-//     start_timeout, 502 start_failed or not_permitted, or 502 upstream_gone
-//     for any other failure (e.g. the manager shutting down).
-//     servePlainProxy holds a cold start the same way.
+//     start_timeout, 502 start_failed or not_permitted, 409
+//     instance_no_capacity (a burst instance that does not fit into free
+//     room, or one that is draining), 409 instance_demand_unknown (a burst
+//     instance whose demand is still unknown -- no declared estimate, and no
+//     running sibling measured yet), or 502 upstream_gone for any other
+//     failure (e.g. the manager shutting down). servePlainProxy holds a cold
+//     start of instance 0 or of a protected instance the same way; it never
+//     starts a burst instance, and answers 409 instance_no_capacity instead.
 //   - The request context is EnsureRunning's context. A client that leaves
 //     while its request is queued drops its waiter, and nothing starts. One
 //     that leaves while the child is starting gets an error and so nothing to
@@ -1746,10 +1779,16 @@ const (
 // child died during the request", which is the closest fit for "something
 // went wrong reaching or using an otherwise-admitted child".
 //
-// The two burst refusals (#340) are 409s: the request conflicts with what
-// this host has free right now, and another host may well have room -- the
-// gateway's cue to re-select (no capacity) or to retry shortly (demand
-// unknown), never an error to surface.
+// The two instance refusals (#340) are 409s: the request conflicts with what
+// this host can serve under that address right now, while another host, or
+// another instance, may well serve it -- the gateway's cue to select again,
+// never an error to surface. runtime.instance_no_capacity answers an ensure of
+// a burst instance that does not fit into free room or is draining, a request
+// the router forwards for a burst instance that is not serving (none running
+// or starting), and a request whose address moved while it was admitted
+// (errAddressMoved); runtime.instance_demand_unknown answers an ensure of a
+// burst instance whose demand is not known yet, which the gateway retries
+// shortly, by which time a sibling has usually been measured.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):

@@ -1985,13 +1985,12 @@ func TestManagerCloseDoesNotWaitOutACrashBackoff(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix round 1. The Critical (F1) and one minor (M3) below are REGRESSIONS this
-// branch's own B6 batch introduced: in both cases the fix reached past the
+// Two regressions of the B6 fix below: in both cases the fix reached past the
 // window its rationale actually covered.
 // ---------------------------------------------------------------------------
 
-// TestManagerAdmissionWaitStillBoundsARequestQueuedWhileDraining is fix round
-// 1's Critical (F1). handleWaiterTimeout's B6 guard was st.proc != nil, but
+// TestManagerAdmissionWaitStillBoundsARequestQueuedWhileDraining: an earlier
+// handleWaiterTimeout B6 guard was st.proc != nil, but
 // the rule it expresses -- "the request is no longer waiting for a SLOT, it is
 // waiting on a startup that has its own bound" -- only holds while the state
 // is StateStarting. StateDraining ALSO has st.proc != nil, and there no bound
@@ -3032,7 +3031,7 @@ func TestRAMMeasuredZeroDoesNotOverwriteARealValue(t *testing.T) {
 }
 
 // TestRAMMeasuredClearedOnExit is the RAM twin of
-// TestManagerClearsMeasuredVRAMWhenTheProcessExits (F2): a measurement
+// TestManagerClearsMeasuredVRAMWhenTheProcessExits: a measurement
 // describes ONE process and stops being true the instant it exits. Left in
 // place, a force-stopped spec would keep reporting a dead process's RAM in
 // every Status() and, once the gateway persists it, rewrite it forever.
