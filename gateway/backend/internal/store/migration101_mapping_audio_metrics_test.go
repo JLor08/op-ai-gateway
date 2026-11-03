@@ -168,15 +168,16 @@ func assertMigration101Defaults(ctx context.Context, t *testing.T, s *SQLStore, 
 	}
 }
 
-// TestMigration101AddsAudioMetricColumns pins migration 101 (#340, design
-// section 8.5) on a fresh install and on an upgrade of a genuine version-100
-// database that already holds an audio mapping, on both dialects: the five
-// audio metric columns exist on model_mappings, the wide pair declared with
-// ADR-005's types and nullable, the rest like their text-metric siblings; a
-// mapping written before (or without naming) them reads every one as unknown,
-// with no backfill; and on the upgrade the columns are absent before the
-// migration, writable through UpdateMappingAudioMetrics after it, and a replay
-// of the migration disturbs nothing.
+// TestMigration101AddsAudioMetricColumns pins migration 101 (#340: the audio
+// benchmark's figures, stored on the mapping) on a fresh install and on an
+// upgrade of a genuine version-100 database that already holds an audio
+// mapping, on both dialects: the five audio metric columns exist on
+// model_mappings, the wide pair declared with ADR-005's types and nullable,
+// the rest like their text-metric siblings; a mapping written before (or
+// without naming) them reads every one as unknown, with no backfill; and on
+// the upgrade the columns are absent before the migration, writable through
+// UpdateMappingAudioMetrics after it, and a replay of the migration disturbs
+// nothing.
 func TestMigration101AddsAudioMetricColumns(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 
@@ -209,8 +210,8 @@ func TestMigration101AddsAudioMetricColumns(t *testing.T) {
 			// The columns are writable through the store, and a replay of the
 			// migration neither errors nor disturbs a stored value.
 			if err := s.UpdateMappingAudioMetrics(ctx, "map_m101", routing.AudioMetrics{
-				RateX: 3.25, TTFAMS: 420, RealtimeConcurrency: 2, ConcurrencyLimit: "performance",
-			}, "audio_benchmark"); err != nil {
+				RateX: 3.25, TTFAMS: 420, RealtimeConcurrency: 2, ConcurrencyLimit: routing.AudioLimitPerformance,
+			}, "audio_benchmark", now); err != nil {
 				t.Fatalf("UpdateMappingAudioMetrics: %v", err)
 			}
 			reinvokeMigration101(ctx, t, s)
@@ -219,7 +220,7 @@ func TestMigration101AddsAudioMetricColumns(t *testing.T) {
 				t.Fatalf("read after replay: %v", err)
 			}
 			if again.AudioRateX != 3.25 || again.AudioTTFAMS != 420 || again.AudioRealtimeConcurrency != 2 ||
-				again.AudioConcurrencyLimit != "performance" || again.AudioMetricsUpdatedAt == nil {
+				again.AudioConcurrencyLimit != routing.AudioLimitPerformance || again.AudioMetricsUpdatedAt == nil || !again.AudioMetricsUpdatedAt.Equal(now) {
 				t.Fatalf("replaying migration 101 disturbed a stored value: %+v", again)
 			}
 		})

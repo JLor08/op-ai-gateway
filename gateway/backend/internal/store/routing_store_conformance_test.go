@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"op-ai-gateway/internal/routing"
 	"path/filepath"
 	"reflect"
@@ -437,11 +438,11 @@ func TestRoutingStoreAffinityRoundTrip(t *testing.T) {
 }
 
 // TestRoutingStoreAffinityInstance proves memory, sqlite and postgres agree on
-// route_affinity.instance (migration 102, #340 design section 10.2): a pin
-// stores the instance it was written with, a re-pin of the same key (the
-// upsert's update path) moves it -- back to 0 included, which is a real
-// instance rather than "no value" -- and a pin of a non-replicable mapping,
-// written with no instance, reads instance 0.
+// route_affinity.instance (migration 102), which keeps a pinned client on the
+// process it was pinned to: a pin stores the instance it was written with, a
+// re-pin of the same key (the upsert's update path) moves it -- back to 0
+// included, which is a real instance rather than "no value" -- and a pin of a
+// non-replicable mapping, written with no instance, reads instance 0.
 func TestRoutingStoreAffinityInstance(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	// The same FK seed TestRoutingStoreAffinityRoundTrip needs: route_affinity
@@ -806,20 +807,24 @@ func TestRoutingStoreUpdateMappingBenchmarkMetricsKeepsUnmeasured(t *testing.T) 
 // on UpdateMappingAudioMetrics (migration 101), the audio benchmark's writer
 // and the audio analogue of UpdateMappingBenchmarkMetrics: it writes only what
 // a run measured -- a zero or negative rate, TTFA or load time is "not
-// measured" and keeps the stored column -- writes load_time_ms only from a
-// positive LoadTimeMS, and writes the concurrency ramp's count and limit as
-// the one result they are: together, a measured 0 included, whenever the run
-// carries a ramp result (a stop reason with a level of 0 or more), and
-// neither half otherwise. It stamps metrics_source, metrics_updated_at and
-// audio_metrics_updated_at with one time, writes nothing at all (provenance
-// included) for a call that measured nothing, never touches the text metrics,
-// and leaves a mapping whose metrics are LOCKED exactly as it was. Routing and
-// the scaler read the figures from the candidate, so the
-// ActiveMappingsForModel join is held to MappingByID on every step.
+// measured" and keeps the stored column, alone or beside a figure that was
+// measured -- writes load_time_ms only from a positive LoadTimeMS, and writes
+// the concurrency ramp's count and limit as the one result they are:
+// together, a 0 included, whenever the run carries a ramp result (a stop
+// reason with a level of 0 or more), and neither half otherwise. It stamps
+// metrics_source with the caller's source and both metrics_updated_at and
+// audio_metrics_updated_at with the caller's time, writes nothing at all
+// (provenance included) for a call that measured nothing, refuses a limit
+// that is not one of the three stop reasons without writing anything, never
+// touches the text metrics, and leaves a mapping whose metrics are LOCKED
+// exactly as it was. Routing and the scaler read the figures from the
+// candidate, so the ActiveMappingsForModel join is held to MappingByID on
+// every step.
 func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
 		now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		at := func(minute int) time.Time { return time.Date(2026, 11, 3, 10, minute, 0, 0, time.UTC) }
 
 		if err := s.CreateAIServer(ctx, routing.AIServer{
 			ID: "srv_aud", Name: "Audio", Domain: "aud.example.test", Provider: routing.ProviderAudioCpp,
@@ -878,17 +883,16 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 			}
 			return got
 		}
-		// write calls UpdateMappingAudioMetrics and returns the window its stamp
-		// must fall into (the store stamps the time itself).
-		write := func(t *testing.T, m routing.AudioMetrics, source string) (from, to time.Time) {
+		write := func(t *testing.T, m routing.AudioMetrics, source string, when time.Time) {
 			t.Helper()
-			from = time.Now().UTC().Add(-time.Second)
-			if err := s.UpdateMappingAudioMetrics(ctx, "m_aud", m, source); err != nil {
+			if err := s.UpdateMappingAudioMetrics(ctx, "m_aud", m, source, when); err != nil {
 				t.Fatalf("UpdateMappingAudioMetrics(%+v, %q): %v", m, source, err)
 			}
-			return from, time.Now().UTC().Add(time.Second)
 		}
-		check := func(t *testing.T, step string, want audio, source string, from, to time.Time) routing.ModelMapping {
+		// check fails unless the mapping reads want, source and both stamps at
+		// when: the caller's time, the moment the run measured, rather than
+		// one the store would take for itself.
+		check := func(t *testing.T, step string, want audio, source string, when time.Time) routing.ModelMapping {
 			t.Helper()
 			got := read(t)
 			if audioOf(got) != want {
@@ -897,25 +901,37 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 			if got.MetricsSource != source {
 				t.Fatalf("%s: MetricsSource = %q, want %q", step, got.MetricsSource, source)
 			}
-			if got.MetricsUpdatedAt == nil || got.MetricsUpdatedAt.Before(from) || got.MetricsUpdatedAt.After(to) {
-				t.Fatalf("%s: MetricsUpdatedAt = %v, want a stamp within [%v, %v]", step, got.MetricsUpdatedAt, from, to)
+			if got.MetricsUpdatedAt == nil || !got.MetricsUpdatedAt.Equal(when) {
+				t.Fatalf("%s: MetricsUpdatedAt = %v, want the caller's %v", step, got.MetricsUpdatedAt, when)
 			}
-			if !sameTimePtr(got.AudioMetricsUpdatedAt, got.MetricsUpdatedAt) {
-				t.Fatalf("%s: AudioMetricsUpdatedAt = %v, want the same stamp as MetricsUpdatedAt (%v)", step, got.AudioMetricsUpdatedAt, got.MetricsUpdatedAt)
+			if got.AudioMetricsUpdatedAt == nil || !got.AudioMetricsUpdatedAt.Equal(when) {
+				t.Fatalf("%s: AudioMetricsUpdatedAt = %v, want the caller's %v", step, got.AudioMetricsUpdatedAt, when)
 			}
 			return got
 		}
+		// unchanged fails unless the mapping still reads exactly as want did:
+		// the figures, the source and both stamps.
+		unchanged := func(t *testing.T, step string, want routing.ModelMapping) {
+			t.Helper()
+			got := read(t)
+			if audioOf(got) != audioOf(want) || got.MetricsSource != want.MetricsSource ||
+				!sameTimePtr(got.MetricsUpdatedAt, want.MetricsUpdatedAt) || !sameTimePtr(got.AudioMetricsUpdatedAt, want.AudioMetricsUpdatedAt) {
+				t.Fatalf("%s changed the mapping: %+v (source %q, stamps %v / %v), want %+v (source %q, stamps %v / %v)",
+					step, audioOf(got), got.MetricsSource, got.MetricsUpdatedAt, got.AudioMetricsUpdatedAt,
+					audioOf(want), want.MetricsSource, want.MetricsUpdatedAt, want.AudioMetricsUpdatedAt)
+			}
+		}
 
-		from, to := write(t, routing.AudioMetrics{
-			RateX: 3.25, TTFAMS: 420, RealtimeConcurrency: 2, ConcurrencyLimit: "performance", LoadTimeMS: 5100,
-		}, "audio_benchmark")
-		check(t, "a write that measured everything", audio{3.25, 420, 2, "performance", 5100}, "audio_benchmark", from, to)
+		write(t, routing.AudioMetrics{
+			RateX: 3.25, TTFAMS: 420, RealtimeConcurrency: 2, ConcurrencyLimit: routing.AudioLimitPerformance, LoadTimeMS: 5100,
+		}, "audio_benchmark", at(0))
+		check(t, "a write that measured everything", audio{3.25, 420, 2, routing.AudioLimitPerformance, 5100}, "audio_benchmark", at(0))
 
-		from, to = write(t, routing.AudioMetrics{RateX: 2.5, TTFAMS: 380}, "audio_speed")
-		check(t, "a speed-only write", audio{2.5, 380, 2, "performance", 5100}, "audio_speed", from, to)
+		write(t, routing.AudioMetrics{RateX: 2.5, TTFAMS: 380}, "audio_speed", at(1))
+		check(t, "a speed-only write", audio{2.5, 380, 2, routing.AudioLimitPerformance, 5100}, "audio_speed", at(1))
 
-		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 3, ConcurrencyLimit: "resources"}, "audio_capacity")
-		check(t, "a capacity-only write", audio{2.5, 380, 3, "resources", 5100}, "audio_capacity", from, to)
+		write(t, routing.AudioMetrics{RealtimeConcurrency: 3, ConcurrencyLimit: routing.AudioLimitResources}, "audio_capacity", at(2))
+		check(t, "a capacity-only write", audio{2.5, 380, 3, routing.AudioLimitResources, 5100}, "audio_capacity", at(2))
 
 		// The ramp's count and limit are one result, written as a pair, and a
 		// ramp that found no good level measured 0: the model is not real-time
@@ -925,40 +941,70 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 		// 3, under which the scaler would keep starting instances of a model that
 		// cannot serve one stream in real time, or a ">= 2" lower bound from a
 		// ramp whose very first ensure was refused.
-		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: "performance"}, "audio_benchmark")
-		check(t, "a ramp that measured 0 over a stored count", audio{2.5, 380, 0, "performance", 5100}, "audio_benchmark", from, to)
+		write(t, routing.AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: routing.AudioLimitPerformance}, "audio_benchmark", at(3))
+		check(t, "a ramp that measured 0 over a stored count", audio{2.5, 380, 0, routing.AudioLimitPerformance, 5100}, "audio_benchmark", at(3))
 
-		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 2, ConcurrencyLimit: "cap"}, "audio_capacity")
-		check(t, "a ramp that reached its cap", audio{2.5, 380, 2, "cap", 5100}, "audio_capacity", from, to)
+		write(t, routing.AudioMetrics{RealtimeConcurrency: 2, ConcurrencyLimit: routing.AudioLimitCap}, "audio_capacity", at(4))
+		check(t, "a ramp that reached its cap", audio{2.5, 380, 2, routing.AudioLimitCap, 5100}, "audio_capacity", at(4))
 
-		from, to = write(t, routing.AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: "resources"}, "audio_benchmark")
-		last := check(t, "a ramp refused at its first level, over a stored count", audio{2.5, 380, 0, "resources", 5100}, "audio_benchmark", from, to)
+		write(t, routing.AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: routing.AudioLimitResources}, "audio_benchmark", at(5))
+		last := check(t, "a ramp refused at its first level, over a stored count", audio{2.5, 380, 0, routing.AudioLimitResources, 5100}, "audio_benchmark", at(5))
 
 		// A call that measured nothing writes nothing, provenance included: all
-		// zero, only negatives, and either half of a ramp result alone -- a count
-		// without the reason the ramp stopped, or a reason with a negative level
-		// no ramp can end on -- since writing it would pair it with the other
-		// half of an older ramp.
+		// zero; only negatives, together and one figure at a time, so every
+		// per-field guard is held on its own; and either half of a ramp result
+		// alone -- a count without the reason the ramp stopped, or a reason with
+		// a negative level no ramp can end on -- since writing it would pair it
+		// with the other half of an older ramp.
 		for _, nothing := range []routing.AudioMetrics{
 			{},
 			{RateX: -1, TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3},
+			{RateX: -1},
+			{TTFAMS: -5},
+			{LoadTimeMS: -3},
 			{RealtimeConcurrency: 4},
-			{RealtimeConcurrency: -1, ConcurrencyLimit: "cap"},
+			{RealtimeConcurrency: -1, ConcurrencyLimit: routing.AudioLimitCap},
 		} {
-			write(t, nothing, "audio_nothing")
-			got := read(t)
-			if audioOf(got) != audioOf(last) || got.MetricsSource != last.MetricsSource ||
-				!sameTimePtr(got.MetricsUpdatedAt, last.MetricsUpdatedAt) || !sameTimePtr(got.AudioMetricsUpdatedAt, last.AudioMetricsUpdatedAt) {
-				t.Fatalf("a write that measured nothing (%+v) changed the mapping: %+v (source %q, stamps %v / %v), want %+v (source %q, stamps %v / %v)",
-					nothing, audioOf(got), got.MetricsSource, got.MetricsUpdatedAt, got.AudioMetricsUpdatedAt,
-					audioOf(last), last.MetricsSource, last.MetricsUpdatedAt, last.AudioMetricsUpdatedAt)
-			}
+			write(t, nothing, "audio_nothing", at(6))
+			unchanged(t, fmt.Sprintf("a write that measured nothing (%+v)", nothing), last)
 		}
 
-		// A load time alone is a measurement: it writes load_time_ms and the
-		// provenance, and keeps every audio figure, a measured 0 included.
-		from, to = write(t, routing.AudioMetrics{LoadTimeMS: 4800}, "audio_speed")
-		check(t, "a write that measured only the load time", audio{2.5, 380, 0, "resources", 4800}, "audio_speed", from, to)
+		// One measured figure alone writes that figure and the provenance and
+		// keeps every other one, a stored 0 count included: each per-field
+		// guard lets its own figure through without moving a neighbour.
+		write(t, routing.AudioMetrics{LoadTimeMS: 4800}, "audio_speed", at(7))
+		check(t, "a write that measured only the load time", audio{2.5, 380, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(7))
+		write(t, routing.AudioMetrics{RateX: 1.75}, "audio_speed", at(8))
+		check(t, "a write that measured only the rate", audio{1.75, 380, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(8))
+		write(t, routing.AudioMetrics{TTFAMS: 250}, "audio_speed", at(9))
+		check(t, "a write that measured only the TTFA", audio{1.75, 250, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(9))
+
+		// A figure that was not measured keeps its column even beside one that
+		// was: the guards are per field, not per call.
+		write(t, routing.AudioMetrics{RateX: -1, TTFAMS: 300}, "audio_speed", at(10))
+		check(t, "a negative rate beside a measured TTFA", audio{1.75, 300, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(10))
+		write(t, routing.AudioMetrics{RateX: 2.25, TTFAMS: -5}, "audio_speed", at(11))
+		check(t, "a negative TTFA beside a measured rate", audio{2.25, 300, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(11))
+		write(t, routing.AudioMetrics{RateX: 2, LoadTimeMS: -7}, "audio_speed", at(12))
+		check(t, "a negative load time beside a measured rate", audio{2, 300, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(12))
+		write(t, routing.AudioMetrics{TTFAMS: 280, RealtimeConcurrency: -1, ConcurrencyLimit: routing.AudioLimitPerformance}, "audio_speed", at(13))
+		check(t, "a negative ramp level beside a measured TTFA", audio{2, 280, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(13))
+		write(t, routing.AudioMetrics{RealtimeConcurrency: 5, LoadTimeMS: 4500}, "audio_speed", at(14))
+		measured := check(t, "a ramp count without its reason beside a measured load time", audio{2, 280, 0, routing.AudioLimitResources, 4500}, "audio_speed", at(14))
+
+		// A limit that is not one of the three stop reasons is refused, and the
+		// call writes nothing at all -- not the figures beside it, not the
+		// provenance -- whether or not its ramp half would otherwise count.
+		for _, bad := range []routing.AudioMetrics{
+			{RealtimeConcurrency: 3, ConcurrencyLimit: "throughput"},
+			{RateX: 9, TTFAMS: 1, LoadTimeMS: 1, RealtimeConcurrency: 2, ConcurrencyLimit: "Performance"},
+			{RealtimeConcurrency: -1, ConcurrencyLimit: " cap"},
+		} {
+			if err := s.UpdateMappingAudioMetrics(ctx, "m_aud", bad, "audio_refused", at(15)); err == nil {
+				t.Fatalf("UpdateMappingAudioMetrics(%+v) = nil, want the unknown limit refused", bad)
+			}
+			unchanged(t, fmt.Sprintf("a refused write (%+v)", bad), measured)
+		}
 
 		// A lock-only operator save keeps the audio figures, and a locked
 		// mapping keeps its figures and provenance against the benchmark.
@@ -971,22 +1017,19 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 		if err := s.UpdateMappingEditable(ctx, mapping, routing.MappingMetricsMask{}); err != nil {
 			t.Fatalf("lock mapping: %v", err)
 		}
-		lockedBefore := read(t)
-		if audioOf(lockedBefore) != (audio{2.5, 380, 0, "resources", 4800}) || lockedBefore.MetricsSource != "audio_speed" {
-			t.Fatalf("a lock-only save changed the audio figures: %+v (source %q)", audioOf(lockedBefore), lockedBefore.MetricsSource)
-		}
-		write(t, routing.AudioMetrics{RateX: 9, TTFAMS: 1, RealtimeConcurrency: 8, ConcurrencyLimit: "cap", LoadTimeMS: 1}, "audio_benchmark")
-		locked := read(t)
-		if audioOf(locked) != audioOf(lockedBefore) || locked.MetricsSource != "audio_speed" ||
-			!sameTimePtr(locked.MetricsUpdatedAt, lockedBefore.MetricsUpdatedAt) || !sameTimePtr(locked.AudioMetricsUpdatedAt, lockedBefore.AudioMetricsUpdatedAt) {
-			t.Fatalf("an audio-metrics write overwrote a LOCKED mapping: %+v (source %q, stamps %v / %v), want %+v (source audio_speed, stamps %v / %v)",
-				audioOf(locked), locked.MetricsSource, locked.MetricsUpdatedAt, locked.AudioMetricsUpdatedAt,
-				audioOf(lockedBefore), lockedBefore.MetricsUpdatedAt, lockedBefore.AudioMetricsUpdatedAt)
-		}
+		unchanged(t, "a lock-only save", measured)
+		write(t, routing.AudioMetrics{
+			RateX: 9, TTFAMS: 1, RealtimeConcurrency: 8, ConcurrencyLimit: routing.AudioLimitCap, LoadTimeMS: 1,
+		}, "audio_benchmark", at(16))
+		unchanged(t, "an audio-metrics write over a LOCKED mapping", measured)
 
-		// A missing mapping is a benign no-op.
-		if err := s.UpdateMappingAudioMetrics(ctx, "does-not-exist", routing.AudioMetrics{RateX: 1}, "audio_benchmark"); err != nil {
+		// A missing mapping is a benign no-op, but an unknown limit is refused
+		// there too: the store checks the run before it looks for the row.
+		if err := s.UpdateMappingAudioMetrics(ctx, "does-not-exist", routing.AudioMetrics{RateX: 1}, "audio_benchmark", at(17)); err != nil {
 			t.Fatalf("UpdateMappingAudioMetrics (missing) = %v, want nil (benign no-op)", err)
+		}
+		if err := s.UpdateMappingAudioMetrics(ctx, "does-not-exist", routing.AudioMetrics{ConcurrencyLimit: "bogus"}, "audio_benchmark", at(17)); err == nil {
+			t.Fatal("UpdateMappingAudioMetrics (missing, unknown limit) = nil, want the limit refused")
 		}
 	})
 }
@@ -1006,15 +1049,15 @@ func sameTimePtr(a, b *time.Time) bool {
 // the deliberate deviation in UpsertMappingCapabilities: UNLIKE every targeted
 // mapping METRIC writer (UpdateMappingContextProbe,
 // UpdateMappingBenchmarkMetrics, UpdateMappingOpportunisticMetrics,
-// UpdateMappingCapacityMetrics, UpdateMappingEnergyEWMA -- five for five),
-// this one must NOT be blocked by MetricsLocked, and must NOT restamp
-// MetricsSource / MetricsUpdatedAt. It writes a capability row on a mapping
-// that is LOCKED, with a known MetricsSource, a known MetricsUpdatedAt and a
-// known GenTokensPerSecond, and asserts the row lands while all four metrics
-// fields stay exactly as seeded. If a future change "fixes" this writer to
-// look like its metric siblings (adds a MetricsLocked guard, or starts
-// stamping the metrics provenance columns), this test must fail on both
-// backends.
+// UpdateMappingCapacityMetrics, UpdateMappingAudioMetrics,
+// UpdateMappingEnergyEWMA -- six for six), this one must NOT be blocked by
+// MetricsLocked, and must NOT restamp MetricsSource / MetricsUpdatedAt. It
+// writes a capability row on a mapping that is LOCKED, with a known
+// MetricsSource, a known MetricsUpdatedAt and a known GenTokensPerSecond, and
+// asserts the row lands while all four metrics fields stay exactly as
+// seeded. If a future change "fixes" this writer to look like its metric
+// siblings (adds a MetricsLocked guard, or starts stamping the metrics
+// provenance columns), this test must fail on both backends.
 //
 // It is this file's converted form of the same test that pinned the property
 // for the pre-78 live_progress_support column: the argument

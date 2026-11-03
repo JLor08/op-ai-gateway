@@ -1470,11 +1470,16 @@ func (m *MemoryStore) UpdateMappingCapacityMetrics(_ context.Context, id string,
 // measured and keeps the stored field, a positive LoadTimeMS also writes
 // LoadTimeMS, the ramp's count and limit are written as a pair, 0 included,
 // exactly when the run carries a ramp result (AudioMetrics.RampMeasured), and
-// whatever is written is stamped with source and one time in both
+// whatever is written is stamped with source and with at in both
 // MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that measured nothing
-// writes nothing, provenance included. A missing or locked mapping is a benign
-// no-op (mirrors the SQL metrics_locked = 0 guard).
-func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID string, am AudioMetrics, source string) error {
+// writes nothing, provenance included. A limit ValidateAudioMetrics refuses is
+// an error before anything else, exactly as the SQL store refuses it before
+// any statement. A missing or locked mapping is a benign no-op (mirrors the
+// SQL metrics_locked = 0 guard).
+func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID string, am AudioMetrics, source string, at time.Time) error {
+	if err := ValidateAudioMetrics(am); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	mapping, ok := m.mappings[mappingID]
@@ -1494,8 +1499,7 @@ func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID str
 	if am.LoadTimeMS > 0 {
 		mapping.LoadTimeMS = int(am.LoadTimeMS)
 	}
-	now := time.Now().UTC()
-	stamp, audioStamp := now, now
+	stamp, audioStamp := at, at
 	mapping.MetricsSource = source
 	mapping.MetricsUpdatedAt = &stamp
 	mapping.AudioMetricsUpdatedAt = &audioStamp

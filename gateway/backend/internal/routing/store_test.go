@@ -4,6 +4,8 @@
 package routing
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -524,10 +526,11 @@ func mergeTimePtrEqual(a, b *time.Time) bool {
 
 // TestAudioMetricsRampMeasured pins what UpdateMappingAudioMetrics treats as
 // measured. The concurrency ramp's count and limit are one result: a stop
-// reason marks it, its level counts even at 0 (the model is not real-time even
-// with one stream), and either half alone -- a count with no reason, or a
-// reason with a negative level -- is no ramp result. The other figures count
-// only when positive.
+// reason marks it, its level counts even at 0 (under "performance" the model
+// is not real-time even with one stream, under "resources" the ramp's first
+// instance start was refused), and either half alone -- a count with no
+// reason, or a reason with a negative level -- is no ramp result. The other
+// figures count only when positive.
 func TestAudioMetricsRampMeasured(t *testing.T) {
 	cases := []struct {
 		name              string
@@ -535,11 +538,11 @@ func TestAudioMetricsRampMeasured(t *testing.T) {
 		ramp, anyMeasured bool
 	}{
 		{"nothing", AudioMetrics{}, false, false},
-		{"a ramp that found no good level", AudioMetrics{ConcurrencyLimit: "performance"}, true, true},
-		{"a ramp whose first ensure was refused", AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: "resources"}, true, true},
-		{"a ramp that reached its cap", AudioMetrics{RealtimeConcurrency: 8, ConcurrencyLimit: "cap"}, true, true},
+		{"a ramp that found no good level", AudioMetrics{ConcurrencyLimit: AudioLimitPerformance}, true, true},
+		{"a ramp whose first ensure was refused", AudioMetrics{RealtimeConcurrency: 0, ConcurrencyLimit: AudioLimitResources}, true, true},
+		{"a ramp that reached its cap", AudioMetrics{RealtimeConcurrency: 8, ConcurrencyLimit: AudioLimitCap}, true, true},
 		{"a count without the reason the ramp stopped", AudioMetrics{RealtimeConcurrency: 3}, false, false},
-		{"a reason with a negative level", AudioMetrics{RealtimeConcurrency: -1, ConcurrencyLimit: "cap"}, false, false},
+		{"a reason with a negative level", AudioMetrics{RealtimeConcurrency: -1, ConcurrencyLimit: AudioLimitCap}, false, false},
 		{"a speed run", AudioMetrics{RateX: 2.5, TTFAMS: 380}, false, true},
 		{"a load time alone", AudioMetrics{LoadTimeMS: 4800}, false, true},
 		{"only negatives", AudioMetrics{RateX: -1, TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3}, false, false},
@@ -553,5 +556,45 @@ func TestAudioMetricsRampMeasured(t *testing.T) {
 				t.Fatalf("Measured(%+v) = %v, want %v", tc.m, got, tc.anyMeasured)
 			}
 		})
+	}
+}
+
+// TestValidateAudioMetrics pins the vocabulary of a ramp's stop reason, which
+// both UpdateMappingAudioMetrics implementations check before they write: ""
+// (no ramp result) and the three exported reasons pass, with the values their
+// readers -- the scaler, the portal -- compare against; anything else is
+// refused, spelling and case exactly, and whatever the rest of the run holds,
+// so a broken producer cannot store a reason no reader knows.
+func TestValidateAudioMetrics(t *testing.T) {
+	if AudioLimitPerformance != "performance" || AudioLimitResources != "resources" || AudioLimitCap != "cap" {
+		t.Fatalf("limit constants = %q / %q / %q, want the stored values performance / resources / cap",
+			AudioLimitPerformance, AudioLimitResources, AudioLimitCap)
+	}
+	for _, ok := range []AudioMetrics{
+		{},
+		{RateX: 2.5, TTFAMS: 380, LoadTimeMS: 4800},
+		{RealtimeConcurrency: 0, ConcurrencyLimit: AudioLimitPerformance},
+		{RealtimeConcurrency: 3, ConcurrencyLimit: AudioLimitResources},
+		{RealtimeConcurrency: 8, ConcurrencyLimit: AudioLimitCap},
+		{RealtimeConcurrency: -1, ConcurrencyLimit: AudioLimitCap},
+	} {
+		if err := ValidateAudioMetrics(ok); err != nil {
+			t.Errorf("ValidateAudioMetrics(%+v) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []AudioMetrics{
+		{ConcurrencyLimit: "throughput"},
+		{RealtimeConcurrency: 2, ConcurrencyLimit: "Performance"},
+		{RealtimeConcurrency: 2, ConcurrencyLimit: " cap"},
+		{RateX: 2.5, TTFAMS: 380, RealtimeConcurrency: -1, ConcurrencyLimit: "none"},
+	} {
+		err := ValidateAudioMetrics(bad)
+		if err == nil {
+			t.Errorf("ValidateAudioMetrics(%+v) = nil, want the limit refused", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), strconv.Quote(bad.ConcurrencyLimit)) {
+			t.Errorf("ValidateAudioMetrics(%+v) = %q, want the message to name the refused limit", bad, err)
+		}
 	}
 }

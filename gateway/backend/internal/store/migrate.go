@@ -4422,10 +4422,10 @@ func migration99Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 }
 
 // migration100Up adds the per-spec instance columns to agent_runtime_specs
-// (#340, design section 12): replicable, min_instances, max_instances and
-// instance_parallelism, the operator's settings for running a spec as several
-// processes, and startup_measured_ms, the agent's measured startup time that
-// the effective idle timeout of a replicable spec is derived from.
+// (#340): replicable, min_instances, max_instances and instance_parallelism,
+// the operator's settings for running a spec as several processes, and
+// startup_measured_ms, the agent's measured startup time that the effective
+// idle timeout of a replicable spec is derived from.
 //
 // The ownership split is migration 96's: the four settings are operator-owned
 // (UpsertRuntimeSpec writes them on every save), the measurement is
@@ -4482,10 +4482,11 @@ func migration100Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // null, defaulting to the empty string like metrics_source, and the stamp is
 // the dialect's nullable timestamp like metrics_updated_at. NULL, 0 and the
 // empty string read as "unknown" -- the count only while the limit is empty:
-// the ramp stores the two together, and its measured 0 (not real-time even
-// with one stream) always comes with the reason the ramp stopped, so the count
-// needs no NULL of its own. Every pre-existing mapping, at 0 and the empty
-// string, reads back unmeasured, and there is nothing to backfill.
+// the ramp stores the two together, and its 0 (under "performance" not
+// real-time even with one stream, under "resources" nothing could be
+// measured) always comes with the reason the ramp stopped, so the count needs
+// no NULL of its own. Every pre-existing mapping, at 0 and the empty string,
+// reads back unmeasured, and there is nothing to backfill.
 //
 // Append-only: the v60-frozen baseline is not touched, so a fresh install gets
 // the columns by replaying this migration; addColumnIfMissing makes the step
@@ -4505,9 +4506,9 @@ func migration101Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return nil
 }
 
-// migration102Up adds route_affinity.instance (#340, design section 10.2): a
-// token-affinity pin records which instance of the mapping's spec it chose, so
-// a pinned client keeps landing on the same process.
+// migration102Up adds route_affinity.instance (#340): a token-affinity pin
+// records which instance of the mapping's spec it chose, so a pinned client
+// keeps landing on the same process.
 //
 // `integer not null default 0`, like the spec's instance counts it indexes
 // into, and the default is the upgrade story: instance 0 is byte-for-byte the

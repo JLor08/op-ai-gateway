@@ -105,11 +105,12 @@ func assertMigration102Default(ctx context.Context, t *testing.T, s *SQLStore) {
 	}
 }
 
-// TestMigration102AddsAffinityInstance pins migration 102 (#340, design
-// section 10.2) on a fresh install and on an upgrade of a genuine version-101
-// database that already holds a token-affinity pin, on both dialects:
-// route_affinity gains `instance`, declared like the spec instance counts it
-// indexes, and a pin written before (or without naming) it reads instance 0.
+// TestMigration102AddsAffinityInstance pins migration 102 (#340: a token
+// affinity pin keeps its client on one instance) on a fresh install and on an
+// upgrade of a genuine version-101 database that already holds a
+// token-affinity pin, on both dialects: route_affinity gains `instance`,
+// declared like the spec instance counts it indexes, and a pin written before
+// (or without naming) it reads instance 0.
 // On the upgrade the column is also absent before the migration, writable
 // through UpsertAffinity after it, and a replay of the migration disturbs
 // nothing.

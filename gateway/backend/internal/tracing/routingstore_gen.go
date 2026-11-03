@@ -1456,7 +1456,7 @@ func (_d *RoutingStoreWithTracing) UpdateMapping(ctx context.Context, mapping _s
 	return _d.Store.UpdateMapping(ctx, mapping)
 }
 
-func (_d *RoutingStoreWithTracing) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m _sourceRouting.AudioMetrics, source string) (err error) {
+func (_d *RoutingStoreWithTracing) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m _sourceRouting.AudioMetrics, source string, at time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateMappingAudioMetrics")
 	defer span.End()
 	defer func() {
@@ -1465,7 +1465,7 @@ func (_d *RoutingStoreWithTracing) UpdateMappingAudioMetrics(ctx context.Context
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.Store.UpdateMappingAudioMetrics(ctx, mappingID, m, source)
+	return _d.Store.UpdateMappingAudioMetrics(ctx, mappingID, m, source, at)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateMappingBenchmarkMetrics(ctx context.Context, id string, genTPS float64, promptTPS float64, loadMS int, at time.Time) (err error) {

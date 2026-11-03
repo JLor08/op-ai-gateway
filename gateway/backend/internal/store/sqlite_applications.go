@@ -520,19 +520,23 @@ func (s *SQLiteStore) UpdateMappingCapacityMetrics(ctx context.Context, id strin
 }
 
 // UpdateMappingAudioMetrics writes one audio benchmark run's measurements +
-// provenance (routing.MappingStore carries the contract). A run that measured
-// nothing returns before any statement, so it writes nothing, provenance
-// included. Otherwise the SET list names only the columns the run measured --
-// the ramp's count and limit always as a pair
-// (routing.AudioMetrics.RampMeasured), so a measured 0 replaces a stored
-// count -- assembled from fixed column names with every value a bound
-// parameter (the UpdateVendorAccountOperateFields shape): "keep the stored
-// value unless measured" spans five columns of four types here, and deciding
-// it on the Go value avoids the typed-cast pair per column a CASE needs on
-// PostgreSQL (UpdateMappingBenchmarkMetrics). The metrics_locked = 0 guard
-// stays in SQL, so the lock is still atomic: a locked (or missing) row
+// provenance (routing.MappingStore carries the contract). A limit
+// routing.ValidateAudioMetrics refuses is an error before any statement, and a
+// run that measured nothing returns before any statement too, so neither
+// writes anything, provenance included. Otherwise the SET list names only the
+// columns the run measured -- the ramp's count and limit always as a pair
+// (routing.AudioMetrics.RampMeasured), so a 0 replaces a stored count --
+// assembled from fixed column names with every value a bound parameter (the
+// UpdateVendorAccountOperateFields shape): "keep the stored value unless
+// measured" spans five columns of four types here, and deciding it on the Go
+// value avoids the typed-cast pair per column a CASE needs on PostgreSQL
+// (UpdateMappingBenchmarkMetrics). Both stamps take at. The metrics_locked = 0
+// guard stays in SQL, so the lock is still atomic: a locked (or missing) row
 // matches 0 rows and is left untouched, a benign no-op (not an error).
-func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m routing.AudioMetrics, source string) error {
+func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m routing.AudioMetrics, source string, at time.Time) error {
+	if err := routing.ValidateAudioMetrics(m); err != nil {
+		return err
+	}
 	if !m.Measured() {
 		return nil
 	}
@@ -551,9 +555,8 @@ func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID s
 	if m.LoadTimeMS > 0 {
 		sets, args = append(sets, "load_time_ms = ?"), append(args, m.LoadTimeMS)
 	}
-	now := time.Now().UTC()
 	sets = append(sets, "metrics_source = ?", "metrics_updated_at = ?", "audio_metrics_updated_at = ?")
-	args = append(args, source, now, now, mappingID)
+	args = append(args, source, at, at, mappingID)
 	if _, err := s.exec(ctx, `update model_mappings set `+strings.Join(sets, ", ")+`
 		where id = ? and metrics_locked = 0`, args...); err != nil {
 		return fmt.Errorf("update mapping audio metrics: %w", err)
