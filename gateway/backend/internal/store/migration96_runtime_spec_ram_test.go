@@ -68,12 +68,10 @@ func TestMigration96AddsRuntimeSpecRAMColumns(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create application: %v", err)
 		}
-		if err := s.CreateMapping(ctx, routing.ModelMapping{
+		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m96", ApplicationID: "app_m96", GatewayModelName: "m96-model", AppModelName: "up-m96",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create mapping: %v", err)
-		}
+		})
 		if _, err := s.db.ExecContext(ctx, s.dl.rebind(
 			`insert into agent_runtime_specs (id, mapping_id, binary_path, created_at, updated_at) values (?, ?, ?, ?, ?)`),
 			"spec_m96", "map_m96", "/usr/bin/llama-server", now, now); err != nil {

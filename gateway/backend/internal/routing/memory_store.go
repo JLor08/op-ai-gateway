@@ -1465,6 +1465,44 @@ func (m *MemoryStore) UpdateMappingCapacityMetrics(_ context.Context, id string,
 	return nil
 }
 
+// UpdateMappingAudioMetrics writes one audio benchmark run's measurements, only
+// while the mapping is unlocked: a number of 0 or below, or an empty limit, is
+// not measured and keeps the stored field, a positive LoadTimeMS also writes
+// LoadTimeMS, and whatever is written is stamped with source and one time in
+// both MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that measured nothing
+// writes nothing, provenance included. A missing or locked mapping is a benign
+// no-op (mirrors the SQL metrics_locked = 0 guard).
+func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID string, am AudioMetrics, source string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapping, ok := m.mappings[mappingID]
+	if !ok || mapping.MetricsLocked || !am.Measured() {
+		return nil
+	}
+	if am.RateX > 0 {
+		mapping.AudioRateX = am.RateX
+	}
+	if am.TTFAMS > 0 {
+		mapping.AudioTTFAMS = am.TTFAMS
+	}
+	if am.RealtimeConcurrency > 0 {
+		mapping.AudioRealtimeConcurrency = am.RealtimeConcurrency
+	}
+	if am.ConcurrencyLimit != "" {
+		mapping.AudioConcurrencyLimit = am.ConcurrencyLimit
+	}
+	if am.LoadTimeMS > 0 {
+		mapping.LoadTimeMS = int(am.LoadTimeMS)
+	}
+	now := time.Now().UTC()
+	stamp, audioStamp := now, now
+	mapping.MetricsSource = source
+	mapping.MetricsUpdatedAt = &stamp
+	mapping.AudioMetricsUpdatedAt = &audioStamp
+	m.mappings[mappingID] = mapping
+	return nil
+}
+
 func (m *MemoryStore) MappingByID(_ context.Context, id string) (ModelMapping, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -2688,10 +2726,12 @@ func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) err
 		if existing.MappingID == spec.MappingID {
 			spec.ID = existingID
 			spec.CreatedAt = existing.CreatedAt
-			// RAMMeasuredMB is agent-owned: the SQL update set list never
-			// touches ram_measured_mb, so an operator re-save (which always
-			// arrives with 0) must not erase the measurement here either.
+			// RAMMeasuredMB and StartupMeasuredMS are agent-owned: the SQL
+			// update set list never touches ram_measured_mb or
+			// startup_measured_ms, so an operator re-save (which always arrives
+			// with 0) must not erase a measurement here either.
 			spec.RAMMeasuredMB = existing.RAMMeasuredMB
+			spec.StartupMeasuredMS = existing.StartupMeasuredMS
 			m.runtimeSpecs[existingID] = spec
 			return nil
 		}
@@ -2832,6 +2872,22 @@ func (m *MemoryStore) UpdateRuntimeSpecRAMMeasured(_ context.Context, specID str
 		return storeerr.ErrNotFound
 	}
 	spec.RAMMeasuredMB = measuredMB
+	m.runtimeSpecs[specID] = spec
+	return nil
+}
+
+// UpdateRuntimeSpecStartupMeasured writes back the agent's measured startup
+// time for the spec, touching only StartupMeasuredMS (the operator-owned
+// instance settings are never written here). ErrNotFound when the spec does
+// not exist -- the in-memory mirror of the one-column SQL update.
+func (m *MemoryStore) UpdateRuntimeSpecStartupMeasured(_ context.Context, specID string, ms int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	spec, ok := m.runtimeSpecs[specID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	spec.StartupMeasuredMS = ms
 	m.runtimeSpecs[specID] = spec
 	return nil
 }

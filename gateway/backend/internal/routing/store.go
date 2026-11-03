@@ -706,10 +706,16 @@ type RouteAffinity struct {
 	SessionID     string
 	ApplicationID string
 	ServerID      string
-	ExpiresAt     time.Time
-	LastUsedAt    time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// Instance is the instance of the mapping's spec the pin chose
+	// (route_affinity.instance, migration 102; #340 design section 10.2): k for
+	// the instance addressed `m#k`, and 0 both for instance 0 and for every
+	// non-replicable mapping -- the address every pin meant before the column
+	// existed, which is why the zero value needs no translation.
+	Instance   int
+	ExpiresAt  time.Time
+	LastUsedAt time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // ModelGroup is a named priority-failover group offered to clients as a synthetic
@@ -949,8 +955,22 @@ type ModelMapping struct {
 	MaxConcurrency               int     // max concurrent requests the model can serve; 0 = unknown
 	RecommendedConcurrency       int     // recommended concurrent requests before throughput degrades; 0 = unknown
 	GenTokensPerSecondAtCapacity float64 // aggregate generation throughput at MaxConcurrency (tokens/s); 0 = unknown
-	CreatedAt                    time.Time
-	UpdatedAt                    time.Time
+
+	// Per-mapping AUDIO performance metrics (migration 101; #340 design section
+	// 8.5), the audio counterpart of the text metrics above, for a mapping with
+	// the speech (TTS) or transcription (ASR) capability. The audio benchmark's
+	// speed and capacity runs write them through UpdateMappingAudioMetrics,
+	// under the same MetricsLocked guard and stamping the same MetricsSource /
+	// MetricsUpdatedAt as the text writers. They live on the mapping, not on a
+	// running process, so routing and the scaler can read them whether or not
+	// the model is loaded. 0 / "" / nil = unknown everywhere.
+	AudioRateX               float64    // audio seconds produced (TTS) or transcribed (ASR) per wall second, one stream; 0 = unknown
+	AudioTTFAMS              int64      // time to the first audio (TTS) or first transcript text (ASR), ms; 0 = unknown
+	AudioRealtimeConcurrency int        // most concurrent streams whose slowest still met the real-time threshold; 0 = unknown
+	AudioConcurrencyLimit    string     // why that ramp stopped: "performance" | "resources" | "cap"; "" = unknown
+	AudioMetricsUpdatedAt    *time.Time // when an audio benchmark last wrote these; nil = never
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 // LimitConfig is a principal's (a Service or a User — see PrincipalType*)
@@ -2187,6 +2207,28 @@ func (m MappingMetricsMask) Any() bool {
 		m.EnergyWhPerToken || m.MaxConcurrency || m.RecommendedConcurrency || m.GenTokensPerSecondAtCapacity
 }
 
+// AudioMetrics is what one audio benchmark run measured, for
+// UpdateMappingAudioMetrics (#340 design section 8.5): a speed run yields RateX
+// and TTFAMS (and LoadTimeMS from a confirmed cold start), a capacity ramp
+// yields RealtimeConcurrency and ConcurrencyLimit. A zero value means "this
+// run did not measure it" and keeps the stored column, so a speed-only run
+// never erases the capacity figures and a capacity-only run never erases the
+// speed ones.
+type AudioMetrics struct {
+	RateX               float64 // -> ModelMapping.AudioRateX
+	TTFAMS              int64   // -> ModelMapping.AudioTTFAMS
+	RealtimeConcurrency int     // -> ModelMapping.AudioRealtimeConcurrency
+	ConcurrencyLimit    string  // -> ModelMapping.AudioConcurrencyLimit
+	LoadTimeMS          int64   // -> ModelMapping.LoadTimeMS, the cold-start figure a text benchmark writes too
+}
+
+// Measured reports whether the run measured anything at all -- a positive
+// number or a non-empty limit. A run that did not writes nothing, provenance
+// included, the rule UpdateMappingBenchmarkMetrics applies to a text run.
+func (m AudioMetrics) Measured() bool {
+	return m.RateX > 0 || m.TTFAMS > 0 || m.RealtimeConcurrency > 0 || m.ConcurrencyLimit != "" || m.LoadTimeMS > 0
+}
+
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	// UpdateMapping, like UpdateMappingEditable below, is one of the two
@@ -2230,6 +2272,18 @@ type MappingStore interface {
 	// non-error, when the mapping is missing or locked). Touches only the 3 capacity columns +
 	// provenance, so it cannot clobber a concurrent edit of other fields.
 	UpdateMappingCapacityMetrics(ctx context.Context, id string, maxConcurrency, recommendedConcurrency int, genTPSAtCapacity float64, at time.Time) error
+	// UpdateMappingAudioMetrics writes one audio benchmark run's measurements
+	// (migration 101), the audio counterpart of UpdateMappingBenchmarkMetrics:
+	// atomically and ONLY when metrics_locked is false (a no-op, non-error, when
+	// the mapping is missing or locked). A run writes only what it measured --
+	// a number of 0 or below, or an empty ConcurrencyLimit, keeps the stored
+	// column -- and a positive LoadTimeMS also writes load_time_ms. A write is
+	// stamped with metrics_source = source and with one store-taken time in both
+	// metrics_updated_at and audio_metrics_updated_at; a call that measured
+	// nothing (AudioMetrics.Measured) writes nothing, provenance included. It
+	// touches only those columns, so it cannot clobber a concurrent edit of
+	// other fields.
+	UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m AudioMetrics, source string) error
 	// UpdateMappingEnergyEWMA EWMA-blends energy_wh_per_token from a live per-request
 	// energy sample (watt-hours/token), atomically and ONLY when metrics_locked is
 	// false (no-op, non-error, when missing or locked). A sample <= 0 leaves the
@@ -2634,6 +2688,33 @@ type RuntimeSpec struct {
 	// and would otherwise erase the measurement with a zero on each save --
 	// the same never-clobber split as RuntimeSpecGPU's two VRAM fields.
 	RAMMeasuredMB int
+	// Replicable opts the spec into running more than one instance (#340;
+	// agent_runtime_specs.replicable, migration 100): instance k >= 1 is
+	// addressed `<app model name>#k` and started on demand. false -- every spec
+	// that never opted in -- is one process, exactly today's behaviour, which is
+	// why the column defaults to 0. Operator-owned: written by UpsertRuntimeSpec.
+	Replicable bool
+	// MinInstances is how many instances are kept warm (0 = none) and
+	// MaxInstances caps how many may run (0 = unbounded; the agent's absolute
+	// per-spec index cap still applies). Both only mean something while
+	// Replicable. Operator-owned (migration 100).
+	MinInstances int
+	MaxInstances int
+	// InstanceParallelism is how many requests one instance serves at once
+	// (0 = 1): the per-instance cap an instance candidate's in-flight count is
+	// compared with. Gateway-only -- the agent never needs it, so it is never
+	// pushed. Operator-owned (migration 100).
+	InstanceParallelism int
+	// StartupMeasuredMS is the agent's measured startup time for this spec, in
+	// ms: process start to the first successful health probe of the most recent
+	// successful start, the maximum over the spec's instances
+	// (agent_runtime_specs.startup_measured_ms, migration 100; a Go int64, so
+	// the column is ADR-005's bigint). 0 = nothing measured yet. Agent-owned,
+	// the RAMMeasuredMB contract: written ONLY by
+	// UpdateRuntimeSpecStartupMeasured, stored by UpsertRuntimeSpec on a fresh
+	// insert and PRESERVED on every later update, so an operator's
+	// full-document save -- which arrives with 0 -- never erases it.
+	StartupMeasuredMS int64
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
@@ -2891,6 +2972,13 @@ type RuntimeStore interface {
 	// Callers pass a strictly positive measurement: a zero is "unknown" and is
 	// dropped before it reaches the store.
 	UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error
+	// UpdateRuntimeSpecStartupMeasured writes back the agent's measured startup
+	// time for the spec, touching only StartupMeasuredMS (the operator-owned
+	// instance settings are never written here); ErrNotFound when the spec does
+	// not exist. Same contract as UpdateRuntimeSpecRAMMeasured: callers pass a
+	// strictly positive measurement (a zero is "unknown" and is dropped before it
+	// reaches the store), and UpsertRuntimeSpec never overwrites what this wrote.
+	UpdateRuntimeSpecStartupMeasured(ctx context.Context, specID string, ms int64) error
 	// SetCoResidencyRules atomically REPLACES the whole set of EXPLICIT
 	// co-residency pair rows for appID (delete-then-insert in one transaction,
 	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). Each rule carries a verdict

@@ -45,9 +45,10 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 // The other FOUR hand it a fully migrated one (forEachDialect), because they
 // test post-79 behaviour rather than the pre-78 shape.
 //
-// The mapping and server rows go through the PUBLIC store API, which no longer
-// writes the eleven columns migration 79 dropped -- they are
-// `not null default` at version 77, so an insert that omits them still lands.
+// The server row goes through the PUBLIC store API and the mapping rows through
+// seedBaselineMapping (see the last paragraph); neither writes the eleven
+// columns migration 79 dropped -- they are `not null default` at version 77,
+// so an insert that omits them still lands.
 // Forcing a legacy value afterwards is the caller's own raw `update`
 // (mustExec) and needs a database stopped before 79, so only the v77 four
 // ever do it.
@@ -70,9 +71,12 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 // both directions, for all eight callers. The application row is therefore
 // what it always was here: an FK parent whose own shape is not the subject of
 // any migration-78 or -79 test, and any future applications column needs no
-// edit here. (ai_servers and model_mappings carry the same latent coupling
-// through CreateAIServer / CreateMapping; the same fix applies to whichever of
-// them a post-77 migration touches first.)
+// edit here. ai_servers carries the same latent coupling through
+// CreateAIServer, and the same fix applies once a post-77 migration touches it.
+// model_mappings already did -- migration 101's audio metric columns made
+// CreateMapping name columns a v77 database lacks -- so the mapping rows go
+// through seedBaselineMapping, the same version-independent insert for that
+// table.
 func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now time.Time, ids ...string) {
 	t.Helper()
 	if err := s.CreateAIServer(ctx, routing.AIServer{
@@ -88,13 +92,11 @@ func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now
 		"app_m78", "srv_m78", routing.ProviderVLLM, 8000, "http", `["openai"]`,
 		1, 1, 30000, 300, routing.ServerStatusActive, now, now)
 	for _, id := range ids {
-		if err := s.CreateMapping(ctx, routing.ModelMapping{
+		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: id, ApplicationID: "app_m78", GatewayModelName: id + "-model",
 			AppModelName: id + "-upstream", Status: routing.ServerStatusActive,
 			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create mapping %s: %v", id, err)
-		}
+		})
 	}
 }
 

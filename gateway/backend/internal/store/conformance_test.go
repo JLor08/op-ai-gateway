@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
@@ -4678,6 +4679,153 @@ func TestConformanceModelMappingEnergyWhPerTokenRoundTrip(t *testing.T) {
 	})
 }
 
+// TestConformanceModelMappingAudioMetricsRoundTrip verifies the five
+// model_mappings audio metric columns (migration 101) through CreateMapping,
+// UpdateMapping and EVERY SQL reader of the table -- MappingByID,
+// MappingsByApplication, MappingsByServer and the ActiveMappingsForModel
+// routing join: four hand-maintained select lists feeding two scanners, the
+// shape persistence.md names as the dangerous one, because a column missed
+// from the routing join reads back a clean zero while the memory driver still
+// passes. Two mappings carry distinct values in every audio field, so a
+// transposed pair or a reader returning the wrong row shows as a mismatch; and
+// a zero rate or TTFA, or an absent stamp, is stored as SQL NULL ("not
+// measured"), never as a value that would claim a measurement.
+func TestConformanceModelMappingAudioMetricsRoundTrip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_aud", Name: "Audio", Domain: "aud.local", Provider: routing.ProviderAudioCpp,
+			Endpoint: "http://aud.local:8080", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_aud", ServerID: "srv_aud", Type: routing.ProviderAudioCpp, Port: 8080, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+
+		stampA := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+		stampB := time.Date(2026, 11, 2, 11, 30, 0, 0, time.UTC)
+		want := []routing.ModelMapping{
+			{
+				ID: "map_aud_a", ApplicationID: "app_aud", GatewayModelName: "aud-a", AppModelName: "up-a",
+				Status: routing.ServerStatusActive, AudioRateX: 3.25, AudioTTFAMS: 420, AudioRealtimeConcurrency: 2,
+				AudioConcurrencyLimit: "performance", AudioMetricsUpdatedAt: &stampA, CreatedAt: now, UpdatedAt: now,
+			},
+			{
+				ID: "map_aud_b", ApplicationID: "app_aud", GatewayModelName: "aud-b", AppModelName: "up-b",
+				Status: routing.ServerStatusActive, AudioRateX: 1.5, AudioTTFAMS: 1800, AudioRealtimeConcurrency: 5,
+				AudioConcurrencyLimit: "resources", AudioMetricsUpdatedAt: &stampB, CreatedAt: now, UpdatedAt: now,
+			},
+			{
+				ID: "map_aud_none", ApplicationID: "app_aud", GatewayModelName: "aud-none", AppModelName: "up-none",
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			},
+		}
+		for _, m := range want {
+			if err := s.CreateMapping(ctx, m); err != nil {
+				t.Fatalf("create mapping %s: %v", m.ID, err)
+			}
+		}
+
+		// audioOf renders the five audio fields comparably across drivers (a
+		// stamp as its UTC instant, since postgres returns another Location).
+		audioOf := func(m routing.ModelMapping) string {
+			stamp := "nil"
+			if m.AudioMetricsUpdatedAt != nil {
+				stamp = m.AudioMetricsUpdatedAt.UTC().Format(time.RFC3339Nano)
+			}
+			return fmt.Sprintf("rate=%v ttfa=%d realtime=%d limit=%q stamp=%s",
+				m.AudioRateX, m.AudioTTFAMS, m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit, stamp)
+		}
+		byID := func(list []routing.ModelMapping) map[string]routing.ModelMapping {
+			out := make(map[string]routing.ModelMapping, len(list))
+			for _, m := range list {
+				out[m.ID] = m
+			}
+			return out
+		}
+		// checkReaders holds every reader to the expected audio fields of every mapping.
+		checkReaders := func(t *testing.T, step string, want []routing.ModelMapping) {
+			t.Helper()
+			byApp, err := s.MappingsByApplication(ctx, "app_aud")
+			if err != nil {
+				t.Fatalf("%s: MappingsByApplication: %v", step, err)
+			}
+			byServer, err := s.MappingsByServer(ctx, "srv_aud")
+			if err != nil {
+				t.Fatalf("%s: MappingsByServer: %v", step, err)
+			}
+			appRows, serverRows := byID(byApp), byID(byServer)
+			for _, w := range want {
+				direct, err := s.MappingByID(ctx, w.ID)
+				if err != nil {
+					t.Fatalf("%s: MappingByID(%s): %v", step, w.ID, err)
+				}
+				cands, err := s.ActiveMappingsForModel(ctx, w.GatewayModelName, routing.APIFlavorOpenAIAudio)
+				if err != nil || len(cands) != 1 {
+					t.Fatalf("%s: ActiveMappingsForModel(%s): %d candidates, err %v", step, w.GatewayModelName, len(cands), err)
+				}
+				for name, got := range map[string]routing.ModelMapping{
+					"MappingByID": direct, "MappingsByApplication": appRows[w.ID],
+					"MappingsByServer": serverRows[w.ID], "ActiveMappingsForModel": cands[0].Mapping,
+				} {
+					if audioOf(got) != audioOf(w) {
+						t.Fatalf("%s: %s lost or reordered an audio column of %s:\n got  %s\n want %s", step, name, w.ID, audioOf(got), audioOf(w))
+					}
+				}
+			}
+		}
+		// nullAudio reports whether a mapping's wide pair and stamp are SQL NULL.
+		nullAudio := func(t *testing.T, id string) bool {
+			t.Helper()
+			var n int
+			if err := s.db.QueryRowContext(ctx, s.dl.rebind(`select count(*) from model_mappings where id = ?
+				and audio_rate_x is null and audio_ttfa_ms is null and audio_metrics_updated_at is null`), id).Scan(&n); err != nil {
+				t.Fatalf("read %s audio NULLs: %v", id, err)
+			}
+			return n == 1
+		}
+
+		checkReaders(t, "after create", want)
+		if !nullAudio(t, "map_aud_none") {
+			t.Fatalf("a mapping created with no audio metrics must store NULL rate, TTFA and stamp, not zeros")
+		}
+		if nullAudio(t, "map_aud_a") {
+			t.Fatalf("a mapping created with audio metrics stored NULLs")
+		}
+
+		// UpdateMapping is a full-row write: new figures land, and zeros put the
+		// columns back to NULL ("unknown"), leaving the other mappings alone.
+		stampC := time.Date(2026, 11, 3, 8, 15, 0, 0, time.UTC)
+		want[0].AudioRateX, want[0].AudioTTFAMS, want[0].AudioRealtimeConcurrency = 4.75, 300, 3
+		want[0].AudioConcurrencyLimit, want[0].AudioMetricsUpdatedAt = "cap", &stampC
+		want[0].UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateMapping(ctx, want[0]); err != nil {
+			t.Fatalf("update mapping: %v", err)
+		}
+		checkReaders(t, "after an update", want)
+
+		want[0].AudioRateX, want[0].AudioTTFAMS, want[0].AudioRealtimeConcurrency = 0, 0, 0
+		want[0].AudioConcurrencyLimit, want[0].AudioMetricsUpdatedAt = "", nil
+		want[0].UpdatedAt = now.Add(2 * time.Minute)
+		if err := s.UpdateMapping(ctx, want[0]); err != nil {
+			t.Fatalf("clear mapping audio metrics: %v", err)
+		}
+		checkReaders(t, "after an update that cleared them", want)
+		if !nullAudio(t, "map_aud_a") {
+			t.Fatalf("an update with zero audio metrics must store NULL rate, TTFA and stamp, not zeros")
+		}
+	})
+}
+
 // TestConformanceUpdateMappingContextProbe verifies the context-probe write path:
 // it stamps context_size + provenance ("probe") only while the mapping is
 // unlocked, and is a benign no-op when the mapping is locked or missing, on both
@@ -5661,6 +5809,13 @@ func TestConformanceAffinityServiceTokenUserIDNullable(t *testing.T) {
 // because NOT NULL rejects that NULL outright), applies migration42Up, and
 // proves the same call now succeeds on BOTH dialects (sqlite's drop+recreate
 // path and postgres's ALTER COLUMN path).
+//
+// The downgrade keeps the columns migrations after 42 added (instance,
+// migration 102), so on both dialects it differs from the head shape in the
+// NOT NULL alone and the repro cannot fail for any other reason. And since
+// sqlite's migration42Up rebuilds the table in its own frozen v42 shape, the
+// test replays migration 102 after it, exactly as the ledger runs it after 42
+// on a real upgrade, before the head-schema store calls.
 func TestMigration42RouteAffinityNullableUpgrade(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
@@ -5713,6 +5868,7 @@ func TestMigration42RouteAffinityNullableUpgrade(t *testing.T) {
 					created_at ` + ts + ` not null,
 					updated_at ` + ts + ` not null,
 					resolved_model text not null default '',
+					instance integer not null default 0,
 					unique(api_token_id, model, api_flavor, session_id)
 				)`,
 				`create index if not exists idx_route_affinity_lookup on route_affinity(api_token_id, model, api_flavor, session_id, expires_at)`,
@@ -5751,6 +5907,7 @@ func TestMigration42RouteAffinityNullableUpgrade(t *testing.T) {
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
+		reinvokeMigration102(ctx, t, s)
 
 		// The same call now succeeds and round-trips.
 		if err := s.UpsertAffinity(ctx, svcAff); err != nil {
