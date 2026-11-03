@@ -986,6 +986,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		AgentPresenceTimeoutDefault:         cfg.AgentPresenceTimeoutSeconds,
 		MaxChatBlobBytes:                    cfg.MaxChatBlobBytes,
 		MaxRunHistoryBytes:                  cfg.MaxRunHistoryBytes,
+		InstanceIdleFactor:                  cfg.InstanceIdleFactor,
+		InstanceIdleFloorSeconds:            cfg.InstanceIdleFloorSeconds,
 		SettingsVolatile:                    b.SettingsVolatile, ACMEChallenges: acmeChallenges,
 		OnCertSettingsChanged: certReconcileTriggerFunc(certReconcileTrigger),
 		OnCertificateIssued:   agentStreams.NotifyCertUpdate,

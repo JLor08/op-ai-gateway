@@ -34,7 +34,11 @@ import (
 // RAMEstimateMB is operator-owned and spreads like any other field: leaving it
 // out would let a benchmark's admin-state write reset the operator's estimate
 // to 0 (unknown). The DTO's RAMMeasuredMB has no request counterpart at all --
-// the store keeps the agent's measurement across the upsert.
+// the store keeps the agent's measurement across the upsert. The four instance
+// settings spread the same way -- dropping them would turn a replicable spec
+// back into one process whenever a benchmark wrote next to it -- and the
+// read-only StartupMeasuredMS and EffectiveIdleTimeoutSeconds, like
+// RAMMeasuredMB, have no request counterpart.
 func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 	liveTimings := dto.ResponsesLiveTimingsEnabled
 	return PutRuntimeSpecRequest{
@@ -55,6 +59,10 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
 		RAMEstimateMB:               dto.RAMEstimateMB,
+		Replicable:                  dto.Replicable,
+		MinInstances:                dto.MinInstances,
+		MaxInstances:                dto.MaxInstances,
+		InstanceParallelism:         dto.InstanceParallelism,
 		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
@@ -355,7 +363,7 @@ func (s *Service) resolveBenchmarkSpecWrite(ctx context.Context, specID string, 
 	if err != nil {
 		return benchmarkSpecWrite{}, err
 	}
-	dto, err := runtimeSpecDTO(spec, gpus, app)
+	dto, err := runtimeSpecDTO(spec, gpus, app, s.effectiveIdleTimeout(spec, mapping))
 	if err != nil {
 		return benchmarkSpecWrite{}, err
 	}

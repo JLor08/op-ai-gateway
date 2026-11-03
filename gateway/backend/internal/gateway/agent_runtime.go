@@ -402,6 +402,12 @@ type agentRuntimeReportSpec struct {
 	// file says, which may be nothing, so unlike the DTO it is omitempty here:
 	// an absent role stays absent in the stored report instead of becoming "".
 	Role string `json:"role,omitempty"`
+	// Replicable / MinInstances / MaxInstances are the spec's instance settings
+	// (AgentRuntimeSpecDTO's), omitempty like the DTO's, so a stored report of
+	// a spec that is not replicable carries none of the keys.
+	Replicable   bool `json:"replicable,omitempty"`
+	MinInstances int  `json:"min_instances,omitempty"`
+	MaxInstances int  `json:"max_instances,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

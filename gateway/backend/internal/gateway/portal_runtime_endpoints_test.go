@@ -185,6 +185,36 @@ func TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400(t *testing.T)
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutInstanceRefusalsReturn400 pins the wire
+// contract of the instance settings' refusals (#340) from a raw body, so the
+// request's JSON names are pinned with them: a floor above the cap is 400
+// runtime_spec.instances_invalid, a replicable spec with a fixed listen_port is
+// 400 runtime_spec.instances_need_ephemeral_port, and a negative count goes
+// through the existing 400 runtime_spec.tuning_invalid row. Without a row in
+// portalRuntimeSpecErrRows a new sentinel falls through to the 500 fallback.
+func TestHandlePortalMappingRuntimeSpecPutInstanceRefusalsReturn400(t *testing.T) {
+	cases := []struct {
+		body, code string
+	}{
+		{`{"binary":"/usr/local/bin/llama-server","replicable":true,"min_instances":3,"max_instances":2}`, "runtime_spec.instances_invalid"},
+		{`{"binary":"/usr/local/bin/llama-server","replicable":true,"listen_port":9000}`, "runtime_spec.instances_need_ephemeral_port"},
+		{`{"binary":"/usr/local/bin/llama-server","replicable":true,"min_instances":-1}`, "runtime_spec.tuning_invalid"},
+		{`{"binary":"/usr/local/bin/llama-server","instance_parallelism":-1}`, "runtime_spec.tuning_invalid"},
+	}
+	for _, tc := range cases {
+		srv := NewTestServer()
+		mappingID := seedRuntimeSpecMapping(t, srv)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", tc.body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %s: status = %d, want 400, body = %s", tc.body, rec.Code, rec.Body.String())
+		}
+		if code := errorBodyOf(t, rec); code != tc.code {
+			t.Fatalf("body %s: error code = %q, want %s", tc.body, code, tc.code)
+		}
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutAcceptsAudioCppAndOpenAIAudio pins the
 // wire side of the audio.cpp configuration: an explicit audio_cpp type with the
 // openai_audio flavor is saved and echoed (200, neither runtime_spec.type_invalid

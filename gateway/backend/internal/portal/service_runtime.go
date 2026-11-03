@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -160,6 +161,18 @@ var (
 	// names the offending file and rule -- never its content, which can hold
 	// the very secret that tripped the check.
 	ErrRuntimeSpecConfigFilesInvalid = errors.New("runtime_spec.config_files_invalid")
+	// ErrRuntimeSpecInstancesInvalid rejects a min_instances above
+	// max_instances when both are set (> 0): a floor of warm instances the cap
+	// never allows. Checked whether or not the spec is replicable, so a pair
+	// that can never be met is not stored to take effect the day the spec is
+	// switched to replicable. HTTP 400.
+	ErrRuntimeSpecInstancesInvalid = errors.New("runtime_spec.instances_invalid")
+	// ErrRuntimeSpecInstancesNeedEphemeralPort rejects a replicable spec with a
+	// fixed listen_port: every instance is its own process on its own port, so
+	// a replicable spec has to leave the port to the agent (0). The agent would
+	// otherwise demote such a spec to its one instance, a setting that quietly
+	// does something else. HTTP 400.
+	ErrRuntimeSpecInstancesNeedEphemeralPort = errors.New("runtime_spec.instances_need_ephemeral_port")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -477,6 +490,28 @@ type RuntimeSpecDTO struct {
 	// "needs no RAM", and both keys are always present on the wire.
 	RAMEstimateMB int `json:"ram_estimate_mb"`
 	RAMMeasuredMB int `json:"ram_measured_mb"`
+	// Replicable / MinInstances / MaxInstances / InstanceParallelism are the
+	// spec's instance settings (#340; routing.RuntimeSpec carries their
+	// meaning): whether the agent may run several instances of it, how many it
+	// keeps warm (0 = none), how many it may run (0 = unbounded) and how many
+	// requests one instance serves at once (0 = 1). Operator-owned, applied
+	// verbatim from PutRuntimeSpecRequest like the fields above.
+	Replicable          bool `json:"replicable"`
+	MinInstances        int  `json:"min_instances"`
+	MaxInstances        int  `json:"max_instances"`
+	InstanceParallelism int  `json:"instance_parallelism"`
+	// StartupMeasuredMS is the agent's measured startup time of the spec in ms
+	// (0 = nothing measured yet), and EffectiveIdleTimeoutSeconds is the idle
+	// timeout the runtime-config document pushes for the spec: for a
+	// replicable spec derived from that measurement and the mapping's
+	// benchmark cold start (effectiveIdleTimeout), otherwise the stored
+	// idle_timeout_seconds. Both are READ-ONLY echoes with no
+	// PutRuntimeSpecRequest counterpart -- the first is agent-owned and the
+	// store keeps it across every write, the second is derived on every read
+	// and never stored -- so the portal shows the value the agent gets
+	// without re-deriving the gateway's factor and floor itself.
+	StartupMeasuredMS           int64 `json:"startup_measured_ms"`
+	EffectiveIdleTimeoutSeconds int   `json:"effective_idle_timeout_seconds"`
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of
 	// the three-state endpoint control (mirrors the same trio on
 	// ApplicationDTO), stored explicitly on this spec rather than inherited
@@ -585,6 +620,16 @@ type PutRuntimeSpecRequest struct {
 	// one. Negative is refused (ErrRuntimeSpecTuningInvalid). The measurement
 	// has no request field: it is agent-owned, and the store keeps it.
 	RAMEstimateMB int `json:"ram_estimate_mb"`
+	// Replicable / MinInstances / MaxInstances / InstanceParallelism: see
+	// RuntimeSpecDTO's doc. Applied verbatim like every field of this
+	// full-document request -- absent means not replicable and 0 -- and checked
+	// by validateRuntimeSpecInstances. The DTO's two read-only echoes beside
+	// them (startup_measured_ms, effective_idle_timeout_seconds) have no
+	// request field, so a body that carries them sets nothing.
+	Replicable          bool `json:"replicable"`
+	MinInstances        int  `json:"min_instances"`
+	MaxInstances        int  `json:"max_instances"`
+	InstanceParallelism int  `json:"instance_parallelism"`
 	// APIFlavors / ResponsesMode / MessagesMode: see RuntimeSpecDTO's doc.
 	// Absent (empty/"") defaults to both/passthrough — see validateRuntimeSpecRequest;
 	// the backend does NOT inherit the parent server_agent application's
@@ -687,7 +732,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	dto, err := runtimeSpecDTO(spec, gpus, app)
+	dto, err := runtimeSpecDTO(spec, gpus, app, s.effectiveIdleTimeout(spec, mapping))
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -860,7 +905,7 @@ func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMap
 	if err != nil {
 		return RuntimeSpecDTO{}, true, err
 	}
-	dto, err = runtimeSpecDTO(spec, storedGPUs, app)
+	dto, err = runtimeSpecDTO(spec, storedGPUs, app, s.effectiveIdleTimeout(spec, mapping))
 	return dto, true, err
 }
 
@@ -952,9 +997,15 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	// The config_files validation (validateRuntimeSpecConfigFiles, #257) also
 	// runs after it, below the args/env encoding, for the same reason: it is
 	// newer than every check above, so it cannot rewrite the answer to a body
-	// that was already invalid for a shipped reason.
+	// that was already invalid for a shipped reason. The instance settings
+	// (validateRuntimeSpecInstances, #340) run after the config files, last of
+	// all, for that reason again -- their negative counts included, although
+	// those answer with the shipped ErrRuntimeSpecTuningInvalid: checked beside
+	// the other tuning values in validateRuntimeSpecShape, a body that also
+	// carried a bad admin_state would answer tuning_invalid where it answered
+	// admin_state_invalid while encoding/json still dropped the counts unread.
 	//
-	// Apart from that one, exactly one REQUEST-REFUSING rejection is left
+	// Apart from those two, exactly one REQUEST-REFUSING rejection is left
 	// after it on the write path: capture.SealSecret's keyless-store failure
 	// (capture.ErrKeyRequired -> 400 runtime_spec.api_token_key_required),
 	// returned from either token branch of runtimeSpecAPIToken that seals,
@@ -1015,6 +1066,9 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	f.args, f.env = string(argsJSON), string(envJSON)
 	f.configFiles, err = validateRuntimeSpecConfigFiles(req.ConfigFiles)
 	if err != nil {
+		return runtimeSpecFields{}, err
+	}
+	if err = validateRuntimeSpecInstances(req); err != nil {
 		return runtimeSpecFields{}, err
 	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
@@ -1097,6 +1151,29 @@ func validateRuntimeSpecShape(req PutRuntimeSpecRequest) (runtimeSpecFields, err
 		metricsPath:      metricsPath,
 		contextProbePath: contextProbePath,
 	}, nil
+}
+
+// validateRuntimeSpecInstances checks the four instance settings -- last of
+// the request validations, see validateRuntimeSpecRequest for why -- in this
+// order: a negative count is ErrRuntimeSpecTuningInvalid like every other
+// negative tuning value, a floor above the cap (both set) is
+// ErrRuntimeSpecInstancesInvalid, and a replicable spec with a fixed port is
+// ErrRuntimeSpecInstancesNeedEphemeralPort. The agent repairs the same shapes
+// when a hand-written file-mode document carries them (a negative count reads
+// as 0, the floor is clamped to the cap, a fixed port demotes the spec to one
+// instance), but a repair the operator never sees is a setting that silently
+// does something else, so the portal refuses them where they are typed.
+func validateRuntimeSpecInstances(req PutRuntimeSpecRequest) error {
+	if req.MinInstances < 0 || req.MaxInstances < 0 || req.InstanceParallelism < 0 {
+		return ErrRuntimeSpecTuningInvalid
+	}
+	if req.MaxInstances > 0 && req.MinInstances > req.MaxInstances {
+		return ErrRuntimeSpecInstancesInvalid
+	}
+	if req.Replicable && req.ListenPort != 0 {
+		return ErrRuntimeSpecInstancesNeedEphemeralPort
+	}
+	return nil
 }
 
 // runtimeSpecEndpointModes resolves responses_mode and messages_mode, in that
@@ -1242,6 +1319,10 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		Pinned:                      req.Pinned,
 		AdminState:                  f.adminState,
 		RAMEstimateMB:               req.RAMEstimateMB,
+		Replicable:                  req.Replicable,
+		MinInstances:                req.MinInstances,
+		MaxInstances:                req.MaxInstances,
+		InstanceParallelism:         req.InstanceParallelism,
 		SetVisibleDevices:           req.SetVisibleDevices,
 		VisibleDevicesMode:          f.visibleMode,
 		APITokenMode:                mode,
@@ -1261,14 +1342,17 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 	if prior.ok {
 		spec.ID = prior.spec.ID
 		spec.CreatedAt = prior.spec.CreatedAt
-		// The agent's RAM measurement is the stored value, never the request's
-		// (the request has no such field -- the VRAM ownership rule, spec-level).
-		// The store's upsert already keeps ram_measured_mb across a conflict, so
-		// this is not what protects the column; it keeps the row this method
-		// hands back honest, because writeRuntimeSpec builds its response DTO
-		// from this row rather than re-reading the store, and a bare 0 here
-		// would report "nothing measured" for a spec that is measured.
+		// The agent's two measurements, RAM and startup, are the stored values,
+		// never the request's (the request has no such fields -- the VRAM
+		// ownership rule, spec-level). The store's upsert already keeps both
+		// columns across a conflict, so this is not what protects them; it
+		// keeps the row this method hands back honest, because writeRuntimeSpec
+		// builds its response DTO from this row rather than re-reading the
+		// store, and a bare 0 here would report "nothing measured" for a spec
+		// that is measured -- and, for a replicable spec, an effective idle
+		// timeout the runtime-config document does not push.
 		spec.RAMMeasuredMB = prior.spec.RAMMeasuredMB
+		spec.StartupMeasuredMS = prior.spec.StartupMeasuredMS
 	}
 	return spec, nil
 }
@@ -1720,13 +1804,15 @@ func validateRuntimeSpecGPUs(gpus []RuntimeSpecGPUDTO) error {
 
 // runtimeSpecDTO builds the wire DTO from a stored spec + its GPU rows, plus
 // the parent application (for the read-only api-token echoes — see
-// RuntimeSpecDTO.AppAPITokenSet/AppAPITokenHeader). Args/Env are opaque JSON
+// RuntimeSpecDTO.AppAPITokenSet/AppAPITokenHeader) and the spec's effective
+// idle timeout, which its callers derive with effectiveIdleTimeout, the one
+// derivation the pushed document uses too. Args/Env are opaque JSON
 // strings at the store layer (the netbird_group_ids pattern) — an unmarshal
 // failure here means the stored row is corrupt, not a client-input problem,
 // but still surfaces as the matching domain sentinel
 // (ErrRuntimeSpecArgsInvalid / ErrRuntimeSpecEnvInvalid) rather than a raw
 // JSON error or a 500.
-func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app routing.Application) (RuntimeSpecDTO, error) {
+func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app routing.Application, effectiveIdleSeconds int) (RuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
@@ -1776,6 +1862,12 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		GPUs:                        gpuDTOs,
 		RAMEstimateMB:               spec.RAMEstimateMB,
 		RAMMeasuredMB:               spec.RAMMeasuredMB,
+		Replicable:                  spec.Replicable,
+		MinInstances:                spec.MinInstances,
+		MaxInstances:                spec.MaxInstances,
+		InstanceParallelism:         spec.InstanceParallelism,
+		StartupMeasuredMS:           spec.StartupMeasuredMS,
+		EffectiveIdleTimeoutSeconds: effectiveIdleSeconds,
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
@@ -2488,7 +2580,10 @@ type AgentRuntimeSpecGPUDTO struct {
 // way to learn them. Env values legitimately carry ${AGENT_ENV:NAME}/${PORT}/
 // ${MODEL} placeholders the agent resolves locally at launch time -- this
 // DTO, like RuntimeSpecDTO, passes them through untouched: never validated or
-// rewritten here.
+// rewritten here. IdleTimeoutSeconds is the EFFECTIVE idle timeout
+// (effectiveIdleTimeout): the stored value for a spec that is not replicable,
+// and for a replicable one at least a floor, derived from its measured
+// startup -- never 0 there, so a replicable spec's instances always idle out.
 type AgentRuntimeSpecDTO struct {
 	ID                          string                   `json:"id"`
 	Model                       string                   `json:"model"`
@@ -2559,6 +2654,19 @@ type AgentRuntimeSpecDTO struct {
 	// ${PORT}/${MODEL}-style placeholders the agent resolves locally --
 	// passed through here untouched.
 	ConfigFiles []ConfigFileDTO `json:"config_files"`
+	// Replicable / MinInstances / MaxInstances are the spec's instance
+	// settings (#340; the agent-side runtime.Spec pairs these exact json
+	// tags): whether the agent may run several instances of the spec, how
+	// many it keeps up (0 = none) and how many it may run (0 = unbounded).
+	// All three are omitempty and set only for a replicable spec, so the
+	// document of a spec that is not replicable is the one it was before
+	// instances existed. Every agent gets them: one without the
+	// runtime_instances feature decodes past the keys, and one with it honours
+	// replicable only while this gateway declares that feature too. The
+	// per-instance parallelism is the gateway's own cap and is never pushed.
+	Replicable   bool `json:"replicable,omitempty"`
+	MinInstances int  `json:"min_instances,omitempty"`
+	MaxInstances int  `json:"max_instances,omitempty"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -2745,7 +2853,7 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
-		specDTO, err := agentRuntimeSpecDTO(spec, mapping, gpus)
+		specDTO, err := agentRuntimeSpecDTO(spec, mapping, gpus, s.effectiveIdleTimeout(spec, mapping))
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
@@ -2899,7 +3007,10 @@ func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Applica
 // The spec's host-RAM demand (RAMMB) follows the identical rule over the spec's
 // own two figures, RAMMeasuredMB and RAMEstimateMB: RAM is host-scoped, so it is
 // ONE number on the spec rather than one per GPU row.
-func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping, gpus []routing.RuntimeSpecGPU) (AgentRuntimeSpecDTO, error) {
+//
+// idleSeconds is the idle timeout to push, the caller's effectiveIdleTimeout of
+// the spec, and the instance settings are pushed for a replicable spec only.
+func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping, gpus []routing.RuntimeSpecGPU, idleSeconds int) (AgentRuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
 		return AgentRuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
@@ -2932,7 +3043,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 	// Host-RAM demand: the same max(measured, estimate) floor as the VRAM above,
 	// over the spec-level pair. Both 0 stays 0 (unknown).
 	ram := max(spec.RAMMeasuredMB, spec.RAMEstimateMB)
-	return AgentRuntimeSpecDTO{
+	dto := AgentRuntimeSpecDTO{
 		ID:                          spec.ID,
 		Model:                       mapping.GatewayModelName,
 		UpstreamModel:               mapping.AppModelName,
@@ -2946,14 +3057,86 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		HealthPath:                  spec.HealthPath,
 		HealthTimeoutSeconds:        spec.HealthTimeoutSeconds,
 		StartupTimeoutSeconds:       spec.StartupTimeoutSeconds,
-		IdleTimeoutSeconds:          spec.IdleTimeoutSeconds,
+		IdleTimeoutSeconds:          idleSeconds,
 		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
 		Pinned:                      spec.Pinned,
 		SetVisibleDevices:           spec.SetVisibleDevices,
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		AdminState:                  spec.AdminState,
 		ConfigFiles:                 configFiles,
-	}, nil
+	}
+	// Counts stored on a spec that is not replicable mean nothing and are not
+	// pushed: its document stays byte-for-byte the pre-instances one, ETag
+	// included, and no agent is handed a count it would have to ignore.
+	if spec.Replicable {
+		dto.Replicable = true
+		dto.MinInstances = spec.MinInstances
+		dto.MaxInstances = spec.MaxInstances
+	}
+	return dto, nil
+}
+
+const (
+	// DefaultInstanceIdleFactor and DefaultInstanceIdleFloorSeconds are the
+	// factor and floor a replicable spec's idle timeout is derived with when
+	// the service is built without them; they mirror the defaults of
+	// OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR and
+	// OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS (config.Config).
+	DefaultInstanceIdleFactor       = 5.0
+	DefaultInstanceIdleFloorSeconds = 120
+	// maxDerivedIdleTimeoutSeconds caps the startup-derived term of a
+	// replicable spec's idle timeout. The agent turns the pushed seconds into a
+	// time.Duration, which wraps a little past 292 years, and a wrapped timeout
+	// is an instance unloaded at once; the cap, about 68 years, is "never" in
+	// practice and leaves that arithmetic room. Only an absurd measurement or
+	// factor gets near it.
+	maxDerivedIdleTimeoutSeconds = math.MaxInt32
+)
+
+// instanceIdleDefaults is NewService's fallback for the two idle knobs: a
+// factor that is not a positive, finite number, or a floor that is not
+// positive -- the zero value of a deps literal that omits them included --
+// uses DefaultInstanceIdleFactor or DefaultInstanceIdleFloorSeconds.
+func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
+	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
+		factor = DefaultInstanceIdleFactor
+	}
+	if floorSec <= 0 {
+		floorSec = DefaultInstanceIdleFloorSeconds
+	}
+	return factor, floorSec
+}
+
+// effectiveIdleTimeoutSeconds is the idle timeout the runtime-config document
+// pushes for spec, whose mapping's benchmark cold start is loadTimeMS. A spec
+// that is not replicable gets its stored IdleTimeoutSeconds as it is, 0 still
+// meaning "never unload". A replicable one gets the largest of its stored
+// value -- where 0 means "no manual override", not "never" -- factor times its
+// startup in seconds, rounded up, and floorSec. The startup is the slower of
+// the agent's measured startup and the benchmark's cold start, so an instance
+// that is slow to bring up is kept longer once it runs, and the floor holds
+// every instance at least that long, also while nothing is measured: a
+// replicable spec is never pushed 0, so its burst instances always idle out.
+func effectiveIdleTimeoutSeconds(spec routing.RuntimeSpec, loadTimeMS int64, factor float64, floorSec int) int {
+	if !spec.Replicable {
+		return spec.IdleTimeoutSeconds
+	}
+	startupMS := max(spec.StartupMeasuredMS, loadTimeMS)
+	derived := math.Ceil(factor * float64(startupMS) / 1000)
+	// Saturate before converting: Go leaves the int value of an out-of-range
+	// float to the platform.
+	derivedSec := maxDerivedIdleTimeoutSeconds
+	if derived < maxDerivedIdleTimeoutSeconds {
+		derivedSec = int(derived)
+	}
+	return max(spec.IdleTimeoutSeconds, derivedSec, floorSec)
+}
+
+// effectiveIdleTimeout is effectiveIdleTimeoutSeconds for spec on mapping,
+// under this gateway's configured factor and floor. The pushed document and the
+// portal's read-only echo both derive the value here, so they cannot disagree.
+func (s *Service) effectiveIdleTimeout(spec routing.RuntimeSpec, mapping routing.ModelMapping) int {
+	return effectiveIdleTimeoutSeconds(spec, int64(mapping.LoadTimeMS), s.instanceIdleFactor, s.instanceIdleFloorSeconds)
 }
 
 // agentRuntimeConfigDTO assembles the wire DTO, normalizing every

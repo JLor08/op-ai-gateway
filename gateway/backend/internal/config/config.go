@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -179,6 +180,24 @@ type Config struct {
 	NetbirdSyncIntervalSeconds      int
 	NetbirdTokenRotateBeforeDays    int
 	NetbirdKeyFile                  string
+	// Model-instance autoscaling (#340). InstanceIdleFactor and
+	// InstanceIdleFloorSeconds derive the idle timeout the gateway pushes for a
+	// replicable runtime spec: the larger of the spec's manual idle timeout,
+	// factor times its measured startup time and the floor, so an instance
+	// that is slow to start is kept for longer once it runs, and none is
+	// unloaded sooner than the floor. InstanceScaleCooldownSeconds is how long
+	// the instance scaler leaves a server's spec alone after its agent refused
+	// another instance for lack of room. AudioRealtimeMinFactor is the speed,
+	// in multiples of real time, an audio stream must reach for the audio
+	// benchmark to count it as real-time, and AudioConcurrencyMax caps the
+	// concurrent streams that benchmark's ramp tries. Each follows integer()'s
+	// rule -- the two factors through its float twin positiveFloat -- so junk,
+	// zero or negative loads the default: 5, 120, 60, 1.2 and 8.
+	InstanceIdleFactor           float64
+	InstanceIdleFloorSeconds     int
+	InstanceScaleCooldownSeconds int
+	AudioRealtimeMinFactor       float64
+	AudioConcurrencyMax          int
 	// CertReconcileIntervalSeconds is the cadence (seconds) of the certificate
 	// reconcile loop (cmd/gateway/cert_reconcile.go), which drives
 	// portal.Service.ReconcileCertificates -- itself a no-op while the
@@ -394,6 +413,18 @@ func Load() (Config, error) {
 		// rejected with 503 immediately instead of piling up. Junk or <= 0 falls back
 		// to the default via integer(). Default 128.
 		AdmissionQueueMaxDepth: l.integer("OP_AI_GATEWAY_ADMISSION_QUEUE_MAX_DEPTH", 128),
+		// Model-instance autoscaling (see the InstanceIdleFactor field doc). A
+		// floor of 0 is no knob of its own: it would let a replicable spec whose
+		// startup is not measured yet push an idle timeout of 0, which the agent
+		// reads as "never unload", so the floor follows the plain rule too. The
+		// idle defaults repeat portal.DefaultInstanceIdleFactor and
+		// portal.DefaultInstanceIdleFloorSeconds (this package cannot import
+		// portal).
+		InstanceIdleFactor:           l.positiveFloat("OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR", 5),
+		InstanceIdleFloorSeconds:     l.integer("OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS", 120),
+		InstanceScaleCooldownSeconds: l.integer("OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS", 60),
+		AudioRealtimeMinFactor:       l.positiveFloat("OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR", 1.2),
+		AudioConcurrencyMax:          l.integer("OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX", 8),
 		// Cadence (seconds) of the NetBird peer-sync loop (peer name <= server name;
 		// server domain <= peer DNS; connected status). Default 60; junk or <= 0
 		// falls back to 60, and any value is floored at 30s to avoid hammering the
@@ -496,6 +527,22 @@ func (l loader) integerAllowZero(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+// positiveFloat is integer()'s rule for a float: empty, junk, zero or negative
+// uses fallback, and so does a value that is not a finite number (NaN, an
+// infinity, or one too large to parse). Used for the factors, where unlike
+// floatRatio's ratio no range is implied but 0 or less makes no sense.
+func (l loader) positiveFloat(key string, fallback float64) float64 {
+	value := strings.TrimSpace(l.getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 {
 		return fallback
 	}
 	return parsed

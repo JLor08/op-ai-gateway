@@ -2740,7 +2740,7 @@ type RuntimeSpec struct {
 	HealthPath                  string
 	HealthTimeoutSeconds        int
 	StartupTimeoutSeconds       int
-	IdleTimeoutSeconds          int // 0 = never unload
+	IdleTimeoutSeconds          int // 0 = never unload; on a Replicable spec 0 = no manual value, and the timeout pushed is derived from the measured startup
 	AdmissionWaitTimeoutSeconds int // 0 = wait until the client disconnects
 	Pinned                      bool
 	AdminState                  string // "" | "force_running" | "force_stopped"
