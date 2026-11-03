@@ -115,8 +115,11 @@ type RuntimeErrorSample struct {
 	StderrTail string    `json:"stderr_tail,omitempty"`
 }
 
-// RuntimeSample is one agent-managed launch spec's current visible-lifecycle
-// state (design spec §7). Most fields mirror runtime.Status field-for-field
+// RuntimeSample is one managed process's current visible-lifecycle state
+// (design spec §7): one row per instance of an agent-managed launch spec
+// (#340) -- so SpecID alone does not identify a row of a replicable spec --
+// and, for a spec that never replicates, its one row as ever. Most fields
+// mirror runtime.Status field-for-field
 // for the wire, but ContextSize, ActiveRequests, and QueueDepth are the
 // exception: they are NOT copied from any Status lifecycle field. Instead
 // the agent's collectOnce (internal/agent) fills them itself, per running
@@ -179,10 +182,12 @@ type RuntimeSample struct {
 	// means "the document was read and states no options".
 	ImageOptions *RuntimeImageOptions `json:"image_options,omitempty"`
 	GPUs         []RuntimeGPUSample   `json:"gpus,omitempty"`
-	// RAMMeasuredMB is the spec's current process's resident host RAM in MB,
+	// RAMMeasuredMB is this row's current process's resident host RAM in MB,
 	// as the agent's own RAM measurer last observed it (RSS off Windows, the
-	// private working set on it). A spec-level scalar beside GPUs, not inside
-	// it: RAM has no per-GPU axis, and one process backs one spec. 0 means
+	// private working set on it). A per-row scalar beside GPUs, not inside
+	// it: RAM has no per-GPU axis, and one process backs one row -- one
+	// instance of a spec (#340), which for a spec that never replicates is the
+	// spec itself. 0 means
 	// UNKNOWN -- never measured, no measurer on this host, or the process has
 	// exited -- and is never "needs no RAM", which is why it is omitempty: an
 	// unmeasured spec, and every agent that predates the field, sends no key at

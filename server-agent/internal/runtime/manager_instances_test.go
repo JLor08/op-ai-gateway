@@ -46,6 +46,17 @@ func instanceStatus(m *Manager, specID string, k int) *Status {
 	return nil
 }
 
+// mustInstance is instanceStatus for a row the test's premise says exists: it
+// fails the test with a message, rather than panicking, when the row is missing.
+func mustInstance(t *testing.T, m *Manager, specID string, k int) Status {
+	t.Helper()
+	st := instanceStatus(m, specID, k)
+	if st == nil {
+		t.Fatalf("no status row for instance %d of %s; the test's premise (it exists) does not hold", k, specID)
+	}
+	return *st
+}
+
 // ensureModel is EnsureRunning with a bounded context, failing the test on an
 // error. The release it returns must still be called by the test.
 func ensureModel(t *testing.T, m *Manager, model string) (endpoint string, release func()) {
@@ -198,7 +209,11 @@ func TestBurstInstanceRefusedWhenNoFreeRoom(t *testing.T) {
 	relS()
 	_, relT := ensureModel(t, m, "t")
 	relT()
-	pidT := statusFor(m, "T").PID
+	stT := statusFor(m, "T")
+	if stT == nil {
+		t.Fatal("no status row for T after it served a request")
+	}
+	pidT := stT.PID
 
 	took, err := ensureErr(t, m, "m#1")
 	if !errors.Is(err, ErrInstanceNoCapacity) {
@@ -267,7 +282,10 @@ func TestBurstInheritsSiblingMeasurement(t *testing.T) {
 
 	spec := replicableSpec("S", "m")
 	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}} // the operator left the estimate at 0
-	m.Apply(Config{Specs: []Spec{spec}, GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 6000}}})
+	budget := func(etag string, mb int) Config {
+		return Config{ETag: etag, Specs: []Spec{spec}, GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: mb}}}
+	}
+	m.Apply(budget("v1", 6000))
 
 	_, rel0 := ensureModel(t, m, "m")
 	defer rel0()
@@ -276,7 +294,15 @@ func TestBurstInheritsSiblingMeasurement(t *testing.T) {
 		return st != nil && st.MeasuredVRAM[0] == 3000
 	})
 
-	// 3000 (S) + 3000 (inherited) = 6000 fits the 6000 budget exactly.
+	// The inherited charge is exactly 3000 -- pinned from both sides. One MB
+	// short of 3000 + 3000 refuses it, so it is charged at least 3000 ...
+	m.Apply(budget("v2", 5999))
+	if _, err := ensureErr(t, m, "m#1"); !errors.Is(err, ErrInstanceNoCapacity) {
+		t.Fatalf("EnsureRunning(m#1) under a 5999 MB budget = %v, want ErrInstanceNoCapacity (3000 for S + the inherited 3000 does not fit)", err)
+	}
+	// ... and 3000 + 3000 = 6000 fits the 6000 budget exactly, so it is charged
+	// at most 3000.
+	m.Apply(budget("v3", 6000))
 	_, rel1 := ensureModel(t, m, "m#1")
 	defer rel1()
 
@@ -315,7 +341,7 @@ func TestProtectedInstanceWaitsForSiblingMeasurement(t *testing.T) {
 		return s0 != nil && s0.State == StateRunning &&
 			s1 != nil && s1.LastError != nil && strings.Contains(s1.LastError.Message, "unknown")
 	})
-	if s1 := instanceStatus(m, "S", 1); s1.State != StateStopped || s1.PID != 0 {
+	if s1 := instanceStatus(m, "S", 1); s1 == nil || s1.State != StateStopped || s1.PID != 0 {
 		t.Fatalf("instance 1 = %+v, want stopped with no process: a baseline instance waits for a measured sibling, never starts blind", s1)
 	}
 
@@ -336,8 +362,18 @@ func TestProtectedInstanceWaitsForSiblingMeasurement(t *testing.T) {
 // sibling passed the health probe (§5.2, §5.4 rule 5): until then a protected
 // instance waits and a burst one is refused as demand-unknown; afterwards both
 // start on the loaded figure.
+//
+// "On the loaded figure" is pinned, not assumed: once instance 0 is ready, the
+// room is first made too small for a second LOADED copy but large enough for
+// one at the mid-load figure, and instance 1 must still not start (a protected
+// one waits, a burst one is refused for capacity). Only when the room is
+// widened to hold the loaded figure does it start.
 func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 	const loadingMB, loadedMB = 1200, 3000
+	// The room once instance 0 holds its loaded 3000: tight fits a second copy
+	// at 1200 (the mid-load reading) but not at 3000; roomy fits 3000.
+	const tightVRAM, roomyVRAM = 5000, 8000
+	const tightRAMAvailable, roomyRAMAvailable = 2000, 4000
 	for _, tc := range []struct {
 		name  string
 		vram  bool // the unknown demand is per-GPU VRAM (else host RAM)
@@ -346,6 +382,7 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 		{"protected, vram unknown", true, false},
 		{"protected, ram unknown", false, false},
 		{"burst, vram unknown", true, true},
+		{"burst, ram unknown", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			skipOnWindows(t)
@@ -353,6 +390,7 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 			m := newTestManager(t, allowlistPolicy())
 
 			var loaded atomic.Bool
+			var ramCalls atomic.Int64
 			reading := func() int {
 				if loaded.Load() {
 					return loadedMB
@@ -365,11 +403,11 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 			if tc.burst {
 				spec.MinInstances = 1
 			}
-			cfg := Config{}
+			cfg := Config{ETag: "tight"}
 			if tc.vram {
 				spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
 				spec.RAMMB = 64
-				cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 8000}}
+				cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: tightVRAM}}
 				m.SetMeasurer(func(pids []int) map[int]map[int]int {
 					out := make(map[int]map[int]int, len(pids))
 					for _, p := range pids {
@@ -379,7 +417,9 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 				})
 			} else {
 				spec.RAMMB = 0
+				m.SetHostInfo(HostInfo{MemAvailableMB: tightRAMAvailable})
 				m.SetRAMMeasurer(func(pids []int) map[int]int {
+					ramCalls.Add(1)
 					out := make(map[int]int, len(pids))
 					for _, p := range pids {
 						out[p] = reading()
@@ -422,16 +462,68 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 
 			loaded.Store(true)
 			openGate()
-			waitUntil(t, 5*time.Second, "instance 0 ready", func() bool {
+			waitUntil(t, 5*time.Second, "instance 0 ready and measured at its loaded figure", func() bool {
 				st := instanceStatus(m, "S", 0)
-				return st != nil && st.State == StateRunning
+				if st == nil || st.State != StateRunning {
+					return false
+				}
+				if tc.vram {
+					return st.MeasuredVRAM[0] == loadedMB
+				}
+				return st.MeasuredRAMMB == loadedMB
 			})
+			if !tc.vram {
+				// A RAM reading is inheritable only when it was dispatched after the
+				// probe passed, and the one that set MeasuredRAMMB may have been
+				// dispatched just before. Measurements go out one at a time, so the
+				// second call from now was dispatched after the first one returned
+				// -- after instance 0 was ready -- and the third goes out only once
+				// that second one has landed.
+				from := ramCalls.Load()
+				waitUntil(t, 5*time.Second, "a RAM reading taken once instance 0 was ready has landed", func() bool {
+					return ramCalls.Load() >= from+3
+				})
+			}
+
+			// The room holds a copy at the mid-load figure but not at the loaded
+			// one: instance 1 must not start.
 			if tc.burst {
-				_, release := ensureModel(t, m, "m#1")
-				release()
+				if _, err := ensureErr(t, m, "m#1"); !errors.Is(err, ErrInstanceNoCapacity) {
+					t.Fatalf("EnsureRunning(m#1) next to a ready instance 0 = %v, want ErrInstanceNoCapacity: charged the loaded %d MB, a second copy does not fit (at the mid-load %d MB it would)", err, loadedMB, loadingMB)
+				}
+			} else {
+				// Ten housekeeping beats, every one of them a chance to re-ask it.
+				deadline := time.Now().Add(300 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					if s1 := instanceStatus(m, "S", 1); s1 == nil || s1.State != StateStopped || s1.PID != 0 {
+						t.Fatalf("instance 1 = %+v next to a ready instance 0, want it stopped: a second copy at the loaded %d MB does not fit (at the mid-load %d MB it would)", s1, loadedMB, loadingMB)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+
+			// Widened to hold the loaded figure: instance 1 starts.
+			if tc.vram {
+				cfg.ETag = "roomy"
+				cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: roomyVRAM}}
+				m.Apply(cfg)
+			} else {
+				m.SetHostInfo(HostInfo{MemAvailableMB: roomyRAMAvailable})
+			}
+			if tc.burst {
+				waitUntil(t, 5*time.Second, "the burst instance admitted once the loaded figure fits", func() bool {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_, release, err := m.EnsureRunning(ctx, "m#1")
+					if err != nil {
+						return false
+					}
+					release()
+					return true
+				})
 				return
 			}
-			waitUntil(t, 5*time.Second, "instance 1 started once its sibling was measured ready", func() bool {
+			waitUntil(t, 5*time.Second, "instance 1 started once the loaded figure fits", func() bool {
 				s1 := instanceStatus(m, "S", 1)
 				return s1 != nil && s1.State == StateRunning
 			})
@@ -477,10 +569,10 @@ func TestIdleUnloadHighestIndexFirst(t *testing.T) {
 			}
 		}
 		if has1 && s1.State != StateRunning && has2 && violation == "" {
-			violation = "instance 1 left running while instance 2 still exists"
+			violation = "instance 1 stopped running while instance 2 still exists: a lower instance was unloaded before a higher one"
 		}
 		if has0 && s0.State != StateRunning && (has1 || has2) && violation == "" {
-			violation = "instance 0 left running while a higher instance still exists"
+			violation = "instance 0 stopped running while a higher instance still exists: instance 0 must be the last to go"
 		}
 		return violation != "" || (has0 && s0.State == StateStopped && !has1 && !has2)
 	})
@@ -529,7 +621,7 @@ func TestIdleUnloadKeepsProtected(t *testing.T) {
 			for k := range pids {
 				_, release := ensureModel(t, m, InstanceAddress("m", k)) // a real last use, before the control's
 				release()
-				pids[k] = instanceStatus(m, "S", k).PID
+				pids[k] = mustInstance(t, m, "S", k).PID
 			}
 
 			_, release := ensureModel(t, m, "u")
@@ -607,8 +699,8 @@ func TestBurstCrashKeptUntilNextApply(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if st := instanceStatus(m, "S", 1); st.LastError == nil {
-		t.Errorf("crashed row has no LastError; it is kept precisely so the operator can read why")
+	if st := instanceStatus(m, "S", 1); st == nil || st.LastError == nil {
+		t.Errorf("crashed row = %+v, want it kept with a LastError: it is kept precisely so the operator can read why", st)
 	}
 
 	// Named again: the crashed row is retired and a fresh instance starts.
@@ -637,7 +729,7 @@ func TestApplyReplicableOffDrainsInstancesGracefully(t *testing.T) {
 
 	_, rel0 := ensureModel(t, m, "m")
 	rel0()
-	pid0 := instanceStatus(m, "S", 0).PID
+	pid0 := mustInstance(t, m, "S", 0).PID
 	ep1, rel1 := ensureModel(t, m, "m#1") // one request in flight on instance 1
 
 	off := spec
@@ -683,7 +775,7 @@ func TestApplyMaxLoweredDrainsDisallowed(t *testing.T) {
 	rel2()
 	ep3, rel3 := ensureModel(t, m, "m#3") // one request in flight on instance 3 across the push
 	defer rel3()
-	pid1 := instanceStatus(m, "S", 1).PID
+	pid1 := mustInstance(t, m, "S", 1).PID
 
 	lowered := spec
 	lowered.MaxInstances = 2
@@ -785,7 +877,7 @@ func TestApplyUnchangedSpecDoesNotRestartInstances(t *testing.T) {
 		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
 		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
 	})
-	pid0, pid1 := instanceStatus(m, "S", 0).PID, instanceStatus(m, "S", 1).PID
+	pid0, pid1 := mustInstance(t, m, "S", 0).PID, mustInstance(t, m, "S", 1).PID
 
 	// An identical push (new ETag) and a metadata-only edit: neither may
 	// bounce an instance. A drain would be visible the moment Apply returns.
@@ -794,7 +886,7 @@ func TestApplyUnchangedSpecDoesNotRestartInstances(t *testing.T) {
 	for i, s := range []Spec{spec, meta} {
 		m.Apply(Config{Specs: []Spec{s}, ETag: "v" + string(rune('2'+i))})
 		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
-		if s0.State != StateRunning || s0.PID != pid0 || s1.State != StateRunning || s1.PID != pid1 {
+		if s0 == nil || s1 == nil || s0.State != StateRunning || s0.PID != pid0 || s1.State != StateRunning || s1.PID != pid1 {
 			t.Fatalf("push %d: instances = %+v / %+v, want both still running as pids %d/%d", i, s0, s1, pid0, pid1)
 		}
 	}
@@ -846,14 +938,14 @@ func TestStartupMSReported(t *testing.T) {
 	spec := baseSpec("S", "m") // measured for every spec, replicable or not
 	spec.Args = stubArgs(300*time.Millisecond, 0, 0, "")
 	m.Apply(Config{Specs: []Spec{spec}})
-	if st := statusFor(m, "S"); st.StartupMS != 0 {
-		t.Fatalf("StartupMS = %d before any start, want 0 (unknown)", st.StartupMS)
+	if st := statusFor(m, "S"); st == nil || st.StartupMS != 0 {
+		t.Fatalf("row before any start = %+v, want StartupMS 0 (unknown)", st)
 	}
 
 	_, release := ensureModel(t, m, "m")
 	defer release()
-	if st := statusFor(m, "S"); st.StartupMS < 300 {
-		t.Fatalf("StartupMS = %d, want >= 300 (the child answers /health only after 300ms)", st.StartupMS)
+	if st := statusFor(m, "S"); st == nil || st.StartupMS < 300 {
+		t.Fatalf("row = %+v, want StartupMS >= 300 (the child answers /health only after 300ms)", st)
 	}
 }
 
@@ -1000,7 +1092,7 @@ func TestApplyDrainsAnInstanceWhoseAddressBecameAnotherSpecsModel(t *testing.T) 
 		}
 		return true
 	})
-	pid0, pid1 := instanceStatus(m, "F", 0).PID, instanceStatus(m, "F", 1).PID
+	pid0, pid1 := mustInstance(t, m, "F", 0).PID, mustInstance(t, m, "F", 1).PID
 	ep2, rel2 := ensureModel(t, m, "foo#2") // F's instance 2 while no spec claims the name
 	defer rel2()
 
@@ -1382,42 +1474,715 @@ func TestEvictOneIdleForBootstrapHonoursInstanceRules(t *testing.T) {
 	}
 }
 
-// hasLogBuffer reports whether the manager's log store retains a buffer for
-// key (an instance key).
-func hasLogBuffer(m *Manager, key string) bool {
+// logBufferKeys lists the keys the manager's log store retains a buffer under.
+func logBufferKeys(m *Manager) []string {
 	m.logs.mu.Lock()
 	defer m.logs.mu.Unlock()
-	_, ok := m.logs.logs[key]
-	return ok
+	keys := make([]string, 0, len(m.logs.logs))
+	for k := range m.logs.logs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
-// TestApplyRetainsLogsOfExistingInstances: an instance's output buffer is
-// keyed by its instance key and kept by every Apply while the instance exists;
-// once a burst instance has been retired, the next Apply releases it.
-func TestApplyRetainsLogsOfExistingInstances(t *testing.T) {
+// TestInstanceOutputIsInTheSpecsLogView: every instance of a replicable spec
+// writes into the BASE spec's one log buffer -- the one the spec's log view and
+// the gateway's watch command name -- instance 0 exactly as it printed, a
+// further instance k with "[#k] " opening each of its lines. So a crashed burst
+// instance's output is readable there after its row has been retired, no
+// buffer is ever keyed by an instance, and an Apply keeps the spec's buffer
+// while the spec exists and releases it with the spec.
+func TestInstanceOutputIsInTheSpecsLogView(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	m := newTestManager(t, allowlistPolicy())
 
 	spec := replicableSpec("S", "m")
-	spec.IdleTimeoutSeconds = 1
+	// Every instance prints "stubchild: scripted crash" to stderr and exits
+	// well after it became healthy, so each request is served first.
+	spec.Args = stubArgs(0, 400*time.Millisecond, 3, "")
+	m.Apply(Config{Specs: []Spec{spec, baseSpec("T", "t")}, ETag: "v1"})
+
+	_, rel0 := ensureModel(t, m, "m")
+	rel0()
+	_, rel1 := ensureModel(t, m, "m#1")
+	rel1()
+
+	const crash = "stubchild: scripted crash"
+	batch := waitForLog(t, m, "S", "both instances' crash output and two exit markers", func(b LogBatch) bool {
+		return strings.Count(batchText(b), crash) == 2 && countEvents(b, logEventExited) == 2
+	})
+	text := batchText(batch)
+	if n := strings.Count(text, "[#1] "+crash); n != 1 {
+		t.Errorf("history has %d lines %q, want instance 1's crash line once, prefixed; history:\n%s", n, "[#1] "+crash, text)
+	}
+	unprefixed := strings.HasPrefix(text, crash) || strings.Contains(text, "\n"+crash)
+	if strings.Contains(text, "[#0]") || !unprefixed {
+		t.Errorf("history:\n%s\nwant instance 0's crash line unprefixed, exactly as it printed", text)
+	}
+	if keys := logBufferKeys(m); len(keys) != 1 || keys[0] != "S" {
+		t.Fatalf("log buffers = %v, want the spec's own [S] alone: no buffer is keyed by an instance", keys)
+	}
+	if st := instanceStatus(m, "S", 1); st == nil || st.LastError == nil || !strings.Contains(st.LastError.StderrTail, "[#1] "+crash) {
+		t.Errorf("instance 1 row = %+v, want its LastError tail to carry its own prefixed crash line", st)
+	}
+
+	// The next Apply retires the crashed burst instance -- and keeps its output,
+	// because the output belongs to the spec.
+	m.Apply(Config{Specs: []Spec{spec, baseSpec("T", "t")}, ETag: "v2"})
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Fatalf("instance 1 = %+v after the next Apply, want it retired", st)
+	}
+	waitForLogText(t, m, "S", "[#1] "+crash)
+	if keys := logBufferKeys(m); len(keys) != 1 || keys[0] != "S" {
+		t.Fatalf("log buffers after the Apply = %v, want [S] alone", keys)
+	}
+
+	// The spec leaves, and its buffer -- every instance's output -- with it.
+	m.Apply(Config{Specs: []Spec{baseSpec("T", "t")}, ETag: "v3"})
+	if keys := logBufferKeys(m); len(keys) != 0 {
+		t.Fatalf("log buffers after the spec was removed = %v, want none", keys)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fold-in round: start order, reserved ids, re-add while draining, names freed
+// by a removed spec, occupant charges, and the instance paths below.
+// ---------------------------------------------------------------------------
+
+// killInstance kills the live process of instance k of specID from outside, the
+// way an OOM killer or a segfault would end it: an exit nobody asked for.
+func killInstance(t *testing.T, m *Manager, specID string, k int) int {
+	t.Helper()
+	pid := mustInstance(t, m, specID, k).PID
+	if pid == 0 {
+		t.Fatalf("instance %d of %s has no process to kill", k, specID)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("find pid %d: %v", pid, err)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatalf("kill pid %d: %v", pid, err)
+	}
+	return pid
+}
+
+// TestLessByQueueAgeOrdersInstancesNumerically: equal queue times -- above all
+// the protected instances with no waiter at all -- are ordered by spec, then by
+// instance index as a NUMBER. As strings S#10 sorts before S#2, and S#1 after
+// nothing that would keep instance 0 first; the wake order decides which
+// instance gets room it never gives back to a sibling.
+func TestLessByQueueAgeOrdersInstancesNumerically(t *testing.T) {
+	t0 := time.Now()
+	c := func(base string, k int, queuedAt time.Time) wakeCandidate {
+		return wakeCandidate{id: InstanceKey(base, k), base: base, instance: k, queuedAt: queuedAt}
+	}
+	var none time.Time
+	for _, tc := range []struct {
+		name          string
+		first, second wakeCandidate // first must sort before second
+	}{
+		{"instance 0 before a further instance", c("S", 0, none), c("S", 1, none)},
+		{"index order, not string order", c("S", 2, none), c("S", 10, none)},
+		{"index order with equal queue times", c("S", 2, t0), c("S", 10, t0)},
+		{"by spec before by index", c("S", 10, none), c("T", 0, none)},
+		{"an older queue time still first", c("S", 10, t0), c("S", 2, t0.Add(time.Millisecond))},
+		{"a waiter still before no waiter", c("S", 10, t0), c("S", 0, none)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !lessByQueueAge(tc.first, tc.second) {
+				t.Errorf("lessByQueueAge(%s, %s) = false, want true: %s sorts first", tc.first.id, tc.second.id, tc.first.id)
+			}
+			if lessByQueueAge(tc.second, tc.first) {
+				t.Errorf("lessByQueueAge(%s, %s) = true, want false: %s sorts first", tc.second.id, tc.first.id, tc.first.id)
+			}
+		})
+	}
+}
+
+// TestSortInstanceOrder: the order the Apply start loop asks protected instances
+// in -- by spec, then by index numerically, never map or string order.
+func TestSortInstanceOrder(t *testing.T) {
+	s := Spec{ID: "S", UpstreamModel: "s", Replicable: true}
+	var states []*specState
+	for _, k := range []int{10, 2, 0, 1} {
+		states = append(states, &specState{spec: specForInstance(s, k), instance: k})
+	}
+	states = append(states, &specState{spec: Spec{ID: "T", UpstreamModel: "t"}})
+	o := instanceOwner(states...)
+	ids := []string{"S#10", "T", "S#2", "S", "S#1"}
+	o.sortInstanceOrder(ids)
+	if got, want := strings.Join(ids, " "), "S S#1 S#2 S#10 T"; got != want {
+		t.Fatalf("sorted = %s, want %s", got, want)
+	}
+}
+
+// TestProtectedFloorComesUpLowestIndexFirst: when the room holds fewer instances
+// than min_instances asks for, the instance that gets it is instance 0. A
+// further instance never gives its room back to a sibling (a sibling is never a
+// victim), so one started first in map order would keep instance 0 down for as
+// long as it runs -- contradicting §4, where instance 0 is the last of a spec to
+// go. Eight protected instances and a process limit of one, a few rounds over:
+// a start order left to the map would pick a random one of the eight.
+func TestProtectedFloorComesUpLowestIndexFirst(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	for round := 0; round < 4; round++ {
+		m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }})
+		t.Cleanup(m.Close)
+
+		spec := replicableSpec("S", "m")
+		spec.MinInstances = 8
+		m.Apply(Config{Specs: []Spec{spec}, MaxProcesses: 1})
+
+		var started []int
+		waitUntil(t, 5*time.Second, "one protected instance started", func() bool {
+			started = started[:0]
+			for _, r := range m.Status() {
+				if r.PID != 0 {
+					started = append(started, r.Instance)
+				}
+			}
+			return len(started) > 0
+		})
+		if len(started) != 1 || started[0] != 0 {
+			t.Fatalf("round %d: instances with a process = %v, want [0]: the room for one goes to instance 0", round, started)
+		}
+		waitUntil(t, 5*time.Second, "instance 0 running", func() bool {
+			st := instanceStatus(m, "S", 0)
+			return st != nil && st.State == StateRunning
+		})
+		for k := 1; k < 8; k++ {
+			if st := instanceStatus(m, "S", k); st == nil || st.PID != 0 {
+				t.Fatalf("round %d: instance %d = %+v, want it waiting with no process (the room holds one)", round, k, st)
+			}
+		}
+		m.Close()
+	}
+}
+
+// TestApplyIgnoresASpecWhoseIDIsAnInstanceKey: "S#1" is the key of S's instance
+// 1, so a spec with that ID -- possible only in a Config handed to Apply without
+// ParseConfig, which drops it -- must not take over S's instance: not its state,
+// not its process, not its address. It is ignored, and S keeps its instance.
+func TestApplyIgnoresASpecWhoseIDIsAnInstanceKey(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := replicableSpec("S", "m")
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+	_, release := ensureModel(t, m, "m#1")
+	defer release()
+	pid1 := mustInstance(t, m, "S", 1).PID
+
+	m.Apply(Config{Specs: []Spec{spec, baseSpec("S#1", "other")}, ETag: "v2"})
+
+	if st := mustInstance(t, m, "S", 1); st.State != StateRunning || st.PID != pid1 || st.Model != "m#1" {
+		t.Fatalf("S instance 1 = %+v after a push with a spec named S#1, want it untouched (running as pid %d, model m#1)", st, pid1)
+	}
+	if base, k, ok := m.ResolveAddress("m#1"); !ok || base != "m" || k != 1 {
+		t.Errorf("ResolveAddress(m#1) = (%q, %d, %v), want (m, 1, true)", base, k, ok)
+	}
+	if _, _, ok := m.ResolveAddress("other"); ok {
+		t.Errorf("ResolveAddress(other) = ok, want not managed: the spec named S#1 is ignored")
+	}
+	for _, r := range m.Status() {
+		if r.SpecID != "S" {
+			t.Errorf("row %+v, want only S's rows: the spec named S#1 is ignored", r)
+		}
+	}
+}
+
+// TestSpecPushedAgainWhileDrainingKeepsEveryInstance: a push without S drains
+// all of its instances; a push with S again before they have exited makes S
+// desired again, for EVERY instance alike. Each drain completes, and each
+// instance then follows the normal rules -- here, protected, it comes straight
+// back -- and the spec stays addressable throughout. Clearing the removal on
+// the further instances but not on instance 0 deleted instance 0 on exit and
+// left instance 1 running behind an address nothing resolved any more.
+func TestSpecPushedAgainWhileDrainingKeepsEveryInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "both protected instances running", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	})
+	pid0, pid1 := mustInstance(t, m, "S", 0).PID, mustInstance(t, m, "S", 1).PID
+	// A request in flight on each holds both drains open across the next push.
+	_, rel0 := ensureModel(t, m, "m")
+	defer rel0()
+	_, rel1 := ensureModel(t, m, "m#1")
+	defer rel1()
+
+	m.Apply(Config{Specs: []Spec{}, ETag: "v2"})
+	for k := 0; k < 2; k++ {
+		if st := mustInstance(t, m, "S", k); st.State != StateDraining {
+			t.Fatalf("instance %d = %+v after its spec was removed, want draining (its request is in flight)", k, st)
+		}
+	}
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v3"})
+
+	rel0()
+	rel1()
+	waitUntil(t, 5*time.Second, "both instances back as new processes once their drains completed", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s0.PID != pid0 &&
+			s1 != nil && s1.State == StateRunning && s1.PID != pid1
+	})
+	for model, k := range map[string]int{"m": 0, "m#1": 1} {
+		if base, gotK, ok := m.ResolveAddress(model); !ok || base != "m" || gotK != k {
+			t.Errorf("ResolveAddress(%s) = (%q, %d, %v), want (m, %d, true)", model, base, gotK, ok, k)
+		}
+	}
+	_, release := ensureModel(t, m, "m")
+	release()
+}
+
+// TestRemovedSpecLeavingFreesAnInstanceAddress: L's literal model foo#2 is
+// replicable F's instance-2 address, so while L exists F's floor (min 3) skips
+// instance 2. When a push removes L while it serves a request, L drains -- and
+// its name stays L's until it has gone. Its exit frees the name: F's protected
+// instance 2 must come up then, not wait for a later push that changes the
+// document.
+func TestRemovedSpecLeavingFreesAnInstanceAddress(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
+	m := newTestManager(t, allowlistPolicy())
+
+	f := replicableSpec("F", "foo")
+	f.MinInstances = 3
+	coresident := [][2]string{{"F", "L"}} // L may run beside F's protected instances
+	m.Apply(Config{Specs: []Spec{baseSpec("L", "foo#2"), f}, Coresident: coresident, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "F's reachable protected instances 0 and 1 running", func() bool {
+		s0, s1 := instanceStatus(m, "F", 0), instanceStatus(m, "F", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	})
+	_, relL := ensureModel(t, m, "foo#2") // L, serving a request across the push
+	defer relL()
+
+	m.Apply(Config{Specs: []Spec{f}, ETag: "v2"})
+	if st := statusFor(m, "L"); st == nil || st.State != StateDraining {
+		t.Fatalf("L = %+v right after its removal, want draining (its request is in flight)", st)
+	}
+	if st := instanceStatus(m, "F", 2); st != nil {
+		t.Fatalf("F instance 2 = %+v while L still drains, want none yet: foo#2 is still L's", st)
+	}
+
+	relL()
+	waitUntil(t, 5*time.Second, "F's instance 2 running once L has gone", func() bool {
+		st := instanceStatus(m, "F", 2)
+		return st != nil && st.State == StateRunning
+	})
+	if st := statusFor(m, "L"); st != nil {
+		t.Errorf("L = %+v, want its row gone", st)
+	}
+	if base, k, ok := m.ResolveAddress("foo#2"); !ok || base != "foo" || k != 2 {
+		t.Errorf("ResolveAddress(foo#2) = (%q, %d, %v), want (foo, 2, true): the name is F's instance 2 now", base, k, ok)
+	}
+}
+
+// ramChargedFor returns the host RAM a snapshot charges to specID.
+func ramChargedFor(t *testing.T, snap PolicySnapshot, specID string) int {
+	t.Helper()
+	for _, r := range snap.Running {
+		if r.SpecID == specID {
+			return r.RAMMB
+		}
+	}
+	t.Fatalf("PolicySnapshot.Running has no row for %q", specID)
+	return 0
+}
+
+// TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement: siblings are summed
+// (§5.4 rule 1), each at what it holds. A running instance with its own ready
+// measurement is charged that -- floored at its declared demand, never raised to
+// a sibling's peak; only what an occupant has not measured of itself (a sibling
+// still loading) inherits the peak. Raised to the peak, siblings measured at
+// 3000 and 3500 would count as 7000, and a third copy that fits next to their
+// real 6500 on a 10000 MB GPU would be refused.
+func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
+	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, GPUs: []SpecGPU{{Index: 0}}}
+
+	t.Run("running siblings are each charged their own", func(t *testing.T) {
+		s0 := liveInstance(s, 0, 100)
+		s0.measuredRAM, s0.readyRAM = 3000, 3000
+		s1 := liveInstance(s, 1, 101)
+		s1.measuredRAM, s1.readyRAM = 3500, 3500
+		s2 := &specState{spec: specForInstance(s, 2), instance: 2, state: StateStopped}
+		o := instanceOwner(s0, s1, s2)
+		o.cfg = Config{GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 10000}}}
+		o.m.SetMeasurer(func([]int) map[int]map[int]int {
+			return map[int]map[int]int{100: {0: 3000}, 101: {0: 3500}}
+		})
+
+		snap := o.buildSnapshot()
+		for _, want := range []struct {
+			id        string
+			vram, ram int
+		}{{"S", 3000, 3000}, {"S#1", 3500, 3500}} {
+			if got := gpusChargedFor(t, snap, want.id); got[0] != want.vram {
+				t.Errorf("%s charged VRAM %v, want gpu0 %d (its own measurement, not the sibling peak)", want.id, got, want.vram)
+			}
+			if got := ramChargedFor(t, snap, want.id); got != want.ram {
+				t.Errorf("%s charged RAM %d, want %d (its own measurement, not the sibling peak)", want.id, got, want.ram)
+			}
+		}
+		// The candidate inherits the peak, and 3000 + 3500 + 3500 fits 10000.
+		d := o.demandSpec(s2)
+		if d.GPUs[0].VRAMMB != 3500 || d.RAMMB != 3500 {
+			t.Fatalf("candidate instance 2 demand = gpus %+v ram %d, want the sibling peak 3500 on both", d.GPUs, d.RAMMB)
+		}
+		snap.NoEvict = true
+		if dec := Admit(snap, d); !dec.OK {
+			t.Fatalf("Admit(instance 2 at 3500 next to 3000 + 3500 on a 10000 MB GPU) = %+v, want OK", dec)
+		}
+
+		// A sibling that this call did not measure is still charged its own last
+		// ready figure, not the other sibling's.
+		o.m.SetMeasurer(func([]int) map[int]map[int]int { return map[int]map[int]int{100: {0: 3000}} })
+		snap = o.buildSnapshot()
+		if got := gpusChargedFor(t, snap, "S#1"); got[0] != 3500 {
+			t.Errorf("S#1 charged %v when this call measured only S, want gpu0 3500 (its own last ready figure)", got)
+		}
+	})
+
+	t.Run("a declared demand above the measurement stays the floor", func(t *testing.T) {
+		declared := s
+		declared.GPUs = []SpecGPU{{Index: 0, VRAMMB: 4000}}
+		s0 := liveInstance(declared, 0, 100)
+		s1 := liveInstance(declared, 1, 101)
+		o := instanceOwner(s0, s1)
+		o.m.SetMeasurer(func([]int) map[int]map[int]int {
+			return map[int]map[int]int{100: {0: 3000}, 101: {0: 5000}}
+		})
+		snap := o.buildSnapshot()
+		if got := gpusChargedFor(t, snap, "S"); got[0] != 4000 {
+			t.Errorf("S charged %v, want gpu0 4000 (its declared demand floors its 3000 measurement)", got)
+		}
+		if got := gpusChargedFor(t, snap, "S#1"); got[0] != 5000 {
+			t.Errorf("S#1 charged %v, want gpu0 5000 (its own measurement above the floor)", got)
+		}
+	})
+
+	t.Run("a sibling still loading inherits the peak", func(t *testing.T) {
+		s0 := liveInstance(s, 0, 100)
+		s0.measuredRAM, s0.readyRAM = 3000, 3000
+		loading := liveInstance(s, 1, 101)
+		loading.state = StateStarting
+		loading.proc.everHealthy = false
+		loading.measuredRAM = 1200 // a mid-load reading: never a ready one
+		o := instanceOwner(s0, loading)
+		o.m.SetMeasurer(func([]int) map[int]map[int]int {
+			return map[int]map[int]int{100: {0: 3000}, 101: {0: 1200}}
+		})
+		snap := o.buildSnapshot()
+		if got := gpusChargedFor(t, snap, "S#1"); got[0] != 3000 {
+			t.Errorf("loading S#1 charged %v, want gpu0 3000 (the ready sibling's figure, above its own mid-load 1200)", got)
+		}
+		if got := ramChargedFor(t, snap, "S#1"); got != 3000 {
+			t.Errorf("loading S#1 charged RAM %d, want 3000 (the ready sibling's figure, above its own mid-load 1200)", got)
+		}
+	})
+}
+
+// TestForceStoppedDrainsEveryInstance: force_stopped applies to all of a spec's
+// instances (§5.2) -- the protected ones and a running burst one drain, nothing
+// restarts, and an ensure of any instance address is refused, creating nothing.
+func TestForceStoppedDrainsEveryInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	invocationLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	spec.Args = stubArgs(0, 0, 0, invocationLog)
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "both protected instances running", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	})
+	_, release := ensureModel(t, m, "m#2") // a burst instance as well
+	release()
+
+	stopped := spec
+	stopped.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{stopped}, ETag: "v2"})
+	waitUntil(t, 5*time.Second, "every instance stopped, the burst one retired", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateStopped && s0.PID == 0 &&
+			s1 != nil && s1.State == StateStopped && s1.PID == 0 &&
+			instanceStatus(m, "S", 2) == nil
+	})
+	execs := countInvocations(t, invocationLog)
+
+	for _, model := range []string{"m", "m#1", "m#2", "m#3"} {
+		if _, err := ensureErr(t, m, model); !errors.Is(err, ErrAdmissionBlocked) {
+			t.Errorf("EnsureRunning(%s) on a force_stopped spec = %v, want ErrAdmissionBlocked", model, err)
+		}
+	}
+	// Ten housekeeping beats: the protected floor must stay down.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for k := 0; k < 2; k++ {
+			if st := instanceStatus(m, "S", k); st == nil || st.State != StateStopped || st.PID != 0 {
+				t.Fatalf("instance %d = %+v, want it to stay stopped while the spec is force_stopped", k, st)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rows := m.Status(); len(rows) != 2 {
+		t.Errorf("Status() = %+v, want instances 0 and 1 only: a refused ensure creates nothing", rows)
+	}
+	if n := countInvocations(t, invocationLog); n != execs {
+		t.Errorf("child invocations = %d after force_stopped, want still %d: nothing may start", n, execs)
+	}
+}
+
+// TestProtectedInstanceRestartsAfterACrash: a protected instance k >= 1 is
+// restarted after a crash, after a crash-loop backoff, like a pinned spec
+// (§5.4 rule 7) -- unlike a burst instance, which is not.
+func TestProtectedInstanceRestartsAfterACrash(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setBackoffWindow(t, 300*time.Millisecond)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "both protected instances running", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	})
+	pid0 := mustInstance(t, m, "S", 0).PID
+
+	killed := killInstance(t, m, "S", 1)
+	waitUntil(t, 5*time.Second, "instance 1 waiting out a crash backoff", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateBackoff && st.PID == 0
+	})
+	if st := mustInstance(t, m, "S", 1); st.LastError == nil {
+		t.Errorf("instance 1 = %+v in backoff, want the crash recorded as its LastError", st)
+	}
+	waitUntil(t, 5*time.Second, "instance 1 restarted after the backoff", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateRunning && st.PID != 0 && st.PID != killed
+	})
+	if st := mustInstance(t, m, "S", 1); st.Restarts != 1 {
+		t.Errorf("instance 1 Restarts = %d, want 1", st.Restarts)
+	}
+	if st := mustInstance(t, m, "S", 0); st.State != StateRunning || st.PID != pid0 {
+		t.Errorf("instance 0 = %+v, want untouched (running as pid %d)", st, pid0)
+	}
+}
+
+// TestEnsureBurstInstanceWhileStarting: a request for a burst instance that is
+// still starting waits for that start -- the one thing burst capacity is ever
+// queued behind (§5.4 rule 6) -- and both requests are served by one process.
+func TestEnsureBurstInstanceWhileStarting(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec, openGate := gatedSpec(t, "S", "m")
+	spec.Replicable = true
+	spec.RAMMB = 64
 	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
 
-	_, release := ensureModel(t, m, "m#1")
-	release()
-	if !hasLogBuffer(m, "S#1") {
-		t.Fatal("instance 1 has no log buffer of its own under its instance key S#1")
-	}
-	m.Apply(Config{Specs: []Spec{spec}, ETag: "v2"})
-	if !hasLogBuffer(m, "S#1") {
-		t.Fatal("an Apply dropped the log buffer of an instance that still exists")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	first := ensureAsync(ctx, m, "m#1")
+	waitUntil(t, 5*time.Second, "instance 1 starting", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateStarting
+	})
+	second := ensureAsync(ctx, m, "m#1")
+	// The health gate holds instance 1 in Starting: a refusal would answer now.
+	select {
+	case r := <-second:
+		t.Fatalf("EnsureRunning(m#1) while instance 1 starts answered before its start finished: %+v, want it to wait for the start", r)
+	case <-time.After(300 * time.Millisecond):
 	}
 
-	waitUntil(t, 5*time.Second, "instance 1 retired after its idle unload", func() bool {
+	openGate()
+	r1, r2 := <-first, <-second
+	if r1.err != nil || r2.err != nil {
+		t.Fatalf("EnsureRunning(m#1) = %v / %v, want both served once the start finished", r1.err, r2.err)
+	}
+	defer r1.release()
+	defer r2.release()
+	if r1.endpoint != r2.endpoint {
+		t.Errorf("endpoints %s / %s, want one process serving both", r1.endpoint, r2.endpoint)
+	}
+	if st := mustInstance(t, m, "S", 1); st.InFlight != 2 {
+		t.Errorf("instance 1 InFlight = %d, want 2", st.InFlight)
+	}
+}
+
+// TestEnsureBurstInstanceWhileDraining: a burst instance on its way out is not
+// waited for -- burst capacity never queues behind a slot (§5.4 rule 6) -- so a
+// request for it is refused with ErrInstanceNoCapacity at once, while the
+// request it is still serving finishes.
+func TestEnsureBurstInstanceWhileDraining(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := replicableSpec("S", "m")
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+	ep, release := ensureModel(t, m, "m#1") // in flight across the push
+	defer release()
+
+	relaunch := spec // a launch-shape change drains every live instance
+	relaunch.Args = append(stubArgs(0, 0, 0, ""), "-health-delay", "1ms")
+	m.Apply(Config{Specs: []Spec{relaunch}, ETag: "v2"})
+	if st := mustInstance(t, m, "S", 1); st.State != StateDraining {
+		t.Fatalf("instance 1 = %+v after a launch-shape change, want draining (its request is in flight)", st)
+	}
+
+	took, err := ensureErr(t, m, "m#1")
+	if !errors.Is(err, ErrInstanceNoCapacity) {
+		t.Fatalf("EnsureRunning(m#1) while instance 1 drains = %v, want ErrInstanceNoCapacity", err)
+	}
+	if took > 2*time.Second {
+		t.Errorf("the refusal took %s, want it immediate", took)
+	}
+	if code, body := httpEcho(t, ep, "still here"); code != 200 || body != "still here" {
+		t.Fatalf("echo through the draining instance = (%d, %q), want it served", code, body)
+	}
+	release()
+	waitUntil(t, 5*time.Second, "instance 1 retired once drained", func() bool {
 		return instanceStatus(m, "S", 1) == nil
 	})
-	m.Apply(Config{Specs: []Spec{spec}, ETag: "v3"})
-	if hasLogBuffer(m, "S#1") {
-		t.Fatal("the next Apply kept the log buffer of a retired instance")
+}
+
+// TestConcurrentEnsureStartsOneBurstInstance is TestManagerConcurrentEnsureSingleStart
+// for a cold instance address: many concurrent requests for m#1 create the
+// instance once and start exactly one process, counted from the child side.
+func TestConcurrentEnsureStartsOneBurstInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	invocationLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := replicableSpec("S", "m")
+	spec.Args = stubArgs(50*time.Millisecond, 0, 0, invocationLog)
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+
+	const n = 10
+	results := make([]<-chan queuedEnsure, n)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for i := range results {
+		results[i] = ensureAsync(ctx, m, "m#1")
+	}
+	endpoints := map[string]bool{}
+	for i, ch := range results {
+		r := <-ch
+		if r.err != nil {
+			t.Errorf("request %d: EnsureRunning(m#1) = %v", i, r.err)
+			continue
+		}
+		endpoints[r.endpoint] = true
+		r.release()
+	}
+	if len(endpoints) != 1 {
+		t.Errorf("endpoints = %v, want one", endpoints)
+	}
+	if got := countInvocations(t, invocationLog); got != 1 {
+		t.Fatalf("child-side invocation count = %d, want exactly 1 (one instance, one start)", got)
+	}
+	if rows := m.Status(); len(rows) != 2 {
+		t.Errorf("Status() = %+v, want instance 0 (never asked for) and instance 1", rows)
+	}
+}
+
+// TestInstanceZeroRestartsOnItsSiblingsMeasurement drives the restart case of
+// TestInstanceZeroInheritsProtectedSiblingMeasurement through the manager's own
+// admission (admitAndStart): instance 0 of an unknown-VRAM spec crashes while
+// its protected -- hence pinned -- sibling runs measured. Charged its declared,
+// unknown demand next to that pinned occupant it would rest at
+// pending_vram_unknown for good; charged the sibling's measurement it simply
+// comes back.
+func TestInstanceZeroRestartsOnItsSiblingsMeasurement(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[int]int{0: 3000}
+		}
+		return out
+	})
+
+	spec := replicableSpec("S", "m")
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}} // the operator left the estimate at 0
+	spec.MinInstances = 2
+	m.Apply(Config{Specs: []Spec{spec}, GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 8000}}, ETag: "v1"})
+	waitUntil(t, 5*time.Second, "both protected instances running and measured", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s0.MeasuredVRAM[0] == 3000 &&
+			s1 != nil && s1.State == StateRunning && s1.MeasuredVRAM[0] == 3000
+	})
+
+	killed := killInstance(t, m, "S", 0)
+	waitUntil(t, 5*time.Second, "instance 0 back after its crash", func() bool {
+		st := instanceStatus(m, "S", 0)
+		if st != nil && st.State == StatePendingVRAMUnknown {
+			t.Fatalf("instance 0 = %+v, want it restarted on its sibling's measured 3000 MB, not blocked as unknown next to the pinned sibling", st)
+		}
+		return st != nil && st.State == StateRunning && st.PID != 0 && st.PID != killed
+	})
+}
+
+// TestEvictOneIdleForBootstrapSparesSiblingsOfAnInstanceAndProtected covers the
+// two branches TestEvictOneIdleForBootstrapHonoursInstanceRules does not: the
+// beneficiary is itself an instance k >= 1 whose state exists (its siblings are
+// found through it, by base spec, not by its key), and an idle instance inside
+// another spec's min_instances floor is never the victim.
+func TestEvictOneIdleForBootstrapSparesSiblingsOfAnInstanceAndProtected(t *testing.T) {
+	now := time.Now()
+	s := Spec{ID: "S", UpstreamModel: "s", Replicable: true}
+	q := Spec{ID: "Q", UpstreamModel: "q", Replicable: true, MinInstances: 1}
+	u := Spec{ID: "U", UpstreamModel: "u"}
+
+	beneficiary := &specState{spec: specForInstance(s, 2), instance: 2, state: StateStartFailed}
+	sib := liveInstance(s, 1, 11) // the beneficiary's sibling, the oldest of all
+	sib.lastUsed = now.Add(-2 * time.Hour)
+	q0 := liveInstance(q, 0, 20) // protected by Q's min_instances, the next oldest
+	q0.lastUsed = now.Add(-time.Hour)
+	uu := liveInstance(u, 0, 30)
+	uu.lastUsed = now.Add(-time.Minute)
+	o := instanceOwner(beneficiary, sib, q0, uu)
+
+	if !o.evictOneIdleForBootstrap("S#2") {
+		t.Fatal("found no victim, want U")
+	}
+	if uu.state != StateDraining || sib.state != StateRunning || q0.state != StateRunning {
+		t.Fatalf("states: S#1 %s, Q %s, U %s -- want only U draining (never the beneficiary's sibling, never a protected instance)",
+			sib.state, q0.state, uu.state)
+	}
+	if len(uu.drainedFor) != 1 || uu.drainedFor[0] != "S#2" {
+		t.Errorf("U.drainedFor = %v, want [S#2]: the freed slot is offered to the beneficiary first", uu.drainedFor)
+	}
+
+	// With U busy, the sibling and the protected instance are all that is idle,
+	// and neither is a legal victim.
+	uu.state, uu.inFlight = StateRunning, 1
+	if o.evictOneIdleForBootstrap("S#2") {
+		t.Fatalf("found a victim: S#1 %s, Q %s -- want none", sib.state, q0.state)
 	}
 }

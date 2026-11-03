@@ -4,8 +4,10 @@
 package runtime
 
 import (
+	"bytes"
 	"op-ai-server-agent/internal/gwapi"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -420,13 +422,30 @@ func (s *LogStore) Capacity() (perSpec, total int) {
 	return s.perSpec, s.perSpec * s.maxSpecs
 }
 
-// newProc opens a fresh generation for specID -- the manager's instance key
-// (#340), so every instance of a replicable spec has a buffer of its own --
-// and returns the io.Writer that startProcess assigns to BOTH
-// exec.Cmd.Stdout and .Stderr. The requirement says stdout and stderr both,
-// and they deliberately share one writer so the interleaving an operator
-// reads is the interleaving the process produced.
+// newProc opens a fresh generation for specID and returns the io.Writer that
+// startProcess assigns to BOTH exec.Cmd.Stdout and .Stderr. The requirement
+// says stdout and stderr both, and they deliberately share one writer so the
+// interleaving an operator reads is the interleaving the process produced. It
+// is newInstanceProc for instance 0: the spec's own process, whose output is
+// recorded byte for byte.
 func (s *LogStore) newProc(specID string) *procLog {
+	return s.newInstanceProc(specID, 0)
+}
+
+// newInstanceProc opens a fresh generation for instance k of the spec specID
+// (#340). Every instance of a spec writes into the ONE buffer of its spec --
+// specID is always the BASE spec's ID, never an instance key -- so the spec's
+// log view, the gateway's watch command (which names spec IDs) and Retain
+// (which keeps spec IDs) all cover every instance with nothing per instance to
+// track, a crashed burst instance's output stays readable after its row is
+// retired, and a spec running many instances holds one buffer of the per-spec
+// budget, not one per instance.
+//
+// Instance 0's output is recorded exactly as it was written. Each line a
+// further instance writes is prefixed with "[#k] " (instanceLinePrefix), so the
+// operator can tell the instances apart in the one interleaved history. The
+// generation markers need no prefix: they are typed, and carry the pid.
+func (s *LogStore) newInstanceProc(specID string, k int) *procLog {
 	if s == nil {
 		return &procLog{}
 	}
@@ -434,22 +453,36 @@ func (s *LogStore) newProc(specID string) *procLog {
 	s.nextGen++
 	gen := s.nextGen
 	s.mu.Unlock()
-	return &procLog{store: s, specID: specID, gen: gen}
+	return &procLog{store: s, specID: specID, gen: gen, prefix: instanceLinePrefix(k)}
 }
 
-// write records p as this generation's output and, when the spec is watched,
+// instanceLinePrefix is the text that opens every line instance k of a spec
+// writes into the spec's buffer: none for instance 0, whose output is the
+// spec's own exactly as before instances existed, and "[#k] " for k >= 1.
+func instanceLinePrefix(k int) string {
+	if k <= 0 {
+		return ""
+	}
+	return "[#" + strconv.Itoa(k) + "] "
+}
+
+// write records b as p's generation's output and, when the spec is watched,
 // queues it for the next Drain. Never blocks on a reader and never fails:
 // there is no failure mode for a bounded in-memory append, and a log write
 // must never be able to stall the process it is reading from.
-func (s *LogStore) write(specID string, gen uint64, pid int, p []byte) {
-	if s == nil || specID == "" || len(p) == 0 {
+//
+// A further instance's text is prefixed line by line here (prefixLinesLocked),
+// under the same lock as the append, so the prefix state of a generation and
+// the order its chunks land in can never disagree.
+func (s *LogStore) write(p *procLog, b []byte) {
+	if s == nil || p.specID == "" || len(b) == 0 {
 		return
 	}
-	rec := logRecord{gen: gen, pid: pid, at: s.now(), text: string(p)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.appendLocked(specID, rec)
-	s.queueLocked(specID, rec)
+	rec := logRecord{gen: p.gen, pid: int(p.pid.Load()), at: s.now(), text: p.prefixLinesLocked(b)}
+	s.appendLocked(p.specID, rec)
+	s.queueLocked(p.specID, rec)
 }
 
 // mark records a lifecycle marker (a generation boundary) in the same
@@ -697,10 +730,10 @@ func (s *LogStore) Watching() []string {
 // from the manager's own config reconciliation: a spec removed from the
 // desired configuration has no row left in the portal to open a log view on,
 // so keeping its output would be memory held for something that no longer
-// exists. The keys are the manager's INSTANCE keys (#340): a spec that never
-// replicates is keyed by its spec ID as ever, a further instance of a
-// replicable spec by S#k, and the manager passes the instances that currently
-// exist -- so a retired burst instance's buffer is released at the next Apply.
+// exists. The keys are SPEC IDs, for a replicable spec too: every instance of
+// a spec writes into its spec's one buffer (newInstanceProc), so a spec's
+// output -- a retired burst instance's included -- lives exactly as long as
+// the spec does.
 func (s *LogStore) Retain(specIDs []string) {
 	if s == nil {
 		return
@@ -1121,17 +1154,26 @@ func (s *LogStore) tail(specID string, gen uint64, n int) string {
 // exec.Cmd for both stdout and stderr, plus the two lifecycle markers the
 // manager records around the process's life.
 //
-// Write is called concurrently from os/exec's two copying goroutines (one per
-// stream), which is why every mutation goes through LogStore's mutex. The pid
-// is an atomic because it is stored by the owner goroutine immediately after
-// cmd.Start while those two goroutines may already be copying: output written
-// in that sliver carries pid 0, and the started marker that follows carries
-// the real one.
+// Write may be called concurrently from os/exec's copying goroutines, which is
+// why every mutation goes through LogStore's mutex. The pid is an atomic
+// because it is stored by the owner goroutine immediately after cmd.Start
+// while a copying goroutine may already be copying: output written in that
+// sliver carries pid 0, and the started marker that follows carries the real
+// one.
+//
+// specID is always the BASE spec's ID (#340): a further instance of a
+// replicable spec writes into its spec's buffer, every line opened by prefix
+// ("[#k] "; empty for instance 0, whose bytes pass through untouched).
+// midLine is whether the generation's last write ended inside a line, so the
+// next byte continues that line rather than opening a new one; it is guarded
+// by the store's mutex like everything else a write touches.
 type procLog struct {
-	store  *LogStore
-	specID string
-	gen    uint64
-	pid    atomic.Int64
+	store   *LogStore
+	specID  string
+	gen     uint64
+	pid     atomic.Int64
+	prefix  string
+	midLine bool
 }
 
 // Write implements io.Writer. It never returns an error: there is no failure
@@ -1139,9 +1181,39 @@ type procLog struct {
 // stop copying the stream -- silencing the process the operator is reading.
 func (p *procLog) Write(b []byte) (int, error) {
 	if p.store != nil {
-		p.store.write(p.specID, p.gen, int(p.pid.Load()), b)
+		p.store.write(p, b)
 	}
 	return len(b), nil
+}
+
+// prefixLinesLocked returns b as the text to record: b itself for instance 0,
+// and for a further instance b with p.prefix opening every line that starts in
+// it. A line starts at the generation's first byte and after every '\n'; the
+// prefix is written when the line's first byte arrives, not when the newline
+// before it does, so output that ends with a newline leaves no dangling prefix
+// and a line split across two writes is prefixed once. The caller holds the
+// store's mutex.
+func (p *procLog) prefixLinesLocked(b []byte) string {
+	if p.prefix == "" {
+		return string(b)
+	}
+	var out strings.Builder
+	out.Grow(len(b) + len(p.prefix)*(1+bytes.Count(b, []byte{'\n'})))
+	for len(b) > 0 {
+		if !p.midLine {
+			out.WriteString(p.prefix)
+		}
+		i := bytes.IndexByte(b, '\n')
+		if i < 0 {
+			out.Write(b)
+			p.midLine = true
+			break
+		}
+		out.Write(b[:i+1])
+		b = b[i+1:]
+		p.midLine = false
+	}
+	return out.String()
 }
 
 // Started records the generation boundary that opens this process's output,

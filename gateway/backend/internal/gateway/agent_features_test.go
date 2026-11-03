@@ -24,8 +24,9 @@ func agentFeaturesRequest(secret, ifNoneMatch string) *http.Request {
 }
 
 // TestAgentFeaturesEndpoint pins the static-list contract (spec §9): an
-// authed agent gets back {"features":["runtime_manager"]} plus a stable
-// ETag, and a repeat request with that ETag answers 304 with no body.
+// authed agent gets back {"features":[...]} -- gatewayAgentFeatures verbatim,
+// runtime_manager and runtime_instances among them -- plus a stable ETag, and
+// a repeat request with that ETag answers 304 with no body.
 func TestAgentFeaturesEndpoint(t *testing.T) {
 	srv := NewTestServer()
 	seedTestAgentToken(t, srv, "agt_features", "mock-host-qwen", "features-secret")
@@ -119,6 +120,39 @@ func TestAgentFeaturesDeclaresTheAudioCppCapabilitySource(t *testing.T) {
 	}
 	if !slices.Contains(got.Features, "capability_source_sdcpp") {
 		t.Fatalf("features = %v, want the sdcpp source still declared beside the audio one", got.Features)
+	}
+}
+
+// TestAgentFeaturesDeclaresRuntimeInstances pins the name an agent's
+// multi-instance runtime hangs on (#340): the agent honours a spec's
+// replicable flag only when this endpoint lists "runtime_instances" (its
+// gatewayFeatureRuntimeInstances), and otherwise runs every spec as a single
+// process. The name is compared as the literal the agent matches, read off the
+// served body, so a renamed constant or a dropped list entry both fail here,
+// where the agent would otherwise just quietly stop scaling.
+func TestAgentFeaturesDeclaresRuntimeInstances(t *testing.T) {
+	if runtimeInstancesFeature != "runtime_instances" {
+		t.Fatalf("runtimeInstancesFeature = %q, want the wire literal runtime_instances", runtimeInstancesFeature)
+	}
+	srv := NewTestServer()
+	seedTestAgentToken(t, srv, "agt_features", "mock-host-qwen", "features-secret")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, agentFeaturesRequest("features-secret", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var got agentFeaturesDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body %s: %v", rec.Body.String(), err)
+	}
+	if !slices.Contains(got.Features, "runtime_instances") {
+		t.Fatalf("features = %v, want it to declare runtime_instances", got.Features)
+	}
+	for _, name := range []string{"runtime_manager", "capability_source_sdcpp", "capability_source_audiocpp"} {
+		if !slices.Contains(got.Features, name) {
+			t.Fatalf("features = %v, want %s still declared beside runtime_instances", got.Features, name)
+		}
 	}
 }
 

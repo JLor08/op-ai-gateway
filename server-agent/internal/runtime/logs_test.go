@@ -841,3 +841,78 @@ func TestLogCommandIsReleasedWithTheSpec(t *testing.T) {
 		t.Fatalf("a removed spec kept entries: %+v", batches[0].Entries)
 	}
 }
+
+// TestInstanceOutputGoesToTheSpecBufferPrefixed is the store half of how a
+// replicable spec's instances share one log view (#340): every instance writes
+// into the BASE spec's buffer, instance 0 byte for byte as a spec that never
+// replicates, and a further instance k with "[#k] " opening each of its lines.
+// A line is prefixed once however the pipe splits it, output that ends with a
+// newline leaves no dangling prefix, and two instances writing in turn
+// interleave in the one history, each line still marked by its own instance.
+func TestInstanceOutputGoesToTheSpecBufferPrefixed(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	p0 := s.newInstanceProc("S", 0)
+	p2 := s.newInstanceProc("S", 2)
+	p0.Started(100, ResolvedCommand{})
+	p2.Started(102, ResolvedCommand{})
+
+	p0.Write([]byte("zero a\nzero "))
+	p2.Write([]byte("two a\ntwo b"))
+	p2.Write([]byte(" continued\n"))
+	p0.Write([]byte("b\n"))
+	p2.Write([]byte("\n"))
+	p2.Write([]byte("two c\n"))
+
+	s.SetWatch([]string{"S"}, nil)
+	batches := s.Drain()
+	if len(batches) != 1 || batches[0].SpecID != "S" || !batches[0].Scrollback {
+		t.Fatalf("drain = %+v, want one scrollback batch for the BASE spec S", batches)
+	}
+	const want = "zero a\nzero " +
+		"[#2] two a\n[#2] two b" +
+		" continued\n" +
+		"b\n" +
+		"[#2] \n" +
+		"[#2] two c\n"
+	if got := batchText(batches[0]); got != want {
+		t.Fatalf("history text =\n%q\nwant\n%q", got, want)
+	}
+
+	// Each generation's tail is still its own, prefix included for instance 2.
+	if got := p0.Tail(1024); got != "zero a\nzero b\n" {
+		t.Errorf("instance 0 tail = %q, want its own bytes unchanged", got)
+	}
+	if got := p2.Tail(1024); got != "[#2] two a\n[#2] two b continued\n[#2] \n[#2] two c\n" {
+		t.Errorf("instance 2 tail = %q, want its own lines, each prefixed", got)
+	}
+
+	// No buffer is keyed by an instance: Retain with the spec ID keeps them all.
+	s.Retain([]string{"S"})
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.logs))
+	for k := range s.logs {
+		keys = append(keys, k)
+	}
+	s.mu.Unlock()
+	if len(keys) != 1 || keys[0] != "S" {
+		t.Fatalf("retained buffers = %v, want only the spec's own [S]", keys)
+	}
+}
+
+// TestInstanceZeroOutputIsUnprefixed: newInstanceProc for instance 0 is
+// exactly newProc -- the spec's own process writes what it wrote.
+func TestInstanceZeroOutputIsUnprefixed(t *testing.T) {
+	for name, open := range map[string]func(*LogStore) *procLog{
+		"newProc":           func(s *LogStore) *procLog { return s.newProc("S") },
+		"newInstanceProc 0": func(s *LogStore) *procLog { return s.newInstanceProc("S", 0) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+			p := open(s)
+			p.Write([]byte("[#1] not mine\nplain"))
+			if got := p.Tail(1024); got != "[#1] not mine\nplain" {
+				t.Fatalf("tail = %q, want the bytes exactly as written", got)
+			}
+		})
+	}
+}

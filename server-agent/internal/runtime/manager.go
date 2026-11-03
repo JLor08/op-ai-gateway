@@ -36,10 +36,13 @@
 // is its spec ID -- so for every such spec the owner is exactly what it was
 // before instances existed. The few places that treat instances of one spec
 // differently from unrelated specs (siblings) say so where they do it:
-// address resolution (resolveAddress), demand inheritance (demandSpec), the
-// burst/baseline split (admitAndStart), the protected floor (protected), the
-// "highest index leaves first" invariant (scanIdle,
-// evictOneIdleForBootstrap) and retirement (retireIfSpent).
+// address resolution (resolveAddress), demand inheritance (demandSpec for a
+// candidate, chargeSpec for an occupant), the burst/baseline split
+// (admitAndStart), the protected floor (protected, ensureProtectedFloor), the
+// order instances are asked in (instanceLess), the "highest index leaves
+// first" invariant (scanIdle, evictOneIdleForBootstrap), retirement
+// (retireIfSpent) and output (one log buffer per spec, a further instance's
+// lines prefixed "[#k] ").
 package runtime
 
 import (
@@ -488,7 +491,9 @@ func cancelTimer(m *Manager, t **time.Timer) {
 // until the owner has applied it (which may itself only be the START of
 // asynchronous work -- a newly pinned spec's process may still be starting
 // when Apply returns). Idempotent: a Config whose ETag equals the
-// currently-applied one is a no-op.
+// currently-applied one is a no-op -- unless it opts a different set of specs
+// into instances (Spec.Replicable), the one part of a document the Driver may
+// withhold until the gateway declares runtime_instances (see applyConfig).
 func (m *Manager) Apply(cfg Config) {
 	done := make(chan struct{})
 	m.postCmd(cmdApply{cfg: cfg, done: done})
@@ -1481,14 +1486,35 @@ func (o *owner) handle(cmd command) {
 //     another spec's literal upstream model (instanceAddressHolder) drains and
 //     is removed the same way, and the protected floor never creates one;
 //   - a BURST instance with no process left -- one resting at a failure,
-//     kept for the operator only until the next Apply -- is retired here.
+//     kept for the operator only until the next Apply -- is retired here;
+//   - a spec that is pushed again while a removal is still draining it is
+//     desired again: none of its instances is deleted on exit any more (the
+//     drain in progress completes, and each instance then follows the normal
+//     rules -- stopped, restarted when protected or asked for, retired when
+//     burst).
 //
-// Order matters in one place: the routing index (rebuildUpstreamIndex) is
+// Order matters in two places. The routing index (rebuildUpstreamIndex) is
 // rebuilt once the removed specs are out and BEFORE the further instances and
 // the floor are reconciled, because which addresses are another spec's literal
-// model is read off that index.
+// model is read off that index. And the protected instances are started in
+// instance order (sortInstanceOrder), instance 0 of a spec first: when the room
+// holds fewer instances than the floor asks for, the ones it holds are the
+// lowest, never a further instance that instance 0 could not get the room back
+// from (a sibling is never a victim, §5.4 rule 3).
+//
+// A spec whose ID is reserved for instance keys (reservedSpecID: it contains
+// '#') is ignored with a Warn, as ParseConfig already drops it from every
+// document a Source parses; this covers a Config handed to Apply directly, so
+// no spec ID in the owner's table ever collides with an instance key.
 func (o *owner) applyConfig(cfg Config) {
-	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag {
+	cfg.Specs = withoutReservedSpecIDs(cfg.Specs)
+	// The ETag names the document, and the multi-instance opt-in is the one
+	// part of it this agent may withhold on its own (Driver.Sync clears
+	// Replicable until the gateway declares runtime_instances), so a document
+	// can arrive a second time under the same ETag with only that opt-in
+	// changed -- when the gateway's declaration changes. That second arrival is
+	// a different desired state and must be applied, not short-circuited.
+	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag && sameReplicableOptIn(cfg.Specs, o.cfg.Specs) {
 		return
 	}
 	o.cfg = cfg
@@ -1504,6 +1530,13 @@ func (o *owner) applyConfig(cfg Config) {
 			o.specs[spec.ID] = &specState{spec: spec, state: StateStopped, since: time.Now()}
 			continue
 		}
+		// Pushed again while a removal was still draining it: desired again,
+		// so it must not be deleted on exit -- left set, instance 0 would vanish
+		// from the table (and the routing index with it) while its further
+		// instances, cleared below, kept running unreachable. The drain in
+		// progress completes; the exit then rests it at Stopped and re-admits
+		// it like any other.
+		st.removed = false
 		o.reconcileSpec(st, spec)
 	}
 
@@ -1576,53 +1609,25 @@ func (o *owner) applyConfig(cfg Config) {
 	}
 
 	// The protected floor: instances 1..P-1 always exist (the start loop below
-	// brings them up). Bounded by InstanceAllowed, so a floor a document could
-	// set above max_instances or past MaxInstanceIndex (ParseConfig clamps
-	// both; Apply is also reachable without it) never loops past the
-	// addressable range. An instance that could never be reached is skipped
-	// rather than started: its key is another spec's ID, or its address is
-	// another spec's literal upstream model (instanceAddressHolder). The rest of
-	// the floor still comes up -- gaps in the index range are allowed (§4).
-	for _, spec := range cfg.Specs {
-		for k := 1; k < ProtectedCount(spec) && InstanceAllowed(spec, k); k++ {
-			key := InstanceKey(spec.ID, k)
-			if existing, taken := o.specs[key]; taken {
-				if specBase(existing.spec) != spec.ID {
-					slog.Warn("runtime: an instance key of a replicable spec is another spec's ID; that instance cannot exist",
-						"spec", spec.ID, "instance", k, "conflicting_spec", key)
-				}
-				continue
-			}
-			if holder, held := o.instanceAddressHolder(spec, k); held {
-				slog.Warn("runtime: an instance address of a replicable spec is another spec's upstream model, which it routes to; that instance cannot exist",
-					"spec", spec.ID, "instance", k, "address", InstanceAddress(spec.UpstreamModel, k), "conflicting_spec", holder)
-				continue
-			}
-			o.specs[key] = &specState{spec: specForInstance(spec, k), instance: k, state: StateStopped, since: time.Now()}
-		}
-	}
+	// brings them up).
+	o.ensureProtectedFloor()
 
 	// Retained output follows the SPEC, so a spec the operator deleted takes
 	// its history with it: there is no row left in the portal to open a log
 	// view on, and the buffer would otherwise be memory held for something
 	// that no longer exists. Driven from newIDs (the DESIRED set), not from
 	// o.specs, because a removed-but-still-draining spec is still in o.specs
-	// and its output stops being reachable the moment the spec is gone.
-	//
-	// The same holds per instance (#340): a further instance's buffer is
-	// kept while the instance exists and is still allowed, so a burst
-	// instance retired since the last Apply releases its buffer here.
-	retained := make([]string, 0, len(o.specs))
+	// and its output stops being reachable the moment the spec is gone. Spec
+	// IDs only, for a replicable spec too: every instance writes into its
+	// spec's one buffer (LogStore.newInstanceProc), so there is no
+	// per-instance buffer to keep or release.
+	retained := make([]string, 0, len(newIDs))
 	for id := range newIDs {
 		retained = append(retained, id)
 	}
-	for id, st := range o.specs {
-		if st.instance > 0 && !st.removed && newIDs[st.spec.InstanceOf] {
-			retained = append(retained, id)
-		}
-	}
 	o.logs.Retain(retained)
 
+	var start []string
 	for id, st := range o.specs {
 		if st.removed || !newIDs[specBase(st.spec)] {
 			continue
@@ -1637,10 +1642,92 @@ func (o *owner) applyConfig(cfg Config) {
 		// instance 0 of a spec that never replicates, and folds the
 		// min_instances floor in for a replicable one.
 		if st.protected() && st.proc == nil && st.state != StateBackoff {
-			o.admitAndStart(id)
+			start = append(start, id)
 		}
 	}
+	// Never in map order: see the order note in this function's doc.
+	o.sortInstanceOrder(start)
+	for _, id := range start {
+		o.admitAndStart(id)
+	}
 	o.wakeAdmissionCandidates()
+}
+
+// ensureProtectedFloor creates every protected instance 1..P-1 (ProtectedCount)
+// of every desired spec that does not exist yet, Stopped -- the Apply start
+// loop and the admission wake bring it up from there. Called from applyConfig,
+// and when a removed state leaves the table (onProcExited), because that can
+// free an address the floor had to skip.
+//
+// Bounded by InstanceAllowed, so a floor a document could set above
+// max_instances or past MaxInstanceIndex (ParseConfig clamps both; Apply is
+// also reachable without it) never loops past the addressable range. An
+// instance that could never be reached is skipped rather than created: its
+// address is another spec's literal upstream model (instanceAddressHolder),
+// which every request for it reaches instead. The rest of the floor still
+// comes up -- gaps in the index range are allowed (§4). An existing state is
+// always this spec's own instance: no spec ID contains '#' (reservedSpecID), so
+// no other spec's state can hold the key.
+func (o *owner) ensureProtectedFloor() {
+	for _, spec := range o.cfg.Specs {
+		for k := 1; k < ProtectedCount(spec) && InstanceAllowed(spec, k); k++ {
+			key := InstanceKey(spec.ID, k)
+			if _, exists := o.specs[key]; exists {
+				continue
+			}
+			if holder, held := o.instanceAddressHolder(spec, k); held {
+				slog.Warn("runtime: an instance address of a replicable spec is another spec's upstream model, which it routes to; that instance cannot exist",
+					"spec", spec.ID, "instance", k, "address", InstanceAddress(spec.UpstreamModel, k), "conflicting_spec", holder)
+				continue
+			}
+			o.specs[key] = &specState{spec: specForInstance(spec, k), instance: k, state: StateStopped, since: time.Now()}
+		}
+	}
+}
+
+// sameReplicableOptIn reports whether two spec lists opt the same spec IDs into
+// instances (Spec.Replicable) -- the one field of an already-applied document
+// that can change without its ETag changing (applyConfig's short circuit).
+func sameReplicableOptIn(a, b []Spec) bool {
+	replicable := make(map[string]bool, len(a))
+	for _, spec := range a {
+		if spec.Replicable {
+			replicable[spec.ID] = true
+		}
+	}
+	n := 0
+	for _, spec := range b {
+		if !spec.Replicable {
+			continue
+		}
+		if !replicable[spec.ID] {
+			return false
+		}
+		n++
+	}
+	return n == len(replicable)
+}
+
+// instanceLess is the owner's order over instances wherever the order decides
+// which one is asked first: by base spec ID, then by instance index
+// NUMERICALLY -- S, S#2, S#10, never the string order S, S#10, S#2 -- so
+// instance 0 of a spec always comes before its further instances, and they
+// come in index order (§4: highest index leaves first, so lowest index comes
+// up first). For a spec that never replicates it is plain spec-ID order.
+func instanceLess(aBase string, aK int, bBase string, bK int) bool {
+	if aBase != bBase {
+		return aBase < bBase
+	}
+	return aK < bK
+}
+
+// sortInstanceOrder sorts instance keys of states in o.specs into instanceLess
+// order.
+func (o *owner) sortInstanceOrder(ids []string) {
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := o.specs[ids[i]], o.specs[ids[j]]
+		return instanceLess(specBase(a.spec), a.instance, specBase(b.spec), b.instance)
+	})
 }
 
 // reconcileSpec stores spec -- the newly pushed spec for instance 0, or the
@@ -1921,8 +2008,9 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 // even when its state has since gone, in which case the name is simply not
 // managed rather than re-read as an instance address of some other spec.
 // Otherwise the name must parse as an instance address of a managed spec that
-// is still desired (not removed) and allows instance k, and the instance key
-// must not be held by an unrelated spec (a file-mode spec ID may contain '#').
+// is still desired (not removed) and allows instance k. The instance key S#k is
+// then this spec's own: no spec ID contains '#' (reservedSpecID -- ParseConfig
+// and applyConfig both drop such a spec), so no other spec's state can hold it.
 func (o *owner) resolveAddress(model string) (specID, base string, k int, ok bool) {
 	if id, found := o.byUpstream[model]; found {
 		if o.specs[id] == nil {
@@ -1937,9 +2025,6 @@ func (o *owner) resolveAddress(model string) (specID, base string, k int, ok boo
 	id, found := o.byUpstream[b]
 	st := o.specs[id]
 	if !found || st == nil || st.removed || !InstanceAllowed(st.spec, n) {
-		return "", "", 0, false
-	}
-	if other := o.specs[InstanceKey(id, n)]; other != nil && specBase(other.spec) != id {
 		return "", "", 0, false
 	}
 	return id, b, n, true
@@ -1966,8 +2051,8 @@ func (o *owner) instanceAddressHolder(spec Spec, k int) (holder string, held boo
 // burst instance resting at a crash or a failed start is "named again" here,
 // which retires that row and starts over with a fresh one: burst capacity is
 // never retried on its own, so a request asking for it again IS the retry.
-// resolveAddress has already established that the key is free or held by an
-// instance of this very spec.
+// A state found under the key is always an instance of this very spec: no spec
+// ID contains '#' (reservedSpecID), so no other spec's state can hold it.
 func (o *owner) instanceForRequest(base *specState, k int) *specState {
 	key := InstanceKey(base.spec.ID, k)
 	st := o.specs[key]
@@ -2258,13 +2343,15 @@ func (o *owner) wantsUp(st *specState) bool {
 // specForInstance returns the Spec instance k of base runs as (#340): base
 // itself for instance 0, and for k >= 1 a copy that differs only in identity.
 // ID becomes the instance key S#k -- which is what gives the instance its own
-// admission identity, ${CONFIG_DIR} and config-file directory, and log buffer,
-// all of which are keyed by spec.ID -- InstanceOf names the base spec, and
-// Instance is k. Everything pushed is shared, UpstreamModel included, so
+// admission identity and its own ${CONFIG_DIR} and config-file directory, all
+// keyed by spec.ID -- InstanceOf names the base spec, and Instance is k. (Its
+// output is the exception: it goes into the BASE spec's log buffer, each line
+// prefixed "[#k] " -- see startProcess and LogStore.newInstanceProc.)
+// Everything pushed is shared, UpstreamModel included, so
 // ${MODEL} expands to the BASE model name: the child never sees an instance
 // address (the router rewrites the request's model to match, §5.3). The copy
 // shares base's slices and maps; nothing in the owner writes through them
-// (demandSpec copies the GPU list before it raises a demand).
+// (raisedDemand copies the GPU list before it raises a demand).
 func specForInstance(base Spec, k int) Spec {
 	if k == 0 {
 		return base
@@ -2342,22 +2429,60 @@ func (o *owner) higherSiblingRuns(st *specState) bool {
 // still loading leaves the demand where it was -- unknown, if nothing was
 // declared -- rather than lending it a fraction of the model.
 //
-// It applies to EVERY instance -- instance 0 included, and occupants as well as
-// the candidate. Instance 0 restarting next to a protected (hence pinned),
-// measured sibling would otherwise be charged its unknown declared demand and
-// hit the pinned-unknown terminal (policy step 2); a starting sibling with no
-// measurement of its own would otherwise be charged nothing at all. A spec that
-// never replicates is returned untouched: the Replicable gate makes that
-// structural rather than a consequence of an empty sibling set.
+// It applies to EVERY instance -- instance 0 included -- as a CANDIDATE: instance
+// 0 restarting next to a protected (hence pinned), measured sibling would
+// otherwise be charged its unknown declared demand and hit the pinned-unknown
+// terminal (policy step 2). An OCCUPANT is charged by chargeSpec instead, which
+// inherits only what the occupant has not measured of itself. A
+// spec that never replicates is returned untouched: the Replicable gate makes
+// that structural rather than a consequence of an empty sibling set.
 //
 // The result never aliases st.spec's GPU list: a raised demand is written into
 // a fresh copy, because the list is shared with the pushed config.
 func (o *owner) demandSpec(st *specState) Spec {
-	spec := st.spec
-	if !spec.Replicable {
-		return spec
+	if !st.spec.Replicable {
+		return st.spec
 	}
 	vram, ram := o.siblingPeak(st)
+	return raisedDemand(st.spec, vram, ram)
+}
+
+// chargeSpec is the demand buildSnapshot charges a LIVE instance st with as an
+// occupant (#340). Siblings' demand is summed (§5.4 rule 1), so each
+// occupant counts for what it holds: an instance with its own READY measurement
+// (readyVRAM per GPU, readyRAM -- taken after its first passing probe) is
+// charged that figure, floored at its declared demand and never raised to a
+// sibling's peak. Raising it would over-charge every measured sibling at once:
+// two instances measured at 3000 and 3500 MB would count as 7000, and a third
+// that fits next to their real 6500 would be refused. What the occupant has not
+// measured of itself since it became ready -- a Starting instance has nothing
+// yet, and a just-ready one may not have its RAM figure yet -- inherits the
+// sibling peak exactly as demandSpec does, the conservative reading of a copy
+// of the same model. A spec that never replicates is returned untouched.
+//
+// The result never aliases st.spec's GPU list, like demandSpec's.
+func (o *owner) chargeSpec(st *specState) Spec {
+	if !st.spec.Replicable {
+		return st.spec
+	}
+	vram, ram := o.siblingPeak(st)
+	for idx, mb := range st.readyVRAM {
+		if vram == nil {
+			vram = make(map[int]int, len(st.readyVRAM))
+		}
+		vram[idx] = mb // its own ready figure supersedes the inherited one
+	}
+	if own := realRAM(st.readyRAM); own > 0 {
+		ram = own
+	}
+	return raisedDemand(st.spec, vram, ram)
+}
+
+// raisedDemand returns spec with each GPU's VRAM demand raised to vram[index]
+// and the host-RAM demand raised to ram -- never lowered: the pushed demand is a
+// floor. The GPU list is copied before it is written, because it is shared with
+// the pushed config; vram is only read.
+func raisedDemand(spec Spec, vram map[int]int, ram int) Spec {
 	if len(vram) > 0 && len(spec.GPUs) > 0 {
 		gpus := make([]SpecGPU, len(spec.GPUs))
 		for i, g := range spec.GPUs {
@@ -2913,13 +3038,14 @@ func (o *owner) measureSoon() {
 // a spec that is still loading, has already been measured, has a known demand, or
 // runs on a host with no RAM measurer to resolve it.
 //
-// The demand is read through demandSpec, exactly as buildSnapshot's interlock
-// reads it, so the beat counter and the interlock it bounds always agree.
+// The demand is read through chargeSpec, exactly as buildSnapshot's interlock
+// reads it for a live process, so the beat counter and the interlock it bounds
+// always agree.
 func (o *owner) healthyBootstrapAwaitingMeasurement(st *specState) bool {
 	return o.m.ramMeasurer.Load() != nil &&
 		st.proc != nil && st.proc.everHealthy &&
 		st.state == StateRunning &&
-		needsRAMBootstrap(o.demandSpec(st), st.measuredRAM)
+		needsRAMBootstrap(o.chargeSpec(st), st.measuredRAM)
 }
 
 // failBootstrapUnmeasured forces a healthy-but-never-measured bootstrap to a
@@ -3001,8 +3127,8 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	ramBoundMB := 0
 	// Two passes over the live processes. The first records this call's
 	// measurements; the second charges every process. They are separate
-	// because an instance's demand inherits its siblings' live measurements
-	// (demandSpec, #340): charging in the same pass would let map order decide
+	// because an instance's demand inherits its siblings' ready measurements
+	// (chargeSpec, #340): charging in the same pass would let map order decide
 	// whether a sibling's figure is this call's or the previous beat's.
 	fresh := make(map[string]map[int]int, len(o.specs))
 	for id, st := range o.specs {
@@ -3045,12 +3171,14 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// reservation. Replacing the demand with the live value is how a
 		// co-resident start got admitted into that gap.
 		//
-		// The demand is the instance's demandSpec: for an instance of a
-		// replicable spec the pushed demand raised to its siblings' largest
-		// live measurement, so a sibling that has not been measured itself yet
-		// is charged what its siblings hold rather than nothing. For a spec
-		// that never replicates it is the pushed spec itself.
-		demand := o.demandSpec(st)
+		// The demand is the occupant's chargeSpec: for an instance of a
+		// replicable spec its own ready measurement where it has one (siblings
+		// are summed, each at what it holds), and where it has none -- a
+		// sibling still loading, or not yet measured since it became ready --
+		// the pushed demand raised to its siblings' largest ready measurement,
+		// rather than nothing. For a spec that never replicates it is the
+		// pushed spec itself.
+		demand := o.chargeSpec(st)
 		byGPU := fresh[id]
 		gpus := make(map[int]int, len(demand.GPUs))
 		for _, g := range demand.GPUs {
@@ -3237,10 +3365,10 @@ func (o *owner) noteRAMFreed(st *specState) {
 	}
 	mb := realRAM(st.measuredRAM)
 	if mb == 0 {
-		// The instance's demand floor, sibling-inherited (#340) exactly as
-		// buildSnapshot charged it; the pushed spec for one that never
-		// replicates.
-		mb = o.demandSpec(st).RAMMB
+		// The instance's demand floor exactly as buildSnapshot charged it
+		// (chargeSpec: sibling-inherited, #340); the pushed spec for one that
+		// never replicates.
+		mb = o.chargeSpec(st).RAMMB
 	}
 	if mb <= 0 {
 		return
@@ -3385,10 +3513,15 @@ func (o *owner) startProcess(st *specState) {
 
 	// One writer for BOTH streams: the requirement is stdout AND stderr, and
 	// sharing the writer means the interleaving an operator reads back is
-	// the interleaving the process actually produced. os/exec spawns one
-	// copying goroutine per stream against a plain io.Writer, which is why
-	// procLog.Write is concurrency-safe by construction.
-	plog := o.logs.newProc(spec.ID)
+	// the interleaving the process actually produced. procLog.Write is
+	// concurrency-safe by construction, whatever goroutines os/exec copies on.
+	//
+	// Into the BASE spec's buffer for every instance (#340): the spec's log
+	// view is where an operator looks, for a burst instance whose row is
+	// already retired too, and a further instance's lines carry "[#k] " so the
+	// instances can be told apart there. Instance 0 writes exactly as a spec
+	// that never replicates always has.
+	plog := o.logs.newInstanceProc(specBase(spec), st.instance)
 	cmd := exec.Command(spec.Binary, args...) //nolint:gosec // spec.Binary is allowlisted by LocalPolicy.Permit above
 	cmd.Env = env
 	// R2: an empty work_dir runs beside the binary. effectiveWorkDir returns
@@ -3793,9 +3926,21 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// C2 fix: resolve any queued waiter before dropping the spec -- otherwise
 	// it (and even its own admission_wait_timeout, since handleWaiterTimeout
 	// is itself a no-op once the spec is gone) would never be resolved at all.
+	//
+	// Leaving the table can free a NAME (#340): a removed spec's upstream model
+	// stays in the routing index for as long as its drain runs, so an instance
+	// address equal to it -- another spec's instance -- stays unreachable, and
+	// the protected floor skips that instance (instanceAddressHolder). The
+	// index is therefore rebuilt here, and the floor re-run, so such an instance
+	// comes up now instead of at the next Apply that changes the document; the
+	// wake below starts it.
 	if removed {
 		o.failPending(st, ErrModelNotManaged)
 		delete(o.specs, st.spec.ID)
+		o.rebuildUpstreamIndex()
+		if !o.closing {
+			o.ensureProtectedFloor()
+		}
 		o.wakeAdmissionCandidates()
 		return
 	}
@@ -4497,7 +4642,7 @@ func (o *owner) wakeAdmission(want func(*specState) bool) {
 		if !want(st) {
 			continue
 		}
-		c := wakeCandidate{id: id}
+		c := wakeCandidate{id: id, base: specBase(st.spec), instance: st.instance}
 		for _, w := range st.pending {
 			if c.queuedAt.IsZero() || w.queuedAt.Before(c.queuedAt) {
 				c.queuedAt = w.queuedAt
@@ -4515,9 +4660,13 @@ func (o *owner) wakeAdmission(want func(*specState) bool) {
 
 // wakeCandidate is one spec wakeAdmission has selected for a retry,
 // carried alongside the queue time of its OLDEST waiter -- the zero
-// time when it has none, which is the pinned/force_running case.
+// time when it has none, which is the pinned/force_running case. id is its
+// instance key; base and instance are the spec it is an instance of and its
+// index (#340), which order equal queue times (instanceLess).
 type wakeCandidate struct {
 	id       string
+	base     string
+	instance int
 	queuedAt time.Time
 }
 
@@ -4543,12 +4692,24 @@ func wantsWake(st *specState) bool {
 // tiebreak so the order is total. That last clause is load-bearing rather
 // than tidiness -- leaving equal keys to fall back on Go's randomized map
 // iteration is what the ordering exists to eliminate.
+//
+// For instances (#340) the tiebreak is instanceLess -- the base spec ID, then
+// the instance index NUMERICALLY -- not the instance key as a string, which
+// would put S#10 before S#2. Equal queue times are the protected instances
+// with no waiter above all, and for them the order decides who gets the room
+// first: instance 0 ahead of every further instance of its spec, which never
+// gives the room back (a sibling is never a victim). The key itself breaks
+// what is left, which for a spec that never replicates is the whole tiebreak:
+// its base is its ID and its index 0.
 func lessByQueueAge(a, b wakeCandidate) bool {
 	if a.queuedAt.IsZero() != b.queuedAt.IsZero() {
 		return b.queuedAt.IsZero() // a real queue time sorts before "no waiter"
 	}
 	if !a.queuedAt.Equal(b.queuedAt) {
 		return a.queuedAt.Before(b.queuedAt)
+	}
+	if a.base != b.base || a.instance != b.instance {
+		return instanceLess(a.base, a.instance, b.base, b.instance)
 	}
 	return a.id < b.id // total order: never leave a tie to map iteration
 }

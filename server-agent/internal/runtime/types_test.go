@@ -1009,3 +1009,63 @@ func TestSameLaunchShapeIgnoresInstanceFields(t *testing.T) {
 		t.Fatal("sameLaunchShape ignored a real launch change next to the instance fields")
 	}
 }
+
+// TestParseConfigDropsSpecWithReservedID: "S#k" is the agent's key for
+// instance k of spec S (#340), so a spec whose own ID contains '#' would name
+// another spec's instance -- take over its state, its config directory and its
+// admission identity. ParseConfig drops such a spec with a Warn naming it, and
+// only that spec: the rest of the document, and every pair that does not name
+// the dropped spec, survives. The gateway never issues such an ID, so only a
+// hand-written file-mode document reaches this.
+func TestParseConfigDropsSpecWithReservedID(t *testing.T) {
+	const raw = `{
+		"router_listen": 8081,
+		"max_processes": 2,
+		"gpu_budgets": [],
+		"specs": [
+			{"id": "S", "model": "m", "upstream_model": "m", "binary": "/bin/a",
+			 "args": [], "env": {}, "gpus": [], "replicable": true},
+			{"id": "S#1", "model": "other", "upstream_model": "other", "binary": "/bin/b",
+			 "args": [], "env": {}, "gpus": []},
+			{"id": "T", "model": "t", "upstream_model": "t", "binary": "/bin/c",
+			 "args": [], "env": {}, "gpus": []}
+		],
+		"coresident": [["S", "T"], ["S#1", "T"], ["S", "S#1"]],
+		"etag": "abc"
+	}`
+	logs := withCountedLogs(t)
+	cfg, err := ParseConfig([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseConfig() error = %v, want the document kept (one bad spec costs that spec only)", err)
+	}
+	var ids []string
+	for _, spec := range cfg.Specs {
+		ids = append(ids, spec.ID)
+	}
+	if len(ids) != 2 || ids[0] != "S" || ids[1] != "T" {
+		t.Fatalf("specs = %v, want [S T]: the spec whose id contains '#' is dropped, the rest kept in order", ids)
+	}
+	if len(cfg.Coresident) != 1 || cfg.Coresident[0] != [2]string{"S", "T"} {
+		t.Fatalf("coresident = %v, want only [S T]: a pair naming the dropped spec goes with it", cfg.Coresident)
+	}
+	if !logs.containsText("S#1") {
+		t.Fatal("no warning named the dropped spec S#1; the operator must be able to learn why it does not run")
+	}
+}
+
+// TestReservedSpecIDRule pins the predicate both entry points share (ParseConfig
+// and the manager's applyConfig): only the instance separator reserves an ID.
+func TestReservedSpecIDRule(t *testing.T) {
+	for id, want := range map[string]bool{
+		"S#1":                 true,
+		"#":                   true,
+		"a#b":                 true,
+		"S":                   false,
+		"rspec_0123456789abc": false,
+		"spec-a.b_c":          false,
+	} {
+		if got := reservedSpecID(id); got != want {
+			t.Errorf("reservedSpecID(%q) = %v, want %v", id, got, want)
+		}
+	}
+}
