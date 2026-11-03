@@ -47,6 +47,22 @@
 //     gateway reads it (peekMultipartModel). A multipart request is always a
 //     plain relay, and the router is blind to the path it was sent to.
 //
+// INSTANCE ADDRESSES (#340, design §5.3). A model may name one instance of a
+// replicable spec: "m" is instance 0, "m#k" instance k, read by the manager's
+// own rule (Manager.ResolveAddress -- an exact upstream match wins first, so a
+// real model whose name merely contains '#' stays itself). Every route reaches
+// the instance the address names, and the child -- every instance is launched
+// with the base name m -- sees m in its place: the top-level JSON model
+// (rewriteModelField, number-preserving), the multipart model field
+// (rebuildMultipartModel, every other part as sent), a live relay's model= and
+// an /upstream probe's model=. Instance 0, which is every request of a spec
+// that never replicates, is never rewritten and passes byte for byte. A
+// request the router forwards is admitted with EnsureServing, which never
+// starts a burst instance (409 runtime.instance_no_capacity when none is up);
+// only POST /ensure/{model} (EnsureRunning) may start one, which is how the
+// gateway adds capacity. /running lists running instances by address,
+// /v1/models every spec once, by its base name.
+//
 // STREAMING ASYMMETRY (the whole point of this design): request bodies are
 // buffered (bounded by maxBodyBytes) because `model`/`stream` must be read
 // out of the JSON (or the multipart form) before the router knows where to
@@ -59,7 +75,7 @@
 // COLD-START HEARTBEATS, LAZILY COMMITTED (design doc §8.3, brief: "once
 // admission succeeds, commit 200" -- after, not before): a request with
 // "stream":true does NOT commit 200 + SSE headers up front. It arms a
-// heartbeatInterval ticker and starts waiting on EnsureRunning (then, on
+// heartbeatInterval ticker and starts waiting on EnsureServing (then, on
 // success, the upstream round trip, then the wait for the first response
 // body byte) with that ticker still running. The FIRST time anything would
 // actually need to be written to the client -- a heartbeat tick fires
@@ -74,7 +90,7 @@
 // bytes have actually started flowing, does the router commit to SSE; a
 // failure from that point on can no longer be a status code (see ACCEPTED
 // TRADE-OFF below). heartbeatInterval covers BOTH the cold-start wait
-// (EnsureRunning pending) and a time-to-first-token wait on an
+// (EnsureServing pending) and a time-to-first-token wait on an
 // already-warm child (the upstream request pending), which the design doc
 // treats as the same "silent window" failure class. Once real bytes start
 // flowing, heartbeats stop for good and the upstream body is spliced
@@ -84,7 +100,7 @@
 // ACCEPTED TRADE-OFF, deliberately implemented and documented here (design
 // doc §8.3, §15): once 200 HAS been committed for a streaming request (a
 // heartbeat fired, or real data started flowing, before the eventual
-// outcome was known), no later failure -- EnsureRunning erroring, the
+// outcome was known), no later failure -- EnsureServing erroring, the
 // child dying mid-response -- can be reported as an HTTP status any more.
 // Each is instead reported as a terminal SSE frame
 // (`data: {"error":{"code":"...","message":"..."}}\n\n`) carrying the exact
@@ -273,8 +289,17 @@ var hopByHopHeaders = []string{
 // real EnsureRunning's own internal idempotency guard). nil is a valid
 // managerPort: every handler below treats "no manager" as "nothing is
 // managed" rather than panicking.
+//
+// Two ensures, because the router asks two different questions (#340): an
+// ensure (POST /ensure/{model}) may start any instance it names, a burst one
+// included -- that is how the gateway adds capacity -- while a request the
+// router forwards (EnsureServing) is served by a burst instance only when one
+// is already up. ResolveAddress is the manager's own address rule, which the
+// router reads to hand an instance's child its base model name.
 type managerPort interface {
 	EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	EnsureServing(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	ResolveAddress(model string) (base string, k int, ok bool)
 	LoadedModels() []string
 	Status() []Status
 }
@@ -354,7 +379,9 @@ func (rt *router) serveHealth(w http.ResponseWriter, _ *http.Request) {
 
 // runningEntry/runningResponse mirror llama-swap's /running shape exactly,
 // so the gateway's existing LoadedModelsFormat:"llama_swap" detection keeps
-// working unchanged against a server_agent application.
+// working unchanged against a server_agent application. Each entry is one
+// running instance by its address (#340, LoadedModels): "m" for instance 0,
+// "m#k" for a further one.
 type runningEntry struct {
 	Model string `json:"model"`
 	State string `json:"state"`
@@ -379,7 +406,10 @@ func (rt *router) serveRunning(w http.ResponseWriter, _ *http.Request) {
 // modelEntry/modelsResponse mirror the OpenAI /v1/models list shape. Unlike
 // /running, this lists EVERY managed (enabled) spec -- cold ones included --
 // since they are servable on demand; the gateway's model-sync health mode
-// and model listing both read this endpoint expecting the full set.
+// and model listing both read this endpoint expecting the full set. A spec is
+// listed once, by its base name, however many instances it runs (#340): an
+// instance is a process of a model, not a model of its own, so only the
+// instance-0 rows -- which every spec has -- are listed.
 type modelEntry struct {
 	ID     string `json:"id"`
 	Object string `json:"object"`
@@ -397,6 +427,9 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	}
 	data := make([]modelEntry, 0, len(statuses))
 	for _, st := range statuses {
+		if st.Instance != 0 {
+			continue
+		}
 		data = append(data, modelEntry{ID: st.Model, Object: "model"})
 	}
 	writeJSON(w, http.StatusOK, modelsResponse{Object: "list", Data: data})
@@ -475,31 +508,28 @@ func (rt *router) serveUpstream(w http.ResponseWriter, r *http.Request) {
 
 // relayToRunningChild is the Status-only relay behind serveUpstream: resolve
 // model to a RUNNING child's port and GET ep.path on it, never starting one.
+//
+// The model is resolved by the manager's own rule (ResolveAddress), so whether
+// it is managed at all is the same answer every other route gets, and the
+// probe reaches exactly the process the address names (#340): an instance
+// address the row of that instance, a literal name that merely contains '#'
+// its own spec's instance-0 row -- never the row of an instance whose address
+// collided with it while that instance drains. An address its spec allows but
+// no process serves (a burst instance not started, or retired) is managed but
+// not running.
 func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, model string, ep upstreamEndpoint) {
 	if model == "" || rt.m == nil {
 		writeError(w, http.StatusNotFound, codeModelNotManaged,
 			"no active launch spec for this model")
 		return
 	}
-	var (
-		port  int
-		found bool
-	)
-	for _, st := range rt.m.Status() {
-		if st.Model != model {
-			continue
-		}
-		found = true
-		if st.State == StateRunning && st.Port != 0 {
-			port = st.Port
-			break // prefer a running entry among duplicate upstream_model specs; byUpstream's own collapse is an arbitrary map-order winner, but a probe must read a live child
-		}
-	}
-	if !found {
+	base, k, ok := rt.m.ResolveAddress(model)
+	if !ok {
 		writeError(w, http.StatusNotFound, codeModelNotManaged,
 			"no active launch spec for this model")
 		return
 	}
+	port := runningPort(rt.m.Status(), model, k)
 	if port == 0 {
 		writeError(w, http.StatusNotFound, "runtime.model_not_running",
 			"model is managed but not running; this probe never starts a child")
@@ -507,7 +537,7 @@ func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, mo
 	}
 	target := "http://127.0.0.1:" + strconv.Itoa(port) + ep.path
 	if ep.forwardQuery && r.URL.RawQuery != "" {
-		target += "?" + r.URL.RawQuery
+		target += "?" + upstreamChildQuery(r.URL.RawQuery, base, k)
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
@@ -532,6 +562,33 @@ func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, mo
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-side close, best-effort
 	forwardUpstreamResponse(w, nil, resp)
+}
+
+// runningPort returns the port of the RUNNING process of instance k reported
+// under the address model, or 0 when none is running. Among duplicate
+// upstream_model specs -- whose collapse in byUpstream is an arbitrary map-order
+// winner -- the first running row wins: a probe must read a live child.
+func runningPort(statuses []Status, model string, k int) int {
+	for _, st := range statuses {
+		if st.Model == model && st.Instance == k && st.State == StateRunning && st.Port != 0 {
+			return st.Port
+		}
+	}
+	return 0
+}
+
+// upstreamChildQuery is the query the /upstream relay forwards: the inbound one
+// verbatim, except that for an instance address (k >= 1) a model= it carries
+// becomes the base name, the only name the instance's child knows -- set the way
+// liveChildQuery sets the live relay's model.
+func upstreamChildQuery(raw, base string, k int) string {
+	if k == 0 {
+		return raw
+	}
+	if values, _ := url.ParseQuery(raw); !values.Has("model") { // a partial parse is enough to find the key
+		return raw
+	}
+	return liveChildQuery(raw, base)
 }
 
 // ensurePathPrefix is the path prefix of POST /ensure/{model}; everything
@@ -631,14 +688,17 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 //   - The model is the decoded PATH after "/live/", the same prefix decode
 //     serveEnsure does, so an id containing "/" works. An empty model or a nil
 //     manager is 404 runtime.model_not_managed, exactly as serveEnsure answers.
-//   - release() is deferred AFTER a successful EnsureRunning and runs exactly
+//   - It is a plain request, so it is admitted with EnsureServing: an instance
+//     address (#340) reaches a burst instance only while one is up, and is
+//     refused with 409 runtime.instance_no_capacity otherwise.
+//   - release() is deferred AFTER a successful EnsureServing and runs exactly
 //     once on every exit path (clean completion, upstream error, client
 //     disconnect) -- unlike serveEnsure, which releases immediately because it
 //     forwards nothing; here the child admission must be held for the whole
 //     relay.
 //   - EnableFullDuplex lets the server interleave reading r.Body with writing
 //     the SSE response on the one HTTP/1.1 connection. It is enabled at the TOP,
-//     before the model guard and EnsureRunning, so EVERY response path -- the
+//     before the model guard and EnsureServing, so EVERY response path -- the
 //     refusals included -- is full-duplex: net/http otherwise drains up to
 //     ~256 KiB of the unread streaming body before writing a refusal, so a
 //     refusal written with full-duplex still off would make the client stream
@@ -653,7 +713,9 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 //   - The child URL is {childBase}/v1/audio/transcriptions/live with query =
 //     the inbound RawQuery plus model=<decoded path model> (audio.cpp reads the
 //     model from its query), forwarding the inbound sample_rate/channels/
-//     sample_format/language params unchanged.
+//     sample_format/language params unchanged. For an instance address the
+//     model in the query is the base name (instanceBase), the only name the
+//     instance's child knows.
 //   - A RoundTrip failure (child unreachable) is 502 runtime.upstream_gone, the
 //     same code the other proxy paths use for a failure reaching an admitted
 //     child.
@@ -673,14 +735,18 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 		writeSentinelError(w, ErrModelNotManaged)
 		return
 	}
-	endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
+	childModel := model
+	if base, ok := rt.instanceBase(model); ok {
+		childModel = base
+	}
+	endpoint, release, err := rt.m.EnsureServing(r.Context(), model)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
 	}
 	defer release()
 
-	target := endpoint + liveChildPath + "?" + liveChildQuery(r.URL.RawQuery, model)
+	target := endpoint + liveChildPath + "?" + liveChildQuery(r.URL.RawQuery, childModel)
 	// Stream r.Body straight through: do NOT io.ReadAll it, and leave
 	// ContentLength unset so the Transport sends it chunked (Request.outgoing
 	// Length reports -1 for a non-nil body with no declared length).
@@ -718,9 +784,11 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 // params (the forwarded sample_rate/channels/sample_format/language, carried
 // through unchanged) with model set to the decoded PATH model, since audio.cpp
 // reads the model from its own query. The path model is AUTHORITATIVE -- it is
-// what the route was dispatched on and what EnsureRunning admitted -- so a stray
-// inbound model= is overwritten rather than appended, which would otherwise
-// leave two model params and let Query().Get("model") read the inbound one.
+// what the route was dispatched on and what EnsureServing admitted (its base
+// name, for an instance address) -- so a stray inbound model= is overwritten
+// rather than appended, which would otherwise leave two model params and let
+// Query().Get("model") read the inbound one. upstreamChildQuery sets an
+// /upstream probe's model the same way.
 func liveChildQuery(inbound, model string) string {
 	values, _ := url.ParseQuery(inbound) // partial parse on error is fine; model is set authoritatively below
 	values.Del("model")                  // drop any inbound model= so the authoritative path model is the only one
@@ -762,7 +830,8 @@ type modelStreamPeek struct {
 // one of the fixed control routes above -- the four GET-only ones (health,
 // running, models, and the /upstream/{model}/props probe) and POST
 // /ensure/{model}. It buffers the body (bounded), extracts the model (and, for
-// JSON, stream), and hands off to the plain or streaming path.
+// JSON, stream), hands the child the base model when the model is an instance
+// address (instanceBase), and hands off to the plain or streaming path.
 //
 // The body is read as a multipart form when the request's Content-Type is
 // multipart/form-data (an image edit or an audio transcription) and as JSON
@@ -795,7 +864,20 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 			writeModelNotNamed(w)
 			return
 		}
-		rt.servePlainProxy(w, r, model, body)
+		contentType := ""
+		if base, ok := rt.instanceBase(model); ok {
+			rebuilt, rebuiltType, err := rebuildMultipartModel(body, params["boundary"], base)
+			if err != nil {
+				// Not expected: peekMultipartModel has walked this very body to
+				// its end. The request cannot be forwarded with the instance
+				// address in it, so it is refused rather than relayed as is.
+				slog.Error("runtime: rewriting the model of a multipart body failed", "model", model, "error", err)
+				writeSentinelError(w, fmt.Errorf("runtime: rewrite the model of a multipart body: %w", err))
+				return
+			}
+			body, contentType = rebuilt, rebuiltType
+		}
+		rt.servePlainProxy(w, r, model, body, contentType)
 		return
 	}
 
@@ -804,12 +886,125 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 		writeModelNotNamed(w)
 		return
 	}
+	if base, ok := rt.instanceBase(peek.Model); ok {
+		body = rewriteModelField(body, base)
+	}
 
 	if peek.Stream {
 		rt.serveStreamProxy(w, r, peek.Model, body)
 		return
 	}
-	rt.servePlainProxy(w, r, peek.Model, body)
+	rt.servePlainProxy(w, r, peek.Model, body, "")
+}
+
+// instanceBase returns the base upstream model the child must see in place of
+// model, and whether model is an INSTANCE ADDRESS at all (#340, design §5.3):
+// "m#k", instance k >= 1 of a managed replicable spec. Every instance's child is
+// launched with the base name (${MODEL} expands to it, specForInstance) and knows
+// nothing of "m#k", so a request for one is handed to it with the base name
+// instead. For instance 0 -- the address of every request a spec that never
+// replicates gets -- ok is false and the request passes byte for byte as it
+// always has.
+//
+// The address is read by the manager's own rule (ResolveAddress: an exact
+// upstream match wins first, so a real model whose name merely contains '#'
+// stays itself). It decides the rewrite only: the ensure that follows resolves
+// the name again on its own, in a later owner turn, and decides admission -- a
+// push that removes the address in between makes that ensure refuse the
+// request. A name that does not even parse as an instance address can never be
+// one -- the rule reads it as an exact name or as nothing -- so it is answered
+// here, without an owner round trip: a request for instance 0, which is every
+// request of a spec that never replicates, costs the owner exactly what it did
+// before instances existed.
+func (rt *router) instanceBase(model string) (base string, ok bool) {
+	if rt.m == nil {
+		return "", false
+	}
+	if _, k := ParseInstanceAddress(model); k == 0 {
+		return "", false
+	}
+	b, k, managed := rt.m.ResolveAddress(model)
+	if !managed || k == 0 {
+		return "", false
+	}
+	return b, true
+}
+
+// rewriteModelField returns raw with its top-level "model" field set to model:
+// the gateway's rewriteModelField (gateway/backend/internal/gateway/
+// native_passthrough.go) on this side of the module boundary, which is why it is
+// a copy. The body is re-serialized, so it is VALUE-lossless -- every other field
+// is kept, numbers with full precision via json.Number (1.50 stays 1.50) -- but
+// not byte-identical: keys come back sorted and <>& HTML-escaped, which any JSON
+// parser reads identically. When model is empty, the body is not a JSON object,
+// or it already names model, raw comes back unchanged.
+func rewriteModelField(raw []byte, model string) []byte {
+	if model == "" {
+		return raw
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var obj map[string]any
+	// obj == nil is a bare null, which decodes without an error into a map
+	// nothing can be assigned to.
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return raw
+	}
+	if cur, _ := obj["model"].(string); cur == model {
+		return raw
+	}
+	obj["model"] = model
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// rebuildMultipartModel returns raw as a new multipart body, and its
+// Content-Type (a fresh boundary), with the value of the form's "model" field
+// replaced by model -- the gateway's transcription and image-edit rebuilds
+// (rebuildTranscriptionBody, rebuildImageEditBody in
+// gateway/backend/internal/gateway) on this side of the module boundary,
+// reduced to the one edit the router makes. The model field is written anew as
+// a plain form field; every other part is copied with its header and its bytes,
+// in its place. The parts are read raw (NextRawPart), so not even a part's
+// transfer encoding is undone on the way through.
+//
+// The model part is found the way peekMultipartModel finds it (FormName), and
+// raw is a body that function has already walked to its end, so an error here
+// is not expected.
+func rebuildMultipartModel(raw []byte, boundary, model string) ([]byte, string, error) {
+	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
+	var out bytes.Buffer
+	out.Grow(len(raw) + len(model) + 512)
+	mw := multipart.NewWriter(&out)
+	for {
+		part, err := mr.NextRawPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("read part: %w", err)
+		}
+		if part.FormName() == "model" {
+			if err := mw.WriteField("model", model); err != nil {
+				return nil, "", fmt.Errorf("write the model field: %w", err)
+			}
+			continue
+		}
+		pw, err := mw.CreatePart(part.Header)
+		if err != nil {
+			return nil, "", fmt.Errorf("create part %q: %w", part.FormName(), err)
+		}
+		if _, err := io.Copy(pw, part); err != nil {
+			return nil, "", fmt.Errorf("copy part %q: %w", part.FormName(), err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", fmt.Errorf("close the multipart writer: %w", err)
+	}
+	return out.Bytes(), mw.FormDataContentType(), nil
 }
 
 // writeModelNotNamed answers a proxied request whose body does not name a
@@ -879,17 +1074,23 @@ func peekMultipartModel(body []byte, boundary string) string {
 	}
 }
 
-// servePlainProxy handles a non-streaming request: EnsureRunning, map any
+// servePlainProxy handles a non-streaming request: EnsureServing, map any
 // pre-forward failure via the sentinel table, otherwise reverse-proxy with
 // immediate per-write flushing (never buffer the response -- this holds for
 // EVERY proxied response, streaming or not: TestRouterNoResponseBuffering
 // exercises exactly this path).
-func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model string, body []byte) {
+//
+// model is the name the request was routed on (an instance address included),
+// body what the child receives -- already carrying the base model when model
+// is an instance address (serveProxy). contentType, when not empty, replaces
+// the request's own: a multipart body rebuilt with the base model has a
+// boundary of its own.
+func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model string, body []byte, contentType string) {
 	if rt.m == nil {
 		writeSentinelError(w, ErrModelNotManaged)
 		return
 	}
-	endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
+	endpoint, release, err := rt.m.EnsureServing(r.Context(), model)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
@@ -917,6 +1118,9 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, model 
 	outReq := r.Clone(r.Context())
 	outReq.Body = io.NopCloser(bytes.NewReader(body))
 	outReq.ContentLength = int64(len(body))
+	if contentType != "" {
+		outReq.Header.Set(headerContentType, contentType)
+	}
 	// F2, second half: do not OFFER the child a protocol switch. This is not
 	// hop-by-hop hygiene -- httputil.ReverseProxy already strips hop-by-hop
 	// headers from the outbound request -- it is declining to forward the
@@ -1028,7 +1232,7 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 	}
 	ensureCh := make(chan ensureResult, 1)
 	go func() {
-		endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
+		endpoint, release, err := rt.m.EnsureServing(r.Context(), model)
 		ensureCh <- ensureResult{endpoint: endpoint, release: release, err: err}
 	}()
 	eres := heartbeatWait(ticker, ensureCh, w, flusher, commit)
@@ -1144,7 +1348,7 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 // heartbeatWait blocks until resultCh yields a value, calling commit() (see
 // serveStreamProxy) and writing a `: keepalive\n\n` SSE comment on every
 // tick of ticker in the meantime. ticker is shared across every phase of
-// one streaming request (EnsureRunning, the upstream round trip, the wait
+// one streaming request (EnsureServing, the upstream round trip, the wait
 // for the first body byte) so the interval keeps counting continuously
 // across phase boundaries instead of resetting at each one. commit is
 // idempotent, so calling it from every phase's heartbeatWait/heartbeatWaitCtx
@@ -1152,10 +1356,10 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 // commits first.
 //
 // Used only for phases where abandoning the wait early is NOT safe: in
-// particular the EnsureRunning phase, where a client disconnecting cannot
-// simply be treated as "done" -- if EnsureRunning goes on to succeed anyway
+// particular the ensure phase, where a client disconnecting cannot
+// simply be treated as "done" -- if EnsureServing goes on to succeed anyway
 // (a narrow but real race between admission completing and the caller's ctx
-// firing, which EnsureRunning itself resolves cleanly either way), the
+// firing, which the ensure itself resolves cleanly either way), the
 // resulting release() MUST still be called or the spec becomes permanently
 // un-evictable (EnsureRunning's own doc comment). See heartbeatWaitCtx for
 // the phases where early abandonment is safe.
@@ -1177,7 +1381,7 @@ func heartbeatWait[T any](ticker *time.Ticker, resultCh <-chan T, w http.Respons
 // unblocks the producer's pending Read with an error, resultCh still always
 // yields a value (the producer is never abandoned/leaked), and there is no
 // release() at stake here (that already happened, or never will, in the
-// EnsureRunning phase above). This exists because relying on ctx
+// ensure phase above). This exists because relying on ctx
 // cancellation to propagate all the way through an *already-returned*
 // http.Transport.RoundTrip's response-body reads turned out, empirically
 // (TestRouterReleaseCalledExactlyOnce/client_disconnect_midstream), not to
@@ -1370,12 +1574,17 @@ const (
 )
 
 // sentinelCode maps a Manager error to the design doc §6.5 stable wire code
-// and HTTP status. Any error that is not one of the five named sentinels
+// and HTTP status. Any error that is not one of the seven named sentinels
 // (including a raw upstream connection failure or non-2xx status, which
 // carry no Manager sentinel of their own) falls through to
 // runtime.upstream_gone/502 -- the same code the design doc assigns to "the
 // child died during the request", which is the closest fit for "something
 // went wrong reaching or using an otherwise-admitted child".
+//
+// The two burst refusals (#340) are 409s: the request conflicts with what
+// this host has free right now, and another host may well have room -- the
+// gateway's cue to re-select (no capacity) or to retry shortly (demand
+// unknown), never an error to surface.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
@@ -1388,6 +1597,10 @@ func sentinelCode(err error) (code string, status int) {
 		return "runtime.admission_blocked", http.StatusServiceUnavailable
 	case errors.Is(err, ErrNotPermitted):
 		return "runtime.not_permitted", http.StatusBadGateway
+	case errors.Is(err, ErrInstanceNoCapacity):
+		return "runtime.instance_no_capacity", http.StatusConflict
+	case errors.Is(err, ErrInstanceDemandUnknown):
+		return "runtime.instance_demand_unknown", http.StatusConflict
 	default:
 		return codeUpstreamGone, http.StatusBadGateway
 	}

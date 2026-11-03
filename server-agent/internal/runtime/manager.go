@@ -39,11 +39,13 @@
 // address resolution (resolveAddress), demand inheritance (demandSpec for a
 // candidate, chargeSpec for an occupant), the burst/baseline split
 // (admitAndStart), the protected floor (protected, ensureProtectedFloor), the
-// order instances are asked in (instanceLess) and started in -- lowest index
-// first, whatever asks (lowerSiblingWaiting) -- the "highest index leaves
-// first" invariant (scanIdle, evictOneIdleForBootstrap), retirement
-// (retireIfSpent) and output (one log buffer per spec, a further instance's
-// lines prefixed "[#k] ").
+// order instances are asked in (instanceLess), the order the PROTECTED ones
+// start in -- lowest index first, whatever asks (lowerSiblingWaiting); a burst
+// instance is never held back for a lower sibling, it takes free room or is
+// refused at once -- the "highest index leaves first" invariant (scanIdle,
+// evictOneIdleForBootstrap), retirement (retireIfSpent), plain requests that
+// never start a burst instance (EnsureServing) and output (one log buffer per
+// spec, a further instance's lines prefixed "[#k] ").
 package runtime
 
 import (
@@ -519,9 +521,42 @@ func (m *Manager) Apply(cfg Config) {
 // is refused with ErrInstanceNoCapacity / ErrInstanceDemandUnknown, and is
 // never queued behind anything but its own start.
 func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
+	return m.ensure(ctx, upstreamModel, false)
+}
+
+// EnsureServing is EnsureRunning for a PLAIN request -- one the router forwards
+// to the child (a proxied or live request), not an ensure (#340, design §5.4
+// rule 6). It is EnsureRunning with one exception: a request naming a BURST
+// instance (IsBurst) is served only by a process that is already there. A
+// running one serves it, and a starting one -- admitted already -- has it wait
+// for that start. In any other state (no state at all, stopped, draining, or
+// resting at a failure) the request is refused at once with
+// ErrInstanceNoCapacity, and nothing is created, started, retired or replaced.
+//
+// Burst capacity is started on purpose: the gateway's scaler asks for it with an
+// ensure (EnsureRunning, the router's /ensure/{model}) once it has decided that
+// one more instance is worth a model load on this host. A plain request names
+// m#k only because the gateway saw that instance up a moment ago; when it is not
+// up any more (idle-unloaded or crashed since), starting it on the request path
+// would add capacity nobody decided on and make the request wait out a cold
+// start, while the refusal lets the gateway re-select a running instance at
+// once. Instance 0 and the protected instances are baseline capacity -- instance
+// 0 is what a request has always started, and a protected instance is wanted up
+// anyway -- and behave exactly as in EnsureRunning.
+//
+// The decision is taken on the owner goroutine in the same turn that resolves
+// the address and reads the instance's state (handleEnsure), so no start can
+// slip in between the check and the request it lets through.
+func (m *Manager) EnsureServing(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
+	return m.ensure(ctx, upstreamModel, true)
+}
+
+// ensure is EnsureRunning and EnsureServing; serving marks a plain request
+// (cmdEnsure.serving).
+func (m *Manager) ensure(ctx context.Context, upstreamModel string, serving bool) (endpoint string, release func(), err error) {
 	reply := make(chan ensureOutcome, 1)
 	select {
-	case m.cmds <- cmdEnsure{model: upstreamModel, reply: reply}:
+	case m.cmds <- cmdEnsure{model: upstreamModel, reply: reply, serving: serving}:
 	case <-ctx.Done():
 		return "", nil, ctx.Err()
 	case <-m.done:
@@ -597,9 +632,12 @@ func (m *Manager) LoadedModels() []string {
 }
 
 // ResolveAddress resolves a model name as the router receives it to the base
-// upstream model and the instance index it addresses (#340, Ruling R1): ok is
-// false for anything that is not a managed address. It is the one resolution
-// rule the router and EnsureRunning share (owner.resolveAddress):
+// upstream model and the instance index it addresses (#340): ok is false for
+// anything that is not a managed address. It is the one resolution rule the
+// router and the ensures (EnsureRunning, EnsureServing) share
+// (owner.resolveAddress) -- one rule in one place, so the name the router hands
+// the child and the instance the request is admitted to are never read off two
+// rules that could disagree:
 //
 //   - an EXACT match on a managed upstream model wins first and is instance 0,
 //     so a real model whose name merely contains '#' ("foo#2") keeps routing
@@ -610,8 +648,8 @@ func (m *Manager) LoadedModels() []string {
 //     max_instances and MaxInstanceIndex).
 //
 // It answers from the owner's current index and creates nothing; a later
-// EnsureRunning re-resolves on its own, so an Apply landing in between is
-// harmless.
+// ensure re-resolves on its own, so an Apply landing in between decides that
+// ensure's answer (a refusal when the push removed the address).
 func (m *Manager) ResolveAddress(model string) (base string, k int, ok bool) {
 	reply := make(chan resolvedAddress, 1)
 	m.postCmd(cmdResolve{model: model, reply: reply})
@@ -879,6 +917,9 @@ func (cmdApply) isCommand() {}
 type cmdEnsure struct {
 	model string
 	reply chan ensureOutcome
+	// serving is set by EnsureServing: a plain request, which a burst instance
+	// serves only while it is running or starting (plainRequestRefused).
+	serving bool
 }
 
 func (cmdEnsure) isCommand() {}
@@ -1589,9 +1630,10 @@ func (o *owner) applyConfig(cfg Config) {
 		}
 		if holder, held := o.instanceAddressHolder(base, st.instance); held {
 			// The push made this instance's address another spec's literal
-			// model, so from now on every request for it reaches that spec
-			// (Ruling R1): the instance is out of reach, and leaves the way a
-			// disallowed one does, draining first.
+			// model, so from now on every request for it reaches that spec (an
+			// exact upstream match wins over an instance address,
+			// resolveAddress): the instance is out of reach, and leaves the way
+			// a disallowed one does, draining first.
 			if !st.removed {
 				slog.Warn("runtime: an instance address of a replicable spec is now another spec's upstream model, which it routes to; that instance drains and is removed",
 					"spec", base.ID, "instance", st.instance, "address", InstanceAddress(base.UpstreamModel, st.instance), "conflicting_spec", holder)
@@ -1954,6 +1996,11 @@ func (o *owner) rebuildUpstreamIndex() {
 // stickiness. See docs/architecture/cross-cutting/agent-runtime-manager.md
 // §6 (final paragraph) for the full reasoning, including the two endpoints
 // that were tried and rejected.
+//
+// A plain request (EnsureServing, cmdEnsure.serving) differs in one place: it
+// is refused with ErrInstanceNoCapacity, creating and starting nothing, when it
+// names a burst instance that is neither running nor starting
+// (plainRequestRefused).
 func (o *owner) handleEnsure(c cmdEnsure) {
 	if o.closing {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
@@ -1973,6 +2020,13 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 	if k > 0 {
+		// Decided before instanceForRequest, which would create the instance, or
+		// retire a failed one and start over -- exactly what a plain request must
+		// not do to a burst instance (EnsureServing).
+		if c.serving && o.plainRequestRefused(st, k) {
+			c.reply <- ensureOutcome{err: ErrInstanceNoCapacity}
+			return
+		}
 		st = o.instanceForRequest(st, k)
 		specID = st.spec.ID
 	}
@@ -2014,7 +2068,7 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 }
 
 // resolveAddress is Manager.ResolveAddress on the owner, and the rule
-// handleEnsure resolves a request with (#340, Ruling R1). specID is the BASE
+// handleEnsure resolves a request with (#340). specID is the BASE
 // spec's ID (instance 0's key); base is the base upstream model; k the
 // instance index. An exact byUpstream match always wins and is instance 0 --
 // even when its state has since gone, in which case the name is simply not
@@ -2044,8 +2098,9 @@ func (o *owner) resolveAddress(model string) (specID, base string, k int, ok boo
 
 // instanceAddressHolder reports whether the address of instance k >= 1 of spec
 // is another spec's literal upstream model, and names that spec. resolveAddress
-// routes an exact upstream match first (Ruling R1), so every request for such an
-// address reaches the other spec and the instance could never be reached: a
+// routes an exact upstream match first -- a real model whose name merely contains
+// '#' must keep reaching its own spec -- so every request for such an address
+// reaches the other spec and the instance could never be reached: a
 // protected one would hold its resources for nothing, and its status row would
 // claim the other spec's model name -- in LoadedModels, and in the router's
 // /upstream relay, which answers from the first running row of that name. It
@@ -2055,6 +2110,27 @@ func (o *owner) resolveAddress(model string) (specID, base string, k int, ok boo
 func (o *owner) instanceAddressHolder(spec Spec, k int) (holder string, held bool) {
 	holder, held = o.byUpstream[InstanceAddress(spec.UpstreamModel, k)]
 	return holder, held && holder != spec.ID
+}
+
+// plainRequestRefused reports whether a plain request (EnsureServing) naming
+// instance k >= 1 of base's spec is refused: k is a burst instance that is
+// neither running nor starting. Burst is read off the pushed spec (IsBurst), so
+// an instance with no state at all is classified too. A running burst instance
+// serves the request, a starting one has been admitted already and the request
+// waits for its start, and a protected instance is admitted as for any request.
+func (o *owner) plainRequestRefused(base *specState, k int) bool {
+	if !IsBurst(base.spec, k) {
+		return false
+	}
+	st := o.specs[InstanceKey(base.spec.ID, k)]
+	switch {
+	case st == nil:
+		return true
+	case st.state == StateStarting:
+		return false
+	default:
+		return st.state != StateRunning || st.proc == nil
+	}
 }
 
 // instanceForRequest returns the state of instance k of base's spec for a
@@ -2233,11 +2309,22 @@ func (o *owner) setState(st *specState, s State) {
 	}
 }
 
+// setNotPermitted records the not_permitted refusal and fails st's queued
+// requests with it.
+//
+// A refused instance is not waiting to start (lowerSiblingWaiting), so a
+// protected sibling above it that was held back for it is re-asked here, on the
+// spot (wakeSiblingsWaitingFor): the paths that refuse an instance -- its
+// crash-loop retry, a request naming it, the dry run of its start -- ask that one
+// instance alone, and nothing else would ask the held sibling until an unrelated
+// event, leaving a request queued on it to its admission timeout. Every refusal
+// goes through here or through setPendingVRAMUnknown.
 func (o *owner) setNotPermitted(st *specState, message string) {
 	o.setState(st, StateNotPermitted)
 	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
 	st.lastError = &LastError{Message: message, At: time.Now()}
 	o.failPending(st, ErrNotPermitted)
+	o.wakeSiblingsWaitingFor(st)
 }
 
 // setPendingVRAMUnknown records the terminal unknown-VRAM block, and records
@@ -2249,6 +2336,9 @@ func (o *owner) setNotPermitted(st *specState, message string) {
 // Rule 4's block is the candidate's own demand, needs no name, and sends no
 // message -- lastError is then left exactly as it was rather than being
 // blanked, since it may still describe a real earlier failure of this spec.
+//
+// Like setNotPermitted, it re-asks a protected sibling held back for st, which a
+// refused st no longer holds back.
 func (o *owner) setPendingVRAMUnknown(st *specState, message string) {
 	o.setState(st, StatePendingVRAMUnknown)
 	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
@@ -2256,6 +2346,7 @@ func (o *owner) setPendingVRAMUnknown(st *specState, message string) {
 		st.lastError = &LastError{Message: message, At: time.Now()}
 	}
 	o.failPending(st, ErrAdmissionBlocked)
+	o.wakeSiblingsWaitingFor(st)
 }
 
 // noteAdmissionWait records a queued spec's reason for waiting as its
@@ -2792,12 +2883,26 @@ func (o *owner) lowerSiblingWaiting(st *specState) (lower int, waits bool) {
 
 // wakeSiblingsWaitingFor re-asks, lowest index first, the further instances of
 // st's spec that the start-order rule held back (specState.waitingOnSibling),
-// now that st has just been given a process. Each is admitted on its own merits
-// again -- it may still find no room, or wait for another lower sibling -- and
-// one that does start re-asks those above it in turn. Without this they would be
-// asked again only when st's start finishes (wakeAfterStart), so two instances
-// whose crash-loop retries fell due in the wrong order would load one after
-// the other instead of side by side.
+// now that st has just been given a process -- or has just been refused, which
+// ends their wait as surely (setNotPermitted, setPendingVRAMUnknown). Each is
+// admitted on its own merits again -- it may still find no room, or wait for
+// another lower sibling -- and one that starts or is refused re-asks those above
+// it in turn. Without this they would be asked again only at some later event
+// (wakeAfterStart when st's start finishes, nothing at all when st is refused),
+// so two instances whose crash-loop retries fell due in the wrong order would
+// load one after the other instead of side by side, and a request queued on a
+// held instance would wait for its admission timeout instead of getting its
+// own verdict.
+//
+// An instance a deeper level of this cascade has already re-asked -- reached
+// through a sibling between it and st that started or was refused meanwhile --
+// is skipped when that ask settled it: it has a process now, or its verdict
+// cleared waitingOnSibling (every verdict rewrites the flag). Asking it again
+// would repeat the same admission decision once per level the cascade unwinds
+// through, and each decision builds a snapshot, which calls the VRAM measurer
+// (a subprocess on a real host). One held back again, behind a sibling that
+// still waits, is asked again at no cost: the start-order rule answers before
+// any snapshot is built.
 func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 	base := specBase(st.spec)
 	var ids []string
@@ -2808,6 +2913,9 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 	}
 	o.sortInstanceOrder(ids)
 	for _, id := range ids {
+		if sib := o.specs[id]; sib == nil || !sib.waitingOnSibling || sib.proc != nil {
+			continue
+		}
 		o.admitAndStart(id)
 	}
 }

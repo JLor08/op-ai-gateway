@@ -131,8 +131,19 @@ type RuntimeErrorSample struct {
 // nil, not an empty array, when nothing was measured this cycle -- e.g. no
 // measurer installed, or the spec is not yet running).
 type RuntimeSample struct {
-	SpecID         string    `json:"spec_id"`
-	Model          string    `json:"model"`
+	SpecID string `json:"spec_id"`
+	// Model is the row's instance address (runtime.Status.Model): the spec's
+	// upstream model for instance 0, "m#k" for instance k.
+	Model string `json:"model"`
+	// Instance is the row's instance index within its spec (#340), 0 for a
+	// spec that never replicates; with SpecID it identifies the row. Always on
+	// the wire, 0 included.
+	Instance int `json:"instance"`
+	// StartupMS is the process's measured cold start: milliseconds from exec to
+	// its first passing health probe on its last successful start (#340,
+	// runtime.Status.StartupMS), for every spec, replicable or not. 0 means
+	// unknown and is omitted.
+	StartupMS      int       `json:"startup_ms,omitempty"`
 	State          string    `json:"state"`
 	Since          time.Time `json:"since"`
 	PID            int       `json:"pid,omitempty"`

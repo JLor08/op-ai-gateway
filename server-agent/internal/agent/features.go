@@ -312,9 +312,18 @@ var Features = []Feature{
 	// runtime_instances: this agent runs several instances (processes) of one
 	// runtime spec (#340). It reads the spec-level replicable/min_instances/
 	// max_instances fields of the runtime-config document, serves each extra
-	// instance under the model address "m#k" (k = 1...), and reports one status
+	// instance under the model address "m#k" (k = 1...) -- its router hands the
+	// child the base name m in the address's place -- and reports one status
 	// row per instance (runtime.Status.Instance, with the process's measured
 	// startup_ms).
+	//
+	// The precondition runs the other way as well: the agent honours a spec's
+	// replicable flag only while the GATEWAY declares runtime_instances in its
+	// own feature set (runtime.Driver.Sync clears the flag otherwise, in file
+	// mode too, and applies the document again when the declaration changes).
+	// Several status rows under one spec_id are something only such a gateway
+	// knows how to fold, so instances run only when both sides declare the name;
+	// against any other gateway every spec runs as its single process.
 	//
 	// Unlike runtime_role_eviction, the GATEWAY gates real behavior on this flag,
 	// fail-closed: it expands a replicable model into "m#k" candidates, routes to

@@ -112,6 +112,8 @@ type driverManager interface {
 	Status() []Status
 	Transitions() <-chan struct{}
 	EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	EnsureServing(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	ResolveAddress(model string) (base string, k int, ok bool)
 	LoadedModels() []string
 	AppliedETag() string
 }

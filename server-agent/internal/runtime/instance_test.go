@@ -101,6 +101,33 @@ func TestInstanceAddressRoundTrip(t *testing.T) {
 	}
 }
 
+// TestInstanceBase: the base name of an address, given its index -- the index,
+// not the shape of the name, decides whether there is a suffix to drop, so a
+// literal name with '#' in it stays whole at instance 0 and keeps its own '#'
+// as the base of a further instance.
+func TestInstanceBase(t *testing.T) {
+	for _, tc := range []struct {
+		address string
+		k       int
+		want    string
+	}{
+		{"m", 0, "m"},
+		{"m#2", 2, "m"},
+		{"foo#2", 0, "foo#2"},
+		{"foo#2#1", 1, "foo#2"},
+		{"org/model#63", 63, "org/model"},
+	} {
+		if got := InstanceBase(tc.address, tc.k); got != tc.want {
+			t.Errorf("InstanceBase(%q, %d) = %q, want %q", tc.address, tc.k, got, tc.want)
+		}
+	}
+	for k := 0; k <= MaxInstanceIndex; k++ {
+		if got := InstanceBase(InstanceAddress("a#1", k), k); got != "a#1" {
+			t.Fatalf("InstanceBase(InstanceAddress(a#1, %d), %d) = %q, want a#1", k, k, got)
+		}
+	}
+}
+
 func TestInstanceAllowed(t *testing.T) {
 	for _, tc := range []struct {
 		name string

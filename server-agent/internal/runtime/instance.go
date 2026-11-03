@@ -62,6 +62,18 @@ func ParseInstanceAddress(model string) (base string, k int) {
 	return model[:i], n
 }
 
+// InstanceBase is InstanceAddress's inverse for a known index: the base name of
+// the address of instance k -- address without its "#k" suffix for k >= 1, and
+// address itself for k == 0, a real model whose name merely contains '#'
+// included, which only the index tells apart from an instance address. It is how
+// a status row (Model, Instance) names the model its process was launched with.
+func InstanceBase(address string, k int) string {
+	if k == 0 {
+		return address
+	}
+	return strings.TrimSuffix(address, instanceSeparator+strconv.Itoa(k))
+}
+
 // plainInstanceIndex reports whether s is one or two ASCII digits with no
 // leading zero. strconv.Atoi alone would also accept a sign and underscore
 // grouping, none of which an instance address may carry.

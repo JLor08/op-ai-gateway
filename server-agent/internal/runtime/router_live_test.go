@@ -162,8 +162,15 @@ type ensureErrManager struct{ err error }
 func (e ensureErrManager) EnsureRunning(context.Context, string) (string, func(), error) {
 	return "", nil, e.err
 }
-func (e ensureErrManager) LoadedModels() []string { return nil }
-func (e ensureErrManager) Status() []Status       { return nil }
+
+func (e ensureErrManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	return e.EnsureRunning(ctx, model)
+}
+
+// ResolveAddress names no instance address: every model is its own, instance 0.
+func (e ensureErrManager) ResolveAddress(string) (string, int, bool) { return "", 0, false }
+func (e ensureErrManager) LoadedModels() []string                    { return nil }
+func (e ensureErrManager) Status() []Status                          { return nil }
 
 // TestRouterLiveUnknownOrEmptyModelReturns404 covers the three ways POST
 // /live/{model} has no model to route on: a nil manager, an empty path model

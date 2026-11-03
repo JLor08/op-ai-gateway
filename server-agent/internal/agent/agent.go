@@ -825,7 +825,8 @@ type Agent struct {
 	runtimeConfigAck runtimeConfigAcknowledger
 
 	// runtimeCtxCache caches each running child's probed context size
-	// (Task 9), keyed by SpecID -- see runtimeCtxEntry and
+	// (Task 9), keyed by the row's instance key (runtimeProbeKey: SpecID, and
+	// "SpecID#k" for instance k) -- see runtimeCtxEntry and
 	// probeRuntimeChild. collectOnce is the only method that touches this
 	// map, and it runs exclusively from the single Run goroutine (Run's
 	// three call sites, agent.go ~639/672/700), so no mutex is needed here.
@@ -834,7 +835,8 @@ type Agent struct {
 	runtimeCtxCache map[string]runtimeCtxEntry
 
 	// runtimeCapabilityCache caches every /props-derived verdict for a
-	// running child's current pid generation, keyed by SpecID -- see
+	// running child's current pid generation, keyed by the row's instance key
+	// (runtimeProbeKey) -- see
 	// runtimeCapabilityEntry and probeRuntimeChildProps. It started as just
 	// the live-progress-capability verdict (task 4 of #51) and was widened
 	// (#49-2) to the full collector.PropsVerdicts (live-progress plus the
@@ -1477,7 +1479,7 @@ func (a *Agent) appliedConfigETag() string {
 //
 // model joins the invalidation key for the same reason Type and
 // ContextProbePath already did, plus one specific to Ollama (issue #54): an
-// ollama-typed spec's context probe now POSTs {"model": st.Model} (the model
+// ollama-typed spec's context probe now POSTs {"model": <probeModel>} (the model
 // determines WHICH model's context length /api/show reports, not just how
 // the body is shaped), so the runtime manager repointing a running
 // `ollama serve` instance at a different model -- same PID, same Type, same
@@ -1549,9 +1551,9 @@ type runtimeCtxEntry struct {
 // Caching it stops probeRuntimeChildProps from re-asking a question this
 // pid's binary can never answer differently, without ever fabricating a
 // verdict it did not actually observe. A merely-absent map entry (no key for
-// st.SpecID, or a stale pid) is the "never determined, and nothing yet says
-// the answer is stable" case, and is NOT the same as a present entry holding
-// the zero value.
+// the row's runtimeProbeKey, or a stale pid) is the "never determined, and
+// nothing yet says the answer is stable" case, and is NOT the same as a
+// present entry holding the zero value.
 //
 // This cache exists SEPARATELY from runtimeCtxCache on purpose (step 2 of
 // task 4): a context-probe cache hit is proof only that the CONTEXT probe
@@ -1581,17 +1583,17 @@ type runtimeCapabilityEntry struct {
 // idle 0. client is shared across all children probed this cycle.
 //
 // Metrics are scraped every call. Context is probed at most once per child
-// lifetime: a cache hit for st.SpecID with the SAME st.PID, st.Type,
-// st.ContextProbePath, and st.Model reuses the stored size (and reports
-// "ok" -- a cached size means a prior probe on this exact generation already
+// lifetime: a cache hit for the row's runtimeProbeKey with the SAME st.PID,
+// st.Type, st.ContextProbePath, and probe model reuses the stored size (and
+// reports "ok" -- a cached size means a prior probe on this exact generation already
 // succeeded); a PID mismatch (the child restarted), a
 // Type/ContextProbePath/Model mismatch (the runtime manager's config
 // reconciliation changed a RUNNING spec's probe config, or repointed it at a
 // different model, without restarting the process), or a cache miss all
 // re-probe. Model joined the cache key in #54, alongside the fix that
 // finally lets an ollama-typed spec's context probe succeed at all: its
-// POST body carries st.Model, so a config edit that only changes the model
-// (same PID, same Type, same ContextProbePath -- e.g. `ollama serve`
+// POST body carries the model (probeModel), so a config edit that only
+// changes the model (same PID, same Type, same ContextProbePath -- e.g. `ollama serve`
 // repointed at a different model) must still force a re-probe, or the cache
 // would keep answering with the PREVIOUS model's context length. A failed
 // metrics or context probe is logged at debug and leaves the corresponding
@@ -1645,8 +1647,9 @@ func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base str
 // returns the reachability state to store on rs.ContextProbe. It also fills
 // rs.ContextSize on a cache hit or a successful (size>0) probe, exactly as
 // probeRuntimeChild did inline before this was split out for readability --
-// the caching semantics (keyed on SpecID, invalidated by a PID/Type/path/
-// model change -- model joined the key in #54, see runtimeCtxEntry), the
+// the caching semantics (keyed on the row's runtimeProbeKey, invalidated by a
+// PID/Type/path/model change -- model joined the key in #54, see
+// runtimeCtxEntry), the
 // deliberate non-caching of a probe error or a non-positive size, and the
 // debug logging are all unchanged.
 func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
@@ -1657,16 +1660,17 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		slog.Debug("skipping unsafe probe path", "spec_id", st.SpecID, "kind", "context", "path", st.ContextProbePath)
 		return "unreachable"
 	}
-	if entry, ok := a.runtimeCtxCache[st.SpecID]; ok && entry.pid == st.PID &&
+	key, model := runtimeProbeKey(st), probeModel(st)
+	if entry, ok := a.runtimeCtxCache[key]; ok && entry.pid == st.PID &&
 		entry.specType == st.Type && entry.contextProbePath == st.ContextProbePath &&
-		entry.model == st.Model {
+		entry.model == model {
 		// A cached size means a prior probe on this exact (pid, type, path,
 		// model) generation already succeeded.
 		rs.ContextSize = entry.size
 		return "ok"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, st.Model)
+	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, model)
 	cancel()
 	if errors.Is(err, collector.ErrRouterMode) {
 		// llama.cpp router mode: /props answered with the router dummy
@@ -1692,15 +1696,39 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 	if a.runtimeCtxCache == nil {
 		a.runtimeCtxCache = make(map[string]runtimeCtxEntry)
 	}
-	a.runtimeCtxCache[st.SpecID] = runtimeCtxEntry{
+	a.runtimeCtxCache[key] = runtimeCtxEntry{
 		pid:              st.PID,
 		specType:         st.Type,
 		contextProbePath: st.ContextProbePath,
-		model:            st.Model,
+		model:            model,
 		size:             size,
 	}
 	rs.ContextSize = size
 	return "ok"
+}
+
+// runtimeProbeKey is the key a status row's probe results are cached under:
+// the row's instance key (runtimectl.InstanceKey) -- its SpecID for instance 0,
+// which is every row of a spec that never replicates, and "SpecID#k" for
+// instance k. A replicable spec reports one row per instance (#340), each its
+// own process with its own pid, so under SpecID alone two instances would
+// overwrite each other's entry on every cycle -- the pid never matching -- and
+// both children would be probed again each time, each answer briefly passing
+// for the other instance's. The keys stay bounded as before: an index is at
+// most runtimectl.MaxInstanceIndex, and a retired instance's key is the one its
+// successor at that index reuses.
+func runtimeProbeKey(st runtimectl.Status) string {
+	return runtimectl.InstanceKey(st.SpecID, st.Instance)
+}
+
+// probeModel is the model a probe names to st's child: the BASE upstream model,
+// also on the row of a further instance (#340), whose Model is its instance
+// address "m#k". Every instance's child is launched with the base name -- the
+// router hands it that name in place of the address on every request -- so the
+// address is a model it does not know: Ollama's /api/show would be asked about
+// a model it does not serve, and audio.cpp's listing has no entry for it.
+func probeModel(st runtimectl.Status) string {
+	return runtimectl.InstanceBase(st.Model, st.Instance)
 }
 
 // gatewayDeclares reports whether the gateway declares name, as of the last
@@ -1775,7 +1803,7 @@ func (a *Agent) clock() time.Time {
 // gate below):
 //
 //   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
-//     {"model": st.Model} (#54). Ollama serves no /props at all, so probing
+//     {"model": <probeModel>} (#54). Ollama serves no /props at all, so probing
 //     it would spend a round trip to learn nothing; its capability array is
 //     the only surface there is. That verdict set carries capabilities only
 //     -- its LiveProgress is ALWAYS "", because Ollama exposes no
@@ -1789,7 +1817,8 @@ func (a *Agent) clock() time.Time {
 //   - "audio_cpp": collector.ProbeAudioCppVerdicts GETs
 //     collector.AudioCppModelsPath ("/v1/models"), audio.cpp's only
 //     capability signal: each listed model carries a task, and the entry for
-//     st.Model answers the speech and transcription capabilities as "yes" or
+//     the probe model (probeModel -- the base model, on an instance's row too)
+//     answers the speech and transcription capabilities as "yes" or
 //     "no" and, for an asr model, the transcription_streaming capability from
 //     its mode (for a tts or clon model, speech_streaming from its mode),
 //     and nothing else; its LiveProgress is ALWAYS "", because audio.cpp has no
@@ -1865,7 +1894,7 @@ func (a *Agent) clock() time.Time {
 //     process keeps running, because the binary behind it does not change.
 //     Cache it -- zero value included -- in runtimeCapabilityCache, keyed
 //     and invalidated like runtimeCtxCache (a changed st.PID, st.Type or
-//     st.Model re-arms the question -- see runtimeCapabilityEntry for why
+//     probe model re-arms the question -- see runtimeCapabilityEntry for why
 //     the type and the model have to be in that key), so this pid's
 //     endpoint is asked at most once per generation, not once per cycle.
 //   - TRANSIENT (a connection refused, a timeout, or an unparseable/
@@ -1910,8 +1939,9 @@ func (a *Agent) clock() time.Time {
 // miss both set it after the gate checks above, never before them. No other
 // probe sets the collector field, so it stays nil for every other type.
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
-	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID &&
-		entry.specType == st.Type && entry.model == st.Model {
+	key, model := runtimeProbeKey(st), probeModel(st)
+	if entry, ok := a.runtimeCapabilityCache[key]; ok && entry.pid == st.PID &&
+		entry.specType == st.Type && entry.model == model {
 		// A cached verdict set means a prior probe on this exact
 		// (pid, type, model) generation already answered conclusively --
 		// and entry.source names the probe that answered.
@@ -1958,13 +1988,13 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 	switch st.Type {
 	case "ollama":
 		source = sample.CapabilitySourceOllamaAPIShow
-		verdicts, stable = collector.ProbeOllamaVerdicts(cctx, client, base, st.Model)
+		verdicts, stable = collector.ProbeOllamaVerdicts(cctx, client, base, model)
 	case "stable_diffusion_cpp":
 		source = sample.CapabilitySourceSdcppCapabilities
 		verdicts, stable = collector.ProbeSdcppVerdicts(cctx, client, base)
 	case "audio_cpp":
 		source = sample.CapabilitySourceAudioCppModels
-		verdicts, stable = collector.ProbeAudioCppVerdicts(cctx, client, base, st.Model)
+		verdicts, stable = collector.ProbeAudioCppVerdicts(cctx, client, base, model)
 	default:
 		source = sample.CapabilitySourceLlamaCppProps
 		verdicts, stable = collector.ProbePropsVerdicts(cctx, client, base)
@@ -1979,10 +2009,10 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 	if a.runtimeCapabilityCache == nil {
 		a.runtimeCapabilityCache = make(map[string]runtimeCapabilityEntry)
 	}
-	a.runtimeCapabilityCache[st.SpecID] = runtimeCapabilityEntry{
+	a.runtimeCapabilityCache[key] = runtimeCapabilityEntry{
 		pid:      st.PID,
 		specType: st.Type,
-		model:    st.Model,
+		model:    model,
 		source:   source,
 		verdicts: verdicts,
 	}
@@ -2347,14 +2377,16 @@ func (a *Agent) collectOnce(ctx context.Context) {
 			probeClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			for _, st := range statuses {
 				rs := sample.RuntimeSample{
-					SpecID:   st.SpecID,
-					Model:    st.Model,
-					State:    string(st.State),
-					Since:    st.Since,
-					PID:      st.PID,
-					Port:     st.Port,
-					InFlight: st.InFlight,
-					Restarts: st.Restarts,
+					SpecID:    st.SpecID,
+					Model:     st.Model,
+					Instance:  st.Instance,
+					StartupMS: st.StartupMS,
+					State:     string(st.State),
+					Since:     st.Since,
+					PID:       st.PID,
+					Port:      st.Port,
+					InFlight:  st.InFlight,
+					Restarts:  st.Restarts,
 				}
 				if len(st.MeasuredVRAM) > 0 {
 					gpus := make([]sample.RuntimeGPUSample, 0, len(st.MeasuredVRAM))

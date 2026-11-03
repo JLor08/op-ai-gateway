@@ -1046,7 +1046,8 @@ func assertFooHash2IsL(t *testing.T, m *Manager) {
 
 // TestProtectedFloorSkipsAnAddressThatIsAnotherSpecsModel: foo#2 is the
 // literal upstream model of L, so it routes to L however F (upstream foo)
-// replicates (Ruling R1) -- instance 2 of F can never be addressed. F's floor
+// replicates (an exact upstream match wins over an instance address) --
+// instance 2 of F can never be addressed. F's floor
 // (min_instances 3) therefore stops short of that instance instead of starting
 // a protected process nobody can reach whose row claims L's model name (in
 // LoadedModels, and in the router's /upstream relay, which answers from the
@@ -2495,4 +2496,428 @@ func TestFurtherInstanceStartsAlongsideTheSiblingItWaitedFor(t *testing.T) {
 
 	setGate(true)
 	waitUntil(t, 5*time.Second, "both instances running once the gate opens", bothRunning)
+}
+
+// ---------------------------------------------------------------------------
+// Plain requests (EnsureServing) and the re-asks of a protected instance held
+// back behind a lower sibling.
+// ---------------------------------------------------------------------------
+
+// servingAsync is ensureAsync for EnsureServing.
+func servingAsync(ctx context.Context, m *Manager, model string) <-chan queuedEnsure {
+	out := make(chan queuedEnsure, 1)
+	go func() {
+		ep, rel, err := m.EnsureServing(ctx, model)
+		out <- queuedEnsure{endpoint: ep, release: rel, err: err}
+	}()
+	return out
+}
+
+// servingOwner is an owner-level fixture for handleEnsure: instance 0 of spec
+// resting at Stopped, the given further states, the stub child allowlisted and
+// the routing index built, so a request is resolved without a run loop.
+func servingOwner(spec Spec, states ...*specState) *owner {
+	o := instanceOwner(append([]*specState{restingInstance(spec, 0, StateStopped)}, states...)...)
+	o.policy = allowlistPolicy()
+	o.rebuildUpstreamIndex()
+	return o
+}
+
+// answered returns what was sent on reply, and whether anything was: a request
+// the owner queued has no answer yet.
+func answered(reply chan ensureOutcome) (ensureOutcome, bool) {
+	select {
+	case out := <-reply:
+		return out, true
+	default:
+		return ensureOutcome{}, false
+	}
+}
+
+// TestEnsureServingNeverStartsABurstInstance: a plain request (EnsureServing)
+// naming a burst instance is served by it while it runs and waits for it while
+// it starts -- its admission has already happened. In every other state it is
+// refused at once with ErrInstanceNoCapacity, and nothing is created, started,
+// retired or replaced: starting burst capacity is an ensure's decision (§5.4
+// rule 6), and the gateway re-selects a running instance for the request.
+func TestEnsureServingNeverStartsABurstInstance(t *testing.T) {
+	spec := replicableSpec("S", "m")
+	spec.AdmissionWaitTimeoutSeconds = 0 // no admission timer on a bare owner
+	live := func(state State) *specState {
+		st := liveInstance(spec, 1, 101)
+		st.state = state
+		st.proc.port = 4242
+		st.proc.everHealthy = state != StateStarting
+		return st
+	}
+	for _, tc := range []struct {
+		name   string
+		burst  *specState // nil: instance 1 has no state at all
+		want   error      // nil: served (running) or queued (starting)
+		queued bool
+	}{
+		{name: "no state", want: ErrInstanceNoCapacity},
+		{name: "stopped", burst: restingInstance(spec, 1, StateStopped), want: ErrInstanceNoCapacity},
+		{name: "crashed", burst: restingInstance(spec, 1, StateCrashed), want: ErrInstanceNoCapacity},
+		{name: "start failed", burst: restingInstance(spec, 1, StateStartFailed), want: ErrInstanceNoCapacity},
+		{name: "not permitted", burst: restingInstance(spec, 1, StateNotPermitted), want: ErrInstanceNoCapacity},
+		{name: "draining", burst: live(StateDraining), want: ErrInstanceNoCapacity},
+		{name: "starting", burst: live(StateStarting), queued: true},
+		{name: "running", burst: live(StateRunning)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var states []*specState
+			var before State
+			if tc.burst != nil {
+				states = append(states, tc.burst)
+				before = tc.burst.state
+			}
+			o := servingOwner(spec, states...)
+			reply := make(chan ensureOutcome, 1)
+
+			o.handleEnsure(cmdEnsure{model: "m#1", reply: reply, serving: true})
+
+			out, ok := answered(reply)
+			switch {
+			case tc.want != nil:
+				if !ok || !errors.Is(out.err, tc.want) {
+					t.Fatalf("EnsureServing(m#1) answered %v (answered at once: %v), want %v at once", out.err, ok, tc.want)
+				}
+				if got := o.specs["S#1"]; got != tc.burst {
+					t.Errorf("instance 1 state is %p after the refusal, want %p: a plain request creates, retires and replaces nothing", got, tc.burst)
+				}
+				if tc.burst != nil && (tc.burst.state != before || len(tc.burst.pending) != 0) {
+					t.Errorf("instance 1 = %s with %d queued, want it left at %s with nothing queued", tc.burst.state, len(tc.burst.pending), before)
+				}
+			case tc.queued:
+				if ok {
+					t.Fatalf("EnsureServing(m#1) answered %+v at once, want it to wait for the start in progress", out)
+				}
+				if len(tc.burst.pending) != 1 {
+					t.Errorf("instance 1 has %d queued requests, want 1", len(tc.burst.pending))
+				}
+			default:
+				if !ok || out.err != nil || out.endpoint != endpointFor(4242) {
+					t.Fatalf("EnsureServing(m#1) = %+v (answered %v), want instance 1's endpoint %s", out, ok, endpointFor(4242))
+				}
+				if tc.burst.inFlight != 1 {
+					t.Errorf("instance 1 InFlight = %d, want 1", tc.burst.inFlight)
+				}
+			}
+			if s0 := o.specs["S"]; s0.state != StateStopped || s0.proc != nil || len(s0.pending) != 0 {
+				t.Errorf("instance 0 = %s (process %v, %d queued), want it untouched", s0.state, s0.proc != nil, len(s0.pending))
+			}
+		})
+	}
+}
+
+// TestEnsureServingAdmitsBaselineInstancesLikeEnsureRunning: instance 0 and a
+// protected instance are baseline capacity, which any request may bring up, so
+// EnsureServing hands them to admission exactly as EnsureRunning does -- the
+// answer is admission's own, never a capacity refusal.
+func TestEnsureServingAdmitsBaselineInstancesLikeEnsureRunning(t *testing.T) {
+	t.Run("instance 0", func(t *testing.T) {
+		spec := replicableSpec("S", "m")
+		spec.AdmissionWaitTimeoutSeconds = 0
+		o := servingOwner(spec)
+		o.policy = LocalPolicy{} // allows no binary: admission answers without starting anything
+		reply := make(chan ensureOutcome, 1)
+
+		o.handleEnsure(cmdEnsure{model: "m", reply: reply, serving: true})
+
+		if out, ok := answered(reply); !ok || !errors.Is(out.err, ErrNotPermitted) {
+			t.Fatalf("EnsureServing(m) answered %v (at once: %v), want admission's own ErrNotPermitted", out.err, ok)
+		}
+	})
+	t.Run("a protected instance", func(t *testing.T) {
+		spec := replicableSpec("S", "m")
+		spec.MinInstances = 2
+		spec.AdmissionWaitTimeoutSeconds = 0
+		s1 := restingInstance(spec, 1, StateStopped)
+		o := servingOwner(spec, s1) // instance 0 still waits to start
+		reply := make(chan ensureOutcome, 1)
+
+		o.handleEnsure(cmdEnsure{model: "m#1", reply: reply, serving: true})
+
+		if out, ok := answered(reply); ok {
+			t.Fatalf("EnsureServing(m#1) answered %v at once, want it queued like EnsureRunning: instance 1 is protected", out.err)
+		}
+		if len(s1.pending) != 1 || !s1.waitingOnSibling {
+			t.Errorf("instance 1 has %d queued (waitingOnSibling %v), want the request queued behind instance 0's start", len(s1.pending), s1.waitingOnSibling)
+		}
+	})
+}
+
+// TestEnsureServingServesABurstInstanceOnlyOnceItIsUp drives the same rule
+// through the real manager: a plain request for a burst instance nobody started
+// is refused at once and starts nothing; once an ensure has started it, a plain
+// request is served by that very process. Instance 0 is started by a plain
+// request as it always was.
+func TestEnsureServingServesABurstInstanceOnlyOnceItIsUp(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, rel, err := m.EnsureServing(ctx, "m#1"); !errors.Is(err, ErrInstanceNoCapacity) {
+		if rel != nil {
+			rel()
+		}
+		t.Fatalf("EnsureServing(m#1) with nothing started = %v, want ErrInstanceNoCapacity", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the refusal took %s, want it immediate", took)
+	}
+	if rows := m.Status(); len(rows) != 1 || rows[0].Instance != 0 || rows[0].State != StateStopped {
+		t.Fatalf("Status() = %+v, want instance 0 alone and stopped: a plain request starts no burst instance", rows)
+	}
+
+	ep, release := ensureModel(t, m, "m#1") // what the gateway's scaler does
+	release()
+	got, rel, err := m.EnsureServing(ctx, "m#1")
+	if err != nil {
+		t.Fatalf("EnsureServing(m#1) once instance 1 runs = %v, want it served", err)
+	}
+	defer rel()
+	if got != ep {
+		t.Errorf("EnsureServing(m#1) endpoint = %s, want instance 1's %s", got, ep)
+	}
+
+	ep0, rel0, err := m.EnsureServing(ctx, "m")
+	if err != nil {
+		t.Fatalf("EnsureServing(m) = %v, want instance 0 started and served", err)
+	}
+	defer rel0()
+	if st := mustInstance(t, m, "S", 0); st.State != StateRunning || endpointFor(st.Port) != ep0 {
+		t.Errorf("instance 0 = %+v, want running behind %s", st, ep0)
+	}
+}
+
+// TestEnsureServingQueuesBehindAStartingBurstInstance: a burst instance an
+// ensure is starting has been admitted already, so a plain request for it waits
+// for that start exactly as EnsureRunning does, and is served when it finishes.
+func TestEnsureServingQueuesBehindAStartingBurstInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec, openGate := gatedSpec(t, "S", "m")
+	spec.Replicable = true
+	spec.RAMMB = 64
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ensured := ensureAsync(ctx, m, "m#1")
+	waitUntil(t, 5*time.Second, "instance 1 starting", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateStarting
+	})
+	served := servingAsync(ctx, m, "m#1")
+	select {
+	case r := <-served:
+		t.Fatalf("EnsureServing(m#1) while instance 1 starts answered before the start finished: %+v, want it to wait", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	openGate()
+	r1, r2 := <-ensured, <-served
+	if r1.err != nil || r2.err != nil {
+		t.Fatalf("EnsureRunning / EnsureServing(m#1) = %v / %v, want both served once the start finished", r1.err, r2.err)
+	}
+	defer r1.release()
+	defer r2.release()
+	if r1.endpoint != r2.endpoint {
+		t.Errorf("endpoints %s / %s, want one process serving both", r1.endpoint, r2.endpoint)
+	}
+}
+
+// TestSiblingCascadeAsksEachHeldInstanceOnce: four protected instances, and
+// room for three of them once the busy neighbour U is gone. Instances 1-3 are
+// held back behind instance 0 (lowerSiblingWaiting). When instance 0 starts,
+// the cascade re-asks them: each one that starts re-asks those above it in
+// turn. Instance 3, which does not fit, must be asked by the cascade ONCE --
+// not once more at every level the cascade unwinds through -- because every ask
+// is a full admission decision, and each decision calls the VRAM measurer (a
+// subprocess on a real host). The only other ask in that turn is the exit's own
+// wake, so instance 3 is decided twice in all.
+func TestSiblingCascadeAsksEachHeldInstanceOnce(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setIdleTick(t, time.Hour) // no housekeeping beat: every measurer call is an admission decision or a start's measurement
+	m := newTestManager(t, allowlistPolicy())
+	var (
+		mu    sync.Mutex
+		sizes []int // how many live processes each measurer call was asked about
+	)
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		mu.Lock()
+		sizes = append(sizes, len(pids))
+		mu.Unlock()
+		return nil
+	})
+
+	u := baseSpec("U", "u")
+	u.GPUs = []SpecGPU{{Index: 0, VRAMMB: 3000}}
+	budget := []GPUBudget{{Index: 0, BudgetMB: 3000}}
+	m.Apply(Config{Specs: []Spec{u}, GPUBudgets: budget, ETag: "v1"})
+	_, releaseU := ensureModel(t, m, "u") // U busy: not evictable while this is held
+
+	s, _ := gatedSpec(t, "S", "m") // never healthy: no start finishes, so nothing re-asks instance 3 later
+	s.Replicable = true
+	s.RAMMB = 64
+	s.MinInstances = 4
+	s.StartupTimeoutSeconds = 60
+	s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{u, s}, GPUBudgets: budget, ETag: "v2"})
+	for k := 0; k < 4; k++ {
+		if st := mustInstance(t, m, "S", k); st.PID != 0 {
+			t.Fatalf("instance %d = %+v, want it waiting: the premise is that U's room is taken", k, st)
+		}
+	}
+
+	releaseU() // U idle: instance 0 evicts it, and starts in the turn U's exit is handled in
+	waitUntil(t, 5*time.Second, "instances 0-2 started into U's room", func() bool {
+		for k := 0; k < 3; k++ {
+			if st := instanceStatus(m, "S", k); st == nil || st.PID == 0 {
+				return false
+			}
+		}
+		return true
+	})
+	if st := mustInstance(t, m, "S", 3); st.PID != 0 {
+		t.Fatalf("instance 3 = %+v, want it waiting: the budget holds three instances", st)
+	}
+
+	// Instance 3 is the only candidate decided with three processes live:
+	// instances 0-2 are, U is gone, and no start finishes behind the shut gate.
+	mu.Lock()
+	asked := 0
+	for _, n := range sizes {
+		if n == 3 {
+			asked++
+		}
+	}
+	mu.Unlock()
+	if asked != 2 {
+		t.Fatalf("instance 3 was decided %d times, want 2 (once by the cascade, once by the exit's own wake): the cascade re-asked it at every level it unwound through", asked)
+	}
+}
+
+// TestHeldInstanceIsReaskedWhenItsLowerSiblingIsRefused: a protected instance
+// held back behind a lower sibling that waits to start (lowerSiblingWaiting) is
+// no longer held once that sibling is refused -- a refused sibling waits for no
+// room -- and is re-asked at that moment, so a request queued on it gets its
+// own verdict now rather than at an unrelated event or its admission timeout.
+// The paths below ask the lower sibling alone: its crash-loop retry, a request
+// naming it, and the dry run of its start.
+func TestHeldInstanceIsReaskedWhenItsLowerSiblingIsRefused(t *testing.T) {
+	newSpec := func() Spec {
+		spec := replicableSpec("S", "m")
+		spec.MinInstances = 2
+		spec.AdmissionWaitTimeoutSeconds = 0 // no admission timer on a bare owner
+		return spec
+	}
+	for _, tc := range []struct {
+		name string
+		// build returns the owner holding s0 and s1, and asks s0 alone.
+		build func(spec Spec, s0, s1 *specState) (o *owner, ask func())
+		// spec edits the spec before the instances are derived from it.
+		spec      func(*Spec)
+		s0State   State
+		wantState State
+		wantErr   error
+	}{
+		{
+			name:    "crash-loop retry refused by the binary allowlist",
+			s0State: StateBackoff,
+			build: func(_ Spec, s0, s1 *specState) (*owner, func()) {
+				o := instanceOwner(s0, s1)
+				o.rebuildUpstreamIndex() // policy left empty: no binary is allowed
+				return o, func() { o.handleBackoffFire("S") }
+			},
+			wantState: StateNotPermitted,
+			wantErr:   ErrNotPermitted,
+		},
+		{
+			name:    "a request for instance 0 refused by the binary allowlist",
+			s0State: StateStopped,
+			build: func(_ Spec, s0, s1 *specState) (*owner, func()) {
+				o := instanceOwner(s0, s1)
+				o.rebuildUpstreamIndex()
+				return o, func() {
+					o.handleEnsure(cmdEnsure{model: "m", reply: make(chan ensureOutcome, 1)})
+				}
+			},
+			wantState: StateNotPermitted,
+			wantErr:   ErrNotPermitted,
+		},
+		{
+			name:    "the dry run of instance 0's start fails",
+			s0State: StateBackoff,
+			spec: func(spec *Spec) {
+				spec.Env = map[string]string{"HF_TOKEN": "${AGENT_ENV:MISSING_TOKEN}"}
+			},
+			build: func(_ Spec, s0, s1 *specState) (*owner, func()) {
+				o := instanceOwner(s0, s1)
+				o.policy = allowlistPolicy()
+				o.getenv = func(string) string { return "" }
+				o.rebuildUpstreamIndex()
+				return o, func() { o.handleBackoffFire("S") }
+			},
+			wantState: StateNotPermitted,
+			wantErr:   ErrNotPermitted,
+		},
+		{
+			name:    "crash-loop retry refused next to a pinned unknown-demand occupant",
+			s0State: StateBackoff,
+			spec: func(spec *Spec) {
+				spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+			},
+			build: func(_ Spec, s0, s1 *specState) (*owner, func()) {
+				pinned := baseSpec("P", "p")
+				pinned.Pinned = true
+				pinned.GPUs = []SpecGPU{{Index: 0}} // its demand on gpu 0 is unknown
+				o := instanceOwner(s0, s1, liveInstance(pinned, 0, 50))
+				o.policy = allowlistPolicy()
+				o.allowedPairs = allowPairs("S", "P")
+				o.rebuildUpstreamIndex()
+				return o, func() { o.handleBackoffFire("S") }
+			},
+			wantState: StatePendingVRAMUnknown,
+			wantErr:   ErrAdmissionBlocked,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := newSpec()
+			if tc.spec != nil {
+				tc.spec(&spec)
+			}
+			s0 := restingInstance(spec, 0, tc.s0State)
+			s1 := restingInstance(spec, 1, StateStopped)
+			s1.waitingOnSibling = true // held back behind instance 0, which waits to start
+			reply := make(chan ensureOutcome, 1)
+			s1.pending = []*ensureWaiter{{reply: reply, queuedAt: time.Now()}}
+			_, ask := tc.build(spec, s0, s1)
+
+			ask()
+
+			if s0.state != tc.wantState {
+				t.Fatalf("instance 0 = %s, want %s: the premise is that it is refused", s0.state, tc.wantState)
+			}
+			out, ok := answered(reply)
+			if !ok {
+				t.Fatalf("the request queued on instance 1 is still waiting (waitingOnSibling %v); want it re-asked the moment instance 0 was refused", s1.waitingOnSibling)
+			}
+			if !errors.Is(out.err, tc.wantErr) {
+				t.Errorf("the request queued on instance 1 = %v, want its own verdict %v", out.err, tc.wantErr)
+			}
+			if s1.waitingOnSibling || s1.state != tc.wantState {
+				t.Errorf("instance 1 = %s (waitingOnSibling %v), want %s on its own verdict", s1.state, s1.waitingOnSibling, tc.wantState)
+			}
+		})
+	}
 }
