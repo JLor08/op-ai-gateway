@@ -1052,6 +1052,32 @@ func TestAudioCapacityCap(t *testing.T) {
 	})
 }
 
+// TestAudioCapacitySkipsAnInstanceAddressAnotherMappingNames: the agent resolves a literal
+// upstream name before an instance address, so an instance whose address m#k is another
+// mapping's model on the same agent can never run -- an ensure of it would start that other
+// model. The ramp by instance skips such an index, as the instance scaler does, and measures
+// the next one, and the cap of instances it can reach shrinks by it.
+func TestAudioCapacitySkipsAnInstanceAddressAnotherMappingNames(t *testing.T) {
+	f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: true, maxInstances: 3, features: []string{"runtime_manager", runtimeInstancesFeature}})
+	if err := f.mem.CreateMapping(context.Background(), routing.ModelMapping{ID: "map2", ApplicationID: "app1", GatewayModelName: "gw-other", AppModelName: "m#1", Status: routing.ServerStatusActive, CreatedAt: audioFixtureNow, UpdatedAt: audioFixtureNow}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	res := f.run(t, "capacity")
+
+	if res.Error != "" || res.AudioRealtimeConcurrency != 2 || res.AudioConcurrencyLimit != routing.AudioLimitCap {
+		t.Fatalf("result = %d / %q, error %q; want 2 / cap (m#1 cannot exist, m#2 is the last below max_instances)", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error)
+	}
+	if got := f.provider.ensuredAddresses(); !slices.Equal(got, []string{"m", "m#2"}) {
+		t.Fatalf("ensured = %v, want m and m#2, never the other mapping's m#1", got)
+	}
+	for _, call := range f.script.recorded() {
+		if call.model == "m#1" {
+			t.Fatalf("a measurement named m#1 (%+v), the other mapping's model", call)
+		}
+	}
+}
+
 // TestAudioCapacityNonReplicableSingleProcess: a target that is not replicable -- a spec
 // that is not replicable, or a direct audio.cpp application -- gets k concurrent streams on
 // its one process, and no instance is ever ensured. max_instances does not cap that ramp.

@@ -16,6 +16,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -539,24 +540,25 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 	}
 	var err error
 	restored := false
-	up := 0 // instances 0 ... up-1 are known to run
+	up := 0 // the instances at addrs[0 ... up-1] are known to run
+	var addrs []string
 	if byInstance {
+		if addrs, err = s.audioRampAddresses(ctx, tgt); err != nil {
+			return res, err
+		}
 		if restored, err = s.audioRampReplicableAgain(ctx, tgt); err != nil {
 			return res, err
 		}
 	}
 	if restored {
 		defer s.audioRampOneProcessAgain(ctx, tgt)
-		if up, err = s.ensureAudioFloor(ctx, tgt, call.target); err != nil {
+		if up, err = s.ensureAudioFloor(ctx, tgt, call.target, addrs); err != nil {
 			return res, err
 		}
 	}
 	capK := s.audioRampCap()
 	if byInstance {
-		capK = min(capK, routing.MaxInstanceIndex+1)
-		if tgt.spec.MaxInstances > 0 {
-			capK = min(capK, tgt.spec.MaxInstances)
-		}
+		capK = min(capK, len(addrs))
 	}
 	threshold := s.audioRealtimeThreshold()
 	var loneFirstMS int64 // level 1's stream's time to first output (audioRampRate)
@@ -568,7 +570,7 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 		if k == 1 || byInstance {
 			fresh := call
 			if byInstance {
-				fresh.target.ProviderModel = audioInstanceAddress(tgt.mapping.AppModelName, k-1)
+				fresh.target.ProviderModel = addrs[k-1]
 				if k > up {
 					if err := s.ensureAudioInstance(ctx, fresh.target, restored); err != nil {
 						return audioRampStop(res, k, err)
@@ -579,7 +581,11 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 				return audioRampStop(res, k, err)
 			}
 		}
-		streams, err := s.measureAudioLevel(ctx, call, tgt.mapping.AppModelName, k, byInstance)
+		var levelAddrs []string
+		if byInstance {
+			levelAddrs = addrs[:k]
+		}
+		streams, err := s.measureAudioLevel(ctx, call, k, levelAddrs)
 		if err != nil {
 			return audioRampStop(res, k, err)
 		}
@@ -626,18 +632,18 @@ func audioWarmUp(call audioMeasureCall) audioMeasureCall {
 }
 
 // measureAudioLevel runs level k: k measurements of call at once, each to its own instance
-// (instance i for stream i) when byInstance, else all to call's target, and returns them.
+// (stream i to addrs[i]) when addrs is given, else all to call's target, and returns them.
 // Every stream is waited for. A failure that is no refusal for lack of room wins over one
 // that is: the level failed, and a lower bound read off it would be wrong.
-func (s *Server) measureAudioLevel(ctx context.Context, call audioMeasureCall, model string, k int, byInstance bool) ([]audioMeasurement, error) {
+func (s *Server) measureAudioLevel(ctx context.Context, call audioMeasureCall, k int, addrs []string) ([]audioMeasurement, error) {
 	streams := make([]audioMeasurement, k)
 	errs := make([]error, k)
 	var wg sync.WaitGroup
 	for i := range k {
 		stream := call
 		stream.level = k
-		if byInstance {
-			stream.target.ProviderModel = audioInstanceAddress(model, i)
+		if addrs != nil {
+			stream.target.ProviderModel = addrs[i]
 		}
 		wg.Add(1)
 		go func() {
@@ -767,26 +773,75 @@ func (s *Server) audioRampReplicableAgain(ctx context.Context, tgt benchmarkTarg
 // (audioRampReplicableAgain), for the instances the agent then starts by itself with no
 // request: the protected ones, 0 ... audioProtectedFloor-1. It ensures them lowest first, the
 // order the agent starts them in, and each ensure returns once that instance runs, so no
-// level is measured while one of them still loads beside the measured process. It returns
-// how many instances, from 0 on, are known to run, which the ramp does not ensure again.
+// level is measured while one of them still loads beside the measured process. A protected
+// index whose address another mapping names is not among addrs (audioRampAddresses): the
+// agent never runs it. It returns how many of addrs, from the first on, are known to run,
+// which the ramp does not ensure again.
 // The agent admits a protected instance like a baseline start, not like a burst one: it may
 // wait for room or evict an idle neighbour for it, and the ensure answers only once it runs,
 // but it never refuses it for room. So an ensure that fails at all -- a start that failed or
 // timed out, whatever code it carries -- fails the ramp: the floor the ramp would be measured
 // beside never came up. A floor of one instance at most starts nothing beside the process
 // the speed part left running.
-func (s *Server) ensureAudioFloor(ctx context.Context, tgt benchmarkTarget, target routing.Target) (int, error) {
+func (s *Server) ensureAudioFloor(ctx context.Context, tgt benchmarkTarget, target routing.Target, addrs []string) (int, error) {
 	floor := audioProtectedFloor(tgt.spec)
 	if floor <= 1 {
 		return 0, nil
 	}
-	for k := range floor {
-		target.ProviderModel = audioInstanceAddress(tgt.mapping.AppModelName, k)
+	up := 0
+	for _, addr := range addrs {
+		if audioAddressIndex(tgt.mapping.AppModelName, addr) >= floor {
+			break
+		}
+		target.ProviderModel = addr
 		if err := s.ensureAudioInstance(ctx, target, true); err != nil {
-			return k, fmt.Errorf("audio benchmark: the protected instances of launch spec %s, which start once it is replicable again: %w", tgt.spec.ID, err)
+			return up, fmt.Errorf("audio benchmark: the protected instances of launch spec %s, which start once it is replicable again: %w", tgt.spec.ID, err)
+		}
+		up++
+	}
+	return up, nil
+}
+
+// audioRampAddresses is the addresses a ramp by instance measures, in order: instance 0's,
+// then every instance k the agent can run -- below max_instances when the spec sets one, and
+// up to its index cap -- whose address is not another mapping's upstream model on the same
+// agent. The agent resolves a literal upstream name before it reads an instance address, so
+// an ensure of such an address would start the other spec, and the agent never runs that
+// instance of this one; the instance scaler skips the same indexes (instanceIndex). The
+// agent's specs are the mappings of the server's server_agent application.
+func (s *Server) audioRampAddresses(ctx context.Context, tgt benchmarkTarget) ([]string, error) {
+	mappings, err := s.Routes.MappingsByApplication(ctx, tgt.app.ID)
+	if err != nil {
+		return nil, fmt.Errorf("audio benchmark: read the agent's mappings for the instance addresses: %w", err)
+	}
+	others := make(map[string]bool, len(mappings))
+	for _, m := range mappings {
+		if m.ID != tgt.mapping.ID {
+			others[m.AppModelName] = true
 		}
 	}
-	return floor, nil
+	model := tgt.mapping.AppModelName
+	last := routing.MaxInstanceIndex
+	if tgt.spec.MaxInstances > 0 {
+		last = min(last, tgt.spec.MaxInstances-1)
+	}
+	addrs := []string{model}
+	for k := 1; k <= last; k++ {
+		if addr := audioInstanceAddress(model, k); !others[addr] {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs, nil
+}
+
+// audioAddressIndex is the instance index addr names for model (audioInstanceAddress's
+// inverse): 0 for model itself, k for model#k.
+func audioAddressIndex(model, addr string) int {
+	k, err := strconv.Atoi(strings.TrimPrefix(addr, model+"#"))
+	if addr == model || err != nil {
+		return 0
+	}
+	return k
 }
 
 // audioProtectedFloor is how many instances of a replicable spec the agent keeps running

@@ -11474,8 +11474,10 @@ mapping; a parallel audio-only mechanism would duplicate all of it.
 - **(d) The ramp records why it stopped.** Level k runs k streams — one per instance for a replicable spec on an agent
   that runs instances (burst rules: free room only), else k streams on the one process — and is good while its slowest
   stream reaches the threshold (1.2× real time). It stops at `performance` (a measured ceiling), `resources` (an
-  instance refused for room — a lower bound) or `cap` (`max_instances`, 64 or the ramp cap — a lower bound). Count and
-  reason are one result, written together; a failed ramp writes neither. A replicable spec whose agent is not known to
+  instance refused for room — a lower bound) or `cap` (`max_instances`, 64 or the ramp cap — a lower bound). An instance
+  whose address `m#k` is another mapping's upstream model on the same agent is skipped, as the scaler skips it: the
+  agent never runs it, and an ensure of that name would start the other spec; the cap then counts only the instances
+  the ramp can reach. Count and reason are one result, written together; a failed ramp writes neither. A replicable spec whose agent is not known to
   run instances (not heard from since the gateway started, or without `runtime_instances`) is refused rather than
   ramped in one process: its result would be read as a ceiling on the instance count it never counted.
 - **(e) Stored on the mapping like the text metrics.** `audio_rate_x`, `audio_ttfa_ms`, `audio_realtime_concurrency`,
