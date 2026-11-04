@@ -54,8 +54,10 @@ var _ RuntimeEnsurer = (*OpenAICompatibleClient)(nil)
 // still hold through it. It is returned as a pointer: match it with
 // errors.As(err, &re) for a re of type *RouterError.
 type RouterError struct {
-	Code string
-	Err  error
+	// Status is the HTTP status the router answered with.
+	Status int
+	Code   string
+	Err    error
 }
 
 // Error puts the router code first, then the provider error.
@@ -96,7 +98,7 @@ func (c *OpenAICompatibleClient) EnsureRuntimeModel(ctx context.Context, target 
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, runtimeEnsureBodyLimit))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return routerStatusError(resp.StatusCode, body)
+		return RouterStatusError(resp.StatusCode, body)
 	}
 	if err != nil {
 		if timeout := ensureDeadlineError(ctx); timeout != nil {
@@ -120,12 +122,15 @@ func ensureDeadlineError(ctx context.Context) error {
 	return fmt.Errorf("%w: ensure route: %w", ErrTimeout, context.Cause(ctx))
 }
 
-// routerStatusError maps a non-2xx ensure answer through unavailableStatus
-// and, when body is the router's error envelope with a non-empty string code,
+// RouterStatusError maps a non-2xx answer through unavailableStatus and, when
+// body is the agent router's error envelope with a non-empty string code,
 // wraps it in a *RouterError. The envelope's message is appended only when it
 // says more than the code: for the router's start failures it is the code
-// itself.
-func routerStatusError(status int, body []byte) error {
+// itself. Every client call to an agent router reports a refusal through it --
+// the ensure route, a chat completion, the start of a stream -- and the
+// gateway uses it for an answer it relays itself, so a refusal reads the same
+// whichever way it arrived.
+func RouterStatusError(status int, body []byte) error {
 	base := unavailableStatus(status)
 	var env struct {
 		Error struct {
@@ -143,7 +148,18 @@ func routerStatusError(status int, body []byte) error {
 	if msg := strings.TrimSpace(env.Error.Message); msg != "" && msg != code {
 		base = fmt.Errorf("%w: %s", base, msg)
 	}
-	return &RouterError{Code: code, Err: base}
+	return &RouterError{Status: status, Code: code, Err: base}
+}
+
+// routerErrorBodyLimit bounds how much of a non-2xx chat answer is read for
+// the router's error envelope, which is a single short line.
+const routerErrorBodyLimit = 4 << 10
+
+// routerErrorFromResponse is RouterStatusError for a non-2xx response whose
+// body the caller has not read: at most routerErrorBodyLimit of it is.
+func routerErrorFromResponse(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, routerErrorBodyLimit))
+	return RouterStatusError(resp.StatusCode, body)
 }
 
 // ensureRunningAnswer accepts a 2xx ensure answer only when its JSON body says

@@ -55,12 +55,16 @@ type streamSession struct {
 	flusher   http.Flusher
 
 	providerReq inference.Request // req with target.ProviderModel applied, for the upstream call
-	ctx         context.Context
-	cancel      context.CancelFunc
-	rc          *http.ResponseController
-	idle        time.Duration
-	watchdog    *time.Timer
-	idledOut    atomic.Bool
+	// baseCtx is ctx before the target's upstream credential is attached: the
+	// cancellable stream context with its capture sink, from which a re-selected
+	// target's ctx is built.
+	baseCtx  context.Context
+	ctx      context.Context
+	cancel   context.CancelFunc
+	rc       *http.ResponseController
+	idle     time.Duration
+	watchdog *time.Timer
+	idledOut atomic.Bool
 
 	respBuf     bytes.Buffer
 	capBytes    int
@@ -121,32 +125,21 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	// threaded into the streamSession below, so both the registry's copy and this
 	// goroutine's writes share one live counter.
 	progress := &requestProgress{}
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, BillingUnit: billingUnitFor(req.APIFlavor), ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: start, Progress: progress})
+	idle := s.streamIdleTimeout // 0 = disabled (unbounded; only client disconnect ends the stream)
+	ctx, cancel := context.WithCancel(r.Context())
+	ss := &streamSession{
+		s: s, w: w, r: r, token: token, req: req, raw: raw, id: id, start: start,
+		capturing: capturing, target: target, streamer: streamer, flusher: flusher,
+		providerReq: s.upstreamRequest(r.Context(), target, req), ctx: ctx, cancel: cancel, rc: http.NewResponseController(w),
+		idle: idle, capBytes: s.captureMaxBytes, progress: progress,
+	}
+	ss.register()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	providerReq := req
-	if target.ProviderModel != "" {
-		providerReq.Model = target.ProviderModel
-	}
-	// Direct Anthropic prompt caching when the flag is on and the request is
-	// eligible (the upstream copy only; req stays the client-facing request).
-	s.applyAnthropicCachePolicy(r.Context(), target, &providerReq)
-	// Claude Code effort -> chat_template_kwargs for a capable translate target
-	// (upstream copy only, like the cache policy above).
-	applyChatTemplateEffortPolicy(target, &providerReq)
-
-	idle := s.streamIdleTimeout // 0 = disabled (unbounded; only client disconnect ends the stream)
-	ctx, cancel := context.WithCancel(r.Context())
-	ss := &streamSession{
-		s: s, w: w, r: r, token: token, req: req, raw: raw, id: id, start: start,
-		capturing: capturing, target: target, streamer: streamer, flusher: flusher,
-		providerReq: providerReq, ctx: ctx, cancel: cancel, rc: http.NewResponseController(w),
-		idle: idle, capBytes: s.captureMaxBytes, progress: progress,
-	}
 	if idle > 0 {
 		ss.watchdog = time.AfterFunc(idle, func() { ss.idledOut.Store(true); cancel() })
 	}
@@ -164,9 +157,18 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	if ss.captureSink != nil {
 		ss.ctx = provider.WithCaptureSink(ss.ctx, ss.captureSink)
 	}
+	ss.baseCtx = ss.ctx
 	// Attach the resolved application's per-app upstream credential (fail-open).
-	ss.ctx = s.upstreamAuthCtx(ss.ctx, target)
+	ss.ctx = s.upstreamAuthCtx(ss.baseCtx, target)
 	return ss, true
+}
+
+// register (re)registers the stream in the active registry under its one id, for
+// the session's current target: an id added again moves to the new target's server
+// and instance, so a re-selected stream counts once, where it now runs.
+func (ss *streamSession) register() {
+	s, r, token, req, target := ss.s, ss.r, ss.token, ss.req, ss.target
+	s.Active.Add(ActiveRequest{ID: ss.id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, BillingUnit: billingUnitFor(req.APIFlavor), ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: ss.start, Progress: ss.progress})
 }
 
 // close releases the session's resources: it stops the idle watchdog, cancels
@@ -208,8 +210,14 @@ func (ss *streamSession) emit(frame string) error {
 // watchdog on every event exactly like each flavor's inline callback used to
 // (StreamEventError is unused: providers report failures via CompleteStream's
 // return value, not events).
+//
+// A stream whose instance turns out to be gone before it delivered a single event
+// is re-selected once onto another instance (reselect) and started there; the
+// client, which has had the response headers and nothing else, sees one stream.
 func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error {
-	return ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, func(ev inference.StreamEvent) error {
+	delivered := false
+	onEvent := func(ev inference.StreamEvent) error {
+		delivered = true
 		if ss.watchdog != nil {
 			ss.watchdog.Reset(ss.idle)
 		}
@@ -220,7 +228,50 @@ func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error
 			ss.progress.observeDelta(time.Now(), ev.Progress)
 		}
 		return handler(ev)
-	})
+	}
+	err := ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
+	if err != nil && !delivered && ss.reselect(err) {
+		err = ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
+	}
+	return err
+}
+
+// reselect moves the session onto a re-selected target when err says its instance
+// is gone (see instance_reselect.go), and reports whether it did. The session's
+// request, token, target, upstream request and credential context all become the
+// re-selected attempt's, and it is registered again under its id; the usage row
+// finish records is that attempt's. A re-selection that fails leaves the session as
+// it was, so the stream ends with the original error.
+//
+// The idle watchdog beginStream armed is held while the selection runs and armed
+// afresh after it. The selection may wait in the admission queue for the next
+// instance -- bounded by the queue timeout and the client, as the first resolve was
+// -- and that wait is not the stream going idle; the instance the stream is then sent
+// to gets the whole first-byte budget the first one had. A watchdog that has already
+// fired has ended the stream, which is then not re-selected.
+func (ss *streamSession) reselect(err error) bool {
+	if !reselectsLostInstance(ss.target, ss.req, err) {
+		return false
+	}
+	if ss.watchdog != nil {
+		if !ss.watchdog.Stop() {
+			return false
+		}
+		defer ss.watchdog.Reset(ss.idle)
+	}
+	req := withLostInstance(ss.req, ss.target)
+	token := ss.token
+	target, rerr := ss.s.resolveTranslateTarget(ss.r, &token, req)
+	if rerr != nil {
+		slog.Warn("inference stream: the routed instance is gone and re-selection failed", "path", ss.r.URL.Path, "model", ss.req.Model, "instance", ss.target.InstanceKey, "err", rerr)
+		return false
+	}
+	slog.Info("inference stream: the routed instance is gone; re-selected once", "path", ss.r.URL.Path, "model", ss.req.Model, "lost", ss.target.InstanceKey, "instance", target.InstanceKey)
+	ss.req, ss.token, ss.target = req, token, target
+	ss.providerReq = ss.s.upstreamRequest(ss.r.Context(), target, req)
+	ss.ctx = ss.s.upstreamAuthCtx(ss.baseCtx, target)
+	ss.register()
+	return true
 }
 
 // terminalStatus classifies how the stream ended from the CompleteStream

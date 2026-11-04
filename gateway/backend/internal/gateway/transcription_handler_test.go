@@ -1271,7 +1271,7 @@ func TestTranscriptionRefusesAModelWithoutATranscriptionVerdict(t *testing.T) {
 // currently has an active LIVE session is refused cleanly with the live path's own
 // busy 503 (transcription.live_busy), instead of colliding at the upstream -- audio.cpp
 // serves one session per model, so the collision would surface as an upstream error and
-// bill an honest loud zero (§11.4(4), interim until #340). The guard reads the per-route
+// bill an honest loud zero (§11.4(4)). The guard reads the target instance's
 // live slot as an advisory snapshot, so it refuses before anything is sent and the
 // upstream is never called; the refusal records the same audio_second loud-zero row the
 // other routing refusals do.
@@ -1287,9 +1287,10 @@ func TestTranscriptionRefusesWhenALiveSessionHoldsTheModelSlot(t *testing.T) {
 			up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
 			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
 
-			// asr-model resolves to route-asr; take its live slot exactly as a live
-			// session does, so the buffered request meets a held slot.
-			release, ok := srv.liveSessions.acquire("route-asr")
+			// asr-model resolves to route-asr, a mapping without instances; take its
+			// one live slot exactly as a live session does, so the buffered request
+			// meets a held slot.
+			release, ok := srv.liveSessions.acquire(routing.InstanceKey("route-asr", 0))
 			if !ok {
 				t.Fatal("could not take the live slot for route-asr")
 			}
@@ -1333,7 +1334,7 @@ func TestTranscriptionProceedsWhenNoLiveSessionHoldsTheModelSlot(t *testing.T) {
 	up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
 	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
 
-	release, ok := srv.liveSessions.acquire("route-asr")
+	release, ok := srv.liveSessions.acquire(routing.InstanceKey("route-asr", 0))
 	if !ok {
 		t.Fatal("could not take the live slot for route-asr")
 	}

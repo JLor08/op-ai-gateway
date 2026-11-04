@@ -680,10 +680,10 @@ func sumRuntimeActiveQueue(runtimes []agentRuntimeSample) (active, queue int) {
 // runtime entry is only ~55 bytes on the wire -- uncapped, a single POST
 // could drive on the order of 19,000 RuntimeSpecByID/resolution attempts on
 // an endpoint agents hit every second. Clamp, don't reject -- mirrors
-// maxHardwareGPUs/maxHardwareModules elsewhere in this file. Only the
-// write-back loop is bounded here; runtimeStatusDTOsFromSamples' status
-// publish is a pure in-memory transform with no store fan-out per entry, so
-// it is not the concern this constant exists for.
+// maxHardwareGPUs/maxHardwareModules elsewhere in this file. It bounds every
+// write-back loop named above; runtimeStatusDTOsFromSamples' status publish is
+// a pure in-memory transform with no store fan-out per entry, so it is not the
+// concern this constant exists for.
 const maxRuntimeSamplesPerSample = 256
 
 // maxRuntimeGPUsPerSample bounds how many per-GPU measured-VRAM entries one

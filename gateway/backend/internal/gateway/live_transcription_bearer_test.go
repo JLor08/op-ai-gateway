@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
 	"strings"
@@ -381,7 +382,7 @@ func TestBearerLiveTranscriptionIdleClientReleasesSlot(t *testing.T) {
 	// busy until it does, so acquiring it succeeds only once the idle session has been reaped.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if release, ok := srv.liveSessions.acquire("route-asr"); ok {
+		if release, ok := srv.liveSessions.acquire(routing.InstanceKey("route-asr", 0)); ok {
 			release()
 			break
 		}
@@ -539,6 +540,9 @@ func TestBearerLiveTranscriptionRegistersActiveRequest(t *testing.T) {
 	}
 	if got.Model == "" || got.UserID == "" || got.TokenID == "" {
 		t.Errorf("live row not fully attributed: Model=%q UserID=%q TokenID=%q", got.Model, got.UserID, got.TokenID)
+	}
+	if got.InstanceKey != "route-asr#0" {
+		t.Errorf("InstanceKey = %q, want route-asr#0 (the target's)", got.InstanceKey)
 	}
 
 	// AFTER the relay ends the deferred Remove has run: no live session lingers in the view.

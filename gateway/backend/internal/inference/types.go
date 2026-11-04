@@ -286,6 +286,21 @@ type Request struct {
 	// never parsed from or serialized to a client body, so a direct OpenAI chat
 	// request that merely sets reasoning_effort stays top-level only.
 	ReasoningEffortViaTemplateKwargs bool `json:"-"`
+	// LiveSession marks the resolve of a live-transcription session, which
+	// holds its instance's one live slot for its whole life. Routing then
+	// passes over an instance whose live slot is already held, and parks the
+	// session when every instance's slot is. Internal only: set by the live
+	// endpoint, never parsed from a client body.
+	LiveSession bool `json:"-"`
+	// ExcludeInstanceKeys are gateway instance keys (routing.InstanceKey)
+	// routing must not select for this request, on any admission turn:
+	// instances it already tried and found gone -- retired between the
+	// telemetry that reported them running and the dispatch. An instance
+	// that is only busy is never listed: a live slot another session took
+	// first is held, routing passes over a held slot by itself, and the
+	// session may still take that slot once it frees. Internal only: set by
+	// the gateway when it re-selects, never parsed from a client body.
+	ExcludeInstanceKeys []string `json:"-"`
 }
 
 func (r Request) Validate() *Error {

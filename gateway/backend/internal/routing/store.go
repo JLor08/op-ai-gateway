@@ -1208,6 +1208,20 @@ type MappingCandidate struct {
 	Server      AIServer
 	Application Application
 	Mapping     ModelMapping
+	// Instance is the index k of the mapping's instance this candidate
+	// addresses: 0 for the mapping itself, k >= 1 for a running further
+	// instance of a replicable spec (expandInstances). Every store read
+	// yields instance 0.
+	Instance int
+	// InstanceCapable and InstanceParallelism are the instance view this
+	// candidate was expanded from: whether its mapping runs instances on
+	// this server, and how many requests one instance serves at once (at
+	// least 1 when capable, 0 otherwise). expandInstances sets both on every
+	// candidate of a capable mapping, instance 0 included, so the capacity
+	// filter judges the same view the candidates came from without asking
+	// the source again. Every store read yields false and 0.
+	InstanceCapable     bool
+	InstanceParallelism int
 	// LiveProgressSupport is the mapping's "live_progress" capability verdict
 	// (model_mapping_capabilities, migration 78), filled by
 	// ActiveMappingsForModel's joined query (SQL) or its MemoryStore mirror

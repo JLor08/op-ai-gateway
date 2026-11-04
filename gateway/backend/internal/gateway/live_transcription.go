@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
@@ -275,9 +276,11 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 //
 // On any refusal it writes the response and returns ok == false; it is a gate, not a
 // relay, so it contacts no upstream and records no usage row. token is taken by value: the
-// resolve refreshes only a last-used-model snapshot neither caller reads again, so there is
-// no second resolve for a pointer to feed. The caller has already rejected a blank model
-// (whose code differs between the two endpoints).
+// resolve refreshes only a last-used-model snapshot the caller does not read again. The
+// caller has already rejected a blank model (whose code differs between the two
+// endpoints). The bearer handler runs the same two halves separately (liveGate, then
+// acquireLiveSession over liveTarget), because it also takes the session's live slot
+// and may select again when it loses one.
 //
 // admit controls step 2's admission. The bearer /v1/audio/transcriptions/live
 // handler and the portal WebSocket's loopback to it call with admit=true, so the
@@ -290,10 +293,27 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 // Threading the bool keeps the two live transports gated byte-for-byte identically
 // while moving the single admission to the one relay both now share.
 func (s *Server) resolveLiveTarget(w http.ResponseWriter, r *http.Request, token auth.Token, model string, params liveParams, admit bool) (routing.Target, bool) {
+	req, ok := s.liveGate(w, r, token, model, params, admit)
+	if !ok {
+		return routing.Target{}, false
+	}
+	tok := token
+	target, err := s.liveTarget(r.Context(), &tok, req)
+	if err != nil {
+		writeLiveRefusal(w, r, model, err)
+		return routing.Target{}, false
+	}
+	return target, true
+}
+
+// liveGate is steps 1 and 2 of resolveLiveTarget: the params, then the gate (with or
+// without admission). It returns the gated request, or ok == false once it has written
+// the refusal.
+func (s *Server) liveGate(w http.ResponseWriter, r *http.Request, token auth.Token, model string, params liveParams, admit bool) (inference.Request, bool) {
 	if _, valid := liveByteRate(params.SampleRate, params.Channels, params.Format); !valid || !validLiveLanguage(params.Language) {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(liveTranscriptionParamsInvalid,
 			"sample_rate must be 1000-384000, channels 1-16, sample_format s16le or f32le, and language a bare language tag", ""))
-		return routing.Target{}, false
+		return inference.Request{}, false
 	}
 	gate := s.inferenceGate
 	if admit {
@@ -301,26 +321,51 @@ func (s *Server) resolveLiveTarget(w http.ResponseWriter, r *http.Request, token
 	}
 	pf, handled := gate(w, r, token, nil, transcriptionInferenceShape(model))
 	if handled {
-		return routing.Target{}, false
+		return inference.Request{}, false
 	}
-	tok := token
-	target, err := s.resolveLiveTranscriptionTarget(r.Context(), &tok, pf.Req)
+	return pf.Req, true
+}
+
+// errLiveNotStreaming and errLiveAgentUnsupported are liveTarget's refusals of steps 4
+// and 5, answered by writeLiveRefusal under their own codes.
+var (
+	errLiveNotStreaming     = errors.New(liveTranscriptionNotStreaming)
+	errLiveAgentUnsupported = errors.New(liveTranscriptionAgentUnsupported)
+)
+
+// liveTarget is steps 3 to 5 of resolveLiveTarget for an already-gated request: the
+// resolve, then the two live verdicts on the target it chose. A refusal is returned,
+// not written, so a caller that selects again can tell the outcomes apart.
+func (s *Server) liveTarget(ctx context.Context, token *auth.Token, req inference.Request) (routing.Target, error) {
+	target, err := s.resolveLiveTranscriptionTarget(ctx, token, req)
 	if err != nil {
-		slog.Debug("live transcription rejected: routing failed", "path", r.URL.Path, "model", model, "err", err)
-		writeJSON(w, completionHTTPStatus(err), completionErrorResponse(err))
-		return routing.Target{}, false
+		return routing.Target{}, err
 	}
-	if !s.mappingStreamsTranscription(r.Context(), target.RouteID) {
-		writeJSON(w, http.StatusConflict, apierror.Response(liveTranscriptionNotStreaming,
-			"this model does not support live transcription: its mapping has no transcription_streaming verdict of yes", ""))
-		return routing.Target{}, false
+	if !s.mappingStreamsTranscription(ctx, target.RouteID) {
+		return routing.Target{}, errLiveNotStreaming
 	}
 	if !s.liveTranscriptionTargetServed(target) {
+		return routing.Target{}, errLiveAgentUnsupported
+	}
+	return target, nil
+}
+
+// writeLiveRefusal writes the answer to a live session refused after the gate: the two
+// live verdicts under their own 409 codes, and everything else -- a routing refusal, a
+// busy slot (errTranscriptionLiveBusy) -- as the buffered transcription endpoint answers
+// it.
+func writeLiveRefusal(w http.ResponseWriter, r *http.Request, model string, err error) {
+	switch {
+	case errors.Is(err, errLiveNotStreaming):
+		writeJSON(w, http.StatusConflict, apierror.Response(liveTranscriptionNotStreaming,
+			"this model does not support live transcription: its mapping has no transcription_streaming verdict of yes", ""))
+	case errors.Is(err, errLiveAgentUnsupported):
 		writeJSON(w, http.StatusConflict, apierror.Response(liveTranscriptionAgentUnsupported,
 			"live transcription is not available on this model's server: its agent has not declared the "+fullduplexProxyFeature+" feature. The agent is older than 0.12.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported", ""))
-		return routing.Target{}, false
+	default:
+		slog.Debug("live transcription rejected", "path", r.URL.Path, "model", model, "err", err)
+		writeJSON(w, completionHTTPStatus(err), completionErrorResponse(err))
 	}
-	return target, true
 }
 
 // resolveLiveTranscriptionTarget resolves the routing target of an already-gated live

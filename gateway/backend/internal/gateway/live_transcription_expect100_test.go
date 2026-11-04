@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"op-ai-gateway/internal/logbuffer"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"strconv"
 	"strings"
@@ -315,7 +316,7 @@ func TestBearerLiveExpect100EmptyBodyCompletesWithoutHanging(t *testing.T) {
 			requireOneBearerLiveRow(t, srv, usage.BillingUnitAudioSecond, 0)
 			deadline := time.Now().Add(5 * time.Second)
 			for {
-				if release, ok := srv.liveSessions.acquire("route-asr"); ok {
+				if release, ok := srv.liveSessions.acquire(routing.InstanceKey("route-asr", 0)); ok {
 					release()
 					return
 				}

@@ -167,6 +167,60 @@ func TestActiveRegistryServerActivityLastCompleted(t *testing.T) {
 	}
 }
 
+// The registry counts in-flight requests per gateway instance key beside the
+// per-server count, and a request's release still wakes a request parked on
+// its server, whichever instance it held.
+func TestActiveRegistryCountsPerInstance(t *testing.T) {
+	r := newActiveRegistry(nil)
+	q := newAdmissionQueue(8)
+	q.recheck = 0 // only a release may wake the waiter
+	r.setAdmission(q)
+	r.Add(ActiveRequest{ID: "a", ServerID: "srv1", InstanceKey: "x#0"})
+	r.Add(ActiveRequest{ID: "b", ServerID: "srv1", InstanceKey: "x#0"})
+	r.Add(ActiveRequest{ID: "c", ServerID: "srv1", InstanceKey: "x#1"})
+	r.Add(ActiveRequest{ID: "d", ServerID: "srv1"}) // a target without an instance key
+
+	for key, want := range map[string]int{"x#0": 2, "x#1": 1, "x#2": 0, "": 0} {
+		if got := r.InstanceActivity(key); got != want {
+			t.Fatalf("InstanceActivity(%q) = %d, want %d", key, got, want)
+		}
+	}
+	if n, _ := r.ServerActivity("srv1"); n != 4 {
+		t.Fatalf("ServerActivity(srv1) = %d, want 4 (the per-server count keeps every request)", n)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- q.WaitForSlot(context.Background(), []string{"srv1"}, 0) }()
+	waitForParked(t, q, 1)
+	r.Remove("a")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForSlot after the release = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("releasing an instance's request did not wake the server's queue")
+	}
+	if got := r.InstanceActivity("x#0"); got != 1 {
+		t.Fatalf("InstanceActivity(x#0) after one release = %d, want 1", got)
+	}
+	r.Remove("b")
+	r.Remove("b") // a second release of the same id changes nothing
+	if got := r.InstanceActivity("x#0"); got != 0 {
+		t.Fatalf("InstanceActivity(x#0) after both releases = %d, want 0", got)
+	}
+	// Re-adding an id moves its count to the new key rather than adding to both.
+	r.Add(ActiveRequest{ID: "c", ServerID: "srv1", InstanceKey: "x#2"})
+	if r.InstanceActivity("x#1") != 0 || r.InstanceActivity("x#2") != 1 {
+		t.Fatalf("after re-adding c on x#2: x#1 = %d, x#2 = %d, want 0 and 1", r.InstanceActivity("x#1"), r.InstanceActivity("x#2"))
+	}
+
+	var nilReg *activeRegistry
+	if got := nilReg.InstanceActivity("x#0"); got != 0 {
+		t.Fatalf("nil registry InstanceActivity = %d, want 0", got)
+	}
+}
+
 func TestActiveRegistryServerActivityNilSafe(t *testing.T) {
 	var r *activeRegistry
 	if n, last := r.ServerActivity("srv1"); n != 0 || !last.IsZero() {

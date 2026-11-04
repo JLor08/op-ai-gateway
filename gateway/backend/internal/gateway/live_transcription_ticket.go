@@ -53,7 +53,7 @@ var liveTicketEncoding = base64.RawURLEncoding.Strict()
 // The WebSocket handler consumes only Target.Model (the model name it loops back
 // with), the four PCM params and UserID (the trusted-loopback identity it replays
 // as). These are LOAD-BEARING: dropping any of them breaks the loopback. Resolution,
-// the per-route guard, admission and billing all re-run at
+// the per-instance slot, admission and billing all re-run at
 // /v1/audio/transcriptions/live, so a live row is attributed to that loopback user.
 //
 // Everything else is AUDIT-ONLY, deliberately kept (#292): TokenID and the

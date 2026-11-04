@@ -596,6 +596,9 @@ func TestProxyNativeRecordsPreOverrideRequestedModel(t *testing.T) {
 	if inFlight[0].Model != "gw-model" || inFlight[0].RequestedModel != "client-model" {
 		t.Fatalf("in-flight model pair = (%q, %q), want (gw-model, client-model)", inFlight[0].Model, inFlight[0].RequestedModel)
 	}
+	if inFlight[0].InstanceKey != "route-native#0" {
+		t.Fatalf("in-flight InstanceKey = %q, want route-native#0 (the target's)", inFlight[0].InstanceKey)
+	}
 	if prov.proxyCalls != 1 {
 		t.Fatalf("ProxyNative calls = %d, want 1 (the request must take the native path, not translate)", prov.proxyCalls)
 	}

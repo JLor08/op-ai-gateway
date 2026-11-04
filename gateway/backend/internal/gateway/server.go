@@ -471,10 +471,11 @@ type Server struct {
 	// per-process key; a bare &Server{} leaves it nil, which the ticket endpoint
 	// answers as a failed mint rather than a panic.
 	liveTickets *liveTicketStore
-	// liveSessions enforces one live-transcription session per route
-	// (live_session_registry.go): the WebSocket handler acquires the route's slot
-	// before relaying and releases it once. Built in New; a bare &Server{} leaves
-	// it nil, which acquire treats as fail-closed (every session rejected busy), so
+	// liveSessions enforces one live-transcription session per instance
+	// (live_session_registry.go): the live relay acquires the selected instance's
+	// slot before relaying and releases it once. Built in New, which also hands it
+	// to the resolver as its routing.LiveSlotChecker; a bare &Server{} leaves it
+	// nil, which acquire treats as fail-closed (every session rejected busy), so
 	// the handler must be wired with a constructed registry.
 	liveSessions *liveSessionRegistry
 	// voiceTickets mints and redeems the Voice Chat tickets (voice_chat_ticket.go): the
@@ -979,6 +980,7 @@ func New(deps ServerDeps) *Server {
 	// the slot-free signal (release) via the attached queue.
 	admission := newAdmissionQueue(deps.AdmissionQueueMaxDepth)
 	active.setAdmission(admission)
+	liveSessions := newLiveSessionRegistry()
 	swapProtectWindow := deps.SwapProtectWindow
 	if swapProtectWindow <= 0 {
 		swapProtectWindow = 30 * time.Second
@@ -1026,6 +1028,12 @@ func New(deps ServerDeps) *Server {
 		resolver.SetServerBusyChecker(benchmarks)
 		resolver.SetLoadedModelChecker(loadedModels)
 		resolver.SetServerActivityChecker(active, swapProtectWindow)
+		// The same registry counts in-flight requests per instance key, which caps
+		// each instance of a replicable spec at its instance_parallelism.
+		resolver.SetInstanceActivityChecker(active)
+		// A live session's resolve passes over an instance whose one live slot the
+		// SAME registry the live relay acquires from already holds.
+		resolver.SetLiveSlotChecker(liveSessions)
 		// The runtime-status registry (Task 13) is wired as the resolver's
 		// RuntimeModelStateChecker so scoring uses live PER-MODEL active/queue counts
 		// (not just the whole server's telemetry) and selection can prefer an
@@ -1033,6 +1041,13 @@ func New(deps ServerDeps) *Server {
 		// runtimeModelStateChecker wraps the SAME registry instance the Server publishes
 		// agent telemetry into, so the resolver's view stays consistent with it.
 		resolver.SetRuntimeModelStateChecker(newRuntimeModelStateChecker(runtimeStatus, agentFeatures))
+		// The same two registries feed the resolver's InstanceSource, which expands a
+		// replicable spec's mapping into the instances its agent reports running. It
+		// reads the spec through deps.Routes, so without a store nothing is expanded
+		// and every candidate stays its mapping's instance 0.
+		if deps.Routes != nil {
+			resolver.SetInstanceSource(newInstanceSource(deps.Routes, agentFeatures, runtimeStatus))
+		}
 		resolver.SetSessionReservation(sessionReservationWindow)
 		resolver.SetAdmissionController(admission)
 		resolver.SetGroupResolver(groups)
@@ -1124,7 +1139,7 @@ func New(deps ServerDeps) *Server {
 		maxChatAudioBytes:              maxChatAudioBytes,
 		maxChatBlobBytes:               maxChatBlobBytes,
 		liveTickets:                    newLiveTicketStore(),
-		liveSessions:                   newLiveSessionRegistry(),
+		liveSessions:                   liveSessions,
 		voiceTickets:                   newVoiceTicketStore(),
 		voiceCoLoadTimeout:             voiceCoLoadTimeout,
 		voiceTiming:                    voiceTiming,

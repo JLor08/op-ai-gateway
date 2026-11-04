@@ -50,16 +50,16 @@ func TestBenchmarkOthersStoppedSeesInstances(t *testing.T) {
 	}
 }
 
-// TestBenchmarkTargetRowIsInstanceZero pins the two rows a benchmark reads
-// for its target. benchmarkSpecStatus -- the target's context size, the
-// stop-all's presence check and its quiet wait -- reads the spec's
-// representative row (representativeRowIndex), the row every other view of
-// the spec reads, so a burst instance that serves speaks for the spec while
-// instance 0 is down. Residency (agentSpecResidency) asks a different
-// question, whether the instance the target's plain model name reaches is
-// up, so it reads the instance-0 row whatever order the agent reports its
-// rows in, and never a burst instance's.
-func TestBenchmarkTargetRowIsInstanceZero(t *testing.T) {
+// TestBenchmarkSpecStatusIsRepresentativeRowResidencyIsInstanceZero pins the
+// two rows a benchmark reads for its target. benchmarkSpecStatus -- the
+// target's context size, the stop-all's presence check and its quiet wait --
+// reads the spec's representative row (representativeRowIndex), the row every
+// other view of the spec reads, so a burst instance that serves speaks for the
+// spec while instance 0 is down. Residency (agentSpecResidency) asks a
+// different question, whether the instance the target's plain model name
+// reaches is up, so it reads the instance-0 row whatever order the agent
+// reports its rows in, and never a burst instance's.
+func TestBenchmarkSpecStatusIsRepresentativeRowResidencyIsInstanceZero(t *testing.T) {
 	frame := []RuntimeStatusDTO{instanceStatus("S", 1, "running", 4242), instanceStatus("S", 0, "stopped", 0)}
 	row, ok := benchmarkSpecStatus(frame, "S")
 	if !ok || row.Instance != 1 || row.State != "running" {
