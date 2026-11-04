@@ -6221,8 +6221,9 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     // the restart deadline, and both are armed by a click, never at mount.
     vi.useFakeTimers();
     try {
-      // Write A: force_stopped, hangs past its 30 s watchdog. The row unlocks
-      // and the operator is told the outcome is unknown.
+      // Write A: Pin as running (force_running), hangs past its 30 s
+      // watchdog. The row unlocks and the operator is told the outcome is
+      // unknown.
       fakeApi.putRuntimeSpec.mockImplementationOnce(() => first);
       fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
@@ -6252,17 +6253,17 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
         await Promise.resolve();
       });
 
-      // ...and only now does A land, having actually stored force_stopped.
+      // ...and only now does A land, having actually stored force_running.
       await act(async () => {
-        landFirst(fullSpec({ admin_state: 'force_stopped' }));
+        landFirst(fullSpec({ admin_state: 'force_running' }));
         await Promise.resolve();
         await Promise.resolve();
       });
 
       // The row has to follow the server, or it offers Pin / Restart and NO
-      // Clear override while the model is admission-blocked --
-      // with the write-timeout notice on screen telling the operator to clear
-      // by hand an override the row denies exists.
+      // Clear override for the override the server now holds -- with the
+      // write-timeout notice on screen telling the operator to clear by hand
+      // an override the row denies exists.
       expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
       // The user-visible half stays abandoned: no success toast for a write the
@@ -6331,7 +6332,7 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     // Now the override write lands. Its run token was never bumped, so it
     // toasts success -- and the row must agree with that toast.
     await act(async () => {
-      landOverride(fullSpec({ admin_state: 'force_stopped' }));
+      landOverride(fullSpec({ admin_state: 'force_running' }));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -11409,8 +11410,11 @@ describe('RuntimeAdminSection per-instance live status', () => {
 });
 
 describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
-  // An agent that declares runtime_stop: the default report declares nothing.
-  const stopReport = makeReport({ agent_features: ['runtime_manager', 'runtime_stop'] });
+  // An agent that declares what Start and Stop need: the default report
+  // declares nothing.
+  const stopReport = makeReport({
+    agent_features: ['runtime_manager', 'runtime_ensure', 'runtime_instances', 'runtime_stop'],
+  });
 
   function instanceRow(instance: number, overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     return makeStatus({
@@ -11524,7 +11528,7 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
 
     expect(await screen.findByText(t.runtimeStartedStarting('Alpha #2'))).toBeInTheDocument();
-    expect(t.runtimeStartedStarting('Alpha #2')).toContain('Alpha #2');
+    expect(screen.queryByText(t.runtimeStartedRunning('Alpha #2'))).not.toBeInTheDocument();
   });
 
   it('Stop POSTs the mapping and the instance index and says it is stopping', async () => {
@@ -11614,7 +11618,10 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
   });
 
   it('disables Start at max_instances and says why', async () => {
-    renderActions([instanceRow(0), instanceRow(1)], replicable({ max_instances: 2 }));
+    const { fakeApi } = renderActions(
+      [instanceRow(0), instanceRow(1)],
+      replicable({ max_instances: 2 }),
+    );
     await openStatusTab();
     await waitFor(() =>
       expect(inRowWith('4100').getByRole('button', { name: t.runtimeStart })).toHaveAttribute(
@@ -11625,7 +11632,79 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     const start = inRowWith('4100').getByRole('button', { name: t.runtimeStart });
     expect(start).toHaveAccessibleDescription(t.runtimeStartMaxInstances(2));
     fireEvent.click(start);
-    expect(screen.queryByText(t.runtimeStartedRunning('Alpha #0'))).not.toBeInTheDocument();
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+  });
+
+  it('counts an instance that still drains as taken in the max_instances hover', () => {
+    for (const m of [messages.de, messages.en]) {
+      expect(m.runtimeStartMaxInstances(2)).not.toBe(m.runtimeStartMaxInstances(1));
+    }
+    expect(messages.en.runtimeStartMaxInstances(2)).toMatch(/still shutting down/);
+    expect(messages.en.errorRuntimeMaxInstancesReached).toMatch(/still shutting down/);
+    expect(messages.de.runtimeStartMaxInstances(2)).toMatch(/fahren noch herunter/);
+    expect(messages.de.errorRuntimeMaxInstancesReached).toMatch(/fahren noch herunter/);
+  });
+
+  it('disables a Start of one more instance on an agent without runtime_instances', async () => {
+    const { fakeApi } = renderActions([instanceRow(0)], replicable(), {
+      report: makeReport({ agent_features: ['runtime_manager', 'runtime_ensure', 'runtime_stop'] }),
+    });
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStart })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const start = inRowWith('4100').getByRole('button', { name: t.runtimeStart });
+    expect(start).toHaveAccessibleDescription(t.runtimeStartFeatureMissing);
+    fireEvent.click(start);
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+  });
+
+  it('disables Stop on the next instance down while a higher one still drains', async () => {
+    const { fakeApi } = renderActions(
+      [instanceRow(0), instanceRow(1), instanceRow(2, { state: 'draining' })],
+      replicable(),
+    );
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4101').getByRole('button', { name: t.runtimeStop })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const stop = inRowWith('4101').getByRole('button', { name: t.runtimeStop });
+    expect(stop).toHaveAccessibleDescription(t.runtimeStopHigherDraining);
+    fireEvent.click(stop);
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+    expect(
+      inRowWith('4102').queryByRole('button', { name: t.runtimeStop }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('holds Start and Stop while an override write runs', async () => {
+    const { fakeApi } = renderActions([instanceRow(0)], replicable());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimePinRunning);
+    await waitForRowActions('4100', t.runtimeStart);
+    await waitForRowActions('4100', t.runtimeStop);
+
+    // The Pin's PUT never answers, so the override lock stays on.
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => new Promise<RuntimeSpec>(() => {}));
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimePinRunning }));
+
+    for (const name of [t.runtimeStart, t.runtimeStop]) {
+      await waitFor(() =>
+        expect(inRowWith('4100').getByRole('button', { name })).toHaveAttribute(
+          'aria-disabled',
+          'true',
+        ),
+      );
+      fireEvent.click(inRowWith('4100').getByRole('button', { name }));
+    }
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
   });
 
   it('disables Start on a spec pinned as stopped and says to clear the override first', async () => {
@@ -11683,7 +11762,11 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     for (const m of [messages.de, messages.en]) {
       expect(m.runtimeStopProtected).toContain(m.runtimeClearOverride);
       expect(m.runtimeStopProtected).toContain(m.runtimeSpecMinInstances);
-      expect(m.runtimeStopProtected).toContain(m.runtimePinStopped);
+      // The way to force_stopped there is the form's override select: the row
+      // offers "Pin as running" while the instance runs, never "Pin as stopped".
+      expect(m.runtimeStopProtected).toContain(m.runtimeSpecAdminState);
+      expect(m.runtimeStopProtected).toContain(m.runtimeForceStop);
+      expect(m.runtimeStopProtected).not.toContain(m.runtimePinStopped);
     }
     expect(messages.de.runtimeStopProtected).toContain('Angeheftet');
     expect(messages.en.runtimeStopProtected).toContain('Pinned');
@@ -11745,13 +11828,20 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     );
     fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
     expect(fakeApi.startRuntime).toHaveBeenCalledTimes(1);
-    // Only the action in flight: the row's other actions stay usable.
-    expect(inRowWith('4100').getByRole('button', { name: t.runtimeStop })).not.toHaveAttribute(
-      'aria-disabled',
-    );
+    // Stop waits too: a stop of the instance the start is waiting on would
+    // fail that start, and its toast would then blame a lack of room. Pin
+    // stays usable.
+    const stop = inRowWith('4100').getByRole('button', { name: t.runtimeStop });
+    expect(stop).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.click(stop);
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+    expect(
+      inRowWith('4100').getByRole('button', { name: t.runtimePinRunning }),
+    ).not.toHaveAttribute('aria-disabled');
 
     await act(async () => finish({ instance: 1, state: 'running' }));
     await waitForRowActions('4100', t.runtimeStart);
+    await waitForRowActions('4100', t.runtimeStop);
   });
 
   it('disables Stop while its request is in flight', async () => {
@@ -11892,6 +11982,8 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
       'runtimeStartForceStopped',
       'runtimeStopProtected',
       'runtimeStopFeatureMissing',
+      'runtimeStopHigherDraining',
+      'runtimeStartFeatureMissing',
     ] as const;
     for (const key of keys) {
       expect(messages.de[key].length, key).toBeGreaterThan(0);

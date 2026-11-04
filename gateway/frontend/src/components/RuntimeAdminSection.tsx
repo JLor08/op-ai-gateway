@@ -591,6 +591,12 @@ function narrowReportConfig(config: unknown): ReportConfig {
   return out;
 }
 
+// The busy key of a live-status Start or Stop: a start is the spec's (the
+// gateway picks the instance), a stop the instance's.
+function runtimeActionKey(action: 'start' | 'stop', row: RuntimeStatus): string {
+  return action === 'start' ? `start:${row.spec_id}` : `stop:${row.spec_id}#${instanceIndex(row)}`;
+}
+
 // The override actions' PUT body. putRuntimeSpec takes the ENTIRE spec
 // (Omit<RuntimeSpec, 'configured' | 'id' | 'mapping_id'>), never a patch, so
 // the body is built by spreading the spec as the action has just read it
@@ -601,12 +607,6 @@ function narrowReportConfig(config: unknown): ReportConfig {
 // review). The rest-spread is deliberate over an explicit field list: a field
 // added to RuntimeSpec later carries through by itself instead of being
 // silently dropped here.
-// The busy key of a live-status Start or Stop: a start is the spec's (the
-// gateway picks the instance), a stop the instance's.
-function runtimeActionKey(action: 'start' | 'stop', row: RuntimeStatus): string {
-  return action === 'start' ? `start:${row.spec_id}` : `stop:${row.spec_id}#${instanceIndex(row)}`;
-}
-
 function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
   // api_token_set/app_api_token_set/app_api_token_header, the RuntimeSpec
   // Type block's own effective_type/resolved_metrics_path/
@@ -2167,8 +2167,9 @@ export function RuntimeAdminSection({
   } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   // The live-status Start and Stop requests in flight, keyed per action and
-  // row (runtimeActionKey). Each disables only its own button: a start or stop
-  // writes nothing, so it does not take the override lock the PUTs share.
+  // row (runtimeActionKey). Each disables its own button, and a start the
+  // spec's Stop as well; a start or stop writes nothing, so it does not take
+  // the override lock the PUTs share.
   const [runtimeActionsBusy, setRuntimeActionsBusy] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -4310,7 +4311,8 @@ export function RuntimeAdminSection({
     if (plan.start) {
       const startKey = runtimeActionKey('start', row);
       let startTitle: string | undefined;
-      if (plan.start.disabled === 'force_stopped') startTitle = t.runtimeStartForceStopped;
+      if (plan.start.disabled === 'feature') startTitle = t.runtimeStartFeatureMissing;
+      else if (plan.start.disabled === 'force_stopped') startTitle = t.runtimeStartForceStopped;
       else if (plan.start.disabled === 'max_instances') {
         startTitle = t.runtimeStartMaxInstances(startInstanceLimit(spec));
       } else if (plan.start.more) startTitle = t.runtimeStartMore;
@@ -4327,14 +4329,21 @@ export function RuntimeAdminSection({
     if (plan.stop) {
       const stopKey = runtimeActionKey('stop', row);
       let stopTitle: string | undefined;
-      if (plan.stop.disabled === 'protected') stopTitle = t.runtimeStopProtected;
-      else if (plan.stop.disabled === 'feature') stopTitle = t.runtimeStopFeatureMissing;
+      if (plan.stop.disabled === 'feature') stopTitle = t.runtimeStopFeatureMissing;
+      else if (plan.stop.disabled === 'protected') stopTitle = t.runtimeStopProtected;
+      else if (plan.stop.disabled === 'draining') stopTitle = t.runtimeStopHigherDraining;
       actions.push({
         key: 'stop',
         label: t.runtimeStop,
         icon: <StopIcon fontSize="small" />,
+        // It also waits while a Start of the spec is in flight: the agent
+        // answers a stop of the instance that start is waiting on by failing
+        // the start, which would then read as a refusal for lack of room.
         disabled:
-          plan.stop.disabled !== undefined || overridesLocked || runtimeActionsBusy.has(stopKey),
+          plan.stop.disabled !== undefined ||
+          overridesLocked ||
+          runtimeActionsBusy.has(stopKey) ||
+          runtimeActionsBusy.has(runtimeActionKey('start', row)),
         title: stopTitle,
         onClick: () => stopRuntimeInstance(row, spec),
       });

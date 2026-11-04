@@ -5813,8 +5813,13 @@ Three more rules on this screen generalise:
 runtime API is deliberately state-shaped (see
 [ADR-026](../09-architecture-decisions.md#adr-026--gatewayagent-control-is-desired-state-not-commands)),
 so a "restart" is a three-step UI sequence: write `force_stopped`, wait for the
-stream to report the spec `stopped`, then clear the override. Because there is
-no endpoint, the sequence carries all the correctness burden:
+stream to report the spec `stopped`, then clear the override. (The live view's
+transient Start and Stop are the stated exception to the state-shaped rule:
+they persist nothing, travel as request-scoped calls that are answered or fail
+rather than as frames a reconnect can lose, and leave the desired state in
+`admin_state`;
+[ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor).)
+Because there is no endpoint, the sequence carries all the correctness burden:
 
 - One flow at a time; while it runs, **all** override actions on **every** row
   are disabled, because any `admin_state` write would fight it.
@@ -8396,7 +8401,12 @@ same function as the pushed document, so the two cannot disagree); neither has a
     index is left below `max_instances` (0: the 64 an address can carry) — by
     the gateway's rule as far as the stream shows it: instance 0 taken while it
     runs or starts, an index k ≥ 1 while it is listed in any state but
-    `crashed`, `start_failed` and `not_permitted`. While the spec is
+    `crashed`, `start_failed` and `not_permitted`, so a burst instance that
+    still drains, or rests at `stopped` before it is retired, keeps its index
+    (the hover says to wait for it or to raise the maximum). It is disabled
+    with a reason, too, when the start would pick an instance k ≥ 1 (instance
+    0 runs or starts) and `agent_features` lacks `runtime_instances`, which the
+    gateway would refuse. While the spec is
     `force_stopped` it is disabled with the hover "Pinned as stopped: clear the
     override first", since the gateway refuses every start then. A 202 answer
     (the agent did not report the instance up within 5 s) says the instance is
@@ -8405,16 +8415,24 @@ same function as the pushed document, so the two cannot disagree); neither has a
     nothing: the agent drains that instance, and demand may start it again
     (`POST /stop/{model}`, §4.1). It sits on the row of the spec's highest
     running or starting instance, because instances stop highest first. It is
-    shown disabled, with a hover naming the ways out — clear the override, lower
-    the minimum instances, untick Pinned, or Pin as stopped — on an instance the
-    agent keeps up: an index below the larger of a replicable spec's
-    `min_instances` and 1 for a spec `pinned` or `force_running` (the agent's
-    `ProtectedCount`), which the agent would refuse with
-    `runtime.instance_protected`. It is shown disabled with a reason, too, when
-    the runtime report's `agent_features` lacks `runtime_stop` (§7); the report
-    is read once per screen, so an agent that changed since is caught by the
-    gateway's `409 runtime.agent_feature_missing`, which the portal renders
-    naming the feature.
+    shown disabled with a reason, checked in this order: when the runtime
+    report's `agent_features` lacks `runtime_stop` (§7), which no spec setting
+    lifts; on an instance the agent keeps up, an index below the larger of a
+    replicable spec's `min_instances` and 1 for a spec `pinned` or
+    `force_running` (the agent's `ProtectedCount`), which the agent would
+    refuse with `runtime.instance_protected`, with a hover naming the ways out
+    — clear the override, lower the minimum instances, untick Pinned, or set
+    the form's admin override to "Force stop"; and while a higher instance of
+    the spec still drains, since the agent refuses a stop while a higher
+    sibling has any process (`runtime.instance_not_highest`), so stepping down
+    one instance at a time waits for each drain to end. Under `force_stopped`
+    the agent drains every instance at once and takes a stop of any of them,
+    so the drain rule does not apply there. The report is read once per
+    screen, so an agent that changed since is caught by the gateway's
+    `409 runtime.agent_feature_missing`, which the portal renders naming the
+    feature. Stop also waits while a Start of the same spec is in flight: the
+    agent answers a stop of the instance that start waits on by failing the
+    start, whose toast would then blame a lack of room.
   - **Pin** sits on the speaking row while the spec carries no override, and
     pins the state the operator sees: "Pin as running" while any instance of
     the spec runs or starts, writing `force_running`, otherwise "Pin as
@@ -8423,7 +8441,8 @@ same function as the pushed document, so the two cannot disagree); neither has a
     which stays its unpin. The rows no longer offer Force start and Force stop;
     the spec form's admin-override select keeps all three values.
 
-  A start or stop in flight disables only its own button; all of them, and the
+  A start or stop in flight disables its own button (and a start the spec's
+  Stop, as above); all of them, and the
   override writes, wait while a restart or an override write runs (§11.2). The
   answer, or the refusal translated in both languages, shows in the screen's
   toast; every code of the two endpoints is mapped

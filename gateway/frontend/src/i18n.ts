@@ -1373,12 +1373,16 @@ const de = {
   runtimeStartForceStopped: 'Gestoppt angeheftet – erst Übersteuerung aufheben',
   runtimeStartMaxInstances: (max: number) =>
     max === 1
-      ? 'Die eine Instanz, die diese Startvorgabe erlaubt, läuft oder startet bereits. Für eine weitere die Höchstanzahl Instanzen anheben.'
-      : `Alle ${max} Instanzen, die diese Startvorgabe erlaubt, laufen oder starten bereits. Für eine weitere die Höchstanzahl Instanzen anheben.`,
+      ? 'Die eine Instanz, die diese Startvorgabe erlaubt, ist bereits belegt (läuft, startet oder fährt noch herunter). Abwarten, bis eine heruntergefahren ist, oder die Höchstanzahl Instanzen anheben.'
+      : `Alle ${max} Instanzen, die diese Startvorgabe erlaubt, sind bereits belegt (laufen, starten oder fahren noch herunter). Abwarten, bis eine heruntergefahren ist, oder die Höchstanzahl Instanzen anheben.`,
   runtimeStopProtected:
-    'Diese Instanz hält die Startvorgabe am Laufen; der Agent würde sie sofort wieder starten. Auswege: Übersteuerung aufheben, Mindestanzahl Instanzen senken, „Angeheftet“ abwählen oder „Gestoppt anheften“.',
+    'Diese Instanz hält die Startvorgabe am Laufen; der Agent würde sie sofort wieder starten. Auswege: Übersteuerung aufheben, Mindestanzahl Instanzen senken, „Angeheftet“ abwählen oder die Admin-Übersteuerung der Startvorgabe auf „Stopp erzwingen“ setzen.',
   runtimeStopFeatureMissing:
     'Der Agent dieses Servers kann keine einzelne Instanz stoppen: Ihm fehlt die Funktion „runtime_stop“ (ab Agent 0.17.0). Den Agenten aktualisieren.',
+  runtimeStopHigherDraining:
+    'Eine höhere Instanz dieses Modells wird noch geleert. Instanzen werden von der höchsten an gestoppt; „Stoppen“ geht hier wieder, sobald sie gestoppt ist.',
+  runtimeStartFeatureMissing:
+    'Der Agent dieses Servers kann keine weitere Instanz starten: Ihm fehlt die Funktion „runtime_instances“ (ab Agent 0.16.0). Den Agenten aktualisieren.',
   runtimeStartedRunning: (target: string) => `„${target}“ läuft.`,
   runtimeStartedStarting: (target: string) =>
     `„${target}“ startet. Die Statuszeilen zeigen den Fortschritt.`,
@@ -2224,7 +2228,7 @@ const de = {
   errorRuntimeAdminStopped:
     'Das Modell ist als gestoppt angeheftet (Übersteuerung „Stopp erzwingen“). Erst die Übersteuerung aufheben, dann starten.',
   errorRuntimeMaxInstancesReached:
-    'Alle Instanzen, die diese Startvorgabe erlaubt, laufen oder starten bereits. Für eine weitere die Höchstanzahl Instanzen anheben.',
+    'Alle Instanzen, die diese Startvorgabe erlaubt, sind bereits belegt (laufen, starten oder fahren noch herunter). Abwarten, bis eine heruntergefahren ist, oder die Höchstanzahl Instanzen anheben.',
   errorRuntimeAgentFeatureMissing:
     'Der Agent dieses Servers kennt eine Funktion nicht, die diese Aktion braucht. Den Agenten aktualisieren.',
   errorRuntimeAgentFeatureMissingNamed: (feature: string) =>
@@ -2244,7 +2248,7 @@ const de = {
   errorRuntimeInstanceProtected:
     'Diese Instanz hält die Startvorgabe am Laufen (Mindestanzahl Instanzen, „Angeheftet“ oder „Start erzwingen“); der Agent würde sie sofort wieder starten.',
   errorRuntimeInstanceNotHighest:
-    'Eine höhere Instanz dieses Modells läuft. Instanzen werden von der höchsten an gestoppt.',
+    'Eine höhere Instanz dieses Modells läuft oder wird noch geleert. Instanzen werden von der höchsten an gestoppt.',
   errorRuntimeModelNotManaged:
     'Der Agent verwaltet dieses Modell oder diese Instanz nicht (mehr). Die Statuszeilen zeigen den aktuellen Stand.',
   errorRuntimeAdmissionBlocked:
@@ -4914,12 +4918,16 @@ const en: PortalMessages = {
   runtimeStartForceStopped: 'Pinned as stopped: clear the override first',
   runtimeStartMaxInstances: (max: number) =>
     max === 1
-      ? 'The one instance this launch spec allows is already running or starting. Raise its maximum instances for another one.'
-      : `All ${max} instances this launch spec allows are already running or starting. Raise its maximum instances for another one.`,
+      ? 'The one instance this launch spec allows is already in use (running, starting or still shutting down). Wait until it has shut down, or raise its maximum instances.'
+      : `All ${max} instances this launch spec allows are already in use (running, starting or still shutting down). Wait until one has shut down, or raise its maximum instances.`,
   runtimeStopProtected:
-    'This instance keeps the launch spec up; the agent would start it again at once. Ways out: Clear override, lower the Minimum instances, untick "Pinned", or Pin as stopped.',
+    'This instance keeps the launch spec up; the agent would start it again at once. Ways out: Clear override, lower the Minimum instances, untick "Pinned", or set the launch spec\'s Admin override to "Force stop".',
   runtimeStopFeatureMissing:
     'This server\'s agent cannot stop a single instance: it lacks the feature "runtime_stop" (agent 0.17.0 and later). Update the agent.',
+  runtimeStopHigherDraining:
+    'A higher instance of this model is still draining. Instances stop highest first; Stop works here again once it has stopped.',
+  runtimeStartFeatureMissing:
+    'This server\'s agent cannot start another instance: it lacks the feature "runtime_instances" (agent 0.16.0 and later). Update the agent.',
   runtimeStartedRunning: (target: string) => `"${target}" is running.`,
   runtimeStartedStarting: (target: string) =>
     `"${target}" is starting. The status rows show its progress.`,
@@ -5687,7 +5695,7 @@ const en: PortalMessages = {
   errorRuntimeAdminStopped:
     'The model is pinned as stopped (the "Force stop" override). Clear the override first, then start it.',
   errorRuntimeMaxInstancesReached:
-    'Every instance this launch spec allows is already running or starting. Raise its maximum instances for another one.',
+    'Every instance this launch spec allows is already in use (running, starting or still shutting down). Wait until one has shut down, or raise its maximum instances.',
   errorRuntimeAgentFeatureMissing:
     "This server's agent lacks a feature this action needs. Update the agent.",
   errorRuntimeAgentFeatureMissingNamed: (feature: string) =>
@@ -5706,7 +5714,7 @@ const en: PortalMessages = {
   errorRuntimeInstanceProtected:
     'This instance keeps the launch spec up (minimum instances, "Pinned" or "Force start"); the agent would start it again at once.',
   errorRuntimeInstanceNotHighest:
-    'A higher instance of this model is running. Instances stop highest first.',
+    'A higher instance of this model is running or still draining. Instances stop highest first.',
   errorRuntimeModelNotManaged:
     'The agent does not manage this model or instance (any more). The status rows show where it stands.',
   errorRuntimeAdmissionBlocked:

@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  RUNTIME_INSTANCES_FEATURE,
   RUNTIME_STOP_FEATURE,
   highestLiveInstance,
   manualStopProtectedCount,
@@ -41,7 +42,8 @@ function spec(overrides: Partial<RowPlanSpec> = {}): RowPlanSpec {
   };
 }
 
-const withStop = [RUNTIME_STOP_FEATURE];
+// An agent that declares both features the plan reads.
+const declared = [RUNTIME_STOP_FEATURE, RUNTIME_INSTANCES_FEATURE];
 
 describe('highestLiveInstance', () => {
   it('is the highest running or starting index of the spec, ignoring other specs', () => {
@@ -129,7 +131,7 @@ describe('startRoomLeft', () => {
 describe('runtimeRowPlan, a spec that is not replicable', () => {
   it('offers Start and Pin as stopped on the stopped row, and no Stop', () => {
     const rows = [row('s', 0, 'stopped')];
-    expect(runtimeRowPlan(rows[0], spec(), rows, withStop)).toEqual({
+    expect(runtimeRowPlan(rows[0], spec(), rows, declared)).toEqual({
       start: { more: false },
       pin: 'force_stopped',
     });
@@ -137,7 +139,7 @@ describe('runtimeRowPlan, a spec that is not replicable', () => {
 
   it('offers Stop and Pin as running on the running row, and no Start', () => {
     const rows = [row('s', 0)];
-    expect(runtimeRowPlan(rows[0], spec(), rows, withStop)).toEqual({
+    expect(runtimeRowPlan(rows[0], spec(), rows, declared)).toEqual({
       stop: {},
       pin: 'force_running',
     });
@@ -145,7 +147,7 @@ describe('runtimeRowPlan, a spec that is not replicable', () => {
 
   it('treats a starting row as live: Stop, no Start, Pin as running', () => {
     const rows = [row('s', 0, 'starting')];
-    expect(runtimeRowPlan(rows[0], spec(), rows, withStop)).toEqual({
+    expect(runtimeRowPlan(rows[0], spec(), rows, declared)).toEqual({
       stop: {},
       pin: 'force_running',
     });
@@ -153,10 +155,10 @@ describe('runtimeRowPlan, a spec that is not replicable', () => {
 
   it('disables Stop on a pinned or force_running instance 0', () => {
     const rows = [row('s', 0)];
-    expect(runtimeRowPlan(rows[0], spec({ pinned: true }), rows, withStop).stop).toEqual({
+    expect(runtimeRowPlan(rows[0], spec({ pinned: true }), rows, declared).stop).toEqual({
       disabled: 'protected',
     });
-    const forced = runtimeRowPlan(rows[0], spec({ admin_state: 'force_running' }), rows, withStop);
+    const forced = runtimeRowPlan(rows[0], spec({ admin_state: 'force_running' }), rows, declared);
     expect(forced.stop).toEqual({ disabled: 'protected' });
     // An override is set, so there is nothing to pin.
     expect(forced.pin).toBeUndefined();
@@ -167,9 +169,23 @@ describe('runtimeRowPlan, a spec that is not replicable', () => {
     expect(runtimeRowPlan(rows[0], spec(), rows, []).stop).toEqual({ disabled: 'feature' });
   });
 
+  it('names the missing feature over the protected floor: no setting lifts it', () => {
+    const rows = [row('s', 0)];
+    expect(runtimeRowPlan(rows[0], spec({ pinned: true }), rows, []).stop).toEqual({
+      disabled: 'feature',
+    });
+  });
+
+  it('needs no runtime_instances to start instance 0', () => {
+    const rows = [row('s', 0, 'stopped')];
+    expect(runtimeRowPlan(rows[0], spec(), rows, [RUNTIME_STOP_FEATURE]).start).toEqual({
+      more: false,
+    });
+  });
+
   it('disables Start while the spec is force_stopped, and offers no Pin', () => {
     const rows = [row('s', 0, 'stopped')];
-    expect(runtimeRowPlan(rows[0], spec({ admin_state: 'force_stopped' }), rows, withStop)).toEqual(
+    expect(runtimeRowPlan(rows[0], spec({ admin_state: 'force_stopped' }), rows, declared)).toEqual(
       { start: { disabled: 'force_stopped', more: false } },
     );
   });
@@ -180,7 +196,7 @@ describe('runtimeRowPlan, a replicable spec', () => {
 
   it('keeps Start on the primary row while instances run, saying it starts one more', () => {
     const rows = [row('s', 0), row('s', 1), row('s', 2)];
-    expect(runtimeRowPlan(rows[0], replicable, rows, withStop)).toEqual({
+    expect(runtimeRowPlan(rows[0], replicable, rows, declared)).toEqual({
       start: { more: true },
       pin: 'force_running',
     });
@@ -188,30 +204,73 @@ describe('runtimeRowPlan, a replicable spec', () => {
 
   it('offers Stop only on the highest running or starting instance', () => {
     const rows = [row('s', 0), row('s', 1), row('s', 2, 'starting'), row('s', 3, 'crashed')];
-    expect(runtimeRowPlan(rows[1], replicable, rows, withStop)).toEqual({});
-    expect(runtimeRowPlan(rows[2], replicable, rows, withStop)).toEqual({ stop: {} });
-    expect(runtimeRowPlan(rows[3], replicable, rows, withStop)).toEqual({});
+    expect(runtimeRowPlan(rows[1], replicable, rows, declared)).toEqual({});
+    expect(runtimeRowPlan(rows[2], replicable, rows, declared)).toEqual({ stop: {} });
+    expect(runtimeRowPlan(rows[3], replicable, rows, declared)).toEqual({});
     // Instance 0 is the primary row: Start and Pin, but it is not the highest.
-    expect(runtimeRowPlan(rows[0], replicable, rows, withStop).stop).toBeUndefined();
+    expect(runtimeRowPlan(rows[0], replicable, rows, declared).stop).toBeUndefined();
+  });
+
+  it('disables Stop on the next instance down while a higher one still drains', () => {
+    const rows = [row('s', 0), row('s', 1), row('s', 2, 'draining')];
+    expect(runtimeRowPlan(rows[1], replicable, rows, declared).stop).toEqual({
+      disabled: 'draining',
+    });
+    // The draining row is on its way out already, and instance 0 is not the
+    // highest: neither carries Stop.
+    expect(runtimeRowPlan(rows[2], replicable, rows, declared).stop).toBeUndefined();
+    expect(runtimeRowPlan(rows[0], replicable, rows, declared).stop).toBeUndefined();
+    // Once the drain is over, Stop is usable on #1.
+    const after = [row('s', 0), row('s', 1), row('s', 2, 'stopped')];
+    expect(runtimeRowPlan(after[1], replicable, after, declared).stop).toEqual({});
+  });
+
+  it('keeps Stop usable under force_stopped while a higher instance drains', () => {
+    // The agent drains every instance of a force_stopped spec at once and
+    // takes a stop of any of them.
+    const s = spec({ replicable: true, admin_state: 'force_stopped' });
+    const rows = [row('s', 0), row('s', 1, 'draining')];
+    expect(runtimeRowPlan(rows[0], s, rows, declared).stop).toEqual({});
+  });
+
+  it('names the missing feature over the protected floor on a burst instance', () => {
+    const s = spec({ replicable: true, min_instances: 2 });
+    const rows = [row('s', 0), row('s', 1)];
+    expect(runtimeRowPlan(rows[1], s, rows, [RUNTIME_INSTANCES_FEATURE]).stop).toEqual({
+      disabled: 'feature',
+    });
+  });
+
+  it('disables a Start of one more instance when the agent lacks runtime_instances', () => {
+    const rows = [row('s', 0)];
+    expect(runtimeRowPlan(rows[0], replicable, rows, [RUNTIME_STOP_FEATURE]).start).toEqual({
+      disabled: 'feature',
+      more: true,
+    });
+    // Instance 0 at rest is what the start picks then: no feature needed.
+    const stopped = [row('s', 0, 'stopped')];
+    expect(runtimeRowPlan(stopped[0], replicable, stopped, [RUNTIME_STOP_FEATURE]).start).toEqual({
+      more: false,
+    });
   });
 
   it('offers Stop on instance 0 once it is the only one left', () => {
     const rows = [row('s', 0), row('s', 1, 'stopped')];
-    expect(runtimeRowPlan(rows[0], replicable, rows, withStop).stop).toEqual({});
+    expect(runtimeRowPlan(rows[0], replicable, rows, declared).stop).toEqual({});
   });
 
   it('disables Stop on an instance below min_instances', () => {
     const s = spec({ replicable: true, min_instances: 2 });
     const rows = [row('s', 0), row('s', 1)];
-    expect(runtimeRowPlan(rows[1], s, rows, withStop).stop).toEqual({ disabled: 'protected' });
+    expect(runtimeRowPlan(rows[1], s, rows, declared).stop).toEqual({ disabled: 'protected' });
     const more = [...rows, row('s', 2)];
-    expect(runtimeRowPlan(more[2], s, more, withStop).stop).toEqual({});
+    expect(runtimeRowPlan(more[2], s, more, declared).stop).toEqual({});
   });
 
   it('disables Start at max_instances', () => {
     const s = spec({ replicable: true, max_instances: 2 });
     const rows = [row('s', 0), row('s', 1)];
-    expect(runtimeRowPlan(rows[0], s, rows, withStop).start).toEqual({
+    expect(runtimeRowPlan(rows[0], s, rows, declared).start).toEqual({
       disabled: 'max_instances',
       more: true,
     });
@@ -220,7 +279,7 @@ describe('runtimeRowPlan, a replicable spec', () => {
   it('names force_stopped over max_instances', () => {
     const s = spec({ replicable: true, max_instances: 1, admin_state: 'force_stopped' });
     const rows = [row('s', 0, 'starting')];
-    expect(runtimeRowPlan(rows[0], s, rows, withStop).start).toEqual({
+    expect(runtimeRowPlan(rows[0], s, rows, declared).start).toEqual({
       disabled: 'force_stopped',
       more: true,
     });
@@ -228,15 +287,15 @@ describe('runtimeRowPlan, a replicable spec', () => {
 
   it('puts the spec-wide actions on the primary row, a running burst instance before a stopped 0', () => {
     const rows = [row('s', 0, 'stopped'), row('s', 1)];
-    const plan0 = runtimeRowPlan(rows[0], replicable, rows, withStop);
-    const plan1 = runtimeRowPlan(rows[1], replicable, rows, withStop);
+    const plan0 = runtimeRowPlan(rows[0], replicable, rows, declared);
+    const plan1 = runtimeRowPlan(rows[1], replicable, rows, declared);
     expect(plan0).toEqual({});
     expect(plan1).toEqual({ start: { more: true }, stop: {}, pin: 'force_running' });
   });
 
   it('offers Start without "one more" while nothing of the spec runs', () => {
     const rows = [row('s', 0, 'stopped')];
-    expect(runtimeRowPlan(rows[0], replicable, rows, withStop)).toEqual({
+    expect(runtimeRowPlan(rows[0], replicable, rows, declared)).toEqual({
       start: { more: false },
       pin: 'force_stopped',
     });

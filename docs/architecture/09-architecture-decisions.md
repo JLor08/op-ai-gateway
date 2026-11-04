@@ -11617,8 +11617,9 @@ the order the agent retires instances in.
 - **(e) A stop goes highest index first and never below the protected floor.** The agent refuses a stop of an
   instance below `ProtectedCount` — `max(min_instances of a replicable spec, 1 for a pinned or force_running spec)` —
   with `409 runtime.instance_protected`, because it would restart it at once, and a stop while a higher sibling has a
-  process with `409 runtime.instance_not_highest`; the gateway passes both through. The portal offers Stop only on the
-  highest running or starting instance and shows it disabled, with the way out, on a protected one. A stop needs the
+  process (starting, running or draining) with `409 runtime.instance_not_highest`; the gateway passes both through.
+  The portal offers Stop only on the highest running or starting instance and shows it disabled, with the way out, on
+  a protected one, and with a reason while a higher instance still drains. A stop needs the
   agent feature `runtime_stop` (`409 runtime.agent_feature_missing` naming it): an older router hands the bodiless
   POST to its proxy, which answers `404 runtime.model_not_managed`, indistinguishable from an unknown address.
 
@@ -11626,8 +11627,15 @@ the order the agent retires instances in.
 
 - **A stopped instance can come back at once** when requests are queued on it or demand parks; that is the point of a
   transient stop, and Pin as stopped is the way to keep a model down.
-- **A stop below the floor has a named way out** — clear the override, lower `min_instances`, untick Pinned, or Pin as
-  stopped — instead of a stop the agent would undo.
+- **A stop below the floor has a named way out** — clear the override, lower `min_instances`, untick Pinned, or set
+  the form's admin override to Force stop — instead of a stop the agent would undo.
+- **Start and Stop are the stated exception to
+  [ADR-026](#adr-026--gatewayagent-control-is-desired-state-not-commands)'s desired-state rule.** They persist
+  nothing, so there is no state a reconnect could lose, and they travel as request-scoped calls on the agent's router,
+  like the ensure route
+  ([ADR-046](#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)): the
+  caller gets the answer or the error, never a silently dropped frame. The desired state stays in `admin_state`, which
+  Pin writes.
 - **The claim set is process memory**: a start that the gateway's restart cut short leaves nothing behind, and the
   agent's status is the truth on the next sample.
 
