@@ -1074,12 +1074,37 @@ func splitRecord(r logRecord, budget int) (head, tail logRecord, ok bool) {
 	for n > 0 && n < len(r.text) && !utf8.RuneStart(r.text[n]) {
 		n--
 	}
+	n = outsideLinePrefix(r, n)
 	if n == 0 {
 		return logRecord{}, logRecord{}, false
 	}
 	head, tail = r, r
 	head.text, tail.text = r.text[:n], r.text[n:]
 	return head, tail, true
+}
+
+// outsideLinePrefix moves a cut at n in r's text back to the start of its line
+// when n falls inside the "[#k] " prefix the agent put there for instance k.
+// A reader that shows one instance on its own removes that prefix from the
+// start of each line, and it can only recognise the prefix whole: cut through
+// it, the head's last line ends in a fragment like "[#2" and the tail opens
+// with "] ", a line continued mid-way, so neither half is removed and the
+// fragment shows up in that view. Moving the cut to the line start keeps the
+// prefix whole in the tail. The cut only ever moves backwards, so the head
+// still fits the budget; n == 0 then means nothing of r fits before the
+// prefix, which defers r to the next chunk like any record too big for the
+// room left. (A record cannot be alone in a chunk with a budget that small:
+// alone, it has nearly the whole frame.)
+func outsideLinePrefix(r logRecord, n int) int {
+	prefix := instanceLinePrefix(r.instance)
+	if prefix == "" || n <= 0 || n >= len(r.text) {
+		return n
+	}
+	start := strings.LastIndexByte(r.text[:n], '\n') + 1
+	if n-start < len(prefix) && strings.HasPrefix(r.text[start:], prefix) {
+		return start
+	}
+	return n
 }
 
 // entryWireMax is an upper bound on the bytes one LogEntry costs inside a

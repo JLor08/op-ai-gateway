@@ -1053,3 +1053,35 @@ func TestADropStampedOntoAnInstanceEntryKeepsItsInstance(t *testing.T) {
 		}
 	})
 }
+
+// TestASplitNeverCutsThroughAnInstancePrefix: a record too big for the room
+// left in a frame is cut, and the cut never falls inside the "[#k] " prefix
+// that opens one of instance k's lines -- a reader removing that prefix to show
+// the instance on its own can only recognise it whole. Every budget that cuts
+// the record is tried, so whichever byte the room ends at, the head ends before
+// a prefix or after it, never in the middle.
+func TestASplitNeverCutsThroughAnInstancePrefix(t *testing.T) {
+	const prefix = "[#2] "
+	r := logRecord{instance: 2, text: prefix + "first\n" + prefix + "second\n" + prefix + "third"}
+	splits := 0
+	for budget := logEntryWireOverhead; budget < logEntryWireOverhead+2*len(r.text); budget++ {
+		head, tail, ok := splitRecord(r, budget)
+		if !ok {
+			continue
+		}
+		splits++
+		if head.text+tail.text != r.text {
+			t.Fatalf("budget %d: halves %q + %q do not rejoin to the record", budget, head.text, tail.text)
+		}
+		lastLine := head.text[strings.LastIndexByte(head.text, '\n')+1:]
+		if lastLine != "" && len(lastLine) < len(prefix) && strings.HasPrefix(prefix, lastLine) {
+			t.Errorf("budget %d: head ends %q, inside the prefix; tail opens %q", budget, lastLine, tail.text)
+		}
+		if head.instance != 2 || tail.instance != 2 {
+			t.Errorf("budget %d: halves name instances %d and %d, want 2 for both", budget, head.instance, tail.instance)
+		}
+	}
+	if splits == 0 {
+		t.Fatal("no budget split the record; the test exercises nothing")
+	}
+}
