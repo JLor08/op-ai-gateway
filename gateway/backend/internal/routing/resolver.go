@@ -131,8 +131,19 @@ type Target struct {
 	// false, whatever the spec: neither path judges instances, and a request
 	// sent there is never re-selected, since only an instance k >= 1 is.
 	InstanceCapable bool
-	Timeout         time.Duration
-	APIFlavor       string
+	// InstancePool is true when the candidates this target was selected from
+	// include an instance candidate -- an instance of a replicable spec, of this
+	// target's mapping or of another mapping of the same model -- and so always
+	// when InstanceCapable is. In such a pool a request that needs a free live
+	// slot (a live session, any transcription) is judged by every candidate's
+	// live slot, a mapping without instances included: a live session that finds
+	// this target's slot taken is selected again, or parks, rather than refused.
+	// In a pool without one it is refused busy at once, as it always was. False
+	// wherever InstanceCapable is false for want of a fresh selection (an
+	// affinity pin, a server override) and on a vendor target.
+	InstancePool bool
+	Timeout      time.Duration
+	APIFlavor    string
 	// APIToken is the resolved application's per-app upstream credential, still
 	// SEALED (enc:/plain:). Routing never decrypts it; the cipher-holding gateway
 	// layers open it and attach it to the upstream call. Empty = no upstream auth.
@@ -1850,8 +1861,23 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 		pool = reachable
 	}
 
+	// Whether the pool holds an instance candidate decides how live slots are judged
+	// (selectUnderCap) and is carried on the selection (Target.InstancePool).
+	instancePool := slices.ContainsFunc(pool, func(c MappingCandidate) bool { return c.InstanceCapable })
+	sel, ok, err := r.selectUnderCap(ctx, pool, req, now, instancePool)
+	if ok {
+		sel.InstancePool = instancePool
+	}
+	return sel, ok, err
+}
+
+// selectUnderCap is selectCandidate's last step: it selects from pool, the candidates
+// that passed every gate, preferring the ones under their cap. instancePool says pool
+// holds an instance candidate.
+func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, req inference.Request, now time.Time, instancePool bool) (MappingCandidate, bool, error) {
+	model := req.Model
 	// Capacity cap, CP3/CP4: PREFER the candidates under their cap (underCap); when none
-	// is, queue the request (CP4) if an admission controller is wired. Two kinds of cap:
+	// is, queue the request (CP4) if an admission controller is wired. The caps:
 	//
 	//   - A candidate of a mapping without instances keeps the reservation-aware server
 	//     cap: in-flight on its server below effectiveCap = max_concurrency −
@@ -1863,11 +1889,17 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	//     against the spec's instance parallelism (always at least 1), read from
 	//     r.instanceActivity: its instances share the server, so the server's count cannot
 	//     say whether this one instance takes another request. Without that source an
-	//     instance is never capped. A request that needs the instance's live slot free --
-	//     a live session, and every transcription (needsFreeLiveSlot) -- additionally
-	//     finds an instance at its cap while its one live slot is held (r.liveSlots).
+	//     instance is never capped.
+	//   - In a pool that holds an instance candidate, a request that needs a live slot
+	//     free -- a live session, and every transcription (needsFreeLiveSlot) -- also
+	//     finds every candidate at its cap while its one live slot is held (r.liveSlots):
+	//     an instance, and a mapping without instances beside it alike, so the request
+	//     goes to a free slot or parks for one (and signals demand for another
+	//     instance). A pool without an instance candidate is not judged by its slots:
+	//     a live session there takes its one slot or is refused busy at once by its own
+	//     acquire, and a buffered transcription by its held check, as before.
 	//
-	// The block runs when any of those three sources is wired, and is a no-op otherwise.
+	// The block runs when any of those sources is wired, and is a no-op otherwise.
 	// A pinned request never reaches here (resolveAffinity returns first). When the
 	// under-cap subset is empty the request queues if an admission controller is wired --
 	// with an instance among the candidates it does so even though no mapping sets a
@@ -1879,7 +1911,7 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	// viable-but-at-cap candidate and leave only under-cap non-viable ones →
 	// ErrNoHealthyHost. So with every cap undefined (the under-cap subset == the full
 	// pool) this is exactly the pre-CP3 behaviour.
-	judgeLive := r.liveSlots != nil && needsFreeLiveSlot(req)
+	judgeLive := instancePool && r.liveSlots != nil && needsFreeLiveSlot(req)
 	if r.activity != nil || r.instanceActivity != nil || judgeLive {
 		capped := make([]MappingCandidate, 0, len(pool))
 		for _, c := range pool {
@@ -1917,23 +1949,20 @@ func needsFreeLiveSlot(req inference.Request) bool {
 	return req.LiveSession || slices.Contains(req.RequiredCapabilities, CapabilityTranscription)
 }
 
-// underCap reports whether candidate c can take a request now. An instance candidate is
-// under its cap while its own in-flight count is below the parallelism its expansion
-// carried (with no instance activity source its load is unknown and that part never caps
-// it) and, when judgeLive is set (needsFreeLiveSlot, with a live-slot source wired),
-// while its live slot is free. Every other candidate keeps the server cap: in-flight on
-// its server below max_concurrency minus the server's reserved sessions, and no cap at
-// all when max_concurrency is unset (<= 0) or no server activity source is wired. Such a
-// candidate is not judged by its live slot here: a mapping without instances has one
-// slot, and a live session's own acquire, or a buffered transcription's held check,
-// answers busy.
+// underCap reports whether candidate c can take a request now. With judgeLive set (a
+// request that needs a free live slot, in a pool that holds an instance candidate, with a
+// live-slot source wired) any candidate whose live slot is held is at its cap. Beyond
+// that, an instance candidate is under its cap while its own in-flight count is below the
+// parallelism its expansion carried (with no instance activity source its load is unknown
+// and that part never caps it). Every other candidate keeps the server cap: in-flight on
+// its server below max_concurrency minus the server's reserved sessions, and no cap at all
+// when max_concurrency is unset (<= 0) or no server activity source is wired.
 func (r *Resolver) underCap(c MappingCandidate, now time.Time, judgeLive bool) bool {
+	if judgeLive && r.liveSlots.LiveHeld(InstanceKey(c.Mapping.ID, c.Instance)) {
+		return false
+	}
 	if c.InstanceCapable {
-		key := InstanceKey(c.Mapping.ID, c.Instance)
-		if judgeLive && r.liveSlots.LiveHeld(key) {
-			return false
-		}
-		return r.instanceActivity == nil || r.instanceActivity.InstanceActivity(key) < c.InstanceParallelism
+		return r.instanceActivity == nil || r.instanceActivity.InstanceActivity(InstanceKey(c.Mapping.ID, c.Instance)) < c.InstanceParallelism
 	}
 	maxC := c.Mapping.MaxConcurrency
 	if maxC <= 0 || r.activity == nil {
@@ -2263,6 +2292,7 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		ProviderModel:        InstanceAddress(mapping.AppModelName, c.Instance),
 		InstanceKey:          InstanceKey(mapping.ID, c.Instance),
 		InstanceCapable:      c.InstanceCapable,
+		InstancePool:         c.InstancePool,
 		Timeout:              time.Duration(app.TimeoutMS) * time.Millisecond,
 		APIFlavor:            apiFlavor,
 		APIToken:             apiToken,

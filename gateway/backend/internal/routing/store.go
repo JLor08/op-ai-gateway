@@ -1222,6 +1222,10 @@ type MappingCandidate struct {
 	// the source again. Every store read yields false and 0.
 	InstanceCapable     bool
 	InstanceParallelism int
+	// InstancePool is set on the candidate a selection returns: whether the pool
+	// it was selected from held an instance candidate (Target.InstancePool).
+	// Every store read and every candidate not yet selected yields false.
+	InstancePool bool
 	// LiveProgressSupport is the mapping's "live_progress" capability verdict
 	// (model_mapping_capabilities, migration 78), filled by
 	// ActiveMappingsForModel's joined query (SQL) or its MemoryStore mirror

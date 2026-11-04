@@ -23,11 +23,11 @@ import (
 )
 
 // liveBearerBusyCode is the wire code a bearer live-transcription request is refused with
-// when no instance it could use has a free live slot and it cannot wait for one (a mapping
-// without instances, whose one slot is taken). It is API surface: a programmatic client
-// branches on it to back off. 503 (not 409) because it is transient -- the slot frees when
-// the active session ends -- and it is the HTTP twin of the WebSocket path's
-// StatusTryAgainLater busy close.
+// when no instance it could use has a free live slot and it cannot wait for one (a model
+// served only by mappings without instances, whose slot is taken). It is API surface: a
+// programmatic client branches on it to back off. 503 (not 409) because it is transient
+// -- the slot frees when the active session ends -- and it is the HTTP twin of the
+// WebSocket path's StatusTryAgainLater busy close.
 const liveBearerBusyCode = "transcription.live_busy"
 
 // liveSlotAcquireHook is a TEST-ONLY seam: when non-nil, acquireLiveSession calls it with
@@ -117,25 +117,28 @@ func (s *Server) acquireLiveSessionOrRefuse(w http.ResponseWriter, r *http.Reque
 const maxLiveSlotRaces = routing.MaxInstanceIndex + 1
 
 // acquireLiveSession selects an instance for a live session (req.LiveSession, so the
-// resolver passes over a held slot, and parks the session when every instance of a
-// replicable spec is held) and takes that instance's live slot, returning the target
-// and the slot's release.
+// resolver passes over a held slot, and parks the session when every slot it could use
+// is held) and takes that instance's live slot, returning the target and the slot's
+// release.
 //
 // The selection reads the slots as a snapshot, so another session can take the chosen
-// slot before this one acquires it. An instance-capable target that loses that race is
-// selected again with the same request. The lost instance is not excluded: it still
-// runs and its slot will free, and the registry now reports that slot held, so the
-// resolver passes over it like any other held slot -- on the next selection and on every
-// admission turn after it, which lets a parked session take that slot once it frees.
-// With every slot held, however that came about, the session parks and signals live
-// demand like any other session that finds them held.
+// slot before this one acquires it. A target selected from a pool with an instance
+// candidate (Target.InstancePool: an instance of a replicable spec, or a mapping without
+// instances beside one -- a mixed fleet) that loses that race is selected again with the
+// same request. The lost slot is not excluded: its instance still runs and the slot will
+// free, and the registry now reports it held, so the resolver passes over it like any
+// other held slot -- on the next selection and on every admission turn after it, which
+// lets a parked session take that slot once it frees. With every slot held, however
+// that came about, the session parks and signals live demand like any other session
+// that finds them held.
 //
 // The loop ends. A selection that hands back a slot still held by the session it lost
 // that slot to is one the resolver could not pass over (no queue to park in, or no
-// viable free instance), so waiting longer here changes nothing: errTranscriptionLiveBusy.
-// So is a session that loses maxLiveSlotRaces races. A target without instances keeps
-// today's answer at once: its one slot is taken, errTranscriptionLiveBusy. Any other
-// refusal (a routing error, a live verdict, a queue timeout) is returned as it is.
+// viable free slot), so waiting longer here changes nothing: errTranscriptionLiveBusy.
+// So is a session that loses maxLiveSlotRaces races. A target from a pool without an
+// instance candidate keeps today's answer at once: its one slot is taken,
+// errTranscriptionLiveBusy. Any other refusal (a routing error, a live verdict, a queue
+// timeout) is returned as it is.
 func (s *Server) acquireLiveSession(ctx context.Context, token *auth.Token, req inference.Request) (routing.Target, func(), error) {
 	lostTo := map[string]uint64{} // instance key -> the session that took it from this one
 	for races := 1; ; races++ {
@@ -150,7 +153,7 @@ func (s *Server) acquireLiveSession(ctx context.Context, token *auth.Token, req 
 		if ok {
 			return target, release, nil
 		}
-		if prev, seen := lostTo[target.InstanceKey]; !target.InstanceCapable || (seen && prev == holder) || races >= maxLiveSlotRaces {
+		if prev, seen := lostTo[target.InstanceKey]; !target.InstancePool || (seen && prev == holder) || races >= maxLiveSlotRaces {
 			return routing.Target{}, nil, errTranscriptionLiveBusy
 		}
 		lostTo[target.InstanceKey] = holder

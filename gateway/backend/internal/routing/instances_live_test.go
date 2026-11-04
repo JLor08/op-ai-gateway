@@ -111,8 +111,8 @@ func TestLiveSlotIgnoredForAMappingWithoutInstances(t *testing.T) {
 	if err != nil || target.InstanceKey != "map_inst#0" || adm.calls != 0 {
 		t.Fatalf("Resolve = %q, %v after %d waits; want map_inst#0 at once", target.InstanceKey, err, adm.calls)
 	}
-	if target.InstanceCapable {
-		t.Fatal("target.InstanceCapable = true, want false for a mapping without instances")
+	if target.InstanceCapable || target.InstancePool {
+		t.Fatalf("target capable %v pool %v, want neither for a pool without instances", target.InstanceCapable, target.InstancePool)
 	}
 	if len(slots.asked) != 0 {
 		t.Fatalf("live slots asked %v, want none for a mapping without instances", slots.asked)
@@ -294,6 +294,63 @@ func TestTranscriptionPassesOverALiveHeldInstance(t *testing.T) {
 		t.Fatalf("Resolve with every live slot held = %v after %d waits, want ErrAdmissionQueueTimeout after 1", err, adm.calls)
 	}
 	want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAIAudio, MappingIDs: []string{"map_inst"}}}
+	if !demandSignalsEqual(sink.got, want) {
+		t.Fatalf("demand signals = %+v, want %+v", sink.got, want)
+	}
+}
+
+// liveMixedStore is mixedFleetStore with both applications serving the audio
+// flavor: qwen-coder's map_inst (instance-capable where a test gives it a view)
+// beside map_old on srv_old, a mapping without instances.
+func liveMixedStore(t *testing.T, now time.Time) *MemoryStore {
+	t.Helper()
+	store := mixedFleetStore(t, now, 0)
+	for _, id := range []string{"app_inst", "app_old"} {
+		app, err := store.ApplicationByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("ApplicationByID %s: %v", id, err)
+		}
+		app.APIFlavors = []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}
+		if err := store.UpdateApplication(context.Background(), app); err != nil {
+			t.Fatalf("UpdateApplication %s: %v", id, err)
+		}
+	}
+	return store
+}
+
+// In a pool that holds an instance candidate, a mapping without instances is
+// judged by its one live slot too: a live session passes over it while it is
+// held -- onto a free instance, or into the admission queue, signalling demand
+// for the instance-capable mapping -- instead of being sent to a slot it cannot
+// take. The target says it came from such a pool (InstancePool), whichever
+// candidate it is.
+func TestLiveSessionPassesOverAHeldPlainMappingInAnInstancePool(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(liveMixedStore(t, now), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1}}})
+	// The old server has the model loaded, so it wins whenever its slot is not judged.
+	r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_old": {"qwen2.5"}}})
+	slots := &fakeLiveSlots{held: map[string]bool{}}
+	r.SetLiveSlotChecker(slots)
+	sink := &fakeDemandSink{}
+	r.SetDemandSink(sink)
+	adm := timeoutAdmission()
+	r.SetAdmissionController(adm)
+
+	target, err := r.Resolve(context.Background(), auth.Token{}, liveRequest("qwen-coder"))
+	if err != nil || target.InstanceKey != "map_old#0" || target.InstanceCapable || !target.InstancePool {
+		t.Fatalf("Resolve = %q capable %v pool %v, %v; want the loaded map_old#0, not instance-capable, from an instance pool", target.InstanceKey, target.InstanceCapable, target.InstancePool, err)
+	}
+	slots.held["map_old#0"] = true
+	target, err = r.Resolve(context.Background(), auth.Token{}, liveRequest("qwen-coder"))
+	if err != nil || target.InstanceKey != "map_inst#0" || !target.InstancePool {
+		t.Fatalf("Resolve with map_old's slot held = %q pool %v, %v; want the free instance map_inst#0", target.InstanceKey, target.InstancePool, err)
+	}
+	slots.held["map_inst#0"] = true
+	if _, err := r.Resolve(context.Background(), auth.Token{}, liveRequest("qwen-coder")); !errors.Is(err, ErrAdmissionQueueTimeout) || adm.calls != 1 {
+		t.Fatalf("Resolve with every slot held = %v after %d waits, want ErrAdmissionQueueTimeout after 1", err, adm.calls)
+	}
+	want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAIAudio, Live: true, MappingIDs: []string{"map_inst"}}}
 	if !demandSignalsEqual(sink.got, want) {
 		t.Fatalf("demand signals = %+v, want %+v", sink.got, want)
 	}

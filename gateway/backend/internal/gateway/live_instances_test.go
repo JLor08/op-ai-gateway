@@ -1068,3 +1068,112 @@ func TestBufferedTranscriptionAvoidsALiveHeldInstance(t *testing.T) {
 		}
 	})
 }
+
+// publishMixedASR reports asr-inst's instances ks running under load and the
+// plain mapping's one process idle, so a selection that does not judge the plain
+// mapping's live slot prefers it.
+func publishMixedASR(srv *Server, ks ...int) {
+	rows := []RuntimeStatusDTO{liveInstanceRow(liveInstASRPlainSpec, liveInstASRPlainUp, 0, 0)}
+	for _, k := range ks {
+		rows = append(rows, liveInstanceRow(liveInstASRSpec, liveInstASRUp, k, 10))
+	}
+	srv.RuntimeStatus.publish(liveInstServer, rows)
+}
+
+// A model served by a mapping without instances beside a replicable one (a mixed
+// fleet) is a model with instances: a live session is not refused busy because the
+// plain mapping's one slot is taken while an instance has a free slot. Whether the
+// slot was held when the session was selected, or taken in the race between the
+// selection and the acquire, the session is selected again onto the instance; with
+// every slot held it waits, and takes whichever slot frees first.
+func TestLiveMixedFleetSessionIsNotRefusedForAPlainSlot(t *testing.T) {
+	cfg := instanceRouterConfig{replicable: true, plainASR: true}
+	t.Run("the plain slot is taken in the race", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		publishMixedASR(srv, 0)
+		ts := httptest.NewServer(srv)
+		t.Cleanup(ts.Close)
+		var raced string
+		var racedRelease func()
+		liveSlotAcquireHook = func(instanceKey string) {
+			if raced != "" {
+				return
+			}
+			raced = instanceKey
+			racedRelease, _ = srv.liveSessions.acquire(instanceKey)
+		}
+		t.Cleanup(func() {
+			liveSlotAcquireHook = nil
+			if racedRelease != nil {
+				racedRelease()
+			}
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		s := establishLiveSession(t, ctx, ts)
+		if raced != "route-asr-plain#0" {
+			t.Fatalf("the first selection took %q, want the idle plain mapping route-asr-plain#0", raced)
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up"}) {
+			t.Fatalf("live addresses served = %v, want [asr-up]: the session lost the plain slot and was selected onto the instance", served)
+		}
+		finishLiveSession(t, s)
+	})
+	t.Run("the plain slot is held", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		publishMixedASR(srv, 0)
+		release, _ := srv.liveSessions.acquire("route-asr-plain#0")
+		defer release()
+		ts := httptest.NewServer(srv)
+		t.Cleanup(ts.Close)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		s := establishLiveSession(t, ctx, ts)
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up"}) {
+			t.Fatalf("live addresses served = %v, want [asr-up], the instance whose slot is free", served)
+		}
+		finishLiveSession(t, s)
+	})
+	t.Run("every slot is held", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		srv.Active.admission.recheck = 0 // only a release wakes the parked session
+		sink := &recordingDemandSink{}
+		srv.Resolver.SetDemandSink(sink)
+		publishMixedASR(srv, 0)
+		releasePlain, _ := srv.liveSessions.acquire("route-asr-plain#0")
+		releaseInst, _ := srv.liveSessions.acquire("route-asr-inst#0")
+		defer releaseInst()
+		ts := httptest.NewServer(srv)
+		t.Cleanup(ts.Close)
+		t.Cleanup(releasePlain) // before ts.Close: a session still parked is let go
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		done := make(chan liveSessionResult, 1)
+		go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+		waitForParked(t, srv.Active.admission, 1)
+		if signals := sink.signals(); len(signals) != 1 || !signals[0].Live || !slices.Equal(signals[0].MappingIDs, []string{liveInstASRMap}) {
+			t.Fatalf("demand signals = %+v, want one live signal naming %s, the mapping that can start another instance", signals, liveInstASRMap)
+		}
+		releasePlain()
+		wakeAdmission(srv)
+		var s liveSessionResult
+		select {
+		case s = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the parked session was not admitted after the plain slot freed")
+		}
+		if s.err != nil || s.resp.StatusCode != http.StatusOK {
+			t.Fatalf("admitted session: err %v status %v, want 200", s.err, s.resp)
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-plain"}) {
+			t.Fatalf("live addresses served = %v, want [asr-plain], the slot that freed", served)
+		}
+		finishLiveSession(t, s)
+	})
+}

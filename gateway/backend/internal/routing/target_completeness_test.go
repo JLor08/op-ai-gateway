@@ -98,8 +98,10 @@ func TestTargetFromPopulatesEveryField(t *testing.T) {
 		// resolve fills it from the joined row / a keyed read.
 		LiveProgressSupport: "supported",
 		// InstanceCapable is the expansion's verdict on the mapping, carried onto
-		// the target.
+		// the target; InstancePool is the selection's verdict on the pool it
+		// picked the candidate from.
 		InstanceCapable: true,
+		InstancePool:    true,
 	}
 
 	resolver := NewResolver(store, func() time.Time { return now }, nil)
