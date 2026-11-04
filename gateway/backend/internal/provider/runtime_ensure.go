@@ -54,11 +54,13 @@ var _ RuntimeEnsurer = (*OpenAICompatibleClient)(nil)
 // still hold through it. It is returned as a pointer: match it with
 // errors.As(err, &re) for a re of type *RouterError.
 //
-// It is produced for an agent router's answers only: the ensure route, and a
-// chat completion or the start of a stream sent to a server_agent target
-// (chatStatusError). Any other upstream's non-2xx answer is the plain provider
-// error its status maps to, whatever its body says, so a code another server
-// happens to send in the same envelope shape is never read as the router's.
+// It is produced for an agent router's answers only: the ensure route, a chat
+// completion or the start of a stream sent to a server_agent target
+// (chatStatusError), and -- through RouterStatusError -- a refusal the gateway
+// relays itself from an agent instance k >= 1 and reads for a gone instance.
+// Any other upstream's non-2xx answer is the plain provider error its status
+// maps to, whatever its body says, so a code another server happens to send in
+// the same envelope shape is never read as the router's.
 type RouterError struct {
 	// Status is the HTTP status the router answered with.
 	Status int
