@@ -456,6 +456,68 @@ func TestAudioSpeedRunMeasuresColdStart(t *testing.T) {
 	}
 }
 
+// TestAudioSpeedLoadTimeIsTheFirstOutputOfEachKind: the load time is the cold pass's time to
+// its first output minus the warm pass's, and what counts as the first output depends on the
+// measurement: the first response byte of a one-shot synthesis, the first transcript text of a
+// live transcription, the whole answer of a one-shot transcription (and the first audio delta
+// of a streamed synthesis, TestAudioSpeedRunMeasuresColdStart). Each pass below carries
+// different figures in every field, so only the right one yields 5000 ms. A cold pass that was
+// not the slower one -- as fast as the warm pass, or faster -- records no load time, and the
+// mapping keeps the one it had.
+func TestAudioSpeedLoadTimeIsTheFirstOutputOfEachKind(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	row := func(capability, verdict string) routing.CapabilityRow {
+		return sbCap(capability, verdict, audioFixtureNow)
+	}
+	oneShotTTS := []routing.CapabilityRow{row(routing.CapabilitySpeech, yes), row(routing.CapabilitySpeechClone, no), row(routing.CapabilitySpeechStreaming, no)}
+	liveASR := []routing.CapabilityRow{row(routing.CapabilityTranscription, yes), row(routing.CapabilityTranscriptionStreaming, yes)}
+	oneShotASR := []routing.CapabilityRow{row(routing.CapabilityTranscription, yes), row(routing.CapabilityTranscriptionStreaming, no)}
+	pass := func(firstByte, ttft, wall int64) audioMeasurement {
+		return audioMeasurement{FirstByteMS: firstByte, TTFTMS: ttft, WallMS: wall, AudioSeconds: 10, RateX: 3, RTF: 0.3}
+	}
+	for _, tc := range []struct {
+		name       string
+		caps       []routing.CapabilityRow
+		kind       audioMeasureKind
+		cold, warm audioMeasurement
+		want       int64
+	}{
+		{"one-shot synthesis: the first response byte", oneShotTTS, audioKindTTSBuffered, pass(5300, 7000, 9900), pass(300, 100, 1100), 5000},
+		{"live transcription: the first transcript text", liveASR, audioKindASRLive, pass(10, 5300, 9900), pass(5, 300, 1500), 5000},
+		{"one-shot transcription: the whole answer", oneShotASR, audioKindASRBuffered, pass(4000, 4000, 5300), pass(100, 100, 300), 5000},
+		{"a cold pass as fast as the warm one", oneShotTTS, audioKindTTSBuffered, pass(300, 7000, 9900), pass(300, 100, 1100), 0},
+		{"a cold pass faster than the warm one", oneShotASR, audioKindASRBuffered, pass(4000, 4000, 900), pass(100, 100, 1000), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAudioFixture(t, audioFixtureOpts{agent: true, caps: tc.caps, features: []string{"runtime_manager", fullduplexProxyFeature}})
+			f.srv.Provider = &audioDuplexProvider{audioEnsureProvider: f.provider}
+			f.srv.RuntimeStatus.publish("srv1", []RuntimeStatusDTO{{SpecID: "rs_map1", Model: "m", State: "stopped"}})
+			f.script.answer = func(call audioMeasureCall, n int) (audioMeasurement, error) {
+				if call.kind != tc.kind {
+					return audioMeasurement{}, fmt.Errorf("measured as %v, want %v", call.kind, tc.kind)
+				}
+				if n == 1 {
+					return tc.cold, nil
+				}
+				return tc.warm, nil
+			}
+
+			res := f.run(t, "speed")
+
+			if res.Error != "" || res.AudioLoadTimeMS != tc.want {
+				t.Fatalf("result = load %d ms, error %q; want %d", res.AudioLoadTimeMS, res.Error, tc.want)
+			}
+			wantStored := tc.want
+			if wantStored == 0 {
+				wantStored = 1234
+			}
+			if m := f.mapping(t); int64(m.LoadTimeMS) != wantStored {
+				t.Fatalf("stored load_time_ms = %d, want %d", m.LoadTimeMS, wantStored)
+			}
+		})
+	}
+}
+
 // adminStateOf is the admin_state the fake agent last applied for spec id.
 func (f *fakeAgentRuntime) adminStateOf(id string) string {
 	f.mu.Lock()

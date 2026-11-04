@@ -532,7 +532,10 @@ func TestSchedulerIncludesAudioSpeed(t *testing.T) {
 		}
 	}
 
-	// A locked audio mapping is left out of the next pass.
+	// A locked audio mapping is left out of the next pass. Whether a run was launched is read
+	// off what a run would leave behind once it has finished -- a new history row, a new
+	// measurement, a new run status -- never off the reservation, which a run that finished
+	// quickly has already given back.
 	locked, err := mem.MappingByID(ctx, "map-audio-ext")
 	if err != nil {
 		t.Fatalf("MappingByID: %v", err)
@@ -541,10 +544,18 @@ func TestSchedulerIncludesAudioSpeed(t *testing.T) {
 	if err := mem.UpdateMapping(ctx, locked); err != nil {
 		t.Fatalf("UpdateMapping: %v", err)
 	}
+	measuredBefore, statusBefore := len(script.recorded()), srv.Benchmarks.Status(server.ID)
 	if !srv.TriggerScheduledBenchmark(ctx, server, audioApp) {
 		t.Fatal("TriggerScheduledBenchmark = false, want true (nothing to do)")
 	}
-	if srv.Benchmarks.ServerBusy(server.ID) {
-		t.Fatal("a run was reserved for an application whose one mapping is locked")
+	waitFor(t, func() bool { return !srv.Benchmarks.Status(server.ID).Running })
+	if runs, err := mem.BenchmarkRunsByMapping(ctx, "map-audio-ext", 10); err != nil || len(runs) != 1 {
+		t.Fatalf("map-audio-ext history = %d rows (%v), want still the one from the first pass", len(runs), err)
+	}
+	if got := len(script.recorded()); got != measuredBefore {
+		t.Fatalf("measurements = %d, want still %d: the locked mapping was measured", got, measuredBefore)
+	}
+	if st := srv.Benchmarks.Status(server.ID); !reflect.DeepEqual(st, statusBefore) {
+		t.Fatalf("run status = %+v, want the last one unchanged %+v: a run was launched", st, statusBefore)
 	}
 }
