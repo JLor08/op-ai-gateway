@@ -7,6 +7,7 @@ import { MappingSection } from './MappingSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
 import {
+  PortalApiError,
   type BenchmarkStatus,
   type CreateMappingRequest,
   type PortalApplication,
@@ -145,6 +146,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       mappingBenchmarks?: PortalApi['mappingBenchmarks'];
       activeBenchmarks?: PortalApi['activeBenchmarks'];
       probeMappingContext?: PortalApi['probeMappingContext'];
+      // Replaces the fake backend's update, for a test of a refused save.
+      updateMapping?: PortalApi['updateMapping'];
     } = {},
   ) {
     const mappings = opts.mappings ?? [];
@@ -224,6 +227,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       activeBenchmarks: opts.activeBenchmarks ?? vi.fn(async () => []),
       probeMappingContext: opts.probeMappingContext ?? vi.fn(async () => idle),
       probeMappingVram: vi.fn(async () => idle),
+      ...(opts.updateMapping ? { updateMapping: opts.updateMapping } : {}),
     };
 
     render(
@@ -372,6 +376,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(updated[0].body).not.toHaveProperty('capability_verdicts');
       expect(updated[0].body).not.toHaveProperty('is_mtp');
       expect(updated[0].body).not.toHaveProperty('vision_capable');
+    });
+  });
+
+  // #340: the gateway refuses an audio metric edit it cannot store -- a
+  // count without a limit, a negative value -- with its own code, which the
+  // toast names in the operator's language rather than the server's English.
+  describe(`MappingSection audio metrics [${locale}]`, () => {
+    it('names a refused audio metrics edit by its localized label', async () => {
+      const updateMapping = vi.fn(async () => {
+        throw new PortalApiError(400, 'mapping.audio_metrics_invalid', 'raw server text');
+      }) as unknown as PortalApi['updateMapping'];
+      renderSection({ mappings: [makeMapping({ id: 'map_1' })], updateMapping });
+      await screen.findByText('gw-model');
+      fireEvent.click(screen.getByRole('button', { name: t.mappingEdit }));
+      fireEvent.change(screen.getByLabelText(t.mappingAudioRateX), { target: { value: '2' } });
+      fireEvent.click(screen.getByRole('button', { name: t.mappingSave }));
+
+      await waitFor(() =>
+        expect(updateMapping).toHaveBeenCalledWith(
+          'map_1',
+          expect.objectContaining({ audio_rate_x: 2 }),
+        ),
+      );
+      expect(
+        await screen.findByText(
+          `mapping.audio_metrics_invalid: ${t.errorMappingAudioMetricsInvalid}`,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/raw server text/)).not.toBeInTheDocument();
     });
   });
 

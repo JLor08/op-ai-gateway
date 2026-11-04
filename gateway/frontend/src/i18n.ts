@@ -1771,7 +1771,7 @@ const de = {
   benchmarkImagesOnlyHint:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkAudioOnlyHint:
-    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und sind deshalb gesperrt.',
+    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität und Beide messen hier seine Audio-Leistung (× Echtzeit, erste Ausgabe, Echtzeit-Parallelität). Vision misst mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und ist deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
   benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Audio, kein Chat-Prompt gesendet',
   benchmarkResultSkippedNotSpeech: 'übersprungen – kein Sprachsynthese-Modell, nichts gesendet',
@@ -5188,7 +5188,7 @@ const en: PortalMessages = {
   benchmarkImagesOnlyHint:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
   benchmarkAudioOnlyHint:
-    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an audio-only model does not answer, so they are disabled.',
+    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity and Both measure its audio performance here (× real time, first output, real-time concurrency). Vision measures with a chat prompt, which an audio-only model does not answer, so it is disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
   benchmarkResultSkippedAudioOnly: 'skipped — generates audio only, no chat prompt sent',
   benchmarkResultSkippedNotSpeech: 'skipped — not a speech synthesis model, nothing sent',

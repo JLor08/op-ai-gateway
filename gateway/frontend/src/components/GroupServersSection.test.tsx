@@ -203,5 +203,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.modelServerLoad)).toBeNull();
       expect(screen.queryByRole('button', { name: t.listRowMenu })).toBeNull();
     });
+
+    // #340: the group's audio members show the same audio columns as the
+    // per-model list, a lower bound as "≥ k".
+    it('shows the audio metrics of an audio member, a lower bound as "≥ k"', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              audio_rate_x: 2.5,
+              audio_ttfa_ms: 300,
+              audio_realtime_concurrency: 2,
+              audio_concurrency_limit: 'cap',
+            }
+          : { ...r, audio_realtime_concurrency: 2, audio_concurrency_limit: 'performance' },
+      );
+      const api = makeApi({ modelGroupServers: vi.fn().mockResolvedValue(rows) });
+      render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
+      await screen.findByText('GPU-Box-A');
+
+      const headers = screen.getAllByRole('columnheader').map((h) => h.textContent?.trim());
+      const cell = (server: string, label: string) =>
+        within(rowFor(server)).getAllByRole('cell')[headers.indexOf(label)];
+      expect(cell('GPU-Box-A', t.modelServersAudioRate)).toHaveTextContent('2.5×');
+      expect(cell('GPU-Box-A', t.modelServersAudioTtft)).toHaveTextContent('300');
+      expect(cell('GPU-Box-A', t.modelServersAudioConcurrency).textContent).toBe('≥ 2');
+      expect(cell('GPU-Box-B', t.modelServersAudioConcurrency).textContent).toBe('2');
+    });
+
+    it('leaves the audio columns out for a group of text models', async () => {
+      const api = makeApi();
+      render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
+      await screen.findByText('GPU-Box-A');
+      expect(screen.queryByRole('columnheader', { name: t.modelServersAudioRate })).toBeNull();
+    });
   });
 }

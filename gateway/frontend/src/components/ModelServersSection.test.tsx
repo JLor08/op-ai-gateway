@@ -1721,5 +1721,71 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         `${t.modelServersRunningInstances}: 2`,
       );
     });
+
+    // #340: an audio model's rows carry its audio metrics. The real-time
+    // concurrency is a measured count only when the ramp stopped on
+    // performance; resources or the cap ended it early, so it is a lower bound.
+    it('shows the audio metrics of an audio model, a lower bound as "≥ k"', async () => {
+      const audio: Record<string, Partial<ModelServerRow>> = {
+        'map-a': {
+          audio_rate_x: 3,
+          audio_ttfa_ms: 250,
+          audio_realtime_concurrency: 2,
+          audio_concurrency_limit: 'resources',
+        },
+        'map-b': {
+          audio_rate_x: 1.4,
+          audio_ttfa_ms: 600,
+          audio_realtime_concurrency: 2,
+          audio_concurrency_limit: 'performance',
+        },
+      };
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(makeRows().map((r) => ({ ...r, ...audio[r.mapping_id] }))),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioRate)).toHaveTextContent('3.0×');
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioTtft)).toHaveTextContent('250');
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioConcurrency)).toHaveTextContent('≥ 2');
+      expect(cellForColumn('GPU-Box-B', t.modelServersAudioConcurrency).textContent).toBe('2');
+      // A row nothing measured reads as unknown, never as 0.
+      expect(cellForColumn('GPU-Box-C', t.modelServersAudioRate).textContent).toBe('—');
+      expect(cellForColumn('GPU-Box-C', t.modelServersAudioConcurrency).textContent).toBe('—');
+    });
+
+    it('names a measured real-time concurrency of 0 as not real-time', async () => {
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) =>
+              r.mapping_id === 'map-a'
+                ? { ...r, audio_realtime_concurrency: 0, audio_concurrency_limit: 'performance' }
+                : r,
+            ),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioConcurrency).textContent).toBe(
+        t.audioRealtimeConcurrency(0, 'performance'),
+      );
+    });
+
+    it('leaves the audio columns out for a text model', async () => {
+      const { api } = makeApi();
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(screen.queryByRole('columnheader', { name: t.modelServersAudioRate })).toBeNull();
+      expect(
+        screen.queryByRole('columnheader', { name: t.modelServersAudioConcurrency }),
+      ).toBeNull();
+    });
   });
 }

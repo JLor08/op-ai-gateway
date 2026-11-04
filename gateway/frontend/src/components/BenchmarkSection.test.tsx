@@ -670,6 +670,180 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
     });
 
+    // #340: a speech or transcription mapping's speed, capacity or both run is
+    // the audio measurement: its result names the rate against real time, the
+    // first output and the real-time concurrency, never chat tokens.
+    function deliveringAudio(result: Partial<BenchmarkResult>): PortalApi['subscribeBenchmark'] {
+      return vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+        onStatus({
+          running: true,
+          server_id: 'srv_1',
+          scope: 'mapping',
+          mode: 'both',
+          total: 1,
+          done: 1,
+          results: [
+            {
+              mapping_id: 'm1',
+              gateway_model_name: 'tts-gw',
+              gen_tokens_per_second: 0,
+              prompt_tokens_per_second: 0,
+              load_time_ms: 0,
+              ...result,
+            },
+          ],
+        });
+        return () => {};
+      }) as unknown as PortalApi['subscribeBenchmark'];
+    }
+
+    it('renders an audio speed result by its rate and first output, never as "0 tok/s"', async () => {
+      renderSection(
+        { kind: 'server' },
+        {
+          subscribeBenchmark: deliveringAudio({
+            audio_rate_x: 3,
+            audio_ttft_ms: 250,
+            audio_load_time_ms: 5000,
+          }),
+        },
+      );
+
+      const line = await screen.findByText(/^tts-gw: /);
+      expect(line).toHaveTextContent('3.0×');
+      expect(line).toHaveTextContent('250 ms');
+      expect(line).toHaveTextContent(
+        `tts-gw: ${t.benchmarkAudioResult(3, 250)}, ${t.benchmarkAudioLoadTime(5000)}`,
+      );
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
+    // Like the text speed line: a load time of 0 was not measured (the cold
+    // start was not confirmed), never a load of 0 ms.
+    it('says the load time of an audio speed result was not measured when it is 0', async () => {
+      renderSection(
+        { kind: 'server' },
+        { subscribeBenchmark: deliveringAudio({ audio_rate_x: 1.5, audio_ttft_ms: 400 }) },
+      );
+      expect(
+        await screen.findByText(
+          `tts-gw: ${t.benchmarkAudioResult(1.5, 400)}, ${t.benchmarkResultLoadTimeNotMeasured}`,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it.each([
+      ['resources', 2, '≥ 2'],
+      ['cap', 3, '≥ 3'],
+      ['performance', 2, '2'],
+    ] as const)(
+      'renders an audio capacity result stopped by %s as its real-time concurrency',
+      async (limit, k, figure) => {
+        renderSection(
+          { kind: 'server' },
+          {
+            subscribeBenchmark: deliveringAudio({
+              audio_realtime_concurrency: k,
+              audio_concurrency_limit: limit,
+            }),
+          },
+        );
+        const line = await screen.findByText(/^tts-gw: /);
+        expect(line).toHaveTextContent(`tts-gw: ${t.benchmarkAudioCapacityResult(k, limit)}`);
+        expect(line).toHaveTextContent(`: ${figure} `);
+        expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+      },
+    );
+
+    it('renders a both result of an audio mapping with its speed and its capacity figures', async () => {
+      renderSection(
+        { kind: 'server' },
+        {
+          subscribeBenchmark: deliveringAudio({
+            audio_rate_x: 3,
+            audio_ttft_ms: 250,
+            audio_realtime_concurrency: 0,
+            audio_concurrency_limit: 'performance',
+          }),
+        },
+      );
+      const line = await screen.findByText(/^tts-gw: /);
+      expect(line).toHaveTextContent(t.benchmarkAudioResult(3, 250));
+      // A measured 0 is a result: not even one stream kept up with real time.
+      expect(line).toHaveTextContent(t.benchmarkAudioCapacityResult(0, 'performance'));
+      expect(line).toHaveTextContent(t.audioRealtimeConcurrency(0, 'performance'));
+    });
+
+    it('renders the audio history sections with their own figures, outside the speed table', async () => {
+      const base: BenchmarkRunDTO = {
+        id: 'run_audio',
+        mapping_id: 'map_1',
+        server_id: 'srv_1',
+        created_at: '2026-11-03T12:00:00Z',
+        gen_tokens_per_second: 0,
+        prompt_tokens_per_second: 0,
+        load_time_ms: 0,
+        context_size: 0,
+        error: '',
+        kind: 'audio',
+      };
+      const audioRun: BenchmarkRunDTO = {
+        ...base,
+        ttft_ms: 250,
+        wall_ms: 7000,
+        rtf: 0.35,
+        load_time_ms: 5000,
+        audio_rate_x: 3,
+      };
+      const audioErrorRun: BenchmarkRunDTO = {
+        ...base,
+        id: 'run_audio_err',
+        created_at: '2026-11-03T11:00:00Z',
+        error: 'audio benchmark: the model refused',
+      };
+      const rampRun: BenchmarkRunDTO = {
+        ...base,
+        id: 'run_ramp',
+        created_at: '2026-11-03T10:00:00Z',
+        kind: 'audio_capacity',
+        audio_realtime_concurrency: 2,
+        audio_concurrency_limit: 'resources',
+        audio_curve: [
+          { k: 1, min_rate_x: 3.1, mean_rate_x: 3.1 },
+          { k: 2, min_rate_x: 1.6, mean_rate_x: 1.9 },
+        ],
+      };
+
+      renderSection(
+        { kind: 'server' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [makeMapping({ id: 'map_1' })],
+          runs: [audioRun, audioErrorRun, rampRun],
+        },
+      );
+
+      await screen.findByText(t.benchmarkAudioRuns);
+      const audioTable = screen.getByText(t.mappingAudioRateX).closest('table') as HTMLElement;
+      expect(within(audioTable).getByText('3.0×')).toBeInTheDocument();
+      expect(within(audioTable).getByText('250')).toBeInTheDocument();
+      expect(within(audioTable).getByText('5000')).toBeInTheDocument();
+      expect(
+        within(audioTable).getByText('audio benchmark: the model refused'),
+      ).toBeInTheDocument();
+
+      expect(screen.getByText(t.benchmarkAudioCapacityRuns)).toBeInTheDocument();
+      expect(screen.getByText(t.benchmarkAudioCapacityResult(2, 'resources'))).toBeInTheDocument();
+      const curve = screen.getByText(t.benchmarkAudioColSlowest).closest('table') as HTMLElement;
+      expect(within(curve).getAllByRole('row')).toHaveLength(3); // header + 2 levels
+      expect(within(curve).getByText('1.6×')).toBeInTheDocument();
+      expect(within(curve).getByText('1.9×')).toBeInTheDocument();
+
+      // Neither kind falls into the speed table as a row of dashes.
+      expect(screen.queryByText(t.mappingGenTokensPerSecond)).not.toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
     it('renders the two speech skips as their own skip lines', async () => {
       const subscribeBenchmark = vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
         onStatus({
@@ -1332,9 +1506,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(start).toBeDisabled());
     });
 
-    // The speech twin of the images-only rules above: a mapping whose
-    // effective flavors name openai_audio and no text flavor is refused every
-    // chat-prompt run (benchmark.audio_only) and skipped by the wider scopes.
+    // The speech twin of the images-only rules above, with one difference: a
+    // mapping whose effective flavors name openai_audio and no text flavor
+    // runs speed, capacity and both as the audio measurement (#340), so only
+    // vision -- still a chat prompt -- is refused it (benchmark.audio_only).
+    // A gateway that skips such a mapping in a wider scope still names it.
     const audioOnlyMapping: Overrides = {
       apps: [makeApp({ id: 'app_1' })],
       mappings: [makeMapping({ id: 'map_tts', gateway_model_name: 'tts-model', audio_only: true })],
@@ -1386,39 +1562,38 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(notice).queryByText(/text-model/)).not.toBeInTheDocument();
     });
 
-    it('disables the chat-prompt run types for an audio-only mapping and says why', async () => {
-      const probeMappingVram = vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram'];
+    it('offers speed, capacity and both for an audio-only mapping, disables vision and says why', async () => {
+      const benchmarkMapping = vi.fn(async () => idle) as unknown as PortalApi['benchmarkMapping'];
       renderSection(
         { kind: 'mapping', id: 'map_tts', name: 'tts-model' },
-        { ...audioOnlyMapping, probeMappingVram },
+        { ...audioOnlyMapping, benchmarkMapping },
       );
-      const start = await screen.findByRole('button', { name: t.benchmarkStart });
-      await waitFor(() => expect(start).toBeDisabled());
-      expect(start).toHaveAccessibleDescription(t.benchmarkAudioOnlyHint);
-      expect(screen.getByText(t.benchmarkAudioOnlyHint)).toBeInTheDocument();
+      await screen.findByText(t.benchmarkAudioOnlyHint);
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      expect(start).not.toHaveAccessibleDescription();
       expect(screen.queryByText(t.benchmarkImagesOnlyHint)).not.toBeInTheDocument();
 
       fireEvent.mouseDown(screen.getByRole('combobox', { name: t.benchmarkType }));
-      for (const label of [
-        t.benchmarkTypeSpeed,
-        t.benchmarkTypeCapacity,
-        t.benchmarkTypeBoth,
-        t.benchmarkTypeVision,
-      ]) {
-        expect(await screen.findByRole('option', { name: label })).toHaveAttribute(
+      for (const label of [t.benchmarkTypeSpeed, t.benchmarkTypeCapacity, t.benchmarkTypeBoth]) {
+        expect(await screen.findByRole('option', { name: label })).not.toHaveAttribute(
           'aria-disabled',
           'true',
         );
       }
       // The VRAM measurement loads the model without a chat prompt, so it stays.
-      const vram = screen.getByRole('option', { name: t.benchmarkTypeVram });
-      expect(vram).not.toHaveAttribute('aria-disabled', 'true');
-      fireEvent.click(vram);
+      expect(screen.getByRole('option', { name: t.benchmarkTypeVram })).not.toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+      expect(screen.getByRole('option', { name: t.benchmarkTypeVision })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+      fireEvent.click(screen.getByRole('option', { name: t.benchmarkTypeBoth }));
 
-      await waitFor(() => expect(start).toBeEnabled());
-      expect(start).not.toHaveAccessibleDescription();
       fireEvent.click(start);
-      await waitFor(() => expect(probeMappingVram).toHaveBeenCalledWith('map_tts'));
+      await waitFor(() => expect(benchmarkMapping).toHaveBeenCalledWith('map_tts', 'both'));
     });
 
     it('leaves the application scope startable although its first mapping is audio-only', async () => {
@@ -1437,7 +1612,29 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(benchmarkApplication).toHaveBeenCalledWith('app_1', 'speed'));
     });
 
-    it('refuses Start when a chat-prompt type stays selected as the picker moves to an audio-only mapping', async () => {
+    it('refuses Start when vision stays selected as the picker moves to an audio-only mapping', async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_txt', name: 'txt', applicationId: 'app_1' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [
+            makeMapping({ id: 'map_txt', gateway_model_name: 'txt' }),
+            makeMapping({ id: 'map_tts', gateway_model_name: 'tts-model', audio_only: true }),
+          ],
+        },
+      );
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      await pickOption(t.benchmarkType, t.benchmarkTypeVision);
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      await pickOption(t.benchmarkScopeMapping, 'tts-model');
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkAudioOnlyHint);
+    });
+
+    // Capacity runs the audio ramp on an audio-only mapping, so moving the
+    // picker there keeps Start, and the hint only explains.
+    it('keeps Start for capacity as the picker moves to an audio-only mapping', async () => {
       renderSection(
         { kind: 'mapping', id: 'map_txt', name: 'txt', applicationId: 'app_1' },
         {
@@ -1450,11 +1647,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
       await screen.findByRole('combobox', { name: t.benchmarkHistory });
       await pickOption(t.benchmarkType, t.benchmarkTypeCapacity);
+      await pickOption(t.benchmarkScopeMapping, 'tts-model');
+      await screen.findByText(t.benchmarkAudioOnlyHint);
       const start = screen.getByRole('button', { name: t.benchmarkStart });
       expect(start).toBeEnabled();
-      await pickOption(t.benchmarkScopeMapping, 'tts-model');
-      await waitFor(() => expect(start).toBeDisabled());
-      expect(start).toHaveAccessibleDescription(t.benchmarkAudioOnlyHint);
+      expect(start).not.toHaveAccessibleDescription();
     });
 
     // A list naming both flavors (and no text flavor) is both markers: the

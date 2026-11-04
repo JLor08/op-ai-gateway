@@ -13,6 +13,7 @@ import {
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
+import { audioMetricColumns } from './shared/audioMetrics';
 import { runningInstanceCount, showsRunningInstances } from './shared/runtimeInstances';
 import { runtimeStateBadge } from './shared/runtimeState';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -580,6 +581,8 @@ export function ModelServersSection({
       value: (r) => String(r.context_size),
       render: (r) => (r.context_size > 0 ? String(r.context_size) : '—'),
     },
+    // #340: the audio metrics, offered while a row serves audio.
+    ...audioMetricColumns(t, rows),
     {
       // See liveProgressChipInfo above for why this is read straight off the
       // row's persisted field, not gated on any probe column.

@@ -28,6 +28,7 @@ import {
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { SelectField } from './shared/SelectField';
+import { formatAudioRate, formatAudioTtfa, isAudioConcurrencyLimit } from './shared/audioMetrics';
 import { pollBenchmarkStatus } from './shared/benchmark';
 import { formatPortalError } from './shared/format';
 import {
@@ -75,15 +76,16 @@ type ScopeKind = BenchmarkScope['kind'];
 type BenchType = 'speed' | 'capacity' | 'both' | 'vision' | 'vram';
 
 /**
- * The four run kinds that are a `?mode=` value. Each sends the mapping a chat
- * prompt, so none of them can run on an images-only or audio-only mapping (the
- * gateway refuses it with `benchmark.images_only` / `benchmark.audio_only` on
- * the model scope and skips it on the others, where it refuses the run the
- * same way only when every mapping in the scope serves images only, or speech
- * only). They are also the kinds whose finished
- * results nothing renders once the live panel closes: the VRAM kind has its
- * own outcome view, and a load or a context probe is not started from this
- * form.
+ * The four run kinds that are a `?mode=` value. Each sends a text mapping a
+ * chat prompt, so none of them can run on an images-only mapping (the gateway
+ * refuses it with `benchmark.images_only` on the model scope and skips it on
+ * the others, where it refuses the run the same way only when every mapping in
+ * the scope serves images only). On a speech or transcription mapping speed,
+ * capacity and both take the audio measurement instead (#340), so of these an
+ * audio-only mapping is refused vision alone (`audioOnlyRefusedModes`). They
+ * are also the kinds whose finished results nothing renders once the live
+ * panel closes: the VRAM kind has its own outcome view, and a load or a
+ * context probe is not started from this form.
  */
 const promptModes: ReadonlySet<string> = new Set<BenchType>([
   'speed',
@@ -92,15 +94,27 @@ const promptModes: ReadonlySet<string> = new Set<BenchType>([
   'vision',
 ]);
 
+/** The run kinds an audio-only mapping is refused: vision still sends a chat prompt. */
+const audioOnlyRefusedModes: ReadonlySet<string> = new Set<BenchType>(['vision']);
+
+const noRefusedModes: ReadonlySet<string> = new Set<BenchType>();
+
+/** The run kinds the model scope's mapping is refused, by why it is. */
+function refusedModesFor(refusal: 'images_only' | 'audio_only' | null): ReadonlySet<string> {
+  if (refusal === 'images_only') return promptModes;
+  if (refusal === 'audio_only') return audioOnlyRefusedModes;
+  return noRefusedModes;
+}
+
 /**
  * Why the mapping the model scope is set to cannot take a chat prompt, if it
- * cannot: it serves images only (`images_only`) or speech only (`audio_only`),
+ * cannot: it serves images only (`images_only`) or audio only (`audio_only`),
  * or null when neither marker is set. A mapping carrying both is reported as
  * images-only: the form shows one hint, and that sentence names a flavor that
- * holds. Only the model scope asks: the application and server scopes skip
- * such a mapping and run the rest, and the gateway answers
- * `benchmark.images_only` / `benchmark.audio_only` for one whose every mapping
- * serves only that, so there is no rest to run.
+ * holds. Only the model scope asks: the application and server scopes run
+ * each mapping as its kind allows, and the gateway answers
+ * `benchmark.images_only` for one whose every mapping serves only images, so
+ * there is nothing to run.
  */
 function selectedMappingChatRefusal(
   scopeKind: ScopeKind,
@@ -316,17 +330,46 @@ function speechResultLine(r: BenchmarkResult, t: Translation): string {
   return parts.join(', ');
 }
 
+/** Whether a result is the audio measurement's (#340): a speed run's rate or a
+ * capacity run's ramp, the figures only a speech or transcription mapping's
+ * result carries. */
+function isAudioResult(r: BenchmarkResult): boolean {
+  return Boolean(r.audio_rate_x) || isAudioConcurrencyLimit(r.audio_concurrency_limit);
+}
+
+/** An audio result's figures: the speed reading when a speed or both run
+ * measured one -- its load time named as not measured when the cold start was
+ * not confirmed, like the text line's -- then the ramp's real-time concurrency
+ * when a capacity or both run measured one. */
+function audioResultLine(r: BenchmarkResult, t: Translation): string {
+  const parts: string[] = [];
+  if (r.audio_rate_x) {
+    const load = r.audio_load_time_ms
+      ? t.benchmarkAudioLoadTime(r.audio_load_time_ms)
+      : t.benchmarkResultLoadTimeNotMeasured;
+    parts.push(`${t.benchmarkAudioResult(r.audio_rate_x, r.audio_ttft_ms ?? 0)}, ${load}`);
+  }
+  if (isAudioConcurrencyLimit(r.audio_concurrency_limit)) {
+    parts.push(
+      t.benchmarkAudioCapacityResult(r.audio_realtime_concurrency ?? 0, r.audio_concurrency_limit),
+    );
+  }
+  return parts.join('; ');
+}
+
 /** One result line: a skip takes priority (a skipped result's numbers are
- * zeros, not a measurement), then an error, then a vision-capability probe
- * result, then a capacity-ramp result, else the plain speed reading. A load
- * time of 0 in that reading means the run measured none, so it reads as not
- * measured, never as 0 ms. */
+ * zeros, not a measurement), then an error, then an audio measurement, then a
+ * speech run's figures, then a vision-capability probe result, then a
+ * capacity-ramp result, else the plain speed reading. A load time of 0 in that
+ * reading means the run measured none, so it reads as not measured, never as
+ * 0 ms. */
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
   if (r.skipped === 'audio_only') return t.benchmarkResultSkippedAudioOnly;
   if (r.skipped === 'not_speech') return t.benchmarkResultSkippedNotSpeech;
   if (r.skipped === 'speech_clone') return t.benchmarkResultSkippedSpeechClone;
   if (r.error) return r.error;
+  if (isAudioResult(r)) return audioResultLine(r, t);
   if (isSpeechResult(r)) return speechResultLine(r, t);
   if (r.vision_capable !== undefined) {
     return `${t.benchmarkVision}: ${r.vision_capable ? '✓' : '✗'}`;
@@ -498,7 +541,14 @@ function FinishedPinNotice({
  * was given its own section.
  */
 function isNonSpeedKind(kind: string): boolean {
-  return kind === 'capacity' || kind === 'vision' || kind === 'vram' || kind === 'speech';
+  return (
+    kind === 'capacity' ||
+    kind === 'vision' ||
+    kind === 'vram' ||
+    kind === 'speech' ||
+    kind === 'audio' ||
+    kind === 'audio_capacity'
+  );
 }
 
 /**
@@ -550,6 +600,111 @@ function SpeechHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRu
           ))}
         </TableBody>
       </Table>
+    </Box>
+  );
+}
+
+/**
+ * The audio speed runs (#340) of a speech or transcription mapping: per run
+ * the single-stream rate against real time, the time to the first audio or
+ * text and the load time (cold minus warm), each a dash while unmeasured --
+ * the three figures the run stores on the mapping -- or the error of a run
+ * that measured none.
+ */
+function AudioHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRunDTO[] }>) {
+  return (
+    <Box sx={{ mt: 2 }}>
+      <Typography variant="subtitle2" component="h3" sx={{ mb: 1 }}>
+        {t.benchmarkAudioRuns}
+      </Typography>
+      <Table size="small">
+        <TableHead>
+          <TableRow>
+            <TableCell>{t.benchmarkRunAt}</TableCell>
+            <TableCell align="right">{t.mappingAudioRateX}</TableCell>
+            <TableCell align="right">{t.mappingAudioTtfaMs}</TableCell>
+            <TableCell align="right">{t.mappingLoadTimeMs}</TableCell>
+            <TableCell>{t.tableStatus}</TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {runs.map((run) => (
+            <TableRow key={run.id}>
+              <TableCell>{new Date(run.created_at).toLocaleString()}</TableCell>
+              <TableCell align="right">{formatAudioRate(run.audio_rate_x)}</TableCell>
+              <TableCell align="right">{formatAudioTtfa(run.ttft_ms)}</TableCell>
+              <TableCell align="right">{run.load_time_ms || '—'}</TableCell>
+              <TableCell>
+                {run.error ? (
+                  <Typography variant="body2" color="error">
+                    {run.error}
+                  </Typography>
+                ) : (
+                  <CheckCircleIcon fontSize="small" color="success" titleAccess={t.benchmarkDone} />
+                )}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Box>
+  );
+}
+
+/**
+ * The audio concurrency ramps (#340): per run the real-time concurrency it
+ * reached and why it stopped -- a measured ceiling or a lower bound -- and the
+ * curve, one row per level k with its slowest and its mean stream's rate. The
+ * level was good while the slowest one kept up with real time.
+ */
+function AudioCapacityHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRunDTO[] }>) {
+  return (
+    <Box sx={{ mt: 2 }}>
+      <Typography variant="subtitle2" component="h3" sx={{ mb: 1 }}>
+        {t.benchmarkAudioCapacityRuns}
+      </Typography>
+      {runs.map((run) => {
+        const curve = run.audio_curve ?? [];
+        return (
+          <Box
+            key={run.id}
+            sx={{ mb: 2, p: 1, border: 1, borderColor: 'divider', borderRadius: 1 }}
+          >
+            <Typography variant="body2">
+              {new Date(run.created_at).toLocaleString()}
+              {run.error ? ` — ${run.error}` : ''}
+            </Typography>
+            {isAudioConcurrencyLimit(run.audio_concurrency_limit) && (
+              <Typography variant="body2" color="text.secondary">
+                {t.benchmarkAudioCapacityResult(
+                  run.audio_realtime_concurrency ?? 0,
+                  run.audio_concurrency_limit,
+                )}
+              </Typography>
+            )}
+            {curve.length > 0 && (
+              <Table size="small" sx={{ mt: 0.5 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>{t.benchmarkColConcurrency}</TableCell>
+                    <TableCell align="right">{t.benchmarkAudioColSlowest}</TableCell>
+                    <TableCell align="right">{t.benchmarkAudioColMean}</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {curve.map((level) => (
+                    <TableRow key={level.k}>
+                      <TableCell>{level.k}</TableCell>
+                      <TableCell align="right">{formatAudioRate(level.min_rate_x)}</TableCell>
+                      <TableCell align="right">{formatAudioRate(level.mean_rate_x)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </Box>
+        );
+      })}
     </Box>
   );
 }
@@ -701,6 +856,12 @@ function HistoryTables({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRu
         </Box>
       )}
       {runs.some((r) => r.kind === 'speech') && <SpeechHistory t={t} runs={runs} />}
+      {runs.some((r) => r.kind === 'audio') && (
+        <AudioHistory t={t} runs={runs.filter((r) => r.kind === 'audio')} />
+      )}
+      {runs.some((r) => r.kind === 'audio_capacity') && (
+        <AudioCapacityHistory t={t} runs={runs.filter((r) => r.kind === 'audio_capacity')} />
+      )}
       {runs.some((r) => r.kind === 'vision') && (
         <Box sx={{ mt: 2 }}>
           <Typography variant="subtitle2" component="h3" sx={{ mb: 1 }}>
@@ -952,13 +1113,14 @@ export function BenchmarkSection({
       : [];
   const unmeasuredResults = finishedUnmeasuredResults(liveStatus);
 
-  // An images-only or audio-only mapping on the model scope: the four
-  // chat-prompt types are disabled, and so is Start while one of them is
-  // selected. The type is not switched to VRAM on the operator's behalf,
-  // because that run drains the whole server.
+  // An images-only mapping on the model scope: the four chat-prompt types are
+  // disabled; an audio-only one: vision alone, since speed, capacity and both
+  // measure its audio. Start is disabled while a refused type is selected. The
+  // type is not switched on the operator's behalf -- not to VRAM, which drains
+  // the whole server, and not to speed, which they did not pick.
   const chatRefusal = selectedMappingChatRefusal(scopeKind, mappings, mappingId);
-  const chatRefused = chatRefusal !== null;
-  const typeRefused = chatRefused && promptModes.has(benchType);
+  const refusedModes = refusedModesFor(chatRefusal);
+  const typeRefused = refusedModes.has(benchType);
 
   const lastCompleted = useMemo(() => {
     if (!history || history.length === 0) return null;
@@ -1032,16 +1194,16 @@ export function BenchmarkSection({
             value={benchType}
             onChange={(e) => setBenchType(e.target.value as BenchType)}
           >
-            <option value="speed" disabled={chatRefused}>
+            <option value="speed" disabled={refusedModes.has('speed')}>
               {t.benchmarkTypeSpeed}
             </option>
-            <option value="capacity" disabled={chatRefused}>
+            <option value="capacity" disabled={refusedModes.has('capacity')}>
               {t.benchmarkTypeCapacity}
             </option>
-            <option value="both" disabled={chatRefused}>
+            <option value="both" disabled={refusedModes.has('both')}>
               {t.benchmarkTypeBoth}
             </option>
-            <option value="vision" disabled={chatRefused}>
+            <option value="vision" disabled={refusedModes.has('vision')}>
               {t.benchmarkTypeVision}
             </option>
             {/* Offered only where it can run. The hint below is UNCONDITIONAL
@@ -1053,7 +1215,7 @@ export function BenchmarkSection({
           <Typography variant="caption" color="text.secondary" sx={{ mt: -1.5 }}>
             {t.benchmarkTypeVramHint}
           </Typography>
-          {chatRefused && (
+          {chatRefusal !== null && (
             <Typography id="benchmark-chat-refusal-hint" variant="caption" color="text.secondary">
               {chatRefusal === 'images_only' ? t.benchmarkImagesOnlyHint : t.benchmarkAudioOnlyHint}
             </Typography>

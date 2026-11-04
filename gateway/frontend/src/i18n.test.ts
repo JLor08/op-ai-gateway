@@ -4440,4 +4440,13 @@ describe('audio metrics (#340) i18n keys', () => {
     expect(messages.en.runtimeSpecMinExceedsRealtime).toMatch(/minimum/);
     expect(messages.en.runtimeSpecMinExceedsRealtime).toMatch(/real-time concurrency/);
   });
+
+  // An audio-only mapping runs speed, capacity and both as audio measurements;
+  // only vision still sends it a chat prompt.
+  it('says in the audio-only hint that only vision is disabled', () => {
+    expect(messages.de.benchmarkAudioOnlyHint).toMatch(/Vision/);
+    expect(messages.de.benchmarkAudioOnlyHint).not.toMatch(/Kapazität, Beide und Vision/);
+    expect(messages.en.benchmarkAudioOnlyHint).toMatch(/vision/i);
+    expect(messages.en.benchmarkAudioOnlyHint).not.toMatch(/both and vision/i);
+  });
 });
