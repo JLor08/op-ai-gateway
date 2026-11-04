@@ -4,7 +4,7 @@
 // This file is the router port (design doc §6.1): the single HTTP port the
 // gateway talks to for a server_agent application, which routes every
 // inference request to the right managed model process, starting it first
-// if necessary. Five route classes:
+// if necessary. Six route classes:
 //
 //   - GET /health, GET /v1/health -- always 200 while the router is up.
 //     "Reachability means the router accepts, not that a model is warm" --
@@ -42,6 +42,12 @@
 //     caller sends anyway is read and discarded, never forwarded. No
 //     heartbeats: a failure is a genuine HTTP status from the sentinel table
 //     below.
+//   - POST /stop/{model} -- begin a graceful drain of ONE instance on the
+//     operator's request, persisting nothing (Manager.Stop): model from the
+//     PATH like /ensure, then 200 {"state":"stopping"|"stopped"} or a 404/409
+//     refusal. Bodiless, so a router without this route answers it from
+//     serveProxy with 404 runtime.model_not_managed and stops nothing; the
+//     gateway calls it only on an agent that declares "runtime_stop".
 //   - everything else -- the model-routed reverse proxy. The model comes from
 //     the JSON body or, when the request is multipart/form-data (an image
 //     edit or an audio transcription, "multipart_proxy" in the agent's
@@ -349,7 +355,7 @@ func newRouter(m managerPort) *router {
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// M9: every control path answers one method -- GET, or POST for
-	// /ensure/{model}; a different method on one of these paths falls
+	// /ensure/{model} and /stop/{model}; a different method on one of these paths falls
 	// through to the model-routed proxy instead (the ordinary "everything
 	// else" case), rather than getting the control treatment regardless
 	// of method.
@@ -365,6 +371,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveUpstream(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, ensurePathPrefix):
 		rt.serveEnsure(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, stopPathPrefix):
+		rt.serveStop(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, livePathPrefix):
 		rt.serveLive(w, r)
 	default:
@@ -637,6 +645,10 @@ func upstreamChildQuery(raw, base string, k int) string {
 // after it is the model.
 const ensurePathPrefix = "/ensure/"
 
+// stopPathPrefix is the path prefix of POST /stop/{model}; everything after
+// it is the instance address.
+const stopPathPrefix = "/stop/"
+
 // livePathPrefix is the path prefix of POST /live/{model}; everything after it
 // is the model. Unlike the model-routed proxy, this route reads the model from
 // the PATH and never buffers the body, so it can carry a full-duplex streaming
@@ -727,6 +739,62 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 	}
 	refreshWriteDeadline(w)
 	writeJSON(w, http.StatusOK, ensureResponse{Status: "running"})
+}
+
+// stopPort is the part of *Manager that POST /stop/{model} needs. It is kept
+// apart from managerPort, and asserted per request, so the many managerPort
+// fakes of the other routes need not grow a method they never use; a manager
+// without it stops nothing and answers as for an unmanaged model.
+type stopPort interface {
+	Stop(ctx context.Context, model string) (StopState, error)
+}
+
+// stopResponse is POST /stop/{model}'s success body.
+type stopResponse struct {
+	State StopState `json:"state"`
+}
+
+// serveStop handles POST /stop/{model}: the transient stop of one instance
+// (Manager.Stop). It begins a graceful drain and answers at once -- it does
+// not wait for the process to exit; Status() and the agent's telemetry report
+// that -- and persists nothing, so demand may start the instance again.
+//
+// Deliberate properties, shared with serveEnsure:
+//   - The model is the decoded PATH after "/stop/", an instance address ("m"
+//     or "m#k", the "#" percent-encoded on the wire), so an id containing "/"
+//     works. Any body is read and discarded; one over maxBodyBytes is refused
+//     with 413 runtime.request_too_large before Stop.
+//   - Bodiless on the gateway's side on purpose: a router without this route
+//     hands the request to serveProxy, which answers a body that names no
+//     model with 404 runtime.model_not_managed, so an older agent stops
+//     nothing.
+//
+// Answers: 200 {"state":"stopping"} when a drain began or was already
+// running (also for a force_stopped spec's draining instance), 200
+// {"state":"stopped"} when the instance has no process (idempotent), 404
+// runtime.model_not_managed for an address that is not managed (also an empty
+// model, or no manager), 409 runtime.instance_protected for an instance inside
+// the protected floor, 409 runtime.instance_not_highest while a higher
+// instance of the spec has a process, or 502 runtime.upstream_gone for any
+// other failure, such as the manager shutting down.
+func (rt *router) serveStop(w http.ResponseWriter, r *http.Request) {
+	model := strings.TrimPrefix(r.URL.Path, stopPathPrefix)
+	stopper, ok := rt.m.(stopPort)
+	if !ok || model == "" {
+		writeSentinelError(w, ErrModelNotManaged)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		writeBodyReadError(w, err)
+		return
+	}
+	state, err := stopper.Stop(r.Context(), model)
+	if err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stopResponse{State: state})
 }
 
 // serveLive handles POST /live/{model}: the full-duplex relay to a managed
@@ -1826,7 +1894,7 @@ const (
 )
 
 // sentinelCode maps a Manager error to the design doc §6.5 stable wire code
-// and HTTP status. Any error that is not one of the seven named sentinels
+// and HTTP status. Any error that is not one of the nine named sentinels
 // (including a raw upstream connection failure or non-2xx status, which
 // carry no Manager sentinel of their own) falls through to
 // runtime.upstream_gone/502 -- the same code the design doc assigns to "the
@@ -1842,7 +1910,11 @@ const (
 // or starting), and a request whose address moved while it was admitted
 // (errAddressMoved); runtime.instance_demand_unknown answers an ensure of a
 // burst instance whose demand is not known yet, which the gateway retries
-// shortly, by which time a sibling has usually been measured.
+// shortly, by which time a sibling has usually been measured. The two stop
+// refusals (POST /stop/{model}) are 409s as well: the stop conflicts with the
+// spec's protected floor (runtime.instance_protected) or with the ordering of
+// its instances (runtime.instance_not_highest), and the operator resolves either
+// by changing the spec or stopping the higher instance first.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
@@ -1859,6 +1931,10 @@ func sentinelCode(err error) (code string, status int) {
 		return "runtime.instance_no_capacity", http.StatusConflict
 	case errors.Is(err, ErrInstanceDemandUnknown):
 		return "runtime.instance_demand_unknown", http.StatusConflict
+	case errors.Is(err, ErrInstanceProtected):
+		return "runtime.instance_protected", http.StatusConflict
+	case errors.Is(err, ErrInstanceNotHighest):
+		return "runtime.instance_not_highest", http.StatusConflict
 	default:
 		return codeUpstreamGone, http.StatusBadGateway
 	}
