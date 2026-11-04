@@ -66,8 +66,13 @@ const audioStreamReadBytes = 32 << 10
 const liveSampleFormatS16 = "s16le"
 
 // audioMeasurement is what one audio measurement established. Every field is positive
-// when a measurement returns without an error.
+// when a measurement returns without an error, and FirstByteMS <= TTFTMS <= WallMS.
 type audioMeasurement struct {
+	// FirstByteMS is the time from sending the request to the start of the answer: its
+	// status line and headers, before any of its body is read. For a buffered synthesis it
+	// is the time to the first response byte, which leaves out the transfer of the WAV that
+	// TTFTMS includes; for a stream it is the answer's start, before its first output.
+	FirstByteMS int64
 	// TTFTMS is the time from sending the request to the first output a client could use:
 	// the first audio of a streamed synthesis, the first transcript text of a live
 	// transcription, and the whole answer of a buffered one (its output is usable only once
@@ -160,6 +165,7 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 	if err != nil {
 		return audioMeasurement{}, fmt.Errorf("audio benchmark: synthesis request failed: %w", err)
 	}
+	answered := m.now()
 	defer resp.Body.Close()
 	if err := checkAudioAnswerStatus(resp); err != nil {
 		return audioMeasurement{}, err
@@ -220,6 +226,7 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 	}
 	wall := done.Sub(sent)
 	return audioMeasurement{
+		FirstByteMS:  millisAtLeastOne(answered.Sub(sent).Seconds()),
 		TTFTMS:       millisAtLeastOne(first.Sub(sent).Seconds()),
 		WallMS:       millisAtLeastOne(wall.Seconds()),
 		AudioSeconds: audioSeconds,
@@ -230,7 +237,9 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 
 // measureTTSBuffered synthesizes text as one WAV on target and times it. The answer is
 // usable only once it is whole, so TTFTMS and WallMS are both the time from the send to
-// the end of the answer, RateX the audio over that time and RTF its inverse. The length of
+// the end of the answer, RateX the audio over that time and RTF its inverse; FirstByteMS is
+// the time to the answer's start, before the WAV is read (the first response byte, which a
+// cold start is told by for a synthesis that does not stream). The length of
 // the audio is audio.cpp's own X-AudioCPP-Audio-Duration-Ms when usable, else the WAV's
 // (speechBenchmarkAudioSeconds, the speech benchmark's rule). voice is a clone model's
 // preset voice, "" for a model that needs none.
@@ -244,6 +253,7 @@ func (m audioMeasurer) measureTTSBuffered(ctx context.Context, client provider.N
 	if err != nil {
 		return audioMeasurement{}, fmt.Errorf("audio benchmark: synthesis request failed: %w", err)
 	}
+	answered := m.now()
 	defer resp.Body.Close()
 	if err := checkAudioAnswerStatus(resp); err != nil {
 		return audioMeasurement{}, err
@@ -259,12 +269,13 @@ func (m audioMeasurer) measureTTSBuffered(ctx context.Context, client provider.N
 	if !ok {
 		return audioMeasurement{}, errors.New("audio benchmark: the synthesis answer states no audio length (no usable duration header and no readable WAV header)")
 	}
-	return bufferedAudioMeasurement(sent, end, audioSeconds)
+	return bufferedAudioMeasurement(sent, answered, end, audioSeconds)
 }
 
 // measureASRBuffered transcribes wav on target in one request and times it: the answer is
 // usable only once it is whole, so TTFTMS and WallMS are both the time from the send to
-// the end of the answer, RateX the clip's length over that time and RTF its inverse. The
+// the end of the answer, RateX the clip's length over that time and RTF its inverse, and
+// FirstByteMS the time to the answer's start, before its document is read. The
 // length is read from the clip that is sent, never from the answer, and a clip whose
 // length cannot be read is refused before anything is sent. lang is passed as the form's
 // language field; "" states none, and the model detects it.
@@ -282,6 +293,7 @@ func (m audioMeasurer) measureASRBuffered(ctx context.Context, client provider.N
 	if err != nil {
 		return audioMeasurement{}, fmt.Errorf("audio benchmark: transcription request failed: %w", err)
 	}
+	answered := m.now()
 	defer resp.Body.Close()
 	if err := checkAudioAnswerStatus(resp); err != nil {
 		return audioMeasurement{}, err
@@ -301,7 +313,7 @@ func (m audioMeasurer) measureASRBuffered(ctx context.Context, client provider.N
 	if strings.TrimSpace(*transcription.Text) == "" {
 		return audioMeasurement{}, errors.New("audio benchmark: the transcription has no text")
 	}
-	return bufferedAudioMeasurement(sent, end, float64(ms)/1000)
+	return bufferedAudioMeasurement(sent, answered, end, float64(ms)/1000)
 }
 
 // buildASRBenchmarkBody is the buffered transcription's multipart form: the target's model
@@ -369,6 +381,7 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 	if err != nil {
 		return audioMeasurement{}, fmt.Errorf("audio benchmark: live transcription request failed: %w", err)
 	}
+	answered := m.now()
 	defer resp.Body.Close()
 	if err := checkAudioAnswerStatus(resp); err != nil {
 		return audioMeasurement{}, err
@@ -422,6 +435,7 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 		return audioMeasurement{}, errors.New("audio benchmark: no measurable time between the send and transcript.text.done")
 	}
 	return audioMeasurement{
+		FirstByteMS:  millisAtLeastOne(answered.Sub(sent).Seconds()),
 		TTFTMS:       millisAtLeastOne(first.Sub(sent).Seconds()),
 		WallMS:       millisAtLeastOne(wall.Seconds()),
 		AudioSeconds: audioSeconds,
@@ -430,10 +444,11 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 	}, nil
 }
 
-// bufferedAudioMeasurement is the figures of a one-shot answer: its output is usable only
-// once it is whole, so the time to it is both TTFTMS and WallMS. A wall time or a length of
+// bufferedAudioMeasurement is the figures of a one-shot answer that started at answered and
+// ended at end: its output is usable only once it is whole, so the time to it is both
+// TTFTMS and WallMS, and the time to its start is FirstByteMS. A wall time or a length of
 // audio that is not positive gives no rate and is an error.
-func bufferedAudioMeasurement(sent, end time.Time, audioSeconds float64) (audioMeasurement, error) {
+func bufferedAudioMeasurement(sent, answered, end time.Time, audioSeconds float64) (audioMeasurement, error) {
 	wall := end.Sub(sent)
 	if wall <= 0 {
 		return audioMeasurement{}, errors.New("audio benchmark: no measurable time between the send and the end of the answer")
@@ -443,6 +458,7 @@ func bufferedAudioMeasurement(sent, end time.Time, audioSeconds float64) (audioM
 	}
 	ms := millisAtLeastOne(wall.Seconds())
 	return audioMeasurement{
+		FirstByteMS:  millisAtLeastOne(answered.Sub(sent).Seconds()),
 		TTFTMS:       ms,
 		WallMS:       ms,
 		AudioSeconds: audioSeconds,

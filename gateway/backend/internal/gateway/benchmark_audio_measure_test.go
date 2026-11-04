@@ -77,12 +77,16 @@ func (b *measureBody) Read(p []byte) (int, error) {
 func (*measureBody) Close() error { return nil }
 
 // measureUpstream is the fake upstream of one measurement: it answers with a scripted
-// response (or fails with err) and records what was sent, and where.
+// response (or fails with err) and records what was sent, and where. Its answer -- the
+// status and headers, before any of the body -- arrives answerAt after the request, when
+// it has a clock to move.
 type measureUpstream struct {
-	status int
-	header http.Header
-	body   *measureBody
-	err    error
+	status   int
+	header   http.Header
+	body     *measureBody
+	err      error
+	clock    *measureClock
+	answerAt time.Duration
 
 	calls       int
 	target      routing.Target
@@ -96,6 +100,9 @@ func (u *measureUpstream) answer(target routing.Target, path string, body []byte
 	u.target, u.path, u.sent, u.contentType = target, path, body, contentType
 	if u.err != nil {
 		return nil, u.err
+	}
+	if u.clock != nil {
+		u.clock.at = u.answerAt
 	}
 	return &provider.ProxyResponse{StatusCode: u.status, Header: u.header, Body: u.body}, nil
 }
@@ -114,12 +121,14 @@ func (u *measureUpstream) ProxyNativeDuplex(_ context.Context, target routing.Ta
 	return u.answer(target, path, sent, contentType)
 }
 
-// scriptedAudioUpstream answers 200 with the given Content-Type and the scripted chunks.
+// scriptedAudioUpstream answers 200 with the given Content-Type and the scripted chunks; the
+// answer itself arrives the moment the request is sent unless the test sets answerAt.
 func scriptedAudioUpstream(clock *measureClock, contentType string, chunks ...measureChunk) *measureUpstream {
 	return &measureUpstream{
 		status: http.StatusOK,
 		header: http.Header{"Content-Type": {contentType}},
 		body:   &measureBody{clock: clock, chunks: chunks},
+		clock:  clock,
 	}
 }
 
@@ -175,15 +184,16 @@ func audioMeasureTarget() routing.Target {
 
 // checkAudioMeasurement compares a measurement with the expected one: the times exactly (they
 // are whole milliseconds of a scripted clock), the figures within a rounding tolerance. Every
-// measurement must also hold the order its times have by definition: the first output comes
-// no later than the end of the output.
+// measurement must also hold the order its times have by definition: the answer starts no
+// later than its first output, and the first output comes no later than its end.
 func checkAudioMeasurement(t *testing.T, got, want audioMeasurement) {
 	t.Helper()
 	const tol = 0.005
-	if got.TTFTMS > got.WallMS {
-		t.Fatalf("measurement = %+v: the first output (%d ms) comes after the end (%d ms)", got, got.TTFTMS, got.WallMS)
+	if got.FirstByteMS > got.TTFTMS || got.TTFTMS > got.WallMS {
+		t.Fatalf("measurement = %+v: want the answer (%d ms) no later than the first output (%d ms), and that no later than the end (%d ms)",
+			got, got.FirstByteMS, got.TTFTMS, got.WallMS)
 	}
-	if got.TTFTMS != want.TTFTMS || got.WallMS != want.WallMS ||
+	if got.FirstByteMS != want.FirstByteMS || got.TTFTMS != want.TTFTMS || got.WallMS != want.WallMS ||
 		math.Abs(got.AudioSeconds-want.AudioSeconds) > tol ||
 		math.Abs(got.RateX-want.RateX) > tol ||
 		math.Abs(got.RTF-want.RTF) > tol {
@@ -251,7 +261,7 @@ func checkAudioRefusal(t *testing.T, got audioMeasurement, err error, want strin
 // request and whose speech.audio.done arrives at 2300 ms, carrying 10 s of PCM at 48000 B/s.
 // The time to first audio is 300 ms; the production rate is the audio over the time from
 // the first chunk to done, 10 s / 2 s = 5x real time; the real-time factor is the whole
-// call over the audio, 2.3 s / 10 s.
+// call over the audio, 2.3 s / 10 s. The answer's headers, at 150 ms, are no audio yet.
 func TestMeasureTTSStreamMath(t *testing.T) {
 	clock := &measureClock{}
 	up := scriptedAudioUpstream(clock, "text/event-stream",
@@ -262,13 +272,14 @@ func TestMeasureTTSStreamMath(t *testing.T) {
 		measureAt(1900, sseSpeechDelta(96000)),
 		measureAt(2300, sseSpeechDone),
 	)
+	up.answerAt = 150 * time.Millisecond
 	target := audioMeasureTarget()
 
 	got, err := clock.measurer().measureTTSStream(context.Background(), up, target, audioBenchmarkPassage, "", 48000)
 	if err != nil {
 		t.Fatalf("measureTTSStream: %v", err)
 	}
-	checkAudioMeasurement(t, got, audioMeasurement{TTFTMS: 300, WallMS: 2300, AudioSeconds: 10, RateX: 5.0, RTF: 0.23})
+	checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 150, TTFTMS: 300, WallMS: 2300, AudioSeconds: 10, RateX: 5.0, RTF: 0.23})
 
 	// One streamed SSE synthesis of the passage, sent to the instance by its own address, with
 	// no voice for a model that needs none and no response_format (a stream is pcm).
@@ -301,22 +312,22 @@ func TestMeasureTTSStreamTimesFirstAudio(t *testing.T) {
 			measureAt(250, delta[:40]),
 			measureAt(400, delta[40:]),
 			measureAt(1400, sseSpeechDone),
-		}, audioMeasurement{TTFTMS: 400, WallMS: 1400, AudioSeconds: 1, RateX: 1.0, RTF: 1.4}},
+		}, audioMeasurement{FirstByteMS: 1, TTFTMS: 400, WallMS: 1400, AudioSeconds: 1, RateX: 1.0, RTF: 1.4}},
 		{"[DONE] without a line break", []measureChunk{
 			measureAt(200, delta),
 			measureAt(1200, "data: {\"type\":\"speech.audio.done\"}\n\ndata: [DONE]"),
-		}, audioMeasurement{TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
+		}, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
 		{"[DONE] well after done: the synthesis ended at done", []measureChunk{
 			measureAt(200, delta),
 			measureAt(1200, "data: {\"type\":\"speech.audio.done\"}\n\n"),
 			measureAt(1700, "data: [DONE]\n\n"),
-		}, audioMeasurement{TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
+		}, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
 		{"audio after done is not part of the synthesis", []measureChunk{
 			measureAt(200, delta),
 			measureAt(1200, "data: {\"type\":\"speech.audio.done\"}\n\n"),
 			measureAt(1300, delta),
 			measureAt(1400, "data: [DONE]\n\n"),
-		}, audioMeasurement{TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
+		}, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -497,18 +508,20 @@ func TestMeasureStreamsStopAtAnyDONE(t *testing.T) {
 
 // TestMeasureTTSBufferedMath: a non-streamed synthesis is usable only once it is whole, so
 // its time to first audio is the wall time to the end of the answer; 3 s of audio whole after
-// 1500 ms is 2x real time. A clone model's preset voice is named in the request.
+// 1500 ms is 2x real time. Its first response byte is the answer's start at 1100 ms, before
+// any of the WAV is read. A clone model's preset voice is named in the request.
 func TestMeasureTTSBufferedMath(t *testing.T) {
 	clock := &measureClock{}
 	wav := buildPCMWav(t, 24000, 1, 16, 144000) // 3 s
 	up := scriptedAudioUpstream(clock, "audio/wav", measureAt(1200, string(wav[:44])), measureAt(1500, string(wav[44:])))
+	up.answerAt = 1100 * time.Millisecond
 	target := audioMeasureTarget()
 
 	got, err := clock.measurer().measureTTSBuffered(context.Background(), up, target, audioBenchmarkPassage, "narrator")
 	if err != nil {
 		t.Fatalf("measureTTSBuffered: %v", err)
 	}
-	checkAudioMeasurement(t, got, audioMeasurement{TTFTMS: 1500, WallMS: 1500, AudioSeconds: 3, RateX: 2.0, RTF: 0.5})
+	checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1100, TTFTMS: 1500, WallMS: 1500, AudioSeconds: 3, RateX: 2.0, RTF: 0.5})
 
 	checkAudioSentTo(t, up, target, "/v1/audio/speech", "application/json")
 	body := audioSentJSON(t, up)
@@ -523,10 +536,12 @@ func TestMeasureTTSBufferedMath(t *testing.T) {
 }
 
 // TestMeasureASRBufferedMath: the bundled 22.85 s clip transcribed in 1000 ms is 22.85x real
-// time, and the answer, whole only at its end, is also the time to the first text.
+// time, and the answer, whole only at its end, is also the time to the first text; its first
+// response byte is the answer's start at 950 ms.
 func TestMeasureASRBufferedMath(t *testing.T) {
 	clock := &measureClock{}
 	up := scriptedAudioUpstream(clock, "application/json", measureAt(1000, `{"text":"der schutz der menschen vor hochwasser","timing":{"audio_duration_ms":22850}}`))
+	up.answerAt = 950 * time.Millisecond
 	target := audioMeasureTarget()
 	wav := benchaudio.WAV()
 
@@ -534,7 +549,7 @@ func TestMeasureASRBufferedMath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("measureASRBuffered: %v", err)
 	}
-	checkAudioMeasurement(t, got, audioMeasurement{TTFTMS: 1000, WallMS: 1000, AudioSeconds: 22.85, RateX: 22.85, RTF: 1 / 22.85})
+	checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 950, TTFTMS: 1000, WallMS: 1000, AudioSeconds: 22.85, RateX: 22.85, RTF: 1 / 22.85})
 
 	// One multipart transcription: the instance's own name, the language, and the clip as
 	// the WAV file part -- and no stream field, so the answer is the one-shot JSON.
@@ -693,6 +708,7 @@ func TestMeasureASRLiveMath(t *testing.T) {
 		measureAt(900, sseTranscriptDelta("der menschen")),
 		measureAt(2000, sseTranscriptDone("der schutz der menschen")),
 	)
+	up.answerAt = 50 * time.Millisecond
 	target := audioMeasureTarget()
 	pcm, sampleRate, channels := benchaudio.PCM()
 	if channels != 1 {
@@ -703,7 +719,7 @@ func TestMeasureASRLiveMath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("measureASRLive: %v", err)
 	}
-	checkAudioMeasurement(t, got, audioMeasurement{TTFTMS: 400, WallMS: 2000, AudioSeconds: 22.85, RateX: 22.85 / 2, RTF: 2 / 22.85})
+	checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 50, TTFTMS: 400, WallMS: 2000, AudioSeconds: 22.85, RateX: 22.85 / 2, RTF: 2 / 22.85})
 
 	// The agent's /live route for the instance's own address (its '#' escaped in the path),
 	// the clip's PCM shape and language in the query, and every byte of the PCM as the body.
@@ -757,7 +773,7 @@ func TestMeasureASRLiveTimesFirstText(t *testing.T) {
 			if err != nil {
 				t.Fatalf("measureASRLive: %v", err)
 			}
-			checkAudioMeasurement(t, got, audioMeasurement{TTFTMS: tc.ttft, WallMS: 1000, AudioSeconds: 22.85, RateX: 22.85, RTF: 1 / 22.85})
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: tc.ttft, WallMS: 1000, AudioSeconds: 22.85, RateX: 22.85, RTF: 1 / 22.85})
 		})
 	}
 }
