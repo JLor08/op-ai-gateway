@@ -52,6 +52,10 @@ func TestRouterStopAnswers(t *testing.T) {
 		{name: "not managed", err: ErrModelNotManaged, wantStatus: http.StatusNotFound, wantCode: "runtime.model_not_managed"},
 		{name: "protected", err: ErrInstanceProtected, wantStatus: http.StatusConflict, wantCode: "runtime.instance_protected"},
 		{name: "not highest", err: ErrInstanceNotHighest, wantStatus: http.StatusConflict, wantCode: "runtime.instance_not_highest"},
+		// Any other failure is 502 runtime.upstream_gone: the manager shutting
+		// down, or the request's own context ending before the owner answered.
+		{name: "manager closed", err: ErrManagerClosed, wantStatus: http.StatusBadGateway, wantCode: "runtime.upstream_gone"},
+		{name: "context canceled", err: context.Canceled, wantStatus: http.StatusBadGateway, wantCode: "runtime.upstream_gone"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := &stopStubManager{state: tc.state, err: tc.err}

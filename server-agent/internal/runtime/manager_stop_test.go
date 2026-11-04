@@ -6,6 +6,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -129,6 +130,13 @@ func TestStopInstanceAnswers(t *testing.T) {
 			wantAfter: map[int]State{0: StateRunning, 1: StateDraining},
 		},
 		{
+			name:      "an instance already draining is answered stopping while a higher one starts",
+			states:    []*specState{liveInstance(repl, 0, 100), draining(repl, 1), starting(repl, 2)},
+			model:     "m#1",
+			wantState: StopStopping,
+			wantAfter: map[int]State{0: StateRunning, 1: StateDraining, 2: StateStarting},
+		},
+		{
 			name:      "an instance with no process is already stopped",
 			states:    []*specState{restingInstance(repl, 0, StateStopped)},
 			model:     "m",
@@ -242,6 +250,130 @@ func TestStopInstanceAnswers(t *testing.T) {
 				if has != wantHas || got != want {
 					t.Errorf("instance %d after stop(%q) = (%q, held %v), want (%q, held %v)", k, tc.model, got, has, want, wantHas)
 				}
+			}
+		})
+	}
+}
+
+// queuedWaiter queues one ensure waiter on st and returns the channel its
+// answer arrives on.
+func queuedWaiter(st *specState) chan ensureOutcome {
+	reply := make(chan ensureOutcome, 1)
+	st.pending = append(st.pending, &ensureWaiter{reply: reply, queuedAt: time.Now()})
+	return reply
+}
+
+// TestStopInstanceAnswersQueuedRequests: a stop that is not refused answers
+// every request queued on the instance at that moment -- with
+// runtime.instance_no_capacity for a burst instance and
+// runtime.admission_blocked for instance 0 -- so none of them is left to want
+// the instance up again once its process exits. A refused stop leaves the
+// queue alone.
+func TestStopInstanceAnswersQueuedRequests(t *testing.T) {
+	repl := replicableSpec("S", "m")
+	repl.MaxInstances = 4
+	min2 := repl
+	min2.MinInstances = 2
+	single := baseSpec("S", "m")
+
+	starting := func(spec Spec, k int) *specState {
+		st := liveInstance(spec, k, 100+k)
+		st.state = StateStarting
+		st.proc.everHealthy = false
+		return st
+	}
+	draining := func(spec Spec, k int) *specState {
+		st := liveInstance(spec, k, 100+k)
+		st.state = StateDraining
+		return st
+	}
+
+	for _, tc := range []struct {
+		name string
+		// queued is the instance the waiter is queued on, by index into states.
+		states    []*specState
+		queued    int
+		model     string
+		wantState StopState
+		wantErr   error
+		// wantAnswer is the error the queued request is answered with; nil means
+		// it must still be queued after the stop.
+		wantAnswer error
+	}{
+		{
+			name:       "a starting burst instance",
+			states:     []*specState{liveInstance(repl, 0, 100), starting(repl, 1)},
+			queued:     1,
+			model:      "m#1",
+			wantState:  StopStopping,
+			wantAnswer: ErrInstanceNoCapacity,
+		},
+		{
+			name:       "a starting instance 0",
+			states:     []*specState{starting(single, 0)},
+			queued:     0,
+			model:      "m",
+			wantState:  StopStopping,
+			wantAnswer: ErrAdmissionBlocked,
+		},
+		{
+			name:       "instance 0 waiting out a crash-loop backoff",
+			states:     []*specState{restingInstance(single, 0, StateBackoff)},
+			queued:     0,
+			model:      "m",
+			wantState:  StopStopped,
+			wantAnswer: ErrAdmissionBlocked,
+		},
+		{
+			name:       "instance 0 already draining",
+			states:     []*specState{draining(single, 0)},
+			queued:     0,
+			model:      "m",
+			wantState:  StopStopping,
+			wantAnswer: ErrAdmissionBlocked,
+		},
+		{
+			name:    "a refused stop of a protected instance",
+			states:  []*specState{liveInstance(min2, 0, 100), starting(min2, 1)},
+			queued:  1,
+			model:   "m#1",
+			wantErr: ErrInstanceProtected,
+		},
+		{
+			name:    "a refused stop of an instance below a higher one",
+			states:  []*specState{starting(repl, 0), starting(repl, 1)},
+			queued:  0,
+			model:   "m",
+			wantErr: ErrInstanceNotHighest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queuedOn := tc.states[tc.queued]
+			reply := queuedWaiter(queuedOn)
+			o := stopOwner(tc.states...)
+			out := o.stopInstance(tc.model)
+			if !errors.Is(out.err, tc.wantErr) || (tc.wantErr == nil && out.err != nil) {
+				t.Fatalf("stop(%q) error = %v, want %v", tc.model, out.err, tc.wantErr)
+			}
+			if out.state != tc.wantState {
+				t.Errorf("stop(%q) state = %q, want %q", tc.model, out.state, tc.wantState)
+			}
+			if tc.wantAnswer == nil {
+				if len(queuedOn.pending) != 1 || len(reply) != 0 {
+					t.Fatalf("after a refused stop: %d queued, %d answered; want the request still queued", len(queuedOn.pending), len(reply))
+				}
+				return
+			}
+			if len(queuedOn.pending) != 0 {
+				t.Fatalf("%d requests still queued after the stop, want none", len(queuedOn.pending))
+			}
+			select {
+			case got := <-reply:
+				if !errors.Is(got.err, tc.wantAnswer) {
+					t.Fatalf("queued request answered %v, want %v", got.err, tc.wantAnswer)
+				}
+			default:
+				t.Fatal("queued request was not answered by the stop")
 			}
 		})
 	}
@@ -383,22 +515,175 @@ func TestStopWaitsForInFlightRequests(t *testing.T) {
 	})
 }
 
-// TestConcurrentStopsDrainOnce races many stops of one instance, and of its
-// lower sibling, against each other on the owner goroutine (run under -race):
-// every stop of the highest instance is answered stopping or stopped, every
-// stop of the lower one is answered stopping (after the higher one left),
-// stopped, or refused as not the highest -- never anything else -- and the
-// burst instance is retired exactly once.
-func TestConcurrentStopsDrainOnce(t *testing.T) {
+// ensureInBackground runs EnsureRunning(model) on its own goroutine and returns
+// the channel its error arrives on; a successful ensure is released at once.
+func ensureInBackground(m *Manager, model string) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, model)
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+	return done
+}
+
+// awaitEnsure waits for the answer of an ensureInBackground call.
+func awaitEnsure(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("the ensure did not return")
+		return nil
+	}
+}
+
+// TestStopOfAStartingInstanceIsNotUndoneByItsEnsure runs on the owner
+// goroutine with a real child that takes a while to pass its health probe. An
+// ensure starts a burst instance (as the portal's Play or the gateway's scaler
+// does), and the instance is stopped while it is still starting. The stop
+// answers that ensure with runtime.instance_no_capacity instead of leaving it
+// queued, so the exit does not start a second process for it: the instance is
+// retired, and the binary ran exactly once for it.
+func TestStopOfAStartingInstanceIsNotUndoneByItsEnsure(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	m := newTestManager(t, allowlistPolicy())
 
-	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}})
+	invocations := filepath.Join(t.TempDir(), "invocations")
+	spec := replicableSpec("S", "m")
+	spec.Args = stubArgs(400*time.Millisecond, 0, 0, invocations)
+	m.Apply(Config{Specs: []Spec{spec}})
+	_, release := ensureModel(t, m, "m")
+	release()
+
+	done := ensureInBackground(m, "m#1")
+	// The child logs itself as its first act; a SIGTERM before that would
+	// leave the count unable to tell a start from none.
+	waitUntil(t, 5*time.Second, "instance 1 starting, its child running", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateStarting && countInvocations(t, invocations) == 2
+	})
+	if got := stopModel(t, m, "m#1"); got != StopStopping {
+		t.Fatalf("Stop(m#1) = %q, want stopping", got)
+	}
+	if err := awaitEnsure(t, done); !errors.Is(err, ErrInstanceNoCapacity) {
+		t.Fatalf("the ensure the stopped instance was starting for = %v, want ErrInstanceNoCapacity", err)
+	}
+	waitUntil(t, 5*time.Second, "the stopped instance retired", func() bool {
+		return instanceStatus(m, "S", 1) == nil
+	})
+	// Longer than a start takes: a restart would have shown by now.
+	time.Sleep(600 * time.Millisecond)
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Fatalf("instance 1 = %+v after the stop, want it retired, not started again", st)
+	}
+	if n := countInvocations(t, invocations); n != 2 {
+		t.Fatalf("the binary ran %d times, want 2 (instance 0 and the one stopped start of instance 1)", n)
+	}
+}
+
+// TestStopOfAStartingInstanceZeroAnswersItsRequest is the same for instance 0
+// of a spec that does not replicate: the request it was starting for is
+// answered runtime.admission_blocked, and the instance rests at stopped rather
+// than loading the model a second time.
+func TestStopOfAStartingInstanceZeroAnswersItsRequest(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	invocations := filepath.Join(t.TempDir(), "invocations")
+	spec := baseSpec("S", "m")
+	spec.Args = stubArgs(400*time.Millisecond, 0, 0, invocations)
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	done := ensureInBackground(m, "m")
+	waitUntil(t, 5*time.Second, "instance 0 starting, its child running", func() bool {
+		st := instanceStatus(m, "S", 0)
+		return st != nil && st.State == StateStarting && countInvocations(t, invocations) == 1
+	})
+	if got := stopModel(t, m, "m"); got != StopStopping {
+		t.Fatalf("Stop(m) = %q, want stopping", got)
+	}
+	if err := awaitEnsure(t, done); !errors.Is(err, ErrAdmissionBlocked) {
+		t.Fatalf("the request the stopped instance was starting for = %v, want ErrAdmissionBlocked", err)
+	}
+	waitUntil(t, 5*time.Second, "instance 0 stopped", func() bool {
+		st := instanceStatus(m, "S", 0)
+		return st != nil && st.State == StateStopped && st.PID == 0
+	})
+	time.Sleep(600 * time.Millisecond)
+	if st := mustInstance(t, m, "S", 0); st.State != StateStopped {
+		t.Fatalf("instance 0 = %+v after the stop, want it to rest at stopped", st)
+	}
+	if n := countInvocations(t, invocations); n != 1 {
+		t.Fatalf("the binary ran %d times, want 1: the stop must not be followed by a second start", n)
+	}
+}
+
+// TestStopLetsARequestQueuedWhileDrainingStartItAgain: a stop answers only the
+// requests queued at the time of the stop. A request for instance 0 that
+// arrives while the stopped instance drains is ordinary demand: it queues, and
+// the exit starts the instance again for it, on a new process.
+//
+// The request is given a moment to queue before the in-flight request is
+// released. Should it arrive late, it finds the instance stopped and starts it
+// just the same, so a slow machine makes the test weaker, never red.
+func TestStopLetsARequestQueuedWhileDrainingStartItAgain(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setDrainGrace(t, 10*time.Second)
+	m := newTestManager(t, allowlistPolicy())
+
+	m.Apply(Config{Specs: []Spec{baseSpec("S", "m")}})
+	_, inFlight := ensureModel(t, m, "m") // held: keeps the drain waiting
+	pid := mustInstance(t, m, "S", 0).PID
+
+	if got := stopModel(t, m, "m"); got != StopStopping {
+		t.Fatalf("Stop(m) = %q, want stopping", got)
+	}
+	done := ensureInBackground(m, "m")
+	time.Sleep(100 * time.Millisecond)
+	if st := mustInstance(t, m, "S", 0); st.State != StateDraining || st.PID != pid {
+		t.Fatalf("instance 0 = %+v, want still draining as pid %d", st, pid)
+	}
+	inFlight()
+
+	if err := awaitEnsure(t, done); err != nil {
+		t.Fatalf("the request queued while instance 0 drained = %v, want it served by a fresh start", err)
+	}
+	if st := mustInstance(t, m, "S", 0); st.State != StateRunning || st.PID == pid {
+		t.Fatalf("instance 0 = %+v, want running on a new process (not pid %d)", st, pid)
+	}
+}
+
+// TestConcurrentStopsAnswerConsistently races many stops of one instance, and
+// of its lower sibling, against each other on the owner goroutine (run under
+// -race). Every stop of the highest instance is answered stopping or stopped;
+// every stop of the lower one is answered stopping (after the higher one
+// left), stopped, or refused as not the highest -- never anything else. No
+// process is started again by the race (the binary ran exactly twice, once per
+// instance), the burst instance is retired, and instance 0 ends as the answers
+// say: stopped if any stop of it was answered stopping, untouched otherwise.
+func TestConcurrentStopsAnswerConsistently(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	invocations := filepath.Join(t.TempDir(), "invocations")
+	spec := replicableSpec("S", "m")
+	spec.Args = stubArgs(0, 0, 0, invocations)
+	m.Apply(Config{Specs: []Spec{spec}})
 	for _, model := range []string{"m", "m#1"} {
 		_, release := ensureModel(t, m, model)
 		release()
 	}
+	pid0 := mustInstance(t, m, "S", 0).PID
 
 	type answer struct {
 		model string
@@ -422,10 +707,12 @@ func TestConcurrentStopsDrainOnce(t *testing.T) {
 	}
 	wg.Wait()
 	close(answers)
+	zeroStopping := false
 	for a := range answers {
 		switch {
 		case a.model == "m#1" && a.err == nil && (a.state == StopStopping || a.state == StopStopped):
 		case a.model == "m" && a.err == nil && (a.state == StopStopping || a.state == StopStopped):
+			zeroStopping = zeroStopping || a.state == StopStopping
 		case a.model == "m" && errors.Is(a.err, ErrInstanceNotHighest):
 		default:
 			t.Errorf("Stop(%s) = (%q, %v), want stopping, stopped, or (for m) not_highest", a.model, a.state, a.err)
@@ -434,6 +721,17 @@ func TestConcurrentStopsDrainOnce(t *testing.T) {
 	waitUntil(t, 5*time.Second, "instance 1 retired", func() bool {
 		return instanceStatus(m, "S", 1) == nil
 	})
+	if zeroStopping {
+		waitUntil(t, 5*time.Second, "instance 0 stopped, as a stop of it was answered stopping", func() bool {
+			st := instanceStatus(m, "S", 0)
+			return st != nil && st.State == StateStopped && st.PID == 0
+		})
+	} else if st := mustInstance(t, m, "S", 0); st.State != StateRunning || st.PID != pid0 {
+		t.Fatalf("instance 0 = %+v, want still running as pid %d: no stop of it was answered stopping", st, pid0)
+	}
+	if got := countInvocations(t, invocations); got != 2 {
+		t.Fatalf("the binary ran %d times, want 2: the stops must not start anything", got)
+	}
 }
 
 // TestStopAfterCloseIsRefused: a stop after Close returns ErrManagerClosed

@@ -526,8 +526,9 @@ func TestFeaturesDeclareRuntimeRoleEviction(t *testing.T) {
 // this module cannot import it.
 //
 // The version assertion lived here, beside the then-newest feature, until
-// 0.17.0 moved it to TestFeaturesDeclareRuntimeStop; it is the forcing function for the repository's bump rule: a change that moves Version
-// has to come THROUGH this test and state which rule it followed. 0.8.0 was
+// 0.17.0 moved it to TestFeaturesDeclareRuntimeStop; it is the forcing
+// function for the repository's bump rule: a change that moves Version has to
+// come THROUGH this test and state which rule it followed. 0.8.0 was
 // MINOR because agent.Features gained runtime_ensure; 0.8.1 and 0.8.2 were
 // PATCH because they gained nothing (0.8.2 added the image_options telemetry
 // field, gated on the gateway-declared capability_source_sdcpp, which is not an
