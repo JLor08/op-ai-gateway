@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -114,14 +115,32 @@ type BenchmarkResult struct {
 	// transcription) and, for a confirmed cold start, AudioLoadTimeMS (cold minus warm time
 	// to first output; 0 = not measured). A capacity run sets the ramp's pair:
 	// AudioRealtimeConcurrency, the last good level, and AudioConcurrencyLimit, why the ramp
-	// stopped (routing.AudioLimitPerformance, AudioLimitResources or AudioLimitCap); a count
-	// of 0 is omitted and still a result whenever the limit is set. A failed part sets none
-	// of its figures.
+	// stopped (routing.AudioLimitPerformance, AudioLimitResources or AudioLimitCap). The two
+	// are one pair: the count is served whenever the limit is, a count of 0 included, which
+	// with the limit performance is a result (not real-time even alone), and neither is
+	// served without a limit (MarshalJSON). A failed part sets none of its figures.
 	AudioRateX               float64 `json:"audio_rate_x,omitempty"`
 	AudioTTFTMS              int64   `json:"audio_ttft_ms,omitempty"`
 	AudioLoadTimeMS          int64   `json:"audio_load_time_ms,omitempty"`
 	AudioRealtimeConcurrency int     `json:"audio_realtime_concurrency,omitempty"`
 	AudioConcurrencyLimit    string  `json:"audio_concurrency_limit,omitempty"`
+}
+
+// MarshalJSON encodes the result with its tags, except that the ramp's count is written
+// whenever its limit is: omitempty alone would drop a measured 0, and the result in the
+// status and in every SSE frame would then read as not measured. Without a limit there is
+// no ramp result, and the count is left out as before. The history row serves the pair the
+// same way (portal.BenchmarkRunDTO).
+func (r BenchmarkResult) MarshalJSON() ([]byte, error) {
+	type tagged BenchmarkResult // the same fields without this method
+	out := struct {
+		tagged
+		AudioRealtimeConcurrency *int `json:"audio_realtime_concurrency,omitempty"`
+	}{tagged: tagged(r)}
+	if r.AudioConcurrencyLimit != "" {
+		out.AudioRealtimeConcurrency = &r.AudioRealtimeConcurrency
+	}
+	return json.Marshal(out)
 }
 
 type benchmarkRun struct {

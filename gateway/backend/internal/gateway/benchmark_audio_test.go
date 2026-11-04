@@ -805,6 +805,64 @@ func TestAudioCapacityNotRealTimeEvenAlone(t *testing.T) {
 	}
 }
 
+// TestLiveAudioResultServesTheRampsCountBesideItsLimit: the run's status -- what the status
+// endpoint answers and each SSE snapshot and progress frame carries (json.Marshal of the
+// BenchmarkStatus) -- serves a ramp's count whenever it serves the ramp's limit, a measured 0
+// included: 0 with the limit performance is "not real-time even alone", a result, where a
+// missing count would read as not measured. A failed ramp and a speed run serve neither.
+// Every other field is encoded as before: the JSON decodes back into the same result.
+func TestLiveAudioResultServesTheRampsCountBesideItsLimit(t *testing.T) {
+	frame := func(t *testing.T, f *audioFixture) map[string]any {
+		t.Helper()
+		status := f.srv.Benchmarks.Status("srv1")
+		data, err := json.Marshal(status)
+		if err != nil {
+			t.Fatalf("marshal the status: %v", err)
+		}
+		var st struct {
+			Results []map[string]any `json:"results"`
+		}
+		var back BenchmarkStatus
+		if err := json.Unmarshal(data, &st); err != nil || len(st.Results) != 1 {
+			t.Fatalf("status JSON %s: %v; want one result", data, err)
+		}
+		if err := json.Unmarshal(data, &back); err != nil || !reflect.DeepEqual(back.Results, status.Results) {
+			t.Fatalf("status JSON %s decodes to %+v (%v), want %+v", data, back.Results, err, status.Results)
+		}
+		return st.Results[0]
+	}
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		answer    func(audioMeasureCall, int) (audioMeasurement, error)
+		wantCount any // nil: the key is absent
+		wantLimit any
+	}{
+		{"a measured 0", "capacity", levelRates(map[int][]float64{1: {0.8}}), 0.0, routing.AudioLimitPerformance},
+		{"a measured 2", "capacity", levelRates(map[int][]float64{1: {3}, 2: {2}, 3: {1}}), 2.0, routing.AudioLimitPerformance},
+		{"a failed ramp", "capacity", func(call audioMeasureCall, _ int) (audioMeasurement, error) {
+			if call.level == 1 && !call.warmUp {
+				return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureTransport, Message: "connection refused"}
+			}
+			return audioFigures(10, 100), nil
+		}, nil, nil},
+		{"a speed run", "speed", nil, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAudioFixture(t, audioFixtureOpts{})
+			if tc.answer != nil {
+				f.script.answer = tc.answer
+			}
+			f.run(t, tc.mode)
+			res := frame(t, f)
+			count, hasCount := res["audio_realtime_concurrency"]
+			if (tc.wantCount == nil) == hasCount || (hasCount && count != tc.wantCount) || res["audio_concurrency_limit"] != tc.wantLimit {
+				t.Fatalf("result JSON = %v, want audio_realtime_concurrency %v beside audio_concurrency_limit %v", res, tc.wantCount, tc.wantLimit)
+			}
+		})
+	}
+}
+
 // TestAudioCapacityStopsOnResources: a replicable target on an agent that runs instances is
 // ramped one instance per stream -- each level ensures the next instance (m, m#1, m#2) and
 // sends each stream to its own instance -- and the agent refusing m#2 for lack of room
