@@ -103,6 +103,7 @@ import {
   instanceSettingsBody,
   instancesSummary,
   listedIdleTimeout,
+  logInstanceIndexes,
   primaryStatusRows,
   runningInstancesBySpec,
   showsAllInstanceLogs,
@@ -2149,6 +2150,7 @@ export function RuntimeAdminSection({
     specId: string;
     title: string;
     allInstances: boolean;
+    instances: number[];
   } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   const [restart, setRestart] = useState<RestartFlow | null>(null);
@@ -4191,6 +4193,10 @@ export function RuntimeAdminSection({
               statusRows,
               row.spec_id,
             ),
+            // The view's per-instance tabs start from the instances the
+            // stream lists for the spec now, and grow with every instance its
+            // log entries name while it is open.
+            instances: logInstanceIndexes(statusRows, row.spec_id),
           }),
       },
     ];
@@ -5982,6 +5988,7 @@ export function RuntimeAdminSection({
           specId={logSpec.specId}
           title={logSpec.title}
           allInstances={logSpec.allInstances}
+          instances={logSpec.instances}
         />
       )}
     </>

@@ -194,6 +194,18 @@ export function showsAllInstanceLogs(
 }
 
 /**
+ * The instance indexes a spec's status rows list, once each and ascending: what
+ * its log view starts its per-instance tabs from. The view adds every instance
+ * the log stream itself names while it is open, so an instance that starts
+ * after the view opened still gets its tab.
+ */
+export function logInstanceIndexes(rows: readonly RuntimeStatus[], specId: string): number[] {
+  const indexes = new Set<number>();
+  for (const row of rows) if (row.spec_id === specId) indexes.add(instanceIndex(row));
+  return [...indexes].sort((a, b) => a - b);
+}
+
+/**
  * A model-server row's running instances (ModelServerRow.running_instances).
  * Always on the wire from a current gateway; a row without a usable count is
  * read as 0 running, so the catalog never renders "undefined".

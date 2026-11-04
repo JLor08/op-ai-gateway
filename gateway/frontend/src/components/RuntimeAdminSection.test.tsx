@@ -11264,6 +11264,26 @@ describe('RuntimeAdminSection per-instance live status', () => {
     expect(await screen.findByText(t.runtimeLogsAllInstances)).toBeInTheDocument();
   });
 
+  it("offers a tab per instance the spec's rows list in its log view", async () => {
+    renderInstances([instanceRow(0), instanceRow(1), instanceRow(2)]);
+    await openStatusTab();
+    await screen.findByText('4102');
+
+    fireEvent.click(inRowWith('4101').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(
+      within(dialog)
+        .getAllByRole('tab')
+        .map((tab) => tab.textContent),
+    ).toEqual([
+      t.runtimeLogsTabAll,
+      t.runtimeLogsTabInstance(0),
+      t.runtimeLogsTabInstance(1),
+      t.runtimeLogsTabInstance(2),
+    ]);
+  });
+
   it('says nothing about instances in the log view of a spec that does not opt in', async () => {
     renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
     await openStatusTab();
@@ -11273,6 +11293,7 @@ describe('RuntimeAdminSection per-instance live status', () => {
 
     expect(await screen.findByText(t.runtimeLogsIntro)).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeLogsAllInstances)).not.toBeInTheDocument();
+    expect(within(screen.getByRole('dialog')).queryAllByRole('tab')).toHaveLength(0);
   });
 
   // The gateway's representative-row rule: a running instance speaks for the

@@ -11,6 +11,7 @@ import {
   instanceSettingsBody,
   instancesSummary,
   listedIdleTimeout,
+  logInstanceIndexes,
   primaryStatusRows,
   restartGate,
   runningInstanceCount,
@@ -230,6 +231,24 @@ describe('showsAllInstanceLogs', () => {
       false,
     );
     expect(showsAllInstanceLogs(undefined, [row('s', 0)], 's')).toBe(false);
+  });
+});
+
+describe('logInstanceIndexes', () => {
+  it("lists a spec's instance indexes from its status rows, once each, ascending", () => {
+    expect(logInstanceIndexes([row('s', 2), row('t', 5), row('s', 0), row('s', 2)], 's')).toEqual([
+      0, 2,
+    ]);
+  });
+
+  it('reads a row without a usable index as instance 0, and a spec without rows as none', () => {
+    expect(
+      logInstanceIndexes(
+        [{ ...row('s', 0), instance: undefined } as unknown as RuntimeStatus],
+        's',
+      ),
+    ).toEqual([0]);
+    expect(logInstanceIndexes([row('t', 1)], 's')).toEqual([]);
   });
 });
 
