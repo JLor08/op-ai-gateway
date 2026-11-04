@@ -1392,11 +1392,11 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Seven fixed GET-only routes and two POST routes (the `/upstream` passthrough counts
+Seven fixed GET-only routes and three POST routes (the `/upstream` passthrough counts
 once per allowlisted endpoint: `/props`, since 0.11.0 `/v1/audio/voices` and since 0.13.0
 `/v1/models`; the second POST route, `/live/{model}`, since 0.12.0, is the one that streams a
-request body rather than controlling anything); any other method on those paths falls through
-to model routing.
+request body rather than controlling anything; the third, `/stop/{model}`, since 0.17.0, drains
+one instance); any other method on those paths falls through to model routing.
 
 | Route | Answers | Blocks during a load? |
 |---|---|---|
@@ -1407,6 +1407,7 @@ to model routing.
 | `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved by `ResolveAddress` and that instance's running row in `Status()` (as for `/props`), **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `GET /upstream/{model}/v1/models` | The allowlist's third endpoint (issue #282, the `runtime_model_params` feature, `Since: "0.13.0"`): an audio.cpp child's model listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved by `ResolveAddress` and that instance's running row in `Status()` (as for `/props`), **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Unlike the voices read it **forwards the inbound query string** (`forwardQuery`), because audio.cpp adds each model's declared request `params` array only when asked with `?include_params=true`; the outbound path is exactly `/v1/models`. **Not** the router's own `GET /v1/models` control route above, which lists the managed specs and answers for the router itself. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `POST /ensure/{model}` | Starts the managed child for `model` — for an instance address `m#k`, that instance, created on demand when its spec allows it ([§6.1](#61-one-lifecycle-per-instance)) — and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), `runtime.instance_no_capacity` / `runtime.instance_demand_unknown` (409) for a burst instance that does not fit into free room or whose demand is not measured yet ([§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. It is the only route that may start a **burst** instance, which is how the gateway's scaler adds capacity. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
+| `POST /stop/{model}` | Begins a graceful drain of **one** instance — `m` for instance 0, `m#k` for instance k, resolved by `ResolveAddress` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) — and persists nothing (the `runtime_stop` feature, `Since: "0.17.0"`): `200 {"state":"stopping"}` when the drain began or was already running, `200 {"state":"stopped"}` when the instance has no process (so a repeat is idempotent, and an allowed instance that does not exist is not created), `404 runtime.model_not_managed` for an address that is not managed (also an empty model, or a spec the last push removed), `409 runtime.instance_protected` for an instance inside the protected floor, `409 runtime.instance_not_highest` while a higher instance of the spec has a process, or `502 runtime.upstream_gone` for any other failure. An instance of a `force_stopped` spec is answered from its process alone (`stopping` while the push's drain runs, `stopped` after), with neither refusal. Bodiless like `/ensure`: any body is read and discarded, one over the 32 MiB bound gets `413 runtime.request_too_large`, and `model` is the decoded path after `/stop/` (the `#` percent-encoded). | Never: it answers as soon as the drain has begun; `Status()` and telemetry report the exit. |
 | `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureServing`, so a burst instance that is not up answers `409 runtime.instance_no_capacity`, §4.8, and the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
@@ -1512,6 +1513,32 @@ predates the route hands the request to model routing, which answers 404
 `runtime.model_not_managed` for a body that names no model before it calls
 `EnsureRunning` (§4.2), so the route starts nothing there. The gateway sends it
 only to an agent that declares `runtime_ensure` (§7).
+
+**`POST /stop/{model}` is the operator's transient stop of one instance**, the
+agent half of the portal's live-status Stop action
+([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)). The
+handler calls `Manager.Stop`, an owner command that resolves the address and
+decides its answer in one owner turn, so no start or exit slips in between the
+checks and the drain. The drain is the one every other stop uses (`beginDrain`:
+an idle unload, an eviction, a push), so in-flight requests finish within the
+drain grace before the process is signalled, and what follows is the ordinary
+exit ([§6.1](#61-one-lifecycle-per-instance)). **Nothing is persisted** — no
+admin state, no pin, nothing in the runtime-config document — so demand may
+start the instance again: a request queued on it when it exits starts it, and so
+does a later request for instance 0 or a later ensure for any instance, exactly
+as after an idle unload (a plain request never starts a burst instance, §4.8). The
+persistent way to keep a spec down stays the pushed `force_stopped`. Two
+refusals keep the stop from fighting the agent's own rules: an instance inside
+the protected floor (`ProtectedCount`, [§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor))
+is refused, process or not, because the agent wants it up with no request and
+would start it again at once; and an instance is refused while a higher sibling
+still has a process (starting, running or draining), because the highest index
+leaves first, as in the idle unload. The route is a separate, optional part of
+the router's view of the manager (`stopPort`), so a manager without it answers
+`404 runtime.model_not_managed`. The gateway's call has no body, so an agent
+that predates the route hands it to model routing, which answers 404
+`runtime.model_not_managed` for a body that names no model and stops nothing
+(§4.2); the gateway sends it only to an agent that declares `runtime_stop` (§7).
 
 **`POST /live/{model}` is the one route that streams its request body, and it is routed
 on the path precisely so it never has to buffer it**
@@ -1630,6 +1657,8 @@ request-id concept.
 | `runtime.request_too_large` | 413 | Body over the router's limit. |
 | `runtime.instance_no_capacity` | 409 | A **burst** instance (§5.8) that cannot run here right now: an ensure of one that does not fit into free room (nothing is evicted for it, nothing queues) or that is draining, a plain request naming one that is neither running nor starting (§4.8: only an ensure starts burst capacity), or a request whose instance address moved while it was admitted. Not an error to act on: the gateway re-selects or tries another host. |
 | `runtime.instance_demand_unknown` | 409 | An ensure of a burst instance whose demand is still unknown — no declared estimate and no sibling measured since it became ready (§5.8). Normally resolves within seconds of the first instance being ready; the gateway's scaler waits 5 s before asking that host again. |
+| `runtime.instance_protected` | 409 | `POST /stop/{model}` named an instance inside its spec's protected floor (`min_instances` of a replicable spec, or the one instance a pinned or `force_running` spec keeps, §5.8). The agent would start it again at once; the way out is the spec's own settings (clear the override, lower `min_instances`, unpin), not a stop. |
+| `runtime.instance_not_highest` | 409 | `POST /stop/{model}` named an instance while a sibling with a higher index still has a process. The highest index leaves first (§6.1); stop that one first. |
 | `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props`, `/v1/audio/voices` or `/v1/models` — the passthrough allowlist (§4.1) is exactly those three endpoints. A router from 0.7.0 on that predates 0.13.0 answers this for `/v1/models` (and one that predates 0.11.0 for `/v1/audio/voices`). |
 | `runtime.upstream_gone` | 502 | The child died during the request — **and the fallthrough** for a raw connection failure, a non-2xx the router could not forward, or the manager-closed sentinel. |
 
@@ -3535,6 +3564,15 @@ restarts no running child.
   A replicable spec's idle timeout is the **effective** one the gateway pushes
   (always > 0, [§9](#9-keeping-the-agent-current-the-notification-rule) and the
   derivation in [§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
+- **The operator's transient stop** (`POST /stop/{model}`, `Manager.Stop`, §4.1)
+  follows the same order: it drains only an instance above the protected floor
+  and with no higher-index sibling that has a process, through the same
+  `beginDrain`. Its exit is the ordinary clean stop: a burst instance with
+  nothing queued is **retired** once its process has exited (the same
+  `retireIfSpent` as after an idle unload), and instance 0 rests at `stopped`.
+  Nothing is recorded that keeps it down: a request queued on it when it exits
+  starts it again, and so does the next request for instance 0 or the next
+  ensure for a burst instance.
 
 **Measured startup.** At an instance's first passing health probe the owner
 records `startupMS`, the wall time from that start's exec to that probe (floored
@@ -3570,13 +3608,13 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Thirteen
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Fourteen
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
 `runtime_config_files`, `runtime_voices`, `fullduplex_proxy`,
 `runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`,
-`runtime_role_eviction`); two,
+`runtime_role_eviction`, `runtime_stop`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below); and one, `runtime_instances`, is on **both** lists
 with a different fact behind each declaration, each side reading the other's (below).
@@ -3616,7 +3654,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_ram_accounting` ([§5.2](#52-the-three-gates)), `Since: "0.14.0"`, and
 `runtime_role_eviction` ([§5.4](#54-eviction-queueing-and-drain)), `Since: "0.15.0"`, and
 `runtime_instances` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite),
-[§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`
+[§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`, and
+`runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -3790,6 +3829,19 @@ gateway restarted, because the gateway holds the declared set in memory
 (`agentFeaturesRegistry`, below), and the refusal's label says so. A newer agent
 under an older gateway simply never receives the route. `server-agent`'s
 `Version` moved `0.7.4` → `0.8.0` for this entry, MINOR per the same rule.
+
+`runtime_stop` is the same shape as `runtime_ensure`: the gateway gates real
+behaviour on it, fail-closed. It says the router serves `POST /stop/{model}`
+(§4.1), and the gateway reads it off the agent's sample before it forwards the
+portal's Stop action for an instance
+([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)); without
+the name the action is refused and the agent is sent nothing. Trying the route
+instead could not tell the two cases apart: an agent without it answers 404
+`runtime.model_not_managed` (§4.2), the same code as an address the agent does not
+manage. A newer agent under an older gateway simply never receives the route.
+`server-agent`'s `Version` moved `0.16.0` → `0.17.0` for this entry, MINOR per the
+same rule (`FeatureRuntimeStop`, pinned with the version by
+`TestFeaturesDeclareRuntimeStop`).
 
 `multipart_proxy` is the same shape as `runtime_ensure`, and it exists for the
 same reason: the gateway gates real behaviour on it, fail-closed. It says the
@@ -4285,6 +4337,15 @@ needs **no upgrade order**: an older gateway never sends `replicable` (and does 
 declare `runtime_instances`, so a 0.16.0 agent would ignore it anyway), and an agent
 older than 0.16.0 behind this gateway is never expanded, scaled or sent an
 instance address, and gets its stored manual idle timeout.
+
+**`0.16.0` → `0.17.0` (live-status row actions) is MINOR, and one bump for the
+whole branch.** `agent.Features` gained `runtime_stop` (§7), and the router gained
+the route it names, `POST /stop/{model}` (§4.1), which drains one instance on the
+operator's request without persisting anything. The `Version` assertion lives in
+the newest feature's test, `TestFeaturesDeclareRuntimeStop`. Compatibility needs
+**no upgrade order**: an older gateway never calls the route, and the gateway
+sends it only to an agent that declares the name, so the portal's Stop action is
+unavailable against an older agent rather than misread.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
