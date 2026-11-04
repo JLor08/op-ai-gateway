@@ -146,6 +146,7 @@ type fakeAgentRuntimeState struct {
 	direct      int
 	adminState  string
 	pinned      bool
+	protected   bool // the applied document holds it replicable with min_instances >= 1
 	backoffEnds time.Time
 }
 
@@ -187,6 +188,11 @@ type fakeAgentRuntime struct {
 	// streamTime is how long a served chat streams between its first and its
 	// last chunk.
 	streamTime time.Duration
+	// protectedFloor: the fake starts a spec its document holds replicable with
+	// min_instances of 1 or more by itself, as the Manager starts its protected
+	// instances (here one process stands for them), whenever it has no process and
+	// no override -- at a stop's clear, say -- and records "protected start <id>".
+	protectedFloor bool
 
 	mu      sync.Mutex
 	specs   []*fakeAgentRuntimeState
@@ -328,14 +334,21 @@ func (f *fakeAgentRuntime) apply(doc portal.AgentRuntimeConfigDTO) {
 			continue
 		}
 		st.pinned = d.Pinned
+		st.protected = d.Replicable && d.MinInstances >= 1
 		if d.AdminState != st.adminState {
 			st.adminState = d.AdminState
 			if d.AdminState == vramAdminStateForceStopped {
 				f.stopLocked(st)
 			}
 		}
-		if st.pinned && st.adminState == "" && st.state == agentSpecStateStopped && st.pid == 0 {
-			f.startPinnedLocked(st)
+		if st.adminState == "" && st.state == agentSpecStateStopped && st.pid == 0 {
+			switch {
+			case st.pinned:
+				f.startPinnedLocked(st)
+			case st.protected && f.protectedFloor:
+				f.events.add("protected start %s", st.cfg.id)
+				f.startPinnedLocked(st)
+			}
 		}
 	}
 	slices.Sort(stopped)
@@ -860,6 +873,8 @@ type stopAllOpts struct {
 	dropClears   bool
 	stopDelay    time.Duration
 	streamTime   time.Duration
+	// protectedFloor is fakeAgentRuntime.protectedFloor.
+	protectedFloor bool
 	// lease is a leftover override lease for srv1 at the start.
 	lease *portal.BenchmarkOverrideLease
 }
@@ -924,7 +939,7 @@ func newStopAllFixture(t *testing.T, opts stopAllOpts) *stopAllFixture {
 	}
 	agent := newFakeAgentRuntime(t, srv, "srv1", events, agentSpecs)
 	agent.closedMatrix, agent.clearDelay, agent.dropClears = opts.closedMatrix, opts.clearDelay, opts.dropClears
-	agent.stopDelay, agent.streamTime = opts.stopDelay, opts.streamTime
+	agent.stopDelay, agent.streamTime, agent.protectedFloor = opts.stopDelay, opts.streamTime, opts.protectedFloor
 
 	server := routing.AIServer{ID: "srv1", Name: "Host", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}
 	app := routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, APIFlavors: []string{routing.APIFlavorOpenAI}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}

@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -85,51 +86,140 @@ func storedReplicable(t *testing.T, st routing.Store, specID string) bool {
 }
 
 // TestManualSpeedRunMeasuresAReplicableTargetAsOneProcess: before its first stop the run
-// records the replicable target in the lease and runs it as one process, and after the run
-// it is replicable again and the lease is released. A target that is not replicable, and a
-// neighbour that is but is not measured, are left alone.
+// records every enabled replicable spec of the server in the lease -- the target's and a
+// neighbour's that the run does not measure alike -- and runs them as one process each, and
+// after the run they are replicable again and the lease is released. A spec that is not
+// replicable, measured or not, is left alone.
 func TestManualSpeedRunMeasuresAReplicableTargetAsOneProcess(t *testing.T) {
-	t1 := stopAllSpecOf("map1", "running", 701)
-	n := stopAllSpecOf("mapn", "stopped", 0)
-	f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{t1, n}})
-	makeReplicable(t, f.mem, "rs_map1")
-	makeReplicable(t, f.mem, "rs_mapn")
-	var leaseAtFlip portal.BenchmarkOverrideLease
-	var flatAtStop bool
-	f.portal.onReplicableBatch = func(kind string, _ []string) {
-		if kind == "single" {
-			leaseAtFlip = f.lease(t)
-		}
-	}
-	f.portal.onBatch = func(kind string, _ []string) {
-		if kind == "stop" {
-			flatAtStop = !storedReplicable(t, f.mem, "rs_map1")
-		}
-	}
+	for _, tc := range []struct {
+		name, target string
+		held         []string
+	}{
+		{"a replicable target beside a replicable neighbour", "map1", []string{"rs_map1", "rs_mapn"}},
+		{"a target that is not replicable beside two replicable neighbours", "mapx", []string{"rs_map1", "rs_mapn"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map1", "running", 701), stopAllSpecOf("mapn", "stopped", 0), stopAllSpecOf("mapx", "running", 702)}})
+			makeReplicable(t, f.mem, "rs_map1")
+			makeReplicable(t, f.mem, "rs_mapn")
+			var leaseAtFlip portal.BenchmarkOverrideLease
+			var flatAtStop []string
+			f.portal.onReplicableBatch = func(kind string, _ []string) {
+				if kind == "single" {
+					leaseAtFlip = f.lease(t)
+				}
+			}
+			f.portal.onBatch = func(kind string, _ []string) {
+				if kind == "stop" && flatAtStop == nil {
+					flatAtStop = []string{}
+					for _, id := range []string{"rs_map1", "rs_mapn"} {
+						if !storedReplicable(t, f.mem, id) {
+							flatAtStop = append(flatAtStop, id)
+						}
+					}
+				}
+			}
 
-	status := f.run(t, "speed", f.targets(t, "speed", "map1"))
+			status := f.run(t, "speed", f.targets(t, "speed", tc.target))
 
-	if status.Error != "" {
-		t.Fatalf("run error = %q", status.Error)
+			if status.Error != "" {
+				t.Fatalf("run error = %q", status.Error)
+			}
+			want := []string{fmt.Sprintf("single %v", tc.held), fmt.Sprintf("replicable %v", tc.held)}
+			if got := f.events.with("single ", "replicable "); !slices.Equal(got, want) {
+				t.Fatalf("replicable batches = %v, want %v: every replicable spec once off and once back on", got, want)
+			}
+			stops := f.events.with("stop ")
+			if len(stops) == 0 {
+				t.Fatal("the run stopped nothing")
+			}
+			if single, stop := f.events.index(want[0], 0), f.events.index(stops[0], 0); single < 0 || single > stop {
+				t.Fatalf("events = %v, want the replicable specs run as one process before the stop", f.events.with("single ", "stop "))
+			}
+			if !slices.Equal(leaseAtFlip.RestoreReplicable, tc.held) {
+				t.Fatalf("lease at the write = %+v, want restore_replicable %v recorded before it", leaseAtFlip, tc.held)
+			}
+			if !slices.Equal(flatAtStop, tc.held) {
+				t.Fatalf("specs stored as one process at the stop = %v, want %v", flatAtStop, tc.held)
+			}
+			if !storedReplicable(t, f.mem, "rs_map1") || !storedReplicable(t, f.mem, "rs_mapn") || storedReplicable(t, f.mem, "rs_mapx") {
+				t.Fatal("after the run a replicable spec is stored as not replicable, or the other one as replicable")
+			}
+			if got := f.lease(t); !got.Empty() {
+				t.Fatalf("lease after the run = %+v, want it released", got)
+			}
+		})
 	}
-	if got := f.events.with("single ", "replicable "); !slices.Equal(got, []string{"single [rs_map1]", "replicable [rs_map1]"}) {
-		t.Fatalf("replicable batches = %v, want the target alone, once off and once back on", got)
+}
+
+// TestStopAllRunHoldsAReplicableNeighbourAsOneProcess: a replicable neighbour that keeps
+// protected instances (min_instances >= 1) starts them by itself whenever it has no process
+// and no override -- at the stop-all's clear, inside the target's cold pass, where their load
+// would land in the target's figures. So a manual speed run holds it as one process for the
+// whole run: it never starts while the run measures, the target's load time is confirmed, and
+// the neighbour is replicable again when the run ends, and starts then. When the run cannot
+// record that hold in its lease -- here for a replicable target and the neighbour -- it writes
+// nothing and stops nothing, where it used to stop the server's models with every replicable
+// spec still replicable: the target is measured as it finds the server, next to the running
+// neighbour, and gets no load time.
+func TestStopAllRunHoldsAReplicableNeighbourAsOneProcess(t *testing.T) {
+	setup := func(t *testing.T) *stopAllFixture {
+		t.Helper()
+		f := newStopAllFixture(t, stopAllOpts{protectedFloor: true, specs: []stopAllSpec{stopAllSpecOf("map1", "running", 751), stopAllSpecOf("mapn", "running", 752)}})
+		makeReplicable(t, f.mem, "rs_mapn")
+		f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager", runtimeInstancesFeature})
+		return f
 	}
-	if single, stop := f.events.index("single [rs_map1]", 0), f.events.index("stop [rs_map1]", 0); single < 0 || stop < 0 || single > stop {
-		t.Fatalf("events = %v, want the target run as one process before its stop", f.events.with("single ", "stop "))
-	}
-	if !slices.Equal(leaseAtFlip.RestoreReplicable, []string{"rs_map1"}) {
-		t.Fatalf("lease at the write = %+v, want restore_replicable [rs_map1] recorded before it", leaseAtFlip)
-	}
-	if !flatAtStop {
-		t.Fatal("the target was still replicable when the run stopped it")
-	}
-	if !storedReplicable(t, f.mem, "rs_map1") || !storedReplicable(t, f.mem, "rs_mapn") {
-		t.Fatal("after the run a replicable spec is stored as not replicable")
-	}
-	if got := f.lease(t); !got.Empty() {
-		t.Fatalf("lease after the run = %+v, want it released", got)
-	}
+	t.Run("held for the run", func(t *testing.T) {
+		f := setup(t)
+
+		status := f.run(t, "speed", f.targets(t, "speed", "map1"))
+
+		if status.Error != "" || len(status.Results) != 1 || status.Results[0].Error != "" {
+			t.Fatalf("status = %+v, want one result and no error", status)
+		}
+		restore := f.events.index("replicable [rs_mapn]", 0)
+		if hold, stop := f.events.index("single [rs_mapn]", 0), f.events.index("stop [rs_map1 rs_mapn]", 0); hold < 0 || stop < 0 || hold > stop || restore < stop {
+			t.Fatalf("events = %v, want the neighbour held before the stop and restored after it", f.events.with("single ", "replicable ", "stop ", "clear "))
+		}
+		if started := f.events.index("protected start rs_mapn", 0); started >= 0 && started < restore {
+			t.Fatalf("events = %v, want the neighbour's protected instances started only once the run made it replicable again", f.events.with("single ", "replicable ", "stop ", "clear ", "protected "))
+		}
+		if row := f.speedRow(t, "map1"); row.LoadTimeMS <= 0 {
+			t.Fatalf("map1 speed row = %+v, want a confirmed load time", row)
+		}
+		if !storedReplicable(t, f.mem, "rs_mapn") {
+			t.Fatal("after the run the neighbour is stored as not replicable")
+		}
+		if got := f.lease(t); !got.Empty() {
+			t.Fatalf("lease after the run = %+v, want it released", got)
+		}
+	})
+	t.Run("the lease write fails", func(t *testing.T) {
+		f := setup(t)
+		makeReplicable(t, f.mem, "rs_map1")
+		f.portal.failLease = func(n int) error {
+			if n == 1 {
+				return errors.New("database is locked")
+			}
+			return nil
+		}
+
+		status := f.run(t, "speed", f.targets(t, "speed", "map1"))
+
+		if status.Error != "" || len(status.Results) != 1 || status.Results[0].Error != "" {
+			t.Fatalf("status = %+v, want one result and no error", status)
+		}
+		if got := f.events.with("single ", "replicable ", "stop ", "clear "); len(got) != 0 {
+			t.Fatalf("batches = %v, want none: without the lease nothing is held and nothing stopped", got)
+		}
+		if row := f.speedRow(t, "map1"); row.LoadTimeMS != 0 {
+			t.Fatalf("map1 speed row = %+v, want no load time next to the running neighbour", row)
+		}
+		if !storedReplicable(t, f.mem, "rs_map1") || !storedReplicable(t, f.mem, "rs_mapn") {
+			t.Fatal("a replicable spec was stored as not replicable")
+		}
+	})
 }
 
 // TestBenchmarkRunsWithoutAStopKeepTheirInstances: a capacity run (the audio ramp

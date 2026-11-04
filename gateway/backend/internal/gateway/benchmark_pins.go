@@ -142,10 +142,10 @@ type benchmarkOverrides struct {
 	stopOwed []string // force_stopped written or possibly written and a clear owed, sorted
 	stopped  []string // the audit set: every spec a stop batch wrote or may have written, sorted
 	// singleProcess is what the run owes a replicable restore and what the
-	// lease's restore_replicable names, sorted: the run's replicable targets
-	// it runs as one process (beginBenchmarkSingleProcess), the specs the
-	// batch wrote or may have written, less a spec an audio ramp made
-	// replicable again (audioRampReplicableAgain) until it is held as one
+	// lease's restore_replicable names, sorted: the server's enabled
+	// replicable specs it runs as one process (beginBenchmarkSingleProcess),
+	// the specs the batch wrote or may have written, less a spec an audio ramp
+	// made replicable again (audioRampReplicableAgain) until it is held as one
 	// process again (audioRampOneProcessAgain); after the run's restore, the
 	// specs it could not restore.
 	singleProcess []string
@@ -187,11 +187,13 @@ func (s *Server) writeBenchmarkLease(ctx context.Context, serverID string, ov *b
 // of the application for the run, the measured ones included
 // (unpinBenchmarkPins): the stop-all may stop only unpinned specs, because a
 // pinned one restarts at the stop's clear. When stops are then allowed, it
-// runs every replicable target as one process for the run
+// runs every enabled replicable spec of the application as one process for the
+// run, the measured ones and their neighbours alike
 // (beginBenchmarkSingleProcess): a replicable spec's protected instances, like
-// a pinned spec, start by themselves at the stop's clear, and its other
-// instances would load beside the measured one. endBenchmarkUnpin pins them
-// again and makes them replicable again after the whole run.
+// a pinned spec, start by themselves at the stop's clear -- a neighbour's
+// inside a target's cold pass -- and a target's other instances would load
+// beside the measured one. endBenchmarkUnpin pins them again and makes them
+// replicable again after the whole run.
 //
 // It does not wait for anything: every runtime-config document for the server
 // is derived and enqueued in write order, so a reconcile's documents reach the
@@ -227,24 +229,19 @@ func (s *Server) beginBenchmarkUnpin(ctx context.Context, run *benchmarkRun, ser
 	}
 	s.unpinBenchmarkPins(ctx, run, serverID, ov, specs)
 	if ov.stopsAllowed {
-		s.beginBenchmarkSingleProcess(ctx, serverID, ov, benchmarkReplicableTargets(targets, specs))
+		s.beginBenchmarkSingleProcess(ctx, serverID, ov, benchmarkReplicableSpecs(specs))
 	}
 	return ov
 }
 
-// benchmarkReplicableTargets is the sorted ids of the enabled replicable specs
-// in specs that are the launch spec of a target that may stop (mayPreStop):
-// what a manual speed or both run measures as one process.
-func benchmarkReplicableTargets(targets []benchmarkTarget, specs []routing.RuntimeSpec) []string {
-	measured := map[string]bool{}
-	for _, tgt := range targets {
-		if tgt.mayPreStop && tgt.spec.ID != "" {
-			measured[tgt.spec.ID] = true
-		}
-	}
+// benchmarkReplicableSpecs is the sorted ids of the enabled replicable specs in
+// specs: what a manual speed or both run that may stop the server's models runs
+// as one process each, whether it measures them or not. A disabled spec is not
+// in the agent's document, so it runs no instance to hold.
+func benchmarkReplicableSpecs(specs []routing.RuntimeSpec) []string {
 	var ids []string
 	for _, spec := range specs {
-		if spec.Enabled && spec.Replicable && measured[spec.ID] {
+		if spec.Enabled && spec.Replicable {
 			ids = append(ids, spec.ID)
 		}
 	}
@@ -252,24 +249,29 @@ func benchmarkReplicableTargets(targets []benchmarkTarget, specs []routing.Runti
 	return ids
 }
 
-// beginBenchmarkSingleProcess runs the replicable specs ids as one process each
-// for the run: it records them in the override lease, then writes replicable =
+// beginBenchmarkSingleProcess runs the replicable specs ids -- every enabled
+// replicable spec of the server's agent application -- as one process each for
+// the run: it records them in the override lease, then writes replicable =
 // false in one batch (portal.SetBenchmarkRuntimeSpecsReplicable), so the agent
-// drains each one's other instances and its floor of protected instances, and
-// a cold start or a load is measured on the instance alone. The instance counts
-// stay stored, and endBenchmarkUnpin writes replicable = true again -- or, in a
-// both run, the target's audio concurrency ramp does, before it measures the
-// instances (audioRampReplicableAgain), and holds the spec as one process again
-// after them while a later target may still stop the server's models
+// drains each one's other instances and its floor of protected instances. A
+// target's cold start or load is then measured on its instance alone, and no
+// neighbour's protected instance starts by itself at a stop's clear, inside a
+// target's cold pass. The instance counts stay stored, and endBenchmarkUnpin
+// writes replicable = true again -- or, in a both run, a target's audio
+// concurrency ramp does for its own spec, before it measures the instances
+// (audioRampReplicableAgain), and holds the spec as one process again after
+// them while a later target may still stop the server's models
 // (audioRampOneProcessAgain).
-//   - A lease write that fails writes nothing, and the targets keep their
-//     instances: their load time is then not confirmed while another instance
-//     runs.
+//   - A lease write that fails writes nothing and turns stops off for the run:
+//     every replicable spec keeps its instances, and a stop's clear would let
+//     their protected instances start inside a cold pass. Each target is then
+//     measured as it finds the server, and its load time is not confirmed
+//     while another instance runs.
 //   - A failed or conflicting batch is logged. A failed spec may have stored
 //     false, so it stays owed to the restore; a conflict (no longer replicable)
-//     or a gone spec owes nothing. A failure turns stops off for the run: a
-//     target that may still be replicable would restart its protected
-//     instances at the stop's clear, inside its cold pass.
+//     or a gone spec owes nothing. A failure turns stops off for the run as
+//     well: a spec that may still be replicable would restart its protected
+//     instances at the stop's clear.
 //   - The lease follows the batch when it wrote fewer specs than it names.
 func (s *Server) beginBenchmarkSingleProcess(ctx context.Context, serverID string, ov *benchmarkOverrides, ids []string) {
 	if len(ids) == 0 {
@@ -277,20 +279,20 @@ func (s *Server) beginBenchmarkSingleProcess(ctx context.Context, serverID strin
 	}
 	ov.singleProcess = ids
 	if err := s.writeBenchmarkLease(ctx, serverID, ov); err != nil {
-		ov.singleProcess = nil
-		slog.Warn("benchmark: could not record the override lease; replicable targets keep their instances in this run", "server_id", serverID, "err", err)
+		ov.singleProcess, ov.stopsAllowed = nil, false
+		slog.Warn("benchmark: could not record the override lease; replicable launch specs keep their instances and running agent models are not stopped in this run", "server_id", serverID, "err", err)
 		return
 	}
-	slog.Warn("benchmark: running the run's replicable targets as one process each; they are replicable again when it ends", "server_id", serverID, "spec_ids", ids)
+	slog.Warn("benchmark: running the server's replicable launch specs as one process each; they are replicable again when the run ends", "server_id", serverID, "spec_ids", ids)
 	out, err := s.Portal.SetBenchmarkRuntimeSpecsReplicable(ctx, ids, true, false)
 	ov.singleProcess = benchmarkUnion(out.Written, out.Failed)
 	if err != nil {
 		ov.stopsAllowed = false
-		slog.Warn("benchmark: could not run every replicable target as one process; running agent models are not stopped in this run", "server_id", serverID, "spec_ids", out.Failed, "err", err)
+		slog.Warn("benchmark: could not run every replicable launch spec as one process; running agent models are not stopped in this run", "server_id", serverID, "spec_ids", out.Failed, "err", err)
 	}
 	if len(ov.singleProcess) < len(ids) {
 		if lerr := s.writeBenchmarkLease(ctx, serverID, ov); lerr != nil {
-			slog.Warn("benchmark: could not update the override lease after running the replicable targets as one process; it is rewritten when the run ends", "server_id", serverID, "err", lerr)
+			slog.Warn("benchmark: could not update the override lease after running the replicable launch specs as one process; it is rewritten when the run ends", "server_id", serverID, "err", lerr)
 		}
 	}
 }

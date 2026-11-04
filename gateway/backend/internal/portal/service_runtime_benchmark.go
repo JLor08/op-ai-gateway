@@ -224,7 +224,10 @@ func (s *Service) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, specIDs []
 // A run writes false so that its replicable target runs as one process while
 // it is measured alone: the agent drains the target's other instances and its
 // floor of protected instances, which would otherwise start beside the
-// measured one, or start by themselves once a stop is cleared.
+// measured one, or start by themselves once a stop is cleared. A manual speed
+// or both run that may stop the server's models writes it for every enabled
+// replicable spec of the server, its neighbours' included, whose protected
+// instances would start by themselves at a stop's clear just the same.
 //
 // WHO AUTHORIZED THIS: its callers, exactly as for
 // SetBenchmarkRuntimeSpecsPinned, and it is not gated by serverIsBenchmarking
