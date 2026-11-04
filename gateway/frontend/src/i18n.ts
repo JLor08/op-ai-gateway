@@ -2154,6 +2154,11 @@ const de = {
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
   errorBenchmarkAudioOnly:
     'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität und Beide messen seine Audio-Leistung. Die Ermittlung der Kontextgröße und die Vision-Messung senden dagegen einen Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Eine Vision-Messung über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes ihrer Modelle nur Audio bereitstellt.',
+  // Not one of the four starter refusals above: 409 benchmark.speech_unavailable,
+  // answered when nothing in the scope can be measured as audio (a speech run with
+  // no model that synthesizes, or a speed, capacity or both run whose audio-only
+  // models have no speech or transcription verdict yet or clone without a preset
+  // voice). It refuses a run, so no disabled Load action shows it.
   errorBenchmarkSpeechUnavailable:
     'In diesem Lauf lässt sich nichts als Audio messen. Die Sprachmessung braucht ein Modell, das Sprache synthetisiert; ein Stimmklon-Modell, das keine vorgegebene Stimme nennt, braucht eine Referenzstimme und wird nicht gemessen. Geschwindigkeit, Kapazität und Beide messen ein reines Audio-Modell erst, wenn es ein Sprach- oder Transkriptions-Urteil hat und, als Stimmklon-Modell, eine vorgegebene Stimme nennt. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn sich keines seiner Modelle messen lässt, auch wenn die übrigen nur Bilder erzeugen.',
   errorBenchmarkAgentEnsureUnsupported:
@@ -5549,6 +5554,11 @@ const en: PortalMessages = {
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an image model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates images.',
   errorBenchmarkAudioOnly:
     'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, capacity and both measure its audio performance. Determining the context size and the vision run, however, send a chat prompt, which an audio-only model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. A vision run over an application or server is refused this way when every model in it only serves audio.',
+  // 409 benchmark.speech_unavailable: answered when nothing in the scope can be
+  // measured as audio (a speech run with no model that synthesizes, or a speed,
+  // capacity or both run whose audio-only models have no speech or transcription
+  // verdict yet or clone without a preset voice). It refuses a run, so no disabled
+  // Load action shows it.
   errorBenchmarkSpeechUnavailable:
     'Nothing in this run can be measured as audio. The speech run needs a model that synthesizes speech; a voice-clone model that lists no preset voice needs a reference voice and is not measured. Speed, capacity and both measure an audio-only model only once it has a speech or transcription verdict and, as a voice-clone model, lists a preset voice. An application or server run is refused this way when none of its models can be measured, even when the others only generate images.',
   errorBenchmarkAgentEnsureUnsupported:
