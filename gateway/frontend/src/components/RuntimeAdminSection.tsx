@@ -101,6 +101,7 @@ import {
   instanceIndex,
   primaryStatusRows,
   runningInstancesBySpec,
+  specStopState,
   validateInstances,
 } from './shared/runtimeInstances';
 
@@ -425,7 +426,9 @@ const restartableStates = new Set([
 // One restart sequence. There is no restart endpoint (design §10.1: every
 // action is state-shaped), so a restart is a three-step UI sequence:
 //   stopping -> the force_stopped PUT is in flight
-//   waiting  -> the stream has to report this spec `stopped`
+//   waiting  -> the stream has to report this spec `stopped`: every one of
+//               its instance rows, since force_stopped drains them all at
+//               once and in no fixed order (specStopState)
 //   clearing -> the admin_state="" PUT is in flight
 // `deadline` is absolute so the overall wait stays bounded even though the
 // timer is re-armed on each phase change.
@@ -2220,15 +2223,16 @@ export function RuntimeAdminSection({
     return () => clearTimeout(timer);
   }, [restart]);
 
-  // Advances the sequence from the live stream: a `stopped` frame for THIS
-  // spec is the only signal that force_stopped actually took effect.
+  // Advances the sequence from the live stream: a frame in which THIS spec is
+  // `stopped` is the only signal that force_stopped actually took effect.
   useEffect(() => {
     if (restart === null || restart.phase !== 'waiting') return;
-    // The spec's own row, not any instance's: a burst instance that stopped
-    // first says nothing about the spec, and clearing the override then would
-    // let the instances still draining restart into it.
-    const row = primaryStatusRows(statusRows).get(restart.specId);
-    if (row === undefined) {
+    // Every instance's row, not one of them: force_stopped drains all of a
+    // spec's instances at once, in no fixed order, so neither instance 0 nor
+    // any other stopping first says the spec is down -- clearing the override
+    // then would let a sibling still draining start again (specStopState).
+    const stop = specStopState(statusRows, restart.specId);
+    if (stop === 'absent') {
       // Absence is not immediately "deleted": the gateway holds runtime
       // status in volatile RAM (spec §7), so a gateway restart empties the
       // list and the next sample (<= 1 s) refills it. Only a SUSTAINED
@@ -2253,7 +2257,7 @@ export function RuntimeAdminSection({
     // watermark accepts only a strictly later frame -- without it a restart
     // of an already-resting spec fires both PUTs back to back, starts
     // nothing, and reports success.
-    if (row.state === 'stopped' && frameSeqRef.current > restart.waitFrom) {
+    if (stop === 'stopped' && frameSeqRef.current > restart.waitFrom) {
       // A spec DELETE for this mapping still in flight holds the clear: the
       // clear's own read can still answer the configured document while the
       // DELETE is in flight, and the spec PUT is an upsert, so a clear handled
@@ -2397,7 +2401,9 @@ export function RuntimeAdminSection({
     // `pending_vram_unknown` / `not_permitted` row start the sequence anyway --
     // the exact harm the gate exists to prevent: a force_stopped override that
     // no `stopped` frame can ever clear, leaving the model admission-blocked
-    // behind a timeout notice. Read the LIVE frame, not the captured row.
+    // behind a timeout notice. Read the LIVE frame, not the captured row --
+    // the row the action is offered on, the one that speaks for the spec
+    // (primaryStatusRows).
     const live = primaryStatusRows(statusRowsRef.current).get(specId);
     if (live === undefined || !restartableStates.has(live.state)) return;
     const run = ++restartRunRef.current;
@@ -3775,10 +3781,11 @@ export function RuntimeAdminSection({
             label={runtimeStateLabel(live.state, t)}
           />
         );
-        // A replicable spec's chip is its instance 0's state (the row that
-        // speaks for it); how many instances run, against the bounds, is the
-        // line under it. Only once the agent reports the spec at all -- with
-        // no row, "0 running" would be a claim nobody made.
+        // A replicable spec's chip is the state of the row that speaks for it
+        // (instance 0's, see primaryStatusRows); how many instances run,
+        // against the bounds, is the line under it. Only once the agent
+        // reports the spec at all -- with no row, "0 running" would be a
+        // claim nobody made.
         const spec = specsById[m.id];
         if (!spec?.replicable || spec.id === undefined) return chip;
         return (

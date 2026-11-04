@@ -10817,26 +10817,88 @@ describe('RuntimeAdminSection per-instance live status', () => {
     ).not.toBeInTheDocument();
   });
 
-  it("clears a restart's override on instance 0's stop, not on another instance's", async () => {
-    const { putSpecs, stream } = renderInstances([instanceRow(0), instanceRow(1)]);
+  // Under force_stopped every instance drains at once, so they stop in any
+  // order: the override may only be cleared once NO instance of the spec still
+  // runs the old process -- every row stopped, or gone (a retired burst
+  // instance). A clear before that lets a sibling still draining start again.
+  async function startInstanceRestart(rows: RuntimeStatus[], rowText: string) {
+    const handles = renderInstances(rows);
     await openStatusTab();
     await waitFor(() =>
-      expect(inRowWith('4100').getByRole('button', { name: t.runtimeRestart })).toBeEnabled(),
+      expect(inRowWith(rowText).getByRole('button', { name: t.runtimeRestart })).toBeEnabled(),
     );
-
-    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeRestart }));
-    await waitFor(() => expect(putSpecs).toHaveLength(1));
-    expect(putSpecs[0].body.admin_state).toBe('force_stopped');
+    fireEvent.click(inRowWith(rowText).getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(handles.putSpecs).toHaveLength(1));
+    expect(handles.putSpecs[0].body.admin_state).toBe('force_stopped');
     await screen.findAllByText(t.runtimeRestartStopping);
+    return handles;
+  }
 
-    // Instance 1 is listed first and has stopped; instance 0 is still draining.
-    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'draining' })]);
+  async function settleFrames() {
     await act(async () => {
       for (let i = 0; i < 5; i++) await Promise.resolve();
     });
+  }
+
+  it("clears a restart's override only once every instance stopped: instance 0 last", async () => {
+    const { putSpecs, stream } = await startInstanceRestart(
+      [instanceRow(0), instanceRow(1)],
+      '4100',
+    );
+
+    // Instance 1 is listed first and has stopped; instance 0 is still draining.
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'draining' })]);
+    await settleFrames();
     expect(putSpecs).toHaveLength(1);
 
     stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.admin_state).toBe('');
+  });
+
+  it("clears a restart's override only once every instance stopped: instance 0 first", async () => {
+    const { putSpecs, stream } = await startInstanceRestart(
+      [instanceRow(0), instanceRow(1), instanceRow(2)],
+      '4100',
+    );
+
+    // Instance 0 stopped first; its siblings still drain the old process.
+    stream.push([
+      instanceRow(0, { state: 'stopped' }),
+      instanceRow(1, { state: 'draining' }),
+      instanceRow(2, { state: 'stopped' }),
+    ]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    // Instance 2 retired (its row is gone), instance 1 still draining.
+    stream.push([instanceRow(0, { state: 'stopped' }), instanceRow(1, { state: 'draining' })]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    // The last sibling retired too: every remaining row is stopped.
+    stream.push([instanceRow(0, { state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.admin_state).toBe('');
+  });
+
+  // Instance 0 crashed and is restarting while two burst instances run: the
+  // first running one speaks for the spec and carries the restart, and the
+  // wait still covers every row.
+  it('runs a restart without an instance-0 row on the first running instance, waiting for every row', async () => {
+    const { putSpecs, stream } = await startInstanceRestart(
+      [instanceRow(1), instanceRow(2)],
+      '4101',
+    );
+    expect(
+      inRowWith('4102').queryByRole('button', { name: t.runtimeRestart }),
+    ).not.toBeInTheDocument();
+
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(2, { state: 'draining' })]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(2, { state: 'stopped' })]);
     await waitFor(() => expect(putSpecs).toHaveLength(2));
     expect(putSpecs[1].body.admin_state).toBe('');
   });

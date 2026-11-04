@@ -24,17 +24,22 @@ export function instanceIndex(row: Pick<RuntimeStatus, 'instance'>): number {
 }
 
 /**
- * The row that speaks for its whole spec wherever one row has to, per spec id.
+ * The row that speaks for its whole spec wherever one row has to, per spec id:
+ * the spec list's state chip, RAM and probe columns, the one status row that
+ * carries the spec-wide override actions, and the restart action's state gate.
  *
- * Every instance of a replicable spec reports its own row under the spec's id,
- * but the spec-level facts -- the spec list's state, the override actions, the
- * restart sequence's `stopped` -- belong to one of them: instance 0's. It is
- * the only row a spec that is not replicable has, and the LAST of a spec's
- * instances to go (an instance unloads only while no higher-index sibling
- * runs), so its `stopped` is the spec's. Only while it is missing -- instance
- * 0 crashed or restarting with a sibling up -- does the first running
- * instance speak instead, else the first row; the gateway folds instance rows
- * with the same pick.
+ * The pick, per spec id: the first instance-0 row wherever the stream lists
+ * it; else the first `running` row; else the first row. The first two steps
+ * are the gateway's own fold pick (foldInstanceRows / primaryRowIndexes in
+ * agent_ingest.go), which reads its context size and capability verdicts from
+ * that row; the gateway stops there and leaves a spec with neither without a
+ * speaking row, while the portal falls back to the first row so the spec still
+ * shows a state. Instance 0 first because it is the only row a spec that is not
+ * replicable has, and the one its plain address names.
+ *
+ * It is NOT the spec's stop signal: under force_stopped every instance drains
+ * at once, so instance 0 need not stop last -- the restart sequence waits on
+ * every row (specStopState).
  */
 export function primaryStatusRows(rows: readonly RuntimeStatus[]): Map<string, RuntimeStatus> {
   const rank = (row: RuntimeStatus) => {
@@ -47,6 +52,31 @@ export function primaryStatusRows(rows: readonly RuntimeStatus[]): Map<string, R
     if (current === undefined || rank(row) < rank(current)) bySpec.set(row.spec_id, row);
   }
   return bySpec;
+}
+
+/**
+ * How far a spec is down, for the restart sequence's wait: `absent` while the
+ * stream lists no row of the spec at all, `stopped` once every row it lists is
+ * `stopped`, `pending` while any other row remains.
+ *
+ * Every row, not one: force_stopped drains all of a spec's instances at once,
+ * in no fixed order, and the override may only be cleared once none of them
+ * still runs the old process -- a clear while a sibling drains lets it start
+ * again under the old one's feet. An instance whose row is gone (a burst
+ * instance the agent retired once it stopped) runs nothing, so only the listed
+ * rows count.
+ */
+export function specStopState(
+  rows: readonly RuntimeStatus[],
+  specId: string,
+): 'absent' | 'stopped' | 'pending' {
+  let listed = false;
+  for (const row of rows) {
+    if (row.spec_id !== specId) continue;
+    if (row.state !== 'stopped') return 'pending';
+    listed = true;
+  }
+  return listed ? 'stopped' : 'absent';
 }
 
 // The upstream name a status row reports when it runs what its mapping says:

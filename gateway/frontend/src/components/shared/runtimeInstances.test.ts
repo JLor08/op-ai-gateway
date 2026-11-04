@@ -10,6 +10,7 @@ import {
   instanceIndex,
   primaryStatusRows,
   runningInstancesBySpec,
+  specStopState,
 } from './runtimeInstances';
 import type { RuntimeStatus } from '../../api';
 
@@ -63,6 +64,27 @@ describe('primaryStatusRows', () => {
     expect(picked.get('a')?.instance).toBe(0);
     expect(picked.get('b')?.instance).toBe(0);
     expect(picked.size).toBe(2);
+  });
+});
+
+// The restart sequence's wait: under force_stopped every instance of the spec
+// drains at once, in any order, so the spec is down only once every row is.
+describe('specStopState', () => {
+  it('is absent while the stream lists no row of the spec', () => {
+    expect(specStopState([row('other', 0, 'stopped')], 's')).toBe('absent');
+  });
+
+  it('is pending while any instance is not stopped, whichever it is', () => {
+    expect(specStopState([row('s', 0, 'stopped'), row('s', 1, 'draining')], 's')).toBe('pending');
+    expect(specStopState([row('s', 0, 'draining'), row('s', 1, 'stopped')], 's')).toBe('pending');
+  });
+
+  it('is stopped once every listed row of the spec is, a retired instance being no row', () => {
+    expect(specStopState([row('s', 0, 'stopped')], 's')).toBe('stopped');
+    expect(specStopState([row('s', 1, 'stopped'), row('s', 2, 'stopped')], 's')).toBe('stopped');
+    expect(specStopState([row('s', 0, 'stopped'), row('s', 1, 'stopped'), row('t', 0)], 's')).toBe(
+      'stopped',
+    );
   });
 });
 
