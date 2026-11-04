@@ -11121,7 +11121,41 @@ describe('RuntimeAdminSection per-instance live status', () => {
 
     await screen.findByText(t.runtimeInstancesSummary(1, 1, null));
     const cell = cellForColumn('Alpha', t.runtimeLiveStatus);
-    expect(cell).toHaveTextContent(t.runtimeStateStarting);
-    expect(cell).not.toHaveTextContent(t.runtimeStateRunning);
+    // The chip itself, not the cell's text: the summary line under it says
+    // "1 läuft", so a text match on the cell for "Läuft" holds or fails only
+    // by letter case.
+    const chips = cell.querySelectorAll('[data-status]');
+    expect(chips).toHaveLength(1);
+    expect(chips[0].textContent).toBe(t.runtimeStateStarting);
+  });
+
+  // The override actions build their PUT from the loaded spec: a replicable
+  // spec's instance settings must ride along verbatim, or a Force stop would
+  // silently turn a spec of several instances back into one.
+  it("replays a replicable spec's instance settings on an override click", async () => {
+    const spec = replicableSpec({
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 3,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+    const { putSpecs } = renderInstances([instanceRow(0), instanceRow(1)], spec);
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop })).toBeEnabled(),
+    );
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      admin_state: 'force_stopped',
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 3,
+    });
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
   });
 });
