@@ -51,17 +51,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	// above never reaches a server, so it is intentionally not tracked as active.
 	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, BillingUnit: billingUnitFor(req.APIFlavor), ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: false, StartedAt: start})
 	defer s.Active.Remove(id)
-	providerReq := req
-	if target.ProviderModel != "" {
-		providerReq.Model = target.ProviderModel
-	}
-	// Direct Anthropic prompt caching when the flag is on and the request is
-	// eligible. Only the upstream copy is touched; the client-facing req (echoed in
-	// the response and recorded in usage) is unchanged.
-	s.applyAnthropicCachePolicy(r.Context(), target, &providerReq)
-	// Claude Code effort -> chat_template_kwargs for a capable translate target
-	// (upstream copy only, like the cache policy above).
-	applyChatTemplateEffortPolicy(target, &providerReq)
+	providerReq := s.upstreamRequest(r.Context(), target, req)
 	// Thread a capture sink so the provider records the upstream response headers.
 	// When capturing, it keeps the full translated request/response (bounded by
 	// captureMaxBytes). For a vendor-account target that is NOT capturing, a
@@ -83,6 +73,17 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	// Attach the resolved application's per-app upstream credential (fail-open).
 	provCtx = s.upstreamAuthCtx(provCtx, target)
 	resp, err := s.Provider.Complete(provCtx, target, providerReq)
+	if err != nil && reselectsLostInstance(target, req, err) {
+		// The instance is gone (see instance_reselect.go): nothing has been written
+		// to the client and nothing recorded, so the request starts over on another
+		// instance -- re-resolved, re-registered, and recorded once, as the attempt
+		// that answers. Removed from the active registry first, so the lost
+		// instance's in-flight count is free before the selection reads it.
+		slog.Info("inference: the routed instance is gone; re-selecting once", "path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "instance", target.InstanceKey, "err", err)
+		s.Active.Remove(id)
+		s.complete(w, r, token, withLostInstance(req, target), raw, render)
+		return
+	}
 	status := "success"
 	errorCode := ""
 	var body []byte
@@ -98,6 +99,21 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	ci := buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor)
 	attachTranslatedCapture(ci, sink)
 	s.recordUsage(start, token, req, target, resp, errorCode, status, usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, ci, sink.ResponseHeaders())
+}
+
+// upstreamRequest is req as it is sent to target: the target's provider model in
+// place of the client's, Anthropic prompt caching when the flag is on and the request
+// is eligible, and Claude Code's effort as chat_template_kwargs for a capable
+// translate target. Only this upstream copy is touched; the client-facing req (echoed
+// in the response and recorded in usage) is unchanged.
+func (s *Server) upstreamRequest(ctx context.Context, target routing.Target, req inference.Request) inference.Request {
+	providerReq := req
+	if target.ProviderModel != "" {
+		providerReq.Model = target.ProviderModel
+	}
+	s.applyAnthropicCachePolicy(ctx, target, &providerReq)
+	applyChatTemplateEffortPolicy(target, &providerReq)
+	return providerReq
 }
 
 func (s *Server) completeStream(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {

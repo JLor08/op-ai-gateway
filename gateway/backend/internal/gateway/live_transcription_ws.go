@@ -119,7 +119,7 @@ type liveUpControl struct {
 // text down). It is a thin ADAPTER: after the ticket is redeemed and the socket
 // upgraded, it loops the session back to the gateway's own public endpoint,
 // /v1/audio/transcriptions/live (relayLiveTranscription), exactly as a portal chat
-// run loops back to /v1/chat/completions. Admission, the per-route session guard
+// run loops back to /v1/chat/completions. Admission, the per-instance session slot
 // and billing all live at that one canonical relay now, so the portal mic exercises
 // the very endpoint a programmatic client would -- one relay, zero drift.
 //
@@ -165,11 +165,11 @@ func (s *Server) handleLiveTranscription(w http.ResponseWriter, r *http.Request)
 	}
 	conn.SetReadLimit(maxLiveFrameBytes)
 
-	// The per-route session guard is NOT taken here any more: it is acquired at
+	// The per-instance session slot is NOT taken here: it is acquired at
 	// /v1/audio/transcriptions/live, so a second concurrent portal session on the
-	// same model is refused there (a 503 busy) and surfaced to the browser as an
-	// error down-frame, never a silent collision -- the same guard a bearer client
-	// meets.
+	// same instance is moved to a free sibling, waits for one, or is refused there
+	// (a 503 busy, surfaced to the browser as an error down-frame) -- never a silent
+	// collision, and the same slot a bearer client meets.
 	s.relayLiveTranscription(r, conn, claims)
 }
 
@@ -190,7 +190,7 @@ func extractLiveTicket(header string) string {
 // hops. It does NOT touch the backend, bill, or guard the route: it relays the
 // browser's WebSocket through an internal loopback to the gateway's own
 // /v1/audio/transcriptions/live, which performs the resolve, the admission, the
-// per-route session guard, the real upstream relay and the one usage row (as the
+// per-instance session slot, the real upstream relay and the one usage row (as the
 // ticket user, over the trusted-loopback pair). It owns only the browser-side
 // lifecycle: ONE context cancelled on any exit; a single writer goroutine that owns
 // every WS write (data frames, the keepalive ping, the connection close); a read

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
 	"strings"
@@ -381,7 +382,7 @@ func TestBearerLiveTranscriptionIdleClientReleasesSlot(t *testing.T) {
 	// busy until it does, so acquiring it succeeds only once the idle session has been reaped.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if release, ok := srv.liveSessions.acquire("route-asr"); ok {
+		if release, ok := srv.liveSessions.acquire(routing.InstanceKey("route-asr", 0)); ok {
 			release()
 			break
 		}

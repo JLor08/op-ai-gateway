@@ -779,7 +779,10 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		if err != nil {
 			return Target{}, err
 		}
-		if ok {
+		// A pin to an instance this request already tried and lost
+		// (ExcludeInstanceKeys) is passed over, not deleted: the fresh selection below
+		// excludes that instance, and the pin stays for the session's next request.
+		if ok && !slices.Contains(req.ExcludeInstanceKeys, target.InstanceKey) {
 			allowed := true
 			if r.provisioning != nil {
 				okMap, perr := r.provisioning.AllowedServerIDs(ctx, token, []string{target.ServerID})

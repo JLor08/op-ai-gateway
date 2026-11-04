@@ -545,6 +545,7 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 		raw:      raw,
 		pfReq:    req,
 		endpoint: endpointImages,
+		reselect: relayAgain(req, func(again inference.Request) { s.relayImages(w, r, token, again, raw) }),
 	})
 }
 

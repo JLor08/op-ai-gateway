@@ -75,7 +75,9 @@ func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Ta
 	}
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return Response{}, unavailableStatus(httpResp.StatusCode)
+		// An agent router's refusal keeps its code (a *RouterError), so the gateway
+		// can tell an instance that is gone from any other failure.
+		return Response{}, routerErrorFromResponse(httpResp)
 	}
 	respBytes, err := io.ReadAll(httpResp.Body)
 	if err != nil {
@@ -739,8 +741,10 @@ func (c *OpenAICompatibleClient) startStreamRequest(ctx context.Context, target 
 		return nil, false, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		// Like Complete: an agent router's refusal keeps its code.
+		statusErr := routerErrorFromResponse(httpResp)
 		httpResp.Body.Close()
-		return nil, SchemaRejectionStatus(httpResp.StatusCode), unavailableStatus(httpResp.StatusCode)
+		return nil, SchemaRejectionStatus(httpResp.StatusCode), statusErr
 	}
 	sink.RecordResponseHeaders(httpResp.Header)
 	return httpResp, false, nil

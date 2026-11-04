@@ -6,11 +6,16 @@ package gateway
 import "sync"
 
 // liveSessionRegistry enforces at most one active live transcription session per
-// route. audio.cpp serves one /live session per model at a time and nothing else
-// serializes it, so the WebSocket handler takes a slot here before relaying and a
-// second concurrent session on the same route is refused with a clean busy reject
-// instead of colliding at the backend. It is pure mutual exclusion: no TTL, count
-// or eviction, so a slot is held until its holder calls the release it was handed.
+// instance, keyed by the target's gateway instance key (routing.InstanceKey, which
+// a mapping without instances has too: "<mapping_id>#0"). audio.cpp serves one
+// /live session per process at a time and nothing else serializes it, so the live
+// relay takes a slot here before relaying, and a session that finds its instance's
+// slot taken is re-selected onto a sibling or refused with a clean busy reject --
+// never left to collide at the backend. N running instances of a replicable spec
+// are N slots; a mapping without instances keeps its one. It is pure mutual
+// exclusion: no TTL, count or eviction, so a slot is held until its holder calls
+// the release it was handed. It is also the resolver's routing.LiveSlotChecker
+// (LiveHeld), so a live session's selection passes over a held instance.
 type liveSessionRegistry struct {
 	mu     sync.Mutex
 	active map[string]struct{}
@@ -20,55 +25,57 @@ func newLiveSessionRegistry() *liveSessionRegistry {
 	return &liveSessionRegistry{active: make(map[string]struct{})}
 }
 
-// acquire claims the slot for routeID. When the route already has an active session
-// it returns (nil, false) and the caller must refuse the new session. Otherwise it
-// returns a release func and true.
+// acquire claims the slot for instanceKey. When the instance already has an active
+// session it returns (nil, false) and the caller must not relay the new session there.
+// Otherwise it returns a release func and true.
 //
 // release frees the slot and is one-shot: only the first call acts, every later call
 // is a no-op. Each acquire gets its own release, so a stale release held by an earlier
 // session can never free the slot a later session has since re-acquired.
 //
-// The empty routeID is an ordinary key and is serialized like any other; callers
-// should pass the resolved route's ID. A nil registry fails closed: it admits
-// nothing, so a missing registry can never let two sessions share a backend.
-func (r *liveSessionRegistry) acquire(routeID string) (release func(), ok bool) {
+// The empty key is an ordinary key and is serialized like any other; callers pass the
+// resolved target's InstanceKey. A nil registry fails closed: it admits nothing, so a
+// missing registry can never let two sessions share a backend.
+func (r *liveSessionRegistry) acquire(instanceKey string) (release func(), ok bool) {
 	if r == nil {
 		return nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, busy := r.active[routeID]; busy {
+	if _, busy := r.active[instanceKey]; busy {
 		return nil, false
 	}
-	r.active[routeID] = struct{}{}
+	r.active[instanceKey] = struct{}{}
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			delete(r.active, routeID)
+			delete(r.active, instanceKey)
 		})
 	}, true
 }
 
-// held reports whether routeID currently has an active live session, WITHOUT claiming
-// or changing the slot. It lets a non-live request to the same single-slot model (a
-// buffered transcription or /details) refuse cleanly instead of colliding at the
-// upstream, where audio.cpp's one-at-a-time behaviour would surface as an error and an
-// honest loud zero. A nil registry holds nothing (it admitted nothing to begin with),
-// so the check is a no-op where live transcription is not wired.
+// LiveHeld reports whether instanceKey currently has an active live session, WITHOUT
+// claiming or changing the slot. The resolver asks it for a live session's instance
+// candidates (routing.LiveSlotChecker), and a non-live request to a single-slot
+// instance (a buffered transcription or /details) asks it to refuse cleanly instead of
+// colliding at the upstream, where audio.cpp's one-at-a-time behaviour would surface as
+// an error and an honest loud zero. A nil registry holds nothing (it admitted nothing
+// to begin with), so the check is a no-op where live transcription is not wired.
 //
 // This is an advisory snapshot, not a lock: a live session may start or end right after
-// the read. The window is small and the fallback is the pre-existing loud zero, so the
-// check only turns the common same-model collision into a clean refusal; it does not
-// try to make the two paths mutually exclusive.
-func (r *liveSessionRegistry) held(routeID string) bool {
+// the read. A live session that selected a slot which is taken before it acquires it is
+// re-selected (acquireLiveSession); a buffered request falls back to the pre-existing
+// loud zero. So the check turns the common collision into a better choice or a clean
+// refusal; it does not try to make the paths mutually exclusive.
+func (r *liveSessionRegistry) LiveHeld(instanceKey string) bool {
 	if r == nil {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, busy := r.active[routeID]
+	_, busy := r.active[instanceKey]
 	return busy
 }

@@ -363,14 +363,24 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 	}
 	switch mode {
 	case routing.EndpointModePassthrough:
-		s.proxyNative(w, r, nativeRelay{
+		rel := nativeRelay{
 			token:    *token,
 			target:   target,
 			path:     path,
 			raw:      raw,
 			pfReq:    req,
 			endpoint: endpoint,
-		})
+		}
+		if len(req.ExcludeInstanceKeys) == 0 {
+			// Again from the resolve: the re-selected target may need translate (false,
+			// nothing written), and then the lost instance's own answer is relayed.
+			rel.reselect = func(lost routing.Target) bool {
+				again := pf
+				again.Req = withLostInstance(req, lost)
+				return s.tryProxyNative(w, r, token, raw, apiFlavor, endpoint, again)
+			}
+		}
+		s.proxyNative(w, r, rel)
 		return true
 	case routing.EndpointModeDisabled:
 		// The resolved application (or, for a server_agent app, the resolved runtime
@@ -646,7 +656,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		progress = &requestProgress{}
 	}
 
-	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, InstanceKey: rel.target.InstanceKey, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
+	register := func() {
+		s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, InstanceKey: rel.target.InstanceKey, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
+	}
+	register()
 	defer s.Active.Remove(id)
 
 	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings, "reasoning_effort_injected", injectedReasoningEffort)
@@ -670,6 +683,21 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		return
 	}
 	defer resp.Body.Close()
+
+	// An instance k >= 1 the agent refuses as gone (instance_reselect.go) is re-selected
+	// once: nothing has been written to the client and nothing recorded, so the caller's
+	// path runs again with the instance excluded and answers in this attempt's place.
+	// This attempt leaves the active registry first, so the lost instance's in-flight
+	// count is free before the selection reads it, and rejoins it only if the
+	// re-selection wrote nothing, to relay its own answer after all.
+	if rel.reselect != nil && rel.target.Instance() >= 1 && peekInstanceGone(resp) {
+		slog.Info("inference native passthrough: the routed instance is gone; re-selecting once", "path", r.URL.Path, "model", rel.pfReq.Model, "server", serverName, "instance", rel.target.InstanceKey, "status", resp.StatusCode)
+		s.Active.Remove(id)
+		if rel.reselect(rel.target) {
+			return
+		}
+		register()
+	}
 
 	// A STREAMED audio request (bufferedRetry is set only for a transcription or a speech
 	// synthesis) that the upstream refuses because the mapped model is not in streaming
@@ -1091,6 +1119,14 @@ type nativeRelay struct {
 	// a request the client did not ask to stream, and never on a streamed relay or its
 	// buffered downgrade (which relays the WAV as it is). Nil/false everywhere else.
 	speechPCMStrip bool
+	// reselect sends the request again, through the caller's whole resolve-and-relay
+	// path, with lost's instance excluded (withLostInstance), when the upstream
+	// refuses an instance k >= 1 as gone (peekInstanceGone). It writes the response
+	// and records the usage row itself, and reports false only when it wrote nothing
+	// (the re-selected target needs a path this relay cannot take), in which case
+	// this attempt's own answer is relayed. Set by every relay caller whose request
+	// carries no exclusion yet, which keeps the re-selection to one; nil otherwise.
+	reselect func(lost routing.Target) bool
 }
 
 // nativeExchange is the request-scoped state proxyNative COMPUTES once and then

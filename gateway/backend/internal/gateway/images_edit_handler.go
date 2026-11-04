@@ -584,6 +584,7 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 		pfReq:       req,
 		endpoint:    endpointImagesEdit,
 		contentType: r.Header.Get(contentTypeHeader),
+		reselect:    relayAgain(req, func(again inference.Request) { s.relayImageEdit(w, r, token, again, form, raw, maskPNG) }),
 	}
 	sent := len(raw)
 	rebuild := imageEditRebuild{mask: maskPNG}

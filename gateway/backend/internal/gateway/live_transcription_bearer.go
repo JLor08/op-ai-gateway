@@ -5,15 +5,18 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +25,19 @@ import (
 )
 
 // liveBearerBusyCode is the wire code a bearer live-transcription request is refused with
-// when the route already has an active session. It is API surface: a programmatic client
+// when no instance it could use has a free live slot and it cannot wait for one (a mapping
+// without instances, whose one slot is taken). It is API surface: a programmatic client
 // branches on it to back off. 503 (not 409) because it is transient -- the slot frees when
 // the active session ends -- and it is the HTTP twin of the WebSocket path's
 // StatusTryAgainLater busy close.
 const liveBearerBusyCode = "transcription.live_busy"
+
+// liveSlotAcquireHook is a TEST-ONLY seam: when non-nil, acquireLiveSession calls it with
+// the instance key it is about to acquire, after the selection and before the acquire, so
+// a test can take that slot in between -- the race acquireLiveSession re-selects on. It is
+// nil in production, and a test that sets it must restore nil in t.Cleanup and must not
+// run in parallel (it is a package variable).
+var liveSlotAcquireHook func(instanceKey string)
 
 // handleBearerLiveTranscription serves POST /v1/audio/transcriptions/live (and its
 // /openai alias): a bearer-authenticated, chunked full-duplex HTTP session that mirrors
@@ -66,12 +77,81 @@ func (s *Server) handleBearerLiveTranscription(w http.ResponseWriter, r *http.Re
 	// admit=true: this endpoint is where a live session's single rate/quota/budget
 	// admission is spent -- for a bearer client directly, and for a portal session
 	// through the WebSocket's internal loopback. The portal ticket mint resolves
-	// with admit=false so the one admission is never double-counted.
-	target, ok := s.resolveLiveTarget(w, r, token, model, params, true)
+	// with admit=false so the one admission is never double-counted. The gate runs
+	// once; the selection after it may run again (acquireLiveSession, and the
+	// relay's re-selection of a vanished instance) without spending it again.
+	req, ok := s.liveGate(w, r, token, model, params, true)
 	if !ok {
 		return
 	}
-	s.relayBearerLiveTranscription(w, r, token, target, params)
+	req.LiveSession = true
+	sess := liveSession{token: token, req: req}
+	if sess.target, sess.release, ok = s.acquireLiveSessionOrRefuse(w, r, &sess.token, model, req); !ok {
+		return
+	}
+	s.relayBearerLiveTranscription(w, r, token, &sess, params)
+}
+
+// liveSession is a bearer live session's hold on the instance it is relayed to: the
+// request it was selected with (re-selection excludes from it), the token resolves
+// refresh, the target, and the release of that instance's live slot.
+type liveSession struct {
+	token   auth.Token
+	req     inference.Request
+	target  routing.Target
+	release func()
+}
+
+// acquireLiveSessionOrRefuse is acquireLiveSession for the handler: a refusal is written
+// (writeLiveRefusal) and ok is false.
+func (s *Server) acquireLiveSessionOrRefuse(w http.ResponseWriter, r *http.Request, token *auth.Token, model string, req inference.Request) (routing.Target, func(), bool) {
+	target, release, err := s.acquireLiveSession(r.Context(), token, req)
+	if err != nil {
+		writeLiveRefusal(w, r, model, err)
+		return routing.Target{}, nil, false
+	}
+	return target, release, true
+}
+
+// acquireLiveSession selects an instance for a live session (req.LiveSession, so the
+// resolver passes over a held slot, and parks the session when every instance of a
+// replicable spec is held) and takes that instance's live slot, returning the target
+// and the slot's release.
+//
+// The selection reads the slots as a snapshot, so another session can take the chosen
+// slot before this one acquires it. An instance-capable target that loses that race is
+// selected again with its instance excluded (req.ExcludeInstanceKeys): the resolver
+// never returns an excluded instance, so each round tries a new one and the loop ends
+// within the candidates there are -- answering errTranscriptionLiveBusy once they are
+// all excluded. A target without instances keeps today's answer at once: its one slot is
+// taken, errTranscriptionLiveBusy. Any other refusal (a routing error, a live verdict,
+// a queue timeout) is returned as it is.
+func (s *Server) acquireLiveSession(ctx context.Context, token *auth.Token, req inference.Request) (routing.Target, func(), error) {
+	for {
+		target, err := s.liveTarget(ctx, token, req)
+		if err != nil {
+			if len(req.ExcludeInstanceKeys) > 0 && errors.Is(err, routing.ErrNoHealthyHost) {
+				return routing.Target{}, nil, errTranscriptionLiveBusy
+			}
+			return routing.Target{}, nil, err
+		}
+		if slices.Contains(req.ExcludeInstanceKeys, target.InstanceKey) {
+			// Only a selection that ignores the exclusion (none does) could get here; it
+			// would only lose the same slot again.
+			return routing.Target{}, nil, errTranscriptionLiveBusy
+		}
+		if hook := liveSlotAcquireHook; hook != nil {
+			hook(target.InstanceKey)
+		}
+		if release, ok := s.liveSessions.acquire(target.InstanceKey); ok {
+			return target, release, nil
+		}
+		if !target.InstanceCapable {
+			return routing.Target{}, nil, errTranscriptionLiveBusy
+		}
+		slog.Debug("live transcription: the selected instance's live slot was taken; selecting again", "model", req.Model, "instance", target.InstanceKey)
+		req = withLostInstance(req, target)
+	}
 }
 
 // liveParamsFromQuery reads the four audio.cpp /live parameters out of the request query.
@@ -93,17 +173,24 @@ func liveParamsFromQuery(q url.Values) liveParams {
 // session and bills it once. It owns the lifecycle, the twin of relayLiveTranscription's on
 // the WebSocket path:
 //
-//   - ONE per-route session slot, acquired before any relay and released exactly once (a
-//     busy route is a clean 503 before a byte moves, with NO usage row -- nothing was
-//     relayed);
+//   - ONE per-instance session slot, acquired by the handler before any relay
+//     (acquireLiveSession: a session that cannot get one is refused there before a byte
+//     moves, with NO usage row -- nothing was relayed) and released exactly once, here,
+//     ahead of the session's active-request row, whose removal wakes the admission queue:
+//     a session parked for a slot then finds it free;
 //   - ONE context, cancelled on any exit, which tears down the upstream request;
-//   - the client's PCM pumped into the upstream request body through an io.Pipe by one
+//   - the client's PCM pumped into the upstream request body through a liveFeed by one
 //     copy goroutine, counting the payload and latching a clean end-of-input (r.Body's EOF,
 //     the terminating chunk) versus a truncated one (any other read error);
+//   - ONE re-selection of an instance k >= 1 the agent refuses as gone (see
+//     instance_reselect.go): the session moves to another instance -- its slot, its
+//     active-request row and its billing with it -- and the new attempt is sent the
+//     session's audio from its first byte (liveFeed.restart), so the client never sees
+//     the refusal;
 //   - for a client that sent Expect: 100-continue, an explicit 100 Continue written before the
 //     success response, so the SSE 200 can never reach it ahead of its 100 Continue (see
 //     sendContinue and #333);
-//   - a DEFERRED teardown that can leave no goroutine blocked: it closes the pipe reader
+//   - a DEFERRED teardown that can leave no goroutine blocked: it closes the feed's pipe
 //     (unblocking both the transport's read of it and the copy goroutine's pipe write),
 //     expires the request read deadline (unblocking a copy goroutine still waiting on
 //     r.Body.Read -- the one thing cancelling the context cannot interrupt, because r.Body
@@ -114,18 +201,10 @@ func liveParamsFromQuery(q url.Values) liveParams {
 // down; liftInferenceDeadlines removes the control-plane read/write deadlines so a long
 // session is not cut at 30s (the teardown re-expires the read deadline on purpose, to end
 // the copy goroutine, which is why it is set here and not left lifted).
-func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, target routing.Target, params liveParams) {
-	// One live session per route (audio.cpp serves one /live per model). A second concurrent
-	// session on the same route is refused 503 BEFORE any relay, so nothing is billed and no
-	// upstream is touched -- the HTTP twin of the WebSocket busy close.
-	release, acquired := s.liveSessions.acquire(target.RouteID)
-	if !acquired {
-		writeJSON(w, http.StatusServiceUnavailable, apierror.Response(liveBearerBusyCode,
-			"a live transcription session is already active for this model; retry once it ends", ""))
-		return
-	}
-	defer release()
-
+//
+// token is the bearer token the session is attributed to; sess carries the selection the
+// handler made, and is moved by a re-selection.
+func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, sess *liveSession, params liveParams) {
 	liftInferenceDeadlines(w)
 	rc := http.NewResponseController(w)
 	// HTTP/1.1: read the client's request body while writing the response. Best-effort: a
@@ -137,23 +216,33 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 
 	// Register the live session in the Active Requests view (GET /api/portal/usage/active)
 	// for its whole lifetime, the same way the chat/stream/native paths do, so an operator
-	// sees a live session holding the model's one /live slot. Added once the per-route slot
-	// is held (the busy 503 above returns first, and nothing is relayed or billed there) and
-	// removed on every exit path by the defer -- clean end, truncation, dial failure, panic.
+	// sees a live session holding its instance's one /live slot. Added once the slot is held
+	// (a busy refusal is written by the handler first, and nothing is relayed or billed there)
+	// and removed on every exit path by the defer -- clean end, truncation, dial failure, panic.
 	// No Progress: like the buffered inference path, a transcription session has no output
 	// tokens to count; its billable measure is the input audio (audio_second), billed once at
-	// the end by the teardown below.
-	s.Active.Add(ActiveRequest{
-		ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name,
-		ServiceID: token.ServiceID, ServiceName: token.ServiceName,
-		ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey,
-		Model: target.Model, RequestedModel: strings.TrimSpace(r.URL.Query().Get("model")),
-		APIFlavor: target.APIFlavor, BillingUnit: usage.BillingUnitAudioSecond,
-		ReqPath: r.URL.Path, ProviderPath: liveUpstreamPath(target, params),
-		ProviderModel: effectiveProviderModel(target, target.Model),
-		Stream:        true, StartedAt: start,
-	})
-	defer s.Active.Remove(id)
+	// the end by the teardown below. register runs again for a re-selected session: the one
+	// id moves to the new instance.
+	register := func() {
+		target := sess.target
+		s.Active.Add(ActiveRequest{
+			ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name,
+			ServiceID: token.ServiceID, ServiceName: token.ServiceName,
+			ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey,
+			Model: target.Model, RequestedModel: strings.TrimSpace(r.URL.Query().Get("model")),
+			APIFlavor: target.APIFlavor, BillingUnit: usage.BillingUnitAudioSecond,
+			ReqPath: r.URL.Path, ProviderPath: liveUpstreamPath(target, params),
+			ProviderModel: effectiveProviderModel(target, target.Model),
+			Stream:        true, StartedAt: start,
+		})
+	}
+	register()
+	// The slot is released before the row is removed: removing the row is what wakes a
+	// session parked in the admission queue for this server, and it must find the slot free.
+	defer func() {
+		sess.release()
+		s.Active.Remove(id)
+	}()
 
 	// The one context: cancelled on any exit tears down the upstream request and the pipe
 	// feeder together. Derived from the request, but the copy goroutine deliberately reads
@@ -161,16 +250,17 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// The upstream request body is the read side of this pipe; the copy goroutine writes the
-	// inbound PCM into the write side and counts the payload.
-	pr, pw := io.Pipe()
+	// The upstream request body is the feed's current pipe; the copy goroutine writes the
+	// inbound PCM into it and counts the payload. A first attempt at an instance k >= 1 may
+	// be re-selected, so its feed keeps what it sends for a replay.
+	feed := newLiveFeed(sess.target.Instance() >= 1)
 	var pcmBytes int64
 	var endReceived atomic.Bool
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		liveBodyCopyLoop(r.Body, cancel, pw, &pcmBytes, &endReceived)
+		liveBodyCopyLoop(r.Body, cancel, feed, &pcmBytes, &endReceived)
 	}()
 
 	scan := s.newTranscriptionStreamScan(endpointTranscription, false)
@@ -179,9 +269,9 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 
 	// Teardown + billing, DEFERRED so they are airtight even on a panic. Leak-free and in
 	// order (the twin of relayLiveTranscription's teardown):
-	//  1. Unblock the pipe from BOTH sides: the transport's read of pr and a copy goroutine
-	//     blocked on pw.Write both return. The transport uses io.NopCloser, so it never
-	//     closes pr for us.
+	//  1. Unblock the feed's pipe from BOTH sides: the transport's read of it and a copy
+	//     goroutine blocked writing into it both return. The transport uses io.NopCloser, so
+	//     it never closes the pipe for us.
 	//  2. Expire the request read deadline, which is the ONLY way to unblock a copy goroutine
 	//     still blocked on r.Body.Read when the gateway tears the session down from its own
 	//     side (a non-2xx upstream, a dial failure, or the upstream ending) while the client
@@ -192,12 +282,14 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	//  3. Cancel the one context: aborts the upstream request.
 	//  4. Join: pcmBytes and endReceived are stable once the copy goroutine returns.
 	//  5. Bill exactly once, through the SAME classifier the WebSocket path uses.
+	//
+	// It bills sess.target as it is then: the instance a re-selection moved the session to.
 	defer func() {
-		_ = pr.CloseWithError(errLiveRelayDone)
+		feed.close()
 		_ = rc.SetReadDeadline(time.Now())
 		cancel()
 		wg.Wait()
-		s.recordLiveUsage(start, id, r.URL.Path, target, params, bearerLiveAttribution(token), liveUsageResult{
+		s.recordLiveUsage(start, id, r.URL.Path, sess.target, params, bearerLiveAttribution(token), liveUsageResult{
 			endRequested: endReceived.Load(),
 			scan:         scan,
 			pcmBytes:     atomic.LoadInt64(&pcmBytes),
@@ -209,7 +301,11 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	// Open the full-duplex upstream request. ProxyNativeDuplex returns as soon as the
 	// response headers arrive, with the body still open and the request body (pr) still being
 	// read; it applies no target.Timeout (the deadline is ctx's).
-	resp, upErr = s.proxyLiveDuplex(ctx, target, params, pr)
+	resp, upErr = s.proxyLiveDuplex(ctx, sess.target, params, feed.body())
+	if upErr == nil && sess.target.Instance() >= 1 && peekInstanceGone(resp) {
+		resp, upErr = s.reselectLiveSession(ctx, sess, feed, params, resp, register)
+	}
+	target := sess.target
 	if upErr != nil {
 		code := completionErrorCode(upErr)
 		slog.Error("bearer live transcription: upstream dial failed", "id", id, "model", target.Model, "server", s.serverName(target.ServerID), "code", code, "err", upErr)
@@ -222,13 +318,15 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 		slog.Warn("bearer live transcription: upstream non-2xx", "id", id, "status", resp.StatusCode, "model", target.Model, "server", s.serverName(target.ServerID))
 		return
 	}
+	// Accepted: no attempt follows, so the feed stops keeping audio for one.
+	feed.accept()
 	// The idle watchdog + per-chunk write deadline, the streamed-transcription relay's own
 	// guard (proxyNative): the first SSE frame is a cold-start time-to-first-token, so the
 	// first-byte budget is coldStartBudget; every frame then re-arms the watchdog to idle
 	// (nativeCopier.writeChunk), and a write that then BLOCKS -- a client that keeps streaming
 	// PCM but stops READING the SSE -- is cut by the write deadline after idle, so it can
-	// never hold the one per-route session slot open forever and deny every future session on
-	// the model. On idle the watchdog cancels the one context, which tears the whole relay
+	// never hold its instance's one session slot open forever and deny every future session
+	// on it. On idle the watchdog cancels the one context, which tears the whole relay
 	// down and releases the slot. A genuine dictation pause is not cut here: with no PCM the
 	// upstream produces no SSE, and audio.cpp's own idle_timeout_ms ends the stream first (a
 	// clean EOF the relay bills normally). When idle is 0 (the operator disabled it) the copier
@@ -261,6 +359,38 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 		sendContinue(w)
 	}
 	s.relayBearerLiveSSE(w, resp, scan, watchdog, idle)
+}
+
+// reselectLiveSession moves a session whose instance k >= 1 refused it as gone (resp, read
+// by peekInstanceGone) to another instance, once, and returns the new attempt's answer. The
+// selection excludes the lost instance and takes the new instance's slot
+// (acquireLiveSession); the feed then starts the new attempt with the session's audio from
+// its first byte. Only then is the old attempt let go: its slot released, its answer
+// closed, the session's active-request row moved (register) -- in that order, so the lost
+// instance's count is never read while it still holds the session. When there is nowhere
+// to go -- no other instance, or audio the feed could no longer keep -- the session stays
+// as it was and resp, the refusal, is returned to be relayed.
+func (s *Server) reselectLiveSession(ctx context.Context, sess *liveSession, feed *liveFeed, params liveParams, resp *provider.ProxyResponse, register func()) (*provider.ProxyResponse, error) {
+	lost := sess.target
+	req := withLostInstance(sess.req, lost)
+	token := sess.token
+	target, release, err := s.acquireLiveSession(ctx, &token, req)
+	if err != nil {
+		slog.Warn("bearer live transcription: the routed instance is gone and re-selection failed", "model", lost.Model, "instance", lost.InstanceKey, "err", err)
+		return resp, nil
+	}
+	body, ok := feed.restart()
+	if !ok {
+		release()
+		slog.Warn("bearer live transcription: the routed instance is gone and the session's audio can no longer be replayed", "model", lost.Model, "instance", lost.InstanceKey)
+		return resp, nil
+	}
+	slog.Info("bearer live transcription: the routed instance is gone; re-selected once", "model", lost.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
+	_ = resp.Body.Close()
+	sess.release()
+	sess.token, sess.req, sess.target, sess.release = token, req, target, release
+	register()
+	return s.proxyLiveDuplex(ctx, target, params, body)
 }
 
 // requestExpectsContinue reports whether Go's server will answer this request's first body read
@@ -312,7 +442,7 @@ var liveBodyCopyStartHook func()
 //     deadline) aborts the upstream body with no terminating chunk (so audio.cpp treats the
 //     input as truncated, no done event -- a loud zero) and cancels the one context, tearing
 //     the relay down.
-func liveBodyCopyLoop(body io.Reader, cancel context.CancelFunc, pw *io.PipeWriter, pcmBytes *int64, endReceived *atomic.Bool) {
+func liveBodyCopyLoop(body io.Reader, cancel context.CancelFunc, feed *liveFeed, pcmBytes *int64, endReceived *atomic.Bool) {
 	if hook := liveBodyCopyStartHook; hook != nil {
 		hook()
 	}
@@ -320,18 +450,17 @@ func liveBodyCopyLoop(body io.Reader, cancel context.CancelFunc, pw *io.PipeWrit
 	for {
 		rn, rerr := body.Read(buf)
 		if rn > 0 {
-			n, werr := pw.Write(buf[:rn])
-			if werr != nil {
-				return // the pipe was torn down; the relay is already ending
+			if !feed.write(buf[:rn]) {
+				return // the feed was torn down; the relay is already ending
 			}
-			atomic.AddInt64(pcmBytes, int64(n))
+			atomic.AddInt64(pcmBytes, int64(rn))
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
 				endReceived.Store(true)
-				_ = pw.Close() // clean EOF -> terminating chunk upstream
+				feed.end(io.EOF) // clean EOF -> terminating chunk upstream
 			} else {
-				_ = pw.CloseWithError(errLiveClientGone) // truncated -> no terminating chunk
+				feed.end(errLiveClientGone) // truncated -> no terminating chunk
 				cancel()
 			}
 			return

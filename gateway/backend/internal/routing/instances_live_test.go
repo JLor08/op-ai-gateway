@@ -170,3 +170,38 @@ func TestExclusionHoldsAcrossAdmissionTurns(t *testing.T) {
 		t.Fatalf("instance activity asked %v: the excluded instance was judged, want it filtered out first", activity.asked)
 	}
 }
+
+// A session pinned to a mapping (an affinity pin addresses its instance 0)
+// whose instance 0 the request has lost is selected afresh rather than sent
+// back to it.
+func TestExclusionPassesOverAnAffinityPin(t *testing.T) {
+	now := instanceCapacityNow
+	store := instanceCandidateStore(t, now, 0)
+	app, err := store.ApplicationByID(context.Background(), "app_inst")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.AffinityTTLSeconds = 1800
+	if err := store.UpdateApplication(context.Background(), app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	r := NewResolver(store, func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1, Running: []int{2}}}})
+	// Fresh selection prefers the loaded instance 2; only the pin sends a request to 0.
+	r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5#2"}}})
+	token := auth.Token{ID: "tok", UserID: "u1", Active: true}
+	req := chatRequest("qwen-coder")
+	req.ClientSessionID = "s1"
+	key := AffinityKey{APITokenID: "tok", Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, SessionID: "s1"}
+	if err := store.UpsertAffinity(context.Background(), RouteAffinity{ID: affinityID(key), APITokenID: "tok", UserID: "u1", Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, SessionID: "s1", ApplicationID: "app_inst", ServerID: "srv_inst", ExpiresAt: now.Add(time.Hour), LastUsedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertAffinity: %v", err)
+	}
+
+	if target, err := r.Resolve(context.Background(), token, req); err != nil || target.InstanceKey != "map_inst#0" {
+		t.Fatalf("pinned Resolve = %q, %v; want the pin's map_inst#0", target.InstanceKey, err)
+	}
+	req.ExcludeInstanceKeys = []string{"map_inst#0"}
+	if target, err := r.Resolve(context.Background(), token, req); err != nil || target.InstanceKey != "map_inst#2" {
+		t.Fatalf("Resolve excluding the pinned instance = %q, %v; want map_inst#2", target.InstanceKey, err)
+	}
+}
