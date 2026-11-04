@@ -3215,10 +3215,11 @@ func TestModelMappingCacheInvalidatedWhenAppModelNameChanges(t *testing.T) {
 // what UpdateMappingAudioMetrics could have written
 // (routing.ValidateMappingAudioMetrics): CreateMapping and UpdateMapping
 // refuse a row with an unknown concurrency limit, a ramp count without its
-// limit, a negative ramp level, or a rate that is negative or not a finite
-// number, and store nothing -- a refused create leaves no row, a refused
-// update leaves the stored one as it was. Every shape the audio writer stores
-// itself goes through both.
+// limit, a negative ramp level, a rate that is negative or not a finite
+// number, or a negative TTFA or load time, with an error that wraps
+// routing.ErrAudioMetricsInvalid, and store nothing -- a refused create
+// leaves no row, a refused update leaves the stored one as it was. Every
+// shape the audio writer stores itself goes through both.
 func TestRoutingStoreMappingFullRowAudioValidation(t *testing.T) {
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
@@ -3268,12 +3269,14 @@ func TestRoutingStoreMappingFullRowAudioValidation(t *testing.T) {
 			{"a negative rate", func(m *routing.ModelMapping) { m.AudioRateX = -1 }},
 			{"a rate that is not a number", func(m *routing.ModelMapping) { m.AudioRateX = math.NaN() }},
 			{"an infinite rate", func(m *routing.ModelMapping) { m.AudioRateX = math.Inf(1) }},
+			{"a negative time to first audio", func(m *routing.ModelMapping) { m.AudioTTFAMS = -380 }},
+			{"a negative load time", func(m *routing.ModelMapping) { m.LoadTimeMS = -1 }},
 		}
 		for i, tc := range bad {
 			created := row(fmt.Sprintf("m_bad_%d", i))
 			tc.mutate(&created)
-			if err := s.CreateMapping(ctx, created); err == nil {
-				t.Fatalf("CreateMapping (%s) = nil, want it refused", tc.name)
+			if err := s.CreateMapping(ctx, created); !errors.Is(err, routing.ErrAudioMetricsInvalid) {
+				t.Fatalf("CreateMapping (%s) = %v, want it refused with routing.ErrAudioMetricsInvalid", tc.name, err)
 			}
 			if _, err := s.MappingByID(ctx, created.ID); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("CreateMapping (%s): MappingByID err = %v, want ErrNotFound (nothing stored)", tc.name, err)
@@ -3281,8 +3284,8 @@ func TestRoutingStoreMappingFullRowAudioValidation(t *testing.T) {
 			updated := good
 			updated.UpdatedAt = now.Add(time.Minute)
 			tc.mutate(&updated)
-			if err := s.UpdateMapping(ctx, updated); err == nil {
-				t.Fatalf("UpdateMapping (%s) = nil, want it refused", tc.name)
+			if err := s.UpdateMapping(ctx, updated); !errors.Is(err, routing.ErrAudioMetricsInvalid) {
+				t.Fatalf("UpdateMapping (%s) = %v, want it refused with routing.ErrAudioMetricsInvalid", tc.name, err)
 			}
 			stored, err := s.MappingByID(ctx, good.ID)
 			if err != nil {

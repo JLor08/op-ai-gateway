@@ -4,6 +4,7 @@
 package routing
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -597,6 +598,9 @@ func TestValidateAudioMetrics(t *testing.T) {
 		if !strings.Contains(err.Error(), strconv.Quote(bad.ConcurrencyLimit)) {
 			t.Errorf("ValidateAudioMetrics(%+v) = %q, want the message to name the refused limit", bad, err)
 		}
+		if !errors.Is(err, ErrAudioMetricsInvalid) {
+			t.Errorf("ValidateAudioMetrics(%+v) = %q, want it to wrap ErrAudioMetricsInvalid", bad, err)
+		}
 	}
 }
 
@@ -610,8 +614,8 @@ func TestValidateAudioMetrics(t *testing.T) {
 // passes.
 func TestValidateAudioMetricsRefusesAnUnusableRate(t *testing.T) {
 	for _, rate := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1, -0.001} {
-		if err := ValidateAudioMetrics(AudioMetrics{RateX: rate, TTFAMS: 380}); err == nil {
-			t.Errorf("ValidateAudioMetrics(rate %v) = nil, want the rate refused", rate)
+		if err := ValidateAudioMetrics(AudioMetrics{RateX: rate, TTFAMS: 380}); !errors.Is(err, ErrAudioMetricsInvalid) {
+			t.Errorf("ValidateAudioMetrics(rate %v) = %v, want the rate refused with ErrAudioMetricsInvalid", rate, err)
 		}
 	}
 	for _, rate := range []float64{0, 0.5, 2.5} {
@@ -623,14 +627,17 @@ func TestValidateAudioMetricsRefusesAnUnusableRate(t *testing.T) {
 
 // TestValidateMappingAudioMetrics pins the full-row writers' check of a
 // mapping's stored audio figures: the rate and limit rules of
-// ValidateAudioMetrics, and the ramp pair as the one result it is -- a count
+// ValidateAudioMetrics, the ramp pair as the one result it is -- a count
 // needs the reason the ramp stopped beside it, and no ramp ends on a negative
-// level. A row with no audio figures at all is valid, and so is every shape
-// the audio writer itself can store.
+// level -- and no negative TTFA or load time, which no measurement yields and
+// which a full row would otherwise store as a figure. A row with no audio
+// figures at all is valid, and so is every shape the audio writer itself can
+// store. Every refusal wraps ErrAudioMetricsInvalid, so a caller can tell it
+// from a store failure.
 func TestValidateMappingAudioMetrics(t *testing.T) {
 	for _, ok := range []ModelMapping{
 		{},
-		{AudioRateX: 2.5, AudioTTFAMS: 380},
+		{AudioRateX: 2.5, AudioTTFAMS: 380, LoadTimeMS: 4800},
 		{AudioRealtimeConcurrency: 0, AudioConcurrencyLimit: AudioLimitPerformance},
 		{AudioRealtimeConcurrency: 3, AudioConcurrencyLimit: AudioLimitResources},
 		{AudioRealtimeConcurrency: 8, AudioConcurrencyLimit: AudioLimitCap},
@@ -646,9 +653,12 @@ func TestValidateMappingAudioMetrics(t *testing.T) {
 		{AudioRateX: math.NaN()},
 		{AudioRateX: math.Inf(1)},
 		{AudioRateX: -1},
+		{AudioTTFAMS: -1},
+		{AudioRateX: 2.5, AudioTTFAMS: -380},
+		{LoadTimeMS: -1},
 	} {
-		if err := ValidateMappingAudioMetrics(bad); err == nil {
-			t.Errorf("ValidateMappingAudioMetrics(%+v) = nil, want it refused", bad)
+		if err := ValidateMappingAudioMetrics(bad); !errors.Is(err, ErrAudioMetricsInvalid) {
+			t.Errorf("ValidateMappingAudioMetrics(%+v) = %v, want it refused with ErrAudioMetricsInvalid", bad, err)
 		}
 	}
 }

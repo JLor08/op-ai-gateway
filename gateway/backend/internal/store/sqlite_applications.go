@@ -531,7 +531,7 @@ func (s *SQLiteStore) UpdateMappingCapacityMetrics(ctx context.Context, id strin
 }
 
 // UpdateMappingAudioMetrics writes one audio benchmark run's measurements +
-// provenance (routing.MappingStore carries the contract). A limit
+// provenance (routing.MappingStore carries the contract). A rate or limit
 // routing.ValidateAudioMetrics refuses is an error before any statement, and a
 // run that measured nothing returns before any statement too, so neither
 // writes anything, provenance included. Otherwise the SET list names only the
