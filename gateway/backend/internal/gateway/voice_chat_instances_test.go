@@ -14,7 +14,9 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"runtime/debug"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,18 +32,29 @@ import (
 // instance fixture (live_instances_test.go), with the voice gate's fake agent as
 // the provider for the ensures and the residency read.
 
-// countingAdmission wraps the server's admission queue and counts the waits.
+// countingAdmission wraps the server's admission queue and counts the waits. stacks
+// keeps the goroutine stack each wait began on, so a test can tell which caller parked.
 type countingAdmission struct {
-	inner routing.AdmissionController
-	mu    sync.Mutex
-	waits int
+	inner  routing.AdmissionController
+	mu     sync.Mutex
+	waits  int
+	stacks []string
 }
 
 func (a *countingAdmission) WaitForSlot(ctx context.Context, serverIDs []string, timeout time.Duration) error {
 	a.mu.Lock()
 	a.waits++
+	a.stacks = append(a.stacks, string(debug.Stack()))
 	a.mu.Unlock()
 	return a.inner.WaitForSlot(ctx, serverIDs, timeout)
+}
+
+// waitedIn reports whether a wait began inside a call of fn (a function name as a
+// stack prints it, e.g. "gateway.(*Server).relaySpeech(").
+func (a *countingAdmission) waitedIn(fn string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.ContainsFunc(a.stacks, func(s string) bool { return strings.Contains(s, fn) })
 }
 
 func (a *countingAdmission) count() int {
@@ -447,5 +460,54 @@ func TestVoiceSynthPreCheckNeitherParksNorSignals(t *testing.T) {
 	}
 	if signals := w.sink.signals(); len(signals) != 0 {
 		t.Fatalf("demand signals = %+v, want none from a check", signals)
+	}
+}
+
+// The replay's synth endpoint at capacity: its pre-check neither waits in the admission
+// queue nor signals demand, and holds the model to no real-time threshold (a replay is
+// not a conversation); only its own relay parks -- once, signalling the demand once --
+// and is served when an instance frees.
+func TestVoiceSynthEndpointAtCapacity(t *testing.T) {
+	w := newVoiceInstanceWorld(t)
+	w.srv.Provider = provider.NewOpenAICompatibleClient(http.DefaultClient) // the agent router serves the synthesis
+	w.publish(nil, []int{0, 1})
+	setVoiceAudioRate(t, w.srv, liveInstTTSMap, 0.5)
+	w.busy(t, liveInstTTSMap+"#0", 1)
+	w.srv.Active.Add(ActiveRequest{ID: "synth-busy-1", ServerID: liveInstServer, InstanceKey: liveInstTTSMap + "#1"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/portal/voice-chat-synth", bytes.NewBufferString(`{"text":"say it again","tts_model":"tts-inst"}`))
+		r.Header.Set("Authorization", "Bearer dev-secret")
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		w.srv.ServeHTTP(rec, r)
+		done <- rec
+	}()
+	// The relay parks: the one wait, with the one demand signal its park sends.
+	if !voicePoll(5*time.Second, func() bool { return w.adm.count() == 1 }) {
+		t.Fatalf("admission waits = %d, want the relay's one", w.adm.count())
+	}
+	if !w.adm.waitedIn("gateway.(*Server).relaySpeech(") || w.adm.waitedIn("gateway.(*Server).checkVoiceTTS(") {
+		t.Fatal("the wait was not the relay's: the pre-check must never park")
+	}
+	if signals := w.sink.signals(); len(signals) != 1 || signals[0].Model != "tts-inst" {
+		t.Fatalf("demand signals = %+v, want the relay's one park signal for tts-inst", signals)
+	}
+	w.srv.Active.Remove("synth-busy-1")
+
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-ctx.Done():
+		t.Fatal("the synth request was not served once an instance freed")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("synth = %d %s, want 200: a replay is not held to real time", rec.Code, rec.Body.String())
+	}
+	if waits, signals := w.adm.count(), w.sink.signals(); waits != 1 || len(signals) != 1 {
+		t.Fatalf("admission waits %d, demand signals %+v; want only the relay's one each", waits, signals)
 	}
 }
