@@ -292,3 +292,63 @@ describe('runtime_spec instance-settings refusals', () => {
     expect(messages.de[key]).not.toBe(messages.en[key]);
   });
 });
+
+// The live-status Play and Stop: transient actions on one instance of a
+// mapping's managed model. Neither writes the spec; both answer the instance
+// they addressed and the agent's state for it.
+describe('runtimeApi manual start and stop', () => {
+  it('POSTs a start without a body, mapping id URL-encoded, and returns the answer', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ instance: 2, state: 'starting' }, 202));
+    const api = createPortalApi(fetcher);
+
+    const got = await api.startRuntime('map/1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/mappings/map%2F1/runtime/start');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(got).toEqual({ instance: 2, state: 'starting' });
+  });
+
+  it('POSTs a stop with the instance index as its body and returns the answer', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ instance: 0, state: 'stopping' }));
+    const api = createPortalApi(fetcher);
+
+    const got = await api.stopRuntime('map_1', 0);
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/mappings/map_1/runtime/stop');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    // Instance 0 is sent as a number, not dropped as falsy: the gateway
+    // refuses a body without an index (runtime.instance_invalid).
+    expect(JSON.parse(init.body)).toEqual({ instance: 0 });
+    expect(got).toEqual({ instance: 0, state: 'stopping' });
+  });
+
+  it('carries the missing feature of a runtime.agent_feature_missing refusal', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          error: {
+            code: 'runtime.agent_feature_missing',
+            message: 'the agent does not declare runtime_stop',
+            feature: 'runtime_stop',
+          },
+        },
+        409,
+      ),
+    );
+    const api = createPortalApi(fetcher);
+
+    const err = await api.stopRuntime('map_1', 1).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(PortalApiError);
+    expect((err as PortalApiError).status).toBe(409);
+    expect((err as PortalApiError).code).toBe('runtime.agent_feature_missing');
+    expect((err as PortalApiError).feature).toBe('runtime_stop');
+  });
+});

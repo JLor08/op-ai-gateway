@@ -572,6 +572,18 @@ export interface RuntimeReport {
   agent_features: string[];
 }
 
+// A manual start's or stop's success body (the Go runtimeActionAnswer in
+// gateway/backend/internal/gateway/runtime_actions.go): the instance index the
+// action addressed and the agent's state for it. A start answers `running`
+// (200, the agent reported it up within the gateway's early-answer window) or
+// `starting` (202, the start goes on in the background and the status stream
+// shows its progress); a stop answers `stopping` (a drain began or was already
+// running) or `stopped` (the instance has no process).
+export interface RuntimeActionAnswer {
+  instance: number;
+  state: 'running' | 'starting' | 'stopping' | 'stopped';
+}
+
 export function runtimeApi(fetcher: Fetcher) {
   return {
     runtimeSpec: (mappingId: string) =>
@@ -593,6 +605,26 @@ export function runtimeApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime-spec`,
         { method: 'DELETE' },
+      ),
+    // The live-status Play: starts one more instance of the mapping's managed
+    // model, transiently -- nothing is written, so the model afterwards follows
+    // the normal idle, eviction and burst rules. The gateway picks the
+    // instance; the answer names it.
+    startRuntime: (mappingId: string) =>
+      request<RuntimeActionAnswer>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/start`,
+        { method: 'POST' },
+      ),
+    // The live-status Stop: asks the agent to drain instance `instance` now,
+    // transiently -- demand can start it again. The agent refuses an instance
+    // the spec keeps up (runtime.instance_protected) and one with a higher
+    // sibling running (runtime.instance_not_highest).
+    stopRuntime: (mappingId: string, instance: number) =>
+      request<RuntimeActionAnswer>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/stop`,
+        { method: 'POST', body: { instance } },
       ),
     runtimeCoresidency: (appId: string) =>
       request<CoResidency>(
