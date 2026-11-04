@@ -33,8 +33,10 @@ var (
 	// "there is no such model" are different facts, and a client that cannot
 	// tell them apart cannot act on either.
 	ErrModelNotCapable = errors.New("routing.model_not_capable")
-	// ErrAdmissionQueueTimeout: an unpinned request waited for a free concurrency slot up
-	// to the per-app admission_queue_timeout_seconds without one freeing. Maps to HTTP 503.
+	// ErrAdmissionQueueTimeout: a request waited for a free concurrency slot up to the
+	// per-app admission_queue_timeout_seconds without one freeing -- an unpinned request,
+	// or a pinned one that needs a free live slot on its pinned server (selectPinned).
+	// Maps to HTTP 503.
 	ErrAdmissionQueueTimeout = errors.New("routing.admission_queue_timeout")
 	// ErrAdmissionQueueFull: the admission queue was already at its configured max depth.
 	// Maps to HTTP 503.
@@ -71,6 +73,17 @@ var (
 // the request signals if it parks; errors.Is matches either.
 var errAllAtCapacity = errors.New("routing: all candidates at capacity")
 
+// errPinnedInstancesGone is selectPinned's answer when the request already found every
+// instance of the pinned mapping on the pinned server gone
+// (inference.Request.ExcludeInstanceKeys): an affinity pin is then passed over and kept
+// (resolveStandard), and a server override has no host left (ErrNoHealthyHost).
+var errPinnedInstancesGone = errors.New("routing: every pinned instance excluded")
+
+// errPinServerUnusable is the answer of resolveAffinity's re-check after a wait: the
+// pinned server stopped passing the gates every candidate passes (affinityServer) while
+// the request was parked for a slot there.
+var errPinServerUnusable = errors.New("routing: pinned server no longer serves")
+
 // atCapacityError is errAllAtCapacity together with what the request would ask the
 // demand sink for, decided where the capped set was built and sent only where the
 // request is about to wait (signalDemand). demand is nil when no candidate at capacity
@@ -99,19 +112,16 @@ func parkDemand(err error) (DemandSignal, bool) {
 
 // signalDemand hands the sink each demand a request about to wait in the admission
 // queue carries: one per at-capacity member with instance candidates (a plain model's
-// pool is its one member), deduplicated by model. It runs at the three places a request
-// parks -- resolveStandard's, resolveGroupOnce's and selectPinned's (a pinned live
-// session) WaitForSlot, after their deadline check -- and nowhere else, so a request
-// signals once per park turn for each such
-// member: never for a candidate a walk skipped or probed and then served around, never
-// on the fail-open path a resolver without a queue takes, never for a request whose
-// deadline has already passed, and never for one the queue has no room for
-// (AdmissionRoom) -- a request about to be refused as full must not start an instance.
-// The other senders serve a request on a busy candidate and signal once for it:
-// signalOverflow, for a request that must not park (inference.Request.NoPark), where it
-// would otherwise have parked, and selectPinned, for a pinned request served on a busy
-// instance of its pinned server, which a pin never queues for. A check-only resolve
-// (inference.Request.CheckOnly) signals nowhere.
+// pool is its one member), deduplicated by model. It runs in parkTurn alone -- the one
+// park turn of resolveStandard, resolveGroupOnce and selectPinned (a pinned request that
+// needs a free live slot), after its deadline check -- so a request signals once per
+// park turn for each such member: never for a candidate a walk skipped or probed and
+// then served around, never on the fail-open path a resolver without a queue takes,
+// never for a request whose deadline has already passed, and never for one the queue
+// has no room for (AdmissionRoom) -- a request about to be refused as full must not
+// start an instance. The other sender, signalOverflow, serves a request on a busy
+// candidate where it would otherwise have waited and signals once for it. A check-only
+// resolve (inference.Request.CheckOnly) signals nowhere.
 func (r *Resolver) signalDemand(demands ...DemandSignal) {
 	if r.demand == nil || len(demands) == 0 {
 		return
@@ -350,7 +360,8 @@ type RuntimeModelStateChecker interface {
 	RuntimeModelState(serverID, appModelName string) (state string, active int, queue int, ok bool, metricsOK bool)
 }
 
-// AdmissionController parks an unpinned request until a slot frees on one of serverIDs
+// AdmissionController parks a request -- an unpinned one, or a pinned one that needs a free
+// live slot on its pinned server (selectPinned) -- until a slot frees on one of serverIDs
 // (returns nil => Resolve retries selection), or bounds it out (ErrAdmissionQueueTimeout /
 // ErrAdmissionQueueFull / a context error). A nil controller disables queuing: selectCandidate
 // keeps the CP3 all-at-cap fail-open. Satisfied by *gateway.admissionQueue.
@@ -832,12 +843,19 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// flavor keeps speech keys apart from every text endpoint's -- so this changes
 	// nothing for any request that reaches here now; it keeps the voice contract
 	// intact should that guard ever be lifted.
+	keepPin := false
 	if token.ID != "" && req.RequiredVoice == "" {
 		target, ok, err := r.resolveAffinity(ctx, token, key, req, now)
-		if err != nil {
+		switch {
+		case errors.Is(err, errPinnedInstancesGone):
+			// Every instance on the pinned server is one this request already found gone:
+			// the fresh selection below serves it, excluding those instances too, and
+			// leaves the pin where it is -- an instance going away is no reason to move
+			// the session off its server, and its next request goes back there.
+			keepPin = true
+		case err != nil:
 			return Target{}, err
-		}
-		if ok {
+		case ok:
 			r.reservation.touch(target.ServerID, affinityID(key), now)
 			return target, nil
 		}
@@ -949,16 +967,11 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		}
 		if errors.Is(err, errAllAtCapacity) {
 			// All candidates at cap + a wired controller: park until a slot frees, then retry.
-			wait := queueTimeout // 0 => unbounded (ctx-only)
-			if queueTimeout > 0 {
-				if wait = deadline.Sub(r.clock()); wait <= 0 {
-					return Target{}, ErrAdmissionQueueTimeout // deadline already elapsed
-				}
-			}
+			var demands []DemandSignal
 			if d, ok := parkDemand(err); ok {
-				r.signalDemand(d)
+				demands = append(demands, d)
 			}
-			if werr := r.admission.WaitForSlot(ctx, serverIDs, wait); werr != nil {
+			if werr := r.parkTurn(ctx, deadline, serverIDs, demands...); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
 			now = r.clock()
@@ -1000,7 +1013,7 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		// the pinned mapping's own on the pinned server, so that refresh cannot
 		// repoint the client at another server or model. It just is not "guarded"
 		// the way these two pin-creating writes are.
-		if token.ID != "" && selected.Application.AffinityTTLSeconds > 0 && len(req.RequiredCapabilities) == 0 {
+		if !keepPin && token.ID != "" && selected.Application.AffinityTTLSeconds > 0 && len(req.RequiredCapabilities) == 0 {
 			if err := r.store.UpsertAffinity(ctx, RouteAffinity{
 				ID:            affinityID(key),
 				APITokenID:    token.ID,
@@ -1468,7 +1481,10 @@ func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, mod
 // On that server the request is served by its mapping's instances as a pinned request is
 // (selectPinned), preferring the instance it names (inference.Request.PreferredInstanceKey:
 // a voice chat leg's, whose turns an overridden token routes here); a mapping without
-// instances is served on its instance 0, as always.
+// instances is served on its instance 0, as always. A request parked there for a free live
+// slot has the server re-checked after every wait (overrideServes), and one that already
+// found every instance there gone has no host left (ErrNoHealthyHost, the answer an
+// unpinned request gets for it).
 func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Request, apiFlavor string, now time.Time) (Target, error) {
 	candidates, err := r.store.ActiveMappingsForModel(ctx, req.Model, apiFlavor)
 	if err != nil {
@@ -1493,32 +1509,49 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 	if mine, err = r.filterRealtime(mine, req); err != nil {
 		return Target{}, err
 	}
-	server := mine[0].Server
-	if server.Status == ServerStatusDisabled {
-		return Target{}, ErrServerOverrideServerUnavailable
-	}
-	// Reachability mirrors the two signals serverSelectable + the affinity/selection path
-	// use (server health + application reachability), EXCEPT the maintenance-status
-	// exclusion baked into serverSelectable (which this override deliberately bypasses —
-	// ServerStatusMaintenance is neither ServerStatusDisabled above nor unhealthy here, so
-	// it falls through to routed).
-	reachable := server.HealthStatus != HealthUnhealthy
-	if r.checker != nil {
-		reachable = reachable && r.checker.Reachable(mine[0].Application.ID)
-	}
-	if !reachable && !req.ServerOverrideForceUnreachable {
-		return Target{}, ErrServerOverrideServerUnavailable
-	}
 	// One server usually offers exactly one mapping for a given gateway model; pick the
 	// first (deterministic: the store's ActiveMappingsForModel result is stably ordered).
-	c, ok, err := r.selectPinned(ctx, mine[0], req, req.PreferredInstanceKey, now)
+	pinned := mine[0]
+	if !r.overrideServes(pinned.Server, pinned.Application.ID, req) {
+		return Target{}, ErrServerOverrideServerUnavailable
+	}
+	servesNow := func(ctx context.Context) error {
+		server, err := r.store.AIServerByID(ctx, pinned.Server.ID)
+		if errors.Is(err, storeerr.ErrNotFound) || (err == nil && !r.overrideServes(server, pinned.Application.ID, req)) {
+			return ErrServerOverrideServerUnavailable
+		}
+		if err != nil {
+			return fmt.Errorf("load override server: %w", err)
+		}
+		return nil
+	}
+	c, _, err := r.selectPinned(ctx, pinned, req, req.PreferredInstanceKey, now, servesNow)
+	if errors.Is(err, errPinnedInstancesGone) {
+		return Target{}, ErrNoHealthyHost
+	}
 	if err != nil {
 		return Target{}, err
 	}
-	if !ok {
-		return Target{}, ErrServerOverrideServerUnavailable
-	}
 	return r.targetFrom(ctx, c, apiFlavor)
+}
+
+// overrideServes reports whether a server override may route to server, whose
+// application appID offers the requested model: the server is not disabled, and it is
+// healthy and the application reachable unless req forces through an unhealthy or
+// unreachable one (inference.Request.ServerOverrideForceUnreachable). Reachability
+// mirrors the two signals serverSelectable + the affinity/selection path use (server
+// health + application reachability), EXCEPT the maintenance-status exclusion baked into
+// serverSelectable, which the override deliberately bypasses: ServerStatusMaintenance is
+// neither ServerStatusDisabled nor unhealthy, so it is routed.
+func (r *Resolver) overrideServes(server AIServer, appID string, req inference.Request) bool {
+	if server.Status == ServerStatusDisabled {
+		return false
+	}
+	reachable := server.HealthStatus != HealthUnhealthy
+	if r.checker != nil {
+		reachable = reachable && r.checker.Reachable(appID)
+	}
+	return reachable || req.ServerOverrideForceUnreachable
 }
 
 // filterProvisioned drops candidates whose server the principal may not use under
@@ -1770,7 +1803,14 @@ func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID stri
 // the pin deleted when it went stale, and kept when only this request cannot use it. On
 // the pinned server the request is served by the pinned mapping's instances
 // (selectPinned), preferring the instance the pin names, and the pin is refreshed with
-// the instance chosen, so the next request follows it there.
+// the instance chosen (refreshAffinity), so the next request follows it there. A request
+// that already found every instance there gone gets errPinnedInstancesGone, and the
+// caller selects afresh without repointing the pin.
+//
+// The provisioning check runs before any instance is chosen and before the refresh, for
+// every mapping, with instances or without: a pin to a server no longer provisioned for
+// the principal is neither served nor touched (its LastUsedAt/UpdatedAt stay as they
+// were), and the request never waits for an instance there.
 func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key AffinityKey, req inference.Request, now time.Time) (Target, bool, error) {
 	fineFlavor, required := req.APIFlavor, req.RequiredCapabilities
 	affinity, ok, err := r.store.Affinity(ctx, key)
@@ -1860,27 +1900,32 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 			return Target{}, false, nil
 		}
 	}
-	sel, ok, err := r.selectPinned(ctx, MappingCandidate{
+	// A request parked for a slot re-checks the pinned server after every wait, with the
+	// same gates as above (affinityServer).
+	servesNow := func(ctx context.Context) error {
+		_, usable, err := r.affinityServer(ctx, app)
+		if err == nil && !usable {
+			return errPinServerUnusable
+		}
+		return err
+	}
+	sel, parked, err := r.selectPinned(ctx, MappingCandidate{
 		Server:              server,
 		Application:         app,
 		Mapping:             mapping,
 		LiveProgressSupport: liveProgressSupport,
-	}, req, InstanceKey(mapping.ID, affinity.Instance), now)
-	if err != nil {
-		return Target{}, false, err
-	}
-	if !ok {
-		// Every instance on the pinned server is one this request already tried and
-		// found gone (ExcludeInstanceKeys): pass the pin over, not delete it -- the fresh
-		// selection excludes those instances too, and the pin stays for the session's
-		// next request.
+	}, req, InstanceKey(mapping.ID, affinity.Instance), now, servesNow)
+	if errors.Is(err, errPinServerUnusable) {
+		// The pinned server stopped passing its gates while the request waited: pass the
+		// pin over to the fresh selection, which leaves that server out as well. The next
+		// request's own checks above drop the pin if the server is still unusable then.
 		return Target{}, false, nil
 	}
-	affinity.Instance = sel.Instance
-	affinity.LastUsedAt = now
-	affinity.UpdatedAt = now
-	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
-		return Target{}, false, fmt.Errorf("update affinity: %w", err)
+	if err != nil {
+		return Target{}, false, err // errPinnedInstancesGone among them, for the caller
+	}
+	if err := r.refreshAffinity(ctx, key, affinity, sel.Instance, parked, now); err != nil {
+		return Target{}, false, err
 	}
 	target, err := r.targetFrom(ctx, sel, key.APIFlavor)
 	if err != nil {
@@ -1889,36 +1934,69 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 	return target, true, nil
 }
 
+// refreshAffinity records on affinity -- key's pin, as resolveAffinity read it -- the
+// instance the request is served on and when it was last used. A request that waited for
+// its slot (parked) re-reads the row first and refreshes it only while it is still the
+// pin it was served from, on the same application and server: a pin another request
+// repointed, or one that was deleted, while it waited is left as it is now, never
+// overwritten or recreated.
+func (r *Resolver) refreshAffinity(ctx context.Context, key AffinityKey, affinity RouteAffinity, instance int, parked bool, now time.Time) error {
+	if parked {
+		cur, ok, err := r.store.Affinity(ctx, key)
+		if err != nil {
+			return fmt.Errorf("lookup affinity: %w", err)
+		}
+		if !ok || cur.ApplicationID != affinity.ApplicationID || cur.ServerID != affinity.ServerID {
+			return nil
+		}
+		affinity, now = cur, r.clock()
+	}
+	affinity.Instance = instance
+	affinity.LastUsedAt = now
+	affinity.UpdatedAt = now
+	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
+		return fmt.Errorf("update affinity: %w", err)
+	}
+	return nil
+}
+
 // selectPinned chooses the instance a pinned request -- a token's affinity hit, or a
 // server override -- is served by: one of pinned's mapping's instances on pinned's server,
 // and never a candidate anywhere else, since the pin names that server. Every other gate
-// is the caller's, applied before: the pin's own checks (resolveAffinity), or the
-// override's model, reachability and real-time checks (resolveServerOverride). ok is false
-// only when the request excludes every instance there (inference.Request.ExcludeInstanceKeys:
-// tried and found gone).
+// is the caller's: the pin's own checks (resolveAffinity), or the override's model,
+// reachability and real-time checks (resolveServerOverride), applied before the first
+// turn and, through servesNow, again after every wait -- so a parked request does not go
+// on waiting for, or get served on, a server that stopped passing them; servesNow's error
+// is then the answer. parked reports whether the request waited at all.
 //
 // A mapping without instances there is served as pinned, its instance 0, exactly as
 // before instances existed. Otherwise the instances are read afresh on every turn
-// (expandInstances), so a pinned instance that is gone is simply not a candidate:
+// (expandInstances), so a pinned instance that is gone is simply not a candidate, and one
+// the request already found gone (inference.Request.ExcludeInstanceKeys) is passed over;
+// with every instance there passed over the answer is errPinnedInstancesGone.
 //
 //  1. preferred -- the instance the pin names, or a server override's preferred one --
 //     when it is a candidate under its cap (underCap; a held live slot counts for a
-//     request that needs a free one);
+//     request that needs a free one, needsFreeLiveSlot);
 //  2. else the least loaded instance under its cap (pinnedChoice);
-//  3. else, every instance at its cap: a request that is not a live session is served on
-//     preferred (or the least loaded instance when preferred is no candidate) at once --
-//     a pinned request has never queued, and its instance takes it in its own queue --
-//     while a live session, which takes a slot no other session may share, parks for one
-//     on this server alone, as an unpinned one parks (resolveStandard), and is offered
-//     every turn's instances again. A live session that must not park
-//     (inference.Request.NoPark, CheckOnly) or has no queue to park in overflows like any
-//     other request. Either way the request asks the demand sink for another instance on
-//     this server (DemandSignal.ServerID) -- once when served at once, once per park turn
-//     when parked -- unless it is a check-only resolve, which signals nothing.
+//  3. else, every instance at its cap, the request is served at once -- a pinned request
+//     has never queued, and its instance takes it in its own queue -- on preferred, or the
+//     least loaded instance when preferred is no candidate, among the instances whose
+//     live slot is free when it needs one (liveSlotFree). Only a request that cannot be
+//     served that way waits: a live session, which takes a slot no other session may
+//     share, and a transcription when every live slot on the server is held, since the
+//     upstream serves no transcription while a live session holds its slot. It parks for
+//     a slot on this server alone (parkTurn), as an unpinned request parks, and is offered
+//     every turn's instances again -- unless it must not park (inference.Request.NoPark,
+//     CheckOnly) or has no queue to park in, and is then served at once like any other.
+//     Either way the request asks the demand sink for another instance on this server
+//     (DemandSignal.ServerID): once when served at once (signalOverflow, whether or not a
+//     queue is wired, since a pin is served instead of queued), once per park turn when
+//     parked (parkTurn) -- and a check-only resolve signals nothing.
 //
 // The pin itself is never the selection's to delete: whichever instance serves, the
 // request stays on the pinned server.
-func (r *Resolver) selectPinned(ctx context.Context, pinned MappingCandidate, req inference.Request, preferred string, now time.Time) (MappingCandidate, bool, error) {
+func (r *Resolver) selectPinned(ctx context.Context, pinned MappingCandidate, req inference.Request, preferred string, now time.Time, servesNow func(context.Context) error) (sel MappingCandidate, parked bool, err error) {
 	var deadline time.Time
 	if secs := pinned.Application.AdmissionQueueTimeoutSeconds; secs > 0 {
 		deadline = admissionStart(req, now).Add(time.Duration(secs) * time.Second)
@@ -1927,38 +2005,68 @@ func (r *Resolver) selectPinned(ctx context.Context, pinned MappingCandidate, re
 	for {
 		turn := expandInstances(ctx, []MappingCandidate{pinned}, r.instances)
 		if !turn[0].InstanceCapable {
-			return pinned, true, nil
+			return pinned, parked, nil
 		}
 		pool := slices.DeleteFunc(turn, func(c MappingCandidate) bool {
 			return slices.Contains(req.ExcludeInstanceKeys, InstanceKey(c.Mapping.ID, c.Instance))
 		})
 		if len(pool) == 0 {
-			return MappingCandidate{}, false, nil
+			return MappingCandidate{}, parked, errPinnedInstancesGone
 		}
-		free := slices.DeleteFunc(slices.Clone(pool), func(c MappingCandidate) bool { return !r.underCap(c, now, judgeLive) })
-		if len(free) > 0 {
-			return r.pinnedChoice(free, preferred), true, nil
+		if free := slices.DeleteFunc(slices.Clone(pool), func(c MappingCandidate) bool { return !r.underCap(c, now, judgeLive) }); len(free) > 0 {
+			return r.pinnedChoice(free, preferred), parked, nil
 		}
+		slotFree := r.liveSlotFree(pool, judgeLive)
 		d := instanceDemand(pool, req)
 		d.ServerID = pinned.Server.ID
-		if !req.LiveSession || neverParks(req) || r.admission == nil {
-			if r.demand != nil && !req.CheckOnly {
-				r.demand.Signal(*d)
+		waits := req.LiveSession || len(slotFree) == 0
+		if !waits || neverParks(req) || r.admission == nil {
+			if len(slotFree) == 0 {
+				slotFree = pool
 			}
-			return r.pinnedChoice(pool, preferred), true, nil
+			r.signalOverflow(req, *d)
+			return r.pinnedChoice(slotFree, preferred), parked, nil
 		}
-		wait := time.Duration(0) // unbounded (ctx-only)
-		if !deadline.IsZero() {
-			if wait = deadline.Sub(r.clock()); wait <= 0 {
-				return MappingCandidate{}, false, ErrAdmissionQueueTimeout
-			}
+		if err := r.parkTurn(ctx, deadline, []string{pinned.Server.ID}, *d); err != nil {
+			return MappingCandidate{}, parked, err
 		}
-		r.signalDemand(*d)
-		if err := r.admission.WaitForSlot(ctx, []string{pinned.Server.ID}, wait); err != nil {
-			return MappingCandidate{}, false, err
+		parked = true
+		if err := servesNow(ctx); err != nil {
+			return MappingCandidate{}, parked, err
 		}
 		now = r.clock()
 	}
+}
+
+// liveSlotFree is the candidates of pool whose live slot is free when judgeLive says the
+// slots count (a request that needs a free one, with a live-slot source wired), and pool
+// itself otherwise.
+func (r *Resolver) liveSlotFree(pool []MappingCandidate, judgeLive bool) []MappingCandidate {
+	if !judgeLive {
+		return pool
+	}
+	return slices.DeleteFunc(slices.Clone(pool), func(c MappingCandidate) bool {
+		return r.liveSlots.LiveHeld(InstanceKey(c.Mapping.ID, c.Instance))
+	})
+}
+
+// parkTurn is one turn of a request parked in the admission queue, the same for
+// resolveStandard, resolveGroupOnce and selectPinned: with a bounded deadline already
+// passed it answers ErrAdmissionQueueTimeout at once; otherwise it hands the sink the
+// demands the request carries (signalDemand) and waits on servers for the time left --
+// until ctx ends when deadline is zero (no bound). The deadline is absolute, never a fresh
+// budget per turn, so the queue's own liveness re-check cannot re-arm it. nil means a slot
+// may have freed and the caller selects again; any other answer is the request's
+// (ErrAdmissionQueueTimeout, ErrAdmissionQueueFull, or ctx's error).
+func (r *Resolver) parkTurn(ctx context.Context, deadline time.Time, servers []string, demands ...DemandSignal) error {
+	wait := time.Duration(0)
+	if !deadline.IsZero() {
+		if wait = deadline.Sub(r.clock()); wait <= 0 {
+			return ErrAdmissionQueueTimeout
+		}
+	}
+	r.signalDemand(demands...)
+	return r.admission.WaitForSlot(ctx, servers, wait)
 }
 
 // pinnedChoice is the instance of pool, a pinned request's instance candidates on its
@@ -2107,8 +2215,9 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 			if r.admission != nil {
 				// Every candidate is at its effective cap: let Resolve queue + retry (CP4)
 				// instead of failing open. Pinned requests never reach here (selectPinned
-				// serves them earlier, and queues only a pinned live session, on its pinned
-				// server). A nil controller keeps the CP3 fail-open below.
+				// serves them earlier, and queues only a pinned request that needs a free
+				// live slot, on its pinned server). A nil controller keeps the CP3
+				// fail-open below.
 				return MappingCandidate{}, false, &atCapacityError{demand: instanceDemand(pool, req), pool: pool, instancePool: instancePool}
 			}
 			slog.Warn("capacity-cap filter empty; routing without it (all candidates at capacity)", "model", model)
@@ -2169,14 +2278,16 @@ func neverParks(req inference.Request) bool {
 	return req.NoPark || req.CheckOnly
 }
 
-// signalOverflow hands the sink d for a request that must not park and was just
-// served on a busy candidate (selectWithoutParking found a selection), once and
-// without asking the queue for room -- signalDemand does both for a parking request:
-// the request is served now, so no park turn will signal for it, and a selection
-// that found no free instance is demand already known. A check-only resolve signals
-// nothing: the request it checks for resolves, parks and signals on its own.
+// signalOverflow hands the sink d for a request just served on a busy candidate where
+// it would otherwise have waited -- one that must not park (inference.Request.NoPark),
+// served from the capped pool (selectWithoutParking), or a pinned request served on a
+// busy instance of its pinned server (selectPinned) -- once and without asking the queue
+// for room -- signalDemand does both for a parking request: the request is served now,
+// so no park turn will signal for it, and a selection that found no free instance is
+// demand already known. A check-only resolve signals nothing: the request it checks for
+// resolves, parks and signals on its own.
 func (r *Resolver) signalOverflow(req inference.Request, d DemandSignal) {
-	if r.demand == nil || !req.NoPark || req.CheckOnly {
+	if r.demand == nil || req.CheckOnly {
 		return
 	}
 	r.demand.Signal(d)
@@ -3237,7 +3348,6 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// the full budget every iteration (mirrors the main Resolve deadline semantics), counted
 	// from the request's admission start (admissionStart) when the caller set one.
 	var deadline time.Time
-	deadlineSet := false
 	for {
 		name, sel, park, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.walk())
 		if err != nil {
@@ -3266,22 +3376,14 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		}
 		if len(park.servers) > 0 && r.admission != nil {
 			queueTimeout := time.Duration(park.queueSecs) * time.Second
-			if queueTimeout > 0 && !deadlineSet {
+			if queueTimeout > 0 && deadline.IsZero() {
 				deadline = admissionStart(g.req, g.now).Add(queueTimeout)
-				deadlineSet = true
 			}
-			wait := time.Duration(0) // 0 => unbounded (ctx-only)
 			// Once a finite deadline is established it is enforced on EVERY subsequent
-			// wake — even if the current at-capacity union is now all-unbounded (e.g. the
-			// sole bounded-timeout member went down mid-queue). A finite wait must never
-			// be silently promoted back to unbounded.
-			if deadlineSet {
-				if wait = deadline.Sub(r.clock()); wait <= 0 {
-					return Target{}, ErrAdmissionQueueTimeout
-				}
-			}
-			r.signalDemand(park.demand...)
-			if werr := r.admission.WaitForSlot(ctx, distinctStrings(park.servers), wait); werr != nil {
+			// wake (parkTurn) — even if the current at-capacity union is now all-unbounded
+			// (e.g. the sole bounded-timeout member went down mid-queue). A finite wait must
+			// never be silently promoted back to unbounded.
+			if werr := r.parkTurn(ctx, deadline, distinctStrings(park.servers), park.demand...); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
 			g.now = r.clock()

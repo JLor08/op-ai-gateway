@@ -448,8 +448,9 @@ type ApplicationDTO struct {
 	Weight             int      `json:"weight"`
 	TimeoutMS          int      `json:"timeout_ms"`
 	AffinityTTLSeconds int      `json:"affinity_ttl_seconds"`
-	// AdmissionQueueTimeoutSeconds bounds how long an unpinned request waits in the
-	// CP4 admission queue for a free concurrency slot; 0 = wait until the client aborts.
+	// AdmissionQueueTimeoutSeconds bounds how long an unpinned request -- or a pinned one
+	// that needs a free live slot on this application's server -- waits in the CP4
+	// admission queue for a free concurrency slot; 0 = wait until the client aborts.
 	AdmissionQueueTimeoutSeconds int    `json:"admission_queue_timeout_seconds"`
 	Status                       string `json:"status"`
 	AlwaysReachable              bool   `json:"always_reachable"`

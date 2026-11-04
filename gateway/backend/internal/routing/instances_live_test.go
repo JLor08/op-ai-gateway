@@ -173,7 +173,10 @@ func TestExclusionHoldsAcrossAdmissionTurns(t *testing.T) {
 
 // A session pinned to an instance (instance 0 here) that the request has lost
 // is served by another instance on the pinned server rather than sent back to
-// it.
+// it. One that has lost every instance there is served by a fresh selection
+// elsewhere, which leaves the pin as it was: an instance going away is no reason
+// to move the session off its server. An override that has lost every instance
+// on its server answers that no host is left, as an unpinned request does.
 func TestExclusionPassesOverAnAffinityPin(t *testing.T) {
 	now := instanceCapacityNow
 	store := instanceCandidateStore(t, now, 0)
@@ -203,6 +206,21 @@ func TestExclusionPassesOverAnAffinityPin(t *testing.T) {
 	req.ExcludeInstanceKeys = []string{"map_inst#0"}
 	if target, err := r.Resolve(context.Background(), token, req); err != nil || target.InstanceKey != "map_inst#2" {
 		t.Fatalf("Resolve excluding the pinned instance = %q, %v; want map_inst#2", target.InstanceKey, err)
+	}
+
+	addAgentMapping(t, store, now, "srv_b", "map_b", "qwen-coder", "qwen2.5", 0, 1800)
+	req.ExcludeInstanceKeys = []string{"map_inst#0", "map_inst#2"}
+	if target, err := r.Resolve(context.Background(), token, req); err != nil || target.InstanceKey != "map_b#0" {
+		t.Fatalf("Resolve excluding every pinned instance = %q, %v; want the fresh selection's map_b#0", target.InstanceKey, err)
+	}
+	if aff, ok, err := store.Affinity(context.Background(), key); err != nil || !ok || aff.ServerID != "srv_inst" || aff.ApplicationID != "app_inst" {
+		t.Fatalf("pin = %q/%q (%v, %v), want it kept on srv_inst/app_inst", aff.ServerID, aff.ApplicationID, ok, err)
+	}
+	override := chatRequest("qwen-coder")
+	override.ServerOverrideID = "srv_inst"
+	override.ExcludeInstanceKeys = []string{"map_inst#0", "map_inst#2"}
+	if _, err := r.Resolve(context.Background(), auth.Token{}, override); !errors.Is(err, ErrNoHealthyHost) {
+		t.Fatalf("override excluding every instance err = %v, want ErrNoHealthyHost", err)
 	}
 }
 

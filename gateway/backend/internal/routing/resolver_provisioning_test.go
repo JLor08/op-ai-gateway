@@ -90,10 +90,10 @@ func TestProvisioningGateAllBlockedNoRoute(t *testing.T) {
 // NOT return the pinned srv_fast — it must fall through to fresh selection and land on
 // srv_slow (the only remaining allowed candidate).
 //
-// Mutation check: removing the affinity re-check in Resolve (returning the
-// resolveAffinity target unconditionally once ok==true) makes this test fail —
-// resolveAffinity itself has no provisioning awareness, so without the re-check it
-// would happily return the now-blocked srv_fast pin.
+// Mutation check: removing the provisioning check in resolveAffinity (serving the
+// pin without asking the gate) makes this test fail — nothing else on the affinity
+// path asks the gate, so without that check it would happily return the now-blocked
+// srv_fast pin.
 func TestProvisioningGateAffinityRecheck(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)

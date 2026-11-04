@@ -864,9 +864,10 @@ type Application struct {
 	TimeoutMS          int
 	AffinityTTLSeconds int
 	// AdmissionQueueTimeoutSeconds bounds how long an unpinned request -- or a pinned
-	// live session, the one pinned request that waits -- waits in the CP4
-	// admission queue for a free concurrency slot on this application's server. 0 = wait
-	// until the client aborts (no server-side deadline).
+	// one that needs a free live slot on this application's server, the one pinned
+	// request that waits -- waits in the CP4 admission queue for a free concurrency slot
+	// on this application's server. 0 = wait until the client aborts (no server-side
+	// deadline).
 	AdmissionQueueTimeoutSeconds int
 	Status                       string
 	AlwaysReachable              bool

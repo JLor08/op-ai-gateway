@@ -135,8 +135,9 @@ type ServerDeps struct {
 	// start one (config OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS). <= 0 defaults
 	// to 60 s.
 	InstanceScaleCooldown time.Duration
-	// AdmissionQueueMaxDepth bounds how many unpinned requests can park in the CP4
-	// admission queue at once; the (maxDepth+1)-th waiter is rejected with a 503.
+	// AdmissionQueueMaxDepth bounds how many requests can park in the CP4 admission
+	// queue at once -- unpinned ones, and pinned ones that need a free live slot on their
+	// pinned server; the (maxDepth+1)-th waiter is rejected with a 503.
 	// <= 0 defaults to 128 in newAdmissionQueue.
 	AdmissionQueueMaxDepth int
 	// NetbirdSyncInterval is the cadence of the background NetBird peer-sync loop
@@ -986,7 +987,8 @@ func New(deps ServerDeps) *Server {
 	// model from eviction.
 	active := newActiveRegistry(broker)
 	// CP4 admission queue: an unpinned request whose every candidate is at its
-	// effective concurrency cap parks here until a slot frees. active.Remove feeds
+	// effective concurrency cap parks here until a slot frees, and so does a pinned one
+	// that needs a free live slot on its pinned server. active.Remove feeds
 	// the slot-free signal (release) via the attached queue.
 	admission := newAdmissionQueue(deps.AdmissionQueueMaxDepth)
 	active.setAdmission(admission)
