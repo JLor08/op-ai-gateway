@@ -2297,8 +2297,10 @@ one more instance where routing would send the waiting request and leaves the fi
   ranked by `Resolver.ScoreModelServers`, the score the resolver ranks with (a candidate it found
   not viable is asked last), and picked afresh before each ask, since an ensure can last as long as
   a start. Each host is asked at most once per scale-up.
-- **The index rule.** The lowest k ≥ 1 that the agent reports in no state (a draining, crashed or
-  stopped row's index is not free), that no ensure of this scaler is under way for, and whose
+- **The index rule.** The lowest k ≥ 1 that the agent reports in no state that keeps the index (a
+  draining or stopped row's index is not free; a row resting at `crashed`, `start_failed` or
+  `not_permitted` is — the agent keeps it only until the index is named again, routing never names
+  it, and an ensure of it is the retry), that no ensure of this scaler is under way for, and whose
   address `m#k` is not another mapping's upstream model on the same agent (the agent resolves a
   literal upstream name first, so that ensure would start the other spec). None left below
   `max_instances` and 64 passes the host over quietly, with no hold (`instanceIndex`,

@@ -949,9 +949,8 @@ func TestInstanceScalerIsWiredAsTheDemandSink(t *testing.T) {
 	}
 }
 
-// The agent still reports a draining, crashed or stopped instance by its
-// index; an ensure of that address is not a fresh start, so the index is not
-// free.
+// The agent still reports a draining or stopped instance by its index; an
+// ensure of that address is not a fresh start, so the index is not free.
 func TestScalerSkipsIndexesTheAgentStillReports(t *testing.T) {
 	f := newScalerFixture(t)
 	f.addHost("srv_a", 50)
@@ -959,12 +958,32 @@ func TestScalerSkipsIndexesTheAgentStillReports(t *testing.T) {
 		specRow("spec_srv_a", scaleUpstream, 0, agentSpecStateRunning),
 		specRow("spec_srv_a", scaleUpstream, 1, agentSpecStateRunning),
 		specRow("spec_srv_a", scaleUpstream, 2, "draining"),
-		specRow("spec_srv_a", scaleUpstream, 3, "crashed"),
-		specRow("spec_srv_a", scaleUpstream, 4, "stopped"),
-		specRow("spec_other", "o", 5, "draining"), // another spec's index blocks nothing
+		specRow("spec_srv_a", scaleUpstream, 3, "stopped"),
+		specRow("spec_other", "o", 4, "draining"), // another spec's index blocks nothing
 	)
 	f.signal(f.demand("map_srv_a"))
-	f.wantEnsured("srv_a m#5")
+	f.wantEnsured("srv_a m#4")
+}
+
+// A burst instance resting at a failure keeps its row on the agent until its
+// index is named again, and an ensure of it is the retry (the agent retires a
+// crashed or start_failed row and starts afresh, and re-runs admission on a
+// not_permitted one). Routing never names such a row, so the scaler must: were
+// the index counted as taken, a failure at the last index below max_instances
+// would stop the spec scaling on that host until the next config push.
+func TestScalerReusesAnIndexRestingAtAFailure(t *testing.T) {
+	for _, state := range []string{"crashed", "start_failed", "not_permitted"} {
+		t.Run(state, func(t *testing.T) {
+			f := newScalerFixture(t)
+			f.addHost("srv_a", 50, func(_ *routing.MappingCandidate, s *routing.RuntimeSpec) { s.MaxInstances = 2 })
+			f.report("srv_a",
+				specRow("spec_srv_a", scaleUpstream, 0, agentSpecStateRunning),
+				specRow("spec_srv_a", scaleUpstream, 1, state),
+			)
+			f.signal(f.demand("map_srv_a"))
+			f.wantEnsured("srv_a m#1")
+		})
+	}
 }
 
 // An index at or above max_instances is one the agent refuses: a spec whose

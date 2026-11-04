@@ -3507,7 +3507,9 @@ restarts no running child.
   `InstanceAllowed` admits it. They are never retried after a failure: a burst
   instance that crashes or fails to start stays visible at `crashed` /
   `start_failed` (or `not_permitted`) so an operator can read why, until it is
-  named again or the next Apply. Named again by an ensure, a `crashed` /
+  named again or the next Apply. The gateway's instance scaler treats such an
+  index as free, so its next ensure for the spec names it again (routing never
+  sends a request to it). Named again by an ensure, a `crashed` /
   `start_failed` row is retired and a fresh instance started in its place, and a
   `not_permitted` row is re-evaluated in place behind the usual rate limit; named
   by a plain request, it is retired and nothing is started (§4.8). A burst

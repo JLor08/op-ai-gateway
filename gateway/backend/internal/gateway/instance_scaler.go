@@ -494,9 +494,9 @@ func (s *instanceScaler) score(ctx context.Context, model string, cands []scaleC
 //   - any instance of the spec is starting: a new sibling would start beside one
 //     whose demand is not measured yet;
 //   - no index is left below max_instances (instanceIndex): the indexes the
-//     agent still reports in any state -- a draining or crashed instance's too
-//     -- are not free, so a spec at its ceiling by index is passed over quietly,
-//     with no hold.
+//     agent still reports -- a draining or stopped instance's too -- are not
+//     free (one resting at a failure is: specInstances), so a spec at its
+//     ceiling by index is passed over quietly, with no hold.
 //
 // Every store read is bounded (bounded), and a read that fails passes the host
 // over.
@@ -562,8 +562,16 @@ func (s *instanceScaler) candidate(ctx context.Context, c routing.MappingCandida
 
 // specInstances reads serverID's status rows of spec specID: whether any instance
 // of it is starting, instance 0 included, and every index k >= 1 the agent
-// reports for it in any state. An index the agent still reports -- an instance
-// draining, crashed or stopped -- is not one an ensure can start afresh.
+// reports for it in a state that keeps the index taken. An index the agent
+// still reports draining, stopped or waiting is not one an ensure can start
+// afresh. An index resting at a failure (instanceReusableStates) is: the agent
+// keeps that row only for the operator to read, until it is named again or
+// the next Apply, and an ensure of it is exactly what names it again -- it
+// retires a crashed or start_failed row and starts a fresh instance there, and
+// runs admission on a not_permitted one again (behind the agent's refusal rate
+// limit). Routing never names such a row, so were its index counted as taken
+// nothing would ever free it, and every failure would use up one index for
+// good -- the last one below max_instances included.
 func (s *instanceScaler) specInstances(serverID, specID string) (starting bool, reported []int) {
 	rows := s.deps.statuses.statusRows(serverID)
 	for i := range rows {
@@ -574,19 +582,25 @@ func (s *instanceScaler) specInstances(serverID, specID string) (starting bool, 
 		if row.State == agentSpecStateStarting {
 			starting = true
 		}
-		if row.Instance >= 1 {
+		if row.Instance >= 1 && !instanceReusableStates[row.State] {
 			reported = append(reported, row.Instance)
 		}
 	}
 	return starting, reported
 }
 
+// instanceReusableStates are the states a burst instance rests at after a
+// failure, which the agent keeps until the index is named again: an ensure of
+// such an index is the retry, so the scaler treats it as free.
+var instanceReusableStates = map[string]bool{"crashed": true, "start_failed": true, "not_permitted": true}
+
 // instanceIndex is the index c's next instance gets (nextInstanceIndex), 0 for none.
-// Besides the indexes taken (taken: present or reported in any state) and the one
-// an ensure is under way for, it skips every index whose address is another
-// mapping's upstream model on the same agent: the agent resolves a literal
-// upstream name before it reads an instance address, so an ensure of that address
-// would start the other spec, and the agent never runs that instance of this one.
+// Besides the indexes taken (taken: present, or reported in a state that keeps
+// the index -- specInstances) and the one an ensure is under way for, it skips
+// every index whose address is another mapping's upstream model on the same
+// agent: the agent resolves a literal upstream name before it reads an instance
+// address, so an ensure of that address would start the other spec, and the
+// agent never runs that instance of this one.
 // The agent's specs are the mappings of the server's server_agent application.
 func (s *instanceScaler) instanceIndex(ctx context.Context, c routing.MappingCandidate, key scaleKey, present []int) int {
 	readCtx, cancel := s.bounded(ctx)

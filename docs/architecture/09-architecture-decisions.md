@@ -11403,8 +11403,11 @@ on its host right now. Scaling down needs neither: an idle instance can leave on
   held off after a refusal, and while **any** instance of the spec is starting (a new sibling would start beside one
   whose demand is not measured yet). The rest are ordered by `Resolver.ScoreModelServers`, the score the resolver
   itself ranks with, re-picked before each ask, and each host is asked at most once per scale-up.
-- **(d) The index is the lowest free one.** The lowest k ≥ 1 that the agent does not report in **any** state (a
-  draining or crashed row's index is not free), that no ensure is under way for, and whose address `m#k` is not
+- **(d) The index is the lowest free one.** The lowest k ≥ 1 that the agent does not report in a state that keeps
+  the index (a draining or stopped row's index is not free; a burst row resting at `crashed`, `start_failed` or
+  `not_permitted` is, because the agent keeps it only until the index is named again, routing never names it, and an
+  ensure of it is the retry — counted as taken, every failure would use up an index for good, the last one below
+  `max_instances` included), that no ensure is under way for, and whose address `m#k` is not
   another mapping's literal upstream name on the same agent (the agent would resolve that name to the other spec,
   ADR-090 (c)); none below `max_instances` and 64 → the host is passed over quietly.
 - **(e) The agent has the final say.** The scaler asks `POST /ensure/m#k` with the target's upstream credential and a

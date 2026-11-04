@@ -2733,7 +2733,10 @@ func demandUnknown(spec Spec) bool {
 // exists only while it serves -- left in place, the row would read "stopped"
 // forever. A burst instance resting at a FAILURE (spentBurst: crashed,
 // start_failed, not_permitted) is kept so an operator can read why, until it is
-// named again or the next Apply retires it. Named by a plain request, the row
+// named again or the next Apply retires it. The gateway's instance scaler
+// treats such an index as free, so its next ensure for the spec is what names
+// it again (routing sends no request to a row that is not running). Named by a
+// plain request, the row
 // is retired whichever of the three failures it shows, and nothing is started
 // (handleEnsure). Named by an ensure, a crashed or start_failed row is retired
 // and a fresh instance started in its place (instanceForRequest), while a
