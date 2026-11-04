@@ -12,6 +12,7 @@ import {
   instancesSummary,
   listedIdleTimeout,
   primaryStatusRows,
+  restartGate,
   runningInstanceCount,
   showsAllInstanceLogs,
   showsRunningInstances,
@@ -78,6 +79,42 @@ describe('primaryStatusRows', () => {
 
 // The restart sequence's wait: under force_stopped every instance of the spec
 // drains at once, in any order, so the spec is down only once every row is.
+describe('restartGate', () => {
+  const restartable = new Set([
+    'running',
+    'starting',
+    'draining',
+    'backoff',
+    'start_failed',
+    'crashed',
+  ]);
+
+  it('is closed on the state of the row that speaks for the spec', () => {
+    expect(restartGate([row('s', 0, 'stopped')], 's', restartable)).toBe('state');
+    expect(restartGate([row('s', 0, 'not_permitted'), row('s', 1)], 's', restartable)).toBe(
+      'state',
+    );
+    expect(restartGate([row('t', 0)], 's', restartable)).toBe('state');
+  });
+
+  it('is closed when another instance rests where force_stopped cannot move it', () => {
+    for (const stuck of ['not_permitted', 'pending_vram_unknown', 'some_future_state']) {
+      expect(restartGate([row('s', 0), row('s', 1, stuck)], 's', restartable)).toBe('instance');
+    }
+  });
+
+  it('is open when every other instance is stopped or restartable', () => {
+    expect(restartGate([row('s', 0)], 's', restartable)).toBe('open');
+    expect(
+      restartGate(
+        [row('s', 0), row('s', 1, 'stopped'), row('s', 2, 'crashed'), row('t', 1, 'not_permitted')],
+        's',
+        restartable,
+      ),
+    ).toBe('open');
+  });
+});
+
 describe('specStopState', () => {
   it('is absent while the stream lists no row of the spec', () => {
     expect(specStopState([row('other', 0, 'stopped')], 's')).toBe('absent');

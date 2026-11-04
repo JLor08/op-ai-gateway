@@ -105,6 +105,7 @@ import {
   primaryStatusRows,
   runningInstancesBySpec,
   showsAllInstanceLogs,
+  restartGate,
   specStopState,
   validateInstances,
   type InstanceForm,
@@ -2414,11 +2415,11 @@ export function RuntimeAdminSection({
     // `pending_vram_unknown` / `not_permitted` row start the sequence anyway --
     // the exact harm the gate exists to prevent: a force_stopped override that
     // no `stopped` frame can ever clear, leaving the model admission-blocked
-    // behind a timeout notice. Read the LIVE frame, not the captured row --
-    // the row the action is offered on, the one that speaks for the spec
-    // (primaryStatusRows).
-    const live = primaryStatusRows(statusRowsRef.current).get(specId);
-    if (live === undefined || !restartableStates.has(live.state)) return;
+    // behind a timeout notice. Read the LIVE frame, not the captured row: the
+    // row the action is offered on (the one that speaks for the spec,
+    // primaryStatusRows) and every other instance row of the spec, since the
+    // wait needs all of them `stopped` (restartGate).
+    if (restartGate(statusRowsRef.current, specId, restartableStates) !== 'open') return;
     const run = ++restartRunRef.current;
     absentSinceRef.current = null;
     setRestartNotice(null);
@@ -4241,7 +4242,10 @@ export function RuntimeAdminSection({
     // forgotten. While this row's own sequence runs the action stays visible
     // but disabled, so it is obvious why nothing else responds.
     if (spec.admin_state === '' || restart?.specId === row.spec_id) {
-      const restartBlocked = !restartableStates.has(row.state);
+      // Over every instance row of the spec, not this row alone: the wait
+      // needs all of them `stopped` (restartGate).
+      const gate = restartGate(statusRows, row.spec_id, restartableStates);
+      const restartBlocked = gate !== 'open';
       actions.push({
         key: 'restart',
         label: t.runtimeRestart,
@@ -4263,7 +4267,12 @@ export function RuntimeAdminSection({
         // portal bug. (`overridesLocked` gets no reason of its own: it is
         // transient and already narrated by the row's own "stopping…" /
         // "clearing…" chip.)
-        title: restartBlocked ? t.runtimeRestartUnavailable : undefined,
+        title:
+          gate === 'state'
+            ? t.runtimeRestartUnavailable
+            : gate === 'instance'
+              ? t.runtimeRestartUnavailableInstance
+              : undefined,
         onClick: () => void startRestart(row.spec_id, spec),
       });
     }

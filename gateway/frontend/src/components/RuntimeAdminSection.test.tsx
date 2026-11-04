@@ -5573,6 +5573,37 @@ describe('RuntimeAdminSection restart state gate is re-asserted on click (fix ro
   });
 });
 
+describe('RuntimeAdminSection restart gate reads every instance of the spec (#340)', () => {
+  // The wait needs every instance row `stopped`, so the gate has to cover
+  // them all: a protected sibling resting at not_permitted has no process for
+  // force_stopped to drain and would never turn `stopped`, so a restart from
+  // the running instance-0 row would time out and leave the model
+  // admission-blocked behind force_stopped.
+  it('disables Restart on a running row while a sibling rests where force_stopped cannot move it', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec() },
+      statusRows: [
+        makeStatus({ spec_id: 'spec_1', state: 'running' }),
+        makeStatus({ spec_id: 'spec_1', instance: 1, model: 'm#1', state: 'not_permitted' }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    const restartButton = await screen.findByRole('button', { name: t.runtimeRestart });
+    expect(restartButton).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.mouseOver(restartButton);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      t.runtimeRestartUnavailableInstance,
+    );
+    restartButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
+  });
+});
+
 describe('RuntimeAdminSection unmount guard (fix round 1)', () => {
   // The existing unmount test tears the ToastProvider down along with the
   // section, so "no success toast" would pass even with the guard removed.

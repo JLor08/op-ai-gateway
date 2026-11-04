@@ -27,7 +27,8 @@ export function instanceIndex(row: Pick<RuntimeStatus, 'instance'>): number {
 /**
  * The row that speaks for its whole spec wherever one row has to, per spec id:
  * the spec list's state chip, RAM and probe columns, the one status row that
- * carries the spec-wide override actions, and the restart action's state gate.
+ * carries the spec-wide override actions, and the first half of the restart
+ * action's state gate (restartGate, which also reads every other row).
  *
  * The pick, per spec id: the first instance-0 row wherever the stream lists
  * it; else the first `running` row; else the first row. The first two steps
@@ -78,6 +79,36 @@ export function specStopState(
     listed = true;
   }
   return listed ? 'stopped' : 'absent';
+}
+
+/**
+ * Whether the restart sequence may start on a spec, and if not, why: `open`;
+ * `state` when the row that speaks for the spec (primaryStatusRows) is not in
+ * a restartable state; `instance` when it is, but another listed row of the
+ * spec rests in a state that is neither restartable nor `stopped`.
+ *
+ * The sequence's wait (specStopState) needs EVERY listed row of the spec to
+ * read `stopped`, so the gate has to hold for every row too. A sibling at
+ * `not_permitted` or `pending_vram_unknown` -- a protected instance the agent
+ * refused, say -- has no process for force_stopped to drain, and the agent's
+ * reset of a changed spec deliberately leaves those two states alone, so that
+ * row would never turn `stopped`: the sequence would time out and leave the
+ * force_stopped override in force, admission-blocking the model. A sibling
+ * already `stopped` is fine (it counts as stopped), and so is one in a
+ * restartable state (it drains, or the reset moves it to `stopped`). An
+ * instance whose row is gone runs nothing and does not count, as in the wait.
+ */
+export function restartGate(
+  rows: readonly RuntimeStatus[],
+  specId: string,
+  restartable: ReadonlySet<string>,
+): 'open' | 'state' | 'instance' {
+  const primary = primaryStatusRows(rows).get(specId);
+  if (primary === undefined || !restartable.has(primary.state)) return 'state';
+  const stuck = rows.some(
+    (row) => row.spec_id === specId && row.state !== 'stopped' && !restartable.has(row.state),
+  );
+  return stuck ? 'instance' : 'open';
 }
 
 /**

@@ -8278,7 +8278,12 @@ same function as the pushed document, so the two cannot disagree); neither has a
   the instance-0 row, else the first running row, else the first row
   (`primaryStatusRows`, the gateway's own fold pick). The restart sequence waits
   for **every** row of the spec to stop (`specStopState`), since under
-  `force_stopped` all instances drain at once.
+  `force_stopped` all instances drain at once, so its state gate reads every row
+  too (`restartGate`): the speaking row must be in a restartable state, and every
+  other row of the spec either restartable or already `stopped`. A sibling resting
+  at `not_permitted` or `pending_vram_unknown` — a protected instance the agent
+  refused — has no process to drain and would never report `stopped`, so Restart
+  stays disabled there and says why on hover.
 - The log view states that it shows every instance of the spec, lines of instance
   k ≥ 1 prefixed `[#k]` (§6.1).
 - The Models catalog's model-servers row carries `running_instances` (one per

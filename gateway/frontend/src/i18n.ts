@@ -1596,6 +1596,11 @@ const de = {
   // Zustand der Ruhezustand der Zeile, also begegnet er jedem Betreiber.
   runtimeRestartUnavailable:
     'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Start erzwingen“ verwenden.',
+  // Neu starten ist auch gesperrt, wenn die Zeile selbst neu gestartet werden
+  // könnte, eine andere Instanz desselben Modells aber in einem Zustand ruht,
+  // aus dem der Agent sie nie „gestoppt“ melden würde.
+  runtimeRestartUnavailableInstance:
+    'Neu starten ist gerade nicht möglich: Eine andere Instanz dieses Modells wartet oder wurde abgelehnt („Wartet auf VRAM“ oder „Nicht zulässig“). Sie hat keinen Prozess, der gestoppt werden könnte, und der Agent würde sie niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen.',
   runtimeRestartStopping: 'Neustart: wird gestoppt…',
   runtimeRestartClearing: 'Neustart: Übersteuerung wird aufgehoben…',
   runtimeRestartTimeout:
@@ -5042,6 +5047,11 @@ const en: PortalMessages = {
   // is the resting state every operator meets, not an edge case.
   runtimeRestartUnavailable:
     'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "force start" instead.',
+  // Restart is also unavailable when this row could restart, but another
+  // instance of the same model rests in a state the agent would never report
+  // "stopped" from.
+  runtimeRestartUnavailableInstance:
+    'Restart is not possible right now: another instance of this model is waiting or was refused ("Pending VRAM" or "Not permitted"). It has no process that could be stopped, and the agent would never report it "stopped" — the restart would time out and leave the "force stop" override behind.',
   runtimeRestartStopping: 'Restart: stopping…',
   runtimeRestartClearing: 'Restart: clearing the override…',
   runtimeRestartTimeout:
