@@ -39,8 +39,8 @@ data:
   # over plain HTTP.)
   OP_AI_GATEWAY_SESSION_COOKIE_SECURE: "true"
 
-  # Streaming / routing / benchmark / capacity / capture / telemetry tuning knobs
-  # (mirror .env.example defaults).
+  # Streaming / routing / benchmark / capacity / instance-scaling / capture /
+  # telemetry tuning knobs (mirror .env.example defaults).
   OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT: "120s"
   OP_AI_GATEWAY_SWAP_PROTECT_WINDOW_SECONDS: "30"
   OP_AI_GATEWAY_SESSION_RESERVATION_WINDOW_SECONDS: "60"
@@ -49,6 +49,16 @@ data:
   OP_AI_GATEWAY_CAPACITY_VRAM_SAFETY_MARGIN_PERCENT: "10"
   OP_AI_GATEWAY_CAPACITY_MAX_CONCURRENCY: "64"
   OP_AI_GATEWAY_CAPACITY_SETTLE_SECONDS: "5"
+  # Instance autoscaling (replicable runtime specs): idle-timeout factor on the
+  # measured startup and its floor (seconds), and the scaler's cooldown (seconds)
+  # after an agent refused or failed to start another instance.
+  OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR: "5"
+  OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS: "120"
+  OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS: "60"
+  # Audio benchmark: real-time threshold (multiples of real time) and the highest
+  # concurrency level the ramp measures.
+  OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR: "1.2"
+  OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX: "8"
   OP_AI_GATEWAY_CAPTURE_MAX_BYTES: "1048576"
   OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES: "67108864"
   OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES: "20971520"
