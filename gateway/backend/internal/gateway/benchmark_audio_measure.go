@@ -37,7 +37,8 @@ import (
 //
 // A measurement either yields every figure or is an error with none: a figure is only
 // ever measured, and a time window or an amount of audio that is zero would make a rate
-// infinite or zero, which a later routing decision would read as a real one.
+// infinite or zero, which a later routing decision would read as a real one. Every error
+// is an *audioMeasureError, whose kind says what the failure tells about the target.
 
 // audioBenchmarkPassage is the text the TTS measurement synthesizes: plain English prose
 // of about 55 words, roughly 20 seconds of speech. It is long enough that a streamed
@@ -86,6 +87,144 @@ type audioMeasurement struct {
 	RateX float64
 	// RTF is the real-time factor, WallMS over AudioSeconds in seconds.
 	RTF float64
+}
+
+// The kinds of audioMeasureError: what a measurement that gave no figures says about its
+// target.
+const (
+	// audioMeasureUpstreamRefused: the upstream answered and refused the work -- a non-2xx
+	// answer (the agent's 409 runtime.instance_no_capacity or runtime.instance_demand_unknown
+	// among them) or an error frame inside a stream. The target did not do the work, so the
+	// refusal says nothing about its speed.
+	audioMeasureUpstreamRefused = "upstream_refused"
+	// audioMeasureTransport: no answer came, or its body broke off -- the connection failed,
+	// or the deadline ended the call.
+	audioMeasureTransport = "transport"
+	// audioMeasureProtocol: the upstream answered, but not with something figures can be read
+	// from -- the wrong media type, an empty or oversized answer, a stream cut short or out
+	// of order, a frame that cannot be read, no audio or no text, or no measurable time.
+	audioMeasureProtocol = "protocol"
+	// audioMeasureInvalidInput: the measurement refused what it was given before sending
+	// anything -- no byte rate, a clip whose length cannot be read, a PCM shape or a language
+	// the live endpoint does not take.
+	audioMeasureInvalidInput = "invalid_input"
+)
+
+// audioMeasureError is why an audio measurement gave no figures; every error a measurement
+// returns is one (errors.As). Its kind lets a caller -- the capacity ramp above all -- tell a
+// target that refused the work (an instance the agent has no room for at that moment) from
+// one that failed or answered nonsense, and both from a slow target, which is no error but
+// figures. Unwrap gives the cause underneath, so errors.Is still finds a transport failure's
+// (context.DeadlineExceeded, provider.ErrUnavailable).
+type audioMeasureError struct {
+	// Kind is one of the audioMeasure* kinds above.
+	Kind string
+	// Status is the HTTP status of a refusal the upstream answered as one; 0 for an error
+	// frame inside a stream and for every other kind.
+	Status int
+	// Code is the upstream's stable error code when its refusal names one
+	// (runtime.instance_no_capacity, say); "" otherwise.
+	Code string
+	// Message is what the upstream said, for a refusal; the measurement's own account of
+	// what went wrong, for every other kind.
+	Message string
+	// Err is the cause underneath, when there is one.
+	Err error
+}
+
+func (e *audioMeasureError) Error() string {
+	var b strings.Builder
+	b.WriteString("audio benchmark: ")
+	switch {
+	case e.Kind == audioMeasureUpstreamRefused && e.Status != 0:
+		fmt.Fprintf(&b, "the upstream answered HTTP %d: %s", e.Status, e.Message)
+	case e.Kind == audioMeasureUpstreamRefused:
+		b.WriteString("the upstream reported an error in its stream: ")
+		b.WriteString(e.Message)
+	default:
+		b.WriteString(e.Message)
+	}
+	if e.Code != "" && !strings.Contains(e.Message, e.Code) {
+		fmt.Fprintf(&b, " (%s)", e.Code)
+	}
+	if e.Err != nil {
+		b.WriteString(": ")
+		b.WriteString(e.Err.Error())
+	}
+	return b.String()
+}
+
+func (e *audioMeasureError) Unwrap() error { return e.Err }
+
+// audioInputError is a measurement refused before it sent anything.
+func audioInputError(message string) error {
+	return &audioMeasureError{Kind: audioMeasureInvalidInput, Message: message}
+}
+
+// audioProtocolError is an answer figures cannot be read from.
+func audioProtocolError(message string) error {
+	return &audioMeasureError{Kind: audioMeasureProtocol, Message: message}
+}
+
+// audioTransportError is an exchange that failed underneath: what failed, and why.
+func audioTransportError(what string, cause error) error {
+	return &audioMeasureError{Kind: audioMeasureTransport, Message: what, Err: cause}
+}
+
+// audioRefusalError is a non-2xx answer: its status, its code and what it said
+// (readBenchmarkRefusal).
+func audioRefusalError(r benchmarkRefusal) error {
+	return &audioMeasureError{Kind: audioMeasureUpstreamRefused, Status: r.status, Code: r.code, Message: r.text}
+}
+
+// audioAnswerReadError is the error of a whole answer readBenchmarkAnswer could not give: an
+// empty or oversized answer is no answer, a body that broke off a failed exchange.
+func audioAnswerReadError(err error) error {
+	if errors.Is(err, errBenchmarkAnswerEmpty) || errors.Is(err, errBenchmarkAnswerTooLarge) {
+		return audioProtocolError(err.Error())
+	}
+	return audioTransportError("the answer could not be read to its end", errors.Unwrap(err))
+}
+
+// audioStreamReadError is the error of a stream whose reading failed (bufio.Scanner.Err): a
+// line past the bound is a frame no reader takes, anything else a body that broke off.
+func audioStreamReadError(what string, err error, maxLine int) error {
+	if errors.Is(err, bufio.ErrTooLong) {
+		return audioProtocolError(fmt.Sprintf("%s has a frame longer than %d bytes", what, maxLine))
+	}
+	return audioTransportError(what+" broke off", err)
+}
+
+// sseStreamError reads one SSE line as an error event an upstream sends inside its stream
+// ({"type":"error",...}) and reports its code and message, or false for any other line. The
+// message is the event's own "message" when it states one, else what an error object
+// says ({"error":{"message":...}}) or, failing that, the frame itself, quoted
+// (speechBenchmarkErrorText); the code is the error object's (liveErrorCode), else the
+// event's own "code".
+func sseStreamError(line []byte) (code, message string, ok bool) {
+	payload, found := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
+	payload = bytes.TrimSpace(payload)
+	var event struct {
+		Type string `json:"type"`
+	}
+	if !found || json.Unmarshal(payload, &event) != nil || event.Type != liveEventError {
+		return "", "", false
+	}
+	var top struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	// A field of another type is a field not stated; json decodes the others regardless.
+	_ = json.Unmarshal(payload, &top)
+	code = liveErrorCode(payload)
+	if own := strings.TrimSpace(top.Code); code == "" && len(own) <= maxLiveRefusalCodeBytes {
+		code = own
+	}
+	message = speechBenchmarkErrorText(payload)
+	if own := strings.TrimSpace(top.Message); own != "" {
+		message = truncateRunes(own, speechBenchmarkErrorRunes)
+	}
+	return code, message, true
 }
 
 // audioMeasurer runs the measurements on a clock. Production uses time.Now (the
@@ -147,10 +286,12 @@ type audioStreamSpeechRequest struct {
 // with every delta before done counted. Reading stops at any [DONE], so an upstream that
 // keeps the connection open after it cannot hold the measurement until its deadline; one
 // that comes before speech.audio.done ends a stream that has no done, and so no
-// measurement. voice is a clone model's preset voice, "" for a model that needs none.
+// measurement. An error frame anywhere before [DONE] is the upstream's refusal
+// (audioMeasureUpstreamRefused, with its code and message), and nothing after it is read.
+// voice is a clone model's preset voice, "" for a model that needs none.
 func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string, byteRate int) (audioMeasurement, error) {
 	if byteRate <= 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: no output byte rate to count the streamed audio with")
+		return audioMeasurement{}, audioInputError("no output byte rate to count the streamed audio with")
 	}
 	body, err := json.Marshal(audioStreamSpeechRequest{
 		speechBenchmarkRequest: speechBenchmarkRequest{Model: target.ProviderModel, Input: text, Voice: voice},
@@ -158,12 +299,12 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 		StreamFormat:           speechStreamFormatSSE,
 	})
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: build the synthesis request: %w", err)
+		return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureInvalidInput, Message: "build the synthesis request", Err: err}
 	}
 	sent := m.now()
 	resp, err := client.ProxyNative(ctx, target, upstreamPath(target, apiFlavorSpeech, endpointSpeech), body, jsonContentType)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: synthesis request failed: %w", err)
+		return audioMeasurement{}, audioTransportError("synthesis request failed", err)
 	}
 	answered := m.now()
 	defer resp.Body.Close()
@@ -183,6 +324,9 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 		if sseLineIsDone(sc.Bytes()) {
 			ended = true
 			break
+		}
+		if code, message, isError := sseStreamError(sc.Bytes()); isError {
+			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
 		}
 		if !done.IsZero() {
 			// The synthesis ended at its done event; what follows up to [DONE] is not part
@@ -206,23 +350,23 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 			// A frame past the relay's own bound is one the relay could not count either.
 			scan.lost = true
 		} else {
-			return audioMeasurement{}, fmt.Errorf("audio benchmark: the synthesis stream broke off: %w", err)
+			return audioMeasurement{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
 		}
 	}
 	switch {
 	case scan.lost:
-		return audioMeasurement{}, errors.New("audio benchmark: the streamed audio could not be counted (a frame or a delta was unreadable)")
+		return audioMeasurement{}, audioProtocolError("the streamed audio could not be counted (a frame or a delta was unreadable)")
 	case done.IsZero():
-		return audioMeasurement{}, errors.New("audio benchmark: the synthesis stream ended before speech.audio.done")
+		return audioMeasurement{}, audioProtocolError("the synthesis stream ended before speech.audio.done")
 	case !ended:
-		return audioMeasurement{}, errors.New("audio benchmark: the synthesis stream ended without [DONE] after speech.audio.done")
+		return audioMeasurement{}, audioProtocolError("the synthesis stream ended without [DONE] after speech.audio.done")
 	case scan.pcmBytes() == 0:
-		return audioMeasurement{}, errors.New("audio benchmark: the synthesis stream carried no audio")
+		return audioMeasurement{}, audioProtocolError("the synthesis stream carried no audio")
 	}
 	audioSeconds := float64(scan.pcmBytes()) / float64(byteRate)
 	production := done.Sub(first)
 	if production <= 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: no measurable time between the first audio and speech.audio.done")
+		return audioMeasurement{}, audioProtocolError("no measurable time between the first audio and speech.audio.done")
 	}
 	wall := done.Sub(sent)
 	return audioMeasurement{
@@ -246,12 +390,12 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 func (m audioMeasurer) measureTTSBuffered(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string) (audioMeasurement, error) {
 	body, err := json.Marshal(speechBenchmarkRequest{Model: target.ProviderModel, Input: text, Voice: voice})
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: build the synthesis request: %w", err)
+		return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureInvalidInput, Message: "build the synthesis request", Err: err}
 	}
 	sent := m.now()
 	resp, err := client.ProxyNative(ctx, target, upstreamPath(target, apiFlavorSpeech, endpointSpeech), body, jsonContentType)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: synthesis request failed: %w", err)
+		return audioMeasurement{}, audioTransportError("synthesis request failed", err)
 	}
 	answered := m.now()
 	defer resp.Body.Close()
@@ -259,15 +403,15 @@ func (m audioMeasurer) measureTTSBuffered(ctx context.Context, client provider.N
 		return audioMeasurement{}, err
 	}
 	if contentType := resp.Header.Get(contentTypeHeader); !speechAudioMediaTypeOf(contentType) {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: the synthesis answer is not labelled as WAV (Content-Type %q)", contentType)
+		return audioMeasurement{}, audioProtocolError(fmt.Sprintf("the synthesis answer is not labelled as WAV (Content-Type %q)", contentType))
 	}
 	audio, end, err := readBenchmarkAnswer(resp.Body, audioBenchmarkMaxAnswerBytes, m.now)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: %w", err)
+		return audioMeasurement{}, audioAnswerReadError(err)
 	}
 	audioSeconds, ok := speechBenchmarkAudioSeconds(resp.Header, audio)
 	if !ok {
-		return audioMeasurement{}, errors.New("audio benchmark: the synthesis answer states no audio length (no usable duration header and no readable WAV header)")
+		return audioMeasurement{}, audioProtocolError("the synthesis answer states no audio length (no usable duration header and no readable WAV header)")
 	}
 	return bufferedAudioMeasurement(sent, answered, end, audioSeconds)
 }
@@ -282,16 +426,16 @@ func (m audioMeasurer) measureTTSBuffered(ctx context.Context, client provider.N
 func (m audioMeasurer) measureASRBuffered(ctx context.Context, client provider.NativeProxyClient, target routing.Target, wav []byte, lang string) (audioMeasurement, error) {
 	ms, ok := wavDurationFromReader(bytes.NewReader(wav))
 	if !ok || ms <= 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: the clip is no WAV whose length can be read")
+		return audioMeasurement{}, audioInputError("the clip is no WAV whose length can be read")
 	}
 	body, contentType, err := buildASRBenchmarkBody(target.ProviderModel, lang, wav)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: build the transcription request: %w", err)
+		return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureInvalidInput, Message: "build the transcription request", Err: err}
 	}
 	sent := m.now()
 	resp, err := client.ProxyNative(ctx, target, upstreamPath(target, apiFlavorSpeech, endpointTranscription), body, contentType)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: transcription request failed: %w", err)
+		return audioMeasurement{}, audioTransportError("transcription request failed", err)
 	}
 	answered := m.now()
 	defer resp.Body.Close()
@@ -300,18 +444,18 @@ func (m audioMeasurer) measureASRBuffered(ctx context.Context, client provider.N
 	}
 	answer, end, err := readBenchmarkAnswer(resp.Body, audioBenchmarkMaxAnswerBytes, m.now)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: %w", err)
+		return audioMeasurement{}, audioAnswerReadError(err)
 	}
 	var transcription struct {
 		Text *string `json:"text"`
 	}
 	if json.Unmarshal(answer, &transcription) != nil || transcription.Text == nil {
-		return audioMeasurement{}, errors.New("audio benchmark: the answer is no transcription (no JSON document with a text field)")
+		return audioMeasurement{}, audioProtocolError("the answer is no transcription (no JSON document with a text field)")
 	}
 	// A clip of speech transcribed to nothing is a failed transcription, and its time is no
 	// rate of transcribing it.
 	if strings.TrimSpace(*transcription.Text) == "" {
-		return audioMeasurement{}, errors.New("audio benchmark: the transcription has no text")
+		return audioMeasurement{}, audioProtocolError("the transcription has no text")
 	}
 	return bufferedAudioMeasurement(sent, answered, end, float64(ms)/1000)
 }
@@ -357,21 +501,22 @@ func buildASRBenchmarkBody(model, lang string, wav []byte) ([]byte, string, erro
 // The PCM's shape and the language are checked as the live relay checks them
 // (liveByteRate, validLiveLanguage) before anything is sent: they ride in the request's
 // query, which the upstream decodes the samples by. The stream must end with
-// transcript.text.done and then [DONE], and reading stops at [DONE]; an error event is
-// the measurement's error.
+// transcript.text.done and then [DONE], and reading stops at [DONE]; an error frame
+// anywhere before [DONE] is the upstream's refusal (audioMeasureUpstreamRefused, with its
+// code and message), and nothing after it is read.
 func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.NativeDuplexProxyClient, target routing.Target, pcm []byte, sampleRate int, lang string) (audioMeasurement, error) {
 	byteRate, ok := liveByteRate(sampleRate, 1, liveSampleFormatS16)
 	if !ok {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: a sample rate of %d Hz is not one the live endpoint takes", sampleRate)
+		return audioMeasurement{}, audioInputError(fmt.Sprintf("a sample rate of %d Hz is not one the live endpoint takes", sampleRate))
 	}
 	if len(pcm) == 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: no audio to transcribe")
+		return audioMeasurement{}, audioInputError("no audio to transcribe")
 	}
 	if len(pcm)%2 != 0 {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: the audio (%d bytes) is not a whole number of 2-byte samples", len(pcm))
+		return audioMeasurement{}, audioInputError(fmt.Sprintf("the audio (%d bytes) is not a whole number of 2-byte samples", len(pcm)))
 	}
 	if !validLiveLanguage(lang) {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: the language %q is no bare language tag", lang)
+		return audioMeasurement{}, audioInputError(fmt.Sprintf("the language %q is no bare language tag", lang))
 	}
 	audioSeconds := float64(len(pcm)) / float64(byteRate)
 	path := liveUpstreamPath(target, liveParams{SampleRate: sampleRate, Channels: 1, Format: liveSampleFormatS16, Language: lang})
@@ -379,7 +524,7 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 	sent := m.now()
 	resp, err := client.ProxyNativeDuplex(ctx, target, path, bytes.NewReader(pcm), liveUpstreamContentType)
 	if err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: live transcription request failed: %w", err)
+		return audioMeasurement{}, audioTransportError("live transcription request failed", err)
 	}
 	answered := m.now()
 	defer resp.Body.Close()
@@ -399,12 +544,12 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 			ended = true
 			break
 		}
+		if code, message, isError := sseStreamError(sc.Bytes()); isError {
+			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
+		}
 		msg, ok := liveDownMsgFromSSELine(sc.Bytes())
 		if !ok {
 			continue
-		}
-		if msg.Type == "error" {
-			return audioMeasurement{}, fmt.Errorf("audio benchmark: the live transcription reported an error: %s", msg.Message)
 		}
 		if !done.IsZero() {
 			// The transcription ended at its done event; what follows up to [DONE] is no
@@ -420,19 +565,19 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return audioMeasurement{}, fmt.Errorf("audio benchmark: the live transcript stream broke off: %w", err)
+		return audioMeasurement{}, audioStreamReadError("the live transcript stream", err, maxLiveSSELineBytes)
 	}
 	switch {
 	case done.IsZero():
-		return audioMeasurement{}, errors.New("audio benchmark: the live transcript stream ended before transcript.text.done")
+		return audioMeasurement{}, audioProtocolError("the live transcript stream ended before transcript.text.done")
 	case !ended:
-		return audioMeasurement{}, errors.New("audio benchmark: the live transcript stream ended without [DONE] after transcript.text.done")
+		return audioMeasurement{}, audioProtocolError("the live transcript stream ended without [DONE] after transcript.text.done")
 	case first.IsZero():
-		return audioMeasurement{}, errors.New("audio benchmark: the live transcription has no text")
+		return audioMeasurement{}, audioProtocolError("the live transcription has no text")
 	}
 	wall := done.Sub(sent)
 	if wall <= 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: no measurable time between the send and transcript.text.done")
+		return audioMeasurement{}, audioProtocolError("no measurable time between the send and transcript.text.done")
 	}
 	return audioMeasurement{
 		FirstByteMS:  millisAtLeastOne(answered.Sub(sent).Seconds()),
@@ -451,10 +596,10 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 func bufferedAudioMeasurement(sent, answered, end time.Time, audioSeconds float64) (audioMeasurement, error) {
 	wall := end.Sub(sent)
 	if wall <= 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: no measurable time between the send and the end of the answer")
+		return audioMeasurement{}, audioProtocolError("no measurable time between the send and the end of the answer")
 	}
 	if audioSeconds <= 0 {
-		return audioMeasurement{}, errors.New("audio benchmark: the answer holds no audio")
+		return audioMeasurement{}, audioProtocolError("the answer holds no audio")
 	}
 	ms := millisAtLeastOne(wall.Seconds())
 	return audioMeasurement{
@@ -467,11 +612,12 @@ func bufferedAudioMeasurement(sent, answered, end time.Time, audioSeconds float6
 	}, nil
 }
 
-// checkAudioAnswerStatus is the error of a non-2xx answer, quoting what the upstream said
-// (readBenchmarkRefusal, the speech benchmark's reading of it), or nil.
+// checkAudioAnswerStatus is the refusal of a non-2xx answer, with its status, its code and
+// what the upstream said (readBenchmarkRefusal, the speech benchmark's reading of it), or
+// nil.
 func checkAudioAnswerStatus(resp *provider.ProxyResponse) error {
 	if refusal, refused := readBenchmarkRefusal(resp); refused {
-		return fmt.Errorf("audio benchmark: the upstream answered HTTP %d: %s", refusal.status, refusal.text)
+		return audioRefusalError(refusal)
 	}
 	return nil
 }
@@ -482,7 +628,7 @@ func checkAudioAnswerStatus(resp *provider.ProxyResponse) error {
 func checkAudioEventStream(resp *provider.ProxyResponse) error {
 	contentType := resp.Header.Get(contentTypeHeader)
 	if mediaType, _, err := mime.ParseMediaType(contentType); err != nil || mediaType != speechStreamSSEType {
-		return fmt.Errorf("audio benchmark: the answer is not an event stream (Content-Type %q)", contentType)
+		return audioProtocolError(fmt.Sprintf("the answer is not an event stream (Content-Type %q)", contentType))
 	}
 	return nil
 }

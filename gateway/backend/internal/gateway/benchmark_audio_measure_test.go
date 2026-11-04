@@ -139,6 +139,14 @@ func refusingAudioUpstream(clock *measureClock, status int, message string) *mea
 	return up
 }
 
+// refusingAgentUpstream answers a non-2xx status with the agent runtime router's error
+// envelope, which names a stable code.
+func refusingAgentUpstream(clock *measureClock, status int, code, message string) *measureUpstream {
+	up := scriptedAudioUpstream(clock, "application/json", measureAt(10, fmt.Sprintf(`{"error":{"code":%q,"message":%q}}`, code, message)))
+	up.status = status
+	return up
+}
+
 // breakingAudioUpstream is scriptedAudioUpstream whose connection breaks after the chunks.
 func breakingAudioUpstream(clock *measureClock, contentType string, chunks ...measureChunk) *measureUpstream {
 	up := scriptedAudioUpstream(clock, contentType, chunks...)
@@ -242,12 +250,17 @@ func audioSentForm(t *testing.T, up *measureUpstream) *multipart.Form {
 	return form
 }
 
-// checkAudioRefusal checks that a measurement that cannot give its figures is an error naming
-// why, carries no figures, and -- when sendsNothing -- reached no upstream at all.
-func checkAudioRefusal(t *testing.T, got audioMeasurement, err error, want string, up *measureUpstream, sendsNothing bool) {
+// checkAudioRefusal checks that a measurement that cannot give its figures is an
+// audioMeasureError of the given kind naming why, carries no figures, and -- when
+// sendsNothing -- reached no upstream at all.
+func checkAudioRefusal(t *testing.T, got audioMeasurement, err error, kind, want string, up *measureUpstream, sendsNothing bool) {
 	t.Helper()
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("measurement = %+v, %v; want an error containing %q", got, err, want)
+	}
+	var merr *audioMeasureError
+	if !errors.As(err, &merr) || merr.Kind != kind {
+		t.Fatalf("error %q (%#v) is not an audioMeasureError of kind %q", err, merr, kind)
 	}
 	if got != (audioMeasurement{}) {
 		t.Fatalf("a refused measurement carries figures: %+v", got)
@@ -353,60 +366,67 @@ func TestMeasureTTSStreamRefusals(t *testing.T) {
 		name     string
 		byteRate int
 		upstream func(*measureClock) *measureUpstream
+		kind     string
 		want     string // a fragment of the error
 	}{
 		{"no byte rate", 0, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, sseSpeechDone))
-		}, "byte rate"},
+		}, audioMeasureInvalidInput, "byte rate"},
 		{"the upstream refuses", 48000, func(c *measureClock) *measureUpstream {
 			return refusingAudioUpstream(c, http.StatusServiceUnavailable, "model is busy")
-		}, "HTTP 503: model is busy"},
+		}, audioMeasureUpstreamRefused, "HTTP 503: model is busy"},
 		{"the model answers a WAV, it does not stream", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "audio/wav", measureAt(900, "RIFF"))
-		}, "not an event stream"},
+		}, audioMeasureProtocol, "not an event stream"},
 		{"the model streams raw PCM", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/octet-stream", measureAt(900, "\x00\x00"))
-		}, "not an event stream"},
+		}, audioMeasureProtocol, "not an event stream"},
 		{"done without audio", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(800, sseSpeechDone))
-		}, "no audio"},
+		}, audioMeasureProtocol, "no audio"},
 		{"audio only after done", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream",
 				measureAt(800, "data: {\"type\":\"speech.audio.done\"}\n\n"),
 				measureAt(900, sseSpeechDelta(48000)),
 				measureAt(1000, "data: [DONE]\n\n"))
-		}, "no audio"},
+		}, audioMeasureProtocol, "no audio"},
 		{"a frame past the line bound", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream",
 				measureAt(300, sseSpeechDelta(48000)),
 				measureAt(500, "data: {\"type\":\"speech.audio.delta\",\"audio\":\""+strings.Repeat("A", speechStreamMaxLine)+"\"}\n\n"),
 				measureAt(800, sseSpeechDone))
-		}, "could not be counted"},
+		}, audioMeasureProtocol, "could not be counted"},
 		{"all the audio at once", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(800, sseSpeechDelta(48000)+sseSpeechDone))
-		}, "no measurable time"},
+		}, audioMeasureProtocol, "no measurable time"},
 		{"cut off before done", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, sseSpeechDelta(48000)))
-		}, "speech.audio.done"},
+		}, audioMeasureProtocol, "speech.audio.done"},
 		{"done without [DONE]", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, "data: {\"type\":\"speech.audio.done\"}\n\n"))
-		}, "[DONE]"},
+		}, audioMeasureProtocol, "[DONE]"},
 		{"a delta that cannot be decoded", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream",
 				measureAt(300, sseSpeechDelta(48000)),
 				measureAt(500, "data: {\"type\":\"speech.audio.delta\",\"audio\":\"not base64!\"}\n\n"),
 				measureAt(800, sseSpeechDone))
-		}, "could not be counted"},
+		}, audioMeasureProtocol, "could not be counted"},
 		{"the connection breaks", 48000, func(c *measureClock) *measureUpstream {
 			return breakingAudioUpstream(c, "text/event-stream", measureAt(300, sseSpeechDelta(48000)))
-		}, "connection reset by peer"},
+		}, audioMeasureTransport, "connection reset by peer"},
+		{"the upstream reports an error mid-stream", 48000, func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream",
+				measureAt(300, sseSpeechDelta(48000)),
+				measureAt(500, "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"out of memory\"}}\n\n"),
+				measureAt(800, sseSpeechDone))
+		}, audioMeasureUpstreamRefused, "out of memory"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := &measureClock{}
 			up := tc.upstream(clock)
 			got, err := clock.measurer().measureTTSStream(context.Background(), up, audioMeasureTarget(), audioBenchmarkPassage, "", tc.byteRate)
-			checkAudioRefusal(t, got, err, tc.want, up, tc.byteRate <= 0)
+			checkAudioRefusal(t, got, err, tc.kind, tc.want, up, tc.byteRate <= 0)
 		})
 	}
 }
@@ -497,7 +517,7 @@ func TestMeasureStreamsStopAtAnyDONE(t *testing.T) {
 			up := scriptedAudioUpstream(clock, "text/event-stream", tc.chunks...)
 			up.body.end = errors.New("read past the end of the stream")
 			got, err := tc.measure(clock.measurer(), up)
-			checkAudioRefusal(t, got, err, tc.want, up, false)
+			checkAudioRefusal(t, got, err, audioMeasureProtocol, tc.want, up, false)
 			if len(up.body.chunks) != 1 || up.body.spentReads != 0 {
 				t.Fatalf("%d chunk(s) left unread and %d read(s) past the end; want the stream read up to its [DONE] and not one read further",
 					len(up.body.chunks), up.body.spentReads)
@@ -602,60 +622,61 @@ func TestMeasureBufferedRefusals(t *testing.T) {
 		name         string
 		upstream     func(*measureClock) *measureUpstream
 		measure      func(audioMeasurer, *measureUpstream) (audioMeasurement, error)
+		kind         string
 		want         string
 		sendsNothing bool
 	}{
 		{"TTS: the upstream refuses", func(c *measureClock) *measureUpstream {
 			return refusingAudioUpstream(c, http.StatusInternalServerError, "needs a reference voice")
-		}, tts, "HTTP 500: needs a reference voice", false},
+		}, tts, audioMeasureUpstreamRefused, "HTTP 500: needs a reference voice", false},
 		{"TTS: the answer is no WAV", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"audio":"UklGRg=="}`))
-		}, tts, "not labelled as WAV", false},
+		}, tts, audioMeasureProtocol, "not labelled as WAV", false},
 		{"TTS: the WAV states no length", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "audio/wav", measureAt(900, "RIFF but not really"))
-		}, tts, "length", false},
+		}, tts, audioMeasureProtocol, "length", false},
 		{"TTS: the connection breaks", func(c *measureClock) *measureUpstream {
 			return breakingAudioUpstream(c, "audio/wav", measureAt(900, string(wav[:100])))
-		}, tts, "connection reset by peer", false},
+		}, tts, audioMeasureTransport, "connection reset by peer", false},
 		{"TTS: the answer takes no time", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "audio/wav", measureAt(0, string(wav)))
-		}, tts, "no measurable time", false},
+		}, tts, audioMeasureProtocol, "no measurable time", false},
 		{"TTS: the answer is empty", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "audio/wav")
-		}, tts, "the answer is empty", false},
+		}, tts, audioMeasureProtocol, "the answer is empty", false},
 		{"ASR: the clip is no WAV", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"hallo"}`))
 		}, func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
 			return m.measureASRBuffered(context.Background(), up, audioMeasureTarget(), []byte("not a wav"), "de")
-		}, "clip", true},
+		}, audioMeasureInvalidInput, "clip", true},
 		{"ASR: the upstream refuses", func(c *measureClock) *measureUpstream {
 			return refusingAudioUpstream(c, http.StatusNotFound, "unknown model id")
-		}, asr, "HTTP 404: unknown model id", false},
+		}, asr, audioMeasureUpstreamRefused, "HTTP 404: unknown model id", false},
 		{"ASR: the answer is no transcription", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/html", measureAt(900, "<html>gateway timeout</html>"))
-		}, asr, "no transcription", false},
+		}, asr, audioMeasureProtocol, "no transcription", false},
 		{"ASR: the answer is JSON without a text", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"segments":[]}`))
-		}, asr, "no transcription", false},
+		}, asr, audioMeasureProtocol, "no transcription", false},
 		{"ASR: the transcript is empty", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"  "}`))
-		}, asr, "no text", false},
+		}, asr, audioMeasureProtocol, "no text", false},
 		{"ASR: the connection breaks", func(c *measureClock) *measureUpstream {
 			return breakingAudioUpstream(c, "application/json", measureAt(900, `{"text":"der sch`))
-		}, asr, "connection reset by peer", false},
+		}, asr, audioMeasureTransport, "connection reset by peer", false},
 		{"ASR: the answer takes no time", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(0, `{"text":"hallo"}`))
-		}, asr, "no measurable time", false},
+		}, asr, audioMeasureProtocol, "no measurable time", false},
 		{"ASR: the answer is empty", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json")
-		}, asr, "the answer is empty", false},
+		}, asr, audioMeasureProtocol, "the answer is empty", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := &measureClock{}
 			up := tc.upstream(clock)
 			got, err := tc.measure(clock.measurer(), up)
-			checkAudioRefusal(t, got, err, tc.want, up, tc.sendsNothing)
+			checkAudioRefusal(t, got, err, tc.kind, tc.want, up, tc.sendsNothing)
 		})
 	}
 }
@@ -789,51 +810,57 @@ func TestMeasureASRLiveRefusals(t *testing.T) {
 		sampleRate   int
 		language     string
 		upstream     func(*measureClock) *measureUpstream
+		kind         string
 		want         string
 		sendsNothing bool
 	}{
-		{"a sample rate the live endpoint does not take", pcm, 0, "de", nil, "sample rate", true},
-		{"no audio", nil, sampleRate, "de", nil, "no audio", true},
-		{"half a sample", pcm[:3], sampleRate, "de", nil, "whole number", true},
-		{"a language that is no bare tag", pcm, sampleRate, "de&model=other", nil, "language", true},
+		{"a sample rate the live endpoint does not take", pcm, 0, "de", nil, audioMeasureInvalidInput, "sample rate", true},
+		{"no audio", nil, sampleRate, "de", nil, audioMeasureInvalidInput, "no audio", true},
+		{"half a sample", pcm[:3], sampleRate, "de", nil, audioMeasureInvalidInput, "whole number", true},
+		{"a language that is no bare tag", pcm, sampleRate, "de&model=other", nil, audioMeasureInvalidInput, "language", true},
 		{"the upstream refuses", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return refusingAudioUpstream(c, http.StatusServiceUnavailable, "live session busy")
-		}, "HTTP 503: live session busy", false},
+		}, audioMeasureUpstreamRefused, "HTTP 503: live session busy", false},
 		{"the answer is no event stream", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"der schutz"}`))
-		}, "not an event stream", false},
+		}, audioMeasureProtocol, "not an event stream", false},
 		{"the upstream reports an error mid-stream", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream",
 				measureAt(400, sseTranscriptDelta("der")),
 				measureAt(900, "data: {\"type\":\"error\",\"message\":\"Audio chunker requires positive input samples\"}\n\n"))
-		}, "Audio chunker requires positive input samples", false},
+		}, audioMeasureUpstreamRefused, "Audio chunker requires positive input samples", false},
 		{"no text at all", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(1000, sseTranscriptDone("")))
-		}, "no text", false},
+		}, audioMeasureProtocol, "no text", false},
 		{"text only after done", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream",
 				measureAt(200, sseTranscriptDelta("")),
 				measureAt(1000, fmt.Sprintf("data: {\"type\":%q,\"text\":\"\"}\n\n", transcriptionEventDone)),
 				measureAt(1300, sseTranscriptDelta("der schutz")),
 				measureAt(1400, sseTranscriptDone("der schutz")))
-		}, "no text", false},
+		}, audioMeasureProtocol, "no text", false},
 		{"cut off before done", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(400, sseTranscriptDelta("der schutz")))
-		}, "transcript.text.done", false},
+		}, audioMeasureProtocol, "transcript.text.done", false},
 		{"done without [DONE]", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream",
 				measureAt(400, sseTranscriptDelta("der schutz")),
 				measureAt(900, fmt.Sprintf("data: {\"type\":%q,\"text\":\"der schutz\"}\n\n", transcriptionEventDone)))
-		}, "[DONE]", false},
+		}, audioMeasureProtocol, "[DONE]", false},
 		{"[DONE] before done", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(400, sseTranscriptDelta("der schutz")+"data: [DONE]\n\n"))
-		}, "transcript.text.done", false},
+		}, audioMeasureProtocol, "transcript.text.done", false},
 		{"the connection breaks", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return breakingAudioUpstream(c, "text/event-stream", measureAt(400, sseTranscriptDelta("der schutz")))
-		}, "connection reset by peer", false},
+		}, audioMeasureTransport, "connection reset by peer", false},
+		{"a line past the bound", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream",
+				measureAt(400, sseTranscriptDelta(strings.Repeat("a", maxLiveSSELineBytes))),
+				measureAt(900, sseTranscriptDone("der schutz")))
+		}, audioMeasureProtocol, "longer than", false},
 		{"done the moment it was sent", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(0, sseTranscriptDelta("der")+sseTranscriptDone("der")))
-		}, "no measurable time", false},
+		}, audioMeasureProtocol, "no measurable time", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -843,14 +870,104 @@ func TestMeasureASRLiveRefusals(t *testing.T) {
 				up = tc.upstream(clock)
 			}
 			got, err := clock.measurer().measureASRLive(context.Background(), up, audioMeasureTarget(), tc.pcm, tc.sampleRate, tc.language)
-			checkAudioRefusal(t, got, err, tc.want, up, tc.sendsNothing)
+			checkAudioRefusal(t, got, err, tc.kind, tc.want, up, tc.sendsNothing)
 		})
 	}
 }
 
+// TestMeasureRefusalsCarryTheUpstreamsWords: a target that refuses the work is told apart
+// from one that failed or answered nonsense, by kind upstream_refused, and the refusal carries
+// what the upstream said -- the HTTP status of a refusal answered as one (the agent's 409 for
+// an instance it has no room for, or whose demand it does not know yet), the stable code and
+// the message, or the code and message of an error frame inside a stream. That is what lets
+// the capacity ramp tell an instance the agent refused (a limit of resources) from a level
+// that was too slow (a limit of performance).
+func TestMeasureRefusalsCarryTheUpstreamsWords(t *testing.T) {
+	pcm, sampleRate, _ := benchaudio.PCM()
+	ctx := context.Background()
+	measurements := map[string]func(audioMeasurer, *measureUpstream) (audioMeasurement, error){
+		"TTS stream": func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureTTSStream(ctx, up, audioMeasureTarget(), audioBenchmarkPassage, "", 48000)
+		},
+		"TTS buffered": func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureTTSBuffered(ctx, up, audioMeasureTarget(), audioBenchmarkPassage, "")
+		},
+		"ASR buffered": func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureASRBuffered(ctx, up, audioMeasureTarget(), benchaudio.WAV(), benchaudio.Language)
+		},
+		"ASR live": func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureASRLive(ctx, up, audioMeasureTarget(), pcm, sampleRate, benchaudio.Language)
+		},
+	}
+	check := func(t *testing.T, err error, want audioMeasureError) {
+		t.Helper()
+		var merr *audioMeasureError
+		if !errors.As(err, &merr) {
+			t.Fatalf("error %v is no audioMeasureError", err)
+		}
+		if merr.Kind != want.Kind || merr.Status != want.Status || merr.Code != want.Code || merr.Message != want.Message || merr.Err != nil {
+			t.Fatalf("error = %#v\nwant    %#v", *merr, want)
+		}
+	}
+
+	for name, measure := range measurements {
+		for _, code := range []string{"runtime.instance_no_capacity", "runtime.instance_demand_unknown"} {
+			t.Run(name+": the agent answers "+code, func(t *testing.T) {
+				clock := &measureClock{}
+				up := refusingAgentUpstream(clock, http.StatusConflict, code, code+": no room on this host")
+				got, err := measure(clock.measurer(), up)
+				checkAudioRefusal(t, got, err, audioMeasureUpstreamRefused, "HTTP 409: "+code+": no room on this host", up, false)
+				check(t, err, audioMeasureError{Kind: audioMeasureUpstreamRefused, Status: http.StatusConflict, Code: code, Message: code + ": no room on this host"})
+			})
+		}
+		t.Run(name+": a refusal with a message and no code", func(t *testing.T) {
+			clock := &measureClock{}
+			up := refusingAudioUpstream(clock, http.StatusServiceUnavailable, "model is busy")
+			_, err := measure(clock.measurer(), up)
+			check(t, err, audioMeasureError{Kind: audioMeasureUpstreamRefused, Status: http.StatusServiceUnavailable, Message: "model is busy"})
+			if err.Error() != "audio benchmark: the upstream answered HTTP 503: model is busy" {
+				t.Fatalf("error text = %q", err)
+			}
+		})
+	}
+
+	frames := []struct {
+		name, frame   string
+		code, message string
+	}{
+		{"an error object", `{"type":"error","error":{"code":"server_error","message":"out of memory"}}`, "server_error", "out of memory"},
+		{"code and message at the top", `{"type":"error","code":"busy","message":"too many sessions"}`, "busy", "too many sessions"},
+		{"a message alone", `{"type":"error","message":"Audio chunker requires positive input samples"}`, "", "Audio chunker requires positive input samples"},
+	}
+	// The frame comes between a first output and the stream's regular end, which is never
+	// read: the error frame ends the measurement.
+	streams := map[string]struct{ before, after string }{
+		"TTS stream": {sseSpeechDelta(48000), sseSpeechDone},
+		"ASR live":   {sseTranscriptDelta("der"), sseTranscriptDone("der")},
+	}
+	for name, stream := range streams {
+		for _, f := range frames {
+			t.Run(name+": an error frame with "+f.name, func(t *testing.T) {
+				clock := &measureClock{}
+				up := scriptedAudioUpstream(clock, "text/event-stream",
+					measureAt(300, stream.before),
+					measureAt(500, "data: "+f.frame+"\n\n"),
+					measureAt(800, stream.after))
+				up.body.end = errors.New("read past the end of the stream")
+				got, err := measurements[name](clock.measurer(), up)
+				checkAudioRefusal(t, got, err, audioMeasureUpstreamRefused, f.message, up, false)
+				check(t, err, audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: f.code, Message: f.message})
+				if len(up.body.chunks) != 1 {
+					t.Fatalf("%d chunk(s) left unread; want the stream given up at the error frame", len(up.body.chunks))
+				}
+			})
+		}
+	}
+}
+
 // TestMeasureAudioEntryPoints: the four production entry points read the real clock and
-// reach the upstream they are given; a transport failure comes back as their error, wrapped
-// so a caller can still tell what it was.
+// reach the upstream they are given; a transport failure comes back as their error, of kind
+// transport and wrapped so a caller can still tell what it was.
 func TestMeasureAudioEntryPoints(t *testing.T) {
 	dialErr := errors.New("dial tcp: connection refused")
 	pcm, sampleRate, _ := benchaudio.PCM()
@@ -875,6 +992,10 @@ func TestMeasureAudioEntryPoints(t *testing.T) {
 			got, err := call(up)
 			if !errors.Is(err, dialErr) || up.calls != 1 || got != (audioMeasurement{}) {
 				t.Fatalf("%s = %+v, %v after %d call(s); want the transport error after one call", name, got, err, up.calls)
+			}
+			var merr *audioMeasureError
+			if !errors.As(err, &merr) || merr.Kind != audioMeasureTransport || merr.Status != 0 {
+				t.Fatalf("%s error %v (%#v) is not a transport audioMeasureError", name, err, merr)
 			}
 		})
 	}
