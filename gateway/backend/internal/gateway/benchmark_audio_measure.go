@@ -94,8 +94,9 @@ type audioMeasurement struct {
 const (
 	// audioMeasureUpstreamRefused: the upstream answered and refused the work -- a non-2xx
 	// answer (the agent's 409 runtime.instance_no_capacity or runtime.instance_demand_unknown
-	// among them) or an error frame inside a stream. The target did not do the work, so the
-	// refusal says nothing about its speed.
+	// among them) or an error frame inside a stream: audio.cpp's own, or the agent's terminal
+	// frame with its code (sseStreamError). The target did not do the work, so the refusal
+	// says nothing about its speed.
 	audioMeasureUpstreamRefused = "upstream_refused"
 	// audioMeasureTransport: no answer came, or its body broke off -- the connection failed,
 	// or the deadline ended the call.
@@ -114,8 +115,9 @@ const (
 // returns is one (errors.As). Its kind lets a caller -- the capacity ramp above all -- tell a
 // target that refused the work (an instance the agent has no room for at that moment) from
 // one that failed or answered nonsense, and both from a slow target, which is no error but
-// figures. Unwrap gives the cause underneath, so errors.Is still finds a transport failure's
-// (context.DeadlineExceeded, provider.ErrUnavailable).
+// figures. Unwrap gives the cause underneath, so errors.Is still finds a transport failure's:
+// provider.ErrTimeout when the deadline ended the request, provider.ErrUnavailable when it
+// could not be made, and the read's own error when the body broke off.
 type audioMeasureError struct {
 	// Kind is one of the audioMeasure* kinds above.
 	Kind string
@@ -195,36 +197,56 @@ func audioStreamReadError(what string, err error, maxLine int) error {
 	return audioTransportError(what+" broke off", err)
 }
 
-// sseStreamError reads one SSE line as an error event an upstream sends inside its stream
-// ({"type":"error",...}) and reports its code and message, or false for any other line. The
-// message is the event's own "message" when it states one, else what an error object
-// says ({"error":{"message":...}}) or, failing that, the frame itself, quoted
-// (speechBenchmarkErrorText); the code is the error object's (liveErrorCode), else the
-// event's own "code".
+// sseStreamError reads one SSE line as an error frame an upstream sends inside its stream
+// and reports its code and message, or false for any other line. Two shapes are error
+// frames:
+//
+//   - an event of type "error", audio.cpp's ({"type":"error","message":...});
+//   - an event with no type that carries an error member: the envelope
+//     {"error":{"code":...,"message":...}} the agent's runtime router ends a streamed
+//     request with when it fails after it already answered 200 -- it commits a stream
+//     with keepalive comments while it waits for the instance, so a cold start that timed
+//     out, an instance address that moved meanwhile (runtime.instance_no_capacity) or a
+//     child that died mid-answer can only be this frame by then.
+//
+// An event of another type is what its type says, and an error member that is null is
+// none. The message is the event's own "message" when it states one, else the error
+// itself when it is a string, else what an error object says or, failing that, the frame
+// quoted (speechBenchmarkErrorText); the code is the error object's (liveErrorCode), else
+// the event's own "code".
 func sseStreamError(line []byte) (code, message string, ok bool) {
 	payload, found := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
 	payload = bytes.TrimSpace(payload)
-	var event struct {
-		Type string `json:"type"`
-	}
-	if !found || json.Unmarshal(payload, &event) != nil || event.Type != liveEventError {
+	if !found || len(payload) == 0 || payload[0] != '{' || !json.Valid(payload) {
 		return "", "", false
 	}
-	var top struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+	var frame struct {
+		Type    string          `json:"type"`
+		Code    string          `json:"code"`
+		Message string          `json:"message"`
+		Error   json.RawMessage `json:"error"`
 	}
-	// A field of another type is a field not stated; json decodes the others regardless.
-	_ = json.Unmarshal(payload, &top)
+	// A member of another type is a member not stated; json decodes the others regardless.
+	_ = json.Unmarshal(payload, &frame)
+	hasError := len(frame.Error) > 0 && string(frame.Error) != "null"
+	if frame.Type != liveEventError && (frame.Type != "" || !hasError) {
+		return "", "", false
+	}
 	code = liveErrorCode(payload)
-	if own := strings.TrimSpace(top.Code); code == "" && len(own) <= maxLiveRefusalCodeBytes {
+	if own := strings.TrimSpace(frame.Code); code == "" && len(own) <= maxLiveRefusalCodeBytes {
 		code = own
 	}
-	message = speechBenchmarkErrorText(payload)
-	if own := strings.TrimSpace(top.Message); own != "" {
-		message = truncateRunes(own, speechBenchmarkErrorRunes)
+	message = strings.TrimSpace(frame.Message)
+	if message == "" {
+		var text string
+		if json.Unmarshal(frame.Error, &text) == nil {
+			message = strings.TrimSpace(text)
+		}
 	}
-	return code, message, true
+	if message == "" {
+		return code, speechBenchmarkErrorText(payload), true
+	}
+	return code, truncateRunes(message, speechBenchmarkErrorRunes), true
 }
 
 // audioMeasurer runs the measurements on a clock. Production uses time.Now (the
@@ -286,7 +308,8 @@ type audioStreamSpeechRequest struct {
 // with every delta before done counted. Reading stops at any [DONE], so an upstream that
 // keeps the connection open after it cannot hold the measurement until its deadline; one
 // that comes before speech.audio.done ends a stream that has no done, and so no
-// measurement. An error frame anywhere before [DONE] is the upstream's refusal
+// measurement. An error frame anywhere before [DONE] -- audio.cpp's, or the terminal frame
+// of the agent's router after its keepalives (sseStreamError) -- is the upstream's refusal
 // (audioMeasureUpstreamRefused, with its code and message), and nothing after it is read.
 // voice is a clone model's preset voice, "" for a model that needs none.
 func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string, byteRate int) (audioMeasurement, error) {
@@ -498,8 +521,8 @@ func buildASRBenchmarkBody(model, lang string, wav []byte) ([]byte, string, erro
 // (liveByteRate, validLiveLanguage) before anything is sent: they ride in the request's
 // query, which the upstream decodes the samples by. The stream must end with
 // transcript.text.done and then [DONE], and reading stops at [DONE]; an error frame
-// anywhere before [DONE] is the upstream's refusal (audioMeasureUpstreamRefused, with its
-// code and message), and nothing after it is read.
+// anywhere before [DONE], in either shape sseStreamError reads, is the upstream's refusal
+// (audioMeasureUpstreamRefused, with its code and message), and nothing after it is read.
 func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.NativeDuplexProxyClient, target routing.Target, pcm []byte, sampleRate int, lang string) (audioMeasurement, error) {
 	byteRate, ok := liveByteRate(sampleRate, 1, liveSampleFormatS16)
 	if !ok {

@@ -380,6 +380,11 @@ func TestMeasureTTSStreamTimesFirstAudio(t *testing.T) {
 			measureAt(1300, delta),
 			measureAt(1400, "data: [DONE]\n\n"),
 		}, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
+		{"a frame with no type whose error is null is no error frame", []measureChunk{
+			measureAt(200, delta),
+			measureAt(700, "data: {\"error\":null}\n\n"),
+			measureAt(1200, sseSpeechDone),
+		}, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1020,6 +1025,11 @@ func TestMeasureRefusalsCarryTheUpstreamsWords(t *testing.T) {
 		{"an error object", `{"type":"error","error":{"code":"server_error","message":"out of memory"}}`, "server_error", "out of memory"},
 		{"code and message at the top", `{"type":"error","code":"busy","message":"too many sessions"}`, "busy", "too many sessions"},
 		{"a message alone", `{"type":"error","message":"Audio chunker requires positive input samples"}`, "", "Audio chunker requires positive input samples"},
+		{"an error that is a string", `{"type":"error","error":"the model was unloaded"}`, "", "the model was unloaded"},
+		{
+			"no type, the agent's error envelope", `{"error":{"code":"runtime.upstream_gone","message":"runtime: upstream body read failed: unexpected EOF"}}`,
+			"runtime.upstream_gone", "runtime: upstream body read failed: unexpected EOF",
+		},
 	}
 	// The frame comes between a first output and the stream's regular end, which is never
 	// read: the error frame ends the measurement.
@@ -1044,6 +1054,29 @@ func TestMeasureRefusalsCarryTheUpstreamsWords(t *testing.T) {
 				}
 			})
 		}
+	}
+
+	// The agent's runtime router answers a streamed request lazily: while it waits for the
+	// instance (a cold start, a moved address) it commits 200 and sends keepalive comments,
+	// and a failure after that can only be its terminal frame, the error envelope with no
+	// type. That frame is the refusal with the agent's code, not a stream cut short.
+	for name, stream := range streams {
+		t.Run(name+": the agent's terminal frame after its keepalives", func(t *testing.T) {
+			const message = `runtime: "voice-model#2" names something else than when the request was read; select again: runtime.instance_no_capacity`
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "text/event-stream",
+				measureAt(300, ": keepalive\n\n"),
+				measureAt(600, ": keepalive\n\n"),
+				measureAt(700, fmt.Sprintf("data: {\"error\":{\"code\":\"runtime.instance_no_capacity\",\"message\":%q}}\n\n", message)),
+				measureAt(800, stream.after))
+			up.body.end = errors.New("read past the end of the stream")
+			got, err := measurements[name](clock.measurer(), up)
+			checkAudioRefusal(t, got, err, audioMeasureUpstreamRefused, "select again", up, false)
+			check(t, err, audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: "runtime.instance_no_capacity", Message: message})
+			if len(up.body.chunks) != 1 {
+				t.Fatalf("%d chunk(s) left unread; want the stream given up at the error frame", len(up.body.chunks))
+			}
+		})
 	}
 }
 
