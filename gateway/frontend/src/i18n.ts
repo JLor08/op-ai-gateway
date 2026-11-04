@@ -1681,7 +1681,7 @@ const de = {
   runtimeLogsTabAll: 'Gesamt',
   runtimeLogsTabInstance: (k: number) => `Instanz ${k}`,
   runtimeLogsInstanceEmpty: (k: number) =>
-    `Von Instanz ${k} enthält der vorgehaltene Verlauf noch keine Ausgabe: Sie hat seither nichts geschrieben, oder ihre Ausgabe wird nicht mehr vorgehalten. Neue Ausgabe erscheint hier, sobald sie eintrifft.`,
+    `Von Instanz ${k} enthält der vorgehaltene Verlauf noch keine Ausgabe: Sie hat seit Beginn des vorgehaltenen Verlaufs nichts geschrieben, oder ihre Ausgabe wird nicht mehr vorgehalten. Neue Ausgabe erscheint hier, sobald sie eintrifft.`,
   runtimeLogsIntro:
     'Standardausgabe und Standardfehlerausgabe des Modellprozesses – bei mehreren Instanzen die jeder Instanz –, so wie sie geschrieben wurden. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
   runtimeLogsWaiting: 'Verbindung wird aufgebaut…',
@@ -5141,7 +5141,7 @@ const en: PortalMessages = {
   runtimeLogsTabAll: 'All',
   runtimeLogsTabInstance: (k: number) => `Instance ${k}`,
   runtimeLogsInstanceEmpty: (k: number) =>
-    `The retained history holds no output from instance ${k} yet: it has written nothing since, or its output is no longer retained. New output appears here as it arrives.`,
+    `The retained history holds no output from instance ${k} yet: it has written nothing since the retained history begins, or its output is no longer retained. New output appears here as it arrives.`,
   runtimeLogsIntro:
     "The stdout and stderr of this model's process (with several instances, of every instance), as they were written. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
   runtimeLogsWaiting: 'Connecting…',

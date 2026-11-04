@@ -585,7 +585,9 @@ export function RuntimeLogView({
     () => knownInstances(instances, seenInstances),
     [instances, seenInstances],
   );
-  // A spec that never ran a second instance looks exactly as it did before
+  // A replicable spec always offers its tabs, even while only instance 0 runs.
+  // A spec that is not replicable, and for which no instance k >= 1 is known
+  // (from the opening row or the open stream), looks exactly as it did before
   // instances existed: no tabs, and nothing said about instances.
   const showTabs = allInstances || tabInstances.length > 1;
   const activeTab: LogTab = showTabs ? tab : 'all';
