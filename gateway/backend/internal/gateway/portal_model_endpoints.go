@@ -66,7 +66,9 @@ func (s *Server) handlePortalModels(w http.ResponseWriter, r *http.Request) {
 // = rep.State` line one section below.
 //
 // A server counts once per model however many instances of its spec start: the set is of
-// server names, and startingCandidates returns each (server, spec) pair once.
+// server names, and startingCandidates returns each (server, spec) pair once. It does not
+// count while an instance of the spec runs there: a burst instance starting beside a running
+// one is a scale-up, not a load (startingCandidates).
 //
 // filterVisibility must match the branch this is called from, because the count has to
 // agree with the SIBLING counts on the same row (OfferedOnCount, LoadedOn), which the
@@ -159,15 +161,16 @@ func loadingCountModelKey(token auth.Token, row portal.ModelDTO, aliasesApply bo
 }
 
 // startingServerCandidate is one (server, spec) pair the runtime-status registry
-// currently reports as State == "starting", before the AllowedServerIDs visibility
-// filter and the offering check are applied.
+// currently reports as loading (startingCandidates: an instance row "starting" and none
+// "running"), before the AllowedServerIDs visibility filter and the offering check are
+// applied.
 type startingServerCandidate struct {
 	serverID string
 	specID   string
 }
 
 // startingServersByModel returns map[gatewayModelName]set-of-server-NAMES for every
-// server currently reporting a "starting" spec for that model, restricted to servers
+// server currently loading a spec for that model (startingCandidates), restricted to servers
 // that actually OFFER it and (when filterVisibility) that this principal is allowed to
 // see. injectLoadingOnCounts turns each set into a plain len() lookup per row.
 //
@@ -251,24 +254,40 @@ func (s *Server) startingServersByModel(ctx context.Context, token auth.Token, f
 }
 
 // startingCandidates walks the runtime-status registry once and returns every
-// (server, spec) pair currently reporting State == "starting", plus the DISTINCT server
-// ids among them -- the exact argument for startingServersByModel's single
-// AllowedServerIDs call. No store access at all: this reads only the in-memory registry.
+// (server, spec) pair currently LOADING the spec's model, plus the DISTINCT server ids among
+// them -- the exact argument for startingServersByModel's single AllowedServerIDs call. No
+// store access at all: this reads only the in-memory registry.
 //
-// A pair is returned once however many of the spec's instance rows start: the count is of
-// servers, and each pair costs startingCandidateOffering's point reads.
+// A server is loading a spec's model while one of the spec's instance rows there reads
+// State == "starting" and none reads "running". A burst instance that starts beside a
+// running one is a scale-up of a model that already serves on that server, not a load, so
+// routine autoscaling does not light the loading indicator; a starting instance with none
+// running (instance 0 coming up, or a burst instance while instance 0 is stopped or crashed)
+// is. A pair is returned once however many of the spec's instance rows start: the count is
+// of servers, and each pair costs startingCandidateOffering's point reads.
 func (s *Server) startingCandidates() ([]startingServerCandidate, []string) {
 	var candidates []startingServerCandidate
-	seen := map[startingServerCandidate]bool{}
 	serverIDSet := map[string]struct{}{}
 	for _, serverID := range s.RuntimeStatus.serverIDs() {
+		starting := map[string]bool{}
+		running := map[string]bool{}
+		var order []string
 		for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
-			c := startingServerCandidate{serverID: serverID, specID: dto.SpecID}
-			if dto.State != agentSpecStateStarting || seen[c] {
+			switch dto.State {
+			case agentSpecStateStarting:
+				if !starting[dto.SpecID] {
+					starting[dto.SpecID] = true
+					order = append(order, dto.SpecID)
+				}
+			case agentSpecStateRunning:
+				running[dto.SpecID] = true
+			}
+		}
+		for _, specID := range order {
+			if running[specID] {
 				continue
 			}
-			seen[c] = true
-			candidates = append(candidates, c)
+			candidates = append(candidates, startingServerCandidate{serverID: serverID, specID: specID})
 			serverIDSet[serverID] = struct{}{}
 		}
 	}
