@@ -340,11 +340,14 @@ type Request struct {
 	// PreferredInstanceKey names the gateway instance (routing.InstanceKey) this
 	// request would like to be served on: a voice chat's leg, the instance its
 	// previous turn used, so a conversation stays on the process that already holds
-	// its model warm. It is advisory: routing selects it only when it is among the
-	// candidates the selection chooses from -- through every filter they pass, the
-	// real-time gate and a held live slot included -- and under its cap, and
-	// otherwise selects as it would without it; it never refuses a request because
-	// of it. Internal only: set by the gateway from the X-OP-Preferred-Instance
+	// its model warm. It is advisory: routing selects it only when it is an instance
+	// of a replicable spec among the candidates the selection chooses from -- through
+	// every filter they pass, the real-time gate and a held live slot included --
+	// under its cap, and in the partition the selection settles on (the swap
+	// protection, and its model loaded or starting where a sibling's is), where it
+	// wins over the score; otherwise routing selects as it would without it, and a
+	// mapping without instances is never preferred. It never refuses a request
+	// because of it. Internal only: set by the gateway from the X-OP-Preferred-Instance
 	// header on the internal loopback pair a voice turn calls the gateway with,
 	// never parsed from a client body.
 	PreferredInstanceKey string `json:"-"`

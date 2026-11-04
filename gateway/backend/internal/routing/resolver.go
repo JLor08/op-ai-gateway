@@ -1968,9 +1968,7 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 	// ErrNoHealthyHost. So with every cap undefined (the under-cap subset == the full
 	// pool) this is exactly the pre-CP3 behaviour.
 	judgeLive := instancePool && r.liveSlots != nil && needsFreeLiveSlot(req)
-	if sel, ok, err := r.selectPreferred(ctx, pool, req, now, judgeLive); err != nil || ok {
-		return sel, ok, err
-	}
+	preferred := r.preferredInstance(pool, req, now, judgeLive)
 	if r.activity != nil || r.instanceActivity != nil || judgeLive {
 		capped := make([]MappingCandidate, 0, len(pool))
 		for _, c := range pool {
@@ -1988,35 +1986,52 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 			}
 			slog.Warn("capacity-cap filter empty; routing without it (all candidates at capacity)", "model", model)
 		} else if len(capped) < len(pool) {
-			if sel, ok, err := r.selectWithSwapProtection(ctx, capped, model, audio, now); err != nil || ok {
+			if sel, ok, err := r.selectWithSwapProtection(ctx, capped, model, audio, now, preferred); err != nil || ok {
 				return sel, ok, err
 			}
 			slog.Warn("capacity-cap survivors non-viable; routing without it", "model", model)
 		}
 	}
-	return r.selectWithSwapProtection(ctx, pool, model, audio, now)
+	return r.selectWithSwapProtection(ctx, pool, model, audio, now, preferred)
 }
 
-// selectPreferred serves req on the instance it prefers (inference.Request.PreferredInstanceKey)
-// when that instance is in pool -- so it passed every filter this request's candidates pass,
-// the real-time gate and an instance excluded as gone among them -- is under its cap (underCap,
-// a held live slot included when judgeLive says slots count) and is Score-viable. ok is false
-// for every other request, which is then selected as if it preferred nothing: the preference
-// only ever picks one of the candidates the plain selection could pick, ahead of the
-// partitions and the score that would rank the others, and never refuses, parks or signals
-// demand by itself. The swap protection does not apply: the preferred instance is the one the
-// session's previous turn ran on, which a swap protection would only ever keep it on.
-func (r *Resolver) selectPreferred(ctx context.Context, pool []MappingCandidate, req inference.Request, now time.Time, judgeLive bool) (MappingCandidate, bool, error) {
+// preferredInstance is the gateway instance key req prefers
+// (inference.Request.PreferredInstanceKey) when the selection may honour it, "" otherwise.
+// It may when the key names an instance candidate of pool -- an instance of a replicable
+// spec that passed every filter this request's candidates pass, the real-time gate and an
+// instance excluded as gone among them -- that is under its cap (underCap, a held live
+// slot included when judgeLive says slots count). A mapping without instances is never
+// preferred, so a spec that did not opt in is routed exactly as without a preference.
+// The key only takes the place of the score's ranking (preferScored): the cap, the swap
+// protection and the loaded and starting partitions still decide which candidates the
+// score ranks, so the preference never moves a request onto a cold or swapped-out model
+// or evicts one in use, and it never refuses, parks or signals demand by itself.
+func (r *Resolver) preferredInstance(pool []MappingCandidate, req inference.Request, now time.Time, judgeLive bool) string {
 	if req.PreferredInstanceKey == "" {
-		return MappingCandidate{}, false, nil
+		return ""
 	}
 	i := slices.IndexFunc(pool, func(c MappingCandidate) bool {
-		return InstanceKey(c.Mapping.ID, c.Instance) == req.PreferredInstanceKey
+		return c.InstanceCapable && InstanceKey(c.Mapping.ID, c.Instance) == req.PreferredInstanceKey
 	})
 	if i < 0 || !r.underCap(pool[i], now, judgeLive) {
-		return MappingCandidate{}, false, nil
+		return ""
 	}
-	return r.argmaxByScore(ctx, pool[i:i+1], req.Model, audioRequest(req), now)
+	return req.PreferredInstanceKey
+}
+
+// preferScored selects from pool, a partition the selection settled on, the candidate
+// whose gateway instance key is preferred (preferredInstance) when pool holds it and it is
+// Score-viable, and the best-scoring candidate otherwise. An empty preferred is
+// argmaxByScore.
+func (r *Resolver) preferScored(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time, preferred string) (MappingCandidate, bool, error) {
+	if preferred != "" {
+		if i := slices.IndexFunc(pool, func(c MappingCandidate) bool { return InstanceKey(c.Mapping.ID, c.Instance) == preferred }); i >= 0 {
+			if sel, ok, err := r.argmaxByScore(ctx, pool[i:i+1], model, audio, now); err != nil || ok {
+				return sel, ok, err
+			}
+		}
+	}
+	return r.argmaxByScore(ctx, pool, model, audio, now)
 }
 
 // neverParks reports whether req must be answered without waiting in the admission
@@ -2052,12 +2067,12 @@ func (r *Resolver) selectWithoutParking(ctx context.Context, ac *atCapacityError
 	ok := false
 	var err error
 	if least := leastLoadedInstances(ac.pool, r.instanceActivity); len(least) > 0 {
-		if sel, ok, err = r.selectWithSwapProtection(ctx, least, model, audio, now); err != nil {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, least, model, audio, now, ""); err != nil {
 			return MappingCandidate{}, false, err
 		}
 	}
 	if !ok {
-		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, audio, now); err != nil || !ok {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, audio, now, ""); err != nil || !ok {
 			return MappingCandidate{}, false, err
 		}
 	}
@@ -2152,8 +2167,9 @@ func instanceDemand(pool []MappingCandidate, req inference.Request) *DemandSigna
 // protected (serving the requested model is no swap). Fail-open on BOTH emptiness AND
 // viability: if protection removes some candidates but the survivors yield no viable pick
 // (or it removes them all), fall back to the full pool rather than refuse a request a busy
-// server could still serve. Gated on r.activity != nil (the no-op invariant).
-func (r *Resolver) selectWithSwapProtection(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
+// server could still serve. Gated on r.activity != nil (the no-op invariant). preferred
+// is as for preferScored, applied only within the partition selected here.
+func (r *Resolver) selectWithSwapProtection(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time, preferred string) (MappingCandidate, bool, error) {
 	if r.activity != nil {
 		protected := make([]MappingCandidate, 0, len(pool))
 		for _, c := range pool {
@@ -2164,19 +2180,20 @@ func (r *Resolver) selectWithSwapProtection(ctx context.Context, pool []MappingC
 		if len(protected) == 0 {
 			slog.Warn("swap-protection filter empty; routing without it", "model", model)
 		} else if len(protected) < len(pool) {
-			if sel, ok, err := r.selectFromPool(ctx, protected, model, audio, now); err != nil || ok {
+			if sel, ok, err := r.selectFromPool(ctx, protected, model, audio, now, preferred); err != nil || ok {
 				return sel, ok, err
 			}
 			slog.Warn("swap-protection survivors non-viable; routing without it", "model", model)
 		}
 	}
-	return r.selectFromPool(ctx, pool, model, audio, now)
+	return r.selectFromPool(ctx, pool, model, audio, now, preferred)
 }
 
 // selectFromPool applies the prefer-loaded partition (dominant, fail-open) and then the
-// bounded-tiebreak score to choose a candidate from pool. Returns ok=false if no
-// candidate in pool is viable (Score gate).
-func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
+// bounded-tiebreak score to choose a candidate from pool -- or, within the chosen
+// partition, the preferred instance when it is there and viable (preferScored). Returns
+// ok=false if no candidate in pool is viable (Score gate).
+func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time, preferred string) (MappingCandidate, bool, error) {
 	// Prefer already-loaded (DOMINANT over the score): if any candidate in the pool has
 	// the requested model resident on its server, prefer that partition — avoiding a cold
 	// load/swap. When loaded state is unknown (nil checker / no data), no candidate is
@@ -2194,7 +2211,7 @@ func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, 
 			}
 		}
 		if len(loadedPool) > 0 {
-			if sel, ok, err := r.argmaxByScore(ctx, loadedPool, model, audio, now); err != nil || ok {
+			if sel, ok, err := r.preferScored(ctx, loadedPool, model, audio, now, preferred); err != nil || ok {
 				return sel, ok, err
 			}
 		}
@@ -2214,12 +2231,12 @@ func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, 
 			}
 		}
 		if len(startingPool) > 0 {
-			if sel, ok, err := r.argmaxByScore(ctx, startingPool, model, audio, now); err != nil || ok {
+			if sel, ok, err := r.preferScored(ctx, startingPool, model, audio, now, preferred); err != nil || ok {
 				return sel, ok, err
 			}
 		}
 	}
-	return r.argmaxByScore(ctx, pool, model, audio, now)
+	return r.preferScored(ctx, pool, model, audio, now, preferred)
 }
 
 // swapProtected reports whether routing to candidate c would evict a live model: c's
