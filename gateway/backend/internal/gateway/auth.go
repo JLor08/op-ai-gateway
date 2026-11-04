@@ -59,11 +59,12 @@ const (
 	// read instance keys back.
 	preferredInstanceHeaderName = "X-OP-Preferred-Instance"
 
-	// servedInstanceHeaderName answers a request whose preferred instance was honoured
-	// with the gateway instance key the request was actually routed to, so the voice
-	// session learns where its leg ran and prefers that instance next time
-	// (markServedInstance). It is written only for such a request, so it never reaches a
-	// client outside the loopback.
+	// servedInstanceHeaderName answers a request that named a preferred instance on the
+	// internal loopback pair with the gateway instance key of the instance it was
+	// actually routed to -- an instance of a replicable spec, never a mapping without
+	// instances -- so the voice session learns where its leg ran and prefers that
+	// instance next time (markServedInstance). It is written only for such a request, so
+	// it never reaches a client outside the loopback.
 	servedInstanceHeaderName = "X-OP-Served-Instance"
 )
 

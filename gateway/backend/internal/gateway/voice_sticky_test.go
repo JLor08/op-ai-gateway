@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"slices"
@@ -354,4 +355,36 @@ func TestPreferredHeaderIgnoredOutsideLoopback(t *testing.T) {
 			t.Fatalf("chat served on %q, want %s#1", got[len(got)-1], liveInstChatUp)
 		}
 	})
+}
+
+// Only an instance of a replicable spec is remembered or reported: a leg whose target is
+// a mapping without instances names no preference, and /v1 tells no caller where such a
+// request ran, so a voice chat on mappings that did not opt in is routed turn by turn as
+// any other request.
+func TestVoiceStickinessOnlyForInstances(t *testing.T) {
+	claims := voiceTicketClaims{
+		ASR: routing.Target{InstanceKey: "route-asr#1", InstanceCapable: true},
+		LLM: routing.Target{InstanceKey: "route-chat#0"},
+		TTS: routing.Target{InstanceKey: "route-tts#0", InstanceCapable: true},
+	}
+	sticky := newVoiceStickiness(claims)
+	for leg, want := range map[voiceLeg]string{voiceLegASR: "route-asr#1", voiceLegLLM: "", voiceLegTTS: "route-tts#0"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/x", nil)
+		sticky.prefer(req, leg)
+		if got := req.Header.Get(preferredInstanceHeaderName); got != want {
+			t.Fatalf("leg %s prefers %q, want %q", leg, got, want)
+		}
+	}
+
+	preferring := inference.Request{PreferredInstanceKey: "route-chat#0"}
+	plain := httptest.NewRecorder()
+	markServedInstance(plain, preferring, routing.Target{InstanceKey: "route-chat#0"})
+	if got := plain.Header().Get(servedInstanceHeaderName); got != "" {
+		t.Fatalf("served on a mapping without instances: %s = %q, want none", servedInstanceHeaderName, got)
+	}
+	inst := httptest.NewRecorder()
+	markServedInstance(inst, preferring, routing.Target{InstanceKey: "route-chat#2", InstanceCapable: true})
+	if got := inst.Header().Get(servedInstanceHeaderName); got != "route-chat#2" {
+		t.Fatalf("served on an instance: %s = %q, want route-chat#2", servedInstanceHeaderName, got)
+	}
 }
