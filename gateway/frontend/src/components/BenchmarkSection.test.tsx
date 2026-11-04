@@ -1596,6 +1596,45 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(benchmarkMapping).toHaveBeenCalledWith('map_tts', 'both'));
     });
 
+    // The VRAM measurement loads the model without a chat prompt, so an
+    // audio-only mapping keeps it: Start stays, without the refusal hint, and
+    // the run goes to the VRAM probe.
+    it('keeps the VRAM run for an audio-only mapping and starts it through probeMappingVram', async () => {
+      const probeMappingVram = vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram'];
+      renderSection(
+        { kind: 'mapping', id: 'map_tts', name: 'tts-model' },
+        { ...audioOnlyMapping, probeMappingVram },
+      );
+      await screen.findByText(t.benchmarkAudioOnlyHint);
+      await pickOption(t.benchmarkType, t.benchmarkTypeVram);
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      expect(start).not.toHaveAccessibleDescription();
+      fireEvent.click(start);
+      await waitFor(() => expect(probeMappingVram).toHaveBeenCalledWith('map_tts'));
+    });
+
+    // A vision run over a scope whose every mapping serves only audio is the
+    // one the gateway still refuses with benchmark.audio_only: the notice
+    // shows the refusal in the operator's words, which name vision and not
+    // the speed or capacity runs that now measure audio.
+    it("shows the gateway's audio-only refusal of a vision run in its own words", async () => {
+      const benchmarkApplication = vi.fn(async () => {
+        throw new PortalApiError(409, 'benchmark.audio_only', 'raw server text');
+      }) as unknown as PortalApi['benchmarkApplication'];
+      renderSection(
+        { kind: 'application', id: 'app_1', name: 'app' },
+        { ...audioOnlyMapping, benchmarkApplication },
+      );
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      await pickOption(t.benchmarkType, t.benchmarkTypeVision);
+      fireEvent.click(screen.getByRole('button', { name: t.benchmarkStart }));
+      await waitFor(() => expect(benchmarkApplication).toHaveBeenCalledWith('app_1', 'vision'));
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent(t.errorBenchmarkAudioOnly);
+      expect(alert).not.toHaveTextContent('raw server text');
+    });
+
     it('leaves the application scope startable although its first mapping is audio-only', async () => {
       const benchmarkApplication = vi.fn(
         async () => idle,

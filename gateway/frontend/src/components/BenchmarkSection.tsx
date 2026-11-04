@@ -109,12 +109,16 @@ function refusedModesFor(refusal: 'images_only' | 'audio_only' | null): Readonly
 /**
  * Why the mapping the model scope is set to cannot take a chat prompt, if it
  * cannot: it serves images only (`images_only`) or audio only (`audio_only`),
- * or null when neither marker is set. A mapping carrying both is reported as
- * images-only: the form shows one hint, and that sentence names a flavor that
- * holds. Only the model scope asks: the application and server scopes run
- * each mapping as its kind allows, and the gateway answers
- * `benchmark.images_only` for one whose every mapping serves only images, so
- * there is nothing to run.
+ * or null when neither marker is set. Which runs that refuses is
+ * refusedModesFor's: every chat-prompt run for images-only, vision alone for
+ * audio-only, since speed, capacity and both measure an audio mapping's audio
+ * (#340). A mapping carrying both is reported as images-only: the form shows
+ * one hint, and that sentence names a flavor that holds. Only the model scope
+ * asks: the application and server scopes run each mapping as its kind
+ * allows, and the gateway answers `benchmark.images_only` for a chat-prompt
+ * run whose every mapping serves only images, and `benchmark.audio_only` for
+ * a vision run whose every mapping serves only audio, so there is nothing to
+ * run.
  */
 function selectedMappingChatRefusal(
   scopeKind: ScopeKind,

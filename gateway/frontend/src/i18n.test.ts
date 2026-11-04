@@ -1031,14 +1031,35 @@ describe('images-only and Load-refusal i18n keys', () => {
       expect(t[key].toLowerCase()).not.toContain(locale === 'de' ? 'sprache' : 'speech');
     });
 
+    // Since #340 speed, capacity and both measure an audio-only mapping's
+    // audio, so a wider scope is refused this way only for a vision run.
     it(`names the whole-scope case in the audio-only refusal (${locale})`, () => {
       const sentence =
         locale === 'de'
-          ? 'Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Audio bereitstellt.'
-          : 'An application or server run is refused this way when every model in it only serves audio.';
+          ? 'Eine Vision-Messung über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes ihrer Modelle nur Audio bereitstellt.'
+          : 'A vision run over an application or server is refused this way when every model in it only serves audio.';
       expect(t.errorBenchmarkAudioOnly.endsWith(` ${sentence}`), t.errorBenchmarkAudioOnly).toBe(
         true,
       );
+    });
+
+    // The refusal names only what an audio-only mapping still cannot do --
+    // the context size and the vision run, which send a chat prompt, and a
+    // Load the agent does not start -- and says that speed, capacity and both
+    // run, measuring its audio.
+    it(`names only the runs an audio-only mapping cannot do in its refusal (${locale})`, () => {
+      const text = t.errorBenchmarkAudioOnly;
+      if (locale === 'de') {
+        expect(text).not.toMatch(/Geschwindigkeit, Kapazität und Vision/);
+        expect(text).toMatch(/Geschwindigkeit, Kapazität und Beide messen seine Audio-Leistung/);
+        expect(text).toMatch(/Kontextgröße und die Vision-Messung/);
+        expect(text).toMatch(/„Laden“/);
+      } else {
+        expect(text).not.toMatch(/speed, capacity and vision/i);
+        expect(text).toMatch(/Speed, capacity and both measure its audio performance/);
+        expect(text).toMatch(/context size and the vision run/);
+        expect(text).toMatch(/"Load"/);
+      }
     });
 
     it(`labels the skipped audio-only result as a skip, distinct from the images one (${locale})`, () => {
