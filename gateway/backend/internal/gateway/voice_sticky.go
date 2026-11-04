@@ -88,7 +88,8 @@ func (v *voiceStickiness) observe(resp *http.Response, leg voiceLeg) {
 // markServedInstance tells the caller of a request that preferred an instance
 // (inference.Request.PreferredInstanceKey -- set only on the internal loopback pair) which
 // instance it was routed to, on the response w is about to write, when that is an instance
-// of a replicable spec (stickyInstance). Every other request is answered as before. It
+// of a replicable spec (stickyInstance) -- the preferred one or, when routing passed the
+// preference over, the one it chose instead. Every other request is answered as before. It
 // must run before the response's headers are written; a relay that
 // moves the request onto another instance afterwards reports the first one, which the
 // leg then prefers next time and routing passes over when it is gone.

@@ -63,8 +63,10 @@ const (
 	// internal loopback pair with the gateway instance key of the instance it was
 	// actually routed to -- an instance of a replicable spec, never a mapping without
 	// instances -- so the voice session learns where its leg ran and prefers that
-	// instance next time (markServedInstance). It is written only for such a request, so
-	// it never reaches a client outside the loopback.
+	// instance next time (markServedInstance). It is written whenever such a request
+	// carried a preference, whether routing honoured it or routed the request to
+	// another instance (which the leg then follows), and only for such a request, so it
+	// never reaches a client outside the loopback.
 	servedInstanceHeaderName = "X-OP-Served-Instance"
 )
 
