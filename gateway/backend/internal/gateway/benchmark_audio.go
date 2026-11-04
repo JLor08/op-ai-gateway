@@ -14,6 +14,7 @@ import (
 	"op-ai-gateway/internal/benchaudio"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -72,6 +73,12 @@ const (
 	audioRampNoCapacityCode    = "runtime.instance_no_capacity"
 	audioRampDemandUnknownCode = "runtime.instance_demand_unknown"
 )
+
+// audioRampNotManagedCode is the agent router's answer to an instance address m#k its spec
+// does not allow: the spec is not replicable in the document the agent holds. A ramp by
+// instance meets it only while the restore it wrote (audioRampReplicableAgain) is still on
+// its way to the agent, and waits it out (ensureAudioInstance).
+const audioRampNotManagedCode = "runtime.model_not_managed"
 
 // audioTarget is what makes a benchmarkTarget an audio target: the role its capability rows
 // name and whether it streams. The zero value is a target that is not one.
@@ -461,7 +468,9 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 // the ramp as a failed benchmark, with the levels it measured.
 //
 // The ramp writes no override: the instances it starts are ordinary burst instances
-// afterwards, which the agent unloads once they idle.
+// afterwards, which the agent unloads once they idle. It needs its spec replicable, so in a
+// both run that holds the spec as one process for its speed part, the ramp by instance first
+// makes it replicable again (audioRampReplicableAgain).
 func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, onLevel func(int)) (audioCapacityResult, error) {
 	var res audioCapacityResult
 	call, err := s.audioCallFor(ctx, tgt)
@@ -469,6 +478,12 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 		return res, err
 	}
 	byInstance := s.audioRampByInstance(tgt)
+	restored := false
+	if byInstance {
+		if restored, err = s.audioRampReplicableAgain(ctx, tgt); err != nil {
+			return res, err
+		}
+	}
 	capK := s.audioRampCap()
 	if byInstance && tgt.spec.MaxInstances > 0 {
 		capK = min(capK, tgt.spec.MaxInstances)
@@ -483,7 +498,7 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 			fresh := call
 			if byInstance {
 				fresh.target.ProviderModel = audioInstanceAddress(tgt.mapping.AppModelName, k-1)
-				if err := s.ensureAudioInstance(ctx, fresh.target); err != nil {
+				if err := s.ensureAudioInstance(ctx, fresh.target, restored); err != nil {
 					return audioRampStop(res, k, err)
 				}
 			}
@@ -582,19 +597,68 @@ func audioLevelOf(k int, rates []float64) audioLevel {
 
 // ensureAudioInstance starts the agent instance target addresses through the agent router's
 // ensure route and returns once it runs. The router starts a burst instance only into free
-// room, evicting nothing, and refuses it otherwise (audioRefusedForRoom). The call is bounded
+// room, evicting nothing, and refuses it otherwise (audioRefusedForRoom). Each call is bounded
 // like a load (newLoadBound) and carries the target's credential.
-func (s *Server) ensureAudioInstance(ctx context.Context, target routing.Target) error {
+//
+// After the ramp's own restore (restored), the agent may still hold the document that runs
+// the spec as one process, and refuses an instance address with 404
+// runtime.model_not_managed until the restore reaches it -- over its stream at once, or at
+// its next poll. That refusal is retried every coldLoadPollGap for as long as the stop path
+// waits for a document to reach an agent (benchmarkStopWaitBound); any other answer, and
+// that one once the bound is spent, is the ensure's.
+func (s *Server) ensureAudioInstance(ctx context.Context, target routing.Target, restored bool) error {
 	ensurer, ok := s.Provider.(provider.RuntimeEnsurer)
 	if !ok {
 		return errBenchmarkNoRuntimeEnsure
 	}
+	deadline := time.Now().Add(benchmarkStopWaitBound)
+	for {
+		err := s.ensureAudioInstanceOnce(ctx, ensurer, target)
+		var rerr *provider.RouterError
+		if err == nil || !restored || !errors.As(err, &rerr) || rerr.Code != audioRampNotManagedCode {
+			return err
+		}
+		if time.Until(deadline) <= coldLoadPollGap || !sleepCtx(ctx, coldLoadPollGap) {
+			return err
+		}
+	}
+}
+
+// ensureAudioInstanceOnce is one ensure of ensureAudioInstance.
+func (s *Server) ensureAudioInstanceOnce(ctx context.Context, ensurer provider.RuntimeEnsurer, target routing.Target) error {
 	ctx, cancel := context.WithTimeout(ctx, s.newLoadBound(target).length)
 	defer cancel()
 	if err := ensurer.EnsureRuntimeModel(s.upstreamAuthCtx(ctx, target), target); err != nil {
 		return fmt.Errorf("ensure %s: %w", target.ProviderModel, err)
 	}
 	return nil
+}
+
+// audioRampReplicableAgain makes tgt's spec replicable again before its ramp by instance when
+// the run holds it as one process -- a manual both run, whose speed part measured it alone
+// (beginBenchmarkSingleProcess) -- and reports whether it took the spec out of the run's
+// override lease: the agent refuses every instance address of a spec it holds as not
+// replicable, and the ramp is the measurement of exactly those instances. The write is the
+// restore the run's end would make (restoreBenchmarkReplicable), made now, and the lease is
+// rewritten without the spec, so the end does not make it again. A restore that failed leaves
+// the spec in the lease for the run's end and fails the ramp: one process cannot be measured
+// as instances. A target the run does not hold as one process needs nothing.
+//
+// For the rest of the run the spec is one of the server's replicable neighbours, like one
+// that is not measured at all.
+func (s *Server) audioRampReplicableAgain(ctx context.Context, tgt benchmarkTarget) (bool, error) {
+	ov := tgt.overrides
+	if ov == nil || !slices.Contains(ov.singleProcess, tgt.spec.ID) {
+		return false, nil
+	}
+	if failed := s.restoreBenchmarkReplicable(ctx, tgt.server.ID, []string{tgt.spec.ID}); len(failed) > 0 {
+		return false, fmt.Errorf("audio benchmark: launch spec %s could not be made replicable again for its concurrency ramp, which measures its instances", tgt.spec.ID)
+	}
+	ov.singleProcess = benchmarkWithout(ov.singleProcess, []string{tgt.spec.ID})
+	if err := s.writeBenchmarkLease(ctx, tgt.server.ID, ov); err != nil {
+		slog.Warn("audio benchmark: could not update the override lease after making the ramp's spec replicable again; it is rewritten when the run ends", "server_id", tgt.server.ID, "spec_id", tgt.spec.ID, "err", err)
+	}
+	return true, nil
 }
 
 // audioRefusedForRoom reports whether err is the agent refusing an instance for lack of room:

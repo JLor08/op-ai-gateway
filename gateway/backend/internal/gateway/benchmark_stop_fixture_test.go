@@ -939,7 +939,9 @@ func newStopAllFixture(t *testing.T, opts stopAllOpts) *stopAllFixture {
 		}))
 	}
 
-	svc := portal.NewService(portal.ServiceDeps{Routes: portalRoutes, SystemSettings: portal.NewMemorySystemSettings(), Clock: func() time.Time { return now }})
+	// The portal reads the agent's declared features as production wires it, so a test that
+	// declares runtime_instances gets the instance settings in the agent's document.
+	svc := portal.NewService(portal.ServiceDeps{Routes: portalRoutes, SystemSettings: portal.NewMemorySystemSettings(), AgentFeatures: srv.AgentFeatures, Clock: func() time.Time { return now }})
 	if opts.lease != nil {
 		must("SetBenchmarkOverrideLease", svc.SetBenchmarkOverrideLease(ctx, "srv1", *opts.lease))
 	}

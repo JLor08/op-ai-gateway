@@ -255,7 +255,9 @@ func benchmarkReplicableTargets(targets []benchmarkTarget, specs []routing.Runti
 // false in one batch (portal.SetBenchmarkRuntimeSpecsReplicable), so the agent
 // drains each one's other instances and its floor of protected instances, and
 // a cold start or a load is measured on the instance alone. The instance counts
-// stay stored, and endBenchmarkUnpin writes replicable = true again.
+// stay stored, and endBenchmarkUnpin writes replicable = true again -- or, in a
+// both run, the target's audio concurrency ramp does, before it measures the
+// instances (audioRampReplicableAgain).
 //   - A lease write that fails writes nothing, and the targets keep their
 //     instances: their load time is then not confirmed while another instance
 //     runs.
