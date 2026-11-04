@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"op-ai-gateway/internal/inference"
 	"strconv"
 	"strings"
@@ -2247,22 +2248,49 @@ const (
 )
 
 // ValidateAudioMetrics rejects a run that could not have come from a caller
-// behaving correctly: a ConcurrencyLimit that is neither "" (no ramp result)
-// nor one of the three stop reasons. Both UpdateMappingAudioMetrics
-// implementations call this exact function before they write anything, so
-// the drivers cannot disagree about which strings are a limit, and
-// audio_concurrency_limit only ever holds a value its readers -- the scaler
-// and the portal -- know how to read. The call is refused rather than its
-// ramp half dropped, the rule ValidateCapabilityRow follows: the benchmark
-// passes one of the constants, so anything else is a bug worth surfacing,
-// and a broken producer's other figures are not worth storing either.
+// behaving correctly: a RateX that is not a finite number of 0 or more, or a
+// ConcurrencyLimit that is neither "" (no ramp result) nor one of the three
+// stop reasons. Both UpdateMappingAudioMetrics implementations call this
+// exact function before they write anything, so the drivers cannot disagree
+// about which strings are a limit, and audio_concurrency_limit only ever
+// holds a value its readers -- the scaler and the portal -- know how to
+// read. The call is refused rather than its bad half dropped, the rule
+// ValidateCapabilityRow follows: the benchmark passes one of the constants
+// and a rate it divided out of two positive durations, so anything else is a
+// bug worth surfacing, and a broken producer's other figures are not worth
+// storing either. An infinite rate in particular would pass the writers'
+// "> 0" measured test, reach the column, and then fail every JSON encoding of
+// the mapping that carries it.
 func ValidateAudioMetrics(m AudioMetrics) error {
+	if math.IsNaN(m.RateX) || math.IsInf(m.RateX, 0) || m.RateX < 0 {
+		return fmt.Errorf("audio metrics: rate must be a finite number of 0 or more, got %v", m.RateX)
+	}
 	switch m.ConcurrencyLimit {
 	case "", AudioLimitPerformance, AudioLimitResources, AudioLimitCap:
 		return nil
 	}
 	return fmt.Errorf("audio metrics: concurrency limit must be %q, %q or %q, got %q",
 		AudioLimitPerformance, AudioLimitResources, AudioLimitCap, m.ConcurrencyLimit)
+}
+
+// ValidateMappingAudioMetrics is ValidateAudioMetrics for a whole mapping
+// row, the check the full-row writers (CreateMapping, UpdateMapping) make in
+// every driver before they store one, so the audio columns hold only what
+// UpdateMappingAudioMetrics itself could have written: a usable rate, a known
+// limit, and the ramp's count and limit as the one result they are -- a count
+// beside the reason the ramp stopped, never a count without one, and never a
+// negative level, which no ramp ends on.
+func ValidateMappingAudioMetrics(m ModelMapping) error {
+	if err := ValidateAudioMetrics(AudioMetrics{RateX: m.AudioRateX, ConcurrencyLimit: m.AudioConcurrencyLimit}); err != nil {
+		return err
+	}
+	if m.AudioRealtimeConcurrency < 0 {
+		return fmt.Errorf("audio metrics: realtime concurrency must be 0 or more, got %d", m.AudioRealtimeConcurrency)
+	}
+	if m.AudioConcurrencyLimit == "" && m.AudioRealtimeConcurrency != 0 {
+		return fmt.Errorf("audio metrics: a realtime concurrency of %d needs the concurrency limit the ramp stopped at", m.AudioRealtimeConcurrency)
+	}
+	return nil
 }
 
 // RampMeasured reports whether the run carries a concurrency-ramp result: a
@@ -2298,6 +2326,10 @@ func (m AudioMetrics) Measured() bool {
 // table's capability columns and migrations 76/77/78 all cite. See
 // CapabilityRow.
 type MappingStore interface {
+	// CreateMapping and UpdateMapping write the whole row, its audio columns
+	// included, so both refuse a row ValidateMappingAudioMetrics refuses
+	// before they write anything: those columns hold only what
+	// UpdateMappingAudioMetrics could have stored.
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	// UpdateMapping, like UpdateMappingEditable below, is one of the two
 	// writers of app_model_name, and both drop the mapping's model_mapping_cache

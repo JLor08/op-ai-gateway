@@ -9107,7 +9107,7 @@ func TestConformanceUpdateMappingEditable(t *testing.T) {
 		}
 
 		// On a LOCKED mapping, a supplied metric is STILL written -- unlike the
-		// five narrow probe writers, UpdateMappingEditable has no metrics_locked
+		// six narrow metric writers, UpdateMappingEditable has no metrics_locked
 		// guard, because a supplied value is the operator's own manual entry.
 		locked := got2
 		locked.MetricsLocked = true

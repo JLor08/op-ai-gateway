@@ -1049,6 +1049,9 @@ func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 }
 
 func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) error {
+	if err := ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.mappings[mapping.ID]; ok {
@@ -1062,6 +1065,9 @@ func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) err
 }
 
 func (m *MemoryStore) UpdateMapping(_ context.Context, mapping ModelMapping) error {
+	if err := ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	stored, ok := m.mappings[mapping.ID]

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"op-ai-gateway/internal/routing"
 	"path/filepath"
 	"reflect"
@@ -806,7 +807,7 @@ func TestRoutingStoreUpdateMappingBenchmarkMetricsKeepsUnmeasured(t *testing.T) 
 // TestRoutingStoreMappingAudioMetrics proves memory, sqlite and postgres agree
 // on UpdateMappingAudioMetrics (migration 101), the audio benchmark's writer
 // and the audio analogue of UpdateMappingBenchmarkMetrics: it writes only what
-// a run measured -- a zero or negative rate, TTFA or load time is "not
+// a run measured -- a zero rate, a zero or negative TTFA or load time is "not
 // measured" and keeps the stored column, alone or beside a figure that was
 // measured -- writes load_time_ms only from a positive LoadTimeMS, and writes
 // the concurrency ramp's count and limit as the one result they are:
@@ -815,7 +816,8 @@ func TestRoutingStoreUpdateMappingBenchmarkMetricsKeepsUnmeasured(t *testing.T) 
 // metrics_source with the caller's source and both metrics_updated_at and
 // audio_metrics_updated_at with the caller's time, writes nothing at all
 // (provenance included) for a call that measured nothing, refuses a limit
-// that is not one of the three stop reasons without writing anything, never
+// that is not one of the three stop reasons, and a rate that is negative or
+// not a finite number, without writing anything, never
 // touches the text metrics, and leaves a mapping whose metrics are LOCKED
 // exactly as it was. Routing and the scaler read the figures from the
 // candidate, so the ActiveMappingsForModel join is held to MappingByID on
@@ -958,8 +960,7 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 		// with the other half of an older ramp.
 		for _, nothing := range []routing.AudioMetrics{
 			{},
-			{RateX: -1, TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3},
-			{RateX: -1},
+			{TTFAMS: -5, RealtimeConcurrency: -2, LoadTimeMS: -3},
 			{TTFAMS: -5},
 			{LoadTimeMS: -3},
 			{RealtimeConcurrency: 4},
@@ -981,8 +982,8 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 
 		// A figure that was not measured keeps its column even beside one that
 		// was: the guards are per field, not per call.
-		write(t, routing.AudioMetrics{RateX: -1, TTFAMS: 300}, "audio_speed", at(10))
-		check(t, "a negative rate beside a measured TTFA", audio{1.75, 300, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(10))
+		write(t, routing.AudioMetrics{RateX: 0, TTFAMS: 300}, "audio_speed", at(10))
+		check(t, "a zero rate beside a measured TTFA", audio{1.75, 300, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(10))
 		write(t, routing.AudioMetrics{RateX: 2.25, TTFAMS: -5}, "audio_speed", at(11))
 		check(t, "a negative TTFA beside a measured rate", audio{2.25, 300, 0, routing.AudioLimitResources, 4800}, "audio_speed", at(11))
 		write(t, routing.AudioMetrics{RateX: 2, LoadTimeMS: -7}, "audio_speed", at(12))
@@ -992,16 +993,20 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 		write(t, routing.AudioMetrics{RealtimeConcurrency: 5, LoadTimeMS: 4500}, "audio_speed", at(14))
 		measured := check(t, "a ramp count without its reason beside a measured load time", audio{2, 280, 0, routing.AudioLimitResources, 4500}, "audio_speed", at(14))
 
-		// A limit that is not one of the three stop reasons is refused, and the
-		// call writes nothing at all -- not the figures beside it, not the
-		// provenance -- whether or not its ramp half would otherwise count.
+		// A limit that is not one of the three stop reasons, and a rate that is
+		// negative or not a finite number, are refused, and the call writes
+		// nothing at all -- not the figures beside it, not the provenance --
+		// whether or not its ramp half would otherwise count.
 		for _, bad := range []routing.AudioMetrics{
 			{RealtimeConcurrency: 3, ConcurrencyLimit: "throughput"},
 			{RateX: 9, TTFAMS: 1, LoadTimeMS: 1, RealtimeConcurrency: 2, ConcurrencyLimit: "Performance"},
 			{RealtimeConcurrency: -1, ConcurrencyLimit: " cap"},
+			{RateX: -1, TTFAMS: 1},
+			{RateX: math.NaN(), TTFAMS: 1},
+			{RateX: math.Inf(1)},
 		} {
 			if err := s.UpdateMappingAudioMetrics(ctx, "m_aud", bad, "audio_refused", at(15)); err == nil {
-				t.Fatalf("UpdateMappingAudioMetrics(%+v) = nil, want the unknown limit refused", bad)
+				t.Fatalf("UpdateMappingAudioMetrics(%+v) = nil, want it refused", bad)
 			}
 			unchanged(t, fmt.Sprintf("a refused write (%+v)", bad), measured)
 		}
@@ -3203,4 +3208,90 @@ func TestModelMappingCacheInvalidatedWhenAppModelNameChanges(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestRoutingStoreMappingFullRowAudioValidation proves memory, sqlite and
+// postgres agree that the full-row mapping writers hold the audio columns to
+// what UpdateMappingAudioMetrics could have written
+// (routing.ValidateMappingAudioMetrics): CreateMapping and UpdateMapping
+// refuse a row with an unknown concurrency limit, a ramp count without its
+// limit, a negative ramp level, or a rate that is negative or not a finite
+// number, and store nothing -- a refused create leaves no row, a refused
+// update leaves the stored one as it was. Every shape the audio writer stores
+// itself goes through both.
+func TestRoutingStoreMappingFullRowAudioValidation(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_row", Name: "Row", Domain: "row.example.test", Provider: routing.ProviderAudioCpp,
+			Endpoint: "http://row.example.test:8080", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_row", ServerID: "srv_row", Type: routing.ProviderAudioCpp, Port: 8080, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		row := func(id string) routing.ModelMapping {
+			return routing.ModelMapping{
+				ID: id, ApplicationID: "app_row", GatewayModelName: "row-" + id, AppModelName: "up-" + id,
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+		}
+		good := row("m_good")
+		good.AudioRateX, good.AudioTTFAMS = 2.5, 380
+		good.AudioRealtimeConcurrency, good.AudioConcurrencyLimit = 3, routing.AudioLimitResources
+		if err := s.CreateMapping(ctx, good); err != nil {
+			t.Fatalf("CreateMapping (a valid audio row): %v", err)
+		}
+		zero := row("m_zero")
+		zero.AudioConcurrencyLimit = routing.AudioLimitPerformance
+		if err := s.CreateMapping(ctx, zero); err != nil {
+			t.Fatalf("CreateMapping (a ramp that measured 0): %v", err)
+		}
+
+		bad := []struct {
+			name   string
+			mutate func(*routing.ModelMapping)
+		}{
+			{"an unknown limit", func(m *routing.ModelMapping) { m.AudioConcurrencyLimit = "throughput" }},
+			{"a count without its limit", func(m *routing.ModelMapping) {
+				m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit = 2, ""
+			}},
+			{"a negative level", func(m *routing.ModelMapping) { m.AudioRealtimeConcurrency = -1 }},
+			{"a negative rate", func(m *routing.ModelMapping) { m.AudioRateX = -1 }},
+			{"a rate that is not a number", func(m *routing.ModelMapping) { m.AudioRateX = math.NaN() }},
+			{"an infinite rate", func(m *routing.ModelMapping) { m.AudioRateX = math.Inf(1) }},
+		}
+		for i, tc := range bad {
+			created := row(fmt.Sprintf("m_bad_%d", i))
+			tc.mutate(&created)
+			if err := s.CreateMapping(ctx, created); err == nil {
+				t.Fatalf("CreateMapping (%s) = nil, want it refused", tc.name)
+			}
+			if _, err := s.MappingByID(ctx, created.ID); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("CreateMapping (%s): MappingByID err = %v, want ErrNotFound (nothing stored)", tc.name, err)
+			}
+			updated := good
+			updated.UpdatedAt = now.Add(time.Minute)
+			tc.mutate(&updated)
+			if err := s.UpdateMapping(ctx, updated); err == nil {
+				t.Fatalf("UpdateMapping (%s) = nil, want it refused", tc.name)
+			}
+			stored, err := s.MappingByID(ctx, good.ID)
+			if err != nil {
+				t.Fatalf("MappingByID: %v", err)
+			}
+			if stored.AudioRateX != 2.5 || stored.AudioTTFAMS != 380 || stored.AudioRealtimeConcurrency != 3 ||
+				stored.AudioConcurrencyLimit != routing.AudioLimitResources || !stored.UpdatedAt.Equal(now) {
+				t.Fatalf("UpdateMapping (%s) changed the stored row: %+v", tc.name, stored)
+			}
+		}
+	})
 }

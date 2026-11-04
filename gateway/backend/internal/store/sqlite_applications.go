@@ -185,7 +185,12 @@ func (s *SQLiteStore) DeleteApplication(ctx context.Context, id string) error {
 	return requireAffected(result)
 }
 
+// CreateMapping inserts the whole row; a row routing.ValidateMappingAudioMetrics
+// refuses is an error before any statement.
 func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMapping) error {
+	if err := routing.ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	_, err := s.exec(ctx, `
 		insert into model_mappings (
 			id, application_id, gateway_model_name, app_model_name, status,
@@ -267,7 +272,13 @@ func (s *SQLiteStore) updateMappingRow(ctx context.Context, mapping routing.Mode
 	return tx.Commit()
 }
 
+// UpdateMapping rewrites the whole row; a row
+// routing.ValidateMappingAudioMetrics refuses is an error before any
+// statement, so the stored row and its cache rows stay as they were.
 func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMapping) error {
+	if err := routing.ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	return s.updateMappingRow(ctx, mapping, "update mapping", `
 		update model_mappings
 		set application_id = ?, gateway_model_name = ?, app_model_name = ?,
