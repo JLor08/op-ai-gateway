@@ -180,6 +180,19 @@ func mappingSpecIsAudioOnly(app routing.Application, spec routing.RuntimeSpec, h
 	return routing.FlavorsAreAudioOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors)
 }
 
+// AudioTargetFlavors is the flavor half of the decision whether a mapping is an audio target
+// of the speed, capacity and both modes (benchmarkViewTarget): its EFFECTIVE flavors serve
+// audio only -- not images-only, and no text flavor, so a chat model that also transcribes
+// or speaks keeps its text benchmark -- and the gateway routes it audio requests
+// (routing.MappingServesAPIFlavor for openai_audio). Whether it is one then depends on its
+// capability rows. It reads nothing but its arguments (the spec the caller read, hasSpec
+// whether the mapping has one), so the app-health loop applies it before it reads any
+// capability row of a mapping it asks the automatic audio run about.
+func AudioTargetFlavors(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) bool {
+	return !mappingSpecIsImagesOnly(app, spec, hasSpec) && mappingSpecIsAudioOnly(app, spec, hasSpec) &&
+		routing.MappingServesAPIFlavor(app, routing.EffectiveFields(app, spec, hasSpec), routing.APIFlavorOpenAIAudio)
+}
+
 // loadRefusal is the one decision whether a Load of a mapping can succeed:
 // "" when it can, else one of the loadRefusal* reasons. It reads nothing but
 // its arguments: the mapping's application, the spec the caller already read
@@ -358,8 +371,8 @@ func (e *benchmarkViewUnreadable) Unwrap() error { return e.err }
 //     or transcription verdict as well -- an omni model that also transcribes, say -- keeps
 //     its text benchmark, and its capability rows are not read.
 //   - With measureAudio, an audio-only view the gateway would route audio to
-//     (routing.MappingServesAPIFlavor for openai_audio, on its effective flavors) has its
-//     capability rows read: one whose role is speech or transcription is an audio target
+//     (AudioTargetFlavors) has its capability rows read: one whose role is speech or
+//     transcription is an audio target
 //     (audioTargetOf), and a TTS clone model synthesizes with its preset voice
 //     (speechBenchmarkPresetVoice) -- one with no preset cannot synthesize without a
 //     reference and is skipped (benchmarkSkippedSpeechClone).
@@ -377,7 +390,7 @@ func (s *Server) benchmarkViewTarget(ctx context.Context, v portal.BenchmarkTarg
 	if !mappingSpecIsAudioOnly(v.App, spec, hasSpec) {
 		return s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec), "", nil
 	}
-	if measureAudio && routing.MappingServesAPIFlavor(v.App, routing.EffectiveFields(v.App, spec, hasSpec), routing.APIFlavorOpenAIAudio) {
+	if measureAudio && AudioTargetFlavors(v.App, spec, hasSpec) {
 		rows, err := s.Routes.MappingCapabilities(ctx, v.Mapping.ID)
 		if err != nil {
 			return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewCapabilities, err: err}

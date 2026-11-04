@@ -1185,8 +1185,10 @@ func TestServerBothRunCoversTextAndAudio(t *testing.T) {
 // TestAutoAudioRunOnceWhenMissing: the health loop's one-time automatic run starts a both run
 // for an audio mapping on an idle server that has no audio metrics yet, or that is replicable
 // and has no ramp result yet, at most once per mapping per process -- the second health tick
-// starts nothing, whatever the first run did. A mapping with metrics, a replicable one with a
-// ramp result (a measured 0 included) and a locked one never start one.
+// starts nothing, whatever the first run did, and is told the mapping is settled. A mapping
+// with metrics, a replicable one with a ramp result (a measured 0 included) and a locked one
+// never start one; each is deferred, which the loop's own rule already keeps it from asking
+// about again.
 func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 	stamp := audioFixtureNow
 	for _, tc := range []struct {
@@ -1195,13 +1197,13 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 		metricsAt  *time.Time
 		limit      string
 		locked     bool
-		want       bool
+		want       AudioAutoRunAnswer
 	}{
-		{"no audio metrics yet", false, nil, "", false, true},
-		{"replicable without a ramp result", true, &stamp, "", false, true},
-		{"replicable with a measured 0", true, &stamp, routing.AudioLimitPerformance, false, false},
-		{"metrics present, not replicable", false, &stamp, "", false, false},
-		{"locked", false, nil, "", true, false},
+		{"no audio metrics yet", false, nil, "", false, AudioAutoRunStarted},
+		{"replicable without a ramp result", true, &stamp, "", false, AudioAutoRunStarted},
+		{"replicable with a measured 0", true, &stamp, routing.AudioLimitPerformance, false, AudioAutoRunDeferred},
+		{"metrics present, not replicable", false, &stamp, "", false, AudioAutoRunDeferred},
+		{"locked", false, nil, "", true, AudioAutoRunDeferred},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: tc.replicable, locked: tc.locked, features: []string{"runtime_manager"}})
@@ -1217,7 +1219,7 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 			if first != tc.want {
 				t.Fatalf("first tick = %v, want %v", first, tc.want)
 			}
-			if !first {
+			if first != AudioAutoRunStarted {
 				if f.srv.Benchmarks.ServerBusy("srv1") || len(f.script.recorded()) != 0 {
 					t.Fatal("a run was reserved or measured although none was started")
 				}
@@ -1228,8 +1230,8 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 			if st.Mode != "both" || st.Scope != benchmarkScopeAudioAuto || len(st.Results) != 1 {
 				t.Fatalf("status = %+v, want one both run of scope %q", st, benchmarkScopeAudioAuto)
 			}
-			if second := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); second {
-				t.Fatal("second tick started another run")
+			if second := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); second != AudioAutoRunSettled {
+				t.Fatalf("second tick = %v, want settled: the mapping's one run was started", second)
 			}
 		})
 	}
@@ -1239,12 +1241,12 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureTransport, Message: "connection refused"}
 		}
 		ctx := context.Background()
-		if !f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("first tick started nothing")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("first tick = %v, want started", got)
 		}
 		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
-		if f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("the failed mapping was started again")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunSettled {
+			t.Fatalf("second tick = %v, want settled: the failed mapping is not started again", got)
 		}
 	})
 	t.Run("an agent not heard from since the gateway started defers", func(t *testing.T) {
@@ -1252,12 +1254,12 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 		// declared features, so the run waits until they are known.
 		f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: true})
 		ctx := context.Background()
-		if f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("started a run before the agent's features were known")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunDeferred {
+			t.Fatalf("answer before the agent's features were known = %v, want deferred", got)
 		}
 		f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager", runtimeInstancesFeature})
-		if !f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("the deferred mapping was not started once the features were known")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("answer once the features were known = %v, want started", got)
 		}
 		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
 	})
@@ -1267,15 +1269,15 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 		f := newAudioFixture(t, audioFixtureOpts{agent: true, features: []string{"runtime_manager"}})
 		ctx := context.Background()
 		f.srv.Active.Add(ActiveRequest{ID: "req_live", ServerName: f.server.Name, APIFlavor: "openai_audio", StartedAt: time.Now()})
-		if f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("started a run on a server with a request in flight")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunDeferred {
+			t.Fatalf("answer on a server with a request in flight = %v, want deferred", got)
 		}
 		if f.srv.Benchmarks.ServerBusy("srv1") || len(f.script.recorded()) != 0 {
 			t.Fatal("the deferred trigger kept the reservation or measured")
 		}
 		f.srv.Active.Remove("req_live")
-		if !f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("the deferred mapping was not started once the server was idle")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("answer once the server was idle = %v, want started", got)
 		}
 		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
 	})
@@ -1285,12 +1287,61 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 		if _, ok := f.srv.Benchmarks.TryStart("srv1", "mapping", "speed", 1, time.Now().UTC(), func() {}); !ok {
 			t.Fatal("TryStart")
 		}
-		if f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("started a run on a busy server")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunDeferred {
+			t.Fatalf("answer on a busy server = %v, want deferred", got)
 		}
 		f.srv.Benchmarks.Release("srv1")
-		if !f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
-			t.Fatal("the deferred mapping was not started once the server was free")
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("answer once the server was free = %v, want started", got)
+		}
+		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
+	})
+}
+
+// TestAutoAudioRunSettlesWhatItWillAlwaysRefuse: the trigger tells the health loop which
+// refusals to remember. A mapping it refuses for what the mapping is -- a chat model with an
+// audio verdict (it keeps its text benchmark), a clone model with no preset voice -- is
+// settled: asking again would be refused again, so the loop stops asking. A mapping with no
+// speech or transcription verdict yet is deferred: the verdict arrives by itself. None of them
+// reserves the server or is measured.
+func TestAutoAudioRunSettlesWhatItWillAlwaysRefuse(t *testing.T) {
+	yes := routing.CapabilityYes
+	chatApp := func(app routing.Application) routing.Application {
+		app.APIFlavors = []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}
+		return app
+	}
+	same := func(app routing.Application) routing.Application { return app }
+	for _, tc := range []struct {
+		name string
+		caps []routing.CapabilityRow
+		app  func(routing.Application) routing.Application
+		want AudioAutoRunAnswer
+	}{
+		{"a chat model that also transcribes", []routing.CapabilityRow{sbCap(routing.CapabilityTranscription, yes, audioFixtureNow)}, chatApp, AudioAutoRunSettled},
+		{"a clone model without a preset voice", []routing.CapabilityRow{sbCap(routing.CapabilitySpeech, yes, audioFixtureNow), sbCap(routing.CapabilitySpeechClone, yes, audioFixtureNow)}, same, AudioAutoRunSettled},
+		{"no speech or transcription verdict yet", []routing.CapabilityRow{sbCap(routing.CapabilitySpeech, routing.CapabilityNo, audioFixtureNow)}, same, AudioAutoRunDeferred},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAudioFixture(t, audioFixtureOpts{caps: tc.caps})
+			if got := f.srv.TriggerAudioBenchmark(context.Background(), f.server, tc.app(f.app), f.mapping(t)); got != tc.want {
+				t.Fatalf("answer = %v, want %v", got, tc.want)
+			}
+			if f.srv.Benchmarks.ServerBusy("srv1") || len(f.script.recorded()) != 0 {
+				t.Fatal("a refused mapping reserved the server or was measured")
+			}
+		})
+	}
+	t.Run("a clone model whose presets are cached later is started then", func(t *testing.T) {
+		f := newAudioFixture(t, audioFixtureOpts{caps: []routing.CapabilityRow{sbCap(routing.CapabilitySpeech, yes, audioFixtureNow), sbCap(routing.CapabilitySpeechClone, yes, audioFixtureNow)}})
+		ctx := context.Background()
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunSettled {
+			t.Fatalf("answer without presets = %v, want settled", got)
+		}
+		if err := f.mem.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: "map1", CacheType: routing.ModelMappingCacheVoices, Payload: `["alba"]`, UpdatedAt: audioFixtureNow}); err != nil {
+			t.Fatalf("UpsertModelMappingCache: %v", err)
+		}
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("answer with a preset cached = %v, want started: the gateway remembers no refusal itself", got)
 		}
 		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
 	})

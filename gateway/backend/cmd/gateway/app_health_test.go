@@ -7493,7 +7493,7 @@ func TestBuildGatewayServerBindsTheAudioBenchmarkTrigger(t *testing.T) {
 		t.Fatalf("seed capabilities: %v", err)
 	}
 
-	if !runner.audioBenchmark(ctx, server, app, mp) {
+	if runner.audioBenchmark(ctx, server, app, mp) != gateway.AudioAutoRunStarted {
 		t.Fatal("the runner's trigger was refused by a Server with an eligible mapping: it is not bound to srv.TriggerAudioBenchmark")
 	}
 	if st := srv.Benchmarks.Status("s1"); st.Mode != "both" || st.Scope != "audio-auto" {

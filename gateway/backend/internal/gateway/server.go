@@ -306,7 +306,8 @@ type ServerDeps struct {
 	// SetAudioBenchmarkTrigger is the same wiring conduit for the app-health loop's
 	// one-time automatic audio benchmark: cmd/gateway's buildGatewayServer calls it ONCE
 	// with the just-built Server's TriggerAudioBenchmark, and until then the loop's
-	// trigger answers false (nothing started). Server never stores or reads this field.
+	// trigger answers AudioAutoRunDeferred (nothing started, ask again). Server never
+	// stores or reads this field.
 	// nil is correct for any Server built without cmd/gateway.
 	SetAudioBenchmarkTrigger func(AudioBenchmarkTrigger)
 	// SetSpeechRateTrigger is the same wiring conduit for the app-health loop: it
@@ -515,8 +516,8 @@ type Server struct {
 	// script the exact figures a run stores. Production leaves it nil.
 	audioMeasureSeam func(ctx context.Context, call audioMeasureCall) (audioMeasurement, error)
 	// audioAutoRuns remembers the mappings the health loop's one-time automatic audio
-	// benchmark was started for in this process (TriggerAudioBenchmark). Its zero value
-	// is ready.
+	// benchmark was started for in this process (TriggerAudioBenchmark). The refusals the
+	// trigger settles are remembered by the loop, not here. Its zero value is ready.
 	audioAutoRuns audioAutoRunMarker
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).

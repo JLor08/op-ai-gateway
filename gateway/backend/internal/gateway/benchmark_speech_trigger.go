@@ -96,7 +96,45 @@ const benchmarkScopeAudioAuto = "audio-auto"
 
 // AudioBenchmarkTrigger is the signature of Server.TriggerAudioBenchmark, which the app-health
 // loop holds bound late, like SpeechRateTrigger (ServerDeps.SetAudioBenchmarkTrigger).
-type AudioBenchmarkTrigger func(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) bool
+type AudioBenchmarkTrigger func(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) AudioAutoRunAnswer
+
+// AudioAutoRunAnswer is TriggerAudioBenchmark's answer about one mapping. Beside whether a
+// run was started, it tells the app-health loop whether asking about the mapping again could
+// start one, so the loop does not ask -- and read the mapping's spec and capability rows --
+// on every tick about a mapping the gateway will always refuse.
+type AudioAutoRunAnswer int
+
+const (
+	// AudioAutoRunDeferred: nothing was started, for a reason that can pass by itself or that
+	// the loop's own rule watches: another run holds the server, it has requests in flight, the
+	// agent has not declared its features since the gateway started, a read failed, the
+	// mapping has no speech or transcription verdict yet, or it is inactive, locked or no
+	// longer lacks what the run measures (AudioAutoRunWanted). The loop asks again later.
+	AudioAutoRunDeferred AudioAutoRunAnswer = iota
+	// AudioAutoRunStarted: the mapping's one run was launched.
+	AudioAutoRunStarted
+	// AudioAutoRunSettled: nothing was started, and asking again would be refused again unless
+	// the mapping itself changes: its one run was started already in this process (it is not
+	// started twice, however it ended), or it is refused for what it is -- a chat model or one
+	// that serves only images is no audio target, and a clone model with no preset voice
+	// cannot synthesize without a reference. Its flavors and model change only by an
+	// operator's edit; a clone model's presets reach the voices cache through the loop's own
+	// write, which the loop watches. The gateway itself remembers only the started runs.
+	AudioAutoRunSettled
+)
+
+// String names the answer, for logs and test failures.
+func (a AudioAutoRunAnswer) String() string {
+	switch a {
+	case AudioAutoRunDeferred:
+		return "deferred"
+	case AudioAutoRunStarted:
+		return "started"
+	case AudioAutoRunSettled:
+		return "settled"
+	}
+	return "unknown"
+}
 
 // audioAutoRunMarker remembers which mappings the one-time automatic audio benchmark was
 // started for in this process. Its zero value is ready, and it is safe for concurrent use:
@@ -147,44 +185,63 @@ func AudioAutoRunWanted(mapping routing.ModelMapping, replicable bool) bool {
 // when the server is found quiet (agentColdStart).
 //
 // Like TriggerSpeechRateBenchmark it decides, reserves and launches, and the run goes on in its
-// own goroutine. It answers true only when a run was launched, and false for everything else:
-//   - the mapping is not active, its metrics are locked (nothing would be written), it is no
-//     audio target, a read failed, or it already has what the run measures
-//     (AudioAutoRunWanted);
+// own goroutine. It answers AudioAutoRunStarted only when a run was launched. It answers
+// AudioAutoRunSettled, and the loop does not ask about the mapping again, when:
 //   - its run was started already in this process: once per mapping, so a run that fails
 //     -- an upstream that cannot synthesize, say -- does not start again on every tick;
+//   - it is no audio target for what it is: a chat model (it keeps its text benchmark, even
+//     with an audio verdict), one that serves only images, or a clone model that lists no
+//     preset voice (benchmarkSkippedSpeechClone).
+//
+// It answers AudioAutoRunDeferred, and the loop asks again on a later tick, for everything
+// else, none of which uses up the mapping's one run:
+//   - the mapping is not active, its metrics are locked (nothing would be written), or it
+//     already has what the run measures (AudioAutoRunWanted) -- what the loop checks itself;
+//   - a read failed, or it has no speech or transcription verdict yet (it arrives by itself);
 //   - the mapping's agent has not declared its features since the gateway started: whether a
 //     replicable spec is ramped one instance per stream depends on them (runtime_instances),
 //     and a run against an agent that has not reported would fail;
-//   - another run holds the server's slot, or the server has requests in flight. These last
-//     two, and the agent's features, do not use up the mapping's one run: the loop asks again
-//     on a later tick.
-func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) bool {
-	if s == nil || s.Routes == nil || mapping.Status != routing.ServerStatusActive || mapping.MetricsLocked || s.audioAutoRuns.done(mapping.ID) {
-		return false
+//   - another run holds the server's slot, or the server has requests in flight.
+func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) AudioAutoRunAnswer {
+	if s == nil || s.Routes == nil || mapping.Status != routing.ServerStatusActive || mapping.MetricsLocked {
+		return AudioAutoRunDeferred
+	}
+	if s.audioAutoRuns.done(mapping.ID) {
+		return AudioAutoRunSettled
 	}
 	if app.Type == routing.ProviderServerAgent && !s.AgentFeatures.Known(server.ID) {
-		return false
+		return AudioAutoRunDeferred
 	}
 	tgt, skipped, err := s.benchmarkViewTarget(ctx, portal.BenchmarkTargetView{Server: server, App: app, Mapping: mapping}, true)
-	if err != nil || skipped != "" || tgt.audio.role == "" || !AudioAutoRunWanted(mapping, tgt.spec.Replicable) {
-		return false
+	switch {
+	case err != nil:
+		return AudioAutoRunDeferred
+	case skipped == benchmarkSkippedImagesOnly, skipped == benchmarkSkippedSpeechClone, skipped == "" && tgt.audio.role == "":
+		slog.Debug("audio benchmark not started by the health loop: the mapping is no audio target it can measure", "mapping_id", mapping.ID, "skipped", skipped)
+		return AudioAutoRunSettled
+	case skipped != "", !AudioAutoRunWanted(mapping, tgt.spec.Replicable):
+		return AudioAutoRunDeferred
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	run, ok := s.Benchmarks.TryStart(server.ID, benchmarkScopeAudioAuto, "both", 1, time.Now().UTC(), cancel)
 	if !ok {
 		cancel()
-		return false
+		return AudioAutoRunDeferred
 	}
-	if (s.Active != nil && s.Active.CountByServerName(server.Name) > 0) || !s.audioAutoRuns.claim(mapping.ID) {
+	if s.Active != nil && s.Active.CountByServerName(server.Name) > 0 {
 		s.Benchmarks.Release(server.ID)
 		cancel()
-		return false
+		return AudioAutoRunDeferred
+	}
+	if !s.audioAutoRuns.claim(mapping.ID) {
+		s.Benchmarks.Release(server.ID)
+		cancel()
+		return AudioAutoRunSettled
 	}
 	slog.Info("audio benchmark started by the health loop", "mapping_id", mapping.ID, "server_id", server.ID)
 	go func() {
 		defer cancel()
 		s.runBenchmark(runCtx, run, server.ID, []benchmarkTarget{tgt}, "both")
 	}()
-	return true
+	return AudioAutoRunStarted
 }

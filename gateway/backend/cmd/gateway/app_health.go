@@ -290,6 +290,14 @@ type appHealthRunner struct {
 	// (startAudioBenchmarks): in production a late-bound handle on the gateway Server's
 	// TriggerAudioBenchmark, like speechRate. Nil is valid and means the step is off.
 	audioBenchmark gateway.AudioBenchmarkTrigger
+	// audioBenchmarkSettled remembers the mappings the automatic audio benchmark is settled
+	// for in this process: their run was started, or the gateway refused them for what they
+	// are (gateway.AudioAutoRunSettled). startAudioBenchmarks neither asks about them nor
+	// reads anything for them again until the gateway restarts -- except that a changed voices
+	// list this loop writes for one (writeVoicesCache) forgets it, because a clone model's
+	// presets are the one fact of such a refusal that changes without an operator's edit.
+	// Its zero value is ready; the runner is used by pointer, never copied.
+	audioBenchmarkSettled mappingSet
 	// speechRateBackoff remembers which mappings had a speech rate benchmark started
 	// lately, so one that produced no rate is retried after speechRateRetryBackoff
 	// and not on every tick. Its zero value is ready; the runner is used by
@@ -302,6 +310,38 @@ type appHealthRunner struct {
 	// is its own read that can fail independently. Its zero value is ready; the
 	// runner is used by pointer, never copied.
 	speechParamsBackoff mappingBackoff
+}
+
+// mappingSet is a set of mapping ids, safe for concurrent use: the loop's per-server cycles
+// and its probe goroutines share it. Its zero value is ready.
+type mappingSet struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+// has reports whether mappingID is in the set.
+func (m *mappingSet) has(mappingID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.ids[mappingID]
+	return ok
+}
+
+// add puts mappingID in the set.
+func (m *mappingSet) add(mappingID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ids == nil {
+		m.ids = map[string]struct{}{}
+	}
+	m.ids[mappingID] = struct{}{}
+}
+
+// remove takes mappingID out of the set, if it is in it.
+func (m *mappingSet) remove(mappingID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.ids, mappingID)
 }
 
 // lateSpeechRateTrigger is the app-health runner's handle on the gateway Server's
@@ -320,7 +360,8 @@ func (l *lateSpeechRateTrigger) set(fn gateway.SpeechRateTrigger) { l.fn.Store(&
 
 // lateAudioBenchmarkTrigger is lateSpeechRateTrigger for the one-time automatic audio
 // benchmark: the runner's handle on the gateway Server's TriggerAudioBenchmark, which answers
-// false (nothing started) until set binds it (ServerDeps.SetAudioBenchmarkTrigger).
+// gateway.AudioAutoRunDeferred (nothing started, ask again) until set binds it
+// (ServerDeps.SetAudioBenchmarkTrigger).
 type lateAudioBenchmarkTrigger struct {
 	fn atomic.Pointer[gateway.AudioBenchmarkTrigger]
 }
@@ -329,10 +370,10 @@ type lateAudioBenchmarkTrigger struct {
 func (l *lateAudioBenchmarkTrigger) set(fn gateway.AudioBenchmarkTrigger) { l.fn.Store(&fn) }
 
 // trigger is the gateway.AudioBenchmarkTrigger the runner calls: the bound one, or a refusal.
-func (l *lateAudioBenchmarkTrigger) trigger(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) bool {
+func (l *lateAudioBenchmarkTrigger) trigger(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) gateway.AudioAutoRunAnswer {
 	fn := l.fn.Load()
 	if fn == nil || *fn == nil {
-		return false
+		return gateway.AudioAutoRunDeferred
 	}
 	return (*fn)(ctx, server, app, mapping)
 }
@@ -1358,6 +1399,9 @@ func (r *appHealthRunner) writeVoicesCache(ctx context.Context, mappingID string
 	}); err != nil {
 		return false, fmt.Errorf("write the voices cache: %w", err)
 	}
+	// A clone model's presets decide whether the automatic audio benchmark can measure it,
+	// so a mapping that benchmark had settled is asked about again (audioBenchmarkSettled).
+	r.audioBenchmarkSettled.remove(mappingID)
 	return true, nil
 }
 
@@ -2452,15 +2496,29 @@ func deriveServerHealth(activeCount, reachableCount int) string {
 
 // startAudioBenchmarks is the health loop's step for the gateway's one-time automatic audio
 // benchmark (#340): for every reachable audio.cpp or server_agent application of the server,
-// it asks r.audioBenchmark about each speech or transcription mapping that still lacks what
-// the run measures, until one run is started -- a run holds the server, so asking further
-// this cycle would only be refused. The verdicts are the stored capability rows (speech or
-// transcription yes), the ones the static audio.cpp pass writes and the agent reports. What
-// the mapping lacks is the gateway's own rule (gateway.AudioAutoRunWanted, through
-// audioBenchmarkWanted), so a mapping the trigger would refuse for it -- one with metrics
-// whose spec is not replicable, say -- is not asked about on every tick. Everything else is
-// the gateway's decision: whether the mapping is an audio target, the once-per-process rule
-// and the idle gate. The step only asks; with no trigger wired it does nothing at all.
+// it asks r.audioBenchmark about each audio mapping that still lacks what the run measures,
+// until one run is started -- a run holds the server, so asking further this cycle would only
+// be refused. It asks only where the gateway could start a run, by the gateway's own rules and
+// with the cheapest read first:
+//   - the mapping alone (audioBenchmarkCandidate): active, unlocked, and lacking what the run
+//     measures at least if its spec is replicable (gateway.AudioAutoRunWanted);
+//   - its effective flavors (gateway.AudioTargetFlavors, from the application and the launch
+//     spec, the specs read once per application and cycle): it serves audio only and is
+//     routed audio. A chat model with an audio verdict keeps its text benchmark and is never
+//     asked about, and its capability rows are never read;
+//   - the rule with its spec (gateway.AudioAutoRunWanted): a mapping with metrics but no ramp
+//     result is wanted only on a replicable spec;
+//   - its stored capability rows: a speech or transcription verdict, the ones the static
+//     audio.cpp pass writes and the agent reports.
+//
+// The gateway's answer decides whether the mapping is asked about again. A started run and a
+// settled refusal (gateway.AudioAutoRunSettled: the run was started already, or the mapping is
+// a clone model without a preset voice, say) are remembered in r.audioBenchmarkSettled, and
+// nothing is read for the mapping again until the process restarts or this loop writes a
+// changed voices list for it. A deferred mapping (another run, live traffic, the agent's
+// features not known yet) is asked about again on the next cycle. Everything else is the
+// gateway's decision: the clone model's preset, the once-per-process rule and the idle gate.
+// With no trigger wired the step does nothing at all.
 func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routing.AIServer, active []routing.Application, reachable []bool) {
 	if r.audioBenchmark == nil {
 		return
@@ -2476,7 +2534,14 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 		}
 		specs := r.audioBenchmarkSpecs(app)
 		for _, mp := range mappings {
-			if !audioBenchmarkCandidate(mp) {
+			if r.audioBenchmarkSettled.has(mp.ID) || !audioBenchmarkCandidate(mp) {
+				continue
+			}
+			spec, hasSpec, err := specs(ctx, mp.ID)
+			if err != nil {
+				continue
+			}
+			if !gateway.AudioTargetFlavors(app, spec, hasSpec) || !gateway.AudioAutoRunWanted(mp, spec.Replicable) {
 				continue
 			}
 			rows, err := r.store.MappingCapabilities(ctx, mp.ID)
@@ -2488,11 +2553,12 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 			if byName[routing.CapabilitySpeech].Verdict != routing.CapabilityYes && byName[routing.CapabilityTranscription].Verdict != routing.CapabilityYes {
 				continue
 			}
-			if wanted, ok := audioBenchmarkWanted(ctx, mp, specs); !ok || !wanted {
-				continue
-			}
-			if r.audioBenchmark(ctx, server, app, mp) {
+			switch r.audioBenchmark(ctx, server, app, mp) {
+			case gateway.AudioAutoRunStarted:
+				r.audioBenchmarkSettled.add(mp.ID)
 				return
+			case gateway.AudioAutoRunSettled:
+				r.audioBenchmarkSettled.add(mp.ID)
 			}
 		}
 	}
@@ -2502,7 +2568,7 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 // benchmark measures, from the mapping alone: it is active and unlocked, and the gateway's
 // rule (gateway.AudioAutoRunWanted) holds for it at least if its spec is replicable. A ramp
 // result, a measured 0 included, carries its limit, so a mapping with one is never asked
-// about again.
+// about again, and its spec is not read for it.
 func audioBenchmarkCandidate(mp routing.ModelMapping) bool {
 	if mp.Status != routing.ServerStatusActive || mp.MetricsLocked || mp.AppModelName == "" {
 		return false
@@ -2510,49 +2576,40 @@ func audioBenchmarkCandidate(mp routing.ModelMapping) bool {
 	return gateway.AudioAutoRunWanted(mp, true)
 }
 
-// audioBenchmarkSpecReader is one application's launch specs for the automatic audio
-// benchmark's rule, read at most once per cycle and only when a mapping's answer depends on
-// them. An application that is not server_agent has none.
-type audioBenchmarkSpecReader func(ctx context.Context) ([]routing.RuntimeSpec, error)
+// audioBenchmarkSpecReader answers one mapping's launch spec for the automatic audio
+// benchmark's rules -- (spec, hasSpec, err), like the gateway's own read -- from its
+// application's specs, which are read at most once per cycle and only once a candidate needs
+// them. An application that is not server_agent has none: (zero, false, nil). A failed read
+// is logged once and answered for every mapping of the application; the mappings are then
+// not asked about this cycle.
+type audioBenchmarkSpecReader func(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error)
 
 // audioBenchmarkSpecs is app's audioBenchmarkSpecReader.
 func (r *appHealthRunner) audioBenchmarkSpecs(app routing.Application) audioBenchmarkSpecReader {
 	var (
-		read  bool
-		specs []routing.RuntimeSpec
-		err   error
+		read      bool
+		byMapping map[string]routing.RuntimeSpec
+		err       error
 	)
-	return func(ctx context.Context) ([]routing.RuntimeSpec, error) {
+	return func(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
 		if app.Type != routing.ProviderServerAgent {
-			return nil, nil
+			return routing.RuntimeSpec{}, false, nil
 		}
 		if !read {
 			read = true
-			specs, err = r.store.RuntimeSpecsByApplication(ctx, app.ID)
+			var specs []routing.RuntimeSpec
+			if specs, err = r.store.RuntimeSpecsByApplication(ctx, app.ID); err != nil {
+				slog.Debug("app health: launch specs for the automatic audio benchmark failed", "app_id", app.ID, "error", err)
+			}
+			byMapping = make(map[string]routing.RuntimeSpec, len(specs))
+			for _, spec := range specs {
+				byMapping[spec.MappingID] = spec
+			}
 		}
-		return specs, err
-	}
-}
-
-// audioBenchmarkWanted is the gateway's rule (gateway.AudioAutoRunWanted) for a candidate
-// mapping (audioBenchmarkCandidate): a mapping with no audio metrics is wanted whatever its
-// spec, and one with metrics but no ramp result only when its launch spec is replicable,
-// which is read for that case alone. ok is false when that read failed: the mapping is then
-// not asked about this cycle.
-func audioBenchmarkWanted(ctx context.Context, mp routing.ModelMapping, specs audioBenchmarkSpecReader) (wanted, ok bool) {
-	if gateway.AudioAutoRunWanted(mp, false) {
-		return true, true
-	}
-	all, err := specs(ctx)
-	if err != nil {
-		slog.Debug("app health: launch specs for the automatic audio benchmark failed", "mapping_id", mp.ID, "error", err)
-		return false, false
-	}
-	replicable := false
-	for _, spec := range all {
-		if spec.MappingID == mp.ID {
-			replicable = spec.Replicable
+		if err != nil {
+			return routing.RuntimeSpec{}, false, err
 		}
+		spec, ok := byMapping[mappingID]
+		return spec, ok, nil
 	}
-	return gateway.AudioAutoRunWanted(mp, replicable), true
 }
