@@ -289,6 +289,7 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 		{errBenchmarkImagesOnly, "benchmark.images_only", "this model, or every model in the run's scope, serves only images, so no chat prompt is sent"},
 		{errBenchmarkAudioOnly, "benchmark.audio_only", "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"},
 		{errBenchmarkAudioUnmeasurable, "benchmark.speech_unavailable", "this model, or every model in the run's scope, serves audio only and cannot be measured yet: it has no speech or transcription verdict, or it clones a voice and lists no preset voice"},
+		{errBenchmarkScopeUnmeasurable, "benchmark.speech_unavailable", "no model in the run's scope can be measured: each serves only images, or serves audio only and cannot be measured yet (it has no speech or transcription verdict, or it clones a voice and lists no preset voice)"},
 		{errBenchmarkAgentEnsureUnsupported, "benchmark.agent_ensure_unsupported", "this model serves only images, and starting it without a chat prompt needs the agent feature runtime_ensure (agent 0.8.0 or newer), or the agent has not reported since the gateway restarted"},
 		{errBenchmarkSpecForceStopped, "benchmark.spec_force_stopped", "this model's runtime spec is force-stopped; clear the admin override before loading it"},
 	} {
@@ -519,7 +520,7 @@ func TestRefuseNothingRunnableNamesTheSkippedKind(t *testing.T) {
 		{"every view audio the run cannot measure", benchmarkViewPartition{audioUnmeasurable: 2}, http.StatusConflict, codeBenchmarkSpeechUnavailable},
 		{"every view images-only", benchmarkViewPartition{imagesOnly: 2}, http.StatusConflict, codeBenchmarkImagesOnly},
 		{"images-only and audio-only views", benchmarkViewPartition{imagesOnly: 1, audioOnly: 1}, http.StatusConflict, codeBenchmarkImagesOnly},
-		{"images-only and unmeasurable audio views", benchmarkViewPartition{imagesOnly: 1, audioUnmeasurable: 1}, http.StatusConflict, codeBenchmarkImagesOnly},
+		{"images-only and unmeasurable audio views", benchmarkViewPartition{imagesOnly: 1, audioUnmeasurable: 1}, http.StatusConflict, codeBenchmarkSpeechUnavailable},
 		{"no view skipped", benchmarkViewPartition{}, http.StatusConflict, codeBenchmarkImagesOnly},
 		{"an unreadable view beside an audio-only one", benchmarkViewPartition{audioOnly: 1, unreadable: 1}, http.StatusInternalServerError, codeBenchmarkRequestFailed},
 		{"an unreadable view beside an unmeasurable audio one", benchmarkViewPartition{audioUnmeasurable: 1, unreadable: 1}, http.StatusInternalServerError, codeBenchmarkRequestFailed},
@@ -535,6 +536,11 @@ func TestRefuseNothingRunnableNamesTheSkippedKind(t *testing.T) {
 			}
 			if rec.Code != tc.status || body.Error.Code != tc.code {
 				t.Fatalf("answer = %d %q, want %d %q", rec.Code, body.Error.Code, tc.status, tc.code)
+			}
+			// The message names what the scope holds: a scope mixing images-only views with
+			// audio it cannot measure is told about both, not that every model serves images.
+			if tc.part.imagesOnly > 0 && tc.part.audioUnmeasurable > 0 && body.Error.Message != msgBenchmarkScopeUnmeasurable {
+				t.Fatalf("message = %q, want %q", body.Error.Message, msgBenchmarkScopeUnmeasurable)
 			}
 		})
 	}

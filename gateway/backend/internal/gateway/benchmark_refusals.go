@@ -63,6 +63,16 @@ const (
 	// that lists no preset voice, so it cannot synthesize without a reference.
 	msgBenchmarkAudioUnmeasurable = "this model, or every model in the run's scope, serves audio only and cannot be measured yet: it has no speech or transcription verdict, or it clones a voice and lists no preset voice"
 
+	// msgBenchmarkScopeUnmeasurable is codeBenchmarkSpeechUnavailable's message for a
+	// speed, capacity or both run whose scope has nothing runnable and mixes the two kinds
+	// that cannot be measured (refuseNothingRunnable): views that serve only images and
+	// audio-only views whose audio cannot be measured yet. Neither single-kind answer would
+	// be true -- images_only would tell the operator that the audio model serves images --
+	// so the message names both, under the audio code: an audio model is in the scope, and
+	// what it lacks (a verdict, a preset voice) is what can still change. The portal shows
+	// this code's message as it is.
+	msgBenchmarkScopeUnmeasurable = "no model in the run's scope can be measured: each serves only images, or serves audio only and cannot be measured yet (it has no speech or transcription verdict, or it clones a voice and lists no preset voice)"
+
 	// codeBenchmarkAgentEnsureUnsupported: an images-only agent child loads
 	// only through the agent's ensure route, and the server's agent has not
 	// declared runtime_ensure. That is an older agent, or one that has not
@@ -86,6 +96,7 @@ var (
 	errBenchmarkAudioOnly              = errors.New(codeBenchmarkAudioOnly)
 	errBenchmarkSpeechUnavailable      = errors.New(codeBenchmarkSpeechUnavailable)
 	errBenchmarkAudioUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (audio)")
+	errBenchmarkScopeUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (images and audio)")
 	errBenchmarkAgentEnsureUnsupported = errors.New(codeBenchmarkAgentEnsureUnsupported)
 	errBenchmarkSpecForceStopped       = errors.New(codeBenchmarkSpecForceStopped)
 )
@@ -416,20 +427,28 @@ func (p benchmarkViewPartition) refuseNothingRunnableFor(w http.ResponseWriter, 
 }
 
 // refuseNothingRunnable answers a partition with no runnable view, and
-// reports whether it did: 409 benchmark.speech_unavailable
-// (msgBenchmarkAudioUnmeasurable) when every skipped view serves only audio
-// that the speed, capacity or both run cannot measure, 409
-// benchmark.audio_only when every skipped view serves only audio and the run
-// is the vision probe, 409 benchmark.images_only otherwise (a skipped
-// images-only view among them, or none skipped at all), and 500
-// benchmark.request_failed when a read failed, because then any refusal
-// would be a guess.
+// reports whether it did, with the answer that is true of the whole scope:
+//   - 500 benchmark.request_failed when a read failed, because then any
+//     refusal would be a guess;
+//   - for the speed, capacity and both modes, 409 benchmark.speech_unavailable
+//     whenever a skipped view serves only audio they cannot measure: with the
+//     audio message (msgBenchmarkAudioUnmeasurable) when every skipped view
+//     is such audio, and with the message that names both kinds
+//     (msgBenchmarkScopeUnmeasurable) when images-only views are skipped
+//     beside it -- images_only would claim the audio model serves images;
+//   - 409 benchmark.audio_only when every skipped view serves only audio and
+//     the run is the vision probe;
+//   - 409 benchmark.images_only otherwise: every skipped view serves only
+//     images, or the vision probe skipped images-only views beside audio-only
+//     ones (both refuse its chat prompt), or none was skipped at all.
 func (p benchmarkViewPartition) refuseNothingRunnable(w http.ResponseWriter) bool {
 	switch {
 	case len(p.runnable) > 0:
 		return false
 	case p.unreadable > 0:
 		writeBenchmarkRequestFailed(w)
+	case p.audioUnmeasurable > 0 && p.imagesOnly > 0:
+		writeBenchmarkError(w, errBenchmarkScopeUnmeasurable)
 	case p.imagesOnly > 0:
 		writeBenchmarkError(w, errBenchmarkImagesOnly)
 	case p.audioUnmeasurable > 0:

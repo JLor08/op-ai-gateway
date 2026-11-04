@@ -1472,8 +1472,9 @@ func (s audioPartitionStore) ModelMappingCache(ctx context.Context, mappingID, c
 // order. The vision probe's partition of the same views skips every audio-only child as
 // audio_only without reading its capability rows. With nothing runnable, a scope of
 // unmeasurable audio answers 409 benchmark.speech_unavailable with the audio message, one
-// with an unreadable view 500 benchmark.request_failed, and the vision probe 409
-// benchmark.audio_only.
+// that mixes it with images-only views the same code with the message that names both
+// kinds, one of images-only views alone 409 benchmark.images_only, one with an unreadable
+// view 500 benchmark.request_failed, and the vision probe 409 benchmark.audio_only.
 func TestAudioPartitionSortsEveryView(t *testing.T) {
 	withCapturedSlogAtTheDefaultLevel(t)
 	ctx := context.Background()
@@ -1568,7 +1569,9 @@ func TestAudioPartitionSortsEveryView(t *testing.T) {
 	}{
 		{"unmeasurable audio only", "speed", []string{"p4_clone", "p5_none"}, http.StatusConflict, codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable},
 		{"unmeasurable audio beside an unreadable view", "both", []string{"p4_clone", "p7_caps"}, http.StatusInternalServerError, codeBenchmarkRequestFailed, msgBenchmarkRequestFailed},
-		{"unmeasurable audio beside an images-only view", "capacity", []string{"p3_img", "p5_none"}, http.StatusConflict, codeBenchmarkImagesOnly, msgBenchmarkImagesOnly},
+		{"unmeasurable audio beside an images-only view", "capacity", []string{"p3_img", "p5_none"}, http.StatusConflict, codeBenchmarkSpeechUnavailable, msgBenchmarkScopeUnmeasurable},
+		{"a clone without a preset beside an images-only view", "speed", []string{"p4_clone", "p3_img"}, http.StatusConflict, codeBenchmarkSpeechUnavailable, msgBenchmarkScopeUnmeasurable},
+		{"images-only views alone", "both", []string{"p3_img"}, http.StatusConflict, codeBenchmarkImagesOnly, msgBenchmarkImagesOnly},
 		{"audio-only views in the vision probe", "vision", []string{"p2_tts", "p5_none"}, http.StatusConflict, codeBenchmarkAudioOnly, msgBenchmarkAudioOnly},
 	} {
 		t.Run("nothing runnable: "+tc.name, func(t *testing.T) {

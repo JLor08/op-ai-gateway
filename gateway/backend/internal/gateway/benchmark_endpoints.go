@@ -74,14 +74,16 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 // a voice from a reference alone; a scope with
 // no such mapping answers 409 benchmark.speech_unavailable
 // (refuseNothingRunnableSpeech). Nothing else about the starter differs. A
-// scope with no runnable view reserves nothing and answers 409
-// benchmark.images_only when a skipped view serves only images (or images and
-// audio); when every skipped view serves only audio, 409
-// benchmark.speech_unavailable for the speed, capacity and both modes (no
-// view's audio can be measured yet) and 409 benchmark.audio_only for the
-// vision probe; and 500 benchmark.request_failed when a read failed
-// (refuseNothingRunnable). A mapping scope's single view therefore gets
-// exactly those answers. Otherwise the skipped and
+// scope with no runnable view reserves nothing and answers what is true of the
+// whole scope (refuseNothingRunnable): 500 benchmark.request_failed when a read
+// failed; for the speed, capacity and both modes, 409
+// benchmark.speech_unavailable when a skipped view serves only audio whose
+// audio cannot be measured yet, with a message that names images-only views
+// too when the scope also holds some; 409 benchmark.audio_only for the vision
+// probe when every skipped view serves only audio; and 409
+// benchmark.images_only otherwise (a skipped view serves only images, or
+// images and audio). A mapping scope's single view therefore gets exactly
+// those answers. Otherwise the skipped and
 // unreadable views are recorded as the run's first results, before it measures
 // anything, so Total counts every view and Done reaches it.
 //
@@ -362,6 +364,7 @@ var benchmarkErrRows = []errRow{
 	{err: errBenchmarkAudioOnly, status: http.StatusConflict, code: codeBenchmarkAudioOnly, msg: msgBenchmarkAudioOnly},
 	{err: errBenchmarkSpeechUnavailable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkSpeechUnavailable},
 	{err: errBenchmarkAudioUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkAudioUnmeasurable},
+	{err: errBenchmarkScopeUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkScopeUnmeasurable},
 	{err: errBenchmarkAgentEnsureUnsupported, status: http.StatusConflict, code: codeBenchmarkAgentEnsureUnsupported, msg: msgBenchmarkAgentEnsureUnsupported},
 	{err: errBenchmarkSpecForceStopped, status: http.StatusConflict, code: codeBenchmarkSpecForceStopped, msg: msgBenchmarkSpecForceStopped},
 }
