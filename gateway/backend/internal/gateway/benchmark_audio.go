@@ -159,8 +159,12 @@ type audioMeasureCall struct {
 	text     string // the synthesis passage (TTS)
 	voice    string // a clone model's preset voice (TTS)
 	byteRate int    // the output byte rate a streamed synthesis counts its audio with
-	warmUp   bool
-	level    int
+	// timesOnly takes a streamed synthesis without counting its audio (measureTTSStreamTimes):
+	// the cold pass of one whose byte rate is not cached yet, which lends the load time only its
+	// time to the first audio. Never set on a pass whose rate or real-time factor is read.
+	timesOnly bool
+	warmUp    bool
+	level     int
 }
 
 // audioMeasureBudget is the deadline of one audio measurement: the stream's first-data budget
@@ -196,6 +200,9 @@ func (s *Server) takeAudioMeasurement(ctx context.Context, call audioMeasureCall
 	}
 	switch call.kind {
 	case audioKindTTSStream:
+		if call.timesOnly {
+			return audioMeasurer{now: time.Now}.measureTTSStreamTimes(ctx, proxy, call.target, call.text, call.voice)
+		}
 		return measureTTSStream(ctx, proxy, call.target, call.text, call.voice, call.byteRate)
 	case audioKindTTSBuffered:
 		return measureTTSBuffered(ctx, proxy, call.target, call.text, call.voice)
@@ -219,22 +226,8 @@ func (s *Server) takeAudioMeasurement(ctx context.Context, call audioMeasureCall
 //     declared the live route (liveTranscriptionTargetServed's rule), and only through a
 //     provider that relays a full-duplex body -- and in one piece otherwise.
 func (s *Server) audioCallFor(ctx context.Context, tgt benchmarkTarget) (audioMeasureCall, error) {
-	target, _ := benchmarkTargetReq(tgt)
-	call := audioMeasureCall{target: target}
-	if tgt.audio.role == routing.RoleASR {
-		call.kind = audioKindASRBuffered
-		if tgt.audio.streaming && s.audioLiveServed(tgt) {
-			call.kind = audioKindASRLive
-		}
-		return call, nil
-	}
-	call.text, call.voice, call.kind = audioBenchmarkPassage, tgt.voice, audioKindTTSBuffered
-	if !tgt.audio.streaming {
-		return call, nil
-	}
-	call.kind = audioKindTTSStream
-	if rate, ok := s.cachedOutputByteRate(ctx, tgt.mapping.ID); ok {
-		call.byteRate = int(rate)
+	call := s.audioCallPlan(ctx, tgt)
+	if !call.needsByteRate() {
 		return call, nil
 	}
 	speech := s.runSpeechTarget(ctx, tgt)
@@ -243,6 +236,36 @@ func (s *Server) audioCallFor(ctx context.Context, tgt benchmarkTarget) (audioMe
 	}
 	call.byteRate = int(speech.OutputByteRate)
 	return call, nil
+}
+
+// audioCallPlan is audioCallFor without its one request: the measurement decided from what is
+// known, a streamed synthesis carrying the cached byte rate or none (needsByteRate) when no rate
+// is cached. It sends nothing, so it may be asked before a cold start is judged.
+func (s *Server) audioCallPlan(ctx context.Context, tgt benchmarkTarget) audioMeasureCall {
+	target, _ := benchmarkTargetReq(tgt)
+	call := audioMeasureCall{target: target}
+	if tgt.audio.role == routing.RoleASR {
+		call.kind = audioKindASRBuffered
+		if tgt.audio.streaming && s.audioLiveServed(tgt) {
+			call.kind = audioKindASRLive
+		}
+		return call
+	}
+	call.text, call.voice, call.kind = audioBenchmarkPassage, tgt.voice, audioKindTTSBuffered
+	if !tgt.audio.streaming {
+		return call
+	}
+	call.kind = audioKindTTSStream
+	if rate, ok := s.cachedOutputByteRate(ctx, tgt.mapping.ID); ok {
+		call.byteRate = int(rate)
+	}
+	return call
+}
+
+// needsByteRate reports whether call is a streamed synthesis with no byte rate to count its
+// audio with yet: audioCallFor runs the speech benchmark for one.
+func (c audioMeasureCall) needsByteRate() bool {
+	return c.kind == audioKindTTSStream && c.byteRate <= 0
 }
 
 // audioLiveServed reports whether tgt can be measured with a live transcription: through a
@@ -264,16 +287,33 @@ type audioPrepared struct {
 	err  error
 }
 
+// audioPreparer prepares an audio target's measurement once per run, on its first ask
+// (audioCallFor), and hands every later ask the same outcome. The speed part asks only after
+// its cold pass, since the preparation may send the target a request of its own.
+type audioPreparer struct {
+	s    *Server
+	tgt  benchmarkTarget
+	done bool
+	prep audioPrepared
+}
+
+func (p *audioPreparer) prepared(ctx context.Context) audioPrepared {
+	if !p.done {
+		p.prep.call, p.prep.err = p.s.audioCallFor(ctx, p.tgt)
+		p.done = true
+	}
+	return p.prep
+}
+
 // measureAudioTarget is runBenchmark's speed, capacity and both modes for an audio target:
 // speed (runAudioSpeed), capacity (runAudioCapacity), or speed then capacity, so the ramp's
 // write comes last and metrics_source ends "capacity", as a text both run's does. The
-// measurement both parts take is prepared once (audioPrepared). Each part stores what it
+// measurement both parts take is prepared once (audioPreparer). Each part stores what it
 // measured and records its own history row. The result carries both parts' figures; its
 // error is the first part's that failed, and the error returned with it as well.
 func (s *Server) measureAudioTarget(ctx context.Context, run *benchmarkRun, tgt benchmarkTarget, mode string) (BenchmarkResult, error) {
 	res := BenchmarkResult{MappingID: tgt.mapping.ID, GatewayModelName: tgt.mapping.GatewayModelName}
-	var prep audioPrepared
-	prep.call, prep.err = s.audioCallFor(ctx, tgt)
+	prep := &audioPreparer{s: s, tgt: tgt}
 	var firstErr error
 	if mode != "capacity" {
 		speed, loadMS, err := s.runAudioSpeed(ctx, tgt, prep)
@@ -281,7 +321,7 @@ func (s *Server) measureAudioTarget(ctx context.Context, run *benchmarkRun, tgt 
 		firstErr = err
 	}
 	if mode == "capacity" || mode == "both" {
-		ramp, err := s.runAudioCapacity(ctx, run, tgt, prep)
+		ramp, err := s.runAudioCapacity(ctx, run, tgt, prep.prepared(ctx))
 		if ramp.Limit != "" {
 			res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit = ramp.Concurrency, ramp.Limit
 		}
@@ -301,7 +341,7 @@ func (s *Server) measureAudioTarget(ctx context.Context, run *benchmarkRun, tgt 
 // figures), and the target's kind=audio history row, appended on success and failure alike.
 // A load time written for a replicable spec pushes the server's runtime config
 // (pushBenchmarkLoadTime).
-func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep audioPrepared) (audioMeasurement, int64, error) {
+func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep *audioPreparer) (audioMeasurement, int64, error) {
 	m, loadMS, err := s.measureAudioSpeed(ctx, tgt, prep)
 	now := time.Now().UTC()
 	row := routing.BenchmarkRun{MappingID: tgt.mapping.ID, ServerID: tgt.server.ID, CreatedAt: now, Kind: benchmarkKindAudio}
@@ -332,26 +372,35 @@ func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep au
 // cold start and the cold pass was the slower: unknown, never bogus, like a text load time.
 // When the stop-all wrote, or may have written, the target's own force_stopped, the cold pass
 // rides the router's 503 until the clear reaches the agent (audioColdPassAfterStop). An error
-// from ensureColdLoad, a stop-all's failed clear, ends the measurement before any pass, and a
-// measurement that could not be prepared ends it before ensureColdLoad.
-func (s *Server) measureAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep audioPrepared) (audioMeasurement, int64, error) {
-	if prep.err != nil {
-		return audioMeasurement{}, 0, prep.err
-	}
-	call := prep.call
+// from ensureColdLoad, a stop-all's failed clear, ends the measurement before any pass.
+//
+// Nothing is sent to the target before the cold pass: the cold start is judged and taken first,
+// and only then is the measurement prepared (prep), which for a streamed synthesis without a
+// cached byte rate runs the speech benchmark -- a synthesis on the target, which a run that does
+// not stop the server would otherwise find resident and judge warm. That cold pass is timed
+// without counting its audio (audioMeasureCall.timesOnly), all its part of the load time needs;
+// a measurement that could not be prepared then ends the run before the warm pass.
+func (s *Server) measureAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep *audioPreparer) (audioMeasurement, int64, error) {
+	coldCall := s.audioCallPlan(ctx, tgt)
+	coldCall.timesOnly = coldCall.needsByteRate()
 	cold, err := s.ensureColdLoad(ctx, tgt)
 	if err != nil {
 		return audioMeasurement{}, 0, err
 	}
 	var coldPass audioMeasurement
 	if cold.rideOutStop {
-		coldPass, err = s.audioColdPassAfterStop(ctx, call)
+		coldPass, err = s.audioColdPassAfterStop(ctx, coldCall)
 	} else {
-		coldPass, err = s.takeAudioMeasurement(ctx, call)
+		coldPass, err = s.takeAudioMeasurement(ctx, coldCall)
 	}
 	if err != nil {
 		return audioMeasurement{}, 0, err
 	}
+	prepared := prep.prepared(ctx)
+	if prepared.err != nil {
+		return audioMeasurement{}, 0, prepared.err
+	}
+	call := prepared.call
 	warm, err := s.takeAudioMeasurement(ctx, call)
 	if err != nil {
 		return audioMeasurement{}, 0, err

@@ -326,26 +326,77 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 	if byteRate <= 0 {
 		return audioMeasurement{}, audioInputError("no output byte rate to count the streamed audio with")
 	}
+	st, err := m.streamSynthesis(ctx, client, target, text, voice)
+	if err != nil {
+		return audioMeasurement{}, err
+	}
+	audioSeconds := float64(st.pcmBytes) / float64(byteRate)
+	production := st.done.Sub(st.first)
+	if production <= 0 {
+		return audioMeasurement{}, audioProtocolError("no measurable time between the first audio and speech.audio.done")
+	}
+	wall := st.done.Sub(st.sent)
+	return audioMeasurement{
+		FirstByteMS:  millisAtLeastOne(st.answered.Sub(st.sent).Seconds()),
+		TTFTMS:       millisAtLeastOne(st.first.Sub(st.sent).Seconds()),
+		WallMS:       millisAtLeastOne(wall.Seconds()),
+		AudioSeconds: audioSeconds,
+		RateX:        audioSeconds / production.Seconds(),
+		RTF:          wall.Seconds() / audioSeconds,
+	}, nil
+}
+
+// measureTTSStreamTimes is measureTTSStream for a pass whose audio is not counted: the same
+// streamed synthesis, held to the same rules, timed to its first byte (FirstByteMS), its first
+// audio delta (TTFTMS) and its speech.audio.done (WallMS), with no byte rate and so no
+// AudioSeconds, RateX or RTF. It is the cold pass of a streamed synthesis whose byte rate is
+// not cached yet: that pass only lends its time to the first audio to the load time, and the
+// speech benchmark that learns the rate is a request to the target, so it may only run once
+// the cold pass has taken the cold start (measureAudioSpeed).
+func (m audioMeasurer) measureTTSStreamTimes(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string) (audioMeasurement, error) {
+	st, err := m.streamSynthesis(ctx, client, target, text, voice)
+	if err != nil {
+		return audioMeasurement{}, err
+	}
+	return audioMeasurement{
+		FirstByteMS: millisAtLeastOne(st.answered.Sub(st.sent).Seconds()),
+		TTFTMS:      millisAtLeastOne(st.first.Sub(st.sent).Seconds()),
+		WallMS:      millisAtLeastOne(st.done.Sub(st.sent).Seconds()),
+	}, nil
+}
+
+// ttsStreamTiming is what one streamed synthesis observed (streamSynthesis): when it was
+// sent, answered, its first audio delta and its speech.audio.done arrived, and the PCM bytes
+// the deltas before done carried.
+type ttsStreamTiming struct {
+	sent, answered, first, done time.Time
+	pcmBytes                    int64
+}
+
+// streamSynthesis sends the streamed synthesis of text on target and reads it to its end by
+// measureTTSStream's rules, returning what it observed; every rule a stream breaks is the
+// error measureTTSStream documents.
+func (m audioMeasurer) streamSynthesis(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string) (ttsStreamTiming, error) {
 	body, err := json.Marshal(audioStreamSpeechRequest{
 		speechBenchmarkRequest: speechBenchmarkRequest{Model: target.ProviderModel, Input: text, Voice: voice},
 		Stream:                 true,
 		StreamFormat:           speechStreamFormatSSE,
 	})
 	if err != nil {
-		return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureInvalidInput, Message: "build the synthesis request", Err: err}
+		return ttsStreamTiming{}, &audioMeasureError{Kind: audioMeasureInvalidInput, Message: "build the synthesis request", Err: err}
 	}
 	sent := m.now()
 	resp, err := client.ProxyNative(ctx, target, upstreamPath(target, apiFlavorSpeech, endpointSpeech), body, jsonContentType)
 	if err != nil {
-		return audioMeasurement{}, audioTransportError("synthesis request failed", err)
+		return ttsStreamTiming{}, audioTransportError("synthesis request failed", err)
 	}
 	answered := m.now()
 	defer resp.Body.Close()
 	if err := checkAudioAnswerStatus(resp); err != nil {
-		return audioMeasurement{}, err
+		return ttsStreamTiming{}, err
 	}
 	if err := checkAudioEventStream(resp); err != nil {
-		return audioMeasurement{}, err
+		return ttsStreamTiming{}, err
 	}
 
 	scan := &speechStreamScan{maxLine: speechStreamMaxLine}
@@ -359,7 +410,7 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 			break
 		}
 		if code, message, isError := sseStreamError(sc.Bytes(), speechStreamErrorMessage); isError {
-			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
+			return ttsStreamTiming{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
 		}
 		if !done.IsZero() {
 			// The synthesis ended at its done event; what follows up to [DONE] is not part
@@ -380,32 +431,19 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 	}
 	if err := sc.Err(); err != nil {
 		// A frame past the relay's own bound is one the relay could not count either.
-		return audioMeasurement{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
+		return ttsStreamTiming{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
 	}
 	switch {
 	case scan.lost:
-		return audioMeasurement{}, audioProtocolError("the streamed audio could not be counted (a frame or a delta was unreadable)")
+		return ttsStreamTiming{}, audioProtocolError("the streamed audio could not be counted (a frame or a delta was unreadable)")
 	case done.IsZero():
-		return audioMeasurement{}, audioProtocolError("the synthesis stream ended before speech.audio.done")
+		return ttsStreamTiming{}, audioProtocolError("the synthesis stream ended before speech.audio.done")
 	case !ended:
-		return audioMeasurement{}, audioProtocolError("the synthesis stream ended without [DONE] after speech.audio.done")
+		return ttsStreamTiming{}, audioProtocolError("the synthesis stream ended without [DONE] after speech.audio.done")
 	case scan.pcmBytes() == 0:
-		return audioMeasurement{}, audioProtocolError("the synthesis stream carried no audio")
+		return ttsStreamTiming{}, audioProtocolError("the synthesis stream carried no audio")
 	}
-	audioSeconds := float64(scan.pcmBytes()) / float64(byteRate)
-	production := done.Sub(first)
-	if production <= 0 {
-		return audioMeasurement{}, audioProtocolError("no measurable time between the first audio and speech.audio.done")
-	}
-	wall := done.Sub(sent)
-	return audioMeasurement{
-		FirstByteMS:  millisAtLeastOne(answered.Sub(sent).Seconds()),
-		TTFTMS:       millisAtLeastOne(first.Sub(sent).Seconds()),
-		WallMS:       millisAtLeastOne(wall.Seconds()),
-		AudioSeconds: audioSeconds,
-		RateX:        audioSeconds / production.Seconds(),
-		RTF:          wall.Seconds() / audioSeconds,
-	}, nil
+	return ttsStreamTiming{sent: sent, answered: answered, first: first, done: done, pcmBytes: scan.pcmBytes()}, nil
 }
 
 // measureTTSBuffered synthesizes text as one WAV on target and times it. The answer is

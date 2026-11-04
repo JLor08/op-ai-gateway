@@ -11462,6 +11462,10 @@ mapping; a parallel audio-only mechanism would duplicate all of it.
   benchmark) stays as it is. `speed` = one stream with the text benchmark's cold-start technique
   (`ensureColdLoad`, cold pass, warm pass, `load_time_ms` = cold − warm time to first output for a confirmed cold
   start, stored in the mapping's existing column); `capacity` = the concurrency ramp; `both` = speed, then capacity.
+  Nothing reaches the target before the cold pass: a streamed synthesis whose output byte rate is not cached yet takes
+  its cold pass without counting audio (only its time to first audio enters the load time), and the speech benchmark
+  that learns the rate runs after it, before the warm pass, so a run that does not stop the server cannot warm its own
+  target first.
 - **(b) Throughput is real-time factor.** `rate_x` = seconds of audio per wall second: for a streamed synthesis from its
   first audio to its end (the speed that decides whether playback stutters), for everything else from the send.
 - **(c) Fixed inputs.** A fixed English passage of about 20 s for TTS; for ASR a bundled clip of real German speech

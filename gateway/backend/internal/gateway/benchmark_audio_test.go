@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -289,8 +290,9 @@ func levelRates(rates map[int][]float64) func(audioMeasureCall, int) (audioMeasu
 // then the measured pass), stores the measured rate and time to first audio on the mapping
 // (UpdateMappingAudioMetrics, source benchmark), reports them on its result and appends one
 // kind=audio history row carrying the time to first audio, the wall time, the real-time
-// factor and the rate. With no byte rate cached, the run first measures one with the speech
-// benchmark's non-streamed synthesis.
+// factor and the rate. With no byte rate cached, the run measures one with the speech
+// benchmark's non-streamed synthesis between the cold pass and the measured pass: the cold
+// pass is taken first, so the benchmark cannot warm the target before it.
 func TestAudioSpeedRunStoresMappingMetrics(t *testing.T) {
 	for _, cached := range []bool{true, false} {
 		t.Run(fmt.Sprintf("byte rate cached %v", cached), func(t *testing.T) {
@@ -366,8 +368,8 @@ func TestAudioSpeedRunStoresMappingMetrics(t *testing.T) {
 				}
 				if body["stream"] == true {
 					streamed++
-				} else if !cached && i != 0 {
-					t.Fatalf("the non-streamed synthesis was request %d, want it first", i)
+				} else if !cached && i != 1 {
+					t.Fatalf("the non-streamed synthesis was request %d, want it second, after the cold pass", i)
 				}
 			}
 			wantAll := 2
@@ -453,6 +455,56 @@ func TestAudioSpeedRunMeasuresColdStart(t *testing.T) {
 				spy.expectNoPush(t, "no load time measured", "srv1")
 			}
 		})
+	}
+}
+
+// audioSpeechWarmingProvider is audioEnsureProvider that also relays the speech benchmark's
+// one-shot synthesis (provider.NativeProxyClient): it answers a 48 kHz mono WAV and, as a real
+// upstream would, leaves the model loaded behind it.
+type audioSpeechWarmingProvider struct {
+	*audioEnsureProvider
+	model string
+}
+
+func (p *audioSpeechWarmingProvider) ProxyNative(context.Context, routing.Target, string, []byte, string) (*provider.ProxyResponse, error) {
+	p.mu.Lock()
+	p.loaded = append(p.loaded, p.model)
+	p.mu.Unlock()
+	return &provider.ProxyResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: io.NopCloser(bytes.NewReader(buildMonoWAV(48000, 48000)))}, nil
+}
+
+// TestAudioSpeedColdStartPrecedesTheByteRateBenchmark: a streamed synthesis whose byte rate is
+// not cached needs the speech benchmark first, and that benchmark is a request to the target.
+// A run that does not stop the server judges the cold start as it finds it, so the judgment and
+// the cold pass come before the benchmark: the cold pass is timed to its first audio without
+// counting audio, the benchmark then caches the rate, and the warm pass counts with it. The
+// load time is measured, not lost to the run's own warm-up.
+func TestAudioSpeedColdStartPrecedesTheByteRateBenchmark(t *testing.T) {
+	f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: true, features: []string{"runtime_manager"}, noByteRate: true})
+	f.srv.Provider = &audioSpeechWarmingProvider{audioEnsureProvider: f.provider, model: "m"}
+	f.srv.RuntimeStatus.publish("srv1", []RuntimeStatusDTO{{SpecID: "rs_map1", Model: "m", State: "stopped"}})
+	var rates []int
+	f.script.answer = func(call audioMeasureCall, n int) (audioMeasurement, error) {
+		if call.kind != audioKindTTSStream {
+			return audioMeasurement{}, fmt.Errorf("measured as %v, want a streamed synthesis", call.kind)
+		}
+		rates = append(rates, call.byteRate)
+		if n == 1 {
+			return audioMeasurement{FirstByteMS: 1, TTFTMS: 5300, WallMS: 6300}, nil
+		}
+		return audioFigures(3, 300), nil
+	}
+
+	res := f.run(t, "speed")
+
+	if res.Error != "" || res.AudioLoadTimeMS != 5000 {
+		t.Fatalf("result = load %d ms, error %q; want 5000", res.AudioLoadTimeMS, res.Error)
+	}
+	if len(rates) != 2 || rates[0] != 0 || rates[1] != 96000 {
+		t.Fatalf("byte rates of the passes = %v, want the cold pass uncounted (0) and the warm pass at the learned 96000", rates)
+	}
+	if rate, ok := f.srv.cachedOutputByteRate(context.Background(), "map1"); !ok || rate != 96000 {
+		t.Fatalf("cached byte rate = %d (%v), want 96000", rate, ok)
 	}
 }
 
@@ -1130,7 +1182,8 @@ func TestAudioBothRunMeasuresSpeedThenCapacity(t *testing.T) {
 // output byte rate, and when none is cached the speech benchmark runs first to measure it.
 // In a both run whose speech benchmark fails, the speed part fails with that error, and the
 // capacity part fails with the same one: the outcome is the run's, and the failing request
-// is not sent a second time (one kind=speech history row, no measurement at all).
+// is not sent a second time (one kind=speech history row, and no measurement but the cold
+// pass, which is taken before the benchmark and counts no audio).
 func TestAudioBothRunMeasuresTheByteRateOnce(t *testing.T) {
 	f := newAudioFixture(t, audioFixtureOpts{noByteRate: true})
 
@@ -1147,8 +1200,8 @@ func TestAudioBothRunMeasuresTheByteRateOnce(t *testing.T) {
 	if len(audio) != 1 || len(ramp) != 1 || audio[0].Error == "" || ramp[0].Error != audio[0].Error {
 		t.Fatalf("audio rows = %+v, ramp rows = %+v; want one failed row each, with the same error", audio, ramp)
 	}
-	if got := f.script.recorded(); len(got) != 0 {
-		t.Fatalf("measurements = %+v, want none", got)
+	if got := f.script.recorded(); len(got) != 1 || got[0].kind != audioKindTTSStream || got[0].level != 0 {
+		t.Fatalf("measurements = %+v, want the speed part's cold pass only", got)
 	}
 }
 
