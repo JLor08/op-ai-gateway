@@ -654,6 +654,43 @@ func TestPinnedParkPassOverSelectsAtTheTimeItWoke(t *testing.T) {
 	})
 }
 
+// A pinned request that parked and is then served on its pin touches its session
+// reservation at the time it woke, as its pin's refresh does: dated at the time it
+// parked, the reservation would lapse a wait's length early and leave the server's
+// session cap a place short of the session it holds.
+func TestPinnedParkHitTouchesTheReservationWhenItWoke(t *testing.T) {
+	now := instanceCapacityNow
+	store := pinnedInstanceStore(t, now)
+	seedPinFor(t, store, now, audioPinKey, "srv_inst", 0)
+	clock := now
+	r, _, _ := pinnedResolver(store, now, InstanceView{}, map[string]int{})
+	r.clock = func() time.Time { return clock }
+	r.SetSessionReservation(time.Minute)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{
+		"map_inst": {Replicable: true, Parallelism: 1, Running: []int{1}},
+	}})
+	slots := &fakeLiveSlots{held: map[string]bool{"map_inst#0": true, "map_inst#1": true}}
+	r.SetLiveSlotChecker(slots)
+	adm := &fakeAdmission{onWait: func(int) error {
+		clock = clock.Add(10 * time.Second)
+		slots.held["map_inst#1"] = false
+		return nil
+	}}
+	r.SetAdmissionController(adm)
+
+	target, err := r.Resolve(context.Background(), pinnedToken, liveRequest("qwen-coder"))
+	if err != nil || target.InstanceKey != "map_inst#1" || adm.calls != 1 {
+		t.Fatalf("Resolve = %q, %v after %d waits; want the pinned map_inst#1 after 1", target.InstanceKey, err, adm.calls)
+	}
+	woke := now.Add(10 * time.Second)
+	r.reservation.mu.Lock()
+	seen := r.reservation.byServer["srv_inst"][affinityID(audioPinKey)]
+	r.reservation.mu.Unlock()
+	if !seen.Equal(woke) {
+		t.Fatalf("reservation touched at %v, want the wake %v", seen, woke)
+	}
+}
+
 // A pinned request that parked refreshes its pin only while the row is still the
 // one it was served from: a pin that another request repointed, or that was
 // deleted, while it waited is left as it is now.

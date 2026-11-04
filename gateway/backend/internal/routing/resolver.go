@@ -859,7 +859,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		case err != nil:
 			return Target{}, err
 		case ok:
-			r.reservation.touch(target.ServerID, affinityID(key), now)
+			// The clock read afresh, as refreshAffinity dates the pin: the pinned pass may
+			// have parked, and the reservation lives from the time the request woke.
+			r.reservation.touch(target.ServerID, affinityID(key), r.clock())
 			return target, nil
 		}
 		// The pinned pass may have parked before it passed the pin over: the fresh
