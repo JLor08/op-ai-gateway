@@ -13,6 +13,7 @@ Exhaustive listing of every environment variable read by the backend (`op-ai-gat
 | `duration` | Go duration string (e.g. `30s`, `15m`, `2h`); empty/unparseable/`<= 0` → default |
 | `duration (0 = auto)` | empty or a value that parses to `<= 0` → `0`, a first-class "automatic" value, not the default |
 | `float [0,1]` | parsed as float64; out-of-range values are clamped into `[0,1]`, not defaulted |
+| `float` | parsed as float64; empty, unparseable, `<= 0` or not finite (NaN, an infinity) → default (`positiveFloat`, the float twin of `int`) |
 | `string` | used verbatim; `""` may itself be a meaningful "disabled" value (noted per row) |
 
 All backend variables are read through `internal/config/config.go`'s `Load()` (env > optional `OP_AI_GATEWAY_CONFIG` JSON file > default). All agent variables are read through `server-agent/internal/config/config.go`'s `Load()` (flag > env > optional `OP_AGENT_CONFIG` JSON file > default).
@@ -100,6 +101,18 @@ All backend variables are read through `internal/config/config.go`'s `Load()` (e
 | `OP_AI_GATEWAY_ENERGY_RECONCILE_INTERVAL_SECONDS` | int | Cadence of the energy-attribution background reconciler | `15` |
 | `OP_AI_GATEWAY_ENERGY_SETTLE_SECONDS` | int | Delay after a request finishes before attributing its energy, so telemetry has time to land | `10` |
 | `OP_AI_GATEWAY_ENERGY_IDLE_WINDOW_SECONDS` | int | Trailing window the per-server idle-wattage tracker uses for its rolling minimum power draw | `3600` (1 h) |
+
+### Model instances and the audio benchmark
+
+The tuning of model-instance autoscaling (#340). Each value that is junk, zero or negative loads the default.
+
+| Variable | Type | Purpose | Default |
+|---|---|---|---|
+| `OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR` | float | Multiplier on a replicable runtime spec's startup time in its pushed idle timeout, `max(manual, ceil(factor × max(startup_measured_ms, load_time_ms) / 1000), floor)`, so an instance that is slow to start is kept longer once it runs ([Agent-Managed Model Runtime §11.11](../cross-cutting/agent-runtime-manager.md#1111-instances-in-the-portal-and-the-effective-idle-timeout)) | `5` |
+| `OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS` | int | The floor of that idle timeout: no unprotected instance of a replicable spec is unloaded sooner, also while its startup is not measured yet (a replicable spec is never pushed `0`) | `120` |
+| `OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS` | int | How long the instance scaler leaves a server's spec alone after its agent refused another instance for lack of room (`runtime.instance_no_capacity`) or failed to start one; a `runtime.instance_demand_unknown` refusal holds the host for a fixed 5 s instead ([ADR-092](../09-architecture-decisions.md#adr-092--the-gateway-scales-up-on-parked-demand-and-the-agent-decides-the-fit-the-agent-alone-scales-down)) | `60` |
+| `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR` | float | The rate, in multiples of real time, an audio benchmark ramp level's slowest stream must reach for the level to count as real-time ([Telemetry §8.6](../cross-cutting/telemetry-usage-observability.md#86-audio-performance-benchmarks)) | `1.2` |
+| `OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX` | int | The highest level (concurrent streams) the audio benchmark's concurrency ramp measures; reaching it stops the ramp with the limit `cap`, a lower bound | `8` |
 
 ### NetBird mesh
 
