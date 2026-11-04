@@ -3,7 +3,10 @@
 
 package inference
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 type Role string
 
@@ -301,6 +304,14 @@ type Request struct {
 	// session may still take that slot once it frees. Internal only: set by
 	// the gateway when it re-selects, never parsed from a client body.
 	ExcludeInstanceKeys []string `json:"-"`
+	// AdmissionStart, when set, is when this request's admission began (wall
+	// clock): a bounded admission-queue timeout counts from it instead of from
+	// the resolve's own start, so one client call that resolves more than once
+	// -- a live session that loses races for a slot -- waits at most one
+	// timeout in all, and is refused without another wait once it has run out.
+	// Zero: the resolve's own start, as for every request that resolves once.
+	// Internal only: set by the gateway, never parsed from a client body.
+	AdmissionStart time.Time `json:"-"`
 }
 
 func (r Request) Validate() *Error {

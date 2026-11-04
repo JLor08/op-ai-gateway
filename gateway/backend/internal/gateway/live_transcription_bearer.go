@@ -132,6 +132,10 @@ const maxLiveSlotRaces = routing.MaxInstanceIndex + 1
 // that came about, the session parks and signals live demand like any other session
 // that finds them held.
 //
+// Every selection of the loop is one admission: the request names when it began
+// (AdmissionStart), so a session that parks again after a lost race waits out what is
+// left of the one admission-queue timeout, not a fresh one per race.
+//
 // The loop ends. A selection that hands back a slot still held by the session it lost
 // that slot to is one the resolver could not pass over (no queue to park in, or no
 // viable free slot), so waiting longer here changes nothing: errTranscriptionLiveBusy.
@@ -140,6 +144,7 @@ const maxLiveSlotRaces = routing.MaxInstanceIndex + 1
 // errTranscriptionLiveBusy. Any other refusal (a routing error, a live verdict, a queue
 // timeout) is returned as it is.
 func (s *Server) acquireLiveSession(ctx context.Context, token *auth.Token, req inference.Request) (routing.Target, func(), error) {
+	req.AdmissionStart = time.Now()
 	lostTo := map[string]uint64{} // instance key -> the session that took it from this one
 	for races := 1; ; races++ {
 		target, err := s.liveTarget(ctx, token, req)

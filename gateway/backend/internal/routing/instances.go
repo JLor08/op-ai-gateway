@@ -123,11 +123,17 @@ type DemandSignal struct {
 }
 
 // DemandSink receives demand signals. Signal is called on the request path,
-// from as many goroutines as there are requests parking, and once on every
-// admission turn a request spends parked -- so a request that waits through
-// several turns signals several times, and a sink that wants one scale-up
-// per need coalesces them. It must not block: the request is about to wait,
-// and a sink that blocked would hold it before it ever reached the queue.
+// from as many goroutines as there are requests parking, once per park turn
+// per at-capacity member with instance candidates: a plain model is its own
+// one member, and a group request parked on two members whose instances are
+// all busy signals for each, by its own model. So a request that waits
+// through several turns signals several times, and a sink that wants one
+// scale-up per need coalesces them. It is called only for a request that
+// actually parks: not on the fail-open path without a queue, not when the
+// request's admission deadline has passed, and not when the queue has no
+// room for it (AdmissionRoom). It must not block: the request is about to
+// wait, and a sink that blocked would hold it before it ever reached the
+// queue.
 type DemandSink interface {
 	Signal(DemandSignal)
 }

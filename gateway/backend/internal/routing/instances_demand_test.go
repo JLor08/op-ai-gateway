@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
 	"slices"
 	"testing"
 	"time"
@@ -252,5 +253,161 @@ func TestGroupWithoutQueueSignalsNothing(t *testing.T) {
 	}
 	if len(sink.got) != 0 {
 		t.Fatalf("demand signals = %+v, want none without a queue", sink.got)
+	}
+}
+
+// roomAdmission is a test admission controller that reports whether it has room
+// (AdmissionRoom) and, like the real queue, refuses a waiter as full when it has
+// none; with room every wait times out.
+type roomAdmission struct {
+	room  bool
+	calls int
+}
+
+func (a *roomAdmission) HasRoom() bool { return a.room }
+
+func (a *roomAdmission) WaitForSlot(context.Context, []string, time.Duration) error {
+	a.calls++
+	if !a.room {
+		return ErrAdmissionQueueFull
+	}
+	return ErrAdmissionQueueTimeout
+}
+
+// A request the admission queue turns away as full never parks, so it signals no
+// demand -- a refusal must not start an instance -- for a plain model and a group
+// alike; with room in the queue the same request signals as it parks.
+func TestNoDemandSignalWhenTheQueueIsFull(t *testing.T) {
+	plain := func(t *testing.T) (*Resolver, inference.Request) {
+		now := instanceCapacityNow
+		r := NewResolver(instanceCandidateStore(t, now, 0), func() time.Time { return now }, nil)
+		r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1}}})
+		r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}})
+		return r, chatRequest("qwen-coder")
+	}
+	group := func(t *testing.T) (*Resolver, inference.Request) {
+		r, _ := demandGroupResolver(t, instanceCapacityNow, "sticky", 0)
+		r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{
+			"map_inst": {Replicable: true, Parallelism: 1},
+			"map_b":    {Replicable: true, Parallelism: 1},
+		}})
+		r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1, "map_b#0": 1}})
+		return r, chatRequest("coder-group")
+	}
+	for name, build := range map[string]func(*testing.T) (*Resolver, inference.Request){"plain": plain, "group": group} {
+		t.Run(name, func(t *testing.T) {
+			r, req := build(t)
+			sink := &fakeDemandSink{}
+			r.SetDemandSink(sink)
+			full := &roomAdmission{}
+			r.SetAdmissionController(full)
+			if _, err := r.Resolve(context.Background(), auth.Token{}, req); !errors.Is(err, ErrAdmissionQueueFull) {
+				t.Fatalf("Resolve err = %v, want ErrAdmissionQueueFull", err)
+			}
+			if len(sink.got) != 0 {
+				t.Fatalf("demand signals = %+v for a request the full queue refused, want none", sink.got)
+			}
+			r.SetAdmissionController(&roomAdmission{room: true})
+			if _, err := r.Resolve(context.Background(), auth.Token{}, req); !errors.Is(err, ErrAdmissionQueueTimeout) {
+				t.Fatalf("Resolve with room err = %v, want ErrAdmissionQueueTimeout", err)
+			}
+			if len(sink.got) == 0 {
+				t.Fatal("no demand signalled by a request that parked, want one per busy member")
+			}
+		})
+	}
+}
+
+// A request whose admission deadline has already passed is refused without
+// waiting, and so without signalling: once its first wait ran the deadline out,
+// the next turn ends the request with the one signal its one park sent.
+func TestNoDemandSignalPastTheDeadline(t *testing.T) {
+	now := instanceCapacityNow
+	store := instanceCandidateStore(t, now, 0)
+	app, err := store.ApplicationByID(context.Background(), "app_inst")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.AdmissionQueueTimeoutSeconds = 10
+	if err := store.UpdateApplication(context.Background(), app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	clock := now
+	r := NewResolver(store, func() time.Time { return clock }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1}}})
+	r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}})
+	sink := &fakeDemandSink{}
+	r.SetDemandSink(sink)
+	adm := &fakeAdmission{onWait: func(int) error {
+		clock = clock.Add(11 * time.Second) // the wait outlasts the deadline
+		return nil
+	}}
+	r.SetAdmissionController(adm)
+
+	if _, err := r.Resolve(context.Background(), auth.Token{}, chatRequest("qwen-coder")); !errors.Is(err, ErrAdmissionQueueTimeout) || adm.calls != 1 {
+		t.Fatalf("Resolve = %v after %d waits, want ErrAdmissionQueueTimeout after 1", err, adm.calls)
+	}
+	if len(sink.got) != 1 {
+		t.Fatalf("demand signals = %+v, want the one the request's one park sent", sink.got)
+	}
+}
+
+// A request that names when its admission began (AdmissionStart: one client call
+// resolving again, as a live session that lost a race for a slot does) waits only
+// for what is left of the queue timeout counted from then -- for a plain model and
+// a group alike -- and one whose timeout has run out is refused without a wait and
+// without a signal.
+func TestAdmissionStartKeepsOneDeadline(t *testing.T) {
+	setup := func(t *testing.T, group bool) (*Resolver, *MemoryStore, inference.Request) {
+		t.Helper()
+		if group {
+			r, store := demandGroupResolver(t, instanceCapacityNow, "sticky", 0)
+			r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{
+				"map_inst": {Replicable: true, Parallelism: 1},
+				"map_b":    {Replicable: true, Parallelism: 1},
+			}})
+			r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1, "map_b#0": 1}})
+			return r, store, chatRequest("coder-group")
+		}
+		store := instanceCandidateStore(t, instanceCapacityNow, 0)
+		r := NewResolver(store, func() time.Time { return instanceCapacityNow }, nil)
+		r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1}}})
+		r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}})
+		return r, store, chatRequest("qwen-coder")
+	}
+	for _, group := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "group"}[group], func(t *testing.T) {
+			r, store, req := setup(t, group)
+			for _, id := range []string{"app_inst", "app_srv_b"} {
+				app, err := store.ApplicationByID(context.Background(), id)
+				if err != nil {
+					continue // the plain store has no srv_b
+				}
+				app.AdmissionQueueTimeoutSeconds = 10
+				if err := store.UpdateApplication(context.Background(), app); err != nil {
+					t.Fatalf("UpdateApplication %s: %v", id, err)
+				}
+			}
+			sink := &fakeDemandSink{}
+			r.SetDemandSink(sink)
+			adm := timeoutAdmission()
+			r.SetAdmissionController(adm)
+
+			req.AdmissionStart = instanceCapacityNow.Add(-4 * time.Second)
+			if _, err := r.Resolve(context.Background(), auth.Token{}, req); !errors.Is(err, ErrAdmissionQueueTimeout) || adm.calls != 1 {
+				t.Fatalf("Resolve = %v after %d waits, want ErrAdmissionQueueTimeout after 1", err, adm.calls)
+			}
+			if adm.gotTimeout != 6*time.Second {
+				t.Fatalf("the wait was given %v, want the 6s left of the 10s timeout begun 4s ago", adm.gotTimeout)
+			}
+			signals := len(sink.got)
+			req.AdmissionStart = instanceCapacityNow.Add(-10 * time.Second)
+			if _, err := r.Resolve(context.Background(), auth.Token{}, req); !errors.Is(err, ErrAdmissionQueueTimeout) || adm.calls != 1 {
+				t.Fatalf("Resolve past the deadline = %v after %d waits, want ErrAdmissionQueueTimeout without another wait", err, adm.calls)
+			}
+			if len(sink.got) != signals {
+				t.Fatalf("demand signals = %+v, want none from the request whose deadline had passed", sink.got[signals:])
+			}
+		})
 	}
 }

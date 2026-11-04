@@ -1177,3 +1177,133 @@ func TestLiveMixedFleetSessionIsNotRefusedForAPlainSlot(t *testing.T) {
 		finishLiveSession(t, s)
 	})
 }
+
+// deadlineRecordingAdmission wraps the server's admission queue and records the
+// absolute deadline each wait was given (the time of the call plus its timeout).
+type deadlineRecordingAdmission struct {
+	inner     routing.AdmissionController
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (a *deadlineRecordingAdmission) WaitForSlot(ctx context.Context, serverIDs []string, timeout time.Duration) error {
+	a.mu.Lock()
+	a.deadlines = append(a.deadlines, time.Now().Add(timeout))
+	a.mu.Unlock()
+	return a.inner.WaitForSlot(ctx, serverIDs, timeout)
+}
+
+func (a *deadlineRecordingAdmission) recorded() []time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.deadlines)
+}
+
+// A live session that parks, is woken, and loses the freed slot to another session
+// parks again under the deadline it parked with first: the races of one session
+// share one admission-queue timeout instead of each starting a new one.
+func TestLiveSlotRacesKeepOneAdmissionDeadline(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServerWith(t, agent, instanceRouterConfig{replicable: true, queueTimeoutSecs: 30})
+	publishASRInstances(srv, 0, 1)
+	srv.Active.admission.recheck = 0 // only a release wakes the parked session
+	adm := &deadlineRecordingAdmission{inner: srv.Active.admission}
+	srv.Resolver.SetAdmissionController(adm)
+	release0, _ := srv.liveSessions.acquire("route-asr-inst#0")
+	release1, _ := srv.liveSessions.acquire("route-asr-inst#1")
+	var mu sync.Mutex
+	race := false
+	var racedRelease func()
+	liveSlotAcquireHook = func(instanceKey string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if race && racedRelease == nil {
+			racedRelease, _ = srv.liveSessions.acquire(instanceKey)
+		}
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	// Before the server closes: every slot is let go and a session still parked is
+	// woken onto one, since a parked bearer session does not notice its client leave.
+	t.Cleanup(func() {
+		liveSlotAcquireHook = nil
+		release0()
+		release1()
+		mu.Lock()
+		if racedRelease != nil {
+			racedRelease()
+		}
+		mu.Unlock()
+		wakeAdmission(srv)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	done := make(chan liveSessionResult, 1)
+	go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+	waitForParked(t, srv.Active.admission, 1)
+	// Time passes before the slot frees, so a deadline counted afresh from the second
+	// park would lie measurably later than the first.
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	race = true
+	mu.Unlock()
+	release0()
+	wakeAdmission(srv)
+	waitForParked(t, srv.Active.admission, 1)
+
+	mu.Lock()
+	raced := racedRelease != nil
+	mu.Unlock()
+	deadlines := adm.recorded()
+	if !raced || len(deadlines) != 2 {
+		t.Fatalf("raced %v, %d waits; want the session woken, its slot taken in the race, and parked again", raced, len(deadlines))
+	}
+	if drift := deadlines[1].Sub(deadlines[0]); drift > 50*time.Millisecond || drift < -50*time.Millisecond {
+		t.Fatalf("the second park's deadline lies %v from the first's, want the same deadline", drift)
+	}
+	release1()
+	wakeAdmission(srv)
+	s := <-done
+	if s.err != nil || s.resp.StatusCode != http.StatusOK {
+		t.Fatalf("the session admitted once instance 1 freed: err %v status %v, want 200", s.err, s.resp)
+	}
+	finishLiveSession(t, s)
+}
+
+// A request the admission queue has no room for is refused as full and starts
+// no instance: only the request that parked signalled demand.
+func TestFullAdmissionQueueSignalsNoDemand(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServer(t, agent, true)
+	srv.Active.admission.recheck = 0
+	srv.Active.admission.maxDepth = 1
+	sink := &recordingDemandSink{}
+	srv.Resolver.SetDemandSink(sink)
+	publishChatInstances(srv)
+	srv.Active.Add(ActiveRequest{ID: "busy0", ServerID: liveInstServer, InstanceKey: "route-chat-inst#0"})
+	defer srv.Active.Remove("busy0")
+	const chatBody = `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	parked := make(chan struct{})
+	go func() {
+		defer close(parked)
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody))
+		req.Header.Set("Authorization", "Bearer dev-secret")
+		req.Header.Set("Content-Type", "application/json")
+		srv.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	waitForParked(t, srv.Active.admission, 1)
+
+	rec := postInstanceJSON(t, srv, "/v1/chat/completions", chatBody)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), routing.ErrAdmissionQueueFull.Error()) {
+		t.Fatalf("status %d body %s; want 503 %s", rec.Code, rec.Body.String(), routing.ErrAdmissionQueueFull)
+	}
+	if signals := sink.signals(); len(signals) != 1 {
+		t.Fatalf("demand signals = %+v, want only the parked request's one", signals)
+	}
+	cancel()
+	<-parked
+}

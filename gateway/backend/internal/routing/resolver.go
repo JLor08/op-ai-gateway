@@ -93,17 +93,35 @@ func parkDemand(err error) (DemandSignal, bool) {
 }
 
 // signalDemand hands the sink each demand a request about to wait in the admission
-// queue carries. It runs at the two places a request parks -- resolveStandard's and
-// resolveGroupOnce's WaitForSlot -- and nowhere else, so a request signals exactly once
-// per turn it spends parked: never for a candidate a walk skipped or probed and then
-// served around, and never on the fail-open path a resolver without a queue takes.
+// queue carries: one per at-capacity member with instance candidates (a plain model's
+// pool is its one member), deduplicated by model. It runs at the two places a request
+// parks -- resolveStandard's and resolveGroupOnce's WaitForSlot, after their deadline
+// check -- and nowhere else, so a request signals once per park turn for each such
+// member: never for a candidate a walk skipped or probed and then served around, never
+// on the fail-open path a resolver without a queue takes, never for a request whose
+// deadline has already passed, and never for one the queue has no room for
+// (AdmissionRoom) -- a request about to be refused as full must not start an instance.
 func (r *Resolver) signalDemand(demands ...DemandSignal) {
-	if r.demand == nil {
+	if r.demand == nil || len(demands) == 0 {
+		return
+	}
+	if room, ok := r.admission.(AdmissionRoom); ok && !room.HasRoom() {
 		return
 	}
 	for _, d := range demands {
 		r.demand.Signal(d)
 	}
+}
+
+// admissionStart is when req's admission began, which a bounded queue timeout counts
+// from: req.AdmissionStart when the caller set it (one client call that resolves more
+// than once), now otherwise. A start in the future -- a clock the caller does not share
+// -- counts as now.
+func admissionStart(req inference.Request, now time.Time) time.Time {
+	if req.AdmissionStart.IsZero() || req.AdmissionStart.After(now) {
+		return now
+	}
+	return req.AdmissionStart
 }
 
 type Target struct {
@@ -328,6 +346,17 @@ type RuntimeModelStateChecker interface {
 // keeps the CP3 all-at-cap fail-open. Satisfied by *gateway.admissionQueue.
 type AdmissionController interface {
 	WaitForSlot(ctx context.Context, serverIDs []string, timeout time.Duration) error
+}
+
+// AdmissionRoom is implemented by an AdmissionController that can tell, before a
+// request parks, whether it would take one more waiter. The resolver asks it right
+// before signalling demand (signalDemand), so a request the queue is about to turn away
+// as full starts no instance. The answer is a snapshot: a queue that fills between it
+// and the wait still refuses a request that signalled, and a place that frees in
+// between lets in a request that sent nothing that turn -- it signals on its next one.
+// A controller without it is taken to have room.
+type AdmissionRoom interface {
+	HasRoom() bool
 }
 
 // ProvisioningGate decides which of a set of candidate server ids the principal
@@ -896,9 +925,11 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// re-check (which returns after a sub-second interval to force a cap re-read) would
 	// re-arm the full timeout every iteration and a request under sustained saturation
 	// would never hit its configured 503. queueTimeout<=0 stays unbounded (ctx-only wait).
+	// It counts from the request's admission start (admissionStart): this resolve's own
+	// start, or an earlier one the caller resolved for the same client call.
 	var deadline time.Time
 	if queueTimeout > 0 {
-		deadline = now.Add(queueTimeout)
+		deadline = admissionStart(req, now).Add(queueTimeout)
 	}
 
 	for {
@@ -2875,7 +2906,8 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// Fresh request or a fallen-through pin: walk priorities; queue only if every member
 	// is at capacity (§3c/§3h). The admission timeout is an absolute wall-clock deadline
 	// established on the first queue so the queue's internal liveness re-check cannot re-arm
-	// the full budget every iteration (mirrors the main Resolve deadline semantics).
+	// the full budget every iteration (mirrors the main Resolve deadline semantics), counted
+	// from the request's admission start (admissionStart) when the caller set one.
 	var deadline time.Time
 	deadlineSet := false
 	for {
@@ -2889,7 +2921,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		if len(park.servers) > 0 && r.admission != nil {
 			queueTimeout := time.Duration(park.queueSecs) * time.Second
 			if queueTimeout > 0 && !deadlineSet {
-				deadline = g.now.Add(queueTimeout)
+				deadline = admissionStart(g.req, g.now).Add(queueTimeout)
 				deadlineSet = true
 			}
 			wait := time.Duration(0) // 0 => unbounded (ctx-only)
