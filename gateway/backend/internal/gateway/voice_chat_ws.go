@@ -96,9 +96,9 @@ const (
 	voiceStateDraining  = "draining"
 )
 
-// The default Voice Chat turn-detection and half-duplex timings, in milliseconds
-// (voice-chat design §6.1/§6.2). They are the defaults of the OP_AI_GATEWAY_VOICE_*
-// knobs; config cannot import this package, so it repeats the literals.
+// The default Voice Chat turn-detection and half-duplex timings, in milliseconds.
+// They are the defaults of the OP_AI_GATEWAY_VOICE_* knobs; config cannot import
+// this package, so it repeats the literals.
 //
 //   - VoiceSilenceTimeoutMs: after a voiced ASR partial, this much quiet (no new
 //     partial) ends the current chunk.

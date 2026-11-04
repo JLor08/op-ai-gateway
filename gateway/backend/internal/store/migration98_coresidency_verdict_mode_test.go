@@ -98,12 +98,10 @@ func TestMigration98And99UpgradeAnExistingCoResidencyDeployment(t *testing.T) {
 			}
 		}
 		for _, mid := range []string{"map_m98_a", "map_m98_b", "map_m98_c"} {
-			if err := s.CreateMapping(ctx, routing.ModelMapping{
+			seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 				ID: mid, ApplicationID: "app_m98", GatewayModelName: mid + "-model", AppModelName: mid + "-up",
 				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-			}); err != nil {
-				t.Fatalf("create mapping %s: %v", mid, err)
-			}
+			})
 		}
 		// Two allowed pairs written before the verdict column existed. Raw SQL
 		// on purpose: at v97 SetCoResidencyRules would name a column that is

@@ -262,7 +262,7 @@ func TestN0StreamedCommitsMarker(t *testing.T) {
 // lost: the user never heard it live, so it is STORED. But the thread must not
 // accumulate on a model that only sometimes falls back, so each buffered-fallback
 // answer keeps only itself -- every older stored answer becomes a marker in the same
-// save (keep-last-1). [Review Focus]
+// save (keep-last-1).
 func TestN0BufferedFallbackKeepsOne(t *testing.T) {
 	forEachRetentionLeg(t, func(t *testing.T, e *retentionEnv) {
 		chatID := e.newChat(t, `{"settings":{},"messages":[]}`)

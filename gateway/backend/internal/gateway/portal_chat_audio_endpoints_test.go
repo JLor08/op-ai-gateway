@@ -234,7 +234,7 @@ func TestPruneChatAudioEndpointRejectsAnInvalidCount(t *testing.T) {
 // checkpoint or its terminal commit and delete audio it is about to reference. The
 // refusal is the same 409 portal.chat_run_active PUT answers with, it leaves the chat
 // untouched, and it is per chat: another idle chat of the same user is not blocked, and
-// once the run is over the same call goes through. [Review Focus]
+// once the run is over the same call goes through.
 func TestAudioMutationsRefusedWhileRunActive(t *testing.T) {
 	e := newChatBlobEnv(t)
 	e.srv.ChatRuns = NewChatRunRegistry(5)

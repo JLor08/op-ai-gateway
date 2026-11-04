@@ -1242,3 +1242,89 @@ func TestCertEdgeProbeTargetDefaultsToEmpty(t *testing.T) {
 		t.Fatalf("CertEdgeProbeTarget = %q, want empty (= probe endpoint disabled)", cfg.CertEdgeProbeTarget)
 	}
 }
+
+// instanceEnvKeys are the five model-instance autoscaling knobs: the idle
+// timeout derivation for a replicable runtime spec (factor, floor), the
+// scaler's refusal cooldown, and the audio benchmark's real-time threshold
+// and concurrency-ramp cap.
+var instanceEnvKeys = []string{
+	"OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR",
+	"OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS",
+	"OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS",
+	"OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR",
+	"OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX",
+}
+
+// instanceKnobs is the five loaded values, for one comparison per case.
+type instanceKnobs struct {
+	idleFactor     float64
+	idleFloor      int
+	scaleCooldown  int
+	realtimeFactor float64
+	concurrencyMax int
+}
+
+func instanceKnobsOf(c Config) instanceKnobs {
+	return instanceKnobs{c.InstanceIdleFactor, c.InstanceIdleFloorSeconds, c.InstanceScaleCooldownSeconds, c.AudioRealtimeMinFactor, c.AudioConcurrencyMax}
+}
+
+// TestConfigInstanceEnvDefaults pins the five model-instance autoscaling
+// knobs: their defaults with nothing set, an environment override of each,
+// and the config file's JSON numbers (a fractional factor included) under an
+// environment that still wins.
+func TestConfigInstanceEnvDefaults(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_CONFIG", "")
+	for _, key := range instanceEnvKeys {
+		t.Setenv(key, "")
+	}
+	if got, want := instanceKnobsOf(mustLoad(t)), (instanceKnobs{5, 120, 60, 1.2, 8}); got != want {
+		t.Fatalf("defaults = %+v, want %+v", got, want)
+	}
+
+	t.Setenv("OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR", "2.5")
+	t.Setenv("OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS", "300")
+	t.Setenv("OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS", "15")
+	t.Setenv("OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR", "1.5")
+	t.Setenv("OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX", "4")
+	if got, want := instanceKnobsOf(mustLoad(t)), (instanceKnobs{2.5, 300, 15, 1.5, 4}); got != want {
+		t.Fatalf("environment overrides = %+v, want %+v", got, want)
+	}
+
+	for _, key := range instanceEnvKeys {
+		t.Setenv(key, "")
+	}
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR":3.75,"OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS":90,`+
+		`"OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS":"45","OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR":1.1,"OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX":16}`)
+	t.Setenv("OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX", "6")
+	if got, want := instanceKnobsOf(mustLoad(t)), (instanceKnobs{3.75, 90, 45, 1.1, 6}); got != want {
+		t.Fatalf("config file under an environment override = %+v, want %+v (the file's values, the environment's concurrency cap)", got, want)
+	}
+}
+
+// TestConfigInstanceEnvFallsBackOnJunk pins the rule every one of the five
+// knobs follows, the file's integer() rule: an unparseable, zero or negative
+// value is junk and loads the default. A factor that is not a finite number is
+// junk too: an infinite idle factor would turn every replicable spec's idle
+// timeout into "never", and NaN compares false with everything.
+func TestConfigInstanceEnvFallsBackOnJunk(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_CONFIG", "")
+	want := instanceKnobs{5, 120, 60, 1.2, 8}
+	for _, v := range []string{"garbage", "0", "-5", "0.0", "-0.5"} {
+		for _, key := range instanceEnvKeys {
+			t.Setenv(key, v)
+		}
+		if got := instanceKnobsOf(mustLoad(t)); got != want {
+			t.Fatalf("value %q: knobs = %+v, want the defaults %+v", v, got, want)
+		}
+	}
+	for _, key := range instanceEnvKeys {
+		t.Setenv(key, "")
+	}
+	for _, v := range []string{"NaN", "Inf", "+Inf", "-Inf", "1e400"} {
+		t.Setenv("OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR", v)
+		t.Setenv("OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR", v)
+		if got := instanceKnobsOf(mustLoad(t)); got != want {
+			t.Fatalf("factor %q: knobs = %+v, want the defaults %+v", v, got, want)
+		}
+	}
+}

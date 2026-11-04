@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"time"
 )
 
@@ -191,8 +192,9 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
 			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
+			audio_rate_x, audio_ttfa_ms, audio_realtime_concurrency, audio_concurrency_limit, audio_metrics_updated_at,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		mapping.ID,
 		mapping.ApplicationID,
 		mapping.GatewayModelName,
@@ -209,6 +211,11 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
+		nullFloat64OfZero(mapping.AudioRateX),
+		nullInt64OfZero(mapping.AudioTTFAMS),
+		mapping.AudioRealtimeConcurrency,
+		mapping.AudioConcurrencyLimit,
+		mapping.AudioMetricsUpdatedAt,
 		mapping.CreatedAt,
 		mapping.UpdatedAt,
 	)
@@ -268,6 +275,8 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 			load_time_ms = ?, context_size = ?, energy_wh_per_token = ?, metrics_locked = ?,
 			metrics_updated_at = ?, metrics_source = ?,
 			max_concurrency = ?, recommended_concurrency = ?, gen_tokens_per_second_at_capacity = ?,
+			audio_rate_x = ?, audio_ttfa_ms = ?, audio_realtime_concurrency = ?,
+			audio_concurrency_limit = ?, audio_metrics_updated_at = ?,
 			updated_at = ?
 		where id = ?`,
 		mapping.ApplicationID,
@@ -285,6 +294,11 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.MaxConcurrency,
 		mapping.RecommendedConcurrency,
 		mapping.GenTokensPerSecondAtCapacity,
+		nullFloat64OfZero(mapping.AudioRateX),
+		nullInt64OfZero(mapping.AudioTTFAMS),
+		mapping.AudioRealtimeConcurrency,
+		mapping.AudioConcurrencyLimit,
+		mapping.AudioMetricsUpdatedAt,
 		mapping.UpdatedAt,
 		mapping.ID,
 	)
@@ -505,12 +519,58 @@ func (s *SQLiteStore) UpdateMappingCapacityMetrics(ctx context.Context, id strin
 	return nil // 0 rows affected (missing or locked) is a benign no-op
 }
 
+// UpdateMappingAudioMetrics writes one audio benchmark run's measurements +
+// provenance (routing.MappingStore carries the contract). A limit
+// routing.ValidateAudioMetrics refuses is an error before any statement, and a
+// run that measured nothing returns before any statement too, so neither
+// writes anything, provenance included. Otherwise the SET list names only the
+// columns the run measured -- the ramp's count and limit always as a pair
+// (routing.AudioMetrics.RampMeasured), so a 0 replaces a stored count --
+// assembled from fixed column names with every value a bound parameter (the
+// UpdateVendorAccountOperateFields shape): "keep the stored value unless
+// measured" spans five columns of four types here, and deciding it on the Go
+// value avoids the typed-cast pair per column a CASE needs on PostgreSQL
+// (UpdateMappingBenchmarkMetrics). Both stamps take at. The metrics_locked = 0
+// guard stays in SQL, so the lock is still atomic: a locked (or missing) row
+// matches 0 rows and is left untouched, a benign no-op (not an error).
+func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m routing.AudioMetrics, source string, at time.Time) error {
+	if err := routing.ValidateAudioMetrics(m); err != nil {
+		return err
+	}
+	if !m.Measured() {
+		return nil
+	}
+	sets := make([]string, 0, 8)
+	args := make([]any, 0, 9)
+	if m.RateX > 0 {
+		sets, args = append(sets, "audio_rate_x = ?"), append(args, m.RateX)
+	}
+	if m.TTFAMS > 0 {
+		sets, args = append(sets, "audio_ttfa_ms = ?"), append(args, m.TTFAMS)
+	}
+	if m.RampMeasured() {
+		sets = append(sets, "audio_realtime_concurrency = ?", "audio_concurrency_limit = ?")
+		args = append(args, m.RealtimeConcurrency, m.ConcurrencyLimit)
+	}
+	if m.LoadTimeMS > 0 {
+		sets, args = append(sets, "load_time_ms = ?"), append(args, m.LoadTimeMS)
+	}
+	sets = append(sets, "metrics_source = ?", "metrics_updated_at = ?", "audio_metrics_updated_at = ?")
+	args = append(args, source, at, at, mappingID)
+	if _, err := s.exec(ctx, `update model_mappings set `+strings.Join(sets, ", ")+`
+		where id = ? and metrics_locked = 0`, args...); err != nil {
+		return fmt.Errorf("update mapping audio metrics: %w", err)
+	}
+	return nil // 0 rows affected (missing or locked) is a benign no-op
+}
+
 func (s *SQLiteStore) MappingByID(ctx context.Context, id string) (routing.ModelMapping, error) {
 	row := s.queryRow(ctx, `
 		select id, application_id, gateway_model_name, app_model_name, status,
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
 			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
+			audio_rate_x, audio_ttfa_ms, audio_realtime_concurrency, audio_concurrency_limit, audio_metrics_updated_at,
 			created_at, updated_at
 		from model_mappings
 		where id = ?`, id)
@@ -523,6 +583,7 @@ func (s *SQLiteStore) MappingsByApplication(ctx context.Context, applicationID s
 			gen_tokens_per_second, prompt_tokens_per_second, load_time_ms, context_size,
 			energy_wh_per_token, metrics_locked, metrics_updated_at, metrics_source,
 			max_concurrency, recommended_concurrency, gen_tokens_per_second_at_capacity,
+			audio_rate_x, audio_ttfa_ms, audio_realtime_concurrency, audio_concurrency_limit, audio_metrics_updated_at,
 			created_at, updated_at
 		from model_mappings
 		where application_id = ?
@@ -540,6 +601,7 @@ func (s *SQLiteStore) MappingsByServer(ctx context.Context, serverID string) ([]
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
 			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
+			m.audio_rate_x, m.audio_ttfa_ms, m.audio_realtime_concurrency, m.audio_concurrency_limit, m.audio_metrics_updated_at,
 			m.created_at, m.updated_at
 		from model_mappings m
 		join applications a on a.id = m.application_id
@@ -570,6 +632,7 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			m.gen_tokens_per_second, m.prompt_tokens_per_second, m.load_time_ms, m.context_size,
 			m.energy_wh_per_token, m.metrics_locked, m.metrics_updated_at, m.metrics_source,
 			m.max_concurrency, m.recommended_concurrency, m.gen_tokens_per_second_at_capacity,
+			m.audio_rate_x, m.audio_ttfa_ms, m.audio_realtime_concurrency, m.audio_concurrency_limit, m.audio_metrics_updated_at,
 			m.created_at, m.updated_at,
 			lp.verdict
 		from model_mappings m
@@ -625,6 +688,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		liveTimings          int64
 		mapLocked            int64
 		mapUpdatedNil        sql.NullTime
+		mapAudio             mappingAudioScan
 		// liveProgressVerdict is the joined model_mapping_capabilities.verdict
 		// column (nullable: a LEFT JOIN row with no match scans as NULL, i.e.
 		// Valid == false, String == "" -- the same "absent = never determined"
@@ -652,6 +716,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Mapping.GenTokensPerSecond, &c.Mapping.PromptTokensPerSecond, &c.Mapping.LoadTimeMS, &c.Mapping.ContextSize,
 		&c.Mapping.EnergyWhPerToken, &mapLocked, &mapUpdatedNil, &c.Mapping.MetricsSource,
 		&c.Mapping.MaxConcurrency, &c.Mapping.RecommendedConcurrency, &c.Mapping.GenTokensPerSecondAtCapacity,
+		&mapAudio.rateX, &mapAudio.ttfaMS, &c.Mapping.AudioRealtimeConcurrency, &c.Mapping.AudioConcurrencyLimit, &mapAudio.updatedAt,
 		&c.Mapping.CreatedAt, &c.Mapping.UpdatedAt,
 		&liveProgressVerdict,
 	)
@@ -675,6 +740,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		t := mapUpdatedNil.Time
 		c.Mapping.MetricsUpdatedAt = &t
 	}
+	mapAudio.apply(&c.Mapping)
 	if lastSeen.Valid {
 		t := lastSeen.Time
 		c.Server.LastSeenAt = &t
@@ -780,10 +846,32 @@ func scanApplications(rows *sql.Rows) ([]routing.Application, error) {
 	return apps, nil
 }
 
+// mappingAudioScan holds the three NULLABLE audio metric columns (migration
+// 101) while a model_mappings row is scanned, so scanMapping and
+// scanMappingCandidate -- two scanners over four select lists -- read them
+// through one conversion instead of two hand copies of it.
+type mappingAudioScan struct {
+	rateX     sql.NullFloat64
+	ttfaMS    sql.NullInt64
+	updatedAt sql.NullTime
+}
+
+// apply copies the scanned columns onto m. NULL, which is what a mapping that
+// was never measured stores (the writers turn a zero into NULL), reads as zero
+// -- "not measured" -- and as a nil stamp.
+func (a mappingAudioScan) apply(m *routing.ModelMapping) {
+	m.AudioRateX, m.AudioTTFAMS = a.rateX.Float64, a.ttfaMS.Int64
+	if a.updatedAt.Valid {
+		t := a.updatedAt.Time
+		m.AudioMetricsUpdatedAt = &t
+	}
+}
+
 func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 	var mapping routing.ModelMapping
 	var locked int64
 	var updatedNil sql.NullTime
+	var audio mappingAudioScan
 	err := row.Scan(
 		&mapping.ID,
 		&mapping.ApplicationID,
@@ -801,6 +889,11 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		&mapping.MaxConcurrency,
 		&mapping.RecommendedConcurrency,
 		&mapping.GenTokensPerSecondAtCapacity,
+		&audio.rateX,
+		&audio.ttfaMS,
+		&mapping.AudioRealtimeConcurrency,
+		&mapping.AudioConcurrencyLimit,
+		&audio.updatedAt,
 		&mapping.CreatedAt,
 		&mapping.UpdatedAt,
 	)
@@ -815,6 +908,7 @@ func scanMapping(row rowScanner) (routing.ModelMapping, error) {
 		t := updatedNil.Time
 		mapping.MetricsUpdatedAt = &t
 	}
+	audio.apply(&mapping)
 	return mapping, nil
 }
 

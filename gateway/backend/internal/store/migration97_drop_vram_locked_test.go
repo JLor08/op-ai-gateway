@@ -61,12 +61,10 @@ func TestMigration97DropsVRAMLockedFromAnUpgradedDatabase(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create application: %v", err)
 		}
-		if err := s.CreateMapping(ctx, routing.ModelMapping{
+		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m97", ApplicationID: "app_m97", GatewayModelName: "m97-model", AppModelName: "up-m97",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create mapping: %v", err)
-		}
+		})
 		// A spec written while the column existed, with the lock ON. Raw SQL on
 		// purpose: UpsertRuntimeSpec no longer names vram_locked, and the whole
 		// point is a row the drop has to remove the column FROM.
@@ -77,8 +75,11 @@ func TestMigration97DropsVRAMLockedFromAnUpgradedDatabase(t *testing.T) {
 			t.Fatalf("seed v96 spec: %v", err)
 		}
 
-		if err := s.Migrate(ctx); err != nil {
-			t.Fatalf("migrate to head: %v", err)
+		// The shape checks run at version 97 itself: a later migration may add
+		// columns of its own (migration 100 adds five), so "exactly one column
+		// dropped" only describes 97 while nothing after it has run.
+		if err := s.migrateTo(ctx, 97); err != nil {
+			t.Fatalf("migrate to 97: %v", err)
 		}
 
 		after := tableColumnDecls(ctx, t, s, "agent_runtime_specs")
@@ -95,6 +96,12 @@ func TestMigration97DropsVRAMLockedFromAnUpgradedDatabase(t *testing.T) {
 		}
 		if len(after) != len(before)-1 {
 			t.Fatalf("migration 97 changed the column count from %d to %d, want exactly one column dropped", len(before), len(after))
+		}
+
+		// The rest of the ledger, so the store's statements -- which speak the
+		// head's column set -- apply to the row below.
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate to head: %v", err)
 		}
 
 		spec, ok, err := s.RuntimeSpecByMapping(ctx, "map_m97")

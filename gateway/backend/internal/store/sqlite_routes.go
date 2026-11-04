@@ -666,8 +666,8 @@ func (s *SQLiteStore) UpsertAffinity(ctx context.Context, affinity routing.Route
 		insert into route_affinity (
 			id, api_token_id, user_id, model, api_flavor, session_id,
 			application_id, server_id, expires_at, last_used_at, created_at, updated_at,
-			resolved_model
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			resolved_model, instance
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(api_token_id, model, api_flavor, session_id) do update set
 			id = excluded.id,
 			user_id = excluded.user_id,
@@ -676,7 +676,8 @@ func (s *SQLiteStore) UpsertAffinity(ctx context.Context, affinity routing.Route
 			expires_at = excluded.expires_at,
 			last_used_at = excluded.last_used_at,
 			updated_at = excluded.updated_at,
-			resolved_model = excluded.resolved_model`,
+			resolved_model = excluded.resolved_model,
+			instance = excluded.instance`,
 		affinity.ID,
 		affinity.APITokenID,
 		nullableTokenRef(affinity.UserID),
@@ -690,6 +691,7 @@ func (s *SQLiteStore) UpsertAffinity(ctx context.Context, affinity routing.Route
 		affinity.CreatedAt,
 		affinity.UpdatedAt,
 		affinity.ResolvedModel,
+		affinity.Instance,
 	)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
@@ -710,7 +712,7 @@ func (s *SQLiteStore) Affinity(ctx context.Context, key routing.AffinityKey) (ro
 	row := s.queryRow(ctx, `
 		select id, api_token_id, coalesce(user_id,''), model, api_flavor, session_id,
 			application_id, server_id, expires_at, last_used_at, created_at, updated_at,
-			resolved_model
+			resolved_model, instance
 		from route_affinity
 		where api_token_id = ? and model = ? and api_flavor = ? and session_id = ?`,
 		key.APITokenID,
@@ -884,6 +886,7 @@ func scanAffinity(row rowScanner) (routing.RouteAffinity, error) {
 		&affinity.CreatedAt,
 		&affinity.UpdatedAt,
 		&affinity.ResolvedModel,
+		&affinity.Instance,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RouteAffinity{}, ErrNotFound

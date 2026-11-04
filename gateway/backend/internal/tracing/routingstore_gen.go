@@ -1456,6 +1456,18 @@ func (_d *RoutingStoreWithTracing) UpdateMapping(ctx context.Context, mapping _s
 	return _d.Store.UpdateMapping(ctx, mapping)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m _sourceRouting.AudioMetrics, source string, at time.Time) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateMappingAudioMetrics")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateMappingAudioMetrics(ctx, mappingID, m, source, at)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateMappingBenchmarkMetrics(ctx context.Context, id string, genTPS float64, promptTPS float64, loadMS int, at time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateMappingBenchmarkMetrics")
 	defer span.End()
@@ -1586,6 +1598,18 @@ func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecRAMMeasured(ctx context.Cont
 		}
 	}()
 	return _d.Store.UpdateRuntimeSpecRAMMeasured(ctx, specID, measuredMB)
+}
+
+func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecStartupMeasured(ctx context.Context, specID string, ms int64) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateRuntimeSpecStartupMeasured")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateRuntimeSpecStartupMeasured(ctx, specID, ms)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateServerCertificateOverride(ctx context.Context, id string, override string) (err error) {

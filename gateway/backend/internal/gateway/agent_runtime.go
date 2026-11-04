@@ -366,7 +366,9 @@ type agentRuntimeReportSpecGPU struct {
 // sanitizeRuntimeReportConfig. Every OTHER non-secret DTO field must appear
 // here, or the sanitizer's re-parse silently drops it from the stored report
 // (issue #64: visible_devices_mode, type and the probe paths were each lost
-// this way, so an args-mode spec showed as env in the report view).
+// this way, so an args-mode spec showed as env in the report view, and later
+// ram_mb). TestAgentRuntimeReportSpecMirrorsEveryNonSecretDTOField holds the
+// two field lists together.
 type agentRuntimeReportSpec struct {
 	ID                          string                      `json:"id"`
 	Model                       string                      `json:"model"`
@@ -376,6 +378,7 @@ type agentRuntimeReportSpec struct {
 	Env                         map[string]string           `json:"env"`
 	WorkDir                     string                      `json:"work_dir,omitempty"`
 	GPUs                        []agentRuntimeReportSpecGPU `json:"gpus"`
+	RAMMB                       int                         `json:"ram_mb"` // host-RAM demand, AgentRuntimeSpecDTO.RAMMB; 0 = unknown
 	ListenPort                  int                         `json:"listen_port"`
 	HealthPath                  string                      `json:"health_path"`
 	HealthTimeoutSeconds        int                         `json:"health_timeout_seconds"`
@@ -399,6 +402,12 @@ type agentRuntimeReportSpec struct {
 	// file says, which may be nothing, so unlike the DTO it is omitempty here:
 	// an absent role stays absent in the stored report instead of becoming "".
 	Role string `json:"role,omitempty"`
+	// Replicable / MinInstances / MaxInstances are the spec's instance settings
+	// (AgentRuntimeSpecDTO's), omitempty like the DTO's, so a stored report of
+	// a spec that is not replicable carries none of the keys.
+	Replicable   bool `json:"replicable,omitempty"`
+	MinInstances int  `json:"min_instances,omitempty"`
+	MaxInstances int  `json:"max_instances,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

@@ -120,6 +120,10 @@ var portalRuntimeSpecErrRows = []errRow{
 	},
 	{err: portal.ErrRuntimeSpecMetricsPathInvalid, status: http.StatusBadRequest, code: "runtime_spec.metrics_path_invalid", msg: "metrics_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	{err: portal.ErrRuntimeSpecContextProbePathInvalid, status: http.StatusBadRequest, code: "runtime_spec.context_probe_path_invalid", msg: "context_probe_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
+	// The two instance-settings refusals (#340); a negative count answers with
+	// the tuning row above.
+	{err: portal.ErrRuntimeSpecInstancesInvalid, status: http.StatusBadRequest, code: "runtime_spec.instances_invalid", msg: "min_instances must not exceed max_instances when both are set"},
+	{err: portal.ErrRuntimeSpecInstancesNeedEphemeralPort, status: http.StatusBadRequest, code: "runtime_spec.instances_need_ephemeral_port", msg: "a replicable runtime spec needs listen_port 0: every instance listens on its own port, picked by the agent"},
 	// The four per-spec API-token sentinels from validateRuntimeSpecAPIToken
 	// -- code is err.Error() verbatim, per the convention every row above
 	// already follows.

@@ -706,10 +706,17 @@ type RouteAffinity struct {
 	SessionID     string
 	ApplicationID string
 	ServerID      string
-	ExpiresAt     time.Time
-	LastUsedAt    time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// Instance is the instance of the mapping's spec the pin chose
+	// (route_affinity.instance, migration 102), so a pinned client keeps
+	// landing on the same process: k for the instance addressed `m#k`, and 0
+	// both for instance 0 and for every non-replicable mapping -- the address
+	// every pin meant before the column existed, which is why the zero value
+	// needs no translation.
+	Instance   int
+	ExpiresAt  time.Time
+	LastUsedAt time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // ModelGroup is a named priority-failover group offered to clients as a synthetic
@@ -949,8 +956,32 @@ type ModelMapping struct {
 	MaxConcurrency               int     // max concurrent requests the model can serve; 0 = unknown
 	RecommendedConcurrency       int     // recommended concurrent requests before throughput degrades; 0 = unknown
 	GenTokensPerSecondAtCapacity float64 // aggregate generation throughput at MaxConcurrency (tokens/s); 0 = unknown
-	CreatedAt                    time.Time
-	UpdatedAt                    time.Time
+
+	// Per-mapping AUDIO performance metrics (migration 101, #340), the audio
+	// counterpart of the text metrics above, for a mapping with the speech
+	// (TTS) or transcription (ASR) capability. The audio benchmark's speed and
+	// capacity runs write them through UpdateMappingAudioMetrics, under the
+	// same MetricsLocked guard and stamping the same MetricsSource /
+	// MetricsUpdatedAt as the text writers. They live on the mapping, not on a
+	// running process, so routing and the scaler can read them whether or not
+	// the model is loaded. 0 / "" / nil = unknown, except for the concurrency
+	// ramp's count: it and AudioConcurrencyLimit are one result -- the last
+	// level whose slowest stream still met the real-time threshold, and why
+	// the ramp stopped there -- so they read together. With no limit, no ramp
+	// has run and the count is unknown. Under AudioLimitPerformance the count
+	// is a measured ceiling, so 0 means not real-time even with a single
+	// stream: a ceiling of 0, which the scaler honours like any other. Under
+	// AudioLimitResources or AudioLimitCap the ramp stopped before it found a
+	// ceiling and the count is a lower bound, so 0 there means nothing could
+	// be measured -- under AudioLimitResources the ramp's very first instance
+	// start was refused -- never "not real-time".
+	AudioRateX               float64    // audio seconds produced (TTS) or transcribed (ASR) per wall second, one stream; 0 = unknown
+	AudioTTFAMS              int64      // time to the first audio (TTS) or first transcript text (ASR), ms; 0 = unknown
+	AudioRealtimeConcurrency int        // the ramp's last good level: most concurrent streams whose slowest still met the real-time threshold; unknown only while AudioConcurrencyLimit is ""
+	AudioConcurrencyLimit    string     // why that ramp stopped: AudioLimitPerformance (a measured ceiling) | AudioLimitResources | AudioLimitCap (the count is a lower bound); "" = no ramp yet
+	AudioMetricsUpdatedAt    *time.Time // when an audio benchmark last wrote these; nil = never
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 // LimitConfig is a principal's (a Service or a User — see PrincipalType*)
@@ -2151,19 +2182,6 @@ func ValidateCapabilityRow(r CapabilityRow) error {
 	return nil
 }
 
-// MappingStore is CRUD for model mappings (gateway model name -> app model
-// name) plus the family of targeted, metrics_locked-respecting metric updates
-// (context probe, benchmark, opportunistic EWMA, capacity, energy EWMA) and
-// the routing-candidate lookup (ActiveMappingsForModel).
-//
-// It also owns the per-capability child rows (model_mapping_capabilities,
-// migration 78): one row per (mapping, capability) carrying the verdict, its
-// SOURCE and when it was established, where the ABSENCE of a row is
-// "unknown". Those are the only writers here that do NOT respect
-// metrics_locked, because they record a capability rather than a metric --
-// UpsertMappingCapabilities carries the full argument, and it is the one this
-// table's capability columns and migrations 76/77/78 all cite. See
-// CapabilityRow.
 // MappingMetricsMask names which of a mapping's machine-owned metric columns a
 // partial edit actually supplies. UpdateMappingEditable writes each column only
 // when its flag is set, leaving the rest to their narrow probe/benchmark
@@ -2187,6 +2205,98 @@ func (m MappingMetricsMask) Any() bool {
 		m.EnergyWhPerToken || m.MaxConcurrency || m.RecommendedConcurrency || m.GenTokensPerSecondAtCapacity
 }
 
+// AudioMetrics is what one audio benchmark run measured, for
+// UpdateMappingAudioMetrics: a speed run yields RateX and TTFAMS (and
+// LoadTimeMS from a confirmed cold start), a capacity ramp yields
+// RealtimeConcurrency and ConcurrencyLimit. A rate, TTFA or load time of 0 or
+// below means "this run did not measure it" and keeps the stored column, so a
+// speed-only run never erases the capacity figures and a capacity-only run
+// never erases the speed ones.
+//
+// The ramp's two fields are one result and follow their own rule
+// (RampMeasured): the level and the reason the ramp stopped there are written
+// together or not at all. A ramp always reports why it stopped, so a
+// non-empty ConcurrencyLimit is what marks a ramp result, and its
+// RealtimeConcurrency counts even at 0: under AudioLimitPerformance the ramp
+// found no good level and the model is not real-time even with one stream,
+// under AudioLimitResources its first instance start was refused and nothing
+// could be measured. Judging the count by its own sign instead would keep a
+// stored count next to the new limit and stamp: a fresh-looking ceiling, or
+// lower bound, that the latest ramp contradicts. ConcurrencyLimit is "" or
+// one of the three stop reasons; ValidateAudioMetrics refuses anything else.
+type AudioMetrics struct {
+	RateX               float64 // -> ModelMapping.AudioRateX
+	TTFAMS              int64   // -> ModelMapping.AudioTTFAMS
+	RealtimeConcurrency int     // -> ModelMapping.AudioRealtimeConcurrency, only together with ConcurrencyLimit
+	ConcurrencyLimit    string  // -> ModelMapping.AudioConcurrencyLimit; "" or an AudioLimit* constant, non-empty marks a ramp result
+	LoadTimeMS          int64   // -> ModelMapping.LoadTimeMS, the cold-start figure a text benchmark writes too
+}
+
+// The three reasons a concurrency ramp stops: the only non-empty values of
+// AudioMetrics.ConcurrencyLimit and ModelMapping.AudioConcurrencyLimit
+// (model_mappings.audio_concurrency_limit). Only AudioLimitPerformance -- a
+// level fell below the real-time threshold -- makes the ramp's count a
+// measured ceiling. The other two stop the ramp before it found one, so the
+// count is a lower bound: AudioLimitResources because an instance start was
+// refused (its neighbours held the room at that moment), AudioLimitCap
+// because the spec's max_instances or the ramp's own cap was reached.
+const (
+	AudioLimitPerformance = "performance"
+	AudioLimitResources   = "resources"
+	AudioLimitCap         = "cap"
+)
+
+// ValidateAudioMetrics rejects a run that could not have come from a caller
+// behaving correctly: a ConcurrencyLimit that is neither "" (no ramp result)
+// nor one of the three stop reasons. Both UpdateMappingAudioMetrics
+// implementations call this exact function before they write anything, so
+// the drivers cannot disagree about which strings are a limit, and
+// audio_concurrency_limit only ever holds a value its readers -- the scaler
+// and the portal -- know how to read. The call is refused rather than its
+// ramp half dropped, the rule ValidateCapabilityRow follows: the benchmark
+// passes one of the constants, so anything else is a bug worth surfacing,
+// and a broken producer's other figures are not worth storing either.
+func ValidateAudioMetrics(m AudioMetrics) error {
+	switch m.ConcurrencyLimit {
+	case "", AudioLimitPerformance, AudioLimitResources, AudioLimitCap:
+		return nil
+	}
+	return fmt.Errorf("audio metrics: concurrency limit must be %q, %q or %q, got %q",
+		AudioLimitPerformance, AudioLimitResources, AudioLimitCap, m.ConcurrencyLimit)
+}
+
+// RampMeasured reports whether the run carries a concurrency-ramp result: a
+// stop reason together with the level the ramp stopped at, 0 or more. Only
+// then are the two written, and always as a pair, so the stored count and
+// limit always come from the same ramp. A count without its reason, or a
+// reason with a negative level no ramp can end on, is no ramp result and
+// keeps both stored fields.
+func (m AudioMetrics) RampMeasured() bool {
+	return m.ConcurrencyLimit != "" && m.RealtimeConcurrency >= 0
+}
+
+// Measured reports whether the run measured anything at all -- a positive
+// rate, TTFA or load time, or a ramp result (RampMeasured). A run that did not
+// writes nothing, provenance included, the rule UpdateMappingBenchmarkMetrics
+// applies to a text run.
+func (m AudioMetrics) Measured() bool {
+	return m.RateX > 0 || m.TTFAMS > 0 || m.RampMeasured() || m.LoadTimeMS > 0
+}
+
+// MappingStore is CRUD for model mappings (gateway model name -> app model
+// name) plus the family of targeted, metrics_locked-respecting metric updates
+// -- six writers: context probe, benchmark, opportunistic EWMA, capacity,
+// audio benchmark and energy EWMA -- and the routing-candidate lookup
+// (ActiveMappingsForModel).
+//
+// It also owns the per-capability child rows (model_mapping_capabilities,
+// migration 78): one row per (mapping, capability) carrying the verdict, its
+// SOURCE and when it was established, where the ABSENCE of a row is
+// "unknown". Those are the only writers here that do NOT respect
+// metrics_locked, because they record a capability rather than a metric --
+// UpsertMappingCapabilities carries the full argument, and it is the one this
+// table's capability columns and migrations 76/77/78 all cite. See
+// CapabilityRow.
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	// UpdateMapping, like UpdateMappingEditable below, is one of the two
@@ -2230,6 +2340,23 @@ type MappingStore interface {
 	// non-error, when the mapping is missing or locked). Touches only the 3 capacity columns +
 	// provenance, so it cannot clobber a concurrent edit of other fields.
 	UpdateMappingCapacityMetrics(ctx context.Context, id string, maxConcurrency, recommendedConcurrency int, genTPSAtCapacity float64, at time.Time) error
+	// UpdateMappingAudioMetrics writes one audio benchmark run's measurements
+	// (migration 101), the audio counterpart of UpdateMappingBenchmarkMetrics:
+	// atomically and ONLY when metrics_locked is false (a no-op, non-error, when
+	// the mapping is missing or locked). A run writes only what it measured: a
+	// rate, TTFA or load time of 0 or below keeps the stored column, and a
+	// positive LoadTimeMS also writes load_time_ms. The ramp's count and limit
+	// are one result, written together -- a 0 included -- when the run carries
+	// one (AudioMetrics.RampMeasured) and both kept otherwise, so the stored
+	// pair never mixes two ramps. A write is stamped with metrics_source =
+	// source and with at in both metrics_updated_at and
+	// audio_metrics_updated_at, like the text writers' at; a call that measured
+	// nothing (AudioMetrics.Measured) writes nothing, provenance included. A
+	// limit other than "" and the three stop reasons is refused with an error
+	// before anything is written (ValidateAudioMetrics), also for a missing or
+	// locked mapping. It touches only those columns, so it cannot clobber a
+	// concurrent edit of other fields.
+	UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m AudioMetrics, source string, at time.Time) error
 	// UpdateMappingEnergyEWMA EWMA-blends energy_wh_per_token from a live per-request
 	// energy sample (watt-hours/token), atomically and ONLY when metrics_locked is
 	// false (no-op, non-error, when missing or locked). A sample <= 0 leaves the
@@ -2613,7 +2740,7 @@ type RuntimeSpec struct {
 	HealthPath                  string
 	HealthTimeoutSeconds        int
 	StartupTimeoutSeconds       int
-	IdleTimeoutSeconds          int // 0 = never unload
+	IdleTimeoutSeconds          int // 0 = never unload; on a Replicable spec 0 = no manual value, and the timeout pushed is derived from the measured startup
 	AdmissionWaitTimeoutSeconds int // 0 = wait until the client disconnects
 	Pinned                      bool
 	AdminState                  string // "" | "force_running" | "force_stopped"
@@ -2634,6 +2761,33 @@ type RuntimeSpec struct {
 	// and would otherwise erase the measurement with a zero on each save --
 	// the same never-clobber split as RuntimeSpecGPU's two VRAM fields.
 	RAMMeasuredMB int
+	// Replicable opts the spec into running more than one instance (#340;
+	// agent_runtime_specs.replicable, migration 100): instance k >= 1 is
+	// addressed `<app model name>#k` and started on demand. false -- every spec
+	// that never opted in -- is one process, exactly today's behaviour, which is
+	// why the column defaults to 0. Operator-owned: written by UpsertRuntimeSpec.
+	Replicable bool
+	// MinInstances is how many instances are kept warm (0 = none) and
+	// MaxInstances caps how many may run (0 = unbounded; the agent's absolute
+	// per-spec index cap still applies). Both only mean something while
+	// Replicable. Operator-owned (migration 100).
+	MinInstances int
+	MaxInstances int
+	// InstanceParallelism is how many requests one instance serves at once
+	// (0 = 1): the per-instance cap an instance candidate's in-flight count is
+	// compared with. Gateway-only -- the agent never needs it, so it is never
+	// pushed. Operator-owned (migration 100).
+	InstanceParallelism int
+	// StartupMeasuredMS is the agent's measured startup time for this spec, in
+	// ms: process start to the first successful health probe of the most recent
+	// successful start, the maximum over the spec's instances
+	// (agent_runtime_specs.startup_measured_ms, migration 100; a Go int64, so
+	// the column is ADR-005's bigint). 0 = nothing measured yet. Agent-owned,
+	// the RAMMeasuredMB contract: written ONLY by
+	// UpdateRuntimeSpecStartupMeasured, stored by UpsertRuntimeSpec on a fresh
+	// insert and PRESERVED on every later update, so an operator's
+	// full-document save -- which arrives with 0 -- never erases it.
+	StartupMeasuredMS int64
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
@@ -2853,7 +3007,13 @@ type RuntimeStore interface {
 	// UpsertRuntimeSpec inserts or replaces the spec for spec.MappingID (1
 	// spec per mapping — the unique key is mapping_id, not id): a fresh
 	// insert uses spec.CreatedAt, an overwrite preserves the existing
-	// created_at. A missing MappingID is ErrNotFound (FK violation).
+	// created_at. The two agent-owned measurements, RAMMeasuredMB and
+	// StartupMeasuredMS, are likewise stored on a fresh insert and PRESERVED
+	// on every overwrite -- only UpdateRuntimeSpecRAMMeasured and
+	// UpdateRuntimeSpecStartupMeasured move them -- because the portal's
+	// full-document save builds the row from the request alone and would
+	// otherwise reset both to 0 on every save. A missing MappingID is
+	// ErrNotFound (FK violation).
 	UpsertRuntimeSpec(ctx context.Context, spec RuntimeSpec) error
 	// RuntimeSpecByMapping returns the spec for mappingID; ok is false when
 	// no spec has been created for that mapping yet (not an error).
@@ -2891,6 +3051,13 @@ type RuntimeStore interface {
 	// Callers pass a strictly positive measurement: a zero is "unknown" and is
 	// dropped before it reaches the store.
 	UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error
+	// UpdateRuntimeSpecStartupMeasured writes back the agent's measured startup
+	// time for the spec, touching only StartupMeasuredMS (the operator-owned
+	// instance settings are never written here); ErrNotFound when the spec does
+	// not exist. Same contract as UpdateRuntimeSpecRAMMeasured: callers pass a
+	// strictly positive measurement (a zero is "unknown" and is dropped before it
+	// reaches the store), and UpsertRuntimeSpec never overwrites what this wrote.
+	UpdateRuntimeSpecStartupMeasured(ctx context.Context, specID string, ms int64) error
 	// SetCoResidencyRules atomically REPLACES the whole set of EXPLICIT
 	// co-residency pair rows for appID (delete-then-insert in one transaction,
 	// mirroring SetRuntimeSpecGPUs/SetGroupMembers). Each rule carries a verdict

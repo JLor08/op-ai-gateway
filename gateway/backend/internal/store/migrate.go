@@ -132,6 +132,9 @@ var migrations = []migration{
 	{version: 97, name: "drop_vram_locked", up: migration97Up},
 	{version: 98, name: "coresidency_rule_verdict", up: migration98Up},
 	{version: 99, name: "application_coresidency_mode", up: migration99Up},
+	{version: 100, name: "runtime_spec_instances", up: migration100Up},
+	{version: 101, name: "model_mapping_audio_metrics", up: migration101Up},
+	{version: 102, name: "route_affinity_instance", up: migration102Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3353,9 +3356,9 @@ func migration72Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 //   - agent_runtime_spec_gpus.position: the operator-chosen GPU order. Backfilled
 //     to the ascending-gpu_index rank per spec, so NO existing spec's env var /
 //     ${…} placeholder order changes on upgrade — the order only moves when an
-//     operator actively reorders (design §3.4).
-//   - agent_runtime_specs.visible_devices_mode: the env/args visibility mechanism
-//     (design §4.1), default 'env' = today's behaviour. [OWNED BY AREA B.]
+//     operator actively reorders.
+//   - agent_runtime_specs.visible_devices_mode: the env/args visibility
+//     mechanism, default 'env' = today's behaviour.
 //
 // Append-only: it does NOT touch migration65Up's create-table or the v60-frozen
 // baseline (a fresh install replays this; the backfill is a no-op on empty
@@ -4416,4 +4419,109 @@ func migration99Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		return err
 	}
 	return execTx(ctx, tx, dl, `update applications set coresidency_mode = 'opt_in'`)
+}
+
+// migration100Up adds the per-spec instance columns to agent_runtime_specs
+// (#340): replicable, min_instances, max_instances and instance_parallelism,
+// the operator's settings for running a spec as several processes, and
+// startup_measured_ms, the agent's measured startup time that the effective
+// idle timeout of a replicable spec is derived from.
+//
+// The ownership split is migration 96's: the four settings are operator-owned
+// (UpsertRuntimeSpec writes them on every save), the measurement is
+// agent-owned (UpdateRuntimeSpecStartupMeasured writes it, and an operator
+// re-save of the spec never touches it).
+//
+// Declarations, each `not null default 0` and the default load-bearing: it is
+// the whole upgrade story. replicable is an integer-boolean exactly like
+// pinned, and 0 -- not replicable -- runs every pre-existing spec as the one
+// process it always was. The three counts are plain integers like the
+// table's other settings, 0 meaning none / unbounded / one request at a time.
+// startup_measured_ms is a millisecond wall time backed by a Go int64, so
+// ADR-005 makes it bigint (an `integer` would be int4 on PostgreSQL); 0 is
+// "nothing measured yet", never "starts instantly". There is no backfill
+// because there is no prior column any of them could be derived from.
+//
+// Append-only: migration 65's create-table and the v60-frozen baseline are not
+// touched, so a fresh install gets the columns by replaying this migration.
+// addColumnIfMissing makes the step replayable on both dialects (`add column if
+// not exists` on PostgreSQL, the duplicate-column tolerance on SQLite).
+func migration100Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"replicable integer not null default 0",
+		"min_instances integer not null default 0",
+		"max_instances integer not null default 0",
+		"instance_parallelism integer not null default 0",
+		"startup_measured_ms bigint not null default 0",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration101Up adds the audio performance metrics to model_mappings (#340):
+// audio_rate_x, audio_ttfa_ms, audio_realtime_concurrency,
+// audio_concurrency_limit and audio_metrics_updated_at -- what the audio
+// benchmark's speed and capacity runs measure, stored on the mapping like the
+// text metrics so routing and the scaler can use them whether or not the
+// model is loaded. They are part of the metrics_locked group:
+// UpdateMappingAudioMetrics writes them only while the mapping is unlocked
+// and stamps metrics_source / metrics_updated_at as the text writers do, plus
+// the audio-only stamp.
+//
+// The two wide columns follow migration 95, the audio columns of the
+// benchmark history: ADR-005's double precision for the factor (a Go float64)
+// and bigint for the milliseconds (a Go int64), NULLABLE with no default, so
+// a mapping that was never measured stays distinguishable from a measured
+// value; the store writes NULL for a zero and reads NULL as zero. The other
+// three mirror their text-metric siblings: the concurrency count is
+// `integer not null default 0` like max_concurrency, the limit -- why the
+// concurrency ramp stopped: performance, resources or cap -- is text, not
+// null, defaulting to the empty string like metrics_source, and the stamp is
+// the dialect's nullable timestamp like metrics_updated_at. NULL, 0 and the
+// empty string read as "unknown" -- the count only while the limit is empty:
+// the ramp stores the two together, and its 0 (under "performance" not
+// real-time even with one stream, under "resources" nothing could be
+// measured) always comes with the reason the ramp stopped, so the count needs
+// no NULL of its own. Every pre-existing mapping, at 0 and the empty string,
+// reads back unmeasured, and there is nothing to backfill.
+//
+// Append-only: the v60-frozen baseline is not touched, so a fresh install gets
+// the columns by replaying this migration; addColumnIfMissing makes the step
+// replayable on both dialects.
+func migration101Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"audio_rate_x double precision",
+		"audio_ttfa_ms bigint",
+		"audio_realtime_concurrency integer not null default 0",
+		"audio_concurrency_limit text not null default ''",
+		"audio_metrics_updated_at " + dl.timestampType(),
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "model_mappings", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration102Up adds route_affinity.instance (#340): a token-affinity pin
+// records which instance of the mapping's spec it chose, so a pinned client
+// keeps landing on the same process.
+//
+// `integer not null default 0`, like the spec's instance counts it indexes
+// into, and the default is the upgrade story: instance 0 is byte-for-byte the
+// address every pin denoted before replicable specs existed, so every
+// pre-existing pin keeps meaning exactly what it meant and there is nothing to
+// backfill. Append-only (the baseline and migration 42's rebuild are not
+// touched); addColumnIfMissing makes the step replayable on both dialects.
+//
+// Migration 42's SQLite path drops and recreates route_affinity in a frozen
+// shape that lacks this column. That is safe only because the ledger always
+// runs 42 before 102, on a fresh install and on every upgrade; a test that
+// replays 42 on a head database has to replay 102 after it
+// (TestMigration42RouteAffinityNullableUpgrade does).
+func migration102Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "route_affinity", "instance integer not null default 0")
 }
