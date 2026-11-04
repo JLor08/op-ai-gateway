@@ -43,9 +43,31 @@ describe('isAudioConcurrencyLimit', () => {
 describe('formatAudioRate', () => {
   it('names a measured rate as a multiple of real time, an unmeasured one as a dash', () => {
     expect(formatAudioRate(3)).toBe('3.0×');
-    expect(formatAudioRate(0.84)).toBe('0.8×');
+    expect(formatAudioRate(0.84)).toBe('0.84×');
     expect(formatAudioRate(0)).toBe('—');
     expect(formatAudioRate(undefined)).toBe('—');
+  });
+
+  // The voice gate refuses a rate below 1.2× by default: a figure near it
+  // keeps the second decimal, and is cut, never rounded up, so a model the
+  // gate refuses never reads as one at the threshold.
+  it.each([
+    [1.15, '1.15×'],
+    [1.16, '1.16×'],
+    [1.18, '1.18×'],
+    [1.199, '1.19×'],
+    [1.2, '1.2×'],
+    [9.999, '9.99×'],
+  ])('shows %s below 10× with up to two decimals as %s', (rate, text) => {
+    expect(formatAudioRate(rate)).toBe(text);
+  });
+
+  it.each([
+    [10, '10.0×'],
+    [12.34, '12.3×'],
+    [12.39, '12.3×'],
+  ])('shows %s at 10× and above with one decimal as %s', (rate, text) => {
+    expect(formatAudioRate(rate)).toBe(text);
   });
 });
 

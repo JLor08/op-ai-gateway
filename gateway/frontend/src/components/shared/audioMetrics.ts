@@ -13,6 +13,7 @@ import type {
   UpdateMappingRequest,
 } from '../../api';
 import type { ListColumn } from './ListTable';
+import { formatRateX } from './audioFigures';
 import { parseMetricInput } from './format';
 import type { Translation } from './types';
 
@@ -30,9 +31,9 @@ export function isAudioConcurrencyLimit(value: string | undefined): value is Aud
   return (AUDIO_CONCURRENCY_LIMITS as readonly (string | undefined)[]).includes(value);
 }
 
-/** A single-stream rate as a multiple of real time; 0 is not measured. */
+/** A single-stream rate as a multiple of real time (formatRateX); 0 is not measured. */
 export function formatAudioRate(rateX: number | undefined): string {
-  return rateX && rateX > 0 ? `${rateX.toFixed(1)}×` : '—';
+  return rateX && rateX > 0 ? formatRateX(rateX) : '—';
 }
 
 /** The time to the first audio or text in whole ms; 0 is not measured. */

@@ -14,6 +14,7 @@ import {
   vramWarningLabelKey,
   vramWarnings,
 } from './components/shared/vram';
+import { formatAudioRate } from './components/shared/audioMetrics';
 import type { MessageKey } from './components/shared/types';
 
 describe('activityNewRequests interpolation', () => {
@@ -4402,6 +4403,19 @@ describe('audio metrics (#340) i18n keys', () => {
       '3.0× real time, first output after 250 ms',
     );
   });
+
+  // The result line writes the rate the way every cell does: one formatter,
+  // so a rate below the 1.2× gate never reads as 1.2× in either place.
+  it.each([1.15, 1.199, 1.2, 3, 12.34])(
+    'writes the rate %s in the result line as the cells do',
+    (rate) => {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale].benchmarkAudioResult(rate, 0), locale).toMatch(
+          new RegExp(`^${formatAudioRate(rate).replace('.', '\\.')} `),
+        );
+      }
+    },
+  );
 
   it('names the load time of an audio run', () => {
     expect(messages.de.benchmarkAudioLoadTime(5000)).toBe('Ladezeit 5000 ms');

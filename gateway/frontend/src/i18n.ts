@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import { formatRateX } from './components/shared/audioFigures';
+
 export type Locale = 'de' | 'en';
 
 type PortalMessageValue =
@@ -51,11 +53,6 @@ function audioLimitEn(limit: string): string {
   if (limit === 'performance') return 'Performance (a measured ceiling)';
   if (limit === 'resources') return 'Resources (a lower bound: no room for another instance)';
   return 'Cap reached (a lower bound: the instance or ramp maximum)';
-}
-
-// The single-stream rate a speed run measured, as a multiple of real time.
-function audioRateX(rate: number): string {
-  return `${rate.toFixed(1)}×`;
 }
 
 const de = {
@@ -1738,7 +1735,7 @@ const de = {
   // #340: die Audio-Messung eines Audio-Modells über Geschwindigkeit,
   // Kapazität und Beide -- die Ergebniszeile und die Verlaufsabschnitte.
   benchmarkAudioResult: (rate: number, ttftMs: number) =>
-    `${audioRateX(rate)} Echtzeit${ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''}`,
+    `${formatRateX(rate)} Echtzeit${ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''}`,
   benchmarkAudioLoadTime: (ms: number) => `Ladezeit ${ms} ms`,
   benchmarkAudioCapacityResult: (k: number, limit: string) =>
     `Echtzeit-Parallelität: ${audioConcurrencyFigure(k, limit, 'nicht echtzeitfähig')} – ${audioLimitDe(limit)}`,
@@ -5161,7 +5158,7 @@ const en: PortalMessages = {
   benchmarkSpeechTtftNote:
     'The measurement does not stream: the audio arrives only after the whole synthesis, and a model the agent launches is loaded behind the request. The time to the first byte therefore covers the synthesis and any model start, not the time to the first streamed audio.',
   benchmarkAudioResult: (rate: number, ttftMs: number) =>
-    `${audioRateX(rate)} real time${ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''}`,
+    `${formatRateX(rate)} real time${ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''}`,
   benchmarkAudioLoadTime: (ms: number) => `load time ${ms} ms`,
   benchmarkAudioCapacityResult: (k: number, limit: string) =>
     `Real-time concurrency: ${audioConcurrencyFigure(k, limit, 'not real-time')} – ${audioLimitEn(limit)}`,
