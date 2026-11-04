@@ -57,6 +57,7 @@ function makeRows(): GroupModelServerRow[] {
       // itself has no Capabilities column, so an empty array (never
       // determined) is a fine minimal default for this fixture.
       capabilities: [],
+      running_instances: 0,
       priority: 1,
     },
     {
@@ -84,6 +85,7 @@ function makeRows(): GroupModelServerRow[] {
       metrics_updated_at: null,
       live_progress_support: '',
       capabilities: [],
+      running_instances: 0,
       priority: 2,
     },
   ];

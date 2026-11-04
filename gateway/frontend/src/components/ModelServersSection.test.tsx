@@ -64,6 +64,9 @@ function makeRows(): ModelServerRow[] {
       // every other verdict field's default here -- individual tests below
       // override this to exercise one determined scenario at a time.
       capabilities: [],
+      // #340: the running instances of the mapping's spec on this server --
+      // rowA's one process, none on the other two.
+      running_instances: 1,
       priority: 1,
     },
     {
@@ -91,6 +94,7 @@ function makeRows(): ModelServerRow[] {
       live_progress_support: 'unsupported',
       live_progress_checked_at: '2026-08-01T07:00:00Z',
       capabilities: [],
+      running_instances: 0,
       priority: 3,
     },
     {
@@ -121,6 +125,7 @@ function makeRows(): ModelServerRow[] {
       live_progress_support: '',
       live_progress_checked_at: null,
       capabilities: [],
+      running_instances: 0,
       priority: 2,
     },
   ];
@@ -1603,6 +1608,42 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         t.modelServerCapabilitiesCheckedAt(new Date('2026-07-01T00:00:00Z').toLocaleString()),
       );
       expect(tooltip).not.toHaveTextContent(t.modelServerCapabilitiesSource('llama_cpp_props'));
+    });
+
+    // #340: a replicable spec runs several processes of one model on a server.
+    // The row says how many while more than one runs; one running process is
+    // what every other model has, so it adds nothing.
+    it('names the running instances once more than one runs', async () => {
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) => (r.mapping_id === 'map-a' ? { ...r, running_instances: 3 } : r)),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColStatus);
+      expect(cell).toHaveTextContent(t.tableModelLoaded);
+      expect(cell).toHaveTextContent(`${t.modelServersRunningInstances}: 3`);
+    });
+
+    it('says nothing about instances while one or none runs, until a live frame reports a second', async () => {
+      const { api, getOnData } = makeApi();
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(screen.queryByText(new RegExp(t.modelServersRunningInstances))).toBeNull();
+
+      act(() =>
+        getOnData()!(
+          makeRows().map((r) => (r.mapping_id === 'map-a' ? { ...r, running_instances: 2 } : r)),
+        ),
+      );
+      expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).toHaveTextContent(
+        `${t.modelServersRunningInstances}: 2`,
+      );
     });
   });
 }

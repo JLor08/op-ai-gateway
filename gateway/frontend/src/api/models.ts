@@ -590,6 +590,12 @@ export type ModelServerRow = {
   state: string;
   active_requests: number;
   queue_depth: number;
+  // How many instances (processes) of the mapping's runtime spec are running
+  // on this server (#340): 1 for a running spec that is not replicable, up to
+  // the spec's maximum for one that is, 0 when none runs or no agent-managed
+  // runtime status is known. Injected from the runtime-status registry like
+  // `state` above.
+  running_instances: number;
   // Whether the agent's last per-model probe of its metrics/context endpoints
   // actually reached the server -- mirrors RuntimeStatusDTO's own closed set
   // (api/runtime.ts): "ok" (reachable) / "unreachable" (configured but the

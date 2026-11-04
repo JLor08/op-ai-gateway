@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState } from 'react';
-import { Tooltip } from '@mui/material';
+import { Box, Tooltip, Typography } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import {
   PortalApiError,
@@ -494,9 +494,25 @@ export function ModelServersSection({
       filter: 'enum',
       searchable: false,
       enumLabel: (v) => modelStatusLabel(v as ModelStatusKey, t),
-      render: (r) => (
-        <StatusChip status={modelStatusBadge(r)} label={modelStatusLabel(modelStatusKey(r), t)} />
-      ),
+      render: (r) => {
+        const chip = (
+          <StatusChip status={modelStatusBadge(r)} label={modelStatusLabel(modelStatusKey(r), t)} />
+        );
+        // #340: a replicable spec can run several instances of the model on
+        // this server, and the row says how many -- but only once more than
+        // one runs. The row does not say whether the spec is replicable, and
+        // one running process is what every other model has, so a count of 1
+        // (or 0) would only add noise.
+        if (r.running_instances <= 1) return chip;
+        return (
+          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+            {chip}
+            <Typography variant="caption" color="text.secondary">
+              {`${t.modelServersRunningInstances}: ${r.running_instances}`}
+            </Typography>
+          </Box>
+        );
+      },
     },
     {
       // Live per-model load (SSE-fed): how many requests are in flight on this
