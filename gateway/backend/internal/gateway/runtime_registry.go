@@ -480,12 +480,16 @@ func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusD
 // statusRows returns serverID's most recent published runtime-status snapshot
 // itself, not a copy, holding the lock for the map read alone -- for a reader
 // on the request path (routing's instance expansion) that must not hold this
-// lock any longer. It is safe to read without the lock because publish stores
-// a fresh slice on every call and never writes to one it has published: a
-// later publish replaces the map entry and leaves the rows a reader holds as
-// they were. The caller must not modify the rows; statusSnapshot is the copy
-// for one that would. Nil for a nil registry and for a server that has never
-// reported.
+// lock any longer. It is safe to read without the lock only because nothing
+// writes to a published slice: publish stores a fresh slice on every call and
+// never touches one it has published (a later publish replaces the map entry
+// and leaves the rows a reader holds as they were), AND every holder of that
+// same slice treats it as read-only -- publish hands the very slice it stores
+// to each subscriber as a frame, so a subscriber that modified its frame
+// would change the rows under this reader. Every subscriber only reads its
+// frames; one that needs to change them must copy first. The caller must not
+// modify the rows either; statusSnapshot is the copy for one that would. Nil
+// for a nil registry and for a server that has never reported.
 func (r *runtimeStatusRegistry) statusRows(serverID string) []RuntimeStatusDTO {
 	if r == nil {
 		return nil

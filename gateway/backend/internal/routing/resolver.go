@@ -239,12 +239,15 @@ type ServerActivityChecker interface {
 const runtimeStateStarting = "starting"
 
 // RuntimeModelStateChecker exposes the gateway's live per-model runtime state
-// (from the volatile runtime-status registry) to routing. state is the model's
-// lifecycle string ("running"/"starting"/"stopped"/...); active/queue are its
-// live per-model request counts. ok is false when no runtime status is known
-// for that model on that server (a legacy/non-runtime agent, or a model with
-// no managed spec) -- callers then fall back to per-server telemetry and treat
-// state as unknown.
+// (from the volatile runtime-status registry) to routing. appModelName is an
+// instance address (InstanceAddress: the mapping's AppModelName for instance
+// 0, "AppModelName#k" for instance k), and the answer is that one instance's:
+// state is its lifecycle string ("running"/"starting"/"stopped"/...);
+// active/queue are its own live request counts, not the spec's total over its
+// instances. ok is false when no runtime status is known for that address on
+// that server (a legacy/non-runtime agent, a model with no managed spec, or an
+// instance no longer reported) -- callers then fall back to per-server
+// telemetry and treat state as unknown.
 //
 // metricsOK gates ONLY the active/queue metrics, separately from ok/state: it
 // is true iff ok AND the reporting agent declared the "runtime_model_probe"

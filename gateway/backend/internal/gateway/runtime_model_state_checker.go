@@ -30,12 +30,18 @@ func newRuntimeModelStateChecker(registry *runtimeStatusRegistry, features *agen
 	return &runtimeModelStateChecker{registry: registry, features: features}
 }
 
-// RuntimeModelState scans serverID's latest published runtime-status snapshot for a
-// managed spec reporting appModelName (RuntimeStatusDTO.Model, set agent-side from
-// st.spec.UpstreamModel -- the same value routing.ModelMapping.AppModelName carries for
-// that mapping). ok is false when nothing matches: a legacy/non-runtime agent that never
-// publishes runtime status, or a model with no managed spec on this server -- the
-// resolver then falls back to per-server telemetry and treats state as unknown.
+// RuntimeModelState scans serverID's latest published runtime-status snapshot for the
+// row reporting appModelName. The lookup key is an INSTANCE ADDRESS: the resolver asks
+// with routing.InstanceAddress(mapping.AppModelName, k) -- the mapping's AppModelName for
+// instance 0, "AppModelName#k" for instance k -- and the agent reports each instance's
+// row under the same address (RuntimeStatusDTO.Model). So instance 0 matches the row a
+// non-replicable spec has always reported, and a burst instance matches only its own:
+// state, active and queue are THAT instance's, never the sum over the spec's instances,
+// and the resolver uses them that way (prefer-starting per instance, and each instance
+// scored on its own load). ok is false when nothing matches: a legacy/non-runtime agent
+// that never publishes runtime status, a model with no managed spec on this server, or
+// an instance the latest snapshot no longer reports -- the resolver then falls back to
+// per-server telemetry and treats state as unknown.
 //
 // When more than one spec reports the same upstream model name (a benchmark run, a
 // duplicate mapping), the RUNNING entry wins over any other state, so a live serving
