@@ -1968,6 +1968,9 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 	// ErrNoHealthyHost. So with every cap undefined (the under-cap subset == the full
 	// pool) this is exactly the pre-CP3 behaviour.
 	judgeLive := instancePool && r.liveSlots != nil && needsFreeLiveSlot(req)
+	if sel, ok, err := r.selectPreferred(ctx, pool, req, now, judgeLive); err != nil || ok {
+		return sel, ok, err
+	}
 	if r.activity != nil || r.instanceActivity != nil || judgeLive {
 		capped := make([]MappingCandidate, 0, len(pool))
 		for _, c := range pool {
@@ -1992,6 +1995,28 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 		}
 	}
 	return r.selectWithSwapProtection(ctx, pool, model, audio, now)
+}
+
+// selectPreferred serves req on the instance it prefers (inference.Request.PreferredInstanceKey)
+// when that instance is in pool -- so it passed every filter this request's candidates pass,
+// the real-time gate and an instance excluded as gone among them -- is under its cap (underCap,
+// a held live slot included when judgeLive says slots count) and is Score-viable. ok is false
+// for every other request, which is then selected as if it preferred nothing: the preference
+// only ever picks one of the candidates the plain selection could pick, ahead of the
+// partitions and the score that would rank the others, and never refuses, parks or signals
+// demand by itself. The swap protection does not apply: the preferred instance is the one the
+// session's previous turn ran on, which a swap protection would only ever keep it on.
+func (r *Resolver) selectPreferred(ctx context.Context, pool []MappingCandidate, req inference.Request, now time.Time, judgeLive bool) (MappingCandidate, bool, error) {
+	if req.PreferredInstanceKey == "" {
+		return MappingCandidate{}, false, nil
+	}
+	i := slices.IndexFunc(pool, func(c MappingCandidate) bool {
+		return InstanceKey(c.Mapping.ID, c.Instance) == req.PreferredInstanceKey
+	})
+	if i < 0 || !r.underCap(pool[i], now, judgeLive) {
+		return MappingCandidate{}, false, nil
+	}
+	return r.argmaxByScore(ctx, pool[i:i+1], req.Model, audioRequest(req), now)
 }
 
 // neverParks reports whether req must be answered without waiting in the admission

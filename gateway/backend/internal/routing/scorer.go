@@ -177,12 +177,13 @@ func effectiveGenTPS(route Route) float64 {
 }
 
 // metricTiebreak returns a bounded refinement (<= genThroughputBonusCap +
-// promptThroughputBonusCap) from a mapping's measured speed metrics. Each throughput term
-// is clamped so an implausibly large stored value cannot dominate; all-zero metrics return
-// 0 (the no-op invariant). The generation-throughput term is now load-aware: it uses
-// effectiveGenTPS(route), which shrinks the single-request gen tok/s toward
-// gen_tokens_per_second_at_capacity as the route's server fills (CurrentLoad rises). With
-// no capacity curve or an idle server it collapses to the flat P4a gen value.
+// promptThroughputBonusCap + audioRateBonusCap, 120 points; the audio term only for a
+// speech or transcription request's route, Route.Audio) from a mapping's measured speed
+// metrics. Each term is clamped so an implausibly large stored value cannot dominate;
+// all-zero metrics return 0 (the no-op invariant). The generation-throughput term is
+// load-aware: it uses effectiveGenTPS(route), which shrinks the single-request gen tok/s
+// toward gen_tokens_per_second_at_capacity as the route's server fills (CurrentLoad
+// rises). With no capacity curve or an idle server it collapses to the flat P4a gen value.
 func metricTiebreak(route Route) float64 {
 	bonus := clampBonus(effectiveGenTPS(route), genThroughputWeight, genThroughputBonusCap)
 	bonus += clampBonus(route.PromptTokensPerSecond, promptThroughputWeight, promptThroughputBonusCap)
