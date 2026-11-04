@@ -135,14 +135,19 @@ func signalKeyOf(d routing.DemandSignal) signalKey {
 }
 
 // signalServedBy reports whether an instance started for host (a zero host: none was)
-// serves d: on d's pinned server, or anywhere for an unpinned d, and of one of the
-// mappings d could use (any of the model's, for a signal that names none). An
+// by a pass for a signal of flavor serves d: on d's pinned server, or anywhere for an
+// unpinned d, and of one of the mappings d could use. For a signal that names none,
+// any of the model's mappings of d's flavor serves it -- so only an instance a pass of
+// that same flavor started, since that pass chose among the mappings of its own. An
 // instance of another mapping would not serve the request that signalled d.
-func signalServedBy(d routing.DemandSignal, host scaleKey) bool {
+func signalServedBy(d routing.DemandSignal, host scaleKey, flavor string) bool {
 	if host.serverID == "" || (d.ServerID != "" && d.ServerID != host.serverID) {
 		return false
 	}
-	return len(d.MappingIDs) == 0 || slices.Contains(d.MappingIDs, host.mappingID)
+	if len(d.MappingIDs) == 0 {
+		return d.APIFlavor == flavor
+	}
+	return slices.Contains(d.MappingIDs, host.mappingID)
 }
 
 // scaleCandidate is one host a scale-up may start an instance on: instance index of
@@ -258,7 +263,7 @@ func (s *instanceScaler) run(ctx context.Context, ensurer provider.RuntimeEnsure
 	defer s.wg.Done()
 	for {
 		started := s.scaleUp(ctx, ensurer, d)
-		next, more := s.followUp(ctx, d.Model, started)
+		next, more := s.followUp(ctx, d.Model, started, d.APIFlavor)
 		if !more {
 			return
 		}
@@ -267,18 +272,18 @@ func (s *instanceScaler) run(ctx context.Context, ensurer provider.RuntimeEnsure
 }
 
 // followUp returns the next signal queued for model, and true, so the scale-up
-// runs a pass for it. A signal the pass that just ended served is dropped: it
-// started an instance for started (zero: none), and signalServedBy says which signals
-// that instance serves. With none left, or once the server is shutting down, the
-// model's scale-up ends.
-func (s *instanceScaler) followUp(ctx context.Context, model string, started scaleKey) (routing.DemandSignal, bool) {
+// runs a pass for it. A signal the pass that just ended served is dropped: that pass,
+// for a signal of flavor, started an instance for started (zero: none), and
+// signalServedBy says which signals that instance serves. With none left, or once the
+// server is shutting down, the model's scale-up ends.
+func (s *instanceScaler) followUp(ctx context.Context, model string, started scaleKey, flavor string) (routing.DemandSignal, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	queued := s.followUps[model]
 	for len(queued) > 0 && ctx.Err() == nil {
 		next := queued[0]
 		queued = queued[1:]
-		if signalServedBy(next, started) {
+		if signalServedBy(next, started, flavor) {
 			continue
 		}
 		s.followUps[model] = queued

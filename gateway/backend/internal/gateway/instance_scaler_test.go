@@ -1099,6 +1099,34 @@ func TestScalerFollowUpKeysByMappings(t *testing.T) {
 	}
 }
 
+// A queued signal that names no mappings is served by the instance the running pass
+// started only when it asks for the same flavor: the pass chose among the model's
+// mappings of its own flavor, and a mapping of the model need not serve another.
+func TestScalerFollowUpRespectsFlavorWithoutMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flavor  string
+		ensured []string
+	}{
+		{"same flavor: served by the started instance", routing.APIFlavorOpenAI, []string{"srv_a m#1"}},
+		{"another flavor: a pass of its own", routing.APIFlavorOpenAIAudio, []string{"srv_a m#1", "srv_a m#2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScalerFixture(t)
+			f.addHost("srv_a", 90)
+			gate := f.ensurer.hold()
+			f.scaler.Signal(f.demand())
+			f.awaitEnsure()
+			queued := f.demand()
+			queued.ServerID, queued.APIFlavor = "srv_a", tc.flavor // another key than the running pass's
+			f.scaler.Signal(queued)
+			close(gate)
+			f.scaler.wait()
+			f.wantEnsured(tc.ensured...)
+		})
+	}
+}
+
 // Every store read a scale-up makes is bounded: a stalled store ends the
 // scale-up -- or, for the scores, leaves the request's order -- instead of
 // holding the model's single flight, and the next signal scales again once
