@@ -205,3 +205,42 @@ func TestExclusionPassesOverAnAffinityPin(t *testing.T) {
 		t.Fatalf("Resolve excluding the pinned instance = %q, %v; want map_inst#2", target.InstanceKey, err)
 	}
 }
+
+// Only a fresh selection expands a mapping into its instances: a token's
+// affinity pin and a server override are served by the mapping's instance 0,
+// and their target says it is not instance-capable even though the spec runs
+// instances -- the contract Target.InstanceCapable documents.
+func TestPinnedAndOverrideTargetsAreInstanceZero(t *testing.T) {
+	now := instanceCapacityNow
+	store := instanceCandidateStore(t, now, 0)
+	app, err := store.ApplicationByID(context.Background(), "app_inst")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.AffinityTTLSeconds = 1800
+	if err := store.UpdateApplication(context.Background(), app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	r := NewResolver(store, func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1, Running: []int{2}}}})
+	r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5#2"}}})
+	token := auth.Token{ID: "tok", UserID: "u1", Active: true}
+	req := chatRequest("qwen-coder")
+	req.ClientSessionID = "s1"
+	key := AffinityKey{APITokenID: "tok", Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, SessionID: "s1"}
+	if err := store.UpsertAffinity(context.Background(), RouteAffinity{ID: affinityID(key), APITokenID: "tok", UserID: "u1", Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, SessionID: "s1", ApplicationID: "app_inst", ServerID: "srv_inst", ExpiresAt: now.Add(time.Hour), LastUsedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertAffinity: %v", err)
+	}
+
+	if fresh, err := r.Resolve(context.Background(), auth.Token{}, chatRequest("qwen-coder")); err != nil || fresh.InstanceKey != "map_inst#2" || !fresh.InstanceCapable {
+		t.Fatalf("fresh Resolve = %q capable %v, %v; want the loaded map_inst#2, instance-capable", fresh.InstanceKey, fresh.InstanceCapable, err)
+	}
+	if pinned, err := r.Resolve(context.Background(), token, req); err != nil || pinned.InstanceKey != "map_inst#0" || pinned.InstanceCapable {
+		t.Fatalf("pinned Resolve = %q capable %v, %v; want the mapping's instance 0, not instance-capable", pinned.InstanceKey, pinned.InstanceCapable, err)
+	}
+	override := chatRequest("qwen-coder")
+	override.ServerOverrideID = "srv_inst"
+	if target, err := r.Resolve(context.Background(), auth.Token{}, override); err != nil || target.InstanceKey != "map_inst#0" || target.InstanceCapable {
+		t.Fatalf("server-override Resolve = %q capable %v, %v; want the mapping's instance 0, not instance-capable", target.InstanceKey, target.InstanceCapable, err)
+	}
+}

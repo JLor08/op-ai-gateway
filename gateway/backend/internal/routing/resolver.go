@@ -123,6 +123,13 @@ type Target struct {
 	// instance 0 included: its live slot and its load are per instance, and a
 	// request that loses its instance may be re-selected onto a sibling.
 	// False for every other target, which keeps today's single-slot behaviour.
+	//
+	// Only a fresh selection -- a plain model's or a group member's, a group
+	// pin included -- expands a mapping into its instances. A target from a
+	// token's affinity pin (resolveAffinity) or a server override
+	// (resolveServerOverride) is its mapping's instance 0 with InstanceCapable
+	// false, whatever the spec: neither path judges instances, and a request
+	// sent there is never re-selected, since only an instance k >= 1 is.
 	InstanceCapable bool
 	Timeout         time.Duration
 	APIFlavor       string
