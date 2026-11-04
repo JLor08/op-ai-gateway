@@ -174,10 +174,15 @@ func audioMeasureTarget() routing.Target {
 }
 
 // checkAudioMeasurement compares a measurement with the expected one: the times exactly (they
-// are whole milliseconds of a scripted clock), the figures within a rounding tolerance.
+// are whole milliseconds of a scripted clock), the figures within a rounding tolerance. Every
+// measurement must also hold the order its times have by definition: the first output comes
+// no later than the end of the output.
 func checkAudioMeasurement(t *testing.T, got, want audioMeasurement) {
 	t.Helper()
 	const tol = 0.005
+	if got.TTFTMS > got.WallMS {
+		t.Fatalf("measurement = %+v: the first output (%d ms) comes after the end (%d ms)", got, got.TTFTMS, got.WallMS)
+	}
 	if got.TTFTMS != want.TTFTMS || got.WallMS != want.WallMS ||
 		math.Abs(got.AudioSeconds-want.AudioSeconds) > tol ||
 		math.Abs(got.RateX-want.RateX) > tol ||
@@ -708,11 +713,13 @@ func TestMeasureASRLiveMath(t *testing.T) {
 	}
 }
 
-// TestMeasureASRLiveTimesFirstText: the time to first text is the first transcript text the
-// stream carried, whatever frame it came in -- a model that revises its hypothesis shows a
-// transcript.text.partial first, and one that streams no increments states its text first in
-// transcript.text.done. A frame without text is not the first text, and the transcription
-// ends at transcript.text.done, not at a [DONE] that comes later.
+// TestMeasureASRLiveTimesFirstText: the time to first text is the first frame before
+// transcript.text.done that carries transcript text, a delta or a partial -- a model that
+// revises its hypothesis shows a transcript.text.partial first -- and for a model that streams
+// no increments, whose text first arrives in transcript.text.done, it is the done event, the
+// whole time. A frame without text is not the first text. The transcription ends at
+// transcript.text.done, not at a [DONE] that comes later, and a frame after done is no part
+// of it: it is never the first text, so the first text never comes after the end.
 func TestMeasureASRLiveTimesFirstText(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -733,6 +740,13 @@ func TestMeasureASRLiveTimesFirstText(t *testing.T) {
 			measureAt(1000, fmt.Sprintf("data: {\"type\":%q,\"text\":\"der schutz\"}\n\n", transcriptionEventDone)),
 			measureAt(1600, "data: [DONE]\n\n"),
 		}, 200},
+		{"text after done is no part of the transcription", []measureChunk{
+			measureAt(100, sseTranscriptDelta("")),
+			measureAt(1000, fmt.Sprintf("data: {\"type\":%q,\"text\":\"der schutz\"}\n\n", transcriptionEventDone)),
+			measureAt(1300, sseTranscriptDelta("nachtrag")),
+			measureAt(1400, "data: {\"type\":\"transcript.text.partial\",\"text\":\"nachtrag\"}\n\n"),
+			measureAt(1600, "data: [DONE]\n\n"),
+		}, 1000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -779,6 +793,13 @@ func TestMeasureASRLiveRefusals(t *testing.T) {
 		}, "Audio chunker requires positive input samples", false},
 		{"no text at all", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(1000, sseTranscriptDone("")))
+		}, "no text", false},
+		{"text only after done", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream",
+				measureAt(200, sseTranscriptDelta("")),
+				measureAt(1000, fmt.Sprintf("data: {\"type\":%q,\"text\":\"\"}\n\n", transcriptionEventDone)),
+				measureAt(1300, sseTranscriptDelta("der schutz")),
+				measureAt(1400, sseTranscriptDone("der schutz")))
 		}, "no text", false},
 		{"cut off before done", pcm, sampleRate, "de", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(400, sseTranscriptDelta("der schutz")))

@@ -332,10 +332,15 @@ func buildASRBenchmarkBody(model, lang string, wav []byte) ([]byte, string, erro
 // transcription endpoint unpaced, as fast as the connection takes it, and times the
 // transcript:
 //
-//   - TTFTMS from the send to the first frame that carries transcript text (a delta, a
-//     partial or, for a model that streams no increments, the done event);
+//   - TTFTMS from the send to the first frame before transcript.text.done that carries
+//     transcript text, a transcript.text.delta or a transcript.text.partial; for a model
+//     that streams no increments, whose text first arrives in transcript.text.done, it is
+//     the done event's time, so TTFTMS equals WallMS;
 //   - WallMS from the send to transcript.text.done, RateX the clip's length over that time
 //     (unpaced, the whole exchange is transcription time) and RTF its inverse.
+//
+// The transcription ends at transcript.text.done: a frame after it, up to [DONE], is no
+// part of it and is never the first text, so TTFTMS never exceeds WallMS.
 //
 // The PCM's shape and the language are checked as the live relay checks them
 // (liveByteRate, validLiveLanguage) before anything is sent: they ride in the request's
@@ -385,14 +390,19 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 		if !ok {
 			continue
 		}
-		at := m.now()
 		if msg.Type == "error" {
 			return audioMeasurement{}, fmt.Errorf("audio benchmark: the live transcription reported an error: %s", msg.Message)
 		}
+		if !done.IsZero() {
+			// The transcription ended at its done event; what follows up to [DONE] is no
+			// part of it.
+			continue
+		}
+		at := m.now()
 		if first.IsZero() && strings.TrimSpace(msg.Text) != "" {
 			first = at
 		}
-		if msg.Type == "done" && done.IsZero() {
+		if msg.Type == "done" {
 			done = at
 		}
 	}
