@@ -7875,7 +7875,12 @@ not, in one batch (`beginBenchmarkSingleProcess`,
 `internal/gateway/benchmark_pins.go`), after recording them in the override lease's
 `restore_replicable` list; the agent drains each one's further instances, the
 instance counts stay stored, and the run's end — or the lease reconcile after a
-crash — writes `replicable = true` again. A lease write that fails writes nothing
+crash — writes `replicable = true` again, by compare-and-set against `false`. A
+spec an operator gave a fixed listen port meanwhile is a conflict like one they
+turned back on (`replicableRestorable`): a replicable spec cannot have that port,
+so the write would fail validation on every attempt and pin the spec in the lease,
+whose leftover stops every later run's unpin and stop; the operator's port wins
+and the lease lets go of the spec. A lease write that fails writes nothing
 and turns the run's stops off, as does a batch that failed, since a spec that may
 still be replicable would restart its protected instances at a stop's clear. The
 VRAM run does the same for its replicable **target** alone (`vramRunAsOneProcess`),

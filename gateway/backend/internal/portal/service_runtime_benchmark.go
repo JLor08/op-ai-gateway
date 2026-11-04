@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"op-ai-gateway/internal/routing"
 	"slices"
@@ -221,6 +222,14 @@ func (s *Service) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, specIDs []
 // error, and nil when nothing failed. specIDs must not repeat an id, as for
 // SetBenchmarkRuntimeSpecsPinned.
 //
+// Writing true -- the restore -- is also a Conflict for a spec that can no
+// longer be replicable (replicableRestorable): an operator gave it a fixed
+// listen port while the run held it as one process. Its write would fail
+// validation on every attempt, and a Failed spec stays in the override lease,
+// whose leftover stops every later run on the server from unpinning or
+// stopping anything; the operator's port is the newer intent, so the restore
+// leaves the spec as they set it.
+//
 // A run writes false so that its replicable target runs as one process while
 // it is measured alone: the agent drains the target's other instances and its
 // floor of protected instances, which would otherwise start beside the
@@ -237,7 +246,11 @@ func (s *Service) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, specIDs []
 // startVRAMProbe's gate; and reconcileBenchmarkOverrideLease, which only
 // undoes, by compare-and-set, what such a run wrote.
 func (s *Service) SetBenchmarkRuntimeSpecsReplicable(ctx context.Context, specIDs []string, expectedReplicable, replicable bool) (BenchmarkSpecsOutcome, error) {
-	out := s.setBenchmarkRuntimeSpecs(ctx, specIDs, expectReplicable(expectedReplicable), withReplicable(replicable))
+	expect := expectReplicable(expectedReplicable)
+	if replicable {
+		expect = replicableRestorable(expect)
+	}
+	out := s.setBenchmarkRuntimeSpecs(ctx, specIDs, expect, withReplicable(replicable))
 	return out, out.firstFailure()
 }
 
@@ -433,6 +446,23 @@ func expectReplicable(expected bool) func(routing.RuntimeSpec) error {
 	return func(spec routing.RuntimeSpec) error {
 		if spec.Replicable != expected {
 			return ErrRuntimeSpecReplicableConflict
+		}
+		return nil
+	}
+}
+
+// replicableRestorable is expect, then the one stored setting a replicable
+// spec cannot have: a fixed listen port (validateRuntimeSpecInstances, which
+// refuses it for a replicable spec only). A spec that has one is a
+// ErrRuntimeSpecReplicableConflict: making it replicable would fail validation
+// for as long as the port stays, so it is not a write that can succeed later.
+func replicableRestorable(expect func(routing.RuntimeSpec) error) func(routing.RuntimeSpec) error {
+	return func(spec routing.RuntimeSpec) error {
+		if err := expect(spec); err != nil {
+			return err
+		}
+		if spec.ListenPort != 0 {
+			return fmt.Errorf("%w: it now listens on fixed port %d, which a replicable spec cannot", ErrRuntimeSpecReplicableConflict, spec.ListenPort)
 		}
 		return nil
 	}

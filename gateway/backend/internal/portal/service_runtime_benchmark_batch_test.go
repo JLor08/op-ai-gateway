@@ -884,4 +884,31 @@ func TestBenchmarkReplicableWriter(t *testing.T) {
 		wantOutcome(t, out, BenchmarkSpecsOutcome{Conflict: specIDs(specs[0])})
 		f.wantCalls(t, before)
 	})
+
+	t.Run("a spec an operator gave a fixed port during the run is a conflict, not a failure", func(t *testing.T) {
+		// While the run holds the spec as one process an operator may give it
+		// a fixed listen port, valid for one process and never for a
+		// replicable spec. Restoring the flag over it would fail validation on
+		// every attempt and keep the spec in the override lease for good,
+		// which blocks every later run's unpin and stop on the server. The
+		// operator's port is the newer intent: nothing is written, and the
+		// lease lets go of the spec.
+		f, specs := newFixture(t)
+		if _, err := f.svc.SetBenchmarkRuntimeSpecsReplicable(ctx, specIDs(specs[0]), true, false); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		f.operatorPut(t, specs[0], func(req *PutRuntimeSpecRequest) { req.Replicable, req.ListenPort = false, 9123 })
+		before := len(f.calls())
+		out, err := f.svc.SetBenchmarkRuntimeSpecsReplicable(ctx, specIDs(specs[0]), false, true)
+		if err != nil {
+			t.Fatalf("restore err = %v, want nil (a conflict is not a failure)", err)
+		}
+		wantOutcome(t, out, BenchmarkSpecsOutcome{Conflict: specIDs(specs[0])})
+		wantErrs(t, out, ErrRuntimeSpecReplicableConflict, specs[0].ID)
+		f.wantCalls(t, before)
+		stored, _, err := f.routes.RuntimeSpecByID(ctx, specs[0].ID)
+		if err != nil || stored.Replicable || stored.ListenPort != 9123 {
+			t.Fatalf("stored spec = replicable %v, port %d (err %v); want the operator's one process on 9123", stored.Replicable, stored.ListenPort, err)
+		}
+	})
 }

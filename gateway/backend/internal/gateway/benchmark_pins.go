@@ -485,8 +485,9 @@ func (s *Server) endBenchmarkUnpin(ctx context.Context, run *benchmarkRun, serve
 // that ran them as one process, by compare-and-set against false, on a context
 // that the run's cancellation does not reach, and returns the specs whose write
 // failed: they may still run as one process. A conflict (an operator turned the
-// flag back on during the run, or the run's own write never stored false) and
-// a gone spec need nothing.
+// flag back on during the run, or gave the spec a fixed listen port a replicable
+// spec cannot have, or the run's own write never stored false) and a gone spec
+// need nothing.
 func (s *Server) restoreBenchmarkReplicable(ctx context.Context, serverID string, ids []string) []string {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
 	defer cancel()
