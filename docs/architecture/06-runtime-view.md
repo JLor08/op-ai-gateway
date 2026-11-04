@@ -19,9 +19,13 @@ sequenceDiagram
     GW->>GW: authenticate (bearer or session+CSRF)
     GW->>CO: translate request → internal model
     GW->>R: resolve(model, flavor) → candidates
-    R->>R: score by telemetry, priority/weight, capacity
-    R-->>GW: chosen (server, application, mapping)
-    GW->>P: dispatch to scheme://domain:port (app model name)
+    R->>R: expand each replicable mapping into its running instances (every turn)
+    R->>R: score by telemetry, priority/weight, capacity (per-instance cap for instances)
+    opt every candidate at its cap
+        R->>R: signal demand to the instance scaler (it ensures m#k in the background), park in the admission queue, select again on a wake
+    end
+    R-->>GW: chosen (server, application, mapping, instance)
+    GW->>P: dispatch to scheme://domain:port (app model name, m#k for instance k ≥ 1)
     P->>AI: upstream request
     alt streaming
         AI-->>P: SSE chunks
@@ -45,6 +49,13 @@ own (`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`,
 lift the server read/write deadlines; SSE streams are bounded by an idle watchdog and
 client disconnect, not a total cap. See
 [Compatibility & Inference](cross-cutting/compatibility-and-inference.md).
+
+A replicable runtime spec's mapping is expanded into one candidate per running instance, and an
+instance candidate is capped by its own in-flight count. With every candidate at its cap the request
+parks in the admission queue and signals the instance scaler, which asks an agent for one more
+instance and wakes the queue once routing sees it; an instance the agent retired since the last
+telemetry sample is refused by the agent router and re-selected once, invisibly to the client
+([Routing & Model Selection §10](cross-cutting/routing-and-model-selection.md#10-model-instances)).
 
 ### 6.1.1 Speech relay (`POST /v1/audio/speech`)
 
@@ -401,7 +412,7 @@ Live transcription is the one scenario where audio flows **up** while text flows
 same exchange: the transcript appears **while the user is still speaking**, where §6.1.4's turn
 transcribes a clip that was recorded and uploaded whole. The gateway's own **`POST
 /v1/audio/transcriptions/live`** is the canonical relay: a chunked, full-duplex HTTP request, bearer-authenticated, that
-mirrors audio.cpp's native `/live` and is the one place a session is resolved, admitted, guarded per route and
+mirrors audio.cpp's native `/live` and is the one place a session is resolved, admitted, guarded per instance and
 billed. A browser cannot drive that (a streaming `fetch()` body needs HTTP/2 and is half-duplex) and a WebSocket
 cannot carry `X-OP-CSRF`, so the portal uses a **WebSocket behind a CSRF-protected ticket** whose handler is a
 thin adapter that **loops back** to the same `/v1` endpoint over the internal trusted-loopback pair, as a portal
@@ -429,7 +440,7 @@ sequenceDiagram
     WS->>WS: redeem the ticket BEFORE Accept (a miss is 401 and no upgrade), Accept with the default same-origin check (cross-origin 403)
     WS-->>B: 101 Switching Protocols (subprotocol op-live-transcription)
     WS->>LV: loopback POST /v1/audio/transcriptions/live?model&sample_rate&channels&sample_format&language, chunked body from an io.Pipe, Expect: 100-continue, X-OP-Internal-Auth + X-OP-Internal-User (the ticket's user)
-    LV->>LV: loopbackPrincipal, then the same gate WITH the one admission (429/402/503), streaming + fullduplex_proxy checks, then the per-route slot (busy = 503 transcription.live_busy)
+    LV->>LV: loopbackPrincipal, then the same gate WITH the one admission (429/402/503), streaming + fullduplex_proxy checks, then the instance's live slot (a lost race selects again, every slot held parks where instances exist, else busy = 503 transcription.live_busy)
     LV-->>WS: 100 Continue on the first body read (and an explicit one right before the SSE 200, an ordering guarantee), or a final refusal status that the adapter turns into one error frame
     LV->>AG: POST /live/{model}?sample_rate&channels&sample_format&language, chunked body fed from an io.Pipe (ProxyNativeDuplex, no target.Timeout)
     Note over LV,AG: a direct audio_cpp target skips the agent: the gateway POSTs the child's own /v1/audio/transcriptions/live?model=...
@@ -471,7 +482,7 @@ sequenceDiagram
 ```
 
 What differs from the transcription relays of §6.1.2 and §6.1.4. **One relay, two doors.** `/v1/audio/transcriptions/live`
-is the only code that resolves a live session, takes its admission, holds the per-route slot, relays upstream and
+is the only code that resolves a live session, takes its admission, holds the instance's live slot, relays upstream and
 records the usage row. A bearer client calls it directly with its token (and is billed to that token, its service and
 project included); the portal's WebSocket handler is an adapter over it, so it **contacts no backend, takes no slot and
 writes no row**, and the session is billed once, to the loopback user (a token-less session principal, so no
@@ -492,9 +503,10 @@ gateway-facing connection, and the dialed fallback enables it per request too, s
 promptly on either path and no PCM is drained and lost ([Agent-Managed Model Runtime §4.7](cross-cutting/agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)).
 **Billing is the input**, over the rate the gateway told the backend to decode at, on a clean end only. **The `/v1` relay is
 guarded by the streaming idle watchdog**: a client that keeps sending PCM but stops reading the SSE is cut after the idle
-timeout, which releases the route's one slot and bills a loud zero. The WebSocket upgrade hijacks its connection, so none
-of the 30 s server deadlines applies to the adapter, and the `/v1` relay lifts them. One live session per route is allowed,
-because audio.cpp serves one `/live` per model. See [API Compatibility & Inference §3.8](cross-cutting/compatibility-and-inference.md#38-live-transcription-the-bearer-v1-endpoint-and-the-portal-websocket), [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event) and
+timeout, which releases the instance's one slot and bills a loud zero. The WebSocket upgrade hijacks its connection, so none
+of the 30 s server deadlines applies to the adapter, and the `/v1` relay lifts them. One live session per instance is allowed,
+because audio.cpp serves one `/live` per process: a mapping without instances has one slot, a replicable spec one per
+running instance ([Routing & Model Selection §10.5](cross-cutting/routing-and-model-selection.md#105-live-slots-per-instance-and-failover-onto-a-sibling)). See [API Compatibility & Inference §3.8](cross-cutting/compatibility-and-inference.md#38-live-transcription-the-bearer-v1-endpoint-and-the-portal-websocket), [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event) and
 [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once).
 
 ### 6.1.6 Voice Chat (browser WebSocket, per-chunk live ASR, speculative LLM, deferred commit, streamed TTS)
@@ -522,7 +534,7 @@ sequenceDiagram
 
     B->>TK: POST /api/portal/voice-chat-ticket {chat_id, asr_model, llm_model, tts_model, voice} (session + X-OP-CSRF)
     TK->>TK: read the caller's own chat (404 portal.chat_not_found), snapshot settings.audio with the request's voice laid over it (400 portal.voice_chat_audio_settings_invalid)
-    TK->>TK: step 1, resolve and gate all three legs WITHOUT admission (400 portal.voice_chat_asr_unavailable, _llm_unavailable, _tts_unavailable)
+    TK->>TK: step 1, resolve and gate all three legs WITHOUT admission and without parking (400 portal.voice_chat_asr_unavailable, _llm_unavailable, _tts_unavailable, 409 voice_chat.no_realtime_model for an ASR or TTS leg measured too slow), every instance busy = the least loaded one and a demand signal
     loop each agent-managed leg, one at a time
         TK->>AG: ensure the model (runtime.admission_blocked is 409 portal.voice_chat_coload_failed)
     end
@@ -606,7 +618,7 @@ machine takes no admission, holds no route slot and writes no usage row; the thr
 [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event). **The ASR relay is per chunk, not per
 session**: it opens on the first admitted mic frame (no check for speech) and is closed at every chunk end, so a relay
 exists whenever the mic gate is open, in `listening` and, until the window closes, in `thinking`, and is reopened about
-100 ms after each chunk end. While it exists it holds its admission and the route's live slot and pins the ASR child
+100 ms after each chunk end. While it exists it holds its admission and its instance's live slot and pins the ASR child
 (including during the continuation window, when the speculative LLM and TTS run); it is absent only in `idle`, `speaking`
 and `draining` (and, since issue #335, after a sustained microphone mute has torn it down, below). A session-long relay would hold them there too, and the clean final comes from end-of-input, the contract
 the relay is tested on. **The live transcript is the current chunk's**:
@@ -627,7 +639,7 @@ is phase 4); since phase 3 `stop` ("stop speaking", below) also returns to `list
 not relay.** The machine relays audio faster than real time, so `audio_done` is "all audio sent", and the drain holds the mic
 gated until `max(floor, min(ceiling, playback_done))`, the floor being the relayed audio's own duration and the ceiling (30 s)
 never cutting below it, so an early or
-forged `playback_done` cannot re-open the mic while the answer is audible and a missing one cannot wedge the session. **A muted microphone is signalled to the gateway, not inferred** (issue #335, [ADR-078](09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)). A muted client sends no PCM, which an already-open ASR relay cannot tell from a stall: the upstream aborts a request body that sees no data within its idle timeout (about 30 s), and the turn used to die with `transcription.stream_error`. So the portal sends `mic_mute` and `mic_unmute`, and while the mute is latched the machine does three things on its own run loop. It **discards the ASR's output** (no `asr_*` frame, no pending text, and in the continuation window no resumed speech that would cancel the speculative answer; the one exception is a chunk already finalizing when the mute lands, whose final is discarded with the rest but which still completes from its last partial), so a model that hallucinates on silence cannot inject text. It **feeds the open relay silence of its own**, a 100 ms zeroed frame in the ticket's PCM shape every 10 s through the same queue real PCM uses, so nothing audio-shaped has to leave the browser and the upstream's idle timeout never fires. And, unless `OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN` is an explicit `0` (**keepalive**), it **tears the relay down after that long a mute** (default 10 s), by closing the pipe like a chunk end: a clean end-of-input, so the relay completes and bills what it carried instead of being aborted into a loud zero. That frees the relay's admission, the route's live slot and the ASR model's pin, which is the point of the knob; keepalive trades them for a muted relay that stays open and billed (for the silence it carries). Every way a relay can end while muted is **quiet toward the browser** (bar a chunk already finalizing, which ends as it always does): no `error` frame, no state change, the mute stays latched and the half-built chunk is dropped. That includes the gateway's own stream-idle watchdog (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`), which only the ASR's SSE re-arms and so cuts a keepalive relay whose model answers silence with nothing; that cut has no end-of-input, so, unlike the mute teardown, it bills the loud zero. The price is that a persistent failure of the relay (the route's live slot taken, the ASR not admitted) is not reported while muted: it surfaces as the ordinary `error` frame only when the first real frame after `mic_unmute` redials. `mic_unmute` lifts the filter and stops the timers (a silence-induced ASR event already in flight can still pass it just after); a relay still open carries on, and a torn-down one reopens lazily on the next real PCM. A mute made before the socket is open is not replayed (the client sent no PCM, so no relay exists to starve, and its next toggle brings the gateway into line). None of this touches the half-duplex gate. **Failure is one typed error and `idle`, never a retry.** The WebSocket upgrade hijacks its
+forged `playback_done` cannot re-open the mic while the answer is audible and a missing one cannot wedge the session. **A muted microphone is signalled to the gateway, not inferred** (issue #335, [ADR-078](09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)). A muted client sends no PCM, which an already-open ASR relay cannot tell from a stall: the upstream aborts a request body that sees no data within its idle timeout (about 30 s), and the turn used to die with `transcription.stream_error`. So the portal sends `mic_mute` and `mic_unmute`, and while the mute is latched the machine does three things on its own run loop. It **discards the ASR's output** (no `asr_*` frame, no pending text, and in the continuation window no resumed speech that would cancel the speculative answer; the one exception is a chunk already finalizing when the mute lands, whose final is discarded with the rest but which still completes from its last partial), so a model that hallucinates on silence cannot inject text. It **feeds the open relay silence of its own**, a 100 ms zeroed frame in the ticket's PCM shape every 10 s through the same queue real PCM uses, so nothing audio-shaped has to leave the browser and the upstream's idle timeout never fires. And, unless `OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN` is an explicit `0` (**keepalive**), it **tears the relay down after that long a mute** (default 10 s), by closing the pipe like a chunk end: a clean end-of-input, so the relay completes and bills what it carried instead of being aborted into a loud zero. That frees the relay's admission, the instance's live slot and the ASR model's pin, which is the point of the knob; keepalive trades them for a muted relay that stays open and billed (for the silence it carries). Every way a relay can end while muted is **quiet toward the browser** (bar a chunk already finalizing, which ends as it always does): no `error` frame, no state change, the mute stays latched and the half-built chunk is dropped. That includes the gateway's own stream-idle watchdog (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`), which only the ASR's SSE re-arms and so cuts a keepalive relay whose model answers silence with nothing; that cut has no end-of-input, so, unlike the mute teardown, it bills the loud zero. The price is that a persistent failure of the relay (the instance's live slot taken, the ASR not admitted) is not reported while muted: it surfaces as the ordinary `error` frame only when the first real frame after `mic_unmute` redials. `mic_unmute` lifts the filter and stops the timers (a silence-induced ASR event already in flight can still pass it just after); a relay still open carries on, and a torn-down one reopens lazily on the next real PCM. A mute made before the socket is open is not replayed (the client sent no PCM, so no relay exists to starve, and its next toggle brings the gateway into line). None of this touches the half-duplex gate. **Failure is one typed error and `idle`, never a retry.** The WebSocket upgrade hijacks its
 connection, so none of the 30 s server deadlines applies to it; the ticket POST, which can wait on a cold start, lifts them
 ([API Compatibility & Inference §7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle)). The frames and codes are in the
 [HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket), the knobs in

@@ -1275,7 +1275,10 @@ on every host, outside the run-spec workflow, and the id in it drifted from the
 as `${MODEL}` in the file's content, the drift is impossible by construction.
 **One child still serves one spec**: each spec provisions its own files, port and
 GPU, and a shared server assembled from several specs was rejected because it
-would make lifecycle, admission and GPU accounting server-scoped (ADR-066).
+would make lifecycle, admission and GPU accounting server-scoped (ADR-066). A
+replicable spec runs one child per **instance** instead, and the rule holds per
+instance: each provisions its own config directory (`<S>#<k>` for k ≥ 1) and its
+own ephemeral port ([§6.1](#61-one-lifecycle-per-instance)).
 
 The facet is general, not audio.cpp-specific, and holds up to **16 files per
 spec**, so a server that needs a per-model or per-voice file as well is covered

@@ -1301,7 +1301,7 @@ bearer client --(raw PCM, chunked, bearer token)--------------------------------
                                                                                      v
 browser --(WebSocket: PCM frames, {"type":"end"})--> portal adapter --(loopback POST)--> POST /v1/audio/transcriptions/live
 browser <--(JSON delta / partial / done / error)---- portal adapter <-------(SSE)------- (the one relay: resolve, gate, admit once,
-                                                                                          per-route slot, billing)
+                                                                                          per-instance slot, billing)
                                                          (chunked PCM, full-duplex POST) |  ^  (SSE, flushed)
                                                                                          v  |
                                                       agent POST /live/{model} --> audio.cpp /v1/audio/transcriptions/live
@@ -1440,8 +1440,11 @@ body. **End-of-input is explicit:** `{"type":"end"}` closes the pipe cleanly, th
 sends the **terminating chunk** upstream, and only then does audio.cpp emit `transcript.text.done` and `[DONE]`;
 a WebSocket **close without it** aborts the loopback body and so the upstream one (no terminating chunk), a
 **truncated** session that bills a loud zero, so the portal's Stop sends `end` and does not close the socket.
-On the **`/v1` relay**: the per-route slot is acquired before anything else and released exactly once
-(`liveSessionRegistry`; a missing registry fails closed); a copy goroutine pumps the client's body into the
+On the **`/v1` relay**: the live slot of the instance the session was routed to is acquired before anything else
+and released exactly once (`liveSessionRegistry`, keyed by the gateway instance key, so a mapping without instances has
+one slot and a replicable spec one per running instance; a missing registry fails closed; a session that loses the slot
+to another between its selection and the acquire is selected again,
+[Routing & Model Selection §10.5](routing-and-model-selection.md#105-live-slots-per-instance-and-failover-onto-a-sibling)); a copy goroutine pumps the client's body into the
 upstream request through an `io.Pipe`, latching a clean EOF (the terminating chunk) versus a truncated body (any
 other read error, which aborts the upstream body and cancels the context). The teardown of both is **deferred**, so a
 panic cannot skip it: it unblocks the pipe from both sides, expires the request read deadline (`/v1` only, the one
@@ -1458,8 +1461,8 @@ and guards the SSE leg like every streamed relay (§7): the streamed-transcripti
 **idle watchdog** (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, default 120 s) and the per-chunk **write deadline**. The first frame gets the
 cold-start budget (the larger of the target's `timeout_ms` and the idle timeout), every frame re-arms the watchdog,
 and a client that keeps streaming PCM but stops **reading** the SSE is cut by the write deadline after the idle timeout; the
-watchdog cancels the context, the relay tears down, the **per-route slot is released** (a non-reading client cannot
-hold the model's one live slot and deny every later session) and the session bills the **loud zero**. A
+watchdog cancels the context, the relay tears down, the **instance's live slot is released** (a non-reading client cannot
+hold the instance's one live slot and deny every later session) and the session bills the **loud zero**. A
 genuine dictation pause is not cut: with no PCM the upstream emits no SSE, and audio.cpp's own idle timeout ends the
 stream first, a clean end billed normally. With the idle timeout disabled there is no watchdog. Because the portal's
 session passes through this relay, the guard covers it too. The upstream SSE line is bounded at 1 MiB, past which the
