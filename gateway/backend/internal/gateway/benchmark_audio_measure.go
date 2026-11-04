@@ -346,12 +346,8 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 		}
 	}
 	if err := sc.Err(); err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
-			// A frame past the relay's own bound is one the relay could not count either.
-			scan.lost = true
-		} else {
-			return audioMeasurement{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
-		}
+		// A frame past the relay's own bound is one the relay could not count either.
+		return audioMeasurement{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
 	}
 	switch {
 	case scan.lost:

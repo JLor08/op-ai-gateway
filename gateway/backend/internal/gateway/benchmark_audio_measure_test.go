@@ -434,7 +434,7 @@ func TestMeasureTTSStreamRefusals(t *testing.T) {
 				measureAt(300, sseSpeechDelta(48000)),
 				measureAt(500, "data: {\"type\":\"speech.audio.delta\",\"audio\":\""+strings.Repeat("A", speechStreamMaxLine)+"\"}\n\n"),
 				measureAt(800, sseSpeechDone))
-		}, audioMeasureProtocol, "could not be counted"},
+		}, audioMeasureProtocol, "a frame longer than"},
 		{"all the audio at once", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(800, sseSpeechDelta(48000)+sseSpeechDone))
 		}, audioMeasureProtocol, "no measurable time"},
