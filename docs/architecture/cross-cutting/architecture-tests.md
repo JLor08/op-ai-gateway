@@ -18,7 +18,7 @@ Two test families per module:
 
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
-   compared against a checked-in allowlist — 65 edges across 27 packages in
+   compared against a checked-in allowlist — 68 edges across 29 packages in
    `op-ai-gateway`, 24 edges across 12 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed
@@ -39,7 +39,8 @@ Gateway backend (`op-ai-gateway`):
 | `compat` imports only `inference` among internals | API-flavor knowledge stays contained in the translation layer |
 | `geminiwire` imports only `inference` among internals | the Gemini wire types and neutral/Gemini converters stay a leaf that the provider client (and the later inbound endpoint) can share; today only `provider` imports it, and a later importer is a deliberate allowlist edit ([ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)) |
 | `tracing` ↛ `portal`, `account`, `provider` | those packages' tracing decorators live inside them via the OTel global, precisely to avoid this cycle |
-| `inference`, `usage`, `apierror`, `storeerr`, `theme`, `auth` import no internal package | leaf vocabulary/utility packages |
+| `inference`, `usage`, `apierror`, `storeerr`, `theme`, `auth`, `benchaudio` import no internal package | leaf vocabulary/utility packages |
+| `benchaudio` imports the standard library alone | `internal/benchaudio` is data — the audio benchmark's bundled ASR clip and transcript (`go:embed`) and the reading of its WAV header; a third-party import would put a dependency into every gateway binary for a header parse. Its one importer is `internal/gateway` (the allowlisted edge `gateway → benchaudio`) |
 
 Server-agent (`op-ai-server-agent`):
 
@@ -80,7 +81,8 @@ imports via the TypeScript compiler API, and asserts:
 | Rule | Why |
 |---|---|
 | `src/api/**` imports nothing from `components/**`, `App.tsx`, `i18n.ts`, `theme/**` | the HTTP client layer is a leaf over `fetch` |
-| `i18n.ts`, `currency.ts` have no relative imports at all | pure vocabulary leaves |
+| `currency.ts` has no relative imports at all, and `i18n.ts` imports nothing but `./audioFigures` | pure vocabulary leaves: `i18n.ts` stays one only while its one import is a leaf too |
+| `audioFigures.ts` imports nothing of ours | the one place an audio figure's wording comes from — the rate formatter (`formatRateX`, cut, never rounded up, so a rate below the real-time threshold never reads as one that passes it) and the closed set of ramp limits — shared by the cells (`components/shared/audioMetrics.ts`) and the sentences (`i18n.ts`); a dependency-free leaf at the `src` root like `currency.ts` |
 | `theme/**` may use the `api` barrel and `components/shared/**`, but no views | theming is a peer of the shared layer |
 | `components/shared/**` imports no non-shared component | shared is a lower layer than the views |
 | only `src/api.ts` may deep-import `src/api/<module>` | the barrel is the single client surface; `PortalApi` stays one type |

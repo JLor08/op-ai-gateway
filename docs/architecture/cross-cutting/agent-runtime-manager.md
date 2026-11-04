@@ -4936,8 +4936,10 @@ and the capability verdicts are not figures to take a maximum of; they come from
 the spec's representative row (the running instance-0 row, else the running row
 with the lowest index, else the instance-0 row, else the lowest index). The
 portal's Models overview counts a server once in its loading count however many of
-its instances start, and the model-servers row carries the number of running
-instances ([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
+its instances start, and not at all while an instance of the spec already runs there,
+so routine scale-up does not light the loading indicator (`startingCandidates`,
+`internal/gateway/portal_model_endpoints.go`); the model-servers row carries the
+number of running instances ([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
 
 **Per-child probing feeds three more fields onto this same channel** —
 `ContextSize`/`ActiveRequests`/`QueueDepth` — one of the two reasons
