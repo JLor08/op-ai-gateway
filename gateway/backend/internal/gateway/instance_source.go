@@ -20,17 +20,20 @@ import (
 // period instead of once per request.
 const instanceSpecCacheTTL = 5 * time.Second
 
-// instanceSpecFailureTTL is how long a failed spec read is remembered. A
-// degraded store is then asked -- and its failure logged -- once per this
-// period per mapping, instead of on every admission turn of every request,
-// while a store that recovers is asked again within a second.
+// instanceSpecFailureTTL is how long a failed spec read is remembered,
+// counted from when the read returned. A degraded store is then asked -- and
+// its failure logged -- once per this period per mapping, instead of on every
+// admission turn of every request, while a store that recovers is asked again
+// within a second.
 const instanceSpecFailureTTL = time.Second
 
 // instanceSpecReadTimeout bounds the one store read a cache miss makes, under
 // the request's own context. A request may carry no deadline at all (a
 // stream lifts its own), and this keeps a stalled store from holding it in
 // routing; a read that times out is answered as "not instance-capable", the
-// behaviour of a mapping without instances.
+// behaviour of a mapping without instances, and remembered like any other
+// failed read, so a stalled store holds one admission turn per period, not
+// every turn.
 const instanceSpecReadTimeout = 2 * time.Second
 
 // instanceSpecReader is the one store read the instance source makes.
@@ -68,10 +71,11 @@ func (e instanceSpecEntry) fresh(now time.Time) bool {
 // Server publishes telemetry into, so a parked request sees an instance as
 // soon as the telemetry that reports it running is ingested.
 type instanceSource struct {
-	store    instanceSpecReader
-	features *agentFeaturesRegistry
-	registry *runtimeStatusRegistry
-	now      func() time.Time
+	store       instanceSpecReader
+	features    *agentFeaturesRegistry
+	registry    *runtimeStatusRegistry
+	now         func() time.Time
+	readTimeout time.Duration // instanceSpecReadTimeout; a test shortens it
 
 	// mu guards specs only; it is never held across the store read.
 	mu    sync.Mutex
@@ -80,11 +84,12 @@ type instanceSource struct {
 
 func newInstanceSource(store instanceSpecReader, features *agentFeaturesRegistry, registry *runtimeStatusRegistry) *instanceSource {
 	return &instanceSource{
-		store:    store,
-		features: features,
-		registry: registry,
-		now:      time.Now,
-		specs:    map[string]instanceSpecEntry{},
+		store:       store,
+		features:    features,
+		registry:    registry,
+		now:         time.Now,
+		readTimeout: instanceSpecReadTimeout,
+		specs:       map[string]instanceSpecEntry{},
 	}
 }
 
@@ -141,33 +146,38 @@ func (s *instanceSource) InstanceView(ctx context.Context, serverID string, m ro
 
 // spec returns mapping mappingID's spec, from the cache while the last read is
 // fresh. A miss reads the store under the request's ctx (bounded by
-// instanceSpecReadTimeout), so the read is traced as part of the request and
-// ends with it. A failed read reads as no spec and is remembered for
-// instanceSpecFailureTTL -- unless the request itself was gone, which says
-// nothing about the store: that failure is not remembered, so one client's
-// cancellation never hides a mapping's instances from the others. A miss
-// drops every expired entry, which bounds the cache by the mappings read in
-// the last period.
+// readTimeout), so the read is traced as part of the request and ends with
+// it. A failed read -- a store error, or a read that ran into readTimeout --
+// reads as no spec and is remembered for instanceSpecFailureTTL, unless the
+// request itself was gone, which says nothing about the store: that failure
+// is not remembered, so one client's cancellation never hides a mapping's
+// instances from the others. An entry's period counts from when its read
+// returned, so a read that took longer than its own period (a stall that hit
+// readTimeout outlasts the failure period) is still remembered for all of it.
+// A miss drops every expired entry, which bounds the cache by the mappings
+// read in the last period.
 func (s *instanceSource) spec(ctx context.Context, mappingID string) instanceSpecEntry {
-	now := s.now()
 	s.mu.Lock()
 	e, hit := s.specs[mappingID]
 	s.mu.Unlock()
-	if hit && e.fresh(now) {
+	if hit && e.fresh(s.now()) {
 		return e
 	}
 	if s.store == nil {
 		return instanceSpecEntry{}
 	}
-	readCtx, cancel := context.WithTimeout(ctx, instanceSpecReadTimeout)
+	readCtx, cancel := context.WithTimeout(ctx, s.readTimeout)
 	defer cancel()
 	spec, found, err := s.store.RuntimeSpecByMapping(readCtx, mappingID)
+	readAt := s.now()
 	if err != nil {
+		// The request's own end, not the read's: a read that timed out under
+		// a live request is a stalled store, and is remembered.
 		if ctx.Err() != nil {
 			return instanceSpecEntry{}
 		}
 		slog.Warn("instance expansion: runtime spec read failed; routing the mapping as one instance", "mapping", mappingID, "err", err)
-		e = instanceSpecEntry{failed: true, readAt: now}
+		e = instanceSpecEntry{failed: true, readAt: readAt}
 	} else {
 		e = instanceSpecEntry{
 			found:        found,
@@ -175,13 +185,13 @@ func (s *instanceSource) spec(ctx context.Context, mappingID string) instanceSpe
 			replicable:   spec.Replicable,
 			maxInstances: spec.MaxInstances,
 			parallelism:  spec.InstanceParallelism,
-			readAt:       now,
+			readAt:       readAt,
 		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, old := range s.specs {
-		if !old.fresh(now) {
+		if !old.fresh(readAt) {
 			delete(s.specs, id)
 		}
 	}

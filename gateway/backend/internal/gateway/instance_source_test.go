@@ -181,6 +181,79 @@ func TestInstanceSourceRemembersAFailedReadForASecond(t *testing.T) {
 	}
 }
 
+// slowSpecReader is a test instanceSpecReader whose every read takes took on
+// the source's clock (advance moves it). A read answers spec; with err set it
+// fails with err instead, and with stall set it waits for its context to end
+// and fails with the context's error -- a store that never answers.
+type slowSpecReader struct {
+	advance func(time.Duration)
+	took    time.Duration
+	spec    routing.RuntimeSpec
+	err     error
+	stall   bool
+	reads   int
+}
+
+func (r *slowSpecReader) RuntimeSpecByMapping(ctx context.Context, _ string) (routing.RuntimeSpec, bool, error) {
+	r.reads++
+	if r.stall {
+		<-ctx.Done()
+	}
+	r.advance(r.took)
+	switch {
+	case r.stall:
+		return routing.RuntimeSpec{}, false, ctx.Err()
+	case r.err != nil:
+		return routing.RuntimeSpec{}, false, r.err
+	}
+	return r.spec, true, nil
+}
+
+// A read is remembered for its period from when it returned, not from when it
+// started. A read that took longer than that period -- a degraded store that
+// failed after more than a second, a stalled store whose read ran into the
+// read timeout while the request was still waiting, a slow store that
+// answered after more than five seconds -- is still remembered, so the next
+// admission turn neither reads the store again nor waits on it again.
+func TestInstanceSourceRemembersASlowReadFromWhenItReturned(t *testing.T) {
+	cases := []struct {
+		name   string
+		reader slowSpecReader
+		ok     bool
+		period time.Duration
+	}{
+		{"failed after 1.5s", slowSpecReader{took: 1500 * time.Millisecond, err: errors.New("store degraded")}, false, instanceSpecFailureTTL},
+		{"timed out under a live request", slowSpecReader{took: instanceSpecReadTimeout, stall: true}, false, instanceSpecFailureTTL},
+		{"answered after 6s", slowSpecReader{took: 6 * time.Second, spec: routing.RuntimeSpec{ID: "S", MappingID: "map_m", Replicable: true}}, true, instanceSpecCacheTTL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, _, m := instanceSourceFixture()
+			now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+			src.now = func() time.Time { return now }
+			src.readTimeout = 10 * time.Millisecond // the stalled read's timeout, in real time
+			reader := tc.reader
+			reader.advance = func(d time.Duration) { now = now.Add(d) }
+			src.store = &reader
+			ctx := context.Background() // the request stays alive throughout
+
+			if _, ok := src.InstanceView(ctx, "srv1", m); ok != tc.ok {
+				t.Fatalf("first read: ok = %v, want %v", ok, tc.ok)
+			}
+			almost := tc.period - 100*time.Millisecond
+			now = now.Add(almost)
+			if _, ok := src.InstanceView(ctx, "srv1", m); ok != tc.ok || reader.reads != 1 {
+				t.Fatalf("%v after the read returned: ok %v after %d reads, want %v after 1 (the read remembered)", almost, ok, reader.reads, tc.ok)
+			}
+			now = now.Add(100 * time.Millisecond)
+			src.InstanceView(ctx, "srv1", m)
+			if reader.reads != 2 {
+				t.Fatalf("spec reads %v after the read returned = %d, want 2", tc.period, reader.reads)
+			}
+		})
+	}
+}
+
 // The spec is read under the request's context, so the read is traced under
 // the request and ends with it. A read that failed because its request was
 // already gone says nothing about the store: it is not remembered, and the
