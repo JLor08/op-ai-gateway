@@ -3428,7 +3428,8 @@ stderr are captured into one in-memory record buffer per **spec** — not per
 process — mutex-guarded because `os/exec` writes from two goroutines. Its tail
 is what populates `last_error.stderr_tail`, and a portal log view is what makes
 the agent stream it upward. Every instance of a replicable spec writes into its
-spec's one buffer, lines of instance k ≥ 1 prefixed `[#k] ` (§6.1). Capacity is an operator setting
+spec's one buffer, lines of instance k ≥ 1 prefixed `[#k] ` and every entry
+naming its instance (§6.1). Capacity is an operator setting
 (`runtime_log_buffer_bytes`, default 1 MiB; `runtime_log_buffer_total_bytes`,
 default 16 MiB). Full description in [§14](#14-managed-process-logs-t3).
 
@@ -3553,7 +3554,10 @@ at the next periodic sample while it keeps naming an address that is gone.
 **Output goes into the spec's one buffer.** Every instance writes into the log
 buffer of its **base** spec (`LogStore.newInstanceProc`); instance 0's lines are
 recorded exactly as written, and every line instance k ≥ 1 writes is prefixed
-`[#k] `. The spec's log view, the gateway's watch command and `Retain` therefore
+`[#k] `. Every text entry and generation marker also carries the instance index
+itself (`instance`, omitted for instance 0), so the portal can show one
+instance's output alone without parsing the prefix back out of the text
+([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). The spec's log view, the gateway's watch command and `Retain` therefore
 cover every instance with nothing per instance to track, a crashed burst
 instance's output stays readable after its row is retired, and a spec running many
 instances holds one buffer of the per-spec budget ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)).
@@ -8301,8 +8305,12 @@ same function as the pushed document, so the two cannot disagree); neither has a
   instance with no process and nothing queued, so its row leaves the stream and
   does not count in the wait. Without the stored spec every row counts as
   protected.
-- The log view states that it shows every instance of the spec, lines of instance
-  k ≥ 1 prefixed `[#k]` (§6.1).
+- The log view of a replicable spec — or of any spec once more than one instance
+  is known to it — offers tabs: **All** shows every instance's output as it
+  arrives, lines of instance k ≥ 1 prefixed `[#k]` (§6.1), and one tab per
+  instance shows only that instance's output, without the prefix
+  ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). A spec that
+  never ran a second instance shows no tabs.
 - The Models catalog's model-servers row carries `running_instances` (one per
   running status row of the spec, so 1 for a running spec that is not replicable)
   and the spec's `replicable` flag; the count is shown for a replicable spec or
@@ -8630,6 +8638,33 @@ spec ids) cover every instance with nothing per instance to track, a crashed bur
 instance's output survives the retirement of its row, and a spec running many
 instances spends one buffer of the per-spec budget, not one per instance.
 
+**Every entry names its instance.** Each text entry and each generation marker
+carries `instance`, the index of the instance whose generation produced it —
+omitted for instance 0, which is also what an agent from before instances sends.
+The text keeps its prefix, so the combined history reads the same to every
+consumer, the stderr tail included. An entry that carries only `dropped_bytes`
+names no instance: the bytes lost may have come from any of them.
+
+**The portal's log view splits the history per instance.** For a replicable spec,
+or once more than one instance is known — the ones the opening row's spec lists,
+plus every one the stream names while the dialog is open, kept as a union — the
+view offers tabs. **All** (*Gesamt*) is selected each time the dialog opens and
+shows the history exactly as it arrives, prefixes included. Each **Instance k**
+tab shows only the entries of instance k, its generation markers and their
+resolved commands included, with the `[#k] ` prefix removed from every line the
+agent prefixed: at the start of a chunk and after every newline inside it. An
+entry is a chunk of output, not a line, so the view tracks per instance whether
+the previous chunk ended inside a line and leaves a continuing chunk's first
+bytes alone; a generation marker opens a new line. Where that state is unknown —
+at the head of the window and after a gap — a chunk is read as opening a line,
+which leaves one ambiguity the text cannot resolve: process output that itself
+begins with the exact prefix at such a boundary loses it in that tab (All still
+shows it). Gaps — `dropped_bytes` and the view's own trim notice
+([§14.5](#145-overflow-is-always-visible)) — appear in **every** tab, because a
+gap cannot be attributed to an instance, and a tab for an instance with no output
+in the history says so in a sentence rather than staying blank. A spec that never
+ran a second instance shows no tabs and looks exactly as before.
+
 ### 14.3 The memory bound is the operator's to set
 
 Capacity is an agent-local operator setting with the same provenance as
@@ -8664,7 +8699,7 @@ under 17 MiB while watching.
 | Frame | Direction | Payload |
 |---|---|---|
 | `runtime_log_config` | gateway → agent | `{"spec_ids":[…],"epochs":{…}}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing; the epoch adds no state to the frame, it makes "a viewer arrived" expressible. `epochs` is one counter per spec id, bumped whenever a **viewer arrives**, and the agent re-snapshots any spec whose epoch differs from the one its last snapshot was taken for — even one it is already streaming. That is the fact the agent cannot derive for itself: watching is a *set*, so a second viewer of the same spec produces a byte-identical `spec_ids`, and a rule keyed to "this id is new" leaves that viewer's window blank while the agent believes it delivered. Compared with `!=`, never `<`, because a gateway restart resets the counters. Re-sent on **every** new agent connection, including the empty set and with every epoch bumped, so neither a watch set nor a history the gateway owes can outlive the connection it was issued on. |
-| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). |
+| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command","instance"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). `instance` is the index of the spec instance that produced a text entry or marker, omitted for instance 0 ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)); the gateway relays it unchanged, reading a negative value as 0. |
 
 The markers are **typed records carrying no text** — `event` plus `pid`/
 `exit_code`/`command`, with the `── … ──` line written by the portal. That is
@@ -8726,7 +8761,10 @@ arrival paths raise it**: a live stream trimmed from the front as it grows, and
 a **scrollback longer than the cap**, which is trimmed from the front the moment
 it arrives. The scrollback path was silent once — it reset the counter to zero
 and sliced the tail — which is why the view now counts what it discards in one
-place that both paths go through, rather than once per path.
+place that both paths go through, rather than once per path. The cap applies to
+the one window all tabs of a replicable spec's view are filtered from, so the
+notice, like every `dropped_bytes` gap, is shown in every tab
+([§14.2](#142-retention-belongs-to-the-spec-not-the-process)).
 
 The count is **UTF-8 bytes**, the same quantity `dropped_bytes` carries
 (`len(e.Text)` in Go). The browser's obvious `String.length` is UTF-16 code

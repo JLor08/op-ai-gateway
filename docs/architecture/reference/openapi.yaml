@@ -2466,7 +2466,10 @@ paths:
         opening marker. On a spec that fails to start
         it is the entire content of this view. "dropped_bytes" on an entry means
         N bytes the process printed are missing immediately
-        before it. Nothing on this path is persisted -- not to disk, not to the
+        before it. "instance" names the spec instance whose generation produced
+        a text entry or marker; it is omitted for instance 0 (and by an agent
+        that predates instances), instance k's text keeps its "[#k] " line
+        prefix, and an entry carrying only "dropped_bytes" names none. Nothing on this path is persisted -- not to disk, not to the
         database. Subscribing is what makes the agent stream this spec, and
         unsubscribing is what stops it.
         Error codes: 400 runtime_logs.spec_required (spec_id absent),
