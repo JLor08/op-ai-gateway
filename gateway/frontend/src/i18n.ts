@@ -1362,6 +1362,28 @@ const de = {
   runtimeForceStart: 'Start erzwingen',
   runtimeForceStop: 'Stopp erzwingen',
   runtimeClearOverride: 'Übersteuerung aufheben',
+  // Die Prozess-Aktionen einer Live-Status-Zeile. „Starten“ und „Stoppen“
+  // wirken einmal und schreiben nichts; „anheften“ setzt die dauerhafte
+  // Übersteuerung.
+  runtimeStart: 'Starten',
+  runtimeStop: 'Stoppen',
+  runtimePinRunning: 'Laufend anheften',
+  runtimePinStopped: 'Gestoppt anheften',
+  runtimeStartMore: 'Startet eine weitere Instanz dieses Modells',
+  runtimeStartForceStopped: 'Gestoppt angeheftet – erst Übersteuerung aufheben',
+  runtimeStartMaxInstances: (max: number) =>
+    max === 1
+      ? 'Die eine Instanz, die diese Startvorgabe erlaubt, läuft oder startet bereits. Für eine weitere die Höchstanzahl Instanzen anheben.'
+      : `Alle ${max} Instanzen, die diese Startvorgabe erlaubt, laufen oder starten bereits. Für eine weitere die Höchstanzahl Instanzen anheben.`,
+  runtimeStopProtected:
+    'Diese Instanz hält die Startvorgabe am Laufen; der Agent würde sie sofort wieder starten. Auswege: Übersteuerung aufheben, Mindestanzahl Instanzen senken, „Angeheftet“ abwählen oder „Gestoppt anheften“.',
+  runtimeStopFeatureMissing:
+    'Der Agent dieses Servers kann keine einzelne Instanz stoppen: Ihm fehlt die Funktion „runtime_stop“ (ab Agent 0.17.0). Den Agenten aktualisieren.',
+  runtimeStartedRunning: (target: string) => `„${target}“ läuft.`,
+  runtimeStartedStarting: (target: string) =>
+    `„${target}“ startet. Die Statuszeilen zeigen den Fortschritt.`,
+  runtimeStopStopping: (target: string) => `„${target}“ wird gestoppt.`,
+  runtimeStopStopped: (target: string) => `„${target}“ ist bereits gestoppt.`,
   runtimeManagedLocally: 'Wird lokal vom Agenten verwaltet (Datei-Modus)',
   runtimeManagedOnlyBanner: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen.',
   runtimeManagedOnlyCreateBlocked:
@@ -1595,7 +1617,7 @@ const de = {
   // ausgegraute Aktion. Nach einem erfolgreichen Neustart ist genau dieser
   // Zustand der Ruhezustand der Zeile, also begegnet er jedem Betreiber.
   runtimeRestartUnavailable:
-    'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Start erzwingen“ verwenden.',
+    'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Starten“ verwenden.',
   // Neu starten ist auch gesperrt, wenn die Zeile selbst neu gestartet werden
   // könnte, eine andere Instanz desselben Modells aber in einem Zustand ruht,
   // aus dem der Agent sie nie „gestoppt“ melden würde.
@@ -4882,6 +4904,27 @@ const en: PortalMessages = {
   runtimeForceStart: 'Force start',
   runtimeForceStop: 'Force stop',
   runtimeClearOverride: 'Clear override',
+  // A live-status row's process actions. Start and Stop act once and write
+  // nothing; Pin sets the persistent override.
+  runtimeStart: 'Start',
+  runtimeStop: 'Stop',
+  runtimePinRunning: 'Pin as running',
+  runtimePinStopped: 'Pin as stopped',
+  runtimeStartMore: 'Starts one more instance of this model',
+  runtimeStartForceStopped: 'Pinned as stopped: clear the override first',
+  runtimeStartMaxInstances: (max: number) =>
+    max === 1
+      ? 'The one instance this launch spec allows is already running or starting. Raise its maximum instances for another one.'
+      : `All ${max} instances this launch spec allows are already running or starting. Raise its maximum instances for another one.`,
+  runtimeStopProtected:
+    'This instance keeps the launch spec up; the agent would start it again at once. Ways out: Clear override, lower the Minimum instances, untick "Pinned", or Pin as stopped.',
+  runtimeStopFeatureMissing:
+    'This server\'s agent cannot stop a single instance: it lacks the feature "runtime_stop" (agent 0.17.0 and later). Update the agent.',
+  runtimeStartedRunning: (target: string) => `"${target}" is running.`,
+  runtimeStartedStarting: (target: string) =>
+    `"${target}" is starting. The status rows show its progress.`,
+  runtimeStopStopping: (target: string) => `"${target}" is stopping.`,
+  runtimeStopStopped: (target: string) => `"${target}" is already stopped.`,
   runtimeManagedLocally: 'Managed locally by the agent (file mode)',
   runtimeManagedOnlyBanner: 'This server only accepts agent-managed applications.',
   runtimeManagedOnlyCreateBlocked:
@@ -5096,7 +5139,7 @@ const en: PortalMessages = {
   // action. A successful restart leaves the row in exactly this state, so it
   // is the resting state every operator meets, not an edge case.
   runtimeRestartUnavailable:
-    'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "force start" instead.',
+    'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "Start" instead.',
   // Restart is also unavailable when this row could restart, but another
   // instance of the same model rests in a state the agent would never report
   // "stopped" from.

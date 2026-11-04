@@ -7,6 +7,7 @@ import {
   highestLiveInstance,
   manualStopProtectedCount,
   runtimeRowPlan,
+  startInstanceLimit,
   startRoomLeft,
   type RowPlanSpec,
 } from './runtimeActions';
@@ -80,6 +81,14 @@ describe('manualStopProtectedCount', () => {
     ).toBe(3);
     // force_stopped protects nothing: everything drains under it.
     expect(manualStopProtectedCount(spec({ admin_state: 'force_stopped' }))).toBe(0);
+  });
+});
+
+describe('startInstanceLimit', () => {
+  it('is max_instances, capped at the 64 indexes an address can carry, and 64 for 0', () => {
+    expect(startInstanceLimit({ max_instances: 3 })).toBe(3);
+    expect(startInstanceLimit({ max_instances: 0 })).toBe(64);
+    expect(startInstanceLimit({ max_instances: 100 })).toBe(64);
   });
 });
 

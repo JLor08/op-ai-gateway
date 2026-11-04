@@ -176,6 +176,8 @@ export function ApplicationSection({
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
     | 'subscribeRuntimeLogs'
+    | 'startRuntime'
+    | 'stopRuntime'
     // Task 21 (matrix + server limits): forwarded the same way.
     | 'updateServer'
     | 'serverHardware'

@@ -83,13 +83,20 @@ const reusableInstanceStates = new Set(['crashed', 'start_failed', 'not_permitte
  * occupies or an ensure under way holds; those it answers with 409
  * runtime.max_instances_reached, which the portal translates.
  */
+/**
+ * How many instances a manual start may run of a spec: its max_instances, and
+ * all 64 an address can carry when that is 0 (no cap of its own).
+ */
+export function startInstanceLimit(spec: Pick<RuntimeSpec, 'max_instances'>): number {
+  return spec.max_instances > 0 ? Math.min(spec.max_instances, INSTANCES_MAX) : INSTANCES_MAX;
+}
+
 export function startRoomLeft(
   spec: Pick<RuntimeSpec, 'max_instances'>,
   rows: readonly RuntimeStatus[],
   specId: string,
 ): boolean {
-  const limit =
-    spec.max_instances > 0 ? Math.min(spec.max_instances, INSTANCES_MAX) : INSTANCES_MAX;
+  const limit = startInstanceLimit(spec);
   const taken = new Set<number>();
   for (const row of rows) {
     if (row.spec_id !== specId) continue;

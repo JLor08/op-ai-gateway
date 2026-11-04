@@ -216,6 +216,8 @@ export function ServerList({
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
     | 'subscribeRuntimeLogs'
+    | 'startRuntime'
+    | 'stopRuntime'
     | 'serverAdminGroupCandidates'
     | 'serverAvailability'
     | 'serverHardware'
