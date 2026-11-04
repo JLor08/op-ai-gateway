@@ -516,7 +516,9 @@ func vramRecordResidency(alreadyResident, residencyProbed bool, err error) vramR
 // the STORED payload names what broke the isolation rather than only saying
 // that it broke, and Isolated is then recomputed through the one function that
 // owns that field. The lost-set conjunct is what covers a spec created AFTER
-// the enumeration: that one is in no list vramIsolationConfirmed reads.
+// the enumeration: that one is in no list vramIsolationConfirmed reads. The
+// target itself is named when another of its instances broke the isolation
+// (vramIsolationLost), so its entry then says restarted_during_run too.
 func (s *Server) vramRecheckIsolation(serverID string, plan vramRunPlanned, report *VRAMReport) bool {
 	lost := s.vramIsolationLost(serverID, plan)
 	for _, specID := range lost {
@@ -758,11 +760,15 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 // ONE status frame, and returns nil when the frame carries none -- which is
 // what keeps the caller waiting rather than answering early.
 //
-// Two things disqualify a row before its numbers are read. A DIFFERENT spec,
-// because a frame carries the whole server. And a zero MeasuredAt: a spec the
-// agent has never measured still reports a GPU array, all zeros, and reading
-// that as a measurement of nothing is exactly the mistake this whole feature
-// refuses to make.
+// Three things disqualify a row before its numbers are read. A DIFFERENT spec,
+// because a frame carries the whole server. ANOTHER INSTANCE of the target: a
+// replicable spec reports one row per instance under its one spec id, and the
+// run loads and measures instance 0 -- another instance's figure, in whichever
+// order the rows arrive, is not the target's cost (and that instance holding a
+// process is what the isolation recheck refuses). And a zero MeasuredAt: a
+// spec the agent has never measured still reports a GPU array, all zeros, and
+// reading that as a measurement of nothing is exactly the mistake this whole
+// feature refuses to make.
 //
 // A measured 0 is likewise UNKNOWN -- the same rule the ingest and the
 // write-back apply to this very array -- so a card at 0 is DROPPED, never
@@ -772,7 +778,7 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 // on a host that has no per-process measurer at all.
 func vramMeasuredFromFrame(frame []RuntimeStatusDTO, specID string) map[int]int {
 	for _, status := range frame {
-		if status.SpecID != specID || status.MeasuredAt.IsZero() {
+		if status.SpecID != specID || status.Instance != 0 || status.MeasuredAt.IsZero() {
 			continue
 		}
 		out := map[int]int{}

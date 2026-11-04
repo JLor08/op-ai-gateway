@@ -7,6 +7,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"slices"
 	"testing"
+	"time"
 )
 
 // instanceStatus is spec specID's instance-k status row in state with pid.
@@ -147,5 +148,146 @@ func TestVRAMIsolationWaitsForEveryInstance(t *testing.T) {
 	quiet := []RuntimeStatusDTO{instanceStatus("S", 0, "stopped", 0), instanceStatus("S", 1, "crashed", 0)}
 	if got := vramFrameEvidence(quiet, map[string]struct{}{"S": {}}, nil); got["S"] == "" {
 		t.Fatalf("vramFrameEvidence(%+v) = %v, want S confirmed once every instance has no process", quiet, got)
+	}
+}
+
+// TestVRAMIsolationLostSeesTheTargetsOtherInstances pins the end-of-run
+// isolation recheck over a replicable target. The run cleared the target's
+// override to load it, so the target's instance-0 row holding a process is the
+// point of the run. Every other instance of the target was drained with the
+// fleet, though, and one that started during the load (a protected minimum
+// coming back once the override cleared, or a burst start) put its whole
+// allocation into the measured delta -- so it breaks the isolation exactly as a
+// sibling does, and the target is named, in whichever order the rows arrive.
+func TestVRAMIsolationLostSeesTheTargetsOtherInstances(t *testing.T) {
+	plan := vramRunPlanned{specIDs: []string{"S", "T"}, targetSpecID: "S"}
+	cases := []struct {
+		name string
+		rows []RuntimeStatusDTO
+		want []string
+	}{
+		{"another instance of the target runs", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "running", 5), instanceStatus("S", 1, "running", 7), instanceStatus("T", 0, "stopped", 0),
+		}, []string{"S"}},
+		{"another instance of the target runs, listed first", []RuntimeStatusDTO{
+			instanceStatus("S", 1, "running", 7), instanceStatus("S", 0, "running", 5), instanceStatus("T", 0, "stopped", 0),
+		}, []string{"S"}},
+		{"another instance of the target starts", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "running", 5), instanceStatus("S", 2, "starting", 0), instanceStatus("T", 0, "stopped", 0),
+		}, []string{"S"}},
+		{"another instance of the target in a state this gateway does not know", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "running", 5), instanceStatus("S", 1, "warming", 0), instanceStatus("T", 0, "stopped", 0),
+		}, []string{"S"}},
+		{"every other instance of the target has no process", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "running", 5), instanceStatus("S", 1, "stopped", 0), instanceStatus("S", 2, "crashed", 0),
+			instanceStatus("T", 0, "stopped", 0),
+		}, nil},
+		{"only the target's instance 0", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "running", 5), instanceStatus("T", 0, "stopped", 0),
+		}, nil},
+		{"a sibling's burst instance runs", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "running", 5), instanceStatus("T", 0, "stopped", 0), instanceStatus("T", 1, "running", 9),
+		}, []string{"T"}},
+		{"both", []RuntimeStatusDTO{
+			instanceStatus("T", 1, "running", 9), instanceStatus("S", 1, "running", 7), instanceStatus("S", 0, "running", 5),
+			instanceStatus("T", 0, "stopped", 0),
+		}, []string{"S", "T"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &Server{RuntimeStatus: NewRuntimeStatusRegistry()}
+			srv.RuntimeStatus.publish("srv1", tc.rows)
+			if got := srv.vramIsolationLost("srv1", plan); !slices.Equal(got, tc.want) {
+				t.Fatalf("vramIsolationLost = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVRAMRunRefusesANumberWhenAnotherInstanceOfTheTargetRuns is the run-level
+// half: once the run clears the target's override, the agent brings up a second
+// instance of the target as well, and the post-load window holds the memory of
+// both. The run must not report that sum as the target's cost.
+func TestVRAMRunRefusesANumberWhenAnotherInstanceOfTheTargetRuns(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{})
+	f.seedLatestSample()
+	f.drive(t)
+	f.provider.onStream = func() {
+		f.used0.Store((500 + 9000 + 9000) * oneMiB)
+		f.setStatuses(
+			RuntimeStatusDTO{SpecID: f.targetSpec, Instance: 0, State: "running", PID: 5},
+			RuntimeStatusDTO{SpecID: f.targetSpec, Instance: 1, State: "running", PID: 7},
+			RuntimeStatusDTO{SpecID: f.siblingSpec, State: "stopped"},
+		)
+	}
+
+	report := f.run(t).Results[0].VRAM
+	if report == nil {
+		t.Fatal("VRAM = nil, want a report carrying the reason")
+	}
+	if report.Inconclusive != "isolation_lost" {
+		t.Fatalf("Inconclusive = %q, want %q -- delta_mb %d holds two instances of the target",
+			report.Inconclusive, "isolation_lost", vramHeadlineDeltaMB(report.GPUs))
+	}
+	if report.Isolated {
+		t.Fatal("Isolated = true while another instance of the target ran")
+	}
+	if got := report.IsolationEvidence[f.targetSpec]; got != "restarted_during_run" {
+		t.Fatalf("IsolationEvidence[%s] = %q, want %q", f.targetSpec, got, "restarted_during_run")
+	}
+	for _, item := range report.GPUs {
+		if item.DeltaMB != 0 {
+			t.Fatalf("a contaminated run reported a delta: %#v", item)
+		}
+	}
+}
+
+// TestVRAMRunAcceptsTheTargetsOtherInstancesStopped: the target's other
+// instances reading stopped at the end leave the isolation intact, so the
+// recheck does not refuse every run of a replicable spec.
+func TestVRAMRunAcceptsTheTargetsOtherInstancesStopped(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{})
+	f.seedLatestSample()
+	f.drive(t)
+	f.provider.onStream = func() {
+		f.used0.Store(21500 * oneMiB)
+		f.setStatuses(
+			RuntimeStatusDTO{SpecID: f.targetSpec, Instance: 1, State: "stopped"},
+			RuntimeStatusDTO{SpecID: f.targetSpec, Instance: 0, State: "running", PID: 5},
+			RuntimeStatusDTO{SpecID: f.siblingSpec, State: "stopped"},
+		)
+	}
+
+	report := f.run(t).Results[0].VRAM
+	if report == nil || report.Inconclusive != "" {
+		t.Fatalf("report = %#v, want a definitive result", report)
+	}
+	if !report.Isolated {
+		t.Fatalf("Isolated = false; evidence = %v", report.IsolationEvidence)
+	}
+}
+
+// TestVRAMMeasuredFromFrameReadsInstanceZero: the agent's own per-card
+// measurement of the target is instance 0's -- the instance the run loaded --
+// never a figure another instance of the same spec reports under the same id,
+// whichever comes first in the frame.
+func TestVRAMMeasuredFromFrameReadsInstanceZero(t *testing.T) {
+	at := time.Now().UTC()
+	burst := RuntimeStatusDTO{
+		SpecID: "S", Instance: 1, State: "running", PID: 7, MeasuredAt: at,
+		GPUs: []RuntimeGPUStatusDTO{{Index: 0, VRAMMeasuredMB: 9100}},
+	}
+	own := RuntimeStatusDTO{
+		SpecID: "S", Instance: 0, State: "running", PID: 5, MeasuredAt: at,
+		GPUs: []RuntimeGPUStatusDTO{{Index: 0, VRAMMeasuredMB: 9000}},
+	}
+	for _, frame := range [][]RuntimeStatusDTO{{burst, own}, {own, burst}} {
+		got := vramMeasuredFromFrame(frame, "S")
+		if len(got) != 1 || got[0] != 9000 {
+			t.Fatalf("vramMeasuredFromFrame(%+v) = %v, want instance 0's {0: 9000}", frame, got)
+		}
+	}
+	if got := vramMeasuredFromFrame([]RuntimeStatusDTO{burst}, "S"); got != nil {
+		t.Fatalf("vramMeasuredFromFrame(only another instance) = %v, want nil", got)
 	}
 }

@@ -41,7 +41,8 @@ const (
 	// and measure again:
 	//
 	//  1. the END-OF-RUN re-verification below (vramIsolationLost): a spec this
-	//     run had drained held a live process again by the end of the
+	//     run had drained -- or an instance of the target other than the one
+	//     the run loaded -- held a live process again by the end of the
 	//     measurement. Observed on the status stream.
 	//  2. the ISOLATION WAIT (vramAwaitIsolation's gate): a freshly derived
 	//     runtime-config document no longer force-stops every enumerated spec,
@@ -141,15 +142,25 @@ func vramCardToleranceMB(gpu routing.GPUSample) int {
 // isolation proof and here, ascending. An empty result means the isolation the
 // report claims held for the whole measurement, not merely at the drain.
 //
-// THE TARGET IS EXCLUDED, and that is the whole asymmetry: the run cleared the
-// target's own override in order to load it, so the target holding a process
-// at the end is the point of the run rather than contamination.
+// THE TARGET'S INSTANCE 0 IS EXCLUDED, and that is the whole asymmetry: the
+// run cleared the target's own override in order to load it, so the target
+// holding a process at the end is the point of the run rather than
+// contamination. Instance 0 is the one the run loaded; a replicable target's
+// other instances report further rows under the same spec id, and those were
+// drained with the fleet like any sibling. Clearing the override lets the agent
+// bring them back (a protected minimum, a burst start), and their allocation
+// would land in the same post-load window, so they are held to the sibling
+// standard and the target is named when one of them breaks it.
 //
-// Two questions, because a spec can break the isolation in two ways, and the
-// two answers come from vramEnumeratedNotQuiet and vramUnenumeratedWithProcess
-// -- each carrying the reasoning for the half it decides. They partition the
-// snapshot (one reads only enumerated specs, the other only unenumerated
-// ones), so their results need no de-duplication between them.
+// Three questions, because a spec can break the isolation in three ways: an
+// enumerated sibling that is no longer quiet (vramEnumeratedNotQuiet), a spec
+// outside the enumeration that holds a process (vramUnenumeratedWithProcess),
+// and another instance of the target that is no longer quiet
+// (vramTargetInstancesNotQuiet) -- each carrying the reasoning for the part it
+// decides. They partition the snapshot (enumerated siblings, unenumerated
+// specs, the target), so their results need no de-duplication between them.
+// All three read one state per spec built without the target's instance-0
+// rows, so the target's entry, when there is one, is its other instances'.
 //
 // It reads the runtime-status snapshot rather than waiting for a delivered
 // frame, so it is up to one telemetry interval stale (the default is 1 s, and
@@ -161,12 +172,15 @@ func (s *Server) vramIsolationLost(serverID string, plan vramRunPlanned) []strin
 	for _, specID := range plan.specIDs {
 		enumerated[specID] = true
 	}
-	stateBySpec := vramStateBySpec(s.RuntimeStatus.statusSnapshot(serverID))
+	stateBySpec := vramStateBySpec(vramRowsBesideTargetInstanceZero(s.RuntimeStatus.statusSnapshot(serverID), plan.targetSpecID))
 
 	lost := append(
 		vramEnumeratedNotQuiet(enumerated, plan.targetSpecID, stateBySpec),
 		vramUnenumeratedWithProcess(enumerated, plan.targetSpecID, stateBySpec)...,
 	)
+	if vramTargetInstancesNotQuiet(plan.targetSpecID, stateBySpec) {
+		lost = append(lost, plan.targetSpecID)
+	}
 	if len(lost) == 0 {
 		return nil
 	}
@@ -223,6 +237,36 @@ func vramUnenumeratedWithProcess(enumerated map[string]bool, targetSpecID string
 		}
 	}
 	return lost
+}
+
+// vramRowsBesideTargetInstanceZero is statuses without the target's instance-0
+// rows -- the instance the run itself loads -- so a state folded from what is
+// left reads the target only through its other instances. A spec that is not
+// replicable reports instance 0 alone, so its target then has no entry at all.
+func vramRowsBesideTargetInstanceZero(statuses []RuntimeStatusDTO, targetSpecID string) []RuntimeStatusDTO {
+	out := make([]RuntimeStatusDTO, 0, len(statuses))
+	for _, status := range statuses {
+		if status.SpecID == targetSpecID && status.Instance == 0 {
+			continue
+		}
+		out = append(out, status)
+	}
+	return out
+}
+
+// vramTargetInstancesNotQuiet is vramIsolationLost's third question: the
+// target's OTHER instances, read from a state folded without its instance-0
+// rows, must have no process.
+//
+// It applies the enumerated standard rather than the unenumerated one: the
+// isolation wait recorded the target's evidence only once every one of its
+// rows was in a state this gateway recognizes as process-free, so an
+// unrecognized state now withdraws evidence the run already held. ABSENT,
+// unlike for a sibling, is quiet: the agent stops reporting an instance it has
+// retired, and a target that is not replicable never reports one.
+func vramTargetInstancesNotQuiet(targetSpecID string, stateBySpec map[string]string) bool {
+	state, present := stateBySpec[targetSpecID]
+	return present && !vramStateNoProcess(state)
 }
 
 // vramUndeclaredAllocations reports the cards OUTSIDE the watched set that this
