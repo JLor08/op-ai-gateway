@@ -128,12 +128,15 @@ func (m *audioAutoRunMarker) claim(mappingID string) bool {
 	return true
 }
 
-// audioAutoRunWanted reports whether an audio mapping still lacks what the automatic run
-// measures: any audio metrics at all (no audio benchmark has stamped it), or, for a replicable
-// spec, a ramp result (its concurrency limit is unknown). A ramp's measured 0 has a limit, so
-// it never asks again: it is a result.
-func audioAutoRunWanted(mapping routing.ModelMapping, spec routing.RuntimeSpec) bool {
-	return mapping.AudioMetricsUpdatedAt == nil || (spec.Replicable && mapping.AudioConcurrencyLimit == "")
+// AudioAutoRunWanted is THE rule whether an audio mapping still lacks what the automatic run
+// measures: any audio metrics at all (no audio benchmark has stamped it), or, when its launch
+// spec is replicable, a ramp result (its concurrency limit is unknown). A ramp's measured 0
+// has a limit, so it never asks again: it is a result. A mapping without a spec -- an
+// operator-run audio.cpp server's -- is not replicable. TriggerAudioBenchmark decides with it,
+// and the app-health loop asks the trigger only about a mapping it holds for, so a mapping
+// the run would not measure again is not asked about on every tick.
+func AudioAutoRunWanted(mapping routing.ModelMapping, replicable bool) bool {
+	return mapping.AudioMetricsUpdatedAt == nil || (replicable && mapping.AudioConcurrencyLimit == "")
 }
 
 // TriggerAudioBenchmark starts the one-time automatic audio benchmark for ONE mapping on behalf
@@ -147,7 +150,7 @@ func audioAutoRunWanted(mapping routing.ModelMapping, spec routing.RuntimeSpec) 
 // own goroutine. It answers true only when a run was launched, and false for everything else:
 //   - the mapping is not active, its metrics are locked (nothing would be written), it is no
 //     audio target, a read failed, or it already has what the run measures
-//     (audioAutoRunWanted);
+//     (AudioAutoRunWanted);
 //   - its run was started already in this process: once per mapping, so a run that fails
 //     -- an upstream that cannot synthesize, say -- does not start again on every tick;
 //   - the mapping's agent has not declared its features since the gateway started: whether a
@@ -164,7 +167,7 @@ func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AISer
 		return false
 	}
 	tgt, skipped, err := s.benchmarkViewTarget(ctx, portal.BenchmarkTargetView{Server: server, App: app, Mapping: mapping}, true)
-	if err != nil || skipped != "" || tgt.audio.role == "" || !audioAutoRunWanted(mapping, tgt.spec) {
+	if err != nil || skipped != "" || tgt.audio.role == "" || !AudioAutoRunWanted(mapping, tgt.spec.Replicable) {
 		return false
 	}
 	runCtx, cancel := context.WithCancel(context.Background())

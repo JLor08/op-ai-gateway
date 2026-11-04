@@ -2452,14 +2452,15 @@ func deriveServerHealth(activeCount, reachableCount int) string {
 
 // startAudioBenchmarks is the health loop's step for the gateway's one-time automatic audio
 // benchmark (#340): for every reachable audio.cpp or server_agent application of the server,
-// it asks r.audioBenchmark about each speech or transcription mapping that may still lack
-// what the run measures (audioBenchmarkCandidate), until one run is started -- a run holds
-// the server, so asking further this cycle would only be refused. The verdicts are the stored
-// capability rows (speech or transcription yes), the ones the static audio.cpp pass writes
-// and the agent reports. Everything else is the gateway's decision: whether the mapping is an
-// audio target, whether it really lacks the figures (a missing ramp result matters only for a
-// replicable spec), the once-per-process rule and the idle gate. The step only asks; with no
-// trigger wired it does nothing at all.
+// it asks r.audioBenchmark about each speech or transcription mapping that still lacks what
+// the run measures, until one run is started -- a run holds the server, so asking further
+// this cycle would only be refused. The verdicts are the stored capability rows (speech or
+// transcription yes), the ones the static audio.cpp pass writes and the agent reports. What
+// the mapping lacks is the gateway's own rule (gateway.AudioAutoRunWanted, through
+// audioBenchmarkWanted), so a mapping the trigger would refuse for it -- one with metrics
+// whose spec is not replicable, say -- is not asked about on every tick. Everything else is
+// the gateway's decision: whether the mapping is an audio target, the once-per-process rule
+// and the idle gate. The step only asks; with no trigger wired it does nothing at all.
 func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routing.AIServer, active []routing.Application, reachable []bool) {
 	if r.audioBenchmark == nil {
 		return
@@ -2473,6 +2474,7 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 			slog.Debug("app health: mappings for the automatic audio benchmark failed", "app_id", app.ID, "error", err)
 			continue
 		}
+		specs := r.audioBenchmarkSpecs(app)
 		for _, mp := range mappings {
 			if !audioBenchmarkCandidate(mp) {
 				continue
@@ -2486,6 +2488,9 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 			if byName[routing.CapabilitySpeech].Verdict != routing.CapabilityYes && byName[routing.CapabilityTranscription].Verdict != routing.CapabilityYes {
 				continue
 			}
+			if wanted, ok := audioBenchmarkWanted(ctx, mp, specs); !ok || !wanted {
+				continue
+			}
 			if r.audioBenchmark(ctx, server, app, mp) {
 				return
 			}
@@ -2494,12 +2499,60 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 }
 
 // audioBenchmarkCandidate reports whether a mapping may still lack what the automatic audio
-// benchmark measures: it is active and unlocked, and has no audio metrics at all or no ramp
-// result. A ramp result, a measured 0 included, carries its limit, so a mapping with one is
-// never asked about again.
+// benchmark measures, from the mapping alone: it is active and unlocked, and the gateway's
+// rule (gateway.AudioAutoRunWanted) holds for it at least if its spec is replicable. A ramp
+// result, a measured 0 included, carries its limit, so a mapping with one is never asked
+// about again.
 func audioBenchmarkCandidate(mp routing.ModelMapping) bool {
 	if mp.Status != routing.ServerStatusActive || mp.MetricsLocked || mp.AppModelName == "" {
 		return false
 	}
-	return mp.AudioMetricsUpdatedAt == nil || mp.AudioConcurrencyLimit == ""
+	return gateway.AudioAutoRunWanted(mp, true)
+}
+
+// audioBenchmarkSpecReader is one application's launch specs for the automatic audio
+// benchmark's rule, read at most once per cycle and only when a mapping's answer depends on
+// them. An application that is not server_agent has none.
+type audioBenchmarkSpecReader func(ctx context.Context) ([]routing.RuntimeSpec, error)
+
+// audioBenchmarkSpecs is app's audioBenchmarkSpecReader.
+func (r *appHealthRunner) audioBenchmarkSpecs(app routing.Application) audioBenchmarkSpecReader {
+	var (
+		read  bool
+		specs []routing.RuntimeSpec
+		err   error
+	)
+	return func(ctx context.Context) ([]routing.RuntimeSpec, error) {
+		if app.Type != routing.ProviderServerAgent {
+			return nil, nil
+		}
+		if !read {
+			read = true
+			specs, err = r.store.RuntimeSpecsByApplication(ctx, app.ID)
+		}
+		return specs, err
+	}
+}
+
+// audioBenchmarkWanted is the gateway's rule (gateway.AudioAutoRunWanted) for a candidate
+// mapping (audioBenchmarkCandidate): a mapping with no audio metrics is wanted whatever its
+// spec, and one with metrics but no ramp result only when its launch spec is replicable,
+// which is read for that case alone. ok is false when that read failed: the mapping is then
+// not asked about this cycle.
+func audioBenchmarkWanted(ctx context.Context, mp routing.ModelMapping, specs audioBenchmarkSpecReader) (wanted, ok bool) {
+	if gateway.AudioAutoRunWanted(mp, false) {
+		return true, true
+	}
+	all, err := specs(ctx)
+	if err != nil {
+		slog.Debug("app health: launch specs for the automatic audio benchmark failed", "mapping_id", mp.ID, "error", err)
+		return false, false
+	}
+	replicable := false
+	for _, spec := range all {
+		if spec.MappingID == mp.ID {
+			replicable = spec.Replicable
+		}
+	}
+	return gateway.AudioAutoRunWanted(mp, replicable), true
 }

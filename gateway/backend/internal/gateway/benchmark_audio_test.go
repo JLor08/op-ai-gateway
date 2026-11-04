@@ -1091,6 +1091,24 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 		}
 		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
 	})
+	t.Run("requests in flight defer without using up the one run", func(t *testing.T) {
+		// The idle gate: the trigger takes the reservation, sees the server's live traffic,
+		// gives the reservation back and starts nothing; once the server is idle it starts.
+		f := newAudioFixture(t, audioFixtureOpts{agent: true, features: []string{"runtime_manager"}})
+		ctx := context.Background()
+		f.srv.Active.Add(ActiveRequest{ID: "req_live", ServerName: f.server.Name, APIFlavor: "openai_audio", StartedAt: time.Now()})
+		if f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
+			t.Fatal("started a run on a server with a request in flight")
+		}
+		if f.srv.Benchmarks.ServerBusy("srv1") || len(f.script.recorded()) != 0 {
+			t.Fatal("the deferred trigger kept the reservation or measured")
+		}
+		f.srv.Active.Remove("req_live")
+		if !f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)) {
+			t.Fatal("the deferred mapping was not started once the server was idle")
+		}
+		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
+	})
 	t.Run("a busy server defers without using up the one run", func(t *testing.T) {
 		f := newAudioFixture(t, audioFixtureOpts{agent: true, features: []string{"runtime_manager"}})
 		ctx := context.Background()
