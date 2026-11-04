@@ -22,8 +22,15 @@ import (
 // gate and where the plain selection would not move the request off it for a loaded model
 // or a swap (inference.Request.PreferredInstanceKey), and a leg moved elsewhere sticks to
 // its new instance from then on. A leg served by a mapping without instances is never
-// sticky (stickyInstance). No route_affinity row is involved: the legs run under a session
-// principal without a token id.
+// sticky (stickyInstance). This memory needs no route_affinity row, and normally none is
+// involved: the legs run under the chat's session principal, which has no token id. The
+// exception is a chat whose settings run it as an API token (X-OP-Run-As-Token, set by
+// setRunLoopbackHeaders on the LLM and TTS legs, never on the ASR leg's live dial): those
+// legs then carry that token's id, and the LLM leg can hit -- or write -- that token's
+// affinity pin for its model. On a hit the pin's own instance is the preferred one
+// (selectPinned), not this memory's, and the hit records the instance it served on in the
+// pin, so the leg stays on one instance either way. The TTS leg takes no pin: a speech
+// request carries a capability list, which no pin writer accepts.
 
 // voiceStickiness is one voice chat session's per-leg instance memory. The ASR leg's dial
 // goroutine and the voice run's LLM and speech goroutines read and write it concurrently,
