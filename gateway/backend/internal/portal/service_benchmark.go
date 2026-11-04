@@ -53,10 +53,11 @@ type BenchmarkRunDTO struct {
 	// vram_measured_mb.
 	VRAM *VRAMReportDTO `json:"vram,omitempty"`
 	// TTFTMS, WallMS and RTF are the audio perf metrics of a kind=="speech" row
-	// (routing.BenchmarkRun documents each): the time to the first response byte
-	// and the synthesis wall time in milliseconds, and the real-time factor. Set
-	// only for that kind, and omitted for a speech row that failed or measured
-	// none, which carries its Error instead.
+	// and of a kind=="audio" row (routing.BenchmarkRun documents each): the time
+	// to the first response byte (speech) or to the first usable output (audio),
+	// the wall time in milliseconds, and the real-time factor. Set only for those
+	// kinds, and omitted for a row that failed or measured none, which carries its
+	// Error instead.
 	TTFTMS int64   `json:"ttft_ms,omitempty"`
 	WallMS int64   `json:"wall_ms,omitempty"`
 	RTF    float64 `json:"rtf,omitempty"`

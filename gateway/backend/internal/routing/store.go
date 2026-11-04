@@ -596,12 +596,26 @@ type BenchmarkRun struct {
 	LoadTimeMS            int
 	ContextSize           int
 	Error                 string
-	// Kind distinguishes a speed-history row ("speed", the P3b default and the value
-	// for a legacy row where the column is empty) from a capacity-ramp row ("capacity").
+	// Kind is what the row records, one of:
+	//   - "speed": a text speed run (the P3b default, and the value for a legacy row
+	//     where the column is empty);
+	//   - "capacity": a text capacity ramp;
+	//   - "vision": the vision-acceptance probe (VisionCapable);
+	//   - "vram": the VRAM benchmark (VRAMJSON);
+	//   - "speech": the speech benchmark, which measures a mapping's output byte rate
+	//     (TTFTMS, WallMS, RTF);
+	//   - BenchmarkKindAudio ("audio"): the audio speed run of a speech or
+	//     transcription mapping (TTFTMS, WallMS, RTF, LoadTimeMS and its
+	//     AudioSpeedHistory in CapacityCurve);
+	//   - BenchmarkKindAudioCapacity ("audio_capacity"): that mapping's audio
+	//     concurrency ramp (its AudioCapacityHistory in CapacityCurve).
 	Kind string
-	// CapacityCurve is the raw JSON of a CapacityReport for a kind=="capacity" row
-	// (empty for a speed row). The store treats it as an opaque string; the gateway
-	// marshals it and the portal decodes it — mirroring how `Error` is a plain column.
+	// CapacityCurve is the row's kind-specific JSON: a CapacityReport for a
+	// kind=="capacity" row, an AudioSpeedHistory for a BenchmarkKindAudio row, an
+	// AudioCapacityHistory for a BenchmarkKindAudioCapacity row, and empty for
+	// every other kind. The store treats it as an opaque string; the gateway
+	// marshals it and the portal decodes it with the same types — mirroring how
+	// `Error` is a plain column.
 	CapacityCurve string
 	// VisionCapable is the definitive vision-acceptance verdict for a kind=="vision"
 	// row (false/unused for any other kind). An inconclusive vision run still writes
@@ -622,13 +636,14 @@ type BenchmarkRun struct {
 	// cross-cutting doc's ownership split).
 	VRAMJSON string
 	// TTFTMS, WallMS and RTF are the audio perf metrics of a kind=="speech" row
-	// (migration 95, #263), and are zero for every other kind and for a speech run
-	// that failed or measured none of them: zero is "not measured", and the SQL
-	// driver stores it as NULL (the columns are nullable), so a real measurement
-	// is never confused with an absent one. A measurement is never exactly zero
-	// -- the speech benchmark rounds a sub-millisecond time up to 1 -- so the two
-	// readings cannot collide.
+	// (migration 95, #263) and of a BenchmarkKindAudio row (#340), and are zero for
+	// every other kind and for a run of either kind that failed or measured none of
+	// them: zero is "not measured", and the SQL driver stores it as NULL (the
+	// columns are nullable), so a real measurement is never confused with an
+	// absent one. A measurement is never exactly zero -- the benchmarks round a
+	// sub-millisecond time up to 1 -- so the two readings cannot collide.
 	//
+	// For a kind=="speech" row:
 	//   - TTFTMS is the time from sending the synthesis request to the first byte
 	//     of the response, in milliseconds. The speech benchmark's request does not
 	//     stream, and audio.cpp answers a non-stream call only once the whole clip
@@ -640,6 +655,13 @@ type BenchmarkRun struct {
 	//   - RTF is the real-time factor, wall time over the length of audio produced
 	//     (below 1 is faster than real time): audio.cpp's own X-AudioCPP-RTF when it
 	//     reported one, else WallMS over the WAV's duration.
+	//
+	// For a BenchmarkKindAudio row, the warm pass of the audio speed run:
+	//   - TTFTMS is the time to the first output a client could use: the first
+	//     audio of a streamed synthesis, the first transcript text of a live
+	//     transcription, the whole answer of a one-shot synthesis or transcription;
+	//   - WallMS is the time from the send to the end of the output;
+	//   - RTF is WallMS over the length of the audio synthesized or transcribed.
 	TTFTMS int64
 	WallMS int64
 	RTF    float64
