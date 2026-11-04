@@ -683,6 +683,27 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.runtimeLogsInstanceEmpty(1))).not.toBeInTheDocument();
     });
 
+    it('explains instance 0 having no output even when a gap is in the history', () => {
+      // A gap-only entry names no instance, and no instance means 0 on the
+      // wire -- but the gap is nobody's output, instance 0's no more than any
+      // other's, so it must not silence instance 0's sentence.
+      const h = renderLogView(true, [0, 1]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ text: '[#1] up\n', instance: 1 }],
+      });
+      h.batch({ spec_id: 'spec-a', entries: [{ dropped_bytes: 77 }] });
+
+      selectTab(t.runtimeLogsTabInstance(0));
+      expect(screen.getByText(t.runtimeLogsInstanceEmpty(0))).toBeInTheDocument();
+      expect(screen.getByText(t.runtimeLogsDropped(77), { exact: false })).toBeInTheDocument();
+
+      h.batch({ spec_id: 'spec-a', entries: [{ text: 'zero\n' }] });
+      expect(screen.queryByText(t.runtimeLogsInstanceEmpty(0))).not.toBeInTheDocument();
+    });
+
     it('opens on All every time, whichever tab was selected when it closed', () => {
       const api = { subscribeRuntimeLogs: vi.fn(() => () => {}) };
       const props = {

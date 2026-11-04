@@ -228,7 +228,11 @@ function instanceView(
   let midLine = false;
   for (const e of entries) {
     if (hasGap(e)) midLine = false;
-    if (entryInstance(e) !== k) {
+    // An entry that is only a gap names no instance, which on the wire reads
+    // as instance 0 -- but a gap is nobody's output, so it is shown in every
+    // tab and counted as none, instance 0's no more than any other's.
+    const gapOnly = hasGap(e) && !e.text && !e.event;
+    if (gapOnly || entryInstance(e) !== k) {
       if (hasGap(e)) out.push({ dropped_bytes: e.dropped_bytes });
       continue;
     }
