@@ -348,7 +348,7 @@ func TestAffinityRefusesOnCapabilityReadError(t *testing.T) {
 	// endpoint's flavor or capability list cannot silently leave this direct
 	// resolveAffinity call on stale values while the other three tests move on.
 	req := imagesReq("coder-a")
-	target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
+	target, ok, err := r.resolveAffinity(ctx, auth.Token{}, key, req, now)
 	// map_a IS capable (per its own stored row), so trusting the errored read
 	// would serve srv_a directly off the pin. Refusing means ok=false even
 	// though the (unreachable) verdict would have allowed it -- and the refusal
@@ -719,7 +719,7 @@ func TestSpeechAffinityRefusesOnCapabilityReadError(t *testing.T) {
 	r := NewResolver(&affinityGateStore{resolverStore: mem, failKeyed: true}, func() time.Time { return now }, nil)
 
 	req := speechReq("coder-a")
-	target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
+	target, ok, err := r.resolveAffinity(ctx, auth.Token{}, key, req, now)
 	if err != nil {
 		t.Fatalf("resolveAffinity returned an error, want a non-destructive refusal: %v", err)
 	}
@@ -743,7 +743,7 @@ func TestSpeechAffinityServesAPinnedCapableMapping(t *testing.T) {
 	r := NewResolver(&affinityGateStore{resolverStore: mem}, func() time.Time { return now }, nil)
 
 	req := speechReq("coder-a")
-	target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
+	target, ok, err := r.resolveAffinity(ctx, auth.Token{}, key, req, now)
 	if err != nil || !ok {
 		t.Fatalf("resolveAffinity = (%+v, %v, %v), want the pinned speech-capable mapping served", target, ok, err)
 	}

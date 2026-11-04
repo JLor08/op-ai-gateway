@@ -103,9 +103,9 @@ func (r *Resolver) SetInstanceActivityChecker(c InstanceActivityChecker) { r.ins
 
 // DemandSignal says a gateway model needs another instance: a request is
 // about to wait in the admission queue -- or, one that must not wait
-// (inference.Request.NoPark), has just been served on a busy candidate --
-// because every candidate it could use was at capacity, at least one of them
-// an instance.
+// (inference.Request.NoPark) or a pinned one (which never waits unless it is
+// a live session), has just been served on a busy candidate -- because every
+// candidate it could use was at capacity, at least one of them an instance.
 type DemandSignal struct {
 	// Model is the gateway model whose instances were all busy -- a group
 	// member's own name, never the group's.
@@ -113,7 +113,9 @@ type DemandSignal struct {
 	// APIFlavor is the coarse flavor (NormalizeAPIFlavor) the model was
 	// resolved under, the one ActiveMappingsForModel keys by.
 	APIFlavor string
-	// ServerID restricts the new instance to one server; "" = any server.
+	// ServerID restricts the new instance to one server -- a pinned
+	// request's (a token's affinity pin, a server override), which no other
+	// server can serve; "" = any server.
 	ServerID string
 	// Live is true when the demand is for a live slot (a live session).
 	Live bool
@@ -137,6 +139,9 @@ type DemandSignal struct {
 // (inference.Request.NoPark), after it was served on a busy candidate where
 // it would have parked: for a group, for the walk's first at-capacity member
 // with instance candidates, which need not be the member that served it. A
+// pinned request served on a busy instance of its pinned server signals once
+// too, restricted to that server, and a pinned live session once per park
+// turn. A
 // request that could not be served at all signals nothing, and neither does
 // a check-only resolve (inference.Request.CheckOnly). It must not block: the
 // request is about to wait, or to be served, and a sink that blocked would
