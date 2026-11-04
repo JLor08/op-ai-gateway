@@ -10,10 +10,6 @@ import "context"
 // where routing would send the next request. It reads them here rather than
 // keeping copies of the rules that could drift from the resolver's.
 
-// ServerSelectable reports whether routing sends requests to server at all:
-// it is active and not unhealthy.
-func ServerSelectable(server AIServer) bool { return serverSelectable(server) }
-
 // CandidateServesNow reports whether c passes the gates every candidate of a
 // request passes first (selectCandidate's first pass): its server selectable,
 // its application reachable by the resolver's reachability checker, and its

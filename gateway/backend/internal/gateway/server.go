@@ -1188,11 +1188,9 @@ func New(deps ServerDeps) *Server {
 	if resolver != nil && instances != nil {
 		s.instanceScaler = newInstanceScaler(instanceScalerDeps{
 			store:     deps.Routes,
-			scorer:    resolver,
+			routing:   resolver,
 			instances: instances,
 			statuses:  runtimeStatus,
-			busy:      benchmarks,
-			reachable: appHealth,
 			ensurer: func() provider.RuntimeEnsurer {
 				ensurer, _ := s.Provider.(provider.RuntimeEnsurer)
 				return ensurer

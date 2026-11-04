@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -18,8 +19,9 @@ import (
 )
 
 // The scaler's tests run it against the real runtime-status and
-// agent-feature registries and the real instance source -- the views routing
-// itself reads -- over a scripted store, scorer and agent (scalerFixture). The
+// agent-feature registries, the real instance source and a real resolver's
+// gates and targets -- the views routing itself reads -- over a scripted
+// store, scores and agent (scalerFixture). The
 // fixture's clock moves only when a test advances it, and a test waits for
 // every scale-up it starts (instanceScaler.wait), so no outcome depends on
 // how the scaler's goroutines happen to interleave with the test.
@@ -29,16 +31,43 @@ const (
 	scaleUpstream = "m"  // its upstream model: instance 0's address
 )
 
-// scalerStore is the scaler's store: the candidates of each gateway model,
-// further mappings by application, and each mapping's runtime spec.
+// scalerStore is the scaler's store, and the resolver's: the candidates of
+// each gateway model, further mappings by application, and each mapping's
+// runtime spec. The embedded Store is nil: a read the scaler does not make
+// panics. A read named in stalled blocks until its context ends.
 type scalerStore struct {
-	mu    sync.Mutex
-	cands []routing.MappingCandidate
-	specs map[string]routing.RuntimeSpec    // by mapping id
-	more  map[string][]routing.ModelMapping // by application id
+	routing.Store
+
+	mu      sync.Mutex
+	cands   []routing.MappingCandidate
+	specs   map[string]routing.RuntimeSpec    // by mapping id
+	more    map[string][]routing.ModelMapping // by application id
+	stalled map[string]bool                   // by read: "mappings", "byApp", "spec", "score"
 }
 
-func (s *scalerStore) ActiveMappingsForModel(_ context.Context, model, _ string) ([]routing.MappingCandidate, error) {
+// stall blocks a read named read that is stalled until ctx ends, and reports
+// ctx's error; nil when the read is not stalled.
+func (s *scalerStore) stall(ctx context.Context, read string) error {
+	s.mu.Lock()
+	stalled := s.stalled[read]
+	s.mu.Unlock()
+	if !stalled {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *scalerStore) setStalled(read string, stalled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stalled[read] = stalled
+}
+
+func (s *scalerStore) ActiveMappingsForModel(ctx context.Context, model, _ string) ([]routing.MappingCandidate, error) {
+	if err := s.stall(ctx, "mappings"); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []routing.MappingCandidate
@@ -50,7 +79,10 @@ func (s *scalerStore) ActiveMappingsForModel(_ context.Context, model, _ string)
 	return out, nil
 }
 
-func (s *scalerStore) MappingsByApplication(_ context.Context, appID string) ([]routing.ModelMapping, error) {
+func (s *scalerStore) MappingsByApplication(ctx context.Context, appID string) ([]routing.ModelMapping, error) {
+	if err := s.stall(ctx, "byApp"); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []routing.ModelMapping
@@ -62,19 +94,33 @@ func (s *scalerStore) MappingsByApplication(_ context.Context, appID string) ([]
 	return append(out, s.more[appID]...), nil
 }
 
-func (s *scalerStore) RuntimeSpecByMapping(_ context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
+func (s *scalerStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
+	if err := s.stall(ctx, "spec"); err != nil {
+		return routing.RuntimeSpec{}, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	spec, ok := s.specs[mappingID]
 	return spec, ok, nil
 }
 
-// scalerScores is a scorer that answers each mapping's fixed score.
+// scalerScores is each mapping's fixed routing score.
 type scalerScores map[string]float64
 
-func (f scalerScores) ScoreModelServers(context.Context, string, time.Time) ([]routing.CandidateScore, error) {
-	out := make([]routing.CandidateScore, 0, len(f))
-	for id, score := range f {
+// scalerRouting is a real resolver over the fixture's store and checkers --
+// its gates and its targets are routing's own -- whose scores are scripted.
+type scalerRouting struct {
+	*routing.Resolver
+	store  *scalerStore
+	scores scalerScores
+}
+
+func (r scalerRouting) ScoreModelServers(ctx context.Context, _ string, _ time.Time) ([]routing.CandidateScore, error) {
+	if err := r.store.stall(ctx, "score"); err != nil {
+		return nil, err
+	}
+	out := make([]routing.CandidateScore, 0, len(r.scores))
+	for id, score := range r.scores {
 		out = append(out, routing.CandidateScore{MappingID: id, Score: score, Available: true})
 	}
 	return out, nil
@@ -175,6 +221,8 @@ type scalerFixture struct {
 	features    *agentFeaturesRegistry
 	statuses    *runtimeStatusRegistry
 	ensurer     *scaleEnsurer
+	instances   *instanceSource
+	resolver    *routing.Resolver
 	scaler      *instanceScaler
 	cancelBase  context.CancelFunc
 
@@ -195,7 +243,7 @@ func newScalerFixtureWithCooldown(t *testing.T, cooldown time.Duration) *scalerF
 	t.Helper()
 	f := &scalerFixture{
 		t:           t,
-		store:       &scalerStore{specs: map[string]routing.RuntimeSpec{}, more: map[string][]routing.ModelMapping{}},
+		store:       &scalerStore{specs: map[string]routing.RuntimeSpec{}, more: map[string][]routing.ModelMapping{}, stalled: map[string]bool{}},
 		scores:      scalerScores{},
 		busy:        scalerBusy{},
 		unreachable: scalerUnreachable{},
@@ -209,15 +257,16 @@ func newScalerFixtureWithCooldown(t *testing.T, cooldown time.Duration) *scalerF
 	f.ensurer.started = f.reportStarted
 	src := newInstanceSource(f.store, f.features, f.statuses)
 	src.now = f.clock
+	f.instances = src
 	base, cancel := context.WithCancel(context.Background())
 	f.cancelBase = cancel
+	f.resolver = routing.NewResolver(f.store, f.clock, f.unreachable)
+	f.resolver.SetServerBusyChecker(f.busy)
 	f.scaler = newInstanceScaler(instanceScalerDeps{
 		store:     f.store,
-		scorer:    f.scores,
+		routing:   scalerRouting{Resolver: f.resolver, store: f.store, scores: f.scores},
 		instances: src,
 		statuses:  f.statuses,
-		busy:      f.busy,
-		reachable: f.unreachable,
 		ensurer:   func() provider.RuntimeEnsurer { return f.ensurer },
 		authCtx: func(ctx context.Context, _ routing.Target) context.Context {
 			return context.WithValue(ctx, scaleAuthKey{}, true)
@@ -240,7 +289,7 @@ func newScalerFixtureWithCooldown(t *testing.T, cooldown time.Duration) *scalerF
 func (f *scalerFixture) addHost(serverID string, score float64, edit ...func(*routing.MappingCandidate, *routing.RuntimeSpec)) {
 	c := routing.MappingCandidate{
 		Server:      routing.AIServer{ID: serverID, Domain: serverID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy},
-		Application: routing.Application{ID: "app_" + serverID, ServerID: serverID, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIToken: "plain:tok_" + serverID, Status: routing.ServerStatusActive},
+		Application: routing.Application{ID: "app_" + serverID, ServerID: serverID, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIToken: "plain:tok_" + serverID, TimeoutMS: 30000, Status: routing.ServerStatusActive},
 		Mapping:     routing.ModelMapping{ID: "map_" + serverID, ApplicationID: "app_" + serverID, GatewayModelName: scaleModel, AppModelName: scaleUpstream, Status: routing.ServerStatusActive},
 	}
 	spec := routing.RuntimeSpec{ID: "spec_" + serverID, MappingID: c.Mapping.ID, Replicable: true, StartupTimeoutSeconds: 120}
@@ -780,15 +829,28 @@ func TestScalerWakesQueueOnSuccess(t *testing.T) {
 		}
 	})
 
+	// An instance routing never sees wakes no one -- a woken request would not
+	// find it -- and the host is left alone for 5 s, so the requests' next
+	// signals do not ensure it again turn after turn.
 	t.Run("not reported within the wait", func(t *testing.T) {
+		buf := withCapturedSlogAtTheDefaultLevel(t)
 		f := newScalerFixture(t)
 		f.addHost("srv_a", 50, parallel)
 		f.ensurer.started = nil
 		f.scaler.visibleWait = time.Millisecond
 		f.signal(f.demand("map_srv_a"))
-		if got := f.woke(); !slices.Equal(got, []string{"srv_a", "srv_a"}) {
-			t.Fatalf("wakes = %q, want srv_a twice after the wait", got)
+		if got := f.woke(); len(got) != 0 {
+			t.Fatalf("wakes = %q, want none for an instance routing does not see", got)
 		}
+		if !findLogRecord(buf.Snapshot(), "WARN", "did not show up") {
+			t.Fatal("no WARN record for a started instance that never showed up")
+		}
+		f.advance(instanceUnseenDelay - time.Millisecond)
+		f.signal(f.demand("map_srv_a"))
+		f.wantEnsured("srv_a m#1")
+		f.advance(time.Millisecond)
+		f.signal(f.demand("map_srv_a"))
+		f.wantEnsured("srv_a m#1", "srv_a m#1")
 	})
 
 	t.Run("refused", func(t *testing.T) {
@@ -885,4 +947,196 @@ func TestInstanceScalerIsWiredAsTheDemandSink(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the started instance did not wake the parked request")
 	}
+}
+
+// The agent still reports a draining, crashed or stopped instance by its
+// index; an ensure of that address is not a fresh start, so the index is not
+// free.
+func TestScalerSkipsIndexesTheAgentStillReports(t *testing.T) {
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 50)
+	f.report("srv_a",
+		specRow("spec_srv_a", scaleUpstream, 0, agentSpecStateRunning),
+		specRow("spec_srv_a", scaleUpstream, 1, agentSpecStateRunning),
+		specRow("spec_srv_a", scaleUpstream, 2, "draining"),
+		specRow("spec_srv_a", scaleUpstream, 3, "crashed"),
+		specRow("spec_srv_a", scaleUpstream, 4, "stopped"),
+		specRow("spec_other", "o", 5, "draining"), // another spec's index blocks nothing
+	)
+	f.signal(f.demand("map_srv_a"))
+	f.wantEnsured("srv_a m#5")
+}
+
+// An index at or above max_instances is one the agent refuses: a spec whose
+// lowest free index is there is at its ceiling, passed over quietly -- no
+// ensure, no hold -- and scaled again as soon as an index below frees.
+func TestScalerRespectsMaxByIndex(t *testing.T) {
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 90, func(_ *routing.MappingCandidate, s *routing.RuntimeSpec) { s.MaxInstances = 3 })
+	f.addHost("srv_b", 50)
+	f.report("srv_a", append(instancesOf("srv_a", agentSpecStateRunning, 0), instancesOf("srv_a", "draining", 1, 2)...)...)
+	f.signal(f.demand("map_srv_a", "map_srv_b"))
+	f.wantEnsured("srv_b m#1")
+	f.scaler.mu.Lock()
+	_, held := f.scaler.notBefore[scaleKey{serverID: "srv_a", mappingID: "map_srv_a"}]
+	f.scaler.mu.Unlock()
+	if held {
+		t.Fatal("srv_a is held off: a host at its ceiling by index is passed over, not cooled down")
+	}
+
+	f.report("srv_a", append(instancesOf("srv_a", agentSpecStateRunning, 0), instancesOf("srv_a", "draining", 1)...)...)
+	f.signal(f.demand("map_srv_a"))
+	f.wantEnsured("srv_b m#1", "srv_a m#2")
+}
+
+// A signal that names no mapping -- the scaler cannot tell which the request
+// could use -- may get an instance of any mapping of the model.
+func TestScalerSignalWithoutMappingIDsUsesTheModelsMappings(t *testing.T) {
+	f := newScalerFixture(t)
+	f.addHost("srv_b", 50)
+	f.addHost("srv_a", 90)
+	f.signal(f.demand())
+	f.wantEnsured("srv_a m#1")
+
+	pinned := f.demand()
+	pinned.ServerID = "srv_b"
+	f.signal(pinned)
+	f.wantEnsured("srv_a m#1", "srv_b m#1")
+}
+
+// A signal arriving while a scale-up with another pin runs gets a pass of its
+// own once that one ends -- unless that one started an instance that serves
+// it: on the signal's pinned server, or anywhere for an unpinned signal.
+// Signals with the running scale-up's own pin are folded into it.
+func TestScalerFollowsUpSignalsWithAnotherPin(t *testing.T) {
+	pinnedTo := func(f *scalerFixture, serverID string) routing.DemandSignal {
+		d := f.demand("map_srv_a", "map_srv_b", "map_srv_c")
+		d.ServerID = serverID
+		return d
+	}
+	cases := []struct {
+		name    string
+		first   string   // the running scale-up's pin
+		arrive  []string // the pins of the signals that arrive while it runs
+		refuse  string   // the server whose agent refuses its first ensure
+		ensured []string
+	}{
+		{"pinned during an unpinned scale-up", "", []string{"srv_b"}, "", []string{"srv_a m#1", "srv_b m#1"}},
+		{"pinned to where the scale-up started one", "", []string{"srv_a"}, "", []string{"srv_a m#1"}},
+		{"two servers, each once", "", []string{"srv_c", "srv_b", "srv_c", ""}, "", []string{"srv_a m#1", "srv_c m#1", "srv_b m#1"}},
+		{"pinned during a scale-up pinned elsewhere", "srv_b", []string{"srv_c"}, "", []string{"srv_b m#1", "srv_c m#1"}},
+		{"pinned during a scale-up pinned there", "srv_b", []string{"srv_b"}, "", []string{"srv_b m#1"}},
+		{"unpinned during a pinned scale-up that started one", "srv_b", []string{""}, "", []string{"srv_b m#1"}},
+		{"unpinned during a pinned scale-up that started none", "srv_b", []string{""}, "srv_b", []string{"srv_b m#1", "srv_a m#1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScalerFixture(t)
+			f.addHost("srv_a", 90)
+			f.addHost("srv_b", 50)
+			f.addHost("srv_c", 40)
+			if tc.refuse != "" {
+				f.ensurer.refuseNext(tc.refuse, scaleRefusal(runtimeInstanceNoCapacityCode))
+			}
+			gate := f.ensurer.hold()
+			f.scaler.Signal(pinnedTo(f, tc.first))
+			f.awaitEnsure()
+			for _, pin := range tc.arrive {
+				f.scaler.Signal(pinnedTo(f, pin))
+			}
+			close(gate)
+			f.scaler.wait()
+			f.wantEnsured(tc.ensured...)
+		})
+	}
+}
+
+// Every store read a scale-up makes is bounded: a stalled store ends the
+// scale-up -- or, for the scores, leaves the request's order -- instead of
+// holding the model's single flight, and the next signal scales again once
+// the store answers.
+func TestScalerBoundsStoreReads(t *testing.T) {
+	cases := []struct {
+		read string
+		want []string // ensured while the read stalls
+	}{
+		{"mappings", nil},
+		{"spec", nil},
+		{"byApp", nil},
+		{"score", []string{"srv_b m#1"}}, // the request listed srv_b first
+	}
+	for _, tc := range cases {
+		t.Run(tc.read, func(t *testing.T) {
+			f := newScalerFixture(t)
+			f.addHost("srv_a", 90)
+			f.addHost("srv_b", 50)
+			f.scaler.readTimeout = 20 * time.Millisecond
+			// The instance source's spec cache is warm, so the reads that stall
+			// are the scale-up's own.
+			for _, c := range f.store.cands {
+				if _, ok := f.instances.InstanceView(context.Background(), c.Server.ID, c.Mapping); !ok {
+					t.Fatalf("no instance view for %s", c.Mapping.ID)
+				}
+			}
+			f.store.setStalled(tc.read, true)
+			d := f.demand("map_srv_b", "map_srv_a")
+			f.scaler.Signal(d)
+			ended := make(chan struct{})
+			go func() {
+				f.scaler.wait()
+				close(ended)
+			}()
+			select {
+			case <-ended:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("a stalled %s read held the scale-up", tc.read)
+			}
+			f.wantEnsured(tc.want...)
+
+			f.store.setStalled(tc.read, false)
+			f.advance(time.Minute) // past the instance source's memory of a failed spec read
+			f.signal(d)
+			if got := f.ensured(); len(got) != len(tc.want)+1 {
+				t.Fatalf("ensures = %q, want one more once the store answers", got)
+			}
+		})
+	}
+}
+
+// The ensure carries the very target routing builds for the instance: the
+// scaler does not assemble one of its own.
+func TestScalerEnsuresRoutingsInstanceTarget(t *testing.T) {
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 50)
+	f.report("srv_a", instancesOf("srv_a", agentSpecStateRunning, 1)...)
+	f.signal(f.demand("map_srv_a"))
+	calls := f.calls()
+	if len(calls) != 1 {
+		t.Fatalf("ensures = %d, want 1", len(calls))
+	}
+	pool, err := f.store.ActiveMappingsForModel(context.Background(), scaleModel, routing.APIFlavorOpenAI)
+	if err != nil || len(pool) != 1 {
+		t.Fatalf("candidates = %d, %v; want one", len(pool), err)
+	}
+	want, err := f.resolver.InstanceTarget(context.Background(), pool[0], 2, routing.APIFlavorOpenAI)
+	if err != nil {
+		t.Fatalf("InstanceTarget: %v", err)
+	}
+	if !reflect.DeepEqual(calls[0].target, want) {
+		t.Fatalf("ensured target\n %+v\nwant routing's\n %+v", calls[0].target, want)
+	}
+}
+
+// A host routing would not send a request to is not scaled onto, whatever
+// gate keeps it out: the scaler asks routing's own gates.
+func TestScalerAsksRoutingsGates(t *testing.T) {
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 90, func(c *routing.MappingCandidate, _ *routing.RuntimeSpec) {
+		c.Server.HealthStatus = routing.HealthDegraded
+	})
+	f.addHost("srv_b", 50, func(c *routing.MappingCandidate, _ *routing.RuntimeSpec) {
+		c.Server.Status = routing.ServerStatusMaintenance
+	})
+	f.signal(f.demand("map_srv_a", "map_srv_b"))
+	f.wantEnsured("srv_a m#1") // degraded is selectable; maintenance is not
 }
