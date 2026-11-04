@@ -85,6 +85,19 @@ It is regenerated with `scripts/gen-third-party-notices.sh`, never hand-edited. 
 - Relabels one dependency (`modernc.org/mathutil`) whose license `go-licenses` cannot auto-classify from its module path, so the table still shows the correct `BSD-3-Clause`.
 - Greps its own output for known AGPL-incompatible markers (`GPL-2.0-only`, `SSPL`, `Business Source`/`BUSL`, `proprietary`, `UNLICENSED`) and prints a warning to stderr if any appear — a best-effort tripwire, not a hard gate, so a hit is a signal to review §3 manually rather than a fully automated policy enforcement.
 
+## 5. Bundled data assets
+
+Besides third-party code, the gateway binary embeds one third-party **data** asset. It is not a dependency: no license scanner sees it, so the generated `THIRD-PARTY-NOTICES.md` (§4) does not list it and is not hand-edited to. It is recorded here instead, and in full in a source note next to the files.
+
+| Asset | Location | License | Source |
+|---|---|---|---|
+| ASR benchmark clip: six German sentences by one speaker, joined with short pauses into one 16 kHz mono 16-bit PCM WAV of 22.85 s, and its transcript | `gateway/backend/internal/benchaudio/` (`asr-benchmark-de.wav`, `asr-benchmark-de.txt`, embedded with `go:embed`) | **CC0 1.0** Universal (public-domain dedication) | Thorsten-Voice recordings: Hugging Face dataset `Thorsten-Voice/TV-44kHz-Full`, subset `TV-2022.10-Neutral`; project <https://www.Thorsten-Voice.de> |
+
+- The audio benchmark's ASR measurement transcribes this clip (language `de`), so every gateway measures every transcription model on the same real speech, with no network access and no TTS model needed.
+- `SOURCE.md` in the same directory names each recording by its dataset id and sentence, and how the clip was made (joined with 0.35 s pauses, resampled from 44.1 kHz).
+- CC0 waives all rights and attaches no conditions, so shipping the clip inside the AGPL-3.0-only binary needs no category in §3's policy and creates no notice obligation; the attribution in `SOURCE.md` and here is a courtesy.
+- The asset files carry no SPDX header (§1): they are not the project's AGPL-licensed source, and a header would change the audio and the transcript the benchmark relies on. `scripts/add-license-headers.sh` leaves them alone (`.md` is excluded, and `.wav` and `.txt` have no comment leader).
+
 ## See also
 
 - [Constraints](../02-constraints.md) — the organizational/legal constraint summary this chapter expands on.
