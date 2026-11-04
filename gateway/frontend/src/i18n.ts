@@ -2190,13 +2190,49 @@ const de = {
   errorBenchmarkVramDeclaredGpuMissing:
     'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
   errorRuntimeSpecServerBenchmarking:
-    'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
+    'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – oder ein Starten oder Stoppen eines Modells würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   errorRuntimeSpecConfigFilesInvalid:
     'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
   errorRuntimeSpecInstancesInvalid:
     'Ungültige Instanzeinstellungen: Mindest- und Höchstanzahl müssen ganze Zahlen von 0 bis 64 sein, die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und die parallelen Anfragen pro Instanz müssen eine ganze Zahl von 1 bis 1024 sein.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
     'Mehrere Instanzen brauchen Listen-Port 0: Jede Instanz lauscht auf ihrem eigenen Port, den der Agent wählt.',
+  // Die Ablehnungen von „Starten“ und „Stoppen“ im Live-Status: die eigenen
+  // Codes des Gateways und die durchgereichten des Agenten.
+  errorRuntimeAdminStopped:
+    'Das Modell ist als gestoppt angeheftet (Übersteuerung „Stopp erzwingen“). Erst die Übersteuerung aufheben, dann starten.',
+  errorRuntimeMaxInstancesReached:
+    'Alle Instanzen, die diese Startvorgabe erlaubt, laufen oder starten bereits. Für eine weitere die Höchstanzahl Instanzen anheben.',
+  errorRuntimeAgentFeatureMissing:
+    'Der Agent dieses Servers kennt eine Funktion nicht, die diese Aktion braucht. Den Agenten aktualisieren.',
+  errorRuntimeAgentFeatureMissingNamed: (feature: string) =>
+    `Der Agent dieses Servers kennt die Funktion „${feature}“ nicht, die diese Aktion braucht. Den Agenten aktualisieren.`,
+  errorRuntimeAgentUnavailable:
+    'Der Agent dieses Servers ist nicht erreichbar oder hat sich seit dem Start des Gateways nicht gemeldet.',
+  errorRuntimeAgentTimeout: 'Der Agent hat nicht rechtzeitig geantwortet. Später erneut versuchen.',
+  errorRuntimeAgentError: 'Der Agent hat die Anfrage mit einem unerwarteten Fehler abgelehnt.',
+  errorRuntimeInstanceInvalid:
+    'Ungültige Instanz: Der Index muss eine ganze Zahl von 0 bis 63 sein.',
+  errorRuntimeActionFailed:
+    'Das Gateway konnte keine Instanz zum Starten auswählen (Lesefehler). Erneut versuchen.',
+  errorRuntimeInstanceNoCapacity:
+    'Auf dem Server ist kein Platz für eine weitere Instanz dieses Modells (VRAM, RAM oder Prozessgrenze).',
+  errorRuntimeInstanceDemandUnknown:
+    'Der Bedarf einer laufenden Instanz ist noch nicht gemessen. In ein paar Sekunden erneut versuchen.',
+  errorRuntimeInstanceProtected:
+    'Diese Instanz hält die Startvorgabe am Laufen (Mindestanzahl Instanzen, „Angeheftet“ oder „Start erzwingen“); der Agent würde sie sofort wieder starten.',
+  errorRuntimeInstanceNotHighest:
+    'Eine höhere Instanz dieses Modells läuft. Instanzen werden von der höchsten an gestoppt.',
+  errorRuntimeModelNotManaged:
+    'Der Agent verwaltet dieses Modell oder diese Instanz nicht (mehr). Die Statuszeilen zeigen den aktuellen Stand.',
+  errorRuntimeAdmissionBlocked:
+    'Der Agent kann das Modell gerade nicht zulassen (z. B. eine Übersteuerung oder fehlender Platz).',
+  errorRuntimeStartTimeout:
+    'Das Modell ist innerhalb seiner Startzeitgrenze nicht betriebsbereit geworden.',
+  errorRuntimeStartFailed:
+    'Das Modell konnte nicht gestartet werden. Die Logs der Zeile zeigen, warum.',
+  errorRuntimeNotPermitted: 'Der Agent hat den Start dieses Modells nicht zugelassen.',
+  errorRuntimeUpstreamGone: 'Der Agent konnte die Anfrage nicht abschließen.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -5596,13 +5632,46 @@ const en: PortalMessages = {
   errorBenchmarkVramDeclaredGpuMissing:
     "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
   errorRuntimeSpecServerBenchmarking:
-    'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
+    'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — or starting or stopping a model would contaminate its measurement. Wait for the run to finish, or cancel it.',
   errorRuntimeSpecConfigFilesInvalid:
     'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
   errorRuntimeSpecInstancesInvalid:
     'Invalid instance settings: the minimum and maximum must be whole numbers from 0 to 64, the minimum must not exceed a set maximum, and the parallel requests per instance must be a whole number from 1 to 1024.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
     'Multiple instances need listen port 0: every instance listens on its own port, picked by the agent.',
+  // The live-status Start's and Stop's refusals: the gateway's own codes and
+  // the agent's, passed through.
+  errorRuntimeAdminStopped:
+    'The model is pinned as stopped (the "Force stop" override). Clear the override first, then start it.',
+  errorRuntimeMaxInstancesReached:
+    'Every instance this launch spec allows is already running or starting. Raise its maximum instances for another one.',
+  errorRuntimeAgentFeatureMissing:
+    "This server's agent lacks a feature this action needs. Update the agent.",
+  errorRuntimeAgentFeatureMissingNamed: (feature: string) =>
+    `This server's agent lacks the feature "${feature}" this action needs. Update the agent.`,
+  errorRuntimeAgentUnavailable:
+    "This server's agent cannot be reached, or has not reported since the gateway started.",
+  errorRuntimeAgentTimeout: 'The agent did not answer in time. Try again later.',
+  errorRuntimeAgentError: 'The agent refused the request with an unexpected error.',
+  errorRuntimeInstanceInvalid: 'Invalid instance: the index must be a whole number from 0 to 63.',
+  errorRuntimeActionFailed:
+    'The gateway could not pick an instance to start (a read failed). Try again.',
+  errorRuntimeInstanceNoCapacity:
+    'The server has no room for another instance of this model (VRAM, RAM or the process limit).',
+  errorRuntimeInstanceDemandUnknown:
+    "A running instance's demand is not measured yet. Try again in a few seconds.",
+  errorRuntimeInstanceProtected:
+    'This instance keeps the launch spec up (minimum instances, "Pinned" or "Force start"); the agent would start it again at once.',
+  errorRuntimeInstanceNotHighest:
+    'A higher instance of this model is running. Instances stop highest first.',
+  errorRuntimeModelNotManaged:
+    'The agent does not manage this model or instance (any more). The status rows show where it stands.',
+  errorRuntimeAdmissionBlocked:
+    'The agent cannot admit this model right now (an override, or no room).',
+  errorRuntimeStartTimeout: 'The model did not become ready within its startup timeout.',
+  errorRuntimeStartFailed: "The model failed to start. The row's logs show why.",
+  errorRuntimeNotPermitted: 'The agent did not permit this model to start.',
+  errorRuntimeUpstreamGone: 'The agent could not complete the request.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the

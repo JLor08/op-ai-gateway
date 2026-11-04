@@ -125,6 +125,31 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // replicable spec on a fixed listen_port.
   'runtime_spec.instances_invalid': 'errorRuntimeSpecInstancesInvalid',
   'runtime_spec.instances_need_ephemeral_port': 'errorRuntimeSpecInstancesNeedEphemeralPort',
+  // The live-status Start's and Stop's refusals (POST .../runtime/start and
+  // .../runtime/stop): the gateway's own codes (the codeRuntime* constants in
+  // gateway/runtime_actions.go) and the agent router's refusals it passes
+  // through with the agent's code (runtimeAgentCodes there). Both actions also
+  // meet runtime_spec.server_benchmarking above. runtime.agent_feature_missing
+  // carries the missing feature's name beside its code, which
+  // formatPortalError puts into the sentence when it is there.
+  'runtime.admin_stopped': 'errorRuntimeAdminStopped',
+  'runtime.max_instances_reached': 'errorRuntimeMaxInstancesReached',
+  'runtime.agent_feature_missing': 'errorRuntimeAgentFeatureMissing',
+  'runtime.agent_unavailable': 'errorRuntimeAgentUnavailable',
+  'runtime.agent_timeout': 'errorRuntimeAgentTimeout',
+  'runtime.agent_error': 'errorRuntimeAgentError',
+  'runtime.instance_invalid': 'errorRuntimeInstanceInvalid',
+  'runtime.action_failed': 'errorRuntimeActionFailed',
+  'runtime.instance_no_capacity': 'errorRuntimeInstanceNoCapacity',
+  'runtime.instance_demand_unknown': 'errorRuntimeInstanceDemandUnknown',
+  'runtime.instance_protected': 'errorRuntimeInstanceProtected',
+  'runtime.instance_not_highest': 'errorRuntimeInstanceNotHighest',
+  'runtime.model_not_managed': 'errorRuntimeModelNotManaged',
+  'runtime.admission_blocked': 'errorRuntimeAdmissionBlocked',
+  'runtime.start_timeout': 'errorRuntimeStartTimeout',
+  'runtime.start_failed': 'errorRuntimeStartFailed',
+  'runtime.not_permitted': 'errorRuntimeNotPermitted',
+  'runtime.upstream_gone': 'errorRuntimeUpstreamGone',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',
@@ -386,6 +411,9 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
 
 export function formatPortalError(err: unknown, t: Translation): string {
   if (err instanceof PortalApiError) {
+    if (err.code === 'runtime.agent_feature_missing' && err.feature) {
+      return `${err.code}: ${t.errorRuntimeAgentFeatureMissingNamed(err.feature)}`;
+    }
     const labelKey = errorLabelByCode[err.code];
     return `${err.code}: ${labelKey ? t[labelKey] : err.message}`;
   }

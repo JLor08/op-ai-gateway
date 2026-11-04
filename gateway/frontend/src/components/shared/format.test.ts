@@ -1067,3 +1067,91 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     }
   });
 });
+
+/**
+ * The live-status Play's and Stop's refusals, pinned as LITERALS: the
+ * whole-map invariants cannot catch a code STRING drifting from the
+ * backend's, and an unmapped code reaches the operator as the raw English the
+ * server sent.
+ *
+ * The gateway's own codes are declared in Go as `codeRuntime*`
+ * (`internal/gateway/runtime_actions.go`); the agent router's refusals pass
+ * through with the agent's code (`runtimeAgentCodes` there).
+ * `runtime_spec.server_benchmarking` is the spec PUT's refusal, which both
+ * actions share.
+ */
+describe('manual runtime start and stop refusals', () => {
+  const runtimeActionWireCodes = [
+    // The gateway's own.
+    'runtime.admin_stopped',
+    'runtime.max_instances_reached',
+    'runtime.agent_feature_missing',
+    'runtime.agent_unavailable',
+    'runtime.agent_timeout',
+    'runtime.agent_error',
+    'runtime.instance_invalid',
+    'runtime.action_failed',
+    // The agent's, passed through.
+    'runtime.instance_no_capacity',
+    'runtime.instance_demand_unknown',
+    'runtime.instance_protected',
+    'runtime.instance_not_highest',
+    'runtime.model_not_managed',
+    'runtime.admission_blocked',
+    'runtime.start_timeout',
+    'runtime.start_failed',
+    'runtime.not_permitted',
+    'runtime.upstream_gone',
+    // Shared with the spec PUT.
+    'runtime_spec.server_benchmarking',
+  ] as const;
+
+  it.each(runtimeActionWireCodes)('labels %s in both locales, never as raw English', (code) => {
+    const key = errorLabelByCode[code];
+    expect(key, `${code} is not mapped: the operator sees raw English`).toBeDefined();
+    const err = new PortalApiError(409, code, 'raw server text');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale][key!];
+      expect(typeof label).toBe('string');
+      expect(String(label).length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}`);
+    }
+    expect(messages.de[key!]).not.toBe(messages.en[key!]);
+  });
+
+  it('carries every runtime.* code the map holds in the list above', () => {
+    // Both directions: a new runtime.* refusal mapped without being named here
+    // fails too, so the list cannot go stale.
+    expect(
+      Object.keys(errorLabelByCode)
+        .filter((code) => code.startsWith('runtime.'))
+        .sort(),
+    ).toEqual(runtimeActionWireCodes.filter((code) => code.startsWith('runtime.')).sort());
+  });
+
+  it('names the missing feature when the refusal carries one', () => {
+    const err = new PortalApiError(
+      409,
+      'runtime.agent_feature_missing',
+      'raw server text',
+      'runtime_stop',
+    );
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      expect(formatPortalError(err, t)).toBe(
+        `runtime.agent_feature_missing: ${t.errorRuntimeAgentFeatureMissingNamed('runtime_stop')}`,
+      );
+      expect(formatPortalError(err, t)).toContain('runtime_stop');
+    }
+    expect(messages.de.errorRuntimeAgentFeatureMissingNamed('x')).not.toBe(
+      messages.en.errorRuntimeAgentFeatureMissingNamed('x'),
+    );
+  });
+
+  it('falls back to the generic label when the refusal names no feature', () => {
+    const err = new PortalApiError(409, 'runtime.agent_feature_missing', 'raw server text');
+    expect(formatPortalError(err, messages.en)).toBe(
+      `runtime.agent_feature_missing: ${messages.en.errorRuntimeAgentFeatureMissing}`,
+    );
+  });
+});
