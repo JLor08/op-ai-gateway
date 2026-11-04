@@ -2351,6 +2351,163 @@ paths:
         # mapping carries no spec row, and mapping.not_found from the
         # authorization no-leak collapse.
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/mappings/{id}/runtime/start:
+    description: >
+      Transient manual start (the live-status Play): starts one instance of the
+      mapping's managed model and writes nothing, so the model afterwards
+      follows the normal idle, eviction and burst rules. Authorized as the
+      runtime-spec PUT. The gateway picks the instance by the scaler's index
+      rule, instance 0 included: instance 0 of a spec that is not replicable;
+      for a replicable spec the lowest index the agent does not report
+      starting or running (k >= 1: in a state that keeps the index; a row
+      resting at crashed, start_failed or not_permitted is free), that is not
+      another mapping's upstream name on the agent and that no ensure of the
+      scaler or another start is under way for, below max_instances (0 = no
+      cap of its own, at most 63). It asks the agent's ensure route for it in
+      the background, bounded by the spec's startup timeout plus 10 s, and
+      waits up to 5 s for an early answer.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Start one more instance of a mapping's managed model, transiently
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: 'The agent reported the instance running within 5 s: {"instance": k, "state": "running"}.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeActionAnswer' }
+        '202':
+          description: >
+            The agent has not answered within 5 s: {"instance": k, "state":
+            "starting"}. The start goes on in the background; the runtime status
+            stream shows its progress, and a later failure is logged and visible
+            on the instance's row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeActionAnswer' }
+        '400':
+          description: The Error envelope with `runtime_spec.application_not_server_agent`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: >
+            The Error envelope with `mapping.not_found` (the authorization
+            no-leak collapse), `runtime_spec.not_found` (the mapping has no
+            spec) or the agent's `runtime.model_not_managed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409':
+          description: >
+            The Error envelope with `runtime.admin_stopped` (the spec is pinned
+            as stopped), `runtime_spec.server_benchmarking` (a benchmark run holds
+            the server), `runtime.agent_feature_missing` (with `error.feature`:
+            runtime_ensure, or runtime_instances for an instance k >= 1),
+            `runtime.max_instances_reached`, or the agent's
+            `runtime.instance_no_capacity` / `runtime.instance_demand_unknown`
+            within the 5 s window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: >
+            The Error envelope with the agent's `runtime.start_failed`,
+            `runtime.not_permitted` or `runtime.upstream_gone` within the 5 s
+            window, or `runtime.agent_error` for any other agent failure.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: >
+            The Error envelope with `runtime.agent_unavailable` (the agent has not
+            reported since the gateway started, or could not be reached) or the
+            agent's `runtime.admission_blocked`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '504':
+          description: The Error envelope with the agent's `runtime.start_timeout`, or `runtime.agent_timeout`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/mappings/{id}/runtime/stop:
+    description: >
+      Transient manual stop (the live-status Stop): asks the agent to drain one
+      instance now and writes nothing, so demand can start it again.
+      Authorized as the runtime-spec PUT. Needs the agent feature runtime_stop
+      (agent 0.17.0). Whether the instance may stop is the agent's decision: it
+      refuses an instance inside the spec's protected floor and one with a
+      higher sibling running.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Stop one instance of a mapping's managed model, transiently
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instance]
+              properties:
+                instance: { type: integer, minimum: 0, maximum: 63 }
+      responses:
+        '200':
+          description: >
+            The agent's state, {"instance": k, "state": "stopping"} (a drain
+            began or was already running) or {"instance": k, "state": "stopped"}
+            (the instance has no process).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeActionAnswer' }
+        '400':
+          description: >
+            The Error envelope with `runtime.instance_invalid` (no index, or one
+            outside 0..63), `request.invalid_json` or
+            `runtime_spec.application_not_server_agent`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: >
+            The Error envelope with `mapping.not_found`, `runtime_spec.not_found`
+            or the agent's `runtime.model_not_managed` (an address the agent does
+            not manage, or an index its spec does not allow).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409':
+          description: >
+            The Error envelope with `runtime_spec.server_benchmarking`,
+            `runtime.agent_feature_missing` (with `error.feature`: runtime_stop),
+            or the agent's `runtime.instance_protected` (the instance is below
+            the spec's protected floor) / `runtime.instance_not_highest` (a higher
+            instance of the spec runs).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: The Error envelope with `runtime.agent_error` or the agent's `runtime.upstream_gone`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: The Error envelope with `runtime.agent_unavailable`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '504':
+          description: The Error envelope with `runtime.agent_timeout`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/applications/{id}/runtime/coresidency:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -4499,6 +4656,18 @@ components:
               description: Stable machine-readable code, e.g. request.not_found, auth.invalid_token
             message: { type: string }
             request_id: { type: string }
+            feature:
+              type: string
+              description: >
+                Only on runtime.agent_feature_missing: the agent feature the
+                action needs and the server's agent does not declare.
+    RuntimeActionAnswer:
+      type: object
+      description: A manual runtime start's or stop's answer.
+      required: [instance, state]
+      properties:
+        instance: { type: integer, minimum: 0, maximum: 63, description: The instance index the action addressed. }
+        state: { type: string, enum: [running, starting, stopping, stopped] }
     ChatAudioSettings:
       type: object
       description: >

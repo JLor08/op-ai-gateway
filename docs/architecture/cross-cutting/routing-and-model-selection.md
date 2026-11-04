@@ -2306,7 +2306,17 @@ one more instance where routing would send the waiting request and leaves the fi
   address `m#k` is not another mapping's upstream model on the same agent (the agent resolves a
   literal upstream name first, so that ensure would start the other spec). None left below
   `max_instances` and 64 passes the host over quietly, with no hold (`instanceIndex`,
-  `nextInstanceIndex`).
+  `nextInstanceIndex`). The rule lives in `internal/gateway/instance_claims.go`
+  (`specInstanceRows`, `otherMappingIndexes`, `instanceClaims`) and is **shared with the
+  portal's manual start** (`POST /api/portal/mappings/{id}/runtime/start`,
+  [ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)),
+  which applies it with instance 0 included. The "ensure under way" set is one claim set per
+  gateway process, built in `gateway.New` and handed to the scaler: an index is claimed right
+  before its ensure and held until the instance source (the scaler) or the agent's status (the
+  manual start) reports the instance, or the ensure failed, so the two never ask an agent for one
+  index at the same time. The scaler's pick claims nothing; an index a manual start claimed
+  between the pick and the ask is not asked for, and the next pick gives the host its next free
+  index without counting it as asked.
 - **The ask.** `POST /ensure/m#k` through the provider's ensure route
   (`provider.RuntimeEnsurer`) with the target's upstream credential, bounded by the spec's startup
   timeout (agent default 30 s) plus 10 s.
