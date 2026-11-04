@@ -316,7 +316,7 @@ export type UpdateMappingRequest = {
   // metrics above. The real-time concurrency and its limit are one pair: a
   // count needs one of the three limits beside it, and a limit of "" clears
   // both, so it is sent alone. Anything else is a 400
-  // mapping.audio_metrics_invalid.
+  // mapping.metric_invalid, the code an invalid text metric answers too.
   audio_rate_x?: number;
   audio_ttfa_ms?: number;
   audio_realtime_concurrency?: number;

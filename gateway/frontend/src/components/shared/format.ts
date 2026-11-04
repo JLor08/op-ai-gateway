@@ -269,9 +269,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'portal.chat_run_active': 'errorChatRunActive',
   'portal.chat_run_limit': 'errorChatRunLimit',
   'mapping.capability_reserved': 'errorMappingCapabilityReserved',
-  // #340: the mapping editor's audio metrics -- a negative value, or a
-  // real-time concurrency without one of the three limits it is measured with.
-  'mapping.audio_metrics_invalid': 'errorMappingAudioMetricsInvalid',
+  // A metric edit the gateway cannot store (portal.ErrMappingMetricInvalid,
+  // portal_mapping_endpoints.go): a negative text metric and, since #340, an
+  // invalid audio metric -- a negative value, or a real-time concurrency
+  // without one of the three limits it is measured with. Both share this code.
+  'mapping.metric_invalid': 'errorMappingMetricInvalid',
   'gateway.chat_run_timeout': 'errorChatRunTimeout',
   'gateway.chat_run_image_dispatch_failed': 'errorChatRunImageDispatchFailed',
   'gateway.chat_run_no_image': 'errorChatRunNoImage',

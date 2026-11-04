@@ -143,20 +143,38 @@ describe('formatPortalError', () => {
     expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
   });
 
-  // #340: the mapping editor's refusal of its audio metrics -- a negative
-  // value, or a real-time concurrency without one of the three limits. The
-  // label carries both rules, since a mapped code renders it instead of the
-  // server's English text.
-  it('labels mapping.audio_metrics_invalid with its own label, in both locales', () => {
-    const err = new PortalApiError(400, 'mapping.audio_metrics_invalid', 'raw server text');
+  // The mapping editor's refusal of a metric it cannot store: the gateway
+  // answers mapping.metric_invalid (portal.ErrMappingMetricInvalid) for a
+  // negative text metric and, since #340, for an invalid audio metric too --
+  // a negative value, or a real-time concurrency without one of the three
+  // limits. The label carries the rules, since a mapped code renders it
+  // instead of the server's English text.
+  it('labels mapping.metric_invalid with the metric rules, in both locales', () => {
+    const err = new PortalApiError(
+      400,
+      'mapping.metric_invalid',
+      'mapping metric value is invalid',
+    );
     for (const locale of ['de', 'en'] as const) {
-      const label = messages[locale].errorMappingAudioMetricsInvalid;
-      expect(formatPortalError(err, messages[locale])).toBe(
-        `mapping.audio_metrics_invalid: ${label}`,
-      );
+      const label = messages[locale].errorMappingMetricInvalid;
+      expect(formatPortalError(err, messages[locale])).toBe(`mapping.metric_invalid: ${label}`);
     }
-    expect(messages.de.errorMappingAudioMetricsInvalid).toMatch(/Echtzeit-Parallelität/);
-    expect(messages.en.errorMappingAudioMetricsInvalid).toMatch(/real-time concurrency/);
+    expect(messages.de.errorMappingMetricInvalid).toMatch(/negativ/);
+    expect(messages.en.errorMappingMetricInvalid).toMatch(/negative/);
+    expect(messages.de.errorMappingMetricInvalid).toMatch(/Echtzeit-Parallelität/);
+    expect(messages.en.errorMappingMetricInvalid).toMatch(/real-time concurrency/);
+    expect(messages.de.errorMappingMetricInvalid).toContain(
+      messages.de.mappingAudioConcurrencyLimitPerformance.split(' ')[0],
+    );
+    expect(messages.en.errorMappingMetricInvalid).toContain(
+      messages.en.mappingAudioConcurrencyLimitPerformance.split(' ')[0],
+    );
+  });
+
+  // No gateway sends a code of its own for the audio metrics: they share the
+  // text metrics' one, so the map names no other.
+  it('maps no separate audio metrics code', () => {
+    expect(errorLabelByCode['mapping.audio_metrics_invalid']).toBeUndefined();
   });
 
   // #257: the gateway's refusal of a runtime spec's config_files (a bad or

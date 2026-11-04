@@ -4354,7 +4354,7 @@ describe('audio metrics (#340) i18n keys', () => {
     'benchmarkAudioColSlowest',
     'benchmarkAudioColMean',
     'runtimeSpecMinExceedsRealtime',
-    'errorMappingAudioMetricsInvalid',
+    'errorMappingMetricInvalid',
   ] as const;
 
   it('defines every string key in de and en, in different words', () => {

@@ -2123,8 +2123,8 @@ const de = {
     'Zu viele Antworten laufen gleichzeitig. Bitte warten Sie, bis eine davon fertig ist.',
   errorMappingCapabilityReserved:
     '„live_progress“ darf nicht auf „no“ gesetzt werden, und „speculation_observed“ akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
-  errorMappingAudioMetricsInvalid:
-    'Die Audio-Metriken sind ungültig: Kein Wert darf negativ sein, die Echtzeit-Parallelität ist eine ganze Zahl und braucht eine Begrenzung (Leistung, Ressourcen oder Höchstzahl erreicht).',
+  errorMappingMetricInvalid:
+    'Ein Metrikwert ist ungültig: Keine Metrik darf negativ sein, und die Echtzeit-Parallelität ist eine ganze Zahl, die nur zusammen mit ihrer Begrenzung (Leistung, Ressourcen oder Höchstzahl erreicht) gespeichert wird.',
   errorChatRunTimeout:
     'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
   // Die Anfrage hat das Gateway nie verlassen (Marshalling, Request-Bau oder
@@ -5497,8 +5497,8 @@ const en: PortalMessages = {
   errorChatRunLimit: 'Too many responses are running at once. Please wait for one to finish.',
   errorMappingCapabilityReserved:
     '"live_progress" cannot be set to "no", and "speculation_observed" accepts no manual verdict at all — an empty verdict resets either.',
-  errorMappingAudioMetricsInvalid:
-    'The audio metrics are invalid: no value may be negative, and the real-time concurrency is a whole number that needs a limit (Performance, Resources or Cap reached).',
+  errorMappingMetricInvalid:
+    'A metric value is invalid: no metric may be negative, and the real-time concurrency is a whole number that is saved only together with its limit (Performance, Resources or Cap reached).',
   errorChatRunTimeout: 'This response took too long and was stopped. Please try again.',
   // The request never left the gateway (marshalling, request construction,
   // or the loopback call itself). The Go error names the internal address

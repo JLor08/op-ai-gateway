@@ -380,12 +380,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   });
 
   // #340: the gateway refuses an audio metric edit it cannot store -- a
-  // count without a limit, a negative value -- with its own code, which the
-  // toast names in the operator's language rather than the server's English.
+  // count without a limit, a negative value -- with the text metrics' code,
+  // mapping.metric_invalid, which the toast names in the operator's language
+  // rather than the server's English.
   describe(`MappingSection audio metrics [${locale}]`, () => {
     it('names a refused audio metrics edit by its localized label', async () => {
       const updateMapping = vi.fn(async () => {
-        throw new PortalApiError(400, 'mapping.audio_metrics_invalid', 'raw server text');
+        throw new PortalApiError(400, 'mapping.metric_invalid', 'raw server text');
       }) as unknown as PortalApi['updateMapping'];
       renderSection({ mappings: [makeMapping({ id: 'map_1' })], updateMapping });
       await screen.findByText('gw-model');
@@ -400,9 +401,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         ),
       );
       expect(
-        await screen.findByText(
-          `mapping.audio_metrics_invalid: ${t.errorMappingAudioMetricsInvalid}`,
-        ),
+        await screen.findByText(`mapping.metric_invalid: ${t.errorMappingMetricInvalid}`),
       ).toBeInTheDocument();
       expect(screen.queryByText(/raw server text/)).not.toBeInTheDocument();
     });
