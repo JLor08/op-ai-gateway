@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -642,6 +643,87 @@ func TestAudioCapacityJudgesALevelByItsSlowestStream(t *testing.T) {
 	if _, payload := f.capacityRow(t); len(payload.Curve) != 2 || payload.Curve[1] != (audioLevel{K: 2, MinRateX: 0.9, MeanRateX: 1.95}) {
 		t.Fatalf("curve = %+v, want level 2 at 0.9 slowest, 1.95 mean", payload.Curve)
 	}
+}
+
+// serializingProcess answers a ramp's streams the way one process that serves its requests
+// one after another does: every stream produces its 20 s of audio at 3x real time once it
+// starts, but stream i of a level (in the order the streams arrive) waits for the i
+// syntheses before it, so its first output comes i x 6967 ms later than a lone stream's
+// 300 ms. A streamed synthesis states that wait only in its time to first audio, a one-shot
+// one in its rate as well (rate is given per stream by oneShotRates then). Warm-ups and
+// speed passes are a lone stream's.
+func serializingProcess(oneShotRates map[int][]float64) func(audioMeasureCall, int) (audioMeasurement, error) {
+	var mu sync.Mutex
+	seen := map[int]int{}
+	return func(call audioMeasureCall, _ int) (audioMeasurement, error) {
+		i := 0
+		if !call.warmUp && call.level > 0 {
+			mu.Lock()
+			i = seen[call.level]
+			seen[call.level]++
+			mu.Unlock()
+		}
+		const audioS, productionMS, loneFirstMS = 20.0, 6667, 300
+		first := int64(loneFirstMS + i*(productionMS+loneFirstMS))
+		rate := 3.0
+		if r := oneShotRates[call.level]; len(r) > 0 && !call.warmUp {
+			rate = r[min(i, len(r)-1)]
+		}
+		return audioMeasurement{FirstByteMS: first, TTFTMS: first, WallMS: first + productionMS, AudioSeconds: audioS, RateX: rate, RTF: float64(first+productionMS) / 1000 / audioS}, nil
+	}
+}
+
+// TestAudioCapacityCountsAStreamsWaitForItsFirstAudio: a streamed synthesis's rate is its
+// speed once audio flows, so a stream that a process holds back behind the others would
+// read as fast as a lone one. Within a ramp level, the time a stream waits for its first
+// audio beyond the lone stream's (level 1's) is therefore counted as part of its production:
+// a process that serializes 20 s syntheses at 3x keeps 2 streams real-time (the second one,
+// 6967 ms late, makes 20 s of audio in 13.6 s) and not 3 (0.97x), so the ramp stops at 3 with
+// 2 / performance instead of running to its cap. A one-shot synthesis's rate already runs
+// from the send, so its streams are judged by their rates as they are.
+func TestAudioCapacityCountsAStreamsWaitForItsFirstAudio(t *testing.T) {
+	t.Run("a streamed synthesis", func(t *testing.T) {
+		f := newAudioFixture(t, audioFixtureOpts{})
+		f.script.answer = serializingProcess(nil)
+
+		res := f.run(t, "capacity")
+
+		if res.Error != "" || res.AudioRealtimeConcurrency != 2 || res.AudioConcurrencyLimit != routing.AudioLimitPerformance {
+			t.Fatalf("result = %d / %q, error %q; want 2 / performance", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error)
+		}
+		_, payload := f.capacityRow(t)
+		if len(payload.Curve) != 3 {
+			t.Fatalf("curve = %+v, want three levels", payload.Curve)
+		}
+		production := 20.0 / 3
+		for _, want := range []audioLevel{
+			{K: 1, MinRateX: 3, MeanRateX: 3},
+			{K: 2, MinRateX: 20 / (production + 6.967), MeanRateX: (3 + 20/(production+6.967)) / 2},
+			{K: 3, MinRateX: 20 / (production + 13.934)},
+		} {
+			got := payload.Curve[want.K-1]
+			if math.Abs(got.MinRateX-want.MinRateX) > 1e-9 || (want.MeanRateX > 0 && math.Abs(got.MeanRateX-want.MeanRateX) > 1e-9) {
+				t.Fatalf("level %d = %+v, want slowest %.4f (mean %.4f)", want.K, got, want.MinRateX, want.MeanRateX)
+			}
+		}
+	})
+	t.Run("a one-shot synthesis", func(t *testing.T) {
+		f := newAudioFixture(t, audioFixtureOpts{caps: []routing.CapabilityRow{
+			sbCap(routing.CapabilitySpeech, routing.CapabilityYes, audioFixtureNow),
+			sbCap(routing.CapabilitySpeechClone, routing.CapabilityNo, audioFixtureNow),
+			sbCap(routing.CapabilitySpeechStreaming, routing.CapabilityNo, audioFixtureNow),
+		}})
+		f.script.answer = serializingProcess(map[int][]float64{2: {3, 1.5}, 3: {3, 1.5, 0.9}})
+
+		res := f.run(t, "capacity")
+
+		if res.Error != "" || res.AudioRealtimeConcurrency != 2 || res.AudioConcurrencyLimit != routing.AudioLimitPerformance {
+			t.Fatalf("result = %d / %q, error %q; want 2 / performance", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error)
+		}
+		if _, payload := f.capacityRow(t); len(payload.Curve) != 3 || payload.Curve[1] != (audioLevel{K: 2, MinRateX: 1.5, MeanRateX: 2.25}) {
+			t.Fatalf("curve = %+v, want level 2 judged by its rates as they are (1.5 slowest)", payload.Curve)
+		}
+	})
 }
 
 // TestAudioCapacityNotRealTimeEvenAlone: a model too slow at k=1 stores a measured 0 with the

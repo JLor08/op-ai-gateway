@@ -34,8 +34,9 @@ import (
 //     load_time_ms like a text one.
 //   - capacity: the concurrency ramp. Level k runs k measurements at once; it is good while its
 //     slowest stream still produces (or transcribes) audio at least
-//     OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR times faster than real time. The last good k and
-//     why the ramp stopped are one result (routing.AudioMetrics).
+//     OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR times faster than real time, counted from the
+//     send, so a stream its process holds back behind the others is that much slower. The
+//     last good k and why the ramp stopped are one result (routing.AudioMetrics).
 //   - both: speed, then capacity.
 //
 // Every measurement goes straight to its target through the provider's native relay, like
@@ -388,7 +389,7 @@ func (s *Server) pushBenchmarkLoadTime(tgt benchmarkTarget, loadMS int) {
 }
 
 // audioLevel is one level of the ramp: k streams at once, the slowest one's rate and the mean
-// of their rates.
+// of their rates, each the rate the level judges the stream by (audioRampRate).
 type audioLevel struct {
 	K         int     `json:"k"`
 	MinRateX  float64 `json:"min_rate_x"`
@@ -449,8 +450,10 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 }
 
 // measureAudioCapacity is the ramp: level k = 1, 2, 3, ... runs k measurements at once
-// (audioCallFor's) and records each stream's rate. Level k is good when its slowest stream's
-// rate is at least the real-time threshold (audioRealtimeThreshold). The ramp stops:
+// (audioCallFor's) and records each stream's rate -- for a streamed synthesis with its wait
+// for the first audio beyond a lone stream's counted in (audioRampRate). Level k is good
+// when its slowest stream's rate is at least the real-time threshold
+// (audioRealtimeThreshold). The ramp stops:
 //   - at the first level that is not good, with the limit performance and the level before as
 //     the count -- a measured ceiling, 0 when not even one stream is real-time;
 //   - when the agent refuses an instance for lack of room, at its ensure or at a stream
@@ -489,6 +492,7 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 		capK = min(capK, tgt.spec.MaxInstances)
 	}
 	threshold := s.audioRealtimeThreshold()
+	var loneFirstMS int64 // level 1's stream's time to first output (audioRampRate)
 	for k := 1; ; k++ {
 		if err := ctx.Err(); err != nil {
 			return res, err
@@ -506,9 +510,16 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 				return audioRampStop(res, k, err)
 			}
 		}
-		rates, err := s.measureAudioLevel(ctx, call, tgt.mapping.AppModelName, k, byInstance)
+		streams, err := s.measureAudioLevel(ctx, call, tgt.mapping.AppModelName, k, byInstance)
 		if err != nil {
 			return audioRampStop(res, k, err)
+		}
+		if k == 1 {
+			loneFirstMS = streams[0].TTFTMS
+		}
+		rates := make([]float64, k)
+		for i, m := range streams {
+			rates[i] = audioRampRate(call.kind, m, loneFirstMS)
 		}
 		level := audioLevelOf(k, rates)
 		res.Curve = append(res.Curve, level)
@@ -546,11 +557,11 @@ func audioWarmUp(call audioMeasureCall) audioMeasureCall {
 }
 
 // measureAudioLevel runs level k: k measurements of call at once, each to its own instance
-// (instance i for stream i) when byInstance, else all to call's target, and returns their
-// rates. Every stream is waited for. A failure that is no refusal for lack of room wins over
-// one that is: the level failed, and a lower bound read off it would be wrong.
-func (s *Server) measureAudioLevel(ctx context.Context, call audioMeasureCall, model string, k int, byInstance bool) ([]float64, error) {
-	rates := make([]float64, k)
+// (instance i for stream i) when byInstance, else all to call's target, and returns them.
+// Every stream is waited for. A failure that is no refusal for lack of room wins over one
+// that is: the level failed, and a lower bound read off it would be wrong.
+func (s *Server) measureAudioLevel(ctx context.Context, call audioMeasureCall, model string, k int, byInstance bool) ([]audioMeasurement, error) {
+	streams := make([]audioMeasurement, k)
 	errs := make([]error, k)
 	var wg sync.WaitGroup
 	for i := range k {
@@ -562,8 +573,7 @@ func (s *Server) measureAudioLevel(ctx context.Context, call audioMeasureCall, m
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			m, err := s.takeAudioMeasurement(ctx, stream)
-			rates[i], errs[i] = m.RateX, err
+			streams[i], errs[i] = s.takeAudioMeasurement(ctx, stream)
 		}()
 	}
 	wg.Wait()
@@ -580,10 +590,30 @@ func (s *Server) measureAudioLevel(ctx context.Context, call audioMeasureCall, m
 	if refused != nil {
 		return nil, refused
 	}
-	return rates, nil
+	return streams, nil
 }
 
-// audioLevelOf is level k's figures from its streams' rates.
+// audioRampRate is the rate a ramp level judges one of its streams by. For a one-shot
+// synthesis, a one-shot transcription and a live transcription it is the stream's rate,
+// which already runs from the send, so a stream its process held back behind the others
+// is slower by exactly that wait. A streamed synthesis's rate runs only from its first
+// audio -- the speed once audio flows -- so a process that serves the level's streams one
+// after another would read as fast as a lone stream for every one of them. Its wait for
+// that first audio beyond the lone stream's (loneFirstMS, level 1's) is therefore counted
+// as part of its production: the rate is its audio over the production time plus that
+// wait. A stream that waited no longer than the lone one keeps its rate, so level 1 is
+// judged by the very rate a speed run stores.
+func audioRampRate(kind audioMeasureKind, m audioMeasurement, loneFirstMS int64) float64 {
+	waited := m.TTFTMS - loneFirstMS
+	if kind != audioKindTTSStream || waited <= 0 || m.RateX <= 0 {
+		return m.RateX
+	}
+	production := m.AudioSeconds / m.RateX
+	return m.AudioSeconds / (production + float64(waited)/1000)
+}
+
+// audioLevelOf is level k's figures from the rates its streams are judged by
+// (audioRampRate).
 func audioLevelOf(k int, rates []float64) audioLevel {
 	level := audioLevel{K: k, MinRateX: math.Inf(1)}
 	var sum float64
