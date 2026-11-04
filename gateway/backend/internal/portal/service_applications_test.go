@@ -4492,6 +4492,9 @@ func TestMappingAudioMetricsEditable(t *testing.T) {
 		if _, err := svc.UpdateMapping(ctx, ownerToken(), created.ID, UpdateMappingRequest{AudioRateX: &rate}); !errors.Is(err, ErrMappingMetricInvalid) {
 			t.Fatalf("UpdateMapping(rate %v) err = %v, want ErrMappingMetricInvalid", rate, err)
 		}
+		if got := stored(); got != want {
+			t.Fatalf("refused rate %v changed the mapping: stored = %+v, want %+v", rate, got, want)
+		}
 	}
 
 	// A measured 0 beside a limit is a result, kept as one.
