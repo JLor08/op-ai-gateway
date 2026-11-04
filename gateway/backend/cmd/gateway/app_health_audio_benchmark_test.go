@@ -165,6 +165,47 @@ func TestHealthAsksAboutAReplicableSpecWithoutARampResult(t *testing.T) {
 	}
 }
 
+// TestHealthAsksAgainOnceTheSpecIsMadeReplicable: a mapping is settled per replicable value
+// of its spec. Its one run measured the spec as one process; once the operator makes the spec
+// replicable (the portal clears the ramp result, which counted the other shape) the loop asks
+// about it again in the same process, and a second cycle with the same shape does not.
+func TestHealthAsksAgainOnceTheSpecIsMadeReplicable(t *testing.T) {
+	stamp := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	app := serverAgentApp("a1", "s1", 8001)
+	app.APIFlavors = []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}
+	st := newHealthTestStore(app)
+	mp := routing.ModelMapping{ID: "m_flip", ApplicationID: "a1", GatewayModelName: "g-m_flip", AppModelName: "m_flip", Status: routing.ServerStatusActive}
+	st.mappings = map[string][]routing.ModelMapping{"a1": {mp}}
+	st.runtimeSpecs = []routing.RuntimeSpec{{ID: "rs_flip", MappingID: "m_flip", Enabled: true, APIFlavors: audio, MinInstances: 1, MaxInstances: 4}}
+	st.caps = map[string]map[string]routing.CapabilityRow{
+		"m_flip": {routing.CapabilitySpeech: {Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes}},
+	}
+	rec := &audioBenchmarkRecorder{answer: gateway.AudioAutoRunStarted}
+	runner := &appHealthRunner{store: st, audioBenchmark: rec.trigger}
+	cycle := func() []string {
+		runner.startAudioBenchmarks(context.Background(), routing.AIServer{ID: "s1"}, st.apps["s1"], []bool{true})
+		return rec.calls()
+	}
+
+	if got := cycle(); !slices.Equal(got, []string{"m_flip"}) {
+		t.Fatalf("first cycle asked = %v, want [m_flip]", got)
+	}
+	// The run measured the speed part; a one-process spec wants no ramp result.
+	mp.AudioMetricsUpdatedAt = &stamp
+	st.mappings["a1"] = []routing.ModelMapping{mp}
+	if got := cycle(); len(got) != 0 {
+		t.Fatalf("cycle after the run asked = %v, want none", got)
+	}
+	st.runtimeSpecs[0].Replicable = true
+	if got := cycle(); !slices.Equal(got, []string{"m_flip"}) {
+		t.Fatalf("cycle after the spec became replicable asked = %v, want [m_flip]", got)
+	}
+	if got := cycle(); len(got) != 0 {
+		t.Fatalf("cycle after the second run asked = %v, want none", got)
+	}
+}
+
 // TestHealthSkipsChatModelsForTheAutomaticAudioBenchmark: a mapping whose effective flavors
 // serve a text flavor is a chat model and keeps its text benchmark, whatever audio verdict it
 // has -- an omni model that also transcribes, on an agent child or a direct application -- so

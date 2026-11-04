@@ -2510,6 +2510,15 @@ type MappingStore interface {
 	// touches only those columns, so it cannot clobber a concurrent edit of
 	// other fields.
 	UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m AudioMetrics, source string, at time.Time) error
+	// ClearMappingAudioConcurrency forgets a mapping's audio ramp result: it
+	// writes the pair back to unknown (count 0, limit ""), atomically and ONLY
+	// when metrics_locked is false (a no-op, non-error, when the mapping is
+	// missing or locked). Nothing else is touched, provenance included. The
+	// portal calls it when an operator changes whether the mapping's launch
+	// spec is replicable: a ramp of a replicable spec counts instances, any
+	// other counts streams inside one process, so a result measured for the
+	// other shape no longer says what it claims.
+	ClearMappingAudioConcurrency(ctx context.Context, mappingID string) error
 	// UpdateMappingEnergyEWMA EWMA-blends energy_wh_per_token from a live per-request
 	// energy sample (watt-hours/token), atomically and ONLY when metrics_locked is
 	// false (no-op, non-error, when missing or locked). A sample <= 0 leaves the

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"math"
 	"op-ai-gateway/internal/auth"
@@ -808,7 +809,45 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if s.serverIsBenchmarking(server.ID) {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecServerBenchmarking
 	}
-	return s.putRuntimeSpec(ctx, mapping, app, server, req, "")
+	prior, hadPrior, err := s.routes.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	dto, err := s.putRuntimeSpec(ctx, mapping, app, server, req, "")
+	if err != nil {
+		return dto, err
+	}
+	if (hadPrior && prior.Replicable) != dto.Replicable {
+		dto = s.forgetAudioRamp(ctx, mapping, dto)
+	}
+	return dto, nil
+}
+
+// forgetAudioRamp clears mapping's audio ramp result after an operator's write
+// changed whether its launch spec is replicable, and returns dto with the
+// real-time warning re-derived from the cleared pair. A ramp of a replicable
+// spec counts instances (the scaler and the warning read its performance
+// result as a ceiling on the instance count), any other counts streams inside
+// one process -- one, normally, for a server that serializes -- so a result of
+// the other shape would read as a ceiling it never measured. Cleared, the pair
+// is unknown again, which also lets the automatic audio run measure the spec
+// as it now is. Only this operator path clears: the benchmark's own writers
+// flip replicable to hold a spec as one process for the length of a run and
+// restore it afterwards, which changes nothing the ramp measured. A locked
+// mapping keeps its pair (the store's write is a no-op there), and a failed
+// clear is logged, not returned: the spec itself is already stored and
+// announced.
+func (s *Service) forgetAudioRamp(ctx context.Context, mapping routing.ModelMapping, dto RuntimeSpecDTO) RuntimeSpecDTO {
+	if mapping.AudioConcurrencyLimit == "" || mapping.MetricsLocked {
+		return dto
+	}
+	if err := s.routes.ClearMappingAudioConcurrency(ctx, mapping.ID); err != nil {
+		slog.Warn("runtime spec: could not clear the audio ramp result after replicable changed", "mapping_id", mapping.ID, "err", err)
+		return dto
+	}
+	mapping.AudioRealtimeConcurrency, mapping.AudioConcurrencyLimit = 0, ""
+	dto.InstancesMinExceedsRealtime = minInstancesExceedRealtime(dto.MinInstances, mapping)
+	return dto
 }
 
 // serverIsBenchmarking reports whether a benchmark run currently holds

@@ -291,11 +291,14 @@ type appHealthRunner struct {
 	// TriggerAudioBenchmark, like speechRate. Nil is valid and means the step is off.
 	audioBenchmark gateway.AudioBenchmarkTrigger
 	// audioBenchmarkSettled remembers the mappings the automatic audio benchmark is settled
-	// for in this process: their run was started, or the gateway refused them for what they
-	// are (gateway.AudioAutoRunSettled). startAudioBenchmarks neither asks about them nor
-	// reads anything for them again until the gateway restarts -- except that a changed voices
-	// list this loop writes for one (writeVoicesCache) forgets it, because a clone model's
-	// presets are the one fact of such a refusal that changes without an operator's edit.
+	// for in this process, per replicable value of their spec (audioBenchmarkSettledKey):
+	// their run was started, or the gateway refused them for what they are
+	// (gateway.AudioAutoRunSettled). startAudioBenchmarks reads their spec (one read of the
+	// application's specs per cycle) but neither asks about them nor reads their capability
+	// rows again until the gateway restarts or the spec is made replicable or not -- except
+	// that a changed voices list this loop writes for one (writeVoicesCache) forgets it,
+	// because a clone model's presets are the one fact of such a refusal that changes
+	// without an operator's edit.
 	// Its zero value is ready; the runner is used by pointer, never copied.
 	audioBenchmarkSettled mappingSet
 	// speechRateBackoff remembers which mappings had a speech rate benchmark started
@@ -1401,7 +1404,8 @@ func (r *appHealthRunner) writeVoicesCache(ctx context.Context, mappingID string
 	}
 	// A clone model's presets decide whether the automatic audio benchmark can measure it,
 	// so a mapping that benchmark had settled is asked about again (audioBenchmarkSettled).
-	r.audioBenchmarkSettled.remove(mappingID)
+	r.audioBenchmarkSettled.remove(audioBenchmarkSettledKey(mappingID, false))
+	r.audioBenchmarkSettled.remove(audioBenchmarkSettledKey(mappingID, true))
 	return true, nil
 }
 
@@ -2513,9 +2517,10 @@ func deriveServerHealth(activeCount, reachableCount int) string {
 //
 // The gateway's answer decides whether the mapping is asked about again. A started run and a
 // settled refusal (gateway.AudioAutoRunSettled: the run was started already, or the mapping is
-// a clone model without a preset voice, say) are remembered in r.audioBenchmarkSettled, and
-// nothing is read for the mapping again until the process restarts or this loop writes a
-// changed voices list for it. A deferred mapping (another run, live traffic, the agent's
+// a clone model without a preset voice, say) are remembered in r.audioBenchmarkSettled, per
+// mapping and replicable value of its spec (audioBenchmarkSettledKey), and the mapping is not
+// asked about again until the process restarts, this loop writes a changed voices list for
+// it, or its spec is made replicable or not. A deferred mapping (another run, live traffic, the agent's
 // features not known yet) is asked about again on the next cycle. Everything else is the
 // gateway's decision: the clone model's preset, the once-per-process rule and the idle gate.
 // With no trigger wired the step does nothing at all.
@@ -2534,11 +2539,15 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 		}
 		specs := r.audioBenchmarkSpecs(app)
 		for _, mp := range mappings {
-			if r.audioBenchmarkSettled.has(mp.ID) || !audioBenchmarkCandidate(mp) {
+			if !audioBenchmarkCandidate(mp) {
 				continue
 			}
 			spec, hasSpec, err := specs(ctx, mp.ID)
 			if err != nil {
+				continue
+			}
+			settledKey := audioBenchmarkSettledKey(mp.ID, spec.Replicable)
+			if r.audioBenchmarkSettled.has(settledKey) {
 				continue
 			}
 			if !gateway.AudioTargetFlavors(app, spec, hasSpec) || !gateway.AudioAutoRunWanted(mp, spec.Replicable) {
@@ -2555,13 +2564,25 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 			}
 			switch r.audioBenchmark(ctx, server, app, mp) {
 			case gateway.AudioAutoRunStarted:
-				r.audioBenchmarkSettled.add(mp.ID)
+				r.audioBenchmarkSettled.add(settledKey)
 				return
 			case gateway.AudioAutoRunSettled:
-				r.audioBenchmarkSettled.add(mp.ID)
+				r.audioBenchmarkSettled.add(settledKey)
 			}
 		}
 	}
+}
+
+// audioBenchmarkSettledKey is a mapping's key in audioBenchmarkSettled: its id and whether its
+// launch spec is replicable (false without a spec). A mapping is settled per shape of its
+// spec, as the gateway's own once-per-process rule is: an operator who turns replicable on or
+// off has the portal clear the ramp result, which counted the other shape, and the mapping is
+// asked about again.
+func audioBenchmarkSettledKey(mappingID string, replicable bool) string {
+	if replicable {
+		return mappingID + "\x00replicable"
+	}
+	return mappingID
 }
 
 // audioBenchmarkCandidate reports whether a mapping may still lack what the automatic audio

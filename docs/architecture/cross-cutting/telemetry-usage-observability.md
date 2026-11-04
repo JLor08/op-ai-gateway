@@ -3245,10 +3245,15 @@ after another is not read as fast as a lone stream. A replicable target on an ag
 known to declare `runtime_instances` is ramped **one instance per stream**: level k
 first ensures instance k−1 through the agent's ensure route (`m`, `m#1`, …, which
 starts a burst instance only into free room) and sends its k streams to instances
-0 … k−1; any other target gets its k streams on its one process, the same
-"concurrency inside one process" a text capacity run measures (audio.cpp serializes,
-so that normally yields 1). Every process a level adds gets one warm-up first, so a
-start is not part of its rate. The ramp stops, and stores **why**:
+0 … k−1. A replicable spec whose agent is **not** known to run instances — not
+heard from since the gateway started, or without `runtime_instances` — is refused
+before any stream (`audioRampShapeKnown`): the scaler reads a replicable spec's
+`performance` result as a ceiling on its instance count, and a ramp inside one
+process would store that process's stream count as that ceiling. Any other target —
+a spec that is not replicable, a direct application — gets its k streams on its one
+process, the same "concurrency inside one process" a text capacity run measures
+(audio.cpp serializes, so that normally yields 1). Every process a level adds gets
+one warm-up first, so a start is not part of its rate. The ramp stops, and stores **why**:
 
 | Stop reason (`audio_concurrency_limit`) | When | What the count means |
 |---|---|---|
@@ -3285,6 +3290,12 @@ scaler read them from the mapping, so they apply whether or not the model is
 loaded. A load time written for a replicable spec pushes the server's runtime
 config, because the effective idle timeout is derived from it
 ([Agent-Managed Model Runtime §11.11](agent-runtime-manager.md#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
+The pair describes the spec's shape when it was measured — instances of a replicable
+spec, streams inside one process otherwise — so an operator's launch-spec write that
+turns `replicable` on or off clears it back to unknown
+(`ClearMappingAudioConcurrency`, under the same `metrics_locked` guard; the
+benchmark's own replicable holds and restores do not). That also re-arms the
+automatic run below.
 
 **History: two kinds, mirroring the text `speed`/`capacity` kinds.** Each part
 appends one `model_mapping_benchmarks` row, on success and failure alike:
@@ -3309,7 +3320,11 @@ an audio mapping that still lacks what the run measures (`AudioAutoRunWanted`: n
 audio metrics at all, or — for a replicable spec — no ramp result, so a measured 0
 never asks again) and that is active and unlocked. The trigger starts one `both` run
 with no principal and no stop-all, only on an idle server, at most **once per
-mapping per gateway process**: a run that fails does not start again every tick.
+mapping and replicable value of its spec per gateway process**: a run that fails
+does not start again every tick, while a spec made replicable (or not) since, whose
+ramp result the portal cleared, is measured again without a restart. A replicable
+spec on an agent without `runtime_instances` gets its speed part only: its ramp is
+refused (above) and the run records that error.
 It answers *settled* — the loop stops asking — for a mapping whose run was started
 already or that is no audio target for what it is (a chat model, images-only, a
 clone without a preset; a changed voices list asks again), and *deferred* — asked on

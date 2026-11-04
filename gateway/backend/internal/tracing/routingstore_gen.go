@@ -160,6 +160,18 @@ func (_d *RoutingStoreWithTracing) Certificates(ctx context.Context) (ca1 []_sou
 	return _d.Store.Certificates(ctx)
 }
 
+func (_d *RoutingStoreWithTracing) ClearMappingAudioConcurrency(ctx context.Context, mappingID string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.ClearMappingAudioConcurrency")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ClearMappingAudioConcurrency(ctx, mappingID)
+}
+
 func (_d *RoutingStoreWithTracing) ClearVendorAccountSharing(ctx context.Context, accountID string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.ClearVendorAccountSharing")
 	defer span.End()

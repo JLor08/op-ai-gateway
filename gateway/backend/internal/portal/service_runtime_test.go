@@ -4504,6 +4504,100 @@ func TestNewServiceDefaultsTheInstanceIdleSettings(t *testing.T) {
 	}
 }
 
+// An operator's write that changes whether the spec is replicable clears the
+// mapping's audio ramp result: a ramp of a replicable spec counts instances and
+// any other counts streams inside one process, so a one-process result kept
+// past the flip would read as a ceiling on the instance count it never
+// measured (the scaler would never start a second instance, and the warning
+// would fire). A write that keeps the shape keeps the result, and a locked
+// mapping keeps it whatever the write.
+func TestPutRuntimeSpecReplicableChangeForgetsTheAudioRamp(t *testing.T) {
+	ctx := context.Background()
+	put := func(t *testing.T, svc *Service, mappingID string, replicable bool) RuntimeSpecDTO {
+		t.Helper()
+		var req PutRuntimeSpecRequest
+		body := fmt.Sprintf(`{"enabled":true,"binary":"/usr/local/bin/audio-server","replicable":%v,"min_instances":2,"max_instances":4}`, replicable)
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		return dto
+	}
+	seedRamp := func(t *testing.T, routeStore *routing.MemoryStore, mappingID string, locked bool) {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit, m.MetricsLocked = 1, routing.AudioLimitPerformance, locked
+		if err := routeStore.UpdateMapping(ctx, m); err != nil {
+			t.Fatalf("UpdateMapping: %v", err)
+		}
+	}
+	pair := func(t *testing.T, routeStore *routing.MemoryStore, mappingID string) (int, string) {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		return m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit
+	}
+
+	t.Run("one process to replicable", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, false)
+		seedRamp(t, routeStore, mappingID, false)
+		dto := put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 0 || limit != "" {
+			t.Fatalf("pair after the flip = %d / %q, want it cleared", n, limit)
+		}
+		if dto.InstancesMinExceedsRealtime {
+			t.Fatal("the write-back still warns from the cleared pair")
+		}
+	})
+	t.Run("replicable to one process", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, true)
+		seedRamp(t, routeStore, mappingID, false)
+		put(t, svc, mappingID, false)
+		if n, limit := pair(t, routeStore, mappingID); n != 0 || limit != "" {
+			t.Fatalf("pair after the flip = %d / %q, want it cleared", n, limit)
+		}
+	})
+	t.Run("first write of a replicable spec", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		seedRamp(t, routeStore, mappingID, false)
+		put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 0 || limit != "" {
+			t.Fatalf("pair after the first replicable write = %d / %q, want it cleared", n, limit)
+		}
+	})
+	t.Run("the shape kept", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, true)
+		seedRamp(t, routeStore, mappingID, false)
+		dto := put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 1 || limit != routing.AudioLimitPerformance {
+			t.Fatalf("pair after a write that kept the shape = %d / %q, want 1 / performance kept", n, limit)
+		}
+		if !dto.InstancesMinExceedsRealtime {
+			t.Fatal("the write-back lost the warning of a kept pair")
+		}
+	})
+	t.Run("a locked mapping", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, false)
+		seedRamp(t, routeStore, mappingID, true)
+		put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 1 || limit != routing.AudioLimitPerformance {
+			t.Fatalf("locked pair after the flip = %d / %q, want 1 / performance kept", n, limit)
+		}
+	})
+}
+
 // A spec whose minimum instance count is above the real-time concurrency its
 // mapping's audio ramp measured as a ceiling carries a warning (it is not
 // refused): only a ramp stopped by performance measured one, and a measured 0

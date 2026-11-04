@@ -1489,6 +1489,21 @@ func (m *MemoryStore) UpdateMappingCapacityMetrics(_ context.Context, id string,
 	return nil
 }
 
+// ClearMappingAudioConcurrency writes the audio ramp pair back to unknown
+// (0, ""), leaving every other column and the provenance alone. A missing or
+// locked mapping is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
+func (m *MemoryStore) ClearMappingAudioConcurrency(_ context.Context, mappingID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapping, ok := m.mappings[mappingID]
+	if !ok || mapping.MetricsLocked {
+		return nil
+	}
+	mapping.AudioRealtimeConcurrency, mapping.AudioConcurrencyLimit = 0, ""
+	m.mappings[mappingID] = mapping
+	return nil
+}
+
 // UpdateMappingAudioMetrics writes one audio benchmark run's measurements, only
 // while the mapping is unlocked: a rate of 0, or a TTFA or load time of 0 or
 // below, is not measured and keeps the stored field, a positive LoadTimeMS

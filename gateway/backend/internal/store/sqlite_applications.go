@@ -600,6 +600,19 @@ func (s *SQLiteStore) UpdateMappingAudioMetrics(ctx context.Context, mappingID s
 	return nil // 0 rows affected (missing or locked) is a benign no-op
 }
 
+// ClearMappingAudioConcurrency writes the audio ramp pair back to its unknown
+// value (a count of 0 and an empty limit), atomically and only on an unlocked
+// mapping: 0 rows affected (missing or locked) is a benign no-op. No other
+// column is touched.
+func (s *SQLiteStore) ClearMappingAudioConcurrency(ctx context.Context, mappingID string) error {
+	if _, err := s.exec(ctx, `update model_mappings
+		set audio_realtime_concurrency = 0, audio_concurrency_limit = ''
+		where id = ? and metrics_locked = 0`, mappingID); err != nil {
+		return fmt.Errorf("clear mapping audio concurrency: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) MappingByID(ctx context.Context, id string) (routing.ModelMapping, error) {
 	row := s.queryRow(ctx, `
 		select id, application_id, gateway_model_name, app_model_name, status,

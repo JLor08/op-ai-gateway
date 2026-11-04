@@ -114,8 +114,9 @@ const (
 	// AudioAutoRunStarted: the mapping's one run was launched.
 	AudioAutoRunStarted
 	// AudioAutoRunSettled: nothing was started, and asking again would be refused again unless
-	// the mapping itself changes: its one run was started already in this process (it is not
-	// started twice, however it ended), or it is refused for what it is -- a chat model or one
+	// the mapping itself changes: its one run was started already in this process for its
+	// spec's current shape (it is not started twice, however it ended, until replicable
+	// changes), or it is refused for what it is -- a chat model or one
 	// that serves only images is no audio target, and a clone model with no preset voice
 	// cannot synthesize without a reference. Its flavors and model change only by an
 	// operator's edit; a clone model's presets reach the voices cache through the loop's own
@@ -137,32 +138,36 @@ func (a AudioAutoRunAnswer) String() string {
 }
 
 // audioAutoRunMarker remembers which mappings the one-time automatic audio benchmark was
-// started for in this process. Its zero value is ready, and it is safe for concurrent use:
-// the health loop asks from one goroutine per application.
+// started for in this process, each with whether its launch spec was replicable then. A run
+// is once per mapping AND shape: an operator who turns replicable on or off has the portal
+// clear the ramp result (it counted the other shape), and the run then measures the spec
+// again. Its zero value is ready, and it is safe for concurrent use: the health loop asks
+// from one goroutine per application.
 type audioAutoRunMarker struct {
 	mu      sync.Mutex
-	started map[string]bool
+	started map[string]bool // mapping id -> its spec's replicable when its run started
 }
 
-// done reports whether mappingID's run was started already.
-func (m *audioAutoRunMarker) done(mappingID string) bool {
+// done reports whether mappingID's run was started already for a spec of this replicable.
+func (m *audioAutoRunMarker) done(mappingID string, replicable bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.started[mappingID]
+	was, ok := m.started[mappingID]
+	return ok && was == replicable
 }
 
-// claim marks mappingID's run started and reports whether this call did, false when another
-// one had already.
-func (m *audioAutoRunMarker) claim(mappingID string) bool {
+// claim marks mappingID's run started for a spec of this replicable and reports whether this
+// call did, false when another one had already.
+func (m *audioAutoRunMarker) claim(mappingID string, replicable bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.started[mappingID] {
+	if was, ok := m.started[mappingID]; ok && was == replicable {
 		return false
 	}
 	if m.started == nil {
 		m.started = map[string]bool{}
 	}
-	m.started[mappingID] = true
+	m.started[mappingID] = replicable
 	return true
 }
 
@@ -187,8 +192,10 @@ func AudioAutoRunWanted(mapping routing.ModelMapping, replicable bool) bool {
 // Like TriggerSpeechRateBenchmark it decides, reserves and launches, and the run goes on in its
 // own goroutine. It answers AudioAutoRunStarted only when a run was launched. It answers
 // AudioAutoRunSettled, and the loop does not ask about the mapping again, when:
-//   - its run was started already in this process: once per mapping, so a run that fails
-//     -- an upstream that cannot synthesize, say -- does not start again on every tick;
+//   - its run was started already in this process: once per mapping and replicable value of
+//     its spec, so a run that fails -- an upstream that cannot synthesize, say -- does not
+//     start again on every tick, while a spec the operator made replicable (or not) since,
+//     whose ramp result the portal cleared, is measured again;
 //   - it is no audio target for what it is: a chat model (it keeps its text benchmark, even
 //     with an audio verdict), one that serves only images, or a clone model that lists no
 //     preset voice (benchmarkSkippedSpeechClone).
@@ -206,9 +213,6 @@ func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AISer
 	if s == nil || s.Routes == nil || mapping.Status != routing.ServerStatusActive || mapping.MetricsLocked {
 		return AudioAutoRunDeferred
 	}
-	if s.audioAutoRuns.done(mapping.ID) {
-		return AudioAutoRunSettled
-	}
 	if app.Type == routing.ProviderServerAgent && !s.AgentFeatures.Known(server.ID) {
 		return AudioAutoRunDeferred
 	}
@@ -216,6 +220,8 @@ func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AISer
 	switch {
 	case err != nil:
 		return AudioAutoRunDeferred
+	case s.audioAutoRuns.done(mapping.ID, tgt.spec.Replicable):
+		return AudioAutoRunSettled
 	case skipped == benchmarkSkippedImagesOnly, skipped == benchmarkSkippedSpeechClone, skipped == "" && tgt.audio.role == "":
 		slog.Debug("audio benchmark not started by the health loop: the mapping is no audio target it can measure", "mapping_id", mapping.ID, "skipped", skipped)
 		return AudioAutoRunSettled
@@ -233,7 +239,7 @@ func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AISer
 		cancel()
 		return AudioAutoRunDeferred
 	}
-	if !s.audioAutoRuns.claim(mapping.ID) {
+	if !s.audioAutoRuns.claim(mapping.ID, tgt.spec.Replicable) {
 		s.Benchmarks.Release(server.ID)
 		cancel()
 		return AudioAutoRunSettled

@@ -1039,6 +1039,80 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 	})
 }
 
+// TestRoutingStoreClearMappingAudioConcurrency proves memory, sqlite and
+// postgres agree on ClearMappingAudioConcurrency: it writes the ramp pair back
+// to unknown (0, "") and touches nothing else -- not the rate, the TTFA, the
+// load time or the provenance -- and leaves a LOCKED mapping, and a missing
+// one, alone without an error.
+func TestRoutingStoreClearMappingAudioConcurrency(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		measuredAt := now.Add(time.Hour)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_clr", Name: "Clear", Domain: "clr.example.test", Provider: routing.ProviderAudioCpp,
+			Endpoint: "http://clr.example.test:8080", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_clr", ServerID: "srv_clr", Type: routing.ProviderAudioCpp, Port: 8080, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		for _, id := range []string{"m_clr", "m_lck"} {
+			if err := s.CreateMapping(ctx, routing.ModelMapping{
+				ID: id, ApplicationID: "app_clr", GatewayModelName: "clr-" + id, AppModelName: "up-" + id,
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("create mapping %s: %v", id, err)
+			}
+			if err := s.UpdateMappingAudioMetrics(ctx, id, routing.AudioMetrics{
+				RateX: 3, TTFAMS: 400, RealtimeConcurrency: 1, ConcurrencyLimit: routing.AudioLimitPerformance, LoadTimeMS: 2500,
+			}, "audio_benchmark", measuredAt); err != nil {
+				t.Fatalf("seed audio metrics %s: %v", id, err)
+			}
+		}
+		locked, err := s.MappingByID(ctx, "m_lck")
+		if err != nil {
+			t.Fatalf("MappingByID m_lck: %v", err)
+		}
+		locked.MetricsLocked = true
+		if err := s.UpdateMapping(ctx, locked); err != nil {
+			t.Fatalf("lock m_lck: %v", err)
+		}
+
+		for _, id := range []string{"m_clr", "m_lck", "does-not-exist"} {
+			if err := s.ClearMappingAudioConcurrency(ctx, id); err != nil {
+				t.Fatalf("ClearMappingAudioConcurrency(%s) = %v, want nil", id, err)
+			}
+		}
+
+		got, err := s.MappingByID(ctx, "m_clr")
+		if err != nil {
+			t.Fatalf("MappingByID m_clr: %v", err)
+		}
+		if got.AudioRealtimeConcurrency != 0 || got.AudioConcurrencyLimit != "" {
+			t.Fatalf("cleared pair = %d / %q, want 0 / \"\"", got.AudioRealtimeConcurrency, got.AudioConcurrencyLimit)
+		}
+		if got.AudioRateX != 3 || got.AudioTTFAMS != 400 || got.LoadTimeMS != 2500 || got.MetricsSource != "audio_benchmark" ||
+			!sameTimePtr(got.AudioMetricsUpdatedAt, &measuredAt) || !sameTimePtr(got.MetricsUpdatedAt, &measuredAt) {
+			t.Fatalf("the clear touched another column: %+v", got)
+		}
+		gotLocked, err := s.MappingByID(ctx, "m_lck")
+		if err != nil {
+			t.Fatalf("MappingByID m_lck: %v", err)
+		}
+		if gotLocked.AudioRealtimeConcurrency != 1 || gotLocked.AudioConcurrencyLimit != routing.AudioLimitPerformance {
+			t.Fatalf("locked pair = %d / %q, want 1 / performance kept", gotLocked.AudioRealtimeConcurrency, gotLocked.AudioConcurrencyLimit)
+		}
+	})
+}
+
 // TestRoutingStoreUpdateMappingEditableAudio proves memory, sqlite and postgres
 // agree on the audio half of UpdateMappingEditable: a supplied audio column is
 // written (a supplied 0 reads back as "not measured"), the count and limit only

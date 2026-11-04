@@ -11471,13 +11471,17 @@ mapping; a parallel audio-only mechanism would duplicate all of it.
   that runs instances (burst rules: free room only), else k streams on the one process — and is good while its slowest
   stream reaches the threshold (1.2× real time). It stops at `performance` (a measured ceiling), `resources` (an
   instance refused for room — a lower bound) or `cap` (`max_instances`, 64 or the ramp cap — a lower bound). Count and
-  reason are one result, written together; a failed ramp writes neither.
+  reason are one result, written together; a failed ramp writes neither. A replicable spec whose agent is not known to
+  run instances (not heard from since the gateway started, or without `runtime_instances`) is refused rather than
+  ramped in one process: its result would be read as a ceiling on the instance count it never counted.
 - **(e) Stored on the mapping like the text metrics.** `audio_rate_x`, `audio_ttfa_ms`, `audio_realtime_concurrency`,
   `audio_concurrency_limit`, `audio_metrics_updated_at` (migration 101), written under `metrics_locked` with the text
   writers' provenance stamps; two history kinds mirror the text ones, `audio` and `audio_capacity`, their figures as
-  JSON in `capacity_curve`.
-- **(f) Measured once automatically.** The health loop starts one `both` run per audio mapping per gateway process on
-  an idle server when the mapping has no audio metrics, or is replicable and has no ramp result; the scheduled speed
+  JSON in `capacity_curve`. The ramp pair describes the spec's shape when it was measured, so an operator's write that
+  turns `replicable` on or off clears it (`ClearMappingAudioConcurrency`, under `metrics_locked`).
+- **(f) Measured once automatically.** The health loop starts one `both` run per audio mapping and replicable value of
+  its spec per gateway process on an idle server when the mapping has no audio metrics, or is replicable and has no
+  ramp result; a spec made replicable after its run is therefore measured again without a restart. The scheduled speed
   run includes audio mappings.
 
 **Consequence:**

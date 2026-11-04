@@ -465,8 +465,9 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 // A replicable target on an agent known to run instances (audioRampByInstance) is ramped one
 // instance per stream: level k first ensures instance k-1 (the address m#(k-1), m itself for
 // k = 1) through the agent's ensure route, which starts it only into free room, then sends
-// its k streams to instances 0 ... k-1. Any other target gets its k streams on its one process,
-// the same concurrency inside one process a text capacity run measures. Every process a level
+// its k streams to instances 0 ... k-1. A replicable target whose agent is not known to run
+// instances is refused (audioRampShapeKnown). Any other target gets its k streams on its one
+// process, the same concurrency inside one process a text capacity run measures. Every process a level
 // adds is sent one warm-up first, so a start is not part of its rate. Any other failure ends
 // the ramp as a failed benchmark, with the levels it measured.
 //
@@ -484,6 +485,9 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 	}
 	call := prep.call
 	byInstance := s.audioRampByInstance(tgt)
+	if err := s.audioRampShapeKnown(tgt, byInstance); err != nil {
+		return res, err
+	}
 	var err error
 	restored := false
 	up := 0 // instances 0 ... up-1 are known to run
@@ -807,9 +811,28 @@ func audioRefusedForRoom(err error) bool {
 // audioRampByInstance reports whether tgt is ramped one instance per stream: a replicable spec
 // of a server_agent application whose agent is known to declare runtime_instances. An agent
 // without the feature, or not heard from since the gateway started, runs the spec as one
-// process whatever the spec says, so its ramp is one process's.
+// process whatever the spec says, and the ramp of such a replicable spec is refused
+// (audioRampShapeKnown).
 func (s *Server) audioRampByInstance(tgt benchmarkTarget) bool {
 	return tgt.app.Type == routing.ProviderServerAgent && tgt.spec.Replicable && s.AgentFeatures.Has(tgt.server.ID, runtimeInstancesFeature)
+}
+
+// audioRampShapeKnown refuses a ramp of a replicable spec that would not be ramped by
+// instance: its agent has not declared its features since the gateway started, or does not
+// declare runtime_instances. The ramp's result is stored as the mapping's real-time
+// concurrency, which for a replicable spec the scaler reads as a ceiling on the instance
+// count, so a ramp that counted streams inside one process -- one, normally, for a server
+// that serializes -- would cap the spec at one instance for good: nothing measures a stored
+// result again by itself. A spec that is not replicable, and a direct application, are
+// ramped inside their one process as before.
+func (s *Server) audioRampShapeKnown(tgt benchmarkTarget, byInstance bool) error {
+	if byInstance || tgt.app.Type != routing.ProviderServerAgent || !tgt.spec.Replicable {
+		return nil
+	}
+	if !s.AgentFeatures.Known(tgt.server.ID) {
+		return fmt.Errorf("audio benchmark: launch spec %s is replicable, so its concurrency ramp counts instances, and the server's agent has not reported whether it runs them since the gateway started; run the ramp again once it has", tgt.spec.ID)
+	}
+	return fmt.Errorf("audio benchmark: launch spec %s is replicable, so its concurrency ramp counts instances, and the server's agent does not run them (it does not declare %s); update the agent, or turn replicable off to measure one process", tgt.spec.ID, runtimeInstancesFeature)
 }
 
 // audioInstanceAddress is the address the agent serves instance k of model under: model

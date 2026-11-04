@@ -1000,10 +1000,9 @@ func TestAudioCapacityCap(t *testing.T) {
 	})
 }
 
-// TestAudioCapacityNonReplicableSingleProcess: a target that is not ramped by instance -- a
-// spec that is not replicable, a direct audio.cpp application, or a replicable spec on an
-// agent that does not declare runtime_instances -- gets k concurrent streams on its one
-// process, and no instance is ever ensured. max_instances does not cap that ramp.
+// TestAudioCapacityNonReplicableSingleProcess: a target that is not replicable -- a spec
+// that is not replicable, or a direct audio.cpp application -- gets k concurrent streams on
+// its one process, and no instance is ever ensured. max_instances does not cap that ramp.
 func TestAudioCapacityNonReplicableSingleProcess(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1011,7 +1010,6 @@ func TestAudioCapacityNonReplicableSingleProcess(t *testing.T) {
 	}{
 		{"an agent spec that is not replicable", audioFixtureOpts{agent: true, features: []string{"runtime_manager", runtimeInstancesFeature}}},
 		{"a direct audio.cpp application", audioFixtureOpts{}},
-		{"a replicable spec on an agent without runtime_instances", audioFixtureOpts{agent: true, replicable: true, maxInstances: 1, features: []string{"runtime_manager"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAudioFixture(t, tc.opts)
@@ -1036,6 +1034,45 @@ func TestAudioCapacityNonReplicableSingleProcess(t *testing.T) {
 			}
 			if !reflect.DeepEqual(perLevel, map[int]int{1: 1, 2: 2, 3: 3}) {
 				t.Fatalf("streams per level = %v, want k at level k", perLevel)
+			}
+		})
+	}
+}
+
+// TestAudioCapacityReplicableNeedsInstances: the ramp of a replicable spec counts instances,
+// and its result is the scaler's ceiling on the instance count. Where the agent is not known
+// to run instances -- not heard from since the gateway started, or without runtime_instances
+// -- a ramp inside one process would store that process's stream count (1 for a server that
+// serializes) as the ceiling, so the ramp is refused: nothing is sent, nothing is ensured, and
+// the mapping's pair stays unknown.
+func TestAudioCapacityReplicableNeedsInstances(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		features []string
+		want     string
+	}{
+		{"an agent not heard from", nil, "has not reported"},
+		{"an agent without runtime_instances", []string{"runtime_manager"}, "does not run them"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: true, maxInstances: 4, features: tc.features})
+			f.script.answer = levelRates(map[int][]float64{1: {4}, 2: {0.9}})
+
+			res := f.run(t, "capacity")
+
+			if !strings.Contains(res.Error, tc.want) || res.AudioConcurrencyLimit != "" {
+				t.Fatalf("result = %d / %q, error %q; want no result and an error naming %q", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error, tc.want)
+			}
+			for _, c := range f.script.recorded() {
+				if c.level > 0 {
+					t.Fatalf("a ramp stream was sent (level %d to %q), want none", c.level, c.model)
+				}
+			}
+			if got := f.provider.ensuredAddresses(); len(got) != 0 {
+				t.Fatalf("ensured = %v, want none", got)
+			}
+			if m := f.mapping(t); m.AudioConcurrencyLimit != "" {
+				t.Fatalf("stored pair = %d / %q, want it unknown", m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit)
 			}
 		})
 	}
@@ -1247,6 +1284,35 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
 		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunSettled {
 			t.Fatalf("second tick = %v, want settled: the failed mapping is not started again", got)
+		}
+	})
+	t.Run("a spec made replicable since its run is measured again", func(t *testing.T) {
+		// The run is once per mapping and shape: the operator's flip has the portal clear the
+		// ramp result, which counted streams inside one process, and the spec's instances are
+		// then measured -- without waiting for a gateway restart.
+		f := newAudioFixture(t, audioFixtureOpts{agent: true, maxInstances: 4, features: []string{"runtime_manager", runtimeInstancesFeature}})
+		ctx := context.Background()
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("first tick = %v, want started", got)
+		}
+		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
+		spec, ok, err := f.mem.RuntimeSpecByMapping(ctx, "map1")
+		if err != nil || !ok {
+			t.Fatalf("RuntimeSpecByMapping: %v, %v", ok, err)
+		}
+		spec.Replicable = true
+		if err := f.mem.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("UpsertRuntimeSpec: %v", err)
+		}
+		if err := f.mem.ClearMappingAudioConcurrency(ctx, "map1"); err != nil {
+			t.Fatalf("ClearMappingAudioConcurrency: %v", err)
+		}
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunStarted {
+			t.Fatalf("tick after the spec became replicable = %v, want started", got)
+		}
+		waitFor(t, func() bool { return !f.srv.Benchmarks.Status("srv1").Running })
+		if got := f.srv.TriggerAudioBenchmark(ctx, f.server, f.app, f.mapping(t)); got != AudioAutoRunSettled && got != AudioAutoRunDeferred {
+			t.Fatalf("tick after the second run = %v, want no third run", got)
 		}
 	})
 	t.Run("an agent not heard from since the gateway started defers", func(t *testing.T) {
