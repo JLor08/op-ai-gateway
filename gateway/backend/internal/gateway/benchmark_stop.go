@@ -327,15 +327,17 @@ var benchmarkStatesAwaitStopped = map[string]bool{"backoff": true, "start_failed
 // benchmarkFormerPinsNotStopped returns the sorted ids of the specs in
 // unpinned, the specs the run unpinned, whose rows read other than stopped
 // with pid 0, the row of targetID aside: the rule benchmarkOthersStopped
-// applies to every neighbour of a run without a stop. It judges only the specs
-// the run unpinned, so a spec somebody else unpinned just before or during the
-// run, whose document the agent has not applied yet, is not judged. A formerly
-// pinned spec the frame has no row for is not in the agent's document, so the
-// agent does not run it.
+// applies to every neighbour of a run without a stop. The target's own row is
+// its instance-0 row, so another instance of the target is judged like a
+// neighbour, and a spec is named once however many of its instance rows read
+// otherwise. It judges only the specs the run unpinned, so a spec somebody
+// else unpinned just before or during the run, whose document the agent has
+// not applied yet, is not judged. A formerly pinned spec the frame has no row
+// for is not in the agent's document, so the agent does not run it.
 func benchmarkFormerPinsNotStopped(rows []RuntimeStatusDTO, unpinned []string, targetID string) []string {
 	var ids []string
 	for _, row := range rows {
-		if row.SpecID == targetID || !slices.Contains(unpinned, row.SpecID) {
+		if (row.SpecID == targetID && row.Instance == 0) || !slices.Contains(unpinned, row.SpecID) {
 			continue
 		}
 		if row.State != agentSpecStateStopped || row.PID != 0 {
@@ -343,7 +345,7 @@ func benchmarkFormerPinsNotStopped(rows []RuntimeStatusDTO, unpinned []string, t
 		}
 	}
 	slices.Sort(ids)
-	return ids
+	return slices.Compact(ids)
 }
 
 // benchmarkSelectionFrame subscribes to serverID's runtime status, discards the
@@ -489,21 +491,37 @@ func (s *Server) benchmarkAwaitQuiet(ctx context.Context, serverID string, stopS
 // done when the frame settles the wait, quiet when it settles it as quiet. A
 // late start anywhere in the frame settles it, whatever the stop set's rows
 // read. When awaitStopped names a spec, the frame settles the wait as quiet
-// only once that spec's row reads stopped. The spec is the target, which is in
-// the stop set, so its row is then also quiet, pid 0 included.
+// only once that spec's row -- its instance-0 row, benchmarkSpecStatus's --
+// reads stopped. The spec is the target, which is in the stop set, so its row
+// is then also quiet, pid 0 included.
+//
+// The stop set names specs, and a replicable spec has a row per instance, so
+// a spec of the set counts as quiet when the frame has a row for it and every
+// one of its rows is quiet. Counting quiet rows instead would let two quiet
+// rows of one spec stand in for another spec that still runs, and would
+// never settle once one spec reported more rows than the set has specs.
 func benchmarkStopFrameVerdict(frame []RuntimeStatusDTO, stopSet []string, awaitStopped string) (done, quiet bool, reason string) {
-	quietInSet := 0
+	present := make(map[string]bool, len(stopSet))
+	loud := make(map[string]bool, len(stopSet))
 	stoppedAwaited := awaitStopped == ""
 	for _, row := range frame {
 		inSet := slices.Contains(stopSet, row.SpecID)
-		switch {
-		case !inSet && !benchmarkRowQuiet(row):
+		rowQuiet := benchmarkRowQuiet(row)
+		if !inSet && !rowQuiet {
 			return true, false, benchmarkStopReasonLateStart
-		case inSet && benchmarkRowQuiet(row):
-			quietInSet++
 		}
-		if row.SpecID == awaitStopped && row.State == agentSpecStateStopped {
+		if inSet {
+			present[row.SpecID] = true
+			loud[row.SpecID] = loud[row.SpecID] || !rowQuiet
+		}
+		if row.SpecID == awaitStopped && row.Instance == 0 && row.State == agentSpecStateStopped {
 			stoppedAwaited = true
+		}
+	}
+	quietInSet := 0
+	for _, specID := range stopSet {
+		if present[specID] && !loud[specID] {
+			quietInSet++
 		}
 	}
 	settled := quietInSet == len(stopSet) && stoppedAwaited

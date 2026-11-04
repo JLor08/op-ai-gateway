@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -576,5 +577,77 @@ func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
 	}
 	if row.MetricsProbe != "ok" || row.ContextProbe != "unreachable" {
 		t.Fatalf("snapshot row probe state = (metrics_probe=%q, context_probe=%q), want (ok, unreachable)", row.MetricsProbe, row.ContextProbe)
+	}
+}
+
+// TestModelServersRowCountsRunningInstances pins a model-servers row over a
+// replicable spec's instance rows: running_instances is how many of the
+// spec's rows on that server run (1 for a running spec that is not
+// replicable, 0 when none runs -- always on the wire), the row's state is the
+// liveliest of its instances' (running before starting before the rest, then
+// instance 0 first), the per-model load is the instances' sum, and the probe
+// states are the chosen row's.
+func TestModelServersRowCountsRunningInstances(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.AgentFeatures.Set(msServerID, []string{runtimeModelProbeFeature})
+	row := func(k int, state string, active, queue int, probe string) RuntimeStatusDTO {
+		return RuntimeStatusDTO{SpecID: specID, Instance: k, Model: msAppModel, State: state, ActiveRequests: active, QueueDepth: queue, MetricsProbe: probe}
+	}
+	cases := []struct {
+		name        string
+		rows        []RuntimeStatusDTO
+		wantRunning int
+		wantState   string
+		wantActive  int
+		wantQueue   int
+		wantProbe   string
+	}{
+		{"three running instances and one starting", []RuntimeStatusDTO{
+			row(0, "running", 1, 0, "ok"), row(1, "running", 2, 1, "unreachable"), row(2, "running", 0, 0, "ok"), row(3, "starting", 0, 0, ""),
+		}, 3, "running", 3, 1, "ok"},
+		{"a running spec that is not replicable", []RuntimeStatusDTO{row(0, "running", 4, 2, "ok")}, 1, "running", 4, 2, "ok"},
+		{"nothing runs", []RuntimeStatusDTO{row(0, "stopped", 0, 0, "na")}, 0, "stopped", 0, 0, "na"},
+		{"instance 0 unloaded, a burst instance runs", []RuntimeStatusDTO{
+			row(0, "stopped", 0, 0, "na"), row(2, "running", 1, 0, "ok"),
+		}, 1, "running", 1, 0, "ok"},
+		{"instance 0 unloaded, a burst instance starts", []RuntimeStatusDTO{
+			row(0, "stopped", 0, 0, "na"), row(1, "starting", 0, 0, ""),
+		}, 0, "starting", 0, 0, ""},
+	}
+	for _, tc := range cases {
+		s.RuntimeStatus.publish(msServerID, tc.rows)
+		req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+		req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body=%s", tc.name, rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Data []map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Data) != 1 {
+			t.Fatalf("%s: decode %s: %v", tc.name, rec.Body.String(), err)
+		}
+		got := out.Data[0]
+		want := map[string]string{
+			"running_instances": fmt.Sprint(tc.wantRunning), "state": fmt.Sprintf("%q", tc.wantState),
+			"active_requests": fmt.Sprint(tc.wantActive), "queue_depth": fmt.Sprint(tc.wantQueue),
+			"metrics_probe": fmt.Sprintf("%q", tc.wantProbe),
+		}
+		for key, value := range want {
+			if string(got[key]) != value {
+				t.Errorf("%s: %s = %s, want %s", tc.name, key, got[key], value)
+			}
+		}
 	}
 }

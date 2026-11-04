@@ -63,7 +63,10 @@ func (s *Server) handlePortalModels(w http.ResponseWriter, r *http.Request) {
 // ANY runtime_manager agent and predates the probe feature entirely, so gating it on
 // runtime_model_probe would wrongly hide "Lädt" for older agents that legitimately
 // report "starting". This mirrors injectRowRuntimeState's own unconditional `row.State
-// = dto.State` line one section below.
+// = rep.State` line one section below.
+//
+// A server counts once per model however many instances of its spec start: the set is of
+// server names, and startingCandidates returns each (server, spec) pair once.
 //
 // filterVisibility must match the branch this is called from, because the count has to
 // agree with the SIBLING counts on the same row (OfferedOnCount, LoadedOn), which the
@@ -251,15 +254,21 @@ func (s *Server) startingServersByModel(ctx context.Context, token auth.Token, f
 // (server, spec) pair currently reporting State == "starting", plus the DISTINCT server
 // ids among them -- the exact argument for startingServersByModel's single
 // AllowedServerIDs call. No store access at all: this reads only the in-memory registry.
+//
+// A pair is returned once however many of the spec's instance rows start: the count is of
+// servers, and each pair costs startingCandidateOffering's point reads.
 func (s *Server) startingCandidates() ([]startingServerCandidate, []string) {
 	var candidates []startingServerCandidate
+	seen := map[startingServerCandidate]bool{}
 	serverIDSet := map[string]struct{}{}
 	for _, serverID := range s.RuntimeStatus.serverIDs() {
 		for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
-			if dto.State != "starting" {
+			c := startingServerCandidate{serverID: serverID, specID: dto.SpecID}
+			if dto.State != agentSpecStateStarting || seen[c] {
 				continue
 			}
-			candidates = append(candidates, startingServerCandidate{serverID: serverID, specID: dto.SpecID})
+			seen[c] = true
+			candidates = append(candidates, c)
 			serverIDSet[serverID] = struct{}{}
 		}
 	}
@@ -387,7 +396,7 @@ func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.Mode
 	if s.Routes == nil {
 		return
 	}
-	byServer := map[string]map[string]RuntimeStatusDTO{}
+	byServer := map[string]map[string][]RuntimeStatusDTO{}
 	apps := map[string]cachedApplication{}
 	for i := range rows {
 		row := &rows[i]
@@ -453,45 +462,85 @@ func (s *Server) rowLoadRefusal(ctx context.Context, apps map[string]cachedAppli
 	return loadRefusal(app, spec, hasSpec, s.AgentFeatures.Has(row.ServerID, runtimeEnsureFeature))
 }
 
-// runtimeStatusesForServer returns serverID's runtime-status snapshot indexed by spec id,
-// building it from s.RuntimeStatus.statusSnapshot on first use and caching the result in
-// byServer so each distinct server's snapshot (a copy of its whole per-server slice) is
+// runtimeStatusesForServer returns serverID's runtime-status snapshot grouped by spec id --
+// a replicable spec has a row per instance, so a spec id maps to all of its rows, in frame
+// order -- building it from s.RuntimeStatus.statusSnapshot on first use and caching the result
+// in byServer so each distinct server's snapshot (a copy of its whole per-server slice) is
 // fetched at most once across the whole rows loop.
-func (s *Server) runtimeStatusesForServer(byServer map[string]map[string]RuntimeStatusDTO, serverID string) map[string]RuntimeStatusDTO {
+func (s *Server) runtimeStatusesForServer(byServer map[string]map[string][]RuntimeStatusDTO, serverID string) map[string][]RuntimeStatusDTO {
 	if m, ok := byServer[serverID]; ok {
 		return m
 	}
-	m := make(map[string]RuntimeStatusDTO)
+	m := make(map[string][]RuntimeStatusDTO)
 	for _, dto := range s.RuntimeStatus.statusSnapshot(serverID) {
-		m[dto.SpecID] = dto
+		m[dto.SpecID] = append(m[dto.SpecID], dto)
 	}
 	byServer[serverID] = m
 	return m
 }
 
-// injectRowRuntimeState fills row's State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe
-// from statuses (row's owning server's runtime-status snapshot indexed by spec id), looking up
-// spec, row's runtime spec. Best-effort: a spec with no published status just leaves the row's
-// zero value.
-func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.RuntimeSpec, statuses map[string]RuntimeStatusDTO) {
-	dto, ok := statuses[spec.ID]
-	if !ok {
+// injectRowRuntimeState fills row's State/RunningInstances/ActiveRequests/QueueDepth/
+// MetricsProbe/ContextProbe from statuses (row's owning server's runtime-status snapshot
+// grouped by spec id), looking up spec, row's runtime spec. Best-effort: a spec with no
+// published status just leaves the row's zero value.
+//
+// A replicable spec has a row per instance, and the mapping row is one line for all of them:
+// RunningInstances counts the running ones, ActiveRequests/QueueDepth are their sum (the
+// model's load on this server), and State and the probe states are those of the liveliest
+// instance (runtimeRowRepresentative), so a model serving from a burst instance while
+// instance 0 has idled out reads running, and one whose only instance is still coming up
+// reads starting. A spec that is not replicable has one row, which is all of these as before.
+func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.RuntimeSpec, statuses map[string][]RuntimeStatusDTO) {
+	rows := statuses[spec.ID]
+	if len(rows) == 0 {
 		return
 	}
+	rep := runtimeRowRepresentative(rows)
 	// State (the loading indicator) is valid for any runtime_manager agent, so it is
-	// injected unconditionally. Active/queue, however, are only real when the reporting
-	// agent declared runtime_model_probe: for a non-probing agent they default to a
-	// fabricated 0, so gate their injection on the flag and otherwise leave the row's
-	// counts at their zero value (same root cause as the routing metricsOK gate).
-	// MetricsProbe/ContextProbe are reachability data from that same probing agent, so
-	// they ride the identical gate rather than State's unconditional one.
-	row.State = dto.State
-	if s.AgentFeatures.Has(row.ServerID, runtimeModelProbeFeature) {
-		row.ActiveRequests = dto.ActiveRequests
-		row.QueueDepth = dto.QueueDepth
-		row.MetricsProbe = dto.MetricsProbe
-		row.ContextProbe = dto.ContextProbe
+	// injected unconditionally, and so is the running count, which reads the same states.
+	// Active/queue, however, are only real when the reporting agent declared
+	// runtime_model_probe: for a non-probing agent they default to a fabricated 0, so gate
+	// their injection on the flag and otherwise leave the row's counts at their zero value
+	// (same root cause as the routing metricsOK gate). MetricsProbe/ContextProbe are
+	// reachability data from that same probing agent, so they ride the identical gate
+	// rather than State's unconditional one.
+	row.State = rep.State
+	for _, dto := range rows {
+		if dto.State == agentSpecStateRunning {
+			row.RunningInstances++
+		}
 	}
+	if s.AgentFeatures.Has(row.ServerID, runtimeModelProbeFeature) {
+		for _, dto := range rows {
+			row.ActiveRequests += dto.ActiveRequests
+			row.QueueDepth += dto.QueueDepth
+		}
+		row.MetricsProbe = rep.MetricsProbe
+		row.ContextProbe = rep.ContextProbe
+	}
+}
+
+// runtimeRowRepresentative picks the one of a spec's status rows (not empty) that speaks for
+// the spec on a mapping row: a running instance before a starting one before any other, and
+// among equals the lowest instance index, instance 0 first.
+func runtimeRowRepresentative(rows []RuntimeStatusDTO) RuntimeStatusDTO {
+	rank := func(state string) int {
+		switch state {
+		case agentSpecStateRunning:
+			return 0
+		case agentSpecStateStarting:
+			return 1
+		default:
+			return 2
+		}
+	}
+	best := rows[0]
+	for _, dto := range rows[1:] {
+		if r, b := rank(dto.State), rank(best.State); r < b || (r == b && dto.Instance < best.Instance) {
+			best = dto
+		}
+	}
+	return best
 }
 
 // handlePortalModelServers lists the servers that offer a gateway model (?name=<model>) with the
@@ -567,7 +616,7 @@ func (s *Server) handlePortalModelImageOptions(w http.ResponseWriter, r *http.Re
 // copies out of it.
 func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provider.SdcppImageOptions {
 	var collected []provider.SdcppImageOptions
-	statusesByServer := make(map[string]map[string]RuntimeStatusDTO)
+	statusesByServer := make(map[string]map[string][]RuntimeStatusDTO)
 	for _, view := range views {
 		switch view.AppType {
 		case routing.ProviderStableDiffusionCpp:
@@ -578,13 +627,33 @@ func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provide
 			if view.SpecID == "" {
 				continue
 			}
-			dto, ok := s.runtimeStatusesForServer(statusesByServer, view.ServerID)[view.SpecID]
-			if ok && dto.ImageOptions != nil {
-				collected = append(collected, *dto.ImageOptions)
+			if opts := specImageOptions(s.runtimeStatusesForServer(statusesByServer, view.ServerID)[view.SpecID]); opts != nil {
+				collected = append(collected, *opts)
 			}
 		}
 	}
 	return collected
+}
+
+// specImageOptions is the image options one spec's status rows carry: the
+// instance-0 row's when it has any, else the first row's that has. Every
+// instance of a replicable spec runs the same build and states the same
+// options, so one is the spec's, and the spec is collected once however many
+// instances run. nil when no row carries any.
+func specImageOptions(rows []RuntimeStatusDTO) *provider.SdcppImageOptions {
+	var found *provider.SdcppImageOptions
+	for _, dto := range rows {
+		if dto.ImageOptions == nil {
+			continue
+		}
+		if dto.Instance == 0 {
+			return dto.ImageOptions
+		}
+		if found == nil {
+			found = dto.ImageOptions
+		}
+	}
+	return found
 }
 
 // handlePortalModelVoices answers which voices the portal's voice picker may offer

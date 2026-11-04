@@ -692,7 +692,9 @@ const (
 
 // agentSpecResidency is agentTargetResident's reading of the agent's most recent runtime-status
 // snapshot, once the router's loaded set has not listed tgt's model. The row is matched by spec
-// id, never by model name:
+// id, never by model name, and it is the spec's instance-0 row, the one tgt's model name
+// reaches: another instance of a replicable target is one of the others benchmarkOthersStopped
+// reads.
 //   - a state with a live process (vramStatesWithProcess: running, starting, draining), or any
 //     process id, is resident: a child /running does not list yet or no longer lists, or a
 //     start_failed child whose process is still up;
@@ -706,7 +708,7 @@ func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) 
 		return false, true
 	}
 	for _, row := range s.RuntimeStatus.statusSnapshot(tgt.server.ID) {
-		if row.SpecID != tgt.spec.ID {
+		if row.SpecID != tgt.spec.ID || row.Instance != 0 {
 			continue
 		}
 		switch {
@@ -722,7 +724,9 @@ func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) 
 }
 
 // benchmarkOthersStopped reports whether rows is not empty and every row of it reads stopped
-// with pid 0, except the row of specID itself, which agentSpecResidency has already read. A
+// with pid 0, except the row of specID itself, which agentSpecResidency has already read. That
+// row is specID's instance-0 row: every other instance of a replicable target is an other here,
+// since a burst instance that runs holds the memory a cold pass would be measured against. A
 // target without a spec (specID "") has no row of its own, so every row counts, one without a
 // spec id included. A neighbour in backoff, not_permitted or pending_vram_unknown has no process
 // now, but a pinned or force_running one can start one by itself: when its backoff timer fires,
@@ -738,7 +742,7 @@ func benchmarkOthersStopped(rows []RuntimeStatusDTO, specID string) bool {
 		return false
 	}
 	for _, row := range rows {
-		if specID != "" && row.SpecID == specID {
+		if specID != "" && row.SpecID == specID && row.Instance == 0 {
 			continue
 		}
 		if row.State != agentSpecStateStopped || row.PID != 0 {
@@ -1171,10 +1175,13 @@ func (s *Server) benchmarkTelemetryContextSize(ctx context.Context, tgt benchmar
 	}
 }
 
-// benchmarkSpecStatus returns specID's row of one status frame.
+// benchmarkSpecStatus returns specID's row of one status frame: its instance-0 row, the
+// instance the spec's model name reaches and a benchmark's requests go to. A replicable spec's
+// other instances report rows under the same spec id; a frame with only those has no row for
+// the spec here.
 func benchmarkSpecStatus(frame []RuntimeStatusDTO, specID string) (RuntimeStatusDTO, bool) {
 	for _, row := range frame {
-		if row.SpecID == specID {
+		if row.SpecID == specID && row.Instance == 0 {
 			return row, true
 		}
 	}
