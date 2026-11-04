@@ -1006,12 +1006,50 @@ func TestInstanceIsCarriedOnEveryEntryOfAGeneration(t *testing.T) {
 	})
 }
 
-// TestADropOnlyEntryCarriesNoInstance: a gap cannot be attributed to any one
-// instance -- the bytes lost may have come from any of them -- so the entry the
-// store synthesizes for a loss with nothing to stamp it onto names none.
-func TestADropOnlyEntryCarriesNoInstance(t *testing.T) {
-	got := withDropped(nil, 4096)
-	if len(got) != 1 || got[0].DroppedBytes != 4096 || got[0].Instance != 0 {
-		t.Fatalf("withDropped(nil, 4096) = %+v, want one entry carrying only the drop", got)
-	}
+// TestADropStampedOntoAnInstanceEntryKeepsItsInstance: a gap is stamped onto
+// the first entry after it, and that entry still names the instance whose
+// output it carries. The gap itself belongs to no instance -- the lost bytes
+// may have come from any of them -- which is why a reader shows it in every
+// view while the entry's text stays with its instance. Both places output can
+// be lost are covered: the retention buffer evicting the oldest history (seen
+// in the scrollback) and the live queue overflowing between two drains.
+func TestADropStampedOntoAnInstanceEntryKeepsItsInstance(t *testing.T) {
+	line := strings.Repeat("x", 4095) + "\n"
+	t.Run("scrollback after eviction", func(t *testing.T) {
+		s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+		p := s.newInstanceProc("S", 2)
+		// 160 KiB into a 64 KiB buffer.
+		for range 40 {
+			p.Write([]byte(line))
+		}
+		s.SetWatch([]string{"S"}, nil)
+		batches := s.Drain()
+		if len(batches) != 1 || len(batches[0].Entries) == 0 {
+			t.Fatalf("drain = %+v, want one scrollback batch with entries", batches)
+		}
+		first := batches[0].Entries[0]
+		if first.DroppedBytes <= 0 || first.Instance != 2 || first.Text == "" {
+			t.Fatalf("first entry = {dropped %d, instance %d, %d text bytes}, want the gap stamped onto instance 2's text",
+				first.DroppedBytes, first.Instance, len(first.Text))
+		}
+	})
+	t.Run("live queue overflow", func(t *testing.T) {
+		s := newTestLogStore(t, 1<<20, 1<<20)
+		p := s.newInstanceProc("S", 2)
+		s.SetWatch([]string{"S"}, nil)
+		s.Drain() // consume the (empty) scrollback
+		// 512 KiB into a 64 KiB live queue.
+		for range 128 {
+			p.Write([]byte(line))
+		}
+		batches := s.Drain()
+		if len(batches) != 1 || len(batches[0].Entries) == 0 {
+			t.Fatalf("drain = %+v, want one live batch with entries", batches)
+		}
+		first := batches[0].Entries[0]
+		if first.DroppedBytes <= 0 || first.Instance != 2 || first.Text == "" {
+			t.Fatalf("first entry = {dropped %d, instance %d, %d text bytes}, want the gap stamped onto instance 2's text",
+				first.DroppedBytes, first.Instance, len(first.Text))
+		}
+	})
 }
