@@ -250,9 +250,10 @@ func (r logRecord) size() int { return len(r.text) + r.command.bytes() + logReco
 // instances existed sends -- and k for instance k. The text of instance k keeps
 // its "[#k] " line prefix (procLog.prefixLinesLocked), so a reader that ignores
 // the field still reads one combined, attributable history; the field is what
-// lets a reader show one instance's output alone. An entry that only carries
-// DroppedBytes names no instance: a gap cannot be attributed to one, because
-// the bytes lost may have come from any of them.
+// lets a reader show one instance's output alone. A gap cannot be attributed
+// to an instance, because the bytes lost may have come from any of them:
+// withDropped stamps it onto the first entry after it, which keeps naming the
+// instance of its own text, and an entry made for a gap alone names none.
 type LogEntry struct {
 	PID          int              `json:"pid,omitempty"`
 	At           time.Time        `json:"at"`

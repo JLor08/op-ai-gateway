@@ -8309,8 +8309,8 @@ same function as the pushed document, so the two cannot disagree); neither has a
   is known to it — offers tabs: **All** shows every instance's output as it
   arrives, lines of instance k ≥ 1 prefixed `[#k]` (§6.1), and one tab per
   instance shows only that instance's output, without the prefix
-  ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). A spec that
-  never ran a second instance shows no tabs.
+  ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). A spec that is
+  not replicable, and for which no instance k ≥ 1 is known, shows no tabs.
 - The Models catalog's model-servers row carries `running_instances` (one per
   running status row of the spec, so 1 for a running spec that is not replicable)
   and the spec's `replicable` flag; the count is shown for a replicable spec or
@@ -8642,8 +8642,14 @@ instances spends one buffer of the per-spec budget, not one per instance.
 carries `instance`, the index of the instance whose generation produced it —
 omitted for instance 0, which is also what an agent from before instances sends.
 The text keeps its prefix, so the combined history reads the same to every
-consumer, the stderr tail included. An entry that carries only `dropped_bytes`
-names no instance: the bytes lost may have come from any of them.
+consumer, the stderr tail included. A gap belongs to no instance: the bytes lost
+may have come from any of them. The agent stamps a gap onto the first entry after
+it, and that entry keeps naming the instance whose text it carries; only an entry
+the agent makes for a gap with nothing to stamp it onto carries `dropped_bytes`
+alone and names no instance. When a frame's room ends inside a record, the agent
+cuts the record's text but never inside the `[#k] ` opening one of its lines: a
+cut that would fall there moves back to the start of that line, so a reader can
+always find the prefix whole.
 
 **The portal's log view splits the history per instance.** For a replicable spec,
 or once more than one instance is known — the ones the opening row's spec lists,
@@ -8662,8 +8668,11 @@ begins with the exact prefix at such a boundary loses it in that tab (All still
 shows it). Gaps — `dropped_bytes` and the view's own trim notice
 ([§14.5](#145-overflow-is-always-visible)) — appear in **every** tab, because a
 gap cannot be attributed to an instance, and a tab for an instance with no output
-in the history says so in a sentence rather than staying blank. A spec that never
-ran a second instance shows no tabs and looks exactly as before.
+in the history says so in a sentence rather than staying blank (a gap alone is no
+instance's output, instance 0's included). A replicable spec shows the tabs even
+while only instance 0 runs. A spec that is not replicable, and for which no
+instance k ≥ 1 is known — from the opening row or from the open stream — shows no
+tabs and looks exactly as before.
 
 ### 14.3 The memory bound is the operator's to set
 
