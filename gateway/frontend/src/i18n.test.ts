@@ -4240,7 +4240,7 @@ describe('instance settings (#340) i18n keys', () => {
     }
   });
 
-  it('names the measured startup and the automatic idle timeout, or says nothing is measured', () => {
+  it('names the measured startup and the idle timeout in effect, or says nothing is measured', () => {
     for (const locale of ['de', 'en'] as readonly Locale[]) {
       const line = messages[locale].runtimeSpecAutoIdleTimeout(150, 30000);
       expect(line, locale).toContain('150 s');

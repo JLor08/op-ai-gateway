@@ -1113,7 +1113,7 @@ const de = {
   runtimeSpecStartupTimeout: 'Start-Timeout (s)',
   runtimeSpecPinned: 'Angeheftet (nie beenden)',
   runtimeSpecEnabled: 'Aktiviert',
-  // #340: mehrere Instanzen (Prozesse) einer Spezifikation auf ihrem Server.
+  // #340: several instances (processes) of one spec on its server.
   runtimeSpecReplicable: 'Mehrere Instanzen',
   runtimeSpecReplicableHint:
     'Sind alle laufenden Instanzen ausgelastet, startet der Agent eine weitere – nur in freie Ressourcen, ohne ein anderes Modell zu verdrängen. Jede Instanz lauscht auf ihrem eigenen Port, daher muss der Listen-Port 0 sein. „Angeheftet“ hält Instanz 0 am Laufen.',
@@ -1122,14 +1122,15 @@ const de = {
   runtimeSpecMaxInstancesUnlimited:
     'Leer = unbegrenzt: Instanzen kommen hinzu, solange freie Ressourcen und das Prozesslimit des Servers es erlauben.',
   runtimeSpecInstanceParallelism: 'Parallele Anfragen pro Instanz',
-  // Die gemessene Startzeit und der Leerlauf-Timeout, den der Gateway dem
-  // Agent für die GESPEICHERTE Spezifikation tatsächlich sendet.
+  // The measured startup and the idle timeout the gateway actually pushes to
+  // the agent for the STORED spec: the larger of the manual value and the one
+  // derived from the startup, so it is named as the one in effect.
   runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
     `${
       startupMs > 0
         ? `Gemessene Startzeit: ${(startupMs / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1, useGrouping: false })} s`
         : 'Startzeit noch nicht gemessen'
-    } · automatischer Leerlauf-Timeout: ${seconds} s`,
+    } · wirksamer Leerlauf-Timeout: ${seconds} s`,
   runtimeSpecIdleTimeoutOverrideHint:
     'Bei mehreren Instanzen: 0 = keine manuelle Vorgabe – der Gateway leitet den Leerlauf-Timeout aus der gemessenen Startzeit ab. Ein Wert hier gilt, sobald er über dem automatischen liegt.',
   // The role-grouped co-residency editor.
@@ -1797,7 +1798,7 @@ const de = {
   // Task 7 (probe-reachability-and-model-status): the merged tri-state column
   // label, replacing the old separate "Geladen" + "Live-Status" columns.
   modelServerColStatus: 'Status',
-  // #340: wie viele Instanzen der Spezifikation auf diesem Server laufen.
+  // #340: how many instances of the mapping's spec run on this server.
   modelServersRunningInstances: 'Laufende Instanzen',
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
@@ -4548,7 +4549,7 @@ const en: PortalMessages = {
       startupMs > 0
         ? `Measured startup: ${(startupMs / 1000).toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })} s`
         : 'Startup not measured yet'
-    } · automatic idle timeout: ${seconds} s`,
+    } · idle timeout in effect: ${seconds} s`,
   runtimeSpecIdleTimeoutOverrideHint:
     'With multiple instances: 0 = no manual override – the gateway derives the idle timeout from the measured startup time. A value here applies once it is above the automatic one.',
   runtimeCoresidency: 'Co-residency',

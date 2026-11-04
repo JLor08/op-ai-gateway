@@ -10547,6 +10547,9 @@ describe('RuntimeAdminSection instance settings', () => {
 
     expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveValue(null);
     expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveValue(null);
+    // Both counts carry the agent's cap of 64 instances as the field's bound.
+    expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveAttribute('max', '64');
+    expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveAttribute('max', '64');
     // An empty maximum is "unlimited", and the field says so.
     expect(screen.getByText(t.runtimeSpecMaxInstancesUnlimited)).toBeInTheDocument();
     expect(screen.getByLabelText(t.runtimeSpecInstanceParallelism)).toHaveValue(1);

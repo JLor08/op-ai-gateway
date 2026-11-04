@@ -745,8 +745,6 @@ function formatGpus(spec: RuntimeSpec | undefined): string {
   return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g)} MB`).join(', ');
 }
 
-// A megabyte quantity for the two summary columns: the em-dash when nothing is
-// known (0 is the UNKNOWN sentinel throughout this feature, never a real zero).
 // An instance-count field's text as the request's number: an empty field is 0,
 // which the backend reads as "none" for the minimum and "unlimited" for the
 // maximum -- so the form never has to show a 0 that means "no limit".
@@ -760,6 +758,8 @@ function instanceCountText(count: number): string {
   return count > 0 ? String(count) : '';
 }
 
+// A megabyte quantity for the two summary columns: the em-dash when nothing is
+// known (0 is the UNKNOWN sentinel throughout this feature, never a real zero).
 function formatMb(mb: number): string {
   return mb > 0 ? `${mb} MB` : '—';
 }
