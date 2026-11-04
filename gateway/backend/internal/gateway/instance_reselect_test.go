@@ -65,8 +65,20 @@ func TestReselectsLostInstance(t *testing.T) {
 	}
 }
 
-// Peeking reads only a 404 or 409, and an answer that is not a gone instance
-// relays byte for byte.
+// closeRecorder is a response body that records whether it was closed.
+type closeRecorder struct {
+	io.Reader
+	closed bool
+}
+
+func (c *closeRecorder) Close() error {
+	c.closed = true
+	return nil
+}
+
+// Peeking reads only a 404 or 409, and every answer keeps its body byte for
+// byte. A gone instance's answer has its connection released at once; any
+// other answer is left open for its relay.
 func TestPeekInstanceGoneKeepsTheBody(t *testing.T) {
 	for _, tc := range []struct {
 		status int
@@ -77,9 +89,13 @@ func TestPeekInstanceGoneKeepsTheBody(t *testing.T) {
 		{http.StatusNotFound, `{"error":{"code":"other"}}`, false},
 		{http.StatusInternalServerError, `{"error":{"code":"runtime.instance_no_capacity"}}`, false},
 	} {
-		resp := &provider.ProxyResponse{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}
+		orig := &closeRecorder{Reader: strings.NewReader(tc.body)}
+		resp := &provider.ProxyResponse{StatusCode: tc.status, Body: orig}
 		if got := peekInstanceGone(resp); got != tc.want {
 			t.Errorf("status %d %s: gone = %v, want %v", tc.status, tc.body, got, tc.want)
+		}
+		if orig.closed != tc.want {
+			t.Errorf("status %d %s: original body closed = %v, want %v", tc.status, tc.body, orig.closed, tc.want)
 		}
 		if rest, _ := io.ReadAll(resp.Body); string(rest) != tc.body {
 			t.Errorf("status %d: body after the peek = %q, want %q", tc.status, rest, tc.body)

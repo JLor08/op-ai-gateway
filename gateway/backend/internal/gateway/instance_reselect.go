@@ -66,15 +66,26 @@ const instanceGonePeekBytes = 4 << 10
 
 // peekInstanceGone reports whether resp, an answer the gateway relays itself, is the
 // agent router's refusal of a gone instance (isInstanceGoneError). Only a 404 or 409
-// is read at all; whatever was read is put back in front of the rest of the body, so
-// an answer that is not such a refusal relays exactly as it arrived.
+// is read at all. An answer that is not such a refusal gets what was read put back in
+// front of the rest of its body, so it relays exactly as it arrived. One that is gets
+// its whole envelope -- a single short line, already read -- as an in-memory body, and
+// its connection is released at once: the request moves on to another attempt, which
+// must not hold this one open, and the refusal can still be relayed if no other
+// attempt is found.
 func peekInstanceGone(resp *provider.ProxyResponse) bool {
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusConflict {
 		return false
 	}
-	head, err := io.ReadAll(io.LimitReader(resp.Body, instanceGonePeekBytes))
-	resp.Body = replayedBody{Reader: io.MultiReader(bytes.NewReader(head), resp.Body), Closer: resp.Body}
-	return err == nil && isInstanceGoneError(provider.RouterStatusError(resp.StatusCode, head))
+	orig := resp.Body
+	head, err := io.ReadAll(io.LimitReader(orig, instanceGonePeekBytes))
+	if err != nil || !isInstanceGoneError(provider.RouterStatusError(resp.StatusCode, head)) {
+		resp.Body = replayedBody{Reader: io.MultiReader(bytes.NewReader(head), orig), Closer: orig}
+		return false
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(orig, instanceGonePeekBytes))
+	_ = orig.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(head))
+	return true
 }
 
 // relayAgain is the nativeRelay reselect hook of a caller whose path always answers:
