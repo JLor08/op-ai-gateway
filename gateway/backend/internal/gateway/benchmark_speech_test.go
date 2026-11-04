@@ -20,6 +20,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -565,6 +566,96 @@ func TestSpeechBenchmarkRunsOnSpeechMapping(t *testing.T) {
 	}
 	if got := up.modelsCalled(); len(got) != 1 || got[0] != sbTTSModel {
 		t.Fatalf("upstream models = %v, want exactly [%s]", got, sbTTSModel)
+	}
+}
+
+// TestBenchmarkMappingScopeDispatchesAnAudioMapping is the mapping-scope half of the audio
+// dispatch, where these modes used to refuse an audio-only mapping with 409
+// benchmark.audio_only: the speed, capacity and both modes (an empty mode is speed) measure
+// a speech or transcription mapping's audio -- 202, a kind=audio (speed) or
+// kind=audio_capacity (ramp) history row, and nothing sent to the upstream but the audio
+// measurement (here the seam) -- while one they cannot measure is refused before anything is
+// reserved or sent, with 409 benchmark.speech_unavailable and the audio message: a clone
+// model that lists no preset voice, and a mapping with no speech or transcription verdict.
+func TestBenchmarkMappingScopeDispatchesAnAudioMapping(t *testing.T) {
+	for _, tc := range []struct {
+		mapping, mode string
+		kinds         []string
+	}{
+		{"sb_tts", "speed", []string{benchmarkKindAudio}},
+		{"sb_tts", "", []string{benchmarkKindAudio}},
+		{"sb_tts", "capacity", []string{benchmarkKindAudioCapacity}},
+		{"sb_tts", "both", []string{benchmarkKindAudio, benchmarkKindAudioCapacity}},
+		{"sb_asr", "speed", []string{benchmarkKindAudio}},
+	} {
+		t.Run(tc.mapping+" mode "+tc.mode, func(t *testing.T) {
+			up := newSpeechBenchUpstream(t, answerWAV(buildPCMWav(t, 24000, 1, 16, 48000), true))
+			s := newSpeechBenchFixture(t, up)
+			if err := s.Routes.UpsertModelMappingCache(context.Background(), routing.ModelMappingCacheRow{MappingID: "sb_tts", CacheType: routing.ModelMappingCacheOutputByteRate, Payload: "48000", UpdatedAt: audioFixtureNow}); err != nil {
+				t.Fatalf("UpsertModelMappingCache: %v", err)
+			}
+			script := &audioScript{answer: levelRates(map[int][]float64{2: {0.5}})}
+			s.audioMeasureSeam = script.seam
+			path := "/api/portal/mappings/" + tc.mapping + "/benchmark"
+			if tc.mode != "" {
+				path += "?mode=" + tc.mode
+			}
+
+			if status, code, body := postSpeechBenchmark(t, s, path); status != http.StatusAccepted {
+				t.Fatalf("POST %s = %d %q (%s), want 202", path, status, code, body)
+			}
+			st := finishedSpeechRun(t, s)
+			if res := speechBenchResult(t, st, tc.mapping); res.Error != "" || res.Skipped != "" {
+				t.Fatalf("result = %+v, want the mapping measured", res)
+			}
+			runs, err := s.Routes.BenchmarkRunsByMapping(context.Background(), tc.mapping, 10)
+			if err != nil {
+				t.Fatalf("BenchmarkRunsByMapping: %v", err)
+			}
+			var kinds []string
+			for _, r := range runs {
+				kinds = append(kinds, r.Kind)
+			}
+			slices.Sort(kinds)
+			if !slices.Equal(kinds, tc.kinds) {
+				t.Fatalf("history kinds = %v, want %v", kinds, tc.kinds)
+			}
+			if len(script.recorded()) == 0 {
+				t.Fatal("no audio measurement was taken")
+			}
+			if got := up.received(); len(got) != 0 {
+				t.Fatalf("the upstream received %d requests, want none besides the audio measurement: %+v", len(got), got)
+			}
+		})
+	}
+	for _, tc := range []struct{ name, mapping string }{
+		{"a clone model without a preset voice", "sb_clone"},
+		{"a mapping with no speech or transcription verdict", "sb_none"},
+	} {
+		for _, mode := range []string{"speed", "capacity", "both"} {
+			t.Run(tc.name+" mode "+mode, func(t *testing.T) {
+				up := newSpeechBenchUpstream(t, answerWAV(buildPCMWav(t, 24000, 1, 16, 48000), true))
+				s := newSpeechBenchFixture(t, up)
+				if err := s.Routes.CreateMapping(context.Background(), routing.ModelMapping{ID: "sb_none", ApplicationID: sbApp, GatewayModelName: "none-bench", AppModelName: "none_model", Status: routing.ServerStatusActive, CreatedAt: audioFixtureNow, UpdatedAt: audioFixtureNow}); err != nil {
+					t.Fatalf("CreateMapping: %v", err)
+				}
+				script := &audioScript{answer: levelRates(nil)}
+				s.audioMeasureSeam = script.seam
+
+				status, code, body := postSpeechBenchmark(t, s, "/api/portal/mappings/"+tc.mapping+"/benchmark?mode="+mode)
+				var errBody apierror.Body
+				_ = json.Unmarshal(body, &errBody)
+				if status != http.StatusConflict || code != codeBenchmarkSpeechUnavailable || errBody.Error.Message != msgBenchmarkAudioUnmeasurable {
+					t.Fatalf("answer = %d %q %q, want 409 %s %q", status, code, errBody.Error.Message, codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable)
+				}
+				if s.Benchmarks.ServerBusy(sbServer) {
+					t.Fatal("a refused run left the server reserved")
+				}
+				if len(script.recorded()) != 0 || len(up.received()) != 0 {
+					t.Fatalf("a refused run measured %+v and sent %+v, want nothing", script.recorded(), up.received())
+				}
+			})
+		}
 	}
 }
 

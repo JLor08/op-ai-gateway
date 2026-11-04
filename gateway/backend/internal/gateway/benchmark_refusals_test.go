@@ -288,6 +288,7 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 	}{
 		{errBenchmarkImagesOnly, "benchmark.images_only", "this model, or every model in the run's scope, serves only images, so no chat prompt is sent"},
 		{errBenchmarkAudioOnly, "benchmark.audio_only", "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"},
+		{errBenchmarkAudioUnmeasurable, "benchmark.speech_unavailable", "this model, or every model in the run's scope, serves audio only and cannot be measured yet: it has no speech or transcription verdict, or it clones a voice and lists no preset voice"},
 		{errBenchmarkAgentEnsureUnsupported, "benchmark.agent_ensure_unsupported", "this model serves only images, and starting it without a chat prompt needs the agent feature runtime_ensure (agent 0.8.0 or newer), or the agent has not reported since the gateway restarted"},
 		{errBenchmarkSpecForceStopped, "benchmark.spec_force_stopped", "this model's runtime spec is force-stopped; clear the admin override before loading it"},
 	} {
@@ -501,10 +502,12 @@ func TestMappingSpecIsAudioOnly(t *testing.T) {
 	}
 }
 
-// A partition with nothing runnable answers for why: audio_only when every
-// skipped view serves only speech, images_only for any skipped images-only
-// view or for a partition that skipped nothing, and request_failed when a
-// spec read failed, because then either answer would be a guess.
+// A partition with nothing runnable answers for why: speech_unavailable when
+// every skipped view serves only audio a speed, capacity or both run cannot
+// measure, audio_only when every skipped view serves only speech and the run is
+// the vision probe, images_only for any skipped images-only view or for a
+// partition that skipped nothing, and request_failed when a read failed,
+// because then any answer would be a guess.
 func TestRefuseNothingRunnableNamesTheSkippedKind(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -513,10 +516,13 @@ func TestRefuseNothingRunnableNamesTheSkippedKind(t *testing.T) {
 		code   string
 	}{
 		{"every view audio-only", benchmarkViewPartition{audioOnly: 2}, http.StatusConflict, codeBenchmarkAudioOnly},
+		{"every view audio the run cannot measure", benchmarkViewPartition{audioUnmeasurable: 2}, http.StatusConflict, codeBenchmarkSpeechUnavailable},
 		{"every view images-only", benchmarkViewPartition{imagesOnly: 2}, http.StatusConflict, codeBenchmarkImagesOnly},
 		{"images-only and audio-only views", benchmarkViewPartition{imagesOnly: 1, audioOnly: 1}, http.StatusConflict, codeBenchmarkImagesOnly},
+		{"images-only and unmeasurable audio views", benchmarkViewPartition{imagesOnly: 1, audioUnmeasurable: 1}, http.StatusConflict, codeBenchmarkImagesOnly},
 		{"no view skipped", benchmarkViewPartition{}, http.StatusConflict, codeBenchmarkImagesOnly},
 		{"an unreadable view beside an audio-only one", benchmarkViewPartition{audioOnly: 1, unreadable: 1}, http.StatusInternalServerError, codeBenchmarkRequestFailed},
+		{"an unreadable view beside an unmeasurable audio one", benchmarkViewPartition{audioUnmeasurable: 1, unreadable: 1}, http.StatusInternalServerError, codeBenchmarkRequestFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
@@ -876,25 +882,37 @@ func TestStartBenchmarkApplicationScopeSkipsAnAudioOnlyChild(t *testing.T) {
 	f.assertOneSpecReadEach(t, "ra_audio")
 }
 
-// A scope whose every view serves only speech has nothing to measure: 409
-// benchmark.audio_only, nothing reserved, no chat prompt. A mapping scope's
-// single view gets exactly that answer, for an agent child (its spec read once)
-// and for a non-agent application's mapping (no spec to read).
+// A scope whose every view serves only speech, none with a speech or
+// transcription verdict, has nothing to measure: a speed, capacity or both run
+// answers 409 benchmark.speech_unavailable with the audio message (it cannot
+// measure their audio yet), and the vision probe, which would send them a chat
+// prompt, 409 benchmark.audio_only. Either way nothing is reserved and no chat
+// prompt is sent. A mapping scope's single view gets exactly that answer, for an
+// agent child (its spec read once) and for a non-agent application's mapping (no
+// spec to read).
 func TestStartBenchmarkRefusesAnAudioOnlyScope(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		path      string
+		code, msg string
 		specReads map[string]int
 	}{
-		{"application scope of non-agent mappings", "/api/portal/applications/ra_audioapp/benchmark?mode=speed", map[string]int{"ra_ext": 0, "ra_ext2": 0}},
-		{"mapping scope, non-agent mapping", "/api/portal/mappings/ra_ext/benchmark?mode=speed", map[string]int{"ra_ext": 0}},
-		{"mapping scope, agent child", "/api/portal/mappings/ra_audio/benchmark?mode=speed", map[string]int{"ra_audio": 1}},
+		{"application scope of non-agent mappings", "/api/portal/applications/ra_audioapp/benchmark?mode=speed", codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable, map[string]int{"ra_ext": 0, "ra_ext2": 0}},
+		{"mapping scope, non-agent mapping", "/api/portal/mappings/ra_ext/benchmark?mode=speed", codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable, map[string]int{"ra_ext": 0}},
+		{"mapping scope, agent child", "/api/portal/mappings/ra_audio/benchmark?mode=speed", codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable, map[string]int{"ra_audio": 1}},
+		{"mapping scope, capacity", "/api/portal/mappings/ra_ext/benchmark?mode=capacity", codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable, map[string]int{"ra_ext": 0}},
+		{"mapping scope, both", "/api/portal/mappings/ra_audio/benchmark?mode=both", codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable, map[string]int{"ra_audio": 1}},
+		{"mapping scope, the vision probe", "/api/portal/mappings/ra_audio/benchmark?mode=vision", codeBenchmarkAudioOnly, msgBenchmarkAudioOnly, map[string]int{"ra_audio": 1}},
+		{"application scope, the vision probe", "/api/portal/applications/ra_audioapp/benchmark?mode=vision", codeBenchmarkAudioOnly, msgBenchmarkAudioOnly, map[string]int{"ra_ext": 0, "ra_ext2": 0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRefusalFixture(t)
 			f.addAudioOnlyMappings(t)
-			if status, code, _ := f.post(t, tc.path); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
-				t.Fatalf("status = %d code = %q, want 409 %s", status, code, codeBenchmarkAudioOnly)
+			status, code, body := f.post(t, tc.path)
+			var errBody apierror.Body
+			_ = json.Unmarshal(body, &errBody)
+			if status != http.StatusConflict || code != tc.code || errBody.Error.Message != tc.msg {
+				t.Fatalf("answer = %d %q %q, want 409 %s %q", status, code, errBody.Error.Message, tc.code, tc.msg)
 			}
 			f.assertNothingReserved(t)
 			for mappingID, want := range tc.specReads {

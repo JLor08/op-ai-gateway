@@ -1131,3 +1131,231 @@ func TestAudioHistoryDecodesIntoThePortalDTO(t *testing.T) {
 		t.Fatalf("ramp payload %s decodes to %+v", ramp, dto)
 	}
 }
+
+// TestAChatModelWithAnAudioVerdictKeepsItsTextBenchmark: a mapping that serves chat (a text
+// flavor) is a chat model even when it carries a speech or transcription verdict as well -- an
+// omni model that also transcribes, say -- so the speed, capacity and both modes measure it
+// with the text benchmark exactly as before, and never read its capability rows for it. The
+// same verdict on a mapping that serves audio only makes it an audio target.
+func TestAChatModelWithAnAudioVerdictKeepsItsTextBenchmark(t *testing.T) {
+	yes := routing.CapabilityYes
+	transcriber := []routing.CapabilityRow{sbCap(routing.CapabilityTranscription, yes, audioFixtureNow), sbCap(routing.CapabilityAudio, yes, audioFixtureNow)}
+	speaker := []routing.CapabilityRow{sbCap(routing.CapabilitySpeech, yes, audioFixtureNow), sbCap(routing.CapabilitySpeechStreaming, yes, audioFixtureNow)}
+	chatAndAudio := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}
+	audioOnly := []string{routing.APIFlavorOpenAIAudio}
+	for _, tc := range []struct {
+		name        string
+		agent       bool
+		appFlavors  []string
+		specFlavors []string
+		specType    routing.RuntimeSpecType
+		caps        []routing.CapabilityRow
+		wantRole    routing.ModelRole
+	}{
+		{"an omni model on a direct application", false, chatAndAudio, nil, "", transcriber, ""},
+		{"an omni model the agent runs", true, chatAndAudio, chatAndAudio, routing.RuntimeSpecTypeVLLM, transcriber, ""},
+		{"a speech model that also serves the messages API", false, []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAIAudio}, nil, "", speaker, ""},
+		{"a transcriber that serves audio only", false, audioOnly, nil, "", transcriber, routing.RoleASR},
+		{"an agent child narrowed to audio", true, chatAndAudio, audioOnly, routing.RuntimeSpecTypeVLLM, transcriber, routing.RoleASR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAudioFixture(t, audioFixtureOpts{agent: tc.agent, caps: tc.caps, features: []string{"runtime_manager"}})
+			ctx := context.Background()
+			f.app.APIFlavors = tc.appFlavors
+			if !tc.agent {
+				f.app.Type = routing.ProviderMock
+			}
+			if err := f.mem.UpdateApplication(ctx, f.app); err != nil {
+				t.Fatalf("UpdateApplication: %v", err)
+			}
+			if tc.agent {
+				spec, _, err := f.mem.RuntimeSpecByMapping(ctx, "map1")
+				if err != nil {
+					t.Fatalf("RuntimeSpecByMapping: %v", err)
+				}
+				spec.APIFlavors, spec.Type = tc.specFlavors, string(tc.specType)
+				if err := f.mem.UpsertRuntimeSpec(ctx, spec); err != nil {
+					t.Fatalf("UpsertRuntimeSpec: %v", err)
+				}
+			}
+			tgt, skipped, err := f.srv.benchmarkViewTarget(ctx, portal.BenchmarkTargetView{Server: f.server, App: f.app, Mapping: f.mapping(t)}, true)
+			if err != nil || skipped != "" || tgt.mapping.ID != "map1" || tgt.audio.role != tc.wantRole {
+				t.Fatalf("benchmarkViewTarget = role %q, skipped %q, err %v; want a target with role %q", tgt.audio.role, skipped, err, tc.wantRole)
+			}
+			if tc.wantRole != "" {
+				return
+			}
+			chat := newColdLister(nil)
+			f.srv.Provider = chat
+			run, ok := f.srv.Benchmarks.TryStart("srv1", "mapping", "speed", 1, time.Now().UTC(), func() {})
+			if !ok {
+				t.Fatal("TryStart did not start")
+			}
+			f.srv.runBenchmark(ctx, run, "srv1", []benchmarkTarget{tgt}, "speed")
+			if res := f.srv.Benchmarks.Status("srv1").Results; len(res) != 1 || res[0].Error != "" || res[0].GenTokensPerSecond == 0 || res[0].AudioRateX != 0 {
+				t.Fatalf("results = %+v, want one text speed result", res)
+			}
+			if rows := f.rows(t); len(rows["speed"]) != 1 || len(rows[benchmarkKindAudio]) != 0 {
+				t.Fatalf("history = %v, want one speed row and no audio row", rows)
+			}
+			if got := f.script.recorded(); len(got) != 0 {
+				t.Fatalf("audio measurements = %+v, want none", got)
+			}
+			if got := chat.streamedModels(); !slices.Contains(got, "m") {
+				t.Fatalf("streamed %v, want the chat prompt to m", got)
+			}
+		})
+	}
+}
+
+// audioPartitionStore fails, per mapping id, the three reads the speed, capacity and both
+// modes classify a view with: its runtime spec, its capability rows and its voices cache.
+type audioPartitionStore struct {
+	routing.Store
+	failSpec, failCaps, failVoices map[string]bool
+}
+
+func (s audioPartitionStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
+	if s.failSpec[mappingID] {
+		return routing.RuntimeSpec{}, false, errors.New("spec read down")
+	}
+	return s.Store.RuntimeSpecByMapping(ctx, mappingID)
+}
+
+func (s audioPartitionStore) MappingCapabilities(ctx context.Context, mappingID string) ([]routing.CapabilityRow, error) {
+	if s.failCaps[mappingID] {
+		return nil, errors.New("capability read down")
+	}
+	return s.Store.MappingCapabilities(ctx, mappingID)
+}
+
+func (s audioPartitionStore) ModelMappingCache(ctx context.Context, mappingID, cacheType string) ([]routing.ModelMappingCacheRow, error) {
+	if cacheType == routing.ModelMappingCacheVoices && s.failVoices[mappingID] {
+		return nil, errors.New("voices read down")
+	}
+	return s.Store.ModelMappingCache(ctx, mappingID, cacheType)
+}
+
+// TestAudioPartitionSortsEveryView covers every branch of the speed, capacity and both modes'
+// partition over one agent application: a chat child is a text target and a speech child an
+// audio target; an images-only child is skipped as images_only; a clone model without a
+// preset voice (speech_clone) and an audio child with no speech or transcription verdict
+// (audio_only) are skipped as audio the run cannot measure; and a child whose runtime spec,
+// capability rows or voices cache cannot be read is recorded with that read's error, in view
+// order. The vision probe's partition of the same views skips every audio-only child as
+// audio_only without reading its capability rows. With nothing runnable, a scope of
+// unmeasurable audio answers 409 benchmark.speech_unavailable with the audio message, one
+// with an unreadable view 500 benchmark.request_failed, and the vision probe 409
+// benchmark.audio_only.
+func TestAudioPartitionSortsEveryView(t *testing.T) {
+	withCapturedSlogAtTheDefaultLevel(t)
+	ctx := context.Background()
+	mem := routing.NewMemoryStore()
+	must := func(what string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	server := routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: audioFixtureNow, UpdatedAt: audioFixtureNow}
+	app := routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", TimeoutMS: 30000, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}, Status: routing.ServerStatusActive, CreatedAt: audioFixtureNow, UpdatedAt: audioFixtureNow}
+	must("CreateAIServer", mem.CreateAIServer(ctx, server))
+	must("CreateApplication", mem.CreateApplication(ctx, app))
+	yes := routing.CapabilityYes
+	clone := []routing.CapabilityRow{sbCap(routing.CapabilitySpeech, yes, audioFixtureNow), sbCap(routing.CapabilitySpeechClone, yes, audioFixtureNow)}
+	children := []struct {
+		id      string
+		flavors []string
+		caps    []routing.CapabilityRow
+	}{
+		{"p1_text", []string{routing.APIFlavorOpenAI}, nil},
+		{"p2_tts", []string{routing.APIFlavorOpenAIAudio}, ttsStreamingCaps()},
+		{"p3_img", []string{routing.APIFlavorOpenAIImages}, nil},
+		{"p4_clone", []string{routing.APIFlavorOpenAIAudio}, clone},
+		{"p5_none", []string{routing.APIFlavorOpenAIAudio}, nil},
+		{"p6_spec", []string{routing.APIFlavorOpenAIAudio}, ttsStreamingCaps()},
+		{"p7_caps", []string{routing.APIFlavorOpenAIAudio}, ttsStreamingCaps()},
+		{"p8_voices", []string{routing.APIFlavorOpenAIAudio}, clone},
+	}
+	views := map[string]portal.BenchmarkTargetView{}
+	for _, c := range children {
+		mp := routing.ModelMapping{ID: c.id, ApplicationID: app.ID, GatewayModelName: "gw-" + c.id, AppModelName: c.id, Status: routing.ServerStatusActive, CreatedAt: audioFixtureNow, UpdatedAt: audioFixtureNow}
+		must("CreateMapping "+c.id, mem.CreateMapping(ctx, mp))
+		must("UpsertRuntimeSpec "+c.id, mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "rs_" + c.id, MappingID: c.id, Enabled: true, Binary: "/opt/bin/server", Args: "[]", Env: "{}", HealthPath: "/health", APIFlavors: c.flavors, CreatedAt: audioFixtureNow, UpdatedAt: audioFixtureNow}))
+		if c.caps != nil {
+			must("UpsertMappingCapabilities "+c.id, mem.UpsertMappingCapabilities(ctx, c.id, c.caps))
+		}
+		views[c.id] = portal.BenchmarkTargetView{Server: server, App: app, Mapping: mp}
+	}
+	srv := &Server{
+		Routes:        audioPartitionStore{Store: mem, failSpec: map[string]bool{"p6_spec": true}, failCaps: map[string]bool{"p7_caps": true}, failVoices: map[string]bool{"p8_voices": true}},
+		Benchmarks:    NewBenchmarkRegistry(),
+		AgentFeatures: NewAgentFeaturesRegistry(),
+	}
+	scope := func(ids ...string) []portal.BenchmarkTargetView {
+		out := make([]portal.BenchmarkTargetView, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, views[id])
+		}
+		return out
+	}
+	all := scope("p1_text", "p2_tts", "p3_img", "p4_clone", "p5_none", "p6_spec", "p7_caps", "p8_voices")
+
+	t.Run("speed, capacity and both", func(t *testing.T) {
+		for _, mode := range []string{"speed", "capacity", "both"} {
+			p := srv.partitionBenchmarkViewsFor(ctx, all, mode)
+			if len(p.runnable) != 2 || p.runnable[0].mapping.ID != "p1_text" || p.runnable[0].audio.role != "" || p.runnable[1].mapping.ID != "p2_tts" || p.runnable[1].audio.role != routing.RoleTTS {
+				t.Fatalf("%s: runnable = %+v, want p1_text as text and p2_tts as a TTS target", mode, p.runnable)
+			}
+			want := []BenchmarkResult{
+				{MappingID: "p3_img", GatewayModelName: "gw-p3_img", Skipped: benchmarkSkippedImagesOnly},
+				{MappingID: "p4_clone", GatewayModelName: "gw-p4_clone", Skipped: benchmarkSkippedSpeechClone},
+				{MappingID: "p5_none", GatewayModelName: "gw-p5_none", Skipped: benchmarkSkippedAudioOnly},
+				{MappingID: "p6_spec", GatewayModelName: "gw-p6_spec", Error: benchmarkSpecUnreadable + "spec read down"},
+				{MappingID: "p7_caps", GatewayModelName: "gw-p7_caps", Error: "audio benchmark: capability unreadable; not benchmarked: capability read down"},
+				{MappingID: "p8_voices", GatewayModelName: "gw-p8_voices", Error: "audio benchmark: voices cache unreadable; not benchmarked: voices read down"},
+			}
+			if !reflect.DeepEqual(p.recorded, want) {
+				t.Fatalf("%s: recorded = %+v, want %+v", mode, p.recorded, want)
+			}
+			if p.unreadable != 3 || p.imagesOnly != 1 || p.audioUnmeasurable != 2 || p.audioOnly != 0 {
+				t.Fatalf("%s: counts = unreadable %d, images %d, unmeasurable %d, audio-only %d; want 3, 1, 2, 0", mode, p.unreadable, p.imagesOnly, p.audioUnmeasurable, p.audioOnly)
+			}
+		}
+	})
+	t.Run("the vision probe", func(t *testing.T) {
+		p := srv.partitionBenchmarkViewsFor(ctx, all, "vision")
+		if len(p.runnable) != 1 || p.runnable[0].mapping.ID != "p1_text" {
+			t.Fatalf("runnable = %+v, want p1_text alone", p.runnable)
+		}
+		if p.unreadable != 1 || p.imagesOnly != 1 || p.audioOnly != 5 || p.audioUnmeasurable != 0 {
+			t.Fatalf("counts = unreadable %d, images %d, audio-only %d, unmeasurable %d; want 1, 1, 5, 0", p.unreadable, p.imagesOnly, p.audioOnly, p.audioUnmeasurable)
+		}
+	})
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		ids       []string
+		status    int
+		code, msg string
+	}{
+		{"unmeasurable audio only", "speed", []string{"p4_clone", "p5_none"}, http.StatusConflict, codeBenchmarkSpeechUnavailable, msgBenchmarkAudioUnmeasurable},
+		{"unmeasurable audio beside an unreadable view", "both", []string{"p4_clone", "p7_caps"}, http.StatusInternalServerError, codeBenchmarkRequestFailed, msgBenchmarkRequestFailed},
+		{"unmeasurable audio beside an images-only view", "capacity", []string{"p3_img", "p5_none"}, http.StatusConflict, codeBenchmarkImagesOnly, msgBenchmarkImagesOnly},
+		{"audio-only views in the vision probe", "vision", []string{"p2_tts", "p5_none"}, http.StatusConflict, codeBenchmarkAudioOnly, msgBenchmarkAudioOnly},
+	} {
+		t.Run("nothing runnable: "+tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if !srv.partitionBenchmarkViewsFor(ctx, scope(tc.ids...), tc.mode).refuseNothingRunnableFor(rec, tc.mode) {
+				t.Fatal("refuseNothingRunnableFor = false, want a refusal")
+			}
+			var body struct {
+				Error struct{ Code, Message string } `json:"error"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			if rec.Code != tc.status || body.Error.Code != tc.code || body.Error.Message != tc.msg {
+				t.Fatalf("answer = %d %q %q, want %d %q %q", rec.Code, body.Error.Code, body.Error.Message, tc.status, tc.code, tc.msg)
+			}
+		})
+	}
+}

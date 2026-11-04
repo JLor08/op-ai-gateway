@@ -2007,10 +2007,13 @@ type ModelMappingDTO struct {
 	// AudioOnly is ImagesOnly's speech twin: the mapping's effective flavors
 	// (the same routing.EffectiveFields) are audio-only
 	// (routing.FlavorsAreAudioOnly), so the gateway refuses to send it a chat
-	// prompt and the portal can disable the same chat-prompt jobs up front. A
-	// list naming both non-text flavors is both. Advisory in the same way, and
-	// always present: false is sent, not omitted. Both markers come out of one
-	// spec read (mappingFlavorMarkers).
+	// prompt, and the portal can disable the jobs that would send one up front:
+	// the context probe and the vision benchmark (409 benchmark.audio_only).
+	// Its speed, capacity and both benchmarks measure its audio instead, when
+	// it has a speech or transcription verdict. A list naming both non-text
+	// flavors is both. Advisory in the same way, and always present: false is
+	// sent, not omitted. Both markers come out of one spec read
+	// (mappingFlavorMarkers).
 	AudioOnly bool `json:"audio_only"`
 }
 

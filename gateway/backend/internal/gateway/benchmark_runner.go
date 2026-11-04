@@ -121,11 +121,12 @@ type benchmarkTarget struct {
 	// audio benchmark's targets carry it the same way (benchmarkViewTarget): a clone model
 	// synthesizes the audio passage in that preset.
 	voice string
-	// audio marks a mapping with the speech or transcription capability whose speed,
+	// audio marks an audio-only mapping whose role is speech or transcription, whose speed,
 	// capacity and both runs measure its audio (measureAudioTarget) instead of sending it a
 	// chat prompt: its role and whether it streams. It is decided once, from the mapping's
-	// capability rows, by the view partition of those modes and by the scheduler
-	// (benchmarkViewTarget); the zero value is a text target.
+	// flavors and capability rows, by the view partition of those modes, the scheduler and
+	// the automatic audio run (benchmarkViewTarget); the zero value is a text target, which a
+	// mapping that serves chat stays even with a speech or transcription verdict.
 	audio audioTarget
 }
 
