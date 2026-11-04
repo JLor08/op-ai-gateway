@@ -90,11 +90,13 @@ export function servesAudio(row: AudioRow): boolean {
  * per-group server lists. They are offered only while some row serves audio:
  * for a text model they would be three columns of dashes. A cell's value is
  * the bare figure, so the columns sort as numbers, and an unmeasured cell's is
- * blank, so it sorts last.
+ * blank, so it sorts last. `defaultHidden` follows the list's other metric
+ * columns: the group view hides them all until chosen in the column menu.
  */
 export function audioMetricColumns<Row extends AudioRow>(
   t: Translation,
   rows: readonly Row[],
+  { defaultHidden = false }: { defaultHidden?: boolean } = {},
 ): ListColumn<Row>[] {
   const available = rows.some(servesAudio);
   return [
@@ -103,6 +105,7 @@ export function audioMetricColumns<Row extends AudioRow>(
       label: t.modelServersAudioRate,
       numeric: true,
       available,
+      defaultHidden,
       value: (r) => ((r.audio_rate_x ?? 0) > 0 ? String(r.audio_rate_x) : ''),
       render: (r) => formatAudioRate(r.audio_rate_x),
     },
@@ -111,6 +114,7 @@ export function audioMetricColumns<Row extends AudioRow>(
       label: t.modelServersAudioTtft,
       numeric: true,
       available,
+      defaultHidden,
       value: (r) => ((r.audio_ttfa_ms ?? 0) > 0 ? String(r.audio_ttfa_ms) : ''),
       render: (r) => formatAudioTtfa(r.audio_ttfa_ms),
     },
@@ -119,6 +123,7 @@ export function audioMetricColumns<Row extends AudioRow>(
       label: t.modelServersAudioConcurrency,
       numeric: true,
       available,
+      defaultHidden,
       value: (r) =>
         isAudioConcurrencyLimit(r.audio_concurrency_limit)
           ? String(r.audio_realtime_concurrency ?? 0)

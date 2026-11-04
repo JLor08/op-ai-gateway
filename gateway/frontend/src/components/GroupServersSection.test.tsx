@@ -2,13 +2,21 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, act, within } from '@testing-library/react';
+import { render, screen, cleanup, act, within, fireEvent, waitFor } from '@testing-library/react';
 import { GroupServersSection } from './GroupServersSection';
 import { messages, type Locale } from '../i18n';
 import type { GroupModelServerRow, ModelOption } from '../api';
 import type { PortalApi } from './shared/types';
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // The column menu's choices persist; each test starts from the default layout.
+  try {
+    window.localStorage.clear();
+  } catch {
+    /* jsdom/private-mode guard */
+  }
+});
 
 const group: ModelOption = {
   id: 'fast-group',
@@ -204,8 +212,38 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByRole('button', { name: t.listRowMenu })).toBeNull();
     });
 
+    // #340: the group view hides every metric column by default, and the
+    // audio ones like the rest: they are offered in the column menu while a
+    // member serves audio, and the default layout stays as it was.
+    it('hides the audio columns by default and offers them in the column menu', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? { ...r, audio_rate_x: 2.5, audio_concurrency_limit: 'performance' }
+          : r,
+      );
+      const api = makeApi({ modelGroupServers: vi.fn().mockResolvedValue(rows) });
+      render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
+      await screen.findByText('GPU-Box-A');
+      for (const label of [
+        t.modelServersAudioRate,
+        t.modelServersAudioTtft,
+        t.modelServersAudioConcurrency,
+      ]) {
+        expect(screen.queryByRole('columnheader', { name: label })).toBeNull();
+      }
+      fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+      for (const label of [
+        t.modelServersAudioRate,
+        t.modelServersAudioTtft,
+        t.modelServersAudioConcurrency,
+      ]) {
+        const box = screen.getByRole('checkbox', { name: label });
+        expect(box).not.toBeChecked();
+      }
+    });
+
     // #340: the group's audio members show the same audio columns as the
-    // per-model list, a lower bound as "≥ k".
+    // per-model list, a lower bound as "≥ k", once they are shown.
     it('shows the audio metrics of an audio member, a lower bound as "≥ k"', async () => {
       const rows = makeRows().map((r) =>
         r.mapping_id === 'map-a'
@@ -221,6 +259,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const api = makeApi({ modelGroupServers: vi.fn().mockResolvedValue(rows) });
       render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
       await screen.findByText('GPU-Box-A');
+      fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+      for (const label of [
+        t.modelServersAudioRate,
+        t.modelServersAudioTtft,
+        t.modelServersAudioConcurrency,
+      ]) {
+        fireEvent.click(screen.getByRole('checkbox', { name: label }));
+      }
+      fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
 
       const headers = screen.getAllByRole('columnheader').map((h) => h.textContent?.trim());
       const cell = (server: string, label: string) =>

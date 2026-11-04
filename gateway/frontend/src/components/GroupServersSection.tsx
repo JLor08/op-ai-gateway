@@ -132,8 +132,9 @@ export function GroupServersSection({
       render: (r) => (r.context_size > 0 ? String(r.context_size) : '-'),
       defaultHidden: true,
     },
-    // #340: the audio metrics, offered while a member serves audio.
-    ...audioMetricColumns(t, rows),
+    // #340: the audio metrics, offered while a member serves audio, and
+    // hidden by default like every other metric column of the group view.
+    ...audioMetricColumns(t, rows, { defaultHidden: true }),
     {
       id: 'maxConc',
       label: t.mappingMaxConcurrency,
