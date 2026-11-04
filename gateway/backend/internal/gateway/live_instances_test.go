@@ -44,6 +44,12 @@ const (
 	liveInstASRPlainUp   = "asr-plain"
 	liveInstChatMap      = "route-chat-inst"
 	liveInstChatUp       = "chat-up"
+	liveInstTTSSpec      = "spec-tts-inst"
+	liveInstTTSMap       = "route-tts-inst"
+	liveInstTTSUp        = "tts-up"
+	liveInstImgSpec      = "spec-img-inst"
+	liveInstImgMap       = "route-img-inst"
+	liveInstImgUp        = "img-up"
 )
 
 // routerRefusal is the error a fake agent router answers for an address.
@@ -54,13 +60,15 @@ type routerRefusal struct {
 
 // instanceAgentRouter is a test agent router. POST /live/{model} relays like an
 // audio.cpp /live child: one SSE delta per PCM read, transcript.text.done on a
-// clean end. POST /v1/chat/completions, /v1/responses and
-// /v1/audio/transcriptions answer for the model their body names. An address in
-// refuse answers its refusal with the router's error envelope instead; a live
-// refusal first reads refuseAfter bytes of the session's PCM, as a request the
-// transport had begun to send before the answer. A chat completion for an address
-// in stall answers only after that long, as a child still producing its first
-// token.
+// clean end. POST /v1/chat/completions, /v1/responses, /v1/audio/speech,
+// /v1/images/generations, and the multipart /v1/audio/transcriptions and
+// /v1/images/edits answer for the model their body names. An address in refuse
+// answers its refusal with the router's error envelope instead; a live refusal
+// first reads refuseAfter bytes of the session's PCM, as a request the transport
+// had begun to send before the answer. A chat completion for an address in stall
+// answers only after that long, as a child still producing its first token.
+// onArrive, when set, is called with every address as its request arrives, before
+// it is answered, so a test can look at the gateway while the request is in flight.
 type instanceAgentRouter struct {
 	server *httptest.Server
 
@@ -70,6 +78,14 @@ type instanceAgentRouter struct {
 	stall       map[string]time.Duration
 	served      []string       // every address a request arrived for, in order
 	liveBytes   map[string]int // PCM bytes each live address received
+	onArrive    func(model string)
+}
+
+// setOnArrive installs the arrival hook (see instanceAgentRouter).
+func (a *instanceAgentRouter) setOnArrive(hook func(model string)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.onArrive = hook
 }
 
 func (a *instanceAgentRouter) setStall(model string, d time.Duration) {
@@ -121,12 +137,17 @@ func (a *instanceAgentRouter) bytesFor(model string) int {
 	return a.liveBytes[model]
 }
 
-// arrive records model and answers its refusal, if it has one.
+// arrive records model, runs the arrival hook, and answers model's refusal, if it
+// has one.
 func (a *instanceAgentRouter) arrive(w http.ResponseWriter, model string) bool {
 	a.mu.Lock()
 	a.served = append(a.served, model)
 	ref, refused := a.refuse[model]
+	hook := a.onArrive
 	a.mu.Unlock()
+	if hook != nil {
+		hook(model)
+	}
 	if !refused {
 		return false
 	}
@@ -171,27 +192,59 @@ func (a *instanceAgentRouter) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"id":"resp_1","object":"response","model":%q,"output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`, body.Model)
 	case r.URL.Path == "/v1/audio/transcriptions":
-		model := ""
-		if mr, err := r.MultipartReader(); err == nil {
-			for {
-				part, err := mr.NextPart()
-				if err != nil {
-					break
-				}
-				if part.FormName() == "model" {
-					raw, _ := io.ReadAll(part)
-					model = string(raw)
-				}
-				_ = part.Close()
-			}
-		}
-		if a.arrive(w, model) {
+		if a.arrive(w, multipartModel(r)) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, transcriptionOKBody)
+	case r.URL.Path == "/v1/audio/speech":
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if a.arrive(w, body.Model) {
+			return
+		}
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write(speechTestWAV())
+	case r.URL.Path == "/v1/images/generations":
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if a.arrive(w, body.Model) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, imagesOKBody)
+	case r.URL.Path == "/v1/images/edits":
+		if a.arrive(w, multipartModel(r)) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, imagesOKBody)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// multipartModel is the model part of a multipart request body, "" without one.
+func multipartModel(r *http.Request) string {
+	model := ""
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return model
+	}
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			return model
+		}
+		if part.FormName() == "model" {
+			raw, _ := io.ReadAll(part)
+			model = string(raw)
+		}
+		_ = part.Close()
 	}
 }
 
@@ -290,7 +343,20 @@ func newInstanceRouterServerWith(t *testing.T, agent *instanceAgentRouter, cfg i
 		}
 	}
 	must("CreateAIServer", routes.CreateAIServer(ctx, routing.AIServer{ID: liveInstServer, Name: "Instances", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: agent.server.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}))
-	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, Priority: 10, Weight: 50, TimeoutMS: 30000, AdmissionQueueTimeoutSeconds: cfg.queueTimeoutSecs, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, AdmissionQueueTimeoutSeconds: cfg.queueTimeoutSecs, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	// tts-inst (speech) and img-inst (image generation and edit), replicable alike.
+	for _, m := range []struct {
+		mapping, spec, model, up, flavor, capability string
+	}{
+		{liveInstTTSMap, liveInstTTSSpec, "tts-inst", liveInstTTSUp, routing.APIFlavorOpenAIAudio, routing.CapabilitySpeech},
+		{liveInstImgMap, liveInstImgSpec, "img-inst", liveInstImgUp, routing.APIFlavorOpenAIImages, routing.CapabilityImage},
+	} {
+		must("CreateMapping "+m.model, routes.CreateMapping(ctx, routing.ModelMapping{ID: m.mapping, ApplicationID: "app-live-inst", GatewayModelName: m.model, AppModelName: m.up, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+		must("UpsertMappingCapabilities "+m.model, routes.UpsertMappingCapabilities(ctx, m.mapping, []routing.CapabilityRow{
+			{Capability: m.capability, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		}))
+		must("UpsertRuntimeSpec "+m.model, routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: m.spec, MappingID: m.mapping, Enabled: true, Binary: "/usr/bin/" + m.up, Args: "[]", Env: "{}", APIFlavors: []string{m.flavor}, Replicable: cfg.replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
+	}
 	must("CreateMapping asr", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstASRMap, ApplicationID: "app-live-inst", GatewayModelName: "asr-inst", AppModelName: liveInstASRUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("CreateMapping chat", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstChatMap, ApplicationID: "app-live-inst", GatewayModelName: "chat-inst", AppModelName: liveInstChatUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertMappingCapabilities", routes.UpsertMappingCapabilities(ctx, liveInstASRMap, []routing.CapabilityRow{
@@ -702,8 +768,9 @@ func postInstanceJSON(t *testing.T, srv *Server, path, body string) *httptest.Re
 // A request routed to instance m#2, which the agent retired a moment after the
 // telemetry that reported it running, is re-selected once, excluding that
 // instance, and served by instance 0: the client never sees the agent's refusal,
-// and the one usage row is the served attempt's. Every agent refusal that means
-// "this instance is gone" qualifies, on every relay.
+// the one usage row is the served attempt's, and while instance 0 serves it the
+// gone instance no longer counts it. Every agent refusal that means "this
+// instance is gone" qualifies.
 func TestVanishedInstanceReselectedOnce(t *testing.T) {
 	const chatBody = `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`
 	cases := []struct {
@@ -724,6 +791,12 @@ func TestVanishedInstanceReselectedOnce(t *testing.T) {
 			srv := newInstanceRouterServer(t, agent, true)
 			publishChatInstances(srv, 2)
 			agent.setRefusal("chat-up#2", tc.status, tc.code)
+			inFlightOnGone := -1
+			agent.setOnArrive(func(model string) {
+				if model == liveInstChatUp {
+					inFlightOnGone = srv.Active.InstanceActivity("route-chat-inst#2")
+				}
+			})
 
 			rec := postInstanceJSON(t, srv, tc.path, tc.body)
 			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), tc.wantBody) {
@@ -736,8 +809,8 @@ func TestVanishedInstanceReselectedOnce(t *testing.T) {
 			if len(rows) != 1 || rows[0].Status != "success" || rows[0].RouteID != liveInstChatMap {
 				t.Fatalf("usage rows = %+v, want one success row for %s", rows, liveInstChatMap)
 			}
-			if n := srv.Active.InstanceActivity("route-chat-inst#2"); n != 0 {
-				t.Fatalf("in flight on the vanished instance = %d, want 0", n)
+			if inFlightOnGone != 0 {
+				t.Fatalf("in flight on the vanished instance while instance 0 served = %d, want 0", inFlightOnGone)
 			}
 		})
 	}
@@ -895,9 +968,7 @@ func TestVanishedInstanceReselectedOnlyOnce(t *testing.T) {
 		agent.setRefusal("chat-up#3", http.StatusConflict, "runtime.instance_no_capacity")
 
 		rec := postInstanceJSON(t, srv, "/v1/chat/completions", `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`)
-		if rec.Code == http.StatusOK {
-			t.Fatalf("status 200, want the second refusal answered; body %s", rec.Body.String())
-		}
+		requireGoneAnswered(t, srv, rec)
 		if served := agent.servedModels(); len(served) != 2 {
 			t.Fatalf("addresses served = %v, want two attempts and no third", served)
 		}
@@ -909,13 +980,24 @@ func TestVanishedInstanceReselectedOnlyOnce(t *testing.T) {
 		agent.setRefusal("chat-up", http.StatusNotFound, "runtime.model_not_managed")
 
 		rec := postInstanceJSON(t, srv, "/v1/chat/completions", `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`)
-		if rec.Code == http.StatusOK {
-			t.Fatalf("status 200, want the refusal answered; body %s", rec.Body.String())
-		}
+		requireGoneAnswered(t, srv, rec)
 		if served := agent.servedModels(); !slices.Equal(served, []string{"chat-up"}) {
 			t.Fatalf("addresses served = %v, want instance 0 once", served)
 		}
 	})
+}
+
+// requireGoneAnswered requires the answer a chat completion gets for an agent
+// refusal it is not re-selected off -- the gateway's 502 provider.unavailable, not
+// the agent's code -- and the one error row that records it.
+func requireGoneAnswered(t *testing.T, srv *Server, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "provider.unavailable") || strings.Contains(rec.Body.String(), "runtime.") {
+		t.Fatalf("status %d body %s; want 502 provider.unavailable without the agent's code", rec.Code, rec.Body.String())
+	}
+	if rows := srv.Usage.All(); len(rows) != 1 || rows[0].Status != "error" || rows[0].ErrorCode != "provider.unavailable" || rows[0].RouteID != liveInstChatMap {
+		t.Fatalf("usage rows = %+v, want one error row provider.unavailable for %s", rows, liveInstChatMap)
+	}
 }
 
 // A buffered transcription sent to a vanished instance is re-selected too, and

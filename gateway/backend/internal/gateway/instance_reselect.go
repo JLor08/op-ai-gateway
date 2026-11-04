@@ -22,6 +22,30 @@ import (
 // refusal. Instance 0 is never re-selected: its address is the one every mapping has
 // always sent, and the agent's refusal of it is an answer about the model, not about
 // a vanished instance.
+//
+// Every path that re-selects -- the buffered and streamed translate paths, every relay
+// through proxyNative (passthrough, speech, images, image edit, transcription) and the
+// bearer live session -- does it the same way:
+//
+//  1. The once-rule decides (reselectable): the lost target is an instance k >= 1 and
+//     the request carries no exclusion yet. A request that already lost an instance is a
+//     re-selection, which is never re-selected again.
+//  2. The lost attempt leaves the instance before anything is selected again: its
+//     active-request row is removed -- and a live session lets its live slot go first --
+//     which frees the attempt's count on the instance and on its server and wakes a
+//     request parked in the admission queue for that server. The re-selection may itself
+//     park (every other instance busy); it then waits for capacity like any request, not
+//     behind its own attempt, which no longer runs anywhere.
+//  3. The request is resolved again with the instance excluded (withLostInstance) and
+//     registered on the instance it is sent to.
+//
+// A request that cannot move off a gone instance -- it was re-selected already, or the
+// instance it was re-selected onto is one its relay cannot take, or its session's audio
+// can no longer be replayed -- is answered with the gateway's own error for the refusal
+// (goneError: provider.unavailable, the code a chat completion gets for it), never the
+// agent router's envelope, whose runtime.* codes are the agent's internals. One whose
+// re-resolve is refused by routing (no host left, a full or timed-out queue) gets that
+// routing answer.
 
 // isInstanceGoneError reports whether err is the agent router's refusal of an
 // instance address it does not serve: 404 runtime.model_not_managed (the address is
@@ -45,12 +69,18 @@ func isInstanceGoneError(err error) bool {
 	return false
 }
 
-// reselectsLostInstance reports whether a request that failed with err on target is
-// re-selected: target is instance k >= 1, err says that instance is gone, and the
-// request has not been re-selected already -- a request carrying an exclusion is a
+// reselectable is the once-rule every re-selecting path applies: a request whose
+// attempt on target found the instance gone moves to another instance only when target
+// is an instance k >= 1 and req carries no exclusion yet -- a request carrying one is a
 // re-selection, which is never re-selected again.
+func reselectable(target routing.Target, req inference.Request) bool {
+	return target.Instance() >= 1 && len(req.ExcludeInstanceKeys) == 0
+}
+
+// reselectsLostInstance reports whether a request that failed with err on target is
+// re-selected: the once-rule allows it (reselectable) and err says the instance is gone.
 func reselectsLostInstance(target routing.Target, req inference.Request, err error) bool {
-	return target.Instance() >= 1 && len(req.ExcludeInstanceKeys) == 0 && isInstanceGoneError(err)
+	return reselectable(target, req) && isInstanceGoneError(err)
 }
 
 // withLostInstance returns req with lost's instance, found gone, added to the instances
@@ -69,10 +99,9 @@ const instanceGonePeekBytes = 4 << 10
 // agent router's refusal of a gone instance (isInstanceGoneError). Only a 404 or 409
 // is read at all. An answer that is not such a refusal gets what was read put back in
 // front of the rest of its body, so it relays exactly as it arrived. One that is gets
-// its whole envelope -- a single short line, already read -- as an in-memory body, and
-// its connection is released at once: the request moves on to another attempt, which
-// must not hold this one open, and the refusal can still be relayed if no other
-// attempt is found.
+// its whole envelope -- a single short line, already read -- as an in-memory body
+// (which goneError reads), and its connection is released at once: the request moves
+// on to another attempt, which must not hold this one open.
 func peekInstanceGone(resp *provider.ProxyResponse) bool {
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusConflict {
 		return false
@@ -89,15 +118,21 @@ func peekInstanceGone(resp *provider.ProxyResponse) bool {
 	return true
 }
 
+// goneError is the error a gone instance's refusal resp maps to, once peekInstanceGone
+// has recognised it: the router's code kept as a *provider.RouterError, whose status
+// maps to provider.unavailable -- what the gateway answers for it (completionErrorCode)
+// when the request cannot move to another instance, exactly as a chat completion's
+// refusal is answered. It reads the envelope peekInstanceGone left in memory.
+func goneError(resp *provider.ProxyResponse) error {
+	body, _ := io.ReadAll(resp.Body)
+	return provider.RouterStatusError(resp.StatusCode, body)
+}
+
 // relayAgain is the nativeRelay reselect hook of a caller whose path always answers:
-// it runs again(req with lost's instance excluded) and reports true. nil when req is
-// itself a re-selection, which is never re-selected again.
-func relayAgain(req inference.Request, again func(inference.Request)) func(lost routing.Target) bool {
-	if len(req.ExcludeInstanceKeys) > 0 {
-		return nil
-	}
-	return func(lost routing.Target) bool {
+// it runs again(req with lost's instance excluded), whose resolve, relay and usage row
+// are the request's from then on.
+func relayAgain(req inference.Request, again func(inference.Request)) func(lost routing.Target, gone error) {
+	return func(lost routing.Target, _ error) {
 		again(withLostInstance(req, lost))
-		return true
 	}
 }

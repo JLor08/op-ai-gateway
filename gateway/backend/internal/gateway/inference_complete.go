@@ -75,10 +75,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	resp, err := s.Provider.Complete(provCtx, target, providerReq)
 	if err != nil && reselectsLostInstance(target, req, err) {
 		// The instance is gone (see instance_reselect.go): nothing has been written
-		// to the client and nothing recorded, so the request starts over on another
-		// instance -- re-resolved, re-registered, and recorded once, as the attempt
-		// that answers. Removed from the active registry first, so the lost
-		// instance's in-flight count is free before the selection reads it.
+		// to the client and nothing recorded. The attempt leaves the instance first --
+		// its active row removed, which frees its count on the instance and its server
+		// and wakes a request parked for that server, so a re-resolve that parks does
+		// not wait behind this attempt -- and the request starts over with the
+		// instance excluded: re-resolved, registered on the instance it lands on, and
+		// recorded once, as the attempt that answers. The once-rule keeps that second
+		// run from being re-selected again.
 		slog.Info("inference: the routed instance is gone; re-selecting once", "path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "instance", target.InstanceKey, "err", err)
 		s.Active.Remove(id)
 		s.complete(w, r, token, withLostInstance(req, target), raw, render)

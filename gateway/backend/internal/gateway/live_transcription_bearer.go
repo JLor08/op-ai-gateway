@@ -195,10 +195,11 @@ func liveParamsFromQuery(q url.Values) liveParams {
 //     copy goroutine, counting the payload and latching a clean end-of-input (r.Body's EOF,
 //     the terminating chunk) versus a truncated one (any other read error);
 //   - ONE re-selection of an instance k >= 1 the agent refuses as gone (see
-//     instance_reselect.go): the session moves to another instance -- its slot, its
-//     active-request row and its billing with it -- and the new attempt is sent the
-//     session's audio from its first byte (liveFeed.restart), so the client never sees
-//     the refusal;
+//     instance_reselect.go): the session leaves the instance -- its slot and its
+//     active-request row -- moves to another instance with its billing, and the new
+//     attempt is sent the session's audio from its first byte (liveFeed.restart), so the
+//     client never sees the refusal; a session that cannot move is answered with the
+//     gateway's error instead;
 //   - for a client that sent Expect: 100-continue, an explicit 100 Continue written before the
 //     success response, so the SSE 200 can never reach it ahead of its 100 Continue (see
 //     sendContinue and #333);
@@ -251,6 +252,13 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	register()
 	// The slot is released before the row is removed: removing the row is what wakes a
 	// session parked in the admission queue for this server, and it must find the slot free.
+	// leave does both for an attempt whose instance is gone, before the session is
+	// selected again (reselectLiveSession); the deferred one then finds the slot let go.
+	leave := func() {
+		sess.release()
+		sess.release = func() {}
+		s.Active.Remove(id)
+	}
 	defer func() {
 		sess.release()
 		s.Active.Remove(id)
@@ -315,7 +323,7 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	// read; it applies no target.Timeout (the deadline is ctx's).
 	resp, upErr = s.proxyLiveDuplex(ctx, sess.target, params, feed.body())
 	if upErr == nil && sess.target.Instance() >= 1 && peekInstanceGone(resp) {
-		resp, upErr = s.reselectLiveSession(ctx, sess, feed, params, resp, register)
+		resp, upErr = s.reselectLiveSession(ctx, sess, feed, params, resp, register, leave)
 	}
 	target := sess.target
 	if upErr != nil {
@@ -374,35 +382,53 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 }
 
 // reselectLiveSession moves a session whose instance k >= 1 refused it as gone (resp, read
-// by peekInstanceGone) to another instance, once, and returns the new attempt's answer. The
-// selection excludes the lost instance and takes the new instance's slot
+// by peekInstanceGone) to another instance under the once-rule, and returns the new
+// attempt's answer -- the steps every re-selecting path takes (instance_reselect.go). The
+// lost attempt leaves the instance first (leave: its live slot let go, then its
+// active-request row removed, which wakes a session parked for that server), so the
+// selection that follows -- which may park -- waits for capacity, not behind its own
+// attempt. The selection excludes the lost instance and takes the new instance's slot
 // (acquireLiveSession); the feed then starts the new attempt with the session's audio from
-// its first byte. Only then is the old attempt let go: its slot released, its answer
-// closed, the session's active-request row moved (register) -- in that order, so the lost
-// instance's count is never read while it still holds the session. When there is nowhere
-// to go -- no other instance, or audio the feed could no longer keep -- the session stays
-// as it was and resp, the refusal, is returned to be relayed.
-func (s *Server) reselectLiveSession(ctx context.Context, sess *liveSession, feed *liveFeed, params liveParams, resp *provider.ProxyResponse, register func()) (*provider.ProxyResponse, error) {
+// its first byte, and the session's row is registered on the new instance.
+//
+// The session ends with the gateway's own answer, never the agent's refusal, when it
+// cannot move: a re-selection that routing refuses gets that refusal (no host left, every
+// slot held with no queue, a queue timeout); a session already re-selected once, audio
+// the feed could no longer keep, or a new instance that turns out to be gone too gets the
+// refusal's gateway error (goneError). Its row is then registered back on the instance
+// that refused it, which its usage row is billed to.
+func (s *Server) reselectLiveSession(ctx context.Context, sess *liveSession, feed *liveFeed, params liveParams, resp *provider.ProxyResponse, register, leave func()) (*provider.ProxyResponse, error) {
+	gone := goneError(resp)
+	_ = resp.Body.Close()
 	lost := sess.target
+	if !reselectable(lost, sess.req) {
+		return nil, gone
+	}
+	leave()
 	req := withLostInstance(sess.req, lost)
 	token := sess.token
 	target, release, err := s.acquireLiveSession(ctx, &token, req)
 	if err != nil {
 		slog.Warn("bearer live transcription: the routed instance is gone and re-selection failed", "model", lost.Model, "instance", lost.InstanceKey, "err", err)
-		return resp, nil
+		register()
+		return nil, err
 	}
 	body, ok := feed.restart()
 	if !ok {
 		release()
 		slog.Warn("bearer live transcription: the routed instance is gone and the session's audio can no longer be replayed", "model", lost.Model, "instance", lost.InstanceKey)
-		return resp, nil
+		register()
+		return nil, gone
 	}
 	slog.Info("bearer live transcription: the routed instance is gone; re-selected once", "model", lost.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
-	_ = resp.Body.Close()
-	sess.release()
 	sess.token, sess.req, sess.target, sess.release = token, req, target, release
 	register()
-	return s.proxyLiveDuplex(ctx, target, params, body)
+	next, err := s.proxyLiveDuplex(ctx, target, params, body)
+	if err == nil && target.Instance() >= 1 && peekInstanceGone(next) {
+		// Gone too: the once-rule allows no further move.
+		return nil, goneError(next)
+	}
+	return next, err
 }
 
 // requestExpectsContinue reports whether Go's server will answer this request's first body read
