@@ -135,7 +135,12 @@ func TestVoicePerTurnLegCarriesRealtime(t *testing.T) {
 		if got := rec.requests(); got[0] != "/v1/audio/transcriptions/live 1" {
 			t.Fatalf("turn loopback = %q, want a marked /v1/audio/transcriptions/live", got)
 		}
-		errFrame := readVoiceUntil(t, ctx, conn, voiceDownError)
+		var errFrame voiceDownMsg
+		for errFrame.Type != voiceDownError {
+			if errFrame, _ = readVoiceFrame(t, ctx, conn); errFrame.Type == voiceDownASRPartial {
+				t.Fatal("the turn was transcribed: /v1 did not hold its ASR loopback to real time")
+			}
+		}
 		if errFrame.Code != voiceChatNoRealtimeModel || errFrame.Message == "" {
 			t.Fatalf("error frame = code %q message %q, want /v1's %s for a model measured too slow", errFrame.Code, errFrame.Message, voiceChatNoRealtimeModel)
 		}
