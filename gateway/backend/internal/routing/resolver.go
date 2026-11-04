@@ -844,6 +844,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// nothing for any request that reaches here now; it keeps the voice contract
 	// intact should that guard ever be lifted.
 	keepPin := false
+	// start is when this request's admission began: the queue deadline below counts from
+	// it however long the pinned pass waited before handing the request on.
+	start := admissionStart(req, now)
 	if token.ID != "" && req.RequiredVoice == "" {
 		target, ok, err := r.resolveAffinity(ctx, token, key, req, now)
 		switch {
@@ -859,6 +862,10 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 			r.reservation.touch(target.ServerID, affinityID(key), now)
 			return target, nil
 		}
+		// The pinned pass may have parked before it passed the pin over: the fresh
+		// selection judges caps and session reservations, and dates the pin it writes, at
+		// the time the request woke, not the time it parked.
+		now = r.clock()
 	}
 
 	candidates, err := r.store.ActiveMappingsForModel(ctx, req.Model, apiFlavor)
@@ -948,7 +955,7 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// start, or an earlier one the caller resolved for the same client call.
 	var deadline time.Time
 	if queueTimeout > 0 {
-		deadline = admissionStart(req, now).Add(queueTimeout)
+		deadline = start.Add(queueTimeout)
 	}
 
 	for {

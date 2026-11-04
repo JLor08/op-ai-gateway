@@ -584,6 +584,76 @@ func TestPinnedParkRechecksThePinnedServer(t *testing.T) {
 	})
 }
 
+// A pin passed over after its request waited hands the fresh selection the time the
+// request woke, not the time it parked: the pin the fresh selection writes counts its
+// lifetime from then. The queue deadline stays counted from the admission start, so a
+// fresh selection that parks again waits only for what is left of it.
+func TestPinnedParkPassOverSelectsAtTheTimeItWoke(t *testing.T) {
+	// setup pins live sessions to srv_inst, whose every live slot is held, beside srv_b
+	// (map_b, instance-capable, its one slot held when srvBHeld), both applications with
+	// a 30 s queue timeout. Each wait lasts 10 s; the first takes srv_inst down, a later
+	// one frees srv_b's slot.
+	setup := func(t *testing.T, srvBHeld bool) (*MemoryStore, *Resolver, *fakeAdmission) {
+		t.Helper()
+		now := instanceCapacityNow
+		store := pinnedInstanceStore(t, now)
+		serveAudioOn(t, store, "srv_b")
+		for _, appID := range []string{"app_inst", "app_srv_b"} {
+			app, err := store.ApplicationByID(context.Background(), appID)
+			if err != nil {
+				t.Fatalf("ApplicationByID %s: %v", appID, err)
+			}
+			app.AdmissionQueueTimeoutSeconds = 30
+			if err := store.UpdateApplication(context.Background(), app); err != nil {
+				t.Fatalf("UpdateApplication %s: %v", appID, err)
+			}
+		}
+		seedPinFor(t, store, now, audioPinKey, "srv_inst", 0)
+		clock := now
+		r, _, _ := pinnedResolver(store, now, InstanceView{}, map[string]int{})
+		r.clock = func() time.Time { return clock }
+		r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{
+			"map_inst": {Replicable: true, Parallelism: 1, Running: []int{1}},
+			"map_b":    {Replicable: true, Parallelism: 1},
+		}})
+		slots := &fakeLiveSlots{held: map[string]bool{"map_inst#0": true, "map_inst#1": true, "map_b#0": srvBHeld}}
+		r.SetLiveSlotChecker(slots)
+		adm := &fakeAdmission{onWait: func(call int) error {
+			clock = clock.Add(10 * time.Second)
+			if call == 1 {
+				return store.SetServerHealth(context.Background(), "srv_inst", HealthUnhealthy)
+			}
+			slots.held["map_b#0"] = false
+			return nil
+		}}
+		r.SetAdmissionController(adm)
+		return store, r, adm
+	}
+
+	t.Run("the fresh pin counts from the wake", func(t *testing.T) {
+		store, r, adm := setup(t, false)
+		target, err := r.Resolve(context.Background(), pinnedToken, liveRequest("qwen-coder"))
+		if err != nil || target.InstanceKey != "map_b#0" || adm.calls != 1 {
+			t.Fatalf("Resolve = %q, %v after %d waits; want the fresh selection's map_b#0 after 1", target.InstanceKey, err, adm.calls)
+		}
+		woke := instanceCapacityNow.Add(10 * time.Second)
+		aff := storedPinFor(t, store, audioPinKey)
+		if aff.ServerID != "srv_b" || !aff.CreatedAt.Equal(woke) || !aff.ExpiresAt.Equal(woke.Add(1800*time.Second)) {
+			t.Fatalf("pin = %q created %v expiring %v; want srv_b created %v expiring 30m later", aff.ServerID, aff.CreatedAt, aff.ExpiresAt, woke)
+		}
+	})
+	t.Run("the deadline counts from the admission start", func(t *testing.T) {
+		_, r, adm := setup(t, true)
+		target, err := r.Resolve(context.Background(), pinnedToken, liveRequest("qwen-coder"))
+		if err != nil || target.InstanceKey != "map_b#0" {
+			t.Fatalf("Resolve = %q, %v; want map_b#0 once its slot freed", target.InstanceKey, err)
+		}
+		if adm.calls != 2 || adm.gotTimeout != 20*time.Second {
+			t.Fatalf("WaitForSlot calls %d, last for %v; want 2, the last for the 20s left of the deadline", adm.calls, adm.gotTimeout)
+		}
+	})
+}
+
 // A pinned request that parked refreshes its pin only while the row is still the
 // one it was served from: a pin that another request repointed, or that was
 // deleted, while it waited is left as it is now.
