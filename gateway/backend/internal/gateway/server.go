@@ -494,6 +494,15 @@ type Server struct {
 	// one instance index at the same time. Built in New; a bare &Server{} leaves
 	// it nil, which holds nothing.
 	instanceClaims *instanceClaims
+	// runtimeStarts counts the portal's manual starts whose ensure runs in the
+	// background (runtime_actions.go); each ends with the server's lifetime
+	// (baseCtx) at the latest. runtimeStartWindow and runtimeStartVisibleWait
+	// are the start's early-answer window and how long a started instance's
+	// index stays claimed waiting for the agent to report it; 0 (a bare
+	// &Server{}, and New) means the defaults, and a test shortens them.
+	runtimeStarts           sync.WaitGroup
+	runtimeStartWindow      time.Duration
+	runtimeStartVisibleWait time.Duration
 	// voiceTickets mints and redeems the Voice Chat tickets (voice_chat_ticket.go): the
 	// authenticated, CSRF-protected ticket POST mints one after the co-load gate, the
 	// WebSocket upgrade redeems it. Built in New with a fresh per-process key; a bare

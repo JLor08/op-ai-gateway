@@ -578,18 +578,25 @@ func (s *instanceScaler) candidate(ctx context.Context, c routing.MappingCandida
 		slog.Debug("instance scaler: building the instance's target failed", "mapping_id", c.Mapping.ID, "err", err)
 		return scaleCandidate{}, false
 	}
-	startup := time.Duration(spec.StartupTimeoutSeconds) * time.Second
-	if startup <= 0 {
-		startup = agentDefaultStartupTimeout
-	}
 	return scaleCandidate{
 		key:         key,
 		mapping:     c.Mapping,
 		index:       k,
 		parallelism: max(view.Parallelism, 1),
-		timeout:     startup + instanceEnsureMargin,
+		timeout:     instanceEnsureTimeout(spec),
 		target:      target,
 	}, true
+}
+
+// instanceEnsureTimeout bounds an ensure of an instance of spec: its startup
+// timeout (the agent's default when it sets none) plus instanceEnsureMargin.
+// The scaler's ensure and the portal's manual start are bounded alike.
+func instanceEnsureTimeout(spec routing.RuntimeSpec) time.Duration {
+	startup := time.Duration(spec.StartupTimeoutSeconds) * time.Second
+	if startup <= 0 {
+		startup = agentDefaultStartupTimeout
+	}
+	return startup + instanceEnsureMargin
 }
 
 // atInstanceCeiling reports whether the spec view describes is at a ceiling, counting
