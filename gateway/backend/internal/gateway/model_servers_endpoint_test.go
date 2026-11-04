@@ -697,3 +697,32 @@ func TestModelServersRowCountsRunningInstancesWithoutModelProbe(t *testing.T) {
 		}
 	}
 }
+
+// TestModelServersRowCarriesReplicable pins the row's replicable flag: the
+// stored flag of the mapping's runtime spec, always on the wire, so the
+// portal can show the running-instance count of a replicable spec even while
+// one instance runs. A spec that is not replicable, and a mapping without a
+// spec, read false.
+func TestModelServersRowCarriesReplicable(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	if got := fetchModelServersRow(t, s, "a mapping without a spec"); string(got["replicable"]) != "false" {
+		t.Fatalf("a mapping without a spec: replicable = %s, want false on the wire", got["replicable"])
+	}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for _, replicable := range []bool{true, false} {
+		if err := s.Routes.UpsertRuntimeSpec(context.Background(), routing.RuntimeSpec{
+			ID: "rspec_ms_rep", MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+			Replicable: replicable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec: %v", err)
+		}
+		s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{{SpecID: "rspec_ms_rep", Model: msAppModel, State: "running"}})
+		got := fetchModelServersRow(t, s, fmt.Sprintf("replicable %v", replicable))
+		if string(got["replicable"]) != fmt.Sprint(replicable) {
+			t.Fatalf("stored replicable %v: replicable = %s on the wire", replicable, got["replicable"])
+		}
+		if string(got["running_instances"]) != "1" {
+			t.Fatalf("stored replicable %v: running_instances = %s, want 1", replicable, got["running_instances"])
+		}
+	}
+}

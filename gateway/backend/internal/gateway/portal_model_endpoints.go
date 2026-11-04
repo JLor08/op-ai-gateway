@@ -380,9 +380,10 @@ func (s *Server) rankModelServers(ctx context.Context, model string) map[string]
 // these zero/empty because only the gateway layer holds the registries + routing store needed to
 // resolve them.
 //
-// Each row costs one RuntimeSpecByMapping read, which serves both: the refusal is computed from it
-// first, so a row with no spec, or with a spec whose status was never published, still gets its
-// reason. Each distinct application is read at most once per listing (applicationForRow).
+// Each row costs one RuntimeSpecByMapping read, which serves all of them: the refusal is computed
+// from it first, so a row with no spec, or with a spec whose status was never published, still
+// gets its reason, and the row's Replicable is the spec's stored flag whether or not a status was
+// published. Each distinct application is read at most once per listing (applicationForRow).
 //
 // Best-effort and nil-safe throughout: a nil RuntimeStatus or Routes, a mapping with no
 // runtime spec, or a spec with no published status all just leave the row's RUNTIME-STATE
@@ -405,6 +406,7 @@ func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.Mode
 		if err != nil || !hasSpec {
 			continue // best-effort: no spec for this mapping, or lookup failed — leave zero
 		}
+		row.Replicable = spec.Replicable
 		s.injectRowRuntimeState(row, spec, s.runtimeStatusesForServer(byServer, row.ServerID))
 	}
 }
