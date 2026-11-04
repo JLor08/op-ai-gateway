@@ -337,15 +337,18 @@ flowchart TD
     IsGroup -->|yes| Group["resolveGroup:\npriority walk / sticky pin\n(see §5)"]
     IsGroup -->|"no, but locked (group-only)"| ErrLocked
     IsGroup -->|no| Affinity{"token pinned via\nRouteAffinity and\nstill valid + provisioned?"}
-    Affinity -->|hit| ReuseTarget["reuse pinned Target;\ntouch session reservation"]
+    Affinity -->|hit| ReuseTarget["selectPinned: an instance of the\npinned mapping on the pinned server\n(see §10.10); touch session reservation"]
     Affinity -->|miss| LoadCands["Store.ActiveMappingsForModel(model, flavor)"]
     LoadCands --> FilterProv["filterProvisioned\n(resource-group gate)"]
     FilterProv --> FilterCap["filterCapable\n(required-capability gate,\nsee §2.3)"]
     FilterCap -->|"emptied, and the request\nrequired a capability"| ErrCap["404: ErrModelNotCapable"]
     FilterCap --> Voice["voice filter (speech only,\nfail-open, see §2.5)"]
-    Voice --> Select["selectCandidate (see §3)"]
-    Select -->|all candidates at\neffective cap| Queue["AdmissionController.WaitForSlot\n(see §6)"]
-    Queue -->|slot signalled / recheck tick| Select
+    Voice --> Realtime["filterRealtime\n(voice chat legs only, see §10.8)"]
+    Realtime -->|"every candidate\nmeasured too slow"| ErrRT["409: ErrNoRealtimeCandidate\n(voice_chat.no_realtime_model)"]
+    Realtime --> Expand["expandInstances\n(running instances, every turn, see §10.1)"]
+    Expand --> Select["selectCandidate (see §3)"]
+    Select -->|all candidates at\neffective cap| Queue["AdmissionController.WaitForSlot\n(see §6), demand signal\nto the instance scaler (see §10.3)"]
+    Queue -->|slot signalled / recheck tick| Expand
     Queue -->|timeout / full / ctx done| ErrQueue["503: ErrAdmissionQueueTimeout\n/ ErrAdmissionQueueFull"]
     Select -->|no reachable/viable candidate| ErrHost["ErrNoHealthyHost"]
     Select -->|picked| Build["targetFrom(ctx, candidate, apiFlavor)"]
@@ -1593,9 +1596,9 @@ still serve. Order matters — later filters see only what survived earlier ones
 
 | # | Filter | Rule | Fail-open behavior |
 |---|---|---|---|
-| 1 | Reachable/selectable | `server.Status==active`, `HealthStatus!=unhealthy`, application reachable (health-check probe), not `ServerBusy` (a benchmark is running on it) | hard — an empty result here is `ErrNoHealthyHost` |
+| 1 | Reachable/selectable | `server.Status==active`, `HealthStatus!=unhealthy`, application reachable (health-check probe), not `ServerBusy` (a benchmark is running on it) — `CandidateServesNow`, the one statement of these gates — and not an instance the request already found gone (§10.6) | hard — an empty result here is `ErrNoHealthyHost` |
 | 2 | Context-fit | estimated prompt tokens (word count × 1.3) + `MaxTokens` must fit the mapping's known `ContextSize` (unknown/0 always fits) | on empty, route without the filter (warn) |
-| 3 | Capacity cap (CP3) | keep candidates whose server is below its *effective cap* = `MaxConcurrency − reservedSessions(server)`; unknown `MaxConcurrency` (0) never caps | on empty **and** an admission controller is wired → queue (§6) instead of falling open; otherwise fail-open (warn) |
+| 3 | Capacity cap (CP3) | keep candidates whose server is below its *effective cap* = `MaxConcurrency − reservedSessions(server)`; unknown `MaxConcurrency` (0) never caps. An **instance candidate** is judged by its own in-flight count against the spec's `instance_parallelism` instead, and, for a request that needs a free live slot, by its live slot (§10.2, §10.5) | on empty **and** an admission controller is wired → queue (§6) instead of falling open; otherwise fail-open (warn) |
 | 4 | Swap-protection | drop a **not-already-loaded** candidate whose server is actively serving (a request in flight, or completed within `swap_protect_window_seconds`) — loading it now would evict a resident model | on empty, or no viable survivor, fail-open (warn) |
 | 5 | Prefer-loaded (dominant, not a filter) | if any survivor already has the requested model resident, that partition is preferred over the rest — but only if it yields a Score-viable pick | fails open to the full pool otherwise |
 | 6 | Prefer-starting (dominant, not a filter) | below prefer-loaded: if any survivor's requested model is currently `starting` (loading) on its server, per the live per-model runtime state, that partition is preferred over cold-starting a stopped one — again only if it yields a Score-viable pick | fails open to the full pool otherwise |
@@ -1622,7 +1625,7 @@ flowchart LR
     Base["base = 1000\n+ priority × 20\n+ weight"] --> Penalties["− activeRequests × 25\n− queueDepth × 20\n− latencyMS × 0.2\n− errorRate × 200\n− 500 if telemetry stale (> 2 min) / missing"]
     Penalties --> Gate{"score ≤ 0 ?"}
     Gate -->|yes| NonViable["non-viable — excluded\n(the viability gate)"]
-    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 70)"]
+    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 70, ≤ 120 for audio)"]
     Tiebreak --> Final["final score"]
 ```
 
@@ -1648,15 +1651,17 @@ server-mates' idle counters. See [Agent-Managed Model Runtime
 §11.7](agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog).
 
 `metricTiebreak` (capped at `genThroughputBonusCap(50) +
-promptThroughputBonusCap(20) = 70`, well under the 200-point error-rate
+promptThroughputBonusCap(20) = 70`, plus `audioRateBonusCap(50)` for a speech or
+transcription request, so at most 120 — still under the 200-point error-rate
 penalty and 500-point stale-telemetry penalty):
 
 | Term | Formula | Cap |
 |---|---|---|
 | Generation throughput | `effectiveGenTPS(route) × 0.25` | 50 (at 200 tok/s) |
 | Prompt (prefill) throughput | `PromptTokensPerSecond × 0.01` | 20 (at 2000 tok/s) |
+| Audio rate (speech and transcription requests only, `Route.Audio`) | `audio_rate_x × 10` (`audioTiebreak`, §10.8) | 50 (at 5× real time) |
 
-Both terms are **measurements**. A third one was not: a flat `+30` for the
+All three are **measurements**. A fourth one was not: a flat `+30` for the
 mapping's `mtp` capability verdict, which guessed from a model *name* at the
 speed the two terms beside it measure. It is gone, and `Route` no longer
 carries the flag at all — nothing the scorer sees says anything about MTP
@@ -1712,6 +1717,12 @@ conversation keeps talking to the same server while a model is resident there.
   default 60s) recording that session as "live" there. The capacity cap (§3,
   filter 3) subtracts this count from `MaxConcurrency` so unpinned traffic
   cannot fill the slots active pinned conversations will return to.
+- **Instance.** A pin names the instance of its mapping it was last served on
+  (`route_affinity.instance`, written on every fresh pin and every hit). On a hit the request is
+  served by the pinned mapping's instances on the pinned server, preferring that one; with none
+  free a request that can share an instance overflows onto it, and a live session (or a
+  transcription finding every live slot held) parks for that server. The pin itself
+  is never deleted for an instance reason (§10.10).
 - **Capability.** A pinned mapping is re-checked against the request's required
   capabilities on every hit (§2.3, site 4), so a pin never serves a stale
   verdict for its whole TTL. A refusal there is non-destructive, and the two
@@ -1978,6 +1989,11 @@ Key properties:
   immediately (`ErrAdmissionQueueFull`, no wait) once full, rather than piling
   up unbounded parked goroutines.
 
+For **instance candidates** the queue is always engaged: an instance's cap is always defined,
+so a pool with an instance candidate whose every candidate is at its cap parks even when no
+mapping sets a `max_concurrency`, and each park turn signals the instance scaler for another
+instance; a scaler that started one wakes the queue once routing sees it (§10.2–§10.4).
+
 The model-group path (§5) queues on the **union** of every at-capacity
 member's candidate servers, using the same absolute-deadline discipline, and
 never silently promotes an established finite deadline back to unbounded even
@@ -2112,6 +2128,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 | `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
 | `ErrVoiceUnavailable` | **503** (`routing.voice_unavailable`) | a speech request's `voice` is one that at least one candidate is **known** (from its cached voice list) to lack while an eligible candidate (one that lists it, or of unknown/uncached status) remained, so the voice narrowed the pool to the eligible ones and none of those is usable; answered **instead of** `ErrNoHealthyHost` and only then (§2.5). A voice no candidate is known to lack, or one **every** candidate is known-absent for (fail open), never produces it |
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes`, and for transcription no `transcription: yes` (a model the listing does not name reads as unknown) |
+| `ErrNoRealtimeCandidate` | **409** (`voice_chat.no_realtime_model`) | a request held to real time — a voice chat's ASR or TTS leg — had candidates and every one was measured below the real-time threshold (§10.8); not `ErrNoHealthyHost`, since a retry does not make the model faster |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
 | `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server with no *usable* live offering of the model: either no live mapping for it at all, **or** one whose mapping does not carry a `yes` verdict for a capability the endpoint requires (§2.3 site 2). The two share this sentinel deliberately — an override names one server, so there is no second candidate the distinction could steer to |
@@ -2142,8 +2159,345 @@ the first — the correct reading of both facts
 | `OP_AI_GATEWAY_CAPACITY_SETTLE_SECONDS` | 5 | §6.1 inter-level telemetry settle wait |
 | `OP_AI_GATEWAY_ADMISSION_QUEUE_MAX_DEPTH` | 128 | §6.3 queue bound |
 | `OP_AI_GATEWAY_BENCHMARK_SCHEDULE_DEFAULT_SECONDS` | 86400 | §7 scheduled-mode default cadence |
+| `OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS` | 60 | §10.4 how long the scaler leaves a host alone after a refusal for room or a failed start |
+| `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR` | 1.2 | §10.8 the real-time gate's threshold (the audio ramp's too) |
 
 See [Configuration](configuration.md) for the full variable list.
+
+## 10. Model instances
+
+A replicable runtime spec runs several processes of one model on one agent, each an
+**instance** with an address of its own: `m` for instance 0, `m#k` for instance k ≥ 1
+([ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place)).
+To routing an instance is a candidate like any other. A candidate carries its index
+(`MappingCandidate.Instance`), and the target built from it carries the instance address as
+`ProviderModel` (`InstanceAddress`) and the gateway instance key `<mapping_id>#<k>` as
+`Target.InstanceKey` (`InstanceKey`, `internal/routing/instances.go`), instance 0 included.
+`RouteID` stays the mapping id, so usage, the opportunistic metrics, the capability and
+streaming checks, the score and the voice lookups still key by mapping. The usage row records
+the **base** provider model (`InstanceBase`, `internal/gateway/inference_complete.go`), so
+analytics never split by instance. What is held per instance keys by the instance key: the
+in-flight count, the live slot and an affinity pin's instance. The agent side (addressing,
+admission, lifecycle) is
+[Agent-Managed Model Runtime §4.8](agent-runtime-manager.md#48-instance-addresses-and-the-in-place-model-rewrite)
+and [§5.8](agent-runtime-manager.md#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor).
+
+A spec that did not opt in is routed exactly as before: its mapping is never expanded, never
+judged by an instance cap, never sends `m#k` and never signals demand.
+
+### 10.1 Instance candidates, expanded on every admission turn
+
+`expandInstances` (`internal/routing/instances.go`) follows each instance-capable candidate with
+one candidate per instance k ≥ 1 its agent reports **running**. The facts come from the
+resolver's `InstanceSource`, in production `instanceSource`
+(`internal/gateway/instance_source.go`) over the agent-features and runtime-status registries
+and the mapping's spec. A mapping is instance-capable only on a `server_agent` application whose
+agent is **known** to declare `runtime_instances` (an older agent beside a newer one, or one
+whose features are not known yet, is never expanded) and whose spec is replicable; the feature
+is checked first, so a mixed fleet's older agents cost no spec read. The spec is read through a
+cache (5 s, a stale entry kept while a re-read fails, one read in flight per mapping, every read
+bounded by 2 s). The running indexes come from the server's latest status snapshot: a row counts
+only when it is this spec's and names the address this mapping sends for that index, so routing
+never sends an address the agent does not serve, and an instance the agent retired or lost in a
+restart is gone from the candidates at the next sample, with nothing to expire.
+
+- **A starting instance is not a candidate.** A request routed to it would wait out its start,
+  while a request parked in the queue takes whichever instance frees first and sees the new one
+  once it runs.
+- **Every candidate of a capable mapping, instance 0 included, carries the view's facts**
+  (`InstanceCapable`, `InstanceParallelism`), so the capacity filter judges the candidates by
+  the very view that produced them.
+- **Expansion runs on every turn of the admission loop** (`resolveStandard`, the group walk and
+  `selectPinned`): the mappings are read once, their running instances on each turn, so a request
+  parked because every instance was busy is offered on its next turn an instance that started
+  while it waited.
+- **The instance-aware name lookups need nothing new.** The loaded state, the swap protection
+  and the per-model runtime overlay (§3, §3.1) read the target's `ProviderModel`, which is the
+  instance address, so each instance reads its own loaded state and its own active and queue
+  figures.
+- **An instance found gone is excluded** (`inference.Request.ExcludeInstanceKeys`) in the first
+  pass of `selectCandidate` on every turn (§10.6).
+
+### 10.2 Per-instance capacity and the queue
+
+Filter 3 of §3 judges an instance candidate by its **own** in-flight count against the spec's
+`instance_parallelism` (`underCap`, `resolver.go`; at least 1, `0` reads as 1), read from the
+active-request registry, which counts every request per instance key beside its per-server
+count (`activeRegistry.InstanceActivity`, `internal/gateway/active_requests.go`). The server's
+`MaxConcurrency` and its session reservations say nothing about one instance of several that
+share the server, so a candidate of a mapping without instances keeps the server cap (§6.2)
+unchanged. Unlike that cap, an instance cap is always defined: with every candidate at its cap
+and an admission controller wired, a pool that holds an instance candidate always reaches the
+CP4 queue (§6.3, `atCapacityError`) — even when no mapping sets a `max_concurrency` — instead of
+failing open. A request that finished releases its slot as before: its active-request row is
+removed and the front waiter for its server is woken. That wakes a waiter even when the freed
+slot belongs to another model on the server; the waiter re-checks and parks again, which costs at
+most the queue's 250 ms recheck interval
+([§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+The voice pre-warm's priming synthesis is unbilled, but it is an in-flight request on its
+instance (`ActiveRequest.InstanceKey`, `internal/gateway/voice_prewarm.go`), so the cap counts
+it and a session's first turn is not sent to an instance busy priming as if it were free.
+
+### 10.3 The demand signal
+
+The resolver hands its `DemandSink` a `routing.DemandSignal` (`instances.go`) when a request could
+not get an instance because every candidate it could use was at capacity, at least one of them an
+instance candidate (`instanceDemand`):
+
+- **A request that parks** signals in `parkTurn`, the one park step of `resolveStandard`,
+  `resolveGroupOnce` and `selectPinned`, after its deadline check and only while the queue has
+  room for it (`AdmissionRoom.HasRoom`, `internal/gateway/admission_room.go`) — so **once per park
+  turn**, never on the fail-open path a resolver without a queue takes, never for a request whose
+  deadline has passed and never for one the queue is about to refuse as full. A group request
+  parked on several at-capacity members signals once per turn for each member with instance
+  candidates, by the member's own name; a walk never signals for a member it skipped.
+- **A request that must not park** (`inference.Request.NoPark`: the voice-chat gate and the
+  live-transcription ticket mint, §10.7) is served at once from the capped pool
+  (`selectWithoutParking`: the least loaded instance, the whole pool when none is viable) and
+  signals **once**, after the selection succeeded (`signalOverflow`); for a group, for the walk's
+  first at-capacity member with instance candidates. A pinned request served on a busy instance
+  of its pinned server signals once the same way (§10.10), whether or not a queue is wired.
+- **A check-only resolve** (`inference.Request.CheckOnly`, the replay re-synthesis' pre-check)
+  never parks and signals nothing: the request it checks for resolves, parks and signals on its
+  own. A request that could not be served at all signals nothing either.
+
+The signal names the gateway model (a group member's own name, never the group's), the coarse
+flavor it was resolved under, `Live` for a live session, `ServerID` for a pinned request (the one
+server that can serve it) and `MappingIDs` — the instance-capable mappings of the model that the
+request passed every filter for (provisioning, endpoint, capability, voice, real time,
+reachability), once each in candidate order, since an instance of any other mapping would not
+serve it. `Signal` must not block: the request is about to wait, or to be served.
+
+### 10.4 The instance scaler
+
+`instanceScaler` (`internal/gateway/instance_scaler.go`) is the resolver's demand sink, one per
+gateway process, wired in `gateway.New` whenever the resolver has an instance source. It starts
+one more instance where routing would send the waiting request and leaves the fit to the agent
+([ADR-092](../09-architecture-decisions.md#adr-092--the-gateway-scales-up-on-parked-demand-and-the-agent-decides-the-fit-the-agent-alone-scales-down)):
+
+- **Single flight per model.** `Signal` starts a scale-up in the background and returns at once.
+  A signal for a model whose scale-up is running with the same key — the same pin, the same
+  mappings and the same flavor (`signalKeyOf`) — is folded into it. One with another key may not
+  be served by it, so it is queued (one per key) and gets a pass of its own once the running one
+  ends (`followUp`), unless an instance that pass started serves it (`signalServedBy`: on its pinned
+  server, or anywhere for an unpinned signal, and of one of its mappings). A parked request signals
+  again on its next turn anyway; the queue keeps a one-shot signal — the voice gate's, a pinned
+  overflow's — from being lost. Every scale-up ends with the server's lifetime.
+- **Host choice.** The hosts are the signal's mappings (every mapping of the model for the flavor
+  when it names none), only on `ServerID` when it is set. A host is passed over when its
+  application is not an agent's; when routing would not send it a request
+  (`Resolver.CandidateServesNow`, `internal/routing/instance_scaling.go`: a selectable server, a
+  reachable application, no benchmark — the same statement `selectCandidate` and a pin's check
+  use); when the instance source does not expand the mapping there; at a ceiling — present
+  instances (`starting` or `running`, instance 0 always counted) at `max_instances`, or at the
+  mapping's measured real-time concurrency when its limit is `performance` (a measured `0`
+  included; `resources` and `cap` are lower bounds, not ceilings); while it is held off after a
+  refusal; and while **any** instance of the spec, instance 0 included, is starting. The rest are
+  ranked by `Resolver.ScoreModelServers`, the score the resolver ranks with (a candidate it found
+  not viable is asked last), and picked afresh before each ask, since an ensure can last as long as
+  a start. Each host is asked at most once per scale-up.
+- **The index rule.** The lowest k ≥ 1 that the agent reports in no state (a draining, crashed or
+  stopped row's index is not free), that no ensure of this scaler is under way for, and whose
+  address `m#k` is not another mapping's upstream model on the same agent (the agent resolves a
+  literal upstream name first, so that ensure would start the other spec). None left below
+  `max_instances` and 64 passes the host over quietly, with no hold (`instanceIndex`,
+  `nextInstanceIndex`).
+- **The ask.** `POST /ensure/m#k` through the provider's ensure route
+  (`provider.RuntimeEnsurer`) with the target's upstream credential, bounded by the spec's startup
+  timeout (agent default 30 s) plus 10 s.
+- **Cooldowns.** `409 runtime.instance_no_capacity` holds the (server, mapping) off for
+  `OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS` (default 60) and asks the next host;
+  `409 runtime.instance_demand_unknown` holds it off for 5 s only (a sibling's measurement
+  normally lands within seconds) and asks the next host; any other failure holds it off for the
+  cooldown and logs a warning. An ensure that the server's shutdown cut short says nothing about
+  the host.
+- **The routable wait.** After a successful ensure the scaler waits, at most 5 s, until routing
+  **sees** the instance running — the instance source reports it, which needs the agent's next
+  telemetry sample — subscribing to the server's status before it looks, so a sample in between is
+  not missed. Only then does it wake as many requests parked on that server as the instance serves
+  at once (one admission-queue release per `instance_parallelism`). Waking them earlier would make
+  each of them find no free instance, signal again and ensure the same instance once more. An
+  instance that never shows up wakes no one and holds the host off for 5 s.
+- **No retry loop.** A scale-up ends once a host started an instance or none is left; parked
+  requests then wait for the instances there are until their queue timeout, and the next demand
+  signal is the next attempt. The scaler never stops an instance — the agent unloads an idle one by
+  itself — and `min_instances` are the agent's to keep up.
+
+### 10.5 Live slots per instance, and failover onto a sibling
+
+audio.cpp serves one live session per process, so the gateway holds one live slot per
+**instance**: `liveSessionRegistry` (`internal/gateway/live_session_registry.go`) keys by the
+target's instance key, and N running instances of a replicable spec are N slots, while a mapping
+without instances keeps its one (`<mapping_id>#0`). The registry is also the resolver's
+`LiveSlotChecker`. In a pool that holds an instance candidate, a request that needs a free live
+slot — a live session, and every transcription, buffered and `/details` alike, which the upstream
+cannot serve while a live session holds the process (`needsFreeLiveSlot`) — finds a candidate
+whose slot is held at its cap, so it goes to a free slot or parks for one, signalling live demand.
+A pool without an instance candidate is not judged by its slots and keeps the previous answers:
+the session's own acquire, or the buffered transcription's held check
+(`internal/gateway/transcription_handler.go`), refuses it at once with
+`503 transcription.live_busy`.
+
+The selection reads the slots as a snapshot, so another session can take the chosen slot before
+this one acquires it. `acquireLiveSession` (`internal/gateway/live_transcription_bearer.go`, the
+one relay both the bearer endpoint and the portal's WebSocket loopback use) then **selects again**
+for a target from an instance pool (`Target.InstancePool`). The lost slot is not excluded: its
+instance still runs, the registry now reports it held, and the resolver passes over it like any
+other held slot, which lets a parked session take it once it frees. The loop is one admission
+(`AdmissionStart`, so a session that parks again waits out what is left of one queue timeout), is
+bounded by 64 lost races, and answers `transcription.live_busy` when a selection hands back a
+slot still held by the session it lost that slot to (no queue to park in, or no viable free slot).
+
+### 10.6 A gone instance is re-selected once
+
+The gateway routes from the last telemetry sample, so it can send a request to an instance the
+agent retired a moment ago (idle scale-down, a lowered `max_instances`, a restart). The agent
+router then refuses the address before anything reaches a child: `404 runtime.model_not_managed`
+or `runtime.model_not_running`, `409 runtime.instance_no_capacity` or
+`runtime.instance_demand_unknown` (`isInstanceGoneError`, `internal/gateway/instance_reselect.go`).
+Every path that dispatches — the buffered and streamed translate paths, every relay through
+`proxyNative` (passthrough, speech, images, image edit, transcription) and the bearer live
+session — re-selects the same way:
+
+1. **The once-rule** (`reselectable`): only an instance k ≥ 1 is re-selected, and only by a
+   request that carries no exclusion yet. Instance 0's address is the one every mapping always
+   sent, so its refusal is an answer about the model, not about a vanished instance.
+2. **The lost attempt leaves first**: its active-request row is removed (a live session lets its
+   slot go first), which frees its count on the instance and the server and wakes a parked request;
+   the re-selection may itself park like any request.
+3. **The request is resolved again** with the instance excluded (`withLostInstance`) and is
+   registered on the instance it is sent to.
+
+A request that cannot move — it was re-selected already, or its relay cannot take the new
+instance, or its live audio can no longer be replayed — gets the gateway's own error for the
+refusal (`provider.unavailable`), never the agent router's `runtime.*` envelope; one whose
+re-resolve routing refuses gets that routing answer. A translated stream re-resolves from inside
+the stream it has begun (`streamSession.reselect`): a refused re-resolve registers it back on the
+instance it lost, and the stream ends with the original gone error. The voice-chat gate re-selects
+on its ensure the same way (§10.7). The client never sees the agent's refusal.
+
+### 10.7 Voice chat: the gate never parks, and one voice chat uses one TTS instance
+
+The voice-chat co-load gate (`voiceCoLoadGate`, `internal/gateway/voice_chat.go`) and the
+live-transcription ticket mint (`resolveLiveTarget` with `admit` false,
+`internal/gateway/live_transcription.go`) answer a browser's ticket POST, so they resolve with
+`inference.Request.NoPark`: the per-instance cap only *prefers* a free instance, and with none free
+the gate takes the least loaded one at once and signals the demand for another (§10.3) — a voice
+chat about to start is demand already known. Only the per-turn requests queue. The gate then
+ensures the instance it **selected**; an instance k ≥ 1 the agent refuses as gone moves the leg
+once, to a sibling selected with it excluded (`ensureVoiceLeg`), while `runtime.admission_blocked`
+stays the co-load refusal and anything else the leg's unavailable code. The TTS pre-warm targets
+the gate-time instance, which also becomes the speech leg's first preferred instance (§10.9).
+
+When the speech leg's target is an instance of a replicable spec, a voice run synthesizes its
+speech sections **one after another** (`voiceTTSConcurrency`, `internal/gateway/chat_runs_voice.go`:
+`1` instead of the configured `VoiceTTSConcurrencyDefault`, 2). audio.cpp serves one request at a
+time, so a second concurrent section only waited inside the process anyway, the real-time gate
+(§10.8) keeps one instance ahead of playback, and a run's own second section is never in flight
+beside its first, where it would read as demand for another instance. Each section prefers the
+instance the leg ran on last, so the sections stay on one instance while it is free. A target
+without instances keeps the configured concurrency.
+
+### 10.8 Audio metrics in routing: the score term and the real-time gate
+
+The audio benchmark stores a mapping's measured real-time factor (`audio_rate_x`) and the
+concurrency its ramp kept above real time
+([Telemetry §8.6](telemetry-usage-observability.md#86-audio-performance-benchmarks),
+[ADR-093](../09-architecture-decisions.md#adr-093--audio-benchmarks-mirror-the-text-modes-a-real-time-threshold-and-a-concurrency-ceiling)).
+Routing reads them from the mapping, so they apply whether or not the model is loaded:
+
+- **The score term.** For a speech or transcription request (`audioRequest`), `metricTiebreak`
+  adds `audioTiebreak(audio_rate_x)` = `clampBonus(rate, 10, 50)`: 10 points per × real time, at
+  most 50 (`internal/routing/scorer.go`; `Route.Audio`). The whole tiebreak is then bounded by
+  120 points, still below the 200-point error-rate penalty, and an unmeasured rate earns nothing.
+  `ScoreModelServers` scores the `openai_audio` flavor with the same term, so the portal's ranking
+  and the scaler's host order agree with routing.
+- **The real-time gate.** A request that must keep up with real time
+  (`inference.Request.RealtimeRequired`) drops every candidate whose **measured** rate is below
+  `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR` (default 1.2, the factor the ramp judges a level by)
+  in `filterRealtime` (`internal/routing/realtime.go`); an unmeasured candidate stays eligible, so
+  a new host is usable before its first measurement. It is a hard gate that never fails open: a
+  pool it empties is `ErrNoRealtimeCandidate`. It runs after the voice filter and before the
+  admission parameters, so the request never queues on a server it may not use, in the plain
+  path, in the group walk and on a server override (a server measured too slow is no better for
+  being named). The token-affinity path does not apply it: a voice chat's ASR leg runs under the
+  bare session principal, which has no pin, and a speech request never writes one (§4).
+- **Where it applies.** The gate's ASR and TTS legs at ticket mint carry it, and so does every
+  per-turn ASR and TTS request of a voice chat: the session marks its loopback request with
+  `X-OP-Realtime-Required: 1`, which `/v1` honours only on the full internal loopback pair
+  (`loopbackRouting`, `internal/gateway/auth.go`) — a client sending it could only narrow its own
+  pool. The LLM leg is never gated. A refusal is `409 voice_chat.no_realtime_model`, its message
+  naming the leg (`voice chat <leg> leg: …`): at the ticket mint from the gate, and in a turn's
+  `error` frame when a model is re-measured slower mid-session (the ASR dial and the voice run
+  add the leg, since `/v1` cannot know which leg it refused).
+
+### 10.9 Voice instance stickiness
+
+A voice chat keeps each leg's turns on the warm instance it already uses (`voiceStickiness`,
+`internal/gateway/voice_sticky.go`). The session remembers, per leg (ASR, LLM, TTS), the gateway
+instance key its last request ran on — before the first turn the instance the ticket's gate
+selected — and every loopback request of that leg names it in `X-OP-Preferred-Instance`
+(`inference.Request.PreferredInstanceKey`). `/v1` answers such a request with
+`X-OP-Served-Instance`, the instance key it was routed to (`markServedInstance`), which becomes the
+leg's next preference, so a leg that routing moved follows its new instance. Both headers act only
+on the full internal loopback pair: from anyone else a preference would let a client choose an
+instance and read instance keys back.
+
+The preference is advisory and never refuses, parks or signals by itself (`preferredInstance`,
+`preferScored`, `resolver.go`). It is honoured only for an instance of a replicable spec that is
+still a candidate after every filter (the real-time gate and an exclusion as gone among them) and
+under its cap, and only within the partition the plain selection settles on: the cap, the swap
+protection and the loaded and starting partitions still decide which candidates are ranked, and
+the preferred one then takes the score's place. A leg served by a mapping without instances is
+never sticky (`stickyInstance`). The memory is the session's own and needs no `route_affinity`
+row. A served header is written before the response, so a relay
+that then moves the request onto another instance reports the first one, which the next turn's
+preference misses and routing passes over
+([§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+### 10.10 Pinned requests on instances
+
+A token-affinity hit (§4, `resolveAffinity`) and a server override (`resolveServerOverride`) are
+**pinned** to one server and return before `selectCandidate`. Both pick their instance in
+`selectPinned` (`resolver.go`), by one rule:
+
+1. **Only the pinned server's instances of the pinned mapping** are considered, read afresh on
+   every turn (`expandInstances`); a mapping without instances there is served on its instance 0,
+   exactly as before.
+2. **The preferred instance** — the one the pin names (`route_affinity.instance`), or a server
+   override's `PreferredInstanceKey` (a voice chat leg of an overridden token) — when it is a
+   candidate under its cap (a held live slot counts for a request that needs a free one); else
+   **the least loaded instance under its cap** on that server (`pinnedChoice`, among equally loaded
+   ones the first whose model is loaded).
+3. **None free — overflow, or park.** A pinned request has never queued, so a request that can be
+   served on a busy instance **overflows** onto the preferred instance (the least loaded one when
+   the preferred one is no candidate), among the instances whose live slot is free when it needs
+   one, and waits inside that instance. Only a request that cannot be served that way **parks** — a
+   live session, which takes a slot no other session may share, and a transcription when every live
+   slot on the server is held — in the queue for that server alone (`parkTurn`), offered every
+   turn's instances again. A pinned live request that must not park (`NoPark`, `CheckOnly`) or has
+   no queue to park in overflows instead. Either way the demand is signalled restricted to the
+   pinned server (`DemandSignal.ServerID`): once on an overflow (`signalOverflow`, whether or not a
+   queue is wired), once per park turn when parked, never for a check-only resolve.
+
+A parked pinned request re-checks its server after every wait with the same gates it passed first
+(`servesNow`): a pin whose server stopped being usable is passed over to the fresh selection
+(without being deleted; the next request's own checks drop it if the server is still unusable),
+and an override answers `ErrServerOverrideServerUnavailable`, unless it forces through an
+unreachable server and keeps waiting there. The fresh selection after such a pass-over judges caps
+and dates the pin it writes at the time the request woke, while its queue deadline still counts
+from the request's admission start.
+
+**The pin itself is never deleted for instance reasons.** A pin records the instance the request
+was served on, on every fresh pin and on every hit (`refreshAffinity`); a request that waited
+re-reads the row first and refreshes it only while it is still the pin it was served from, so a
+pin another request repointed, or one that was deleted, while it waited is left as it is. A
+request whose every instance on the pinned server it has already found gone
+(`errPinnedInstancesGone`) is served by the fresh selection, excluding those instances, and the pin
+stays where it is — an instance going away is no reason to move a session off its server — while
+an override in that state has no host left (`ErrNoHealthyHost`). A group pin records the instance
+its member was served on too (`upsertGroupPin`); the group walk does not read it back.
 
 ## Related chapters
 
@@ -2159,4 +2513,7 @@ See [Configuration](configuration.md) for the full variable list.
 - [Agent-Managed Model Runtime](agent-runtime-manager.md) — `RuntimeSpec.Type`
   and per-kind probe-path derivation (§3.4), the volatile runtime-status
   registry the live per-model metrics and prefer-starting preference read
-  (§10), and the Models catalog's own live-state injection (§11.7).
+  (§10), the Models catalog's own live-state injection (§11.7), and the agent's
+  side of model instances: addressing and the in-place rewrite (§4.8), burst
+  admission and the protected floor (§5.8) and one lifecycle per instance (§6.1)
+  ([ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place)–[ADR-094](../09-architecture-decisions.md#adr-094--a-pinned-request-chooses-an-instance-on-its-pinned-server-overflows-unless-it-needs-a-free-live-slot-and-a-voice-chat-leg-prefers-the-instance-it-ran-on-last)).
