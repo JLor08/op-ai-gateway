@@ -8307,10 +8307,12 @@ same function as the pushed document, so the two cannot disagree); neither has a
   protected.
 - The log view of a replicable spec — or of any spec once more than one instance
   is known to it — offers tabs: **All** shows every instance's output as it
-  arrives, lines of instance k ≥ 1 prefixed `[#k]` (§6.1), and one tab per
-  instance shows only that instance's output, without the prefix
-  ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). A spec that is
-  not replicable, and for which no instance k ≥ 1 is known, shows no tabs.
+  arrives, lines of instance k ≥ 1 prefixed `[#k]` by the agent (§6.1) and
+  instance 0's lines prefixed `[#0]` by the view, and one tab per instance shows
+  only that instance's output, without the prefix
+  ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). Opened from an
+  instance's row, the view starts on that instance's tab. A spec that is not
+  replicable, and for which no instance k ≥ 1 is known, shows no tabs.
 - The Models catalog's model-servers row carries `running_instances` (one per
   running status row of the spec, so 1 for a running spec that is not replicable)
   and the spec's `replicable` flag; the count is shown for a replicable spec or
@@ -8654,25 +8656,35 @@ always find the prefix whole.
 **The portal's log view splits the history per instance.** For a replicable spec,
 or once more than one instance is known — the ones the opening row's spec lists,
 plus every one the stream names while the dialog is open, kept as a union — the
-view offers tabs. **All** (*Gesamt*) is selected each time the dialog opens and
-shows the history exactly as it arrives, prefixes included. Each **Instance k**
-tab shows only the entries of instance k, its generation markers and their
-resolved commands included, with the `[#k] ` prefix removed from every line the
-agent prefixed: at the start of a chunk and after every newline inside it. An
+view offers tabs. Each time the dialog opens it starts on the tab of the instance
+whose row it was opened from; a view that opens without tabs opens on **All**
+(*Gesamt*) and stays there if the stream later names a further instance. **All**
+shows the interleaved history as it arrives, the agent's `[#k] ` prefixes
+included, and adds `[#0] ` at the start of every line of instance 0's output, so
+that no line in it is left unattributed. It tracks instance 0's line state the
+way the instance tabs do (below): a chunk that continues instance 0's open line
+keeps its first bytes unprefixed, a gap or one of instance 0's generation
+markers opens a new line, a blank line is a line, and the empty piece after a
+trailing newline is not; gap notices and generation markers are never prefixed.
+Each **Instance k** tab shows only the entries of instance k, its generation
+markers and their resolved commands included, with the `[#k] ` prefix removed
+from every line the agent prefixed: at the start of a chunk and after every
+newline inside it. An
 entry is a chunk of output, not a line, so the view tracks per instance whether
 the previous chunk ended inside a line and leaves a continuing chunk's first
 bytes alone; a generation marker opens a new line. Where that state is unknown —
 at the head of the window and after a gap — a chunk is read as opening a line,
 which leaves one ambiguity the text cannot resolve: process output that itself
 begins with the exact prefix at such a boundary loses it in that tab (All still
-shows it). Gaps — `dropped_bytes` and the view's own trim notice
+shows it). The `[#0] ` prefix lives only in All: instance 0's own tab shows its
+output exactly as written. Gaps — `dropped_bytes` and the view's own trim notice
 ([§14.5](#145-overflow-is-always-visible)) — appear in **every** tab, because a
 gap cannot be attributed to an instance, and a tab for an instance with no output
 in the history says so in a sentence rather than staying blank (a gap alone is no
 instance's output, instance 0's included). A replicable spec shows the tabs even
 while only instance 0 runs. A spec that is not replicable, and for which no
 instance k ≥ 1 is known — from the opening row or from the open stream — shows no
-tabs and looks exactly as before.
+tabs and looks exactly as before, with no `[#0] ` prefix.
 
 ### 14.3 The memory bound is the operator's to set
 
