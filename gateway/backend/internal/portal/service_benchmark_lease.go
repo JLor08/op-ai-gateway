@@ -19,16 +19,19 @@ import (
 const benchmarkOverrideLeaseKeyPrefix = "benchmark_override_lease:"
 
 // BenchmarkOverrideLease is what a benchmark run on one server still owes the
-// store if the process dies: the specs to pin again, and the transient
-// force_stopped overrides to clear. Both lists are sorted.
+// store if the process dies: the specs to pin again, the transient
+// force_stopped overrides to clear, and the replicable specs it runs as one
+// process for its duration, whose replicable flag is to be set again. Every
+// list is sorted.
 type BenchmarkOverrideLease struct {
 	Repin             []string `json:"repin,omitempty"`
 	ClearForceStopped []string `json:"clear_force_stopped,omitempty"`
+	RestoreReplicable []string `json:"restore_replicable,omitempty"`
 }
 
 // Empty reports whether the lease owes nothing.
 func (l BenchmarkOverrideLease) Empty() bool {
-	return len(l.Repin) == 0 && len(l.ClearForceStopped) == 0
+	return len(l.Repin) == 0 && len(l.ClearForceStopped) == 0 && len(l.RestoreReplicable) == 0
 }
 
 // SetBenchmarkOverrideLease replaces serverID's whole lease row; an empty lease

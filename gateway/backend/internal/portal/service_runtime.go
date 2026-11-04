@@ -81,6 +81,10 @@ var (
 	// stored pinned other than the expected value, and wrote nothing for that
 	// spec.
 	ErrRuntimeSpecPinnedConflict = errors.New("runtime_spec.pinned_conflict")
+	// ErrRuntimeSpecReplicableConflict: SetBenchmarkRuntimeSpecsReplicable
+	// found a stored replicable other than the expected value, and wrote
+	// nothing for that spec.
+	ErrRuntimeSpecReplicableConflict = errors.New("runtime_spec.replicable_conflict")
 	// ErrRuntimeSpecEndpointModeInvalid rejects a responses_mode/messages_mode
 	// that is not one of the three EndpointMode values. HTTP 400.
 	ErrRuntimeSpecEndpointModeInvalid = errors.New("runtime_spec.endpoint_mode_invalid")

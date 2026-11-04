@@ -209,6 +209,35 @@ func (s *Service) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, specIDs []
 	return out, out.firstFailure()
 }
 
+// SetBenchmarkRuntimeSpecsReplicable sets replicable on every launch spec in
+// specIDs, each keyed by the spec's own id and each a compare-and-set against
+// expectedReplicable: a spec whose stored replicable is not expectedReplicable
+// is a Conflict (ErrRuntimeSpecReplicableConflict) and is not written. It is
+// the only benchmark writer of replicable. Only the flag moves: the instance
+// counts stay on the row (a spec that is not replicable pushes none of them),
+// so the inverse batch brings the spec back exactly as it was. The batch
+// notifies after its last write, once for each server a write stored to
+// (setBenchmarkRuntimeSpecs). The error return is the first Failed spec's
+// error, and nil when nothing failed. specIDs must not repeat an id, as for
+// SetBenchmarkRuntimeSpecsPinned.
+//
+// A run writes false so that its replicable target runs as one process while
+// it is measured alone: the agent drains the target's other instances and its
+// floor of protected instances, which would otherwise start beside the
+// measured one, or start by themselves once a stop is cleared.
+//
+// WHO AUTHORIZED THIS: its callers, exactly as for
+// SetBenchmarkRuntimeSpecsPinned, and it is not gated by serverIsBenchmarking
+// either. Its callers, and what authorized each: beginBenchmarkUnpin and
+// endBenchmarkUnpin, for a manual speed or both run behind
+// AuthorizeBenchmarkScope in startBenchmark; the VRAM run, behind
+// startVRAMProbe's gate; and reconcileBenchmarkOverrideLease, which only
+// undoes, by compare-and-set, what such a run wrote.
+func (s *Service) SetBenchmarkRuntimeSpecsReplicable(ctx context.Context, specIDs []string, expectedReplicable, replicable bool) (BenchmarkSpecsOutcome, error) {
+	out := s.setBenchmarkRuntimeSpecs(ctx, specIDs, expectReplicable(expectedReplicable), withReplicable(replicable))
+	return out, out.firstFailure()
+}
+
 // SetBenchmarkRuntimeSpecsAdminState sets admin_state on every launch spec in
 // specIDs, each keyed by the spec's own id and each a compare-and-set against
 // expectedAdminState, both sides trimmed: a mismatch is a Conflict
@@ -304,7 +333,7 @@ func (o *BenchmarkSpecsOutcome) record(specID string, err error) {
 	case errors.Is(err, ErrRuntimeSpecNotServerAgent):
 		slog.Warn("benchmark: a launch spec's application is no longer server_agent; its stored pinned and admin_state stay on the row and act again if the application is retyped back", "spec_id", specID)
 		o.Gone = append(o.Gone, specID)
-	case errors.Is(err, ErrRuntimeSpecPinnedConflict), errors.Is(err, ErrRuntimeSpecAdminStateConflict):
+	case errors.Is(err, ErrRuntimeSpecPinnedConflict), errors.Is(err, ErrRuntimeSpecAdminStateConflict), errors.Is(err, ErrRuntimeSpecReplicableConflict):
 		o.Conflict = append(o.Conflict, specID)
 	default:
 		o.Failed = append(o.Failed, specID)
@@ -393,6 +422,22 @@ func expectPinned(expected bool) func(routing.RuntimeSpec) error {
 		}
 		return nil
 	}
+}
+
+// expectReplicable is SetBenchmarkRuntimeSpecsReplicable's compare-and-set:
+// the stored replicable must equal expected.
+func expectReplicable(expected bool) func(routing.RuntimeSpec) error {
+	return func(spec routing.RuntimeSpec) error {
+		if spec.Replicable != expected {
+			return ErrRuntimeSpecReplicableConflict
+		}
+		return nil
+	}
+}
+
+// withReplicable replaces replicable in a spread request.
+func withReplicable(replicable bool) func(*PutRuntimeSpecRequest) {
+	return func(req *PutRuntimeSpecRequest) { req.Replicable = replicable }
 }
 
 // withAdminState replaces admin_state in a spread request.

@@ -760,3 +760,128 @@ func TestBenchmarkBatchedWriters(t *testing.T) {
 		}, f.specs...)
 	})
 }
+
+// addReplicableSpecs adds replicable launch specs to the fixture's
+// application: an ephemeral port, replicable with two protected instances and
+// room for four, unpinned, each on its own mapping.
+func (f *benchmarkWriterFixture) addReplicableSpecs(t *testing.T, models ...string) []RuntimeSpecDTO {
+	t.Helper()
+	ctx := context.Background()
+	app := f.app
+	specs := make([]RuntimeSpecDTO, 0, len(models))
+	for _, model := range models {
+		mapping, err := f.svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: model, AppModelName: model})
+		if err != nil {
+			t.Fatalf("CreateMapping(%s): %v", model, err)
+		}
+		spec, err := f.svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+			Enabled:      true,
+			Binary:       "/usr/local/bin/audio-server",
+			Args:         []string{"--model", "/models/" + model + ".gguf"},
+			Replicable:   true,
+			MinInstances: 2,
+			MaxInstances: 4,
+			APIFlavors:   []string{routing.APIFlavorOpenAIAudio},
+		})
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec(%s): %v", model, err)
+		}
+		specs = append(specs, spec)
+	}
+	return specs
+}
+
+// TestBenchmarkReplicableWriter pins SetBenchmarkRuntimeSpecsReplicable, the
+// writer a run uses to measure a replicable spec as one process: a
+// compare-and-set of the flag alone, through the full-document write, with
+// one notification per batch. The instance counts stay on the row, so the
+// pushed document loses the spec's instance keys while the flag is off, and
+// the inverse batch restores the document, ETag included. A spec whose flag
+// is not the expected one is a Conflict and is not written.
+func TestBenchmarkReplicableWriter(t *testing.T) {
+	ctx := context.Background()
+	newFixture := func(t *testing.T) (*benchmarkWriterFixture, []RuntimeSpecDTO) {
+		t.Helper()
+		f := newBenchmarkWriterFixture(t)
+		f.svc.agentFeatures = fakeAgentFeatures{f.serverID: {"runtime_manager", AgentFeatureRuntimeInstances}}
+		return f, f.addReplicableSpecs(t, "whisper", "kokoro")
+	}
+	pushed := func(t *testing.T, f *benchmarkWriterFixture, specID string) AgentRuntimeSpecDTO {
+		t.Helper()
+		doc, err := f.svc.AgentRuntimeConfig(ctx, f.serverID)
+		if err != nil {
+			t.Fatalf("AgentRuntimeConfig: %v", err)
+		}
+		for _, spec := range doc.Specs {
+			if spec.ID == specID {
+				return spec
+			}
+		}
+		t.Fatalf("the document has no spec %s", specID)
+		return AgentRuntimeSpecDTO{}
+	}
+
+	t.Run("off and on again: the flag alone moves, and the document comes back", func(t *testing.T) {
+		f, specs := newFixture(t)
+		etag := f.etag(t)
+		before := len(f.calls())
+		out, err := f.svc.SetBenchmarkRuntimeSpecsReplicable(ctx, specIDs(specs...), true, false)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		wantOutcome(t, out, BenchmarkSpecsOutcome{Written: specIDs(specs...), Notified: true})
+		f.wantCalls(t, before, f.serverID)
+		f.wantSpecs(t, func(dto RuntimeSpecDTO) RuntimeSpecDTO {
+			// A spec that is not replicable is pushed its stored idle timeout,
+			// so the read-only echo of the effective one follows the flag.
+			dto.Replicable, dto.EffectiveIdleTimeoutSeconds = false, dto.IdleTimeoutSeconds
+			return dto
+		}, specs...)
+		stored, _, err := f.routes.RuntimeSpecByID(ctx, specs[0].ID)
+		if err != nil || stored.MinInstances != 2 || stored.MaxInstances != 4 {
+			t.Fatalf("stored spec = %+v (err %v), want the instance counts 2 / 4 kept", stored, err)
+		}
+		if got := pushed(t, f, specs[0].ID); got.Replicable || got.MinInstances != 0 || got.MaxInstances != 0 {
+			t.Fatalf("pushed spec = replicable %v, min %d, max %d; want one process, no instance keys", got.Replicable, got.MinInstances, got.MaxInstances)
+		}
+
+		before = len(f.calls())
+		out, err = f.svc.SetBenchmarkRuntimeSpecsReplicable(ctx, specIDs(specs...), false, true)
+		if err != nil {
+			t.Fatalf("restore err = %v, want nil", err)
+		}
+		wantOutcome(t, out, BenchmarkSpecsOutcome{Written: specIDs(specs...), Notified: true})
+		f.wantCalls(t, before, f.serverID)
+		f.wantSpecs(t, unchanged, specs...)
+		if got := f.etag(t); got != etag {
+			t.Fatalf("ETag after the restore = %s, want the original %s", got, etag)
+		}
+		if got := pushed(t, f, specs[0].ID); !got.Replicable || got.MinInstances != 2 || got.MaxInstances != 4 {
+			t.Fatalf("pushed spec after the restore = replicable %v, min %d, max %d; want 2 / 4 again", got.Replicable, got.MinInstances, got.MaxInstances)
+		}
+	})
+
+	t.Run("a spec whose flag is not the expected one is a conflict", func(t *testing.T) {
+		f, specs := newFixture(t)
+		plain := f.specs[0] // not replicable
+		before := len(f.calls())
+		out, err := f.svc.SetBenchmarkRuntimeSpecsReplicable(ctx, specIDs(plain, specs[0]), true, false)
+		if err != nil {
+			t.Fatalf("err = %v, want nil (a conflict is not a failure)", err)
+		}
+		wantOutcome(t, out, BenchmarkSpecsOutcome{Written: specIDs(specs[0]), Conflict: specIDs(plain), Notified: true})
+		wantErrs(t, out, ErrRuntimeSpecReplicableConflict, plain.ID)
+		f.wantCalls(t, before, f.serverID)
+
+		// An operator who turned the flag back on during the run owns it: the
+		// restore writes nothing.
+		f.operatorPut(t, specs[0], func(req *PutRuntimeSpecRequest) { req.Replicable = true })
+		before = len(f.calls())
+		out, err = f.svc.SetBenchmarkRuntimeSpecsReplicable(ctx, specIDs(specs[0]), false, true)
+		if err != nil {
+			t.Fatalf("restore err = %v, want nil", err)
+		}
+		wantOutcome(t, out, BenchmarkSpecsOutcome{Conflict: specIDs(specs[0])})
+		f.wantCalls(t, before)
+	})
+}

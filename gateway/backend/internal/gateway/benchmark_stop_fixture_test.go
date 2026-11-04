@@ -678,6 +678,12 @@ type stopAllPortal struct {
 	// pinNotifies is the number of notifications each pinned batch sent, in
 	// call order.
 	pinNotifies []int
+	// onReplicableBatch runs before every replicable batch reaches the
+	// service ("single" turns replicable off, "replicable" back on), and
+	// failReplicableRestore makes a batch that turns it back on report its
+	// specs as Failed with this error, writing nothing.
+	onReplicableBatch     func(kind string, ids []string)
+	failReplicableRestore map[string]error
 }
 
 func (p *stopAllPortal) SetBenchmarkRuntimeSpecsAdminState(ctx context.Context, specIDs []string, expectedAdminState, adminState string) (portal.BenchmarkSpecsOutcome, error) {
