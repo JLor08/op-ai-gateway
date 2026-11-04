@@ -75,8 +75,13 @@ type Target struct {
 	Endpoint      string
 	Model         string
 	ProviderModel string
-	Timeout       time.Duration
-	APIFlavor     string
+	// InstanceKey names the mapping instance this target addresses,
+	// "<mapping_id>#<k>" for every k, instance 0 included (the InstanceKey
+	// function), on a target built from a mapping; "" on a vendor target.
+	// ProviderModel is that instance's address.
+	InstanceKey string
+	Timeout     time.Duration
+	APIFlavor   string
 	// APIToken is the resolved application's per-app upstream credential, still
 	// SEALED (enc:/plain:). Routing never decrypts it; the cipher-holding gateway
 	// layers open it and attach it to the upstream call. Empty = no upstream auth.
@@ -461,6 +466,7 @@ type Resolver struct {
 	vendorEnumerator  VendorAccountEnumerator
 	groups            GroupResolver
 	warmer            ModelWarmer
+	instances         InstanceSource
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
 	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
 	// the per-user vendor-account branch (resolveVendorAccount). All three are
@@ -677,7 +683,8 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 // resolveStandard is the self-hosted/shared resolution path: model-group dispatch,
 // route affinity, then fresh candidate selection (ActiveMappingsForModel →
 // filterProvisioned → filterServesEndpoint → filterCapable → the fail-open voice filter →
-// selectCandidate → targetFrom). It is everything Resolve did below the server-override short-circuit
+// expandInstances, on every admission turn → selectCandidate → targetFrom). It is
+// everything Resolve did below the server-override short-circuit
 // before the vendor-account branch was layered on top; extracting it verbatim lets
 // Resolve wrap it with the vendor precedence without duplicating any of its
 // ErrNoModelRoute exits. now and apiFlavor are passed in, computed once by Resolve.
@@ -797,7 +804,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// Admission-queue params (CP4): the servers to watch for a freeing slot, and the wait
 	// timeout = the MAX admission_queue_timeout_seconds across the candidate apps (0 = at
 	// least one app is willing to wait unboundedly => ctx-only wait). Computed once — the
-	// model's candidate set is stable across a short wait.
+	// model's mappings are stable across a short wait, and the instances each turn adds
+	// below run on those same servers under those same applications, so they change
+	// neither.
 	serverIDs := make([]string, 0, len(candidates))
 	seenServer := map[string]struct{}{}
 	queueTimeoutSecs := 0
@@ -822,7 +831,12 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	}
 
 	for {
-		selected, ok, err := r.selectCandidate(ctx, candidates, req, now)
+		// The mappings' running instances are read on EVERY turn, not once with the
+		// mappings: a request parked below because every candidate was at capacity must
+		// be offered, on its next turn, an instance that started while it waited. The
+		// capacity filter in selectCandidate therefore judges this turn's instances.
+		turn := expandInstances(candidates, r.instances)
+		selected, ok, err := r.selectCandidate(ctx, turn, req, now)
 		if errors.Is(err, errAllAtCapacity) {
 			// All candidates at cap + a wired controller: park until a slot frees, then retry.
 			wait := queueTimeout // 0 => unbounded (ctx-only)
@@ -1910,10 +1924,14 @@ func (r *Resolver) swapProtected(c MappingCandidate, now time.Time) bool {
 }
 
 // modelLoadedOn reports whether the candidate's upstream model is currently loaded on
-// its server/application, per the loaded-model checker.
+// its server/application, per the loaded-model checker. It asks for the candidate's
+// instance address: an agent reports each running instance under its own address, so
+// instance 0 being down while instance 2 serves reads as instance 2 loaded and instance
+// 0 not, and swap protection and the loaded partitions judge each instance by its own.
 func modelLoadedOn(checker LoadedModelChecker, c MappingCandidate) bool {
+	address := InstanceAddress(c.Mapping.AppModelName, c.Instance)
 	for _, name := range checker.LoadedAppModels(c.Application.ID, c.Server.ID) {
-		if name == c.Mapping.AppModelName {
+		if name == address {
 			return true
 		}
 	}
@@ -1926,11 +1944,13 @@ func modelLoadedOn(checker LoadedModelChecker, c MappingCandidate) bool {
 // modelStartingOn) is automatically a no-op, matching the P4a/P4b nil-checker lenient
 // invariant. metricsOK is threaded through untouched: it gates the active/queue overlay
 // (see mergeRuntimeModelMetrics) separately from ok/state (which drives prefer-starting).
+// It asks for the candidate's instance address, so each instance reads its own lifecycle
+// state and its own active/queue, never instance 0's.
 func (r *Resolver) runtimeModelState(c MappingCandidate) (state string, active int, queue int, ok bool, metricsOK bool) {
 	if r.runtimeState == nil {
 		return "", 0, 0, false, false
 	}
-	return r.runtimeState.RuntimeModelState(c.Server.ID, c.Mapping.AppModelName)
+	return r.runtimeState.RuntimeModelState(c.Server.ID, InstanceAddress(c.Mapping.AppModelName, c.Instance))
 }
 
 // modelStartingOn reports whether the candidate's upstream model is currently reported
@@ -2028,7 +2048,11 @@ func serverSelectable(server AIServer) bool {
 }
 
 // targetFrom builds the Target for a resolved candidate (server + application +
-// mapping, plus the mapping's joined capability verdicts). The Target's
+// mapping, plus the mapping's joined capability verdicts). It addresses the
+// candidate's instance: ProviderModel is the instance's address, so the body
+// and path rewrites reach that instance unchanged, and InstanceKey names it,
+// while RouteID stays the mapping id that usage, metrics and capability
+// lookups attribute by. The Target's
 // flavors, endpoint modes and live-timings flag are the mapping's
 // EffectiveFields: the application's own for an ordinary application, and for
 // a server_agent mapping the RESOLVED RuntimeSpec's, the sole authority for
@@ -2067,7 +2091,8 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		Provider:             app.Type,
 		Endpoint:             ApplicationEndpoint(server, app),
 		Model:                mapping.GatewayModelName,
-		ProviderModel:        mapping.AppModelName,
+		ProviderModel:        InstanceAddress(mapping.AppModelName, c.Instance),
+		InstanceKey:          InstanceKey(mapping.ID, c.Instance),
 		Timeout:              time.Duration(app.TimeoutMS) * time.Millisecond,
 		APIFlavor:            apiFlavor,
 		APIToken:             apiToken,
@@ -2229,6 +2254,11 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
+	// A member's running instances are candidates like its mappings, read on every call:
+	// the group walk calls this afresh on each admission turn, so a parked group request
+	// sees an instance that started while it waited. Expanded BEFORE the loaded-only
+	// filter, which then keeps an instance by its own address.
+	cands = expandInstances(cands, r.instances)
 	cands, err = r.filterBySpeedFloor(ctx, cands, name, gw.policy.MinTokensPerSecond)
 	if err != nil {
 		return nil, true, err

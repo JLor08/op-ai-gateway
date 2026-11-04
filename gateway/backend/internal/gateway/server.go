@@ -1006,6 +1006,13 @@ func New(deps ServerDeps) *Server {
 		// runtimeModelStateChecker wraps the SAME registry instance the Server publishes
 		// agent telemetry into, so the resolver's view stays consistent with it.
 		resolver.SetRuntimeModelStateChecker(newRuntimeModelStateChecker(runtimeStatus, agentFeatures))
+		// The same two registries feed the resolver's InstanceSource, which expands a
+		// replicable spec's mapping into the instances its agent reports running. It
+		// reads the spec through deps.Routes, so without a store nothing is expanded
+		// and every candidate stays its mapping's instance 0.
+		if deps.Routes != nil {
+			resolver.SetInstanceSource(newInstanceSource(deps.Routes, agentFeatures, runtimeStatus))
+		}
 		resolver.SetSessionReservation(sessionReservationWindow)
 		resolver.SetAdmissionController(admission)
 		resolver.SetGroupResolver(groups)

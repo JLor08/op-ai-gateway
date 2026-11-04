@@ -477,6 +477,24 @@ func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusD
 	return append([]RuntimeStatusDTO(nil), r.statuses[serverID]...)
 }
 
+// statusRows returns serverID's most recent published runtime-status snapshot
+// itself, not a copy, holding the lock for the map read alone -- for a reader
+// on the request path (routing's instance expansion) that must not hold this
+// lock any longer. It is safe to read without the lock because publish stores
+// a fresh slice on every call and never writes to one it has published: a
+// later publish replaces the map entry and leaves the rows a reader holds as
+// they were. The caller must not modify the rows; statusSnapshot is the copy
+// for one that would. Nil for a nil registry and for a server that has never
+// reported.
+func (r *runtimeStatusRegistry) statusRows(serverID string) []RuntimeStatusDTO {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.statuses[serverID]
+}
+
 // serverIDs returns every server id that has a published runtime-status
 // snapshot, in no particular order. Bounded to the deployment's GPU-box
 // count (servers running agent-managed models), pruned by Retain below as

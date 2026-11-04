@@ -242,3 +242,32 @@ func TestRuntimeStatusRegistryNilSafe(t *testing.T) {
 	}
 	unsub() // must not panic
 }
+
+// statusRows hands out the published snapshot itself, and that is safe only
+// because publish never writes to a slice it has published: a later publish
+// replaces the server's snapshot and leaves the rows a reader already holds as
+// they were.
+func TestRuntimeStatusRegistryStatusRowsIsThePublishedSnapshot(t *testing.T) {
+	r := newRuntimeStatusRegistry()
+	in := []RuntimeStatusDTO{{SpecID: "spec-1", State: "running"}}
+	r.publish("srv-a", in)
+	in[0].State = "crashed" // the caller's slice is not the published one
+	held := r.statusRows("srv-a")
+	if len(held) != 1 || held[0].State != "running" {
+		t.Fatalf("statusRows = %+v, want the published running row", held)
+	}
+	r.publish("srv-a", []RuntimeStatusDTO{{SpecID: "spec-1", State: "stopped"}, {SpecID: "spec-2", State: "running"}})
+	if len(held) != 1 || held[0].State != "running" {
+		t.Fatalf("rows held across a publish = %+v, want them unchanged", held)
+	}
+	if now := r.statusRows("srv-a"); len(now) != 2 || now[0].State != "stopped" {
+		t.Fatalf("statusRows after the publish = %+v, want the new snapshot", now)
+	}
+	if rows := r.statusRows("srv-unknown"); rows != nil {
+		t.Fatalf("statusRows(unknown server) = %+v, want nil", rows)
+	}
+	var nilRegistry *runtimeStatusRegistry
+	if rows := nilRegistry.statusRows("srv-a"); rows != nil {
+		t.Fatalf("nil registry statusRows = %+v, want nil", rows)
+	}
+}

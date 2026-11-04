@@ -683,6 +683,16 @@ type usageMeta struct {
 // mapping average when the application opts into opportunistic metric updates.
 const opportunisticEWMAAlpha = 0.2
 
+// usageProviderModel is the provider model a usage row records: the model sent
+// upstream, with the instance suffix stripped when the target addressed an
+// instance k >= 1, so a replicable model's usage is one model in the analytics
+// whichever of its instances served. Only the suffix the target's InstanceKey
+// names is stripped, so a model whose own name contains a '#' is recorded as
+// itself.
+func usageProviderModel(target routing.Target, requested string) string {
+	return routing.InstanceBase(effectiveProviderModel(target, requested), target.Instance())
+}
+
 // recordUsage persists the usage_events row for a completed request and runs the
 // fire-and-forget epilogue (capture, opportunistic metrics, vendor usage scrape).
 // upstreamHeaders are the UPSTREAM provider response headers when available (the
@@ -738,7 +748,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		ContentType:      meta.ContentType,
 		ReqPath:          meta.ReqPath,
 		ProviderPath:     upstreamPath(target, req.APIFlavor, meta.Endpoint),
-		ProviderModel:    effectiveProviderModel(target, req.Model),
+		ProviderModel:    usageProviderModel(target, req.Model),
 		Stream:           req.Stream,
 		TokenName:        token.Name,
 		ServerName:       s.serverName(target.ServerID),
