@@ -227,26 +227,40 @@ function instanceView(
   let own = 0;
   let midLine = false;
   for (const e of entries) {
-    if (hasGap(e)) midLine = false;
+    const gap = hasGap(e);
+    if (gap) midLine = false;
     // An entry that is only a gap names no instance, which on the wire reads
     // as instance 0 -- but a gap is nobody's output, so it is shown in every
     // tab and counted as none, instance 0's no more than any other's.
-    const gapOnly = hasGap(e) && !e.text && !e.event;
+    const gapOnly = gap && !e.text && !e.event;
     if (gapOnly || entryInstance(e) !== k) {
-      if (hasGap(e)) out.push({ dropped_bytes: e.dropped_bytes });
+      if (gap) out.push({ dropped_bytes: e.dropped_bytes });
       continue;
     }
     own++;
-    const text = e.text ?? '';
-    if (e.event || text === '') {
-      if (e.event) midLine = false;
-      out.push(e);
-      continue;
-    }
-    out.push(prefix === '' ? e : { ...e, text: stripLinePrefixes(text, prefix, midLine) });
-    midLine = !text.endsWith('\n');
+    const shown = ownEntryInTab(e, prefix, midLine);
+    out.push(shown.entry);
+    midLine = shown.midLine;
   }
   return { entries: out, own };
+}
+
+/**
+ * One of instance k's own entries as its tab shows it, and the line state after
+ * it: a generation marker opens a new line, an empty chunk leaves the state as
+ * it was, and a text chunk loses the prefixes of the lines it opens and leaves
+ * the line open unless it ends in a newline.
+ */
+function ownEntryInTab(
+  e: RuntimeLogEntry,
+  prefix: string,
+  midLine: boolean,
+): { entry: RuntimeLogEntry; midLine: boolean } {
+  if (e.event) return { entry: e, midLine: false };
+  const text = e.text ?? '';
+  if (text === '') return { entry: e, midLine };
+  const entry = prefix === '' ? e : { ...e, text: stripLinePrefixes(text, prefix, midLine) };
+  return { entry, midLine: !text.endsWith('\n') };
 }
 
 /**
