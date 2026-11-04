@@ -337,8 +337,9 @@ type replicableAgentEnsurer struct {
 	specOf map[string]string // base model -> spec id
 
 	mu         sync.Mutex
-	replicable map[string]bool   // spec id -> the flag the agent applied
-	refuse     map[string]string // address -> router code
+	replicable map[string]bool          // spec id -> the flag the agent applied
+	refuse     map[string]string        // address -> router code
+	delay      map[string]time.Duration // address -> how long its start takes before the ensure answers
 }
 
 func (e *replicableAgentEnsurer) LoadedModels(ctx context.Context, target routing.Target, path, format string) ([]string, error) {
@@ -351,6 +352,7 @@ func (e *replicableAgentEnsurer) EnsureRuntimeModel(_ context.Context, target ro
 	e.mu.Lock()
 	allowed := e.replicable[e.specOf[base]]
 	code, refused := e.refuse[target.ProviderModel]
+	delay := e.delay[target.ProviderModel]
 	e.mu.Unlock()
 	if instance && !allowed {
 		return &provider.RouterError{Code: "runtime.model_not_managed", Err: provider.ErrUnavailable}
@@ -358,6 +360,8 @@ func (e *replicableAgentEnsurer) EnsureRuntimeModel(_ context.Context, target ro
 	if refused {
 		return &provider.RouterError{Code: code, Err: provider.ErrUnavailable}
 	}
+	time.Sleep(delay)
+	e.events.add("ensured %s", target.ProviderModel)
 	return nil
 }
 
@@ -383,7 +387,7 @@ func newBothRunAudioFixture(t *testing.T, opts stopAllOpts) (*stopAllFixture, *a
 	f := newStopAllFixture(t, opts)
 	makeReplicable(t, f.mem, "rs_map1") // two protected instances, room for four
 	f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager", runtimeInstancesFeature})
-	ensurer := &replicableAgentEnsurer{Client: f.srv.Provider, events: f.events, specOf: map[string]string{"m1": "rs_map1"}, replicable: map[string]bool{"rs_map1": true}, refuse: map[string]string{}}
+	ensurer := &replicableAgentEnsurer{Client: f.srv.Provider, events: f.events, specOf: map[string]string{"m1": "rs_map1"}, replicable: map[string]bool{"rs_map1": true}, refuse: map[string]string{}, delay: map[string]time.Duration{}}
 	f.srv.Provider = ensurer
 	f.agent.onApply = ensurer.watch
 	script := &audioScript{answer: func(audioMeasureCall, int) (audioMeasurement, error) { return audioFigures(5, 100), nil }}
@@ -406,9 +410,10 @@ func bothRunAudioTargets(t *testing.T, f *stopAllFixture, mappingIDs ...string) 
 
 // TestBothRunRampWaitsForTheFloorItsRestoreStarts: making the spec replicable again before
 // its ramp also starts its protected instances (min_instances 3: m1#1 and m1#2) by
-// themselves. The ramp ensures them -- each ensure returns once the instance runs -- before
-// it sends anything, so no level is measured while a sibling of the measured process still
-// loads, and it does not ensure them again at their own levels.
+// themselves. The ramp ensures them -- each ensure returns once the instance runs, after any
+// wait its start takes (m1#2 here takes 80 ms) -- before it sends anything, so no level is
+// measured while a sibling of the measured process still loads, and it does not ensure them
+// again at their own levels.
 func TestBothRunRampWaitsForTheFloorItsRestoreStarts(t *testing.T) {
 	f, _, _ := newBothRunAudioFixture(t, stopAllOpts{stopDelay: 100 * time.Millisecond})
 	spec, _, err := f.mem.RuntimeSpecByID(context.Background(), "rs_map1")
@@ -419,6 +424,7 @@ func TestBothRunRampWaitsForTheFloorItsRestoreStarts(t *testing.T) {
 	if err := f.mem.UpsertRuntimeSpec(context.Background(), spec); err != nil {
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
+	f.srv.Provider.(*replicableAgentEnsurer).delay["m1#2"] = 80 * time.Millisecond
 
 	status := f.run(t, "both", bothRunAudioTargets(t, f, "map1"))
 
@@ -431,8 +437,8 @@ func TestBothRunRampWaitsForTheFloorItsRestoreStarts(t *testing.T) {
 		t.Fatalf("ensures = %v, want the protected instances first, then m1#3", got)
 	}
 	firstRampCall := f.events.index("audio m1 level 0 warm-up true", 0)
-	if floorUp := f.events.lastIndex("ensure m1#2"); floorUp < 0 || firstRampCall < 0 || floorUp > firstRampCall {
-		t.Fatalf("events = %v, want the protected instances up before the ramp's first warm-up", f.events.with("replicable ", "ensure ", "audio m1 "))
+	if floorUp := f.events.index("ensured m1#2", 0); floorUp < 0 || firstRampCall < 0 || floorUp > firstRampCall {
+		t.Fatalf("events = %v, want the protected instances up before the ramp's first warm-up", f.events.with("replicable ", "ensure", "audio m1 "))
 	}
 	var later []string
 	for _, ev := range f.events.list()[firstRampCall:] {
@@ -445,22 +451,37 @@ func TestBothRunRampWaitsForTheFloorItsRestoreStarts(t *testing.T) {
 	}
 }
 
-// TestBothRunRampMeetsAFloorWithoutRoomAtItsLevel: a protected instance the agent has no
-// room for (m1#1, 409 runtime.instance_no_capacity) does not load either, so the wait for
-// the floor ends there without failing the ramp: level 1 is measured on m1, and level 2,
-// whose ensure of m1#1 meets the same refusal, stops the ramp at 1 with the limit
-// resources.
-func TestBothRunRampMeetsAFloorWithoutRoomAtItsLevel(t *testing.T) {
-	f, _, targets := newBothRunAudioFixture(t, stopAllOpts{})
-	f.srv.Provider.(*replicableAgentEnsurer).refuse["m1#1"] = audioRampNoCapacityCode
+// TestBothRunRampFailsWhenAProtectedInstanceDoesNotStart: the agent admits a protected
+// instance like a baseline start -- it waits for room or evicts an idle neighbour, and never
+// refuses it for room -- so an ensure of one that fails at all, whatever its code (here even
+// runtime.instance_no_capacity, or a start that timed out), is a failure of the ramp, not a
+// lower bound: no level is measured, no pair is stored, and the spec is replicable again and
+// the lease released after the run.
+func TestBothRunRampFailsWhenAProtectedInstanceDoesNotStart(t *testing.T) {
+	for _, code := range []string{audioRampNoCapacityCode, "runtime.start_timeout"} {
+		t.Run(code, func(t *testing.T) {
+			f, _, targets := newBothRunAudioFixture(t, stopAllOpts{})
+			f.srv.Provider.(*replicableAgentEnsurer).refuse["m1#1"] = code
 
-	status := f.run(t, "both", targets)
+			status := f.run(t, "both", targets)
 
-	if res := status.Results[0]; res.Error != "" || res.AudioRealtimeConcurrency != 1 || res.AudioConcurrencyLimit != routing.AudioLimitResources {
-		t.Fatalf("result = %d / %q, error %q; want 1 / resources", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error)
-	}
-	if f.events.index("audio m1 level 1 warm-up false", 0) < 0 {
-		t.Fatalf("events = %v, want level 1 measured", f.events.with("ensure ", "audio m1 "))
+			res := status.Results[0]
+			if !strings.Contains(res.Error, "protected instances") || !strings.Contains(res.Error, code) || res.AudioConcurrencyLimit != "" {
+				t.Fatalf("result = %d / %q, error %q; want the ramp failed on the protected instance", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error)
+			}
+			if f.events.index("audio m1 level 1 warm-up false", 0) >= 0 {
+				t.Fatalf("events = %v, want no level measured", f.events.with("ensure ", "audio m1 "))
+			}
+			if m, err := f.mem.MappingByID(context.Background(), "map1"); err != nil || m.AudioConcurrencyLimit != "" {
+				t.Fatalf("mapping limit = %q (%v), want no pair stored", m.AudioConcurrencyLimit, err)
+			}
+			if !storedReplicable(t, f.mem, "rs_map1") {
+				t.Fatal("after the run the spec is stored as not replicable")
+			}
+			if got := f.lease(t); !got.Empty() {
+				t.Fatalf("lease after the run = %+v, want it released", got)
+			}
+		})
 	}
 }
 

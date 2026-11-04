@@ -205,7 +205,10 @@ func (s *Server) takeAudioMeasurement(ctx context.Context, call audioMeasureCall
 }
 
 // audioCallFor decides the one measurement an audio target gets, and is the measurement every
-// pass of its speed run and every stream of its ramp takes:
+// pass of its speed run and every stream of its ramp takes. measureAudioTarget asks it once per
+// target and run (audioPrepared), so its one request of its own -- the speech benchmark for a
+// missing byte rate -- is sent at most once per run, and its outcome, a failure included, is
+// every part's:
 //   - a TTS model synthesizes the passage, as a stream when it streams (speech_streaming yes)
 //     and in one piece otherwise, with a clone model's preset voice. A stream counts its audio
 //     with the mapping's output byte rate, the one the speech benchmark caches; when none is
@@ -252,21 +255,33 @@ func (s *Server) audioLiveServed(tgt benchmarkTarget) bool {
 	return tgt.app.Type != routing.ProviderServerAgent || s.AgentFeatures.Has(tgt.server.ID, fullduplexProxyFeature)
 }
 
+// audioPrepared is the measurement an audio target's parts take in one run (audioCallFor),
+// decided once for the run, or why it could not be: the outcome of the speech benchmark a
+// streamed synthesis without a cached byte rate needs first. A both run's capacity part fails
+// with the speed part's error then, instead of sending the failing request again.
+type audioPrepared struct {
+	call audioMeasureCall
+	err  error
+}
+
 // measureAudioTarget is runBenchmark's speed, capacity and both modes for an audio target:
 // speed (runAudioSpeed), capacity (runAudioCapacity), or speed then capacity, so the ramp's
-// write comes last and metrics_source ends "capacity", as a text both run's does. Each part
-// stores what it measured and records its own history row. The result carries both parts'
-// figures; its error is the first part's that failed, and the error returned with it as well.
+// write comes last and metrics_source ends "capacity", as a text both run's does. The
+// measurement both parts take is prepared once (audioPrepared). Each part stores what it
+// measured and records its own history row. The result carries both parts' figures; its
+// error is the first part's that failed, and the error returned with it as well.
 func (s *Server) measureAudioTarget(ctx context.Context, run *benchmarkRun, tgt benchmarkTarget, mode string) (BenchmarkResult, error) {
 	res := BenchmarkResult{MappingID: tgt.mapping.ID, GatewayModelName: tgt.mapping.GatewayModelName}
+	var prep audioPrepared
+	prep.call, prep.err = s.audioCallFor(ctx, tgt)
 	var firstErr error
 	if mode != "capacity" {
-		speed, loadMS, err := s.runAudioSpeed(ctx, tgt)
+		speed, loadMS, err := s.runAudioSpeed(ctx, tgt, prep)
 		res.AudioRateX, res.AudioTTFTMS, res.AudioLoadTimeMS = speed.RateX, speed.TTFTMS, loadMS
 		firstErr = err
 	}
 	if mode == "capacity" || mode == "both" {
-		ramp, err := s.runAudioCapacity(ctx, run, tgt)
+		ramp, err := s.runAudioCapacity(ctx, run, tgt, prep)
 		if ramp.Limit != "" {
 			res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit = ramp.Concurrency, ramp.Limit
 		}
@@ -286,8 +301,8 @@ func (s *Server) measureAudioTarget(ctx context.Context, run *benchmarkRun, tgt 
 // figures), and the target's kind=audio history row, appended on success and failure alike.
 // A load time written for a replicable spec pushes the server's runtime config
 // (pushBenchmarkLoadTime).
-func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget) (audioMeasurement, int64, error) {
-	m, loadMS, err := s.measureAudioSpeed(ctx, tgt)
+func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep audioPrepared) (audioMeasurement, int64, error) {
+	m, loadMS, err := s.measureAudioSpeed(ctx, tgt, prep)
 	now := time.Now().UTC()
 	row := routing.BenchmarkRun{MappingID: tgt.mapping.ID, ServerID: tgt.server.ID, CreatedAt: now, Kind: benchmarkKindAudio}
 	if err != nil {
@@ -310,19 +325,20 @@ func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget) (audioM
 }
 
 // measureAudioSpeed measures one audio target's speed with the text benchmark's technique:
-// ensureColdLoad, a cold pass, then a warm pass of the same measurement (audioCallFor). The
+// ensureColdLoad, a cold pass, then a warm pass of the same measurement (prep's). The
 // warm pass is the measurement; the cold pass, which a load may lengthen, is its warm-up. The
 // load time is the cold pass's time to its first output minus the warm pass's
 // (audioMeasureKind.firstOutputMS), and it is recorded only when ensureColdLoad confirmed a
 // cold start and the cold pass was the slower: unknown, never bogus, like a text load time.
 // When the stop-all wrote, or may have written, the target's own force_stopped, the cold pass
 // rides the router's 503 until the clear reaches the agent (audioColdPassAfterStop). An error
-// from ensureColdLoad, a stop-all's failed clear, ends the measurement before any pass.
-func (s *Server) measureAudioSpeed(ctx context.Context, tgt benchmarkTarget) (audioMeasurement, int64, error) {
-	call, err := s.audioCallFor(ctx, tgt)
-	if err != nil {
-		return audioMeasurement{}, 0, err
+// from ensureColdLoad, a stop-all's failed clear, ends the measurement before any pass, and a
+// measurement that could not be prepared ends it before ensureColdLoad.
+func (s *Server) measureAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep audioPrepared) (audioMeasurement, int64, error) {
+	if prep.err != nil {
+		return audioMeasurement{}, 0, prep.err
 	}
+	call := prep.call
 	cold, err := s.ensureColdLoad(ctx, tgt)
 	if err != nil {
 		return audioMeasurement{}, 0, err
@@ -405,12 +421,12 @@ type audioCapacityResult struct {
 // kind=audio_capacity history row, appended on success and failure alike. A failed ramp
 // stores no pair: it established no reason to stop, and a partial count would read as a
 // lower bound the ramp never found.
-func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt benchmarkTarget) (audioCapacityResult, error) {
+func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt benchmarkTarget, prep audioPrepared) (audioCapacityResult, error) {
 	onLevel := func(k int) {
 		run.setCurrentConcurrency(k)
 		s.Benchmarks.publish(tgt.server.ID, run.snapshot())
 	}
-	ramp, err := s.measureAudioCapacity(ctx, tgt, onLevel)
+	ramp, err := s.measureAudioCapacity(ctx, tgt, prep, onLevel)
 	now := time.Now().UTC()
 	curve := ramp.Curve
 	if curve == nil {
@@ -433,7 +449,7 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 }
 
 // measureAudioCapacity is the ramp: level k = 1, 2, 3, ... runs k measurements at once
-// (audioCallFor's) and records each stream's rate -- for a streamed synthesis with its wait
+// (prep's, audioCallFor) and records each stream's rate -- for a streamed synthesis with its wait
 // for the first audio beyond a lone stream's counted in (audioRampRate). Level k is good
 // when its slowest stream's rate is at least the real-time threshold
 // (audioRealtimeThreshold). The ramp stops:
@@ -443,7 +459,8 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 //     (audioRefusedForRoom), with the limit resources and the level before -- a lower bound,
 //     the room its neighbours held at that moment;
 //   - once level k reaches the ramp's cap (audioRampCap) or, for a ramp by instance, the
-//     spec's max_instances, with the limit cap and k -- a lower bound.
+//     spec's max_instances or the agent's instance index cap (routing.MaxInstanceIndex + 1
+//     instances, m#63 the last), with the limit cap and k -- a lower bound.
 //
 // A replicable target on an agent known to run instances (audioRampByInstance) is ramped one
 // instance per stream: level k first ensures instance k-1 (the address m#(k-1), m itself for
@@ -460,13 +477,14 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 // protected instances that starts by themselves (ensureAudioFloor), and afterwards holds the
 // spec as one process again when a later target of the run may still stop the server's
 // models (audioRampOneProcessAgain).
-func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, onLevel func(int)) (audioCapacityResult, error) {
+func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, prep audioPrepared, onLevel func(int)) (audioCapacityResult, error) {
 	var res audioCapacityResult
-	call, err := s.audioCallFor(ctx, tgt)
-	if err != nil {
-		return res, err
+	if prep.err != nil {
+		return res, prep.err
 	}
+	call := prep.call
 	byInstance := s.audioRampByInstance(tgt)
+	var err error
 	restored := false
 	up := 0 // instances 0 ... up-1 are known to run
 	if byInstance {
@@ -481,8 +499,11 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 		}
 	}
 	capK := s.audioRampCap()
-	if byInstance && tgt.spec.MaxInstances > 0 {
-		capK = min(capK, tgt.spec.MaxInstances)
+	if byInstance {
+		capK = min(capK, routing.MaxInstanceIndex+1)
+		if tgt.spec.MaxInstances > 0 {
+			capK = min(capK, tgt.spec.MaxInstances)
+		}
 	}
 	threshold := s.audioRealtimeThreshold()
 	var loneFirstMS int64 // level 1's stream's time to first output (audioRampRate)
@@ -695,10 +716,12 @@ func (s *Server) audioRampReplicableAgain(ctx context.Context, tgt benchmarkTarg
 // order the agent starts them in, and each ensure returns once that instance runs, so no
 // level is measured while one of them still loads beside the measured process. It returns
 // how many instances, from 0 on, are known to run, which the ramp does not ensure again.
-// An instance the agent has no room for at that moment (audioRefusedForRoom) does not load
-// either, and the ramp meets the same refusal at that instance's own level, so the wait
-// ends there without an error; any other failure fails the ramp. A floor of one instance at
-// most starts nothing beside the process the speed part left running.
+// The agent admits a protected instance like a baseline start, not like a burst one: it may
+// wait for room or evict an idle neighbour for it, and the ensure answers only once it runs,
+// but it never refuses it for room. So an ensure that fails at all -- a start that failed or
+// timed out, whatever code it carries -- fails the ramp: the floor the ramp would be measured
+// beside never came up. A floor of one instance at most starts nothing beside the process
+// the speed part left running.
 func (s *Server) ensureAudioFloor(ctx context.Context, tgt benchmarkTarget, target routing.Target) (int, error) {
 	floor := audioProtectedFloor(tgt.spec)
 	if floor <= 1 {
@@ -707,9 +730,6 @@ func (s *Server) ensureAudioFloor(ctx context.Context, tgt benchmarkTarget, targ
 	for k := range floor {
 		target.ProviderModel = audioInstanceAddress(tgt.mapping.AppModelName, k)
 		if err := s.ensureAudioInstance(ctx, target, true); err != nil {
-			if audioRefusedForRoom(err) {
-				return k, nil
-			}
 			return k, fmt.Errorf("audio benchmark: the protected instances of launch spec %s, which start once it is replicable again: %w", tgt.spec.ID, err)
 		}
 	}

@@ -842,6 +842,30 @@ func TestAudioCapacityCap(t *testing.T) {
 			t.Fatalf("curve = %+v, want three levels", payload.Curve)
 		}
 	})
+	t.Run("the agent's instance index cap", func(t *testing.T) {
+		// A ramp cap above the agent's instance index cap (63), with no max_instances, stops a
+		// ramp by instance at 64 instances, m#63 the last: m#64 is no address the agent serves.
+		f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: true, features: []string{"runtime_manager", runtimeInstancesFeature}})
+		f.srv.audioConcurrencyMax = 100
+
+		res := f.run(t, "capacity")
+
+		if res.Error != "" || res.AudioRealtimeConcurrency != routing.MaxInstanceIndex+1 || res.AudioConcurrencyLimit != routing.AudioLimitCap {
+			t.Fatalf("result = %d / %q, error %q; want %d / cap", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error, routing.MaxInstanceIndex+1)
+		}
+		got := f.provider.ensuredAddresses()
+		if len(got) != routing.MaxInstanceIndex+1 || got[len(got)-1] != "m#"+strconv.Itoa(routing.MaxInstanceIndex) {
+			t.Fatalf("ensured %d addresses ending %q, want %d ending m#%d", len(got), got[len(got)-1], routing.MaxInstanceIndex+1, routing.MaxInstanceIndex)
+		}
+	})
+	t.Run("the index cap does not cap one process", func(t *testing.T) {
+		f := newAudioFixture(t, audioFixtureOpts{})
+		f.srv.audioConcurrencyMax = routing.MaxInstanceIndex + 3
+
+		if res := f.run(t, "capacity"); res.Error != "" || res.AudioRealtimeConcurrency != routing.MaxInstanceIndex+3 || res.AudioConcurrencyLimit != routing.AudioLimitCap {
+			t.Fatalf("result = %d / %q, error %q; want %d / cap", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error, routing.MaxInstanceIndex+3)
+		}
+	})
 	t.Run("max_instances", func(t *testing.T) {
 		f := newAudioFixture(t, audioFixtureOpts{agent: true, replicable: true, maxInstances: 2, features: []string{"runtime_manager", runtimeInstancesFeature}})
 
@@ -942,6 +966,32 @@ func TestAudioBothRunMeasuresSpeedThenCapacity(t *testing.T) {
 	calls := f.script.recorded()
 	if len(calls) < 3 || calls[0].level != 0 || calls[1].level != 0 {
 		t.Fatalf("measurements = %+v, want the speed passes first", calls)
+	}
+}
+
+// TestAudioBothRunMeasuresTheByteRateOnce: a streamed synthesis is counted with the mapping's
+// output byte rate, and when none is cached the speech benchmark runs first to measure it.
+// In a both run whose speech benchmark fails, the speed part fails with that error, and the
+// capacity part fails with the same one: the outcome is the run's, and the failing request
+// is not sent a second time (one kind=speech history row, no measurement at all).
+func TestAudioBothRunMeasuresTheByteRateOnce(t *testing.T) {
+	f := newAudioFixture(t, audioFixtureOpts{noByteRate: true})
+
+	res := f.run(t, "both")
+
+	if res.Error == "" || !strings.Contains(res.Error, "output byte rate") {
+		t.Fatalf("result = %+v, want the byte rate's failure", res)
+	}
+	rows := f.rows(t)
+	if len(rows[benchmarkKindSpeech]) != 1 {
+		t.Fatalf("speech history rows = %d, want the one speech benchmark the run sent", len(rows[benchmarkKindSpeech]))
+	}
+	audio, ramp := rows[benchmarkKindAudio], rows[benchmarkKindAudioCapacity]
+	if len(audio) != 1 || len(ramp) != 1 || audio[0].Error == "" || ramp[0].Error != audio[0].Error {
+		t.Fatalf("audio rows = %+v, ramp rows = %+v; want one failed row each, with the same error", audio, ramp)
+	}
+	if got := f.script.recorded(); len(got) != 0 {
+		t.Fatalf("measurements = %+v, want none", got)
 	}
 }
 
