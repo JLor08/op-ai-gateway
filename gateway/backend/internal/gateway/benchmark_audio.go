@@ -45,10 +45,11 @@ import (
 
 // The Kind of the audio benchmark's history rows: a speed run's and a ramp's. A row of either
 // kind carries its own figures as JSON in the history's capacity_curve column
-// (audioSpeedHistory, audioCapacityHistory), which the portal decodes by kind.
+// (routing.AudioSpeedHistory, routing.AudioCapacityHistory), which the portal decodes by kind
+// with the same types.
 const (
-	benchmarkKindAudio         = "audio"
-	benchmarkKindAudioCapacity = "audio_capacity"
+	benchmarkKindAudio         = routing.BenchmarkKindAudio
+	benchmarkKindAudioCapacity = routing.BenchmarkKindAudioCapacity
 )
 
 // The metrics_source an audio run stamps on the mapping: a speed run the text speed run's, a
@@ -279,13 +280,6 @@ func (s *Server) measureAudioTarget(ctx context.Context, run *benchmarkRun, tgt 
 	return res, firstErr
 }
 
-// audioSpeedHistory is a kind=audio history row's JSON payload: the single-stream rate, the
-// one speed figure the row has no column for (its time to first output, wall time, real-time
-// factor and load time have theirs).
-type audioSpeedHistory struct {
-	RateX float64 `json:"audio_rate_x"`
-}
-
 // runAudioSpeed is the speed part of an audio run for one target: the measurement
 // (measureAudioSpeed), its write on the mapping (UpdateMappingAudioMetrics: the rate, the time
 // to first output and a confirmed load time, source benchmark; a locked mapping keeps its
@@ -300,7 +294,7 @@ func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget) (audioM
 		m, loadMS = audioMeasurement{}, 0
 		row.Error = err.Error()
 	} else {
-		payload, _ := json.Marshal(audioSpeedHistory{RateX: m.RateX})
+		payload, _ := json.Marshal(routing.AudioSpeedHistory{RateX: m.RateX})
 		row.TTFTMS, row.WallMS, row.RTF, row.LoadTimeMS, row.CapacityCurve = m.TTFTMS, m.WallMS, m.RTF, int(loadMS), string(payload)
 		metrics := routing.AudioMetrics{RateX: m.RateX, TTFAMS: m.TTFTMS, LoadTimeMS: loadMS}
 		if werr := s.Routes.UpdateMappingAudioMetrics(ctx, tgt.mapping.ID, metrics, audioMetricsSourceSpeed, now); werr != nil {
@@ -389,12 +383,9 @@ func (s *Server) pushBenchmarkLoadTime(tgt benchmarkTarget, loadMS int) {
 }
 
 // audioLevel is one level of the ramp: k streams at once, the slowest one's rate and the mean
-// of their rates, each the rate the level judges the stream by (audioRampRate).
-type audioLevel struct {
-	K         int     `json:"k"`
-	MinRateX  float64 `json:"min_rate_x"`
-	MeanRateX float64 `json:"mean_rate_x"`
-}
+// of their rates, each the rate the level judges the stream by (audioRampRate). It is the
+// history payload's own type (routing.AudioLevel), so the curve is stored as measured.
+type audioLevel = routing.AudioLevel
 
 // audioCapacityResult is what a ramp established: the last good level (Concurrency, 0 when
 // not even one stream was real-time or nothing could be measured) and why the ramp stopped
@@ -405,14 +396,6 @@ type audioCapacityResult struct {
 	Concurrency int
 	Limit       string
 	Curve       []audioLevel
-}
-
-// audioCapacityHistory is a kind=audio_capacity history row's JSON payload: the ramp's pair
-// and its curve. A failed ramp carries no limit, and the curve of the levels it measured.
-type audioCapacityHistory struct {
-	RealtimeConcurrency int          `json:"audio_realtime_concurrency"`
-	ConcurrencyLimit    string       `json:"audio_concurrency_limit,omitempty"`
-	Curve               []audioLevel `json:"audio_curve"`
 }
 
 // runAudioCapacity is the capacity part of an audio run for one target: the ramp
@@ -433,7 +416,7 @@ func (s *Server) runAudioCapacity(ctx context.Context, run *benchmarkRun, tgt be
 	if curve == nil {
 		curve = []audioLevel{}
 	}
-	payload, _ := json.Marshal(audioCapacityHistory{RealtimeConcurrency: ramp.Concurrency, ConcurrencyLimit: ramp.Limit, Curve: curve})
+	payload, _ := json.Marshal(routing.AudioCapacityHistory{RealtimeConcurrency: ramp.Concurrency, ConcurrencyLimit: ramp.Limit, Curve: curve})
 	row := routing.BenchmarkRun{MappingID: tgt.mapping.ID, ServerID: tgt.server.ID, CreatedAt: now, Kind: benchmarkKindAudioCapacity, CapacityCurve: string(payload)}
 	if err != nil {
 		row.Error = err.Error()

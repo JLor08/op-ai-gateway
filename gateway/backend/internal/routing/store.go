@@ -676,6 +676,44 @@ type CapacityReport struct {
 	Levels                       []CapacityLevel `json:"levels,omitempty"`
 }
 
+// The Kind of the audio benchmark's history rows (#340): BenchmarkKindAudio for
+// a speed run of a speech or transcription mapping, BenchmarkKindAudioCapacity
+// for its concurrency ramp. A row of either kind carries its own figures as
+// JSON in BenchmarkRun.CapacityCurve -- AudioSpeedHistory and
+// AudioCapacityHistory, the one definition the gateway writes and the portal
+// reads.
+const (
+	BenchmarkKindAudio         = "audio"
+	BenchmarkKindAudioCapacity = "audio_capacity"
+)
+
+// AudioLevel is one level k of an audio concurrency ramp: k streams at once,
+// and the slowest one's and the mean of their rates (seconds of audio per wall
+// second), each the rate the ramp judged the stream by.
+type AudioLevel struct {
+	K         int     `json:"k"`
+	MinRateX  float64 `json:"min_rate_x"`
+	MeanRateX float64 `json:"mean_rate_x"`
+}
+
+// AudioSpeedHistory is a BenchmarkKindAudio row's CapacityCurve payload: the
+// single-stream rate, the one speed figure the row has no column for (its time
+// to first output, wall time, real-time factor and load time have theirs).
+type AudioSpeedHistory struct {
+	RateX float64 `json:"audio_rate_x"`
+}
+
+// AudioCapacityHistory is a BenchmarkKindAudioCapacity row's CapacityCurve
+// payload: the ramp's pair -- the last good level and why the ramp stopped
+// there, one of the AudioLimit* constants -- and its curve, one AudioLevel per
+// level measured. A ramp that failed carries no limit, and then its count
+// means nothing; with a limit the count is a result even at 0 (AudioMetrics).
+type AudioCapacityHistory struct {
+	RealtimeConcurrency int          `json:"audio_realtime_concurrency"`
+	ConcurrencyLimit    string       `json:"audio_concurrency_limit,omitempty"`
+	Curve               []AudioLevel `json:"audio_curve"`
+}
+
 type GPUSample struct {
 	Index         int
 	Name          string

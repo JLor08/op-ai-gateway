@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
@@ -248,13 +249,13 @@ func (f *audioFixture) rows(t *testing.T) map[string][]routing.BenchmarkRun {
 }
 
 // capacityRow is map1's one audio_capacity history row, decoded.
-func (f *audioFixture) capacityRow(t *testing.T) (routing.BenchmarkRun, audioCapacityHistory) {
+func (f *audioFixture) capacityRow(t *testing.T) (routing.BenchmarkRun, routing.AudioCapacityHistory) {
 	t.Helper()
 	rows := f.rows(t)[benchmarkKindAudioCapacity]
 	if len(rows) != 1 {
 		t.Fatalf("audio_capacity rows = %d, want 1", len(rows))
 	}
-	var payload audioCapacityHistory
+	var payload routing.AudioCapacityHistory
 	if err := json.Unmarshal([]byte(rows[0].CapacityCurve), &payload); err != nil {
 		t.Fatalf("capacity_curve %q does not decode: %v", rows[0].CapacityCurve, err)
 	}
@@ -352,7 +353,7 @@ func TestAudioSpeedRunStoresMappingMetrics(t *testing.T) {
 			if row.Error != "" || row.TTFTMS != m.AudioTTFAMS || row.WallMS <= 0 || row.RTF <= 0 {
 				t.Fatalf("audio row = %+v, want ttft %d, a wall time and a real-time factor", row, m.AudioTTFAMS)
 			}
-			var payload audioSpeedHistory
+			var payload routing.AudioSpeedHistory
 			if err := json.Unmarshal([]byte(row.CapacityCurve), &payload); err != nil || payload.RateX != m.AudioRateX {
 				t.Fatalf("audio row payload = %q (%v), want the rate %v", row.CapacityCurve, err, m.AudioRateX)
 			}
@@ -1107,28 +1108,66 @@ func TestAutoAudioRunOnceWhenMissing(t *testing.T) {
 	})
 }
 
-// TestAudioHistoryDecodesIntoThePortalDTO: the JSON an audio history row carries is written
-// under the portal's own DTO keys, so the portal serves the figures the gateway stored. A
-// field dropped or renamed on either side shows up as a zero on the far side.
-func TestAudioHistoryDecodesIntoThePortalDTO(t *testing.T) {
-	speed, err := json.Marshal(audioSpeedHistory{RateX: 3.5})
+// TestAudioHistoryRoundTripsThroughThePortal: the history rows the gateway writes are read by
+// the portal's history endpoint into the figures the gateway stored, through the one payload
+// definition both share. A speed row serves its rate; a ramp that measured 0 -- not real-time
+// even alone, the limit performance -- serves the count 0 beside its limit and curve, where an
+// omitted count would read as unknown; and a ramp that failed serves neither count nor limit.
+func TestAudioHistoryRoundTripsThroughThePortal(t *testing.T) {
+	f := newAudioFixture(t, audioFixtureOpts{})
+	f.script.answer = levelRates(map[int][]float64{1: {0.8}})
+	if res := f.run(t, "both"); res.Error != "" || res.AudioConcurrencyLimit != routing.AudioLimitPerformance {
+		t.Fatalf("both run = %+v, want a ramp that stopped on performance", res)
+	}
+	f.srv.Benchmarks.Release("srv1")
+	f.script.answer = func(call audioMeasureCall, _ int) (audioMeasurement, error) {
+		if call.level == 2 {
+			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureTransport, Message: "connection reset"}
+		}
+		return audioFigures(5, 100), nil
+	}
+	if res := f.run(t, "capacity"); res.Error == "" {
+		t.Fatalf("capacity run = %+v, want a failed ramp", res)
+	}
+	svc := portal.NewService(portal.ServiceDeps{Routes: f.mem})
+	runs, err := svc.MappingBenchmarks(context.Background(), auth.Token{Scopes: []string{"gateway:use", "admin", "system"}}, "map1", 50)
 	if err != nil {
-		t.Fatalf("marshal speed: %v", err)
+		t.Fatalf("MappingBenchmarks: %v", err)
 	}
-	var dto portal.BenchmarkRunDTO
-	if err := json.Unmarshal(speed, &dto); err != nil || dto.AudioRateX != 3.5 {
-		t.Fatalf("speed payload %s decodes to rate %v (%v), want 3.5", speed, dto.AudioRateX, err)
+	var speed, measured0, failed map[string]any
+	for _, r := range runs {
+		raw, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal %+v: %v", r, err)
+		}
+		var row map[string]any
+		if err := json.Unmarshal(raw, &row); err != nil {
+			t.Fatalf("unmarshal %s: %v", raw, err)
+		}
+		switch {
+		case r.Kind == benchmarkKindAudio:
+			speed = row
+		case r.Kind == benchmarkKindAudioCapacity && r.Error == "":
+			measured0 = row
+		case r.Kind == benchmarkKindAudioCapacity:
+			failed = row
+		}
 	}
-	ramp, err := json.Marshal(audioCapacityHistory{RealtimeConcurrency: 2, ConcurrencyLimit: routing.AudioLimitResources, Curve: []audioLevel{{K: 1, MinRateX: 3, MeanRateX: 3.5}}})
-	if err != nil {
-		t.Fatalf("marshal ramp: %v", err)
+	if speed == nil || speed["audio_rate_x"] != 10.0 {
+		t.Fatalf("speed row = %v, want audio_rate_x 10", speed)
 	}
-	dto = portal.BenchmarkRunDTO{}
-	if err := json.Unmarshal(ramp, &dto); err != nil {
-		t.Fatalf("unmarshal ramp: %v", err)
+	count, ok := measured0["audio_realtime_concurrency"]
+	if !ok || count != 0.0 || measured0["audio_concurrency_limit"] != routing.AudioLimitPerformance {
+		t.Fatalf("measured-0 ramp row = %v, want audio_realtime_concurrency 0 beside the limit performance", measured0)
 	}
-	if dto.AudioRealtimeConcurrency != 2 || dto.AudioConcurrencyLimit != routing.AudioLimitResources || !reflect.DeepEqual(dto.AudioCurve, []portal.AudioLevelDTO{{K: 1, MinRateX: 3, MeanRateX: 3.5}}) {
-		t.Fatalf("ramp payload %s decodes to %+v", ramp, dto)
+	if curve, _ := measured0["audio_curve"].([]any); len(curve) != 1 || !reflect.DeepEqual(curve[0], map[string]any{"k": 1.0, "min_rate_x": 0.8, "mean_rate_x": 0.8}) {
+		t.Fatalf("measured-0 ramp row curve = %v, want its one level", measured0["audio_curve"])
+	}
+	if failed == nil {
+		t.Fatalf("history = %+v, want a failed ramp row", runs)
+	}
+	if _, ok := failed["audio_realtime_concurrency"]; ok || failed["audio_concurrency_limit"] != nil {
+		t.Fatalf("failed ramp row = %v, want neither a count nor a limit", failed)
 	}
 }
 

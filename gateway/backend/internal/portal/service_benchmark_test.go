@@ -480,25 +480,39 @@ func TestMappingBenchmarksAudioDecode(t *testing.T) {
 		t.Fatalf("audio row = %#v", a)
 	}
 	wantCurve := []AudioLevelDTO{{K: 1, MinRateX: 3, MeanRateX: 3}, {K: 2, MinRateX: 1.5, MeanRateX: 2}, {K: 3, MinRateX: 1.1, MeanRateX: 1.1}}
-	if r := byServer["srv-ramp"]; r.Kind != "audio_capacity" || r.AudioRealtimeConcurrency != 2 || r.AudioConcurrencyLimit != "performance" || !reflect.DeepEqual(r.AudioCurve, wantCurve) || r.AudioRateX != 0 {
+	if r := byServer["srv-ramp"]; r.Kind != "audio_capacity" || r.AudioRealtimeConcurrency == nil || *r.AudioRealtimeConcurrency != 2 || r.AudioConcurrencyLimit != "performance" || !reflect.DeepEqual(r.AudioCurve, wantCurve) || r.AudioRateX != 0 {
 		t.Fatalf("ramp row = %#v", r)
 	}
-	if z := byServer["srv-zero"]; z.AudioRealtimeConcurrency != 0 || z.AudioConcurrencyLimit != "performance" || len(z.AudioCurve) != 1 {
+	if z := byServer["srv-zero"]; z.AudioRealtimeConcurrency == nil || *z.AudioRealtimeConcurrency != 0 || z.AudioConcurrencyLimit != "performance" || len(z.AudioCurve) != 1 {
 		t.Fatalf("measured-0 row = %#v, want 0 / performance and its one level", z)
 	}
-	if b := byServer["srv-bad"]; b.Error == "" || b.AudioConcurrencyLimit != "" || b.AudioCurve != nil {
+	if b := byServer["srv-bad"]; b.Error == "" || b.AudioRealtimeConcurrency != nil || b.AudioConcurrencyLimit != "" || b.AudioCurve != nil {
 		t.Fatalf("malformed row = %#v, want its error and no figures", b)
 	}
 	if o := byServer["srv-other"]; o.AudioConcurrencyLimit != "" || o.AudioCurve != nil {
 		t.Fatalf("capacity row = %#v, want no audio figures read from another kind's payload", o)
 	}
-	raw, err := json.Marshal(byServer["srv-ramp"])
-	if err != nil {
-		t.Fatalf("marshal ramp row: %v", err)
-	}
-	for _, key := range []string{`"audio_realtime_concurrency":2`, `"audio_concurrency_limit":"performance"`, `"audio_curve":[{"k":1,"min_rate_x":3,"mean_rate_x":3}`} {
-		if !strings.Contains(string(raw), key) {
-			t.Fatalf("ramp row JSON %s lacks %s", raw, key)
+	for server, keys := range map[string][]string{
+		"srv-ramp": {`"audio_realtime_concurrency":2`, `"audio_concurrency_limit":"performance"`, `"audio_curve":[{"k":1,"min_rate_x":3,"mean_rate_x":3}`},
+		// A measured 0 is a result beside its limit, and must not read as unknown.
+		"srv-zero": {`"audio_realtime_concurrency":0`, `"audio_concurrency_limit":"performance"`},
+	} {
+		raw, err := json.Marshal(byServer[server])
+		if err != nil {
+			t.Fatalf("marshal %s row: %v", server, err)
 		}
+		for _, key := range keys {
+			if !strings.Contains(string(raw), key) {
+				t.Fatalf("%s row JSON %s lacks %s", server, raw, key)
+			}
+		}
+	}
+	// A failed ramp has no limit, and its count means nothing: neither is served.
+	raw, err := json.Marshal(byServer["srv-bad"])
+	if err != nil {
+		t.Fatalf("marshal malformed row: %v", err)
+	}
+	if strings.Contains(string(raw), "audio_realtime_concurrency") || strings.Contains(string(raw), "audio_concurrency_limit") {
+		t.Fatalf("malformed row JSON %s, want no count and no limit", raw)
 	}
 }

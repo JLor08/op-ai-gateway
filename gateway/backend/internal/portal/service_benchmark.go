@@ -61,40 +61,27 @@ type BenchmarkRunDTO struct {
 	WallMS int64   `json:"wall_ms,omitempty"`
 	RTF    float64 `json:"rtf,omitempty"`
 	// The audio benchmark's figures (#340), decoded from the JSON a row of
-	// either audio kind holds in its capacity_curve column (decodeAudioHistory).
-	// A kind=="audio" row (an audio speed run) carries TTFTMS, WallMS, RTF and
-	// LoadTimeMS above -- its time to first audio or text, wall time, real-time
-	// factor and confirmed cold start -- plus AudioRateX, its single-stream rate.
-	// A kind=="audio_capacity" row (the concurrency ramp) carries
-	// AudioRealtimeConcurrency, the last good level, AudioConcurrencyLimit, why the
-	// ramp stopped ("performance" | "resources" | "cap"; "" for a ramp that failed,
-	// and then the count means nothing), and AudioCurve, one entry per level.
-	// Every other kind carries none of them.
+	// either audio kind holds in its capacity_curve column
+	// (routing.AudioSpeedHistory, routing.AudioCapacityHistory, the types the
+	// gateway writes it with). A kind=="audio" row (an audio speed run) carries
+	// TTFTMS, WallMS, RTF and LoadTimeMS above -- its time to first audio or
+	// text, wall time, real-time factor and confirmed cold start -- plus
+	// AudioRateX, its single-stream rate. A kind=="audio_capacity" row (the
+	// concurrency ramp) carries AudioConcurrencyLimit, why the ramp stopped
+	// ("performance" | "resources" | "cap"), with AudioRealtimeConcurrency, the
+	// last good level, which is then always served, a measured 0 included (0
+	// under "performance": not real-time even alone); and AudioCurve, one entry
+	// per level. A ramp that failed has no limit, and neither field is served:
+	// its count means nothing. Every other kind carries none of them.
 	AudioRateX               float64         `json:"audio_rate_x,omitempty"`
-	AudioRealtimeConcurrency int             `json:"audio_realtime_concurrency,omitempty"`
+	AudioRealtimeConcurrency *int            `json:"audio_realtime_concurrency,omitempty"`
 	AudioConcurrencyLimit    string          `json:"audio_concurrency_limit,omitempty"`
 	AudioCurve               []AudioLevelDTO `json:"audio_curve,omitempty"`
 }
 
-// AudioLevelDTO is one level k of an audio concurrency ramp: k streams at
-// once, the slowest one's and the mean rate in seconds of audio per wall
-// second. It mirrors the gateway's audioLevel field for field, which the
-// gateway's own test pins.
-type AudioLevelDTO struct {
-	K         int     `json:"k"`
-	MinRateX  float64 `json:"min_rate_x"`
-	MeanRateX float64 `json:"mean_rate_x"`
-}
-
-// audioHistoryPayload is the JSON an audio history row holds in its
-// capacity_curve column. Its keys are the DTO's own, so the gateway writes the
-// figures under the names the portal serves them by.
-type audioHistoryPayload struct {
-	AudioRateX               float64         `json:"audio_rate_x"`
-	AudioRealtimeConcurrency int             `json:"audio_realtime_concurrency"`
-	AudioConcurrencyLimit    string          `json:"audio_concurrency_limit"`
-	AudioCurve               []AudioLevelDTO `json:"audio_curve"`
-}
+// AudioLevelDTO is one level k of an audio concurrency ramp
+// (routing.AudioLevel, the type the gateway writes the curve with).
+type AudioLevelDTO = routing.AudioLevel
 
 // CapacityLevelDTO / CapacityReportDTO are the decoded capacity curve for a
 // kind=="capacity" benchmark-history row (decoded from BenchmarkRun.CapacityCurve).
@@ -248,27 +235,31 @@ func benchmarkRunDTO(r routing.BenchmarkRun) BenchmarkRunDTO {
 		dto.VRAM = decodeVRAMReport(r.VRAMJSON)
 	case "speech":
 		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
-	case "audio":
+	case routing.BenchmarkKindAudio:
 		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
-		dto.AudioRateX = decodeAudioHistory(r.CapacityCurve).AudioRateX
-	case "audio_capacity":
-		h := decodeAudioHistory(r.CapacityCurve)
-		dto.AudioRealtimeConcurrency, dto.AudioConcurrencyLimit = h.AudioRealtimeConcurrency, h.AudioConcurrencyLimit
-		if len(h.AudioCurve) > 0 {
-			dto.AudioCurve = h.AudioCurve
+		dto.AudioRateX = decodeAudioHistory[routing.AudioSpeedHistory](r.CapacityCurve).RateX
+	case routing.BenchmarkKindAudioCapacity:
+		h := decodeAudioHistory[routing.AudioCapacityHistory](r.CapacityCurve)
+		if h.ConcurrencyLimit != "" {
+			count := h.RealtimeConcurrency
+			dto.AudioRealtimeConcurrency, dto.AudioConcurrencyLimit = &count, h.ConcurrencyLimit
+		}
+		if len(h.Curve) > 0 {
+			dto.AudioCurve = h.Curve
 		}
 	}
 	return dto
 }
 
-// decodeAudioHistory decodes an audio history row's opaque payload, tolerating
-// a blank or malformed one as no figures for the same reason
-// decodeCapacityReport does: the row's own columns and Error still make a
-// usable history entry.
-func decodeAudioHistory(raw string) audioHistoryPayload {
-	var payload audioHistoryPayload
+// decodeAudioHistory decodes an audio history row's opaque payload into its
+// kind's type, tolerating a blank or malformed one as no figures for the same
+// reason decodeCapacityReport does: the row's own columns and Error still make
+// a usable history entry.
+func decodeAudioHistory[T routing.AudioSpeedHistory | routing.AudioCapacityHistory](raw string) T {
+	var payload T
 	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &payload) != nil {
-		return audioHistoryPayload{}
+		var none T
+		return none
 	}
 	return payload
 }
