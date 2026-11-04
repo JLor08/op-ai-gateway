@@ -840,7 +840,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   server** — and this is the *only* write it gates, which a client
   reasoning about a run's isolation has to know. The endpoint is a full-document replace with `admin_state` among
   its fields, so it is an override action as much as an edit, and one
-  "Force start" on a spec a VRAM run has drained puts a sibling's allocation
+  "Pin as running" on a spec a VRAM run has drained puts a sibling's allocation
   inside the measurement window. The gate is the benchmark reservation — the
   same fact that already excludes the server from routing — checked after
   authorization, so an unauthorized caller learns nothing from it. `GET` and
@@ -1652,7 +1652,12 @@ sample's `capabilities.features` and not in this document; the newest are
 `runtime_role_eviction` (it captures each spec's pushed `role` and protects a
 recently used model from eviction, agent 0.15.0, [ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)), which is
 declared for **visibility only** and gates nothing: the document below is one
-shared shape for every agent whether or not it declares it. `runtime_instances`
+shared shape for every agent whether or not it declares it. `runtime_stop`
+(agent 0.17.0, [ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor))
+says the router serves `POST /stop/{model}`; unlike `runtime_role_eviction` it
+gates real behaviour, fail-closed: the gateway forwards the portal's manual stop
+of an instance only to an agent that declares it, and the portal shows Stop
+disabled on a server whose runtime report lacks it. `runtime_instances`
 (agent 0.16.0, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
 is on **both** lists with a different fact behind each: the gateway's says it
 understands one status row per instance, and the agent honours a spec's

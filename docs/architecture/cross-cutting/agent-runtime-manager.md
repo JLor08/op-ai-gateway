@@ -5768,8 +5768,8 @@ Three more rules on this screen generalise:
 - **An `admin_state` write builds its PUT body by rest-spreading the spec it
   has just read** and replacing the one field, never by assembling an explicit
   field list — so a field added to the spec later carries through instead of
-  being silently defaulted. "Force start", "Force stop", "Clear override" and
-  both writes of a restart (§11.2) read the spec with their own GET inside the
+  being silently defaulted. "Pin as running", "Pin as stopped", "Clear
+  override" and both writes of a restart (§11.2) read the spec with their own GET inside the
   action, once the override actions are locked and within the same bound as
   the write, and a failed GET writes nothing — and so does a spec that read as
   deleted, or still being deleted, since the write is an upsert that would
@@ -5889,8 +5889,7 @@ this screen.
 > exists. A change to any of those four must be checked against the portal's
 > bound, and vice versa.
 
-The `admin_state` writes of Force start, Force stop and Clear override, and a
-restart's clear, are additionally bounded client-side by a 30 s watchdog,
+The `admin_state` writes of Pin and Clear override, and a restart's clear, are additionally bounded client-side by a 30 s watchdog,
 because the portal's HTTP transport has no `AbortController`: nothing else ever
 gives up on a request, so a PUT that never settles would leave the busy flag set
 for the life of the page, disabling every action on every row with no escape but
@@ -6438,7 +6437,7 @@ space, Windows device names, invisible Unicode format characters) are
 deliberately not mirrored, for the reason the gateway does not mirror them either.
 The list is part of the **full-document** PUT, so the form binds it from the loaded
 spec and always sends it, `[]` included: an absent `config_files` clears the stored
-set, and that is also why the Start/Stop/Clear override body spreads it through
+set, and that is also why the Pin/Clear override body spreads it through
 unchanged. Once at least one file is configured and the agent's features have
 been read, an agent that has not declared `runtime_config_files` draws a
 non-blocking warning with its reported version ([§7](#7-feature-negotiation)).
@@ -6782,9 +6781,11 @@ text targets included.
 
 **A launch-spec write is refused while a run holds the server.** The
 launch-spec endpoint is a full-document replace with `admin_state` among its
-fields, so it is an override action as much as an edit: one "Force start" on a
-spec the run has drained puts a sibling's allocation inside the measurement
-window. `PUT /api/portal/mappings/{id}/runtime-spec` therefore answers **409
+fields, so it is an override action as much as an edit: one "Pin as running" on
+a spec the run has drained puts a sibling's allocation inside the measurement
+window. The live-status Start and Stop are refused under the same reservation
+with the same code, since a start or a stop on that server moves the same
+measurement. `PUT /api/portal/mappings/{id}/runtime-spec` therefore answers **409
 `runtime_spec.server_benchmarking`** whenever the benchmark reservation is held
 for that mapping's server — the same reservation that already excludes the
 server from gateway routing, checked *after* authorization so it leaks nothing,
@@ -8379,6 +8380,56 @@ same function as the pushed document, so the two cannot disagree); neither has a
   instance with no process and nothing queued, so its row leaves the stream and
   does not count in the wait. Without the stored spec every row counts as
   protected.
+- **The status rows' process actions** (`components/shared/runtimeActions.ts`,
+  `runtimeRowPlan`). Beside the log view, which every row keeps, a row offers
+  at most three, each placed by one rule, plus Clear override and Restart on
+  the row that speaks for the spec (§11.2):
+  - **Start** (Play) calls `POST /api/portal/mappings/{id}/runtime/start`,
+    which writes nothing: the gateway picks the instance by the scaler's index
+    rule and asks the agent's ensure route for it, and afterwards the instance
+    follows the normal idle, eviction and burst rules
+    ([ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)).
+    It sits on the speaking row.
+    A spec that is not replicable shows it only while its one instance neither
+    runs nor starts. A replicable spec keeps it while instances run, its hover
+    saying it starts one more, and shows it disabled with a reason once no
+    index is left below `max_instances` (0: the 64 an address can carry) — by
+    the gateway's rule as far as the stream shows it: instance 0 taken while it
+    runs or starts, an index k ≥ 1 while it is listed in any state but
+    `crashed`, `start_failed` and `not_permitted`. While the spec is
+    `force_stopped` it is disabled with the hover "Pinned as stopped: clear the
+    override first", since the gateway refuses every start then. A 202 answer
+    (the agent did not report the instance up within 5 s) says the instance is
+    starting and that the status rows show its progress.
+  - **Stop** calls `POST …/runtime/stop` with `{"instance": k}` and also writes
+    nothing: the agent drains that instance, and demand may start it again
+    (`POST /stop/{model}`, §4.1). It sits on the row of the spec's highest
+    running or starting instance, because instances stop highest first. It is
+    shown disabled, with a hover naming the ways out — clear the override, lower
+    the minimum instances, untick Pinned, or Pin as stopped — on an instance the
+    agent keeps up: an index below the larger of a replicable spec's
+    `min_instances` and 1 for a spec `pinned` or `force_running` (the agent's
+    `ProtectedCount`), which the agent would refuse with
+    `runtime.instance_protected`. It is shown disabled with a reason, too, when
+    the runtime report's `agent_features` lacks `runtime_stop` (§7); the report
+    is read once per screen, so an agent that changed since is caught by the
+    gateway's `409 runtime.agent_feature_missing`, which the portal renders
+    naming the feature.
+  - **Pin** sits on the speaking row while the spec carries no override, and
+    pins the state the operator sees: "Pin as running" while any instance of
+    the spec runs or starts, writing `force_running`, otherwise "Pin as
+    stopped", writing `force_stopped`. It is the persistent override, written
+    through the same fresh-read full-document PUT as Clear override (§11.1),
+    which stays its unpin. The rows no longer offer Force start and Force stop;
+    the spec form's admin-override select keeps all three values.
+
+  A start or stop in flight disables only its own button; all of them, and the
+  override writes, wait while a restart or an override write runs (§11.2). The
+  answer, or the refusal translated in both languages, shows in the screen's
+  toast; every code of the two endpoints is mapped
+  ([HTTP API Surface](../reference/api-surface.md#agent-managed-model-runtime)). The status table keeps up
+  to five actions inline, which a replicable spec's speaking row reaches (Logs,
+  Start, Stop, Pin, Restart).
 - The log view of a replicable spec — or of any spec once more than one instance
   is known to it — offers tabs: **All** shows every instance's output as it
   arrives, lines of instance k ≥ 1 prefixed `[#k]` by the agent (§6.1) and
@@ -8540,7 +8591,7 @@ operator meets first:
   live state/context/active/queue on the Models catalog; "last load failed"
   — `runtimes[].last_error` — is still visible only on the runtime admin
   screen (§11.5), which is the only place that also lets an operator act on
-  it (force-start, inspect logs).
+  it (Start, inspect logs).
 - **Capability auto-detection landed; the richer per-request telemetry the
   same endpoints carry did not.** Modality/capability detection is no longer
   out of scope — llama.cpp's `modalities`/`chat_template_caps` shipped with
