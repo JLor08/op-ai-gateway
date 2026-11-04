@@ -718,6 +718,46 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
     });
 
+    // The audio result carries its own load time; a gateway that fills only
+    // the shared load_time_ms still has its figure shown, and the audio one
+    // wins where both are there.
+    it('reads the load time of an audio speed result from load_time_ms when the audio one is absent', async () => {
+      renderSection(
+        { kind: 'server' },
+        {
+          subscribeBenchmark: deliveringAudio({
+            audio_rate_x: 2,
+            audio_ttft_ms: 300,
+            load_time_ms: 4200,
+          }),
+        },
+      );
+      expect(
+        await screen.findByText(
+          `tts-gw: ${t.benchmarkAudioResult(2, 300)}, ${t.benchmarkAudioLoadTime(4200)}`,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('prefers the audio load time over load_time_ms', async () => {
+      renderSection(
+        { kind: 'server' },
+        {
+          subscribeBenchmark: deliveringAudio({
+            audio_rate_x: 2,
+            audio_ttft_ms: 300,
+            audio_load_time_ms: 5000,
+            load_time_ms: 4200,
+          }),
+        },
+      );
+      expect(
+        await screen.findByText(
+          `tts-gw: ${t.benchmarkAudioResult(2, 300)}, ${t.benchmarkAudioLoadTime(5000)}`,
+        ),
+      ).toBeInTheDocument();
+    });
+
     // Like the text speed line: a load time of 0 was not measured (the cold
     // start was not confirmed), never a load of 0 ms.
     it('says the load time of an audio speed result was not measured when it is 0', async () => {
@@ -825,9 +865,26 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       await screen.findByText(t.benchmarkAudioRuns);
       const audioTable = screen.getByText(t.mappingAudioRateX).closest('table') as HTMLElement;
-      expect(within(audioTable).getByText('3.0×')).toBeInTheDocument();
-      expect(within(audioTable).getByText('250')).toBeInTheDocument();
-      expect(within(audioTable).getByText('5000')).toBeInTheDocument();
+      // Every figure the run stored, under its own header: the rate, the
+      // first output, the wall time, the real-time factor and the load time.
+      const headers = within(audioTable)
+        .getAllByRole('columnheader')
+        .map((h) => h.textContent);
+      const cells = within(within(audioTable).getAllByRole('row')[1])
+        .getAllByRole('cell')
+        .map((c) => c.textContent);
+      const cellUnder = (label: string) => cells[headers.indexOf(label)];
+      expect(cellUnder(t.mappingAudioRateX)).toBe('3.0×');
+      expect(cellUnder(t.mappingAudioTtfaMs)).toBe('250');
+      expect(cellUnder(t.benchmarkAudioColWall)).toBe('7000');
+      expect(cellUnder(t.benchmarkAudioColRtf)).toBe('0.35');
+      expect(cellUnder(t.mappingLoadTimeMs)).toBe('5000');
+      // The run that measured nothing shows its error and a dash per figure.
+      const errorCells = within(within(audioTable).getAllByRole('row')[2])
+        .getAllByRole('cell')
+        .map((c) => c.textContent);
+      expect(errorCells[headers.indexOf(t.benchmarkAudioColWall)]).toBe('—');
+      expect(errorCells[headers.indexOf(t.benchmarkAudioColRtf)]).toBe('—');
       expect(
         within(audioTable).getByText('audio benchmark: the model refused'),
       ).toBeInTheDocument();
@@ -842,6 +899,78 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // Neither kind falls into the speed table as a row of dashes.
       expect(screen.queryByText(t.mappingGenTokensPerSecond)).not.toBeInTheDocument();
       expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
+    // Every branch of a ramp row: the error after its time, a measured 0 as
+    // not real-time, a limit this build does not know as unknown (never a
+    // lower bound), and no curve table for a ramp that stored none.
+    it('renders each audio capacity history row by what it measured', async () => {
+      const base: BenchmarkRunDTO = {
+        id: 'run_ramp',
+        mapping_id: 'map_1',
+        server_id: 'srv_1',
+        created_at: '2026-11-03T12:00:00Z',
+        gen_tokens_per_second: 0,
+        prompt_tokens_per_second: 0,
+        load_time_ms: 0,
+        context_size: 0,
+        error: '',
+        kind: 'audio_capacity',
+      };
+      const failed: BenchmarkRunDTO = {
+        ...base,
+        id: 'run_failed',
+        error: 'audio ramp: the ensure failed',
+      };
+      const notRealtime: BenchmarkRunDTO = {
+        ...base,
+        id: 'run_zero',
+        created_at: '2026-11-03T11:00:00Z',
+        audio_realtime_concurrency: 0,
+        audio_concurrency_limit: 'performance',
+        audio_curve: [{ k: 1, min_rate_x: 0.8, mean_rate_x: 0.8 }],
+      };
+      const newer: BenchmarkRunDTO = {
+        ...base,
+        id: 'run_newer',
+        created_at: '2026-11-03T10:00:00Z',
+        audio_realtime_concurrency: 3,
+        audio_concurrency_limit: 'thermal',
+      };
+
+      renderSection(
+        { kind: 'server' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [makeMapping({ id: 'map_1' })],
+          runs: [failed, notRealtime, newer],
+        },
+      );
+
+      await screen.findByText(t.benchmarkAudioCapacityRuns);
+      const when = (run: BenchmarkRunDTO) => new Date(run.created_at).toLocaleString();
+      expect(
+        screen.getByText(`${when(failed)} — audio ramp: the ensure failed`),
+      ).toBeInTheDocument();
+      expect(screen.getByText(when(notRealtime))).toBeInTheDocument();
+      expect(screen.getByText(when(newer))).toBeInTheDocument();
+
+      // A measured 0 is a result: not even one stream kept up.
+      const zero = screen.getByText(t.benchmarkAudioCapacityResult(0, 'performance'));
+      expect(zero).toHaveTextContent(t.audioRealtimeConcurrency(0, 'performance'));
+
+      // The failed ramp and the one with an unknown limit read "unknown".
+      expect(screen.getAllByText(t.benchmarkAudioCapacityResult(0, ''))).toHaveLength(2);
+      expect(screen.queryByText(/≥/)).not.toBeInTheDocument();
+      expect(screen.queryByText(new RegExp(t.mappingAudioConcurrencyLimitCap))).toBeNull();
+
+      // Only the ramp that stored a curve has a curve table.
+      const curves = screen
+        .getAllByText(t.benchmarkAudioColSlowest)
+        .map((h) => h.closest('table') as HTMLElement);
+      expect(curves).toHaveLength(1);
+      expect(within(curves[0]).getAllByRole('row')).toHaveLength(2); // header + 1 level
+      expect(within(curves[0]).getAllByText('0.8×')).toHaveLength(2);
     });
 
     it('renders the two speech skips as their own skip lines', async () => {

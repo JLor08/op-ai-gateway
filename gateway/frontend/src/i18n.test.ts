@@ -4378,6 +4378,8 @@ describe('audio metrics (#340) i18n keys', () => {
     'benchmarkAudioCapacityRuns',
     'benchmarkAudioColSlowest',
     'benchmarkAudioColMean',
+    'benchmarkAudioColWall',
+    'benchmarkAudioColRtf',
     'runtimeSpecMinExceedsRealtime',
     'errorMappingMetricInvalid',
   ] as const;

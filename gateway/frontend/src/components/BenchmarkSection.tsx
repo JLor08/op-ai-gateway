@@ -28,7 +28,12 @@ import {
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { SelectField } from './shared/SelectField';
-import { formatAudioRate, formatAudioTtfa, isAudioConcurrencyLimit } from './shared/audioMetrics';
+import {
+  audioLimitOf,
+  formatAudioRate,
+  formatAudioTtfa,
+  isAudioConcurrencyLimit,
+} from './shared/audioMetrics';
 import { pollBenchmarkStatus } from './shared/benchmark';
 import { formatPortalError } from './shared/format';
 import {
@@ -344,13 +349,15 @@ function isAudioResult(r: BenchmarkResult): boolean {
 /** An audio result's figures: the speed reading when a speed or both run
  * measured one -- its load time named as not measured when the cold start was
  * not confirmed, like the text line's -- then the ramp's real-time concurrency
- * when a capacity or both run measured one. */
+ * when a capacity or both run measured one. The load time is the audio
+ * result's own (audio_load_time_ms), else the shared load_time_ms a gateway
+ * may fill instead. */
 function audioResultLine(r: BenchmarkResult, t: Translation): string {
   const parts: string[] = [];
   if (r.audio_rate_x) {
-    const load = r.audio_load_time_ms
-      ? t.benchmarkAudioLoadTime(r.audio_load_time_ms)
-      : t.benchmarkResultLoadTimeNotMeasured;
+    const loadMs = r.audio_load_time_ms || r.load_time_ms;
+    const load =
+      loadMs > 0 ? t.benchmarkAudioLoadTime(loadMs) : t.benchmarkResultLoadTimeNotMeasured;
     parts.push(`${t.benchmarkAudioResult(r.audio_rate_x, r.audio_ttft_ms ?? 0)}, ${load}`);
   }
   if (isAudioConcurrencyLimit(r.audio_concurrency_limit)) {
@@ -611,9 +618,9 @@ function SpeechHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRu
 /**
  * The audio speed runs (#340) of a speech or transcription mapping: per run
  * the single-stream rate against real time, the time to the first audio or
- * text and the load time (cold minus warm), each a dash while unmeasured --
- * the three figures the run stores on the mapping -- or the error of a run
- * that measured none.
+ * text, the wall time and the real-time factor of the measured request (like
+ * the speech history's), and the load time (cold minus warm), each a dash
+ * while unmeasured, or the error of a run that measured none.
  */
 function AudioHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRunDTO[] }>) {
   return (
@@ -627,6 +634,8 @@ function AudioHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRun
             <TableCell>{t.benchmarkRunAt}</TableCell>
             <TableCell align="right">{t.mappingAudioRateX}</TableCell>
             <TableCell align="right">{t.mappingAudioTtfaMs}</TableCell>
+            <TableCell align="right">{t.benchmarkAudioColWall}</TableCell>
+            <TableCell align="right">{t.benchmarkAudioColRtf}</TableCell>
             <TableCell align="right">{t.mappingLoadTimeMs}</TableCell>
             <TableCell>{t.tableStatus}</TableCell>
           </TableRow>
@@ -637,6 +646,8 @@ function AudioHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRun
               <TableCell>{new Date(run.created_at).toLocaleString()}</TableCell>
               <TableCell align="right">{formatAudioRate(run.audio_rate_x)}</TableCell>
               <TableCell align="right">{formatAudioTtfa(run.ttft_ms)}</TableCell>
+              <TableCell align="right">{run.wall_ms || '—'}</TableCell>
+              <TableCell align="right">{run.rtf ? run.rtf.toFixed(2) : '—'}</TableCell>
               <TableCell align="right">{run.load_time_ms || '—'}</TableCell>
               <TableCell>
                 {run.error ? (
@@ -657,9 +668,11 @@ function AudioHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRun
 
 /**
  * The audio concurrency ramps (#340): per run the real-time concurrency it
- * reached and why it stopped -- a measured ceiling or a lower bound -- and the
- * curve, one row per level k with its slowest and its mean stream's rate. The
- * level was good while the slowest one kept up with real time.
+ * reached and why it stopped -- a measured ceiling or a lower bound; unknown
+ * when the run stored none of the three limits (a failed ramp, or a limit
+ * this build does not know), never a lower bound -- and the curve, one row
+ * per level k with its slowest and its mean stream's rate. The level was good
+ * while the slowest one kept up with real time.
  */
 function AudioCapacityHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRunDTO[] }>) {
   return (
@@ -678,14 +691,12 @@ function AudioCapacityHistory({ t, runs }: Readonly<{ t: Translation; runs: Benc
               {new Date(run.created_at).toLocaleString()}
               {run.error ? ` — ${run.error}` : ''}
             </Typography>
-            {isAudioConcurrencyLimit(run.audio_concurrency_limit) && (
-              <Typography variant="body2" color="text.secondary">
-                {t.benchmarkAudioCapacityResult(
-                  run.audio_realtime_concurrency ?? 0,
-                  run.audio_concurrency_limit,
-                )}
-              </Typography>
-            )}
+            <Typography variant="body2" color="text.secondary">
+              {t.benchmarkAudioCapacityResult(
+                run.audio_realtime_concurrency ?? 0,
+                audioLimitOf(run.audio_concurrency_limit),
+              )}
+            </Typography>
             {curve.length > 0 && (
               <Table size="small" sx={{ mt: 0.5 }}>
                 <TableHead>
