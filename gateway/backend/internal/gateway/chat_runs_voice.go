@@ -150,9 +150,10 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 	// checkpointed or committed during the run -- a cancelled speculative run must leave no trace.
 	speak := newSpeakScanner()
 	// synth is the run's backpressure on the TTS: a bare/test Server (zero voiceTiming) reads as the
-	// default cap, never 0. It is NOT the relay queue below -- that stays deep so document order never
-	// depends on how many legs are synthesizing.
-	synth := newVoiceSynthGate(s.voiceTiming.ttsConcurrencyCap())
+	// default cap, never 0, and a TTS target that is an instance of a replicable spec takes one
+	// section at a time (voiceTTSConcurrency). It is NOT the relay queue below -- that stays deep so
+	// document order never depends on how many legs are synthesizing.
+	synth := newVoiceSynthGate(voiceTTSConcurrency(vp.tts, s.voiceTiming.ttsConcurrencyCap()))
 	legsCh := make(chan *voiceSpeechLeg, voiceSectionQueue)
 	var relayWG sync.WaitGroup
 	relayWG.Add(1)
@@ -305,6 +306,19 @@ type voiceSynthGate struct {
 	// tail is the settled signal of the most recently queued leg: the next leg waits on it. Only the
 	// goroutine that launches the legs calls queue, so it needs no lock.
 	tail <-chan struct{}
+}
+
+// voiceTTSConcurrency is how many speech sections a run synthesizes at once on its TTS target: 1
+// when the target is an instance of a replicable spec (InstanceCapable), configured otherwise. One
+// voice chat uses one TTS instance: its sections are synthesized one after another there, which is
+// what an audio.cpp child does anyway (it serves one request at a time, so a second section only
+// waited inside the one process), and the run's own second section is then never in flight beside
+// its first -- a request at the instance's cap that would read as demand for another instance.
+func voiceTTSConcurrency(target routing.Target, configured int) int {
+	if target.InstanceCapable {
+		return 1
+	}
+	return configured
 }
 
 // newVoiceSynthGate builds a gate admitting limit concurrent syntheses; limit is the run timing's

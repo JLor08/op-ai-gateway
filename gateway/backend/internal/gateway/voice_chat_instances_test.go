@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/provider"
+	"op-ai-gateway/internal/routing"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// The voice-chat gate and the live-transcription ticket mint only select: they
+// answer a browser POST, and the requests that will use the models come later,
+// per turn. So they never wait in the admission queue -- with every instance busy
+// they take the least loaded one and signal the demand for another -- and the gate
+// warms the instance it selected, moving once to a sibling when the agent says that
+// instance is gone. These tests drive the real Server and resolver over the
+// instance fixture (live_instances_test.go), with the voice gate's fake agent as
+// the provider for the ensures and the residency read.
+
+// voiceGateNoParkBound is how long a gate whose every instance is busy may take:
+// it must answer at once, not after a wait in the admission queue.
+const voiceGateNoParkBound = 100 * time.Millisecond
+
+// countingAdmission wraps the server's admission queue and counts the waits.
+type countingAdmission struct {
+	inner routing.AdmissionController
+	mu    sync.Mutex
+	waits int
+}
+
+func (a *countingAdmission) WaitForSlot(ctx context.Context, serverIDs []string, timeout time.Duration) error {
+	a.mu.Lock()
+	a.waits++
+	a.mu.Unlock()
+	return a.inner.WaitForSlot(ctx, serverIDs, timeout)
+}
+
+func (a *countingAdmission) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.waits
+}
+
+// voiceInstanceWorld is the instance fixture set up for the voice gate: asr-inst,
+// chat-inst and tts-inst replicable on one agent, tts-inst streaming its speech,
+// the gate's fake agent as the provider, a recording demand sink and an
+// admission queue whose waits are counted.
+type voiceInstanceWorld struct {
+	srv   *Server
+	agent *voiceGateFake
+	sink  *recordingDemandSink
+	adm   *countingAdmission
+	token auth.Token
+}
+
+func newVoiceInstanceWorld(t *testing.T) *voiceInstanceWorld {
+	t.Helper()
+	srv := newInstanceRouterServer(t, newInstanceAgentRouter(t), true)
+	routes, ok := srv.Routes.(*routing.MemoryStore)
+	if !ok {
+		t.Fatalf("routes are %T, want the memory store", srv.Routes)
+	}
+	now := time.Now().UTC()
+	if err := routes.UpsertMappingCapabilities(context.Background(), liveInstTTSMap, []routing.CapabilityRow{
+		{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		{Capability: routing.CapabilitySpeechStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities tts: %v", err)
+	}
+	agent := &voiceGateFake{ensureErr: map[string]error{}}
+	srv.Provider = agent
+	sink := &recordingDemandSink{}
+	srv.Resolver.SetDemandSink(sink)
+	adm := &countingAdmission{inner: srv.Active.admission}
+	srv.Resolver.SetAdmissionController(adm)
+	return &voiceInstanceWorld{srv: srv, agent: agent, sink: sink, adm: adm, token: auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true}}
+}
+
+// publish reports asr-inst's instances asr and tts-inst's instances tts running
+// (chat-inst runs its instance 0 only).
+func (w *voiceInstanceWorld) publish(asr, tts []int) {
+	var rows []RuntimeStatusDTO
+	for _, k := range asr {
+		rows = append(rows, liveInstanceRow(liveInstASRSpec, liveInstASRUp, k, 0))
+	}
+	for _, k := range tts {
+		rows = append(rows, liveInstanceRow(liveInstTTSSpec, liveInstTTSUp, k, 0))
+	}
+	w.srv.RuntimeStatus.publish(liveInstServer, rows)
+}
+
+// busy puts n requests in flight on the gateway instance key.
+func (w *voiceInstanceWorld) busy(t *testing.T, instanceKey string, n int) {
+	t.Helper()
+	for i := range n {
+		id := fmt.Sprintf("busy-%s-%d", instanceKey, i)
+		w.srv.Active.Add(ActiveRequest{ID: id, ServerID: liveInstServer, InstanceKey: instanceKey})
+		t.Cleanup(func() { w.srv.Active.Remove(id) })
+	}
+}
+
+// gate runs the voice-chat gate for the fixture's three models under a context
+// that ends a gate which waits, so a regression fails instead of hanging.
+func (w *voiceInstanceWorld) gate(t *testing.T) (asr, llm, tts routing.Target, code string, took time.Duration, err error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	asr, llm, tts, code, err = w.srv.voiceCoLoadGate(ctx, &w.token, "asr-inst", "chat-inst", "tts-inst")
+	return asr, llm, tts, code, time.Since(start), err
+}
+
+func (w *voiceInstanceWorld) ensured() []string {
+	w.agent.mu.Lock()
+	defer w.agent.mu.Unlock()
+	return slices.Clone(w.agent.ensured)
+}
+
+// Every instance of a leg busy: the gate answers at once with a target on the
+// least loaded instance, never waits in the admission queue, and signals the
+// demand for another instance of that leg's model once.
+func TestVoiceGateNeverParks(t *testing.T) {
+	for _, leg := range []struct {
+		name, model, mapping string
+		pick                 func(asr, tts routing.Target) routing.Target
+	}{
+		{"asr", "asr-inst", liveInstASRMap, func(asr, _ routing.Target) routing.Target { return asr }},
+		{"tts", "tts-inst", liveInstTTSMap, func(_, tts routing.Target) routing.Target { return tts }},
+	} {
+		t.Run(leg.name, func(t *testing.T) {
+			w := newVoiceInstanceWorld(t)
+			w.publish([]int{0, 1}, []int{0, 1})
+			w.busy(t, leg.mapping+"#0", 2)
+			w.busy(t, leg.mapping+"#1", 1)
+
+			asr, _, tts, code, took, err := w.gate(t)
+			if err != nil || code != "" {
+				t.Fatalf("gate = %q, %v; want it passed", code, err)
+			}
+			if took > voiceGateNoParkBound {
+				t.Fatalf("gate took %v, want it within %v (it must not wait for a free instance)", took, voiceGateNoParkBound)
+			}
+			if waits := w.adm.count(); waits != 0 {
+				t.Fatalf("admission waits = %d, want none", waits)
+			}
+			if got := leg.pick(asr, tts).InstanceKey; got != leg.mapping+"#1" {
+				t.Fatalf("%s target = %q, want %s#1, the least loaded instance", leg.name, got, leg.mapping)
+			}
+			signals := w.sink.signals()
+			if len(signals) != 1 || signals[0].Model != leg.model || !slices.Equal(signals[0].MappingIDs, []string{leg.mapping}) {
+				t.Fatalf("demand signals = %+v, want one for %s naming %s", signals, leg.model, leg.mapping)
+			}
+		})
+	}
+}
+
+// The gate warms the instance it selected -- m#1 when instance 0 is busy -- not
+// the mapping's instance 0, and proves that instance resident.
+func TestVoiceGateEnsuresSelectedInstance(t *testing.T) {
+	w := newVoiceInstanceWorld(t)
+	w.publish([]int{0, 1}, []int{0, 1})
+	w.busy(t, liveInstASRMap+"#0", 1)
+	w.busy(t, liveInstTTSMap+"#0", 1)
+
+	asr, _, tts, code, _, err := w.gate(t)
+	if err != nil || code != "" {
+		t.Fatalf("gate = %q, %v; want it passed", code, err)
+	}
+	if asr.InstanceKey != liveInstASRMap+"#1" || tts.InstanceKey != liveInstTTSMap+"#1" {
+		t.Fatalf("targets = %q, %q; want the free instances %s#1 and %s#1", asr.InstanceKey, tts.InstanceKey, liveInstASRMap, liveInstTTSMap)
+	}
+	want := []string{liveInstASRUp + "#1", liveInstChatUp, liveInstTTSUp + "#1"}
+	if got := w.ensured(); !slices.Equal(got, want) {
+		t.Fatalf("ensured = %v, want %v: each leg's selected instance", got, want)
+	}
+	if signals := w.sink.signals(); len(signals) != 0 {
+		t.Fatalf("demand signals = %+v, want none (a free instance was selected)", signals)
+	}
+}
+
+// The agent refusing the selected instance k >= 1 as gone (a 409
+// runtime.instance_* or a 404) moves the leg once, to a sibling, which the gate
+// warms instead; a second gone instance, or a refusal of instance 0, is the leg's
+// own unavailable answer as before.
+func TestVoiceGateReselectsVanishedInstance(t *testing.T) {
+	gone := map[string]error{
+		"409 instance_no_capacity":    provider.RouterStatusError(http.StatusConflict, []byte(`{"error":{"code":"runtime.instance_no_capacity","message":"gone"}}`)),
+		"409 instance_demand_unknown": provider.RouterStatusError(http.StatusConflict, []byte(`{"error":{"code":"runtime.instance_demand_unknown","message":"gone"}}`)),
+		"404 model_not_managed":       provider.RouterStatusError(http.StatusNotFound, []byte(`{"error":{"code":"runtime.model_not_managed","message":"gone"}}`)),
+	}
+	for name, refusal := range gone {
+		t.Run(name, func(t *testing.T) {
+			w := newVoiceInstanceWorld(t)
+			w.publish([]int{0, 1}, []int{0})
+			w.busy(t, liveInstASRMap+"#0", 1)
+			w.agent.ensureErr[liveInstASRUp+"#1"] = refusal
+
+			asr, _, _, code, _, err := w.gate(t)
+			if err != nil || code != "" {
+				t.Fatalf("gate = %q, %v; want it passed on the sibling", code, err)
+			}
+			if asr.InstanceKey != liveInstASRMap+"#0" {
+				t.Fatalf("asr target = %q, want %s#0, the sibling of the gone instance", asr.InstanceKey, liveInstASRMap)
+			}
+			if got := w.ensured(); !slices.Equal(got[:2], []string{liveInstASRUp + "#1", liveInstASRUp}) {
+				t.Fatalf("ensured = %v, want the gone instance, then its sibling", got)
+			}
+		})
+	}
+	t.Run("only once", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.publish([]int{0, 1, 2}, []int{0})
+		w.busy(t, liveInstASRMap+"#0", 1)
+		w.agent.ensureErr[liveInstASRUp+"#1"] = gone["409 instance_no_capacity"]
+		w.agent.ensureErr[liveInstASRUp+"#2"] = gone["409 instance_no_capacity"]
+
+		asr, llm, tts, code, _, err := w.gate(t)
+		requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatASRUnavailable)
+		if got := w.ensured(); len(got) != 2 {
+			t.Fatalf("ensured = %v, want two attempts: the selection and its one re-selection", got)
+		}
+	})
+	t.Run("instance 0 is not re-selected", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.publish([]int{0, 1}, []int{0})
+		w.busy(t, liveInstASRMap+"#1", 1)
+		w.agent.ensureErr[liveInstASRUp] = gone["404 model_not_managed"]
+
+		asr, llm, tts, code, _, err := w.gate(t)
+		requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatASRUnavailable)
+		if got := w.ensured(); !slices.Equal(got, []string{liveInstASRUp}) {
+			t.Fatalf("ensured = %v, want instance 0 only", got)
+		}
+	})
+	t.Run("admission blocked stays a co-load failure", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.publish([]int{0, 1}, []int{0})
+		w.busy(t, liveInstASRMap+"#0", 1)
+		w.agent.ensureErr[liveInstASRUp+"#1"] = provider.RouterStatusError(http.StatusServiceUnavailable, []byte(`{"error":{"code":"runtime.admission_blocked","message":"no room"}}`))
+
+		asr, llm, tts, code, _, err := w.gate(t)
+		requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatCoLoadFailed)
+		if got := w.ensured(); !slices.Equal(got, []string{liveInstASRUp + "#1"}) {
+			t.Fatalf("ensured = %v, want the one refused instance and no re-selection", got)
+		}
+	})
+}
+
+// The live-transcription ticket mint with every instance busy answers at once:
+// it never waits in the admission queue, and signals the demand for another
+// instance once. The session parks later, at the relay, if it has to.
+func TestLiveTicketMintNeverParks(t *testing.T) {
+	w := newVoiceInstanceWorld(t)
+	w.publish([]int{0, 1}, nil)
+	w.busy(t, liveInstASRMap+"#0", 2)
+	w.busy(t, liveInstASRMap+"#1", 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	body := `{"model":"asr-inst","sample_rate":16000,"channels":1,"sample_format":"s16le"}`
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/portal/transcription-live-ticket", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	start := time.Now()
+	w.srv.ServeHTTP(rec, req)
+	took := time.Since(start)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mint status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if took > voiceGateNoParkBound {
+		t.Fatalf("mint took %v, want it within %v", took, voiceGateNoParkBound)
+	}
+	if waits := w.adm.count(); waits != 0 {
+		t.Fatalf("admission waits = %d, want none", waits)
+	}
+	signals := w.sink.signals()
+	if len(signals) != 1 || signals[0].Model != "asr-inst" || !slices.Equal(signals[0].MappingIDs, []string{liveInstASRMap}) {
+		t.Fatalf("demand signals = %+v, want one for asr-inst naming %s", signals, liveInstASRMap)
+	}
+}
+
+// A run synthesizes its speech sections one at a time when its TTS target is an
+// instance of a replicable spec: the run stays on one instance, and its own second
+// section never looks like demand for another. Every other target keeps the
+// configured concurrency.
+func TestVoiceTTSConcurrencyOneForInstances(t *testing.T) {
+	cases := []struct {
+		name   string
+		target routing.Target
+		want   int
+	}{
+		{"an instance k >= 1 of a replicable spec", routing.Target{InstanceKey: "route-tts#1", InstanceCapable: true}, 1},
+		{"instance 0 of a replicable spec", routing.Target{InstanceKey: "route-tts#0", InstanceCapable: true}, 1},
+		{"a mapping of a spec that is not replicable", routing.Target{InstanceKey: "route-tts#0"}, 2},
+		{"a target that addresses no instance", routing.Target{}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := voiceTTSConcurrency(tc.target, 2); got != tc.want {
+				t.Fatalf("voiceTTSConcurrency = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// A run whose TTS target is an instance of a replicable spec keeps one synthesis
+// in flight at a time, though the configured cap is two: a burst of sections is
+// spoken one after another on that one instance.
+func TestVoiceRunOnATTSInstanceSynthesizesOneSectionAtATime(t *testing.T) {
+	script, _ := burstScript()
+	prov := defaultVoiceProvider()
+	prov.llmScript = script
+	prov.speechBodies = make(chan []byte, 2*burstSections)
+	prov.speechRelease = make(chan struct{})
+	prov.speechInflight, prov.speechPeak = new(atomic.Int32), new(atomic.Int32)
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+	srv.voiceTiming = voiceTiming{ttsConcurrency: 2}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(prov.speechRelease) }) }
+	t.Cleanup(release)
+
+	tts := voiceTTSTarget
+	tts.InstanceKey, tts.InstanceCapable = "route-tts#1", true
+	history, err := srv.Portal.VoiceRunHistory(context.Background(), owner, chatID, "unused")
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	run, runCtx, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+	_, ch, unsub := run.subscribe()
+	t.Cleanup(unsub)
+	srv.launchRun(runCtx, owner, run, PrepareRunResult{
+		History:  history,
+		Settings: portal.ChatRunSettings{Model: voiceLLMTarget.Model, Kind: chatRunKindVoice},
+		Voice:    &voiceRunParams{pendingText: "unused", tts: tts},
+	})
+
+	if !voicePoll(10*time.Second, func() bool { return prov.speechInflight.Load() >= 1 }) {
+		t.Fatal("no synthesis reached the TTS")
+	}
+	if voicePoll(150*time.Millisecond, func() bool { return prov.speechInflight.Load() > 1 }) {
+		t.Fatalf("%d syntheses in flight at once on one TTS instance, want one", prov.speechInflight.Load())
+	}
+	release()
+	drainRunAudio(t, ch)
+	if got := run.statusValue(); got != "completed" {
+		t.Fatalf("status = %q, want completed", got)
+	}
+	if peak := prov.speechPeak.Load(); peak != 1 {
+		t.Fatalf("peak concurrent syntheses = %d, want 1", peak)
+	}
+}

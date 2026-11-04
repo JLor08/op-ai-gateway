@@ -85,12 +85,14 @@ var (
 	errVoiceNotCoResident   = errors.New("the models are not resident together: an agent evicted one of them while starting another, so the co-residency matrix or the GPU VRAM budget does not allow all three at once")
 )
 
-// voiceGateLeg is one resolved leg of the gate: its name, its resolved routing target
-// and the code the gate refuses with when this leg's model cannot be used.
+// voiceGateLeg is one resolved leg of the gate: its name, its resolved routing target,
+// the code the gate refuses with when this leg's model cannot be used, and how the leg is
+// selected again with an instance excluded that the agent refused as gone.
 type voiceGateLeg struct {
 	leg         voiceLeg
 	target      routing.Target
 	unavailable string
+	reselect    func(lost routing.Target) (routing.Target, error)
 }
 
 // agentManaged reports whether the leg's model is started and evicted by a ServerAgent:
@@ -116,7 +118,12 @@ func (l voiceGateLeg) agentManaged() bool {
 //
 //  1. Resolve + gate each leg for the shape it will be called on, WITHOUT spending
 //     admission (inferenceGate, never inferencePreflight -- the same no-admit split
-//     the live-transcription ticket mint uses): ASR as the live relay is gated
+//     the live-transcription ticket mint uses) and without ever waiting in the
+//     admission queue (inference.Request.NoPark): the gate answers the browser's
+//     ticket POST, and a leg whose every instance is busy is selected onto the least
+//     loaded one at once, signalling the demand for another -- a voice chat about to
+//     start is demand already known. The per-turn requests are the ones that queue.
+//     ASR as the live relay is gated
 //     (transcription capability, the effective-served flavor, a streaming verdict, and
 //     an agent that declared fullduplex_proxy), the LLM as /v1/chat/completions is
 //     (resolveTranslateTarget), the TTS as the streaming speech relay is (speech
@@ -125,7 +132,10 @@ func (l voiceGateLeg) agentManaged() bool {
 //     The gate spends no admission of its own: each /v1 core spends it per turn.
 //  2. Ensure each AGENT-MANAGED leg (provider.RuntimeEnsurer, through the same
 //     ensureLoadAttempt the load core uses, so the same deadline bounds it): this
-//     warms it. runtime.admission_blocked is the agent saying it will not admit the
+//     warms the instance step 1 selected. An instance k >= 1 the agent refuses as
+//     gone (isInstanceGoneError: it retired it since the telemetry that reported it)
+//     moves the leg once, to a sibling selected with it excluded, which is ensured
+//     instead. runtime.admission_blocked is the agent saying it will not admit the
 //     child, which is a co-load verdict (voiceChatCoLoadFailed); any other failure is
 //     that leg's model being unavailable. One at a time, in leg order: starts race on
 //     the agent's admission, and a failure ends the gate, so nothing later is started
@@ -173,7 +183,7 @@ func (s *Server) voiceCoLoadGate(ctx context.Context, token *auth.Token, asrMode
 		leg         voiceLeg
 		model       string
 		unavailable string
-		resolve     func(*http.Request, *auth.Token, string) (routing.Target, error)
+		resolve     func(*http.Request, *auth.Token, string, []string) (routing.Target, error)
 	}{
 		{voiceLegASR, asrModel, voiceChatASRUnavailable, s.resolveVoiceASR},
 		{voiceLegLLM, llmModel, voiceChatLLMUnavailable, s.resolveVoiceLLM},
@@ -182,12 +192,15 @@ func (s *Server) voiceCoLoadGate(ctx context.Context, token *auth.Token, asrMode
 		if strings.TrimSpace(step.model) == "" {
 			return refuse(step.unavailable, fmt.Errorf("voice chat %s leg: %w", step.leg, errVoiceModelRequired))
 		}
-		target, err := step.resolve(r, token, step.model)
+		target, err := step.resolve(r, token, step.model, nil)
 		if err != nil {
 			slog.Debug("voice chat gate: leg refused", "leg", step.leg, "model", step.model, "err", err)
 			return refuse(step.unavailable, fmt.Errorf("voice chat %s leg: %w", step.leg, err))
 		}
-		legs = append(legs, voiceGateLeg{leg: step.leg, target: target, unavailable: step.unavailable})
+		reselect := func(lost routing.Target) (routing.Target, error) {
+			return step.resolve(r, token, step.model, []string{lost.InstanceKey})
+		}
+		legs = append(legs, voiceGateLeg{leg: step.leg, target: target, unavailable: step.unavailable, reselect: reselect})
 	}
 
 	// Steps 2 and 3: warm the agent-managed legs, then prove they are resident together.
@@ -206,9 +219,10 @@ func (s *Server) voiceCoLoadGate(ctx context.Context, token *auth.Token, asrMode
 // target resolve with its effective-served-flavor conjunct, the streaming verdict, and
 // the fullduplex_proxy declaration of a server_agent target's agent. The relay the
 // orchestrator opens per turn is the bearer /v1/audio/transcriptions/live, so a model
-// it would refuse there is refused here.
-func (s *Server) resolveVoiceASR(r *http.Request, token *auth.Token, model string) (routing.Target, error) {
-	req, err := s.voiceInferenceGate(r, *token, transcriptionInferenceShape(model))
+// it would refuse there is refused here. exclude is the instances the selection must not
+// pick (voiceInferenceGate).
+func (s *Server) resolveVoiceASR(r *http.Request, token *auth.Token, model string, exclude []string) (routing.Target, error) {
+	req, err := s.voiceInferenceGate(r, *token, transcriptionInferenceShape(model), exclude)
 	if err != nil {
 		return routing.Target{}, err
 	}
@@ -227,9 +241,10 @@ func (s *Server) resolveVoiceASR(r *http.Request, token *auth.Token, model strin
 
 // resolveVoiceLLM resolves and gates the LLM leg as /v1/chat/completions will be called
 // per turn: a streamed chat shape through the shared gate, then resolveTranslateTarget,
-// which refuses a target that serves images or audio only.
-func (s *Server) resolveVoiceLLM(r *http.Request, token *auth.Token, model string) (routing.Target, error) {
-	req, err := s.voiceInferenceGate(r, *token, inferenceShape{apiFlavor: "openai_chat_completions", endpoint: endpointChat, model: model, stream: true})
+// which refuses a target that serves images or audio only. exclude is as for
+// resolveVoiceASR.
+func (s *Server) resolveVoiceLLM(r *http.Request, token *auth.Token, model string, exclude []string) (routing.Target, error) {
+	req, err := s.voiceInferenceGate(r, *token, inferenceShape{apiFlavor: "openai_chat_completions", endpoint: endpointChat, model: model, stream: true}, exclude)
 	if err != nil {
 		return routing.Target{}, err
 	}
@@ -242,8 +257,9 @@ func (s *Server) resolveVoiceLLM(r *http.Request, token *auth.Token, model strin
 // speech_streaming verdict of yes (mappingStreamsSpeech: the stream the loop plays), and
 // an offerable model (routing.CapabilityRowsOfferableTTS: a clone model only with a named
 // preset to speak in, the rule the portal's voice picker and streaming gate apply).
-func (s *Server) resolveVoiceTTS(r *http.Request, token *auth.Token, model string) (routing.Target, error) {
-	req, err := s.voiceInferenceGate(r, *token, speechInferenceShape(model, ""))
+// exclude is as for resolveVoiceASR.
+func (s *Server) resolveVoiceTTS(r *http.Request, token *auth.Token, model string, exclude []string) (routing.Target, error) {
+	req, err := s.voiceInferenceGate(r, *token, speechInferenceShape(model, ""), exclude)
 	if err != nil {
 		return routing.Target{}, err
 	}
@@ -292,13 +308,22 @@ func (s *Server) voiceTTSOfferable(ctx context.Context, routeID string) (bool, e
 // NOT the principal's admission) for one leg, and returns the gated request. The gate
 // answers a refusal by writing to a ResponseWriter; there is no client response here, so
 // what it would have written is captured and returned as the error.
-func (s *Server) voiceInferenceGate(r *http.Request, token auth.Token, shape inferenceShape) (inference.Request, error) {
+//
+// The request it returns never parks (NoPark): every caller only selects -- the co-load
+// gate, and the synth endpoint's check before its own admitted relay -- and must answer
+// without waiting behind the requests that will use the model. exclude is the instances
+// (routing.InstanceKey) its selection must not pick: one the agent refused as gone when
+// the gate re-selects a leg, nil otherwise.
+func (s *Server) voiceInferenceGate(r *http.Request, token auth.Token, shape inferenceShape, exclude []string) (inference.Request, error) {
 	rec := &voiceGateWriter{header: http.Header{}}
 	pf, handled := s.inferenceGate(rec, r, token, nil, shape)
 	if handled {
 		return inference.Request{}, rec.refusal()
 	}
-	return pf.Req, nil
+	req := pf.Req
+	req.NoPark = true
+	req.ExcludeInstanceKeys = exclude
+	return req, nil
 }
 
 // voiceGateWriter is the http.ResponseWriter the shared inference gate writes a refusal
@@ -335,10 +360,13 @@ func (w *voiceGateWriter) refusal() error {
 
 // ensureVoiceLegs is step 2 of the gate: it starts each agent-managed leg through the
 // agent router's ensure route, one after the other, and returns the code to refuse with
-// and the cause on the first failure. A direct leg has no ensure route and is skipped.
+// and the cause on the first failure. A direct leg has no ensure route and is skipped. A
+// leg re-selected off a gone instance (ensureVoiceLeg) has its target replaced in legs, so
+// the residency check and the gate's answer name the instance that was warmed.
 func (s *Server) ensureVoiceLegs(ctx context.Context, legs []voiceGateLeg) (string, error) {
 	var ensurer provider.RuntimeEnsurer
-	for _, l := range legs {
+	for i := range legs {
+		l := &legs[i]
 		if !l.agentManaged() {
 			continue
 		}
@@ -356,17 +384,17 @@ func (s *Server) ensureVoiceLegs(ctx context.Context, legs []voiceGateLeg) (stri
 }
 
 // ensureVoiceLeg starts one agent-managed leg through the ensure route and returns, on a
-// failure, the code to refuse with and the cause. A caller that went away mid-start, or an
-// agent that did not admit the leg, is a co-load failure; any other start failure is the
-// leg's own unavailable code.
-func (s *Server) ensureVoiceLeg(ctx context.Context, ensurer provider.RuntimeEnsurer, l voiceGateLeg) (string, error) {
-	// The spec only words the failure (its start timeout); a failed read is no reason
-	// to refuse to start the model.
-	var spec routing.RuntimeSpec
-	if s.Routes != nil {
-		spec, _, _ = s.Routes.RuntimeSpecByMapping(ctx, l.target.RouteID)
+// failure, the code to refuse with and the cause. An instance k >= 1 refused as gone is
+// left once for a sibling (reselectVoiceLeg), which replaces l.target. A caller that went
+// away mid-start, or an agent that did not admit the leg, is a co-load failure; any other
+// start failure -- a second gone instance among them -- is the leg's own unavailable code.
+func (s *Server) ensureVoiceLeg(ctx context.Context, ensurer provider.RuntimeEnsurer, l *voiceGateLeg) (string, error) {
+	err := s.ensureVoiceTarget(ctx, ensurer, l.target)
+	// The gate's own selection excludes nothing, so its first gone instance may always
+	// be left: the once-rule is that the re-selection is never re-selected again.
+	if err != nil && ctx.Err() == nil && l.target.Instance() >= 1 && isInstanceGoneError(err) {
+		err = s.reselectVoiceLeg(ctx, ensurer, l, err)
 	}
-	err := s.ensureLoadAttempt(ensurer, l.target, spec)(ctx, s.newLoadBound(l.target))
 	if err == nil {
 		return "", nil
 	}
@@ -382,6 +410,37 @@ func (s *Server) ensureVoiceLeg(ctx context.Context, ensurer provider.RuntimeEns
 	}
 	slog.Warn("voice chat gate: a leg could not be started", "leg", l.leg, "model", l.target.ProviderModel, "server", s.serverName(l.target.ServerID), "err", err)
 	return l.unavailable, wrapped
+}
+
+// ensureVoiceTarget is one ensure of target through the ensure route, under the load
+// loop's deadline.
+func (s *Server) ensureVoiceTarget(ctx context.Context, ensurer provider.RuntimeEnsurer, target routing.Target) error {
+	// The spec only words the failure (its start timeout); a failed read is no reason
+	// to refuse to start the model.
+	var spec routing.RuntimeSpec
+	if s.Routes != nil {
+		spec, _, _ = s.Routes.RuntimeSpecByMapping(ctx, target.RouteID)
+	}
+	return s.ensureLoadAttempt(ensurer, target, spec)(ctx, s.newLoadBound(target))
+}
+
+// reselectVoiceLeg moves leg l off its selected instance, which the agent refused as gone
+// with the error gone: the leg is selected again with that instance excluded, l.target
+// becomes the new selection, and that is ensured -- unless it is a direct target, which has
+// no ensure route. A re-selection that routing refuses ends the leg with gone, the answer
+// the instance it could not leave gave, as a stream that cannot move ends.
+func (s *Server) reselectVoiceLeg(ctx context.Context, ensurer provider.RuntimeEnsurer, l *voiceGateLeg, gone error) error {
+	target, err := l.reselect(l.target)
+	if err != nil {
+		slog.Warn("voice chat gate: the selected instance is gone and re-selection failed", "leg", l.leg, "instance", l.target.InstanceKey, "err", err)
+		return gone
+	}
+	slog.Info("voice chat gate: the selected instance is gone; re-selected once", "leg", l.leg, "lost", l.target.InstanceKey, "instance", target.InstanceKey)
+	l.target = target
+	if !l.agentManaged() {
+		return nil
+	}
+	return s.ensureVoiceTarget(ctx, ensurer, target)
 }
 
 // voiceLoadedKey identifies one loaded-set read: the server, and the path and format it

@@ -179,7 +179,9 @@ type liveTicketResponse struct {
 //     session's one admission, taken here because a refusal is a plain HTTP response on this
 //     request and opaque on a WebSocket upgrade -- then the resolve, which enforces the
 //     user's reachable servers and the transcription capability, and the effective-flavor
-//     rule. A refusal is that endpoint's own (404 routing.no_model_route or
+//     rule -- a resolve that never waits in the admission queue: with every instance
+//     busy the mint answers at once on the least loaded one and signals the demand for
+//     another. A refusal is that endpoint's own (404 routing.no_model_route or
 //     routing.model_not_capable, so no new way to probe which models exist), but this is a
 //     gate and not a relay: no usage row is recorded, no capture is written and no upstream
 //     is contacted.
@@ -291,12 +293,18 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 // admission, because the portal session admits exactly once, later, at
 // /v1/audio/transcriptions/live (the same canonical relay the bearer client hits).
 // Threading the bool keeps the two live transports gated byte-for-byte identically
-// while moving the single admission to the one relay both now share.
+// while moving the single admission to the one relay both now share. The no-admit
+// resolve also never parks: a ticket POST must not block in the admission queue.
 func (s *Server) resolveLiveTarget(w http.ResponseWriter, r *http.Request, token auth.Token, model string, params liveParams, admit bool) (routing.Target, bool) {
 	req, ok := s.liveGate(w, r, token, model, params, admit)
 	if !ok {
 		return routing.Target{}, false
 	}
+	// A gate that spends no admission -- the ticket mint -- only selects, so it never
+	// waits in the admission queue (NoPark): with every instance busy it answers at once
+	// on the least loaded one and signals the demand for another. The session admits,
+	// and parks if it must, at the relay.
+	req.NoPark = !admit
 	tok := token
 	target, err := s.liveTarget(r.Context(), &tok, req)
 	if err != nil {

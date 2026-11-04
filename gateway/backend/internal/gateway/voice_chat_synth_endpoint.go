@@ -82,7 +82,7 @@ func (s *Server) handlePortalVoiceChatSynth(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if _, err := s.resolveVoiceTTS(r, &token, req.TTSModel); err != nil {
+	if _, err := s.resolveVoiceTTS(r, &token, req.TTSModel, nil); err != nil {
 		slog.Debug("voice chat synth refused: the speech model cannot be used", "model", req.TTSModel, "err", err)
 		writeVoiceChatRefusal(w, voiceChatTTSUnavailable)
 		return
