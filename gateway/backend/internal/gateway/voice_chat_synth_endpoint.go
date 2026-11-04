@@ -53,11 +53,13 @@ type voiceChatSynthRequest struct {
 //     -- the speech core's own rules (validateSpeechRequest) applied to the body this
 //     handler builds, so they cannot drift (a blank model is reported first). Both precede
 //     the gate, so the precise code wins over the gate's generic refusal.
-//  3. The model goes through the gate the live Voice Chat applies to its speech leg
-//     (resolveVoiceTTS: speech-capable, a streaming model, an offerable one, reachable by
+//  3. The model goes through the rules the live Voice Chat applies to its speech leg
+//     (checkVoiceTTS: speech-capable, a streaming model, an offerable one, reachable by
 //     the caller): a model a session could not have spoken with is no model the replay can
-//     re-speak with. A refusal is 400 portal.voice_chat_tts_unavailable -- the ticket's
-//     code for the same leg -- and never carries the cause, which is for the log.
+//     re-speak with. The check only resolves -- it never waits in the admission queue and
+//     signals no demand; the relay below does both if it must. A refusal is 400
+//     portal.voice_chat_tts_unavailable -- the ticket's code for the same leg -- and never
+//     carries the cause, which is for the log.
 //  4. The synthesis is the speech core's, unchanged: the request is built as the
 //     /v1/audio/speech body {model, input, voice?, language?}, admitted by the one
 //     preflight (inferencePreflight) and relayed by relaySpeech, which answers the
@@ -82,7 +84,7 @@ func (s *Server) handlePortalVoiceChatSynth(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if _, err := s.resolveVoiceTTS(r, &token, req.TTSModel, nil); err != nil {
+	if err := s.checkVoiceTTS(r, &token, req.TTSModel); err != nil {
 		slog.Debug("voice chat synth refused: the speech model cannot be used", "model", req.TTSModel, "err", err)
 		writeVoiceChatRefusal(w, voiceChatTTSUnavailable)
 		return

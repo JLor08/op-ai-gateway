@@ -50,6 +50,14 @@ const (
 	// voiceTicketAudioMaxBytes. Raised by the ticket endpoint before the gate, never by
 	// the gate itself. 400: the user's to change in the chat's speech settings.
 	voiceChatAudioSettingsInvalid = "portal.voice_chat_audio_settings_invalid"
+	// voiceChatNoRealtimeModel: every candidate of the ASR or the TTS leg was measured
+	// slower than the real-time threshold a conversation needs
+	// (routing.ErrNoRealtimeCandidate). 409, with the leg named in the message
+	// ("voice chat <leg> leg: ..."): the operator's remedy is another model or a faster
+	// host, and the user's another model for that leg. Surface-neutral (not portal.*),
+	// since a voice turn's /v1 loopback answers it too when a model is re-measured
+	// slower mid-session.
+	voiceChatNoRealtimeModel = "voice_chat.no_realtime_model"
 )
 
 // voiceGatePath is the path of the request the gate builds for the shared inference
@@ -84,6 +92,18 @@ var (
 	errVoiceNoResidencyRead = errors.New("the provider cannot read which models an agent has loaded")
 	errVoiceNotCoResident   = errors.New("the models are not resident together: an agent evicted one of them while starting another, so the co-residency matrix or the GPU VRAM budget does not allow all three at once")
 )
+
+// voiceLegError is a leg's refusal that carries the leg itself, for a refusal whose answer
+// names it (voiceChatNoRealtimeModel). It reads as every other leg refusal does ("voice
+// chat <leg> leg: <cause>") and unwraps to its cause.
+type voiceLegError struct {
+	leg voiceLeg
+	err error
+}
+
+func (e *voiceLegError) Error() string { return fmt.Sprintf("voice chat %s leg: %v", e.leg, e.err) }
+
+func (e *voiceLegError) Unwrap() error { return e.err }
 
 // voiceGateLeg is one resolved leg of the gate: its name, its resolved routing target,
 // the code the gate refuses with when this leg's model cannot be used, and how the leg is
@@ -128,7 +148,10 @@ func (l voiceGateLeg) agentManaged() bool {
 //     an agent that declared fullduplex_proxy), the LLM as /v1/chat/completions is
 //     (resolveTranslateTarget), the TTS as the streaming speech relay is (speech
 //     capability, the effective-served flavor, a streaming verdict, and an offerable
-//     model). A failure is that leg's *Unavailable code, and nothing has been started.
+//     model). The ASR and TTS legs must also keep up with real time
+//     (inference.Request.RealtimeRequired): a leg whose every candidate was measured
+//     too slow is voiceChatNoRealtimeModel, naming the leg. Any other failure is that
+//     leg's *Unavailable code, and nothing has been started.
 //     The gate spends no admission of its own: each /v1 core spends it per turn.
 //  2. Ensure each AGENT-MANAGED leg (provider.RuntimeEnsurer, through the same
 //     ensureLoadAttempt the load core uses, so the same deadline bounds it): this
@@ -193,6 +216,10 @@ func (s *Server) voiceCoLoadGate(ctx context.Context, token *auth.Token, asrMode
 			return refuse(step.unavailable, fmt.Errorf("voice chat %s leg: %w", step.leg, errVoiceModelRequired))
 		}
 		target, err := step.resolve(r, token, step.model, nil)
+		if errors.Is(err, routing.ErrNoRealtimeCandidate) {
+			slog.Debug("voice chat gate: leg measured too slow for real time", "leg", step.leg, "model", step.model)
+			return refuse(voiceChatNoRealtimeModel, &voiceLegError{leg: step.leg, err: err})
+		}
 		if err != nil {
 			slog.Debug("voice chat gate: leg refused", "leg", step.leg, "model", step.model, "err", err)
 			return refuse(step.unavailable, fmt.Errorf("voice chat %s leg: %w", step.leg, err))
@@ -221,11 +248,14 @@ func (s *Server) voiceCoLoadGate(ctx context.Context, token *auth.Token, asrMode
 // orchestrator opens per turn is the bearer /v1/audio/transcriptions/live, so a model
 // it would refuse there is refused here. exclude is the instances the selection must not
 // pick (voiceInferenceGate).
+//
+// The leg must keep up with real time (RealtimeRequired), as every turn's relay will.
 func (s *Server) resolveVoiceASR(r *http.Request, token *auth.Token, model string, exclude []string) (routing.Target, error) {
 	req, err := s.voiceInferenceGate(r, *token, transcriptionInferenceShape(model), exclude)
 	if err != nil {
 		return routing.Target{}, err
 	}
+	req.RealtimeRequired = true
 	target, err := s.resolveLiveTranscriptionTarget(r.Context(), token, req)
 	if err != nil {
 		return routing.Target{}, err
@@ -257,12 +287,38 @@ func (s *Server) resolveVoiceLLM(r *http.Request, token *auth.Token, model strin
 // speech_streaming verdict of yes (mappingStreamsSpeech: the stream the loop plays), and
 // an offerable model (routing.CapabilityRowsOfferableTTS: a clone model only with a named
 // preset to speak in, the rule the portal's voice picker and streaming gate apply).
-// exclude is as for resolveVoiceASR.
+// exclude is as for resolveVoiceASR, and the leg must keep up with real time like the ASR
+// leg (RealtimeRequired).
 func (s *Server) resolveVoiceTTS(r *http.Request, token *auth.Token, model string, exclude []string) (routing.Target, error) {
 	req, err := s.voiceInferenceGate(r, *token, speechInferenceShape(model, ""), exclude)
 	if err != nil {
 		return routing.Target{}, err
 	}
+	req.RealtimeRequired = true
+	return s.voiceTTSTarget(r, token, req)
+}
+
+// checkVoiceTTS is the voice-chat replay's check of its speech model (the synth
+// endpoint, before its own admitted relay): the TTS leg's rules (voiceTTSTarget) over a
+// resolve that only checks (inference.Request.CheckOnly). It never waits in the
+// admission queue and signals no demand -- the relay it precedes resolves, parks and
+// signals on its own, so a check that did either would wait twice, or ask for an
+// instance twice, for one synthesis. The replay is no live conversation, so it is not
+// held to real time.
+func (s *Server) checkVoiceTTS(r *http.Request, token *auth.Token, model string) error {
+	req, err := s.voiceShapeGate(r, *token, speechInferenceShape(model, ""))
+	if err != nil {
+		return err
+	}
+	req.CheckOnly = true
+	_, err = s.voiceTTSTarget(r, token, req)
+	return err
+}
+
+// voiceTTSTarget resolves an already-gated speech request and holds the target to the
+// TTS leg's rules: the effective-served flavor, a speech_streaming verdict of yes and an
+// offerable model (see resolveVoiceTTS).
+func (s *Server) voiceTTSTarget(r *http.Request, token *auth.Token, req inference.Request) (routing.Target, error) {
 	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
 		return routing.Target{}, err
@@ -303,27 +359,34 @@ func (s *Server) voiceTTSOfferable(ctx context.Context, routeID string) (bool, e
 	return routing.CapabilityRowsOfferableTTS(rows, namesErr == nil && len(names) > 0), nil
 }
 
-// voiceInferenceGate runs the shared inference gate (inferenceGate: model override and
+// voiceInferenceGate is voiceShapeGate for one leg of the co-load gate. The request it
+// returns never parks (NoPark): the gate only selects and must answer the ticket POST
+// without waiting behind the requests that will use the model, and with every instance
+// busy it signals the demand for another itself -- a voice chat about to start is demand
+// already known. exclude is the instances (routing.InstanceKey) its selection must not
+// pick: one the agent refused as gone when the gate re-selects a leg, nil otherwise.
+func (s *Server) voiceInferenceGate(r *http.Request, token auth.Token, shape inferenceShape, exclude []string) (inference.Request, error) {
+	req, err := s.voiceShapeGate(r, token, shape)
+	if err != nil {
+		return inference.Request{}, err
+	}
+	req.NoPark = true
+	req.ExcludeInstanceKeys = exclude
+	return req, nil
+}
+
+// voiceShapeGate runs the shared inference gate (inferenceGate: model override and
 // redirect, the server-override re-auth, the model allowlist and session extraction, but
-// NOT the principal's admission) for one leg, and returns the gated request. The gate
+// NOT the principal's admission) for shape, and returns the gated request. The gate
 // answers a refusal by writing to a ResponseWriter; there is no client response here, so
 // what it would have written is captured and returned as the error.
-//
-// The request it returns never parks (NoPark): every caller only selects -- the co-load
-// gate, and the synth endpoint's check before its own admitted relay -- and must answer
-// without waiting behind the requests that will use the model. exclude is the instances
-// (routing.InstanceKey) its selection must not pick: one the agent refused as gone when
-// the gate re-selects a leg, nil otherwise.
-func (s *Server) voiceInferenceGate(r *http.Request, token auth.Token, shape inferenceShape, exclude []string) (inference.Request, error) {
+func (s *Server) voiceShapeGate(r *http.Request, token auth.Token, shape inferenceShape) (inference.Request, error) {
 	rec := &voiceGateWriter{header: http.Header{}}
 	pf, handled := s.inferenceGate(rec, r, token, nil, shape)
 	if handled {
 		return inference.Request{}, rec.refusal()
 	}
-	req := pf.Req
-	req.NoPark = true
-	req.ExcludeInstanceKeys = exclude
-	return req, nil
+	return pf.Req, nil
 }
 
 // voiceGateWriter is the http.ResponseWriter the shared inference gate writes a refusal

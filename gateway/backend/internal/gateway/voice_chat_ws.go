@@ -1188,7 +1188,7 @@ func voiceLoopbackPump(turnCtx context.Context, pcm <-chan []byte, pw *io.PipeWr
 // failure so the transport's body read ends at once. Like the pump it touches no machine
 // state -- it is a Server method only so it can reach openLiveLoopback without the machine.
 func (s *Server) dialTurnLoopback(turnCtx context.Context, claims liveTicketClaims, pr *io.PipeReader, events chan<- voiceLoopbackEvent) {
-	resp, err := s.openLiveLoopback(turnCtx, claims, pr)
+	resp, err := s.openLiveLoopback(turnCtx, claims, pr, true)
 	if err != nil {
 		_ = pr.CloseWithError(err)
 		events <- voiceLoopbackEvent{kind: loopbackDialFailed}

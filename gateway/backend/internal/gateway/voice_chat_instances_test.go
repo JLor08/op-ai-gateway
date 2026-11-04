@@ -6,6 +6,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -28,10 +29,6 @@ import (
 // instance is gone. These tests drive the real Server and resolver over the
 // instance fixture (live_instances_test.go), with the voice gate's fake agent as
 // the provider for the ensures and the residency read.
-
-// voiceGateNoParkBound is how long a gate whose every instance is busy may take:
-// it must answer at once, not after a wait in the admission queue.
-const voiceGateNoParkBound = 100 * time.Millisecond
 
 // countingAdmission wraps the server's admission queue and counts the waits.
 type countingAdmission struct {
@@ -112,14 +109,13 @@ func (w *voiceInstanceWorld) busy(t *testing.T, instanceKey string, n int) {
 }
 
 // gate runs the voice-chat gate for the fixture's three models under a context
-// that ends a gate which waits, so a regression fails instead of hanging.
-func (w *voiceInstanceWorld) gate(t *testing.T) (asr, llm, tts routing.Target, code string, took time.Duration, err error) {
+// that ends a gate which waits, so a regression fails instead of hanging. Whether
+// it parked is read off the admission queue's wait count (w.adm), not off a clock.
+func (w *voiceInstanceWorld) gate(t *testing.T) (asr, llm, tts routing.Target, code string, err error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	start := time.Now()
-	asr, llm, tts, code, err = w.srv.voiceCoLoadGate(ctx, &w.token, "asr-inst", "chat-inst", "tts-inst")
-	return asr, llm, tts, code, time.Since(start), err
+	return w.srv.voiceCoLoadGate(ctx, &w.token, "asr-inst", "chat-inst", "tts-inst")
 }
 
 func (w *voiceInstanceWorld) ensured() []string {
@@ -145,12 +141,9 @@ func TestVoiceGateNeverParks(t *testing.T) {
 			w.busy(t, leg.mapping+"#0", 2)
 			w.busy(t, leg.mapping+"#1", 1)
 
-			asr, _, tts, code, took, err := w.gate(t)
+			asr, _, tts, code, err := w.gate(t)
 			if err != nil || code != "" {
 				t.Fatalf("gate = %q, %v; want it passed", code, err)
-			}
-			if took > voiceGateNoParkBound {
-				t.Fatalf("gate took %v, want it within %v (it must not wait for a free instance)", took, voiceGateNoParkBound)
 			}
 			if waits := w.adm.count(); waits != 0 {
 				t.Fatalf("admission waits = %d, want none", waits)
@@ -174,7 +167,7 @@ func TestVoiceGateEnsuresSelectedInstance(t *testing.T) {
 	w.busy(t, liveInstASRMap+"#0", 1)
 	w.busy(t, liveInstTTSMap+"#0", 1)
 
-	asr, _, tts, code, _, err := w.gate(t)
+	asr, _, tts, code, err := w.gate(t)
 	if err != nil || code != "" {
 		t.Fatalf("gate = %q, %v; want it passed", code, err)
 	}
@@ -207,18 +200,36 @@ func TestVoiceGateReselectsVanishedInstance(t *testing.T) {
 			w.busy(t, liveInstASRMap+"#0", 1)
 			w.agent.ensureErr[liveInstASRUp+"#1"] = refusal
 
-			asr, _, _, code, _, err := w.gate(t)
+			asr, _, _, code, err := w.gate(t)
 			if err != nil || code != "" {
 				t.Fatalf("gate = %q, %v; want it passed on the sibling", code, err)
 			}
 			if asr.InstanceKey != liveInstASRMap+"#0" {
 				t.Fatalf("asr target = %q, want %s#0, the sibling of the gone instance", asr.InstanceKey, liveInstASRMap)
 			}
-			if got := w.ensured(); !slices.Equal(got[:2], []string{liveInstASRUp + "#1", liveInstASRUp}) {
+			if got := w.ensured(); len(got) < 2 || !slices.Equal(got[:2], []string{liveInstASRUp + "#1", liveInstASRUp}) {
 				t.Fatalf("ensured = %v, want the gone instance, then its sibling", got)
 			}
 		})
 	}
+	t.Run("the tts leg", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.publish([]int{0}, []int{0, 1})
+		w.busy(t, liveInstTTSMap+"#0", 1)
+		w.agent.ensureErr[liveInstTTSUp+"#1"] = gone["409 instance_no_capacity"]
+
+		_, _, tts, code, err := w.gate(t)
+		if err != nil || code != "" {
+			t.Fatalf("gate = %q, %v; want it passed on the sibling", code, err)
+		}
+		if tts.InstanceKey != liveInstTTSMap+"#0" {
+			t.Fatalf("tts target = %q, want %s#0, the sibling of the gone instance", tts.InstanceKey, liveInstTTSMap)
+		}
+		want := []string{liveInstASRUp, liveInstChatUp, liveInstTTSUp + "#1", liveInstTTSUp}
+		if got := w.ensured(); !slices.Equal(got, want) {
+			t.Fatalf("ensured = %v, want %v: the gone tts instance, then its sibling", got, want)
+		}
+	})
 	t.Run("only once", func(t *testing.T) {
 		w := newVoiceInstanceWorld(t)
 		w.publish([]int{0, 1, 2}, []int{0})
@@ -226,7 +237,7 @@ func TestVoiceGateReselectsVanishedInstance(t *testing.T) {
 		w.agent.ensureErr[liveInstASRUp+"#1"] = gone["409 instance_no_capacity"]
 		w.agent.ensureErr[liveInstASRUp+"#2"] = gone["409 instance_no_capacity"]
 
-		asr, llm, tts, code, _, err := w.gate(t)
+		asr, llm, tts, code, err := w.gate(t)
 		requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatASRUnavailable)
 		if got := w.ensured(); len(got) != 2 {
 			t.Fatalf("ensured = %v, want two attempts: the selection and its one re-selection", got)
@@ -238,7 +249,7 @@ func TestVoiceGateReselectsVanishedInstance(t *testing.T) {
 		w.busy(t, liveInstASRMap+"#1", 1)
 		w.agent.ensureErr[liveInstASRUp] = gone["404 model_not_managed"]
 
-		asr, llm, tts, code, _, err := w.gate(t)
+		asr, llm, tts, code, err := w.gate(t)
 		requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatASRUnavailable)
 		if got := w.ensured(); !slices.Equal(got, []string{liveInstASRUp}) {
 			t.Fatalf("ensured = %v, want instance 0 only", got)
@@ -250,7 +261,7 @@ func TestVoiceGateReselectsVanishedInstance(t *testing.T) {
 		w.busy(t, liveInstASRMap+"#0", 1)
 		w.agent.ensureErr[liveInstASRUp+"#1"] = provider.RouterStatusError(http.StatusServiceUnavailable, []byte(`{"error":{"code":"runtime.admission_blocked","message":"no room"}}`))
 
-		asr, llm, tts, code, _, err := w.gate(t)
+		asr, llm, tts, code, err := w.gate(t)
 		requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatCoLoadFailed)
 		if got := w.ensured(); !slices.Equal(got, []string{liveInstASRUp + "#1"}) {
 			t.Fatalf("ensured = %v, want the one refused instance and no re-selection", got)
@@ -274,14 +285,9 @@ func TestLiveTicketMintNeverParks(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
-	start := time.Now()
 	w.srv.ServeHTTP(rec, req)
-	took := time.Since(start)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("mint status = %d, want 200; body = %s", rec.Code, rec.Body.String())
-	}
-	if took > voiceGateNoParkBound {
-		t.Fatalf("mint took %v, want it within %v", took, voiceGateNoParkBound)
 	}
 	if waits := w.adm.count(); waits != 0 {
 		t.Fatalf("admission waits = %d, want none", waits)
@@ -293,9 +299,8 @@ func TestLiveTicketMintNeverParks(t *testing.T) {
 }
 
 // A run synthesizes its speech sections one at a time when its TTS target is an
-// instance of a replicable spec: the run stays on one instance, and its own second
-// section never looks like demand for another. Every other target keeps the
-// configured concurrency.
+// instance of a replicable spec, so its own second section never looks like demand
+// for another instance. Every other target keeps the configured concurrency.
 func TestVoiceTTSConcurrencyOneForInstances(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -318,7 +323,7 @@ func TestVoiceTTSConcurrencyOneForInstances(t *testing.T) {
 
 // A run whose TTS target is an instance of a replicable spec keeps one synthesis
 // in flight at a time, though the configured cap is two: a burst of sections is
-// spoken one after another on that one instance.
+// spoken one after another.
 func TestVoiceRunOnATTSInstanceSynthesizesOneSectionAtATime(t *testing.T) {
 	script, _ := burstScript()
 	prov := defaultVoiceProvider()
@@ -363,5 +368,84 @@ func TestVoiceRunOnATTSInstanceSynthesizesOneSectionAtATime(t *testing.T) {
 	}
 	if peak := prov.speechPeak.Load(); peak != 1 {
 		t.Fatalf("peak concurrent syntheses = %d, want 1", peak)
+	}
+}
+
+// The branches of a leg's re-selection off a gone instance that the gate tests
+// above do not reach: a re-selection routing refuses ends the leg with the gone
+// instance's own error, a re-selected direct target is not ensured, and a caller
+// gone mid-start re-selects nothing.
+func TestVoiceGateReselectionEdges(t *testing.T) {
+	goneErr := provider.RouterStatusError(http.StatusConflict, []byte(`{"error":{"code":"runtime.instance_no_capacity","message":"gone"}}`))
+	gone := routing.Target{Provider: routing.ProviderServerAgent, RouteID: liveInstASRMap, ServerID: liveInstServer, ProviderModel: liveInstASRUp + "#1", InstanceKey: liveInstASRMap + "#1"}
+	newLeg := func(reselect func(routing.Target) (routing.Target, error)) *voiceGateLeg {
+		return &voiceGateLeg{leg: voiceLegASR, target: gone, unavailable: voiceChatASRUnavailable, reselect: reselect}
+	}
+
+	t.Run("a refused re-selection answers the gone error", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.agent.ensureErr[gone.ProviderModel] = goneErr
+		leg := newLeg(func(routing.Target) (routing.Target, error) { return routing.Target{}, routing.ErrNoHealthyHost })
+		code, err := w.srv.ensureVoiceLeg(context.Background(), w.agent, leg)
+		if code != voiceChatASRUnavailable || !errors.Is(err, goneErr) || errors.Is(err, routing.ErrNoHealthyHost) {
+			t.Fatalf("ensureVoiceLeg = %q, %v; want the leg unavailable with the gone instance's error", code, err)
+		}
+		if leg.target.InstanceKey != gone.InstanceKey {
+			t.Fatalf("target = %+v, want the gone instance kept: nothing else was selected", leg.target)
+		}
+	})
+
+	t.Run("a direct re-selected target is not ensured", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.agent.ensureErr[gone.ProviderModel] = goneErr
+		direct := routing.Target{Provider: routing.ProviderAudioCpp, RouteID: "route-direct", ServerID: "srv-direct", ProviderModel: "asr-direct"}
+		leg := newLeg(func(routing.Target) (routing.Target, error) { return direct, nil })
+		if code, err := w.srv.ensureVoiceLeg(context.Background(), w.agent, leg); code != "" || err != nil {
+			t.Fatalf("ensureVoiceLeg = %q, %v; want it passed on the direct target", code, err)
+		}
+		if leg.target.ProviderModel != direct.ProviderModel || leg.target.RouteID != direct.RouteID {
+			t.Fatalf("target = %+v, want the re-selected direct target", leg.target)
+		}
+		if got := w.ensured(); !slices.Equal(got, []string{gone.ProviderModel}) {
+			t.Fatalf("ensured = %v, want only the gone instance: a direct target has no ensure route", got)
+		}
+	})
+
+	t.Run("a cancelled caller re-selects nothing", func(t *testing.T) {
+		w := newVoiceInstanceWorld(t)
+		w.agent.ensureErr[gone.ProviderModel] = goneErr
+		reselected := false
+		leg := newLeg(func(routing.Target) (routing.Target, error) { reselected = true; return routing.Target{}, nil })
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		code, err := w.srv.ensureVoiceLeg(ctx, w.agent, leg)
+		if code != voiceChatCoLoadFailed || !errors.Is(err, context.Canceled) {
+			t.Fatalf("ensureVoiceLeg = %q, %v; want a co-load failure carrying the cancellation", code, err)
+		}
+		if reselected {
+			t.Fatal("the leg was re-selected for a caller that went away")
+		}
+	})
+}
+
+// The replay's synth pre-check with every TTS instance busy answers at once: it
+// never waits in the admission queue, and signals no demand -- the relay after it
+// parks, and signals, if it must.
+func TestVoiceSynthPreCheckNeitherParksNorSignals(t *testing.T) {
+	w := newVoiceInstanceWorld(t)
+	w.publish(nil, []int{0, 1})
+	w.busy(t, liveInstTTSMap+"#0", 1)
+	w.busy(t, liveInstTTSMap+"#1", 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/portal/voice-chat-synth", http.NoBody)
+	if err := w.srv.checkVoiceTTS(r, &w.token, "tts-inst"); err != nil {
+		t.Fatalf("checkVoiceTTS: %v, want the model accepted", err)
+	}
+	if waits := w.adm.count(); waits != 0 {
+		t.Fatalf("admission waits = %d, want none", waits)
+	}
+	if signals := w.sink.signals(); len(signals) != 0 {
+		t.Fatalf("demand signals = %+v, want none from a check", signals)
 	}
 }

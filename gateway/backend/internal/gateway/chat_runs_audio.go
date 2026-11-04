@@ -204,7 +204,7 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 // (run.publishAudio, the standalone speech run); a VOICE section leg passes its ordered sink so
 // the client sees one monotonic, section-serialized stream across all the turn's legs.
 func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) (json.RawMessage, string, string, bool) {
-	out := s.speechTurnAttempt(ctx, owner, run, prep, liftDeadline, stampTTFT, audioSink)
+	out := s.speechTurnAttempt(ctx, owner, run, prep, liftDeadline, stampTTFT, audioSink, false)
 	return out.parts, out.status, out.errMsg, out.streamed
 }
 
@@ -228,7 +228,9 @@ type speechAttemptResult struct {
 
 // speechTurnAttempt is generateSpeechTurn's body: one loopback synthesis request and its outcome,
 // with the retry classification (speechAttemptResult.transient) generateSpeechTurn drops.
-func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) speechAttemptResult {
+// realtime marks the request as a voice chat's TTS leg (realtimeRequiredHeaderName), which /v1
+// then routes under the real-time gate; a standalone speech run sets it false.
+func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio), realtime bool) speechAttemptResult {
 	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
 	build := buildSpeechBody
 	if streaming {
@@ -248,6 +250,9 @@ func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *C
 		return speechAttemptResult{status: "error", errMsg: speechRunDispatchFailedMessage}
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
+	if realtime {
+		req.Header.Set(realtimeRequiredHeaderName, "1")
+	}
 
 	dispatchedAt := time.Now()
 	resp, err := http.DefaultClient.Do(req)

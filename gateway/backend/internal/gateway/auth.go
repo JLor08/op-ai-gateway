@@ -43,6 +43,13 @@ const (
 	// rely on the header's provenance alone.
 	serverOverrideHeaderName      = "X-OP-Server-Override"
 	serverOverrideForceHeaderName = "X-OP-Server-Override-Force"
+
+	// realtimeRequiredHeaderName marks a voice chat turn's ASR or TTS loopback request
+	// ("1"): /v1 then routes it under the real-time gate
+	// (inference.Request.RealtimeRequired). It is honoured only beside the internal
+	// secret (loopbackRealtimeRequired), so a client that sends it gains nothing -- and
+	// a client may well want to: the gate only ever narrows what it is served on.
+	realtimeRequiredHeaderName = "X-OP-Realtime-Required"
 )
 
 // Auth error codes/messages reused by more than one handler below.
@@ -105,7 +112,7 @@ const (
 // Fail-closed on three independent conditions, checked in order -- a non-
 // empty s.internalAuthSecret, a non-nil s.users, and a nil error from
 // UserByID (which also covers "user not found") -- any one of them failing
-// returns false with no side effect. The secret comparison is
+// returns false with no side effect. The secret comparison (presentsInternalSecret) is
 // subtle.ConstantTimeCompare, guarded by presented != "" (an empty header must
 // never be allowed to match an unconfigured/empty secret, which
 // ConstantTimeCompare alone would happily do since two empty byte slices
@@ -114,11 +121,7 @@ const (
 // that went through the System-Admin step-up, and there is no cookie here to
 // resolve elevation from.
 func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
-	if s.internalAuthSecret == "" || s.users == nil {
-		return auth.Token{}, false
-	}
-	presented := r.Header.Get(internalAuthHeaderName)
-	if presented == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) != 1 {
+	if s.internalAuthSecret == "" || s.users == nil || !s.presentsInternalSecret(r) {
 		return auth.Token{}, false
 	}
 	user, err := s.users.UserByID(r.Context(), r.Header.Get(internalUserHeaderName))
@@ -126,6 +129,26 @@ func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
 		return auth.Token{}, false
 	}
 	return sessionPrincipal(user, false), true
+}
+
+// presentsInternalSecret reports whether r carries the per-process internal secret
+// (internalAuthHeaderName), the half of the trusted-loopback pair only the gateway itself
+// can send. It is loopbackPrincipal's secret check, shared with loopbackRealtimeRequired
+// so the comparison exists once: a configured, non-empty secret compared in constant
+// time, an empty header never matching.
+func (s *Server) presentsInternalSecret(r *http.Request) bool {
+	if s.internalAuthSecret == "" {
+		return false
+	}
+	presented := r.Header.Get(internalAuthHeaderName)
+	return presented != "" && subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) == 1
+}
+
+// loopbackRealtimeRequired reports whether r is a voice chat turn's loopback request
+// marked as one that must keep up with real time: the marker header beside the internal
+// secret. The same header from anyone else is ignored.
+func (s *Server) loopbackRealtimeRequired(r *http.Request) bool {
+	return r.Header.Get(realtimeRequiredHeaderName) == "1" && s.presentsInternalSecret(r)
 }
 
 // authenticateWeb resolves a principal. It first checks the internal trusted-

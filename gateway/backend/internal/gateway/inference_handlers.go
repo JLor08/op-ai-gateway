@@ -611,6 +611,8 @@ func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token aut
 	req.ClientSessionID = si.ClientSession
 	req.SessionSource = si.Source
 	req.AgentID = si.AgentID
+	// A voice chat turn's loopback leg asks for the real-time gate; nothing else can.
+	req.RealtimeRequired = s.loopbackRealtimeRequired(r)
 	return preflight{Req: req}, false
 }
 

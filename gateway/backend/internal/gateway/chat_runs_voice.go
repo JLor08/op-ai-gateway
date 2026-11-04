@@ -309,11 +309,12 @@ type voiceSynthGate struct {
 }
 
 // voiceTTSConcurrency is how many speech sections a run synthesizes at once on its TTS target: 1
-// when the target is an instance of a replicable spec (InstanceCapable), configured otherwise. One
-// voice chat uses one TTS instance: its sections are synthesized one after another there, which is
-// what an audio.cpp child does anyway (it serves one request at a time, so a second section only
-// waited inside the one process), and the run's own second section is then never in flight beside
-// its first -- a request at the instance's cap that would read as demand for another instance.
+// when the target is an instance of a replicable spec (InstanceCapable), configured otherwise. An
+// audio.cpp child serves one request at a time, so a second concurrent section only waited inside
+// the process anyway; with the cap at 1 a run's own second section is never in flight beside its
+// first -- a request at the instance's cap that would read as demand for another instance. The cap
+// says how many of the run's sections synthesize at once, not where: each section's request is
+// routed on its own.
 func voiceTTSConcurrency(target routing.Target, configured int) int {
 	if target.InstanceCapable {
 		return 1
@@ -695,7 +696,8 @@ func retrySpeechAttempts(ctx context.Context, who string, retries int, relayed *
 // relayed: the TTS did produce audio, and a retry would bill it again. stampTTFT=false: the LLM leg
 // is streaming into the same run.metrics concurrently, so the speech leg must NOT also write it (a
 // lost update on the perf metrics); the LLM leg is the sole metrics writer, keeping them
-// deterministic.
+// deterministic. The request is marked as a voice chat leg (realtime), so /v1 resolves it under
+// the same real-time gate the ticket mint applied.
 func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg, relayed *atomic.Bool) speechAttemptResult {
 	ttsCtx, cancelTTS := context.WithCancelCause(ctx)
 	defer cancelTTS(nil)
@@ -708,7 +710,7 @@ func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *
 		case <-ttsCtx.Done():
 		}
 	}
-	return s.speechTurnAttempt(ttsCtx, owner, run, prep, liftDeadline, false, sink)
+	return s.speechTurnAttempt(ttsCtx, owner, run, prep, liftDeadline, false, sink, true)
 }
 
 // voiceSpeechLanguage resolves the language the speech leg is asked to speak: the per-answer

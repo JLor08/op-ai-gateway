@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
@@ -92,6 +93,8 @@ func voiceChatRefusal(code string) (int, apierror.Body) {
 		return http.StatusBadRequest, apierror.Response(code, "the chat's speech settings cannot be used for a voice chat: they are unreadable or too large", "")
 	case voiceChatCoLoadFailed:
 		return http.StatusConflict, apierror.Response(code, "the chosen models could not be loaded together", "")
+	case voiceChatNoRealtimeModel:
+		return http.StatusConflict, apierror.Response(code, voiceNoRealtimeMessage, "")
 	default:
 		return http.StatusInternalServerError, apierror.Response(voiceChatTicketFailed, "voice chat ticket could not be issued", "")
 	}
@@ -101,6 +104,11 @@ func writeVoiceChatRefusal(w http.ResponseWriter, code string) {
 	status, body := voiceChatRefusal(code)
 	writeJSON(w, status, body)
 }
+
+// voiceNoRealtimeMessage is the wording of voiceChatNoRealtimeModel. The gate's answer
+// prefixes the leg ("voice chat tts leg: ..."), the form the portal reads the leg from;
+// the leg is the gate's own constant, so nothing of the cause reaches the client.
+const voiceNoRealtimeMessage = "no server of the chosen model is measured fast enough to keep up with real time"
 
 // voiceCoLoadBound is the deadline the gate runs under: the configured one, or the default
 // for a Server that was not built through New.
@@ -278,6 +286,11 @@ func (s *Server) writeVoiceCoLoadRefusal(gateCtx context.Context, w http.Respons
 		code = voiceChatCoLoadFailed
 	} else {
 		slog.Debug("voice chat ticket refused", "code", code, "chat", chatID, "err", err)
+	}
+	var legErr *voiceLegError
+	if code == voiceChatNoRealtimeModel && errors.As(err, &legErr) {
+		writeJSON(w, http.StatusConflict, apierror.Response(code, fmt.Sprintf("voice chat %s leg: %s", legErr.leg, voiceNoRealtimeMessage), ""))
+		return
 	}
 	writeVoiceChatRefusal(w, code)
 }

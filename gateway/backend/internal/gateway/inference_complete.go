@@ -998,6 +998,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrVoiceUnavailable) {
 		message = "no usable server offers the requested voice right now"
 	}
+	if errors.Is(err, routing.ErrNoRealtimeCandidate) {
+		message = voiceNoRealtimeMessage
+	}
 	if errors.Is(err, routing.ErrAdmissionQueueTimeout) {
 		message = "capacity queue timed out"
 	}
@@ -1052,6 +1055,11 @@ func completionHTTPStatus(err error) int {
 	}
 	if errors.Is(err, routing.ErrServerOverrideServerUnavailable) {
 		return http.StatusBadGateway
+	}
+	// A voice turn's model measured too slow for real time (routing.ErrNoRealtimeCandidate):
+	// the 409 the ticket mint answers it with, since a retry does not make the model faster.
+	if errors.Is(err, routing.ErrNoRealtimeCandidate) {
+		return http.StatusConflict
 	}
 	// ErrModelNotCapable, ErrNoModelRoute and ErrNoHealthyHost had no cases here
 	// and all three fell through to 502, which made a routing refusal
@@ -1119,6 +1127,8 @@ func completionErrorCode(err error) string {
 		return routing.ErrNoHealthyHost.Error()
 	case errors.Is(err, routing.ErrVoiceUnavailable):
 		return routing.ErrVoiceUnavailable.Error()
+	case errors.Is(err, routing.ErrNoRealtimeCandidate):
+		return voiceChatNoRealtimeModel
 	case errors.Is(err, routing.ErrAdmissionQueueTimeout):
 		return routing.ErrAdmissionQueueTimeout.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueFull):

@@ -1179,6 +1179,9 @@ func New(deps ServerDeps) *Server {
 			func() string { return s.vendorAccountRoutingModeCached(context.Background()) },
 			func() bool { return s.vendorSubscriptionsEnabledCached(context.Background()) },
 		)
+		// A voice chat's speech and transcription legs are gated by the real-time factor
+		// the audio benchmark judges a ramp level by, so "real time" means one thing.
+		resolver.SetAudioRealtimeMinFactor(s.audioRealtimeMinFactor)
 	}
 	// The instance scaler is the resolver's demand sink: a request about to park
 	// because every instance of its model is busy asks it for another. It needs
