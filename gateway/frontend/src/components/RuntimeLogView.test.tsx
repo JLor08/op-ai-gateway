@@ -544,6 +544,19 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
     });
 
+    it('names the tab list apart from the log, and links every tab to the log it filters', () => {
+      renderLogView(true, [0, 1]);
+      const log = screen.getByRole('log');
+      const tablist = screen.getByRole('tablist');
+      expect(log).toHaveAccessibleName(t.runtimeLogsTitle);
+      expect(tablist).toHaveAccessibleName(t.runtimeLogsTabsLabel);
+      expect(t.runtimeLogsTabsLabel).not.toBe(t.runtimeLogsTitle);
+      expect(log.id).not.toBe('');
+      for (const tab of screen.getAllByRole('tab')) {
+        expect(tab).toHaveAttribute('aria-controls', log.id);
+      }
+    });
+
     it("shows only an instance's own output in its tab, the [#k] prefix removed, and everything in All", () => {
       const h = renderLogView(true, [0, 1]);
       h.state('streaming');

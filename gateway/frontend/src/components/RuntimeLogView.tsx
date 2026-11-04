@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -547,6 +547,9 @@ export function RuntimeLogView({
   // purpose.
   const followRef = useRef(true);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  // Every tab filters the one log region below it, so each tab names that
+  // region as the one it controls.
+  const logId = useId();
 
   useEffect(() => {
     if (!open) return undefined;
@@ -635,12 +638,12 @@ export function RuntimeLogView({
             }}
             variant="scrollable"
             scrollButtons="auto"
-            aria-label={t.runtimeLogsTitle}
+            aria-label={t.runtimeLogsTabsLabel}
             sx={{ mb: 1, borderBottom: 1, borderColor: 'divider' }}
           >
-            <Tab label={t.runtimeLogsTabAll} value="all" />
+            <Tab label={t.runtimeLogsTabAll} value="all" aria-controls={logId} />
             {tabInstances.map((k) => (
-              <Tab key={k} label={t.runtimeLogsTabInstance(k)} value={k} />
+              <Tab key={k} label={t.runtimeLogsTabInstance(k)} value={k} aria-controls={logId} />
             ))}
           </Tabs>
         )}
@@ -677,6 +680,7 @@ export function RuntimeLogView({
         )}
         <Box
           ref={boxRef}
+          id={logId}
           role="log"
           aria-label={t.runtimeLogsTitle}
           aria-live="polite"
