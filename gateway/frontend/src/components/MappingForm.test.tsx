@@ -965,5 +965,81 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         audio_concurrency_limit: 'cap',
       });
     });
+
+    // A detour through "unknown" is no edit: the measured count comes back
+    // with its limit, and an unchanged pair is left to the benchmark.
+    it('keeps the measured count when the limit goes to unknown and back', async () => {
+      const { submitted } = renderForm({ row: measured() });
+      await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitUnknown);
+      expect(countField().value).toBe('');
+      await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitResources);
+      expect(countField().value).toBe('2');
+      await save();
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0]).not.toHaveProperty('audio_realtime_concurrency');
+      expect(submitted[0]).not.toHaveProperty('audio_concurrency_limit');
+    });
+
+    it('sends the measured count beside a new limit chosen after unknown', async () => {
+      const { submitted } = renderForm({ row: measured() });
+      await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitUnknown);
+      await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitPerformance);
+      await save();
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0]).toMatchObject({
+        audio_realtime_concurrency: 2,
+        audio_concurrency_limit: 'performance',
+      });
+    });
+
+    // Beside a limit, 0 is a result -- "not real-time even alone", a ceiling
+    // the scaler obeys -- so a blank count is never saved as one: the form
+    // names the missing count and does not save.
+    it('refuses to save a chosen limit without its count', async () => {
+      const { submitted } = renderForm({ row: makeMapping() });
+      await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitPerformance);
+      expect(countField().value).toBe('');
+      expect(screen.getByText(t.mappingAudioRealtimeConcurrencyRequired)).toBeInTheDocument();
+      expect(countField()).toHaveAttribute('aria-invalid', 'true');
+      await save();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(submitted).toHaveLength(0);
+
+      fireEvent.change(countField(), { target: { value: '0' } });
+      expect(screen.queryByText(t.mappingAudioRealtimeConcurrencyRequired)).not.toBeInTheDocument();
+      await save();
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0]).toMatchObject({
+        audio_realtime_concurrency: 0,
+        audio_concurrency_limit: 'performance',
+      });
+    });
+
+    // The field is required beside a limit, which stops the Save button in a
+    // browser; the form is submitted directly here, past that constraint
+    // validation, to prove the form's own check for a browser that skips it.
+    it('refuses to save a measured count cleared beside its limit', async () => {
+      const { submitted } = renderForm({ row: measured() });
+      fireEvent.change(countField(), { target: { value: '' } });
+      expect(screen.getByText(t.mappingAudioRealtimeConcurrencyRequired)).toBeInTheDocument();
+      expect(countField()).toBeRequired();
+      fireEvent.submit(countField().closest('form')!);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(submitted).toHaveLength(0);
+      expect(countField()).toHaveFocus();
+    });
+
+    // The hint says what an empty field or a 0 means per field: not measured
+    // for the rate and the time, a result for the count.
+    it('does not call a count of 0 unknown in its hint', () => {
+      renderForm({ row: measured() });
+      const hint = screen.getByText(t.mappingAudioMetricsHint);
+      expect(hint.textContent).not.toMatch(/0 = (unbekannt|unknown)/i);
+      expect(hint.textContent).toContain(t.audioRealtimeConcurrency(0, 'performance'));
+    });
   });
 }

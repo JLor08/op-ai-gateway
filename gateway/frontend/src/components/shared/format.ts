@@ -422,8 +422,10 @@ export function formatMetric(
 
 /**
  * Read a metric the operator typed into a free-text numeric field: a
- * non-negative number, and 0 for a blank, invalid or negative entry -- 0 is
- * how the backend stores "unknown".
+ * non-negative number, and 0 for a blank, invalid or negative entry -- for
+ * the metrics read through here, 0 is how the backend stores "not measured".
+ * Not for an audio ramp's real-time concurrency, where 0 beside its limit is
+ * a result ("not real-time"); shared/audioMetrics.ts reads that count itself.
  */
 export function parseMetricInput(text: string): number {
   const n = Number(text.trim());

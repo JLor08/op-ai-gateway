@@ -4343,6 +4343,7 @@ describe('audio metrics (#340) i18n keys', () => {
     'mappingAudioRateX',
     'mappingAudioTtfaMs',
     'mappingAudioRealtimeConcurrency',
+    'mappingAudioRealtimeConcurrencyRequired',
     'mappingAudioConcurrencyLimit',
     'mappingAudioConcurrencyLimitUnknown',
     'mappingAudioConcurrencyLimitPerformance',
@@ -4431,6 +4432,21 @@ describe('audio metrics (#340) i18n keys', () => {
     }
     expect(messages.de.mappingAudioConcurrencyLimitPerformance).toMatch(/gemessene Obergrenze/);
     expect(messages.en.mappingAudioConcurrencyLimitPerformance).toMatch(/measured ceiling/);
+  });
+
+  // Beside a limit a count of 0 is a result, never "unknown": the hint says
+  // so, and the count is asked for whenever a limit is chosen.
+  it('does not call a real-time concurrency of 0 unknown', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      expect(t.mappingAudioMetricsHint, locale).not.toMatch(/0 = (unbekannt|unknown)/i);
+      expect(t.mappingAudioMetricsHint, locale).toContain(
+        t.audioRealtimeConcurrency(0, 'performance'),
+      );
+      expect(t.mappingAudioRealtimeConcurrencyRequired, locale).toContain(
+        t.audioRealtimeConcurrency(0, 'performance'),
+      );
+    }
   });
 
   // The warning never refuses: the setting stays saved.

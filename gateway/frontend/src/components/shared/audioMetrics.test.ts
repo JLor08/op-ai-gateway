@@ -7,6 +7,7 @@ import {
   audioMetricColumns,
   audioMetricsBody,
   audioMetricsForm,
+  audioPairIncomplete,
   formatAudioConcurrency,
   formatAudioRate,
   formatAudioTtfa,
@@ -221,19 +222,64 @@ describe('audioMetricsBody', () => {
     });
   });
 
-  it('sends an empty count as 0 beside a chosen limit', () => {
+  // Beside a limit, 0 is a result ("not real-time even alone", a ceiling the
+  // scaler obeys), so a blank or unusable count is never sent as one: the pair
+  // stays as stored. The editor refuses such a save (audioPairIncomplete).
+  it('never sends a blank or unusable count as a measured 0 beside a chosen limit', () => {
     const none: AudioMetricsForm = { rateText: '', ttfaText: '', countText: '', limit: '' };
-    expect(audioMetricsBody({ ...none, limit: 'performance' }, none)).toEqual({
+    expect(audioMetricsBody({ ...none, limit: 'performance' }, none)).toEqual({});
+    for (const countText of ['', '  ', '1.5', '-1', 'abc']) {
+      expect(audioMetricsBody({ ...seed, countText }, seed), countText).toEqual({});
+      expect(audioMetricsBody({ ...seed, countText, limit: 'cap' }, seed), countText).toEqual({});
+    }
+  });
+
+  it('sends a typed 0 beside a limit as the result it is', () => {
+    const none: AudioMetricsForm = { rateText: '', ttfaText: '', countText: '', limit: '' };
+    expect(audioMetricsBody({ ...none, limit: 'performance', countText: '0' }, none)).toEqual({
       audio_realtime_concurrency: 0,
       audio_concurrency_limit: 'performance',
     });
   });
 
   // An unknown limit clears both, and a count sent with it would be a count
-  // without a limit.
+  // without a limit -- whatever the hidden count field still holds.
   it('clears the pair with an empty limit alone', () => {
     expect(audioMetricsBody({ ...seed, limit: '', countText: '' }, seed)).toEqual({
       audio_concurrency_limit: '',
     });
+    expect(audioMetricsBody({ ...seed, limit: '' }, seed)).toEqual({
+      audio_concurrency_limit: '',
+    });
+  });
+});
+
+describe('audioPairIncomplete', () => {
+  const form = (limit: AudioMetricsForm['limit'], countText: string): AudioMetricsForm => ({
+    rateText: '',
+    ttfaText: '',
+    countText,
+    limit,
+  });
+
+  // A limit is half a result: the count the ramp reached belongs beside it.
+  it('holds for a limit without a whole count of 0 or more', () => {
+    for (const countText of ['', '   ', '1.5', '-1', 'abc']) {
+      expect(audioPairIncomplete(form('performance', countText)), countText).toBe(true);
+      expect(audioPairIncomplete(form('resources', countText)), countText).toBe(true);
+    }
+  });
+
+  it('does not hold for a limit with its count, a 0 included', () => {
+    for (const countText of ['0', '2', ' 3 ']) {
+      expect(audioPairIncomplete(form('cap', countText)), countText).toBe(false);
+    }
+  });
+
+  // An unknown limit clears the pair, so no count is wanted beside it.
+  it('does not hold without a limit, whatever the count field holds', () => {
+    for (const countText of ['', '2', 'abc']) {
+      expect(audioPairIncomplete(form('', countText)), countText).toBe(false);
+    }
   });
 });

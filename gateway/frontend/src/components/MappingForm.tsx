@@ -21,6 +21,7 @@ import { BenchmarkPollTimeoutError, pollBenchmarkStatus } from './shared/benchma
 import {
   audioMetricsBody,
   audioMetricsForm,
+  audioPairIncomplete,
   type AudioConcurrencyLimit,
   type AudioMetricsForm,
 } from './shared/audioMetrics';
@@ -354,6 +355,7 @@ export function MappingForm({
   // two can never alias.
   const [audioSeed] = useState<AudioMetricsForm>(() => audioMetricsForm(row));
   const [audio, setAudio] = useState<AudioMetricsForm>(() => audioMetricsForm(row));
+  const audioCountRef = useRef<HTMLInputElement>(null);
 
   // Manual context-size probe: running state + whether this server is busy with
   // a benchmark/probe run (polled while editing so the button disables).
@@ -477,6 +479,15 @@ export function MappingForm({
     ] as const) {
       if (m.value.trim() === metricSeeds[m.key].trim()) continue;
       metrics[m.key] = parseMetricInput(m.value);
+    }
+    // A limit without its count is half a result, and a blank read as 0
+    // would store "not real-time": the count field already names what is
+    // missing, so the save stops there and takes the operator to it. (The
+    // field's own required/min/step stop this in a browser first; this is
+    // the check for one that skips them.)
+    if (audioPairIncomplete(audio)) {
+      audioCountRef.current?.focus();
+      return;
     }
     onSubmit({
       gateway_model_name: gatewayName,
@@ -612,8 +623,11 @@ export function MappingForm({
         {/* The audio metrics (#340), on the edit form only: the create request
             carries none, so a value typed there would be dropped without a
             word. The count is entered only beside a limit, because the two are
-            one result -- choosing "unknown" empties and locks it, and clears
-            both on save. */}
+            one result -- choosing "unknown" empties and locks the field and
+            clears both on save, while the count it held comes back with a
+            limit chosen again, so a detour through "unknown" loses nothing.
+            Beside a limit the count is required (audioPairIncomplete): there
+            a 0 is a result, so a blank cannot stand for "unknown". */}
         {editing && (
           <>
             <Typography variant="subtitle2" component="h4" sx={{ mt: 0.5 }}>
@@ -642,10 +656,9 @@ export function MappingForm({
               id="mapping-audio-concurrency-limit"
               label={t.mappingAudioConcurrencyLimit}
               value={audio.limit}
-              onChange={(e) => {
-                const limit = e.target.value as AudioConcurrencyLimit | '';
-                setAudio({ ...audio, limit, countText: limit === '' ? '' : audio.countText });
-              }}
+              onChange={(e) =>
+                setAudio({ ...audio, limit: e.target.value as AudioConcurrencyLimit | '' })
+              }
             >
               <option value="">{t.mappingAudioConcurrencyLimitUnknown}</option>
               <option value="performance">{t.mappingAudioConcurrencyLimitPerformance}</option>
@@ -656,10 +669,15 @@ export function MappingForm({
               id="mapping-audio-realtime-concurrency"
               type="number"
               label={t.mappingAudioRealtimeConcurrency}
-              value={audio.countText}
+              value={audio.limit === '' ? '' : audio.countText}
               onChange={(e) => setAudio({ ...audio, countText: e.target.value })}
               disabled={audio.limit === ''}
+              required={audio.limit !== ''}
+              inputRef={audioCountRef}
               inputProps={{ min: 0, step: 1 }}
+              {...(audioPairIncomplete(audio)
+                ? { error: true, helperText: t.mappingAudioRealtimeConcurrencyRequired }
+                : {})}
             />
           </>
         )}

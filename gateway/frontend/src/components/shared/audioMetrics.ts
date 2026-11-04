@@ -149,6 +149,24 @@ export type AudioMetricsBody = Pick<
   'audio_rate_x' | 'audio_ttfa_ms' | 'audio_realtime_concurrency' | 'audio_concurrency_limit'
 >;
 
+/** The count field's text as the whole count of 0 or more it must be, else null. */
+function audioCountFromText(text: string): number | null {
+  const n = Number(text.trim());
+  return text.trim() !== '' && Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Whether the editor holds a limit without the count that belongs beside it:
+ * a blank field, or one that is not a whole number of 0 or more. Beside a
+ * limit, 0 is a result -- not real-time even with one stream, a ceiling the
+ * scaler obeys -- so a blank field cannot stand for "unknown" there the way
+ * it does for the rate and the time. The editor names the field and refuses
+ * the save; "unknown" is the limit's own choice, which clears both.
+ */
+export function audioPairIncomplete(form: AudioMetricsForm): boolean {
+  return form.limit !== '' && audioCountFromText(form.countText) === null;
+}
+
 /**
  * The audio half of the mapping update: like the text metrics, a field is sent
  * only when the operator changed it from the value the form opened with
@@ -158,7 +176,9 @@ export type AudioMetricsBody = Pick<
  * The count and its limit are one result, so either one changed sends both --
  * the gateway refuses a count without one of the three limits beside it. An
  * unknown limit clears both and goes alone: a count beside it would be a count
- * without a limit.
+ * without a limit, whatever the hidden count field still holds. A limit
+ * without its count (audioPairIncomplete) sends neither and leaves the stored
+ * pair as it is: a blank read as 0 would store a measured "not real-time".
  */
 export function audioMetricsBody(form: AudioMetricsForm, seed: AudioMetricsForm): AudioMetricsBody {
   const body: AudioMetricsBody = {};
@@ -170,10 +190,11 @@ export function audioMetricsBody(form: AudioMetricsForm, seed: AudioMetricsForm)
   }
   const countChanged = form.limit !== '' && form.countText.trim() !== seed.countText.trim();
   if (form.limit !== seed.limit || countChanged) {
+    const count = audioCountFromText(form.countText);
     if (form.limit === '') {
       body.audio_concurrency_limit = '';
-    } else {
-      body.audio_realtime_concurrency = parseMetricInput(form.countText);
+    } else if (count !== null) {
+      body.audio_realtime_concurrency = count;
       body.audio_concurrency_limit = form.limit;
     }
   }

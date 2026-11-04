@@ -1116,10 +1116,12 @@ const de = {
   // #340: die Audio-Metriken, neben den Text-Metriken und unter derselben Sperre.
   mappingAudioMetricsSection: 'Audio-Metriken',
   mappingAudioMetricsHint:
-    'Optional. 0 = unbekannt. Die Audio-Messung (Geschwindigkeit, Kapazität, Beide) füllt diese Werte, sofern die Metriken nicht gesperrt sind. Die Echtzeit-Parallelität gilt nur zusammen mit ihrer Begrenzung; „Unbekannt“ löscht beide.',
+    'Optional. Bei × Echtzeit und der Zeit bis zur ersten Ausgabe heißt leer oder 0 „nicht gemessen“. Die Audio-Messung (Geschwindigkeit, Kapazität, Beide) füllt diese Werte, sofern die Metriken nicht gesperrt sind. Die Echtzeit-Parallelität gilt nur zusammen mit ihrer Begrenzung und gehört dann dazu; 0 heißt dort „nicht echtzeitfähig“. „Unbekannt“ löscht beide.',
   mappingAudioRateX: '× Echtzeit (ein Strom)',
   mappingAudioTtfaMs: 'Zeit bis zur ersten Ausgabe (ms)',
   mappingAudioRealtimeConcurrency: 'Echtzeit-Parallelität',
+  mappingAudioRealtimeConcurrencyRequired:
+    'Gehört zur gewählten Begrenzung: die letzte Stufe, die mit der Echtzeit Schritt hielt, als ganze Zahl ab 0 (0 = nicht echtzeitfähig).',
   mappingAudioConcurrencyLimit: 'Begrenzt durch',
   mappingAudioConcurrencyLimitUnknown: 'Unbekannt',
   mappingAudioConcurrencyLimitPerformance: audioLimitDe('performance'),
@@ -4580,10 +4582,12 @@ const en: PortalMessages = {
   mappingGenTpsAtCapacity: 'Tokens/s (max capacity)',
   mappingAudioMetricsSection: 'Audio metrics',
   mappingAudioMetricsHint:
-    'Optional. 0 = unknown. The audio measurement (Speed, Capacity, Both) fills these in unless the metrics are locked. The real-time concurrency holds only together with its limit; "Unknown" clears both.',
+    'Optional. For × real time and the time to first output, empty or 0 means "not measured". The audio measurement (Speed, Capacity, Both) fills these in unless the metrics are locked. The real-time concurrency holds only together with its limit and is then required; 0 there means "not real-time". "Unknown" clears both.',
   mappingAudioRateX: '× real time (one stream)',
   mappingAudioTtfaMs: 'Time to first output (ms)',
   mappingAudioRealtimeConcurrency: 'Real-time concurrency',
+  mappingAudioRealtimeConcurrencyRequired:
+    'Required with the chosen limit: the last level that kept up with real time, a whole number of 0 or more (0 = not real-time).',
   mappingAudioConcurrencyLimit: 'Limited by',
   mappingAudioConcurrencyLimitUnknown: 'Unknown',
   mappingAudioConcurrencyLimitPerformance: audioLimitEn('performance'),
