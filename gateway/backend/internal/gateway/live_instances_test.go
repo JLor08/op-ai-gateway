@@ -55,15 +55,41 @@ type routerRefusal struct {
 // /v1/audio/transcriptions answer for the model their body names. An address in
 // refuse answers its refusal with the router's error envelope instead; a live
 // refusal first reads refuseAfter bytes of the session's PCM, as a request the
-// transport had begun to send before the answer.
+// transport had begun to send before the answer. A chat completion for an address
+// in stall answers only after that long, as a child still producing its first
+// token.
 type instanceAgentRouter struct {
 	server *httptest.Server
 
 	mu          sync.Mutex
 	refuse      map[string]routerRefusal
 	refuseAfter int
+	stall       map[string]time.Duration
 	served      []string       // every address a request arrived for, in order
 	liveBytes   map[string]int // PCM bytes each live address received
+}
+
+func (a *instanceAgentRouter) setStall(model string, d time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.stall == nil {
+		a.stall = map[string]time.Duration{}
+	}
+	a.stall[model] = d
+}
+
+// stallFor waits out model's stall, or until the request ends.
+func (a *instanceAgentRouter) stallFor(r *http.Request, model string) {
+	a.mu.Lock()
+	d := a.stall[model]
+	a.mu.Unlock()
+	if d <= 0 {
+		return
+	}
+	select {
+	case <-time.After(d):
+	case <-r.Context().Done():
+	}
 }
 
 func newInstanceAgentRouter(t *testing.T) *instanceAgentRouter {
@@ -121,6 +147,7 @@ func (a *instanceAgentRouter) serve(w http.ResponseWriter, r *http.Request) {
 		if a.arrive(w, body.Model) {
 			return
 		}
+		a.stallFor(r, body.Model)
 		if body.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"served by %s\"}}]}\n\n", body.Model)
@@ -682,6 +709,143 @@ func TestVanishedInstanceReselectedOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A streamed request re-selected off a gone instance may wait in the admission
+// queue for the next one. That wait is not the stream going idle: the idle
+// watchdog is held while the request is parked and starts afresh for the
+// instance it is sent to, so the stream is served there even when the wait
+// outlasts the idle timeout.
+func TestVanishedStreamReselectWaitsOutsideTheIdleBudget(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServer(t, agent, true)
+	const idle = 300 * time.Millisecond
+	srv.streamIdleTimeout = idle
+	publishChatInstances(srv, 2)
+	// Instance 0 at its parallelism of one: the stream goes to instance 2, and its
+	// re-selection waits for instance 0.
+	srv.Active.Add(ActiveRequest{ID: "busy0", ServerID: liveInstServer, InstanceKey: "route-chat-inst#0"})
+	defer srv.Active.Remove("busy0")
+	agent.setRefusal("chat-up#2", http.StatusNotFound, "runtime.model_not_managed")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // lets go of a request still parked when the test fails
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat-inst","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.ServeHTTP(rec, req)
+	}()
+
+	refused := time.Now().Add(5 * time.Second)
+	for !slices.Contains(agent.servedModels(), "chat-up#2") {
+		if time.Now().After(refused) {
+			t.Fatal("the stream never reached instance 2")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatalf("the stream ended while instance 0 was busy, want its re-selection parked; body %s", rec.Body.String())
+	case <-time.After(3 * idle):
+	}
+	srv.Active.Remove("busy0")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the parked re-selection was not admitted after instance 0 freed")
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "served by chat-up") || strings.Contains(body, errCodeStreamIdleTimeout) {
+		t.Fatalf("stream body = %s; want it served by instance 0 with no idle timeout", body)
+	}
+	if served := agent.servedModels(); !slices.Equal(served, []string{"chat-up#2", "chat-up"}) {
+		t.Fatalf("addresses served = %v, want [chat-up#2 chat-up]", served)
+	}
+	rows := srv.Usage.All()
+	if len(rows) != 1 || rows[0].Status != "success" {
+		t.Fatalf("usage rows = %+v, want one success row", rows)
+	}
+}
+
+// The idle watchdog of a re-selected stream starts afresh for the instance it is
+// sent to: a wait for that instance shorter than the idle timeout does not eat
+// into the instance's first-byte budget, and an instance that then sends nothing
+// is still cut at the idle timeout.
+func TestVanishedStreamReselectArmsAFreshIdleBudget(t *testing.T) {
+	const streamBody = `{"model":"chat-inst","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	start := func(t *testing.T, srv *Server) (*httptest.ResponseRecorder, chan struct{}) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel) // lets go of a request still running when the test fails
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(streamBody))
+		req.Header.Set("Authorization", "Bearer dev-secret")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			srv.ServeHTTP(rec, req)
+		}()
+		return rec, done
+	}
+	t.Run("a short wait leaves the next instance the whole budget", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServer(t, agent, true)
+		const idle = time.Second
+		srv.streamIdleTimeout = idle
+		publishChatInstances(srv, 2)
+		srv.Active.Add(ActiveRequest{ID: "busy0", ServerID: liveInstServer, InstanceKey: "route-chat-inst#0"})
+		defer srv.Active.Remove("busy0")
+		agent.setRefusal("chat-up#2", http.StatusNotFound, "runtime.model_not_managed")
+		// Waiting 600 ms for instance 0 and then 700 ms for its first token: 1.3 s in
+		// all, past the idle timeout, but each part well inside it.
+		agent.setStall("chat-up", 700*time.Millisecond)
+
+		rec, done := start(t, srv)
+		refused := time.Now().Add(5 * time.Second)
+		for !slices.Contains(agent.servedModels(), "chat-up#2") {
+			if time.Now().After(refused) {
+				t.Fatal("the stream never reached instance 2")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(600 * time.Millisecond)
+		srv.Active.Remove("busy0")
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the stream did not end")
+		}
+		if body := rec.Body.String(); !strings.Contains(body, "served by chat-up") || strings.Contains(body, errCodeStreamIdleTimeout) {
+			t.Fatalf("stream body = %s; want it served by instance 0 with no idle timeout", body)
+		}
+	})
+	t.Run("the next instance is still watched", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServer(t, agent, true)
+		const idle = 300 * time.Millisecond
+		srv.streamIdleTimeout = idle
+		publishChatInstances(srv, 2)
+		agent.setRefusal("chat-up#2", http.StatusNotFound, "runtime.model_not_managed")
+		agent.setStall("chat-up", time.Minute)
+
+		rec, done := start(t, srv)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a re-selected stream whose instance sends nothing was not cut at the idle timeout")
+		}
+		if body := rec.Body.String(); !strings.Contains(body, errCodeStreamIdleTimeout) {
+			t.Fatalf("stream body = %s; want the idle timeout", body)
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"chat-up#2", "chat-up"}) {
+			t.Fatalf("addresses served = %v, want [chat-up#2 chat-up]", served)
+		}
+	})
 }
 
 // The re-selection happens once: a request whose second instance is gone too

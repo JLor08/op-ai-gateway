@@ -242,9 +242,22 @@ func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error
 // re-selected attempt's, and it is registered again under its id; the usage row
 // finish records is that attempt's. A re-selection that fails leaves the session as
 // it was, so the stream ends with the original error.
+//
+// The idle watchdog beginStream armed is held while the selection runs and armed
+// afresh after it. The selection may wait in the admission queue for the next
+// instance -- bounded by the queue timeout and the client, as the first resolve was
+// -- and that wait is not the stream going idle; the instance the stream is then sent
+// to gets the whole first-byte budget the first one had. A watchdog that has already
+// fired has ended the stream, which is then not re-selected.
 func (ss *streamSession) reselect(err error) bool {
 	if !reselectsLostInstance(ss.target, ss.req, err) {
 		return false
+	}
+	if ss.watchdog != nil {
+		if !ss.watchdog.Stop() {
+			return false
+		}
+		defer ss.watchdog.Reset(ss.idle)
 	}
 	req := withLostInstance(ss.req, ss.target)
 	token := ss.token
