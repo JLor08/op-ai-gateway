@@ -18,10 +18,12 @@ import (
 // runtimeConfigReadSpy wraps a portal.API and reports every
 // AgentRuntimeConfig derive on reads: the first thing a runtime-config push
 // pass does once its gates let it through, so a read is the observable sign
-// that a push for that server ran.
+// that a push for that server ran. srv is the server whose push worker the
+// expectations wait on.
 type runtimeConfigReadSpy struct {
 	portal.API
 	reads chan string
+	srv   *Server
 }
 
 func (p *runtimeConfigReadSpy) AgentRuntimeConfig(ctx context.Context, serverID string) (portal.AgentRuntimeConfigDTO, error) {
@@ -37,43 +39,53 @@ func (p *runtimeConfigReadSpy) AgentRuntimeConfig(ctx context.Context, serverID 
 
 // spyRuntimeConfigPushes swaps srv.Portal for a runtimeConfigReadSpy over it.
 func spyRuntimeConfigPushes(srv *Server) *runtimeConfigReadSpy {
-	spy := &runtimeConfigReadSpy{API: srv.Portal, reads: make(chan string, 64)}
+	spy := &runtimeConfigReadSpy{API: srv.Portal, reads: make(chan string, 64), srv: srv}
 	srv.Portal = spy
 	return spy
 }
 
-// expectPush fails unless a push pass for serverID derives a document within
-// a generous bound.
-func (p *runtimeConfigReadSpy) expectPush(t *testing.T, step, serverID string) {
+// pushesSettled waits until serverID's push worker has nothing left to do
+// and reports whether a pass for serverID derived a document since the last
+// call, draining every read. It needs no wall-clock window: PushRuntimeConfig
+// registers the server's worker before it returns (runtimeConfigPusher.notify
+// takes the map entry synchronously), so once the call that may push has
+// returned, runtimePush.idle hands back that worker's done channel -- or a
+// closed one when the worker has already exited -- and every derive the
+// worker ran has sent its read before the channel closes. The bound only
+// keeps a wedged worker from hanging the test.
+func (p *runtimeConfigReadSpy) pushesSettled(t *testing.T, step, serverID string) bool {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	select {
+	case <-p.srv.runtimePush.idle(serverID):
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: the runtime-config push worker for %s never went idle", step, serverID)
+	}
+	pushed := false
 	for {
 		select {
 		case got := <-p.reads:
-			if got == serverID {
-				return
-			}
-		case <-deadline:
-			t.Fatalf("%s: no runtime-config push for %s", step, serverID)
+			pushed = pushed || got == serverID
+		default:
+			return pushed
 		}
 	}
 }
 
-// expectNoPush fails if a push pass for serverID derives a document within a
-// short window. A push runs at once on its own goroutine, so the window only
-// has to cover scheduling.
+// expectPush fails unless a push pass for serverID derived a document for the
+// call that just returned (pushesSettled).
+func (p *runtimeConfigReadSpy) expectPush(t *testing.T, step, serverID string) {
+	t.Helper()
+	if !p.pushesSettled(t, step, serverID) {
+		t.Fatalf("%s: no runtime-config push for %s", step, serverID)
+	}
+}
+
+// expectNoPush fails if a push pass for serverID derived a document for the
+// call that just returned (pushesSettled).
 func (p *runtimeConfigReadSpy) expectNoPush(t *testing.T, step, serverID string) {
 	t.Helper()
-	window := time.After(200 * time.Millisecond)
-	for {
-		select {
-		case got := <-p.reads:
-			if got == serverID {
-				t.Fatalf("%s: a runtime-config push ran for %s, want none", step, serverID)
-			}
-		case <-window:
-			return
-		}
+	if p.pushesSettled(t, step, serverID) {
+		t.Fatalf("%s: a runtime-config push ran for %s, want none", step, serverID)
 	}
 }
 
@@ -318,6 +330,13 @@ func TestIngestStartupWrittenOnTenPercentChange(t *testing.T) {
 	spec, ok, err := srv.Routes.RuntimeSpecByID(ctx, "rspec_startup")
 	if err != nil || !ok || spec.StartupMeasuredMS != 11500 {
 		t.Fatalf("stored startup = %d (ok=%v err=%v), want 11500", spec.StartupMeasuredMS, ok, err)
+	}
+	sample(9000, 8000) // 22 % below the stored 11500: a quicker start is a move too
+	if got := st.writes(&st.startupWrites); !slices.Equal(got, []string{"rspec_startup=11500", "rspec_startup=9000"}) {
+		t.Fatalf("startup writes after 9000 = %v, want the large downward move written", got)
+	}
+	if spec, _, _ := srv.Routes.RuntimeSpecByID(ctx, "rspec_startup"); spec.StartupMeasuredMS != 9000 {
+		t.Fatalf("stored startup = %d, want 9000 after the downward move", spec.StartupMeasuredMS)
 	}
 
 	ingestInstanceRows(t, srv, "", instanceRow("rspec_unmeasured", 0, "running", `,"startup_ms":400`))
