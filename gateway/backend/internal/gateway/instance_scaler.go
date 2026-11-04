@@ -511,24 +511,15 @@ func (s *instanceScaler) candidate(ctx context.Context, c routing.MappingCandida
 	if !ok {
 		return scaleCandidate{}, false
 	}
-	total := 1 + len(view.Present)
-	if view.MaxInstances > 0 && total >= view.MaxInstances {
-		return scaleCandidate{}, false
-	}
-	if c.Mapping.AudioConcurrencyLimit == routing.AudioLimitPerformance && total >= c.Mapping.AudioRealtimeConcurrency {
+	if atInstanceCeiling(view, c.Mapping) {
 		return scaleCandidate{}, false
 	}
 	key := scaleKey{serverID: serverID, mappingID: c.Mapping.ID}
 	if s.heldOff(key) {
 		return scaleCandidate{}, false
 	}
-	specCtx, cancel := s.bounded(ctx)
-	spec, found, err := s.deps.store.RuntimeSpecByMapping(specCtx, c.Mapping.ID)
-	cancel()
-	if err != nil {
-		slog.Debug("instance scaler: reading the runtime spec failed", "mapping_id", c.Mapping.ID, "err", err)
-	}
-	if err != nil || !found {
+	spec, found := s.candidateSpec(ctx, c.Mapping.ID)
+	if !found {
 		return scaleCandidate{}, false
 	}
 	starting, reported := s.specInstances(serverID, spec.ID)
@@ -558,6 +549,30 @@ func (s *instanceScaler) candidate(ctx context.Context, c routing.MappingCandida
 		timeout:     startup + instanceEnsureMargin,
 		target:      target,
 	}, true
+}
+
+// atInstanceCeiling reports whether the spec view describes is at a ceiling, counting
+// instance 0 whether it runs or not: its max_instances, or the real-time concurrency the
+// audio benchmark measured for m as a performance limit (a limit of 0 included).
+func atInstanceCeiling(view routing.InstanceView, m routing.ModelMapping) bool {
+	total := 1 + len(view.Present)
+	if view.MaxInstances > 0 && total >= view.MaxInstances {
+		return true
+	}
+	return m.AudioConcurrencyLimit == routing.AudioLimitPerformance && total >= m.AudioRealtimeConcurrency
+}
+
+// candidateSpec reads the runtime spec of mappingID for candidate, bounded (bounded). A
+// read that fails is logged and, like a mapping without a spec, answers found false.
+func (s *instanceScaler) candidateSpec(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool) {
+	specCtx, cancel := s.bounded(ctx)
+	spec, found, err := s.deps.store.RuntimeSpecByMapping(specCtx, mappingID)
+	cancel()
+	if err != nil {
+		slog.Debug("instance scaler: reading the runtime spec failed", "mapping_id", mappingID, "err", err)
+		return routing.RuntimeSpec{}, false
+	}
+	return spec, found
 }
 
 // specInstances reads serverID's status rows of spec specID: whether any instance

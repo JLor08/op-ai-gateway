@@ -721,7 +721,7 @@ func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *
 		case <-ttsCtx.Done():
 		}
 	}
-	return s.speechTurnAttempt(ttsCtx, owner, run, prep, liftDeadline, false, sink, true, sticky)
+	return s.speechTurnAttempt(ttsCtx, owner, run, prep, speechAttemptOptions{liftDeadline: liftDeadline, audioSink: sink, realtime: true, sticky: sticky})
 }
 
 // voiceSpeechLanguage resolves the language the speech leg is asked to speak: the per-answer

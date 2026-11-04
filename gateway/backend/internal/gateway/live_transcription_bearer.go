@@ -256,7 +256,9 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	// selected again (reselectLiveSession); the deferred one then finds the slot let go.
 	leave := func() {
 		sess.release()
-		sess.release = func() {}
+		sess.release = func() {
+			// The slot is let go already; the deferred release must not free it twice.
+		}
 		s.Active.Remove(id)
 	}
 	defer func() {

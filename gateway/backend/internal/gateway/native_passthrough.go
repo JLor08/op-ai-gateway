@@ -305,6 +305,7 @@ func sniffRoutingModel(raw []byte) (model string, stream bool) {
 // chain into proxyNative.
 func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, endpoint sessionEndpoint, pf preflight) bool {
 	start := time.Now()
+	pr := passthroughRequest{token: token, raw: raw, apiFlavor: apiFlavor, endpoint: endpoint, pf: pf}
 	req := pf.Req
 	model := req.Model
 	// The native decision must be made BEFORE the lossy compat parse (which would
@@ -328,7 +329,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 		// consistent. Mark the request handled (true).
 		if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
 			slog.Warn("native passthrough admission rejected", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "code", completionErrorCode(err), "status", completionHTTPStatus(err))
-			s.failPassthrough(w, r, *token, req, raw, apiFlavor, start, routing.Target{}, err)
+			s.failPassthrough(w, r, pr, start, routing.Target{}, err)
 			return true
 		}
 		// Routing failed (no route for the model, or the application is currently
@@ -338,15 +339,27 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 		slog.Debug("native passthrough not applied: routing failed", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "err", err)
 		return false
 	}
-	return s.relayPassthroughTarget(w, r, token, raw, apiFlavor, endpoint, pf, target, start)
+	return s.relayPassthroughTarget(w, r, pr, target, start)
 }
 
-// relayPassthroughTarget is tryProxyNative past its resolve: it relays pf's request to
+// passthroughRequest is one /v1/responses or /v1/messages request tryProxyNative handles:
+// the caller's token snapshot, the client's raw body, the request's flavor and session
+// endpoint (tryProxyNative says why those are two), and its preflight.
+type passthroughRequest struct {
+	token     *auth.Token
+	raw       []byte
+	apiFlavor string
+	endpoint  sessionEndpoint
+	pf        preflight
+}
+
+// relayPassthroughTarget is tryProxyNative past its resolve: it relays pr's request to
 // target, already resolved, when target passes this endpoint through, refuses it when
 // the endpoint is disabled there, and returns false -- having written nothing -- when
 // target serves the endpoint by translate.
-func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, endpoint sessionEndpoint, pf preflight, target routing.Target, start time.Time) bool {
-	req := pf.Req
+func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, pr passthroughRequest, target routing.Target, start time.Time) bool {
+	token, raw, apiFlavor := pr.token, pr.raw, pr.apiFlavor
+	req := pr.pf.Req
 	model := req.Model
 	path, mode := endpointModeFor(target, apiFlavor)
 	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
@@ -375,9 +388,9 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 			path:     path,
 			raw:      raw,
 			pfReq:    req,
-			endpoint: endpoint,
+			endpoint: pr.endpoint,
 			reselect: func(lost routing.Target, gone error) {
-				s.reselectPassthrough(w, r, token, raw, apiFlavor, endpoint, pf, lost, gone)
+				s.reselectPassthrough(w, r, pr, lost, gone)
 			},
 		})
 		return true
@@ -414,7 +427,7 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 
 // reselectPassthrough moves a /v1/responses or /v1/messages passthrough whose instance
 // lost was refused as gone (gone, the refusal as an error) to another instance: it
-// resolves pf's request again with lost excluded and relays it there
+// resolves pr's request again with lost excluded and relays it there
 // (relayPassthroughTarget), and always answers. A re-resolve that routing refuses -- no
 // host left, a full or timed-out queue -- is answered with that routing error. A
 // re-selected instance that serves this endpoint by translate (another mapping of the
@@ -423,28 +436,29 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 // body this one accepted, so the request is answered with gone's own gateway error
 // (provider.unavailable) -- never with the agent's envelope, whose runtime.* code is the
 // agent's internals.
-func (s *Server) reselectPassthrough(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, endpoint sessionEndpoint, pf preflight, lost routing.Target, gone error) {
+func (s *Server) reselectPassthrough(w http.ResponseWriter, r *http.Request, pr passthroughRequest, lost routing.Target, gone error) {
 	start := time.Now()
-	again := pf
-	again.Req = withLostInstance(pf.Req, lost)
-	target, err := s.resolveTarget(r.Context(), token, again.Req)
+	again := pr
+	again.pf.Req = withLostInstance(pr.pf.Req, lost)
+	target, err := s.resolveTarget(r.Context(), again.token, again.pf.Req)
 	if err != nil {
-		slog.Warn("native passthrough: the routed instance is gone and re-selection failed", "path", r.URL.Path, "api_flavor", apiFlavor, "model", again.Req.Model, "instance", lost.InstanceKey, "code", completionErrorCode(err), "err", err)
-		s.failPassthrough(w, r, *token, again.Req, raw, apiFlavor, start, routing.Target{}, err)
+		slog.Warn("native passthrough: the routed instance is gone and re-selection failed", "path", r.URL.Path, "api_flavor", again.apiFlavor, "model", again.pf.Req.Model, "instance", lost.InstanceKey, "code", completionErrorCode(err), "err", err)
+		s.failPassthrough(w, r, again, start, routing.Target{}, err)
 		return
 	}
-	if s.relayPassthroughTarget(w, r, token, raw, apiFlavor, endpoint, again, target, start) {
+	if s.relayPassthroughTarget(w, r, again, target, start) {
 		return
 	}
-	slog.Warn("native passthrough: the routed instance is gone and the instance re-selected serves this endpoint by translate only", "path", r.URL.Path, "api_flavor", apiFlavor, "model", again.Req.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
-	s.failPassthrough(w, r, *token, again.Req, raw, apiFlavor, start, lost, gone)
+	slog.Warn("native passthrough: the routed instance is gone and the instance re-selected serves this endpoint by translate only", "path", r.URL.Path, "api_flavor", again.apiFlavor, "model", again.pf.Req.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
+	s.failPassthrough(w, r, again, start, lost, gone)
 }
 
 // failPassthrough answers a /v1/responses or /v1/messages request that ends before any
 // relay -- an admission refusal, or a re-selection off a gone instance that found
 // nothing it can relay to -- with the gateway's error for err, and records its usage row
 // against target (routing.Target{} when routing resolved none).
-func (s *Server) failPassthrough(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, apiFlavor string, start time.Time, target routing.Target, err error) {
+func (s *Server) failPassthrough(w http.ResponseWriter, r *http.Request, pr passthroughRequest, start time.Time, target routing.Target, err error) {
+	token, req, raw, apiFlavor := *pr.token, pr.pf.Req, pr.raw, pr.apiFlavor
 	id := nextRequestID()
 	capturing := s.capturingEnabled(token)
 	body := writeCompletionErrorCaptured(w, err)

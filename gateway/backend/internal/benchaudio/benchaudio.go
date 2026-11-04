@@ -101,37 +101,53 @@ func parsePCM(w []byte) (pcmClip, error) {
 	if len(w) < riffHeaderSize || string(w[0:4]) != "RIFF" || string(w[8:12]) != "WAVE" {
 		return pcmClip{}, errors.New("benchaudio: not a RIFF/WAVE file")
 	}
-	le := binary.LittleEndian
 	var c pcmClip
 	haveFormat := false
 	for off := riffHeaderSize; ; {
-		if len(w)-off < chunkHeaderSize {
-			return pcmClip{}, errors.New("benchaudio: the WAV has no data chunk")
-		}
-		id := string(w[off : off+4])
-		size := int(le.Uint32(w[off+4:]))
-		body := off + chunkHeaderSize
-		if size > len(w)-body {
-			return pcmClip{}, fmt.Errorf("benchaudio: the %q chunk is cut short", id)
+		id, body, err := chunkAt(w, off)
+		if err != nil {
+			return pcmClip{}, err
 		}
 		switch id {
 		case "fmt ":
-			if err := c.readFormat(w[body : body+size]); err != nil {
+			if err := c.readFormat(body); err != nil {
 				return pcmClip{}, err
 			}
 			haveFormat = true
 		case "data":
-			if !haveFormat {
-				return pcmClip{}, errors.New("benchaudio: the data chunk comes before the fmt chunk")
-			}
-			if frame := c.channels * pcmBitsS16 / 8; size%frame != 0 {
-				return pcmClip{}, fmt.Errorf("benchaudio: the audio (%d bytes) is not a whole number of %d-byte frames", size, frame)
-			}
-			c.pcm = w[body : body+size]
-			return c, nil
+			return c.withData(body, haveFormat)
 		}
-		off = body + size + size%2
+		off += chunkHeaderSize + len(body) + len(body)%2
 	}
+}
+
+// chunkAt reads the chunk whose header starts at off: its id and its body, which aliases w.
+// Too few bytes left for a header means the walk ran out before a data chunk; a body longer
+// than what is left is a chunk cut short.
+func chunkAt(w []byte, off int) (id string, body []byte, err error) {
+	if len(w)-off < chunkHeaderSize {
+		return "", nil, errors.New("benchaudio: the WAV has no data chunk")
+	}
+	id = string(w[off : off+4])
+	size := int(binary.LittleEndian.Uint32(w[off+4:]))
+	start := off + chunkHeaderSize
+	if size > len(w)-start {
+		return "", nil, fmt.Errorf("benchaudio: the %q chunk is cut short", id)
+	}
+	return id, w[start : start+size], nil
+}
+
+// withData is c with the samples of a `data` chunk's body, refusing audio that comes before
+// the format or is not a whole number of frames.
+func (c pcmClip) withData(data []byte, haveFormat bool) (pcmClip, error) {
+	if !haveFormat {
+		return pcmClip{}, errors.New("benchaudio: the data chunk comes before the fmt chunk")
+	}
+	if frame := c.channels * pcmBitsS16 / 8; len(data)%frame != 0 {
+		return pcmClip{}, fmt.Errorf("benchaudio: the audio (%d bytes) is not a whole number of %d-byte frames", len(data), frame)
+	}
+	c.pcm = data
+	return c, nil
 }
 
 // readFormat takes the format a `fmt ` chunk's body states, refusing anything that is not

@@ -549,70 +549,30 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 	if prep.err != nil {
 		return res, prep.err
 	}
-	call := prep.call
-	byInstance := s.audioRampByInstance(tgt)
-	if err := s.audioRampShapeKnown(tgt, byInstance); err != nil {
+	ramp, err := s.audioRampSetup(ctx, tgt, prep.call)
+	if err != nil {
 		return res, err
 	}
-	var err error
-	restored := false
-	up := 0 // the instances at addrs[0 ... up-1] are known to run
-	var addrs []string
-	if byInstance {
-		if addrs, err = s.audioRampAddresses(ctx, tgt); err != nil {
-			return res, err
-		}
-		if restored, err = s.audioRampReplicableAgain(ctx, tgt); err != nil {
-			return res, err
-		}
-	}
-	if restored {
+	if ramp.restored {
 		defer s.audioRampOneProcessAgain(ctx, tgt)
-		if up, err = s.ensureAudioFloor(ctx, tgt, call.target, addrs); err != nil {
+		if ramp.up, err = s.ensureAudioFloor(ctx, tgt, ramp.call.target, ramp.addrs); err != nil {
 			return res, err
 		}
 	}
 	capK := s.audioRampCap()
-	if byInstance {
-		capK = min(capK, len(addrs))
+	if ramp.byInstance {
+		capK = min(capK, len(ramp.addrs))
 	}
 	threshold := s.audioRealtimeThreshold()
-	var loneFirstMS int64 // level 1's stream's time to first output (audioRampRate)
 	for k := 1; ; k++ {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
 		onLevel(k)
-		if k == 1 || byInstance {
-			fresh := call
-			if byInstance {
-				fresh.target.ProviderModel = addrs[k-1]
-				if k > up {
-					if err := s.ensureAudioInstance(ctx, fresh.target, restored); err != nil {
-						return audioRampStop(res, k, err)
-					}
-				}
-			}
-			if _, err := s.takeAudioMeasurement(ctx, audioWarmUp(fresh)); err != nil {
-				return audioRampStop(res, k, err)
-			}
-		}
-		var levelAddrs []string
-		if byInstance {
-			levelAddrs = addrs[:k]
-		}
-		streams, err := s.measureAudioLevel(ctx, call, k, levelAddrs)
+		level, err := s.runAudioRampLevel(ctx, &ramp, k)
 		if err != nil {
 			return audioRampStop(res, k, err)
 		}
-		if k == 1 {
-			loneFirstMS = streams[0].TTFTMS
-		}
-		rates := make([]float64, k)
-		for i, m := range streams {
-			rates[i] = audioRampRate(call.kind, m, loneFirstMS)
-		}
-		level := audioLevelOf(k, rates)
 		res.Curve = append(res.Curve, level)
 		switch {
 		case level.MinRateX < threshold:
@@ -623,6 +583,82 @@ func (s *Server) measureAudioCapacity(ctx context.Context, tgt benchmarkTarget, 
 			return res, nil
 		}
 	}
+}
+
+// audioRamp is the state one capacity ramp (measureAudioCapacity) carries from level to level.
+type audioRamp struct {
+	call       audioMeasureCall
+	byInstance bool     // the ramp adds one instance per stream (audioRampByInstance)
+	addrs      []string // the instance addresses of a ramp by instance, m itself first
+	restored   bool     // the ramp made the spec replicable again (audioRampReplicableAgain)
+	up         int      // the instances at addrs[0 ... up-1] are known to run
+	// loneFirstMS is level 1's stream's time to first output (audioRampRate).
+	loneFirstMS int64
+}
+
+// audioRampSetup is the shape of tgt's ramp before its first level: whether it is a ramp by
+// instance, which the agent must be known to support (audioRampShapeKnown), and for one its
+// instance addresses and whether the spec had to be made replicable again for it.
+func (s *Server) audioRampSetup(ctx context.Context, tgt benchmarkTarget, call audioMeasureCall) (audioRamp, error) {
+	ramp := audioRamp{call: call, byInstance: s.audioRampByInstance(tgt)}
+	if err := s.audioRampShapeKnown(tgt, ramp.byInstance); err != nil {
+		return ramp, err
+	}
+	if !ramp.byInstance {
+		return ramp, nil
+	}
+	var err error
+	if ramp.addrs, err = s.audioRampAddresses(ctx, tgt); err != nil {
+		return ramp, err
+	}
+	ramp.restored, err = s.audioRampReplicableAgain(ctx, tgt)
+	return ramp, err
+}
+
+// runAudioRampLevel measures level k of ramp: it warms up the process the level adds
+// (warmAudioRampLevel), sends the level's k streams and returns the level's figures from the
+// rates they are judged by (audioRampRate). Level 1 records its lone stream's time to first
+// output in ramp for the levels after it.
+func (s *Server) runAudioRampLevel(ctx context.Context, ramp *audioRamp, k int) (audioLevel, error) {
+	if err := s.warmAudioRampLevel(ctx, ramp, k); err != nil {
+		return audioLevel{}, err
+	}
+	var levelAddrs []string
+	if ramp.byInstance {
+		levelAddrs = ramp.addrs[:k]
+	}
+	streams, err := s.measureAudioLevel(ctx, ramp.call, k, levelAddrs)
+	if err != nil {
+		return audioLevel{}, err
+	}
+	if k == 1 {
+		ramp.loneFirstMS = streams[0].TTFTMS
+	}
+	rates := make([]float64, k)
+	for i, m := range streams {
+		rates[i] = audioRampRate(ramp.call.kind, m, ramp.loneFirstMS)
+	}
+	return audioLevelOf(k, rates), nil
+}
+
+// warmAudioRampLevel sends the process level k adds its warm-up: level 1's one process, or for
+// a ramp by instance instance k-1, which is first ensured unless it is known to run already.
+// A level that adds no process sends nothing.
+func (s *Server) warmAudioRampLevel(ctx context.Context, ramp *audioRamp, k int) error {
+	if k != 1 && !ramp.byInstance {
+		return nil
+	}
+	fresh := ramp.call
+	if ramp.byInstance {
+		fresh.target.ProviderModel = ramp.addrs[k-1]
+		if k > ramp.up {
+			if err := s.ensureAudioInstance(ctx, fresh.target, ramp.restored); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := s.takeAudioMeasurement(ctx, audioWarmUp(fresh))
+	return err
 }
 
 // audioRampStop ends a ramp at level k on err: a refusal for lack of room

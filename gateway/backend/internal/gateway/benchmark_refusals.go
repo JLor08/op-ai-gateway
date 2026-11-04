@@ -392,26 +392,36 @@ func (s *Server) benchmarkViewTarget(ctx context.Context, v portal.BenchmarkTarg
 		return s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec), "", nil
 	}
 	if measureAudio && AudioTargetFlavors(v.App, spec, hasSpec) {
-		rows, err := s.Routes.MappingCapabilities(ctx, v.Mapping.ID)
-		if err != nil {
-			return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewCapabilities, err: err}
-		}
-		if at := audioTargetOf(rows, routing.EffectiveRuntimeSpecType(spec)); at.role != "" {
-			voice := ""
-			if at.role == routing.RoleTTS {
-				if voice, err = s.speechBenchmarkPresetVoice(ctx, v.Mapping.ID, rows); err != nil {
-					return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewVoices, err: err}
-				}
-				if !routing.CapabilityRowsOfferableTTS(rows, voice != "") {
-					return benchmarkTarget{}, benchmarkSkippedSpeechClone, nil
-				}
-			}
-			tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
-			tgt.audio, tgt.voice = at, voice
-			return tgt, "", nil
-		}
+		return s.benchmarkAudioViewTarget(ctx, v, spec, hasSpec)
 	}
 	return benchmarkTarget{}, benchmarkSkippedAudioOnly, nil
+}
+
+// benchmarkAudioViewTarget is benchmarkViewTarget for an audio-only view the gateway routes
+// audio to, with audio measured: its capability rows decide whether it is an audio target, a
+// TTS clone model without a preset voice is skipped (benchmarkSkippedSpeechClone), and a view
+// with no speech or transcription role is skipped as audio-only (benchmarkSkippedAudioOnly).
+func (s *Server) benchmarkAudioViewTarget(ctx context.Context, v portal.BenchmarkTargetView, spec routing.RuntimeSpec, hasSpec bool) (benchmarkTarget, string, error) {
+	rows, err := s.Routes.MappingCapabilities(ctx, v.Mapping.ID)
+	if err != nil {
+		return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewCapabilities, err: err}
+	}
+	at := audioTargetOf(rows, routing.EffectiveRuntimeSpecType(spec))
+	if at.role == "" {
+		return benchmarkTarget{}, benchmarkSkippedAudioOnly, nil
+	}
+	voice := ""
+	if at.role == routing.RoleTTS {
+		if voice, err = s.speechBenchmarkPresetVoice(ctx, v.Mapping.ID, rows); err != nil {
+			return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewVoices, err: err}
+		}
+		if !routing.CapabilityRowsOfferableTTS(rows, voice != "") {
+			return benchmarkTarget{}, benchmarkSkippedSpeechClone, nil
+		}
+	}
+	tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
+	tgt.audio, tgt.voice = at, voice
+	return tgt, "", nil
 }
 
 // partitionBenchmarkViewsFor is the split a run of mode makes: the speech

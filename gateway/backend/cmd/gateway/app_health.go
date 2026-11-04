@@ -2532,45 +2532,66 @@ func (r *appHealthRunner) startAudioBenchmarks(ctx context.Context, server routi
 		if !reachable[i] || (app.Type != routing.ProviderAudioCpp && app.Type != routing.ProviderServerAgent) {
 			continue
 		}
-		mappings, err := r.store.MappingsByApplication(ctx, app.ID)
-		if err != nil {
-			slog.Debug("app health: mappings for the automatic audio benchmark failed", "app_id", app.ID, "error", err)
-			continue
-		}
-		specs := r.audioBenchmarkSpecs(app)
-		for _, mp := range mappings {
-			if !audioBenchmarkCandidate(mp) {
-				continue
-			}
-			spec, hasSpec, err := specs(ctx, mp.ID)
-			if err != nil {
-				continue
-			}
-			settledKey := audioBenchmarkSettledKey(mp.ID, spec.Replicable)
-			if r.audioBenchmarkSettled.has(settledKey) {
-				continue
-			}
-			if !gateway.AudioTargetFlavors(app, spec, hasSpec) || !gateway.AudioAutoRunWanted(mp, spec.Replicable) {
-				continue
-			}
-			rows, err := r.store.MappingCapabilities(ctx, mp.ID)
-			if err != nil {
-				slog.Debug("app health: capabilities for the automatic audio benchmark failed", "mapping_id", mp.ID, "error", err)
-				continue
-			}
-			byName := routing.CapabilityRowsByName(rows)
-			if byName[routing.CapabilitySpeech].Verdict != routing.CapabilityYes && byName[routing.CapabilityTranscription].Verdict != routing.CapabilityYes {
-				continue
-			}
-			switch r.audioBenchmark(ctx, server, app, mp) {
-			case gateway.AudioAutoRunStarted:
-				r.audioBenchmarkSettled.add(settledKey)
-				return
-			case gateway.AudioAutoRunSettled:
-				r.audioBenchmarkSettled.add(settledKey)
-			}
+		if r.startAudioBenchmarksForApp(ctx, server, app) {
+			return
 		}
 	}
+}
+
+// startAudioBenchmarksForApp is startAudioBenchmarks for one reachable audio application: it
+// asks about each of the application's mappings in turn and reports whether a run was
+// started, which ends the step for this cycle.
+func (r *appHealthRunner) startAudioBenchmarksForApp(ctx context.Context, server routing.AIServer, app routing.Application) bool {
+	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
+	if err != nil {
+		slog.Debug("app health: mappings for the automatic audio benchmark failed", "app_id", app.ID, "error", err)
+		return false
+	}
+	specs := r.audioBenchmarkSpecs(app)
+	for _, mp := range mappings {
+		settledKey, ask := r.audioBenchmarkAsk(ctx, app, mp, specs)
+		if !ask {
+			continue
+		}
+		switch r.audioBenchmark(ctx, server, app, mp) {
+		case gateway.AudioAutoRunStarted:
+			r.audioBenchmarkSettled.add(settledKey)
+			return true
+		case gateway.AudioAutoRunSettled:
+			r.audioBenchmarkSettled.add(settledKey)
+		}
+	}
+	return false
+}
+
+// audioBenchmarkAsk reports whether the gateway is to be asked about mp this cycle, by the
+// rules startAudioBenchmarks lists, cheapest read first, and answers the mapping's
+// audioBenchmarkSettledKey for remembering the gateway's answer.
+func (r *appHealthRunner) audioBenchmarkAsk(ctx context.Context, app routing.Application, mp routing.ModelMapping, specs audioBenchmarkSpecReader) (string, bool) {
+	if !audioBenchmarkCandidate(mp) {
+		return "", false
+	}
+	spec, hasSpec, err := specs(ctx, mp.ID)
+	if err != nil {
+		return "", false
+	}
+	settledKey := audioBenchmarkSettledKey(mp.ID, spec.Replicable)
+	if r.audioBenchmarkSettled.has(settledKey) {
+		return "", false
+	}
+	if !gateway.AudioTargetFlavors(app, spec, hasSpec) || !gateway.AudioAutoRunWanted(mp, spec.Replicable) {
+		return "", false
+	}
+	rows, err := r.store.MappingCapabilities(ctx, mp.ID)
+	if err != nil {
+		slog.Debug("app health: capabilities for the automatic audio benchmark failed", "mapping_id", mp.ID, "error", err)
+		return "", false
+	}
+	byName := routing.CapabilityRowsByName(rows)
+	if byName[routing.CapabilitySpeech].Verdict != routing.CapabilityYes && byName[routing.CapabilityTranscription].Verdict != routing.CapabilityYes {
+		return "", false
+	}
+	return settledKey, true
 }
 
 // audioBenchmarkSettledKey is a mapping's key in audioBenchmarkSettled: its id and whether its

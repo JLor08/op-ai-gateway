@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"mime/multipart"
 	"op-ai-gateway/internal/provider"
@@ -399,51 +400,84 @@ func (m audioMeasurer) streamSynthesis(ctx context.Context, client provider.Nati
 		return ttsStreamTiming{}, err
 	}
 
-	scan := &speechStreamScan{maxLine: speechStreamMaxLine}
-	var first, done time.Time
-	ended := false
-	sc := bufio.NewScanner(resp.Body)
+	read, err := m.readSynthesisStream(resp.Body)
+	if err != nil {
+		return ttsStreamTiming{}, err
+	}
+	if err := read.complete(); err != nil {
+		return ttsStreamTiming{}, err
+	}
+	return ttsStreamTiming{sent: sent, answered: answered, first: read.first, done: read.done, pcmBytes: read.scan.pcmBytes()}, nil
+}
+
+// synthesisStreamRead is what reading one synthesis stream (readSynthesisStream) observed:
+// its counted audio, when its first audio delta and its speech.audio.done arrived, and
+// whether it ended with [DONE].
+type synthesisStreamRead struct {
+	scan        *speechStreamScan
+	first, done time.Time
+	ended       bool
+}
+
+// readSynthesisStream reads a synthesis event stream up to [DONE], the first line its audio
+// can no longer be counted from, or its end. An error frame before [DONE] is the upstream's
+// refusal, and a read that fails is the stream's error; whether what was read is a whole
+// synthesis is complete's to judge.
+func (m audioMeasurer) readSynthesisStream(body io.Reader) (synthesisStreamRead, error) {
+	read := synthesisStreamRead{scan: &speechStreamScan{maxLine: speechStreamMaxLine}}
+	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, audioStreamReadBytes), speechStreamMaxLine)
 	for sc.Scan() {
 		if sseLineIsDone(sc.Bytes()) {
-			ended = true
+			read.ended = true
 			break
 		}
 		if code, message, isError := sseStreamError(sc.Bytes(), speechStreamErrorMessage); isError {
-			return ttsStreamTiming{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
+			return synthesisStreamRead{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
 		}
-		if !done.IsZero() {
+		if !read.done.IsZero() {
 			// The synthesis ended at its done event; what follows up to [DONE] is not part
 			// of what was timed.
 			continue
 		}
-		scan.scanLine(sc.Bytes())
-		if scan.lost {
+		read.scan.scanLine(sc.Bytes())
+		if read.scan.lost {
 			break
 		}
-		at := m.now()
-		if first.IsZero() && scan.pcmBytes() > 0 {
-			first = at
-		}
-		if scan.sawDone {
-			done = at
-		}
+		read.mark(m.now())
 	}
 	if err := sc.Err(); err != nil {
 		// A frame past the relay's own bound is one the relay could not count either.
-		return ttsStreamTiming{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
+		return synthesisStreamRead{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
 	}
+	return read, nil
+}
+
+// mark records at as the time of the first audio and of speech.audio.done once the line just
+// scanned brought either.
+func (read *synthesisStreamRead) mark(at time.Time) {
+	if read.first.IsZero() && read.scan.pcmBytes() > 0 {
+		read.first = at
+	}
+	if read.scan.sawDone {
+		read.done = at
+	}
+}
+
+// complete reports whether the stream read was a whole synthesis: every frame counted, ended
+// by speech.audio.done and then [DONE], with audio in it.
+func (read synthesisStreamRead) complete() error {
 	switch {
-	case scan.lost:
-		return ttsStreamTiming{}, audioProtocolError("the streamed audio could not be counted (a frame or a delta was unreadable)")
-	case done.IsZero():
-		return ttsStreamTiming{}, audioProtocolError("the synthesis stream ended before speech.audio.done")
-	case !ended:
-		return ttsStreamTiming{}, audioProtocolError("the synthesis stream ended without [DONE] after speech.audio.done")
-	case scan.pcmBytes() == 0:
-		return ttsStreamTiming{}, audioProtocolError("the synthesis stream carried no audio")
+	case read.scan.lost:
+		return audioProtocolError("the streamed audio could not be counted (a frame or a delta was unreadable)")
+	case read.done.IsZero():
+		return audioProtocolError("the synthesis stream ended before speech.audio.done")
+	case !read.ended:
+		return audioProtocolError("the synthesis stream ended without [DONE] after speech.audio.done")
+	case read.scan.pcmBytes() == 0:
+		return audioProtocolError("the synthesis stream carried no audio")
 	}
-	return ttsStreamTiming{sent: sent, answered: answered, first: first, done: done, pcmBytes: scan.pcmBytes()}, nil
+	return nil
 }
 
 // measureTTSBuffered synthesizes text as one WAV on target and times it. The answer is
@@ -572,18 +606,9 @@ func buildASRBenchmarkBody(model, lang string, wav []byte) ([]byte, string, erro
 // anywhere before [DONE], in either shape sseStreamError reads, is the upstream's refusal
 // (audioMeasureUpstreamRefused, with its code and message), and nothing after it is read.
 func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.NativeDuplexProxyClient, target routing.Target, pcm []byte, sampleRate int, lang string) (audioMeasurement, error) {
-	byteRate, ok := liveByteRate(sampleRate, 1, liveSampleFormatS16)
-	if !ok {
-		return audioMeasurement{}, audioInputError(fmt.Sprintf("a sample rate of %d Hz is not one the live endpoint takes", sampleRate))
-	}
-	if len(pcm) == 0 {
-		return audioMeasurement{}, audioInputError("no audio to transcribe")
-	}
-	if len(pcm)%2 != 0 {
-		return audioMeasurement{}, audioInputError(fmt.Sprintf("the audio (%d bytes) is not a whole number of 2-byte samples", len(pcm)))
-	}
-	if !validLiveLanguage(lang) {
-		return audioMeasurement{}, audioInputError(fmt.Sprintf("the language %q is no bare language tag", lang))
+	byteRate, err := liveMeasureByteRate(pcm, sampleRate, lang)
+	if err != nil {
+		return audioMeasurement{}, err
 	}
 	audioSeconds := float64(len(pcm)) / float64(byteRate)
 	path := liveUpstreamPath(target, liveParams{SampleRate: sampleRate, Channels: 1, Format: liveSampleFormatS16, Language: lang})
@@ -602,45 +627,9 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 		return audioMeasurement{}, err
 	}
 
-	var first, done time.Time
-	ended := false
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64<<10), maxLiveSSELineBytes)
-	for sc.Scan() {
-		if sseLineIsDone(sc.Bytes()) {
-			ended = true
-			break
-		}
-		if code, message, isError := sseStreamError(sc.Bytes(), liveErrorMessage); isError {
-			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
-		}
-		msg, ok := liveDownMsgFromSSELine(sc.Bytes())
-		if !ok {
-			continue
-		}
-		if !done.IsZero() {
-			// The transcription ended at its done event; what follows up to [DONE] is no
-			// part of it.
-			continue
-		}
-		at := m.now()
-		if first.IsZero() && strings.TrimSpace(msg.Text) != "" {
-			first = at
-		}
-		if msg.Type == "done" {
-			done = at
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return audioMeasurement{}, audioStreamReadError("the live transcript stream", err, maxLiveSSELineBytes)
-	}
-	switch {
-	case done.IsZero():
-		return audioMeasurement{}, audioProtocolError("the live transcript stream ended before transcript.text.done")
-	case !ended:
-		return audioMeasurement{}, audioProtocolError("the live transcript stream ended without [DONE] after transcript.text.done")
-	case first.IsZero():
-		return audioMeasurement{}, audioProtocolError("the live transcription has no text")
+	first, done, err := m.readLiveTranscript(resp.Body)
+	if err != nil {
+		return audioMeasurement{}, err
 	}
 	wall := done.Sub(sent)
 	if wall <= 0 {
@@ -654,6 +643,95 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 		RateX:        audioSeconds / wall.Seconds(),
 		RTF:          wall.Seconds() / audioSeconds,
 	}, nil
+}
+
+// liveMeasureByteRate checks a live measurement's input as the live relay checks it --
+// mono s16le pcm at a sample rate the endpoint takes, a whole number of samples, a bare
+// language tag or none -- and returns the PCM's byte rate.
+func liveMeasureByteRate(pcm []byte, sampleRate int, lang string) (int, error) {
+	byteRate, ok := liveByteRate(sampleRate, 1, liveSampleFormatS16)
+	if !ok {
+		return 0, audioInputError(fmt.Sprintf("a sample rate of %d Hz is not one the live endpoint takes", sampleRate))
+	}
+	if len(pcm) == 0 {
+		return 0, audioInputError("no audio to transcribe")
+	}
+	if len(pcm)%2 != 0 {
+		return 0, audioInputError(fmt.Sprintf("the audio (%d bytes) is not a whole number of 2-byte samples", len(pcm)))
+	}
+	if !validLiveLanguage(lang) {
+		return 0, audioInputError(fmt.Sprintf("the language %q is no bare language tag", lang))
+	}
+	return byteRate, nil
+}
+
+// liveTranscriptRead is what reading one live transcript stream (readLiveTranscript)
+// observed: when its first text and its transcript.text.done arrived, and whether it ended
+// with [DONE].
+type liveTranscriptRead struct {
+	first, done time.Time
+	ended       bool
+}
+
+// readLiveTranscript reads a live transcript stream up to [DONE] or its end and returns when
+// its first text and its transcript.text.done arrived. An error frame before [DONE] is the
+// upstream's refusal; a stream without transcript.text.done, without [DONE] after it, or
+// without any text is a protocol error.
+func (m audioMeasurer) readLiveTranscript(body io.Reader) (first, done time.Time, err error) {
+	var read liveTranscriptRead
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64<<10), maxLiveSSELineBytes)
+	for sc.Scan() {
+		if sseLineIsDone(sc.Bytes()) {
+			read.ended = true
+			break
+		}
+		if code, message, isError := sseStreamError(sc.Bytes(), liveErrorMessage); isError {
+			return time.Time{}, time.Time{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
+		}
+		msg, ok := liveDownMsgFromSSELine(sc.Bytes())
+		if !ok {
+			continue
+		}
+		if !read.done.IsZero() {
+			// The transcription ended at its done event; what follows up to [DONE] is no
+			// part of it.
+			continue
+		}
+		read.mark(m.now(), msg)
+	}
+	if err := sc.Err(); err != nil {
+		return time.Time{}, time.Time{}, audioStreamReadError("the live transcript stream", err, maxLiveSSELineBytes)
+	}
+	if err := read.complete(); err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return read.first, read.done, nil
+}
+
+// mark records at as the time of the first text and of transcript.text.done once msg brought
+// either.
+func (read *liveTranscriptRead) mark(at time.Time, msg liveDownMsg) {
+	if read.first.IsZero() && strings.TrimSpace(msg.Text) != "" {
+		read.first = at
+	}
+	if msg.Type == "done" {
+		read.done = at
+	}
+}
+
+// complete reports whether the stream read was a whole live transcription: ended by
+// transcript.text.done and then [DONE], with text in it.
+func (read liveTranscriptRead) complete() error {
+	switch {
+	case read.done.IsZero():
+		return audioProtocolError("the live transcript stream ended before transcript.text.done")
+	case !read.ended:
+		return audioProtocolError("the live transcript stream ended without [DONE] after transcript.text.done")
+	case read.first.IsZero():
+		return audioProtocolError("the live transcription has no text")
+	}
+	return nil
 }
 
 // bufferedAudioMeasurement is the figures of a one-shot answer that started at answered and
