@@ -5,7 +5,8 @@
 // rows the agent reports, and the launch-spec form's instance settings. Kept
 // out of RuntimeAdminSection so each rule is testable on its own.
 
-import type { PutRuntimeSpecRequest, RuntimeStatus } from '../../api';
+import type { PutRuntimeSpecRequest, RuntimeSpec, RuntimeStatus } from '../../api';
+import { formatMetric } from './format';
 import type { Translation } from './types';
 
 // The agent's cap on a spec's instances (indexes 0..63); the backend refuses a
@@ -77,6 +78,50 @@ export function specStopState(
     listed = true;
   }
   return listed ? 'stopped' : 'absent';
+}
+
+/**
+ * The spec list's idle-timeout cell. A spec STORED as replicable lists the
+ * idle timeout in effect -- the one the gateway pushes and the agent unloads
+ * its instances after, derived from the measured startup -- because its manual
+ * value is only an override there (0 = no override; the form shows it), and
+ * listing that 0 would hide an unload after, say, 150 s. A timeout in effect
+ * of 0 is `never` (never unloaded: an agent without instance support keeps the
+ * manual 0), not "0". Any other spec lists its stored value as before
+ * instances existed, its 0 as the em-dash.
+ */
+export function listedIdleTimeout(
+  spec:
+    | Pick<
+        RuntimeSpec,
+        'configured' | 'replicable' | 'idle_timeout_seconds' | 'effective_idle_timeout_seconds'
+      >
+    | undefined,
+  never: string,
+): string {
+  if (spec?.configured && spec.replicable) {
+    const seconds = spec.effective_idle_timeout_seconds;
+    return seconds > 0 ? String(seconds) : never;
+  }
+  return formatMetric(spec?.idle_timeout_seconds, 0);
+}
+
+/**
+ * Whether a spec's log view shows several instances' output. The agent writes
+ * every instance's output into the spec's one log buffer, the lines of
+ * instance k >= 1 prefixed `[#k] ` (instance 0's unprefixed), so the spec-id
+ * log view is spec-wide whichever instance row it is opened from. Said for a
+ * spec stored as replicable, and for any spec the stream lists an instance
+ * k >= 1 of (one turned off whose burst instances still drain, or one the
+ * portal has no stored document for).
+ */
+export function showsAllInstanceLogs(
+  spec: Pick<RuntimeSpec, 'replicable'> | undefined,
+  rows: readonly RuntimeStatus[],
+  specId: string,
+): boolean {
+  if (spec?.replicable) return true;
+  return rows.some((row) => row.spec_id === specId && instanceIndex(row) > 0);
 }
 
 // The upstream name a status row reports when it runs what its mapping says:

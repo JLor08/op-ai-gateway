@@ -11058,6 +11058,64 @@ describe('RuntimeAdminSection per-instance live status', () => {
     expect(screen.queryByText(t.runtimeInstancesSummary(1, 0, null))).not.toBeInTheDocument();
   });
 
+  // A replicable spec's manual idle timeout is only an override (0 = none), so
+  // the list shows the one in effect -- the one the agent unloads after.
+  it('lists the idle timeout in effect for a spec stored as replicable', async () => {
+    renderInstances(
+      [instanceRow(0)],
+      replicableSpec({ idle_timeout_seconds: 0, effective_idle_timeout_seconds: 150 }),
+    );
+
+    await screen.findByText('Alpha');
+    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(/^150$/);
+  });
+
+  it('lists an idle timeout in effect of 0 as never unloaded', async () => {
+    renderInstances(
+      [instanceRow(0)],
+      replicableSpec({ idle_timeout_seconds: 0, effective_idle_timeout_seconds: 0 }),
+    );
+
+    await screen.findByText('Alpha');
+    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(
+      t.runtimeSpecIdleTimeoutNever,
+    );
+  });
+
+  it('lists the stored idle timeout for a spec that does not opt in', async () => {
+    renderInstances(
+      [instanceRow(0)],
+      fullSpec({ idle_timeout_seconds: 600, effective_idle_timeout_seconds: 600 }),
+    );
+
+    await screen.findByText('Alpha');
+    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(/^600$/);
+  });
+
+  // Every instance writes into the spec's one log buffer, instance k's lines
+  // prefixed [#k]: the spec's log view shows them all, and says so.
+  it("says a replicable spec's log view shows every instance, from any instance row", async () => {
+    const { logs } = renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+    await screen.findByText('4101');
+
+    fireEvent.click(inRowWith('4101').getByRole('button', { name: t.runtimeLogs }));
+
+    expect(logs.subscribedSpecIds).toEqual(['spec_1']);
+    expect(await screen.findByText(t.runtimeLogsAllInstances)).toBeInTheDocument();
+  });
+
+  it('says nothing about instances in the log view of a spec that does not opt in', async () => {
+    renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
+    await openStatusTab();
+    await screen.findByText('4100');
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeLogs }));
+
+    expect(await screen.findByText(t.runtimeLogsIntro)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeLogsAllInstances)).not.toBeInTheDocument();
+  });
+
   it("shows instance 0's state for the spec, whichever instance the stream lists last", async () => {
     renderInstances([instanceRow(0, { state: 'starting' }), instanceRow(1)]);
 

@@ -1543,6 +1543,9 @@ const de = {
   // Frage, die der Betreiber hier beantworten will.
   runtimeLogs: 'Protokoll',
   runtimeLogsTitle: 'Prozessausgabe',
+  // #340: every instance of a spec writes into its one log buffer.
+  runtimeLogsAllInstances:
+    'Zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Zeilen von Instanz k ≥ 1 beginnen mit [#k], die von Instanz 0 haben kein Präfix.',
   runtimeLogsIntro:
     'Standardausgabe und Standardfehlerausgabe dieses Modellprozesses, so wie er sie geschrieben hat. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
   runtimeLogsWaiting: 'Verbindung wird aufgebaut…',
@@ -4938,6 +4941,8 @@ const en: PortalMessages = {
   // prints nothing", which is the question the operator opened it to answer.
   runtimeLogs: 'Logs',
   runtimeLogsTitle: 'Process output',
+  runtimeLogsAllInstances:
+    "Shows the output of every instance of this launch spec: lines of instance k ≥ 1 start with [#k], instance 0's carry no prefix.",
   runtimeLogsIntro:
     "This model process's stdout and stderr, as it wrote them. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
   runtimeLogsWaiting: 'Connecting…',

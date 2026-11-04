@@ -390,6 +390,7 @@ export function RuntimeLogView({
   serverId,
   specId,
   title,
+  allInstances = false,
 }: Readonly<{
   open: boolean;
   onClose: () => void;
@@ -401,6 +402,10 @@ export function RuntimeLogView({
   serverId: string;
   specId: string;
   title: string;
+  // #340: the spec runs several instances, which all write into its one log
+  // buffer -- instance k's lines prefixed [#k] -- so the view says whose
+  // lines are whose.
+  allInstances?: boolean;
 }>) {
   const [win, setWin] = useState<LogWindow>(emptyLogWindow);
   const [state, setState] = useState<RuntimeLogState | null>(null);
@@ -474,6 +479,11 @@ export function RuntimeLogView({
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
           {t.runtimeLogsIntro}
         </Typography>
+        {allInstances && (
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            {t.runtimeLogsAllInstances}
+          </Typography>
+        )}
         {notice && (
           <Alert severity={notice.severity} sx={{ mb: 1 }}>
             {notice.text}

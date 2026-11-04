@@ -4316,6 +4316,13 @@ describe('instance settings (#340) i18n keys', () => {
     expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/at least 1/);
   });
 
+  it("names the log view's [#k] prefix of instance k's lines", () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].runtimeLogsAllInstances, locale).toContain('[#k]');
+    }
+    expect(messages.de.runtimeLogsAllInstances).not.toBe(messages.en.runtimeLogsAllInstances);
+  });
+
   it('says the maximum field left empty means unlimited', () => {
     expect(messages.de.runtimeSpecMaxInstancesUnlimited).toMatch(/Leer = unbegrenzt/);
     expect(messages.en.runtimeSpecMaxInstancesUnlimited).toMatch(/Empty = unlimited/);

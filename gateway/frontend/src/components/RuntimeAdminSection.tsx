@@ -99,8 +99,10 @@ import {
   instanceCountText,
   instanceIndex,
   instanceSettingsBody,
+  listedIdleTimeout,
   primaryStatusRows,
   runningInstancesBySpec,
+  showsAllInstanceLogs,
   specStopState,
   validateInstances,
   type InstanceForm,
@@ -2135,7 +2137,11 @@ export function RuntimeAdminSection({
   // first viewer and stops on the last), so it is deliberately per-row state
   // that clears on close rather than a mounted-but-hidden panel: a hidden
   // panel would keep an agent streaming output nobody is reading.
-  const [logSpec, setLogSpec] = useState<{ specId: string; title: string } | null>(null);
+  const [logSpec, setLogSpec] = useState<{
+    specId: string;
+    title: string;
+    allInstances: boolean;
+  } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   const [restart, setRestart] = useState<RestartFlow | null>(null);
   const [restartNotice, setRestartNotice] = useState<
@@ -3748,9 +3754,12 @@ export function RuntimeAdminSection({
       render: (m) => renderBoolChip(Boolean(specsById[m.id]?.pinned), t.runtimeSpecPinned),
     },
     {
+      // For a spec stored as replicable, the idle timeout in effect (0:
+      // never unloaded), not the manual override the form edits
+      // (listedIdleTimeout).
       id: 'idle_timeout',
       label: t.runtimeSpecIdleTimeout,
-      value: (m) => formatMetric(specsById[m.id]?.idle_timeout_seconds, 0),
+      value: (m) => listedIdleTimeout(specsById[m.id], t.runtimeSpecIdleTimeoutNever),
       filter: 'text',
       numeric: true,
     },
@@ -4170,6 +4179,14 @@ export function RuntimeAdminSection({
           setLogSpec({
             specId: row.spec_id,
             title: gatewayNameFor(row) || row.model || row.spec_id,
+            // The view is spec-wide: every instance writes into the spec's
+            // one buffer, so for a replicable spec it says whose lines are
+            // whose -- from whichever instance row it is opened.
+            allInstances: showsAllInstanceLogs(
+              specByRuntimeId.get(row.spec_id),
+              statusRows,
+              row.spec_id,
+            ),
           }),
       },
     ];
@@ -5941,6 +5958,7 @@ export function RuntimeAdminSection({
           serverId={server.id}
           specId={logSpec.specId}
           title={logSpec.title}
+          allInstances={logSpec.allInstances}
         />
       )}
     </>

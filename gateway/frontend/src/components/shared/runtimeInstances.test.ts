@@ -9,7 +9,9 @@ import {
   instanceCountText,
   instanceIndex,
   instanceSettingsBody,
+  listedIdleTimeout,
   primaryStatusRows,
+  showsAllInstanceLogs,
   runningInstancesBySpec,
   specStopState,
   validateInstances,
@@ -89,6 +91,61 @@ describe('specStopState', () => {
     expect(specStopState([row('s', 0, 'stopped'), row('s', 1, 'stopped'), row('t', 0)], 's')).toBe(
       'stopped',
     );
+  });
+});
+
+describe('listedIdleTimeout', () => {
+  const never = 'never unloaded';
+  const stored = {
+    configured: true,
+    replicable: false,
+    idle_timeout_seconds: 600,
+    effective_idle_timeout_seconds: 600,
+  };
+
+  it('lists the idle timeout in effect for a spec stored as replicable, 0 as never', () => {
+    expect(
+      listedIdleTimeout(
+        {
+          ...stored,
+          replicable: true,
+          idle_timeout_seconds: 0,
+          effective_idle_timeout_seconds: 150,
+        },
+        never,
+      ),
+    ).toBe('150');
+    expect(
+      listedIdleTimeout(
+        { ...stored, replicable: true, idle_timeout_seconds: 0, effective_idle_timeout_seconds: 0 },
+        never,
+      ),
+    ).toBe(never);
+  });
+
+  it('lists the stored value for any other spec, as before instances', () => {
+    expect(listedIdleTimeout(stored, never)).toBe('600');
+    expect(listedIdleTimeout({ ...stored, idle_timeout_seconds: 0 }, never)).toBe('—');
+    expect(listedIdleTimeout(undefined, never)).toBe('—');
+    // Not configured: nothing stored to be replicable.
+    expect(listedIdleTimeout({ ...stored, configured: false, replicable: true }, never)).toBe(
+      '600',
+    );
+  });
+});
+
+describe('showsAllInstanceLogs', () => {
+  it('is true for a spec stored as replicable, or one the stream lists an instance k >= 1 of', () => {
+    expect(showsAllInstanceLogs({ replicable: true }, [], 's')).toBe(true);
+    expect(showsAllInstanceLogs({ replicable: false }, [row('s', 0), row('s', 1)], 's')).toBe(true);
+    expect(showsAllInstanceLogs(undefined, [row('s', 2)], 's')).toBe(true);
+  });
+
+  it('is false for a single-process spec', () => {
+    expect(showsAllInstanceLogs({ replicable: false }, [row('s', 0), row('t', 1)], 's')).toBe(
+      false,
+    );
+    expect(showsAllInstanceLogs(undefined, [row('s', 0)], 's')).toBe(false);
   });
 });
 
