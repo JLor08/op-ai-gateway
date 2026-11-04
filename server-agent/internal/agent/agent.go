@@ -385,7 +385,14 @@ import (
 // instance address "m#k" -- a change to its wire contract and to observable
 // runtime behaviour. This is the ONE bump for the whole branch; later commits on
 // it do not bump again.
-const Version = "0.16.0"
+//
+// 0.16.0 -> 0.17.0 is the single bump for the live-status row actions branch.
+// MINOR, and the rule decides it: agent.Features gains "runtime_stop". The
+// router serves a new route, POST /stop/{model}, which drains one instance on
+// the operator's request without persisting anything -- a change to the wire
+// contract and to observable runtime behaviour. This is the ONE bump for the
+// whole branch; later commits on it do not bump again.
+const Version = "0.17.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

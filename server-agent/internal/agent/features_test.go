@@ -525,8 +525,8 @@ func TestFeaturesDeclareRuntimeRoleEviction(t *testing.T) {
 // the whole feature off. The gateway spells the same string in its own constant;
 // this module cannot import it.
 //
-// The version assertion lives here, beside the newest feature, and it is the
-// forcing function for the repository's bump rule: a change that moves Version
+// The version assertion lived here, beside the then-newest feature, until
+// 0.17.0 moved it to TestFeaturesDeclareRuntimeStop; it is the forcing function for the repository's bump rule: a change that moves Version
 // has to come THROUGH this test and state which rule it followed. 0.8.0 was
 // MINOR because agent.Features gained runtime_ensure; 0.8.1 and 0.8.2 were
 // PATCH because they gained nothing (0.8.2 added the image_options telemetry
@@ -554,7 +554,9 @@ func TestFeaturesDeclareRuntimeRoleEviction(t *testing.T) {
 // one bump for the co-residency rework branch, whatever its commit count;
 // 0.16.0 is MINOR because agent.Features gained runtime_instances -- the one
 // bump for the model-instance autoscaling branch (#340), whatever its commit
-// count. A Since records the version a feature shipped in, so runtime_ensure's
+// count; 0.17.0 is MINOR because agent.Features gained runtime_stop, and its
+// assertion lives in TestFeaturesDeclareRuntimeStop. A Since records the
+// version a feature shipped in, so runtime_ensure's
 // stays 0.8.0, multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0,
 // runtime_voices' stays 0.11.0, fullduplex_proxy's stays 0.12.0,
 // runtime_model_params' stays 0.13.0, runtime_ram_measurement's and
@@ -579,7 +581,40 @@ func TestFeaturesDeclareRuntimeInstances(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_instances") {
 		t.Fatal("FeatureNames() does not carry runtime_instances, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.16.0" {
-		t.Fatalf("Version = %q, want 0.16.0 (runtime_instances is a new agent.Features entry, so the rule is MINOR, and it is the model-instance autoscaling branch's single bump from 0.15.0)", Version)
+}
+
+// TestFeaturesDeclareRuntimeStop pins the runtime_stop declaration and the
+// version bump it brought. The GATEWAY gates the portal's Stop action on the
+// name, fail-closed: a router without POST /stop/{model} hands the request to
+// the model-routed proxy, which answers a bodiless POST with 404
+// runtime.model_not_managed -- the same answer as an unmanaged model -- so only
+// the declaration tells the two apart. The gateway spells the same string in
+// its own constant; this module cannot import it.
+//
+// The version assertion lives here, beside the newest feature: 0.17.0 is MINOR
+// because agent.Features gained runtime_stop -- the one bump for the
+// live-status row actions branch, whatever its commit count. runtime_instances'
+// Since stays 0.16.0 (TestFeaturesDeclareRuntimeInstances).
+func TestFeaturesDeclareRuntimeStop(t *testing.T) {
+	if FeatureRuntimeStop != "runtime_stop" {
+		t.Fatalf("FeatureRuntimeStop = %q, want the wire literal runtime_stop", FeatureRuntimeStop)
+	}
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_stop" {
+			found = true
+			if f.Since != "0.17.0" {
+				t.Fatalf("runtime_stop Since = %q, want 0.17.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_stop")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_stop") {
+		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
+	}
+	if Version != "0.17.0" {
+		t.Fatalf("Version = %q, want 0.17.0 (runtime_stop is a new agent.Features entry, so the rule is MINOR, and it is the live-status row actions branch's single bump from 0.16.0)", Version)
 	}
 }
