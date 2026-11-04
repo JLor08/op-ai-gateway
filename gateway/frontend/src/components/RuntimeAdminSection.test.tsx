@@ -10798,6 +10798,82 @@ describe('RuntimeAdminSection instance settings', () => {
     expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
   });
 
+  // The warning follows the minimum as typed: the save closes the editor, so
+  // a warning that waited for the stored flag would never stand beside the
+  // edit that causes it, and would linger under a minimum lowered below the
+  // ceiling. The edited minimum is judged by the gateway's own rule against
+  // the mapping's measured figures.
+  async function openRealtimeSpecEdit(
+    specOverrides: Partial<RuntimeSpec>,
+    mappingOverrides: Partial<PortalModelMapping>,
+  ) {
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1', ...mappingOverrides })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          replicable: true,
+          ...specOverrides,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return rendered;
+  }
+
+  const measuredCeiling = {
+    audio_realtime_concurrency: 2,
+    audio_concurrency_limit: 'performance',
+  } as const;
+
+  function typeMinimum(value: string) {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value } });
+  }
+
+  it('warns as soon as the typed minimum rises above the measured ceiling, before the save', async () => {
+    const { putSpecs } = await openRealtimeSpecEdit({ min_instances: 1 }, measuredCeiling);
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+
+    typeMinimum('3');
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+
+    typeMinimum('2');
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('drops the stored warning once the typed minimum is back at the ceiling', async () => {
+    await openRealtimeSpecEdit(
+      { min_instances: 5, instances_min_exceeds_realtime: true },
+      measuredCeiling,
+    );
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+
+    typeMinimum('1');
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+
+    typeMinimum('5');
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+  });
+
+  // Resources and the cap stop the ramp before the model ran out of speed:
+  // the count is a lower bound, no ceiling to exceed.
+  it.each(['resources', 'cap'])(
+    'does not warn above a lower bound (a ramp stopped by %s)',
+    async (limit) => {
+      await openRealtimeSpecEdit(
+        { min_instances: 1 },
+        { audio_realtime_concurrency: 2, audio_concurrency_limit: limit },
+      );
+      typeMinimum('5');
+      expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+    },
+  );
+
   // The minimum is hidden with the box, and so is what is said about it.
   it('drops the real-time warning with "Multiple instances" unticked', async () => {
     await openApiTokenSpecEdit({

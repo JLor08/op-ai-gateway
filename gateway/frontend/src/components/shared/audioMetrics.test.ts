@@ -12,6 +12,8 @@ import {
   formatAudioRate,
   formatAudioTtfa,
   isAudioConcurrencyLimit,
+  minExceedsRealtime,
+  minRealtimeWarning,
   servesAudio,
   type AudioMetrics,
   type AudioMetricsForm,
@@ -281,5 +283,73 @@ describe('audioPairIncomplete', () => {
     for (const countText of ['', '2', 'abc']) {
       expect(audioPairIncomplete(form('', countText)), countText).toBe(false);
     }
+  });
+});
+
+describe('minExceedsRealtime', () => {
+  // The gateway's rule for instances_min_exceeds_realtime: only a ramp
+  // stopped by performance measured a ceiling.
+  it('holds for a minimum above a measured ceiling', () => {
+    const ceiling: AudioMetrics = {
+      audio_realtime_concurrency: 2,
+      audio_concurrency_limit: 'performance',
+    };
+    expect(minExceedsRealtime(3, ceiling)).toBe(true);
+    expect(minExceedsRealtime(2, ceiling)).toBe(false);
+    expect(minExceedsRealtime(0, ceiling)).toBe(false);
+    // Not real-time even alone: any minimum is above it.
+    expect(
+      minExceedsRealtime(1, {
+        audio_realtime_concurrency: 0,
+        audio_concurrency_limit: 'performance',
+      }),
+    ).toBe(true);
+  });
+
+  it('does not hold for a lower bound, an unknown limit or no metrics', () => {
+    for (const limit of ['resources', 'cap', '', undefined]) {
+      expect(
+        minExceedsRealtime(5, { audio_realtime_concurrency: 2, audio_concurrency_limit: limit }),
+        String(limit),
+      ).toBe(false);
+    }
+    expect(minExceedsRealtime(5, undefined)).toBe(false);
+  });
+});
+
+describe('minRealtimeWarning', () => {
+  const ceiling: AudioMetrics = {
+    audio_realtime_concurrency: 2,
+    audio_concurrency_limit: 'performance',
+  };
+  const stored = (min: number, flagged: boolean) => ({
+    min_instances: min,
+    instances_min_exceeds_realtime: flagged,
+  });
+
+  // The warning follows the minimum as typed, not the last save.
+  it('warns as soon as the typed minimum rises above the measured ceiling', () => {
+    expect(minRealtimeWarning(1, stored(1, false), ceiling)).toBe(false);
+    expect(minRealtimeWarning(3, stored(1, false), ceiling)).toBe(true);
+  });
+
+  it('drops the stored warning once the typed minimum is back at the ceiling', () => {
+    expect(minRealtimeWarning(5, stored(5, true), ceiling)).toBe(true);
+    expect(minRealtimeWarning(2, stored(5, true), ceiling)).toBe(false);
+  });
+
+  // For the stored minimum the gateway's flag is the verdict, and a flagged
+  // minimum stays flagged when raised further, whatever the row says.
+  it('takes the gateway flag for the stored minimum and any minimum above it', () => {
+    expect(minRealtimeWarning(3, stored(3, true), undefined)).toBe(true);
+    expect(minRealtimeWarning(4, stored(3, true), undefined)).toBe(true);
+    expect(minRealtimeWarning(3, stored(3, false), ceiling)).toBe(false);
+  });
+
+  // A new spec has no stored minimum: the rule alone decides.
+  it('applies the rule alone without a stored spec', () => {
+    expect(minRealtimeWarning(3, undefined, ceiling)).toBe(true);
+    expect(minRealtimeWarning(2, undefined, ceiling)).toBe(false);
+    expect(minRealtimeWarning(3, undefined, undefined)).toBe(false);
   });
 });

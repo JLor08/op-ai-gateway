@@ -2,10 +2,16 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // The pure side of a mapping's audio metrics (#340): how they read in a cell,
-// which rows have them, and the mapping editor's rules for sending them. Kept
-// out of the large components so each rule is testable on its own.
+// which rows have them, the mapping editor's rules for sending them, and the
+// spec editor's warning about a minimum above the measured ceiling. Kept out
+// of the large components so each rule is testable on its own.
 
-import type { ModelServerCapability, PortalModelMapping, UpdateMappingRequest } from '../../api';
+import type {
+  ModelServerCapability,
+  PortalModelMapping,
+  RuntimeSpec,
+  UpdateMappingRequest,
+} from '../../api';
 import type { ListColumn } from './ListTable';
 import { parseMetricInput } from './format';
 import type { Translation } from './types';
@@ -199,4 +205,40 @@ export function audioMetricsBody(form: AudioMetricsForm, seed: AudioMetricsForm)
     }
   }
   return body;
+}
+
+/**
+ * Whether a launch spec's minimum instance count is above the real-time
+ * concurrency its mapping's audio ramp measured as a ceiling: the gateway's
+ * rule for a spec's instances_min_exceeds_realtime. Only a ramp stopped by
+ * performance measured one; resources and the cap leave a lower bound, which
+ * no minimum exceeds.
+ */
+export function minExceedsRealtime(
+  minInstances: number,
+  metrics: AudioMetrics | undefined,
+): boolean {
+  return (
+    metrics?.audio_concurrency_limit === 'performance' &&
+    minInstances > (metrics.audio_realtime_concurrency ?? 0)
+  );
+}
+
+/**
+ * The spec editor's real-time warning for the minimum as typed, so it stands
+ * beside the edit that causes it -- the save closes the editor -- and leaves
+ * with an edit that resolves it. For the stored minimum the gateway's own
+ * flag is the verdict, and a flagged minimum stays flagged when raised
+ * further. Any other minimum is judged by the gateway's rule against the
+ * mapping's measured figures (minExceedsRealtime), as is every minimum of a
+ * spec not yet stored.
+ */
+export function minRealtimeWarning(
+  minInstances: number,
+  stored: Pick<RuntimeSpec, 'min_instances' | 'instances_min_exceeds_realtime'> | undefined,
+  metrics: AudioMetrics | undefined,
+): boolean {
+  if (stored?.instances_min_exceeds_realtime && minInstances >= stored.min_instances) return true;
+  if (stored && minInstances === stored.min_instances) return false;
+  return minExceedsRealtime(minInstances, metrics);
 }

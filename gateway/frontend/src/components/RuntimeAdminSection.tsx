@@ -96,6 +96,7 @@ import { RuntimeLogView } from './RuntimeLogView';
 import {
   INSTANCES_MAX,
   instanceAddress,
+  instanceCountFromText,
   instanceCountText,
   instanceIndex,
   instanceSettingsBody,
@@ -108,6 +109,7 @@ import {
   validateInstances,
   type InstanceForm,
 } from './shared/runtimeInstances';
+import { minRealtimeWarning } from './shared/audioMetrics';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
@@ -4925,15 +4927,19 @@ export function RuntimeAdminSection({
                   onChange={(e) => setMinInstancesText(e.target.value)}
                   inputProps={{ min: 0, max: INSTANCES_MAX }}
                 />
-                {/* The gateway's verdict on the STORED spec (#340): its
-                    minimum is above the real-time concurrency the audio ramp
-                    measured as a ceiling for this mapping. A warning, never a
-                    refusal -- an operator may keep instances up for other
-                    reasons -- and it follows the stored minimum, so an edit
-                    here shows its effect after the save. */}
-                {currentSpec?.instances_min_exceeds_realtime && (
-                  <Alert severity="warning">{t.runtimeSpecMinExceedsRealtime}</Alert>
-                )}
+                {/* The minimum is above the real-time concurrency the audio
+                    ramp measured as a ceiling for this mapping (#340). A
+                    warning, never a refusal -- an operator may keep instances
+                    up for other reasons. It follows the minimum as typed,
+                    because the save closes this editor: the stored spec's
+                    flag speaks for the stored minimum, and an edited one is
+                    judged by the gateway's rule against the mapping's
+                    measured figures (minRealtimeWarning). */}
+                {minRealtimeWarning(
+                  instanceCountFromText(minInstancesText),
+                  currentSpec,
+                  editingSpecMappingId ? mappingById.get(editingSpecMappingId) : undefined,
+                ) && <Alert severity="warning">{t.runtimeSpecMinExceedsRealtime}</Alert>}
                 <Field
                   id="runtime-spec-max-instances"
                   type="number"
