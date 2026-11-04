@@ -448,10 +448,10 @@ type preflight struct {
 }
 
 // mergeInto copies the preflight's resolved model, server-override verdict,
-// and session fields onto a fully-parsed inference.Request, leaving every
-// other field (Messages, Tools, ToolChoice, …) exactly as the flavor-specific
-// compat.Parse* call produced it. Every translate handler below calls this
-// exactly once, instead of re-deriving any of these fields itself.
+// preferred instance and session fields onto a fully-parsed inference.Request,
+// leaving every other field (Messages, Tools, ToolChoice, …) exactly as the
+// flavor-specific compat.Parse* call produced it. Every translate handler below
+// calls this exactly once, instead of re-deriving any of these fields itself.
 func (pf preflight) mergeInto(req inference.Request) inference.Request {
 	req.Model = pf.Req.Model
 	req.RequestedModel = pf.Req.RequestedModel
@@ -461,6 +461,7 @@ func (pf preflight) mergeInto(req inference.Request) inference.Request {
 	req.ClientSessionID = pf.Req.ClientSessionID
 	req.SessionSource = pf.Req.SessionSource
 	req.AgentID = pf.Req.AgentID
+	req.PreferredInstanceKey = pf.Req.PreferredInstanceKey
 	return req
 }
 
@@ -611,8 +612,9 @@ func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token aut
 	req.ClientSessionID = si.ClientSession
 	req.SessionSource = si.Source
 	req.AgentID = si.AgentID
-	// A voice chat turn's loopback leg asks for the real-time gate; nothing else can.
-	req.RealtimeRequired = s.loopbackRealtimeRequired(r)
+	// A voice chat turn's loopback leg asks for the real-time gate and names the instance
+	// it ran on last; nothing else can.
+	req.RealtimeRequired, req.PreferredInstanceKey = s.loopbackRouting(r)
 	return preflight{Req: req}, false
 }
 

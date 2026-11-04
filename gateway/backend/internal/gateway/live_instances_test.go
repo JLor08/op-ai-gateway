@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -313,6 +314,10 @@ type instanceRouterConfig struct {
 	// plainASR adds route-asr-plain: a second mapping of asr-inst, upstream
 	// asr-plain, whose spec is not replicable -- a mixed fleet.
 	plainASR bool
+	// voice wires what a voice chat session needs beyond routing: a chat store
+	// and its cipher, the chat-run registry, and the internal loopback pair (the
+	// secret "test-internal-secret" for the user usr_dev) its turns call /v1 with.
+	voice bool
 }
 
 // newInstanceRouterServerWith is newInstanceRouterServer shaped by cfg.
@@ -375,13 +380,21 @@ func newInstanceRouterServerWith(t *testing.T, agent *instanceAgentRouter, cfg i
 	must("UpsertRuntimeSpec chat", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-chat-inst", MappingID: liveInstChatMap, Enabled: true, Binary: "/usr/bin/llama-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, ResponsesMode: routing.EndpointModePassthrough, Replicable: replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertTelemetry", routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: liveInstServer, ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}))
 	recorder := usage.NewRecorder()
-	srv := New(ServerDeps{
+	deps := ServerDeps{
 		Tokens:   tokens,
 		Usage:    recorder,
 		Provider: provider.NewOpenAICompatibleClient(http.DefaultClient),
 		Routes:   routes,
 		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routes, Clock: time.Now, ModelLister: provider.NewMock()}),
-	})
+	}
+	if cfg.voice {
+		cipher, err := capture.New(testCaptureKey)
+		must("capture.New", err)
+		deps.Portal = portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routes, Clock: time.Now, ModelLister: provider.NewMock(), Chats: store.NewMemoryChatStore(0), Cipher: cipher})
+		deps.Cipher, deps.Captures = cipher, &fakeCaptureStore{}
+		deps.InternalAuthSecret, deps.Users, deps.ChatRuns = "test-internal-secret", directory, NewChatRunRegistry(5)
+	}
+	srv := New(deps)
 	srv.AgentFeatures.Set(liveInstServer, []string{"runtime_manager", "runtime_model_probe", runtimeInstancesFeature, fullduplexProxyFeature, multipartProxyFeature})
 	return srv
 }

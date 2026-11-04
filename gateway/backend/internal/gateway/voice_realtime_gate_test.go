@@ -141,12 +141,32 @@ func TestVoicePerTurnLegCarriesRealtime(t *testing.T) {
 				t.Fatal("the turn was transcribed: /v1 did not hold its ASR loopback to real time")
 			}
 		}
-		if errFrame.Code != voiceChatNoRealtimeModel || errFrame.Message == "" {
-			t.Fatalf("error frame = code %q message %q, want /v1's %s for a model measured too slow", errFrame.Code, errFrame.Message, voiceChatNoRealtimeModel)
+		if errFrame.Code != voiceChatNoRealtimeModel || errFrame.Message != voiceLegNoRealtimeMessage(voiceLegASR) {
+			t.Fatalf("error frame = code %q message %q, want /v1's %s naming the asr leg", errFrame.Code, errFrame.Message, voiceChatNoRealtimeModel)
 		}
 		readVoiceUntilState(t, ctx, conn, voiceStateIdle)
 		if n, _ := child.snapshot(); n != 0 {
 			t.Fatalf("ASR child connections = %d, want 0: a gate refusal never reaches the child", n)
+		}
+	})
+
+	t.Run("tts leg of a voice turn", func(t *testing.T) {
+		// The speech mapping is re-measured too slow after the ticket: the turn's speech
+		// request is refused by /v1, and the error frame names the tts leg as the ticket
+		// mint would.
+		child := newFakeVoiceASRChild(t)
+		child.finals = []string{"hello there"}
+		h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+		setVoiceAudioRate(t, h.srv, "route-tts", 0.5)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		conn := h.dial(t, ctx)
+		readVoiceUntilState(t, ctx, conn, voiceStateListening)
+		drainAChunk(t, ctx, conn)
+		errFrame := readVoiceUntil(t, ctx, conn, voiceDownError)
+		if errFrame.Code != voiceChatNoRealtimeModel || errFrame.Message != voiceLegNoRealtimeMessage(voiceLegTTS) {
+			t.Fatalf("error frame = code %q message %q, want %s naming the tts leg", errFrame.Code, errFrame.Message, voiceChatNoRealtimeModel)
 		}
 	})
 
@@ -254,6 +274,12 @@ func TestVoicePerTurnLegCarriesRealtime(t *testing.T) {
 		bearer := map[string]string{"Authorization": "Bearer dev-secret", realtimeRequiredHeaderName: "1"}
 		if rec := post(bearer); rec.Code != http.StatusOK {
 			t.Fatalf("bearer with the marker = %d %s, want 200: a client cannot set the marker", rec.Code, rec.Body.String())
+		}
+		// The secret beside a user that does not resolve is not the loopback pair: the
+		// request is the bearer's, and the marker is the bearer's too.
+		secretOnly := map[string]string{internalAuthHeaderName: "test-internal-secret", internalUserHeaderName: "usr_nobody", "Authorization": "Bearer dev-secret", realtimeRequiredHeaderName: "1"}
+		if rec := post(secretOnly); rec.Code != http.StatusOK {
+			t.Fatalf("secret without a resolvable user, marked = %d %s, want 200: only the full pair is the loopback", rec.Code, rec.Body.String())
 		}
 	})
 }

@@ -46,10 +46,25 @@ const (
 
 	// realtimeRequiredHeaderName marks a voice chat turn's ASR or TTS loopback request
 	// ("1"): /v1 then routes it under the real-time gate
-	// (inference.Request.RealtimeRequired). It is honoured only beside the internal
-	// secret (loopbackRealtimeRequired), so a client that sends it gains nothing -- and
+	// (inference.Request.RealtimeRequired). It is honoured only on the full internal
+	// loopback pair (loopbackRouting), so a client that sends it gains nothing -- and
 	// a client may well want to: the gate only ever narrows what it is served on.
 	realtimeRequiredHeaderName = "X-OP-Realtime-Required"
+
+	// preferredInstanceHeaderName carries the gateway instance key (routing.InstanceKey)
+	// a voice chat leg's loopback request would like to be served on -- the instance
+	// the leg's previous request used (inference.Request.PreferredInstanceKey). Like
+	// the real-time marker it is honoured only on the full internal loopback pair
+	// (loopbackRouting): from anyone else it would let a client pick an instance and
+	// read instance keys back.
+	preferredInstanceHeaderName = "X-OP-Preferred-Instance"
+
+	// servedInstanceHeaderName answers a request whose preferred instance was honoured
+	// with the gateway instance key the request was actually routed to, so the voice
+	// session learns where its leg ran and prefers that instance next time
+	// (markServedInstance). It is written only for such a request, so it never reaches a
+	// client outside the loopback.
+	servedInstanceHeaderName = "X-OP-Served-Instance"
 )
 
 // Auth error codes/messages reused by more than one handler below.
@@ -133,9 +148,8 @@ func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
 
 // presentsInternalSecret reports whether r carries the per-process internal secret
 // (internalAuthHeaderName), the half of the trusted-loopback pair only the gateway itself
-// can send. It is loopbackPrincipal's secret check, shared with loopbackRealtimeRequired
-// so the comparison exists once: a configured, non-empty secret compared in constant
-// time, an empty header never matching.
+// can send: a configured, non-empty secret compared in constant time, an empty header
+// never matching. It is loopbackPrincipal's secret check.
 func (s *Server) presentsInternalSecret(r *http.Request) bool {
 	if s.internalAuthSecret == "" {
 		return false
@@ -144,11 +158,24 @@ func (s *Server) presentsInternalSecret(r *http.Request) bool {
 	return presented != "" && subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) == 1
 }
 
-// loopbackRealtimeRequired reports whether r is a voice chat turn's loopback request
-// marked as one that must keep up with real time: the marker header beside the internal
-// secret. The same header from anyone else is ignored.
-func (s *Server) loopbackRealtimeRequired(r *http.Request) bool {
-	return r.Header.Get(realtimeRequiredHeaderName) == "1" && s.presentsInternalSecret(r)
+// loopbackRouting reads the routing markers of a voice chat turn's loopback request:
+// whether it must keep up with real time (realtimeRequiredHeaderName "1") and the
+// instance it prefers (preferredInstanceHeaderName). Both are honoured only on the full
+// internal loopback pair -- the secret AND a user it resolves (loopbackPrincipal), the
+// pair a voice turn's own request carries -- and read as unset from anyone else: the
+// secret alone is not the gateway calling itself, since a request whose user does not
+// resolve is authenticated by its bearer, if at all. The user is looked up only for a
+// request that carries a marker.
+func (s *Server) loopbackRouting(r *http.Request) (realtime bool, preferredInstance string) {
+	realtime = r.Header.Get(realtimeRequiredHeaderName) == "1"
+	preferredInstance = strings.TrimSpace(r.Header.Get(preferredInstanceHeaderName))
+	if !realtime && preferredInstance == "" {
+		return false, ""
+	}
+	if _, ok := s.loopbackPrincipal(r); !ok {
+		return false, ""
+	}
+	return realtime, preferredInstance
 }
 
 // authenticateWeb resolves a principal. It first checks the internal trusted-

@@ -929,6 +929,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		relayBody = io.LimitReader(resp.Body, dataSize)
 	}
 
+	markServedInstance(w, rel.pfReq, rel.target)
 	w.Header().Set("Content-Type", contentType)
 	if rel.pfReq.Stream {
 		w.Header().Set("Cache-Control", "no-cache")

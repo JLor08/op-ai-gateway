@@ -71,6 +71,10 @@ type voiceRunParams struct {
 	// audio is the chat's speech settings (voice/language, #282), applied to the TTS
 	// leg exactly as a speech thread's are.
 	audio portal.ChatAudioSettings
+	// sticky is the voice chat session's per-leg instance memory (voice_sticky.go): the
+	// LLM and speech loopbacks name the instance their leg ran on last and remember the
+	// one they were served on. nil (a run started outside a session) prefers nothing.
+	sticky *voiceStickiness
 }
 
 // voiceRunRequest is what startVoiceRun is asked to run: the principal and the chat, the
@@ -88,6 +92,9 @@ type voiceRunRequest struct {
 	tts routing.Target
 	// audio is the chat's speech settings (voice/language, #282).
 	audio portal.ChatAudioSettings
+	// sticky is the session's per-leg instance memory, handed to the run
+	// (voiceRunParams.sticky).
+	sticky *voiceStickiness
 }
 
 // startVoiceRun reserves a run and launches the voice executor for one turn. It reads
@@ -119,6 +126,7 @@ func (s *Server) startVoiceRun(ctx context.Context, req voiceRunRequest) (*ChatR
 			pendingText: req.pendingText,
 			tts:         req.tts,
 			audio:       req.audio,
+			sticky:      req.sticky,
 		},
 	}
 	s.launchRun(runCtx, req.owner, run, prep)
@@ -312,9 +320,10 @@ type voiceSynthGate struct {
 // when the target is an instance of a replicable spec (InstanceCapable), configured otherwise. An
 // audio.cpp child serves one request at a time, so a second concurrent section only waited inside
 // the process anyway; with the cap at 1 a run's own second section is never in flight beside its
-// first -- a request at the instance's cap that would read as demand for another instance. The cap
-// says how many of the run's sections synthesize at once, not where: each section's request is
-// routed on its own.
+// first -- a request at the instance's cap that would read as demand for another instance. Where a
+// section runs is its request's routing: each one prefers the instance the session's speech leg
+// ran on last (voiceStickiness), so one after another the run's sections stay on one instance
+// while it is free, and move only when routing finds it busy, gone or no longer fast enough.
 func voiceTTSConcurrency(target routing.Target, configured int) int {
 	if target.InstanceCapable {
 		return 1
@@ -564,7 +573,7 @@ func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *C
 		}
 		defer leg.synth.release()
 		prep := voiceSpeechPrep(text, vp.tts, vp.audio, language)
-		out := s.retryVoiceSpeech(ctx, owner, run, prep, leg)
+		out := s.retryVoiceSpeech(ctx, owner, run, prep, leg, vp.sticky)
 		// Close the audio channel first (ending the relay's drain of this leg so it advances to the
 		// next section), then report the terminal outcome.
 		close(leg.audioCh)
@@ -650,11 +659,11 @@ func voiceTTSRetryBackoff(retry int) time.Duration {
 // so the leg keeps it for the whole retry budget. Each attempt gets its OWN first-chunk deadline
 // (voiceSpeechAttempt): the one armed for an attempt cannot be re-armed, so sharing it would charge
 // a retry for the time the failed attempt and the backoff already spent.
-func (s *Server) retryVoiceSpeech(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg) speechAttemptResult {
+func (s *Server) retryVoiceSpeech(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg, sticky *voiceStickiness) speechAttemptResult {
 	var relayed atomic.Bool
 	who := fmt.Sprintf("chat run %s: speech leg for section %d", run.ID, leg.section)
 	return retrySpeechAttempts(ctx, who, s.voiceTiming.ttsRetryLimit(), &relayed, func() speechAttemptResult {
-		return s.voiceSpeechAttempt(ctx, owner, run, prep, leg, &relayed)
+		return s.voiceSpeechAttempt(ctx, owner, run, prep, leg, &relayed, sticky)
 	})
 }
 
@@ -697,8 +706,10 @@ func retrySpeechAttempts(ctx context.Context, who string, retries int, relayed *
 // is streaming into the same run.metrics concurrently, so the speech leg must NOT also write it (a
 // lost update on the perf metrics); the LLM leg is the sole metrics writer, keeping them
 // deterministic. The request is marked as a voice chat leg (realtime), so /v1 resolves it under
-// the same real-time gate the ticket mint applied.
-func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg, relayed *atomic.Bool) speechAttemptResult {
+// the same real-time gate the ticket mint applied, and names the instance the session's speech
+// leg ran on last (sticky), so the run's sections and the session's turns stay on one TTS
+// instance while it is free.
+func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg, relayed *atomic.Bool, sticky *voiceStickiness) speechAttemptResult {
 	ttsCtx, cancelTTS := context.WithCancelCause(ctx)
 	defer cancelTTS(nil)
 	liftDeadline := armRunDeadline(chatRunKindSpeech, cancelTTS)
@@ -710,7 +721,7 @@ func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *
 		case <-ttsCtx.Done():
 		}
 	}
-	return s.speechTurnAttempt(ttsCtx, owner, run, prep, liftDeadline, false, sink, true)
+	return s.speechTurnAttempt(ttsCtx, owner, run, prep, liftDeadline, false, sink, true, sticky)
 }
 
 // voiceSpeechLanguage resolves the language the speech leg is asked to speak: the per-answer
@@ -836,7 +847,9 @@ func (s *Server) runVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun
 // terminal (status, errMsg): "canceled" on the orchestrator's cancel (an empty message), the
 // timed-out message on a deadline (a deadline is NOT a cancel -- the voice kind arms none of
 // its own here, but a future one might), or "error" with the upstream's code. A non-200
-// closes the body before returning, exactly as the happy path's deferred close does.
+// closes the body before returning, exactly as the happy path's deferred close does. The
+// request names the instance the session's LLM leg ran on last and a 200 records the one it
+// was served on (voiceRunParams.sticky; prep.Voice is set, executeVoiceRun checked it).
 func (s *Server) dispatchVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) (resp *http.Response, status, errMsg string) {
 	body, err := buildChatCompletionsBody(prep)
 	if err != nil {
@@ -847,6 +860,7 @@ func (s *Server) dispatchVoiceLLM(ctx context.Context, owner auth.Token, run *Ch
 		return nil, "error", err.Error()
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
+	prep.Voice.sticky.prefer(req, voiceLegLLM)
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -865,6 +879,7 @@ func (s *Server) dispatchVoiceLLM(ctx context.Context, owner auth.Token, run *Ch
 		resp.Body.Close()
 		return nil, "error", upstreamErrorCode(b, resp.Status)
 	}
+	prep.Voice.sticky.observe(resp, voiceLegLLM)
 	return resp, "completed", ""
 }
 

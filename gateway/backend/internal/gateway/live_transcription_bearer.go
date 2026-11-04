@@ -378,6 +378,7 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	if requestExpectsContinue(r) {
 		sendContinue(w)
 	}
+	markServedInstance(w, sess.req, target)
 	s.relayBearerLiveSSE(w, resp, scan, watchdog, idle)
 }
 

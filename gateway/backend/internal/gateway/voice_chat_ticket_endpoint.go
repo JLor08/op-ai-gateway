@@ -110,6 +110,13 @@ func writeVoiceChatRefusal(w http.ResponseWriter, code string) {
 // the leg is the gate's own constant, so nothing of the cause reaches the client.
 const voiceNoRealtimeMessage = "no server of the chosen model is measured fast enough to keep up with real time"
 
+// voiceLegNoRealtimeMessage is voiceNoRealtimeMessage naming leg ("voice chat tts leg: ..."):
+// the gate's refusal at the ticket mint and a turn's error frame when /v1 refuses the leg's
+// per-turn request as too slow, so the portal reads the leg the same way from either.
+func voiceLegNoRealtimeMessage(leg voiceLeg) string {
+	return fmt.Sprintf("voice chat %s leg: %s", leg, voiceNoRealtimeMessage)
+}
+
 // voiceCoLoadBound is the deadline the gate runs under: the configured one, or the default
 // for a Server that was not built through New.
 func (s *Server) voiceCoLoadBound() time.Duration {
@@ -289,7 +296,7 @@ func (s *Server) writeVoiceCoLoadRefusal(gateCtx context.Context, w http.Respons
 	}
 	var legErr *voiceLegError
 	if code == voiceChatNoRealtimeModel && errors.As(err, &legErr) {
-		writeJSON(w, http.StatusConflict, apierror.Response(code, fmt.Sprintf("voice chat %s leg: %s", legErr.leg, voiceNoRealtimeMessage), ""))
+		writeJSON(w, http.StatusConflict, apierror.Response(code, voiceLegNoRealtimeMessage(legErr.leg), ""))
 		return
 	}
 	writeVoiceChatRefusal(w, code)
