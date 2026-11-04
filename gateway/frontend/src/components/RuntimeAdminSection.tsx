@@ -2419,7 +2419,7 @@ export function RuntimeAdminSection({
     // row the action is offered on (the one that speaks for the spec,
     // primaryStatusRows) and every other instance row of the spec, since the
     // wait needs all of them `stopped` (restartGate).
-    if (restartGate(statusRowsRef.current, specId, restartableStates) !== 'open') return;
+    if (restartGate(statusRowsRef.current, specId, restartableStates, spec) !== 'open') return;
     const run = ++restartRunRef.current;
     absentSinceRef.current = null;
     setRestartNotice(null);
@@ -4244,7 +4244,7 @@ export function RuntimeAdminSection({
     if (spec.admin_state === '' || restart?.specId === row.spec_id) {
       // Over every instance row of the spec, not this row alone: the wait
       // needs all of them `stopped` (restartGate).
-      const gate = restartGate(statusRows, row.spec_id, restartableStates);
+      const gate = restartGate(statusRows, row.spec_id, restartableStates, spec);
       const restartBlocked = gate !== 'open';
       actions.push({
         key: 'restart',

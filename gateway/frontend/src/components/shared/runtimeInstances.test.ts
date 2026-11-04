@@ -90,26 +90,54 @@ describe('restartGate', () => {
   ]);
 
   it('is closed on the state of the row that speaks for the spec', () => {
-    expect(restartGate([row('s', 0, 'stopped')], 's', restartable)).toBe('state');
-    expect(restartGate([row('s', 0, 'not_permitted'), row('s', 1)], 's', restartable)).toBe(
-      'state',
-    );
-    expect(restartGate([row('t', 0)], 's', restartable)).toBe('state');
+    expect(restartGate([row('s', 0, 'stopped')], 's', restartable, undefined)).toBe('state');
+    expect(
+      restartGate([row('s', 0, 'not_permitted'), row('s', 1)], 's', restartable, undefined),
+    ).toBe('state');
+    expect(restartGate([row('t', 0)], 's', restartable, undefined)).toBe('state');
   });
 
   it('is closed when another instance rests where force_stopped cannot move it', () => {
     for (const stuck of ['not_permitted', 'pending_vram_unknown', 'some_future_state']) {
-      expect(restartGate([row('s', 0), row('s', 1, stuck)], 's', restartable)).toBe('instance');
+      expect(restartGate([row('s', 0), row('s', 1, stuck)], 's', restartable, undefined)).toBe(
+        'instance',
+      );
     }
   });
 
+  it('ignores a burst sibling the force_stopped push retires', () => {
+    // Under force_stopped the agent protects instances below max(min_instances
+    // of a replicable spec, 1 when pinned, 1); a burst one with no process is
+    // retired by that very push, so its resting state never blocks the wait.
+    const spec = { replicable: true, min_instances: 2, pinned: false };
+    for (const stuck of ['not_permitted', 'pending_vram_unknown']) {
+      expect(restartGate([row('s', 0), row('s', 2, stuck)], 's', restartable, spec)).toBe('open');
+      expect(restartGate([row('s', 0), row('s', 1, stuck)], 's', restartable, spec)).toBe(
+        'instance',
+      );
+    }
+    // A stored spec that is not replicable protects instance 0 only.
+    expect(
+      restartGate([row('s', 0), row('s', 1, 'not_permitted')], 's', restartable, {
+        replicable: false,
+        min_instances: 3,
+        pinned: true,
+      }),
+    ).toBe('open');
+    // Without the stored spec every sibling counts as protected.
+    expect(
+      restartGate([row('s', 0), row('s', 3, 'not_permitted')], 's', restartable, undefined),
+    ).toBe('instance');
+  });
+
   it('is open when every other instance is stopped or restartable', () => {
-    expect(restartGate([row('s', 0)], 's', restartable)).toBe('open');
+    expect(restartGate([row('s', 0)], 's', restartable, undefined)).toBe('open');
     expect(
       restartGate(
         [row('s', 0), row('s', 1, 'stopped'), row('s', 2, 'crashed'), row('t', 1, 'not_permitted')],
         's',
         restartable,
+        undefined,
       ),
     ).toBe('open');
   });

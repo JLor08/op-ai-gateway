@@ -84,31 +84,58 @@ export function specStopState(
 /**
  * Whether the restart sequence may start on a spec, and if not, why: `open`;
  * `state` when the row that speaks for the spec (primaryStatusRows) is not in
- * a restartable state; `instance` when it is, but another listed row of the
- * spec rests in a state that is neither restartable nor `stopped`.
+ * a restartable state; `instance` when it is, but another listed row of a
+ * protected instance of the spec rests in a state that is neither restartable
+ * nor `stopped`.
  *
  * The sequence's wait (specStopState) needs EVERY listed row of the spec to
- * read `stopped`, so the gate has to hold for every row too. A sibling at
- * `not_permitted` or `pending_vram_unknown` -- a protected instance the agent
- * refused, say -- has no process for force_stopped to drain, and the agent's
- * reset of a changed spec deliberately leaves those two states alone, so that
- * row would never turn `stopped`: the sequence would time out and leave the
- * force_stopped override in force, admission-blocking the model. A sibling
- * already `stopped` is fine (it counts as stopped), and so is one in a
- * restartable state (it drains, or the reset moves it to `stopped`). An
- * instance whose row is gone runs nothing and does not count, as in the wait.
+ * read `stopped`, so the gate has to hold for every row that stays listed. A
+ * protected sibling at `not_permitted` or `pending_vram_unknown` has no
+ * process for force_stopped to drain, and the agent's reset of a changed spec
+ * deliberately leaves those two states alone, so that row would never turn
+ * `stopped`: the sequence would time out and leave the force_stopped override
+ * in force, admission-blocking the model. A burst sibling (an index at or
+ * above stopProtectedCount) is different: the force_stopped push is an Apply,
+ * and the agent retires every burst instance with no process and nothing
+ * queued on it, so its row leaves the stream and does not count in the wait.
+ * A sibling already `stopped` is fine (it counts as stopped), and so is one in
+ * a restartable state (it drains, or the reset moves it to `stopped`).
  */
 export function restartGate(
   rows: readonly RuntimeStatus[],
   specId: string,
   restartable: ReadonlySet<string>,
+  spec: Pick<RuntimeSpec, 'replicable' | 'min_instances' | 'pinned'> | undefined,
 ): 'open' | 'state' | 'instance' {
   const primary = primaryStatusRows(rows).get(specId);
   if (primary === undefined || !restartable.has(primary.state)) return 'state';
+  const protectedCount = stopProtectedCount(spec);
   const stuck = rows.some(
-    (row) => row.spec_id === specId && row.state !== 'stopped' && !restartable.has(row.state),
+    (row) =>
+      row.spec_id === specId &&
+      instanceIndex(row) < protectedCount &&
+      row.state !== 'stopped' &&
+      !restartable.has(row.state),
   );
   return stuck ? 'instance' : 'open';
+}
+
+/**
+ * How many instances of a spec the agent protects once the restart
+ * sequence's force_stopped push reaches it -- instances 0 .. count-1, the
+ * rest being burst capacity it retires when it has no process (the agent's
+ * ProtectedCount and IsBurst, instance.go): the larger of a replicable spec's
+ * min_instances, 1 for a pinned spec (force_running, the other source of that
+ * 1, is gone under force_stopped), and 1 for instance 0, which is never
+ * burst. Without the stored spec nothing is known about the floor, so every
+ * instance counts as protected.
+ */
+function stopProtectedCount(
+  spec: Pick<RuntimeSpec, 'replicable' | 'min_instances' | 'pinned'> | undefined,
+): number {
+  if (spec === undefined) return Number.POSITIVE_INFINITY;
+  const floor = spec.replicable ? spec.min_instances : 0;
+  return Math.max(floor, spec.pinned ? 1 : 0, 1);
 }
 
 /**

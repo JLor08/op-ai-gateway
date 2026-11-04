@@ -8280,10 +8280,16 @@ same function as the pushed document, so the two cannot disagree); neither has a
   for **every** row of the spec to stop (`specStopState`), since under
   `force_stopped` all instances drain at once, so its state gate reads every row
   too (`restartGate`): the speaking row must be in a restartable state, and every
-  other row of the spec either restartable or already `stopped`. A sibling resting
-  at `not_permitted` or `pending_vram_unknown` — a protected instance the agent
-  refused — has no process to drain and would never report `stopped`, so Restart
-  stays disabled there and says why on hover.
+  other row of a protected instance either restartable or already `stopped`. A
+  protected sibling resting at `not_permitted` or `pending_vram_unknown` has no
+  process to drain and would never report `stopped`, so Restart stays disabled
+  there and says why on hover. A burst sibling in those states does not block:
+  the protected count under `force_stopped` is the larger of a replicable spec's
+  minimum, 1 for a pinned spec and 1 for instance 0 (`ProtectedCount`, with
+  `force_running` gone), and the `force_stopped` push retires every burst
+  instance with no process and nothing queued, so its row leaves the stream and
+  does not count in the wait. Without the stored spec every row counts as
+  protected.
 - The log view states that it shows every instance of the spec, lines of instance
   k ≥ 1 prefixed `[#k]` (§6.1).
 - The Models catalog's model-servers row carries `running_instances` (one per
