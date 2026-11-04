@@ -70,6 +70,8 @@ type routerRefusal struct {
 // answers only after that long, as a child still producing its first token.
 // onArrive, when set, is called with every address as its request arrives, before
 // it is answered, so a test can look at the gateway while the request is in flight.
+// A streamed chat completion's content is chatAnswer when set ("served by <address>"
+// otherwise).
 type instanceAgentRouter struct {
 	server *httptest.Server
 
@@ -80,6 +82,14 @@ type instanceAgentRouter struct {
 	served      []string       // every address a request arrived for, in order
 	liveBytes   map[string]int // PCM bytes each live address received
 	onArrive    func(model string)
+	chatAnswer  string
+}
+
+// setChatAnswer sets the content every streamed chat completion answers with.
+func (a *instanceAgentRouter) setChatAnswer(answer string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.chatAnswer = answer
 }
 
 // setOnArrive installs the arrival hook (see instanceAgentRouter).
@@ -174,8 +184,15 @@ func (a *instanceAgentRouter) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		a.stallFor(r, body.Model)
 		if body.Stream {
+			a.mu.Lock()
+			content := a.chatAnswer
+			a.mu.Unlock()
+			if content == "" {
+				content = "served by " + body.Model
+			}
+			quoted, _ := json.Marshal(content)
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"served by %s\"}}]}\n\n", body.Model)
+			fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":%s}}]}\n\n", quoted)
 			fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n")
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			return

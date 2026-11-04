@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"slices"
 	"strings"
@@ -132,7 +133,12 @@ func (w *voiceStickyWorld) busy(instanceKey string) (free func()) {
 
 func (w *voiceStickyWorld) dial(t *testing.T, ctx context.Context, claims voiceTicketClaims) *websocket.Conn {
 	t.Helper()
-	ticket := mustMintVoiceTicket(t, w.srv.voiceTickets, claims)
+	return w.dialTicket(t, ctx, mustMintVoiceTicket(t, w.srv.voiceTickets, claims))
+}
+
+// dialTicket opens the voice chat WebSocket on ticket and waits for it to listen.
+func (w *voiceStickyWorld) dialTicket(t *testing.T, ctx context.Context, ticket string) *websocket.Conn {
+	t.Helper()
 	conn, _, err := websocket.Dial(ctx, wsURL(w.url, "/api/portal/voice-chat"), &websocket.DialOptions{
 		Subprotocols: []string{"op-voice-chat", ticket},
 	})
@@ -205,6 +211,45 @@ func (w *voiceStickyWorld) speak(t *testing.T, hdr map[string]string) *http.Resp
 	return resp
 }
 
+// gateFrontedProvider is the fixture's provider client with the co-load gate's ensures and
+// residency reads answered by gate, so the ticket endpoint's gate passes without an agent's
+// /ensure, while every request -- the pre-warm's synthesis and the session's legs -- still
+// goes to the fake agent router.
+type gateFrontedProvider struct {
+	*provider.OpenAICompatibleClient
+	gate *voiceGateFake
+}
+
+func (p gateFrontedProvider) EnsureRuntimeModel(ctx context.Context, target routing.Target) error {
+	return p.gate.EnsureRuntimeModel(ctx, target)
+}
+
+func (p gateFrontedProvider) LoadedModels(ctx context.Context, target routing.Target, statusPath, format string) ([]string, error) {
+	return p.gate.LoadedModels(ctx, target, statusPath, format)
+}
+
+// ticket asks the ticket endpoint, as the world's user, for a voice chat ticket on the three
+// models in voice, and returns it.
+func (w *voiceStickyWorld) ticket(t *testing.T, voice string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, w.url+voiceTicketPath, strings.NewReader(voiceTicketBodyVoice(w.chatID, "asr-inst", "chat-inst", "tts-inst", voice)))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("ticket request: %v", err)
+	}
+	defer resp.Body.Close()
+	var body voiceChatTicketResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || resp.StatusCode != http.StatusOK || body.Ticket == "" {
+		t.Fatalf("ticket = %d %q, %v; want 200 with a ticket", resp.StatusCode, body.Ticket, err)
+	}
+	return body.Ticket
+}
+
 func repeatKey(s string, n int) []string {
 	out := make([]string, n)
 	for i := range out {
@@ -261,25 +306,153 @@ func TestVoiceTurnsStickToInstance(t *testing.T) {
 	}
 }
 
-// The first turn's speech goes to the instance the gate selected and the pre-warm
-// primed -- instance 1 here, since instance 0 was busy at the gate -- although instance
-// 0 is free again by then and the plain selection would take it.
-func TestVoiceFirstTurnUsesPrewarmedTTS(t *testing.T) {
-	w := newVoiceStickyWorld(t)
-	freeTTS := w.busy(liveInstTTSMap + "#0")
-	claims := w.gate(t)
-	freeTTS()
-	if claims.TTS.InstanceKey != liveInstTTSMap+"#1" {
-		t.Fatalf("gate TTS target = %q, want %s#1, the free instance", claims.TTS.InstanceKey, liveInstTTSMap)
+// runningRows is the status rows of the world's ASR and TTS instances 0 and 1 and the
+// chat instances chat lists, all running and idle.
+func runningRows(chat ...int) []RuntimeStatusDTO {
+	rows := []RuntimeStatusDTO{
+		liveInstanceRow(liveInstASRSpec, liveInstASRUp, 0, 0),
+		liveInstanceRow(liveInstASRSpec, liveInstASRUp, 1, 0),
+		liveInstanceRow(liveInstTTSSpec, liveInstTTSUp, 0, 0),
+		liveInstanceRow(liveInstTTSSpec, liveInstTTSUp, 1, 0),
 	}
-	// The ticket endpoint primes the gate's TTS target (startVoicePrewarm runs this).
+	for _, k := range chat {
+		rows = append(rows, liveInstanceRow("spec-chat-inst", liveInstChatUp, k, 0))
+	}
+	return rows
+}
+
+// The LLM leg moves and sticks like the others: the first turn finds the chat model's
+// instance 0 busy and runs on instance 1, and the second, with instance 0 free again and
+// the plain selection taking it, goes back to instance 1, the one the leg remembers.
+func TestVoiceLLMLegMovesAndSticks(t *testing.T) {
+	w := newVoiceStickyWorld(t)
+	claims := w.gate(t)
+	if claims.LLM.InstanceKey != liveInstChatMap+"#0" {
+		t.Fatalf("gate LLM target = %q, want %s#0", claims.LLM.InstanceKey, liveInstChatMap)
+	}
+	w.srv.RuntimeStatus.publish(liveInstServer, runningRows(0, 1))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := w.srv.primeSpeechVoice(ctx, claims.TTS, "alloy"); err != nil {
-		t.Fatalf("primeSpeechVoice: %v", err)
+	conn := w.dial(t, ctx, claims)
+
+	freeChat := w.busy(liveInstChatMap + "#0")
+	w.turn(t, ctx, conn)
+	freeChat()
+	w.turn(t, ctx, conn)
+
+	if got := w.served(liveInstChatUp); !slices.Equal(got, repeatKey(liveInstChatUp+"#1", 2)) {
+		t.Fatalf("LLM addresses served = %v, want instance 1 for both turns", got)
+	}
+	if got, want := w.rec.preferred("/v1/chat/completions"), []string{liveInstChatMap + "#0", liveInstChatMap + "#1"}; !slices.Equal(got, want) {
+		t.Fatalf("LLM leg preferred = %v, want %v", got, want)
 	}
 
+	// The control: a chat request without a preference is served on instance 0.
+	req, err := http.NewRequest(http.MethodPost, w.url+"/v1/chat/completions", strings.NewReader(`{"model":"chat-inst","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("chat request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if got := w.served(liveInstChatUp); resp.StatusCode != http.StatusOK || got[len(got)-1] != liveInstChatUp {
+		t.Fatalf("a plain chat request = %d served on %v, want 200 on instance 0", resp.StatusCode, got)
+	}
+}
+
+// A turn whose answer speaks in several sections keeps them on one TTS instance: the
+// first section finds instance 0 at its cap and runs on instance 1; instance 0 frees
+// while it runs, and the second section, which the plain selection would send to
+// instance 0, prefers instance 1, the one the first was served on.
+func TestVoiceSpeechSectionsStickToInstance(t *testing.T) {
+	w := newVoiceStickyWorld(t)
+	routes, ok := w.srv.Routes.(*routing.MemoryStore)
+	if !ok {
+		t.Fatalf("routes are %T, want the memory store", w.srv.Routes)
+	}
+	// Two requests at once per TTS instance, so the second section is not held off
+	// instance 1 by the first one's request still finishing there.
+	spec, found, err := routes.RuntimeSpecByMapping(context.Background(), liveInstTTSMap)
+	if err != nil || !found {
+		t.Fatalf("RuntimeSpecByMapping = %v, %v", found, err)
+	}
+	spec.InstanceParallelism = 2
+	if err := routes.UpsertRuntimeSpec(context.Background(), spec); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	claims := w.gate(t)
+	if claims.TTS.InstanceKey != liveInstTTSMap+"#0" {
+		t.Fatalf("gate TTS target = %q, want %s#0", claims.TTS.InstanceKey, liveInstTTSMap)
+	}
+	w.agent.setChatAnswer(`<speak lang="en">One.</speak> Between. <speak lang="en">Two.</speak>`)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	conn := w.dial(t, ctx, claims)
+
+	for _, id := range []string{"sections-busy-a", "sections-busy-b"} {
+		w.srv.Active.Add(ActiveRequest{ID: id, ServerID: liveInstServer, InstanceKey: liveInstTTSMap + "#0"})
+	}
+	var once sync.Once
+	w.agent.setOnArrive(func(model string) {
+		if model == liveInstTTSUp+"#1" {
+			once.Do(func() { w.srv.Active.Remove("sections-busy-a"); w.srv.Active.Remove("sections-busy-b") })
+		}
+	})
+	w.turn(t, ctx, conn)
+
+	if got := w.served(liveInstTTSUp); !slices.Equal(got, repeatKey(liveInstTTSUp+"#1", 2)) {
+		t.Fatalf("TTS addresses served = %v, want instance 1 for both sections", got)
+	}
+	if got, want := w.rec.preferred("/v1/audio/speech"), []string{liveInstTTSMap + "#0", liveInstTTSMap + "#1"}; !slices.Equal(got, want) {
+		t.Fatalf("speech sections preferred = %v, want %v", got, want)
+	}
+
+	// The control: a request without a preference is served on instance 0.
+	w.agent.setOnArrive(nil)
+	w.speak(t, map[string]string{"Authorization": "Bearer dev-secret"})
+	if got := w.served(liveInstTTSUp); got[len(got)-1] != liveInstTTSUp {
+		t.Fatalf("a plain speech request was served on %q, want instance 0", got[len(got)-1])
+	}
+}
+
+// The first turn's speech goes to the instance the ticket's gate selected and the
+// pre-warm primed -- instance 1 here, since instance 0 was busy when the ticket was
+// minted -- although instance 0 is free again by then and the plain selection would
+// take it.
+func TestVoiceFirstTurnUsesPrewarmedTTS(t *testing.T) {
+	w := newVoiceStickyWorld(t)
+	w.srv.voicePrewarm = true
+	w.srv.Provider = gateFrontedProvider{OpenAICompatibleClient: provider.NewOpenAICompatibleClient(http.DefaultClient), gate: &voiceGateFake{ensureErr: map[string]error{}}}
+	primed := make(chan string, 1)
+	w.agent.setOnArrive(func(model string) {
+		if model == liveInstTTSUp || strings.HasPrefix(model, liveInstTTSUp+"#") {
+			select {
+			case primed <- model:
+			default:
+			}
+		}
+	})
+	freeTTS := w.busy(liveInstTTSMap + "#0")
+	ticket := w.ticket(t, "alloy")
+	select {
+	case model := <-primed:
+		if model != liveInstTTSUp+"#1" {
+			t.Fatalf("the pre-warm primed %q, want %s#1, the free instance the gate selected", model, liveInstTTSUp)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the ticket endpoint started no pre-warm")
+	}
+	w.agent.setOnArrive(nil)
+	freeTTS()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := w.dialTicket(t, ctx, ticket)
 	w.turn(t, ctx, conn)
 
 	if got := w.served(liveInstTTSUp); !slices.Equal(got, []string{liveInstTTSUp + "#1", liveInstTTSUp + "#1"}) {
