@@ -10538,6 +10538,18 @@ describe('RuntimeAdminSection instance settings', () => {
     fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
   }
 
+  // The words runtimeSpecAutoIdleTimeout puts after the measured startup to
+  // name the idle timeout in effect, whatever its figure: what two lines with
+  // different figures share past the startup both begin with. Read off the
+  // i18n object, so an assertion on them holds in every language.
+  function idleTimeoutInEffectWords(): string {
+    const one = t.runtimeSpecAutoIdleTimeout(1, 0);
+    const two = t.runtimeSpecAutoIdleTimeout(2, 0);
+    let shared = 0;
+    while (shared < one.length && one[shared] === two[shared]) shared++;
+    return one.slice(t.runtimeSpecMeasuredStartup(0).length, shared);
+  }
+
   it('reveals min, max and the parallel requests per instance only with "Multiple instances" ticked', async () => {
     await openFilledCreate();
     expect(screen.queryByLabelText(t.runtimeSpecMinInstances)).not.toBeInTheDocument();
@@ -10879,7 +10891,9 @@ describe('RuntimeAdminSection instance settings', () => {
     tickReplicable();
 
     expect(screen.getByText(t.runtimeSpecMeasuredStartup(0))).toBeInTheDocument();
-    expect(screen.queryByText(/wirksamer Leerlauf-Timeout/)).not.toBeInTheDocument();
+    const inEffect = idleTimeoutInEffectWords();
+    expect(inEffect.trim()).not.toBe('');
+    expect(screen.queryByText((text) => text.includes(inEffect))).not.toBeInTheDocument();
   });
 
   // An agent without instance support keeps the manual 0 -- never unloaded --

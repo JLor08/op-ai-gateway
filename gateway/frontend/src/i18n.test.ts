@@ -4449,4 +4449,11 @@ describe('audio metrics (#340) i18n keys', () => {
     expect(messages.en.benchmarkAudioOnlyHint).toMatch(/vision/i);
     expect(messages.en.benchmarkAudioOnlyHint).not.toMatch(/both and vision/i);
   });
+
+  // A replicable spec's log view shows every instance's output; the intro
+  // above it must not speak of one process only.
+  it('names the instances in the log view intro', () => {
+    expect(messages.de.runtimeLogsIntro).toMatch(/mehreren Instanzen/);
+    expect(messages.en.runtimeLogsIntro).toMatch(/several instances/);
+  });
 });
