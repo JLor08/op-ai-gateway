@@ -163,9 +163,10 @@ var (
 	ErrRuntimeSpecConfigFilesInvalid = errors.New("runtime_spec.config_files_invalid")
 	// ErrRuntimeSpecInstancesInvalid rejects a min_instances above
 	// max_instances when both are set (> 0): a floor of warm instances the cap
-	// never allows. Checked whether or not the spec is replicable, so a pair
-	// that can never be met is not stored to take effect the day the spec is
-	// switched to replicable. HTTP 400.
+	// never allows; and either count above maxRuntimeSpecInstances, more
+	// instances than the agent can address. Checked whether or not the spec is
+	// replicable, so a setting that can never be met is not stored to take
+	// effect the day the spec is switched to replicable. HTTP 400.
 	ErrRuntimeSpecInstancesInvalid = errors.New("runtime_spec.instances_invalid")
 	// ErrRuntimeSpecInstancesNeedEphemeralPort rejects a replicable spec with a
 	// fixed listen_port: every instance is its own process on its own port, so
@@ -1154,19 +1155,29 @@ func validateRuntimeSpecShape(req PutRuntimeSpecRequest) (runtimeSpecFields, err
 	}, nil
 }
 
+// maxRuntimeSpecInstances is how many instances one replicable spec can have:
+// the agent addresses them 0 to routing.MaxInstanceIndex, so a count above it
+// names instances that cannot exist.
+const maxRuntimeSpecInstances = routing.MaxInstanceIndex + 1
+
 // validateRuntimeSpecInstances checks the four instance settings -- last of
 // the request validations, see validateRuntimeSpecRequest for why -- in this
 // order: a negative count is ErrRuntimeSpecTuningInvalid like every other
-// negative tuning value, a floor above the cap (both set) is
-// ErrRuntimeSpecInstancesInvalid, and a replicable spec with a fixed port is
+// negative tuning value, a count above maxRuntimeSpecInstances and a floor
+// above the cap (both set) are ErrRuntimeSpecInstancesInvalid, and a
+// replicable spec with a fixed port is
 // ErrRuntimeSpecInstancesNeedEphemeralPort. The agent repairs the same shapes
 // when a hand-written file-mode document carries them (a negative count reads
-// as 0, the floor is clamped to the cap, a fixed port demotes the spec to one
-// instance), but a repair the operator never sees is a setting that silently
-// does something else, so the portal refuses them where they are typed.
+// as 0, the floor is clamped to the cap and to the addressable range, a fixed
+// port demotes the spec to one instance), but a repair the operator never sees
+// is a setting that silently does something else, so the portal refuses them
+// where they are typed.
 func validateRuntimeSpecInstances(req PutRuntimeSpecRequest) error {
 	if req.MinInstances < 0 || req.MaxInstances < 0 || req.InstanceParallelism < 0 {
 		return ErrRuntimeSpecTuningInvalid
+	}
+	if req.MinInstances > maxRuntimeSpecInstances || req.MaxInstances > maxRuntimeSpecInstances {
+		return ErrRuntimeSpecInstancesInvalid
 	}
 	if req.MaxInstances > 0 && req.MinInstances > req.MaxInstances {
 		return ErrRuntimeSpecInstancesInvalid
@@ -2584,7 +2595,9 @@ type AgentRuntimeSpecGPUDTO struct {
 // rewritten here. IdleTimeoutSeconds is the EFFECTIVE idle timeout
 // (effectiveIdleTimeout): the stored value for a spec that is not replicable,
 // and for a replicable one at least a floor, derived from its measured
-// startup -- never 0 there, so a replicable spec's instances always idle out.
+// startup -- never 0 there, so a replicable spec's unprotected instances
+// always idle out. The instances it protects (min_instances, and instance 0
+// while pinned) never idle out, whatever this says.
 type AgentRuntimeSpecDTO struct {
 	ID                          string                   `json:"id"`
 	Model                       string                   `json:"model"`
@@ -3085,19 +3098,22 @@ const (
 	// OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS (config.Config).
 	DefaultInstanceIdleFactor       = 5.0
 	DefaultInstanceIdleFloorSeconds = 120
-	// maxDerivedIdleTimeoutSeconds caps the startup-derived term of a
-	// replicable spec's idle timeout. The agent turns the pushed seconds into a
+	// maxDerivedIdleTimeoutSeconds caps the idle timeout pushed for a
+	// replicable spec, every term of it: the startup-derived one, the manual
+	// value and the floor. The agent turns the pushed seconds into a
 	// time.Duration, which wraps a little past 292 years, and a wrapped timeout
 	// is an instance unloaded at once; the cap, about 68 years, is "never" in
-	// practice and leaves that arithmetic room. Only an absurd measurement or
-	// factor gets near it.
+	// practice and leaves that arithmetic room. Only an absurd measurement,
+	// factor or setting gets near it.
 	maxDerivedIdleTimeoutSeconds = math.MaxInt32
 )
 
 // instanceIdleDefaults is NewService's fallback for the two idle knobs: a
 // factor that is not a positive, finite number, or a floor that is not
 // positive -- the zero value of a deps literal that omits them included --
-// uses DefaultInstanceIdleFactor or DefaultInstanceIdleFloorSeconds.
+// uses DefaultInstanceIdleFactor or DefaultInstanceIdleFloorSeconds. A floor
+// above maxDerivedIdleTimeoutSeconds is held at it, for the reason that cap
+// exists.
 func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
 		factor = DefaultInstanceIdleFactor
@@ -3105,7 +3121,7 @@ func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 	if floorSec <= 0 {
 		floorSec = DefaultInstanceIdleFloorSeconds
 	}
-	return factor, floorSec
+	return factor, min(floorSec, maxDerivedIdleTimeoutSeconds)
 }
 
 // effectiveIdleTimeoutSeconds is the idle timeout the runtime-config document
@@ -3117,20 +3133,38 @@ func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 // the agent's measured startup and the benchmark's cold start, so an instance
 // that is slow to bring up is kept longer once it runs, and the floor holds
 // every instance at least that long, also while nothing is measured: a
-// replicable spec is never pushed 0, so its burst instances always idle out.
+// replicable spec is never pushed 0, so its unprotected instances always idle
+// out. The result is held at maxDerivedIdleTimeoutSeconds.
 func effectiveIdleTimeoutSeconds(spec routing.RuntimeSpec, loadTimeMS int64, factor float64, floorSec int) int {
 	if !spec.Replicable {
 		return spec.IdleTimeoutSeconds
 	}
-	startupMS := max(spec.StartupMeasuredMS, loadTimeMS)
-	derived := math.Ceil(factor * float64(startupMS) / 1000)
-	// Saturate before converting: Go leaves the int value of an out-of-range
-	// float to the platform.
-	derivedSec := maxDerivedIdleTimeoutSeconds
-	if derived < maxDerivedIdleTimeoutSeconds {
-		derivedSec = int(derived)
+	derivedSec := derivedIdleSeconds(factor, max(spec.StartupMeasuredMS, loadTimeMS))
+	return min(max(spec.IdleTimeoutSeconds, derivedSec, floorSec), maxDerivedIdleTimeoutSeconds)
+}
+
+// derivedIdleSeconds is factor times startupMS in whole seconds, rounded up,
+// held at maxDerivedIdleTimeoutSeconds.
+//
+// The product is taken to the nearest whole millisecond first and the
+// rounding up to seconds is integer arithmetic. A factor such as 1.1 has no
+// exact binary form, so in floating point 1.1 x 200000 ms is
+// 220000.00000000003, and rounding that up to seconds directly answers 221
+// where the exact answer is 220. A millisecond is far finer than anything a
+// startup measurement can tell apart, so the rounding costs nothing real.
+//
+// The saturation comes before the conversion, because Go leaves the int value
+// of an out-of-range float to the platform.
+func derivedIdleSeconds(factor float64, startupMS int64) int {
+	if startupMS <= 0 {
+		return 0
 	}
-	return max(spec.IdleTimeoutSeconds, derivedSec, floorSec)
+	productMS := math.Round(factor * float64(startupMS))
+	if productMS >= float64(maxDerivedIdleTimeoutSeconds)*1000 {
+		return maxDerivedIdleTimeoutSeconds
+	}
+	ms := int64(productMS)
+	return int((ms + 999) / 1000)
 }
 
 // effectiveIdleTimeout is effectiveIdleTimeoutSeconds for spec on mapping,

@@ -2769,8 +2769,8 @@ type RuntimeSpec struct {
 	Replicable bool
 	// MinInstances is how many instances are kept warm (0 = none) and
 	// MaxInstances caps how many may run (0 = unbounded; the agent's absolute
-	// per-spec index cap still applies). Both only mean something while
-	// Replicable. Operator-owned (migration 100).
+	// per-spec index cap, MaxInstanceIndex+1 instances, still applies). Both
+	// only mean something while Replicable. Operator-owned (migration 100).
 	MinInstances int
 	MaxInstances int
 	// InstanceParallelism is how many requests one instance serves at once
@@ -2853,6 +2853,13 @@ type RuntimeSpec struct {
 	CreatedAt                   time.Time
 	UpdatedAt                   time.Time
 }
+
+// MaxInstanceIndex is the highest instance index k an instance address
+// (`<app model name>#k`) can carry, so a replicable spec has at most
+// MaxInstanceIndex+1 instances, 0 to MaxInstanceIndex. It is a wire constant
+// shared with the agent (server-agent/internal/runtime.MaxInstanceIndex), which
+// this module cannot import, so both spell it.
+const MaxInstanceIndex = 63
 
 // RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec
 // (agent_runtime_spec_gpus, migration 65), keyed by (SpecID, GPUIndex).
