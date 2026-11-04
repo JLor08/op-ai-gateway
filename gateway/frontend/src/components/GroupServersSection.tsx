@@ -7,6 +7,7 @@ import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
+import { audioMetricColumns } from './shared/audioMetrics';
 import { makeVisionColumn } from './shared/visionColumn';
 
 /**
@@ -131,6 +132,9 @@ export function GroupServersSection({
       render: (r) => (r.context_size > 0 ? String(r.context_size) : '-'),
       defaultHidden: true,
     },
+    // #340: the audio metrics, offered while a member serves audio, and
+    // hidden by default like every other metric column of the group view.
+    ...audioMetricColumns(t, rows, { defaultHidden: true }),
     {
       id: 'maxConc',
       label: t.mappingMaxConcurrency,

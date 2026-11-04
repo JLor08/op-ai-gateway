@@ -20,7 +20,7 @@ afterEach(cleanup);
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
 
-  function renderLogView() {
+  function renderLogView(allInstances?: boolean) {
     let pushBatch: (batch: RuntimeLogBatch) => void = () => {};
     let pushState: (state: RuntimeLogState) => void = () => {};
     let unsubscribes = 0;
@@ -53,6 +53,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         serverId="srv-1"
         specId="spec-a"
         title="qwen-coder"
+        allInstances={allInstances}
       />,
     );
     return {
@@ -66,6 +67,18 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   }
 
   describe(`RuntimeLogView [${locale}]`, () => {
+    // #340: a replicable spec's instances share its log buffer, instance k's
+    // lines prefixed [#k]; the view says so for such a spec only.
+    it('names the [#k] prefix of a replicable spec, and nothing of instances otherwise', () => {
+      renderLogView(true);
+      expect(screen.getByText(t.runtimeLogsAllInstances)).toBeInTheDocument();
+      cleanup();
+
+      renderLogView();
+      expect(screen.getByText(t.runtimeLogsIntro)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeLogsAllInstances)).not.toBeInTheDocument();
+    });
+
     it('subscribes on open and unsubscribes on unmount -- the subscription IS the stream request', () => {
       const h = renderLogView();
       expect(h.subscribedSpecIds).toEqual(['spec-a']);

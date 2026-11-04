@@ -14,6 +14,11 @@ import {
   vramWarningLabelKey,
   vramWarnings,
 } from './components/shared/vram';
+import {
+  AUDIO_CONCURRENCY_LIMITS,
+  formatAudioRate,
+  type AudioConcurrencyLimit,
+} from './components/shared/audioMetrics';
 import type { MessageKey } from './components/shared/types';
 
 describe('activityNewRequests interpolation', () => {
@@ -1031,14 +1036,35 @@ describe('images-only and Load-refusal i18n keys', () => {
       expect(t[key].toLowerCase()).not.toContain(locale === 'de' ? 'sprache' : 'speech');
     });
 
+    // Since #340 speed, capacity and both measure an audio-only mapping's
+    // audio, so a wider scope is refused this way only for a vision run.
     it(`names the whole-scope case in the audio-only refusal (${locale})`, () => {
       const sentence =
         locale === 'de'
-          ? 'Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Audio bereitstellt.'
-          : 'An application or server run is refused this way when every model in it only serves audio.';
+          ? 'Eine Vision-Messung über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes ihrer Modelle nur Audio bereitstellt.'
+          : 'A vision run over an application or server is refused this way when every model in it only serves audio.';
       expect(t.errorBenchmarkAudioOnly.endsWith(` ${sentence}`), t.errorBenchmarkAudioOnly).toBe(
         true,
       );
+    });
+
+    // The refusal names only what an audio-only mapping still cannot do --
+    // the context size and the vision run, which send a chat prompt, and a
+    // Load the agent does not start -- and says that speed, capacity and both
+    // run, measuring its audio.
+    it(`names only the runs an audio-only mapping cannot do in its refusal (${locale})`, () => {
+      const text = t.errorBenchmarkAudioOnly;
+      if (locale === 'de') {
+        expect(text).not.toMatch(/Geschwindigkeit, Kapazität und Vision/);
+        expect(text).toMatch(/Geschwindigkeit, Kapazität und Beide messen seine Audio-Leistung/);
+        expect(text).toMatch(/Kontextgröße und die Vision-Messung/);
+        expect(text).toMatch(/„Laden“/);
+      } else {
+        expect(text).not.toMatch(/speed, capacity and vision/i);
+        expect(text).toMatch(/Speed, capacity and both measure its audio performance/);
+        expect(text).toMatch(/context size and the vision run/);
+        expect(text).toMatch(/"Load"/);
+      }
     });
 
     it(`labels the skipped audio-only result as a skip, distinct from the images one (${locale})`, () => {
@@ -4114,6 +4140,9 @@ describe('Voice Chat (#312) i18n keys', () => {
     'chatVoiceErrorCoLoad',
     'chatVoiceErrorAudioSettings',
     'chatVoiceErrorTicket',
+    'chatVoiceErrorNoRealtimeModel',
+    'chatVoiceErrorNoRealtimeAsr',
+    'chatVoiceErrorNoRealtimeTts',
     'chatVoiceErrorRefused',
     'chatVoiceErrorUnsupported',
     'chatVoiceErrorCapture',
@@ -4129,6 +4158,28 @@ describe('Voice Chat (#312) i18n keys', () => {
         expect(text.length).toBeGreaterThan(0);
       }
       expect(messages.de[key]).not.toBe(messages.en[key]);
+    }
+  });
+
+  // #340: voice_chat.no_realtime_model -- every model of a leg measured below the real time a
+  // conversation needs. The leg's sentence names the leg's model, the general one both, and every
+  // one says what is missing: real time.
+  it('words the real-time refusal per leg in de and en', () => {
+    const de = messages.de;
+    const en = messages.en;
+    expect(de.chatVoiceErrorNoRealtimeAsr).toMatch(/Transkriptionsmodell/);
+    expect(en.chatVoiceErrorNoRealtimeAsr).toMatch(/transcription model/);
+    expect(de.chatVoiceErrorNoRealtimeTts).toMatch(/Sprachmodell/);
+    expect(en.chatVoiceErrorNoRealtimeTts).toMatch(/speech model/);
+    expect(de.chatVoiceErrorNoRealtimeModel).toMatch(/Transkriptions- oder Sprachmodell/);
+    expect(en.chatVoiceErrorNoRealtimeModel).toMatch(/transcription or speech model/);
+    for (const key of [
+      'chatVoiceErrorNoRealtimeModel',
+      'chatVoiceErrorNoRealtimeAsr',
+      'chatVoiceErrorNoRealtimeTts',
+    ] as const) {
+      expect(de[key], key).toMatch(/Echtzeit/);
+      expect(en[key], key).toMatch(/real time/);
     }
   });
 
@@ -4209,5 +4260,339 @@ describe('the transcription Diarized toggle keys', () => {
     for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(messages[locale].chatTranscriptionDiarizeHint, locale).toMatch(/live/i);
     }
+  });
+});
+
+// The instance settings (#340): the launch-spec form's "Multiple instances" block, the live
+// status's per-instance column and the spec list's summary, the models catalog's count, and the
+// two refusals -- every key in both languages.
+describe('instance settings (#340) i18n keys', () => {
+  const stringKeys = [
+    'runtimeSpecReplicable',
+    'runtimeSpecReplicableHint',
+    'runtimeSpecMinInstances',
+    'runtimeSpecMaxInstances',
+    'runtimeSpecMaxInstancesUnlimited',
+    'runtimeSpecInstanceParallelism',
+    'runtimeSpecIdleTimeoutOverrideHint',
+    'runtimeStatusInstance',
+    'errorRuntimeSpecInstancesInvalid',
+    'errorRuntimeSpecInstancesNeedEphemeralPort',
+    'modelServersRunningInstances',
+  ] as const;
+
+  it('defines every string key in de and en, in different words', () => {
+    for (const key of stringKeys) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale][key].length, `${locale} ${key}`).toBeGreaterThan(0);
+      }
+      // "Instanz"/"Instance" differ by one letter only, so every key is compared.
+      expect(messages.de[key], key).not.toBe(messages.en[key]);
+    }
+  });
+
+  it('names the measured startup and the idle timeout in effect, or says nothing is measured', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const line = messages[locale].runtimeSpecAutoIdleTimeout(150, 30000);
+      expect(line, locale).toContain('150 s');
+      expect(line, locale).toContain('30 s');
+      expect(messages[locale].runtimeSpecAutoIdleTimeout(120, 0), locale).toContain('120 s');
+    }
+    // 0 is "nothing measured yet", never a startup of zero seconds.
+    expect(messages.de.runtimeSpecAutoIdleTimeout(120, 0)).toMatch(/noch nicht gemessen/);
+    expect(messages.en.runtimeSpecAutoIdleTimeout(120, 0)).toMatch(/not measured yet/);
+    // A fraction of a second is kept, in each language's own decimal mark.
+    expect(messages.de.runtimeSpecAutoIdleTimeout(150, 12500)).toContain('12,5 s');
+    expect(messages.en.runtimeSpecAutoIdleTimeout(150, 12500)).toContain('12.5 s');
+  });
+
+  // 0 in effect: the agent keeps the model loaded (an agent without instance
+  // support keeps the manual 0), never an unload after zero seconds.
+  it('names an idle timeout in effect of 0 as never unloaded', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const never = messages[locale].runtimeSpecIdleTimeoutNever;
+      expect(never.length, locale).toBeGreaterThan(0);
+      const line = messages[locale].runtimeSpecAutoIdleTimeout(0, 30000);
+      expect(line, locale).toContain(never);
+      expect(line, locale).not.toMatch(/: 0 s/);
+      expect(line, locale).toContain('30 s');
+    }
+    expect(messages.de.runtimeSpecIdleTimeoutNever).toBe('nie entladen');
+    expect(messages.en.runtimeSpecIdleTimeoutNever).toBe('never unloaded');
+  });
+
+  // Shown as soon as "Multiple instances" is ticked: the startup is measured
+  // for every spec, unlike the idle timeout in effect.
+  it('names the measured startup on its own, or says nothing is measured yet', () => {
+    expect(messages.de.runtimeSpecMeasuredStartup(12500)).toBe('Gemessene Startzeit: 12,5 s');
+    expect(messages.en.runtimeSpecMeasuredStartup(12500)).toBe('Measured startup: 12.5 s');
+    expect(messages.de.runtimeSpecMeasuredStartup(0)).toBe('Startzeit noch nicht gemessen');
+    expect(messages.en.runtimeSpecMeasuredStartup(0)).toBe('Startup not measured yet');
+    // The combined line starts with the same words.
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].runtimeSpecAutoIdleTimeout(150, 12500), locale).toMatch(
+        new RegExp(`^${messages[locale].runtimeSpecMeasuredStartup(12500)} · `),
+      );
+    }
+  });
+
+  it('sums up running instances with the bounds, an unset maximum as unlimited', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const unlimited = messages[locale].runtimeInstancesSummary(2, 1, null);
+      expect(unlimited, locale).toMatch(/^2 /);
+      expect(unlimited, locale).toContain('min 1');
+      expect(unlimited, locale).toContain('max ∞');
+      expect(messages[locale].runtimeInstancesSummary(2, 1, 3), locale).toContain('max 3');
+    }
+    expect(messages.de.runtimeInstancesSummary(1, 0, null)).toBe('1 läuft · min 0 · max ∞');
+    expect(messages.de.runtimeInstancesSummary(2, 1, null)).toBe('2 laufen · min 1 · max ∞');
+    expect(messages.en.runtimeInstancesSummary(2, 1, null)).toBe('2 running · min 1 · max ∞');
+  });
+
+  it('says in the idle-timeout hint what 0 means once a spec runs several instances', () => {
+    expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = keine manuelle Vorgabe/);
+    expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = no manual override/);
+    // ...only on an agent that runs instances; one without keeps 0 as "never".
+    expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/Agenten mit Instanz/);
+    expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/nie entladen/);
+    expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/agent with instance support/);
+    expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/never unloaded/);
+  });
+
+  // One message for every refusal of the instance fields, so it names each rule.
+  it('names every instance-settings rule in the refusal', () => {
+    expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ganze Zahlen von 0 bis 64/);
+    expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ab 1/);
+    expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/whole numbers from 0 to 64/);
+    expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/at least 1/);
+  });
+
+  it("names the log view's [#k] prefix of instance k's lines", () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].runtimeLogsAllInstances, locale).toContain('[#k]');
+    }
+    expect(messages.de.runtimeLogsAllInstances).not.toBe(messages.en.runtimeLogsAllInstances);
+  });
+
+  it('says the maximum field left empty means unlimited', () => {
+    expect(messages.de.runtimeSpecMaxInstancesUnlimited).toMatch(/Leer = unbegrenzt/);
+    expect(messages.en.runtimeSpecMaxInstancesUnlimited).toMatch(/Empty = unlimited/);
+  });
+});
+
+// The audio performance metrics (#340): the benchmark panel's result lines and
+// history, the models catalog's three columns, the mapping editor's four
+// fields, the runtime spec's warning and the editor's refusal -- every key in
+// both languages.
+describe('audio metrics (#340) i18n keys', () => {
+  const stringKeys = [
+    'modelServersAudioRate',
+    'modelServersAudioTtft',
+    'modelServersAudioConcurrency',
+    'mappingAudioMetricsSection',
+    'mappingAudioMetricsHint',
+    'mappingAudioRateX',
+    'mappingAudioTtfaMs',
+    'mappingAudioRealtimeConcurrency',
+    'mappingAudioConcurrencyLimit',
+    'mappingAudioConcurrencyLimitUnknown',
+    'mappingAudioConcurrencyLimitPerformance',
+    'mappingAudioConcurrencyLimitResources',
+    'mappingAudioConcurrencyLimitCap',
+    'benchmarkAudioRuns',
+    'benchmarkAudioCapacityRuns',
+    'benchmarkAudioColSlowest',
+    'benchmarkAudioColMean',
+    'benchmarkAudioColWall',
+    'benchmarkAudioColRtf',
+    'runtimeSpecMinExceedsRealtime',
+    'errorMappingMetricInvalid',
+  ] as const;
+
+  it('defines every string key in de and en, in different words', () => {
+    for (const key of stringKeys) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale][key].length, `${locale} ${key}`).toBeGreaterThan(0);
+      }
+      expect(messages.de[key], key).not.toBe(messages.en[key]);
+    }
+  });
+
+  it('names the single-stream rate as a multiple of real time and the first output in ms', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const line = messages[locale].benchmarkAudioResult(3, 250);
+      expect(line, locale).toContain('3.0×');
+      expect(line, locale).toContain('250 ms');
+      // An unmeasured first output is left out, never shown as 0 ms.
+      expect(messages[locale].benchmarkAudioResult(3, 0), locale).not.toContain('0 ms');
+    }
+    expect(messages.de.benchmarkAudioResult(3, 250)).toBe(
+      '3.0× Echtzeit, erste Ausgabe nach 250 ms',
+    );
+    expect(messages.en.benchmarkAudioResult(3, 250)).toBe(
+      '3.0× real time, first output after 250 ms',
+    );
+  });
+
+  // The result line writes the rate the way every cell does: one formatter,
+  // so a rate below the 1.2× gate never reads as 1.2× in either place.
+  it.each([1.15, 1.199, 1.2, 3, 12.34])(
+    'writes the rate %s in the result line as the cells do',
+    (rate) => {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale].benchmarkAudioResult(rate, 0), locale).toMatch(
+          new RegExp(`^${formatAudioRate(rate).replace('.', '\\.')} `),
+        );
+      }
+    },
+  );
+
+  it('names the load time of an audio run', () => {
+    expect(messages.de.benchmarkAudioLoadTime(5000)).toBe('Ladezeit 5000 ms');
+    expect(messages.en.benchmarkAudioLoadTime(5000)).toBe('load time 5000 ms');
+  });
+
+  // Only a ramp stopped by performance measured a ceiling; resources and the
+  // cap end it early, so the count is a lower bound.
+  it('shows the real-time concurrency as a count, a lower bound or not real-time', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const figure = messages[locale].audioRealtimeConcurrency;
+      expect(figure(2, 'performance'), locale).toBe('2');
+      expect(figure(2, 'resources'), locale).toBe('≥ 2');
+      expect(figure(3, 'cap'), locale).toBe('≥ 3');
+      expect(figure(0, 'performance'), locale).not.toMatch(/^0$|≥/);
+    }
+    expect(messages.de.audioRealtimeConcurrency(0, 'performance')).toBe('nicht echtzeitfähig');
+    expect(messages.en.audioRealtimeConcurrency(0, 'performance')).toBe('not real-time');
+  });
+
+  // Without one of the three limits no ramp result stands behind the count:
+  // the figure and the result line say "unknown", never a lower bound and
+  // never the cap. That holds for a limit this build does not know, too.
+  it('names a real-time concurrency without a known limit unknown, never a lower bound', () => {
+    const newer = 'thermal' as string as AudioConcurrencyLimit;
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const unknown = locale === 'de' ? 'unbekannt' : 'unknown';
+      for (const limit of ['', newer] as const) {
+        expect(t.audioRealtimeConcurrency(2, limit), `${locale} ${limit}`).toBe(unknown);
+        const line = t.benchmarkAudioCapacityResult(2, limit);
+        expect(line, `${locale} ${limit}`).toBe(`${t.modelServersAudioConcurrency}: ${unknown}`);
+        expect(line, `${locale} ${limit}`).not.toContain('≥');
+        expect(line, `${locale} ${limit}`).not.toContain(t.mappingAudioConcurrencyLimitCap);
+      }
+    }
+  });
+
+  // The limit is typed as the closed set the gateway writes plus '': a raw
+  // string from the wire has to be read through it first.
+  it('takes the limit only as one of the three or unknown', () => {
+    const raw: string = 'resources';
+    // @ts-expect-error a raw string is no limit
+    expect(messages.en.audioRealtimeConcurrency(2, raw)).toBe('≥ 2');
+    // @ts-expect-error a raw string is no limit
+    expect(messages.en.benchmarkAudioCapacityResult(2, raw)).toContain('≥ 2');
+    // @ts-expect-error a raw string is no limit
+    expect(messages.en.mappingAudioRealtimeConcurrencyRequired(raw)).toContain('≥ 0');
+  });
+
+  // The count's help texts say what a 0 is under the limit beside it: with
+  // performance a measured "not real-time", even one stream alone; with
+  // resources or the cap a lower bound, "≥ 0".
+  it('says per limit what a count of 0 means', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const notRealtime = t.audioRealtimeConcurrency(0, 'performance');
+      const performance = t.mappingAudioRealtimeConcurrencyRequired('performance');
+      expect(performance, locale).toContain(notRealtime);
+      expect(performance, locale).toMatch(locale === 'de' ? /einzelner Strom/ : /one stream alone/);
+      expect(performance, locale).not.toContain('≥');
+      for (const limit of ['resources', 'cap'] as const) {
+        const text = t.mappingAudioRealtimeConcurrencyRequired(limit);
+        expect(text, `${locale} ${limit}`).toContain(t.audioRealtimeConcurrency(0, limit));
+        expect(text, `${locale} ${limit}`).toContain('≥ 0');
+        expect(text, `${locale} ${limit}`).not.toContain(notRealtime);
+      }
+      const none = t.mappingAudioRealtimeConcurrencyRequired('');
+      expect(none, locale).not.toContain(notRealtime);
+      expect(none, locale).not.toContain('≥');
+      expect(t.mappingAudioMetricsHint, locale).toContain(notRealtime);
+      expect(t.mappingAudioMetricsHint, locale).toContain(
+        t.audioRealtimeConcurrency(0, 'resources'),
+      );
+    }
+  });
+
+  it('names the figure and why the ramp stopped in the capacity result line', () => {
+    const limitKeys = {
+      performance: 'mappingAudioConcurrencyLimitPerformance',
+      resources: 'mappingAudioConcurrencyLimitResources',
+      cap: 'mappingAudioConcurrencyLimitCap',
+    } as const;
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      for (const limit of AUDIO_CONCURRENCY_LIMITS) {
+        const key = limitKeys[limit];
+        const line = t.benchmarkAudioCapacityResult(2, limit);
+        expect(line, `${locale} ${limit}`).toContain(t.audioRealtimeConcurrency(2, limit));
+        expect(line, `${locale} ${limit}`).toContain(t[key]);
+        expect(line, `${locale} ${limit}`).toContain(t.modelServersAudioConcurrency);
+      }
+    }
+    expect(messages.en.benchmarkAudioCapacityResult(2, 'resources')).toBe(
+      `Real-time concurrency: ≥ 2 – ${messages.en.mappingAudioConcurrencyLimitResources}`,
+    );
+  });
+
+  // A lower bound is said in words where the limit is chosen, too.
+  it('says which limits make the count a lower bound', () => {
+    for (const key of [
+      'mappingAudioConcurrencyLimitResources',
+      'mappingAudioConcurrencyLimitCap',
+    ] as const) {
+      expect(messages.de[key], key).toMatch(/Untergrenze/);
+      expect(messages.en[key], key).toMatch(/lower bound/);
+    }
+    expect(messages.de.mappingAudioConcurrencyLimitPerformance).toMatch(/gemessene Obergrenze/);
+    expect(messages.en.mappingAudioConcurrencyLimitPerformance).toMatch(/measured ceiling/);
+  });
+
+  // Beside a limit a count of 0 is a result, never "unknown": the hint says
+  // so, and the count is asked for whenever a limit is chosen.
+  it('does not call a real-time concurrency of 0 unknown', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      expect(t.mappingAudioMetricsHint, locale).not.toMatch(/0 = (unbekannt|unknown)/i);
+      expect(t.mappingAudioMetricsHint, locale).toContain(
+        t.audioRealtimeConcurrency(0, 'performance'),
+      );
+      expect(t.mappingAudioRealtimeConcurrencyRequired('performance'), locale).toContain(
+        t.audioRealtimeConcurrency(0, 'performance'),
+      );
+    }
+  });
+
+  // The warning never refuses: the setting stays saved.
+  it('warns of a minimum above the measured real-time concurrency without refusing it', () => {
+    expect(messages.de.runtimeSpecMinExceedsRealtime).toMatch(/Mindestanzahl/);
+    expect(messages.de.runtimeSpecMinExceedsRealtime).toMatch(/Echtzeit-Parallelität/);
+    expect(messages.en.runtimeSpecMinExceedsRealtime).toMatch(/minimum/);
+    expect(messages.en.runtimeSpecMinExceedsRealtime).toMatch(/real-time concurrency/);
+  });
+
+  // An audio-only mapping runs speed, capacity and both as audio measurements;
+  // only vision still sends it a chat prompt.
+  it('says in the audio-only hint that only vision is disabled', () => {
+    expect(messages.de.benchmarkAudioOnlyHint).toMatch(/Vision/);
+    expect(messages.de.benchmarkAudioOnlyHint).not.toMatch(/Kapazität, Beide und Vision/);
+    expect(messages.en.benchmarkAudioOnlyHint).toMatch(/vision/i);
+    expect(messages.en.benchmarkAudioOnlyHint).not.toMatch(/both and vision/i);
+  });
+
+  // A replicable spec's log view shows every instance's output; the intro
+  // above it must not speak of one process only.
+  it('names the instances in the log view intro', () => {
+    expect(messages.de.runtimeLogsIntro).toMatch(/mehreren Instanzen/);
+    expect(messages.en.runtimeLogsIntro).toMatch(/several instances/);
   });
 });

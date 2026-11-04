@@ -126,6 +126,10 @@ describe('runtimeApi runtime spec role', () => {
       visible_devices_mode: 'env',
       gpus: [],
       ram_estimate_mb: 0,
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
       api_token_mode: 'app',
       api_token_header_source: 'app',
       api_token_header: '',
@@ -139,5 +143,152 @@ describe('runtimeApi runtime spec role', () => {
       role: 'asr',
     };
     expect(body).toBeDefined();
+  });
+});
+
+// The instance settings (#340): four operator-owned fields the PUT carries like
+// every other field of the full document, and two read-only figures beside
+// them -- the agent's measured startup and the idle timeout the gateway pushes
+// for the stored spec -- that only a GET carries.
+describe('runtimeApi runtime spec instance settings', () => {
+  it('reads the four settings and the two read-only figures off a GET', async () => {
+    const spec = {
+      configured: true,
+      mapping_id: 'map_1',
+      replicable: true,
+      min_instances: 1,
+      max_instances: 0,
+      instance_parallelism: 2,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    } as RuntimeSpec;
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(spec));
+    const api = createPortalApi(fetcher);
+
+    const got = await api.runtimeSpec('map_1');
+
+    expect(got).toMatchObject({
+      replicable: true,
+      min_instances: 1,
+      max_instances: 0,
+      instance_parallelism: 2,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+  });
+
+  it('PUTs the four settings verbatim, an unlimited maximum as 0', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ configured: true }));
+    const api = createPortalApi(fetcher);
+    const body: Parameters<ReturnType<typeof createPortalApi>['putRuntimeSpec']>[1] = {
+      enabled: true,
+      binary: 'x',
+      args: [],
+      env: {},
+      work_dir: '',
+      listen_port: 0,
+      health_path: '',
+      health_timeout_seconds: 0,
+      startup_timeout_seconds: 0,
+      idle_timeout_seconds: 0,
+      admission_wait_timeout_seconds: 0,
+      pinned: false,
+      admin_state: '',
+      set_visible_devices: false,
+      visible_devices_mode: 'env',
+      gpus: [],
+      ram_estimate_mb: 0,
+      replicable: true,
+      min_instances: 1,
+      max_instances: 0,
+      instance_parallelism: 2,
+      api_token_mode: 'app',
+      api_token_header_source: 'app',
+      api_token_header: '',
+      api_flavors: [],
+      responses_mode: 'passthrough',
+      messages_mode: 'passthrough',
+      type: '',
+      metrics_path: '',
+      context_probe_path: '',
+    };
+
+    await api.putRuntimeSpec('map_1', body);
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toMatchObject({
+      replicable: true,
+      min_instances: 1,
+      max_instances: 0,
+      instance_parallelism: 2,
+    });
+  });
+
+  it('keeps the read-only figures and the real-time warning out of the PUT request shape', () => {
+    // Compile-time: each is an excess-property error on the request.
+    const base: Parameters<ReturnType<typeof createPortalApi>['putRuntimeSpec']>[1] = {
+      enabled: true,
+      binary: 'x',
+      args: [],
+      env: {},
+      work_dir: '',
+      listen_port: 0,
+      health_path: '',
+      health_timeout_seconds: 0,
+      startup_timeout_seconds: 0,
+      idle_timeout_seconds: 0,
+      admission_wait_timeout_seconds: 0,
+      pinned: false,
+      admin_state: '',
+      set_visible_devices: false,
+      visible_devices_mode: 'env',
+      gpus: [],
+      ram_estimate_mb: 0,
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
+      api_token_mode: 'app',
+      api_token_header_source: 'app',
+      api_token_header: '',
+      api_flavors: [],
+      responses_mode: 'passthrough',
+      messages_mode: 'passthrough',
+      type: '',
+      metrics_path: '',
+      context_probe_path: '',
+    };
+    const withStartup: typeof base = {
+      ...base,
+      // @ts-expect-error startup_measured_ms is agent-owned, not part of the request
+      startup_measured_ms: 30000,
+    };
+    const withEffective: typeof base = {
+      ...base,
+      // @ts-expect-error effective_idle_timeout_seconds is derived, not part of the request
+      effective_idle_timeout_seconds: 150,
+    };
+    const withRealtimeWarning: typeof base = {
+      ...base,
+      // @ts-expect-error instances_min_exceeds_realtime is derived, not part of the request
+      instances_min_exceeds_realtime: true,
+    };
+    expect(withStartup).toBeDefined();
+    expect(withEffective).toBeDefined();
+    expect(withRealtimeWarning).toBeDefined();
+  });
+});
+
+// The two refusals of the instance settings: a min above the max (or a count
+// above the agent's cap of 64), and several instances on one fixed port. Each
+// renders its own localized label, never the server's English text.
+describe('runtime_spec instance-settings refusals', () => {
+  it.each([
+    ['runtime_spec.instances_invalid', 'errorRuntimeSpecInstancesInvalid'],
+    ['runtime_spec.instances_need_ephemeral_port', 'errorRuntimeSpecInstancesNeedEphemeralPort'],
+  ] as const)('maps %s to %s, in both locales', (code, key) => {
+    const err = new PortalApiError(400, code, 'raw server text');
+    expect(formatPortalError(err, messages.de)).toBe(`${code}: ${messages.de[key]}`);
+    expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
+    expect(messages.de[key]).not.toBe(messages.en[key]);
   });
 });

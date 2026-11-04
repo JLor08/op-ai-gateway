@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import { formatRateX, isAudioConcurrencyLimit, type AudioConcurrencyLimit } from './audioFigures';
+
 export type Locale = 'de' | 'en';
 
 type PortalMessageValue =
@@ -9,7 +11,121 @@ type PortalMessageValue =
   | ((a: string, b: string) => string)
   | ((a: string, b: number) => string)
   | ((a: number) => string)
-  | ((a: number, b: number) => string);
+  | ((a: number, b: number) => string)
+  | ((a: number, b: string) => string)
+  | ((a: AudioConcurrencyLimit | '') => string)
+  | ((a: number, b: AudioConcurrencyLimit | '') => string)
+  | ((a: number, b: number, c: number | null) => string);
+
+// A measured startup in ms as the launch-spec form names it (#340), shared by
+// runtimeSpecMeasuredStartup and the start of runtimeSpecAutoIdleTimeout. 0 is
+// "nothing measured yet", never a startup of zero seconds.
+function measuredStartupDe(startupMs: number): string {
+  return startupMs > 0
+    ? `Gemessene Startzeit: ${(startupMs / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1, useGrouping: false })} s`
+    : 'Startzeit noch nicht gemessen';
+}
+
+function measuredStartupEn(startupMs: number): string {
+  return startupMs > 0
+    ? `Measured startup: ${(startupMs / 1000).toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })} s`
+    : 'Startup not measured yet';
+}
+
+// The real-time concurrency an audio ramp measured (#340), as a figure, in
+// every language: only a ramp stopped by performance measured a ceiling (0:
+// not even one stream kept up with real time); one stopped by resources or by
+// its cap ended before the model ran out of speed, so its count is a lower
+// bound. Without one of the three limits ('' -- or one this build does not
+// know) no ramp result stands behind the count: it is unknown, never a lower
+// bound. (A cell of the models catalog shows that as a dash.)
+function audioConcurrencyFigure(
+  k: number,
+  limit: AudioConcurrencyLimit | '',
+  words: { notRealtime: string; unknown: string },
+): string {
+  switch (limit) {
+    case 'performance':
+      return k > 0 ? String(k) : words.notRealtime;
+    case 'resources':
+    case 'cap':
+      return `≥ ${k}`;
+    default:
+      return words.unknown;
+  }
+}
+
+function audioFigureDe(k: number, limit: AudioConcurrencyLimit | ''): string {
+  return audioConcurrencyFigure(k, limit, {
+    notRealtime: 'nicht echtzeitfähig',
+    unknown: 'unbekannt',
+  });
+}
+
+function audioFigureEn(k: number, limit: AudioConcurrencyLimit | ''): string {
+  return audioConcurrencyFigure(k, limit, { notRealtime: 'not real-time', unknown: 'unknown' });
+}
+
+// Why an audio ramp stopped, named once per language for the mapping editor's
+// choice and the benchmark result line; '' (or a limit this build does not
+// know) is unknown.
+function audioLimitDe(limit: AudioConcurrencyLimit | ''): string {
+  switch (limit) {
+    case 'performance':
+      return 'Leistung (gemessene Obergrenze)';
+    case 'resources':
+      return 'Ressourcen (Untergrenze: kein Platz für eine weitere Instanz)';
+    case 'cap':
+      return 'Höchstzahl erreicht (Untergrenze: Instanz- oder Messobergrenze)';
+    default:
+      return 'Unbekannt';
+  }
+}
+
+function audioLimitEn(limit: AudioConcurrencyLimit | ''): string {
+  switch (limit) {
+    case 'performance':
+      return 'Performance (a measured ceiling)';
+    case 'resources':
+      return 'Resources (a lower bound: no room for another instance)';
+    case 'cap':
+      return 'Cap reached (a lower bound: the instance or ramp maximum)';
+    default:
+      return 'Unknown';
+  }
+}
+
+// What the count beside a limit is, said where the mapping editor asks for
+// it: with performance a measured ceiling, whose 0 is "not real-time" even
+// for one stream alone; with resources or the cap a lower bound, whose 0
+// reads "≥ 0". Without a limit no count is saved at all.
+function audioCountRequiredDe(limit: AudioConcurrencyLimit | ''): string {
+  const what =
+    'Gehört zur gewählten Begrenzung: die letzte Stufe, die mit der Echtzeit Schritt hielt, als ganze Zahl ab 0.';
+  switch (limit) {
+    case 'performance':
+      return `${what} Bei „Leistung“ ist sie eine gemessene Obergrenze: 0 = ${audioFigureDe(0, limit)}, schon ein einzelner Strom ist zu langsam.`;
+    case 'resources':
+    case 'cap':
+      return `${what} Mit dieser Begrenzung ist sie eine Untergrenze, denn die Messung endete, bevor das Modell zu langsam wurde: 0 heißt „${audioFigureDe(0, limit)}“.`;
+    default:
+      return 'Ohne Begrenzung wird keine Echtzeit-Parallelität gespeichert: Wählen Sie zuerst, wodurch die Messung begrenzt war.';
+  }
+}
+
+function audioCountRequiredEn(limit: AudioConcurrencyLimit | ''): string {
+  const what =
+    'Required with the chosen limit: the last level that kept up with real time, a whole number of 0 or more.';
+  switch (limit) {
+    case 'performance':
+      return `${what} With Performance it is a measured ceiling: 0 = ${audioFigureEn(0, limit)}, even one stream alone is too slow.`;
+    case 'resources':
+    case 'cap':
+      return `${what} With this limit it is a lower bound, since the measurement ended before the model ran out of speed: 0 reads "${audioFigureEn(0, limit)}".`;
+    default:
+      return 'Without a limit no real-time concurrency is saved: first choose what limited the measurement.';
+  }
+}
 
 const de = {
   dashboard: 'Dashboard',
@@ -483,6 +599,14 @@ const de = {
     'Die zu diesem Chat gespeicherten Spracheinstellungen sind ungültig oder zu umfangreich. Nutzen Sie den Sprachchat in einem neuen Chat.',
   chatVoiceErrorTicket:
     'Der Sprachchat konnte nicht gestartet werden. Versuchen Sie es in einem Moment erneut.',
+  // #340: voice_chat.no_realtime_model -- every model of a leg was measured slower than the real
+  // time a conversation needs. The leg's own sentence when the gateway names the leg.
+  chatVoiceErrorNoRealtimeModel:
+    'Für den Sprachchat ist kein Modell schnell genug: Das Transkriptions- oder Sprachmodell hält laut Messung auf keinem Server mit der Echtzeit Schritt, die ein Gespräch braucht. Wählen Sie ein schnelleres Modell oder wenden Sie sich an Ihren Administrator.',
+  chatVoiceErrorNoRealtimeAsr:
+    'Das Transkriptionsmodell ist für den Sprachchat zu langsam: Es hält laut Messung auf keinem Server mit der Echtzeit Schritt, die ein Gespräch braucht. Wählen Sie ein schnelleres Transkriptionsmodell oder wenden Sie sich an Ihren Administrator.',
+  chatVoiceErrorNoRealtimeTts:
+    'Das Sprachmodell ist für den Sprachchat zu langsam: Es hält laut Messung auf keinem Server mit der Echtzeit Schritt, die ein Gespräch braucht. Wählen Sie ein schnelleres Sprachmodell oder wenden Sie sich an Ihren Administrator.',
   chatVoiceErrorRefused: 'Das Gateway hat den Sprachchat abgelehnt.',
   chatVoiceErrorUnsupported:
     'Der Sprachchat ist in diesem Browser nicht verfügbar: Er braucht einen aktuellen Browser, Zugriff auf das Mikrofon und eine sichere Verbindung (HTTPS).',
@@ -1066,6 +1190,20 @@ const de = {
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
   mappingGenTpsAtCapacity: 'Tokens/s (max. Kapazität)',
+  // #340: die Audio-Metriken, neben den Text-Metriken und unter derselben Sperre.
+  mappingAudioMetricsSection: 'Audio-Metriken',
+  mappingAudioMetricsHint:
+    'Optional. Bei × Echtzeit und der Zeit bis zur ersten Ausgabe heißt leer oder 0 „nicht gemessen“. Die Audio-Messung (Geschwindigkeit, Kapazität, Beide) füllt diese Werte, sofern die Metriken nicht gesperrt sind. Die Echtzeit-Parallelität gilt nur zusammen mit ihrer Begrenzung und gehört dann dazu: Bei „Leistung“ ist sie eine gemessene Obergrenze, und 0 heißt „nicht echtzeitfähig“ (schon ein einzelner Strom ist zu langsam); bei „Ressourcen“ und „Höchstzahl erreicht“ ist sie eine Untergrenze, und 0 heißt „≥ 0“. „Unbekannt“ löscht beide.',
+  mappingAudioRateX: '× Echtzeit (ein Strom)',
+  mappingAudioTtfaMs: 'Zeit bis zur ersten Ausgabe (ms)',
+  mappingAudioRealtimeConcurrency: 'Echtzeit-Parallelität',
+  mappingAudioRealtimeConcurrencyRequired: (limit: AudioConcurrencyLimit | '') =>
+    audioCountRequiredDe(limit),
+  mappingAudioConcurrencyLimit: 'Begrenzt durch',
+  mappingAudioConcurrencyLimitUnknown: audioLimitDe(''),
+  mappingAudioConcurrencyLimitPerformance: audioLimitDe('performance'),
+  mappingAudioConcurrencyLimitResources: audioLimitDe('resources'),
+  mappingAudioConcurrencyLimitCap: audioLimitDe('cap'),
   mappingProbeContext: 'Kontextgröße ermitteln',
   mappingProbeContextRunning: 'Wird ermittelt…',
   mappingProbeContextFailed: 'Kontextgröße konnte nicht ermittelt werden',
@@ -1112,6 +1250,32 @@ const de = {
   runtimeSpecStartupTimeout: 'Start-Timeout (s)',
   runtimeSpecPinned: 'Angeheftet (nie beenden)',
   runtimeSpecEnabled: 'Aktiviert',
+  // #340: several instances (processes) of one spec on its server.
+  runtimeSpecReplicable: 'Mehrere Instanzen',
+  runtimeSpecReplicableHint:
+    'Sind alle laufenden Instanzen ausgelastet, startet der Agent eine weitere – nur in freie Ressourcen, ohne ein anderes Modell zu verdrängen. Jede Instanz lauscht auf ihrem eigenen Port, daher muss der Listen-Port 0 sein. „Angeheftet“ hält Instanz 0 am Laufen.',
+  runtimeSpecMinInstances: 'Mindestanzahl Instanzen',
+  runtimeSpecMaxInstances: 'Höchstanzahl Instanzen',
+  runtimeSpecMaxInstancesUnlimited:
+    'Leer = unbegrenzt: Instanzen kommen hinzu, solange freie Ressourcen und das Prozesslimit des Servers es erlauben.',
+  runtimeSpecInstanceParallelism: 'Parallele Anfragen pro Instanz',
+  // A warning, never a refusal: the minimum stays as saved.
+  runtimeSpecMinExceedsRealtime:
+    'Die Mindestanzahl liegt über der für dieses Modell gemessenen Echtzeit-Parallelität: Sind so viele Instanzen gleichzeitig ausgelastet, hält mindestens eine nicht mehr mit der Echtzeit Schritt. Das ist nur ein Hinweis – die Einstellung bleibt gültig.',
+  // The measured startup (measured for every spec), shown on its own while
+  // the box is ticked on a spec not STORED with instances.
+  runtimeSpecMeasuredStartup: (startupMs: number) => measuredStartupDe(startupMs),
+  // The measured startup and the idle timeout the gateway actually pushes to
+  // the agent for the STORED spec: the larger of the manual value and the one
+  // derived from the startup, so it is named as the one in effect. 0 in effect
+  // is "never unloaded" (an agent without instance support keeps the manual 0).
+  runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
+    `${measuredStartupDe(startupMs)} · wirksamer Leerlauf-Timeout: ${
+      seconds > 0 ? `${seconds} s` : 'keiner – nie entladen'
+    }`,
+  runtimeSpecIdleTimeoutNever: 'nie entladen',
+  runtimeSpecIdleTimeoutOverrideHint:
+    'Bei mehreren Instanzen auf einem Agenten mit Instanzunterstützung: 0 = keine manuelle Vorgabe – der Gateway leitet den Leerlauf-Timeout aus der gemessenen Startzeit ab. Ein Wert hier gilt, sobald er über dem automatischen liegt. Ein Agent ohne Instanzunterstützung behält 0 als „nie entladen“.',
   // The role-grouped co-residency editor.
   runtimeCoresidency: 'Koresidenz',
   runtimeCoresidencyHint:
@@ -1415,6 +1579,9 @@ const de = {
     'Live-Datenstrom unterbrochen — diese Anzeige kann veraltet sein. Es ist nicht bekannt, welche Prozesse gerade laufen.',
   runtimeStatusEmpty: 'Der Agent meldet aktuell keinen verwalteten Modellprozess.',
   runtimeStatusSince: 'Seit',
+  runtimeStatusInstance: 'Instanz',
+  runtimeInstancesSummary: (running: number, min: number, max: number | null) =>
+    `${running} ${running === 1 ? 'läuft' : 'laufen'} · min ${min} · max ${max ?? '∞'}`,
   runtimeStatusPid: 'PID',
   runtimeStatusPort: 'Port',
   runtimeStatusInFlight: 'Laufende Anfragen',
@@ -1501,11 +1668,14 @@ const de = {
   // Frage, die der Betreiber hier beantworten will.
   runtimeLogs: 'Protokoll',
   runtimeLogsTitle: 'Prozessausgabe',
+  // #340: every instance of a spec writes into its one log buffer.
+  runtimeLogsAllInstances:
+    'Zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Zeilen von Instanz k ≥ 1 beginnen mit [#k], die von Instanz 0 haben kein Präfix.',
   runtimeLogsIntro:
-    'Standardausgabe und Standardfehlerausgabe dieses Modellprozesses, so wie er sie geschrieben hat. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
+    'Standardausgabe und Standardfehlerausgabe des Modellprozesses – bei mehreren Instanzen die jeder Instanz –, so wie sie geschrieben wurden. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
   runtimeLogsWaiting: 'Verbindung wird aufgebaut…',
   runtimeLogsEmptyBuffer:
-    'Der Agent hat für diesen Prozess nichts vorgehalten. Das ist keine Aussage darüber, ob der Prozess etwas ausgegeben hat: Der Puffer liegt ausschließlich im Arbeitsspeicher des Agenten und geht bei einem Neustart des Agenten verloren.',
+    'Der Agent hat für dieses Modell nichts vorgehalten. Das ist keine Aussage darüber, ob der Prozess etwas ausgegeben hat: Der Puffer liegt ausschließlich im Arbeitsspeicher des Agenten und geht bei einem Neustart des Agenten verloren.',
   runtimeLogsUnsupported:
     'Der Agent dieses Servers meldet die Funktion „runtime_logs“ nicht. Er wird die Anfrage nie beantworten — dieses Fenster bliebe dauerhaft leer. Den Agenten aktualisieren.',
   runtimeLogsOffline:
@@ -1642,6 +1812,21 @@ const de = {
   benchmarkSpeechByteRate: 'Ausgaberate',
   benchmarkSpeechTtftNote:
     'Die Messung streamt nicht: Das Audio kommt erst nach der ganzen Synthese, und ein vom Agenten gestartetes Modell wird hinter der Anfrage geladen. Die Zeit bis zum ersten Byte umfasst daher Synthese und einen etwaigen Modellstart, nicht die Zeit bis zum ersten gestreamten Audio.',
+  // #340: die Audio-Messung eines Audio-Modells über Geschwindigkeit,
+  // Kapazität und Beide -- die Ergebniszeile und die Verlaufsabschnitte.
+  benchmarkAudioResult: (rate: number, ttftMs: number) =>
+    `${formatRateX(rate)} Echtzeit${ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''}`,
+  benchmarkAudioLoadTime: (ms: number) => `Ladezeit ${ms} ms`,
+  benchmarkAudioCapacityResult: (k: number, limit: AudioConcurrencyLimit | '') =>
+    isAudioConcurrencyLimit(limit)
+      ? `Echtzeit-Parallelität: ${audioFigureDe(k, limit)} – ${audioLimitDe(limit)}`
+      : `Echtzeit-Parallelität: ${audioFigureDe(k, '')}`,
+  benchmarkAudioRuns: 'Audio-Messungen',
+  benchmarkAudioCapacityRuns: 'Audio-Kapazitäts-Messungen',
+  benchmarkAudioColSlowest: 'Langsamster Strom (× Echtzeit)',
+  benchmarkAudioColMean: 'Mittelwert (× Echtzeit)',
+  benchmarkAudioColWall: 'Laufzeit (ms)',
+  benchmarkAudioColRtf: 'Echtzeitfaktor (Laufzeit ÷ Audiodauer)',
   benchmarkMemoryObserved: 'Speicher beobachtet',
   benchmarkColConcurrency: 'Parallel',
   benchmarkColAggregateTps: 'Gesamt tok/s',
@@ -1669,7 +1854,7 @@ const de = {
   benchmarkImagesOnlyHint:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkAudioOnlyHint:
-    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und sind deshalb gesperrt.',
+    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität und Beide messen hier seine Audio-Leistung (× Echtzeit, erste Ausgabe, Echtzeit-Parallelität). Vision misst mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und ist deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
   benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Audio, kein Chat-Prompt gesendet',
   benchmarkResultSkippedNotSpeech: 'übersprungen – kein Sprachsynthese-Modell, nichts gesendet',
@@ -1774,6 +1959,14 @@ const de = {
   // Task 7 (probe-reachability-and-model-status): the merged tri-state column
   // label, replacing the old separate "Geladen" + "Live-Status" columns.
   modelServerColStatus: 'Status',
+  // #340: how many instances of the mapping's spec run on this server.
+  modelServersRunningInstances: 'Laufende Instanzen',
+  // #340: die Audio-Spalten des Modellkatalogs.
+  modelServersAudioRate: '× Echtzeit',
+  modelServersAudioTtft: 'Erste Ausgabe (ms)',
+  modelServersAudioConcurrency: 'Echtzeit-Parallelität',
+  audioRealtimeConcurrency: (k: number, limit: AudioConcurrencyLimit | '') =>
+    audioFigureDe(k, limit),
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
   // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
@@ -1955,7 +2148,7 @@ const de = {
   errorBenchmarkImagesOnly:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
   errorBenchmarkAudioOnly:
-    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Audio bereitstellt.',
+    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität und Beide messen seine Audio-Leistung. Die Ermittlung der Kontextgröße und die Vision-Messung senden dagegen einen Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Eine Vision-Messung über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes ihrer Modelle nur Audio bereitstellt.',
   errorBenchmarkAgentEnsureUnsupported:
     'Dieses Modell erzeugt nur Bilder oder stellt nur Audio bereit und lässt sich deshalb nur laden, indem der Agent es ohne Chat-Prompt startet. Das kann erst ein Agent mit der Fähigkeit runtime_ensure (Agent 0.8.0 oder neuer). Der Agent dieses Servers meldet sie nicht: Er ist älter, oder er hat sich seit dem Neustart des Gateways noch nicht gemeldet. Aktualisieren Sie den Agenten, oder versuchen Sie es erneut, sobald er sich gemeldet hat.',
   errorBenchmarkSpecForceStopped:
@@ -1979,6 +2172,10 @@ const de = {
     'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   errorRuntimeSpecConfigFilesInvalid:
     'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
+  errorRuntimeSpecInstancesInvalid:
+    'Ungültige Instanzeinstellungen: Mindest- und Höchstanzahl müssen ganze Zahlen von 0 bis 64 sein, die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und die parallelen Anfragen pro Instanz müssen eine ganze Zahl ab 1 sein.',
+  errorRuntimeSpecInstancesNeedEphemeralPort:
+    'Mehrere Instanzen brauchen Listen-Port 0: Jede Instanz lauscht auf ihrem eigenen Port, den der Agent wählt.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -2007,6 +2204,8 @@ const de = {
     'Zu viele Antworten laufen gleichzeitig. Bitte warten Sie, bis eine davon fertig ist.',
   errorMappingCapabilityReserved:
     '„live_progress“ darf nicht auf „no“ gesetzt werden, und „speculation_observed“ akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
+  errorMappingMetricInvalid:
+    'Ein Metrikwert ist ungültig: Keine Metrik darf negativ sein, und die Echtzeit-Parallelität ist eine ganze Zahl, die nur zusammen mit ihrer Begrenzung (Leistung, Ressourcen oder Höchstzahl erreicht) gespeichert wird.',
   errorChatRunTimeout:
     'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
   // Die Anfrage hat das Gateway nie verlassen (Marshalling, Request-Bau oder
@@ -3977,6 +4176,12 @@ const en: PortalMessages = {
   chatVoiceErrorAudioSettings:
     'The speech settings stored with this chat are invalid or too large. Use Voice Chat in a new chat.',
   chatVoiceErrorTicket: 'Voice Chat could not be started. Try again in a moment.',
+  chatVoiceErrorNoRealtimeModel:
+    'No model is fast enough for Voice Chat: the transcription or speech model keeps up with the real time a conversation needs on no server, as measured. Pick a faster model, or contact your administrator.',
+  chatVoiceErrorNoRealtimeAsr:
+    'The transcription model is too slow for Voice Chat: as measured, it keeps up with the real time a conversation needs on no server. Pick a faster transcription model, or contact your administrator.',
+  chatVoiceErrorNoRealtimeTts:
+    'The speech model is too slow for Voice Chat: as measured, it keeps up with the real time a conversation needs on no server. Pick a faster speech model, or contact your administrator.',
   chatVoiceErrorRefused: 'The gateway refused Voice Chat.',
   chatVoiceErrorUnsupported:
     'Voice Chat is not available in this browser: it needs a current browser, microphone access and a secure connection (HTTPS).',
@@ -4462,6 +4667,19 @@ const en: PortalMessages = {
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
   mappingGenTpsAtCapacity: 'Tokens/s (max capacity)',
+  mappingAudioMetricsSection: 'Audio metrics',
+  mappingAudioMetricsHint:
+    'Optional. For × real time and the time to first output, empty or 0 means "not measured". The audio measurement (Speed, Capacity, Both) fills these in unless the metrics are locked. The real-time concurrency holds only together with its limit and is then required: with Performance it is a measured ceiling, and 0 means "not real-time" (even one stream alone is too slow); with Resources or Cap reached it is a lower bound, and 0 means "≥ 0". "Unknown" clears both.',
+  mappingAudioRateX: '× real time (one stream)',
+  mappingAudioTtfaMs: 'Time to first output (ms)',
+  mappingAudioRealtimeConcurrency: 'Real-time concurrency',
+  mappingAudioRealtimeConcurrencyRequired: (limit: AudioConcurrencyLimit | '') =>
+    audioCountRequiredEn(limit),
+  mappingAudioConcurrencyLimit: 'Limited by',
+  mappingAudioConcurrencyLimitUnknown: audioLimitEn(''),
+  mappingAudioConcurrencyLimitPerformance: audioLimitEn('performance'),
+  mappingAudioConcurrencyLimitResources: audioLimitEn('resources'),
+  mappingAudioConcurrencyLimitCap: audioLimitEn('cap'),
   mappingProbeContext: 'Determine context size',
   mappingProbeContextRunning: 'Determining…',
   mappingProbeContextFailed: 'Could not determine context size',
@@ -4506,6 +4724,24 @@ const en: PortalMessages = {
   runtimeSpecStartupTimeout: 'Startup timeout (s)',
   runtimeSpecPinned: 'Pinned (never stop)',
   runtimeSpecEnabled: 'Enabled',
+  runtimeSpecReplicable: 'Multiple instances',
+  runtimeSpecReplicableHint:
+    'When every running instance is busy, the agent starts another one – only into free resources, never by evicting another model. Each instance listens on its own port, so the listen port must be 0. "Pinned" keeps instance 0 up.',
+  runtimeSpecMinInstances: 'Minimum instances',
+  runtimeSpecMaxInstances: 'Maximum instances',
+  runtimeSpecMaxInstancesUnlimited:
+    "Empty = unlimited: instances are added while free resources and the server's process limit allow.",
+  runtimeSpecInstanceParallelism: 'Parallel requests per instance',
+  runtimeSpecMinExceedsRealtime:
+    'The minimum is above the real-time concurrency measured for this model: with that many instances busy at once, at least one no longer keeps up with real time. This is a warning only – the setting stays valid.',
+  runtimeSpecMeasuredStartup: (startupMs: number) => measuredStartupEn(startupMs),
+  runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
+    `${measuredStartupEn(startupMs)} · idle timeout in effect: ${
+      seconds > 0 ? `${seconds} s` : 'none – never unloaded'
+    }`,
+  runtimeSpecIdleTimeoutNever: 'never unloaded',
+  runtimeSpecIdleTimeoutOverrideHint:
+    'With multiple instances on an agent with instance support: 0 = no manual override – the gateway derives the idle timeout from the measured startup time. A value here applies once it is above the automatic one. An agent without instance support keeps 0 as "never unloaded".',
   runtimeCoresidency: 'Co-residency',
   runtimeCoresidencyHint:
     'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy. Anything you leave unset follows the server default.',
@@ -4787,6 +5023,9 @@ const en: PortalMessages = {
     'Live stream interrupted — this view may be stale. Which processes are running right now is unknown.',
   runtimeStatusEmpty: 'The agent currently reports no managed model process.',
   runtimeStatusSince: 'Since',
+  runtimeStatusInstance: 'Instance',
+  runtimeInstancesSummary: (running: number, min: number, max: number | null) =>
+    `${running} running · min ${min} · max ${max ?? '∞'}`,
   runtimeStatusPid: 'PID',
   runtimeStatusPort: 'Port',
   runtimeStatusInFlight: 'In-flight requests',
@@ -4871,11 +5110,13 @@ const en: PortalMessages = {
   // prints nothing", which is the question the operator opened it to answer.
   runtimeLogs: 'Logs',
   runtimeLogsTitle: 'Process output',
+  runtimeLogsAllInstances:
+    "Shows the output of every instance of this launch spec: lines of instance k ≥ 1 start with [#k], instance 0's carry no prefix.",
   runtimeLogsIntro:
-    "This model process's stdout and stderr, as it wrote them. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
+    "The stdout and stderr of this model's process (with several instances, of every instance), as they were written. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
   runtimeLogsWaiting: 'Connecting…',
   runtimeLogsEmptyBuffer:
-    "The agent has nothing retained for this process. That is not a statement about whether the process printed anything: the buffer lives only in the agent's memory and is lost when the agent restarts.",
+    "The agent has nothing retained for this model. That is not a statement about whether the process printed anything: the buffer lives only in the agent's memory and is lost when the agent restarts.",
   runtimeLogsUnsupported:
     'This server\'s agent does not declare the "runtime_logs" feature. It will never answer the request — this window would stay empty forever. Update the agent.',
   runtimeLogsOffline:
@@ -5006,6 +5247,19 @@ const en: PortalMessages = {
   benchmarkSpeechByteRate: 'Output rate',
   benchmarkSpeechTtftNote:
     'The measurement does not stream: the audio arrives only after the whole synthesis, and a model the agent launches is loaded behind the request. The time to the first byte therefore covers the synthesis and any model start, not the time to the first streamed audio.',
+  benchmarkAudioResult: (rate: number, ttftMs: number) =>
+    `${formatRateX(rate)} real time${ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''}`,
+  benchmarkAudioLoadTime: (ms: number) => `load time ${ms} ms`,
+  benchmarkAudioCapacityResult: (k: number, limit: AudioConcurrencyLimit | '') =>
+    isAudioConcurrencyLimit(limit)
+      ? `Real-time concurrency: ${audioFigureEn(k, limit)} – ${audioLimitEn(limit)}`
+      : `Real-time concurrency: ${audioFigureEn(k, '')}`,
+  benchmarkAudioRuns: 'Audio runs',
+  benchmarkAudioCapacityRuns: 'Audio capacity runs',
+  benchmarkAudioColSlowest: 'Slowest stream (× real time)',
+  benchmarkAudioColMean: 'Mean (× real time)',
+  benchmarkAudioColWall: 'Wall time (ms)',
+  benchmarkAudioColRtf: 'Real-time factor (wall time ÷ audio length)',
   benchmarkMemoryObserved: 'Memory observed',
   benchmarkColConcurrency: 'Parallel',
   benchmarkColAggregateTps: 'Total tok/s',
@@ -5029,7 +5283,7 @@ const en: PortalMessages = {
   benchmarkImagesOnlyHint:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
   benchmarkAudioOnlyHint:
-    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an audio-only model does not answer, so they are disabled.',
+    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity and Both measure its audio performance here (× real time, first output, real-time concurrency). Vision measures with a chat prompt, which an audio-only model does not answer, so it is disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
   benchmarkResultSkippedAudioOnly: 'skipped — generates audio only, no chat prompt sent',
   benchmarkResultSkippedNotSpeech: 'skipped — not a speech synthesis model, nothing sent',
@@ -5128,6 +5382,12 @@ const en: PortalMessages = {
   modelServerColPrio: 'Prio',
   modelServerColModel: 'Model',
   modelServerColStatus: 'Status',
+  modelServersRunningInstances: 'Running instances',
+  modelServersAudioRate: '× real time',
+  modelServersAudioTtft: 'First output (ms)',
+  modelServersAudioConcurrency: 'Real-time concurrency',
+  audioRealtimeConcurrency: (k: number, limit: AudioConcurrencyLimit | '') =>
+    audioFigureEn(k, limit),
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
   modelServerColLiveProgress: 'Live progress',
@@ -5276,7 +5536,7 @@ const en: PortalMessages = {
   errorBenchmarkImagesOnly:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an image model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates images.',
   errorBenchmarkAudioOnly:
-    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an audio-only model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only serves audio.',
+    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, capacity and both measure its audio performance. Determining the context size and the vision run, however, send a chat prompt, which an audio-only model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. A vision run over an application or server is refused this way when every model in it only serves audio.',
   errorBenchmarkAgentEnsureUnsupported:
     "This model only generates images, or only serves audio, so it can only be loaded by the agent starting it without a chat prompt. Only an agent with the runtime_ensure capability can do that (agent 0.8.0 or newer). This server's agent does not report it: it is older, or the agent has not reported since the gateway restarted. Update the agent, or try again once it has reported.",
   errorBenchmarkSpecForceStopped:
@@ -5299,6 +5559,10 @@ const en: PortalMessages = {
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
   errorRuntimeSpecConfigFilesInvalid:
     'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
+  errorRuntimeSpecInstancesInvalid:
+    'Invalid instance settings: the minimum and maximum must be whole numbers from 0 to 64, the minimum must not exceed a set maximum, and the parallel requests per instance must be a whole number of at least 1.',
+  errorRuntimeSpecInstancesNeedEphemeralPort:
+    'Multiple instances need listen port 0: every instance listens on its own port, picked by the agent.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -5324,6 +5588,8 @@ const en: PortalMessages = {
   errorChatRunLimit: 'Too many responses are running at once. Please wait for one to finish.',
   errorMappingCapabilityReserved:
     '"live_progress" cannot be set to "no", and "speculation_observed" accepts no manual verdict at all — an empty verdict resets either.',
+  errorMappingMetricInvalid:
+    'A metric value is invalid: no metric may be negative, and the real-time concurrency is a whole number that is saved only together with its limit (Performance, Resources or Cap reached).',
   errorChatRunTimeout: 'This response took too long and was stopped. Please try again.',
   // The request never left the gateway (marshalling, request construction,
   // or the loopback call itself). The Go error names the internal address

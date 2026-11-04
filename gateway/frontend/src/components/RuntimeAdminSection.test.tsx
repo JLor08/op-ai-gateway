@@ -159,6 +159,15 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     gpus: [],
     ram_estimate_mb: 0,
     ram_measured_mb: 0,
+    // A spec that never opted into instances, as the backend stores one: off,
+    // no bounds, the default parallelism, and nothing measured yet.
+    replicable: false,
+    min_instances: 0,
+    max_instances: 0,
+    instance_parallelism: 0,
+    startup_measured_ms: 0,
+    effective_idle_timeout_seconds: 0,
+    instances_min_exceeds_realtime: false,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -251,6 +260,9 @@ function makeHardware(gpus: HardwareGPU[], os = 'linux'): HardwareResponse {
 function makeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
   return {
     spec_id: 'spec_1',
+    // Instance 0: the one row every spec has, and the only one of a spec that
+    // is not replicable.
+    instance: 0,
     model: 'app-model',
     state: 'running',
     since: '2026-07-16T12:00:00Z',
@@ -3239,6 +3251,14 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // agent-owned and deliberately absent from the request shape (toEqual
     // fails if an override click echoes it back).
     ram_estimate_mb: spec.ram_estimate_mb,
+    // The four instance settings are operator-owned and replayed verbatim too.
+    // Their two read-only neighbours, startup_measured_ms and
+    // effective_idle_timeout_seconds, have no request counterpart, so an
+    // override click that echoed either back fails this toEqual.
+    replicable: spec.replicable,
+    min_instances: spec.min_instances,
+    max_instances: spec.max_instances,
+    instance_parallelism: spec.instance_parallelism,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
     messages_mode: spec.messages_mode,
@@ -10496,5 +10516,772 @@ describe('RuntimeAdminSection spec-level RAM estimate', () => {
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.ram_estimate_mb).toBe(12288);
+  });
+});
+
+// Instance settings (#340). A spec opts into several instances (processes) with
+// "Multiple instances"; the bounds and the per-instance parallelism mean
+// nothing without it, so they are shown only with it ticked -- and sent on
+// every save regardless, because the PUT is a full document.
+describe('RuntimeAdminSection instance settings', () => {
+  async function openFilledCreate() {
+    const handles = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/audio-server' },
+    });
+    return handles;
+  }
+
+  function tickReplicable() {
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+  }
+
+  // The words runtimeSpecAutoIdleTimeout puts after the measured startup to
+  // name the idle timeout in effect, whatever its figure: what two lines with
+  // different figures share past the startup both begin with. Read off the
+  // i18n object, so an assertion on them holds in every language.
+  function idleTimeoutInEffectWords(): string {
+    const one = t.runtimeSpecAutoIdleTimeout(1, 0);
+    const two = t.runtimeSpecAutoIdleTimeout(2, 0);
+    let shared = 0;
+    while (shared < one.length && one[shared] === two[shared]) shared++;
+    return one.slice(t.runtimeSpecMeasuredStartup(0).length, shared);
+  }
+
+  it('reveals min, max and the parallel requests per instance only with "Multiple instances" ticked', async () => {
+    await openFilledCreate();
+    expect(screen.queryByLabelText(t.runtimeSpecMinInstances)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecMaxInstances)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecInstanceParallelism)).not.toBeInTheDocument();
+
+    tickReplicable();
+
+    expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveValue(null);
+    expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveValue(null);
+    // Both counts carry the agent's cap of 64 instances as the field's bound.
+    expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveAttribute('max', '64');
+    expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveAttribute('max', '64');
+    // An empty maximum is "unlimited", and the field says so.
+    expect(screen.getByText(t.runtimeSpecMaxInstancesUnlimited)).toBeInTheDocument();
+    expect(screen.getByLabelText(t.runtimeSpecInstanceParallelism)).toHaveValue(1);
+    // Pinned stays beside it: it is what keeps instance 0 up.
+    expect(screen.getByLabelText(t.runtimeSpecPinned)).toBeInTheDocument();
+
+    tickReplicable();
+    expect(screen.queryByLabelText(t.runtimeSpecMinInstances)).not.toBeInTheDocument();
+  });
+
+  it('sends an empty min and max as 0 -- none and unlimited -- and the parallelism as 1', async () => {
+    const { putSpecs } = await openFilledCreate();
+    tickReplicable();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body.replicable).toBe(true);
+    expect(body.min_instances).toBe(0);
+    expect(body.max_instances).toBe(0);
+    expect(body.instance_parallelism).toBe(1);
+  });
+
+  it('sends the typed bounds and parallelism', async () => {
+    const { putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '1' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
+      target: { value: '2' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: true,
+      min_instances: 1,
+      max_instances: 3,
+      instance_parallelism: 2,
+    });
+  });
+
+  // Unticked, the three settings are not on screen and mean nothing: the form
+  // sends the backend's neutral values, never what the hidden fields hold.
+  it('saves a spec that does not opt in as one instance with no bounds', async () => {
+    const { putSpecs } = await openFilledCreate();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+  });
+
+  it('sends the neutral 0/0/0 once unticked, and never refuses what the hidden fields hold', async () => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '2' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
+      target: { value: '4' },
+    });
+    tickReplicable();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(created).toHaveLength(1);
+    expect(screen.queryByText(t.errorRuntimeSpecInstancesInvalid)).not.toBeInTheDocument();
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+  });
+
+  it('saves a stored replicable spec unticked as the neutral 0/0/0', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 4,
+    });
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+  });
+
+  // Ticked, every setting is checked before the round trip. The fields' own
+  // min/max/step attributes stop most of these in a browser already, so the
+  // form is submitted directly here: the submit event reaches the handler
+  // without the browser's constraint validation, which is what proves the
+  // handler's own check (and what a browser that skips it relies on).
+  const invalidTicked = [
+    ['a negative minimum', { min: '-1' }],
+    ['a negative maximum', { max: '-2' }],
+    ['a fractional minimum', { min: '1.5' }],
+    ['a fractional maximum', { max: '2.5' }],
+    ['a minimum above 64', { min: '65' }],
+    ['a maximum above 64', { max: '65' }],
+    ['a minimum above the maximum', { min: '3', max: '2' }],
+    ['a parallelism of 0', { parallelism: '0' }],
+    ['a negative parallelism', { parallelism: '-1' }],
+    ['a fractional parallelism', { parallelism: '1.5' }],
+  ] as const;
+
+  function typeInstanceSettings(values: { min?: string; max?: string; parallelism?: string }) {
+    if (values.min !== undefined)
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), {
+        target: { value: values.min },
+      });
+    if (values.max !== undefined)
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), {
+        target: { value: values.max },
+      });
+    if (values.parallelism !== undefined)
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
+        target: { value: values.parallelism },
+      });
+  }
+
+  function submitSpecForm() {
+    fireEvent.submit(screen.getByLabelText(t.runtimeSpecBinary).closest('form')!);
+  }
+
+  it.each(invalidTicked)('refuses %s on Create before ever calling the API', async (_, values) => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    typeInstanceSettings(values);
+
+    submitSpecForm();
+
+    expect(await screen.findByText(t.errorRuntimeSpecInstancesInvalid)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it.each(invalidTicked)('refuses %s on Edit before ever calling the API', async (_, values) => {
+    const { putSpecs } = await openApiTokenSpecEdit({ replicable: true });
+    typeInstanceSettings(values);
+
+    submitSpecForm();
+
+    expect(await screen.findByText(t.errorRuntimeSpecInstancesInvalid)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // The agent caps a spec at 64 instances and the backend refuses a count
+  // above it; the fields carry the same bound, so the form never submits one.
+  it.each([
+    ['minimum', 'runtimeSpecMinInstances'],
+    ['maximum', 'runtimeSpecMaxInstances'],
+  ] as const)('never sends a %s above 64', async (_which, label) => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t[label]), { target: { value: '65' } });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // Both are refused by the backend too; checked first for the same reason as
+  // the visible-devices pair: on Create a refused spec write would leave the
+  // mapping behind without its spec.
+  it('refuses a minimum above the maximum before ever calling the API', async () => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '2' } });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(await screen.findByText(t.errorRuntimeSpecInstancesInvalid)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('refuses multiple instances on a fixed listen port before ever calling the API', async () => {
+    const { created, putSpecs } = await openFilledCreate();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecListenPort), { target: { value: '9000' } });
+    tickReplicable();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(
+      await screen.findByText(t.errorRuntimeSpecInstancesNeedEphemeralPort),
+    ).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // The gateway flags a minimum above the real-time concurrency the audio
+  // ramp measured for the spec's mapping -- a measured ceiling: that many
+  // instances busy at once no longer all keep up with real time. A warning
+  // only: the spec saves as it is.
+  it('warns of a minimum above the measured real-time concurrency, and saves anyway', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 3,
+      instances_min_exceeds_realtime: true,
+    });
+
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({ replicable: true, min_instances: 3 });
+    expect(putSpecs[0].body).not.toHaveProperty('instances_min_exceeds_realtime');
+  });
+
+  it('shows no real-time warning for a minimum the gateway does not flag', async () => {
+    await openApiTokenSpecEdit({ replicable: true, min_instances: 3 });
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+  });
+
+  // The warning follows the minimum as typed: the save closes the editor, so
+  // a warning that waited for the stored flag would never stand beside the
+  // edit that causes it, and would linger under a minimum lowered below the
+  // ceiling. The edited minimum is judged by the gateway's own rule against
+  // the mapping's measured figures.
+  async function openRealtimeSpecEdit(
+    specOverrides: Partial<RuntimeSpec>,
+    mappingOverrides: Partial<PortalModelMapping>,
+  ) {
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1', ...mappingOverrides })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          replicable: true,
+          ...specOverrides,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return rendered;
+  }
+
+  const measuredCeiling = {
+    audio_realtime_concurrency: 2,
+    audio_concurrency_limit: 'performance',
+  } as const;
+
+  function typeMinimum(value: string) {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value } });
+  }
+
+  it('warns as soon as the typed minimum rises above the measured ceiling, before the save', async () => {
+    const { putSpecs } = await openRealtimeSpecEdit({ min_instances: 1 }, measuredCeiling);
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+
+    typeMinimum('3');
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+
+    typeMinimum('2');
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('drops the stored warning once the typed minimum is back at the ceiling', async () => {
+    await openRealtimeSpecEdit(
+      { min_instances: 5, instances_min_exceeds_realtime: true },
+      measuredCeiling,
+    );
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+
+    typeMinimum('1');
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+
+    typeMinimum('5');
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+  });
+
+  // Resources and the cap stop the ramp before the model ran out of speed:
+  // the count is a lower bound, no ceiling to exceed.
+  it.each(['resources', 'cap'])(
+    'does not warn above a lower bound (a ramp stopped by %s)',
+    async (limit) => {
+      await openRealtimeSpecEdit(
+        { min_instances: 1 },
+        { audio_realtime_concurrency: 2, audio_concurrency_limit: limit },
+      );
+      typeMinimum('5');
+      expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+    },
+  );
+
+  // The minimum is hidden with the box, and so is what is said about it.
+  it('drops the real-time warning with "Multiple instances" unticked', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 3,
+      instances_min_exceeds_realtime: true,
+    });
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+  });
+
+  it('opens a stored replicable spec as stored: an empty max for unlimited, parallelism 0 as 1', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 1,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+
+    expect(screen.getByLabelText(t.runtimeSpecReplicable)).toBeChecked();
+    expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveValue(1);
+    expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveValue(null);
+    expect(screen.getByLabelText(t.runtimeSpecInstanceParallelism)).toHaveValue(1);
+  });
+
+  it('replays the stored settings on an untouched save, and never the two read-only figures', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 4,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 4,
+    });
+    expect(putSpecs[0].body).not.toHaveProperty('startup_measured_ms');
+    expect(putSpecs[0].body).not.toHaveProperty('effective_idle_timeout_seconds');
+  });
+
+  it('shows the measured startup and the idle timeout in effect, and what 0 means for the manual field', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+
+    expect(screen.getByText(t.runtimeSpecAutoIdleTimeout(150, 30000))).toBeInTheDocument();
+    // The idle-timeout field stays, as the manual override.
+    expect(screen.getByLabelText(t.runtimeSpecIdleTimeout)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecIdleTimeoutOverrideHint)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+
+    expect(screen.queryByText(t.runtimeSpecAutoIdleTimeout(150, 30000))).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecIdleTimeoutOverrideHint)).not.toBeInTheDocument();
+  });
+
+  // The startup is measured for every spec, so it is shown as soon as the box
+  // is ticked. The idle timeout in effect is the one the gateway pushes for the
+  // STORED spec, and for a spec stored without instances that is its manual
+  // value, not an automatic one -- so ticking the box there shows the startup
+  // alone until a save.
+  it('shows the measured startup but no idle-timeout figure for a spec stored without instances', async () => {
+    await openApiTokenSpecEdit({
+      idle_timeout_seconds: 600,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 600,
+    });
+    expect(screen.queryByText(t.runtimeSpecMeasuredStartup(30000))).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+
+    expect(screen.getByText(t.runtimeSpecIdleTimeoutOverrideHint)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecMeasuredStartup(30000))).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecAutoIdleTimeout(600, 30000))).not.toBeInTheDocument();
+  });
+
+  it('says on Create, once ticked, that no startup is measured yet, and shows no idle timeout', async () => {
+    await openFilledCreate();
+    expect(screen.queryByText(t.runtimeSpecMeasuredStartup(0))).not.toBeInTheDocument();
+
+    tickReplicable();
+
+    expect(screen.getByText(t.runtimeSpecMeasuredStartup(0))).toBeInTheDocument();
+    const inEffect = idleTimeoutInEffectWords();
+    expect(inEffect.trim()).not.toBe('');
+    expect(screen.queryByText((text) => text.includes(inEffect))).not.toBeInTheDocument();
+  });
+
+  // An agent without instance support keeps the manual 0 -- never unloaded --
+  // and the gateway reports that 0 as the timeout in effect.
+  it('names an idle timeout in effect of 0 as never unloaded, not as 0 s', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 0,
+    });
+
+    const line = screen.getByText(t.runtimeSpecAutoIdleTimeout(0, 30000));
+    expect(line).toHaveTextContent(t.runtimeSpecIdleTimeoutNever);
+    expect(line).not.toHaveTextContent(/: 0 s/);
+  });
+});
+
+// One status row per instance (#340): every instance of a replicable spec is
+// its own process, reported under the spec's id with its own instance number.
+describe('RuntimeAdminSection per-instance live status', () => {
+  function replicableSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+    return fullSpec({ listen_port: 0, replicable: true, min_instances: 1, ...overrides });
+  }
+
+  function instanceRow(instance: number, overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
+    return makeStatus({
+      spec_id: 'spec_1',
+      instance,
+      model: instance === 0 ? 'app-model' : `app-model#${instance}`,
+      pid: 4100 + instance,
+      ...overrides,
+    });
+  }
+
+  function renderInstances(statusRows: RuntimeStatus[], spec: RuntimeSpec = replicableSpec()) {
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: { map_1: spec },
+      statusRows,
+    });
+    handles.stream.setStatus('open');
+    return handles;
+  }
+
+  it('renders one row per instance, keyed by spec id and instance, with an Instance column', async () => {
+    const consoleError = vi.spyOn(console, 'error');
+    try {
+      const { stream } = renderInstances([instanceRow(0), instanceRow(1)]);
+      await openStatusTab();
+
+      expect(await screen.findByText('4100')).toBeInTheDocument();
+      expect(cellForColumn('4100', t.runtimeStatusInstance)).toHaveTextContent('#0');
+      expect(cellForColumn('4101', t.runtimeStatusInstance)).toHaveTextContent('#1');
+
+      // A later frame with a third instance must not fold any two together.
+      stream.push([instanceRow(0), instanceRow(1), instanceRow(2)]);
+      expect(await screen.findByText('4102')).toBeInTheDocument();
+      expect(cellForColumn('4102', t.runtimeStatusInstance)).toHaveTextContent('#2');
+      expect(screen.getByText('4100')).toBeInTheDocument();
+      expect(screen.getByText('4101')).toBeInTheDocument();
+
+      // Two rows under one React key is reported as a console error.
+      const logged = consoleError.mock.calls.map((call) => call.map(String).join(' ')).join('\n');
+      expect(logged).not.toMatch(/same key/);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('reads an instance address as its upstream name: no mismatch marker on instance 1', async () => {
+    renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+
+    await screen.findByText('4101');
+    expect(screen.queryByTitle(t.runtimeStatusNameMismatch)).not.toBeInTheDocument();
+  });
+
+  // Only the exact suffix of the row's own instance is an address: on instance
+  // 0 a name that merely contains a `#` is the name itself.
+  it('still marks a mismatch on instance 0 whose name only looks like an address', async () => {
+    renderInstances([instanceRow(0, { model: 'app-model#1' })]);
+    await openStatusTab();
+
+    await screen.findByText('4100');
+    expect(screen.getByTitle(t.runtimeStatusNameMismatch)).toBeInTheDocument();
+  });
+
+  // The overrides act on the whole spec, every instance at once, so a Force
+  // stop beside instance 1 would read as stopping instance 1 alone.
+  it('offers the spec-wide overrides once, on instance 0, and only the log view on another instance', async () => {
+    renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop })).toBeEnabled(),
+    );
+    expect(inRowWith('4100').getByRole('button', { name: t.runtimeRestart })).toBeInTheDocument();
+    expect(inRowWith('4101').getByRole('button', { name: t.runtimeLogs })).toBeInTheDocument();
+    expect(
+      inRowWith('4101').queryByRole('button', { name: t.runtimeForceStop }),
+    ).not.toBeInTheDocument();
+    expect(
+      inRowWith('4101').queryByRole('button', { name: t.runtimeRestart }),
+    ).not.toBeInTheDocument();
+  });
+
+  // Under force_stopped every instance drains at once, so they stop in any
+  // order: the override may only be cleared once NO instance of the spec still
+  // runs the old process -- every row stopped, or gone (a retired burst
+  // instance). A clear before that lets a sibling still draining start again.
+  async function startInstanceRestart(rows: RuntimeStatus[], rowText: string) {
+    const handles = renderInstances(rows);
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith(rowText).getByRole('button', { name: t.runtimeRestart })).toBeEnabled(),
+    );
+    fireEvent.click(inRowWith(rowText).getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(handles.putSpecs).toHaveLength(1));
+    expect(handles.putSpecs[0].body.admin_state).toBe('force_stopped');
+    await screen.findAllByText(t.runtimeRestartStopping);
+    return handles;
+  }
+
+  async function settleFrames() {
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+  }
+
+  it("clears a restart's override only once every instance stopped: instance 0 last", async () => {
+    const { putSpecs, stream } = await startInstanceRestart(
+      [instanceRow(0), instanceRow(1)],
+      '4100',
+    );
+
+    // Instance 1 is listed first and has stopped; instance 0 is still draining.
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'draining' })]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.admin_state).toBe('');
+  });
+
+  it("clears a restart's override only once every instance stopped: instance 0 first", async () => {
+    const { putSpecs, stream } = await startInstanceRestart(
+      [instanceRow(0), instanceRow(1), instanceRow(2)],
+      '4100',
+    );
+
+    // Instance 0 stopped first; its siblings still drain the old process.
+    stream.push([
+      instanceRow(0, { state: 'stopped' }),
+      instanceRow(1, { state: 'draining' }),
+      instanceRow(2, { state: 'stopped' }),
+    ]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    // Instance 2 retired (its row is gone), instance 1 still draining.
+    stream.push([instanceRow(0, { state: 'stopped' }), instanceRow(1, { state: 'draining' })]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    // The last sibling retired too: every remaining row is stopped.
+    stream.push([instanceRow(0, { state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.admin_state).toBe('');
+  });
+
+  // Instance 0 crashed and is restarting while two burst instances run: the
+  // first running one speaks for the spec and carries the restart, and the
+  // wait still covers every row.
+  it('runs a restart without an instance-0 row on the first running instance, waiting for every row', async () => {
+    const { putSpecs, stream } = await startInstanceRestart(
+      [instanceRow(1), instanceRow(2)],
+      '4101',
+    );
+    expect(
+      inRowWith('4102').queryByRole('button', { name: t.runtimeRestart }),
+    ).not.toBeInTheDocument();
+
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(2, { state: 'draining' })]);
+    await settleFrames();
+    expect(putSpecs).toHaveLength(1);
+
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(2, { state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.admin_state).toBe('');
+  });
+
+  it("sums up a replicable spec's running instances in the launch-specs list", async () => {
+    renderInstances([instanceRow(0), instanceRow(1)]);
+
+    expect(await screen.findByText(t.runtimeInstancesSummary(2, 1, null))).toBeInTheDocument();
+  });
+
+  it('counts only running instances, and names a set maximum', async () => {
+    renderInstances(
+      [instanceRow(0), instanceRow(1, { state: 'starting' }), instanceRow(2)],
+      replicableSpec({ min_instances: 1, max_instances: 3 }),
+    );
+
+    expect(await screen.findByText(t.runtimeInstancesSummary(2, 1, 3))).toBeInTheDocument();
+  });
+
+  it('keeps a spec that does not opt in to its single state', async () => {
+    renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
+
+    await screen.findByText(t.runtimeStateRunning);
+    expect(screen.queryByText(t.runtimeInstancesSummary(1, 0, null))).not.toBeInTheDocument();
+  });
+
+  // A replicable spec's manual idle timeout is only an override (0 = none), so
+  // the list shows the one in effect -- the one the agent unloads after.
+  it('lists the idle timeout in effect for a spec stored as replicable', async () => {
+    renderInstances(
+      [instanceRow(0)],
+      replicableSpec({ idle_timeout_seconds: 0, effective_idle_timeout_seconds: 150 }),
+    );
+
+    await screen.findByText('Alpha');
+    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(/^150$/);
+  });
+
+  it('lists an idle timeout in effect of 0 as never unloaded', async () => {
+    renderInstances(
+      [instanceRow(0)],
+      replicableSpec({ idle_timeout_seconds: 0, effective_idle_timeout_seconds: 0 }),
+    );
+
+    await screen.findByText('Alpha');
+    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(
+      t.runtimeSpecIdleTimeoutNever,
+    );
+  });
+
+  it('lists the stored idle timeout for a spec that does not opt in', async () => {
+    renderInstances(
+      [instanceRow(0)],
+      fullSpec({ idle_timeout_seconds: 600, effective_idle_timeout_seconds: 600 }),
+    );
+
+    await screen.findByText('Alpha');
+    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(/^600$/);
+  });
+
+  // Every instance writes into the spec's one log buffer, instance k's lines
+  // prefixed [#k]: the spec's log view shows them all, and says so.
+  it("says a replicable spec's log view shows every instance, from any instance row", async () => {
+    const { logs } = renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+    await screen.findByText('4101');
+
+    fireEvent.click(inRowWith('4101').getByRole('button', { name: t.runtimeLogs }));
+
+    expect(logs.subscribedSpecIds).toEqual(['spec_1']);
+    expect(await screen.findByText(t.runtimeLogsAllInstances)).toBeInTheDocument();
+  });
+
+  it('says nothing about instances in the log view of a spec that does not opt in', async () => {
+    renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
+    await openStatusTab();
+    await screen.findByText('4100');
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeLogs }));
+
+    expect(await screen.findByText(t.runtimeLogsIntro)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeLogsAllInstances)).not.toBeInTheDocument();
+  });
+
+  it("shows instance 0's state for the spec, whichever instance the stream lists last", async () => {
+    renderInstances([instanceRow(0, { state: 'starting' }), instanceRow(1)]);
+
+    await screen.findByText(t.runtimeInstancesSummary(1, 1, null));
+    const cell = cellForColumn('Alpha', t.runtimeLiveStatus);
+    // The chip itself, not the cell's text: the summary line under it says
+    // "1 läuft", so a text match on the cell for "Läuft" holds or fails only
+    // by letter case.
+    const chips = cell.querySelectorAll('[data-status]');
+    expect(chips).toHaveLength(1);
+    expect(chips[0].textContent).toBe(t.runtimeStateStarting);
+  });
+
+  // The override actions build their PUT from the loaded spec: a replicable
+  // spec's instance settings must ride along verbatim, or a Force stop would
+  // silently turn a spec of several instances back into one.
+  it("replays a replicable spec's instance settings on an override click", async () => {
+    const spec = replicableSpec({
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 3,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+    const { putSpecs } = renderInstances([instanceRow(0), instanceRow(1)], spec);
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop })).toBeEnabled(),
+    );
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      admin_state: 'force_stopped',
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 3,
+    });
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
   });
 });
