@@ -4362,9 +4362,9 @@ describe('instance settings (#340) i18n keys', () => {
   // One message for every refusal of the instance fields, so it names each rule.
   it('names every instance-settings rule in the refusal', () => {
     expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ganze Zahlen von 0 bis 64/);
-    expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ab 1/);
+    expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ganze Zahl von 1 bis 1024/);
     expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/whole numbers from 0 to 64/);
-    expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/at least 1/);
+    expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/whole number from 1 to 1024/);
   });
 
   it("names the log view's [#k] prefix of instance k's lines", () => {
