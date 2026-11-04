@@ -373,11 +373,12 @@ func TestIngestStartupWriteOfAReplicableSpecPushesTheRuntimeConfig(t *testing.T)
 }
 
 // TestIngestContextFromInstanceZero pins the context write-back over instance
-// rows: the mapping's context size comes from the spec's instance-0 row,
-// whatever order the rows arrive in, else from its first running row, and a
-// spec with neither -- only a starting burst instance -- writes nothing.
-// Writing every row in turn would flip the column between the instances'
-// values.
+// rows: the mapping's context size comes from the spec's representative row
+// (representativeRowIndex) -- its running instance-0 row whatever order the
+// rows arrive in, else its running row with the lowest index -- and a sample
+// whose representative probed nothing (only a starting burst instance, which
+// carries no context size yet) writes nothing. Writing every row in turn
+// would flip the column between the instances' values.
 func TestIngestContextFromInstanceZero(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_ctx")
@@ -396,9 +397,37 @@ func TestIngestContextFromInstanceZero(t *testing.T) {
 	if got := st.writes(&st.contextWrites); !slices.Equal(got, []string{"map_rspec_ctx=8192", "map_rspec_ctx=2048"}) {
 		t.Fatalf("context writes = %v, want the first running row's 2048 without an instance-0 row", got)
 	}
-	ingestInstanceRows(t, srv, features, instanceRow("rspec_ctx", 2, "starting", `,"context_size":1000`))
+	ingestInstanceRows(t, srv, features, instanceRow("rspec_ctx", 2, "starting", ""))
 	if got := st.writes(&st.contextWrites); len(got) != 2 {
-		t.Fatalf("context writes = %v, want nothing from a sample with neither an instance-0 nor a running row", got)
+		t.Fatalf("context writes = %v, want nothing from a sample whose only row is starting and probed nothing", got)
+	}
+}
+
+// TestIngestWriteBackSpeaksFromARunningBurstWhenInstanceZeroCrashed pins the
+// write-backs' side of the representative rule: a crashed instance 0 has
+// probed nothing, and when a burst instance serves beside it, that burst
+// instance's row is the one that speaks for the spec -- its context size and
+// its capability verdicts are written. Letting the crashed instance-0 row
+// speak would silence both for as long as instance 0 stays down while the
+// model serves.
+func TestIngestWriteBackSpeaksFromARunningBurstWhenInstanceZeroCrashed(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_crash0")
+	st := wrapInstanceIngestStore(srv)
+
+	ingestInstanceRows(t, srv, `"runtime_model_probe"`,
+		instanceRow("rspec_crash0", 0, "crashed", ""),
+		instanceRow("rspec_crash0", 2, "running", `,"context_size":4096,"live_progress_support":"supported"`))
+
+	if got := st.writes(&st.contextWrites); !slices.Equal(got, []string{"map_rspec_crash0=4096"}) {
+		t.Fatalf("context writes = %v, want the running burst instance's [map_rspec_crash0=4096]", got)
+	}
+	caps, err := srv.Routes.MappingCapabilities(context.Background(), "map_rspec_crash0")
+	if err != nil {
+		t.Fatalf("MappingCapabilities: %v", err)
+	}
+	if len(caps) != 1 || caps[0].Capability != routing.CapabilityLiveProgress || caps[0].Verdict != routing.CapabilityYes {
+		t.Fatalf("capability rows = %+v, want the running burst instance's live_progress yes", caps)
 	}
 }
 

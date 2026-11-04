@@ -708,9 +708,12 @@ type foldedSpec struct {
 	// when no row measured one.
 	MaxStartupMS int
 	// Primary is the row that speaks for the spec where only one row can:
-	// the probed context size and the capability verdicts. It is the
-	// instance-0 row, else the first running row, else nil (only starting or
-	// otherwise idle burst instances: nothing that speaks for the spec yet).
+	// the probed context size and the capability verdicts. It is the spec's
+	// representative row (representativeRowIndex: the running instance-0
+	// row, else the running row with the lowest index, else the instance-0
+	// row, else the lowest index), so it is set for every spec in the fold.
+	// A row that probed nothing -- one that is not running carries no
+	// context size -- writes nothing.
 	Primary *RuntimeStatusDTO
 }
 
@@ -768,33 +771,31 @@ func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
 }
 
 // primaryRowIndexes picks, per spec id, the index of the row that speaks for
-// the spec (foldedSpec.Primary): the first instance-0 row wherever it sits,
-// else the first running row. A spec with neither has no entry. row reads
-// the spec id, instance index and state of row i of a slice of n, so the rule
-// is one function for the status rows and for the raw samples the capability
-// write-back reads.
+// the spec (foldedSpec.Primary): its representative row, by the one rule
+// every reader of a spec's rows applies (representativeRowIndex). row reads
+// the spec id, instance index and state of row i of a slice of n, so the
+// rule is one function for the status rows and for the raw samples the
+// capability write-back reads. A row without a spec id is skipped, as every
+// write-back skips it.
 //
-// Instance 0 first because it is the instance the spec's plain address names
-// and the one an agent without instances ever had: what it probed is what the
-// mapping described before instances existed. A burst instance runs the same
-// command line, so while instance 0 is down a running one is as good a
-// witness; one that is merely starting has probed nothing yet.
+// Every instance runs the same command line, so the running row a request
+// would reach probes what the mapping describes. A crashed or idled-out
+// instance 0 has probed nothing, and letting it speak beside a burst instance
+// that serves would silence the context and capability write-backs.
 func primaryRowIndexes(n int, row func(i int) (specID string, instance int, state string)) map[string]int {
-	picked := make(map[string]int)
-	isZero := make(map[string]bool)
+	bySpec := make(map[string][]int)
 	for i := range n {
-		specID, instance, state := row(i)
-		specID = strings.TrimSpace(specID)
-		if specID == "" || isZero[specID] {
-			continue
+		specID, _, _ := row(i)
+		if specID = strings.TrimSpace(specID); specID != "" {
+			bySpec[specID] = append(bySpec[specID], i)
 		}
-		_, seen := picked[specID]
-		switch {
-		case instance == 0:
-			picked[specID], isZero[specID] = i, true
-		case !seen && state == agentSpecStateRunning:
-			picked[specID] = i
-		}
+	}
+	picked := make(map[string]int, len(bySpec))
+	for specID, indexes := range bySpec {
+		picked[specID] = indexes[representativeRowIndex(len(indexes), func(k int) (int, string) {
+			_, instance, state := row(indexes[k])
+			return instance, state
+		})]
 	}
 	return picked
 }
@@ -1164,10 +1165,10 @@ func (s *Server) resolveRuntimeSpecMapping(ctx context.Context, serverID, specID
 // no migration, no new store method; UpdateMappingContextProbe already exists
 // and already sets context_size + metrics_source="probe" + metrics_updated_at,
 // no-oping on a locked or missing mapping). The size is the spec's Primary
-// row's (foldInstanceRows: instance 0's, else the first running instance's):
-// every instance runs the same command line, so one row speaks for the
-// mapping, and taking each row in turn would flip the column between two
-// instances that probed differently.
+// row's (foldInstanceRows: the spec's representative row,
+// representativeRowIndex): every instance runs the same command line, so one
+// row speaks for the mapping, and taking each row in turn would flip the
+// column between two instances that probed differently.
 //
 // Mirrors writeBackRuntimeVRAM's discipline throughout: the caller caps the
 // folded rows at maxRuntimeSamplesPerSample before any store call; the fold
@@ -1340,11 +1341,12 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 	// carried across the loop so a spec_id repeated inside ONE sample sees
 	// what the earlier iteration already wrote -- see capabilityResolution.
 	resolved := make(map[string]capabilityResolution, len(runtimes))
-	// Only each spec's primary row speaks (primaryRowIndexes: instance 0,
-	// else the first running instance), for the reason writeBackRuntimeContext
-	// gives: every instance probes the same build, and taking each row in
-	// turn would write one instance's verdicts over another's. In input order,
-	// so a spec without instances is handled exactly as before.
+	// Only each spec's primary row speaks (primaryRowIndexes: the spec's
+	// representative row, representativeRowIndex), for the reason
+	// writeBackRuntimeContext gives: every instance probes the same build, and
+	// taking each row in turn would write one instance's verdicts over
+	// another's. In input order, so a spec without instances is handled
+	// exactly as before.
 	primary := primaryRowIndexes(len(runtimes), func(i int) (string, int, string) {
 		return runtimes[i].SpecID, runtimes[i].Instance, runtimes[i].State
 	})

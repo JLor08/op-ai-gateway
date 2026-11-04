@@ -486,16 +486,16 @@ func (s *Server) runtimeStatusesForServer(byServer map[string]map[string][]Runti
 //
 // A replicable spec has a row per instance, and the mapping row is one line for all of them:
 // RunningInstances counts the running ones, ActiveRequests/QueueDepth are their sum (the
-// model's load on this server), and State and the probe states are those of the liveliest
-// instance (runtimeRowRepresentative), so a model serving from a burst instance while
-// instance 0 has idled out reads running, and one whose only instance is still coming up
-// reads starting. A spec that is not replicable has one row, which is all of these as before.
+// model's load on this server), and State and the probe states are those of the spec's
+// representative row (runtimeRowRepresentative), the row every other view of the spec reads
+// too, so a model serving from a burst instance while instance 0 has idled out or crashed
+// reads running. A spec that is not replicable has one row, which is all of these as before.
 func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.RuntimeSpec, statuses map[string][]RuntimeStatusDTO) {
 	rows := statuses[spec.ID]
 	if len(rows) == 0 {
 		return
 	}
-	rep := runtimeRowRepresentative(rows)
+	rep, _ := runtimeRowRepresentative(rows)
 	// State (the loading indicator) is valid for any runtime_manager agent, so it is
 	// injected unconditionally, and so is the running count, which reads the same states.
 	// Active/queue, however, are only real when the reporting agent declared
@@ -520,27 +520,16 @@ func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.
 	}
 }
 
-// runtimeRowRepresentative picks the one of a spec's status rows (not empty) that speaks for
-// the spec on a mapping row: a running instance before a starting one before any other, and
-// among equals the lowest instance index, instance 0 first.
-func runtimeRowRepresentative(rows []RuntimeStatusDTO) RuntimeStatusDTO {
-	rank := func(state string) int {
-		switch state {
-		case agentSpecStateRunning:
-			return 0
-		case agentSpecStateStarting:
-			return 1
-		default:
-			return 2
-		}
+// runtimeRowRepresentative returns the one of a spec's status rows that speaks for the spec,
+// by the rule every reader of a spec's rows applies (representativeRowIndex: the running
+// instance-0 row, else the running row with the lowest index, else the instance-0 row, else the
+// lowest index). ok is false when rows is empty.
+func runtimeRowRepresentative(rows []RuntimeStatusDTO) (RuntimeStatusDTO, bool) {
+	i := representativeRowIndex(len(rows), func(i int) (int, string) { return rows[i].Instance, rows[i].State })
+	if i < 0 {
+		return RuntimeStatusDTO{}, false
 	}
-	best := rows[0]
-	for _, dto := range rows[1:] {
-		if r, b := rank(dto.State), rank(best.State); r < b || (r == b && dto.Instance < best.Instance) {
-			best = dto
-		}
-	}
-	return best
+	return rows[i], true
 }
 
 // handlePortalModelServers lists the servers that offer a gateway model (?name=<model>) with the
@@ -635,25 +624,20 @@ func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provide
 	return collected
 }
 
-// specImageOptions is the image options one spec's status rows carry: the
-// instance-0 row's when it has any, else the first row's that has. Every
-// instance of a replicable spec runs the same build and states the same
-// options, so one is the spec's, and the spec is collected once however many
-// instances run. nil when no row carries any.
+// specImageOptions is the image options one spec's status rows carry: those
+// of the spec's representative row (runtimeRowRepresentative), the row every
+// other view of the spec reads. Every instance of a replicable spec runs the
+// same build and states the same options, so one row's are the spec's, and
+// the spec is collected once however many instances run. A crashed instance 0
+// that still carries the options of its last start does not speak beside a
+// burst instance that serves. nil when there is no row, or the representative
+// row carries none.
 func specImageOptions(rows []RuntimeStatusDTO) *provider.SdcppImageOptions {
-	var found *provider.SdcppImageOptions
-	for _, dto := range rows {
-		if dto.ImageOptions == nil {
-			continue
-		}
-		if dto.Instance == 0 {
-			return dto.ImageOptions
-		}
-		if found == nil {
-			found = dto.ImageOptions
-		}
+	rep, ok := runtimeRowRepresentative(rows)
+	if !ok {
+		return nil
 	}
-	return found
+	return rep.ImageOptions
 }
 
 // handlePortalModelVoices answers which voices the portal's voice picker may offer

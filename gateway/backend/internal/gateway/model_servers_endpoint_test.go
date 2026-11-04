@@ -583,10 +583,11 @@ func TestModelServersEndpointEventsInjectsLiveRuntimeState(t *testing.T) {
 // TestModelServersRowCountsRunningInstances pins a model-servers row over a
 // replicable spec's instance rows: running_instances is how many of the
 // spec's rows on that server run (1 for a running spec that is not
-// replicable, 0 when none runs -- always on the wire), the row's state is the
-// liveliest of its instances' (running before starting before the rest, then
-// instance 0 first), the per-model load is the instances' sum, and the probe
-// states are the chosen row's.
+// replicable, 0 when none runs -- always on the wire), the row's state is
+// that of the spec's representative row (representativeRowIndex: the running
+// instance-0 row, else the running row with the lowest index, else the
+// instance-0 row, else the lowest index), the per-model load is the
+// instances' sum, and the probe states are the representative row's.
 func TestModelServersRowCountsRunningInstances(t *testing.T) {
 	s, _ := newModelServersEndpointFixture(t)
 	ctx := context.Background()
@@ -619,26 +620,16 @@ func TestModelServersRowCountsRunningInstances(t *testing.T) {
 		{"instance 0 unloaded, a burst instance runs", []RuntimeStatusDTO{
 			row(0, "stopped", 0, 0, "na"), row(2, "running", 1, 0, "ok"),
 		}, 1, "running", 1, 0, "ok"},
+		{"instance 0 crashed, a burst instance serves", []RuntimeStatusDTO{
+			row(0, "crashed", 0, 0, "unreachable"), row(2, "running", 2, 1, "ok"),
+		}, 1, "running", 2, 1, "ok"},
 		{"instance 0 unloaded, a burst instance starts", []RuntimeStatusDTO{
-			row(0, "stopped", 0, 0, "na"), row(1, "starting", 0, 0, ""),
-		}, 0, "starting", 0, 0, ""},
+			row(1, "starting", 0, 0, ""), row(0, "stopped", 0, 0, "na"),
+		}, 0, "stopped", 0, 0, "na"},
 	}
 	for _, tc := range cases {
 		s.RuntimeStatus.publish(msServerID, tc.rows)
-		req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
-		req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
-		rec := httptest.NewRecorder()
-		s.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s: status = %d, body=%s", tc.name, rec.Code, rec.Body.String())
-		}
-		var out struct {
-			Data []map[string]json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Data) != 1 {
-			t.Fatalf("%s: decode %s: %v", tc.name, rec.Body.String(), err)
-		}
-		got := out.Data[0]
+		got := fetchModelServersRow(t, s, tc.name)
 		want := map[string]string{
 			"running_instances": fmt.Sprint(tc.wantRunning), "state": fmt.Sprintf("%q", tc.wantState),
 			"active_requests": fmt.Sprint(tc.wantActive), "queue_depth": fmt.Sprint(tc.wantQueue),
@@ -648,6 +639,61 @@ func TestModelServersRowCountsRunningInstances(t *testing.T) {
 			if string(got[key]) != value {
 				t.Errorf("%s: %s = %s, want %s", tc.name, key, got[key], value)
 			}
+		}
+	}
+}
+
+// fetchModelServersRow GETs the model-servers listing of msModel with the
+// fixture's owner token and returns its one row as raw JSON per key, so a test
+// can assert what is on the wire, a zero value included.
+func fetchModelServersRow(t *testing.T, s *Server, step string) map[string]json.RawMessage {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: status = %d, body=%s", step, rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Data) != 1 {
+		t.Fatalf("%s: decode %s: %v", step, rec.Body.String(), err)
+	}
+	return out.Data[0]
+}
+
+// TestModelServersRowCountsRunningInstancesWithoutModelProbe pins that the
+// running-instance count, like the state, does not depend on the agent's
+// runtime_model_probe declaration: it reads only the rows' states, which every
+// runtime_manager agent reports. Only the per-model load and the probe states
+// are that feature's, so they stay zero for an agent without it.
+func TestModelServersRowCountsRunningInstancesWithoutModelProbe(t *testing.T) {
+	s, _ := newModelServersEndpointFixture(t)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms_noprobe"
+	if err := s.Routes.UpsertRuntimeSpec(context.Background(), routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}", Replicable: true,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.AgentFeatures.Set(msServerID, []string{"runtime_manager", runtimeInstancesFeature})
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Instance: 0, Model: msAppModel, State: "running", ActiveRequests: 3, QueueDepth: 1, MetricsProbe: "ok"},
+		{SpecID: specID, Instance: 1, Model: msAppModel + "#1", State: "running", ActiveRequests: 2, MetricsProbe: "ok"},
+		{SpecID: specID, Instance: 2, Model: msAppModel + "#2", State: "starting"},
+	})
+
+	got := fetchModelServersRow(t, s, "an agent without runtime_model_probe")
+	want := map[string]string{
+		"running_instances": "2", "state": `"running"`,
+		"active_requests": "0", "queue_depth": "0", "metrics_probe": `""`,
+	}
+	for key, value := range want {
+		if string(got[key]) != value {
+			t.Errorf("%s = %s, want %s", key, got[key], value)
 		}
 	}
 }

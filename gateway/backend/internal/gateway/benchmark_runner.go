@@ -497,13 +497,14 @@ var (
 type coldStart struct {
 	// confirmed: the next request starts the target from cold, so the cold-minus-warm delta is its
 	// load time. For a server_agent target whose run stops (preStopServer) that means that no
-	// model of the application had a process and the target's own row read stopped, or that the
-	// agent reported every model the stop-all stopped without a process, the target's own row
-	// stopped with pid 0 when it had read backoff, start_failed or crashed, and the clear was
-	// written. When every row was quiet at the selection, every launch spec the run unpinned, the
-	// target aside, also read stopped with pid 0. For one whose run does not stop it means that
-	// the router does not list it, its own status row reads stopped with pid 0 or is absent, and
-	// every other row of a non-empty status snapshot reads stopped with pid 0 (agentColdStart).
+	// model of the application had a process and every row of the target read stopped, or that
+	// the agent reported every model the stop-all stopped without a process, the target's
+	// instance-0 row stopped with pid 0 when it had read backoff, start_failed or crashed, and
+	// the clear was written. When every row was quiet at the selection, every launch spec the run
+	// unpinned, the target aside, also read stopped with pid 0. For one whose run does not stop it
+	// means that the router does not list it, its own instance-0 status row reads stopped with
+	// pid 0 or is absent, and every other row of a non-empty status snapshot reads stopped with
+	// pid 0 (agentColdStart).
 	// For any other target the loaded-models probe confirmed it absent (ensureColdLoadByEviction).
 	confirmed bool
 	// rideOutStop: the target's own force_stopped was or may have been written, so the cold
@@ -1175,17 +1176,22 @@ func (s *Server) benchmarkTelemetryContextSize(ctx context.Context, tgt benchmar
 	}
 }
 
-// benchmarkSpecStatus returns specID's row of one status frame: its instance-0 row, the
-// instance the spec's model name reaches and a benchmark's requests go to. A replicable spec's
-// other instances report rows under the same spec id; a frame with only those has no row for
-// the spec here.
+// benchmarkSpecStatus returns specID's row of one status frame: the spec's representative row
+// (runtimeRowRepresentative: the running instance-0 row, else the running row with the lowest
+// index, else the instance-0 row, else the lowest index), the row every other view of the spec
+// reads too. A replicable spec reports a row per instance under the one spec id; ok is false
+// only when the frame has none of them. Two questions are about instance 0 alone, the instance
+// the target's plain model name reaches and a benchmark's requests go to, and read its row
+// directly instead: whether the target is resident (agentSpecResidency) and whether the
+// stop-all's quiet wait also waits for the target to read stopped (benchmarkStopSelectionOf).
 func benchmarkSpecStatus(frame []RuntimeStatusDTO, specID string) (RuntimeStatusDTO, bool) {
+	var rows []RuntimeStatusDTO
 	for _, row := range frame {
-		if row.SpecID == specID && row.Instance == 0 {
-			return row, true
+		if row.SpecID == specID {
+			rows = append(rows, row)
 		}
 	}
-	return RuntimeStatusDTO{}, false
+	return runtimeRowRepresentative(rows)
 }
 
 // benchmarkSnapshotContextSize decides on the snapshot a subscription starts

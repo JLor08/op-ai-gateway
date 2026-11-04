@@ -45,13 +45,15 @@ type RuntimeGPUStatusDTO struct {
 // for every field it carries, except ImageOptions, which is in-process only --
 // see that field).
 //
-// A replicable spec (#340) has one row per running or starting instance, all
-// under the spec's own SpecID: SpecID is the BASE spec id, Instance tells the
-// rows apart, and Model is the instance's address ("m" for instance 0,
-// "m#k" for instance k). So "a spec's row" is the instance-0 row, and every
-// reader that indexes rows by SpecID alone has to say what it does with the
-// others. A spec that is not replicable, and every row of an agent without
-// the runtime_instances feature, is instance 0 alone: exactly the one row per
+// A replicable spec (#340) has one row for every instance the agent reports,
+// whatever its state -- running, starting, stopped, draining, crashed or any
+// other -- all under the spec's own SpecID: SpecID is the BASE spec id,
+// Instance tells the rows apart, and Model is the instance's address ("m" for
+// instance 0, "m#k" for instance k). A reader that needs ONE row to speak for
+// the spec takes its representative row (representativeRowIndex); a reader
+// that indexes rows by SpecID alone has to say what it does with the others.
+// A spec that is not replicable, and every row of an agent without the
+// runtime_instances feature, is instance 0 alone: exactly the one row per
 // spec there always was.
 type RuntimeStatusDTO struct {
 	SpecID string `json:"spec_id"`
@@ -559,5 +561,56 @@ func (r *runtimeStatusRegistry) Retain(live map[string]struct{}) {
 		if _, ok := live[id]; !ok {
 			delete(r.appliedETag, id)
 		}
+	}
+}
+
+// representativeRowIndex is the rule for which of one spec's status rows on
+// a server speaks for the spec, wherever a reader needs one row: the running
+// instance-0 row; else the running row with the lowest instance index; else
+// the instance-0 row; else the row with the lowest instance index. Among rows
+// the rule cannot tell apart (a malformed frame repeating an instance) the
+// first wins. row reads the instance index and state of row i of n rows, all
+// of one spec, so the one function serves the status rows and the raw
+// telemetry samples alike. It returns -1 when n is 0.
+//
+// Every reader that lets one row stand for the spec goes through it: the
+// context and capability write-backs (primaryRowIndexes), the model-servers
+// row's state and probe states (runtimeRowRepresentative), the image options
+// (specImageOptions) and a benchmark's reading of its target
+// (benchmarkSpecStatus). So no two views of one spec disagree about which row
+// is the spec's.
+//
+// A running row first, because it is the one serving: a crashed or idled-out
+// instance 0 beside a burst instance that serves must not stand for the spec,
+// or it would silence the write-backs while the model serves and read the
+// model as down. Among the running rows and among the rest, instance 0 first,
+// because it is the instance the spec's plain address names and the only one
+// an agent without instances ever had; then the lowest index, so the choice
+// does not depend on the order the agent lists its rows in.
+func representativeRowIndex(n int, row func(i int) (instance int, state string)) int {
+	best, bestRank, bestInstance := -1, 0, 0
+	for i := range n {
+		instance, state := row(i)
+		rank := representativeRank(instance, state)
+		if best < 0 || rank < bestRank || (rank == bestRank && instance < bestInstance) {
+			best, bestRank, bestInstance = i, rank, instance
+		}
+	}
+	return best
+}
+
+// representativeRank orders a row for representativeRowIndex, lower first:
+// running instance 0, another running instance, instance 0, any other row.
+func representativeRank(instance int, state string) int {
+	running := state == agentSpecStateRunning
+	switch {
+	case running && instance == 0:
+		return 0
+	case running:
+		return 1
+	case instance == 0:
+		return 2
+	default:
+		return 3
 	}
 }

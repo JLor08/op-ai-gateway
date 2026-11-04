@@ -50,18 +50,23 @@ func TestBenchmarkOthersStoppedSeesInstances(t *testing.T) {
 	}
 }
 
-// TestBenchmarkTargetRowIsInstanceZero pins which row is "the target's own"
-// wherever a benchmark reads one (benchmarkSpecStatus, agentSpecResidency):
-// the instance-0 row -- the instance the target's plain model name reaches --
-// whatever order the agent reports its rows in, and never a burst instance's.
+// TestBenchmarkTargetRowIsInstanceZero pins the two rows a benchmark reads
+// for its target. benchmarkSpecStatus -- the target's context size, the
+// stop-all's presence check and its quiet wait -- reads the spec's
+// representative row (representativeRowIndex), the row every other view of
+// the spec reads, so a burst instance that serves speaks for the spec while
+// instance 0 is down. Residency (agentSpecResidency) asks a different
+// question, whether the instance the target's plain model name reaches is
+// up, so it reads the instance-0 row whatever order the agent reports its
+// rows in, and never a burst instance's.
 func TestBenchmarkTargetRowIsInstanceZero(t *testing.T) {
 	frame := []RuntimeStatusDTO{instanceStatus("S", 1, "running", 4242), instanceStatus("S", 0, "stopped", 0)}
 	row, ok := benchmarkSpecStatus(frame, "S")
-	if !ok || row.Instance != 0 || row.State != "stopped" {
-		t.Fatalf("benchmarkSpecStatus = %+v (ok %v), want the instance-0 row", row, ok)
+	if !ok || row.Instance != 1 || row.State != "running" {
+		t.Fatalf("benchmarkSpecStatus = %+v (ok %v), want the representative row, the running instance 1", row, ok)
 	}
-	if _, ok := benchmarkSpecStatus([]RuntimeStatusDTO{instanceStatus("S", 2, "running", 1)}, "S"); ok {
-		t.Fatal("benchmarkSpecStatus found a row for S with only a burst instance reported, want none")
+	if row, ok := benchmarkSpecStatus([]RuntimeStatusDTO{instanceStatus("S", 2, "running", 1)}, "S"); !ok || row.Instance != 2 {
+		t.Fatalf("benchmarkSpecStatus = %+v (ok %v), want the only row, the running instance 2", row, ok)
 	}
 
 	srv := &Server{RuntimeStatus: NewRuntimeStatusRegistry()}
@@ -69,6 +74,40 @@ func TestBenchmarkTargetRowIsInstanceZero(t *testing.T) {
 	tgt := benchmarkTarget{server: routing.AIServer{ID: "srv1"}, spec: routing.RuntimeSpec{ID: "S"}}
 	if resident, known := srv.agentSpecResidency(tgt); resident || !known {
 		t.Fatalf("agentSpecResidency = resident %v known %v, want instance 0's stopped row read: not resident, known", resident, known)
+	}
+}
+
+// TestBenchmarkStopSelectionAwaitsTheTargetsInstanceZero pins whose state
+// decides that the stop-all's quiet wait also waits for the target to read
+// stopped: instance 0's, the instance the cold pass's request reaches. A
+// request for an instance 0 in backoff waits behind its backoff timer, and
+// that wait would land in the load time, even while a burst instance of the
+// target serves and is the spec's representative row.
+func TestBenchmarkStopSelectionAwaitsTheTargetsInstanceZero(t *testing.T) {
+	cases := []struct {
+		name string
+		rows []RuntimeStatusDTO
+		want string
+	}{
+		{"instance 0 in backoff beside a serving burst instance", []RuntimeStatusDTO{
+			instanceStatus("S", 1, "running", 4242), instanceStatus("S", 0, "backoff", 0),
+		}, "S"},
+		{"instance 0 stopped beside a crashed burst instance", []RuntimeStatusDTO{
+			instanceStatus("S", 0, "stopped", 0), instanceStatus("S", 1, "crashed", 0),
+		}, ""},
+		{"a plain target that crashed", []RuntimeStatusDTO{instanceStatus("S", 0, "crashed", 0)}, "S"},
+	}
+	for _, tc := range cases {
+		sel, reason := benchmarkStopSelectionOf(tc.rows, "S", nil)
+		if reason != "" || sel.awaitStopped != tc.want {
+			t.Errorf("%s: awaitStopped = %q (reason %q), want %q", tc.name, sel.awaitStopped, reason, tc.want)
+		}
+		if !slices.Contains(sel.stopSet, "S") {
+			t.Errorf("%s: stop set = %v, want the target in it", tc.name, sel.stopSet)
+		}
+	}
+	if _, reason := benchmarkStopSelectionOf([]RuntimeStatusDTO{instanceStatus("T", 0, "running", 1)}, "S", nil); reason != benchmarkStopReasonNoStatus {
+		t.Fatalf("a frame without the target: reason = %q, want %q", reason, benchmarkStopReasonNoStatus)
 	}
 }
 
