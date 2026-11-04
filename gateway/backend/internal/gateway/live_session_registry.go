@@ -76,12 +76,15 @@ func (r *liveSessionRegistry) claim(instanceKey string) (release func(), holder 
 }
 
 // LiveHeld reports whether instanceKey currently has an active live session, WITHOUT
-// claiming or changing the slot. The resolver asks it for a live session's instance
-// candidates (routing.LiveSlotChecker), and a non-live request to a single-slot
-// instance (a buffered transcription or /details) asks it to refuse cleanly instead of
-// colliding at the upstream, where audio.cpp's one-at-a-time behaviour would surface as
-// an error and an honest loud zero. A nil registry holds nothing (it admitted nothing
-// to begin with), so the check is a no-op where live transcription is not wired.
+// claiming or changing the slot. The resolver asks it (routing.LiveSlotChecker) for every
+// candidate of a request that needs a free live slot -- a live session and every
+// transcription, buffered or /details -- in a pool that holds an instance candidate: the
+// instances, and in a mixed pool the plain mappings beside them. A buffered transcription
+// (or /details) also asks it for the target its resolve chose -- a mapping's one taken
+// slot, or a session that started after the resolve -- to refuse cleanly instead of
+// colliding at the upstream, where audio.cpp's one-at-a-time behaviour would surface as an
+// error and an honest loud zero. A nil registry holds nothing (it admitted nothing to
+// begin with), so the check is a no-op where live transcription is not wired.
 //
 // This is an advisory snapshot, not a lock: a live session may start or end right after
 // the read. A live session that selected a slot which is taken before it acquires it is

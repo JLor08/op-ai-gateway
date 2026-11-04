@@ -45,7 +45,13 @@ import (
 // (goneError: provider.unavailable, the code a chat completion gets for it), never the
 // agent router's envelope, whose runtime.* codes are the agent's internals. One whose
 // re-resolve is refused by routing (no host left, a full or timed-out queue) gets that
-// routing answer.
+// routing answer -- except a translated stream (streamSession.reselect), which re-resolves
+// from inside the stream it has begun: a refused re-resolve registers it back on the
+// instance it lost, and the stream ends with the original gone error.
+//
+// The voice-chat gate re-selects as well, when the agent refuses the instance it ensures
+// for a leg (ensureVoiceLeg): the same once-rule, no attempt to leave since the gate sends
+// no request, and a refused re-resolve ends the leg with the original gone error too.
 
 // isInstanceGoneError reports whether err is the agent router's refusal of an
 // instance address it does not serve: 404 runtime.model_not_managed (the address is
