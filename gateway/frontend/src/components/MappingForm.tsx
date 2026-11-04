@@ -21,6 +21,7 @@ import { BenchmarkPollTimeoutError, pollBenchmarkStatus } from './shared/benchma
 import {
   audioMetricsBody,
   audioMetricsForm,
+  AUDIO_COUNT_MAX,
   audioPairIncomplete,
   type AudioConcurrencyLimit,
   type AudioMetricsForm,
@@ -674,7 +675,7 @@ export function MappingForm({
               disabled={audio.limit === ''}
               required={audio.limit !== ''}
               inputRef={audioCountRef}
-              inputProps={{ min: 0, step: 1 }}
+              inputProps={{ min: 0, max: AUDIO_COUNT_MAX, step: 1 }}
               {...(audioPairIncomplete(audio)
                 ? {
                     error: true,

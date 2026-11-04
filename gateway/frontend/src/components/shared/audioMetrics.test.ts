@@ -301,14 +301,15 @@ describe('audioPairIncomplete', () => {
 
   // A limit is half a result: the count the ramp reached belongs beside it.
   it('holds for a limit without a whole count of 0 or more', () => {
-    for (const countText of ['', '   ', '1.5', '-1', 'abc']) {
+    // 2147483648 is one past the int4 column the count is stored in.
+    for (const countText of ['', '   ', '1.5', '-1', 'abc', '2147483648']) {
       expect(audioPairIncomplete(form('performance', countText)), countText).toBe(true);
       expect(audioPairIncomplete(form('resources', countText)), countText).toBe(true);
     }
   });
 
   it('does not hold for a limit with its count, a 0 included', () => {
-    for (const countText of ['0', '2', ' 3 ']) {
+    for (const countText of ['0', '2', ' 3 ', '2147483647']) {
       expect(audioPairIncomplete(form('cap', countText)), countText).toBe(false);
     }
   });

@@ -3234,9 +3234,19 @@ type mappingMetrics struct {
 	genTPSAtCapacity, energyWhPerToken     float64
 }
 
-// validateMappingMetrics rejects negative metric values (zero = "unknown" is allowed).
+// maxMappingMetricInt is the largest value an integer metric of a mapping can
+// hold: its columns are int4 (integer), so a larger value would fail the write
+// on PostgreSQL. It bounds the four integer text metrics and the audio
+// real-time concurrency (audio_ttfa_ms is bigint and takes any int64).
+const maxMappingMetricInt = math.MaxInt32
+
+// validateMappingMetrics rejects negative metric values (zero = "unknown" is
+// allowed) and integer values past their int4 column (maxMappingMetricInt).
 func validateMappingMetrics(m mappingMetrics) error {
 	if m.genTPS < 0 || m.promptTPS < 0 || m.loadMS < 0 || m.contextSize < 0 || m.maxConcurrency < 0 || m.recommendedConcurrency < 0 || m.genTPSAtCapacity < 0 || m.energyWhPerToken < 0 {
+		return ErrMappingMetricInvalid
+	}
+	if max(m.loadMS, m.contextSize, m.maxConcurrency, m.recommendedConcurrency) > maxMappingMetricInt {
 		return ErrMappingMetricInvalid
 	}
 	return nil
@@ -3253,7 +3263,8 @@ func validateMappingMetrics(m mappingMetrics) error {
 //     the ramp stopped, so a count alone would read as a measured ceiling no ramp
 //     reported;
 //   - a limit other than "" or one of the three stop reasons, or one of the three
-//     without a count of 0 or more beside it -- a measured 0 is a result, not a blank;
+//     without a count of 0 to maxMappingMetricInt (the int4 column's range) beside
+//     it -- a measured 0 is a result, not a blank;
 //   - a limit of "" beside a non-zero count. "" sent alone (or with a count of 0)
 //     clears the pair: no ramp, count unknown.
 func applyAudioMetrics(mapping *routing.ModelMapping, req UpdateMappingRequest) (routing.MappingMetricsMask, error) {
@@ -3299,7 +3310,7 @@ func audioConcurrencyPair(count *int, limit *string) (int, string, bool, error) 
 		}
 		return 0, "", true, nil
 	case routing.AudioLimitPerformance, routing.AudioLimitResources, routing.AudioLimitCap:
-		if count == nil || *count < 0 {
+		if count == nil || *count < 0 || *count > maxMappingMetricInt {
 			return 0, "", false, ErrMappingMetricInvalid
 		}
 		return *count, *limit, true, nil

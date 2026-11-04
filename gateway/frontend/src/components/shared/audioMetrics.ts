@@ -163,15 +163,22 @@ export type AudioMetricsBody = Pick<
   'audio_rate_x' | 'audio_ttfa_ms' | 'audio_realtime_concurrency' | 'audio_concurrency_limit'
 >;
 
-/** The count field's text as the whole count of 0 or more it must be, else null. */
+// The largest real-time count the gateway stores: its column is int4, and the
+// gateway refuses a larger one (maxMappingMetricInt).
+export const AUDIO_COUNT_MAX = 2147483647;
+
+/**
+ * The count field's text as the whole count of 0 to AUDIO_COUNT_MAX it must
+ * be, else null.
+ */
 function audioCountFromText(text: string): number | null {
   const n = Number(text.trim());
-  return text.trim() !== '' && Number.isInteger(n) && n >= 0 ? n : null;
+  return text.trim() !== '' && Number.isInteger(n) && n >= 0 && n <= AUDIO_COUNT_MAX ? n : null;
 }
 
 /**
  * Whether the editor holds a limit without the count that belongs beside it:
- * a blank field, or one that is not a whole number of 0 or more. Beside a
+ * a blank field, or one that is not a whole number of 0 to AUDIO_COUNT_MAX. Beside a
  * limit, 0 is a result -- not real-time even with one stream, a ceiling the
  * scaler obeys -- so a blank field cannot stand for "unknown" there the way
  * it does for the rate and the time. The editor names the field and refuses

@@ -101,7 +101,7 @@ function audioLimitEn(limit: AudioConcurrencyLimit | ''): string {
 // reads "≥ 0". Without a limit no count is saved at all.
 function audioCountRequiredDe(limit: AudioConcurrencyLimit | ''): string {
   const what =
-    'Gehört zur gewählten Begrenzung: die letzte Stufe, die mit der Echtzeit Schritt hielt, als ganze Zahl ab 0.';
+    'Gehört zur gewählten Begrenzung: die letzte Stufe, die mit der Echtzeit Schritt hielt, als ganze Zahl von 0 bis 2147483647.';
   switch (limit) {
     case 'performance':
       return `${what} Bei „Leistung“ ist sie eine gemessene Obergrenze: 0 = ${audioFigureDe(0, limit)}, schon ein einzelner Strom ist zu langsam.`;
@@ -115,7 +115,7 @@ function audioCountRequiredDe(limit: AudioConcurrencyLimit | ''): string {
 
 function audioCountRequiredEn(limit: AudioConcurrencyLimit | ''): string {
   const what =
-    'Required with the chosen limit: the last level that kept up with real time, a whole number of 0 or more.';
+    'Required with the chosen limit: the last level that kept up with real time, a whole number from 0 to 2147483647.';
   switch (limit) {
     case 'performance':
       return `${what} With Performance it is a measured ceiling: 0 = ${audioFigureEn(0, limit)}, even one stream alone is too slow.`;

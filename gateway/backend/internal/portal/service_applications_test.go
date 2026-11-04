@@ -4478,8 +4478,16 @@ func TestMappingAudioMetricsEditable(t *testing.T) {
 		`{"audio_realtime_concurrency":2,"audio_concurrency_limit":"bogus"}`,
 		`{"audio_realtime_concurrency":2,"audio_concurrency_limit":""}`,
 		`{"audio_realtime_concurrency":-1,"audio_concurrency_limit":"performance"}`,
+		// The count is an int4 column: one past its range would fail the
+		// write on PostgreSQL (and wrap nowhere else), so it is refused here.
+		`{"audio_realtime_concurrency":2147483648,"audio_concurrency_limit":"performance"}`,
 		`{"audio_rate_x":-0.5}`,
 		`{"audio_ttfa_ms":-1}`,
+		// So are the text metrics' int4 columns, edited in the same request.
+		`{"load_time_ms":2147483648}`,
+		`{"context_size":2147483648}`,
+		`{"max_concurrency":2147483648}`,
+		`{"recommended_concurrency":2147483648}`,
 	} {
 		if _, err := update(body); !errors.Is(err, ErrMappingMetricInvalid) {
 			t.Fatalf("UpdateMapping(%s) err = %v, want ErrMappingMetricInvalid", body, err)
