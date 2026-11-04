@@ -28,6 +28,9 @@ var benchmarkOmits = map[string]bool{
 	// the mapping's instance 0 through the plain model name ProviderModel carries,
 	// and leaves the key empty for the reason RouteID is.
 	"InstanceKey": true,
+	// Whether the mapping runs instances matters only to what is held per instance and
+	// to re-selecting a request that lost its instance; a benchmark stream does neither.
+	"InstanceCapable": true,
 	// No ActiveRequest is registered and no InferenceEvent emitted on the benchmark
 	// stream (streamOnce -> CompleteStream), so nothing reads Target.ServerID here.
 	"ServerID": true,

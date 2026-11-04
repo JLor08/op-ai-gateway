@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package routing
+
+import (
+	"context"
+	"errors"
+	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
+	"slices"
+	"testing"
+	"time"
+)
+
+// fakeLiveSlots is a test LiveSlotChecker: the instance keys whose live slot
+// is held. asked records every key it was asked about.
+type fakeLiveSlots struct {
+	held  map[string]bool
+	asked []string
+}
+
+func (f *fakeLiveSlots) LiveHeld(instanceKey string) bool {
+	f.asked = append(f.asked, instanceKey)
+	return f.held[instanceKey]
+}
+
+func liveRequest(model string) inference.Request {
+	return inference.Request{Model: model, APIFlavor: APIFlavorOpenAIAudio, LiveSession: true}
+}
+
+// liveInstanceStore is instanceCandidateStore's qwen-coder mapping serving the
+// audio flavor too, so a live session can resolve to it.
+func liveInstanceStore(t *testing.T, now time.Time) *MemoryStore {
+	t.Helper()
+	store := instanceCandidateStore(t, now, 0)
+	app, err := store.ApplicationByID(context.Background(), "app_inst")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.APIFlavors = []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}
+	if err := store.UpdateApplication(context.Background(), app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	return store
+}
+
+// A live session is never routed to an instance whose live slot is held: with
+// instance 0's slot taken the session lands on instance 1, while a request
+// that is not a live session is judged without the slots.
+func TestLiveSessionSkipsAHeldInstance(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(liveInstanceStore(t, now), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1, Running: []int{1}}}})
+	r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5"}}})
+	slots := &fakeLiveSlots{held: map[string]bool{"map_inst#0": true}}
+	r.SetLiveSlotChecker(slots)
+	r.SetAdmissionController(timeoutAdmission())
+
+	target, err := r.Resolve(context.Background(), auth.Token{}, liveRequest("qwen-coder"))
+	if err != nil || target.InstanceKey != "map_inst#1" {
+		t.Fatalf("live Resolve = %q, %v; want map_inst#1, the instance whose slot is free", target.InstanceKey, err)
+	}
+	if !target.InstanceCapable {
+		t.Fatal("target.InstanceCapable = false, want true for an instance of a replicable spec")
+	}
+	plain := liveRequest("qwen-coder")
+	plain.LiveSession = false
+	slots.asked = nil
+	if target, err := r.Resolve(context.Background(), auth.Token{}, plain); err != nil || target.InstanceKey != "map_inst#0" {
+		t.Fatalf("non-live Resolve = %q, %v; want the loaded instance 0, judged without the live slots", target.InstanceKey, err)
+	}
+	if len(slots.asked) != 0 {
+		t.Fatalf("live slots asked %v for a request that is not a live session, want none", slots.asked)
+	}
+}
+
+// Every live slot of a replicable model held parks the live session in the
+// admission queue, and the demand it signals is for a live slot.
+func TestLiveSessionAllHeldParksAndSignalsLive(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(liveInstanceStore(t, now), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1, Running: []int{1}}}})
+	r.SetLiveSlotChecker(&fakeLiveSlots{held: map[string]bool{"map_inst#0": true, "map_inst#1": true}})
+	sink := &fakeDemandSink{}
+	r.SetDemandSink(sink)
+	adm := timeoutAdmission()
+	r.SetAdmissionController(adm)
+
+	if _, err := r.Resolve(context.Background(), auth.Token{}, liveRequest("qwen-coder")); !errors.Is(err, ErrAdmissionQueueTimeout) || adm.calls != 1 {
+		t.Fatalf("Resolve = %v after %d waits, want ErrAdmissionQueueTimeout after 1", err, adm.calls)
+	}
+	want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAIAudio, Live: true, MappingIDs: []string{"map_inst"}}}
+	if !demandSignalsEqual(sink.got, want) {
+		t.Fatalf("demand signals = %+v, want %+v", sink.got, want)
+	}
+}
+
+// A mapping without instances is not judged by its live slot: the resolver
+// routes to it as before, and the session's own slot acquire answers busy.
+func TestLiveSlotIgnoredForAMappingWithoutInstances(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(liveInstanceStore(t, now), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{}})
+	slots := &fakeLiveSlots{held: map[string]bool{"map_inst#0": true}}
+	r.SetLiveSlotChecker(slots)
+	adm := timeoutAdmission()
+	r.SetAdmissionController(adm)
+
+	target, err := r.Resolve(context.Background(), auth.Token{}, liveRequest("qwen-coder"))
+	if err != nil || target.InstanceKey != "map_inst#0" || adm.calls != 0 {
+		t.Fatalf("Resolve = %q, %v after %d waits; want map_inst#0 at once", target.InstanceKey, err, adm.calls)
+	}
+	if target.InstanceCapable {
+		t.Fatal("target.InstanceCapable = true, want false for a mapping without instances")
+	}
+	if len(slots.asked) != 0 {
+		t.Fatalf("live slots asked %v, want none for a mapping without instances", slots.asked)
+	}
+}
+
+// An instance the request names in ExcludeInstanceKeys is never selected --
+// not even when it would win -- and a request that excludes every candidate
+// has no healthy host.
+func TestExcludedInstanceIsNeverSelected(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(instanceCandidateStore(t, now, 0), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1, Running: []int{2}}}})
+	r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5#2"}}})
+	r.SetAdmissionController(timeoutAdmission())
+
+	req := chatRequest("qwen-coder")
+	if target, err := r.Resolve(context.Background(), auth.Token{}, req); err != nil || target.InstanceKey != "map_inst#2" {
+		t.Fatalf("Resolve = %q, %v; want the loaded map_inst#2", target.InstanceKey, err)
+	}
+	req.ExcludeInstanceKeys = []string{"map_inst#2"}
+	if target, err := r.Resolve(context.Background(), auth.Token{}, req); err != nil || target.InstanceKey != "map_inst#0" {
+		t.Fatalf("Resolve excluding map_inst#2 = %q, %v; want map_inst#0", target.InstanceKey, err)
+	}
+	req.ExcludeInstanceKeys = []string{"map_inst#2", "map_inst#0"}
+	if _, err := r.Resolve(context.Background(), auth.Token{}, req); !errors.Is(err, ErrNoHealthyHost) {
+		t.Fatalf("Resolve excluding every instance err = %v, want ErrNoHealthyHost", err)
+	}
+}
+
+// A parked request keeps its exclusions on every admission turn: an excluded
+// instance that frees while it waits is still never selected.
+func TestExclusionHoldsAcrossAdmissionTurns(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(instanceCandidateStore(t, now, 0), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1, Running: []int{2}}}})
+	activity := &fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}}
+	r.SetInstanceActivityChecker(activity)
+	adm := &fakeAdmission{onWait: func(call int) error {
+		if call == 1 {
+			activity.byKey["map_inst#0"] = 0
+			return nil
+		}
+		return ErrAdmissionQueueTimeout
+	}}
+	r.SetAdmissionController(adm)
+
+	req := chatRequest("qwen-coder")
+	req.ExcludeInstanceKeys = []string{"map_inst#2"}
+	target, err := r.Resolve(context.Background(), auth.Token{}, req)
+	if err != nil || target.InstanceKey != "map_inst#0" || adm.calls != 1 {
+		t.Fatalf("Resolve = %q, %v after %d waits; want map_inst#0 after one wait", target.InstanceKey, err, adm.calls)
+	}
+	if slices.Contains(activity.asked, "map_inst#2") {
+		t.Fatalf("instance activity asked %v: the excluded instance was judged, want it filtered out first", activity.asked)
+	}
+}

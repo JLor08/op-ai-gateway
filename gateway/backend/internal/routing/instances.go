@@ -101,8 +101,9 @@ type InstanceActivityChecker interface {
 // -- the same lenience a nil ServerActivityChecker gives the server cap.
 func (r *Resolver) SetInstanceActivityChecker(c InstanceActivityChecker) { r.instanceActivity = c }
 
-// DemandSignal says a gateway model needs another instance: every instance
-// candidate the resolver had for it was at capacity.
+// DemandSignal says a gateway model needs another instance: a request is
+// about to wait in the admission queue because every candidate it could use
+// was at capacity, at least one of them an instance.
 type DemandSignal struct {
 	// Model is the gateway model whose instances were all busy -- a group
 	// member's own name, never the group's.
@@ -114,13 +115,35 @@ type DemandSignal struct {
 	ServerID string
 	// Live is true when the demand is for a live slot (a live session).
 	Live bool
+	// MappingIDs are the instance-capable mappings of Model the waiting
+	// request could use -- the ones that passed its provisioning, endpoint,
+	// capability and reachability filters -- once each, in candidate order. An
+	// instance started for any other mapping of Model would not serve it.
+	MappingIDs []string
 }
 
 // DemandSink receives demand signals. Signal is called on the request path,
-// so it must not block.
+// from as many goroutines as there are requests parking, and once on every
+// admission turn a request spends parked -- so a request that waits through
+// several turns signals several times, and a sink that wants one scale-up
+// per need coalesces them. It must not block: the request is about to wait,
+// and a sink that blocked would hold it before it ever reached the queue.
 type DemandSink interface {
 	Signal(DemandSignal)
 }
+
+// LiveSlotChecker reports whether an instance's live slot is held: a live
+// transcription session is in progress on it, by its gateway instance key
+// (InstanceKey). Satisfied by the gateway's live-session registry.
+type LiveSlotChecker interface {
+	LiveHeld(instanceKey string) bool
+}
+
+// SetLiveSlotChecker installs the live-slot source a live session's resolve
+// (inference.Request.LiveSession) judges instance candidates by. Leaving it
+// unset (nil) means no slot is known to be held: a session is routed as any
+// request is, and only its own slot acquire can find the instance taken.
+func (r *Resolver) SetLiveSlotChecker(c LiveSlotChecker) { r.liveSlots = c }
 
 // SetDemandSink installs the receiver of demand signals. Leaving it unset
 // (nil) drops them: an all-busy request still queues, nothing starts another

@@ -257,7 +257,10 @@ func TestResolveSeesInstanceStartedDuringAdmissionWait(t *testing.T) {
 	r.SetInstanceSource(src)
 	r.SetLoadedModelChecker(loaded)
 	r.SetInstanceActivityChecker(activity)
-	adm := &fakeAdmission{onWait: func(int) error {
+	adm := &fakeAdmission{onWait: func(call int) error {
+		if call > 1 {
+			return ErrAdmissionQueueTimeout // the second turn did not see the new instance
+		}
 		// While the request waits, instance 1 reaches running and instance 0 frees.
 		src.views["map_inst"] = InstanceView{Replicable: true, Parallelism: 1, Running: []int{1}}
 		loaded.byServer["srv_inst"] = []string{"qwen2.5#1"}

@@ -135,8 +135,8 @@ func TestAllInstancesBusyQueuesAndSignals(t *testing.T) {
 	if adm.calls != 1 || !slices.Equal(adm.gotServers, []string{"srv_inst"}) {
 		t.Fatalf("WaitForSlot calls %d on %v, want 1 on [srv_inst]", adm.calls, adm.gotServers)
 	}
-	want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAI}}
-	if !slices.Equal(sink.got, want) {
+	want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, MappingIDs: []string{"map_inst"}}}
+	if !demandSignalsEqual(sink.got, want) {
 		t.Fatalf("demand signals = %+v, want %+v", sink.got, want)
 	}
 }
@@ -210,7 +210,12 @@ func TestResolveReExpandsEachAdmissionTurn(t *testing.T) {
 	r.SetInstanceSource(src)
 	r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}})
 	r.SetDemandSink(sink)
-	adm := &fakeAdmission{onWait: func(int) error {
+	adm := &fakeAdmission{onWait: func(call int) error {
+		if call > 1 {
+			// A second wait means the second turn did not see the new instance:
+			// fail with an assertion rather than park forever.
+			return ErrAdmissionQueueTimeout
+		}
 		// While the request waits, instance 1 reaches running; instance 0 stays busy.
 		src.views["map_inst"] = InstanceView{Replicable: true, Parallelism: 1, Running: []int{1}}
 		return nil
@@ -248,7 +253,10 @@ func TestGroupReExpandsEachAdmissionTurn(t *testing.T) {
 	r.SetInstanceSource(src)
 	r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}})
 	r.SetDemandSink(sink)
-	adm := &fakeAdmission{onWait: func(int) error {
+	adm := &fakeAdmission{onWait: func(call int) error {
+		if call > 1 {
+			return ErrAdmissionQueueTimeout // the second turn did not see the new instance
+		}
 		src.views["map_inst"] = InstanceView{Replicable: true, Parallelism: 1, Running: []int{1}}
 		return nil
 	}}
@@ -264,7 +272,7 @@ func TestGroupReExpandsEachAdmissionTurn(t *testing.T) {
 	if adm.calls != 1 || !slices.Equal(adm.gotServers, []string{"srv_inst"}) {
 		t.Fatalf("WaitForSlot calls %d on %v, want 1 on [srv_inst]", adm.calls, adm.gotServers)
 	}
-	if want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAI}}; !slices.Equal(sink.got, want) {
+	if want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, MappingIDs: []string{"map_inst"}}}; !demandSignalsEqual(sink.got, want) {
 		t.Fatalf("demand signals = %+v, want %+v (the member's model)", sink.got, want)
 	}
 	if n := len(src.asked); n != 2 {
@@ -415,6 +423,25 @@ func TestMixedFleetCapacity(t *testing.T) {
 			t.Fatalf("waits %d, demand signals %v; want neither while a candidate is under its cap", adm.calls, sink.got)
 		}
 	})
+	// The scorer alone would pick an instance here: srv_inst carries no load
+	// and holds the model resident, srv_old is loaded down and cold. Only each
+	// instance's own cap -- its in-flight request at parallelism one -- sends
+	// the request to the old server.
+	t.Run("the per-instance cap overrides a better-scoring busy instance", func(t *testing.T) {
+		now := instanceCapacityNow
+		r := NewResolver(mixedFleetStore(t, now, 0), func() time.Time { return now }, nil)
+		r.SetInstanceSource(&fakeInstanceSource{views: views()})
+		r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5", "qwen2.5#2"}}})
+		r.SetServerActivityChecker(&fakeActivity{inFlight: map[string]int{"srv_old": 6}}, 0)
+		r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: busy})
+		adm := timeoutAdmission()
+		r.SetAdmissionController(adm)
+
+		target, err := r.Resolve(context.Background(), auth.Token{}, chatRequest("qwen-coder"))
+		if err != nil || target.InstanceKey != "map_old#0" || adm.calls != 0 {
+			t.Fatalf("Resolve = %q, %v after %d waits; want map_old#0 at once, every instance being at its own cap", target.InstanceKey, err, adm.calls)
+		}
+	})
 	t.Run("everything at its cap queues on both servers and signals", func(t *testing.T) {
 		now := instanceCapacityNow
 		r := NewResolver(mixedFleetStore(t, now, 1), func() time.Time { return now }, nil)
@@ -434,7 +461,7 @@ func TestMixedFleetCapacity(t *testing.T) {
 		if adm.calls != 1 || !slices.Equal(servers, []string{"srv_inst", "srv_old"}) {
 			t.Fatalf("WaitForSlot calls %d on %v, want 1 on both servers", adm.calls, adm.gotServers)
 		}
-		if want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAI}}; !slices.Equal(sink.got, want) {
+		if want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAI, MappingIDs: []string{"map_inst"}}}; !demandSignalsEqual(sink.got, want) {
 			t.Fatalf("demand signals = %+v, want %+v", sink.got, want)
 		}
 	})

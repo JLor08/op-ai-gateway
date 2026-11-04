@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/storeerr"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -66,7 +67,44 @@ var (
 
 // errAllAtCapacity is an INTERNAL sentinel from selectCandidate: every candidate is at its
 // effective cap AND an admission controller is wired, so Resolve should queue + retry.
+// selectCandidate returns it wrapped in an *atCapacityError, which carries the demand
+// the request signals if it parks; errors.Is matches either.
 var errAllAtCapacity = errors.New("routing: all candidates at capacity")
+
+// atCapacityError is errAllAtCapacity together with what the request would ask the
+// demand sink for, decided where the capped set was built and sent only where the
+// request is about to wait (signalDemand). demand is nil when no candidate at capacity
+// was an instance: another instance could not serve the request sooner.
+type atCapacityError struct {
+	demand *DemandSignal
+}
+
+func (e *atCapacityError) Error() string { return errAllAtCapacity.Error() }
+
+func (e *atCapacityError) Unwrap() error { return errAllAtCapacity }
+
+// parkDemand returns the demand an all-at-capacity err carries, if any.
+func parkDemand(err error) (DemandSignal, bool) {
+	var ac *atCapacityError
+	if !errors.As(err, &ac) || ac.demand == nil {
+		return DemandSignal{}, false
+	}
+	return *ac.demand, true
+}
+
+// signalDemand hands the sink each demand a request about to wait in the admission
+// queue carries. It runs at the two places a request parks -- resolveStandard's and
+// resolveGroupOnce's WaitForSlot -- and nowhere else, so a request signals exactly once
+// per turn it spends parked: never for a candidate a walk skipped or probed and then
+// served around, and never on the fail-open path a resolver without a queue takes.
+func (r *Resolver) signalDemand(demands ...DemandSignal) {
+	if r.demand == nil {
+		return
+	}
+	for _, d := range demands {
+		r.demand.Signal(d)
+	}
+}
 
 type Target struct {
 	RouteID       string // serving model mapping id (kept for usage attribution)
@@ -80,8 +118,14 @@ type Target struct {
 	// function), on a target built from a mapping; "" on a vendor target.
 	// ProviderModel is that instance's address.
 	InstanceKey string
-	Timeout     time.Duration
-	APIFlavor   string
+	// InstanceCapable is true when the mapping behind this target runs
+	// instances on its server (a replicable spec on an agent that runs them),
+	// instance 0 included: its live slot and its load are per instance, and a
+	// request that loses its instance may be re-selected onto a sibling.
+	// False for every other target, which keeps today's single-slot behaviour.
+	InstanceCapable bool
+	Timeout         time.Duration
+	APIFlavor       string
 	// APIToken is the resolved application's per-app upstream credential, still
 	// SEALED (enc:/plain:). Routing never decrypts it; the cipher-holding gateway
 	// layers open it and attach it to the upstream call. Empty = no upstream auth.
@@ -472,6 +516,7 @@ type Resolver struct {
 	instances         InstanceSource
 	instanceActivity  InstanceActivityChecker
 	demand            DemandSink
+	liveSlots         LiveSlotChecker
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
 	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
 	// the per-user vendor-account branch (resolveVendorAccount). All three are
@@ -849,6 +894,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 				if wait = deadline.Sub(r.clock()); wait <= 0 {
 					return Target{}, ErrAdmissionQueueTimeout // deadline already elapsed
 				}
+			}
+			if d, ok := parkDemand(err); ok {
+				r.signalDemand(d)
 			}
 			if werr := r.admission.WaitForSlot(ctx, serverIDs, wait); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
@@ -1755,10 +1803,15 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	// route anyway; no clamp is needed.
 	need := estInputTokens(req) + req.MaxTokens
 
-	// Pass 1: the reachable/selectable/non-busy candidates (the existing gates).
+	// Pass 1: the reachable/selectable/non-busy candidates (the existing gates), less any
+	// instance the request already tried and lost (ExcludeInstanceKeys) -- a hard filter
+	// on every admission turn, so a parked request never comes back to it.
 	reachable := make([]MappingCandidate, 0, len(candidates))
 	for _, c := range candidates {
 		if !serverSelectable(c.Server) {
+			continue
+		}
+		if len(req.ExcludeInstanceKeys) > 0 && slices.Contains(req.ExcludeInstanceKeys, InstanceKey(c.Mapping.ID, c.Instance)) {
 			continue
 		}
 		if r.checker != nil && !r.checker.Reachable(c.Application.ID) {
@@ -1787,54 +1840,48 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 		pool = reachable
 	}
 
-	// Capacity cap (reservation-aware), CP3: PREFER candidates whose server is below its
-	// effective concurrency ceiling for new/unpinned traffic —
-	// effectiveCap = max_concurrency − activeReservedSessions(server). Gated on BOTH a
-	// known max_concurrency (>0) AND a live activity signal (r.activity != nil, the source
-	// of the in-flight load k) — otherwise a no-op (today's behaviour). A pinned request
-	// never reaches here (resolveAffinity returns first). FAIL-OPEN on BOTH emptiness AND
-	// viability (exactly like swap-protection): if the under-cap subset is empty, OR it
-	// yields no Score-viable pick, fall back to the full pool rather than refuse a request
-	// an at-capacity-but-viable server could still serve (the upstream then queues it — CP4
-	// replaces this fallback with the admission queue). The emptiness-only variant was a
-	// verification-caught MAJOR: it could strip the sole viable-but-at-cap candidate and
-	// leave only under-cap non-viable ones → ErrNoHealthyHost. So max_concurrency==0
-	// everywhere (the under-cap subset == the full pool) is exactly the pre-CP3 behaviour.
+	// Capacity cap, CP3/CP4: PREFER the candidates under their cap (underCap); when none
+	// is, queue the request (CP4) if an admission controller is wired. Two kinds of cap:
 	//
-	// An instance candidate -- every candidate of a mapping expandInstances found
-	// instance-capable, instance 0 included -- is judged by its OWN in-flight count against
-	// the spec's instance parallelism instead (underCap). Its instances share the server, so
-	// the server's count cannot say whether this one instance takes another request, and the
-	// parallelism is always known (at least 1), so with the instance activity source wired
-	// an instance's cap is always defined: when every candidate is at its cap and at least
-	// one is an instance, the request queues even though the mapping sets no
-	// max_concurrency, and the demand sink hears that the model needs another instance --
-	// the one thing that would serve it sooner.
-	if r.activity != nil || r.instanceActivity != nil {
+	//   - A candidate of a mapping without instances keeps the reservation-aware server
+	//     cap: in-flight on its server below effectiveCap = max_concurrency −
+	//     activeReservedSessions(server). It is defined only with a known max_concurrency
+	//     (>0) AND a live server activity signal (r.activity != nil); otherwise such a
+	//     candidate is never capped (today's behaviour).
+	//   - An instance candidate -- every candidate of a mapping expandInstances found
+	//     instance-capable, instance 0 included -- is judged by its OWN in-flight count
+	//     against the spec's instance parallelism (always at least 1), read from
+	//     r.instanceActivity: its instances share the server, so the server's count cannot
+	//     say whether this one instance takes another request. Without that source an
+	//     instance is never capped. A live session (req.LiveSession) additionally finds an
+	//     instance at its cap while its one live slot is held (r.liveSlots).
+	//
+	// The block runs when any of those three sources is wired, and is a no-op otherwise.
+	// A pinned request never reaches here (resolveAffinity returns first). When the
+	// under-cap subset is empty the request queues if an admission controller is wired --
+	// with an instance among the candidates it does so even though no mapping sets a
+	// max_concurrency, and carries the demand it signals once it actually parks
+	// (atCapacityError, signalDemand) -- and fails open onto the full pool otherwise.
+	// When the subset is non-empty but yields no Score-viable pick, it also fails open
+	// rather than refuse a request an at-capacity-but-viable server could still serve.
+	// The emptiness-only variant was a verification-caught MAJOR: it could strip the sole
+	// viable-but-at-cap candidate and leave only under-cap non-viable ones →
+	// ErrNoHealthyHost. So with every cap undefined (the under-cap subset == the full
+	// pool) this is exactly the pre-CP3 behaviour.
+	if r.activity != nil || r.instanceActivity != nil || (req.LiveSession && r.liveSlots != nil) {
 		capped := make([]MappingCandidate, 0, len(pool))
-		demandModel := ""
 		for _, c := range pool {
-			if c.InstanceCapable && demandModel == "" {
-				// The mapping's own gateway model, so a group member names itself
-				// rather than the group req.Model carries.
-				demandModel = c.Mapping.GatewayModelName
-			}
-			if r.underCap(c, now) {
+			if r.underCap(c, req, now) {
 				capped = append(capped, c)
 			}
 		}
 		if len(capped) == 0 {
-			// Signalled whether or not a queue is wired: the demand is the same either way,
-			// and the sink must not block, so this costs the request nothing.
-			if demandModel != "" && r.demand != nil {
-				r.demand.Signal(DemandSignal{Model: demandModel, APIFlavor: NormalizeAPIFlavor(req.APIFlavor)})
-			}
 			if r.admission != nil {
 				// Every candidate is at its effective cap: let Resolve queue + retry (CP4)
 				// instead of failing open. Pinned requests never reach here (resolveAffinity
 				// returns earlier), so only unpinned traffic queues. A nil controller keeps the
 				// CP3 fail-open below.
-				return MappingCandidate{}, false, errAllAtCapacity
+				return MappingCandidate{}, false, &atCapacityError{demand: instanceDemand(pool, req)}
 			}
 			slog.Warn("capacity-cap filter empty; routing without it (all candidates at capacity)", "model", model)
 		} else if len(capped) < len(pool) {
@@ -1847,15 +1894,21 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	return r.selectWithSwapProtection(ctx, pool, model, now)
 }
 
-// underCap reports whether candidate c can take another request now. An instance
-// candidate is under its cap while its own in-flight count is below the parallelism its
-// expansion carried; with no instance activity source its load is unknown and it is never
-// capped. Every other candidate keeps the server cap: in-flight on its server below
-// max_concurrency minus the server's reserved sessions, and no cap at all when
-// max_concurrency is unset (<= 0) or no server activity source is wired.
-func (r *Resolver) underCap(c MappingCandidate, now time.Time) bool {
+// underCap reports whether candidate c can take req now. An instance candidate is under
+// its cap while its own in-flight count is below the parallelism its expansion carried
+// (with no instance activity source its load is unknown and that part never caps it) and,
+// for a live session, while its live slot is free. Every other candidate keeps the server
+// cap: in-flight on its server below max_concurrency minus the server's reserved
+// sessions, and no cap at all when max_concurrency is unset (<= 0) or no server activity
+// source is wired. A live session on such a candidate is not judged by its slot here: a
+// mapping without instances has one slot, and the session's own acquire answers busy.
+func (r *Resolver) underCap(c MappingCandidate, req inference.Request, now time.Time) bool {
 	if c.InstanceCapable {
-		return r.instanceActivity == nil || r.instanceActivity.InstanceActivity(InstanceKey(c.Mapping.ID, c.Instance)) < c.InstanceParallelism
+		key := InstanceKey(c.Mapping.ID, c.Instance)
+		if req.LiveSession && r.liveSlots != nil && r.liveSlots.LiveHeld(key) {
+			return false
+		}
+		return r.instanceActivity == nil || r.instanceActivity.InstanceActivity(key) < c.InstanceParallelism
 	}
 	maxC := c.Mapping.MaxConcurrency
 	if maxC <= 0 || r.activity == nil {
@@ -1863,6 +1916,27 @@ func (r *Resolver) underCap(c MappingCandidate, now time.Time) bool {
 	}
 	k, _ := r.activity.ServerActivity(c.Server.ID)
 	return k < maxC-r.reservation.activeCount(c.Server.ID, now)
+}
+
+// instanceDemand is the demand a request finding every candidate of pool at its cap
+// signals once it parks: for the gateway model of pool's first instance candidate (a
+// member's own name in a group walk, which hands selectCandidate one member's pool), the
+// distinct instance-capable mappings of that model among pool -- the ones this request
+// passed every filter for. nil when pool holds no instance candidate.
+func instanceDemand(pool []MappingCandidate, req inference.Request) *DemandSignal {
+	var d *DemandSignal
+	for _, c := range pool {
+		if !c.InstanceCapable {
+			continue
+		}
+		if d == nil {
+			d = &DemandSignal{Model: c.Mapping.GatewayModelName, APIFlavor: NormalizeAPIFlavor(req.APIFlavor), Live: req.LiveSession}
+		}
+		if c.Mapping.GatewayModelName == d.Model && !slices.Contains(d.MappingIDs, c.Mapping.ID) {
+			d.MappingIDs = append(d.MappingIDs, c.Mapping.ID)
+		}
+	}
+	return d
 }
 
 // selectWithSwapProtection applies the swap-protection filter to pool, then selects.
@@ -2163,6 +2237,7 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		Model:                mapping.GatewayModelName,
 		ProviderModel:        InstanceAddress(mapping.AppModelName, c.Instance),
 		InstanceKey:          InstanceKey(mapping.ID, c.Instance),
+		InstanceCapable:      c.InstanceCapable,
 		Timeout:              time.Duration(app.TimeoutMS) * time.Millisecond,
 		APIFlavor:            apiFlavor,
 		APIToken:             apiToken,
@@ -2379,39 +2454,66 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 	return kept
 }
 
+// parkMaterial is what the members a group walk found at capacity give a request that
+// parks: the distinct candidate server ids to watch, the MAX
+// admission_queue_timeout_seconds across their candidates (mirroring the main Resolve
+// admission-param computation), and the demand each member whose candidates include an
+// instance signals -- one per member, by its own model and mappings.
+type parkMaterial struct {
+	servers   []string
+	queueSecs int
+	demand    []DemandSignal
+}
+
+// add folds one more at-capacity member's material into p: its servers, its queue
+// timeout if larger, and its demand unless a member of the same model already gave one
+// (a duplicated member name is walked twice but needs one more instance once).
+func (p *parkMaterial) add(m parkMaterial) {
+	p.servers = append(p.servers, m.servers...)
+	p.queueSecs = max(p.queueSecs, m.queueSecs)
+	for _, d := range m.demand {
+		if !slices.ContainsFunc(p.demand, func(have DemandSignal) bool { return have.Model == d.Model }) {
+			p.demand = append(p.demand, d)
+		}
+	}
+}
+
 // selectMember resolves one group member's eligible candidates and reports its status.
-// For a memberAtCapacity result it also returns the member's distinct candidate server
-// ids and the MAX admission_queue_timeout_seconds across those candidates (queue
-// material, mirroring the main Resolve admission-param computation). memberAtCapacity is
-// only possible when an AdmissionController is wired (selectCandidate returns
-// errAllAtCapacity only then); otherwise an all-at-cap member fails open inside
-// selectCandidate and comes back memberOK, so a group without a wired admission
-// controller never queues.
+// For a memberAtCapacity result it also returns the member's park material (its
+// distinct candidate server ids, the MAX queue timeout across those candidates, and the
+// demand it signals if the request parks). memberAtCapacity is only possible when an
+// AdmissionController is wired (selectCandidate returns errAllAtCapacity only then);
+// otherwise an all-at-cap member fails open inside selectCandidate and comes back
+// memberOK, so a group without a wired admission controller never queues.
 //
 // Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
 // eligibleCandidates; this function only turns that outcome into a status and selects.
-func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, gw groupWalk) (MappingCandidate, memberStatus, []string, int, error) {
+func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, gw groupWalk) (MappingCandidate, memberStatus, parkMaterial, error) {
 	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, gw)
 	if err != nil {
-		return MappingCandidate{}, memberUnavailable, nil, 0, err
+		return MappingCandidate{}, memberUnavailable, parkMaterial{}, err
 	}
 	if len(cands) == 0 {
 		if !live {
-			return MappingCandidate{}, memberNoMapping, nil, 0, nil // no live mapping at all
+			return MappingCandidate{}, memberNoMapping, parkMaterial{}, nil // no live mapping at all
 		}
-		return MappingCandidate{}, memberUnavailable, nil, 0, nil // live, but every candidate gated
+		return MappingCandidate{}, memberUnavailable, parkMaterial{}, nil // live, but every candidate gated
 	}
 	selected, ok, serr := r.selectCandidate(ctx, cands, req, now)
 	if errors.Is(serr, errAllAtCapacity) {
-		return MappingCandidate{}, memberAtCapacity, distinctServerIDs(cands), maxQueueTimeoutSecs(cands), nil
+		pm := parkMaterial{servers: distinctServerIDs(cands), queueSecs: maxQueueTimeoutSecs(cands)}
+		if d, has := parkDemand(serr); has {
+			pm.demand = []DemandSignal{d}
+		}
+		return MappingCandidate{}, memberAtCapacity, pm, nil
 	}
 	if serr != nil {
-		return MappingCandidate{}, memberUnavailable, nil, 0, serr
+		return MappingCandidate{}, memberUnavailable, parkMaterial{}, serr
 	}
 	if !ok {
-		return MappingCandidate{}, memberUnavailable, nil, 0, nil
+		return MappingCandidate{}, memberUnavailable, parkMaterial{}, nil
 	}
-	return selected, memberOK, nil, 0, nil
+	return selected, memberOK, parkMaterial{}, nil
 }
 
 // orderMembersBySpeed returns members re-sorted by their fastest ELIGIBLE candidate's
@@ -2486,37 +2588,34 @@ func (r *Resolver) speedMarginMet(ctx context.Context, best, pinned MappingCandi
 
 // firstAvailable walks members top-down — in whatever order the slice arrives in, which is
 // the manual priority order or the speed-sorted one — and returns the first memberOK member
-// (its name + selection). If none is OK it returns the accumulated at-capacity server ids
-// across the skipped members and the MAX queue timeout over those members (for queuing on
-// the union), plus anyLive = whether ANY member had at
-// least one live mapping (a member with live-but-gated candidates or at-capacity
-// counts; a member with no mapping does not). anyLive lets resolveGroup pick
-// ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
-// store/selection error is propagated.
-func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, gw groupWalk) (string, MappingCandidate, []string, int, bool, error) {
-	var atCap []string
-	queueTimeoutSecs := 0
+// (its name + selection). If none is OK it returns the park material accumulated across
+// the at-capacity members (for queuing on the union of their servers), plus anyLive =
+// whether ANY member had at least one live mapping (a member with live-but-gated
+// candidates or at-capacity counts; a member with no mapping does not). anyLive lets
+// resolveGroup pick ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g).
+// A hard store/selection error is propagated. The material is only that: nothing is
+// signalled here, because a caller that finds a member (or only probes, like
+// climbTarget) parks no request.
+func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, gw groupWalk) (string, MappingCandidate, parkMaterial, bool, error) {
+	var park parkMaterial
 	anyLive := false
 	for _, m := range members {
-		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, gw)
+		sel, status, pm, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, gw)
 		if err != nil {
-			return "", MappingCandidate{}, nil, 0, false, err
+			return "", MappingCandidate{}, parkMaterial{}, false, err
 		}
 		switch status {
 		case memberOK:
-			return m.MemberGatewayName, sel, atCap, queueTimeoutSecs, true, nil
+			return m.MemberGatewayName, sel, park, true, nil
 		case memberAtCapacity:
 			anyLive = true
-			atCap = append(atCap, ids...)
-			if secs > queueTimeoutSecs {
-				queueTimeoutSecs = secs
-			}
+			park.add(pm)
 		case memberUnavailable:
 			anyLive = true // has a live mapping, just gated / non-viable
 		}
 		// memberNoMapping contributes nothing (no live mapping).
 	}
-	return "", MappingCandidate{}, atCap, queueTimeoutSecs, anyLive, nil
+	return "", MappingCandidate{}, park, anyLive, nil
 }
 
 // groupPin returns the concrete member a group session is pinned to, or "" when there
@@ -2725,15 +2824,15 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
+		name, sel, park, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
 		if err != nil {
 			return Target{}, err
 		}
 		if name != "" {
 			return serve(name, sel)
 		}
-		if len(atCap) > 0 && r.admission != nil {
-			queueTimeout := time.Duration(queueTimeoutSecs) * time.Second
+		if len(park.servers) > 0 && r.admission != nil {
+			queueTimeout := time.Duration(park.queueSecs) * time.Second
 			if queueTimeout > 0 && !deadlineSet {
 				deadline = g.now.Add(queueTimeout)
 				deadlineSet = true
@@ -2748,7 +2847,8 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 					return Target{}, ErrAdmissionQueueTimeout
 				}
 			}
-			if werr := r.admission.WaitForSlot(ctx, distinctStrings(atCap), wait); werr != nil {
+			r.signalDemand(park.demand...)
+			if werr := r.admission.WaitForSlot(ctx, distinctStrings(park.servers), wait); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
 			g.now = r.clock()
@@ -2778,7 +2878,7 @@ func (r *Resolver) pinnedMember(ctx context.Context, g groupResolve) (string, Ma
 	if pinned == "" {
 		return "", MappingCandidate{}, nil
 	}
-	pinSel, pinStatus, _, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
+	pinSel, pinStatus, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}
@@ -2812,7 +2912,7 @@ func (r *Resolver) climbTarget(ctx context.Context, g groupResolve, pinned strin
 	// Is a better-ranked member available? The pin is memberOK, so firstAvailable stops
 	// at-or-before it in the effective order → best index <= pin index (the memberIndex
 	// guard below is belt-and-suspenders for that invariant).
-	best, bestSel, _, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
+	best, bestSel, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}
