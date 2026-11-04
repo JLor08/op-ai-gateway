@@ -749,6 +749,13 @@ func (s *Server) ensureAudioInstanceOnce(ctx context.Context, ensurer provider.R
 // the spec in the lease for the run's end and fails the ramp: one process cannot be measured
 // as instances. A target the run does not hold as one process needs nothing.
 //
+// A restore that was not written -- a Conflict or a gone spec -- takes the spec out of the
+// lease as well, since the run's end owes it nothing, but it may leave the spec not
+// replicable: an operator gave it a fixed listen port while the run held it, which a
+// replicable spec cannot have, and the operator's setting stands. The spec is then read
+// again (audioRampStillReplicable), and one that is not replicable, or gone, fails the ramp
+// at once: the agent would refuse every instance address of it for good.
+//
 // Replicable again, the spec's protected instances start by themselves, as a pinned spec's
 // one does: right away, beside the process the ramp is about to measure (ensureAudioFloor
 // waits for them), and at every later stop's clear, inside a later target's cold pass. So
@@ -759,14 +766,40 @@ func (s *Server) audioRampReplicableAgain(ctx context.Context, tgt benchmarkTarg
 	if ov == nil || !slices.Contains(ov.singleProcess, tgt.spec.ID) {
 		return false, nil
 	}
-	if failed := s.restoreBenchmarkReplicable(ctx, tgt.server.ID, []string{tgt.spec.ID}); len(failed) > 0 {
+	out := s.restoreBenchmarkReplicableOutcome(ctx, tgt.server.ID, []string{tgt.spec.ID})
+	if len(out.Failed) > 0 {
 		return false, fmt.Errorf("audio benchmark: launch spec %s could not be made replicable again for its concurrency ramp, which measures its instances", tgt.spec.ID)
 	}
 	ov.singleProcess = benchmarkWithout(ov.singleProcess, []string{tgt.spec.ID})
 	if err := s.writeBenchmarkLease(ctx, tgt.server.ID, ov); err != nil {
 		slog.Warn("audio benchmark: could not update the override lease after making the ramp's spec replicable again; it is rewritten when the run ends", "server_id", tgt.server.ID, "spec_id", tgt.spec.ID, "err", err)
 	}
+	if !slices.Contains(out.Written, tgt.spec.ID) {
+		if err := s.audioRampStillReplicable(ctx, tgt.spec.ID); err != nil {
+			return false, err
+		}
+	}
 	return true, nil
+}
+
+// audioRampStillReplicable reads launch spec specID again after a restore that was not
+// written (audioRampReplicableAgain) and returns nil only when it is stored replicable -- an
+// operator turned the flag back on during the run, or the run's own write never stored
+// false. A spec that is not replicable is the ramp's error, naming the fixed listen port that
+// keeps it one process when it has one, and so is a spec that is gone or could not be read.
+func (s *Server) audioRampStillReplicable(ctx context.Context, specID string) error {
+	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("audio benchmark: read launch spec %s again after its replicable restore was not written: %w", specID, err)
+	case !ok:
+		return fmt.Errorf("audio benchmark: launch spec %s is gone, so its concurrency ramp, which measures its instances, has nothing to measure", specID)
+	case spec.Replicable:
+		return nil
+	case spec.ListenPort != 0:
+		return fmt.Errorf("audio benchmark: launch spec %s now listens on fixed port %d, which keeps it one process, so its concurrency ramp, which measures its instances, cannot run; remove the fixed port and turn multiple instances on to ramp it", specID, spec.ListenPort)
+	}
+	return fmt.Errorf("audio benchmark: launch spec %s is not replicable any more, so its concurrency ramp, which measures its instances, cannot run", specID)
 }
 
 // ensureAudioFloor waits, before a ramp whose spec it has just made replicable again

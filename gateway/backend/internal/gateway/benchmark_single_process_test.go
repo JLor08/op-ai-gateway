@@ -654,3 +654,55 @@ func TestBothRunRampFailsWhenItsSpecStaysOneProcess(t *testing.T) {
 		t.Fatalf("run error = %q, want it to name rs_map1", status.Error)
 	}
 }
+
+// TestBothRunRampEndsWhenAnOperatorsFixedPortKeepsItsSpecOneProcess: while the run holds the
+// target as one process, an operator gives it a fixed listen port, which a replicable spec
+// cannot have. The restore before the ramp is then a conflict that leaves the operator's
+// setting -- one process on that port -- and lets go of the spec, so the agent will never run
+// an instance address of it. The ramp ends at once with an error that names the port: no
+// instance address is ensured, no pair is stored, and the lease is released.
+func TestBothRunRampEndsWhenAnOperatorsFixedPortKeepsItsSpecOneProcess(t *testing.T) {
+	f, _, targets := newBothRunAudioFixture(t, stopAllOpts{})
+	var once sync.Once
+	f.portal.onReplicableBatch = func(kind string, _ []string) {
+		if kind != "replicable" {
+			return
+		}
+		once.Do(func() {
+			spec, ok, err := f.mem.RuntimeSpecByID(context.Background(), "rs_map1")
+			if err != nil || !ok {
+				t.Errorf("RuntimeSpecByID = %v, %v", ok, err)
+				return
+			}
+			spec.ListenPort = 9123
+			if err := f.mem.UpsertRuntimeSpec(context.Background(), spec); err != nil {
+				t.Errorf("UpsertRuntimeSpec: %v", err)
+			}
+		})
+	}
+
+	status := f.run(t, "both", targets)
+
+	if len(status.Results) != 1 {
+		t.Fatalf("status = %+v, want one result", status)
+	}
+	res := status.Results[0]
+	if !strings.Contains(res.Error, "rs_map1") || !strings.Contains(res.Error, "9123") || res.AudioConcurrencyLimit != "" || res.AudioRateX == 0 {
+		t.Fatalf("result = %+v, want the speed figures and a ramp error naming rs_map1 and its port 9123", res)
+	}
+	if got := f.events.with("ensure "); len(got) != 0 {
+		t.Fatalf("ensures = %v, want none", got)
+	}
+	if m, err := f.mem.MappingByID(context.Background(), "map1"); err != nil || m.AudioConcurrencyLimit != "" {
+		t.Fatalf("mapping limit = %q (%v), want no pair stored", m.AudioConcurrencyLimit, err)
+	}
+	if storedReplicable(t, f.mem, "rs_map1") {
+		t.Fatal("after the run the spec is stored as replicable, want the operator's one process")
+	}
+	if got := f.lease(t); !got.Empty() {
+		t.Fatalf("lease after the run = %+v, want it released", got)
+	}
+	if status.Error != "" {
+		t.Fatalf("run error = %q, want none: the conflict owes no restore", status.Error)
+	}
+}

@@ -3270,6 +3270,9 @@ instances (lowest first), so no level is measured while one of them still loads
 beside the measured process; in a both run that held the spec as one process for
 its speed part, it makes the spec replicable again first and holds it as one
 process again afterwards while a later target may still stop the server's models.
+A restore that was not written is followed by a fresh read of the spec: one an
+operator gave a fixed listen port meanwhile stays one process, and the ramp ends at
+once, before any ensure, with an error naming the port and no stored pair.
 
 **both** — speed, then capacity, so the ramp's write comes last and
 `metrics_source` ends `capacity`, as a text both run's does. The measurement is

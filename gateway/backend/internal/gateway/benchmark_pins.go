@@ -489,6 +489,14 @@ func (s *Server) endBenchmarkUnpin(ctx context.Context, run *benchmarkRun, serve
 // spec cannot have, or the run's own write never stored false) and a gone spec
 // need nothing.
 func (s *Server) restoreBenchmarkReplicable(ctx context.Context, serverID string, ids []string) []string {
+	return s.restoreBenchmarkReplicableOutcome(ctx, serverID, ids).Failed
+}
+
+// restoreBenchmarkReplicableOutcome is restoreBenchmarkReplicable with the
+// batch's whole outcome, for a caller that needs to know more than which specs
+// failed: a Conflict may leave a spec not replicable (a fixed listen port), and
+// a Gone spec is no spec at all.
+func (s *Server) restoreBenchmarkReplicableOutcome(ctx context.Context, serverID string, ids []string) portal.BenchmarkSpecsOutcome {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
 	defer cancel()
 	out, _ := s.Portal.SetBenchmarkRuntimeSpecsReplicable(rctx, ids, false, true)
@@ -498,7 +506,7 @@ func (s *Server) restoreBenchmarkReplicable(ctx context.Context, serverID string
 	for _, id := range out.Failed {
 		slog.Warn("benchmark: could not make a launch spec replicable again after the run; turn multiple instances on again in the runtime section", "server_id", serverID, "spec_id", id, "err", out.Errs[id])
 	}
-	return out.Failed
+	return out
 }
 
 // benchmarkReplicableRestoreFailed is a run's error for the specs whose

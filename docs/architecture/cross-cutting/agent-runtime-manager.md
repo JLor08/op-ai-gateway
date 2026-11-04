@@ -7887,7 +7887,10 @@ VRAM run does the same for its replicable **target** alone (`vramRunAsOneProcess
 so the load it measures is one instance's. In a both run the audio concurrency
 ramp makes its own target replicable again before it measures instances and holds
 it as one process again afterwards while a later target may still stop the
-server's models ([Telemetry §8.6](telemetry-usage-observability.md#86-audio-performance-benchmarks)).
+server's models ([Telemetry §8.6](telemetry-usage-observability.md#86-audio-performance-benchmarks));
+when that restore is a conflict that leaves the spec one process — the operator's
+fixed listen port — the ramp ends at once with an error naming the port and stores
+no result, since the agent would refuse every instance address of the spec.
 
 **One meaning for the column, whether a run stops or not.** A cold start is
 confirmed only when no other model of the server's agent application has a
