@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -122,6 +123,28 @@ type instanceScalerDeps struct {
 // one mapping, and a mapping to one application on one server.
 type scaleKey struct{ serverID, mappingID string }
 
+// signalKey is what tells two demand signals of one model apart: the server the
+// request is pinned to ("" for none), the mappings it could use (sorted, joined)
+// and its flavor -- everything that decides which instance would serve it. Two
+// signals with one key ask for the same instance; signals that differ in any of
+// them may each need one of their own.
+type signalKey struct{ serverID, mappingIDs, apiFlavor string }
+
+func signalKeyOf(d routing.DemandSignal) signalKey {
+	return signalKey{serverID: d.ServerID, mappingIDs: strings.Join(slices.Sorted(slices.Values(d.MappingIDs)), "\x00"), apiFlavor: d.APIFlavor}
+}
+
+// signalServedBy reports whether an instance started for host (a zero host: none was)
+// serves d: on d's pinned server, or anywhere for an unpinned d, and of one of the
+// mappings d could use (any of the model's, for a signal that names none). An
+// instance of another mapping would not serve the request that signalled d.
+func signalServedBy(d routing.DemandSignal, host scaleKey) bool {
+	if host.serverID == "" || (d.ServerID != "" && d.ServerID != host.serverID) {
+		return false
+	}
+	return len(d.MappingIDs) == 0 || slices.Contains(d.MappingIDs, host.mappingID)
+}
+
 // scaleCandidate is one host a scale-up may start an instance on: instance index of
 // mapping on key's server, asked for through target within timeout, ranked by
 // score. parallelism is how many requests the instance serves at once.
@@ -145,11 +168,11 @@ type instanceScaler struct {
 
 	mu sync.Mutex
 	// scaling holds the gateway models with a scale-up running, each with the
-	// server that scale-up is pinned to ("" for none).
-	scaling map[string]string
+	// key of the signal that pass serves (signalKeyOf).
+	scaling map[string]signalKey
 	// followUps holds, per gateway model, the signals that arrived while a
-	// scale-up of the model pinned elsewhere ran -- one per pin ("" included), in
-	// arrival order: each may get a pass of its own once the running one ends.
+	// scale-up of the model for another key ran -- one per key, in arrival order:
+	// each may get a pass of its own once the running one ends.
 	followUps map[string][]routing.DemandSignal
 	// notBefore holds each host left alone after a refusal or a failure, until when.
 	notBefore map[scaleKey]time.Time
@@ -173,7 +196,7 @@ func newInstanceScaler(deps instanceScalerDeps, cooldown time.Duration) *instanc
 		cooldown:    cooldown,
 		visibleWait: instanceVisibleWait,
 		readTimeout: instanceScaleReadTimeout,
-		scaling:     map[string]string{},
+		scaling:     map[string]signalKey{},
 		followUps:   map[string][]routing.DemandSignal{},
 		notBefore:   map[scaleKey]time.Time{},
 		ensuring:    map[scaleKey]int{},
@@ -187,17 +210,18 @@ func newInstanceScaler(deps instanceScalerDeps, cooldown time.Duration) *instanc
 //   - d.MappingIDs empty: every mapping of d.Model the store lists for
 //     d.APIFlavor may get the instance (the scale-up still skips those that do
 //     not run instances).
-//   - A signal arriving while a scale-up of d.Model with the same pin runs (the
-//     same d.ServerID, or none for both) is folded into it: that scale-up starts
-//     the instance the signal asks for. A parked request signals again on its
-//     next turn, so the next scale-up starts from what this one left; a one-shot
-//     signal -- the voice gate's, a pinned request's overflow -- is not
-//     repeated, and is served only by the running scale-up.
-//   - A signal arriving while a scale-up with another pin runs is not served by
-//     it -- a scale-up pinned elsewhere, or one free to place the instance off
-//     the signal's pinned server -- so it is queued (one per pin) and gets a pass
-//     of its own once the running one ends (followUp), unless an instance that
-//     serves it was started meanwhile.
+//   - A signal arriving while a scale-up of d.Model for the same key runs (the
+//     same pin, the same mappings and flavor: signalKeyOf) is folded into it:
+//     that scale-up starts the instance the signal asks for. A parked request
+//     signals again on its next turn, so the next scale-up starts from what this
+//     one left; a one-shot signal -- the voice gate's, a pinned request's
+//     overflow -- is not repeated, and is served only by the running scale-up.
+//   - A signal arriving while a scale-up for another key runs may not be served
+//     by it -- a scale-up pinned elsewhere, one free to place the instance off
+//     the signal's pinned server, or one that may start an instance of a mapping
+//     the signal's request cannot use -- so it is queued (one per key) and gets a
+//     pass of its own once the running one ends (followUp), unless an instance
+//     that serves it was started meanwhile (signalServedBy).
 //
 // Nothing starts, and the signal is dropped, when it names no model, when the
 // provider cannot ensure, or once the server is shutting down.
@@ -212,16 +236,17 @@ func (s *instanceScaler) Signal(d routing.DemandSignal) {
 	}
 	// The slice is the request's; the scale-up outlives the call.
 	d.MappingIDs = slices.Clone(d.MappingIDs)
+	key := signalKeyOf(d)
 	s.mu.Lock()
-	if pin, running := s.scaling[d.Model]; running {
+	if runningKey, running := s.scaling[d.Model]; running {
 		queued := s.followUps[d.Model]
-		if d.ServerID != pin && !slices.ContainsFunc(queued, func(q routing.DemandSignal) bool { return q.ServerID == d.ServerID }) {
+		if key != runningKey && !slices.ContainsFunc(queued, func(q routing.DemandSignal) bool { return signalKeyOf(q) == key }) {
 			s.followUps[d.Model] = append(queued, d)
 		}
 		s.mu.Unlock()
 		return
 	}
-	s.scaling[d.Model] = d.ServerID
+	s.scaling[d.Model] = key
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go s.run(ctx, ensurer, d)
@@ -232,8 +257,8 @@ func (s *instanceScaler) Signal(d routing.DemandSignal) {
 func (s *instanceScaler) run(ctx context.Context, ensurer provider.RuntimeEnsurer, d routing.DemandSignal) {
 	defer s.wg.Done()
 	for {
-		startedOn := s.scaleUp(ctx, ensurer, d)
-		next, more := s.followUp(ctx, d.Model, startedOn)
+		started := s.scaleUp(ctx, ensurer, d)
+		next, more := s.followUp(ctx, d.Model, started)
 		if !more {
 			return
 		}
@@ -243,21 +268,21 @@ func (s *instanceScaler) run(ctx context.Context, ensurer provider.RuntimeEnsure
 
 // followUp returns the next signal queued for model, and true, so the scale-up
 // runs a pass for it. A signal the pass that just ended served is dropped: it
-// started an instance on startedOn, which serves an unpinned signal and one
-// pinned there. With none left, or once the server is shutting down, the
+// started an instance for started (zero: none), and signalServedBy says which signals
+// that instance serves. With none left, or once the server is shutting down, the
 // model's scale-up ends.
-func (s *instanceScaler) followUp(ctx context.Context, model, startedOn string) (routing.DemandSignal, bool) {
+func (s *instanceScaler) followUp(ctx context.Context, model string, started scaleKey) (routing.DemandSignal, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	queued := s.followUps[model]
 	for len(queued) > 0 && ctx.Err() == nil {
 		next := queued[0]
 		queued = queued[1:]
-		if startedOn != "" && (next.ServerID == "" || next.ServerID == startedOn) {
+		if signalServedBy(next, started) {
 			continue
 		}
 		s.followUps[model] = queued
-		s.scaling[model] = next.ServerID
+		s.scaling[model] = signalKeyOf(next)
 		return next, true
 	}
 	delete(s.followUps, model)
@@ -266,7 +291,7 @@ func (s *instanceScaler) followUp(ctx context.Context, model, startedOn string) 
 }
 
 // scaleUp starts one instance of d.Model on the best host that takes it, and
-// returns that host's server ("" for none). Hosts are asked one at a time, best
+// returns that host (zero for none). Hosts are asked one at a time, best
 // routing score first, and the choice is made afresh before each ask: an ensure
 // can last as long as a start, and a host that was free of a benchmark or of a
 // starting sibling when the scale-up began may not be any more. Each host is
@@ -274,20 +299,20 @@ func (s *instanceScaler) followUp(ctx context.Context, model, startedOn string) 
 // is asked brings no host back -- so the scale-up ends once a host started an
 // instance or none is left, and parked requests then wait for the instances
 // there are. There is no retry beyond the next demand signal.
-func (s *instanceScaler) scaleUp(ctx context.Context, ensurer provider.RuntimeEnsurer, d routing.DemandSignal) string {
+func (s *instanceScaler) scaleUp(ctx context.Context, ensurer provider.RuntimeEnsurer, d routing.DemandSignal) scaleKey {
 	asked := map[scaleKey]bool{}
 	for ctx.Err() == nil {
 		cands := s.pickHost(ctx, d)
 		i := slices.IndexFunc(cands, func(c scaleCandidate) bool { return !asked[c.key] })
 		if i < 0 {
-			return ""
+			return scaleKey{}
 		}
 		asked[cands[i].key] = true
 		if s.start(ctx, ensurer, d.Model, cands[i]) {
-			return cands[i].key.serverID
+			return cands[i].key
 		}
 	}
-	return ""
+	return scaleKey{}
 }
 
 // start asks c's agent for instance c.index and reports whether it runs. Once it
