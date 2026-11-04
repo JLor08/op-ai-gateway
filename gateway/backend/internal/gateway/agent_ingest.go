@@ -673,7 +673,9 @@ func sumRuntimeActiveQueue(runtimes []agentRuntimeSample) (active, queue int) {
 }
 
 // maxRuntimeSamplesPerSample bounds how many entries of a telemetry sample's
-// runtimes array the VRAM write-back loop will process. Nothing else caps
+// runtimes array the store write-backs will process: the fold every
+// spec-level write-back reads (VRAM, RAM, startup, context) and the
+// capability write-back's own loop. Nothing else caps
 // this array's length, and within the 1 MiB readRawJSON body cap a minimal
 // runtime entry is only ~55 bytes on the wire -- uncapped, a single POST
 // could drive on the order of 19,000 RuntimeSpecByID/resolution attempts on
@@ -801,18 +803,27 @@ func primaryRowIndexes(n int, row func(i int) (specID string, instance int, stat
 }
 
 // runtimeWriteBackLogPrefix is the fixed lead-in of resolveRuntimeSpecOwned's
-// log messages; the axis name ("vram", "ram") is spliced in after it, so the
-// same four audit-trail lines read "runtime vram write-back: ..." and
-// "runtime ram write-back: ..." from one source. It exists so the literal is
-// not repeated at every log site (go:S1192).
+// log messages; the axis name ("vram", or runtimeSpecLevelWriteBackAxis) is
+// spliced in after it, so the same four audit-trail lines read "runtime vram
+// write-back: ..." and "runtime ram/startup write-back: ..." from one source.
+// It exists so the literal is not repeated at every log site (go:S1192).
 const runtimeWriteBackLogPrefix = "runtime "
+
+// runtimeSpecLevelWriteBackAxis is the axis name the spec-level write-backs'
+// shared ownership resolution (ownedRuntimeSpec) logs under. The measured RAM
+// and the measured startup resolve a spec once per sample between them
+// (runtimeSpecMemo), so its log lines -- a cross-server Warn above all --
+// speak for both, whichever write-back asked first: logged under "ram" alone,
+// a refused startup write would leave no trace of its own.
+const runtimeSpecLevelWriteBackAxis = "ram/startup"
 
 // resolveRuntimeSpecOwned reports whether specID names a spec that exists and
 // belongs to serverID, and returns it. It is the AUTHORIZATION gate of every
-// per-spec measurement write-back (VRAM and RAM both call it directly): the
-// measurement always lands for an owned spec, there is no per-axis operator
-// opt-out on top of it. writeBack names the axis ("vram", "ram") in the log
-// lines only.
+// per-spec measurement write-back -- the VRAM write-back calls it directly,
+// and the RAM and startup write-backs through their shared per-sample memo
+// (ownedRuntimeSpec): the measurement always lands for an owned spec, there is
+// no per-axis operator opt-out on top of it. writeBack names the axis ("vram",
+// or runtimeSpecLevelWriteBackAxis) in the log lines only.
 //
 //  1. The spec exists (RuntimeSpecByID's ok).
 //  2. Its owning application belongs to serverID -- resolved via
@@ -971,7 +982,9 @@ func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string
 //   - Ownership is checked once per spec in the fold (resolveRuntimeSpecOwned:
 //     the spec exists and belongs to serverID, with the cross-server Warn),
 //     through memo, which writeBackRuntimeStartup shares, so the two
-//     spec-level write-backs of one sample resolve a spec once between them.
+//     spec-level write-backs of one sample resolve a spec once between them,
+//     and that resolution logs under both their names
+//     (runtimeSpecLevelWriteBackAxis).
 //   - An unchanged measurement is NOT rewritten. Telemetry arrives once per
 //     second as a full snapshot, so a merely stable value would otherwise cost
 //     one UPDATE per second per spec indefinitely (the cost argument
@@ -991,7 +1004,7 @@ func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, folde
 		if f.MaxRAM <= 0 {
 			continue
 		}
-		spec, ok := s.ownedRuntimeSpec(ctx, serverID, specID, "ram", memo)
+		spec, ok := s.ownedRuntimeSpec(ctx, serverID, specID, memo)
 		if !ok || spec.RAMMeasuredMB == f.MaxRAM {
 			continue // not owned, or already on file byte for byte
 		}
@@ -1037,7 +1050,7 @@ func (s *Server) writeBackRuntimeStartup(ctx context.Context, serverID string, f
 			continue
 		}
 		measured := int64(f.MaxStartupMS)
-		spec, ok := s.ownedRuntimeSpec(ctx, serverID, specID, "startup", memo)
+		spec, ok := s.ownedRuntimeSpec(ctx, serverID, specID, memo)
 		if !ok || !startupMovedEnough(spec.StartupMeasuredMS, measured) {
 			continue
 		}
@@ -1081,17 +1094,18 @@ func startupMovedEnough(stored, measured int64) bool {
 type runtimeSpecMemo map[string]*routing.RuntimeSpec
 
 // ownedRuntimeSpec reports whether specID is a spec serverID owns and returns
-// its stored row, resolving it AT MOST ONCE per sample: the first call runs
-// resolveRuntimeSpecOwned (axis names the write-back in its log lines) and
-// memoizes the verdict -- owned or not -- in memo, and every later call
-// answers from the memo without touching the store. The returned row is the
-// memo's own, so a caller that writes a column updates it there and a later
-// caller in the same sample compares against what it wrote.
-func (s *Server) ownedRuntimeSpec(ctx context.Context, serverID, specID, axis string, memo runtimeSpecMemo) (*routing.RuntimeSpec, bool) {
+// its stored row, resolving it AT MOST ONCE per sample for the RAM and startup
+// write-backs both: the first call runs resolveRuntimeSpecOwned, logging under
+// runtimeSpecLevelWriteBackAxis since its verdict serves both, and memoizes
+// the verdict -- owned or not -- in memo, and every later call answers from
+// the memo without touching the store. The returned row is the memo's own, so
+// a caller that writes a column updates it there and a later caller in the
+// same sample compares against what it wrote.
+func (s *Server) ownedRuntimeSpec(ctx context.Context, serverID, specID string, memo runtimeSpecMemo) (*routing.RuntimeSpec, bool) {
 	if spec, seen := memo[specID]; seen {
 		return spec, spec != nil
 	}
-	spec, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, axis)
+	spec, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, runtimeSpecLevelWriteBackAxis)
 	if !ok {
 		memo[specID] = nil
 		return nil, false

@@ -77,17 +77,6 @@ func (p *runtimeConfigReadSpy) expectNoPush(t *testing.T, step, serverID string)
 	}
 }
 
-// TestAgentFeatureRuntimeInstancesNamesOneFeature pins the portal's spelling
-// of the agent's runtime_instances declaration to this package's: the portal
-// builds each agent's document by it, the ingest records it, and two literals
-// that drifted apart would push every agent the document of one without it.
-func TestAgentFeatureRuntimeInstancesNamesOneFeature(t *testing.T) {
-	if portal.AgentFeatureRuntimeInstances != runtimeInstancesFeature {
-		t.Fatalf("portal.AgentFeatureRuntimeInstances = %q, runtimeInstancesFeature = %q, want one name",
-			portal.AgentFeatureRuntimeInstances, runtimeInstancesFeature)
-	}
-}
-
 // TestIngestPushesTheRuntimeConfigWhenRuntimeInstancesFlips pins the push that
 // follows a change of the agent's runtime_instances declaration: the
 // runtime-config document carries a replicable spec's instance settings only
@@ -503,6 +492,46 @@ func TestSpeedBenchmarkLoadTimeOfAReplicableSpecPushesTheRuntimeConfig(t *testin
 			spy.expectPush(t, "a replicable spec's load time", "srv1")
 		} else {
 			spy.expectNoPush(t, "the load time of a spec that is not replicable", "srv1")
+		}
+	}
+}
+
+// TestIngestSpecLevelWriteBackLogsNameBothAxes pins the audit trail of the
+// one ownership resolution the RAM and startup write-backs share per sample
+// (runtimeSpecMemo): its log lines name both write-backs it serves, whichever
+// asked first. A cross-server spec named in a sample that carries both
+// figures, or only a startup, logs one Warn under "ram/startup", never under
+// "ram" alone, which would hide that the startup write was refused too.
+func TestIngestSpecLevelWriteBackLogsNameBothAxes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra string
+	}{
+		{"RAM and startup", `,"ram_measured_mb":6000,"startup_ms":30000`},
+		{"startup only", `,"startup_ms":30000`},
+	} {
+		srv := NewTestServer()
+		ctx := context.Background()
+		now := time.Now().UTC()
+		const otherServerID = "mock-host-other-axes"
+		if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+			ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+			Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+			Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create other server: %v", err)
+		}
+		seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_axes")
+		buf, restore := withCapturedSlog(t)
+		ingestInstanceRows(t, srv, "", instanceRow("rspec_axes", 0, "running", tc.extra))
+		restore()
+
+		recs := buf.Snapshot()
+		if !findLogRecord(recs, "WARN", "runtime ram/startup write-back rejected") {
+			t.Errorf("%s: no Warn under the shared ram/startup resolution; records = %+v", tc.name, recs)
+		}
+		if findLogRecord(recs, "WARN", "runtime ram write-back rejected") || findLogRecord(recs, "WARN", "runtime startup write-back rejected") {
+			t.Errorf("%s: the shared resolution logged under one axis alone; records = %+v", tc.name, recs)
 		}
 	}
 }

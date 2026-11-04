@@ -508,8 +508,7 @@ type RuntimeSpecDTO struct {
 	// has not declared its features yet, while its document is held -- see
 	// AgentRuntimeConfigDTO.AwaitsAgentFeatures) derived from that measurement
 	// and the mapping's benchmark cold start (effectiveIdleTimeout), otherwise
-	// the stored idle_timeout_seconds. Both
-	// are READ-ONLY echoes with no
+	// the stored idle_timeout_seconds. Both are READ-ONLY echoes with no
 	// PutRuntimeSpecRequest counterpart -- the first is agent-owned and the
 	// store keeps it across every write, the second is derived on every read
 	// and never stored -- so the portal shows the value the agent gets
@@ -2705,10 +2704,9 @@ type AgentRuntimeSpecDTO struct {
 	// a document held for an agent not heard from yet carries them too, and
 	// reaches no agent), so the document of a spec that is not replicable, and
 	// every document an older agent gets, is the one it was before instances
-	// existed. An agent
-	// with the feature honours replicable only while this gateway declares
-	// that feature too. The per-instance parallelism is the gateway's own cap
-	// and is never pushed.
+	// existed. An agent with the feature honours replicable only while this
+	// gateway declares that feature too. The per-instance parallelism is the
+	// gateway's own cap and is never pushed.
 	Replicable   bool `json:"replicable,omitempty"`
 	MinInstances int  `json:"min_instances,omitempty"`
 	MaxInstances int  `json:"max_instances,omitempty"`
@@ -3228,9 +3226,11 @@ func derivedIdleSeconds(factor float64, startupMS int64) int {
 }
 
 // AgentFeatureRuntimeInstances is the feature an agent declares when it runs
-// several instances of a replicable spec and serves them as "m#k". The gateway
-// package spells the same string for its own declaration
-// (runtimeInstancesFeature) and pins the two together.
+// several instances of a replicable spec and serves them as "m#k". It is the
+// module's one spelling of the name: the gateway package declares its own
+// runtime_instances feature and reads the agent's declaration by this
+// constant (its runtimeInstancesFeature is defined as it), so the document
+// built here and the declaration the ingest records cannot drift apart.
 const AgentFeatureRuntimeInstances = "runtime_instances"
 
 // agentRunsInstances reports whether serverID's agent declares
