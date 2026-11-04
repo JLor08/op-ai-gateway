@@ -139,10 +139,13 @@ type LiveSlotChecker interface {
 	LiveHeld(instanceKey string) bool
 }
 
-// SetLiveSlotChecker installs the live-slot source a live session's resolve
-// (inference.Request.LiveSession) judges instance candidates by. Leaving it
-// unset (nil) means no slot is known to be held: a session is routed as any
-// request is, and only its own slot acquire can find the instance taken.
+// SetLiveSlotChecker installs the live-slot source that the resolve of a
+// request needing a free live slot -- a live session
+// (inference.Request.LiveSession) and every transcription, buffered or not --
+// judges instance candidates by. Leaving it unset (nil) means no slot is known
+// to be held: such a request is routed as any request is, and only a session's
+// own slot acquire, or a buffered transcription's held check, can find the
+// instance taken.
 func (r *Resolver) SetLiveSlotChecker(c LiveSlotChecker) { r.liveSlots = c }
 
 // SetDemandSink installs the receiver of demand signals. Leaving it unset

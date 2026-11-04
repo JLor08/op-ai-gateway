@@ -1081,7 +1081,7 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errTranscriptionTooLarge) {
 		return http.StatusRequestEntityTooLarge
 	}
-	// A transcription refused because a live session holds the model's one slot
+	// A transcription refused because a live session holds its instance's one slot
 	// (errTranscriptionLiveBusy): the same transient 503 the live bearer path's busy
 	// reject uses -- a retry, once the live session ends, is what cures it.
 	if errors.Is(err, errTranscriptionLiveBusy) {

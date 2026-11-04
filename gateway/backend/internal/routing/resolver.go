@@ -1863,8 +1863,9 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	//     against the spec's instance parallelism (always at least 1), read from
 	//     r.instanceActivity: its instances share the server, so the server's count cannot
 	//     say whether this one instance takes another request. Without that source an
-	//     instance is never capped. A live session (req.LiveSession) additionally finds an
-	//     instance at its cap while its one live slot is held (r.liveSlots).
+	//     instance is never capped. A request that needs the instance's live slot free --
+	//     a live session, and every transcription (needsFreeLiveSlot) -- additionally
+	//     finds an instance at its cap while its one live slot is held (r.liveSlots).
 	//
 	// The block runs when any of those three sources is wired, and is a no-op otherwise.
 	// A pinned request never reaches here (resolveAffinity returns first). When the
@@ -1878,10 +1879,11 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	// viable-but-at-cap candidate and leave only under-cap non-viable ones →
 	// ErrNoHealthyHost. So with every cap undefined (the under-cap subset == the full
 	// pool) this is exactly the pre-CP3 behaviour.
-	if r.activity != nil || r.instanceActivity != nil || (req.LiveSession && r.liveSlots != nil) {
+	judgeLive := r.liveSlots != nil && needsFreeLiveSlot(req)
+	if r.activity != nil || r.instanceActivity != nil || judgeLive {
 		capped := make([]MappingCandidate, 0, len(pool))
 		for _, c := range pool {
-			if r.underCap(c, req, now) {
+			if r.underCap(c, now, judgeLive) {
 				capped = append(capped, c)
 			}
 		}
@@ -1904,18 +1906,31 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	return r.selectWithSwapProtection(ctx, pool, model, now)
 }
 
-// underCap reports whether candidate c can take req now. An instance candidate is under
-// its cap while its own in-flight count is below the parallelism its expansion carried
-// (with no instance activity source its load is unknown and that part never caps it) and,
-// for a live session, while its live slot is free. Every other candidate keeps the server
-// cap: in-flight on its server below max_concurrency minus the server's reserved
-// sessions, and no cap at all when max_concurrency is unset (<= 0) or no server activity
-// source is wired. A live session on such a candidate is not judged by its slot here: a
-// mapping without instances has one slot, and the session's own acquire answers busy.
-func (r *Resolver) underCap(c MappingCandidate, req inference.Request, now time.Time) bool {
+// needsFreeLiveSlot reports whether req can only be served by an instance whose live
+// slot is free: a live session's resolve, which takes that slot for its whole life, and
+// every transcription, buffered and details alike, which the upstream cannot serve while
+// a live session holds it -- audio.cpp serves one transcription at a time. Judged on the
+// request's capability list, which a transcription always carries (and only a
+// transcription carries this capability), so a buffered request is steered off a
+// held instance even where the instance's parallelism would still take it.
+func needsFreeLiveSlot(req inference.Request) bool {
+	return req.LiveSession || slices.Contains(req.RequiredCapabilities, CapabilityTranscription)
+}
+
+// underCap reports whether candidate c can take a request now. An instance candidate is
+// under its cap while its own in-flight count is below the parallelism its expansion
+// carried (with no instance activity source its load is unknown and that part never caps
+// it) and, when judgeLive is set (needsFreeLiveSlot, with a live-slot source wired),
+// while its live slot is free. Every other candidate keeps the server cap: in-flight on
+// its server below max_concurrency minus the server's reserved sessions, and no cap at
+// all when max_concurrency is unset (<= 0) or no server activity source is wired. Such a
+// candidate is not judged by its live slot here: a mapping without instances has one
+// slot, and a live session's own acquire, or a buffered transcription's held check,
+// answers busy.
+func (r *Resolver) underCap(c MappingCandidate, now time.Time, judgeLive bool) bool {
 	if c.InstanceCapable {
 		key := InstanceKey(c.Mapping.ID, c.Instance)
-		if req.LiveSession && r.liveSlots != nil && r.liveSlots.LiveHeld(key) {
+		if judgeLive && r.liveSlots.LiveHeld(key) {
 			return false
 		}
 		return r.instanceActivity == nil || r.instanceActivity.InstanceActivity(key) < c.InstanceParallelism

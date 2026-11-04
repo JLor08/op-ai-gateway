@@ -35,12 +35,15 @@ import (
 // router that serves every instance of two replicable specs on one server.
 
 const (
-	liveInstServer  = "srv-live-inst"
-	liveInstASRSpec = "spec-asr-inst"
-	liveInstASRMap  = "route-asr-inst"
-	liveInstASRUp   = "asr-up"
-	liveInstChatMap = "route-chat-inst"
-	liveInstChatUp  = "chat-up"
+	liveInstServer       = "srv-live-inst"
+	liveInstASRSpec      = "spec-asr-inst"
+	liveInstASRMap       = "route-asr-inst"
+	liveInstASRUp        = "asr-up"
+	liveInstASRPlainSpec = "spec-asr-plain"
+	liveInstASRPlainMap  = "route-asr-plain"
+	liveInstASRPlainUp   = "asr-plain"
+	liveInstChatMap      = "route-chat-inst"
+	liveInstChatUp       = "chat-up"
 )
 
 // routerRefusal is the error a fake agent router answers for an address.
@@ -242,6 +245,27 @@ func liveInstanceRow(spec, upstream string, k, active int) RuntimeStatusDTO {
 // multipart_proxy; the status rows are the caller's to publish.
 func newInstanceRouterServer(t *testing.T, agent *instanceAgentRouter, replicable bool) *Server {
 	t.Helper()
+	return newInstanceRouterServerWith(t, agent, instanceRouterConfig{replicable: replicable})
+}
+
+// instanceRouterConfig shapes newInstanceRouterServerWith's fixture.
+type instanceRouterConfig struct {
+	// replicable is both specs' replicable flag.
+	replicable bool
+	// asrParallelism is asr-inst's instance_parallelism (0 = one request at a time).
+	asrParallelism int
+	// queueTimeoutSecs is the application's admission_queue_timeout_seconds (0 = a
+	// request parks until its context ends).
+	queueTimeoutSecs int
+	// plainASR adds route-asr-plain: a second mapping of asr-inst, upstream
+	// asr-plain, whose spec is not replicable -- a mixed fleet.
+	plainASR bool
+}
+
+// newInstanceRouterServerWith is newInstanceRouterServer shaped by cfg.
+func newInstanceRouterServerWith(t *testing.T, agent *instanceAgentRouter, cfg instanceRouterConfig) *Server {
+	t.Helper()
+	replicable := cfg.replicable
 	ctx := context.Background()
 	now := time.Now().UTC()
 	tokens := auth.NewTokenStore()
@@ -266,14 +290,22 @@ func newInstanceRouterServer(t *testing.T, agent *instanceAgentRouter, replicabl
 		}
 	}
 	must("CreateAIServer", routes.CreateAIServer(ctx, routing.AIServer{ID: liveInstServer, Name: "Instances", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: agent.server.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}))
-	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, Priority: 10, Weight: 50, TimeoutMS: 30000, AdmissionQueueTimeoutSeconds: cfg.queueTimeoutSecs, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("CreateMapping asr", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstASRMap, ApplicationID: "app-live-inst", GatewayModelName: "asr-inst", AppModelName: liveInstASRUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("CreateMapping chat", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstChatMap, ApplicationID: "app-live-inst", GatewayModelName: "chat-inst", AppModelName: liveInstChatUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertMappingCapabilities", routes.UpsertMappingCapabilities(ctx, liveInstASRMap, []routing.CapabilityRow{
 		{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
 		{Capability: routing.CapabilityTranscriptionStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
 	}))
-	must("UpsertRuntimeSpec asr", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: liveInstASRSpec, MappingID: liveInstASRMap, Enabled: true, Binary: "/usr/bin/audio-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Replicable: replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
+	must("UpsertRuntimeSpec asr", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: liveInstASRSpec, MappingID: liveInstASRMap, Enabled: true, Binary: "/usr/bin/audio-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Replicable: replicable, MaxInstances: 4, InstanceParallelism: cfg.asrParallelism, CreatedAt: now, UpdatedAt: now}))
+	if cfg.plainASR {
+		must("CreateMapping asr plain", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstASRPlainMap, ApplicationID: "app-live-inst", GatewayModelName: "asr-inst", AppModelName: liveInstASRPlainUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+		must("UpsertMappingCapabilities plain", routes.UpsertMappingCapabilities(ctx, liveInstASRPlainMap, []routing.CapabilityRow{
+			{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+			{Capability: routing.CapabilityTranscriptionStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		}))
+		must("UpsertRuntimeSpec asr plain", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: liveInstASRPlainSpec, MappingID: liveInstASRPlainMap, Enabled: true, Binary: "/usr/bin/audio-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, CreatedAt: now, UpdatedAt: now}))
+	}
 	must("UpsertRuntimeSpec chat", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-chat-inst", MappingID: liveInstChatMap, Enabled: true, Binary: "/usr/bin/llama-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, ResponsesMode: routing.EndpointModePassthrough, Replicable: replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertTelemetry", routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: liveInstServer, ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}))
 	recorder := usage.NewRecorder()
@@ -964,4 +996,75 @@ func TestVanishedLiveInstanceReselectedWithItsAudio(t *testing.T) {
 	if ev.Status != "success" || ev.RouteID != liveInstASRMap {
 		t.Fatalf("row = %+v, want a success row for %s", ev, liveInstASRMap)
 	}
+}
+
+// wakeAdmission wakes a request parked for the instance server, the way a
+// request finishing there does: its active row's removal releases the queue.
+func wakeAdmission(srv *Server) {
+	srv.Active.Add(ActiveRequest{ID: "waker", ServerID: liveInstServer})
+	srv.Active.Remove("waker")
+}
+
+// postTranscription sends a buffered transcription of model.
+func postTranscription(t *testing.T, srv *Server, model string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, ct := buildEditMultipart(t, validTranscriptionParts(model))
+	return postEditRaw(t, srv, http.MethodPost, "/v1/audio/transcriptions", body, ct, devBearerHeader)
+}
+
+// A buffered transcription is never routed onto an instance a live session holds,
+// even where the instance's parallelism leaves room beside the session: audio.cpp
+// serves one transcription at a time, so it would only be refused busy there. It
+// goes to a sibling whose slot is free -- whose own check, keyed by that instance,
+// lets it through -- or waits for a slot when every one is held.
+func TestBufferedTranscriptionAvoidsALiveHeldInstance(t *testing.T) {
+	cfg := instanceRouterConfig{replicable: true, asrParallelism: 2}
+	t.Run("a free sibling serves it", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		// Instance 0 reports the lighter load, so it is the one chosen when its slot is
+		// not considered.
+		srv.RuntimeStatus.publish(liveInstServer, []RuntimeStatusDTO{
+			liveInstanceRow(liveInstASRSpec, liveInstASRUp, 0, 0),
+			liveInstanceRow(liveInstASRSpec, liveInstASRUp, 1, 5),
+		})
+		release, _ := srv.liveSessions.acquire("route-asr-inst#0")
+		defer release()
+
+		rec := postTranscription(t, srv, "asr-inst")
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello there") {
+			t.Fatalf("status %d body %s; want the transcription from instance 1", rec.Code, rec.Body.String())
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up#1"}) {
+			t.Fatalf("addresses served = %v, want [asr-up#1], the instance whose live slot is free", served)
+		}
+	})
+	t.Run("it waits for a slot instead of being refused", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		srv.Active.admission.recheck = 0 // only a release wakes a parked request
+		publishASRInstances(srv, 0)
+		release, _ := srv.liveSessions.acquire("route-asr-inst#0")
+		defer release()
+
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- postTranscription(t, srv, "asr-inst") }()
+		waitForParked(t, srv.Active.admission, 1)
+		select {
+		case rec := <-done:
+			t.Fatalf("answered %d %s while the only instance's live slot was held, want it parked", rec.Code, rec.Body.String())
+		default:
+		}
+		release()
+		wakeAdmission(srv)
+		var rec *httptest.ResponseRecorder
+		select {
+		case rec = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the parked transcription was not admitted after the live slot freed")
+		}
+		if rec.Code != http.StatusOK || !slices.Equal(agent.servedModels(), []string{"asr-up"}) {
+			t.Fatalf("status %d body %s served %v; want instance 0's transcription", rec.Code, rec.Body.String(), agent.servedModels())
+		}
+	})
 }

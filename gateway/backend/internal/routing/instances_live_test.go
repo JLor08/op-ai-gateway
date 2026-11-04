@@ -244,3 +244,57 @@ func TestPinnedAndOverrideTargetsAreInstanceZero(t *testing.T) {
 		t.Fatalf("server-override Resolve = %q capable %v, %v; want the mapping's instance 0, not instance-capable", target.InstanceKey, target.InstanceCapable, err)
 	}
 }
+
+// transcriptionRequest is a buffered transcription's request: the audio flavor
+// and the transcription capability, no live session.
+func transcriptionRequest(model string) inference.Request {
+	return inference.Request{Model: model, APIFlavor: APIFlavorOpenAIAudio, RequiredCapabilities: []string{CapabilityTranscription}}
+}
+
+// liveTranscriptionStore is liveInstanceStore with map_inst able to
+// transcribe, so a transcription request resolves to it.
+func liveTranscriptionStore(t *testing.T, now time.Time) *MemoryStore {
+	t.Helper()
+	store := liveInstanceStore(t, now)
+	if err := store.UpsertMappingCapabilities(context.Background(), "map_inst", []CapabilityRow{
+		{Capability: CapabilityTranscription, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	return store
+}
+
+// Every transcription needs its instance's live slot free, not only a live
+// session: the upstream serves one transcription at a time while a live session
+// holds it. So a buffered transcription passes over an instance whose live slot
+// is held -- even below its parallelism, where the session's one request leaves
+// room -- and parks, signalling demand that is not for a live slot, when every
+// instance's slot is held.
+func TestTranscriptionPassesOverALiveHeldInstance(t *testing.T) {
+	now := instanceCapacityNow
+	r := NewResolver(liveTranscriptionStore(t, now), func() time.Time { return now }, nil)
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 2, Running: []int{1}}}})
+	r.SetLoadedModelChecker(&fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5"}}})
+	// The live session on instance 0 is one request of its two.
+	r.SetInstanceActivityChecker(&fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}})
+	slots := &fakeLiveSlots{held: map[string]bool{"map_inst#0": true}}
+	r.SetLiveSlotChecker(slots)
+	sink := &fakeDemandSink{}
+	r.SetDemandSink(sink)
+	adm := timeoutAdmission()
+	r.SetAdmissionController(adm)
+
+	target, err := r.Resolve(context.Background(), auth.Token{}, transcriptionRequest("qwen-coder"))
+	if err != nil || target.InstanceKey != "map_inst#1" {
+		t.Fatalf("transcription Resolve = %q, %v; want map_inst#1, the instance whose live slot is free", target.InstanceKey, err)
+	}
+
+	slots.held["map_inst#1"] = true
+	if _, err := r.Resolve(context.Background(), auth.Token{}, transcriptionRequest("qwen-coder")); !errors.Is(err, ErrAdmissionQueueTimeout) || adm.calls != 1 {
+		t.Fatalf("Resolve with every live slot held = %v after %d waits, want ErrAdmissionQueueTimeout after 1", err, adm.calls)
+	}
+	want := []DemandSignal{{Model: "qwen-coder", APIFlavor: APIFlavorOpenAIAudio, MappingIDs: []string{"map_inst"}}}
+	if !demandSignalsEqual(sink.got, want) {
+		t.Fatalf("demand signals = %+v, want %+v", sink.got, want)
+	}
+}
