@@ -1629,6 +1629,82 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(cell).toHaveTextContent(`${t.modelServersRunningInstances}: 3`);
     });
 
+    // A replicable spec names its count even with one instance running (or
+    // none): that one is a count of instances, not the model's only process.
+    it.each([1, 0])(
+      'names the running instances of a replicable spec with %i running',
+      async (running) => {
+        const { api } = makeApi({
+          modelServers: vi
+            .fn()
+            .mockResolvedValue(
+              makeRows().map((r) =>
+                r.mapping_id === 'map-a'
+                  ? { ...r, replicable: true, running_instances: running }
+                  : r,
+              ),
+            ),
+        } as Partial<ModelServersSectionApi>);
+        renderSection(api);
+        await screen.findByText('GPU-Box-C');
+
+        expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).toHaveTextContent(
+          `${t.modelServersRunningInstances}: ${running}`,
+        );
+      },
+    );
+
+    it('says nothing about instances for a spec that is not replicable with one running', async () => {
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) =>
+              r.mapping_id === 'map-a' ? { ...r, replicable: false, running_instances: 1 } : r,
+            ),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).not.toHaveTextContent(
+        t.modelServersRunningInstances,
+      );
+    });
+
+    // A row without the field (a gateway that predates instances) reads as 0
+    // running: never "undefined", and no count for a spec not known as
+    // replicable.
+    it('reads a row without running_instances as none running, never as "undefined"', async () => {
+      const withoutCount = (r: ModelServerRow, replicable?: boolean) => {
+        const { running_instances: _dropped, ...rest } = r;
+        return (replicable === undefined ? rest : { ...rest, replicable }) as ModelServerRow;
+      };
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) =>
+              r.mapping_id === 'map-a'
+                ? withoutCount(r)
+                : r.mapping_id === 'map-b'
+                  ? withoutCount(r, true)
+                  : r,
+            ),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(screen.queryByText(/undefined/)).toBeNull();
+      expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).not.toHaveTextContent(
+        t.modelServersRunningInstances,
+      );
+      expect(cellForColumn('GPU-Box-B', t.modelServerColStatus)).toHaveTextContent(
+        `${t.modelServersRunningInstances}: 0`,
+      );
+    });
+
     it('says nothing about instances while one or none runs, until a live frame reports a second', async () => {
       const { api, getOnData } = makeApi();
       renderSection(api);

@@ -11,7 +11,9 @@ import {
   instanceSettingsBody,
   listedIdleTimeout,
   primaryStatusRows,
+  runningInstanceCount,
   showsAllInstanceLogs,
+  showsRunningInstances,
   runningInstancesBySpec,
   specStopState,
   validateInstances,
@@ -245,6 +247,28 @@ describe('validateInstances', () => {
   it('refuses several instances on a fixed listen port, after the counts', () => {
     expect(validateInstances(form(), 9000, t)).toBe(t.errorRuntimeSpecInstancesNeedEphemeralPort);
     expect(validateInstances(form({ minText: '-1' }), 9000, t)).toBe(invalid);
+  });
+});
+
+// The models catalog's per-server count (ModelServerRow).
+describe('running instances on a model-server row', () => {
+  it('reads a missing or unusable count as 0', () => {
+    expect(runningInstanceCount({ running_instances: 3 })).toBe(3);
+    expect(runningInstanceCount({})).toBe(0);
+    expect(runningInstanceCount({ running_instances: -1 })).toBe(0);
+    expect(runningInstanceCount({ running_instances: Number.NaN })).toBe(0);
+  });
+
+  it('is shown for a replicable spec whatever runs, otherwise once more than one runs', () => {
+    expect(showsRunningInstances({ replicable: true, running_instances: 1 })).toBe(true);
+    expect(showsRunningInstances({ replicable: true, running_instances: 0 })).toBe(true);
+    expect(showsRunningInstances({ replicable: true })).toBe(true);
+    expect(showsRunningInstances({ replicable: false, running_instances: 1 })).toBe(false);
+    expect(showsRunningInstances({ running_instances: 1 })).toBe(false);
+    expect(showsRunningInstances({})).toBe(false);
+    // A spec turned off while its burst instances still drain.
+    expect(showsRunningInstances({ replicable: false, running_instances: 2 })).toBe(true);
+    expect(showsRunningInstances({ running_instances: 2 })).toBe(true);
   });
 });
 

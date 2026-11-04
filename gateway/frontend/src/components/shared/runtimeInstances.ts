@@ -124,6 +124,31 @@ export function showsAllInstanceLogs(
   return rows.some((row) => row.spec_id === specId && instanceIndex(row) > 0);
 }
 
+/**
+ * A model-server row's running instances (ModelServerRow.running_instances).
+ * Always on the wire from a current gateway; a row without a usable count is
+ * read as 0 running, so the catalog never renders "undefined".
+ */
+export function runningInstanceCount(row: { running_instances?: number }): number {
+  const n = row.running_instances;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Whether the models catalog names a row's running instances: always for a
+ * replicable spec -- one running instance of it is a count, not the model's
+ * only process, and none running is worth saying too -- and otherwise only
+ * once more than one runs (a spec turned off while its burst instances still
+ * drain). One running process is what every other model has, so a count of 1
+ * there would only add noise.
+ */
+export function showsRunningInstances(row: {
+  replicable?: boolean;
+  running_instances?: number;
+}): boolean {
+  return row.replicable === true || runningInstanceCount(row) > 1;
+}
+
 // The upstream name a status row reports when it runs what its mapping says:
 // the mapping's own name for instance 0, `<name>#<k>` -- the instance's
 // address -- for instance k. Only the row's own suffix counts, so on instance 0

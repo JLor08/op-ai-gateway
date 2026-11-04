@@ -594,8 +594,13 @@ export type ModelServerRow = {
   // on this server (#340): 1 for a running spec that is not replicable, up to
   // the spec's maximum for one that is, 0 when none runs or no agent-managed
   // runtime status is known. Injected from the runtime-status registry like
-  // `state` above.
+  // `state` above. Read through runningInstanceCount, which takes a row
+  // without it as 0.
   running_instances: number;
+  // Whether the mapping's runtime spec is replicable (#340): the catalog then
+  // names its running instances even while one (or none) runs. Optional: a
+  // gateway that does not send it leaves the count to show only above one.
+  replicable?: boolean;
   // Whether the agent's last per-model probe of its metrics/context endpoints
   // actually reached the server -- mirrors RuntimeStatusDTO's own closed set
   // (api/runtime.ts): "ok" (reachable) / "unreachable" (configured but the

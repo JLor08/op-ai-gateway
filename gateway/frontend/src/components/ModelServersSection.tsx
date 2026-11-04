@@ -13,6 +13,7 @@ import {
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
+import { runningInstanceCount, showsRunningInstances } from './shared/runtimeInstances';
 import { runtimeStateBadge } from './shared/runtimeState';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { makeVisionColumn } from './shared/visionColumn';
@@ -499,16 +500,15 @@ export function ModelServersSection({
           <StatusChip status={modelStatusBadge(r)} label={modelStatusLabel(modelStatusKey(r), t)} />
         );
         // #340: a replicable spec can run several instances of the model on
-        // this server, and the row says how many -- but only once more than
-        // one runs. The row does not say whether the spec is replicable, and
-        // one running process is what every other model has, so a count of 1
-        // (or 0) would only add noise.
-        if (r.running_instances <= 1) return chip;
+        // this server, and the row says how many -- for a replicable spec
+        // always, for any other once more than one runs
+        // (showsRunningInstances).
+        if (!showsRunningInstances(r)) return chip;
         return (
           <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
             {chip}
             <Typography variant="caption" color="text.secondary">
-              {`${t.modelServersRunningInstances}: ${r.running_instances}`}
+              {`${t.modelServersRunningInstances}: ${runningInstanceCount(r)}`}
             </Typography>
           </Box>
         );
