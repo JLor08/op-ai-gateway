@@ -454,6 +454,68 @@ func TestAudioSpeedRunMeasuresColdStart(t *testing.T) {
 	}
 }
 
+// adminStateOf is the admin_state the fake agent last applied for spec id.
+func (f *fakeAgentRuntime) adminStateOf(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.specLocked(id).adminState
+}
+
+// TestAudioColdPassWaitsOutTheStopsRefusal: a manual speed run's stop-all force-stops the
+// running audio target and clears it again before the cold pass, and the agent refuses the
+// target 503 runtime.admission_blocked until that clear reaches it (here 150 ms late). The
+// cold pass takes the refusal for a start still under way and tries again until it is
+// served, so the run succeeds and stores the load time of the attempt that was served
+// (5300 - 300 = 5000 ms), with the clear before the first refusal and exactly two served
+// passes (cold and warm).
+func TestAudioColdPassWaitsOutTheStopsRefusal(t *testing.T) {
+	f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map1", "running", 741)}, clearDelay: 150 * time.Millisecond})
+	if err := f.mem.UpsertModelMappingCache(context.Background(), routing.ModelMappingCacheRow{MappingID: "map1", CacheType: routing.ModelMappingCacheOutputByteRate, Payload: "48000", UpdatedAt: audioFixtureNow}); err != nil {
+		t.Fatalf("UpsertModelMappingCache: %v", err)
+	}
+	targets := f.targets(t, "speed", "map1")
+	targets[0].audio = audioTarget{role: routing.RoleTTS, streaming: true}
+	var mu sync.Mutex
+	served := 0
+	f.srv.audioMeasureSeam = func(_ context.Context, call audioMeasureCall) (audioMeasurement, error) {
+		if f.agent.adminStateOf("rs_map1") == vramAdminStateForceStopped {
+			f.events.add("audio %s 503", call.target.ProviderModel)
+			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Status: http.StatusServiceUnavailable, Code: "runtime.admission_blocked", Message: "admission blocked: the spec is force-stopped"}
+		}
+		f.events.add("audio %s 200", call.target.ProviderModel)
+		mu.Lock()
+		served++
+		n := served
+		mu.Unlock()
+		if n == 1 {
+			return audioFigures(2.5, 5300), nil
+		}
+		return audioFigures(3, 300), nil
+	}
+
+	status := f.run(t, "speed", targets)
+
+	if status.Error != "" || len(status.Results) != 1 {
+		t.Fatalf("status = %+v, want one result and no run error", status)
+	}
+	if res := status.Results[0]; res.Error != "" || res.AudioLoadTimeMS != 5000 {
+		t.Fatalf("result = load %d ms, error %q; want 5000 and no error", res.AudioLoadTimeMS, res.Error)
+	}
+	clear, refused := f.events.index("clear [rs_map1]", 0), f.events.index("audio m1 503", 0)
+	if clear < 0 || refused < 0 || refused < clear {
+		t.Fatalf("events = %v, want the cold pass refused after the clear was written", f.events.with("stop ", "clear ", "audio "))
+	}
+	if first := f.events.index("audio m1 200", 0); first < refused {
+		t.Fatalf("events = %v, want the cold pass served only after its refusals", f.events.with("clear ", "audio "))
+	}
+	if got := f.events.count("audio m1 200"); got != 2 {
+		t.Fatalf("served passes = %d, want 2 (cold and warm)", got)
+	}
+	if m, err := f.mem.MappingByID(context.Background(), "map1"); err != nil || m.LoadTimeMS != 5000 {
+		t.Fatalf("stored load_time_ms = %d (%v), want 5000", m.LoadTimeMS, err)
+	}
+}
+
 // TestAudioSpeedMeasuresWhatTheMappingDoes: the speed run picks its one measurement from the
 // mapping's capability rows -- a streamed synthesis for a TTS model that streams, a one-shot
 // one for one that does not, a live transcription for an ASR model that streams on a target
