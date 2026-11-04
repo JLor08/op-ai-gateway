@@ -11533,9 +11533,11 @@ process.
 - **(c) Overflow, or park — by whether the request can share an instance.** With every instance at its cap, a request
   that can be served on a busy instance **overflows** onto the preferred one and waits inside it, keeping "pins never
   queue". A live session — one slot per instance, so overflow is impossible — and a transcription when every live slot
-  there is held **park** in the queue for that server alone, re-checking the server's gates after every wait. Both
-  signal demand restricted to the pinned server (`DemandSignal.ServerID`): once on an overflow, once per park turn. A
-  request that must not park (`NoPark`, `CheckOnly`) overflows instead.
+  there is held **park** in the queue for that server alone, re-checking the server's gates after every wait. A request
+  that would park, either kind, overflows instead when it must not park (`NoPark`, `CheckOnly`) or when no admission
+  queue is wired. So the three overflow triggers are: the request can share a busy instance; it must not park; there
+  is no queue to park in. Both outcomes signal demand restricted to the pinned server (`DemandSignal.ServerID`): once
+  on an overflow, once per park turn; a check-only resolve signals nothing.
 - **(d) A voice chat leg prefers the instance it ran on last.** The session remembers per leg the gateway instance key
   its last request ran on (the gate's selection before the first turn, for the TTS the pre-warmed one) and names it in
   `X-OP-Preferred-Instance` on the loopback request; `/v1` answers with `X-OP-Served-Instance`, which becomes the next

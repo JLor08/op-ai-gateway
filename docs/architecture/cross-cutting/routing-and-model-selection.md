@@ -2472,16 +2472,20 @@ A token-affinity hit (§4, `resolveAffinity`) and a server override (`resolveSer
    candidate under its cap (a held live slot counts for a request that needs a free one); else
    **the least loaded instance under its cap** on that server (`pinnedChoice`, among equally loaded
    ones the first whose model is loaded).
-3. **None free — overflow, or park.** A pinned request has never queued, so a request that can be
-   served on a busy instance **overflows** onto the preferred instance (the least loaded one when
-   the preferred one is no candidate), among the instances whose live slot is free when it needs
-   one, and waits inside that instance. Only a request that cannot be served that way **parks** — a
-   live session, which takes a slot no other session may share, and a transcription when every live
-   slot on the server is held — in the queue for that server alone (`parkTurn`), offered every
-   turn's instances again. A pinned live request that must not park (`NoPark`, `CheckOnly`) or has
-   no queue to park in overflows instead. Either way the demand is signalled restricted to the
-   pinned server (`DemandSignal.ServerID`): once on an overflow (`signalOverflow`, whether or not a
-   queue is wired), once per park turn when parked, never for a check-only resolve.
+3. **None free — overflow, or park.** A pinned request has never queued, so with every instance at
+   its cap it **overflows** onto the preferred instance (the least loaded one when the preferred one
+   is no candidate), among the instances whose live slot is free when it needs one, and waits inside
+   that instance. Only a request that cannot be served that way **parks** — a live session, which
+   takes a slot no other session may share, and a transcription when every live slot on the server
+   is held (the upstream serves no transcription while a live session holds its slot) — in the
+   queue for that server alone (`parkTurn`), offered every turn's instances again. So a pinned
+   request overflows in exactly three cases: (a) it can share a busy instance — it is no live
+   session and, if it needs a free live slot, one is free; (b) it would park, either kind, but must
+   not (`NoPark`, `CheckOnly`); (c) it would park, either kind, but no admission queue is wired.
+   In (b) and (c) with every live slot held it overflows onto the preferred instance among all of
+   them. Either way the demand is signalled restricted to the pinned server
+   (`DemandSignal.ServerID`): once on an overflow (`signalOverflow`, whether or not a queue is
+   wired), once per park turn when parked, never for a check-only resolve.
 
 A parked pinned request re-checks its server after every wait with the same gates it passed first
 (`servesNow`): a pin whose server stopped being usable is passed over to the fresh selection
