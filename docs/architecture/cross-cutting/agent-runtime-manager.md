@@ -8272,7 +8272,7 @@ same function as the pushed document, so the two cannot disagree); neither has a
 - The spec editor has a **Multiple instances** checkbox; ticked, it shows the
   minimum (empty = 0), the maximum (empty = unlimited) and the parallel requests
   per instance (default 1), validated client-side (whole numbers 0…64, parallelism
-  ≥ 1, minimum ≤ a set maximum), and a read-only line with the measured startup
+  1…1024, minimum ≤ a set maximum), and a read-only line with the measured startup
   and, for a stored replicable spec, the idle timeout in effect (`0` read as
   "never unloaded"). Unticked, it sends the three counts as 0 and validates none of
   them.

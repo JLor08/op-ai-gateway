@@ -13,6 +13,10 @@ import type { Translation } from './types';
 // minimum or maximum above it.
 export const INSTANCES_MAX = 64;
 
+// The most requests one instance may serve at once; the backend refuses more
+// (maxRuntimeSpecInstanceParallelism).
+export const INSTANCE_PARALLELISM_MAX = 1024;
+
 /**
  * A status row's instance index. The wire always carries it, but a row
  * without a usable one -- from a gateway that predates instances -- is the
@@ -314,11 +318,11 @@ function isWholeIn(n: number, min: number, max: number): boolean {
  * one the operator cannot act on. Ticked, in this order:
  *
  *  - Each count a whole number from 0 to the cap (empty is 0), the
- *    parallelism a whole number of at least 1 (empty is its default 1), and a
+ *    parallelism a whole number from 1 to INSTANCE_PARALLELISM_MAX (empty is its default 1), and a
  *    minimum no higher than the maximum when both are set (an empty maximum is
  *    unlimited, so no minimum exceeds it). The backend refuses a negative
- *    count as a tuning value and a count above the cap or a minimum above the
- *    maximum as `runtime_spec.instances_invalid`; the form names all of them
+ *    count as a tuning value and a count above the cap, a parallelism above
+ *    its bound or a minimum above the maximum as `runtime_spec.instances_invalid`; the form names all of them
  *    with that one message, since they are all the instance fields' own.
  *  - Several instances on a fixed listen port: every instance is its own
  *    process on its own port, so only the agent's free-port pick (0) works.
@@ -337,7 +341,7 @@ export function validateInstances(
   if (!isWholeIn(min, 0, INSTANCES_MAX) || !isWholeIn(max, 0, INSTANCES_MAX)) {
     return t.errorRuntimeSpecInstancesInvalid;
   }
-  if (!isWholeIn(parallelismFromText(form.parallelismText), 1, Number.MAX_SAFE_INTEGER)) {
+  if (!isWholeIn(parallelismFromText(form.parallelismText), 1, INSTANCE_PARALLELISM_MAX)) {
     return t.errorRuntimeSpecInstancesInvalid;
   }
   if (min > 0 && max > 0 && min > max) return t.errorRuntimeSpecInstancesInvalid;

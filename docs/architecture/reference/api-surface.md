@@ -739,9 +739,11 @@ Conventions worth stating, because each is a judgement call a client depends on:
   (`minInstancesExceedRealtime`, `internal/portal/service_runtime.go`). The PUT refuses, in
   this order: a negative `min_instances`, `max_instances` or
   `instance_parallelism` `400 runtime_spec.tuning_invalid`; a `min_instances` or
-  `max_instances` above 64 (`MaxInstanceIndex` + 1), or `min_instances` above a
-  set `max_instances`, `400 runtime_spec.instances_invalid` (checked whether or
-  not the spec is replicable; `instance_parallelism` has no upper bound);
+  `max_instances` above 64 (`MaxInstanceIndex` + 1), an `instance_parallelism`
+  above 1024, or `min_instances` above a set `max_instances`, `400
+  runtime_spec.instances_invalid` (checked whether or not the spec is
+  replicable; the scaler wakes one queued request per unit of parallelism when
+  it starts an instance, and the column is int4);
   `replicable` with a non-zero `listen_port` `400
   runtime_spec.instances_need_ephemeral_port` (`validateRuntimeSpecInstances`).
 - **The VRAM benchmark writes neither of those two fields**, and its six

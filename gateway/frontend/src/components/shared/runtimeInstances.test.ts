@@ -295,6 +295,7 @@ describe('validateInstances', () => {
     ['a parallelism of 0', { parallelismText: '0' }],
     ['a negative parallelism', { parallelismText: '-2' }],
     ['a fractional parallelism', { parallelismText: '1.5' }],
+    ['a parallelism above 1024', { parallelismText: '1025' }],
   ])('refuses %s while ticked', (_, fields) => {
     expect(validateInstances(form(fields), 0, t)).toBe(invalid);
   });
@@ -306,6 +307,7 @@ describe('validateInstances', () => {
     ['a maximum with no minimum', { maxText: '5' }],
     ['equal bounds at the cap', { minText: '64', maxText: '64' }],
     ['a minimum below the maximum', { minText: '1', maxText: '3', parallelismText: '8' }],
+    ['the highest parallelism', { parallelismText: '1024' }],
   ])('accepts %s while ticked', (_, fields) => {
     expect(validateInstances(form(fields), 0, t)).toBeUndefined();
   });

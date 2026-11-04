@@ -56,6 +56,37 @@ func TestPutRuntimeSpecInstanceRefusalOrder(t *testing.T) {
 	}
 }
 
+// TestPutRuntimeSpecInstanceParallelismBounded pins the upper bound of
+// instance_parallelism: the instance scaler wakes one queued request per unit
+// of it once an instance runs, and the column is int4, so a value past
+// maxRuntimeSpecInstanceParallelism is runtime_spec.instances_invalid and
+// stores nothing. Exactly the bound is valid.
+func TestPutRuntimeSpecInstanceParallelismBounded(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+	if maxRuntimeSpecInstanceParallelism != 1024 {
+		t.Fatalf("parallelism bound = %d, want 1024", maxRuntimeSpecInstanceParallelism)
+	}
+	base := func() PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true}
+	}
+	for _, p := range []int{maxRuntimeSpecInstanceParallelism + 1, math.MaxInt32, math.MaxInt32 + 1} {
+		req := base()
+		req.InstanceParallelism = p
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req); !errors.Is(err, ErrRuntimeSpecInstancesInvalid) {
+			t.Fatalf("parallelism %d: err = %v, want ErrRuntimeSpecInstancesInvalid", p, err)
+		}
+		if _, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID); err != nil || ok {
+			t.Fatalf("parallelism %d: a refused PUT stored a spec (ok=%v err=%v)", p, ok, err)
+		}
+	}
+	req := base()
+	req.InstanceParallelism = maxRuntimeSpecInstanceParallelism
+	if dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req); err != nil || dto.InstanceParallelism != maxRuntimeSpecInstanceParallelism {
+		t.Fatalf("parallelism %d: dto %d err %v, want it stored", maxRuntimeSpecInstanceParallelism, dto.InstanceParallelism, err)
+	}
+}
+
 // TestPutRuntimeSpecInstanceCountsAboveTheAgentCapRefused pins the upper bound
 // of both counts: the agent addresses instances 0 to routing.MaxInstanceIndex,
 // so a spec has at most 64 of them, and a min_instances or max_instances above

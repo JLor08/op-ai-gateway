@@ -94,6 +94,7 @@ import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 import {
+  INSTANCE_PARALLELISM_MAX,
   INSTANCES_MAX,
   instanceAddress,
   instanceCountFromText,
@@ -4964,7 +4965,7 @@ export function RuntimeAdminSection({
                   label={t.runtimeSpecInstanceParallelism}
                   value={instanceParallelismText}
                   onChange={(e) => setInstanceParallelismText(e.target.value)}
-                  inputProps={{ min: 1 }}
+                  inputProps={{ min: 1, max: INSTANCE_PARALLELISM_MAX }}
                 />
               </>
             )}

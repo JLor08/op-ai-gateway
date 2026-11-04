@@ -1212,11 +1212,20 @@ func validateRuntimeSpecShape(req PutRuntimeSpecRequest) (runtimeSpecFields, err
 // names instances that cannot exist.
 const maxRuntimeSpecInstances = routing.MaxInstanceIndex + 1
 
+// maxRuntimeSpecInstanceParallelism is the most requests one instance may be
+// set to serve at once. The instance scaler wakes one queued request per unit
+// of it once it starts an instance, so an unbounded value would hold it in
+// that loop for as long as the number is large -- minutes, at the int4
+// column's own limit, which a larger value would overflow on PostgreSQL. 1024
+// is far above the request slots one inference server process runs.
+const maxRuntimeSpecInstanceParallelism = 1024
+
 // validateRuntimeSpecInstances checks the four instance settings -- last of
 // the request validations, see validateRuntimeSpecRequest for why -- in this
 // order: a negative count is ErrRuntimeSpecTuningInvalid like every other
-// negative tuning value, a count above maxRuntimeSpecInstances and a floor
-// above the cap (both set) are ErrRuntimeSpecInstancesInvalid, and a
+// negative tuning value, a count above maxRuntimeSpecInstances, a parallelism
+// above maxRuntimeSpecInstanceParallelism and a floor above the cap (both set)
+// are ErrRuntimeSpecInstancesInvalid, and a
 // replicable spec with a fixed port is
 // ErrRuntimeSpecInstancesNeedEphemeralPort. The agent repairs the same shapes
 // when a hand-written file-mode document carries them (a negative count reads
@@ -1229,6 +1238,9 @@ func validateRuntimeSpecInstances(req PutRuntimeSpecRequest) error {
 		return ErrRuntimeSpecTuningInvalid
 	}
 	if req.MinInstances > maxRuntimeSpecInstances || req.MaxInstances > maxRuntimeSpecInstances {
+		return ErrRuntimeSpecInstancesInvalid
+	}
+	if req.InstanceParallelism > maxRuntimeSpecInstanceParallelism {
 		return ErrRuntimeSpecInstancesInvalid
 	}
 	if req.MaxInstances > 0 && req.MinInstances > req.MaxInstances {
