@@ -1820,7 +1820,9 @@ const de = {
   // #340: die Audio-Messung eines Audio-Modells über Geschwindigkeit,
   // Kapazität und Beide -- die Ergebniszeile und die Verlaufsabschnitte.
   benchmarkAudioResult: (rate: number, ttftMs: number) =>
-    `${formatRateX(rate)} Echtzeit${ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''}`,
+    formatRateX(rate) +
+    ' Echtzeit' +
+    (ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''),
   benchmarkAudioLoadTime: (ms: number) => `Ladezeit ${ms} ms`,
   benchmarkAudioCapacityResult: (k: number, limit: AudioConcurrencyLimit | '') =>
     isAudioConcurrencyLimit(limit)
@@ -5265,7 +5267,9 @@ const en: PortalMessages = {
   benchmarkSpeechTtftNote:
     'The measurement does not stream: the audio arrives only after the whole synthesis, and a model the agent launches is loaded behind the request. The time to the first byte therefore covers the synthesis and any model start, not the time to the first streamed audio.',
   benchmarkAudioResult: (rate: number, ttftMs: number) =>
-    `${formatRateX(rate)} real time${ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''}`,
+    formatRateX(rate) +
+    ' real time' +
+    (ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''),
   benchmarkAudioLoadTime: (ms: number) => `load time ${ms} ms`,
   benchmarkAudioCapacityResult: (k: number, limit: AudioConcurrencyLimit | '') =>
     isAudioConcurrencyLimit(limit)

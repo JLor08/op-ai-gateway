@@ -4247,6 +4247,15 @@ export function RuntimeAdminSection({
       // needs all of them `stopped` (restartGate).
       const gate = restartGate(statusRows, row.spec_id, restartableStates, spec);
       const restartBlocked = gate !== 'open';
+      // A successful restart ends with the row `stopped`, where Restart is
+      // disabled -- so this is the RESTING state of a healthy row, not an edge
+      // case, and every operator meets it. An unexplained grey button is what
+      // makes a correct gate look like a portal bug. (`overridesLocked` gets
+      // no reason of its own: it is transient and already narrated by the
+      // row's own "stopping…" / "clearing…" chip.)
+      let restartTitle: string | undefined;
+      if (gate === 'state') restartTitle = t.runtimeRestartUnavailable;
+      else if (gate === 'instance') restartTitle = t.runtimeRestartUnavailableInstance;
       actions.push({
         key: 'restart',
         label: t.runtimeRestart,
@@ -4261,19 +4270,8 @@ export function RuntimeAdminSection({
         // a portal bug -- but never clickable there. `force_running`, offered
         // above, is the action that does something on those three.
         disabled: overridesLocked || restartBlocked,
-        // …and SAY so on hover. A successful restart ends with the row
-        // `stopped`, where Restart is disabled -- so this is the RESTING state
-        // of a healthy row, not an edge case, and every operator meets it. An
-        // unexplained grey button is what makes a correct gate look like a
-        // portal bug. (`overridesLocked` gets no reason of its own: it is
-        // transient and already narrated by the row's own "stopping…" /
-        // "clearing…" chip.)
-        title:
-          gate === 'state'
-            ? t.runtimeRestartUnavailable
-            : gate === 'instance'
-              ? t.runtimeRestartUnavailableInstance
-              : undefined,
+        // …and SAY so on hover (restartTitle).
+        title: restartTitle,
         onClick: () => void startRestart(row.spec_id, spec),
       });
     }

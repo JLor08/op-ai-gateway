@@ -254,6 +254,6 @@ export function minRealtimeWarning(
   metrics: AudioMetrics | undefined,
 ): boolean {
   if (stored?.instances_min_exceeds_realtime && minInstances >= stored.min_instances) return true;
-  if (stored && minInstances === stored.min_instances) return false;
+  if (stored?.min_instances === minInstances) return false;
   return minExceedsRealtime(minInstances, metrics);
 }
