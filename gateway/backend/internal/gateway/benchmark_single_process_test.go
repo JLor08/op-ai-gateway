@@ -706,3 +706,112 @@ func TestBothRunRampEndsWhenAnOperatorsFixedPortKeepsItsSpecOneProcess(t *testin
 		t.Fatalf("run error = %q, want none: the conflict owes no restore", status.Error)
 	}
 }
+
+// TestBothRunRampGoesAheadWhenAnOperatorMadeItsSpecReplicableAgain: while the run holds
+// target A (map1) as one process, an operator turns multiple instances back on, and the
+// portal pushes that document. The restore before A's ramp is then a conflict -- the spec is
+// no longer stored as the not replicable the run wrote -- but the spec read again is
+// replicable (audioRampStillReplicable), so the ramp counts it as restored: it goes ahead by
+// instance up to max_instances (4 / cap, one stream per instance), and afterwards holds A as
+// one process again for the stop-all of B (map2) after it (audioRampOneProcessAgain),
+// recorded in the lease before the write. B's load time is confirmed, and at the end A is
+// replicable again, as the operator left it, and the lease is released.
+func TestBothRunRampGoesAheadWhenAnOperatorMadeItsSpecReplicableAgain(t *testing.T) {
+	f, script, _ := newBothRunAudioFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map2", "stopped", 0)}})
+	var mu sync.Mutex
+	coldPassesOfB := 0
+	script.answer = func(call audioMeasureCall, _ int) (audioMeasurement, error) {
+		m := audioFigures(5, 100)
+		if call.target.ProviderModel == "m2" && call.level == 0 && !call.warmUp {
+			mu.Lock()
+			coldPassesOfB++
+			cold := coldPassesOfB == 1
+			mu.Unlock()
+			if cold {
+				m.FirstByteMS = 2100
+			} else {
+				m.FirstByteMS = 100
+			}
+		}
+		return m, nil
+	}
+	var once sync.Once
+	var replicableBeforeRestore bool
+	f.portal.onReplicableBatch = func(kind string, _ []string) {
+		if kind != "replicable" {
+			return
+		}
+		once.Do(func() {
+			ctx := context.Background()
+			spec, ok, err := f.mem.RuntimeSpecByID(ctx, "rs_map1")
+			if err != nil || !ok {
+				t.Errorf("RuntimeSpecByID = %v, %v", ok, err)
+				return
+			}
+			spec.Replicable = true
+			if err := f.mem.UpsertRuntimeSpec(ctx, spec); err != nil {
+				t.Errorf("UpsertRuntimeSpec: %v", err)
+				return
+			}
+			replicableBeforeRestore = storedReplicable(t, f.mem, "rs_map1")
+			f.srv.PushRuntimeConfig("srv1")             // the operator's save pushes its document
+			f.agent.setState("rs_map1", "running", 733) // and the spec's instances run
+		})
+	}
+	var heldAtStop, leaseNamesA bool
+	stops := 0
+	f.portal.onBatch = func(kind string, _ []string) {
+		if kind != "stop" {
+			return
+		}
+		if stops++; stops == 2 {
+			heldAtStop = !storedReplicable(t, f.mem, "rs_map1")
+			leaseNamesA = slices.Contains(f.lease(t).RestoreReplicable, "rs_map1")
+		}
+	}
+
+	status := f.run(t, "both", bothRunAudioTargets(t, f, "map1", "map2"))
+
+	if status.Error != "" || len(status.Results) != 2 {
+		t.Fatalf("status = %+v, want two results and no run error", status)
+	}
+	if !replicableBeforeRestore {
+		t.Fatal("the operator's write did not store rs_map1 as replicable before the restore")
+	}
+	a, b := status.Results[0], status.Results[1]
+	if a.Error != "" || a.AudioRealtimeConcurrency != 4 || a.AudioConcurrencyLimit != routing.AudioLimitCap {
+		t.Fatalf("A = %d / %q, error %q; want 4 / cap: the conflicted restore of a replicable spec counts as restored", a.AudioRealtimeConcurrency, a.AudioConcurrencyLimit, a.Error)
+	}
+	byLevel := map[int][]string{} // A's ramp: its streams, B's aside
+	for _, c := range script.recorded() {
+		if !c.warmUp && c.level > 0 && strings.HasPrefix(c.model, "m1") {
+			byLevel[c.level] = append(byLevel[c.level], c.model)
+		}
+	}
+	for k := 1; k <= 4; k++ {
+		models := byLevel[k]
+		slices.Sort(models)
+		if want := []string{"m1", "m1#1", "m1#2", "m1#3"}[:k]; !slices.Equal(models, want) {
+			t.Fatalf("level %d streams went to %v, want one per instance %v", k, models, want)
+		}
+	}
+	wantBatches := []string{"single [rs_map1]", "replicable [rs_map1]", "single [rs_map1]", "replicable [rs_map1]"}
+	if got := f.events.with("single ", "replicable "); !slices.Equal(got, wantBatches) {
+		t.Fatalf("replicable batches = %v, want %v: held, the conflicted restore, held again for B, restored at the end", got, wantBatches)
+	}
+	if hold, firstOfB := f.events.index("single [rs_map1]", 1), f.events.index("audio m2 level 0 warm-up false", 0); hold < f.events.lastIndex("ensure m1#3") || firstOfB < 0 || hold > firstOfB {
+		t.Fatalf("events = %v, want A held again after its ramp and before B is measured", f.events.with("single ", "replicable ", "ensure ", "stop ", "audio m2 level 0"))
+	}
+	if stops != 2 || !heldAtStop || !leaseNamesA {
+		t.Fatalf("stop batches = %d; at B's stop A held as one process %v, named in the lease %v; want both", stops, heldAtStop, leaseNamesA)
+	}
+	if b.Error != "" || b.AudioLoadTimeMS != 2000 {
+		t.Fatalf("B = load %d ms, error %q; want the confirmed 2000", b.AudioLoadTimeMS, b.Error)
+	}
+	if !storedReplicable(t, f.mem, "rs_map1") {
+		t.Fatal("after the run A is stored as not replicable, want the operator's replicable")
+	}
+	if got := f.lease(t); !got.Empty() {
+		t.Fatalf("lease after the run = %+v, want it released", got)
+	}
+}

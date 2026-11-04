@@ -537,6 +537,101 @@ func TestAudioSpeedStopAllRunPreparesBeforeItStops(t *testing.T) {
 	}
 }
 
+// stopAllSpeechAgent is the stop-all fixture's provider that also relays the speech
+// benchmark's one-shot synthesis (provider.NativeProxyClient) as the fake agent would serve
+// it: the synthesis starts the spec's child (its row reads running with a pid, published
+// like any start) and answers a 48 kHz mono WAV, so the byte rate learned is 96000. Every
+// synthesis is an event "speech <model>".
+type stopAllSpeechAgent struct {
+	*provider.Multiplexer
+	agent  *fakeAgentRuntime
+	events *stopAllEvents
+	specID string
+}
+
+func (p *stopAllSpeechAgent) ProxyNative(_ context.Context, target routing.Target, _ string, _ []byte, _ string) (*provider.ProxyResponse, error) {
+	p.events.add("speech %s", target.ProviderModel)
+	p.agent.setState(p.specID, "running", 742)
+	return &provider.ProxyResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: io.NopCloser(bytes.NewReader(buildMonoWAV(48000, 48000)))}, nil
+}
+
+// TestAudioSpeedStopAllRunStopsTheTargetItsPreparationWarmed: the success path of a stop-all
+// run's prepare-first order. The streamed synthesis has no cached byte rate, so the speech
+// benchmark runs first, caches the rate and leaves the target running. The stop-all's fresh
+// selection frame shows that start, so the target is in the stop set: the stop and the clear
+// come after the benchmark and before any pass, the cold pass then finds the target stopped
+// and counts its audio with the learned rate, and the confirmed cold start is stored as the
+// mapping's load time (5300 - 300 = 5000 ms). A stop set that left the warmed target out --
+// read from a frame from before the benchmark, say -- would stop nothing, and the cold pass
+// would find the target warm and record no load time.
+func TestAudioSpeedStopAllRunStopsTheTargetItsPreparationWarmed(t *testing.T) {
+	f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map1", "stopped", 0)}})
+	f.srv.Provider = &stopAllSpeechAgent{Multiplexer: f.srv.Provider.(*provider.Multiplexer), agent: f.agent, events: f.events, specID: "rs_map1"}
+	targets := f.targets(t, "speed", "map1")
+	targets[0].audio = audioTarget{role: routing.RoleTTS, streaming: true}
+	var mu sync.Mutex
+	var served []audioMeasureCall
+	f.srv.audioMeasureSeam = func(_ context.Context, call audioMeasureCall) (audioMeasurement, error) {
+		if f.agent.adminStateOf("rs_map1") == vramAdminStateForceStopped {
+			f.events.add("audio %s 503", call.target.ProviderModel)
+			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Status: http.StatusServiceUnavailable, Code: "runtime.admission_blocked", Message: "admission blocked: the spec is force-stopped"}
+		}
+		f.events.add("audio %s 200", call.target.ProviderModel)
+		mu.Lock()
+		served = append(served, call)
+		mu.Unlock()
+		if state, _ := f.agent.stateOf("rs_map1"); state != "running" {
+			f.agent.setState("rs_map1", "running", 743) // the pass loads the model
+			return audioFigures(2.5, 5300), nil
+		}
+		return audioFigures(3, 300), nil
+	}
+
+	status := f.run(t, "speed", targets)
+
+	if status.Error != "" || len(status.Results) != 1 {
+		t.Fatalf("status = %+v, want one result and no run error", status)
+	}
+	if got := f.batches(); !slices.Equal(got, []string{"stop [rs_map1]", "clear [rs_map1]"}) {
+		t.Fatalf("batches = %v, want the warmed target stopped and cleared", got)
+	}
+	if res := status.Results[0]; res.Error != "" || res.AudioLoadTimeMS != 5000 {
+		t.Fatalf("result = load %d ms, error %q; want the confirmed 5000", res.AudioLoadTimeMS, res.Error)
+	}
+	firstPass := slices.IndexFunc(f.events.list(), func(ev stopAllEvent) bool { return strings.HasPrefix(ev.what, "audio ") })
+	speech, stop, clear := f.events.index("speech m1", 0), f.events.index("stop [rs_map1]", 0), f.events.index("clear [rs_map1]", 0)
+	if speech < 0 || stop < speech || clear < stop || firstPass < clear {
+		t.Fatalf("events = %v, want the speech benchmark, then the stop and the clear, then the passes", f.events.with("speech ", "stop ", "clear ", "audio "))
+	}
+	if got := f.events.count("speech m1"); got != 1 {
+		t.Fatalf("speech benchmarks = %d, want 1", got)
+	}
+	mu.Lock()
+	passes := append([]audioMeasureCall(nil), served...)
+	mu.Unlock()
+	if len(passes) != 2 {
+		t.Fatalf("served passes = %d, want 2 (cold and warm)", len(passes))
+	}
+	for i, call := range passes {
+		if call.kind != audioKindTTSStream || call.timesOnly || call.byteRate != 96000 {
+			t.Fatalf("pass %d = kind %v, times only %v, byte rate %d; want a streamed synthesis counted at the learned 96000", i, call.kind, call.timesOnly, call.byteRate)
+		}
+	}
+	if rate, ok := f.srv.cachedOutputByteRate(context.Background(), "map1"); !ok || rate != 96000 {
+		t.Fatalf("cached byte rate = %d (%v), want 96000", rate, ok)
+	}
+	if m, err := f.mem.MappingByID(context.Background(), "map1"); err != nil || m.LoadTimeMS != 5000 {
+		t.Fatalf("stored load_time_ms = %d (%v), want the confirmed 5000", m.LoadTimeMS, err)
+	}
+	rows, err := f.mem.BenchmarkRunsByMapping(context.Background(), "map1", 10)
+	if err != nil {
+		t.Fatalf("BenchmarkRunsByMapping: %v", err)
+	}
+	if i := slices.IndexFunc(rows, func(r routing.BenchmarkRun) bool { return r.Kind == benchmarkKindAudio }); i < 0 || rows[i].LoadTimeMS != 5000 {
+		t.Fatalf("history rows = %+v, want an audio row with load 5000", rows)
+	}
+}
+
 // TestAudioSpeedLoadTimeIsTheFirstOutputOfEachKind: the load time is the cold pass's time to
 // its first output minus the warm pass's, and what counts as the first output depends on the
 // measurement: the first response byte of a one-shot synthesis, the first transcript text of a
