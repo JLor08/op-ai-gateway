@@ -4255,6 +4255,36 @@ describe('instance settings (#340) i18n keys', () => {
     expect(messages.en.runtimeSpecAutoIdleTimeout(150, 12500)).toContain('12.5 s');
   });
 
+  // 0 in effect: the agent keeps the model loaded (an agent without instance
+  // support keeps the manual 0), never an unload after zero seconds.
+  it('names an idle timeout in effect of 0 as never unloaded', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const never = messages[locale].runtimeSpecIdleTimeoutNever;
+      expect(never.length, locale).toBeGreaterThan(0);
+      const line = messages[locale].runtimeSpecAutoIdleTimeout(0, 30000);
+      expect(line, locale).toContain(never);
+      expect(line, locale).not.toMatch(/: 0 s/);
+      expect(line, locale).toContain('30 s');
+    }
+    expect(messages.de.runtimeSpecIdleTimeoutNever).toBe('nie entladen');
+    expect(messages.en.runtimeSpecIdleTimeoutNever).toBe('never unloaded');
+  });
+
+  // Shown as soon as "Multiple instances" is ticked: the startup is measured
+  // for every spec, unlike the idle timeout in effect.
+  it('names the measured startup on its own, or says nothing is measured yet', () => {
+    expect(messages.de.runtimeSpecMeasuredStartup(12500)).toBe('Gemessene Startzeit: 12,5 s');
+    expect(messages.en.runtimeSpecMeasuredStartup(12500)).toBe('Measured startup: 12.5 s');
+    expect(messages.de.runtimeSpecMeasuredStartup(0)).toBe('Startzeit noch nicht gemessen');
+    expect(messages.en.runtimeSpecMeasuredStartup(0)).toBe('Startup not measured yet');
+    // The combined line starts with the same words.
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].runtimeSpecAutoIdleTimeout(150, 12500), locale).toMatch(
+        new RegExp(`^${messages[locale].runtimeSpecMeasuredStartup(12500)} · `),
+      );
+    }
+  });
+
   it('sums up running instances with the bounds, an unset maximum as unlimited', () => {
     for (const locale of ['de', 'en'] as readonly Locale[]) {
       const unlimited = messages[locale].runtimeInstancesSummary(2, 1, null);
@@ -4271,6 +4301,11 @@ describe('instance settings (#340) i18n keys', () => {
   it('says in the idle-timeout hint what 0 means once a spec runs several instances', () => {
     expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = keine manuelle Vorgabe/);
     expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = no manual override/);
+    // ...only on an agent that runs instances; one without keeps 0 as "never".
+    expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/Agenten mit Instanz/);
+    expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/nie entladen/);
+    expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/agent with instance support/);
+    expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/never unloaded/);
   });
 
   // One message for every refusal of the instance fields, so it names each rule.

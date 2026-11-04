@@ -10816,20 +10816,48 @@ describe('RuntimeAdminSection instance settings', () => {
     expect(screen.queryByText(t.runtimeSpecIdleTimeoutOverrideHint)).not.toBeInTheDocument();
   });
 
-  // The figure is the idle timeout the gateway pushes for the STORED spec, and
-  // for a spec stored without instances that is its manual value, not an
-  // automatic one -- so ticking the box there shows no figure until a save.
-  it('shows no idle-timeout figure for a spec stored without instances', async () => {
+  // The startup is measured for every spec, so it is shown as soon as the box
+  // is ticked. The idle timeout in effect is the one the gateway pushes for the
+  // STORED spec, and for a spec stored without instances that is its manual
+  // value, not an automatic one -- so ticking the box there shows the startup
+  // alone until a save.
+  it('shows the measured startup but no idle-timeout figure for a spec stored without instances', async () => {
     await openApiTokenSpecEdit({
       idle_timeout_seconds: 600,
       startup_measured_ms: 30000,
       effective_idle_timeout_seconds: 600,
     });
+    expect(screen.queryByText(t.runtimeSpecMeasuredStartup(30000))).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
 
     expect(screen.getByText(t.runtimeSpecIdleTimeoutOverrideHint)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecMeasuredStartup(30000))).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeSpecAutoIdleTimeout(600, 30000))).not.toBeInTheDocument();
+  });
+
+  it('says on Create, once ticked, that no startup is measured yet, and shows no idle timeout', async () => {
+    await openFilledCreate();
+    expect(screen.queryByText(t.runtimeSpecMeasuredStartup(0))).not.toBeInTheDocument();
+
+    tickReplicable();
+
+    expect(screen.getByText(t.runtimeSpecMeasuredStartup(0))).toBeInTheDocument();
+    expect(screen.queryByText(/wirksamer Leerlauf-Timeout/)).not.toBeInTheDocument();
+  });
+
+  // An agent without instance support keeps the manual 0 -- never unloaded --
+  // and the gateway reports that 0 as the timeout in effect.
+  it('names an idle timeout in effect of 0 as never unloaded, not as 0 s', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 0,
+    });
+
+    const line = screen.getByText(t.runtimeSpecAutoIdleTimeout(0, 30000));
+    expect(line).toHaveTextContent(t.runtimeSpecIdleTimeoutNever);
+    expect(line).not.toHaveTextContent(/: 0 s/);
   });
 });
 

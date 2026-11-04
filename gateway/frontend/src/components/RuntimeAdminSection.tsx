@@ -4853,17 +4853,21 @@ export function RuntimeAdminSection({
               helperText={replicable ? t.runtimeSpecIdleTimeoutOverrideHint : undefined}
               inputProps={{ min: 0 }}
             />
-            {/* The timeout the gateway actually pushes, beside the field that
-                overrides it. Only for a spec STORED as replicable: for any
-                other the figure is the stored manual value, not an automatic
-                one, so ticking the box on such a spec shows nothing until a
-                save has made the gateway derive it. */}
-            {replicable && currentSpec?.configured && currentSpec.replicable && (
+            {/* While the box is ticked: the measured startup, which the agent
+                measures for every spec (none yet on Create), and beside it the
+                timeout the gateway actually pushes -- only for a spec STORED
+                as replicable: for any other the figure is the stored manual
+                value, not an automatic one, so ticking the box on such a spec
+                shows the startup alone until a save has made the gateway
+                derive it. A timeout in effect of 0 reads "never unloaded". */}
+            {replicable && (
               <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
-                {t.runtimeSpecAutoIdleTimeout(
-                  currentSpec.effective_idle_timeout_seconds,
-                  currentSpec.startup_measured_ms,
-                )}
+                {currentSpec?.configured && currentSpec.replicable
+                  ? t.runtimeSpecAutoIdleTimeout(
+                      currentSpec.effective_idle_timeout_seconds,
+                      currentSpec.startup_measured_ms,
+                    )
+                  : t.runtimeSpecMeasuredStartup(currentSpec?.startup_measured_ms ?? 0)}
               </Typography>
             )}
             <Field

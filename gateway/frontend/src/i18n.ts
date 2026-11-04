@@ -12,6 +12,21 @@ type PortalMessageValue =
   | ((a: number, b: number) => string)
   | ((a: number, b: number, c: number | null) => string);
 
+// A measured startup in ms as the launch-spec form names it (#340), shared by
+// runtimeSpecMeasuredStartup and the start of runtimeSpecAutoIdleTimeout. 0 is
+// "nothing measured yet", never a startup of zero seconds.
+function measuredStartupDe(startupMs: number): string {
+  return startupMs > 0
+    ? `Gemessene Startzeit: ${(startupMs / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1, useGrouping: false })} s`
+    : 'Startzeit noch nicht gemessen';
+}
+
+function measuredStartupEn(startupMs: number): string {
+  return startupMs > 0
+    ? `Measured startup: ${(startupMs / 1000).toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })} s`
+    : 'Startup not measured yet';
+}
+
 const de = {
   dashboard: 'Dashboard',
   chat: 'Chat',
@@ -1122,17 +1137,20 @@ const de = {
   runtimeSpecMaxInstancesUnlimited:
     'Leer = unbegrenzt: Instanzen kommen hinzu, solange freie Ressourcen und das Prozesslimit des Servers es erlauben.',
   runtimeSpecInstanceParallelism: 'Parallele Anfragen pro Instanz',
+  // The measured startup (measured for every spec), shown on its own while
+  // the box is ticked on a spec not STORED with instances.
+  runtimeSpecMeasuredStartup: (startupMs: number) => measuredStartupDe(startupMs),
   // The measured startup and the idle timeout the gateway actually pushes to
   // the agent for the STORED spec: the larger of the manual value and the one
-  // derived from the startup, so it is named as the one in effect.
+  // derived from the startup, so it is named as the one in effect. 0 in effect
+  // is "never unloaded" (an agent without instance support keeps the manual 0).
   runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
-    `${
-      startupMs > 0
-        ? `Gemessene Startzeit: ${(startupMs / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1, useGrouping: false })} s`
-        : 'Startzeit noch nicht gemessen'
-    } · wirksamer Leerlauf-Timeout: ${seconds} s`,
+    `${measuredStartupDe(startupMs)} · wirksamer Leerlauf-Timeout: ${
+      seconds > 0 ? `${seconds} s` : 'keiner – nie entladen'
+    }`,
+  runtimeSpecIdleTimeoutNever: 'nie entladen',
   runtimeSpecIdleTimeoutOverrideHint:
-    'Bei mehreren Instanzen: 0 = keine manuelle Vorgabe – der Gateway leitet den Leerlauf-Timeout aus der gemessenen Startzeit ab. Ein Wert hier gilt, sobald er über dem automatischen liegt.',
+    'Bei mehreren Instanzen auf einem Agenten mit Instanzunterstützung: 0 = keine manuelle Vorgabe – der Gateway leitet den Leerlauf-Timeout aus der gemessenen Startzeit ab. Ein Wert hier gilt, sobald er über dem automatischen liegt. Ein Agent ohne Instanzunterstützung behält 0 als „nie entladen“.',
   // The role-grouped co-residency editor.
   runtimeCoresidency: 'Koresidenz',
   runtimeCoresidencyHint:
@@ -4544,14 +4562,14 @@ const en: PortalMessages = {
   runtimeSpecMaxInstancesUnlimited:
     "Empty = unlimited: instances are added while free resources and the server's process limit allow.",
   runtimeSpecInstanceParallelism: 'Parallel requests per instance',
+  runtimeSpecMeasuredStartup: (startupMs: number) => measuredStartupEn(startupMs),
   runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
-    `${
-      startupMs > 0
-        ? `Measured startup: ${(startupMs / 1000).toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })} s`
-        : 'Startup not measured yet'
-    } · idle timeout in effect: ${seconds} s`,
+    `${measuredStartupEn(startupMs)} · idle timeout in effect: ${
+      seconds > 0 ? `${seconds} s` : 'none – never unloaded'
+    }`,
+  runtimeSpecIdleTimeoutNever: 'never unloaded',
   runtimeSpecIdleTimeoutOverrideHint:
-    'With multiple instances: 0 = no manual override – the gateway derives the idle timeout from the measured startup time. A value here applies once it is above the automatic one.',
+    'With multiple instances on an agent with instance support: 0 = no manual override – the gateway derives the idle timeout from the measured startup time. A value here applies once it is above the automatic one. An agent without instance support keeps 0 as "never unloaded".',
   runtimeCoresidency: 'Co-residency',
   runtimeCoresidencyHint:
     'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy. Anything you leave unset follows the server default.',
