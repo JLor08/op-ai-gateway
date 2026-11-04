@@ -124,6 +124,12 @@ type ServerDeps struct {
 	CapacityVRAMSafetyMarginPercent int
 	CapacityMaxConcurrency          int
 	CapacitySettleSeconds           int
+	// Audio-benchmark tuning (config OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR and
+	// OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX): the rate a concurrency ramp level's slowest
+	// stream must reach to count as real-time, and the highest level the ramp measures.
+	// Each <= 0 defaults in New (1.2 / 8).
+	AudioRealtimeMinFactor float64
+	AudioConcurrencyMax    int
 	// AdmissionQueueMaxDepth bounds how many unpinned requests can park in the CP4
 	// admission queue at once; the (maxDepth+1)-th waiter is rejected with a 503.
 	// <= 0 defaults to 128 in newAdmissionQueue.
@@ -297,6 +303,12 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetAudioBenchmarkTrigger is the same wiring conduit for the app-health loop's
+	// one-time automatic audio benchmark: cmd/gateway's buildGatewayServer calls it ONCE
+	// with the just-built Server's TriggerAudioBenchmark, and until then the loop's
+	// trigger answers false (nothing started). Server never stores or reads this field.
+	// nil is correct for any Server built without cmd/gateway.
+	SetAudioBenchmarkTrigger func(AudioBenchmarkTrigger)
 	// SetSpeechRateTrigger is the same wiring conduit for the app-health loop: it
 	// binds the trigger the loop starts the speech rate benchmark with (#263). The
 	// loop is built together with the portal Service, before this Server exists, so
@@ -492,6 +504,20 @@ type Server struct {
 	// test land a cancel in exactly the window between the run finishing its TTS leg and its
 	// commit claim, deterministically. Production leaves it nil.
 	voiceBeforeCommitClaim func(run *ChatRun)
+	// audioRealtimeMinFactor and audioConcurrencyMax tune the audio benchmark's
+	// concurrency ramp (see ServerDeps.AudioRealtimeMinFactor), defaulted in New. A
+	// bare &Server{} leaves them 0, which the ramp reads as their defaults
+	// (audioRealtimeThreshold, audioRampCap).
+	audioRealtimeMinFactor float64
+	audioConcurrencyMax    int
+	// audioMeasureSeam, when non-nil, takes every audio benchmark measurement in place
+	// of the real ones (takeAudioMeasurement). It is a TEST SEAM only: it lets a test
+	// script the exact figures a run stores. Production leaves it nil.
+	audioMeasureSeam func(ctx context.Context, call audioMeasureCall) (audioMeasurement, error)
+	// audioAutoRuns remembers the mappings the health loop's one-time automatic audio
+	// benchmark was started for in this process (TriggerAudioBenchmark). Its zero value
+	// is ready.
+	audioAutoRuns audioAutoRunMarker
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -1058,6 +1084,8 @@ func New(deps ServerDeps) *Server {
 		capacityMaxConcurrency:      capacityMaxConcurrency,
 		capacitySettleSeconds:       capacitySettleSeconds,
 		capacitySettle:              time.Duration(capacitySettleSeconds) * time.Second,
+		audioRealtimeMinFactor:      positiveOr(deps.AudioRealtimeMinFactor, defaultAudioRealtimeMinFactor),
+		audioConcurrencyMax:         positiveOr(deps.AudioConcurrencyMax, defaultAudioConcurrencyMax),
 		mux:                         http.NewServeMux(),
 		agentMux:                    http.NewServeMux(),
 		baseCtx:                     context.Background(),

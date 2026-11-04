@@ -50,7 +50,8 @@ var benchmarkStopWaitBound = vramIsolationBindDelay + vramIsolationDrainBound
 
 // benchmarkMayPreStop marks every target of a manual speed or both run
 // (startBenchmark) as one whose cold pass may first stop the server's running
-// agent models (mayPreStop, preStopServer). Any other mode marks nothing, and no
+// agent models (mayPreStop, preStopServer), an audio target's cold pass
+// (measureAudioSpeed) as well as a text one's. Any other mode marks nothing, and no
 // other starter calls it: a scheduled, capacity, vision, Load, VRAM or
 // context-probe run never runs the stop-all (a VRAM run force-stops the launch
 // specs through its own drain, vramDrain).

@@ -87,9 +87,11 @@ type BenchmarkResult struct {
 	// Skipped names why an application- or server-scope run did not measure
 	// this mapping, from a closed set: "images_only"
 	// (benchmarkSkippedImagesOnly) or "audio_only"
-	// (benchmarkSkippedAudioOnly) for a chat-prompt run, and "not_speech"
-	// (benchmarkSkippedNotSpeech) or "speech_clone"
-	// (benchmarkSkippedSpeechClone) for a speech run. A skipped result carries
+	// (benchmarkSkippedAudioOnly) for a run that cannot measure the mapping,
+	// and "not_speech" (benchmarkSkippedNotSpeech) or "speech_clone"
+	// (benchmarkSkippedSpeechClone) for a speech run, the latter also for a
+	// speed, capacity or both run of a clone model without a preset voice. A
+	// skipped result carries
 	// no metrics and no error, and no history row is written for it.
 	Skipped string `json:"skipped,omitempty"`
 	// The speech benchmark's figures (a speech run; omitted on every other mode
@@ -103,6 +105,21 @@ type BenchmarkResult struct {
 	TTFTMS         int64   `json:"ttft_ms,omitempty"`
 	WallMS         int64   `json:"wall_ms,omitempty"`
 	RTF            float64 `json:"rtf,omitempty"`
+	// The audio benchmark's figures (#340): set only on the result of a speech or
+	// transcription mapping's speed, capacity or both run (benchmark_audio.go). A speed run
+	// sets AudioRateX (seconds of audio produced or transcribed per wall second, one stream),
+	// AudioTTFTMS (the time to the first audio of a synthesis, or the first text of a
+	// transcription) and, for a confirmed cold start, AudioLoadTimeMS (cold minus warm time
+	// to first output; 0 = not measured). A capacity run sets the ramp's pair:
+	// AudioRealtimeConcurrency, the last good level, and AudioConcurrencyLimit, why the ramp
+	// stopped (routing.AudioLimitPerformance, AudioLimitResources or AudioLimitCap); a count
+	// of 0 is omitted and still a result whenever the limit is set. A failed part sets none
+	// of its figures.
+	AudioRateX               float64 `json:"audio_rate_x,omitempty"`
+	AudioTTFTMS              int64   `json:"audio_ttft_ms,omitempty"`
+	AudioLoadTimeMS          int64   `json:"audio_load_time_ms,omitempty"`
+	AudioRealtimeConcurrency int     `json:"audio_realtime_concurrency,omitempty"`
+	AudioConcurrencyLimit    string  `json:"audio_concurrency_limit,omitempty"`
 }
 
 type benchmarkRun struct {

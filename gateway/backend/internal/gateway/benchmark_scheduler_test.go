@@ -9,6 +9,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -469,5 +470,81 @@ func TestTriggerScheduledBenchmarkSkipsAMappingWhoseSpecReadFails(t *testing.T) 
 	}
 	if srv.Benchmarks.ServerBusy(server.ID) {
 		t.Fatalf("ServerBusy = true, want false: no child could be classified, so no run is reserved")
+	}
+}
+
+// TestSchedulerIncludesAudioSpeed: a speech or transcription mapping takes part in the
+// scheduled speed run like a chat mapping, measured as audio: schedAudioFixture's audio
+// mappings, given their capability verdicts, get a kind=audio history row and no chat
+// prompt, and the text children are benchmarked as before. A locked audio mapping is
+// skipped, as a locked chat mapping is.
+func TestSchedulerIncludesAudioSpeed(t *testing.T) {
+	ctx := context.Background()
+	mem := routing.NewMemoryStore()
+	server, audioApp, agentApp := schedAudioFixture(t, mem)
+	now := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	caps := map[string][]routing.CapabilityRow{
+		"map-audio-ext":   ttsStreamingCaps(),
+		"map-agent-audio": {sbCap(routing.CapabilityTranscription, routing.CapabilityYes, now)},
+	}
+	for id, rows := range caps {
+		if err := mem.UpsertMappingCapabilities(ctx, id, rows); err != nil {
+			t.Fatalf("UpsertMappingCapabilities(%s): %v", id, err)
+		}
+	}
+	if err := mem.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: "map-audio-ext", CacheType: routing.ModelMappingCacheOutputByteRate, Payload: "48000", UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertModelMappingCache: %v", err)
+	}
+	prov := newColdLister(nil)
+	script := &audioScript{answer: func(audioMeasureCall, int) (audioMeasurement, error) { return audioFigures(4, 250), nil }}
+	srv := &Server{Provider: prov, Routes: mem, Benchmarks: NewBenchmarkRegistry(), Active: newActiveRegistry(nil), audioMeasureSeam: script.seam}
+
+	for _, app := range []routing.Application{audioApp, agentApp} {
+		if !srv.TriggerScheduledBenchmark(ctx, server, app) {
+			t.Fatalf("%s: TriggerScheduledBenchmark = false, want a launched run", app.ID)
+		}
+		waitFor(t, func() bool { return !srv.Benchmarks.Status(server.ID).Running })
+	}
+	for id, kind := range map[string]string{"map-audio-ext": benchmarkKindAudio, "map-agent-audio": benchmarkKindAudio, "map-agent-text": "speed"} {
+		runs, err := mem.BenchmarkRunsByMapping(ctx, id, 10)
+		if err != nil || len(runs) != 1 || runs[0].Kind != kind || runs[0].Error != "" {
+			t.Fatalf("%s history = %+v (%v), want one %s row", id, runs, err, kind)
+		}
+	}
+	for id, kind := range map[string]audioMeasureKind{"map-audio-ext": audioKindTTSStream, "map-agent-audio": audioKindASRBuffered} {
+		m, err := mem.MappingByID(ctx, id)
+		if err != nil || m.AudioRateX != 4 || m.AudioTTFAMS != 250 {
+			t.Fatalf("%s audio metrics = %v / %d (%v), want 4 / 250", id, m.AudioRateX, m.AudioTTFAMS, err)
+		}
+		measured := false
+		for _, c := range script.recorded() {
+			if c.model == strings.TrimPrefix(id, "map-") && c.kind == kind {
+				measured = true
+			}
+		}
+		if !measured {
+			t.Fatalf("%s was not measured as %v: %+v", id, kind, script.recorded())
+		}
+	}
+	for _, model := range prov.streamedModels() {
+		if model == "audio-ext" || model == "agent-audio" {
+			t.Fatalf("streamed a chat prompt to the audio mapping %s", model)
+		}
+	}
+
+	// A locked audio mapping is left out of the next pass.
+	locked, err := mem.MappingByID(ctx, "map-audio-ext")
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	locked.MetricsLocked = true
+	if err := mem.UpdateMapping(ctx, locked); err != nil {
+		t.Fatalf("UpdateMapping: %v", err)
+	}
+	if !srv.TriggerScheduledBenchmark(ctx, server, audioApp) {
+		t.Fatal("TriggerScheduledBenchmark = false, want true (nothing to do)")
+	}
+	if srv.Benchmarks.ServerBusy(server.ID) {
+		t.Fatal("a run was reserved for an application whose one mapping is locked")
 	}
 }

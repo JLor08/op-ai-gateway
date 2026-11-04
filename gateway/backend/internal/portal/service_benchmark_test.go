@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -433,5 +434,71 @@ func TestMappingBenchmarksVRAMDecode(t *testing.T) {
 	// Plain speed row: no VRAM report at all.
 	if speed := byServer["srv-speed"]; speed.Kind != "speed" || speed.VRAM != nil {
 		t.Fatalf("speed row = %#v, want kind=speed with VRAM nil", speed)
+	}
+}
+
+// TestMappingBenchmarksAudioDecode covers the audio benchmark's two history kinds (#340): a
+// kind=="audio" row (a speed run) serves its time to first output, wall time, real-time factor
+// and load time from their columns and its rate from the JSON its capacity_curve column holds;
+// a kind=="audio_capacity" row (the ramp) serves the real-time concurrency, the limit and the
+// curve from that JSON, a measured 0 with its limit included. A malformed payload is tolerated
+// as no figures, and the same payload on another kind is not read.
+func TestMappingBenchmarksAudioDecode(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	ctx := context.Background()
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "http"})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "gw", AppModelName: "up", Status: routing.ServerStatusActive})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	ramp := `{"audio_realtime_concurrency":2,"audio_concurrency_limit":"performance","audio_curve":[{"k":1,"min_rate_x":3,"mean_rate_x":3},{"k":2,"min_rate_x":1.5,"mean_rate_x":2},{"k":3,"min_rate_x":1.1,"mean_rate_x":1.1}]}`
+	for i, r := range []routing.BenchmarkRun{
+		{MappingID: mapping.ID, ServerID: "srv-audio", CreatedAt: now.Add(5 * time.Minute), Kind: "audio", TTFTMS: 300, WallMS: 4300, RTF: 0.2, LoadTimeMS: 5000, CapacityCurve: `{"audio_rate_x":3.5}`},
+		{MappingID: mapping.ID, ServerID: "srv-ramp", CreatedAt: now.Add(4 * time.Minute), Kind: "audio_capacity", CapacityCurve: ramp},
+		{MappingID: mapping.ID, ServerID: "srv-zero", CreatedAt: now.Add(3 * time.Minute), Kind: "audio_capacity", CapacityCurve: `{"audio_realtime_concurrency":0,"audio_concurrency_limit":"performance","audio_curve":[{"k":1,"min_rate_x":0.8,"mean_rate_x":0.8}]}`},
+		{MappingID: mapping.ID, ServerID: "srv-bad", CreatedAt: now.Add(2 * time.Minute), Kind: "audio_capacity", CapacityCurve: `{not json`, Error: "audio benchmark: level 1 failed"},
+		{MappingID: mapping.ID, ServerID: "srv-other", CreatedAt: now.Add(time.Minute), Kind: "capacity", CapacityCurve: ramp},
+	} {
+		if err := routeStore.InsertBenchmarkRun(ctx, r); err != nil {
+			t.Fatalf("InsertBenchmarkRun %d: %v", i, err)
+		}
+	}
+	got, err := svc.MappingBenchmarks(ctx, ownerToken(), mapping.ID, 50)
+	if err != nil {
+		t.Fatalf("MappingBenchmarks: %v", err)
+	}
+	byServer := make(map[string]BenchmarkRunDTO, len(got))
+	for _, r := range got {
+		byServer[r.ServerID] = r
+	}
+	if a := byServer["srv-audio"]; a.Kind != "audio" || a.AudioRateX != 3.5 || a.TTFTMS != 300 || a.WallMS != 4300 || a.RTF != 0.2 || a.LoadTimeMS != 5000 || a.AudioCurve != nil {
+		t.Fatalf("audio row = %#v", a)
+	}
+	wantCurve := []AudioLevelDTO{{K: 1, MinRateX: 3, MeanRateX: 3}, {K: 2, MinRateX: 1.5, MeanRateX: 2}, {K: 3, MinRateX: 1.1, MeanRateX: 1.1}}
+	if r := byServer["srv-ramp"]; r.Kind != "audio_capacity" || r.AudioRealtimeConcurrency != 2 || r.AudioConcurrencyLimit != "performance" || !reflect.DeepEqual(r.AudioCurve, wantCurve) || r.AudioRateX != 0 {
+		t.Fatalf("ramp row = %#v", r)
+	}
+	if z := byServer["srv-zero"]; z.AudioRealtimeConcurrency != 0 || z.AudioConcurrencyLimit != "performance" || len(z.AudioCurve) != 1 {
+		t.Fatalf("measured-0 row = %#v, want 0 / performance and its one level", z)
+	}
+	if b := byServer["srv-bad"]; b.Error == "" || b.AudioConcurrencyLimit != "" || b.AudioCurve != nil {
+		t.Fatalf("malformed row = %#v, want its error and no figures", b)
+	}
+	if o := byServer["srv-other"]; o.AudioConcurrencyLimit != "" || o.AudioCurve != nil {
+		t.Fatalf("capacity row = %#v, want no audio figures read from another kind's payload", o)
+	}
+	raw, err := json.Marshal(byServer["srv-ramp"])
+	if err != nil {
+		t.Fatalf("marshal ramp row: %v", err)
+	}
+	for _, key := range []string{`"audio_realtime_concurrency":2`, `"audio_concurrency_limit":"performance"`, `"audio_curve":[{"k":1,"min_rate_x":3,"mean_rate_x":3}`} {
+		if !strings.Contains(string(raw), key) {
+			t.Fatalf("ramp row JSON %s lacks %s", raw, key)
+		}
 	}
 }

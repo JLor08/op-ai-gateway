@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"sync"
 	"time"
 )
 
@@ -85,6 +86,102 @@ func (s *Server) TriggerSpeechRateBenchmark(ctx context.Context, server routing.
 	go func() {
 		defer cancel()
 		s.runBenchmark(runCtx, run, server.ID, []benchmarkTarget{tgt}, benchmarkModeSpeech)
+	}()
+	return true
+}
+
+// benchmarkScopeAudioAuto is the Scope of the one-time automatic audio benchmark the
+// app-health loop starts for a mapping (TriggerAudioBenchmark).
+const benchmarkScopeAudioAuto = "audio-auto"
+
+// AudioBenchmarkTrigger is the signature of Server.TriggerAudioBenchmark, which the app-health
+// loop holds bound late, like SpeechRateTrigger (ServerDeps.SetAudioBenchmarkTrigger).
+type AudioBenchmarkTrigger func(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) bool
+
+// audioAutoRunMarker remembers which mappings the one-time automatic audio benchmark was
+// started for in this process. Its zero value is ready, and it is safe for concurrent use:
+// the health loop asks from one goroutine per application.
+type audioAutoRunMarker struct {
+	mu      sync.Mutex
+	started map[string]bool
+}
+
+// done reports whether mappingID's run was started already.
+func (m *audioAutoRunMarker) done(mappingID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.started[mappingID]
+}
+
+// claim marks mappingID's run started and reports whether this call did, false when another
+// one had already.
+func (m *audioAutoRunMarker) claim(mappingID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.started[mappingID] {
+		return false
+	}
+	if m.started == nil {
+		m.started = map[string]bool{}
+	}
+	m.started[mappingID] = true
+	return true
+}
+
+// audioAutoRunWanted reports whether an audio mapping still lacks what the automatic run
+// measures: any audio metrics at all (no audio benchmark has stamped it), or, for a replicable
+// spec, a ramp result (its concurrency limit is unknown). A ramp's measured 0 has a limit, so
+// it never asks again: it is a result.
+func audioAutoRunWanted(mapping routing.ModelMapping, spec routing.RuntimeSpec) bool {
+	return mapping.AudioMetricsUpdatedAt == nil || (spec.Replicable && mapping.AudioConcurrencyLimit == "")
+}
+
+// TriggerAudioBenchmark starts the one-time automatic audio benchmark for ONE mapping on behalf
+// of the app-health loop (#340), so a speech or transcription mapping has its audio metrics --
+// and a replicable one its real-time concurrency -- normally right after the operator set it
+// up, before real use. It is a both run of exactly the manual run's target
+// (benchmarkViewTarget), with no principal and no stop-all: the cold start is measured only
+// when the server is found quiet (agentColdStart).
+//
+// Like TriggerSpeechRateBenchmark it decides, reserves and launches, and the run goes on in its
+// own goroutine. It answers true only when a run was launched, and false for everything else:
+//   - the mapping is not active, its metrics are locked (nothing would be written), it is no
+//     audio target, a read failed, or it already has what the run measures
+//     (audioAutoRunWanted);
+//   - its run was started already in this process: once per mapping, so a run that fails
+//     -- an upstream that cannot synthesize, say -- does not start again on every tick;
+//   - the mapping's agent has not declared its features since the gateway started: whether a
+//     replicable spec is ramped one instance per stream depends on them (runtime_instances),
+//     and a run against an agent that has not reported would fail;
+//   - another run holds the server's slot, or the server has requests in flight. These last
+//     two, and the agent's features, do not use up the mapping's one run: the loop asks again
+//     on a later tick.
+func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) bool {
+	if s == nil || s.Routes == nil || mapping.Status != routing.ServerStatusActive || mapping.MetricsLocked || s.audioAutoRuns.done(mapping.ID) {
+		return false
+	}
+	if app.Type == routing.ProviderServerAgent && !s.AgentFeatures.Known(server.ID) {
+		return false
+	}
+	tgt, skipped, err := s.benchmarkViewTarget(ctx, portal.BenchmarkTargetView{Server: server, App: app, Mapping: mapping}, true)
+	if err != nil || skipped != "" || tgt.audio.role == "" || !audioAutoRunWanted(mapping, tgt.spec) {
+		return false
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	run, ok := s.Benchmarks.TryStart(server.ID, benchmarkScopeAudioAuto, "both", 1, time.Now().UTC(), cancel)
+	if !ok {
+		cancel()
+		return false
+	}
+	if (s.Active != nil && s.Active.CountByServerName(server.Name) > 0) || !s.audioAutoRuns.claim(mapping.ID) {
+		s.Benchmarks.Release(server.ID)
+		cancel()
+		return false
+	}
+	slog.Info("audio benchmark started by the health loop", "mapping_id", mapping.ID, "server_id", server.ID)
+	go func() {
+		defer cancel()
+		s.runBenchmark(runCtx, run, server.ID, []benchmarkTarget{tgt}, "both")
 	}()
 	return true
 }

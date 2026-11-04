@@ -60,6 +60,40 @@ type BenchmarkRunDTO struct {
 	TTFTMS int64   `json:"ttft_ms,omitempty"`
 	WallMS int64   `json:"wall_ms,omitempty"`
 	RTF    float64 `json:"rtf,omitempty"`
+	// The audio benchmark's figures (#340), decoded from the JSON a row of
+	// either audio kind holds in its capacity_curve column (decodeAudioHistory).
+	// A kind=="audio" row (an audio speed run) carries TTFTMS, WallMS, RTF and
+	// LoadTimeMS above -- its time to first audio or text, wall time, real-time
+	// factor and confirmed cold start -- plus AudioRateX, its single-stream rate.
+	// A kind=="audio_capacity" row (the concurrency ramp) carries
+	// AudioRealtimeConcurrency, the last good level, AudioConcurrencyLimit, why the
+	// ramp stopped ("performance" | "resources" | "cap"; "" for a ramp that failed,
+	// and then the count means nothing), and AudioCurve, one entry per level.
+	// Every other kind carries none of them.
+	AudioRateX               float64         `json:"audio_rate_x,omitempty"`
+	AudioRealtimeConcurrency int             `json:"audio_realtime_concurrency,omitempty"`
+	AudioConcurrencyLimit    string          `json:"audio_concurrency_limit,omitempty"`
+	AudioCurve               []AudioLevelDTO `json:"audio_curve,omitempty"`
+}
+
+// AudioLevelDTO is one level k of an audio concurrency ramp: k streams at
+// once, the slowest one's and the mean rate in seconds of audio per wall
+// second. It mirrors the gateway's audioLevel field for field, which the
+// gateway's own test pins.
+type AudioLevelDTO struct {
+	K         int     `json:"k"`
+	MinRateX  float64 `json:"min_rate_x"`
+	MeanRateX float64 `json:"mean_rate_x"`
+}
+
+// audioHistoryPayload is the JSON an audio history row holds in its
+// capacity_curve column. Its keys are the DTO's own, so the gateway writes the
+// figures under the names the portal serves them by.
+type audioHistoryPayload struct {
+	AudioRateX               float64         `json:"audio_rate_x"`
+	AudioRealtimeConcurrency int             `json:"audio_realtime_concurrency"`
+	AudioConcurrencyLimit    string          `json:"audio_concurrency_limit"`
+	AudioCurve               []AudioLevelDTO `json:"audio_curve"`
 }
 
 // CapacityLevelDTO / CapacityReportDTO are the decoded capacity curve for a
@@ -214,8 +248,29 @@ func benchmarkRunDTO(r routing.BenchmarkRun) BenchmarkRunDTO {
 		dto.VRAM = decodeVRAMReport(r.VRAMJSON)
 	case "speech":
 		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
+	case "audio":
+		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
+		dto.AudioRateX = decodeAudioHistory(r.CapacityCurve).AudioRateX
+	case "audio_capacity":
+		h := decodeAudioHistory(r.CapacityCurve)
+		dto.AudioRealtimeConcurrency, dto.AudioConcurrencyLimit = h.AudioRealtimeConcurrency, h.AudioConcurrencyLimit
+		if len(h.AudioCurve) > 0 {
+			dto.AudioCurve = h.AudioCurve
+		}
 	}
 	return dto
+}
+
+// decodeAudioHistory decodes an audio history row's opaque payload, tolerating
+// a blank or malformed one as no figures for the same reason
+// decodeCapacityReport does: the row's own columns and Error still make a
+// usable history entry.
+func decodeAudioHistory(raw string) audioHistoryPayload {
+	var payload audioHistoryPayload
+	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &payload) != nil {
+		return audioHistoryPayload{}
+	}
+	return payload
 }
 
 // decodeCapacityReport decodes a kind=="capacity" row's opaque curve column.

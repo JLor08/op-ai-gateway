@@ -446,6 +446,11 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	if deps.SetSpeechRateTrigger != nil {
 		deps.SetSpeechRateTrigger(srv.TriggerSpeechRateBenchmark)
 	}
+	// The one-time automatic audio benchmark (#340) is bound the same way, for the
+	// same reasons.
+	if deps.SetAudioBenchmarkTrigger != nil {
+		deps.SetAudioBenchmarkTrigger(srv.TriggerAudioBenchmark)
+	}
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
 	// *portal.Service, and RouteAffinitySessionMode is intentionally off the
@@ -1029,6 +1034,9 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// the ServerDeps.SetSpeechRateTrigger conduit below. Until then the trigger starts
 	// nothing and the loop asks again on its next tick.
 	speechRate := &lateSpeechRateTrigger{}
+	// The one-time automatic audio benchmark (#340) is bound late for the same reason,
+	// through ServerDeps.SetAudioBenchmarkTrigger.
+	audioBenchmark := &lateAudioBenchmarkTrigger{}
 	cancelHealth := startAppHealthLoop(&appHealthRunner{
 		store:                b.Routes,
 		prober:               mux,
@@ -1036,6 +1044,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		registry:             appHealth,
 		loaded:               loadedModels,
 		speechRate:           speechRate.trigger,
+		audioBenchmark:       audioBenchmark.trigger,
 		imageOptionsRegistry: appImageOptions,
 		agents:               agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus, agentFeatures: agentFeatures},
 		groups:               groups,
@@ -1102,6 +1111,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SetBenchmarkReservationHook:     portalService.SetBenchmarkReservationHook,
 		SetVendorTokenRefresher:         portalService.SetVendorTokenRefresher,
 		SetSpeechRateTrigger:            speechRate.set,
+		SetAudioBenchmarkTrigger:        audioBenchmark.set,
 		Account:                         b.Account,
 		CookieSecure:                    resolveCookieSecure(cfg),
 		SessionMaxAge:                   cfg.SessionMaxTTL,
@@ -1115,6 +1125,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		CapacityVRAMSafetyMarginPercent: cfg.CapacityVRAMSafetyMarginPercent,
 		CapacityMaxConcurrency:          cfg.CapacityMaxConcurrency,
 		CapacitySettleSeconds:           cfg.CapacitySettleSeconds,
+		AudioRealtimeMinFactor:          cfg.AudioRealtimeMinFactor,
+		AudioConcurrencyMax:             cfg.AudioConcurrencyMax,
 		AdmissionQueueMaxDepth:          cfg.AdmissionQueueMaxDepth,
 		NetbirdSyncInterval:             time.Duration(cfg.NetbirdSyncIntervalSeconds) * time.Second,
 		ACMEChallenges:                  acmeChallenges,

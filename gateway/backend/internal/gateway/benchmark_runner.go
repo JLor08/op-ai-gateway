@@ -111,8 +111,16 @@ type benchmarkTarget struct {
 	// (#306): the first preset of a configured clone model's voices cache, decided once in
 	// partitionSpeechBenchmarkViews (speechBenchmarkPresetVoice) so the manual run and the
 	// health loop's trigger send the same request. Empty on every other target -- a plain
-	// speech model speaks in its own default voice -- and then the request names none.
+	// speech model speaks in its own default voice -- and then the request names none. The
+	// audio benchmark's targets carry it the same way (benchmarkViewTarget): a clone model
+	// synthesizes the audio passage in that preset.
 	voice string
+	// audio marks a mapping with the speech or transcription capability whose speed,
+	// capacity and both runs measure its audio (measureAudioTarget) instead of sending it a
+	// chat prompt: its role and whether it streams. It is decided once, from the mapping's
+	// capability rows, by the view partition of those modes and by the scheduler
+	// (benchmarkViewTarget); the zero value is a text target.
+	audio audioTarget
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -869,7 +877,8 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 // finishes the run (clearing the server-busy state) even on error/cancel. mode selects
 // what is measured per target: "speed" (throughput/load, the pre-CP2 behavior), "capacity"
 // (the OOM-safe concurrency ramp), "both" (speed then capacity, so metrics_source ends
-// "capacity"), or "vision" (the image-acceptance probe: on a definitive verdict, writes
+// "capacity") -- for an audio target (benchmarkTarget.audio) these three measure its audio
+// instead (measureAudioTarget, benchmark_audio.go) -- or "vision" (the image-acceptance probe: on a definitive verdict, writes
 // the mapping's `vision` capability row, sourced vision_benchmark, subject to the same
 // precedence rank every capability writer obeys -- routing.WritableCapabilityRows -- so
 // it never overwrites an operator's CapabilitySourceManual verdict; always appends a
@@ -902,6 +911,14 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 		if ctx.Err() != nil {
 			runErr = "canceled"
 			return
+		}
+		if tgt.audio.role != "" && benchmarkModeMeasuresAudio(mode) {
+			// An audio target's speed, capacity and both modes measure its audio instead of
+			// sending it a chat prompt, and record their own history rows.
+			res, _ := s.measureAudioTarget(ctx, run, tgt, mode)
+			run.addResult(res)
+			s.Benchmarks.publish(serverID, run.snapshot())
+			continue
 		}
 		var res BenchmarkResult
 		// speedErr is the SPEED measurement's own error, captured before a "both" run
@@ -1301,14 +1318,7 @@ func (s *Server) measureSpeedTarget(ctx context.Context, tgt benchmarkTarget) Be
 		// Both writes skip a locked mapping. This write never touches
 		// context_size, so a probed context survives.
 		_ = s.Routes.UpdateMappingBenchmarkMetrics(ctx, tgt.mapping.ID, res.GenTokensPerSecond, res.PromptTokensPerSecond, res.LoadTimeMS, time.Now().UTC())
-		// A replicable spec's pushed idle timeout is derived from its mapping's
-		// load_time_ms, and this write is outside the portal service, whose
-		// write paths push a changed document themselves, so it pushes here.
-		// A spec that is not replicable is pushed its stored idle timeout,
-		// which a load time does not change.
-		if res.LoadTimeMS > 0 && tgt.spec.Replicable {
-			s.PushRuntimeConfig(tgt.server.ID)
-		}
+		s.pushBenchmarkLoadTime(tgt, res.LoadTimeMS)
 	}
 	return res
 }

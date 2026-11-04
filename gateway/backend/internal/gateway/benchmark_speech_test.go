@@ -523,31 +523,26 @@ func TestSpeechBenchmarkFailureCachesNothing(t *testing.T) {
 	}
 }
 
-// The audio-only refusal is lifted for the speech benchmark ONLY: a speech-capable
-// mapping that serves nothing but openai_audio is accepted and measured under
-// ?mode=speech, while every chat-prompt mode still refuses it with 409
-// benchmark.audio_only and sends it nothing. A mapping that does not synthesize
-// speech (a transcriber) is refused by the speech benchmark with its own 409, and
-// neither refusal reserves the server.
+// A speech-capable mapping that serves nothing but openai_audio is accepted and
+// measured under ?mode=speech, while the vision probe, a chat prompt such a mapping
+// cannot answer, still refuses it with 409 benchmark.audio_only and sends it
+// nothing. (Its speed, capacity and both runs measure its audio instead:
+// benchmark_audio_test.go.) A mapping that does not synthesize speech (a
+// transcriber) is refused by the speech benchmark with its own 409, and neither
+// refusal reserves the server.
 func TestSpeechBenchmarkRunsOnSpeechMapping(t *testing.T) {
 	up := newSpeechBenchUpstream(t, answerWAV(buildPCMWav(t, 24000, 1, 16, 48000), true))
 	s := newSpeechBenchFixture(t, up)
 
-	// The chat/speed family still refuses an audio-only mapping, before reserving anything.
-	for _, mode := range []string{"speed", "both", "capacity", "vision", ""} {
-		path := "/api/portal/mappings/sb_tts/benchmark"
-		if mode != "" {
-			path += "?mode=" + mode
-		}
-		if status, code, _ := postSpeechBenchmark(t, s, path); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
-			t.Fatalf("POST %s = %d %q, want 409 %s (the chat benchmark must still refuse audio)", path, status, code, codeBenchmarkAudioOnly)
-		}
+	// The vision probe still refuses an audio-only mapping, before reserving anything.
+	if status, code, _ := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_tts/benchmark?mode=vision"); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
+		t.Fatalf("POST ?mode=vision = %d %q, want 409 %s (the vision probe must still refuse audio)", status, code, codeBenchmarkAudioOnly)
 	}
 	if s.Benchmarks.ServerBusy(sbServer) {
-		t.Fatal("a refused chat benchmark left the server reserved")
+		t.Fatal("a refused vision probe left the server reserved")
 	}
 	if got := up.received(); len(got) != 0 {
-		t.Fatalf("a refused chat benchmark reached the upstream: %+v", got)
+		t.Fatalf("a refused vision probe reached the upstream: %+v", got)
 	}
 
 	// A mapping that does not synthesize speech is refused by the speech benchmark.

@@ -57,11 +57,15 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 // mode is "speed"|"capacity"|"both"|"vision"|"speech" (already validated by
 // parseBenchmarkMode).
 //
-// Every mode but speech sends each target a chat prompt, so before the reservation the
-// scope's views are partitioned (partitionBenchmarkViews): a view that serves
-// only images or only audio (speech, transcription) is skipped, and one whose runtime spec cannot be
-// read is not measured either, because the answer is unknown and is not
-// guessed at. The speech benchmark inverts the audio half of that split
+// Before the reservation the scope's views are partitioned
+// (partitionBenchmarkViewsFor). The speed, capacity and both modes send a chat
+// mapping a chat prompt and measure a speech or transcription mapping's audio
+// (benchmarkViewTarget, measureAudioTarget); the vision probe sends every
+// target a chat prompt. A view the mode cannot measure -- one that serves only
+// images, or only audio it has no audio measurement for -- is skipped, and one
+// whose runtime spec (or, for an audio view, capability rows or voices cache)
+// cannot be read is not measured either, because the answer is unknown and is
+// not guessed at. The speech benchmark inverts the audio half of that split
 // (partitionSpeechBenchmarkViews): it synthesizes a clip on each plain
 // text-to-speech mapping, the audio-only ones included, and on each configured
 // clone model that lists a preset voice (with that preset named in the request,

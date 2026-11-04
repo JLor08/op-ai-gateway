@@ -87,6 +87,7 @@ var allowedDeps = map[string][]string{
 		"internal/account",
 		"internal/apierror",
 		"internal/auth",
+		"internal/benchaudio",
 		"internal/capture",
 		"internal/certissue",
 		"internal/compat",
