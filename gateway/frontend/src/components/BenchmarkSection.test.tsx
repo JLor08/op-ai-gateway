@@ -962,7 +962,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // The failed ramp and the one with an unknown limit read "unknown".
       expect(screen.getAllByText(t.benchmarkAudioCapacityResult(0, ''))).toHaveLength(2);
       expect(screen.queryByText(/≥/)).not.toBeInTheDocument();
-      expect(screen.queryByText(new RegExp(t.mappingAudioConcurrencyLimitCap))).toBeNull();
+      // A plain substring match: the label carries parentheses, which a RegExp
+      // built from it would read as a group and so never find.
+      expect(screen.queryByText(t.mappingAudioConcurrencyLimitCap, { exact: false })).toBeNull();
 
       // Only the ramp that stored a curve has a curve table.
       const curves = screen

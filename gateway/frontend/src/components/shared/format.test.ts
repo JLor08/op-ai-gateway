@@ -143,6 +143,21 @@ describe('formatPortalError', () => {
     expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
   });
 
+  // benchmark.speech_unavailable carries one of three server messages (the
+  // speech run with no target, an audio-only scope the speed/capacity/both runs
+  // cannot measure yet, and that scope beside images-only models), so its one
+  // label states every case rather than showing the English text.
+  it('labels benchmark.speech_unavailable for every scope it refuses, in both locales', () => {
+    const err = new PortalApiError(409, 'benchmark.speech_unavailable', 'raw server text');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale].errorBenchmarkSpeechUnavailable;
+      expect(label).toBeTruthy();
+      expect(formatPortalError(err, messages[locale])).toBe(
+        `benchmark.speech_unavailable: ${label}`,
+      );
+    }
+  });
+
   // The mapping editor's refusal of a metric it cannot store: the gateway
   // answers mapping.metric_invalid (portal.ErrMappingMetricInvalid) for a
   // negative text metric and, since #340, for an invalid audio metric too --
@@ -372,7 +387,10 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `errBenchmarkAudioOnly`, `errBenchmarkAgentEnsureUnsupported` and
    * `errBenchmarkSpecForceStopped`, rows in the same `benchmarkErrRows`. The
    * VRAM probe answers the third of them too, under this same code rather than
-   * a `benchmark.vram_*` one.
+   * a `benchmark.vram_*` one. `benchmark.speech_unavailable`
+   * (`codeBenchmarkSpeechUnavailable`, `benchmark_refusals.go`) is the
+   * refusal of a run with nothing it can measure as audio, under one of three
+   * server messages.
    *
    * The starters also answer three other codes that this list leaves out on
    * purpose, because no portal action can trigger them:
@@ -392,6 +410,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'benchmark.audio_only',
     'benchmark.agent_ensure_unsupported',
     'benchmark.spec_force_stopped',
+    'benchmark.speech_unavailable',
   ] as const;
 
   it('carries every non-VRAM benchmark code a portal action can receive, by its exact wire string', () => {

@@ -97,6 +97,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // `load_refusal` reuses these labels as the disabled Load action's tooltip.
   'benchmark.images_only': 'errorBenchmarkImagesOnly',
   'benchmark.audio_only': 'errorBenchmarkAudioOnly',
+  // A run with nothing it can measure as audio: the speech run with no
+  // speech target, or a speed/capacity/both scope whose audio-only models
+  // cannot be measured yet (beside images-only ones or not). The gateway
+  // words those cases apart; this one label states them all.
+  'benchmark.speech_unavailable': 'errorBenchmarkSpeechUnavailable',
   'benchmark.agent_ensure_unsupported': 'errorBenchmarkAgentEnsureUnsupported',
   'benchmark.spec_force_stopped': 'errorBenchmarkSpecForceStopped',
   // The VRAM benchmark's precondition refusals (409 at the trigger), read

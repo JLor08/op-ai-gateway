@@ -70,7 +70,8 @@ const (
 	// be true -- images_only would tell the operator that the audio model serves images --
 	// so the message names both, under the audio code: an audio model is in the scope, and
 	// what it lacks (a verdict, a preset voice) is what can still change. The portal shows
-	// this code's message as it is.
+	// one label for this code that states all three cases, so the wording here is for API
+	// clients and logs.
 	msgBenchmarkScopeUnmeasurable = "no model in the run's scope can be measured: each serves only images, or serves audio only and cannot be measured yet (it has no speech or transcription verdict, or it clones a voice and lists no preset voice)"
 
 	// codeBenchmarkAgentEnsureUnsupported: an images-only agent child loads
