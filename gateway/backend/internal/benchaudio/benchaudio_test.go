@@ -5,8 +5,13 @@ package benchaudio
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"math"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -49,6 +54,90 @@ func TestBenchaudioClipIsPCM16kMono(t *testing.T) {
 	}
 	if Language != "de" {
 		t.Fatalf("Language = %q, want de", Language)
+	}
+}
+
+// The SHA-256 of the two embedded files, as committed: the clip assembled from the
+// recordings SOURCE.md lists and its transcript. A re-encode, a resample, a trim or an edit
+// of either changes what every ASR measurement transcribes, so it must show up here as a
+// deliberate change, never pass unnoticed because the format and the length still fit.
+const (
+	clipWAVSHA256        = "5341390baed5937380b22d1eb01faf78cfe405afd8b9980329fa0ddb5bf5d81a"
+	clipTranscriptSHA256 = "9882cdcda525610738a1670ea9848e208f1a1e4e3315ea443b1c522fdb009513"
+)
+
+// clipRecordings are the dataset recordings the clip joins, in order, as SOURCE.md names
+// them: their ids and their lengths in seconds.
+var clipRecordings = []struct {
+	id      string
+	seconds float64
+}{
+	{"d1b3400ade45bdef42a86ebc61759baf", 4.52},
+	{"47cac1d3ad61a1f0fbd0a3817e6c5701", 4.35},
+	{"a8241b5172bbcd3014b619979a973c3c", 3.28},
+	{"920c3946b93d94ea9bfb3b7afc89b42d", 3.14},
+	{"d2ee3b78d854600f3defb13f7bf0e603", 3.58},
+	{"236335285af27d7318e0b09b4da822f0", 2.23},
+}
+
+// clipPauseSeconds is the pause SOURCE.md says separates two recordings in the clip.
+const clipPauseSeconds = 0.35
+
+// sourceRecording is one recording line of SOURCE.md: "- `<id>` (<seconds> s): "<sentence>"".
+var sourceRecording = regexp.MustCompile("(?m)^ *- `([0-9a-f]{32})` \\(([0-9.]+) s\\): \"([^\"]*)\"$")
+
+// TestBenchaudioClipIsPinned pins the bundled clip byte for byte: the embedded WAV and
+// transcript hash to the committed files' SHA-256, and SOURCE.md lists exactly the six
+// recordings the clip is made of, in order. SOURCE.md must also agree with the clip it
+// describes -- its sentences, joined, are the transcript, and its recordings with the
+// pauses between them add up to the clip's length -- so the note cannot drift from the
+// asset either.
+func TestBenchaudioClipIsPinned(t *testing.T) {
+	for _, f := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"asr-benchmark-de.wav", wav, clipWAVSHA256},
+		{"asr-benchmark-de.txt", []byte(transcript), clipTranscriptSHA256},
+	} {
+		if sum := sha256.Sum256(f.data); hex.EncodeToString(sum[:]) != f.want {
+			t.Errorf("the embedded %s (%d bytes) has SHA-256 %x, want %s: the bundled clip changed", f.name, len(f.data), sum, f.want)
+		}
+	}
+
+	source, err := os.ReadFile("SOURCE.md")
+	if err != nil {
+		t.Fatalf("read SOURCE.md: %v", err)
+	}
+	for _, fact := range []string{"CC0 1.0", "Thorsten-Voice/TV-44kHz-Full", "TV-2022.10-Neutral"} {
+		if !strings.Contains(string(source), fact) {
+			t.Errorf("SOURCE.md does not name %q", fact)
+		}
+	}
+	listed := sourceRecording.FindAllStringSubmatch(string(source), -1)
+	if len(listed) != len(clipRecordings) {
+		t.Fatalf("SOURCE.md lists %d recordings, want the clip's %d", len(listed), len(clipRecordings))
+	}
+	sentences := make([]string, 0, len(listed))
+	total := clipPauseSeconds * float64(len(listed)-1)
+	for i, rec := range listed {
+		seconds, err := strconv.ParseFloat(rec[2], 64)
+		if err != nil {
+			t.Fatalf("SOURCE.md recording %d: length %q: %v", i+1, rec[2], err)
+		}
+		if want := clipRecordings[i]; rec[1] != want.id || seconds != want.seconds {
+			t.Errorf("SOURCE.md recording %d is %s (%v s), want %s (%v s)", i+1, rec[1], seconds, want.id, want.seconds)
+		}
+		sentences = append(sentences, rec[3])
+		total += seconds
+	}
+	if joined := strings.Join(sentences, " "); joined != Transcript() {
+		t.Errorf("SOURCE.md's sentences, joined, are\n%q\nwant the transcript\n%q", joined, Transcript())
+	}
+	pcm, sampleRate, channels := PCM()
+	if clip := float64(len(pcm)) / float64(sampleRate*channels*2); math.Abs(clip-total) > 0.05 {
+		t.Errorf("SOURCE.md's recordings and pauses add up to %.2f s, the clip is %.2f s", total, clip)
 	}
 }
 
