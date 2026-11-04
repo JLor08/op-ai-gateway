@@ -349,7 +349,7 @@ func TestBearerLiveTranscriptionBusyRejectsSecondSession(t *testing.T) {
 }
 
 // AVAILABILITY: a client that establishes a session and then goes idle -- the half-open
-// shape, the twin of the WebSocket ping guard -- must not hold the single per-route slot
+// shape, the twin of the WebSocket ping guard -- must not hold its instance's one live slot
 // forever. The idle watchdog (streamIdleTimeout, armed on the SSE relay) fires, tears the
 // relay down and RELEASES the slot, so a later session on the same model is not denied 503
 // forever. A short idle makes the test fast; the slot's release is asserted directly on the
@@ -378,7 +378,7 @@ func TestBearerLiveTranscriptionIdleClientReleasesSlot(t *testing.T) {
 	_ = readBearerSSE(t, br, 5*time.Second)
 
 	// The client now goes idle: it neither streams more PCM nor reads the SSE. The watchdog
-	// must fire within ~idle, tear the relay down and release the per-route slot. The slot is
+	// must fire within ~idle, tear the relay down and release the instance's slot. The slot is
 	// busy until it does, so acquiring it succeeds only once the idle session has been reaped.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -387,7 +387,7 @@ func TestBearerLiveTranscriptionIdleClientReleasesSlot(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the per-route slot was never released after the client went idle: the idle watchdog did not reap the session")
+			t.Fatal("the instance's live slot was never released after the client went idle: the idle watchdog did not reap the session")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

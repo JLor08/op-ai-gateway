@@ -26,8 +26,8 @@ import (
 // gateway's OWN /v1/audio/transcriptions/live, so the portal mic exercises the very
 // endpoint a programmatic bearer client hits. These tests stand up the whole chain --
 // browser WebSocket -> in-process loopback -> /v1/audio/transcriptions/live -> a mock
-// full-duplex /live child -- and assert that resolution, admission, the per-route
-// guard and the SINGLE usage row all happen at /v1 (as the ticket's loopback user),
+// full-duplex /live child -- and assert that resolution, admission, the per-instance
+// live-slot guard and the SINGLE usage row all happen at /v1 (as the ticket's loopback user),
 // never a second time at the portal.
 
 // liveWSProtocol is the fixed subprotocol the browser offers first; the ticket is
@@ -540,10 +540,10 @@ func TestLiveTranscriptionLoopbackNonStreamingModelErrorFrame(t *testing.T) {
 	}
 }
 
-// TestLiveTranscriptionLoopbackBusyRejectsSecondSession proves the per-route session
-// guard now lives at /v1: a second concurrent portal session on the same route is
-// refused there (503 busy) and surfaced to the browser as an error down-frame, not a
-// silent collision.
+// TestLiveTranscriptionLoopbackBusyRejectsSecondSession proves the per-instance session
+// guard now lives at /v1: a second concurrent portal session on a mapping without
+// instances, whose one live slot the first session holds, is refused there (503 busy)
+// and surfaced to the browser as an error down-frame, not a silent collision.
 func TestLiveTranscriptionLoopbackBusyRejectsSecondSession(t *testing.T) {
 	child := newMockLiveChild(t)
 	srv, ts := newLiveLoopbackTestServer(t, child)

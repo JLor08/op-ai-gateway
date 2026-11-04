@@ -257,8 +257,8 @@ func startExpect100(ctx context.Context, t *testing.T, ts *httptest.Server) (*io
 
 // An Expect: 100-continue turn whose request body ends without a single PCM byte must still
 // complete: the client holds its (empty) body for the handshake, the relay's 100 Continue
-// releases it, the upstream sees a clean end-of-input and answers done + [DONE], the per-route
-// slot is freed and one zero-quantity row is billed -- nothing hangs. The copy goroutine's first
+// releases it, the upstream sees a clean end-of-input and answers done + [DONE], the instance's
+// live slot is freed and one zero-quantity row is billed -- nothing hangs. The copy goroutine's first
 // read is held back, so it is the relay's own 100 Continue that has to release the client (an
 // aborted body would end the session without a done event). A POST body from an io.Pipe is
 // always sent chunked, so the relay reads only the terminating chunk; the pipe is closed either
@@ -321,7 +321,7 @@ func TestBearerLiveExpect100EmptyBodyCompletesWithoutHanging(t *testing.T) {
 					return
 				}
 				if time.Now().After(deadline) {
-					t.Fatal("the per-route live slot was never released after the empty session ended")
+					t.Fatal("the instance's live slot was never released after the empty session ended")
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
