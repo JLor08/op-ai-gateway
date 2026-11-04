@@ -10762,6 +10762,41 @@ describe('RuntimeAdminSection instance settings', () => {
     expect(putSpecs).toHaveLength(0);
   });
 
+  // The gateway flags a minimum above the real-time concurrency the audio
+  // ramp measured for the spec's mapping -- a measured ceiling: that many
+  // instances busy at once no longer all keep up with real time. A warning
+  // only: the spec saves as it is.
+  it('warns of a minimum above the measured real-time concurrency, and saves anyway', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 3,
+      instances_min_exceeds_realtime: true,
+    });
+
+    expect(screen.getByText(t.runtimeSpecMinExceedsRealtime)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({ replicable: true, min_instances: 3 });
+    expect(putSpecs[0].body).not.toHaveProperty('instances_min_exceeds_realtime');
+  });
+
+  it('shows no real-time warning for a minimum the gateway does not flag', async () => {
+    await openApiTokenSpecEdit({ replicable: true, min_instances: 3 });
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+  });
+
+  // The minimum is hidden with the box, and so is what is said about it.
+  it('drops the real-time warning with "Multiple instances" unticked', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 3,
+      instances_min_exceeds_realtime: true,
+    });
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+    expect(screen.queryByText(t.runtimeSpecMinExceedsRealtime)).not.toBeInTheDocument();
+  });
+
   it('opens a stored replicable spec as stored: an empty max for unlimited, parallelism 0 as 1', async () => {
     await openApiTokenSpecEdit({
       replicable: true,
