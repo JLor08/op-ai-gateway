@@ -48,11 +48,16 @@ type measureChunk struct {
 // after the read is the time those bytes arrived; a chunk that does not fit is delivered
 // over several reads, all at its moment. Once the chunks are spent a read answers end
 // (io.EOF when it is nil), and spentReads counts those reads.
+//
+// A body with no clock runs on the real one instead: it waits gap before it delivers the
+// first bytes of each chunk, so a chunk arrives at least gap after the one before it.
 type measureBody struct {
 	clock  *measureClock
 	chunks []measureChunk
 	end    error
+	gap    time.Duration
 
+	midChunk   bool
 	spentReads int
 }
 
@@ -65,10 +70,16 @@ func (b *measureBody) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	c := &b.chunks[0]
-	b.clock.at = c.at
+	switch {
+	case b.clock != nil:
+		b.clock.at = c.at
+	case !b.midChunk:
+		time.Sleep(b.gap)
+	}
 	n := copy(p, c.data)
 	c.data = c.data[n:]
-	if c.data == "" {
+	b.midChunk = c.data != ""
+	if !b.midChunk {
 		b.chunks = b.chunks[1:]
 	}
 	return n, nil
@@ -78,8 +89,8 @@ func (*measureBody) Close() error { return nil }
 
 // measureUpstream is the fake upstream of one measurement: it answers with a scripted
 // response (or fails with err) and records what was sent, and where. Its answer -- the
-// status and headers, before any of the body -- arrives answerAt after the request, when
-// it has a clock to move.
+// status and headers, before any of the body -- arrives answerAt after the request: on its
+// clock when it has one, else on the real one, by waiting.
 type measureUpstream struct {
 	status   int
 	header   http.Header
@@ -103,6 +114,8 @@ func (u *measureUpstream) answer(target routing.Target, path string, body []byte
 	}
 	if u.clock != nil {
 		u.clock.at = u.answerAt
+	} else {
+		time.Sleep(u.answerAt)
 	}
 	return &provider.ProxyResponse{StatusCode: u.status, Header: u.header, Body: u.body}, nil
 }
@@ -187,6 +200,32 @@ func audioMeasureTarget() routing.Target {
 		Model:         "voice",
 		ProviderModel: "voice-model#2",
 		RouteID:       "map_voice",
+	}
+}
+
+// audioMeasureTargetKinds are the three kinds of target a measurement is handed, each with
+// the path its live transcription goes to: an instance of a replicable model on an agent
+// (instance 2, so its address carries a '#', escaped in the agent's /live path), a plain
+// model the agent manages, and a direct audio_cpp application, whose live endpoint takes the
+// model in its query, verbatim (a quantization suffix's ':' included).
+func audioMeasureTargetKinds() []struct {
+	name     string
+	target   routing.Target
+	livePath string
+} {
+	const query = "channels=1&language=de&sample_format=s16le&sample_rate=16000"
+	return []struct {
+		name     string
+		target   routing.Target
+		livePath string
+	}{
+		{"an agent instance", audioMeasureTarget(), "/live/voice-model%232?" + query},
+		{"a plain agent model", routing.Target{
+			Provider: routing.ProviderServerAgent, Endpoint: "https://agent.test:8600", Model: "voice", ProviderModel: "voice-model", RouteID: "map_voice",
+		}, "/live/voice-model?" + query},
+		{"a direct audio_cpp application", routing.Target{
+			Provider: routing.ProviderAudioCpp, Endpoint: "http://audio.test:8200", Model: "voice", ProviderModel: "voice-model:Q8_0", RouteID: "map_voice",
+		}, "/v1/audio/transcriptions/live?" + query + "&model=voice-model:Q8_0"},
 	}
 }
 
@@ -607,6 +646,34 @@ func TestMeasureASRBufferedWithoutLanguage(t *testing.T) {
 	}
 }
 
+// TestMeasureASRBufferedLengthIsTheClips: the length a buffered transcription's rate is taken
+// over is the clip that was sent, read from its own WAV header, never what the answer claims
+// about it -- a model that reports a different duration, or none, does not change the
+// figure -- so a 3 s clip is 3 s and the bundled clip 22.85 s, whatever the answer says.
+func TestMeasureASRBufferedLengthIsTheClips(t *testing.T) {
+	cases := []struct {
+		name    string
+		clip    []byte
+		answer  string
+		seconds float64
+	}{
+		{"the bundled clip, the answer claims 5 s", benchaudio.WAV(), `{"text":"der schutz","duration":5,"timing":{"audio_duration_ms":5000}}`, 22.85},
+		{"the bundled clip, the answer states no length", benchaudio.WAV(), `{"text":"der schutz"}`, 22.85},
+		{"a 3 s clip, the answer claims 22.85 s", buildPCMWav(t, 16000, 1, 16, 96000), `{"text":"der schutz","duration":22.85,"timing":{"audio_duration_ms":22850}}`, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "application/json", measureAt(1000, tc.answer))
+			got, err := clock.measurer().measureASRBuffered(context.Background(), up, audioMeasureTarget(), tc.clip, benchaudio.Language)
+			if err != nil {
+				t.Fatalf("measureASRBuffered: %v", err)
+			}
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: 1000, WallMS: 1000, AudioSeconds: tc.seconds, RateX: tc.seconds, RTF: 1 / tc.seconds})
+		})
+	}
+}
+
 // TestMeasureBufferedRefusals: a buffered answer that cannot give the figures is an error,
 // never a zero or an infinite rate; a clip whose length cannot be read is refused before
 // anything is sent.
@@ -648,6 +715,21 @@ func TestMeasureBufferedRefusals(t *testing.T) {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"hallo"}`))
 		}, func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
 			return m.measureASRBuffered(context.Background(), up, audioMeasureTarget(), []byte("not a wav"), "de")
+		}, audioMeasureInvalidInput, "clip", true},
+		{"ASR: the clip is a WAV of no audio", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"hallo"}`))
+		}, func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureASRBuffered(context.Background(), up, audioMeasureTarget(), buildPCMWav(t, 16000, 1, 16, 0), "de")
+		}, audioMeasureInvalidInput, "clip", true},
+		{"ASR: there is no clip", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"hallo"}`))
+		}, func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureASRBuffered(context.Background(), up, audioMeasureTarget(), nil, "de")
+		}, audioMeasureInvalidInput, "clip", true},
+		{"ASR: the clip's header is cut short", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"hallo"}`))
+		}, func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+			return m.measureASRBuffered(context.Background(), up, audioMeasureTarget(), benchaudio.WAV()[:30], "de")
 		}, audioMeasureInvalidInput, "clip", true},
 		{"ASR: the upstream refuses", func(c *measureClock) *measureUpstream {
 			return refusingAudioUpstream(c, http.StatusNotFound, "unknown model id")
@@ -965,9 +1047,74 @@ func TestMeasureRefusalsCarryTheUpstreamsWords(t *testing.T) {
 	}
 }
 
-// TestMeasureAudioEntryPoints: the four production entry points read the real clock and
-// reach the upstream they are given; a transport failure comes back as their error, of kind
-// transport and wrapped so a caller can still tell what it was.
+// TestMeasureAudioTargetKinds: every measurement measures each kind of target it is handed --
+// an agent instance, a plain agent-managed model and a direct audio_cpp application -- with
+// one request to exactly that target, at its own path and by its own model name, and gives
+// the same figures for the same answer whatever the kind.
+func TestMeasureAudioTargetKinds(t *testing.T) {
+	pcm, sampleRate, _ := benchaudio.PCM()
+	wav := buildPCMWav(t, 24000, 1, 16, 144000) // 3 s
+	ctx := context.Background()
+	for _, kind := range audioMeasureTargetKinds() {
+		target, model := kind.target, kind.target.ProviderModel
+		t.Run(kind.name+": TTS stream", func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, sseSpeechDone))
+			got, err := clock.measurer().measureTTSStream(ctx, up, target, audioBenchmarkPassage, "", 48000)
+			if err != nil {
+				t.Fatalf("measureTTSStream: %v", err)
+			}
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: 300, WallMS: 800, AudioSeconds: 1, RateX: 2, RTF: 0.8})
+			checkAudioSentTo(t, up, target, "/v1/audio/speech", "application/json")
+			if body := audioSentJSON(t, up); body["model"] != model || body["stream"] != true {
+				t.Fatalf("request body = %v; want model %q, streamed", body, model)
+			}
+		})
+		t.Run(kind.name+": TTS buffered", func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "audio/wav", measureAt(1500, string(wav)))
+			got, err := clock.measurer().measureTTSBuffered(ctx, up, target, audioBenchmarkPassage, "")
+			if err != nil {
+				t.Fatalf("measureTTSBuffered: %v", err)
+			}
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: 1500, WallMS: 1500, AudioSeconds: 3, RateX: 2, RTF: 0.5})
+			checkAudioSentTo(t, up, target, "/v1/audio/speech", "application/json")
+			if body := audioSentJSON(t, up); body["model"] != model {
+				t.Fatalf("request body = %v; want model %q", body, model)
+			}
+		})
+		t.Run(kind.name+": ASR buffered", func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "application/json", measureAt(1000, `{"text":"der schutz"}`))
+			got, err := clock.measurer().measureASRBuffered(ctx, up, target, benchaudio.WAV(), benchaudio.Language)
+			if err != nil {
+				t.Fatalf("measureASRBuffered: %v", err)
+			}
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: 1000, WallMS: 1000, AudioSeconds: 22.85, RateX: 22.85, RTF: 1 / 22.85})
+			if up.calls != 1 || up.path != "/v1/audio/transcriptions" || !reflect.DeepEqual(up.target, target) {
+				t.Fatalf("sent %d request(s) to %q at %+v; want one to /v1/audio/transcriptions at %+v", up.calls, up.path, up.target, target)
+			}
+			if got := audioSentForm(t, up).Value["model"]; !reflect.DeepEqual(got, []string{model}) {
+				t.Fatalf("form model = %v, want %q", got, model)
+			}
+		})
+		t.Run(kind.name+": ASR live", func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "text/event-stream", measureAt(400, sseTranscriptDelta("der")), measureAt(2000, sseTranscriptDone("der schutz")))
+			got, err := clock.measurer().measureASRLive(ctx, up, target, pcm, sampleRate, benchaudio.Language)
+			if err != nil {
+				t.Fatalf("measureASRLive: %v", err)
+			}
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: 400, WallMS: 2000, AudioSeconds: 22.85, RateX: 22.85 / 2, RTF: 2 / 22.85})
+			checkAudioSentTo(t, up, target, kind.livePath, "application/octet-stream")
+		})
+	}
+}
+
+// TestMeasureAudioEntryPoints: the four production entry points reach the upstream they are
+// given; a transport failure comes back as their error, of kind transport and wrapped so a
+// caller can still tell what it was. TestMeasureAudioEntryPointsReadTheRealClock shows they
+// time on the real clock.
 func TestMeasureAudioEntryPoints(t *testing.T) {
 	dialErr := errors.New("dial tcp: connection refused")
 	pcm, sampleRate, _ := benchaudio.PCM()
@@ -996,6 +1143,61 @@ func TestMeasureAudioEntryPoints(t *testing.T) {
 			var merr *audioMeasureError
 			if !errors.As(err, &merr) || merr.Kind != audioMeasureTransport || merr.Status != 0 {
 				t.Fatalf("%s error %v (%#v) is not a transport audioMeasureError", name, err, merr)
+			}
+		})
+	}
+}
+
+// TestMeasureAudioEntryPointsReadTheRealClock: the production entry points time with the
+// real clock. Their answer starts 20 ms after the request and each chunk of it arrives at
+// least 20 ms after the one before, so every time they report is at least the waits that
+// elapsed before it -- a measurement on a frozen clock would have no measurable time at all,
+// and one on any clock but the real one would not see the waits.
+func TestMeasureAudioEntryPointsReadTheRealClock(t *testing.T) {
+	const gap = 20 * time.Millisecond
+	pcm, sampleRate, _ := benchaudio.PCM()
+	wav := buildPCMWav(t, 24000, 1, 16, 48000)
+	ctx := context.Background()
+	cases := []struct {
+		name        string
+		contentType string
+		chunks      []string
+		measure     func(*measureUpstream) (audioMeasurement, error)
+		// the least time each figure can be: the waits before the answer, the first output and
+		// the end
+		firstByte, ttft, wall time.Duration
+	}{
+		{"measureTTSStream", "text/event-stream", []string{sseSpeechDelta(48000), sseSpeechDone},
+			func(up *measureUpstream) (audioMeasurement, error) {
+				return measureTTSStream(ctx, up, audioMeasureTarget(), audioBenchmarkPassage, "", 48000)
+			}, gap, 2 * gap, 3 * gap},
+		{"measureTTSBuffered", "audio/wav", []string{string(wav[:44]), string(wav[44:])},
+			func(up *measureUpstream) (audioMeasurement, error) {
+				return measureTTSBuffered(ctx, up, audioMeasureTarget(), audioBenchmarkPassage, "")
+			}, gap, 3 * gap, 3 * gap},
+		{"measureASRBuffered", "application/json", []string{`{"text":"der schutz"}`},
+			func(up *measureUpstream) (audioMeasurement, error) {
+				return measureASRBuffered(ctx, up, audioMeasureTarget(), benchaudio.WAV(), benchaudio.Language)
+			}, gap, 2 * gap, 2 * gap},
+		{"measureASRLive", "text/event-stream", []string{sseTranscriptDelta("der"), sseTranscriptDone("der")},
+			func(up *measureUpstream) (audioMeasurement, error) {
+				return measureASRLive(ctx, up, audioMeasureTarget(), pcm, sampleRate, benchaudio.Language)
+			}, gap, 2 * gap, 3 * gap},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &measureBody{gap: gap}
+			for _, c := range tc.chunks {
+				body.chunks = append(body.chunks, measureChunk{data: c})
+			}
+			up := &measureUpstream{status: http.StatusOK, header: http.Header{"Content-Type": {tc.contentType}}, body: body, answerAt: gap}
+			got, err := tc.measure(up)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got.FirstByteMS < tc.firstByte.Milliseconds() || got.TTFTMS < tc.ttft.Milliseconds() || got.WallMS < tc.wall.Milliseconds() ||
+				got.FirstByteMS > got.TTFTMS || got.TTFTMS > got.WallMS {
+				t.Fatalf("%s = %+v; want first byte >= %v, first output >= %v, end >= %v, in that order", tc.name, got, tc.firstByte, tc.ttft, tc.wall)
 			}
 		})
 	}
