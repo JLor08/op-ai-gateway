@@ -1056,10 +1056,43 @@ func TestMeasureRefusalsCarryTheUpstreamsWords(t *testing.T) {
 		}
 	}
 
-	// The agent's runtime router answers a streamed request lazily: while it waits for the
+	// A frame that states no message of its own reads the way each stream's own relay reads
+	// it. The live measurement says what the live relay would tell the browser
+	// (liveErrorMessage, with its generic sentence for a frame that says nothing); the
+	// synthesis stream quotes the frame, as the speech benchmark quotes an answer it cannot
+	// read a message from.
+	silent := []struct {
+		name, frame, tts, live string
+	}{
+		{"a bare error event", `{"type":"error"}`, `{"type":"error"}`, "live transcription upstream error"},
+		{"an error object with a code alone", `{"type":"error","error":{"code":"busy"}}`, `{"type":"error","error":{"code":"busy"}}`, "live transcription upstream error"},
+	}
+	for _, f := range silent {
+		for name, want := range map[string]string{"TTS stream": f.tts, "ASR live": f.live} {
+			t.Run(name+": "+f.name, func(t *testing.T) {
+				clock := &measureClock{}
+				up := scriptedAudioUpstream(clock, "text/event-stream",
+					measureAt(300, streams[name].before),
+					measureAt(500, "data: "+f.frame+"\n\n"),
+					measureAt(800, streams[name].after))
+				up.body.end = errors.New("read past the end of the stream")
+				_, err := measurements[name](clock.measurer(), up)
+				var merr *audioMeasureError
+				if !errors.As(err, &merr) || merr.Kind != audioMeasureUpstreamRefused || merr.Message != want {
+					t.Fatalf("error = %#v; want an upstream refusal saying %q", err, want)
+				}
+			})
+		}
+	}
+
+	// The agent's runtime router answers a streamed SYNTHESIS lazily: while it waits for the
 	// instance (a cold start, a moved address) it commits 200 and sends keepalive comments,
 	// and a failure after that can only be its terminal frame, the error envelope with no
-	// type. That frame is the refusal with the agent's code, not a stream cut short.
+	// type. That frame is the refusal with the agent's code, not a stream cut short. The
+	// agent's /live route does neither -- it refuses an instance it cannot serve with a
+	// non-2xx answer before any frame and relays the child's stream verbatim -- so for the
+	// live transcription this case only pins the parser: keepalive comments and an untyped
+	// error frame are read the same way on both streams.
 	for name, stream := range streams {
 		t.Run(name+": the agent's terminal frame after its keepalives", func(t *testing.T) {
 			const message = `runtime: "voice-model#2" names something else than when the request was read; select again: runtime.instance_no_capacity`

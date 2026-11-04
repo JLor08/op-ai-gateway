@@ -1,0 +1,4 @@
+# The audio benchmark's bundled clip, its transcript and its source note are pinned byte
+# for byte (TestBenchaudioClipIsPinned hashes them), so no line-ending conversion may touch
+# any file of that directory on any checkout, core.autocrlf included.
+gateway/backend/internal/benchaudio/* -text

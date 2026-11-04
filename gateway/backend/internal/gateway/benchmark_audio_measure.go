@@ -210,21 +210,21 @@ func audioStreamReadError(what string, err error, maxLine int) error {
 //     child that died mid-answer can only be this frame by then.
 //
 // An event of another type is what its type says, and an error member that is null is
-// none. The message is the event's own "message" when it states one, else the error
-// itself when it is a string, else what an error object says or, failing that, the frame
-// quoted (speechBenchmarkErrorText); the code is the error object's (liveErrorCode), else
-// the event's own "code".
-func sseStreamError(line []byte) (code, message string, ok bool) {
+// none. The code is the error object's (liveErrorCode), else the event's own "code". The
+// message is what messageOf reads from the frame, bounded to speechBenchmarkErrorRunes:
+// each stream reads it the way its own relay does (speechStreamErrorMessage for a
+// synthesis, liveErrorMessage for a live transcription), so a measurement says what a
+// client of that relay would have been told.
+func sseStreamError(line []byte, messageOf func(payload []byte) string) (code, message string, ok bool) {
 	payload, found := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
 	payload = bytes.TrimSpace(payload)
 	if !found || len(payload) == 0 || payload[0] != '{' || !json.Valid(payload) {
 		return "", "", false
 	}
 	var frame struct {
-		Type    string          `json:"type"`
-		Code    string          `json:"code"`
-		Message string          `json:"message"`
-		Error   json.RawMessage `json:"error"`
+		Type  string          `json:"type"`
+		Code  string          `json:"code"`
+		Error json.RawMessage `json:"error"`
 	}
 	// A member of another type is a member not stated; json decodes the others regardless.
 	_ = json.Unmarshal(payload, &frame)
@@ -236,17 +236,27 @@ func sseStreamError(line []byte) (code, message string, ok bool) {
 	if own := strings.TrimSpace(frame.Code); code == "" && len(own) <= maxLiveRefusalCodeBytes {
 		code = own
 	}
-	message = strings.TrimSpace(frame.Message)
-	if message == "" {
-		var text string
-		if json.Unmarshal(frame.Error, &text) == nil {
-			message = strings.TrimSpace(text)
-		}
+	return code, truncateRunes(messageOf(payload), speechBenchmarkErrorRunes), true
+}
+
+// speechStreamErrorMessage is what an error frame of a streamed synthesis says: the event's
+// own "message" when it states one, else the error itself when it is a string, else what
+// an error object says or, failing that, the frame quoted (speechBenchmarkErrorText, the
+// speech benchmark's reading of an answer it cannot read a message from).
+func speechStreamErrorMessage(payload []byte) string {
+	var frame struct {
+		Message string          `json:"message"`
+		Error   json.RawMessage `json:"error"`
 	}
-	if message == "" {
-		return code, speechBenchmarkErrorText(payload), true
+	_ = json.Unmarshal(payload, &frame)
+	if message := strings.TrimSpace(frame.Message); message != "" {
+		return message
 	}
-	return code, truncateRunes(message, speechBenchmarkErrorRunes), true
+	var text string
+	if json.Unmarshal(frame.Error, &text) == nil && strings.TrimSpace(text) != "" {
+		return strings.TrimSpace(text)
+	}
+	return speechBenchmarkErrorText(payload)
 }
 
 // audioMeasurer runs the measurements on a clock. Production uses time.Now (the
@@ -348,7 +358,7 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 			ended = true
 			break
 		}
-		if code, message, isError := sseStreamError(sc.Bytes()); isError {
+		if code, message, isError := sseStreamError(sc.Bytes(), speechStreamErrorMessage); isError {
 			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
 		}
 		if !done.IsZero() {
@@ -563,7 +573,7 @@ func (m audioMeasurer) measureASRLive(ctx context.Context, client provider.Nativ
 			ended = true
 			break
 		}
-		if code, message, isError := sseStreamError(sc.Bytes()); isError {
+		if code, message, isError := sseStreamError(sc.Bytes(), liveErrorMessage); isError {
 			return audioMeasurement{}, &audioMeasureError{Kind: audioMeasureUpstreamRefused, Code: code, Message: message}
 		}
 		msg, ok := liveDownMsgFromSSELine(sc.Bytes())
