@@ -89,6 +89,12 @@ type instanceSource struct {
 	registry    *runtimeStatusRegistry
 	now         func() time.Time
 	readTimeout time.Duration // instanceSpecReadTimeout; a test shortens it
+	// flightWaitHook is a TEST-ONLY seam: when non-nil, spec calls it with the
+	// mapping id each time a request starts waiting on a read in flight, once it
+	// is committed to that read's answer (or its own end), so a test can tell its
+	// waiters have joined without sleeping. Set before any request runs; nil in
+	// production.
+	flightWaitHook func(mappingID string)
 
 	// mu guards specs and flights; it is never held across the store read.
 	mu      sync.Mutex
@@ -184,6 +190,9 @@ func (s *instanceSource) spec(ctx context.Context, mappingID string) instanceSpe
 	}
 	s.mu.Unlock()
 	if waiting {
+		if hook := s.flightWaitHook; hook != nil {
+			hook(mappingID)
+		}
 		select {
 		case <-f.done:
 			return f.entry

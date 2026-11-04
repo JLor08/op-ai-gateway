@@ -216,7 +216,8 @@ func TestInstanceSourceKeepsTheLastGoodSpecWhenAReadFails(t *testing.T) {
 }
 
 // gatedSpecReader is a concurrency-safe test instanceSpecReader whose reads
-// each wait for a token on gate before answering spec.
+// each wait for a token on gate before answering spec -- or, like a store, fail
+// with their context's error when it ended meanwhile.
 type gatedSpecReader struct {
 	spec    routing.RuntimeSpec
 	gate    chan struct{}
@@ -225,13 +226,35 @@ type gatedSpecReader struct {
 	reads   int
 }
 
-func (g *gatedSpecReader) RuntimeSpecByMapping(context.Context, string) (routing.RuntimeSpec, bool, error) {
+func (g *gatedSpecReader) RuntimeSpecByMapping(ctx context.Context, _ string) (routing.RuntimeSpec, bool, error) {
 	g.mu.Lock()
 	g.reads++
 	g.mu.Unlock()
 	g.started <- struct{}{}
 	<-g.gate
+	if err := ctx.Err(); err != nil {
+		return routing.RuntimeSpec{}, false, err
+	}
 	return g.spec, true, nil
+}
+
+// countFlightWaiters makes src report each request that starts waiting on a read
+// in flight; awaitFlightWaiters then waits for n of them.
+func countFlightWaiters(src *instanceSource) chan struct{} {
+	joined := make(chan struct{}, 16)
+	src.flightWaitHook = func(string) { joined <- struct{}{} }
+	return joined
+}
+
+func awaitFlightWaiters(t *testing.T, joined chan struct{}, n int) {
+	t.Helper()
+	for i := range n {
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d of %d requests joined the read in flight", i, n)
+		}
+	}
 }
 
 func (g *gatedSpecReader) readCount() int {
@@ -248,6 +271,7 @@ func TestInstanceSourceReadsOnceForConcurrentMisses(t *testing.T) {
 	src, _, m := instanceSourceFixture()
 	reader := &gatedSpecReader{spec: routing.RuntimeSpec{ID: "S", MappingID: "map_m", Replicable: true}, gate: make(chan struct{}), started: make(chan struct{}, 8)}
 	src.store = reader
+	joined := countFlightWaiters(src)
 
 	results := make(chan bool, 4)
 	go func() {
@@ -267,7 +291,7 @@ func TestInstanceSourceReadsOnceForConcurrentMisses(t *testing.T) {
 		_, ok := src.InstanceView(gone, "srv1", m)
 		waiterDone <- ok
 	}()
-	waitForFlightWaiters(t, src)
+	awaitFlightWaiters(t, joined, 4)
 	cancel()
 	if ok := <-waiterDone; ok {
 		t.Fatal("a waiter whose request ended: ok = true, want the empty cache's answer")
@@ -283,23 +307,45 @@ func TestInstanceSourceReadsOnceForConcurrentMisses(t *testing.T) {
 	}
 }
 
-// waitForFlightWaiters waits until a read is in flight for map_m, giving the
-// goroutines started before it a moment to reach the flight.
-func waitForFlightWaiters(t *testing.T, src *instanceSource) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		src.mu.Lock()
-		_, inFlight := src.flights["map_m"]
-		src.mu.Unlock()
-		if inFlight {
-			time.Sleep(50 * time.Millisecond)
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("no read in flight")
-		}
-		time.Sleep(5 * time.Millisecond)
+// The read every waiting request shares is not the request that started it: it
+// carries that request's values but not its end, so when the starter goes away
+// while it is in flight the read still lands -- for the requests waiting on it and
+// in the cache.
+func TestInstanceSourceSharedReadSurvivesItsStartersCancellation(t *testing.T) {
+	src, _, m := instanceSourceFixture()
+	reader := &gatedSpecReader{spec: routing.RuntimeSpec{ID: "S", MappingID: "map_m", Replicable: true}, gate: make(chan struct{}), started: make(chan struct{}, 2)}
+	src.store = reader
+	joined := countFlightWaiters(src)
+
+	starter, cancelStarter := context.WithCancel(context.Background())
+	defer cancelStarter()
+	starterDone := make(chan struct{})
+	go func() {
+		defer close(starterDone)
+		src.InstanceView(starter, "srv1", m)
+	}()
+	<-reader.started // the starter's miss is reading
+	waiterDone := make(chan bool, 1)
+	go func() {
+		_, ok := src.InstanceView(context.Background(), "srv1", m)
+		waiterDone <- ok
+	}()
+	awaitFlightWaiters(t, joined, 1)
+	cancelStarter()
+	close(reader.gate)
+
+	if ok := <-waiterDone; !ok {
+		t.Fatal("the waiting request: ok = false, want the spec the shared read fetched after its starter went away")
+	}
+	<-starterDone
+	src.mu.Lock()
+	cached := src.specs["map_m"]
+	src.mu.Unlock()
+	if cached.failed || !cached.replicable {
+		t.Fatalf("cached entry = %+v, want the read's replicable spec", cached)
+	}
+	if n := reader.readCount(); n != 1 {
+		t.Fatalf("store reads = %d, want the one shared read", n)
 	}
 }
 
@@ -473,7 +519,8 @@ func TestInstanceCapIsWiredEndToEnd(t *testing.T) {
 // With every instance at its parallelism, a request parks on the server's real
 // admission queue -- telling the demand sink the model needs another instance --
 // and the release of one instance's request wakes it onto that instance. The
-// queue's periodic recheck is off, so only the release can wake it.
+// queue's periodic recheck is off, so only the release can wake it, and the test
+// asserts on the parked request once the queue holds it.
 func TestAllBusyInstancesParkAndAReleaseWakes(t *testing.T) {
 	srv := NewTestServer()
 	seedReplicableRuntimeSpec(t, srv)
@@ -496,10 +543,11 @@ func TestAllBusyInstancesParkAndAReleaseWakes(t *testing.T) {
 		target, err := srv.Resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "inst-model", APIFlavor: "openai_chat"})
 		done <- result{target, err}
 	}()
+	waitForParked(t, srv.Active.admission, 1)
 	select {
 	case res := <-done:
 		t.Fatalf("Resolve returned %q, %v while every instance was busy, want it parked", res.target.InstanceKey, res.err)
-	case <-time.After(300 * time.Millisecond):
+	default:
 	}
 	if got := sink.signals(); len(got) != 1 || got[0].Model != "inst-model" || !slices.Equal(got[0].MappingIDs, []string{"map_rspec_inst"}) {
 		t.Fatalf("demand signals = %+v, want one for inst-model naming map_rspec_inst", got)

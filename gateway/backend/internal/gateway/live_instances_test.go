@@ -546,10 +546,13 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 			publishASRInstances(srv, tc.running...)
 			sink := &recordingDemandSink{}
 			srv.Resolver.SetDemandSink(sink)
-			// Closed last (cleanups run in reverse): every slot is released first, so a
-			// session still parked when the test fails is let go instead of holding Close.
+			srv.Active.admission.recheck = 0 // only a release wakes the parked session
+			// Closed last (cleanups run in reverse): every slot is released first and a
+			// session still parked when the test fails is woken onto one, instead of
+			// holding Close.
 			ts := httptest.NewServer(srv)
 			t.Cleanup(ts.Close)
+			t.Cleanup(func() { wakeAdmission(srv) })
 			for _, key := range tc.held {
 				release, ok := srv.liveSessions.acquire(key)
 				if !ok {
@@ -584,6 +587,7 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 
 			done := make(chan liveSessionResult, 1)
 			go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+			waitForParked(t, srv.Active.admission, 1)
 			select {
 			case s := <-done:
 				status := 0
@@ -591,7 +595,7 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 					status = s.resp.StatusCode
 				}
 				t.Fatalf("session answered (status %d, err %v) after losing its slot while no slot was free, want it to wait", status, s.err)
-			case <-time.After(400 * time.Millisecond):
+			default:
 			}
 			mu.Lock()
 			lost := slices.Clone(raced)
@@ -607,6 +611,7 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 			mu.Lock()
 			racedReleases[0]()
 			mu.Unlock()
+			wakeAdmission(srv) // the lost slot's session ends: its row's removal wakes the queue
 			var s liveSessionResult
 			select {
 			case s = <-done:
