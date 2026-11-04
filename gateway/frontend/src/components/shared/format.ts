@@ -115,6 +115,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // file and the rule, but a mapped code renders THIS label instead of it, so
   // the label states every rule rather than one.
   'runtime_spec.config_files_invalid': 'errorRuntimeSpecConfigFilesInvalid',
+  // #340: the instance settings' two refusals (portalRuntimeSpecErrRows): a
+  // minimum above a set maximum or a count above the agent's cap of 64, and a
+  // replicable spec on a fixed listen_port.
+  'runtime_spec.instances_invalid': 'errorRuntimeSpecInstancesInvalid',
+  'runtime_spec.instances_need_ephemeral_port': 'errorRuntimeSpecInstancesNeedEphemeralPort',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',

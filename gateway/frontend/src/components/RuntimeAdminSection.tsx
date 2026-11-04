@@ -244,6 +244,12 @@ function emptySpec(mappingId: string): RuntimeSpec {
     gpus: [],
     ram_estimate_mb: 0,
     ram_measured_mb: 0,
+    replicable: false,
+    min_instances: 0,
+    max_instances: 0,
+    instance_parallelism: 0,
+    startup_measured_ms: 0,
+    effective_idle_timeout_seconds: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -585,7 +591,11 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // the same reason: the PUT applies an absent estimate as 0 and clears the
   // stored one, so an override click must restate it. ram_measured_mb is the
   // opposite: agent-owned with no request counterpart (PutRuntimeSpecRequest
-  // excludes it), so it is dropped here rather than echoed back.
+  // excludes it), so it is dropped here rather than echoed back. The instance
+  // settings split the same way: replicable/min_instances/max_instances/
+  // instance_parallelism are the operator's and ride `rest`, while
+  // startup_measured_ms (agent-owned) and effective_idle_timeout_seconds
+  // (derived on every read) have no request counterpart and are dropped.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -607,6 +617,8 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     role,
     responses_live_timings_enabled,
     ram_measured_mb,
+    startup_measured_ms,
+    effective_idle_timeout_seconds,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -701,6 +713,19 @@ function formatGpus(spec: RuntimeSpec | undefined): string {
 
 // A megabyte quantity for the two summary columns: the em-dash when nothing is
 // known (0 is the UNKNOWN sentinel throughout this feature, never a real zero).
+// An instance-count field's text as the request's number: an empty field is 0,
+// which the backend reads as "none" for the minimum and "unlimited" for the
+// maximum -- so the form never has to show a 0 that means "no limit".
+function instanceCountFromText(text: string): number {
+  return text.trim() === '' ? 0 : Number(text);
+}
+
+// The other direction, for a stored count: 0 shows as the empty field it is
+// sent from.
+function instanceCountText(count: number): string {
+  return count > 0 ? String(count) : '';
+}
+
 function formatMb(mb: number): string {
   return mb > 0 ? `${mb} MB` : '—';
 }
@@ -2508,6 +2533,16 @@ export function RuntimeAdminSection({
   const [idleTimeoutSeconds, setIdleTimeoutSeconds] = useState(0);
   const [admissionWaitTimeoutSeconds, setAdmissionWaitTimeoutSeconds] = useState(0);
   const [pinned, setPinned] = useState(false);
+  // The instance settings. Bound to state and emitted by buildSpecBody on
+  // every save, whether "Multiple instances" is ticked or not, for the same
+  // full-document reason as ramEstimateMb below: an absent field is applied as
+  // its zero value. The two counts are held as the field's TEXT, because an
+  // empty field is a value of its own (0: none / unlimited); the parallelism
+  // too, so a field cleared while typing is not forced back to a number.
+  const [replicable, setReplicable] = useState(false);
+  const [minInstancesText, setMinInstancesText] = useState('');
+  const [maxInstancesText, setMaxInstancesText] = useState('');
+  const [instanceParallelismText, setInstanceParallelismText] = useState('1');
   const [adminState, setAdminState] = useState('');
   // The spec's operator RAM estimate in MB: ONE spec-level scalar (RAM is
   // host-scoped, so it is not a GpuRow field). It must be bound to state and
@@ -2669,6 +2704,10 @@ export function RuntimeAdminSection({
     setIdleTimeoutSeconds(0);
     setAdmissionWaitTimeoutSeconds(0);
     setPinned(false);
+    setReplicable(false);
+    setMinInstancesText('');
+    setMaxInstancesText('');
+    setInstanceParallelismText('1');
     setAdminState('');
     setRamEstimateMb(0);
     setRamMeasuredMb(0);
@@ -2704,6 +2743,11 @@ export function RuntimeAdminSection({
     setIdleTimeoutSeconds(spec.idle_timeout_seconds);
     setAdmissionWaitTimeoutSeconds(spec.admission_wait_timeout_seconds);
     setPinned(spec.pinned);
+    setReplicable(spec.replicable);
+    setMinInstancesText(instanceCountText(spec.min_instances));
+    setMaxInstancesText(instanceCountText(spec.max_instances));
+    // 0 is the backend's "default", which is 1: shown as what it means.
+    setInstanceParallelismText(String(spec.instance_parallelism || 1));
     setAdminState(spec.admin_state);
     setRamEstimateMb(spec.ram_estimate_mb);
     setRamMeasuredMb(spec.ram_measured_mb);
@@ -3103,6 +3147,10 @@ export function RuntimeAdminSection({
       idle_timeout_seconds: idleTimeoutSeconds,
       admission_wait_timeout_seconds: admissionWaitTimeoutSeconds,
       pinned,
+      replicable,
+      min_instances: instanceCountFromText(minInstancesText),
+      max_instances: instanceCountFromText(maxInstancesText),
+      instance_parallelism: instanceCountFromText(instanceParallelismText) || 1,
       admin_state: adminState,
       ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,

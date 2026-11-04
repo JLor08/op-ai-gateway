@@ -9,7 +9,8 @@ type PortalMessageValue =
   | ((a: string, b: string) => string)
   | ((a: string, b: number) => string)
   | ((a: number) => string)
-  | ((a: number, b: number) => string);
+  | ((a: number, b: number) => string)
+  | ((a: number, b: number, c: number | null) => string);
 
 const de = {
   dashboard: 'Dashboard',
@@ -1112,6 +1113,25 @@ const de = {
   runtimeSpecStartupTimeout: 'Start-Timeout (s)',
   runtimeSpecPinned: 'Angeheftet (nie beenden)',
   runtimeSpecEnabled: 'Aktiviert',
+  // #340: mehrere Instanzen (Prozesse) einer Spezifikation auf ihrem Server.
+  runtimeSpecReplicable: 'Mehrere Instanzen',
+  runtimeSpecReplicableHint:
+    'Sind alle laufenden Instanzen ausgelastet, startet der Agent eine weitere – nur in freie Ressourcen, ohne ein anderes Modell zu verdrängen. Jede Instanz lauscht auf ihrem eigenen Port, daher muss der Listen-Port 0 sein. „Angeheftet“ hält Instanz 0 am Laufen.',
+  runtimeSpecMinInstances: 'Mindestanzahl Instanzen',
+  runtimeSpecMaxInstances: 'Höchstanzahl Instanzen',
+  runtimeSpecMaxInstancesUnlimited:
+    'Leer = unbegrenzt: Instanzen kommen hinzu, solange freie Ressourcen und das Prozesslimit des Servers es erlauben.',
+  runtimeSpecInstanceParallelism: 'Parallele Anfragen pro Instanz',
+  // Die gemessene Startzeit und der Leerlauf-Timeout, den der Gateway dem
+  // Agent für die GESPEICHERTE Spezifikation tatsächlich sendet.
+  runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
+    `${
+      startupMs > 0
+        ? `Gemessene Startzeit: ${(startupMs / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1, useGrouping: false })} s`
+        : 'Startzeit noch nicht gemessen'
+    } · automatischer Leerlauf-Timeout: ${seconds} s`,
+  runtimeSpecIdleTimeoutOverrideHint:
+    'Bei mehreren Instanzen: 0 = keine manuelle Vorgabe – der Gateway leitet den Leerlauf-Timeout aus der gemessenen Startzeit ab. Ein Wert hier gilt, sobald er über dem automatischen liegt.',
   // The role-grouped co-residency editor.
   runtimeCoresidency: 'Koresidenz',
   runtimeCoresidencyHint:
@@ -1415,6 +1435,9 @@ const de = {
     'Live-Datenstrom unterbrochen — diese Anzeige kann veraltet sein. Es ist nicht bekannt, welche Prozesse gerade laufen.',
   runtimeStatusEmpty: 'Der Agent meldet aktuell keinen verwalteten Modellprozess.',
   runtimeStatusSince: 'Seit',
+  runtimeStatusInstance: 'Instanz',
+  runtimeInstancesSummary: (running: number, min: number, max: number | null) =>
+    `${running} ${running === 1 ? 'läuft' : 'laufen'} · min ${min} · max ${max ?? '∞'}`,
   runtimeStatusPid: 'PID',
   runtimeStatusPort: 'Port',
   runtimeStatusInFlight: 'Laufende Anfragen',
@@ -1774,6 +1797,8 @@ const de = {
   // Task 7 (probe-reachability-and-model-status): the merged tri-state column
   // label, replacing the old separate "Geladen" + "Live-Status" columns.
   modelServerColStatus: 'Status',
+  // #340: wie viele Instanzen der Spezifikation auf diesem Server laufen.
+  modelServersRunningInstances: 'Laufende Instanzen',
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
   // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
@@ -1979,6 +2004,10 @@ const de = {
     'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   errorRuntimeSpecConfigFilesInvalid:
     'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
+  errorRuntimeSpecInstancesInvalid:
+    'Ungültige Instanzanzahl: Die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und keine Anzahl darf über 64 liegen.',
+  errorRuntimeSpecInstancesNeedEphemeralPort:
+    'Mehrere Instanzen brauchen Listen-Port 0: Jede Instanz lauscht auf ihrem eigenen Port, den der Agent wählt.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -4506,6 +4535,22 @@ const en: PortalMessages = {
   runtimeSpecStartupTimeout: 'Startup timeout (s)',
   runtimeSpecPinned: 'Pinned (never stop)',
   runtimeSpecEnabled: 'Enabled',
+  runtimeSpecReplicable: 'Multiple instances',
+  runtimeSpecReplicableHint:
+    'When every running instance is busy, the agent starts another one – only into free resources, never by evicting another model. Each instance listens on its own port, so the listen port must be 0. "Pinned" keeps instance 0 up.',
+  runtimeSpecMinInstances: 'Minimum instances',
+  runtimeSpecMaxInstances: 'Maximum instances',
+  runtimeSpecMaxInstancesUnlimited:
+    "Empty = unlimited: instances are added while free resources and the server's process limit allow.",
+  runtimeSpecInstanceParallelism: 'Parallel requests per instance',
+  runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
+    `${
+      startupMs > 0
+        ? `Measured startup: ${(startupMs / 1000).toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })} s`
+        : 'Startup not measured yet'
+    } · automatic idle timeout: ${seconds} s`,
+  runtimeSpecIdleTimeoutOverrideHint:
+    'With multiple instances: 0 = no manual override – the gateway derives the idle timeout from the measured startup time. A value here applies once it is above the automatic one.',
   runtimeCoresidency: 'Co-residency',
   runtimeCoresidencyHint:
     'Choose which model processes may run on the same server at the same time — whichever GPUs they occupy. Anything you leave unset follows the server default.',
@@ -4787,6 +4832,9 @@ const en: PortalMessages = {
     'Live stream interrupted — this view may be stale. Which processes are running right now is unknown.',
   runtimeStatusEmpty: 'The agent currently reports no managed model process.',
   runtimeStatusSince: 'Since',
+  runtimeStatusInstance: 'Instance',
+  runtimeInstancesSummary: (running: number, min: number, max: number | null) =>
+    `${running} running · min ${min} · max ${max ?? '∞'}`,
   runtimeStatusPid: 'PID',
   runtimeStatusPort: 'Port',
   runtimeStatusInFlight: 'In-flight requests',
@@ -5128,6 +5176,7 @@ const en: PortalMessages = {
   modelServerColPrio: 'Prio',
   modelServerColModel: 'Model',
   modelServerColStatus: 'Status',
+  modelServersRunningInstances: 'Running instances',
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
   modelServerColLiveProgress: 'Live progress',
@@ -5299,6 +5348,10 @@ const en: PortalMessages = {
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
   errorRuntimeSpecConfigFilesInvalid:
     'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
+  errorRuntimeSpecInstancesInvalid:
+    'Invalid instance count: the minimum must not exceed a set maximum, and no count may be above 64.',
+  errorRuntimeSpecInstancesNeedEphemeralPort:
+    'Multiple instances need listen port 0: every instance listens on its own port, picked by the agent.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the

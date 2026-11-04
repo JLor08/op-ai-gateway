@@ -159,6 +159,14 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     gpus: [],
     ram_estimate_mb: 0,
     ram_measured_mb: 0,
+    // A spec that never opted into instances, as the backend stores one: off,
+    // no bounds, the default parallelism, and nothing measured yet.
+    replicable: false,
+    min_instances: 0,
+    max_instances: 0,
+    instance_parallelism: 0,
+    startup_measured_ms: 0,
+    effective_idle_timeout_seconds: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -251,6 +259,9 @@ function makeHardware(gpus: HardwareGPU[], os = 'linux'): HardwareResponse {
 function makeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
   return {
     spec_id: 'spec_1',
+    // Instance 0: the one row every spec has, and the only one of a spec that
+    // is not replicable.
+    instance: 0,
     model: 'app-model',
     state: 'running',
     since: '2026-07-16T12:00:00Z',
@@ -3239,6 +3250,14 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // agent-owned and deliberately absent from the request shape (toEqual
     // fails if an override click echoes it back).
     ram_estimate_mb: spec.ram_estimate_mb,
+    // The four instance settings are operator-owned and replayed verbatim too.
+    // Their two read-only neighbours, startup_measured_ms and
+    // effective_idle_timeout_seconds, have no request counterpart, so an
+    // override click that echoed either back fails this toEqual.
+    replicable: spec.replicable,
+    min_instances: spec.min_instances,
+    max_instances: spec.max_instances,
+    instance_parallelism: spec.instance_parallelism,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
     messages_mode: spec.messages_mode,

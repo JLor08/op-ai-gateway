@@ -4211,3 +4211,70 @@ describe('the transcription Diarized toggle keys', () => {
     }
   });
 });
+
+// The instance settings (#340): the launch-spec form's "Multiple instances" block, the live
+// status's per-instance column and the spec list's summary, the models catalog's count, and the
+// two refusals -- every key in both languages.
+describe('instance settings (#340) i18n keys', () => {
+  const stringKeys = [
+    'runtimeSpecReplicable',
+    'runtimeSpecReplicableHint',
+    'runtimeSpecMinInstances',
+    'runtimeSpecMaxInstances',
+    'runtimeSpecMaxInstancesUnlimited',
+    'runtimeSpecInstanceParallelism',
+    'runtimeSpecIdleTimeoutOverrideHint',
+    'runtimeStatusInstance',
+    'errorRuntimeSpecInstancesInvalid',
+    'errorRuntimeSpecInstancesNeedEphemeralPort',
+    'modelServersRunningInstances',
+  ] as const;
+
+  it('defines every string key in de and en, in different words', () => {
+    for (const key of stringKeys) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale][key].length, `${locale} ${key}`).toBeGreaterThan(0);
+      }
+      // "Instanz"/"Instance" differ by one letter only, so every key is compared.
+      expect(messages.de[key], key).not.toBe(messages.en[key]);
+    }
+  });
+
+  it('names the measured startup and the automatic idle timeout, or says nothing is measured', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const line = messages[locale].runtimeSpecAutoIdleTimeout(150, 30000);
+      expect(line, locale).toContain('150 s');
+      expect(line, locale).toContain('30 s');
+      expect(messages[locale].runtimeSpecAutoIdleTimeout(120, 0), locale).toContain('120 s');
+    }
+    // 0 is "nothing measured yet", never a startup of zero seconds.
+    expect(messages.de.runtimeSpecAutoIdleTimeout(120, 0)).toMatch(/noch nicht gemessen/);
+    expect(messages.en.runtimeSpecAutoIdleTimeout(120, 0)).toMatch(/not measured yet/);
+    // A fraction of a second is kept, in each language's own decimal mark.
+    expect(messages.de.runtimeSpecAutoIdleTimeout(150, 12500)).toContain('12,5 s');
+    expect(messages.en.runtimeSpecAutoIdleTimeout(150, 12500)).toContain('12.5 s');
+  });
+
+  it('sums up running instances with the bounds, an unset maximum as unlimited', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const unlimited = messages[locale].runtimeInstancesSummary(2, 1, null);
+      expect(unlimited, locale).toMatch(/^2 /);
+      expect(unlimited, locale).toContain('min 1');
+      expect(unlimited, locale).toContain('max ∞');
+      expect(messages[locale].runtimeInstancesSummary(2, 1, 3), locale).toContain('max 3');
+    }
+    expect(messages.de.runtimeInstancesSummary(1, 0, null)).toBe('1 läuft · min 0 · max ∞');
+    expect(messages.de.runtimeInstancesSummary(2, 1, null)).toBe('2 laufen · min 1 · max ∞');
+    expect(messages.en.runtimeInstancesSummary(2, 1, null)).toBe('2 running · min 1 · max ∞');
+  });
+
+  it('says in the idle-timeout hint what 0 means once a spec runs several instances', () => {
+    expect(messages.de.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = keine manuelle Vorgabe/);
+    expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = no manual override/);
+  });
+
+  it('says the maximum field left empty means unlimited', () => {
+    expect(messages.de.runtimeSpecMaxInstancesUnlimited).toMatch(/Leer = unbegrenzt/);
+    expect(messages.en.runtimeSpecMaxInstancesUnlimited).toMatch(/Empty = unlimited/);
+  });
+});

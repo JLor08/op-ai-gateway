@@ -98,6 +98,29 @@ export interface RuntimeSpec {
   // RAM". Both keys are always present on the wire.
   ram_estimate_mb: number;
   ram_measured_mb: number;
+  // The instance settings (#340). `replicable` lets the agent run several
+  // processes (instances) of this spec on its server; without it the spec runs
+  // exactly one, as before the field existed, and the other three mean
+  // nothing. min_instances is how many it keeps up (0 = none: the model may
+  // unload completely), max_instances how many it may run (0 = unlimited: free
+  // resources and the server's process limit are then the only bound; the
+  // backend refuses a count above 64, the agent's cap), and
+  // instance_parallelism how many requests one instance serves at once (0 =
+  // the default, 1). Operator-owned and applied verbatim like every field of
+  // this full-document upsert. A replicable spec needs listen_port 0, since
+  // every instance listens on its own port.
+  replicable: boolean;
+  min_instances: number;
+  max_instances: number;
+  instance_parallelism: number;
+  // READ-ONLY, both, with no PutRuntimeSpecRequest counterpart. The agent's
+  // measured startup time of this spec in ms (0 = nothing measured yet), and
+  // the idle timeout the gateway actually pushes to the agent for the STORED
+  // spec: for a replicable one derived from that measurement (a manual
+  // idle_timeout_seconds of 0 is then "no manual override", not "never
+  // unload"), otherwise the stored idle_timeout_seconds as is.
+  startup_measured_ms: number;
+  effective_idle_timeout_seconds: number;
   // How this mapping authenticates to its agent-managed process (Runtime-Spec
   // API Token feature). 'off' sends no auth; 'set' sends the operator's own
   // spec-level token (api_token_set says whether one is stored, never the
@@ -186,7 +209,10 @@ export interface RuntimeSpec {
 // VRAM ownership rule in service_runtime.go. The spec-level ram_measured_mb is
 // agent-owned too, but the backend request has no counterpart for it at all,
 // so it is excluded from this shape below instead of being carried and
-// ignored; ram_estimate_mb is the operator's and is applied verbatim.
+// ignored; ram_estimate_mb is the operator's and is applied verbatim. The same
+// split for the instance settings: the four operator fields are carried, and
+// startup_measured_ms (agent-owned) and effective_idle_timeout_seconds
+// (derived on every read) have no request counterpart and are excluded.
 //
 // The three api_token_set/app_api_token_set/app_api_token_header fields (and
 // the derived `role`) are READ-ONLY echoes (server state, never
@@ -206,6 +232,8 @@ export type PutRuntimeSpecRequest = Omit<
   | 'role'
   | 'responses_live_timings_enabled'
   | 'ram_measured_mb'
+  | 'startup_measured_ms'
+  | 'effective_idle_timeout_seconds'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).
@@ -299,8 +327,16 @@ export interface RuntimeGPUStatus {
 // gpus[].vram_measured_mb (from the write-back) stays the durable value but
 // carries no timestamp and is not rewritten when it does not change, so reading
 // it back tells you nothing about when it was taken.
+//
+// One row per INSTANCE (#340): every process of a replicable spec reports its
+// own row under the spec's own `spec_id`, told apart by `instance` (0 for
+// instance 0 and for every spec that is not replicable), so `spec_id` alone is
+// no longer a row's identity -- `${spec_id}#${instance}` is. `model` is then
+// the instance's ADDRESS, the upstream model name for instance 0 and
+// `<name>#<k>` for instance k.
 export interface RuntimeStatus {
   spec_id: string;
+  instance: number;
   model: string;
   state: string;
   since: string;
@@ -327,6 +363,10 @@ export interface RuntimeStatus {
   // carries none.
   // It does not stamp `measured_at`, which is the per-GPU watermark.
   ram_measured_mb?: number;
+  // This instance's measured startup in ms: process start to its first
+  // successful health probe, for its most recent successful start. Absent
+  // while unknown (0 is the unknown sentinel and is omitted on the wire).
+  startup_ms?: number;
   last_error?: RuntimeError;
   // Whether the agent's last per-model probe of its `/metrics` and context
   // (e.g. llama.cpp `/props`) endpoints actually reached the server, mirroring
