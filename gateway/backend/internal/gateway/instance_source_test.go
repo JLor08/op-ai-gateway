@@ -12,6 +12,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -150,11 +151,11 @@ func TestInstanceSourceNeedsReplicableSpec(t *testing.T) {
 	}
 }
 
-// A failed spec read is remembered for a second: a degraded store is asked
-// (and its failure logged) once a second per mapping, not on every admission
-// turn of every request; once that second has passed it is asked again, and
-// a store that has recovered answers.
-func TestInstanceSourceRemembersAFailedReadForASecond(t *testing.T) {
+// A failed spec read with no good read before it is remembered for its
+// period: a degraded store is asked (and its failure logged) once per period
+// per mapping, not on every admission turn of every request; once the period
+// has passed it is asked again, and a store that has recovered answers.
+func TestInstanceSourceRemembersAFailedReadForItsPeriod(t *testing.T) {
 	src, _, m := instanceSourceFixture()
 	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
 	src.now = func() time.Time { return now }
@@ -164,20 +165,186 @@ func TestInstanceSourceRemembersAFailedReadForASecond(t *testing.T) {
 	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok {
 		t.Fatal("spec read failed: ok = true, want false")
 	}
-	now = now.Add(900 * time.Millisecond)
+	now = now.Add(instanceSpecFailureTTL - 100*time.Millisecond)
 	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok || len(failing.reads) != 1 {
-		t.Fatalf("within a second of the failure: ok %v after %d reads, want false after 1", ok, len(failing.reads))
+		t.Fatalf("within the failure period: ok %v after %d reads, want false after 1", ok, len(failing.reads))
 	}
 	now = now.Add(100 * time.Millisecond)
 	src.InstanceView(context.Background(), "srv1", m)
 	if len(failing.reads) != 2 {
-		t.Fatalf("spec reads a second after the failure = %d, want 2", len(failing.reads))
+		t.Fatalf("spec reads once the failure period passed = %d, want 2", len(failing.reads))
 	}
 	failing.err = nil
 	failing.specs = map[string]routing.RuntimeSpec{"map_m": {ID: "S", MappingID: "map_m", Replicable: true}}
-	now = now.Add(time.Second)
+	now = now.Add(instanceSpecFailureTTL)
 	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
 		t.Fatal("after the store recovered: ok = false, want the replicable spec")
+	}
+}
+
+// A failed read never takes a mapping's instances away while the cache holds a
+// spec read before it: the last good spec keeps answering (stale-if-error),
+// the store is asked again once per failure period, and a read that succeeds
+// replaces it.
+func TestInstanceSourceKeepsTheLastGoodSpecWhenAReadFails(t *testing.T) {
+	src, reader, m := instanceSourceFixture()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	src.now = func() time.Time { return now }
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
+		t.Fatal("first read: ok = false, want the replicable spec")
+	}
+	reader.err = errors.New("store down")
+	now = now.Add(instanceSpecCacheTTL)
+	view, ok := src.InstanceView(context.Background(), "srv1", m)
+	if !ok || view.Parallelism != 2 || len(reader.reads) != 2 {
+		t.Fatalf("a failed re-read: view %+v ok %v after %d reads; want the last good spec after 2", view, ok, len(reader.reads))
+	}
+	now = now.Add(instanceSpecFailureTTL - 100*time.Millisecond)
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok || len(reader.reads) != 2 {
+		t.Fatalf("within the failure period: ok %v after %d reads; want the last good spec without a read", ok, len(reader.reads))
+	}
+	now = now.Add(100 * time.Millisecond)
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok || len(reader.reads) != 3 {
+		t.Fatalf("the next failure period: ok %v after %d reads; want the last good spec after 3", ok, len(reader.reads))
+	}
+	reader.err = nil
+	reader.specs["map_m"] = routing.RuntimeSpec{ID: "S", MappingID: "map_m"}
+	now = now.Add(instanceSpecFailureTTL)
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok {
+		t.Fatal("after the store recovered: ok = true, want the re-read spec that is no longer replicable")
+	}
+}
+
+// gatedSpecReader is a concurrency-safe test instanceSpecReader whose reads
+// each wait for a token on gate before answering spec.
+type gatedSpecReader struct {
+	spec    routing.RuntimeSpec
+	gate    chan struct{}
+	started chan struct{}
+	mu      sync.Mutex
+	reads   int
+}
+
+func (g *gatedSpecReader) RuntimeSpecByMapping(context.Context, string) (routing.RuntimeSpec, bool, error) {
+	g.mu.Lock()
+	g.reads++
+	g.mu.Unlock()
+	g.started <- struct{}{}
+	<-g.gate
+	return g.spec, true, nil
+}
+
+func (g *gatedSpecReader) readCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.reads
+}
+
+// Requests that miss the cache while a read of the same mapping is in flight
+// wait for that read instead of reading too; a waiter whose own request ends
+// first answers with what the cache held, and the read still lands for the
+// others.
+func TestInstanceSourceReadsOnceForConcurrentMisses(t *testing.T) {
+	src, _, m := instanceSourceFixture()
+	reader := &gatedSpecReader{spec: routing.RuntimeSpec{ID: "S", MappingID: "map_m", Replicable: true}, gate: make(chan struct{}), started: make(chan struct{}, 8)}
+	src.store = reader
+
+	results := make(chan bool, 4)
+	go func() {
+		_, ok := src.InstanceView(context.Background(), "srv1", m)
+		results <- ok
+	}()
+	<-reader.started // the first miss is reading
+	for range 3 {
+		go func() {
+			_, ok := src.InstanceView(context.Background(), "srv1", m)
+			results <- ok
+		}()
+	}
+	gone, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan bool, 1)
+	go func() {
+		_, ok := src.InstanceView(gone, "srv1", m)
+		waiterDone <- ok
+	}()
+	waitForFlightWaiters(t, src)
+	cancel()
+	if ok := <-waiterDone; ok {
+		t.Fatal("a waiter whose request ended: ok = true, want the empty cache's answer")
+	}
+	close(reader.gate)
+	for range 4 {
+		if ok := <-results; !ok {
+			t.Fatal("a request served by the shared read: ok = false, want the replicable spec")
+		}
+	}
+	if n := reader.readCount(); n != 1 {
+		t.Fatalf("store reads = %d, want 1 for every concurrent miss", n)
+	}
+}
+
+// waitForFlightWaiters waits until a read is in flight for map_m, giving the
+// goroutines started before it a moment to reach the flight.
+func waitForFlightWaiters(t *testing.T, src *instanceSource) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		src.mu.Lock()
+		_, inFlight := src.flights["map_m"]
+		src.mu.Unlock()
+		if inFlight {
+			time.Sleep(50 * time.Millisecond)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no read in flight")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A read never replaces the entry of a read that began after it: when a slow
+// read returns after a later one already answered, the later answer stays.
+func TestInstanceSourceEarlierReadNeverOverwritesALaterOne(t *testing.T) {
+	src, _, _ := instanceSourceFixture()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	src.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+	}
+	slow := &gatedSpecReader{spec: routing.RuntimeSpec{ID: "S", MappingID: "map_m", Replicable: false}, gate: make(chan struct{}), started: make(chan struct{}, 1)}
+	src.store = slow
+	earlier := make(chan instanceSpecEntry, 1)
+	go func() { earlier <- src.read(context.Background(), "map_m") }()
+	<-slow.started
+
+	advance(time.Second)
+	src.store = &countingSpecReader{specs: map[string]routing.RuntimeSpec{"map_m": {ID: "S", MappingID: "map_m", Replicable: true}}}
+	if e := src.read(context.Background(), "map_m"); !e.replicable {
+		t.Fatalf("the later read = %+v, want the replicable spec", e)
+	}
+	close(slow.gate)
+	<-earlier
+	src.mu.Lock()
+	kept := src.specs["map_m"]
+	src.mu.Unlock()
+	if !kept.replicable {
+		t.Fatalf("cached entry = %+v after the earlier read returned, want the later read's replicable spec", kept)
+	}
+}
+
+// Every request missing the cache waits on the read in flight, so the failure
+// period must cover a read that runs into its timeout.
+func TestInstanceSpecFailurePeriodCoversTheReadTimeout(t *testing.T) {
+	if instanceSpecFailureTTL < instanceSpecReadTimeout {
+		t.Fatalf("instanceSpecFailureTTL %v < instanceSpecReadTimeout %v", instanceSpecFailureTTL, instanceSpecReadTimeout)
 	}
 }
 
@@ -254,10 +421,9 @@ func TestInstanceSourceRemembersASlowReadFromWhenItReturned(t *testing.T) {
 	}
 }
 
-// The spec is read under the request's context, so the read is traced under
-// the request and ends with it. A read that failed because its request was
-// already gone says nothing about the store: it is not remembered, and the
-// next request reads the spec afresh.
+// The spec is read under a context carrying the request's values, so the read
+// is traced under the request. A request already gone when it misses reads
+// nothing and leaves nothing behind: the next request reads the spec afresh.
 func TestInstanceSourceReadsSpecUnderRequestContext(t *testing.T) {
 	type ctxKey struct{}
 	src, reader, m := instanceSourceFixture()
@@ -278,8 +444,8 @@ func TestInstanceSourceReadsSpecUnderRequestContext(t *testing.T) {
 	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
 		t.Fatal("the next request: ok = false, want the spec read afresh, not the cancelled read's failure")
 	}
-	if len(reader.reads) != 3 {
-		t.Fatalf("spec reads = %d, want 3 (the cancelled read is not remembered)", len(reader.reads))
+	if len(reader.reads) != 2 {
+		t.Fatalf("spec reads = %d, want 2 (the cancelled request read nothing)", len(reader.reads))
 	}
 }
 
@@ -301,6 +467,52 @@ func TestInstanceCapIsWiredEndToEnd(t *testing.T) {
 	defer srv.Active.Remove("held")
 	if target, err := srv.Resolver.Resolve(ctx, auth.Token{}, req); err != nil || target.InstanceKey != "map_rspec_inst#2" {
 		t.Fatalf("instance 0 at capacity: target %q, err %v; want map_rspec_inst#2", target.InstanceKey, err)
+	}
+}
+
+// With every instance at its parallelism, a request parks on the server's real
+// admission queue -- telling the demand sink the model needs another instance --
+// and the release of one instance's request wakes it onto that instance. The
+// queue's periodic recheck is off, so only the release can wake it.
+func TestAllBusyInstancesParkAndAReleaseWakes(t *testing.T) {
+	srv := NewTestServer()
+	seedReplicableRuntimeSpec(t, srv)
+	srv.Active.admission.recheck = 0
+	sink := &recordingDemandSink{}
+	srv.Resolver.SetDemandSink(sink)
+	ingestInstanceRows(t, srv, `"runtime_manager","runtime_model_probe","runtime_instances"`, instRow(0, "running", 0, 0), instRow(2, "running", 0, 0))
+	srv.Active.Add(ActiveRequest{ID: "held0", ServerID: "mock-host-qwen", InstanceKey: "map_rspec_inst#0"})
+	defer srv.Active.Remove("held0")
+	srv.Active.Add(ActiveRequest{ID: "held2", ServerID: "mock-host-qwen", InstanceKey: "map_rspec_inst#2"})
+
+	type result struct {
+		target routing.Target
+		err    error
+	}
+	done := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() {
+		target, err := srv.Resolver.Resolve(ctx, auth.Token{}, inference.Request{Model: "inst-model", APIFlavor: "openai_chat"})
+		done <- result{target, err}
+	}()
+	select {
+	case res := <-done:
+		t.Fatalf("Resolve returned %q, %v while every instance was busy, want it parked", res.target.InstanceKey, res.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := sink.signals(); len(got) != 1 || got[0].Model != "inst-model" || !slices.Equal(got[0].MappingIDs, []string{"map_rspec_inst"}) {
+		t.Fatalf("demand signals = %+v, want one for inst-model naming map_rspec_inst", got)
+	}
+
+	srv.Active.Remove("held2")
+	select {
+	case res := <-done:
+		if res.err != nil || res.target.InstanceKey != "map_rspec_inst#2" {
+			t.Fatalf("woken Resolve = %q, %v; want the released instance map_rspec_inst#2", res.target.InstanceKey, res.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the release did not wake the parked request")
 	}
 }
 
@@ -336,11 +548,15 @@ func TestInstanceSourceCachesSpecForFiveSeconds(t *testing.T) {
 	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok {
 		t.Fatal("after 5s: ok = true, want the re-read spec that is no longer replicable")
 	}
+	// map_other, asked about once, is kept as a last good spec for a while
+	// after it expired, then dropped by the next read.
+	now = now.Add(instanceSpecCacheTTL + instanceSpecRetention)
+	src.InstanceView(context.Background(), "srv1", m)
 	src.mu.Lock()
-	cached := len(src.specs)
+	_, kept := src.specs["map_other"]
 	src.mu.Unlock()
-	if cached != 1 {
-		t.Fatalf("cached specs = %d, want 1 (expired entries are dropped on the next read)", cached)
+	if kept {
+		t.Fatal("map_other is still cached past its retention, want it dropped by the next read")
 	}
 }
 
