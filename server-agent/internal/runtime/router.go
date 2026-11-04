@@ -1092,35 +1092,27 @@ func rewriteModelField(raw []byte, model string) ([]byte, error) {
 		return nil, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+	if !nextIsDelim(dec, '{') {
 		return nil, errors.New("the body is not a JSON object")
 	}
 	out := make([]byte, 0, len(raw)+len(literal))
 	copied, found := 0, false // copied: raw[:copied] is in out already
 	for dec.More() {
-		tok, err := dec.Token()
+		key, start, end, err := nextMember(dec)
 		if err != nil {
-			return nil, fmt.Errorf("read a key: %w", err)
+			return nil, err
 		}
-		key, _ := tok.(string)
-		var n valueLen
-		if err := dec.Decode(&n); err != nil {
-			return nil, fmt.Errorf("read the value of %q: %w", key, err)
-		}
-		end := int(dec.InputOffset())
-		start := end - int(n)
 		if !strings.EqualFold(key, "model") || raw[start] != '"' {
 			continue
 		}
 		found = true
-		var current string
-		if err := json.Unmarshal(raw[start:end], &current); err != nil || current == model {
+		if keepsModelValue(raw[start:end], model) {
 			continue
 		}
 		out = append(append(out, raw[copied:start]...), literal...)
 		copied = end
 	}
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+	if !nextIsDelim(dec, '}') {
 		return nil, errors.New("the body's top-level object does not end")
 	}
 	if !found {
@@ -1130,6 +1122,37 @@ func rewriteModelField(raw []byte, model string) ([]byte, error) {
 		return raw, nil
 	}
 	return append(out, raw[copied:]...), nil
+}
+
+// nextIsDelim reports whether dec's next token is the delimiter d.
+func nextIsDelim(dec *json.Decoder, d json.Delim) bool {
+	tok, err := dec.Token()
+	return err == nil && tok == d
+}
+
+// nextMember reads the next key of the object dec is inside and steps over its
+// value, returning the key and where the value's bytes sit in the input
+// (start inclusive, end exclusive).
+func nextMember(dec *json.Decoder) (key string, start, end int, err error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("read a key: %w", err)
+	}
+	key, _ = tok.(string)
+	var n valueLen
+	if err := dec.Decode(&n); err != nil {
+		return "", 0, 0, fmt.Errorf("read the value of %q: %w", key, err)
+	}
+	end = int(dec.InputOffset())
+	return key, end - int(n), end, nil
+}
+
+// keepsModelValue reports whether the string literal value keeps its bytes:
+// it already names model, or it does not decode as a string.
+func keepsModelValue(value []byte, model string) bool {
+	var current string
+	err := json.Unmarshal(value, &current)
+	return err != nil || current == model
 }
 
 // valueLen records the length of the JSON value it is decoded from, and keeps
@@ -1372,9 +1395,9 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, addr m
 // serveStreamProxy handles a "stream":true request with a LAZY commit (see
 // the package doc's COLD-START HEARTBEATS section): nothing is written to
 // w until either a heartbeat actually fires or real data is actually ready
-// to write. commit() is the single idempotent function that sends 200 + SSE
-// headers the first time either of those happens; every error path below
-// checks committed via failStream instead of always emitting an SSE frame,
+// to write. sseCommit.commit is the single idempotent function that sends
+// 200 + SSE headers the first time either of those happens; every error path
+// checks committed via sseCommit.fail instead of always emitting an SSE frame,
 // so a failure fast enough to beat the first heartbeat -- model not
 // managed, a policy refusal, a synchronously failing exec, an immediate
 // non-2xx from an already-admitted child -- is still a genuine HTTP status,
@@ -1385,41 +1408,13 @@ func (rt *router) servePlainProxy(w http.ResponseWriter, r *http.Request, addr m
 // keeps covering that owner round trip too.
 func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr modelAddress, body []byte) {
 	flusher, _ := w.(http.Flusher)
-	fw := flushWriter{w: w, f: flusher}
-
-	committed := false
-	commit := func() {
-		if committed {
-			return
-		}
-		committed = true
-		refreshWriteDeadline(w) // I5: about to write headers -- start the deadline before, not after
-		w.Header().Set(headerContentType, "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-	// failStream reports err as a genuine HTTP status if nothing has been
-	// committed yet (sentinelCode via the same envelope the non-streaming
-	// path uses), or as a terminal SSE frame if 200 was already sent --
-	// the ACCEPTED TRADE-OFF the package doc describes, now paid only when
-	// a heartbeat or real data actually forced the commit.
-	failStream := func(err error) {
-		if !committed {
-			writeSentinelError(w, err)
-			return
-		}
-		writeSSEError(w, flusher, err)
-	}
+	s := &sseCommit{w: w, flusher: flusher}
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	if rt.m == nil {
-		failStream(ErrModelNotManaged)
+		s.fail(ErrModelNotManaged)
 		return
 	}
 
@@ -1433,17 +1428,69 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr 
 		endpoint, release, err := rt.ensureServing(r.Context(), addr)
 		ensureCh <- ensureResult{endpoint: endpoint, release: release, err: err}
 	}()
-	eres := heartbeatWait(ticker, ensureCh, w, flusher, commit)
+	eres := heartbeatWait(ticker, ensureCh, w, flusher, s.commit)
 	if eres.err != nil {
-		failStream(eres.err)
+		s.fail(eres.err)
 		return
 	}
 	defer eres.release()
 
-	outReq, err := rt.buildUpstreamRequest(r, eres.endpoint, body)
-	if err != nil {
-		failStream(fmt.Errorf("runtime: build upstream request: %w", err))
+	resp := rt.openUpstreamStream(r, ticker, s, eres.endpoint, body)
+	if resp == nil {
 		return
+	}
+	defer resp.Body.Close()
+	spliceUpstreamStream(r.Context(), ticker, s, resp)
+}
+
+// sseCommit is serveStreamProxy's lazy commit: nothing is written to w until
+// commit is first called, and fail picks the error envelope by whether that
+// has happened yet.
+type sseCommit struct {
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	committed bool
+}
+
+// commit is the single idempotent function that sends 200 + SSE headers the
+// first time a heartbeat fires or real data is ready to write.
+func (s *sseCommit) commit() {
+	if s.committed {
+		return
+	}
+	s.committed = true
+	refreshWriteDeadline(s.w) // I5: about to write headers -- start the deadline before, not after
+	s.w.Header().Set(headerContentType, "text/event-stream")
+	s.w.Header().Set("Cache-Control", "no-cache")
+	s.w.Header().Set("Connection", "keep-alive")
+	s.w.WriteHeader(http.StatusOK)
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// fail reports err as a genuine HTTP status if nothing has been committed yet
+// (sentinelCode via the same envelope the non-streaming path uses), or as a
+// terminal SSE frame if 200 was already sent -- the ACCEPTED TRADE-OFF the
+// package doc describes, now paid only when a heartbeat or real data actually
+// forced the commit.
+func (s *sseCommit) fail(err error) {
+	if !s.committed {
+		writeSentinelError(s.w, err)
+		return
+	}
+	writeSSEError(s.w, s.flusher, err)
+}
+
+// openUpstreamStream sends r's upstream request to endpoint with heartbeats
+// ticking, and returns the child's 2xx response for the caller to splice (and
+// close). It returns nil once it has answered the client itself: the request
+// could not be built or sent, or the child answered with a non-2xx.
+func (rt *router) openUpstreamStream(r *http.Request, ticker *time.Ticker, s *sseCommit, endpoint string, body []byte) *http.Response {
+	outReq, err := rt.buildUpstreamRequest(r, endpoint, body)
+	if err != nil {
+		s.fail(fmt.Errorf("runtime: build upstream request: %w", err))
+		return nil
 	}
 
 	type roundTripResult struct {
@@ -1455,14 +1502,14 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr 
 		resp, err := rt.transport.RoundTrip(outReq)
 		rtCh <- roundTripResult{resp: resp, err: err}
 	}()
-	rres := heartbeatWait(ticker, rtCh, w, flusher, commit)
+	rres := heartbeatWait(ticker, rtCh, s.w, s.flusher, s.commit)
 	if rres.err != nil {
-		failStream(fmt.Errorf("runtime: upstream request failed: %w", rres.err))
-		return
+		s.fail(fmt.Errorf("runtime: upstream request failed: %w", rres.err))
+		return nil
 	}
 	resp := rres.resp
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
 		// C1: an already-admitted child answering with its own non-2xx
 		// (e.g. 400 "context length exceeded") is a legitimate response,
 		// not a router-level failure. If nothing has been committed to
@@ -1475,13 +1522,20 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr 
 		// brief prescribes that treatment for a non-2xx "after heartbeats
 		// began", not unconditionally, which the lazy commit exists to
 		// distinguish.
-		if !committed {
-			forwardUpstreamResponse(w, flusher, resp)
-			return
+		if !s.committed {
+			forwardUpstreamResponse(s.w, s.flusher, resp)
+			return nil
 		}
-		failStream(fmt.Errorf("runtime: upstream returned status %d", resp.StatusCode))
-		return
+		s.fail(fmt.Errorf("runtime: upstream returned status %d", resp.StatusCode))
+		return nil
 	}
+	return resp
+}
+
+// spliceUpstreamStream copies the child's 2xx streaming response to the
+// client.
+func spliceUpstreamStream(ctx context.Context, ticker *time.Ticker, s *sseCommit, resp *http.Response) {
+	fw := flushWriter{w: s.w, f: s.flusher}
 
 	// Wait for the first body byte with heartbeats still ticking (a warm
 	// child's time-to-first-token is the same silent-window class as a cold
@@ -1497,14 +1551,14 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr 
 		n, err := resp.Body.Read(buf)
 		firstCh <- readResult{n: n, err: err}
 	}()
-	fres := heartbeatWaitCtx(r.Context(), ticker, firstCh, w, flusher, resp.Body, commit)
+	fres := heartbeatWaitCtx(ctx, ticker, firstCh, s.w, s.flusher, resp.Body, s.commit)
 	if fres.n > 0 {
 		// Real data is ready: commit now if a heartbeat never happened to
 		// fire first (the common warm-model case) -- commit is idempotent,
 		// so this is a no-op if it already fired. Written through fw (not
 		// a direct w.Write) so this first chunk gets the same I5 write-
 		// deadline refresh as every later one.
-		commit()
+		s.commit()
 		if _, werr := fw.Write(buf[:fres.n]); werr != nil {
 			return // client gone; nothing further to do
 		}
@@ -1515,7 +1569,7 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr 
 			// explicitly (rather than relying on net/http's implicit
 			// default-200-on-return) since this path IS a successful
 			// outcome of a stream request.
-			commit()
+			s.commit()
 			return
 		}
 		// M7: heartbeatWaitCtx force-closed resp.Body because r.Context()
@@ -1523,23 +1577,23 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, addr 
 		// error here too, but it must be reported the same way
 		// spliceWithCancel already reports the identical event for the
 		// LATER read (as no error: there is no one left to report an
-		// error TO), not as a failStream(runtime.upstream_gone) call that
+		// error TO), not as a s.fail(runtime.upstream_gone) call that
 		// would otherwise try to write a real HTTP status to a connection
 		// that is already gone.
-		if r.Context().Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
-		failStream(fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
+		s.fail(fmt.Errorf("runtime: upstream body read failed: %w", fres.err))
 		return
 	}
 
-	commit() // defensive: reachable only if Read legally returned (0, nil), which committing again is a no-op for
-	if err := spliceWithCancel(r.Context(), fw, resp.Body); err != nil {
+	s.commit() // defensive: reachable only if Read legally returned (0, nil), which committing again is a no-op for
+	if err := spliceWithCancel(ctx, fw, resp.Body); err != nil {
 		// The child died mid-response after already sending real bytes: no
 		// HTTP status is available any more (spent long ago), but an SSE
 		// client can still parse one more terminal frame appended after
 		// legitimate data -- design doc §6.4 "child dies mid-request".
-		failStream(fmt.Errorf("runtime: upstream body read failed: %w", err))
+		s.fail(fmt.Errorf("runtime: upstream body read failed: %w", err))
 	}
 }
 
