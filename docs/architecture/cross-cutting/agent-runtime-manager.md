@@ -313,9 +313,11 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   with multi-device Metal support — the portal shows a hint when the placeholder
   is used against a non-macOS agent, since stock llama.cpp Metal builds expose
   one device.
-- `${CONFIG_DIR}` — an exact match substitutes the **absolute per-spec directory
-  the agent writes the spec's config files into**,
-  `<config_files_dir>/<spec-id>` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child), issue #257):
+- `${CONFIG_DIR}` — an exact match substitutes the **absolute per-instance
+  directory the agent writes the spec's config files into**,
+  `<config_files_dir>/<spec-id>` for instance 0 and
+  `<config_files_dir>/<spec-id>#<k>` for instance k ≥ 1 of a replicable spec
+  ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child), issue #257, §6.1):
   `["--config", "${CONFIG_DIR}/server.json"]`. It is a plain path the agent
   chose, **not a secret**: it records no secret span, and the reported launch
   command ([§14.7](#147-the-resolved-command-what-actually-ran)) shows the
@@ -1281,15 +1283,19 @@ without a second mechanism. A spec with none (`config_files: []`, the default of
 every spec that predates the facet) behaves byte-for-byte as before: the base
 directory is not even required.
 
-**Where the files go.** `<config_files_dir>/<spec-id>/<name>`, under an
-agent-owned base directory the operator sets on the agent
+**Where the files go.** `<config_files_dir>/<spec-id>/<name>` for instance 0 —
+every spec that is not replicable has no other — and
+`<config_files_dir>/<spec-id>#<k>/<name>` for instance k ≥ 1 of a replicable spec
+(§6.1: each instance is its own process with its own port, and a file may carry
+`${PORT}`), under an agent-owned base directory the operator sets on the agent
 (`config_files_dir`, [§15](#15-configuration-reference); default
 `server-agent-config-files` beside the binary). It is **never the spec's
 `work_dir`**: that is operator-chosen and may be a read-only mount or the
 binary's own directory, so the one place the agent can be sure to write is a
-directory it owns. The per-spec subdirectory, keyed by spec id, is what makes
-uniqueness structural — two specs that both name their file `server.json` land in
-different directories and can never overwrite each other. The gateway supplies a
+directory it owns. The per-instance subdirectory, keyed by the instance key
+(`S` or `S#k`), is what makes uniqueness structural — two specs, or two instances
+of one spec, that name their file `server.json` land in different directories and
+can never overwrite each other. The gateway supplies a
 file's relative name and content and **never where on the host it is written**,
 exactly as it never supplies the binary allowlist.
 
@@ -1299,7 +1305,7 @@ listen port is chosen and the placeholders are resolved, and **before** the
 atomic — a temp file created inside the target directory, `chmod 0600`, renamed
 into place, the same helper the runtime-config cache uses (§8.1) — so a child, or
 a crash mid-write, sees the old file or the new one and never a torn one. The
-per-spec directory is created `0755` if needed. The whole spec's files are
+per-instance directory is created `0755` if needed. The whole spec's files are
 validated and expanded **before the first byte is written**, so a bad second file
 cannot leave a half-provisioned directory behind. A change to a spec's
 `config_files` is **launch-affecting** ([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)):
@@ -1971,8 +1977,11 @@ and cache per instance key.
 
 VRAM demand is **per GPU, not per spec**, because a tensor-parallel model may
 span GPUs unevenly. **Host RAM is the opposite and a second axis:** one process
-backs one spec, whatever GPUs it spans, so RAM is a single spec-level scalar and
-a **host-scoped** quantity, never a column of the per-GPU rows
+backs one instance of a spec, whatever GPUs it spans, and every instance runs the
+same model from the same spec, so RAM is a single spec-level scalar — the demand
+of **one** instance, charged once per instance admitted (§5.8), and for a
+replicable spec the largest figure any of its instances measured — and a
+**host-scoped** quantity, never a column of the per-GPU rows
 ([ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)).
 Every VRAM and RAM figure in this feature is **megabytes**; live GPU and host
 telemetry report bytes and must be converted at the boundary. Full column detail
@@ -3012,13 +3021,16 @@ reads a cached value, never polls hardware, and the owner loads the sample
 **once** per snapshot so the VRAM and RAM budgets of one admission come from the
 same sample.
 
-The ordering that guarantees at most one process per spec: inside the owner,
-`admitAndStart` runs Permit → `Admit` → mark victims draining or the target
-starting → `exec.Cmd.Start()` **synchronously**, and only afterwards spawns the
-health-poll and exit-wait goroutines, once the new generation is already
-recorded. A second concurrent attempt then sees a non-nil current process and
-no-ops. Moving the blocking `exec.Start` off the owner goroutine looks like an
-obvious latency win and silently permits two children for one spec.
+The ordering that guarantees at most one process per instance key — the spec
+id `S` for instance 0, `S#k` for instance k ≥ 1 (§4.8, §6.1), so a replicable
+spec runs one process per instance and never two for the same instance: inside
+the owner, `admitAndStart` runs Permit → `Admit` → mark victims draining or the
+target starting → `exec.Cmd.Start()` **synchronously**, and only afterwards
+spawns the health-poll and exit-wait goroutines, once the new generation is
+already recorded. A second concurrent attempt for the same instance key then sees
+a non-nil current process and no-ops. Moving the blocking `exec.Start` off the
+owner goroutine looks like an obvious latency win and silently permits two
+children for one instance key.
 
 The admission *policy* is a pure function over a snapshot —
 `Admit(PolicySnapshot, Spec) Decision` has no clocks, no I/O, no goroutines, no
@@ -5396,8 +5408,9 @@ Two honesty rules on those two fields, and both are contracts:
 
 **Host RAM rides the sample as one spec-level scalar, `ram_measured_mb`, and the
 live status frame forwards it.** RAM has no GPU axis and one process
-backs one spec, so the figure sits **beside** `gpus[]` on the runtime entry, not
-inside it: the managed child's resident RAM in MB (RSS, the private working set on
+backs one instance, so the figure sits **beside** `gpus[]` on the instance's
+runtime entry, not inside it (a replicable spec reports one entry per instance,
+and the gateway writes back the largest, `foldInstanceRows`): the managed child's resident RAM in MB (RSS, the private working set on
 Windows), declared by the agent feature `runtime_ram_measurement` (§7), `omitempty`,
 and `0` is *unknown* — never measured, no measurer on this host, or the process has
 exited — so an unmeasured spec and every agent that predates the field send no key at
@@ -8464,12 +8477,12 @@ operator meets first:
   the directory check, is the boundary.
 - **Config files are written, never garbage-collected, and never hold a secret**
   ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A file dropped from a spec's `config_files`, and the whole
-  `<spec-id>/` directory of a removed spec, stay on disk until an operator deletes
-  them: the write is overwrite-on-launch only. A secret cannot be placed in a file
+  `<spec-id>/` directory of a removed spec — and the `<spec-id>#<k>/` directory of
+  a retired instance — stay on disk until an operator deletes them: the write is overwrite-on-launch only. A secret cannot be placed in a file
   at all (`${API_TOKEN}` and `${AGENT_ENV:…}` are refused in content, by the
   gateway at submit time and again by the agent), so a server that can take a
   credential only from a file cannot be fully provisioned this way. Containment
-  of the per-spec directory is **lexical**, like the work-directory check: a
+  of the per-instance directory is **lexical**, like the work-directory check: a
   symlink an operator planted under their own `config_files_dir` is theirs to
   explain. And an agent older than `0.10.0` silently ignores the facet (the portal
   warns, §7), so a spec whose `args` reference `${CONFIG_DIR}` launches against a

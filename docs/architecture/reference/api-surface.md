@@ -980,7 +980,7 @@ Runtime
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `config_files`, an array of
 `{name, content}` objects (issue #257, [ADR-066](../09-architecture-decisions.md#adr-066--agent-provisioned-config-files-one-child-per-spec-a-0n-config-files-facet-written-to-an-agent-owned-directory-a-config_dir-placeholder-and-non-secret-content-only)): up to 16 plain-text files the
-agent writes into its own per-spec directory before it launches the child, which
+agent writes into its own per-instance directory before it launches the child, which
 the spec's `args`/`env` reach through the `${CONFIG_DIR}` placeholder
 ([Agent-Managed Model Runtime §3.5](../cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)). The **GET** response always carries the
 array (`[]` for none, never `null`). The PUT is a full document like every other

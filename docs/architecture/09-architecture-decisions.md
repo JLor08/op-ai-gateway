@@ -6819,6 +6819,15 @@ succeed). **A gateway-side gate on the flag** (the document that carries
 `config_files` is the one every agent already polls, so there is no route to
 withhold). **Garbage-collecting a removed spec's directory** (deferred;
 overwrite-on-launch is enough for the current need).
+**Amended by [ADR-090](#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place) (one directory per instance).** Choice (a)'s one child per
+spec still holds for every spec that is not replicable; a replicable spec runs one
+child per **instance**, each its own process with its own port, so (c) and (d) are
+keyed by the instance key rather than the spec id: instance 0 keeps
+`<config_files_dir>/<spec-id>/`, and instance k ≥ 1 writes, and resolves
+`${CONFIG_DIR}` to, `<config_files_dir>/<spec-id>#<k>/` (`specForInstance`), since a
+file may carry `${PORT}`. The uniqueness argument is unchanged, one level down: two
+instances of one spec can no more overwrite each other's files than two specs can.
+
 → [Agent-Managed Model Runtime
 §3.5](cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
@@ -10848,6 +10857,14 @@ in exactly the states an eviction's beneficiary is admitted in). **Waking every 
 second). **The plain Windows working set** (shared pages counted once per process). **Gating the RAM measurement on a declared GPU**
 (it would skip the CPU-only specs the axis exists for). **Seeding `MemAvailable` from the hardware inventory** (the inventory carries no such figure,
 and a stale reading would be worse than an honest `0`).
+**Amended by [ADR-090](#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place) (one RAM figure for several processes).** Choice (a)'s "one
+process backs one spec" now reads one process per **instance**. RAM stays two
+scalars on the spec row, because every instance runs the same model from the same
+spec: the figure is the demand of **one** instance, each admitted instance is
+charged it like any other process, and the agent-owned measurement of a replicable
+spec is the largest over its instance rows (`foldInstanceRows`), so the next
+instance is admitted against the hungriest one.
+
 → [Agent-Managed Model Runtime §5.1](cross-cutting/agent-runtime-manager.md#51-the-per-gpu-data-model),
 [§5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates),
 [§5.4](cross-cutting/agent-runtime-manager.md#54-eviction-queueing-and-drain),
