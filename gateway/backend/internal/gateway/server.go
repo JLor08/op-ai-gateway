@@ -508,6 +508,11 @@ type Server struct {
 	// ServerDeps.VoicePrewarmEnabled and voicePrewarmEnabled). A bare &Server{} leaves it
 	// off, so no test that mints a voice ticket primes the TTS unless it asks to.
 	voicePrewarm bool
+	// voicePrewarmDone, when non-nil, is called by the pre-warm's goroutine
+	// (startVoicePrewarm) once its priming synthesis has returned, its in-flight request
+	// already removed. It is a TEST SEAM only: it lets a test run a turn after the
+	// pre-warm has finished, without sleeping; production leaves it nil.
+	voicePrewarmDone func()
 	// voiceOnPending, when non-nil, is called by the Voice Chat state machine after each
 	// chunk is appended to the session's pendingText, with the buffer's new value. It is a
 	// TEST SEAM only (pendingText is not otherwise on the wire); production leaves it nil.

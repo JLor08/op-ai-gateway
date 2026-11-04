@@ -80,11 +80,15 @@ func (s *Server) startVoicePrewarm(tts routing.Target, voice string) {
 	if !s.voicePrewarmEnabled() || voice == "" {
 		return
 	}
+	done := s.voicePrewarmDone
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), voicePrimingTimeout)
 		defer cancel()
 		if err := s.primeSpeechVoice(ctx, tts, voice); err != nil {
 			slog.Warn("voice prewarm: priming synthesis failed", "model", tts.Model, "route", tts.RouteID, "voice", voice, "err", err)
+		}
+		if done != nil {
+			done()
 		}
 	}()
 }

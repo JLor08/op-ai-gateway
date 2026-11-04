@@ -437,6 +437,8 @@ func TestVoiceFirstTurnUsesPrewarmedTTS(t *testing.T) {
 			}
 		}
 	})
+	prewarmed := make(chan struct{})
+	w.srv.voicePrewarmDone = func() { close(prewarmed) }
 	freeTTS := w.busy(liveInstTTSMap + "#0")
 	ticket := w.ticket(t, "alloy")
 	select {
@@ -446,6 +448,13 @@ func TestVoiceFirstTurnUsesPrewarmedTTS(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the ticket endpoint started no pre-warm")
+	}
+	// The turn runs only once the pre-warm has finished, so its in-flight request no
+	// longer holds instance 1 when the turn's speech is routed.
+	select {
+	case <-prewarmed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pre-warm did not finish")
 	}
 	w.agent.setOnArrive(nil)
 	freeTTS()
