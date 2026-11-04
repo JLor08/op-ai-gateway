@@ -204,7 +204,7 @@ func (w *voiceStickyWorld) speak(t *testing.T, hdr map[string]string) *http.Resp
 	return resp
 }
 
-func repeat(s string, n int) []string {
+func repeatKey(s string, n int) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = s
@@ -233,27 +233,23 @@ func TestVoiceTurnsStickToInstance(t *testing.T) {
 	w.turn(t, ctx, conn)
 	w.turn(t, ctx, conn)
 
-	if got := w.served(liveInstASRUp); !slices.Equal(got, repeat(liveInstASRUp+"#1", 3)) {
+	if got := w.served(liveInstASRUp); !slices.Equal(got, repeatKey(liveInstASRUp+"#1", 3)) {
 		t.Fatalf("ASR addresses served = %v, want instance 1 for all three turns", got)
 	}
-	if got := w.served(liveInstTTSUp); !slices.Equal(got, repeat(liveInstTTSUp+"#1", 3)) {
+	if got := w.served(liveInstTTSUp); !slices.Equal(got, repeatKey(liveInstTTSUp+"#1", 3)) {
 		t.Fatalf("TTS addresses served = %v, want instance 1 for all three turns", got)
 	}
 	// What each leg asked for: the gate's instance first, then the one it was served on.
-	sticky := []string{"", "#1", "#1"}
 	for _, leg := range []struct{ path, mapping string }{
 		{"/v1/audio/transcriptions/live", liveInstASRMap},
 		{"/v1/audio/speech", liveInstTTSMap},
 	} {
-		want := []string{leg.mapping + "#0"}
-		for _, s := range sticky[1:] {
-			want = append(want, leg.mapping+s)
-		}
+		want := []string{leg.mapping + "#0", leg.mapping + "#1", leg.mapping + "#1"}
 		if got := w.rec.preferred(leg.path); !slices.Equal(got, want) {
 			t.Fatalf("%s preferred = %v, want %v", leg.path, got, want)
 		}
 	}
-	if got := w.rec.preferred("/v1/chat/completions"); !slices.Equal(got, repeat(liveInstChatMap+"#0", 3)) {
+	if got := w.rec.preferred("/v1/chat/completions"); !slices.Equal(got, repeatKey(liveInstChatMap+"#0", 3)) {
 		t.Fatalf("LLM leg preferred = %v, want the gate's chat instance on every turn", got)
 	}
 
