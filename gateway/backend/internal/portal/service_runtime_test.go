@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -4499,5 +4501,71 @@ func TestNewServiceDefaultsTheInstanceIdleSettings(t *testing.T) {
 		if svc.instanceIdleFactor != tc.wantFactor || svc.instanceIdleFloorSeconds != tc.wantFloor {
 			t.Errorf("%s: factor %v floor %d, want %v / %d", tc.name, svc.instanceIdleFactor, svc.instanceIdleFloorSeconds, tc.wantFactor, tc.wantFloor)
 		}
+	}
+}
+
+// A spec whose minimum instance count is above the real-time concurrency its
+// mapping's audio ramp measured as a ceiling carries a warning (it is not
+// refused): only a ramp stopped by performance measured one, and a measured 0
+// counts. Read-only: derived on every read, never taken from a request.
+func TestRuntimeSpecMinExceedsRealtimeWarning(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+	ramp := func(count int, limit string) {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit = count, limit
+		if err := routeStore.UpdateMapping(ctx, m); err != nil {
+			t.Fatalf("UpdateMapping: %v", err)
+		}
+	}
+	put := func(minInstances int) RuntimeSpecDTO {
+		t.Helper()
+		var req PutRuntimeSpecRequest
+		body := fmt.Sprintf(`{"enabled":true,"binary":"/usr/local/bin/audio-server","replicable":true,"min_instances":%d,"max_instances":8,"instances_min_exceeds_realtime":true}`, minInstances)
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		return dto
+	}
+	cases := []struct {
+		name     string
+		count    int
+		limit    string
+		min      int
+		expected bool
+	}{
+		{"no ramp yet", 0, "", 3, false},
+		{"min above a measured ceiling", 2, routing.AudioLimitPerformance, 3, true},
+		{"min at the ceiling", 2, routing.AudioLimitPerformance, 2, false},
+		{"a measured 0 counts", 0, routing.AudioLimitPerformance, 1, true},
+		{"no minimum", 0, routing.AudioLimitPerformance, 0, false},
+		{"a lower bound (resources)", 1, routing.AudioLimitResources, 3, false},
+		{"a lower bound (cap)", 1, routing.AudioLimitCap, 3, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ramp(tc.count, tc.limit)
+			if got := put(tc.min).InstancesMinExceedsRealtime; got != tc.expected {
+				t.Fatalf("PUT echo instances_min_exceeds_realtime = %v, want %v", got, tc.expected)
+			}
+			got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+			if err != nil {
+				t.Fatalf("GetRuntimeSpec: %v", err)
+			}
+			if got.InstancesMinExceedsRealtime != tc.expected {
+				t.Fatalf("GET instances_min_exceeds_realtime = %v, want %v", got.InstancesMinExceedsRealtime, tc.expected)
+			}
+			if raw := string(wireKeys(t, got)["instances_min_exceeds_realtime"]); raw != strconv.FormatBool(tc.expected) {
+				t.Fatalf("wire instances_min_exceeds_realtime = %q, want %v (always present)", raw, tc.expected)
+			}
+		})
 	}
 }

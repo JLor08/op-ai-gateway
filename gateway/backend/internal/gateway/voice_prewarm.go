@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -34,7 +33,11 @@ import (
 // benchmark result) and a pre-warm is not worth a change to that path. What the two do share is
 // the pieces that define the request itself -- the body type (speechBenchmarkRequest), the
 // upstream path (upstreamPath for the speech flavor), the content type and the credential
-// (upstreamAuthCtx).
+// (upstreamAuthCtx) -- and the reading of the answer (readBenchmarkRefusal, readBenchmarkAnswer).
+//
+// Unbilled is not invisible: while it runs the synthesis is an in-flight request on the target's
+// instance (an ActiveRequest on its InstanceKey), so the per-instance cap counts it and routing does
+// not send a session's first turn to an instance busy priming as if it were free.
 
 // voicePrimingText is what the priming synthesis speaks: a few words, enough for the model to run
 // its whole synthesis path once and short enough that the clip is quick. It is fixed so every
@@ -77,20 +80,25 @@ func (s *Server) startVoicePrewarm(tts routing.Target, voice string) {
 	if !s.voicePrewarmEnabled() || voice == "" {
 		return
 	}
+	done := s.voicePrewarmDone
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), voicePrimingTimeout)
 		defer cancel()
 		if err := s.primeSpeechVoice(ctx, tts, voice); err != nil {
 			slog.Warn("voice prewarm: priming synthesis failed", "model", tts.Model, "route", tts.RouteID, "voice", voice, "err", err)
 		}
+		if done != nil {
+			done()
+		}
 	}()
 }
 
 // primeSpeechVoice fires ONE short synthesis for tts and voice straight at the target's upstream, to
 // make its first real synthesis warm. It reads the answer to its end and discards it, and returns
-// nil on a 2xx answer; any failure (no native relay, a transport error, a non-2xx answer, an
-// unreadable body) is returned for the caller to log -- priming is best-effort and must never fail
-// the ticket or the session, so there is nothing here to retry or recover.
+// nil on a 2xx answer with audio in it; any failure (no native relay, a transport error, a non-2xx
+// answer, an unreadable, empty or oversized body) is returned for the caller to log -- priming is
+// best-effort and must never fail the ticket or the session, so there is nothing here to retry or
+// recover. From the call to the end of the answer it is an in-flight request on tts's instance.
 //
 // It runs on ctx as given: the caller bounds it (voicePrimingTimeout) and ends it. It writes no
 // usage row and stores nothing (see the file comment): the one request is a plain non-stream
@@ -107,21 +115,29 @@ func (s *Server) primeSpeechVoice(ctx context.Context, tts routing.Target, voice
 		return fmt.Errorf("voice prewarm: build request: %w", err)
 	}
 	ctx = s.upstreamAuthCtx(ctx, tts)
+	path := upstreamPath(tts, apiFlavorSpeech, endpointSpeech)
 
-	resp, err := proxy.ProxyNative(ctx, tts, upstreamPath(tts, apiFlavorSpeech, endpointSpeech), body, jsonContentType)
+	id := nextRequestID()
+	s.Active.Add(ActiveRequest{
+		ID: id, ServerName: s.serverName(tts.ServerID), ServerID: tts.ServerID, InstanceKey: tts.InstanceKey,
+		Model: tts.Model, APIFlavor: apiFlavorSpeech, BillingUnit: billingUnitFor(apiFlavorSpeech),
+		ProviderPath: path, ProviderModel: effectiveProviderModel(tts, tts.Model), StartedAt: time.Now(),
+	})
+	defer s.Active.Remove(id)
+
+	resp, err := proxy.ProxyNative(ctx, tts, path, body, jsonContentType)
 	if err != nil {
 		return fmt.Errorf("voice prewarm: synthesis request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
-		return fmt.Errorf("voice prewarm: the upstream answered HTTP %d: %s", resp.StatusCode, speechBenchmarkErrorText(errBody))
+	if refusal, refused := readBenchmarkRefusal(resp); refused {
+		return fmt.Errorf("voice prewarm: the upstream answered HTTP %d: %s", refusal.status, refusal.text)
 	}
-	// The clip is only discarded, so it is not held (no size cap is needed: nothing accumulates, and
-	// ctx bounds the time). It is read to the end because the upstream's synthesis is the point.
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return fmt.Errorf("voice prewarm: the answer could not be read to its end: %w", err)
+	// The clip is read to its end because the upstream's synthesis is the point, then dropped; the
+	// benchmark's bound keeps a runaway answer from accumulating, and ctx bounds the time.
+	if _, _, err := readBenchmarkAnswer(resp.Body, speechBenchmarkMaxAudioBytes, time.Now); err != nil {
+		return fmt.Errorf("voice prewarm: %w", err)
 	}
 	return nil
 }

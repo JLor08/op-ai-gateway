@@ -102,3 +102,55 @@ func TestPeekInstanceGoneKeepsTheBody(t *testing.T) {
 		}
 	}
 }
+
+// The once-rule every re-selecting path applies: an instance k >= 1, on a request
+// that has not lost an instance yet.
+func TestReselectableIsTheOnceRule(t *testing.T) {
+	k2 := routing.Target{InstanceKey: "map#2"}
+	cases := []struct {
+		name   string
+		target routing.Target
+		req    inference.Request
+		want   bool
+	}{
+		{"instance 2, first attempt", k2, inference.Request{}, true},
+		{"instance 0", routing.Target{InstanceKey: "map#0"}, inference.Request{}, false},
+		{"a target without instances", routing.Target{}, inference.Request{}, false},
+		{"a re-selection", routing.Target{InstanceKey: "map#3"}, withLostInstance(inference.Request{}, k2), false},
+	}
+	for _, tc := range cases {
+		if got := reselectable(tc.target, tc.req); got != tc.want {
+			t.Errorf("%s: reselectable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A gone instance's refusal that cannot be moved is answered as the gateway answers a
+// chat completion's refusal: provider.unavailable under 502, its agent code kept
+// only inside the error, never in the client's answer.
+func TestGoneErrorIsTheGatewaysAnswer(t *testing.T) {
+	resp := &provider.ProxyResponse{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"runtime.instance_no_capacity","message":"busy"}}`))}
+	if !peekInstanceGone(resp) {
+		t.Fatal("peekInstanceGone = false for a gone instance's refusal")
+	}
+	err := goneError(resp)
+	if !isInstanceGoneError(err) {
+		t.Fatalf("goneError = %v, want the router's refusal kept as a RouterError", err)
+	}
+	if code, status := completionErrorCode(err), completionHTTPStatus(err); code != "provider.unavailable" || status != http.StatusBadGateway {
+		t.Fatalf("answered as %s %d, want provider.unavailable 502", code, status)
+	}
+	if body := completionErrorResponse(err); strings.Contains(fmt.Sprint(body), "runtime.") {
+		t.Fatalf("client body %+v carries the agent's code", body)
+	}
+}
+
+// relayAgain runs the caller's path again with the lost instance excluded.
+func TestRelayAgainExcludesTheLostInstance(t *testing.T) {
+	var got inference.Request
+	hook := relayAgain(inference.Request{Model: "m"}, func(again inference.Request) { got = again })
+	hook(routing.Target{InstanceKey: "map#2"}, errors.New("gone"))
+	if got.Model != "m" || strings.Join(got.ExcludeInstanceKeys, ",") != "map#2" {
+		t.Fatalf("ran again with %+v, want model m excluding map#2", got)
+	}
+}

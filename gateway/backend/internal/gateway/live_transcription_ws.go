@@ -257,7 +257,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	// Open the full-duplex loopback to the gateway's own /v1 endpoint. Do returns as
 	// soon as the response headers arrive, with the SSE body still open and the
 	// request body (pr) still streaming.
-	resp, err := s.openLiveLoopback(ctx, claims, pr)
+	resp, err := s.openLiveLoopback(ctx, claims, pr, false, nil)
 	if err != nil {
 		if ctx.Err() == nil {
 			writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription unavailable"}))
@@ -286,6 +286,10 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // the browser session cookie (requireInternalOrBearerAnyScope). The model name and
 // the PCM params the ticket sealed become the query the public endpoint re-resolves
 // and re-gates, so the portal path runs the exact same relay a bearer client would.
+// realtime marks the request as a voice chat turn's ASR leg (realtimeRequiredHeaderName),
+// which /v1 then routes under the real-time gate; a live session sets it false. sticky is the
+// voice chat session's instance memory, whose ASR leg's last instance the request names; a
+// live session passes nil.
 //
 // The body is an io.PipeReader -- not one of the length-carrying reader types
 // net/http special-cases -- so the request is sent chunked and streamed, never
@@ -306,7 +310,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // body, #333) or answers a final status (the refusal, which Do then returns at once).
 // DefaultTransport's ExpectContinueTimeout bounds the wait, so a /v1 that somehow neither
 // reads nor refuses cannot stall the dial forever.
-func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, pr io.Reader) (*http.Response, error) {
+func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, pr io.Reader, realtime bool, sticky *voiceStickiness) (*http.Response, error) {
 	q := url.Values{}
 	q.Set("model", claims.Target.Model)
 	q.Set("sample_rate", strconv.Itoa(claims.SampleRate))
@@ -324,6 +328,10 @@ func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, 
 	req.Header.Set(csrfHeaderName, "1")
 	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
 	req.Header.Set(internalUserHeaderName, claims.UserID)
+	if realtime {
+		req.Header.Set(realtimeRequiredHeaderName, "1")
+	}
+	sticky.prefer(req, voiceLegASR)
 	return http.DefaultClient.Do(req)
 }
 

@@ -102,8 +102,11 @@ type InstanceActivityChecker interface {
 func (r *Resolver) SetInstanceActivityChecker(c InstanceActivityChecker) { r.instanceActivity = c }
 
 // DemandSignal says a gateway model needs another instance: a request is
-// about to wait in the admission queue because every candidate it could use
-// was at capacity, at least one of them an instance.
+// about to wait in the admission queue -- or, one that must not wait
+// (inference.Request.NoPark) or a pinned one (which waits only when it needs a
+// free live slot and cannot be served without one), has just been served on a
+// busy candidate -- because every candidate it could use was at capacity, at
+// least one of them an instance.
 type DemandSignal struct {
 	// Model is the gateway model whose instances were all busy -- a group
 	// member's own name, never the group's.
@@ -111,7 +114,9 @@ type DemandSignal struct {
 	// APIFlavor is the coarse flavor (NormalizeAPIFlavor) the model was
 	// resolved under, the one ActiveMappingsForModel keys by.
 	APIFlavor string
-	// ServerID restricts the new instance to one server; "" = any server.
+	// ServerID restricts the new instance to one server -- a pinned
+	// request's (a token's affinity pin, a server override), which no other
+	// server can serve; "" = any server.
 	ServerID string
 	// Live is true when the demand is for a live slot (a live session).
 	Live bool
@@ -123,11 +128,24 @@ type DemandSignal struct {
 }
 
 // DemandSink receives demand signals. Signal is called on the request path,
-// from as many goroutines as there are requests parking, and once on every
-// admission turn a request spends parked -- so a request that waits through
-// several turns signals several times, and a sink that wants one scale-up
-// per need coalesces them. It must not block: the request is about to wait,
-// and a sink that blocked would hold it before it ever reached the queue.
+// from as many goroutines as there are requests parking, once per park turn
+// per at-capacity member with instance candidates: a plain model is its own
+// one member, and a group request parked on two members whose instances are
+// all busy signals for each, by its own model. So a request that waits
+// through several turns signals several times, and a sink that wants one
+// scale-up per need coalesces them. It is called only for a request that
+// actually parks: not on the fail-open path without a queue, not when the
+// request's admission deadline has passed, and not when the queue has no
+// room for it (AdmissionRoom) -- and once for a request that must not park
+// (inference.Request.NoPark), after it was served on a busy candidate where
+// it would have parked: for a group, for the walk's first at-capacity member
+// with instance candidates, which need not be the member that served it. A
+// pinned request served on a busy instance of its pinned server signals once
+// too, restricted to that server, and a parked pinned request once per park
+// turn. A request that could not be served at all signals nothing, and neither does
+// a check-only resolve (inference.Request.CheckOnly). It must not block: the
+// request is about to wait, or to be served, and a sink that blocked would
+// hold it there.
 type DemandSink interface {
 	Signal(DemandSignal)
 }
@@ -139,10 +157,14 @@ type LiveSlotChecker interface {
 	LiveHeld(instanceKey string) bool
 }
 
-// SetLiveSlotChecker installs the live-slot source a live session's resolve
-// (inference.Request.LiveSession) judges instance candidates by. Leaving it
-// unset (nil) means no slot is known to be held: a session is routed as any
-// request is, and only its own slot acquire can find the instance taken.
+// SetLiveSlotChecker installs the live-slot source that the resolve of a
+// request needing a free live slot -- a live session
+// (inference.Request.LiveSession) and every transcription, buffered or not --
+// judges its candidates by, in a pool that holds an instance candidate: the
+// instances, and a mixed fleet's mappings without instances beside them. Leaving
+// it unset (nil) means no slot is known to be held: such a request is routed as
+// any request is, and only a session's own slot acquire, or a buffered
+// transcription's held check, can find the slot taken.
 func (r *Resolver) SetLiveSlotChecker(c LiveSlotChecker) { r.liveSlots = c }
 
 // SetDemandSink installs the receiver of demand signals. Leaving it unset

@@ -11,10 +11,12 @@ import "context"
 // keeping copies of the rules that could drift from the resolver's.
 
 // CandidateServesNow reports whether c passes the gates every candidate of a
-// request passes first (selectCandidate's first pass): its server selectable,
-// its application reachable by the resolver's reachability checker, and its
-// server not held by a benchmark (the resolver's busy checker). A checker left
-// unset passes every candidate, as it does for a request.
+// request passes first: its server selectable, its application reachable by the
+// resolver's reachability checker, and its server not held by a benchmark (the
+// resolver's busy checker). A checker left unset passes every candidate. It is
+// the one statement of those gates: selectCandidate's first pass and a sticky
+// pin's check (affinityServer) call it too, so the scaler, a fresh selection and
+// a pin cannot disagree about where a request may go.
 func (r *Resolver) CandidateServesNow(c MappingCandidate) bool {
 	if !serverSelectable(c.Server) {
 		return false

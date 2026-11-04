@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/provider"
@@ -447,8 +448,9 @@ type ApplicationDTO struct {
 	Weight             int      `json:"weight"`
 	TimeoutMS          int      `json:"timeout_ms"`
 	AffinityTTLSeconds int      `json:"affinity_ttl_seconds"`
-	// AdmissionQueueTimeoutSeconds bounds how long an unpinned request waits in the
-	// CP4 admission queue for a free concurrency slot; 0 = wait until the client aborts.
+	// AdmissionQueueTimeoutSeconds bounds how long an unpinned request -- or a pinned one
+	// that needs a free live slot on this application's server -- waits in the CP4
+	// admission queue for a free concurrency slot; 0 = wait until the client aborts.
 	AdmissionQueueTimeoutSeconds int    `json:"admission_queue_timeout_seconds"`
 	Status                       string `json:"status"`
 	AlwaysReachable              bool   `json:"always_reachable"`
@@ -1994,7 +1996,16 @@ type ModelMappingDTO struct {
 	MetricsLocked    bool                       `json:"metrics_locked"`
 	MetricsSource    string                     `json:"metrics_source"`
 	MetricsUpdatedAt *time.Time                 `json:"metrics_updated_at,omitempty"`
-	CreatedAt        time.Time                  `json:"created_at"`
+	// The audio metrics (#340; routing.ModelMapping carries their meaning), written
+	// by the audio benchmark and editable through UpdateMappingRequest. 0 and "" are
+	// unknown, except the count beside a limit. AudioMetricsUpdatedAt is when a run
+	// or an edit last wrote them, null for never; read-only.
+	AudioRateX               float64    `json:"audio_rate_x"`
+	AudioTTFAMS              int64      `json:"audio_ttfa_ms"`
+	AudioRealtimeConcurrency int        `json:"audio_realtime_concurrency"`
+	AudioConcurrencyLimit    string     `json:"audio_concurrency_limit"`
+	AudioMetricsUpdatedAt    *time.Time `json:"audio_metrics_updated_at"`
+	CreatedAt                time.Time  `json:"created_at"`
 	// ImagesOnly reports that the mapping's effective flavors
 	// (routing.EffectiveFields: its runtime spec's for a server_agent mapping
 	// that has one, its application's otherwise) are images-only
@@ -2083,6 +2094,17 @@ type UpdateMappingRequest struct {
 	MaxConcurrency               *int     `json:"max_concurrency,omitempty"`
 	RecommendedConcurrency       *int     `json:"recommended_concurrency,omitempty"`
 	GenTokensPerSecondAtCapacity *float64 `json:"gen_tokens_per_second_at_capacity,omitempty"`
+	// The audio metrics (#340; routing.ModelMapping carries their meaning),
+	// editable like the text metrics above: a present key is the operator's
+	// value, written with manual provenance whatever metrics_locked says, and the
+	// lock then keeps the benchmark from overwriting it. The real-time count and
+	// its limit are one pair (applyAudioMetrics): a count needs one of the three
+	// limits beside it, and a limit of "" sent alone clears both. A value no
+	// measurement could yield is ErrMappingMetricInvalid.
+	AudioRateX               *float64 `json:"audio_rate_x,omitempty"`
+	AudioTTFAMS              *int64   `json:"audio_ttfa_ms,omitempty"`
+	AudioRealtimeConcurrency *int     `json:"audio_realtime_concurrency,omitempty"`
+	AudioConcurrencyLimit    *string  `json:"audio_concurrency_limit,omitempty"`
 	// IsMTP/VisionCapable are the LEGACY two-state fields, kept as the
 	// COMPATIBILITY path for a client that submits every field on every save
 	// -- an old cached portal bundle during a rollout, or a script. They are
@@ -2493,6 +2515,10 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	mapping.RecommendedConcurrency = effRecConc
 	mapping.GenTokensPerSecondAtCapacity = effGenCap
 	mapping.EnergyWhPerToken = effEnergy
+	audioMask, err := applyAudioMetrics(&mapping, req)
+	if err != nil {
+		return ModelMappingDTO{}, err
+	}
 	// req.IsMTP / req.VisionCapable are NOT merged onto the mapping: it has
 	// no such field any more (migration 79 dropped the columns). The
 	// operative capability write is the differs-from-stored rule further
@@ -2521,11 +2547,17 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 		MaxConcurrency:               req.MaxConcurrency != nil,
 		RecommendedConcurrency:       req.RecommendedConcurrency != nil,
 		GenTokensPerSecondAtCapacity: req.GenTokensPerSecondAtCapacity != nil,
+		AudioRateX:                   audioMask.AudioRateX,
+		AudioTTFAMS:                  audioMask.AudioTTFAMS,
+		AudioConcurrencyPair:         audioMask.AudioConcurrencyPair,
 	}
 	if metricsMask.Any() {
 		now2 := s.clock().UTC()
 		mapping.MetricsSource = "manual"
 		mapping.MetricsUpdatedAt = &now2
+		if metricsMask.AnyAudio() {
+			mapping.AudioMetricsUpdatedAt = &now2
+		}
 	}
 	// The mapping's STORED capability rows, read BEFORE the write so a read
 	// failure aborts the whole update instead of letting it proceed on a
@@ -3175,6 +3207,11 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		MetricsLocked:                mapping.MetricsLocked,
 		MetricsSource:                mapping.MetricsSource,
 		MetricsUpdatedAt:             mapping.MetricsUpdatedAt,
+		AudioRateX:                   mapping.AudioRateX,
+		AudioTTFAMS:                  mapping.AudioTTFAMS,
+		AudioRealtimeConcurrency:     mapping.AudioRealtimeConcurrency,
+		AudioConcurrencyLimit:        mapping.AudioConcurrencyLimit,
+		AudioMetricsUpdatedAt:        mapping.AudioMetricsUpdatedAt,
 		CreatedAt:                    mapping.CreatedAt,
 		ImagesOnly:                   markers.ImagesOnly,
 		AudioOnly:                    markers.AudioOnly,
@@ -3203,6 +3240,71 @@ func validateMappingMetrics(m mappingMetrics) error {
 		return ErrMappingMetricInvalid
 	}
 	return nil
+}
+
+// applyAudioMetrics validates the audio metrics req supplies and lays them over
+// mapping, and returns the mask of the columns it supplied (only the audio flags
+// are set). Every refusal is ErrMappingMetricInvalid -- the code an invalid text
+// metric answers -- and leaves mapping untouched:
+//
+//   - a rate that is not a finite number of 0 or more, or a negative time to first
+//     audio: no measurement yields one (0 is "not measured", as for the text metrics);
+//   - a count without a limit beside it: the count means nothing without the reason
+//     the ramp stopped, so a count alone would read as a measured ceiling no ramp
+//     reported;
+//   - a limit other than "" or one of the three stop reasons, or one of the three
+//     without a count of 0 or more beside it -- a measured 0 is a result, not a blank;
+//   - a limit of "" beside a non-zero count. "" sent alone (or with a count of 0)
+//     clears the pair: no ramp, count unknown.
+func applyAudioMetrics(mapping *routing.ModelMapping, req UpdateMappingRequest) (routing.MappingMetricsMask, error) {
+	var mask routing.MappingMetricsMask
+	if req.AudioRateX != nil {
+		if r := *req.AudioRateX; math.IsNaN(r) || math.IsInf(r, 0) || r < 0 {
+			return mask, ErrMappingMetricInvalid
+		}
+	}
+	if req.AudioTTFAMS != nil && *req.AudioTTFAMS < 0 {
+		return mask, ErrMappingMetricInvalid
+	}
+	count, limit, pair, err := audioConcurrencyPair(req.AudioRealtimeConcurrency, req.AudioConcurrencyLimit)
+	if err != nil {
+		return mask, err
+	}
+	if req.AudioRateX != nil {
+		mapping.AudioRateX, mask.AudioRateX = *req.AudioRateX, true
+	}
+	if req.AudioTTFAMS != nil {
+		mapping.AudioTTFAMS, mask.AudioTTFAMS = *req.AudioTTFAMS, true
+	}
+	if pair {
+		mapping.AudioRealtimeConcurrency, mapping.AudioConcurrencyLimit, mask.AudioConcurrencyPair = count, limit, true
+	}
+	return mask, nil
+}
+
+// audioConcurrencyPair is applyAudioMetrics' rule for the real-time count and its
+// limit: the pair to write and true, nothing and false when the request names
+// neither, or ErrMappingMetricInvalid (see applyAudioMetrics for the cases).
+func audioConcurrencyPair(count *int, limit *string) (int, string, bool, error) {
+	if limit == nil {
+		if count != nil {
+			return 0, "", false, ErrMappingMetricInvalid
+		}
+		return 0, "", false, nil
+	}
+	switch *limit {
+	case "":
+		if count != nil && *count != 0 {
+			return 0, "", false, ErrMappingMetricInvalid
+		}
+		return 0, "", true, nil
+	case routing.AudioLimitPerformance, routing.AudioLimitResources, routing.AudioLimitCap:
+		if count == nil || *count < 0 {
+			return 0, "", false, ErrMappingMetricInvalid
+		}
+		return *count, *limit, true, nil
+	}
+	return 0, "", false, ErrMappingMetricInvalid
 }
 
 // metricValuesPresent reports whether any MEASURED value was supplied (the lock flag

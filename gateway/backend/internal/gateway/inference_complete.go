@@ -75,10 +75,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	resp, err := s.Provider.Complete(provCtx, target, providerReq)
 	if err != nil && reselectsLostInstance(target, req, err) {
 		// The instance is gone (see instance_reselect.go): nothing has been written
-		// to the client and nothing recorded, so the request starts over on another
-		// instance -- re-resolved, re-registered, and recorded once, as the attempt
-		// that answers. Removed from the active registry first, so the lost
-		// instance's in-flight count is free before the selection reads it.
+		// to the client and nothing recorded. The attempt leaves the instance first --
+		// its active row removed, which frees its count on the instance and its server
+		// and wakes a request parked for that server, so a re-resolve that parks does
+		// not wait behind this attempt -- and the request starts over with the
+		// instance excluded: re-resolved, registered on the instance it lands on, and
+		// recorded once, as the attempt that answers. The once-rule keeps that second
+		// run from being re-selected again.
 		slog.Info("inference: the routed instance is gone; re-selecting once", "path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "instance", target.InstanceKey, "err", err)
 		s.Active.Remove(id)
 		s.complete(w, r, token, withLostInstance(req, target), raw, render)
@@ -995,6 +998,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrVoiceUnavailable) {
 		message = "no usable server offers the requested voice right now"
 	}
+	if errors.Is(err, routing.ErrNoRealtimeCandidate) {
+		message = voiceNoRealtimeMessage
+	}
 	if errors.Is(err, routing.ErrAdmissionQueueTimeout) {
 		message = "capacity queue timed out"
 	}
@@ -1050,6 +1056,11 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, routing.ErrServerOverrideServerUnavailable) {
 		return http.StatusBadGateway
 	}
+	// A voice turn's model measured too slow for real time (routing.ErrNoRealtimeCandidate):
+	// the 409 the ticket mint answers it with, since a retry does not make the model faster.
+	if errors.Is(err, routing.ErrNoRealtimeCandidate) {
+		return http.StatusConflict
+	}
 	// ErrModelNotCapable, ErrNoModelRoute and ErrNoHealthyHost had no cases here
 	// and all three fell through to 502, which made a routing refusal
 	// indistinguishable from an upstream outage. A capability gate that refuses
@@ -1081,7 +1092,7 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errTranscriptionTooLarge) {
 		return http.StatusRequestEntityTooLarge
 	}
-	// A transcription refused because a live session holds the model's one slot
+	// A transcription refused because a live session holds its instance's one slot
 	// (errTranscriptionLiveBusy): the same transient 503 the live bearer path's busy
 	// reject uses -- a retry, once the live session ends, is what cures it.
 	if errors.Is(err, errTranscriptionLiveBusy) {
@@ -1116,6 +1127,8 @@ func completionErrorCode(err error) string {
 		return routing.ErrNoHealthyHost.Error()
 	case errors.Is(err, routing.ErrVoiceUnavailable):
 		return routing.ErrVoiceUnavailable.Error()
+	case errors.Is(err, routing.ErrNoRealtimeCandidate):
+		return voiceChatNoRealtimeModel
 	case errors.Is(err, routing.ErrAdmissionQueueTimeout):
 		return routing.ErrAdmissionQueueTimeout.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueFull):

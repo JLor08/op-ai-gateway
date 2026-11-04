@@ -401,13 +401,15 @@ var errTranscriptionTooLarge = errors.New(codeRequestBodyTooLarge)
 // completionErrorCode, completionErrorResponse), so the response and the usage row
 // cannot disagree.
 //
-// It is rarely the answer for a replicable spec's instances. Each instance is its own
-// slot, and a live session counts as a request in flight on its instance, so a buffered
-// request is routed beside a live one onto a free sibling, or waits in the admission
-// queue for one; a live session that loses the race for a slot is re-selected onto a
-// sibling, and one that finds every slot held waits likewise. The clean 503 stays the
-// answer for a mapping without instances, whose one slot is taken, and for the race
-// the advisory check below cannot close.
+// It is rarely the answer for a model with instances. Each instance is its own slot,
+// and routing passes over a held slot for every transcription -- buffered, details and
+// live alike, whatever the spec's instance parallelism would leave room for, and a
+// mixed fleet's mapping without instances included -- so the request goes to a slot
+// that is free, or waits in the admission queue for one; a live session that loses the
+// race for a slot is selected again like one that found it held. The clean 503 stays
+// the answer for a model served only by mappings without instances, whose slot is
+// taken, and for the race the advisory check below cannot close: a session that takes
+// the slot between the resolve and the check.
 var errTranscriptionLiveBusy = errors.New(liveBearerBusyCode)
 
 // transcriptionInferenceShape is the shape serveTranscription hands the ONE
@@ -893,7 +895,10 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	// buffered transcription (or /details) sent to it now would collide at the upstream
 	// and bill an honest loud zero (§11.4(4)); refuse it cleanly with the live path's own
 	// busy 503 instead. Keyed by the instance, so a live session on one instance of a
-	// replicable spec never refuses a request routed to another. Checked after the
+	// replicable spec never refuses a request routed to another -- and for a model with
+	// instances the resolve has already passed over every held slot, so this only
+	// catches a session that started after the resolve; for a model served only by
+	// mappings without instances it is the answer whenever the slot is taken. Checked after the
 	// resolve and the served/multipart gates so a permanent refusal still wins, and
 	// before any upstream body is built. The check is an advisory snapshot
 	// (liveSessions.LiveHeld), not a lock: a live session may start right after it,

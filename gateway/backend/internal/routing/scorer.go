@@ -22,14 +22,17 @@ const (
 	// viability gate and BOUNDED (each throughput term clamped) so speed refines the
 	// ranking among already-viable candidates — competing with priority/weight —
 	// without ever overriding a health/load penalty or rescuing a non-viable server.
-	// The total tiebreak is <= 70 points, well below errorRatePenalty (200) and
-	// staleTelemetryPenalty (500), and ~3.5 priority levels (priorityMultiplier).
+	// The two text terms total <= 70 points; a request with the speech or
+	// transcription capability adds the audio term (<= 50), so the whole tiebreak
+	// stays <= 120, below errorRatePenalty (200) and staleTelemetryPenalty (500).
 	// Weights are tunable. All-zero metrics contribute 0 (the no-op invariant: an
 	// unmeasured mapping scores exactly as before P4).
 	genThroughputWeight      = 0.25 // points per generation tok/s ...
 	genThroughputBonusCap    = 50.0 // ... clamped here (cap reached at 200 tok/s)
 	promptThroughputWeight   = 0.01 // points per prefill tok/s ...
 	promptThroughputBonusCap = 20.0 // ... clamped here (cap reached at 2000 tok/s)
+	audioRateWeight          = 10.0 // points per x of real time (audio_rate_x) ...
+	audioRateBonusCap        = 50.0 // ... clamped here (cap reached at 5x real time)
 )
 
 type Route struct {
@@ -55,14 +58,22 @@ type Route struct {
 	MaxConcurrency               int     // OOM-safe ceiling (0 = unknown)
 	GenTokensPerSecondAtCapacity float64 // per-request gen tok/s at RecommendedConcurrency
 	CurrentLoad                  int     // in-flight requests on this route's server (k)
+
+	// AudioRateX is the mapping's measured single-stream audio rate (seconds of
+	// audio per wall second; 0 = unmeasured). Audio is whether the request carries
+	// the speech or transcription capability: only such a request scores the rate,
+	// so a model that also chats is not ranked on its audio speed for a chat.
+	AudioRateX float64
+	Audio      bool
 }
 
 // scoringRoute builds the Route used to score one candidate against `model`, given its
 // server telemetry (tel, with hasTel reporting whether telemetry was found) and the
 // current load k (in-flight requests, from activity tracking when available, else
-// tel.ActiveRequests). Shared by argmaxByScore and ScoreModelServers so the two callers
-// score identically off the same field assembly.
-func scoringRoute(c MappingCandidate, tel ServerTelemetry, hasTel bool, k int, model string) Route {
+// tel.ActiveRequests). audio says the request is a speech or transcription one
+// (audioRequest), which scores the mapping's audio rate. Shared by argmaxByScore and
+// ScoreModelServers so the two callers score identically off the same field assembly.
+func scoringRoute(c MappingCandidate, tel ServerTelemetry, hasTel bool, k int, model string, audio bool) Route {
 	route := Route{
 		ID:             c.Mapping.ID,
 		Model:          model,
@@ -83,6 +94,9 @@ func scoringRoute(c MappingCandidate, tel ServerTelemetry, hasTel bool, k int, m
 		MaxConcurrency:               c.Mapping.MaxConcurrency,
 		GenTokensPerSecondAtCapacity: c.Mapping.GenTokensPerSecondAtCapacity,
 		CurrentLoad:                  k,
+
+		AudioRateX: c.Mapping.AudioRateX,
+		Audio:      audio,
 	}
 	if hasTel {
 		route.TelemetryAt = tel.ReportedAt
@@ -163,16 +177,28 @@ func effectiveGenTPS(route Route) float64 {
 }
 
 // metricTiebreak returns a bounded refinement (<= genThroughputBonusCap +
-// promptThroughputBonusCap) from a mapping's measured speed metrics. Each throughput term
-// is clamped so an implausibly large stored value cannot dominate; all-zero metrics return
-// 0 (the no-op invariant). The generation-throughput term is now load-aware: it uses
-// effectiveGenTPS(route), which shrinks the single-request gen tok/s toward
-// gen_tokens_per_second_at_capacity as the route's server fills (CurrentLoad rises). With
-// no capacity curve or an idle server it collapses to the flat P4a gen value.
+// promptThroughputBonusCap + audioRateBonusCap, 120 points; the audio term only for a
+// speech or transcription request's route, Route.Audio) from a mapping's measured speed
+// metrics. Each term is clamped so an implausibly large stored value cannot dominate;
+// all-zero metrics return 0 (the no-op invariant). The generation-throughput term is
+// load-aware: it uses effectiveGenTPS(route), which shrinks the single-request gen tok/s
+// toward gen_tokens_per_second_at_capacity as the route's server fills (CurrentLoad
+// rises). With no capacity curve or an idle server it collapses to the flat P4a gen value.
 func metricTiebreak(route Route) float64 {
 	bonus := clampBonus(effectiveGenTPS(route), genThroughputWeight, genThroughputBonusCap)
 	bonus += clampBonus(route.PromptTokensPerSecond, promptThroughputWeight, promptThroughputBonusCap)
+	if route.Audio {
+		bonus += audioTiebreak(route.AudioRateX)
+	}
 	return bonus
+}
+
+// audioTiebreak is the audio term of a speech or transcription request's score: 10
+// points per x of real time the mapping was measured at, at most 50 -- bounded like the
+// text terms, so a fast model refines the ranking among viable candidates and never
+// outweighs a health or load penalty. An unmeasured rate (0) earns nothing.
+func audioTiebreak(rateX float64) float64 {
+	return clampBonus(rateX, audioRateWeight, audioRateBonusCap)
 }
 
 // clampBonus returns min(v*weight, capValue) for a finite v > 0, else 0. Guards NaN/Inf and

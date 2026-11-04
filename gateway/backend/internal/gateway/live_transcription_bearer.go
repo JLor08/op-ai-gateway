@@ -23,11 +23,11 @@ import (
 )
 
 // liveBearerBusyCode is the wire code a bearer live-transcription request is refused with
-// when no instance it could use has a free live slot and it cannot wait for one (a mapping
-// without instances, whose one slot is taken). It is API surface: a programmatic client
-// branches on it to back off. 503 (not 409) because it is transient -- the slot frees when
-// the active session ends -- and it is the HTTP twin of the WebSocket path's
-// StatusTryAgainLater busy close.
+// when no instance it could use has a free live slot and it cannot wait for one (a model
+// served only by mappings without instances, whose slot is taken). It is API surface: a
+// programmatic client branches on it to back off. 503 (not 409) because it is transient
+// -- the slot frees when the active session ends -- and it is the HTTP twin of the
+// WebSocket path's StatusTryAgainLater busy close.
 const liveBearerBusyCode = "transcription.live_busy"
 
 // liveSlotAcquireHook is a TEST-ONLY seam: when non-nil, acquireLiveSession calls it with
@@ -117,26 +117,34 @@ func (s *Server) acquireLiveSessionOrRefuse(w http.ResponseWriter, r *http.Reque
 const maxLiveSlotRaces = routing.MaxInstanceIndex + 1
 
 // acquireLiveSession selects an instance for a live session (req.LiveSession, so the
-// resolver passes over a held slot, and parks the session when every instance of a
-// replicable spec is held) and takes that instance's live slot, returning the target
-// and the slot's release.
+// resolver passes over a held slot, and parks the session when every slot it could use
+// is held) and takes that instance's live slot, returning the target and the slot's
+// release.
 //
 // The selection reads the slots as a snapshot, so another session can take the chosen
-// slot before this one acquires it. An instance-capable target that loses that race is
-// selected again with the same request. The lost instance is not excluded: it still
-// runs and its slot will free, and the registry now reports that slot held, so the
-// resolver passes over it like any other held slot -- on the next selection and on every
-// admission turn after it, which lets a parked session take that slot once it frees.
-// With every slot held, however that came about, the session parks and signals live
-// demand like any other session that finds them held.
+// slot before this one acquires it. A target selected from a pool with an instance
+// candidate (Target.InstancePool: an instance of a replicable spec, or a mapping without
+// instances beside one -- a mixed fleet) that loses that race is selected again with the
+// same request. The lost slot is not excluded: its instance still runs and the slot will
+// free, and the registry now reports it held, so the resolver passes over it like any
+// other held slot -- on the next selection and on every admission turn after it, which
+// lets a parked session take that slot once it frees. With every slot held, however
+// that came about, the session parks and signals live demand like any other session
+// that finds them held.
+//
+// Every selection of the loop is one admission: the request names when it began
+// (AdmissionStart), so a session that parks again after a lost race waits out what is
+// left of the one admission-queue timeout, not a fresh one per race.
 //
 // The loop ends. A selection that hands back a slot still held by the session it lost
 // that slot to is one the resolver could not pass over (no queue to park in, or no
-// viable free instance), so waiting longer here changes nothing: errTranscriptionLiveBusy.
-// So is a session that loses maxLiveSlotRaces races. A target without instances keeps
-// today's answer at once: its one slot is taken, errTranscriptionLiveBusy. Any other
-// refusal (a routing error, a live verdict, a queue timeout) is returned as it is.
+// viable free slot), so waiting longer here changes nothing: errTranscriptionLiveBusy.
+// So is a session that loses maxLiveSlotRaces races. A target from a pool without an
+// instance candidate keeps today's answer at once: its one slot is taken,
+// errTranscriptionLiveBusy. Any other refusal (a routing error, a live verdict, a queue
+// timeout) is returned as it is.
 func (s *Server) acquireLiveSession(ctx context.Context, token *auth.Token, req inference.Request) (routing.Target, func(), error) {
+	req.AdmissionStart = time.Now()
 	lostTo := map[string]uint64{} // instance key -> the session that took it from this one
 	for races := 1; ; races++ {
 		target, err := s.liveTarget(ctx, token, req)
@@ -150,7 +158,7 @@ func (s *Server) acquireLiveSession(ctx context.Context, token *auth.Token, req 
 		if ok {
 			return target, release, nil
 		}
-		if prev, seen := lostTo[target.InstanceKey]; !target.InstanceCapable || (seen && prev == holder) || races >= maxLiveSlotRaces {
+		if prev, seen := lostTo[target.InstanceKey]; !target.InstancePool || (seen && prev == holder) || races >= maxLiveSlotRaces {
 			return routing.Target{}, nil, errTranscriptionLiveBusy
 		}
 		lostTo[target.InstanceKey] = holder
@@ -187,10 +195,11 @@ func liveParamsFromQuery(q url.Values) liveParams {
 //     copy goroutine, counting the payload and latching a clean end-of-input (r.Body's EOF,
 //     the terminating chunk) versus a truncated one (any other read error);
 //   - ONE re-selection of an instance k >= 1 the agent refuses as gone (see
-//     instance_reselect.go): the session moves to another instance -- its slot, its
-//     active-request row and its billing with it -- and the new attempt is sent the
-//     session's audio from its first byte (liveFeed.restart), so the client never sees
-//     the refusal;
+//     instance_reselect.go): the session leaves the instance -- its slot and its
+//     active-request row -- moves to another instance with its billing, and the new
+//     attempt is sent the session's audio from its first byte (liveFeed.restart), so the
+//     client never sees the refusal; a session that cannot move is answered with the
+//     gateway's error instead;
 //   - for a client that sent Expect: 100-continue, an explicit 100 Continue written before the
 //     success response, so the SSE 200 can never reach it ahead of its 100 Continue (see
 //     sendContinue and #333);
@@ -243,6 +252,13 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	register()
 	// The slot is released before the row is removed: removing the row is what wakes a
 	// session parked in the admission queue for this server, and it must find the slot free.
+	// leave does both for an attempt whose instance is gone, before the session is
+	// selected again (reselectLiveSession); the deferred one then finds the slot let go.
+	leave := func() {
+		sess.release()
+		sess.release = func() {}
+		s.Active.Remove(id)
+	}
 	defer func() {
 		sess.release()
 		s.Active.Remove(id)
@@ -307,7 +323,7 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	// read; it applies no target.Timeout (the deadline is ctx's).
 	resp, upErr = s.proxyLiveDuplex(ctx, sess.target, params, feed.body())
 	if upErr == nil && sess.target.Instance() >= 1 && peekInstanceGone(resp) {
-		resp, upErr = s.reselectLiveSession(ctx, sess, feed, params, resp, register)
+		resp, upErr = s.reselectLiveSession(ctx, sess, feed, params, resp, register, leave)
 	}
 	target := sess.target
 	if upErr != nil {
@@ -362,39 +378,58 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	if requestExpectsContinue(r) {
 		sendContinue(w)
 	}
+	markServedInstance(w, sess.req, target)
 	s.relayBearerLiveSSE(w, resp, scan, watchdog, idle)
 }
 
 // reselectLiveSession moves a session whose instance k >= 1 refused it as gone (resp, read
-// by peekInstanceGone) to another instance, once, and returns the new attempt's answer. The
-// selection excludes the lost instance and takes the new instance's slot
+// by peekInstanceGone) to another instance under the once-rule, and returns the new
+// attempt's answer -- the steps every re-selecting path takes (instance_reselect.go). The
+// lost attempt leaves the instance first (leave: its live slot let go, then its
+// active-request row removed, which wakes a session parked for that server), so the
+// selection that follows -- which may park -- waits for capacity, not behind its own
+// attempt. The selection excludes the lost instance and takes the new instance's slot
 // (acquireLiveSession); the feed then starts the new attempt with the session's audio from
-// its first byte. Only then is the old attempt let go: its slot released, its answer
-// closed, the session's active-request row moved (register) -- in that order, so the lost
-// instance's count is never read while it still holds the session. When there is nowhere
-// to go -- no other instance, or audio the feed could no longer keep -- the session stays
-// as it was and resp, the refusal, is returned to be relayed.
-func (s *Server) reselectLiveSession(ctx context.Context, sess *liveSession, feed *liveFeed, params liveParams, resp *provider.ProxyResponse, register func()) (*provider.ProxyResponse, error) {
+// its first byte, and the session's row is registered on the new instance.
+//
+// The session ends with the gateway's own answer, never the agent's refusal, when it
+// cannot move: a re-selection that routing refuses gets that refusal (no host left, every
+// slot held with no queue, a queue timeout); a session already re-selected once, audio
+// the feed could no longer keep, or a new instance that turns out to be gone too gets the
+// refusal's gateway error (goneError). Its row is then registered back on the instance
+// that refused it, which its usage row is billed to.
+func (s *Server) reselectLiveSession(ctx context.Context, sess *liveSession, feed *liveFeed, params liveParams, resp *provider.ProxyResponse, register, leave func()) (*provider.ProxyResponse, error) {
+	gone := goneError(resp)
+	_ = resp.Body.Close()
 	lost := sess.target
+	if !reselectable(lost, sess.req) {
+		return nil, gone
+	}
+	leave()
 	req := withLostInstance(sess.req, lost)
 	token := sess.token
 	target, release, err := s.acquireLiveSession(ctx, &token, req)
 	if err != nil {
 		slog.Warn("bearer live transcription: the routed instance is gone and re-selection failed", "model", lost.Model, "instance", lost.InstanceKey, "err", err)
-		return resp, nil
+		register()
+		return nil, err
 	}
 	body, ok := feed.restart()
 	if !ok {
 		release()
 		slog.Warn("bearer live transcription: the routed instance is gone and the session's audio can no longer be replayed", "model", lost.Model, "instance", lost.InstanceKey)
-		return resp, nil
+		register()
+		return nil, gone
 	}
 	slog.Info("bearer live transcription: the routed instance is gone; re-selected once", "model", lost.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
-	_ = resp.Body.Close()
-	sess.release()
 	sess.token, sess.req, sess.target, sess.release = token, req, target, release
 	register()
-	return s.proxyLiveDuplex(ctx, target, params, body)
+	next, err := s.proxyLiveDuplex(ctx, target, params, body)
+	if err == nil && target.Instance() >= 1 && peekInstanceGone(next) {
+		// Gone too: the once-rule allows no further move.
+		return nil, goneError(next)
+	}
+	return next, err
 }
 
 // requestExpectsContinue reports whether Go's server will answer this request's first body read

@@ -43,6 +43,31 @@ const (
 	// rely on the header's provenance alone.
 	serverOverrideHeaderName      = "X-OP-Server-Override"
 	serverOverrideForceHeaderName = "X-OP-Server-Override-Force"
+
+	// realtimeRequiredHeaderName marks a voice chat turn's ASR or TTS loopback request
+	// ("1"): /v1 then routes it under the real-time gate
+	// (inference.Request.RealtimeRequired). It is honoured only on the full internal
+	// loopback pair (loopbackRouting), so a client that sends it gains nothing -- and
+	// a client may well want to: the gate only ever narrows what it is served on.
+	realtimeRequiredHeaderName = "X-OP-Realtime-Required"
+
+	// preferredInstanceHeaderName carries the gateway instance key (routing.InstanceKey)
+	// a voice chat leg's loopback request would like to be served on -- the instance
+	// the leg's previous request used (inference.Request.PreferredInstanceKey). Like
+	// the real-time marker it is honoured only on the full internal loopback pair
+	// (loopbackRouting): from anyone else it would let a client pick an instance and
+	// read instance keys back.
+	preferredInstanceHeaderName = "X-OP-Preferred-Instance"
+
+	// servedInstanceHeaderName answers a request that named a preferred instance on the
+	// internal loopback pair with the gateway instance key of the instance it was
+	// actually routed to -- an instance of a replicable spec, never a mapping without
+	// instances -- so the voice session learns where its leg ran and prefers that
+	// instance next time (markServedInstance). It is written whenever such a request
+	// carried a preference, whether routing honoured it or routed the request to
+	// another instance (which the leg then follows), and only for such a request, so it
+	// never reaches a client outside the loopback.
+	servedInstanceHeaderName = "X-OP-Served-Instance"
 )
 
 // Auth error codes/messages reused by more than one handler below.
@@ -105,7 +130,7 @@ const (
 // Fail-closed on three independent conditions, checked in order -- a non-
 // empty s.internalAuthSecret, a non-nil s.users, and a nil error from
 // UserByID (which also covers "user not found") -- any one of them failing
-// returns false with no side effect. The secret comparison is
+// returns false with no side effect. The secret comparison (presentsInternalSecret) is
 // subtle.ConstantTimeCompare, guarded by presented != "" (an empty header must
 // never be allowed to match an unconfigured/empty secret, which
 // ConstantTimeCompare alone would happily do since two empty byte slices
@@ -114,11 +139,7 @@ const (
 // that went through the System-Admin step-up, and there is no cookie here to
 // resolve elevation from.
 func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
-	if s.internalAuthSecret == "" || s.users == nil {
-		return auth.Token{}, false
-	}
-	presented := r.Header.Get(internalAuthHeaderName)
-	if presented == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) != 1 {
+	if s.internalAuthSecret == "" || s.users == nil || !s.presentsInternalSecret(r) {
 		return auth.Token{}, false
 	}
 	user, err := s.users.UserByID(r.Context(), r.Header.Get(internalUserHeaderName))
@@ -126,6 +147,38 @@ func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
 		return auth.Token{}, false
 	}
 	return sessionPrincipal(user, false), true
+}
+
+// presentsInternalSecret reports whether r carries the per-process internal secret
+// (internalAuthHeaderName), the half of the trusted-loopback pair only the gateway itself
+// can send: a configured, non-empty secret compared in constant time, an empty header
+// never matching. It is loopbackPrincipal's secret check.
+func (s *Server) presentsInternalSecret(r *http.Request) bool {
+	if s.internalAuthSecret == "" {
+		return false
+	}
+	presented := r.Header.Get(internalAuthHeaderName)
+	return presented != "" && subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) == 1
+}
+
+// loopbackRouting reads the routing markers of a voice chat turn's loopback request:
+// whether it must keep up with real time (realtimeRequiredHeaderName "1") and the
+// instance it prefers (preferredInstanceHeaderName). Both are honoured only on the full
+// internal loopback pair -- the secret AND a user it resolves (loopbackPrincipal), the
+// pair a voice turn's own request carries -- and read as unset from anyone else: the
+// secret alone is not the gateway calling itself, since a request whose user does not
+// resolve is authenticated by its bearer, if at all. The user is looked up only for a
+// request that carries a marker.
+func (s *Server) loopbackRouting(r *http.Request) (realtime bool, preferredInstance string) {
+	realtime = r.Header.Get(realtimeRequiredHeaderName) == "1"
+	preferredInstance = strings.TrimSpace(r.Header.Get(preferredInstanceHeaderName))
+	if !realtime && preferredInstance == "" {
+		return false, ""
+	}
+	if _, ok := s.loopbackPrincipal(r); !ok {
+		return false, ""
+	}
+	return realtime, preferredInstance
 }
 
 // authenticateWeb resolves a principal. It first checks the internal trusted-

@@ -1039,6 +1039,92 @@ func TestRoutingStoreMappingAudioMetrics(t *testing.T) {
 	})
 }
 
+// TestRoutingStoreUpdateMappingEditableAudio proves memory, sqlite and postgres
+// agree on the audio half of UpdateMappingEditable: a supplied audio column is
+// written (a supplied 0 reads back as "not measured"), the count and limit only
+// together, an unsupplied one keeps its value even from a stale struct, both
+// stamps are taken when an audio column is supplied and audio_metrics_updated_at
+// is left alone when none is, and a mapping ValidateMappingAudioMetrics refuses
+// is refused without a write.
+func TestRoutingStoreUpdateMappingEditableAudio(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+		if err := s.CreateAIServer(ctx, routing.AIServer{ID: "srv_ed", Name: "Ed", Domain: "ed.example.test", Provider: routing.ProviderAudioCpp, Endpoint: "http://ed.example.test:8080", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{ID: "app_ed", ServerID: "srv_ed", Type: routing.ProviderAudioCpp, Port: 8080, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1, TimeoutMS: 30000, Status: routing.ServerStatusActive, HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		base := routing.ModelMapping{ID: "m_ed", ApplicationID: "app_ed", GatewayModelName: "ed-tts", AppModelName: "up", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+		if err := s.CreateMapping(ctx, base); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+		type audio struct {
+			rate  float64
+			ttfa  int64
+			count int
+			limit string
+		}
+		read := func(t *testing.T) (audio, routing.ModelMapping) {
+			t.Helper()
+			got, err := s.MappingByID(ctx, "m_ed")
+			if err != nil {
+				t.Fatalf("MappingByID: %v", err)
+			}
+			return audio{got.AudioRateX, got.AudioTTFAMS, got.AudioRealtimeConcurrency, got.AudioConcurrencyLimit}, got
+		}
+		at1 := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+		m := base
+		m.AudioRateX, m.AudioTTFAMS, m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit = 2.5, 300, 3, routing.AudioLimitPerformance
+		m.MetricsSource, m.MetricsUpdatedAt, m.AudioMetricsUpdatedAt = "manual", &at1, &at1
+		if err := s.UpdateMappingEditable(ctx, m, routing.MappingMetricsMask{AudioRateX: true, AudioTTFAMS: true, AudioConcurrencyPair: true}); err != nil {
+			t.Fatalf("UpdateMappingEditable (all audio): %v", err)
+		}
+		got, row := read(t)
+		if want := (audio{2.5, 300, 3, routing.AudioLimitPerformance}); got != want {
+			t.Fatalf("written = %+v, want %+v", got, want)
+		}
+		if row.MetricsSource != "manual" || !sameTimePtr(row.MetricsUpdatedAt, &at1) || !sameTimePtr(row.AudioMetricsUpdatedAt, &at1) {
+			t.Fatalf("stamps = %q %v %v, want manual and %v twice", row.MetricsSource, row.MetricsUpdatedAt, row.AudioMetricsUpdatedAt, at1)
+		}
+
+		// A stale struct with only the rate supplied (as 0): the rate is cleared,
+		// the rest kept.
+		at2 := at1.Add(time.Hour)
+		stale := base
+		stale.MetricsSource, stale.MetricsUpdatedAt, stale.AudioMetricsUpdatedAt = "manual", &at2, &at2
+		if err := s.UpdateMappingEditable(ctx, stale, routing.MappingMetricsMask{AudioRateX: true}); err != nil {
+			t.Fatalf("UpdateMappingEditable (rate 0): %v", err)
+		}
+		if got, _ := read(t); got != (audio{0, 300, 3, routing.AudioLimitPerformance}) {
+			t.Fatalf("after clearing the rate = %+v, want only the rate cleared", got)
+		}
+
+		// A config-only edit from a stale struct touches no audio column and no stamp.
+		at3 := at2.Add(time.Hour)
+		configOnly := base
+		configOnly.GatewayModelName, configOnly.AudioMetricsUpdatedAt = "ed-tts-2", &at3
+		if err := s.UpdateMappingEditable(ctx, configOnly, routing.MappingMetricsMask{}); err != nil {
+			t.Fatalf("UpdateMappingEditable (config only): %v", err)
+		}
+		got, row = read(t)
+		if got != (audio{0, 300, 3, routing.AudioLimitPerformance}) || !sameTimePtr(row.AudioMetricsUpdatedAt, &at2) {
+			t.Fatalf("after a config-only edit = %+v @ %v, want the audio columns and their stamp kept", got, row.AudioMetricsUpdatedAt)
+		}
+
+		// A count without its limit is refused, writing nothing.
+		bad := row
+		bad.AudioConcurrencyLimit, bad.AudioRealtimeConcurrency = "", 4
+		if err := s.UpdateMappingEditable(ctx, bad, routing.MappingMetricsMask{AudioConcurrencyPair: true}); !errors.Is(err, routing.ErrAudioMetricsInvalid) {
+			t.Fatalf("UpdateMappingEditable (count without limit) = %v, want ErrAudioMetricsInvalid", err)
+		}
+		if got, _ := read(t); got != (audio{0, 300, 3, routing.AudioLimitPerformance}) {
+			t.Fatalf("after a refused write = %+v, want it unchanged", got)
+		}
+	})
+}
+
 // sameTimePtr reports whether two optional stamps are both absent or the same
 // instant (Equal, not ==: the drivers return different *time.Location values).
 func sameTimePtr(a, b *time.Time) bool {

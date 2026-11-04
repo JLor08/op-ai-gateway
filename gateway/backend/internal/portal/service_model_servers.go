@@ -79,6 +79,13 @@ type ModelServerDTO struct {
 	MaxConcurrency               int     `json:"max_concurrency"`
 	RecommendedConcurrency       int     `json:"recommended_concurrency"`
 	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
+	// The mapping's audio metrics (#340), as ModelMappingDTO carries them: what
+	// the audio score term and the voice real-time gate route on, and the scaler's
+	// ceiling for a speech or transcription model.
+	AudioRateX               float64 `json:"audio_rate_x"`
+	AudioTTFAMS              int64   `json:"audio_ttfa_ms"`
+	AudioRealtimeConcurrency int     `json:"audio_realtime_concurrency"`
+	AudioConcurrencyLimit    string  `json:"audio_concurrency_limit"`
 	// IsMtp/VisionCapable are convenience booleans folded from Capabilities
 	// below (the "mtp"/"vision" row's Verdict == CapabilityYes; a missing row
 	// is NOT capable, same fail-closed rule Capabilities itself carries).
@@ -312,6 +319,10 @@ func modelServerRow(view mappingView, loaded, canLoad bool, caps []routing.Capab
 		MaxConcurrency:               view.mapping.MaxConcurrency,
 		RecommendedConcurrency:       view.mapping.RecommendedConcurrency,
 		GenTokensPerSecondAtCapacity: view.mapping.GenTokensPerSecondAtCapacity,
+		AudioRateX:                   view.mapping.AudioRateX,
+		AudioTTFAMS:                  view.mapping.AudioTTFAMS,
+		AudioRealtimeConcurrency:     view.mapping.AudioRealtimeConcurrency,
+		AudioConcurrencyLimit:        view.mapping.AudioConcurrencyLimit,
 		IsMtp:                        byName[routing.CapabilityMTP].Verdict == routing.CapabilityYes,
 		VisionCapable:                byName[routing.CapabilityVision].Verdict == routing.CapabilityYes,
 		MetricsSource:                view.mapping.MetricsSource,

@@ -675,3 +675,29 @@ func TestModelServersCapabilitiesSingleBatchQuery(t *testing.T) {
 		}
 	}
 }
+
+// A model-servers row carries its mapping's audio metrics, under the keys the
+// mapping DTO uses, so the catalog can show what the audio score and the voice
+// real-time gate route on.
+func TestModelServersCarriesAudioMetrics(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newModelServersTestService(t, now, nil)
+	seedOffering(t, routeStore, now, "srv-a", "app-a", "map-a", "tts", "tts-up", 0)
+	if err := routeStore.UpdateMappingAudioMetrics(context.Background(), "map-a", routing.AudioMetrics{RateX: 2.5, TTFAMS: 320, RealtimeConcurrency: 3, ConcurrencyLimit: routing.AudioLimitResources}, "audio_benchmark", now); err != nil {
+		t.Fatalf("UpdateMappingAudioMetrics: %v", err)
+	}
+	rows, err := svc.ModelServers(context.Background(), systemToken(), "tts")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ModelServers = %d rows, %v; want 1", len(rows), err)
+	}
+	raw, _ := json.Marshal(rows[0])
+	keys := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("row wire: %v", err)
+	}
+	for key, want := range map[string]string{"audio_rate_x": "2.5", "audio_ttfa_ms": "320", "audio_realtime_concurrency": "3", "audio_concurrency_limit": `"resources"`} {
+		if got := string(keys[key]); got != want {
+			t.Fatalf("row %s = %s, want %s", key, got, want)
+		}
+	}
+}

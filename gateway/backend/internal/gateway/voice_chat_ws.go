@@ -750,6 +750,10 @@ type voiceMachine struct {
 	writer *voiceWriter
 	claims voiceTicketClaims
 	timing voiceTiming
+	// sticky remembers, per leg, the instance the session's last request of that leg ran
+	// on (voice_sticky.go), starting at the ticket's gate targets. It is shared with the
+	// turns' dial goroutines and runs, and locks for itself.
+	sticky *voiceStickiness
 
 	pcmCh  <-chan []byte
 	ctrlCh <-chan voiceUpControl
@@ -957,7 +961,8 @@ func (s *Server) newVoiceMachine(ctx context.Context, cancel context.CancelFunc,
 	}
 	return &voiceMachine{
 		s: s, ctx: ctx, cancel: cancel, writer: writer, claims: claims, timing: timing,
-		pcmCh: pcmCh, ctrlCh: ctrlCh,
+		sticky: newVoiceStickiness(claims),
+		pcmCh:  pcmCh, ctrlCh: ctrlCh,
 	}
 }
 
@@ -1133,7 +1138,7 @@ func (m *voiceMachine) openTurnLoopback() {
 	events := make(chan voiceLoopbackEvent, 2)
 	m.pw, m.turnCtx, m.turnCancel, m.pcmOut, m.loopCh = pw, turnCtx, turnCancel, pcm, events
 
-	s := m.s
+	s, sticky := m.s, m.sticky
 	liveClaims := liveTicketClaims{
 		Target:     routing.Target{Model: m.claims.ASR.Model},
 		SampleRate: m.claims.SampleRate,
@@ -1149,7 +1154,7 @@ func (m *voiceMachine) openTurnLoopback() {
 	}()
 	go func() {
 		defer wg.Done()
-		s.dialTurnLoopback(turnCtx, liveClaims, pr, events)
+		s.dialTurnLoopback(turnCtx, liveClaims, sticky, pr, events)
 	}()
 }
 
@@ -1186,9 +1191,11 @@ func voiceLoopbackPump(turnCtx context.Context, pcm <-chan []byte, pw *io.PipeWr
 // carries /v1's own error code + message (liveRefusalFrame), so the browser gets a typed
 // error rather than a bare failure; a transport error is reported bare. It closes pr on a
 // failure so the transport's body read ends at once. Like the pump it touches no machine
-// state -- it is a Server method only so it can reach openLiveLoopback without the machine.
-func (s *Server) dialTurnLoopback(turnCtx context.Context, claims liveTicketClaims, pr *io.PipeReader, events chan<- voiceLoopbackEvent) {
-	resp, err := s.openLiveLoopback(turnCtx, claims, pr)
+// state -- it is a Server method only so it can reach openLiveLoopback without the machine;
+// sticky, the session's instance memory, locks for itself. The dial names the instance the
+// session's ASR leg ran on last, and a 2xx records the one it was served on.
+func (s *Server) dialTurnLoopback(turnCtx context.Context, claims liveTicketClaims, sticky *voiceStickiness, pr *io.PipeReader, events chan<- voiceLoopbackEvent) {
+	resp, err := s.openLiveLoopback(turnCtx, claims, pr, true, sticky)
 	if err != nil {
 		_ = pr.CloseWithError(err)
 		events <- voiceLoopbackEvent{kind: loopbackDialFailed}
@@ -1196,11 +1203,16 @@ func (s *Server) dialTurnLoopback(turnCtx context.Context, claims liveTicketClai
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		frame := liveRefusalFrame(resp.Body)
+		if frame.Code == voiceChatNoRealtimeModel {
+			// /v1 cannot know which leg of a voice chat it refused; this request is the ASR's.
+			frame.Message = voiceLegNoRealtimeMessage(voiceLegASR)
+		}
 		_ = resp.Body.Close()
 		_ = pr.CloseWithError(errVoiceTurnDone)
 		events <- voiceLoopbackEvent{kind: loopbackRefused, code: frame.Code, message: frame.Message}
 		return
 	}
+	sticky.observe(resp, voiceLegASR)
 	events <- voiceLoopbackEvent{kind: loopbackDialed, body: resp.Body}
 }
 
@@ -1499,6 +1511,7 @@ func (m *voiceMachine) beginAnswer() {
 		llm:         m.claims.LLM,
 		tts:         m.claims.TTS,
 		audio:       m.claims.Audio,
+		sticky:      m.sticky,
 	})
 	if err != nil {
 		// The run could not even be reserved/launched (no slot, a history read failure):
@@ -2026,9 +2039,15 @@ func (m *voiceMachine) tryResume() bool {
 // degrade surfaces a recoverable leg failure (spec 6.6): one typed error frame carrying the
 // core's stable code, the turn stopped (run cancelled, loopback torn down, pending dropped),
 // and a fall back to idle with the mic re-enabled -- no silent retry. The client re-engages
-// with push_start.
+// with push_start. A run refused as too slow for real time names its leg, as the ticket mint
+// does: of a voice run's requests only the speech leg's is held to real time
+// (voiceSpeechAttempt), so that code is the TTS leg's.
 func (m *voiceMachine) degrade(code string) {
-	m.emitError(code, voiceTurnFailedMessage)
+	message := voiceTurnFailedMessage
+	if code == voiceChatNoRealtimeModel {
+		message = voiceLegNoRealtimeMessage(voiceLegTTS)
+	}
+	m.emitError(code, message)
 	m.detachRun()
 	m.teardownTurn()
 	m.resetChunk()

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -35,12 +36,21 @@ import (
 // router that serves every instance of two replicable specs on one server.
 
 const (
-	liveInstServer  = "srv-live-inst"
-	liveInstASRSpec = "spec-asr-inst"
-	liveInstASRMap  = "route-asr-inst"
-	liveInstASRUp   = "asr-up"
-	liveInstChatMap = "route-chat-inst"
-	liveInstChatUp  = "chat-up"
+	liveInstServer       = "srv-live-inst"
+	liveInstASRSpec      = "spec-asr-inst"
+	liveInstASRMap       = "route-asr-inst"
+	liveInstASRUp        = "asr-up"
+	liveInstASRPlainSpec = "spec-asr-plain"
+	liveInstASRPlainMap  = "route-asr-plain"
+	liveInstASRPlainUp   = "asr-plain"
+	liveInstChatMap      = "route-chat-inst"
+	liveInstChatUp       = "chat-up"
+	liveInstTTSSpec      = "spec-tts-inst"
+	liveInstTTSMap       = "route-tts-inst"
+	liveInstTTSUp        = "tts-up"
+	liveInstImgSpec      = "spec-img-inst"
+	liveInstImgMap       = "route-img-inst"
+	liveInstImgUp        = "img-up"
 )
 
 // routerRefusal is the error a fake agent router answers for an address.
@@ -51,13 +61,17 @@ type routerRefusal struct {
 
 // instanceAgentRouter is a test agent router. POST /live/{model} relays like an
 // audio.cpp /live child: one SSE delta per PCM read, transcript.text.done on a
-// clean end. POST /v1/chat/completions, /v1/responses and
-// /v1/audio/transcriptions answer for the model their body names. An address in
-// refuse answers its refusal with the router's error envelope instead; a live
-// refusal first reads refuseAfter bytes of the session's PCM, as a request the
-// transport had begun to send before the answer. A chat completion for an address
-// in stall answers only after that long, as a child still producing its first
-// token.
+// clean end. POST /v1/chat/completions, /v1/responses, /v1/audio/speech,
+// /v1/images/generations, and the multipart /v1/audio/transcriptions and
+// /v1/images/edits answer for the model their body names. An address in refuse
+// answers its refusal with the router's error envelope instead; a live refusal
+// first reads refuseAfter bytes of the session's PCM, as a request the transport
+// had begun to send before the answer. A chat completion for an address in stall
+// answers only after that long, as a child still producing its first token.
+// onArrive, when set, is called with every address as its request arrives, before
+// it is answered, so a test can look at the gateway while the request is in flight.
+// A streamed chat completion's content is chatAnswer when set ("served by <address>"
+// otherwise).
 type instanceAgentRouter struct {
 	server *httptest.Server
 
@@ -67,6 +81,22 @@ type instanceAgentRouter struct {
 	stall       map[string]time.Duration
 	served      []string       // every address a request arrived for, in order
 	liveBytes   map[string]int // PCM bytes each live address received
+	onArrive    func(model string)
+	chatAnswer  string
+}
+
+// setChatAnswer sets the content every streamed chat completion answers with.
+func (a *instanceAgentRouter) setChatAnswer(answer string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.chatAnswer = answer
+}
+
+// setOnArrive installs the arrival hook (see instanceAgentRouter).
+func (a *instanceAgentRouter) setOnArrive(hook func(model string)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.onArrive = hook
 }
 
 func (a *instanceAgentRouter) setStall(model string, d time.Duration) {
@@ -118,12 +148,17 @@ func (a *instanceAgentRouter) bytesFor(model string) int {
 	return a.liveBytes[model]
 }
 
-// arrive records model and answers its refusal, if it has one.
+// arrive records model, runs the arrival hook, and answers model's refusal, if it
+// has one.
 func (a *instanceAgentRouter) arrive(w http.ResponseWriter, model string) bool {
 	a.mu.Lock()
 	a.served = append(a.served, model)
 	ref, refused := a.refuse[model]
+	hook := a.onArrive
 	a.mu.Unlock()
+	if hook != nil {
+		hook(model)
+	}
 	if !refused {
 		return false
 	}
@@ -149,8 +184,15 @@ func (a *instanceAgentRouter) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		a.stallFor(r, body.Model)
 		if body.Stream {
+			a.mu.Lock()
+			content := a.chatAnswer
+			a.mu.Unlock()
+			if content == "" {
+				content = "served by " + body.Model
+			}
+			quoted, _ := json.Marshal(content)
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"served by %s\"}}]}\n\n", body.Model)
+			fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":%s}}]}\n\n", quoted)
 			fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n")
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			return
@@ -168,27 +210,59 @@ func (a *instanceAgentRouter) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"id":"resp_1","object":"response","model":%q,"output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`, body.Model)
 	case r.URL.Path == "/v1/audio/transcriptions":
-		model := ""
-		if mr, err := r.MultipartReader(); err == nil {
-			for {
-				part, err := mr.NextPart()
-				if err != nil {
-					break
-				}
-				if part.FormName() == "model" {
-					raw, _ := io.ReadAll(part)
-					model = string(raw)
-				}
-				_ = part.Close()
-			}
-		}
-		if a.arrive(w, model) {
+		if a.arrive(w, multipartModel(r)) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, transcriptionOKBody)
+	case r.URL.Path == "/v1/audio/speech":
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if a.arrive(w, body.Model) {
+			return
+		}
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write(speechTestWAV())
+	case r.URL.Path == "/v1/images/generations":
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if a.arrive(w, body.Model) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, imagesOKBody)
+	case r.URL.Path == "/v1/images/edits":
+		if a.arrive(w, multipartModel(r)) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, imagesOKBody)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// multipartModel is the model part of a multipart request body, "" without one.
+func multipartModel(r *http.Request) string {
+	model := ""
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return model
+	}
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			return model
+		}
+		if part.FormName() == "model" {
+			raw, _ := io.ReadAll(part)
+			model = string(raw)
+		}
+		_ = part.Close()
 	}
 }
 
@@ -242,6 +316,31 @@ func liveInstanceRow(spec, upstream string, k, active int) RuntimeStatusDTO {
 // multipart_proxy; the status rows are the caller's to publish.
 func newInstanceRouterServer(t *testing.T, agent *instanceAgentRouter, replicable bool) *Server {
 	t.Helper()
+	return newInstanceRouterServerWith(t, agent, instanceRouterConfig{replicable: replicable})
+}
+
+// instanceRouterConfig shapes newInstanceRouterServerWith's fixture.
+type instanceRouterConfig struct {
+	// replicable is both specs' replicable flag.
+	replicable bool
+	// asrParallelism is asr-inst's instance_parallelism (0 = one request at a time).
+	asrParallelism int
+	// queueTimeoutSecs is the application's admission_queue_timeout_seconds (0 = a
+	// request parks until its context ends).
+	queueTimeoutSecs int
+	// plainASR adds route-asr-plain: a second mapping of asr-inst, upstream
+	// asr-plain, whose spec is not replicable -- a mixed fleet.
+	plainASR bool
+	// voice wires what a voice chat session needs beyond routing: a chat store
+	// and its cipher, the chat-run registry, and the internal loopback pair (the
+	// secret "test-internal-secret" for the user usr_dev) its turns call /v1 with.
+	voice bool
+}
+
+// newInstanceRouterServerWith is newInstanceRouterServer shaped by cfg.
+func newInstanceRouterServerWith(t *testing.T, agent *instanceAgentRouter, cfg instanceRouterConfig) *Server {
+	t.Helper()
+	replicable := cfg.replicable
 	ctx := context.Background()
 	now := time.Now().UTC()
 	tokens := auth.NewTokenStore()
@@ -266,24 +365,53 @@ func newInstanceRouterServer(t *testing.T, agent *instanceAgentRouter, replicabl
 		}
 	}
 	must("CreateAIServer", routes.CreateAIServer(ctx, routing.AIServer{ID: liveInstServer, Name: "Instances", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: agent.server.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}))
-	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, AdmissionQueueTimeoutSeconds: cfg.queueTimeoutSecs, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	// tts-inst (speech) and img-inst (image generation and edit), replicable alike.
+	for _, m := range []struct {
+		mapping, spec, model, up, flavor, capability string
+	}{
+		{liveInstTTSMap, liveInstTTSSpec, "tts-inst", liveInstTTSUp, routing.APIFlavorOpenAIAudio, routing.CapabilitySpeech},
+		{liveInstImgMap, liveInstImgSpec, "img-inst", liveInstImgUp, routing.APIFlavorOpenAIImages, routing.CapabilityImage},
+	} {
+		must("CreateMapping "+m.model, routes.CreateMapping(ctx, routing.ModelMapping{ID: m.mapping, ApplicationID: "app-live-inst", GatewayModelName: m.model, AppModelName: m.up, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+		must("UpsertMappingCapabilities "+m.model, routes.UpsertMappingCapabilities(ctx, m.mapping, []routing.CapabilityRow{
+			{Capability: m.capability, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		}))
+		must("UpsertRuntimeSpec "+m.model, routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: m.spec, MappingID: m.mapping, Enabled: true, Binary: "/usr/bin/" + m.up, Args: "[]", Env: "{}", APIFlavors: []string{m.flavor}, Replicable: cfg.replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
+	}
 	must("CreateMapping asr", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstASRMap, ApplicationID: "app-live-inst", GatewayModelName: "asr-inst", AppModelName: liveInstASRUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("CreateMapping chat", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstChatMap, ApplicationID: "app-live-inst", GatewayModelName: "chat-inst", AppModelName: liveInstChatUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertMappingCapabilities", routes.UpsertMappingCapabilities(ctx, liveInstASRMap, []routing.CapabilityRow{
 		{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
 		{Capability: routing.CapabilityTranscriptionStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
 	}))
-	must("UpsertRuntimeSpec asr", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: liveInstASRSpec, MappingID: liveInstASRMap, Enabled: true, Binary: "/usr/bin/audio-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Replicable: replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
+	must("UpsertRuntimeSpec asr", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: liveInstASRSpec, MappingID: liveInstASRMap, Enabled: true, Binary: "/usr/bin/audio-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Replicable: replicable, MaxInstances: 4, InstanceParallelism: cfg.asrParallelism, CreatedAt: now, UpdatedAt: now}))
+	if cfg.plainASR {
+		must("CreateMapping asr plain", routes.CreateMapping(ctx, routing.ModelMapping{ID: liveInstASRPlainMap, ApplicationID: "app-live-inst", GatewayModelName: "asr-inst", AppModelName: liveInstASRPlainUp, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+		must("UpsertMappingCapabilities plain", routes.UpsertMappingCapabilities(ctx, liveInstASRPlainMap, []routing.CapabilityRow{
+			{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+			{Capability: routing.CapabilityTranscriptionStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		}))
+		must("UpsertRuntimeSpec asr plain", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: liveInstASRPlainSpec, MappingID: liveInstASRPlainMap, Enabled: true, Binary: "/usr/bin/audio-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, CreatedAt: now, UpdatedAt: now}))
+	}
 	must("UpsertRuntimeSpec chat", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-chat-inst", MappingID: liveInstChatMap, Enabled: true, Binary: "/usr/bin/llama-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, ResponsesMode: routing.EndpointModePassthrough, Replicable: replicable, MaxInstances: 4, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertTelemetry", routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: liveInstServer, ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}))
 	recorder := usage.NewRecorder()
-	srv := New(ServerDeps{
+	deps := ServerDeps{
 		Tokens:   tokens,
 		Usage:    recorder,
 		Provider: provider.NewOpenAICompatibleClient(http.DefaultClient),
 		Routes:   routes,
 		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routes, Clock: time.Now, ModelLister: provider.NewMock()}),
-	})
+	}
+	if cfg.voice {
+		cipher, err := capture.New(testCaptureKey)
+		must("capture.New", err)
+		deps.Portal = portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routes, Clock: time.Now, ModelLister: provider.NewMock(), Chats: store.NewMemoryChatStore(0), Cipher: cipher})
+		deps.Cipher, deps.Captures = cipher, &fakeCaptureStore{}
+		deps.InternalAuthSecret, deps.Users, deps.ChatRuns = "test-internal-secret", directory, NewChatRunRegistry(5)
+	}
+	srv := New(deps)
 	srv.AgentFeatures.Set(liveInstServer, []string{"runtime_manager", "runtime_model_probe", runtimeInstancesFeature, fullduplexProxyFeature, multipartProxyFeature})
 	return srv
 }
@@ -448,10 +576,13 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 			publishASRInstances(srv, tc.running...)
 			sink := &recordingDemandSink{}
 			srv.Resolver.SetDemandSink(sink)
-			// Closed last (cleanups run in reverse): every slot is released first, so a
-			// session still parked when the test fails is let go instead of holding Close.
+			srv.Active.admission.recheck = 0 // only a release wakes the parked session
+			// Closed last (cleanups run in reverse): every slot is released first and a
+			// session still parked when the test fails is woken onto one, instead of
+			// holding Close.
 			ts := httptest.NewServer(srv)
 			t.Cleanup(ts.Close)
+			t.Cleanup(func() { wakeAdmission(srv) })
 			for _, key := range tc.held {
 				release, ok := srv.liveSessions.acquire(key)
 				if !ok {
@@ -486,6 +617,7 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 
 			done := make(chan liveSessionResult, 1)
 			go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+			waitForParked(t, srv.Active.admission, 1)
 			select {
 			case s := <-done:
 				status := 0
@@ -493,7 +625,7 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 					status = s.resp.StatusCode
 				}
 				t.Fatalf("session answered (status %d, err %v) after losing its slot while no slot was free, want it to wait", status, s.err)
-			case <-time.After(400 * time.Millisecond):
+			default:
 			}
 			mu.Lock()
 			lost := slices.Clone(raced)
@@ -509,6 +641,7 @@ func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
 			mu.Lock()
 			racedReleases[0]()
 			mu.Unlock()
+			wakeAdmission(srv) // the lost slot's session ends: its row's removal wakes the queue
 			var s liveSessionResult
 			select {
 			case s = <-done:
@@ -556,51 +689,98 @@ func TestLiveAllHeldWithoutAQueueAnswersBusy(t *testing.T) {
 }
 
 // Every live slot of a replicable model held: the session waits in the admission
-// queue -- signalling demand for a live slot -- and is admitted once a slot frees.
+// queue -- signalling demand for a live slot -- and is admitted onto the instance
+// whose session ends first. The queue's periodic recheck is off, so it is that
+// session's end -- its slot let go, then its active row removed -- that wakes it.
 func TestLiveAllHeldReplicableParks(t *testing.T) {
 	agent := newInstanceAgentRouter(t)
 	srv := newInstanceRouterServer(t, agent, true)
 	publishASRInstances(srv, 0, 1)
+	srv.Active.admission.recheck = 0
 	sink := &recordingDemandSink{}
 	srv.Resolver.SetDemandSink(sink)
-	release0, _ := srv.liveSessions.acquire("route-asr-inst#0")
-	release1, _ := srv.liveSessions.acquire("route-asr-inst#1")
-	defer release0()
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	first := establishLiveSession(t, ctx, ts)
+	second := establishLiveSession(t, ctx, ts)
+	held := agent.servedModels() // [first's instance, second's instance]
 	done := make(chan liveSessionResult, 1)
 	go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+	waitForParked(t, srv.Active.admission, 1)
 	select {
 	case s := <-done:
-		status := 0
-		if s.resp != nil {
-			status = s.resp.StatusCode
-		}
-		t.Fatalf("session answered (status %d, err %v) while every slot was held, want it to wait", status, s.err)
-	case <-time.After(400 * time.Millisecond):
+		t.Fatalf("session answered (status %v, err %v) while every slot was held, want it parked", s.resp, s.err)
+	default:
 	}
 	signals := sink.signals()
-	if len(signals) == 0 || !signals[0].Live || !slices.Equal(signals[0].MappingIDs, []string{liveInstASRMap}) || signals[0].Model != "asr-inst" {
-		t.Fatalf("demand signals = %+v, want a live signal for asr-inst naming %s", signals, liveInstASRMap)
+	if len(signals) != 1 || !signals[0].Live || !slices.Equal(signals[0].MappingIDs, []string{liveInstASRMap}) || signals[0].Model != "asr-inst" {
+		t.Fatalf("demand signals = %+v, want one live signal for asr-inst naming %s", signals, liveInstASRMap)
 	}
 
-	release1()
+	finishLiveSession(t, second)
 	var s liveSessionResult
 	select {
 	case s = <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the parked session was not admitted after a slot freed")
+		t.Fatal("the parked session was not woken when a session ended")
 	}
 	if s.err != nil || s.resp.StatusCode != http.StatusOK {
 		t.Fatalf("admitted session: err %v status %v, want 200", s.err, s.resp)
 	}
-	if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up#1"}) {
-		t.Fatalf("live addresses served = %v, want the freed instance asr-up#1", served)
+	if served := agent.servedModels(); len(served) != 3 || served[2] != held[1] {
+		t.Fatalf("live addresses served = %v, want the third session on %s, the instance whose session ended", served, held[1])
 	}
 	finishLiveSession(t, s)
+	finishLiveSession(t, first)
+}
+
+// A live session that keeps losing the race for the slot it selected -- each time to a
+// session that took it a moment before, while the slot it lost the time before frees
+// -- is answered busy after maxLiveSlotRaces selections instead of selecting forever.
+func TestLiveSlotRacesAreBounded(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServer(t, agent, true)
+	publishASRInstances(srv, 0, 1)
+	var mu sync.Mutex
+	races := 0
+	var winner func()
+	liveSlotAcquireHook = func(instanceKey string) {
+		mu.Lock()
+		defer mu.Unlock()
+		races++
+		if winner != nil {
+			winner() // the last race's winner ends, so a slot is free at every selection
+			winner = nil
+		}
+		if races <= maxLiveSlotRaces+1 { // a loop without a bound gets its slot after that
+			winner, _ = srv.liveSessions.acquire(instanceKey)
+		}
+	}
+	t.Cleanup(func() {
+		liveSlotAcquireHook = nil
+		mu.Lock()
+		defer mu.Unlock()
+		if winner != nil {
+			winner()
+		}
+	})
+
+	rec := postBearerLiveRecorder(t, srv, bearerLiveQuery("asr-inst"), devBearerHeader)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), liveBearerBusyCode)
+	mu.Lock()
+	defer mu.Unlock()
+	if races != maxLiveSlotRaces {
+		t.Fatalf("%d selections, want maxLiveSlotRaces = %d", races, maxLiveSlotRaces)
+	}
+	if served := agent.servedModels(); len(served) != 0 {
+		t.Fatalf("upstream reached for %v, want no relay", served)
+	}
 }
 
 // A mapping without instances keeps its one live slot: a second session is
@@ -670,8 +850,9 @@ func postInstanceJSON(t *testing.T, srv *Server, path, body string) *httptest.Re
 // A request routed to instance m#2, which the agent retired a moment after the
 // telemetry that reported it running, is re-selected once, excluding that
 // instance, and served by instance 0: the client never sees the agent's refusal,
-// and the one usage row is the served attempt's. Every agent refusal that means
-// "this instance is gone" qualifies, on every relay.
+// the one usage row is the served attempt's, and while instance 0 serves it the
+// gone instance no longer counts it. Every agent refusal that means "this
+// instance is gone" qualifies.
 func TestVanishedInstanceReselectedOnce(t *testing.T) {
 	const chatBody = `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`
 	cases := []struct {
@@ -692,6 +873,12 @@ func TestVanishedInstanceReselectedOnce(t *testing.T) {
 			srv := newInstanceRouterServer(t, agent, true)
 			publishChatInstances(srv, 2)
 			agent.setRefusal("chat-up#2", tc.status, tc.code)
+			inFlightOnGone := -1
+			agent.setOnArrive(func(model string) {
+				if model == liveInstChatUp {
+					inFlightOnGone = srv.Active.InstanceActivity("route-chat-inst#2")
+				}
+			})
 
 			rec := postInstanceJSON(t, srv, tc.path, tc.body)
 			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), tc.wantBody) {
@@ -704,8 +891,8 @@ func TestVanishedInstanceReselectedOnce(t *testing.T) {
 			if len(rows) != 1 || rows[0].Status != "success" || rows[0].RouteID != liveInstChatMap {
 				t.Fatalf("usage rows = %+v, want one success row for %s", rows, liveInstChatMap)
 			}
-			if n := srv.Active.InstanceActivity("route-chat-inst#2"); n != 0 {
-				t.Fatalf("in flight on the vanished instance = %d, want 0", n)
+			if inFlightOnGone != 0 {
+				t.Fatalf("in flight on the vanished instance while instance 0 served = %d, want 0", inFlightOnGone)
 			}
 		})
 	}
@@ -863,9 +1050,7 @@ func TestVanishedInstanceReselectedOnlyOnce(t *testing.T) {
 		agent.setRefusal("chat-up#3", http.StatusConflict, "runtime.instance_no_capacity")
 
 		rec := postInstanceJSON(t, srv, "/v1/chat/completions", `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`)
-		if rec.Code == http.StatusOK {
-			t.Fatalf("status 200, want the second refusal answered; body %s", rec.Body.String())
-		}
+		requireGoneAnswered(t, srv, rec)
 		if served := agent.servedModels(); len(served) != 2 {
 			t.Fatalf("addresses served = %v, want two attempts and no third", served)
 		}
@@ -877,13 +1062,24 @@ func TestVanishedInstanceReselectedOnlyOnce(t *testing.T) {
 		agent.setRefusal("chat-up", http.StatusNotFound, "runtime.model_not_managed")
 
 		rec := postInstanceJSON(t, srv, "/v1/chat/completions", `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`)
-		if rec.Code == http.StatusOK {
-			t.Fatalf("status 200, want the refusal answered; body %s", rec.Body.String())
-		}
+		requireGoneAnswered(t, srv, rec)
 		if served := agent.servedModels(); !slices.Equal(served, []string{"chat-up"}) {
 			t.Fatalf("addresses served = %v, want instance 0 once", served)
 		}
 	})
+}
+
+// requireGoneAnswered requires the answer a chat completion gets for an agent
+// refusal it is not re-selected off -- the gateway's 502 provider.unavailable, not
+// the agent's code -- and the one error row that records it.
+func requireGoneAnswered(t *testing.T, srv *Server, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "provider.unavailable") || strings.Contains(rec.Body.String(), "runtime.") {
+		t.Fatalf("status %d body %s; want 502 provider.unavailable without the agent's code", rec.Code, rec.Body.String())
+	}
+	if rows := srv.Usage.All(); len(rows) != 1 || rows[0].Status != "error" || rows[0].ErrorCode != "provider.unavailable" || rows[0].RouteID != liveInstChatMap {
+		t.Fatalf("usage rows = %+v, want one error row provider.unavailable for %s", rows, liveInstChatMap)
+	}
 }
 
 // A buffered transcription sent to a vanished instance is re-selected too, and
@@ -964,4 +1160,314 @@ func TestVanishedLiveInstanceReselectedWithItsAudio(t *testing.T) {
 	if ev.Status != "success" || ev.RouteID != liveInstASRMap {
 		t.Fatalf("row = %+v, want a success row for %s", ev, liveInstASRMap)
 	}
+}
+
+// wakeAdmission wakes a request parked for the instance server, the way a
+// request finishing there does: its active row's removal releases the queue.
+func wakeAdmission(srv *Server) {
+	srv.Active.Add(ActiveRequest{ID: "waker", ServerID: liveInstServer})
+	srv.Active.Remove("waker")
+}
+
+// postTranscription sends a buffered transcription of model.
+func postTranscription(t *testing.T, srv *Server, model string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, ct := buildEditMultipart(t, validTranscriptionParts(model))
+	return postEditRaw(t, srv, http.MethodPost, "/v1/audio/transcriptions", body, ct, devBearerHeader)
+}
+
+// A buffered transcription is never routed onto an instance a live session holds,
+// even where the instance's parallelism leaves room beside the session: audio.cpp
+// serves one transcription at a time, so it would only be refused busy there. It
+// goes to a sibling whose slot is free -- whose own check, keyed by that instance,
+// lets it through -- or waits for a slot when every one is held.
+func TestBufferedTranscriptionAvoidsALiveHeldInstance(t *testing.T) {
+	cfg := instanceRouterConfig{replicable: true, asrParallelism: 2}
+	t.Run("a free sibling serves it", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		// Instance 0 reports the lighter load, so it is the one chosen when its slot is
+		// not considered.
+		srv.RuntimeStatus.publish(liveInstServer, []RuntimeStatusDTO{
+			liveInstanceRow(liveInstASRSpec, liveInstASRUp, 0, 0),
+			liveInstanceRow(liveInstASRSpec, liveInstASRUp, 1, 5),
+		})
+		release, _ := srv.liveSessions.acquire("route-asr-inst#0")
+		defer release()
+
+		rec := postTranscription(t, srv, "asr-inst")
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello there") {
+			t.Fatalf("status %d body %s; want the transcription from instance 1", rec.Code, rec.Body.String())
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up#1"}) {
+			t.Fatalf("addresses served = %v, want [asr-up#1], the instance whose live slot is free", served)
+		}
+	})
+	t.Run("it waits for a slot instead of being refused", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		srv.Active.admission.recheck = 0 // only a release wakes a parked request
+		publishASRInstances(srv, 0)
+		release, _ := srv.liveSessions.acquire("route-asr-inst#0")
+		defer release()
+
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- postTranscription(t, srv, "asr-inst") }()
+		waitForParked(t, srv.Active.admission, 1)
+		select {
+		case rec := <-done:
+			t.Fatalf("answered %d %s while the only instance's live slot was held, want it parked", rec.Code, rec.Body.String())
+		default:
+		}
+		release()
+		wakeAdmission(srv)
+		var rec *httptest.ResponseRecorder
+		select {
+		case rec = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the parked transcription was not admitted after the live slot freed")
+		}
+		if rec.Code != http.StatusOK || !slices.Equal(agent.servedModels(), []string{"asr-up"}) {
+			t.Fatalf("status %d body %s served %v; want instance 0's transcription", rec.Code, rec.Body.String(), agent.servedModels())
+		}
+	})
+}
+
+// publishMixedASR reports asr-inst's instances ks running under load and the
+// plain mapping's one process idle, so a selection that does not judge the plain
+// mapping's live slot prefers it.
+func publishMixedASR(srv *Server, ks ...int) {
+	rows := []RuntimeStatusDTO{liveInstanceRow(liveInstASRPlainSpec, liveInstASRPlainUp, 0, 0)}
+	for _, k := range ks {
+		rows = append(rows, liveInstanceRow(liveInstASRSpec, liveInstASRUp, k, 10))
+	}
+	srv.RuntimeStatus.publish(liveInstServer, rows)
+}
+
+// A model served by a mapping without instances beside a replicable one (a mixed
+// fleet) is a model with instances: a live session is not refused busy because the
+// plain mapping's one slot is taken while an instance has a free slot. Whether the
+// slot was held when the session was selected, or taken in the race between the
+// selection and the acquire, the session is selected again onto the instance; with
+// every slot held it waits, and takes whichever slot frees first.
+func TestLiveMixedFleetSessionIsNotRefusedForAPlainSlot(t *testing.T) {
+	cfg := instanceRouterConfig{replicable: true, plainASR: true}
+	t.Run("the plain slot is taken in the race", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		publishMixedASR(srv, 0)
+		ts := httptest.NewServer(srv)
+		t.Cleanup(ts.Close)
+		var raced string
+		var racedRelease func()
+		liveSlotAcquireHook = func(instanceKey string) {
+			if raced != "" {
+				return
+			}
+			raced = instanceKey
+			racedRelease, _ = srv.liveSessions.acquire(instanceKey)
+		}
+		t.Cleanup(func() {
+			liveSlotAcquireHook = nil
+			if racedRelease != nil {
+				racedRelease()
+			}
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		s := establishLiveSession(t, ctx, ts)
+		if raced != "route-asr-plain#0" {
+			t.Fatalf("the first selection took %q, want the idle plain mapping route-asr-plain#0", raced)
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up"}) {
+			t.Fatalf("live addresses served = %v, want [asr-up]: the session lost the plain slot and was selected onto the instance", served)
+		}
+		finishLiveSession(t, s)
+	})
+	t.Run("the plain slot is held", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		publishMixedASR(srv, 0)
+		release, _ := srv.liveSessions.acquire("route-asr-plain#0")
+		defer release()
+		ts := httptest.NewServer(srv)
+		t.Cleanup(ts.Close)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		s := establishLiveSession(t, ctx, ts)
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-up"}) {
+			t.Fatalf("live addresses served = %v, want [asr-up], the instance whose slot is free", served)
+		}
+		finishLiveSession(t, s)
+	})
+	t.Run("every slot is held", func(t *testing.T) {
+		agent := newInstanceAgentRouter(t)
+		srv := newInstanceRouterServerWith(t, agent, cfg)
+		srv.Active.admission.recheck = 0 // only a release wakes the parked session
+		sink := &recordingDemandSink{}
+		srv.Resolver.SetDemandSink(sink)
+		publishMixedASR(srv, 0)
+		releasePlain, _ := srv.liveSessions.acquire("route-asr-plain#0")
+		releaseInst, _ := srv.liveSessions.acquire("route-asr-inst#0")
+		defer releaseInst()
+		ts := httptest.NewServer(srv)
+		t.Cleanup(ts.Close)
+		t.Cleanup(releasePlain) // before ts.Close: a session still parked is let go
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		done := make(chan liveSessionResult, 1)
+		go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+		waitForParked(t, srv.Active.admission, 1)
+		if signals := sink.signals(); len(signals) != 1 || !signals[0].Live || !slices.Equal(signals[0].MappingIDs, []string{liveInstASRMap}) {
+			t.Fatalf("demand signals = %+v, want one live signal naming %s, the mapping that can start another instance", signals, liveInstASRMap)
+		}
+		releasePlain()
+		wakeAdmission(srv)
+		var s liveSessionResult
+		select {
+		case s = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the parked session was not admitted after the plain slot freed")
+		}
+		if s.err != nil || s.resp.StatusCode != http.StatusOK {
+			t.Fatalf("admitted session: err %v status %v, want 200", s.err, s.resp)
+		}
+		if served := agent.servedModels(); !slices.Equal(served, []string{"asr-plain"}) {
+			t.Fatalf("live addresses served = %v, want [asr-plain], the slot that freed", served)
+		}
+		finishLiveSession(t, s)
+	})
+}
+
+// deadlineRecordingAdmission wraps the server's admission queue and records the
+// absolute deadline each wait was given (the time of the call plus its timeout).
+type deadlineRecordingAdmission struct {
+	inner     routing.AdmissionController
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (a *deadlineRecordingAdmission) WaitForSlot(ctx context.Context, serverIDs []string, timeout time.Duration) error {
+	a.mu.Lock()
+	a.deadlines = append(a.deadlines, time.Now().Add(timeout))
+	a.mu.Unlock()
+	return a.inner.WaitForSlot(ctx, serverIDs, timeout)
+}
+
+func (a *deadlineRecordingAdmission) recorded() []time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.deadlines)
+}
+
+// A live session that parks, is woken, and loses the freed slot to another session
+// parks again under the deadline it parked with first: the races of one session
+// share one admission-queue timeout instead of each starting a new one.
+func TestLiveSlotRacesKeepOneAdmissionDeadline(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServerWith(t, agent, instanceRouterConfig{replicable: true, queueTimeoutSecs: 30})
+	publishASRInstances(srv, 0, 1)
+	srv.Active.admission.recheck = 0 // only a release wakes the parked session
+	adm := &deadlineRecordingAdmission{inner: srv.Active.admission}
+	srv.Resolver.SetAdmissionController(adm)
+	release0, _ := srv.liveSessions.acquire("route-asr-inst#0")
+	release1, _ := srv.liveSessions.acquire("route-asr-inst#1")
+	var mu sync.Mutex
+	race := false
+	var racedRelease func()
+	liveSlotAcquireHook = func(instanceKey string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if race && racedRelease == nil {
+			racedRelease, _ = srv.liveSessions.acquire(instanceKey)
+		}
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	// Before the server closes: every slot is let go and a session still parked is
+	// woken onto one, since a parked bearer session does not notice its client leave.
+	t.Cleanup(func() {
+		liveSlotAcquireHook = nil
+		release0()
+		release1()
+		mu.Lock()
+		if racedRelease != nil {
+			racedRelease()
+		}
+		mu.Unlock()
+		wakeAdmission(srv)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	done := make(chan liveSessionResult, 1)
+	go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+	waitForParked(t, srv.Active.admission, 1)
+	// Time passes before the slot frees, so a deadline counted afresh from the second
+	// park would lie measurably later than the first.
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	race = true
+	mu.Unlock()
+	release0()
+	wakeAdmission(srv)
+	waitForParked(t, srv.Active.admission, 1)
+
+	mu.Lock()
+	raced := racedRelease != nil
+	mu.Unlock()
+	deadlines := adm.recorded()
+	if !raced || len(deadlines) != 2 {
+		t.Fatalf("raced %v, %d waits; want the session woken, its slot taken in the race, and parked again", raced, len(deadlines))
+	}
+	if drift := deadlines[1].Sub(deadlines[0]); drift > 50*time.Millisecond || drift < -50*time.Millisecond {
+		t.Fatalf("the second park's deadline lies %v from the first's, want the same deadline", drift)
+	}
+	release1()
+	wakeAdmission(srv)
+	s := <-done
+	if s.err != nil || s.resp.StatusCode != http.StatusOK {
+		t.Fatalf("the session admitted once instance 1 freed: err %v status %v, want 200", s.err, s.resp)
+	}
+	finishLiveSession(t, s)
+}
+
+// A request the admission queue has no room for is refused as full and starts
+// no instance: only the request that parked signalled demand.
+func TestFullAdmissionQueueSignalsNoDemand(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServer(t, agent, true)
+	srv.Active.admission.recheck = 0
+	srv.Active.admission.maxDepth = 1
+	sink := &recordingDemandSink{}
+	srv.Resolver.SetDemandSink(sink)
+	publishChatInstances(srv)
+	srv.Active.Add(ActiveRequest{ID: "busy0", ServerID: liveInstServer, InstanceKey: "route-chat-inst#0"})
+	defer srv.Active.Remove("busy0")
+	const chatBody = `{"model":"chat-inst","messages":[{"role":"user","content":"hi"}]}`
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	parked := make(chan struct{})
+	go func() {
+		defer close(parked)
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody))
+		req.Header.Set("Authorization", "Bearer dev-secret")
+		req.Header.Set("Content-Type", "application/json")
+		srv.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	waitForParked(t, srv.Active.admission, 1)
+
+	rec := postInstanceJSON(t, srv, "/v1/chat/completions", chatBody)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), routing.ErrAdmissionQueueFull.Error()) {
+		t.Fatalf("status %d body %s; want 503 %s", rec.Code, rec.Body.String(), routing.ErrAdmissionQueueFull)
+	}
+	if signals := sink.signals(); len(signals) != 1 {
+		t.Fatalf("demand signals = %+v, want only the parked request's one", signals)
+	}
+	cancel()
+	<-parked
 }

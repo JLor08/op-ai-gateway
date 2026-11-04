@@ -135,6 +135,7 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	}
 	ss.register()
 
+	markServedInstance(w, req, target)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -237,11 +238,15 @@ func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error
 }
 
 // reselect moves the session onto a re-selected target when err says its instance
-// is gone (see instance_reselect.go), and reports whether it did. The session's
-// request, token, target, upstream request and credential context all become the
-// re-selected attempt's, and it is registered again under its id; the usage row
-// finish records is that attempt's. A re-selection that fails leaves the session as
-// it was, so the stream ends with the original error.
+// is gone and the once-rule allows it (see instance_reselect.go), and reports whether
+// it did. The lost attempt leaves the instance before the re-resolve -- its active row
+// removed, which frees its count on the instance and its server and wakes a request
+// parked for that server -- so a re-resolve that parks does not wait behind it. The
+// session's request, token, target, upstream request and credential context then all
+// become the re-selected attempt's, and it is registered again under its id on the
+// new instance; the usage row finish records is that attempt's. A re-selection that
+// fails registers the session where it was, so the stream ends with the original
+// error, attributed to the instance that refused it.
 //
 // The idle watchdog beginStream armed is held while the selection runs and armed
 // afresh after it. The selection may wait in the admission queue for the next
@@ -259,11 +264,13 @@ func (ss *streamSession) reselect(err error) bool {
 		}
 		defer ss.watchdog.Reset(ss.idle)
 	}
+	ss.s.Active.Remove(ss.id)
 	req := withLostInstance(ss.req, ss.target)
 	token := ss.token
 	target, rerr := ss.s.resolveTranslateTarget(ss.r, &token, req)
 	if rerr != nil {
 		slog.Warn("inference stream: the routed instance is gone and re-selection failed", "path", ss.r.URL.Path, "model", ss.req.Model, "instance", ss.target.InstanceKey, "err", rerr)
+		ss.register()
 		return false
 	}
 	slog.Info("inference stream: the routed instance is gone; re-selected once", "path", ss.r.URL.Path, "model", ss.req.Model, "lost", ss.target.InstanceKey, "instance", target.InstanceKey)

@@ -47,12 +47,20 @@ type RuntimeEnsurer interface {
 
 var _ RuntimeEnsurer = (*OpenAICompatibleClient)(nil)
 
-// RouterError is a non-2xx answer whose body is the agent router's error
-// envelope, {"error":{"code":"runtime.…","message":"…"}}. Code is that
-// envelope's code; Err is the provider error its HTTP status maps to, so
-// errors.Is(err, ErrUpstreamStarting) and errors.Is(err, ErrAuthRejected)
+// RouterError is a non-2xx answer from an agent router whose body is the
+// router's error envelope, {"error":{"code":"runtime.…","message":"…"}}. Code
+// is that envelope's code; Err is the provider error its HTTP status maps to,
+// so errors.Is(err, ErrUpstreamStarting) and errors.Is(err, ErrAuthRejected)
 // still hold through it. It is returned as a pointer: match it with
 // errors.As(err, &re) for a re of type *RouterError.
+//
+// It is produced for an agent router's answers only: the ensure route, a chat
+// completion or the start of a stream sent to a server_agent target
+// (chatStatusError), and -- through RouterStatusError -- a refusal the gateway
+// relays itself from an agent instance k >= 1 and reads for a gone instance.
+// Any other upstream's non-2xx answer is the plain provider error its status
+// maps to, whatever its body says, so a code another server happens to send in
+// the same envelope shape is never read as the router's.
 type RouterError struct {
 	// Status is the HTTP status the router answered with.
 	Status int
@@ -128,8 +136,9 @@ func ensureDeadlineError(ctx context.Context) error {
 // says more than the code: for the router's start failures it is the code
 // itself. Every client call to an agent router reports a refusal through it --
 // the ensure route, a chat completion, the start of a stream -- and the
-// gateway uses it for an answer it relays itself, so a refusal reads the same
-// whichever way it arrived.
+// gateway uses it for an agent's answer it relays itself, so a refusal reads
+// the same whichever way it arrived. It is for agent routers' answers only (see
+// RouterError).
 func RouterStatusError(status int, body []byte) error {
 	base := unavailableStatus(status)
 	var env struct {
@@ -155,9 +164,16 @@ func RouterStatusError(status int, body []byte) error {
 // the router's error envelope, which is a single short line.
 const routerErrorBodyLimit = 4 << 10
 
-// routerErrorFromResponse is RouterStatusError for a non-2xx response whose
-// body the caller has not read: at most routerErrorBodyLimit of it is.
-func routerErrorFromResponse(resp *http.Response) error {
+// chatStatusError is the error of a non-2xx chat answer from target, whose body
+// the caller has not read. An agent router's refusal keeps its code: at most
+// routerErrorBodyLimit of the body is read for RouterStatusError, so the gateway
+// can tell an instance that is gone from any other failure. Every other
+// upstream's answer maps through unavailableStatus alone, its body unread, as it
+// always has.
+func chatStatusError(target routing.Target, resp *http.Response) error {
+	if target.Provider != routing.ProviderServerAgent {
+		return unavailableStatus(resp.StatusCode)
+	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, routerErrorBodyLimit))
 	return RouterStatusError(resp.StatusCode, body)
 }

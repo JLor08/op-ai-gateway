@@ -1051,6 +1051,82 @@ func TestScalerFollowsUpSignalsWithAnotherPin(t *testing.T) {
 	}
 }
 
+// The follow-up queue tells signals apart by everything that decides which
+// instance serves them -- the pinned server, the mappings the request could use
+// and its flavor -- not by the pin alone: a signal for other mappings is neither
+// folded into a running scale-up with its pin nor dropped as a duplicate of a
+// queued one, and the pass that ended serves a queued signal only with an
+// instance of one of its mappings, on its server when it is pinned.
+func TestScalerFollowUpKeysByMappings(t *testing.T) {
+	signal := func(f *scalerFixture, serverID string, mappingIDs ...string) routing.DemandSignal {
+		d := f.demand(mappingIDs...)
+		d.ServerID = serverID
+		return d
+	}
+	type arrival struct {
+		pin      string
+		mappings []string
+	}
+	cases := []struct {
+		name          string
+		firstPin      string
+		firstMappings []string
+		arrive        []arrival
+		ensured       []string
+	}{
+		{"same pin, other mappings: a pass of its own", "", []string{"map_srv_a"}, []arrival{{"", []string{"map_srv_b"}}}, []string{"srv_a m#1", "srv_b m#1"}},
+		{"same pin, same mappings: folded", "", []string{"map_srv_a"}, []arrival{{"", []string{"map_srv_a"}}}, []string{"srv_a m#1"}},
+		{"queued twice for other mappings: one pass each", "", []string{"map_srv_a"}, []arrival{{"", []string{"map_srv_b"}}, {"", []string{"map_srv_c"}}, {"", []string{"map_srv_b"}}}, []string{"srv_a m#1", "srv_b m#1", "srv_c m#1"}},
+		{"unpinned, not served by an instance of another mapping", "srv_b", []string{"map_srv_a", "map_srv_b"}, []arrival{{"", []string{"map_srv_a"}}}, []string{"srv_b m#1", "srv_a m#1"}},
+		{"unpinned, served by an instance of one of its mappings", "srv_b", []string{"map_srv_a", "map_srv_b"}, []arrival{{"", []string{"map_srv_a", "map_srv_b"}}}, []string{"srv_b m#1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScalerFixture(t)
+			f.addHost("srv_a", 90)
+			f.addHost("srv_b", 50)
+			f.addHost("srv_c", 40)
+			gate := f.ensurer.hold()
+			f.scaler.Signal(signal(f, tc.firstPin, tc.firstMappings...))
+			f.awaitEnsure()
+			for _, a := range tc.arrive {
+				f.scaler.Signal(signal(f, a.pin, a.mappings...))
+			}
+			close(gate)
+			f.scaler.wait()
+			f.wantEnsured(tc.ensured...)
+		})
+	}
+}
+
+// A queued signal that names no mappings is served by the instance the running pass
+// started only when it asks for the same flavor: the pass chose among the model's
+// mappings of its own flavor, and a mapping of the model need not serve another.
+func TestScalerFollowUpRespectsFlavorWithoutMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flavor  string
+		ensured []string
+	}{
+		{"same flavor: served by the started instance", routing.APIFlavorOpenAI, []string{"srv_a m#1"}},
+		{"another flavor: a pass of its own", routing.APIFlavorOpenAIAudio, []string{"srv_a m#1", "srv_a m#2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScalerFixture(t)
+			f.addHost("srv_a", 90)
+			gate := f.ensurer.hold()
+			f.scaler.Signal(f.demand())
+			f.awaitEnsure()
+			queued := f.demand()
+			queued.ServerID, queued.APIFlavor = "srv_a", tc.flavor // another key than the running pass's
+			f.scaler.Signal(queued)
+			close(gate)
+			f.scaler.wait()
+			f.wantEnsured(tc.ensured...)
+		})
+	}
+}
+
 // Every store read a scale-up makes is bounded: a stalled store ends the
 // scale-up -- or, for the scores, leaves the request's order -- instead of
 // holding the model's single flight, and the next signal scales again once

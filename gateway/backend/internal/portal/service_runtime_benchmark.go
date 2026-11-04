@@ -395,7 +395,7 @@ func (s *Service) resolveBenchmarkSpecWrite(ctx context.Context, specID string, 
 	if err != nil {
 		return benchmarkSpecWrite{}, err
 	}
-	dto, err := runtimeSpecDTO(spec, gpus, app, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
+	dto, err := runtimeSpecDTO(spec, gpus, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	if err != nil {
 		return benchmarkSpecWrite{}, err
 	}

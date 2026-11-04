@@ -731,3 +731,39 @@ func TestVoiceTicketEndpointPrimesOnACleanBackgroundContext(t *testing.T) {
 	}
 	requireNothingRecorded(t, recorder)
 }
+
+// The priming synthesis occupies its instance while it runs: it is an in-flight request on the
+// target's instance key, so the per-instance cap counts it and no other request is sent to an
+// instance that is busy priming as if it were free. It leaves when the synthesis ends.
+func TestPrimeSpeechVoiceCountsOnItsInstance(t *testing.T) {
+	const instanceKey = "route-tts#1"
+	s := &Server{Active: newActiveRegistry(nil)}
+	inFlight := -1
+	s.Provider = &primingProvider{answer: func(context.Context) (*provider.ProxyResponse, error) {
+		inFlight = s.Active.InstanceActivity(instanceKey)
+		return &provider.ProxyResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: io.NopCloser(strings.NewReader("RIFF"))}, nil
+	}}
+	tts := primingTarget()
+	tts.InstanceKey = instanceKey
+
+	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice); err != nil {
+		t.Fatalf("primeSpeechVoice returned %v, want nil", err)
+	}
+	if inFlight != 1 {
+		t.Fatalf("in flight on %s during the synthesis = %d, want 1", instanceKey, inFlight)
+	}
+	if after := s.Active.InstanceActivity(instanceKey); after != 0 {
+		t.Fatalf("in flight on %s after the synthesis = %d, want 0", instanceKey, after)
+	}
+}
+
+// A 2xx answer with nothing in it warmed nothing: it is a failure for the caller to log.
+func TestPrimeSpeechVoiceEmptyAnswerIsAFailure(t *testing.T) {
+	prov := &primingProvider{answer: func(context.Context) (*provider.ProxyResponse, error) {
+		return &provider.ProxyResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}}
+	s := &Server{Provider: prov}
+	if err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice); !errors.Is(err, errBenchmarkAnswerEmpty) {
+		t.Fatalf("primeSpeechVoice = %v, want errBenchmarkAnswerEmpty", err)
+	}
+}

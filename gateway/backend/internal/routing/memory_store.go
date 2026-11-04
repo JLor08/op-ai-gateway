@@ -1099,6 +1099,11 @@ func (m *MemoryStore) invalidateMappingCacheOnRenameLocked(stored ModelMapping, 
 // overlays the operator-editable columns, and overlays only the metric columns
 // the mask marks supplied plus the provenance stamp when any is (issue #65).
 func (m *MemoryStore) UpdateMappingEditable(_ context.Context, mapping ModelMapping, metrics MappingMetricsMask) error {
+	if metrics.AnyAudio() {
+		if err := ValidateMappingAudioMetrics(mapping); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	existing, ok := m.mappings[mapping.ID]
@@ -1138,6 +1143,19 @@ func (m *MemoryStore) UpdateMappingEditable(_ context.Context, mapping ModelMapp
 	}
 	if metrics.GenTokensPerSecondAtCapacity {
 		existing.GenTokensPerSecondAtCapacity = mapping.GenTokensPerSecondAtCapacity
+	}
+	if metrics.AudioRateX {
+		existing.AudioRateX = mapping.AudioRateX
+	}
+	if metrics.AudioTTFAMS {
+		existing.AudioTTFAMS = mapping.AudioTTFAMS
+	}
+	if metrics.AudioConcurrencyPair {
+		existing.AudioRealtimeConcurrency = mapping.AudioRealtimeConcurrency
+		existing.AudioConcurrencyLimit = mapping.AudioConcurrencyLimit
+	}
+	if metrics.AnyAudio() && mapping.AudioMetricsUpdatedAt != nil {
+		existing.AudioMetricsUpdatedAt = mapping.AudioMetricsUpdatedAt
 	}
 	if metrics.Any() {
 		existing.MetricsSource = mapping.MetricsSource
