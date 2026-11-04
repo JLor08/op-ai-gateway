@@ -5,6 +5,23 @@
 // (audioMetrics.ts) and the sentences (i18n.ts) take it from. It imports
 // nothing, so the messages can use it without pulling in the components.
 
+/** Why an audio concurrency ramp stopped: the closed set the gateway writes. */
+export const AUDIO_CONCURRENCY_LIMITS = ['performance', 'resources', 'cap'] as const;
+export type AudioConcurrencyLimit = (typeof AUDIO_CONCURRENCY_LIMITS)[number];
+
+export function isAudioConcurrencyLimit(value: string | undefined): value is AudioConcurrencyLimit {
+  return (AUDIO_CONCURRENCY_LIMITS as readonly (string | undefined)[]).includes(value);
+}
+
+/**
+ * A limit from the wire as the portal reads it: one of the three, else ''
+ * (unknown) -- none, or one this build does not know, which is never taken
+ * for a lower bound.
+ */
+export function audioLimitOf(value: string | undefined): AudioConcurrencyLimit | '' {
+  return isAudioConcurrencyLimit(value) ? value : '';
+}
+
 /**
  * A measured rate as a multiple of real time. It is cut, never rounded up:
  * the voice gate refuses a rate below a factor (1.2 by default), and a figure

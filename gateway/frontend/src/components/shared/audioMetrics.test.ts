@@ -8,6 +8,7 @@ import {
   audioMetricsBody,
   audioMetricsForm,
   audioPairIncomplete,
+  audioLimitOf,
   formatAudioConcurrency,
   formatAudioRate,
   formatAudioTtfa,
@@ -36,6 +37,18 @@ describe('isAudioConcurrencyLimit', () => {
     for (const limit of AUDIO_CONCURRENCY_LIMITS) expect(isAudioConcurrencyLimit(limit)).toBe(true);
     for (const other of ['', 'Performance', 'unknown', undefined]) {
       expect(isAudioConcurrencyLimit(other)).toBe(false);
+    }
+  });
+});
+
+// The wire's limit is a string: it is read as one of the three, or as ''
+// (unknown) -- a limit this build does not know included, so that it is never
+// shown as a lower bound.
+describe('audioLimitOf', () => {
+  it('reads one of the three limits as itself and anything else as unknown', () => {
+    for (const limit of AUDIO_CONCURRENCY_LIMITS) expect(audioLimitOf(limit)).toBe(limit);
+    for (const other of ['', 'Performance', 'thermal', undefined]) {
+      expect(audioLimitOf(other)).toBe('');
     }
   });
 });

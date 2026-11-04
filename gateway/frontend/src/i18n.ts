@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { formatRateX } from './components/shared/audioFigures';
+import {
+  formatRateX,
+  isAudioConcurrencyLimit,
+  type AudioConcurrencyLimit,
+} from './components/shared/audioFigures';
 
 export type Locale = 'de' | 'en';
 
@@ -13,6 +17,8 @@ type PortalMessageValue =
   | ((a: number) => string)
   | ((a: number, b: number) => string)
   | ((a: number, b: string) => string)
+  | ((a: AudioConcurrencyLimit | '') => string)
+  | ((a: number, b: AudioConcurrencyLimit | '') => string)
   | ((a: number, b: number, c: number | null) => string);
 
 // A measured startup in ms as the launch-spec form names it (#340), shared by
@@ -34,25 +40,95 @@ function measuredStartupEn(startupMs: number): string {
 // every language: only a ramp stopped by performance measured a ceiling (0:
 // not even one stream kept up with real time); one stopped by resources or by
 // its cap ended before the model ran out of speed, so its count is a lower
-// bound. Callers pass one of the three limits (shared/audioMetrics.ts shows an
-// unknown one as a dash).
-function audioConcurrencyFigure(k: number, limit: string, notRealtime: string): string {
-  if (limit === 'performance') return k > 0 ? String(k) : notRealtime;
-  return `≥ ${k}`;
+// bound. Without one of the three limits ('' -- or one this build does not
+// know) no ramp result stands behind the count: it is unknown, never a lower
+// bound. (A cell of the models catalog shows that as a dash.)
+function audioConcurrencyFigure(
+  k: number,
+  limit: AudioConcurrencyLimit | '',
+  words: { notRealtime: string; unknown: string },
+): string {
+  switch (limit) {
+    case 'performance':
+      return k > 0 ? String(k) : words.notRealtime;
+    case 'resources':
+    case 'cap':
+      return `≥ ${k}`;
+    default:
+      return words.unknown;
+  }
+}
+
+function audioFigureDe(k: number, limit: AudioConcurrencyLimit | ''): string {
+  return audioConcurrencyFigure(k, limit, {
+    notRealtime: 'nicht echtzeitfähig',
+    unknown: 'unbekannt',
+  });
+}
+
+function audioFigureEn(k: number, limit: AudioConcurrencyLimit | ''): string {
+  return audioConcurrencyFigure(k, limit, { notRealtime: 'not real-time', unknown: 'unknown' });
 }
 
 // Why an audio ramp stopped, named once per language for the mapping editor's
-// choice and the benchmark result line.
-function audioLimitDe(limit: string): string {
-  if (limit === 'performance') return 'Leistung (gemessene Obergrenze)';
-  if (limit === 'resources') return 'Ressourcen (Untergrenze: kein Platz für eine weitere Instanz)';
-  return 'Höchstzahl erreicht (Untergrenze: Instanz- oder Messobergrenze)';
+// choice and the benchmark result line; '' (or a limit this build does not
+// know) is unknown.
+function audioLimitDe(limit: AudioConcurrencyLimit | ''): string {
+  switch (limit) {
+    case 'performance':
+      return 'Leistung (gemessene Obergrenze)';
+    case 'resources':
+      return 'Ressourcen (Untergrenze: kein Platz für eine weitere Instanz)';
+    case 'cap':
+      return 'Höchstzahl erreicht (Untergrenze: Instanz- oder Messobergrenze)';
+    default:
+      return 'Unbekannt';
+  }
 }
 
-function audioLimitEn(limit: string): string {
-  if (limit === 'performance') return 'Performance (a measured ceiling)';
-  if (limit === 'resources') return 'Resources (a lower bound: no room for another instance)';
-  return 'Cap reached (a lower bound: the instance or ramp maximum)';
+function audioLimitEn(limit: AudioConcurrencyLimit | ''): string {
+  switch (limit) {
+    case 'performance':
+      return 'Performance (a measured ceiling)';
+    case 'resources':
+      return 'Resources (a lower bound: no room for another instance)';
+    case 'cap':
+      return 'Cap reached (a lower bound: the instance or ramp maximum)';
+    default:
+      return 'Unknown';
+  }
+}
+
+// What the count beside a limit is, said where the mapping editor asks for
+// it: with performance a measured ceiling, whose 0 is "not real-time" even
+// for one stream alone; with resources or the cap a lower bound, whose 0
+// reads "≥ 0". Without a limit no count is saved at all.
+function audioCountRequiredDe(limit: AudioConcurrencyLimit | ''): string {
+  const what =
+    'Gehört zur gewählten Begrenzung: die letzte Stufe, die mit der Echtzeit Schritt hielt, als ganze Zahl ab 0.';
+  switch (limit) {
+    case 'performance':
+      return `${what} Bei „Leistung“ ist sie eine gemessene Obergrenze: 0 = ${audioFigureDe(0, limit)}, schon ein einzelner Strom ist zu langsam.`;
+    case 'resources':
+    case 'cap':
+      return `${what} Mit dieser Begrenzung ist sie eine Untergrenze, denn die Messung endete, bevor das Modell zu langsam wurde: 0 heißt „${audioFigureDe(0, limit)}“.`;
+    default:
+      return 'Ohne Begrenzung wird keine Echtzeit-Parallelität gespeichert: Wählen Sie zuerst, wodurch die Messung begrenzt war.';
+  }
+}
+
+function audioCountRequiredEn(limit: AudioConcurrencyLimit | ''): string {
+  const what =
+    'Required with the chosen limit: the last level that kept up with real time, a whole number of 0 or more.';
+  switch (limit) {
+    case 'performance':
+      return `${what} With Performance it is a measured ceiling: 0 = ${audioFigureEn(0, limit)}, even one stream alone is too slow.`;
+    case 'resources':
+    case 'cap':
+      return `${what} With this limit it is a lower bound, since the measurement ended before the model ran out of speed: 0 reads "${audioFigureEn(0, limit)}".`;
+    default:
+      return 'Without a limit no real-time concurrency is saved: first choose what limited the measurement.';
+  }
 }
 
 const de = {
@@ -1113,14 +1189,14 @@ const de = {
   // #340: die Audio-Metriken, neben den Text-Metriken und unter derselben Sperre.
   mappingAudioMetricsSection: 'Audio-Metriken',
   mappingAudioMetricsHint:
-    'Optional. Bei × Echtzeit und der Zeit bis zur ersten Ausgabe heißt leer oder 0 „nicht gemessen“. Die Audio-Messung (Geschwindigkeit, Kapazität, Beide) füllt diese Werte, sofern die Metriken nicht gesperrt sind. Die Echtzeit-Parallelität gilt nur zusammen mit ihrer Begrenzung und gehört dann dazu; 0 heißt dort „nicht echtzeitfähig“. „Unbekannt“ löscht beide.',
+    'Optional. Bei × Echtzeit und der Zeit bis zur ersten Ausgabe heißt leer oder 0 „nicht gemessen“. Die Audio-Messung (Geschwindigkeit, Kapazität, Beide) füllt diese Werte, sofern die Metriken nicht gesperrt sind. Die Echtzeit-Parallelität gilt nur zusammen mit ihrer Begrenzung und gehört dann dazu: Bei „Leistung“ ist sie eine gemessene Obergrenze, und 0 heißt „nicht echtzeitfähig“ (schon ein einzelner Strom ist zu langsam); bei „Ressourcen“ und „Höchstzahl erreicht“ ist sie eine Untergrenze, und 0 heißt „≥ 0“. „Unbekannt“ löscht beide.',
   mappingAudioRateX: '× Echtzeit (ein Strom)',
   mappingAudioTtfaMs: 'Zeit bis zur ersten Ausgabe (ms)',
   mappingAudioRealtimeConcurrency: 'Echtzeit-Parallelität',
-  mappingAudioRealtimeConcurrencyRequired:
-    'Gehört zur gewählten Begrenzung: die letzte Stufe, die mit der Echtzeit Schritt hielt, als ganze Zahl ab 0 (0 = nicht echtzeitfähig).',
+  mappingAudioRealtimeConcurrencyRequired: (limit: AudioConcurrencyLimit | '') =>
+    audioCountRequiredDe(limit),
   mappingAudioConcurrencyLimit: 'Begrenzt durch',
-  mappingAudioConcurrencyLimitUnknown: 'Unbekannt',
+  mappingAudioConcurrencyLimitUnknown: audioLimitDe(''),
   mappingAudioConcurrencyLimitPerformance: audioLimitDe('performance'),
   mappingAudioConcurrencyLimitResources: audioLimitDe('resources'),
   mappingAudioConcurrencyLimitCap: audioLimitDe('cap'),
@@ -1737,8 +1813,10 @@ const de = {
   benchmarkAudioResult: (rate: number, ttftMs: number) =>
     `${formatRateX(rate)} Echtzeit${ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''}`,
   benchmarkAudioLoadTime: (ms: number) => `Ladezeit ${ms} ms`,
-  benchmarkAudioCapacityResult: (k: number, limit: string) =>
-    `Echtzeit-Parallelität: ${audioConcurrencyFigure(k, limit, 'nicht echtzeitfähig')} – ${audioLimitDe(limit)}`,
+  benchmarkAudioCapacityResult: (k: number, limit: AudioConcurrencyLimit | '') =>
+    isAudioConcurrencyLimit(limit)
+      ? `Echtzeit-Parallelität: ${audioFigureDe(k, limit)} – ${audioLimitDe(limit)}`
+      : `Echtzeit-Parallelität: ${audioFigureDe(k, '')}`,
   benchmarkAudioRuns: 'Audio-Messungen',
   benchmarkAudioCapacityRuns: 'Audio-Kapazitäts-Messungen',
   benchmarkAudioColSlowest: 'Langsamster Strom (× Echtzeit)',
@@ -1881,8 +1959,8 @@ const de = {
   modelServersAudioRate: '× Echtzeit',
   modelServersAudioTtft: 'Erste Ausgabe (ms)',
   modelServersAudioConcurrency: 'Echtzeit-Parallelität',
-  audioRealtimeConcurrency: (k: number, limit: string) =>
-    audioConcurrencyFigure(k, limit, 'nicht echtzeitfähig'),
+  audioRealtimeConcurrency: (k: number, limit: AudioConcurrencyLimit | '') =>
+    audioFigureDe(k, limit),
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
   // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
@@ -4579,14 +4657,14 @@ const en: PortalMessages = {
   mappingGenTpsAtCapacity: 'Tokens/s (max capacity)',
   mappingAudioMetricsSection: 'Audio metrics',
   mappingAudioMetricsHint:
-    'Optional. For × real time and the time to first output, empty or 0 means "not measured". The audio measurement (Speed, Capacity, Both) fills these in unless the metrics are locked. The real-time concurrency holds only together with its limit and is then required; 0 there means "not real-time". "Unknown" clears both.',
+    'Optional. For × real time and the time to first output, empty or 0 means "not measured". The audio measurement (Speed, Capacity, Both) fills these in unless the metrics are locked. The real-time concurrency holds only together with its limit and is then required: with Performance it is a measured ceiling, and 0 means "not real-time" (even one stream alone is too slow); with Resources or Cap reached it is a lower bound, and 0 means "≥ 0". "Unknown" clears both.',
   mappingAudioRateX: '× real time (one stream)',
   mappingAudioTtfaMs: 'Time to first output (ms)',
   mappingAudioRealtimeConcurrency: 'Real-time concurrency',
-  mappingAudioRealtimeConcurrencyRequired:
-    'Required with the chosen limit: the last level that kept up with real time, a whole number of 0 or more (0 = not real-time).',
+  mappingAudioRealtimeConcurrencyRequired: (limit: AudioConcurrencyLimit | '') =>
+    audioCountRequiredEn(limit),
   mappingAudioConcurrencyLimit: 'Limited by',
-  mappingAudioConcurrencyLimitUnknown: 'Unknown',
+  mappingAudioConcurrencyLimitUnknown: audioLimitEn(''),
   mappingAudioConcurrencyLimitPerformance: audioLimitEn('performance'),
   mappingAudioConcurrencyLimitResources: audioLimitEn('resources'),
   mappingAudioConcurrencyLimitCap: audioLimitEn('cap'),
@@ -5160,8 +5238,10 @@ const en: PortalMessages = {
   benchmarkAudioResult: (rate: number, ttftMs: number) =>
     `${formatRateX(rate)} real time${ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''}`,
   benchmarkAudioLoadTime: (ms: number) => `load time ${ms} ms`,
-  benchmarkAudioCapacityResult: (k: number, limit: string) =>
-    `Real-time concurrency: ${audioConcurrencyFigure(k, limit, 'not real-time')} – ${audioLimitEn(limit)}`,
+  benchmarkAudioCapacityResult: (k: number, limit: AudioConcurrencyLimit | '') =>
+    isAudioConcurrencyLimit(limit)
+      ? `Real-time concurrency: ${audioFigureEn(k, limit)} – ${audioLimitEn(limit)}`
+      : `Real-time concurrency: ${audioFigureEn(k, '')}`,
   benchmarkAudioRuns: 'Audio runs',
   benchmarkAudioCapacityRuns: 'Audio capacity runs',
   benchmarkAudioColSlowest: 'Slowest stream (× real time)',
@@ -5292,8 +5372,8 @@ const en: PortalMessages = {
   modelServersAudioRate: '× real time',
   modelServersAudioTtft: 'First output (ms)',
   modelServersAudioConcurrency: 'Real-time concurrency',
-  audioRealtimeConcurrency: (k: number, limit: string) =>
-    audioConcurrencyFigure(k, limit, 'not real-time'),
+  audioRealtimeConcurrency: (k: number, limit: AudioConcurrencyLimit | '') =>
+    audioFigureEn(k, limit),
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
   modelServerColLiveProgress: 'Live progress',

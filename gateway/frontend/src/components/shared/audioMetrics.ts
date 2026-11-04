@@ -13,23 +13,27 @@ import type {
   UpdateMappingRequest,
 } from '../../api';
 import type { ListColumn } from './ListTable';
-import { formatRateX } from './audioFigures';
+import {
+  audioLimitOf,
+  formatRateX,
+  isAudioConcurrencyLimit,
+  type AudioConcurrencyLimit,
+} from './audioFigures';
 import { parseMetricInput } from './format';
 import type { Translation } from './types';
 
-/** Why an audio concurrency ramp stopped: the closed set the gateway writes. */
-export const AUDIO_CONCURRENCY_LIMITS = ['performance', 'resources', 'cap'] as const;
-export type AudioConcurrencyLimit = (typeof AUDIO_CONCURRENCY_LIMITS)[number];
+export {
+  AUDIO_CONCURRENCY_LIMITS,
+  audioLimitOf,
+  isAudioConcurrencyLimit,
+  type AudioConcurrencyLimit,
+} from './audioFigures';
 
 /** The four audio metrics as a mapping and a model-servers row carry them. */
 export type AudioMetrics = Pick<
   PortalModelMapping,
   'audio_rate_x' | 'audio_ttfa_ms' | 'audio_realtime_concurrency' | 'audio_concurrency_limit'
 >;
-
-export function isAudioConcurrencyLimit(value: string | undefined): value is AudioConcurrencyLimit {
-  return (AUDIO_CONCURRENCY_LIMITS as readonly (string | undefined)[]).includes(value);
-}
 
 /** A single-stream rate as a multiple of real time (formatRateX); 0 is not measured. */
 export function formatAudioRate(rateX: number | undefined): string {
@@ -140,9 +144,7 @@ export type AudioMetricsForm = {
  * does not know reads as unknown, like a missing one.
  */
 export function audioMetricsForm(row: AudioMetrics | null): AudioMetricsForm {
-  const limit = isAudioConcurrencyLimit(row?.audio_concurrency_limit)
-    ? row.audio_concurrency_limit
-    : '';
+  const limit = audioLimitOf(row?.audio_concurrency_limit);
   return {
     rateText: row?.audio_rate_x ? String(row.audio_rate_x) : '',
     ttfaText: row?.audio_ttfa_ms ? String(row.audio_ttfa_ms) : '',

@@ -676,7 +676,10 @@ export function MappingForm({
               inputRef={audioCountRef}
               inputProps={{ min: 0, step: 1 }}
               {...(audioPairIncomplete(audio)
-                ? { error: true, helperText: t.mappingAudioRealtimeConcurrencyRequired }
+                ? {
+                    error: true,
+                    helperText: t.mappingAudioRealtimeConcurrencyRequired(audio.limit),
+                  }
                 : {})}
             />
           </>

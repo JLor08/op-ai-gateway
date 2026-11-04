@@ -14,7 +14,11 @@ import {
   vramWarningLabelKey,
   vramWarnings,
 } from './components/shared/vram';
-import { formatAudioRate } from './components/shared/audioMetrics';
+import {
+  AUDIO_CONCURRENCY_LIMITS,
+  formatAudioRate,
+  type AudioConcurrencyLimit,
+} from './components/shared/audioMetrics';
 import type { MessageKey } from './components/shared/types';
 
 describe('activityNewRequests interpolation', () => {
@@ -4365,7 +4369,6 @@ describe('audio metrics (#340) i18n keys', () => {
     'mappingAudioRateX',
     'mappingAudioTtfaMs',
     'mappingAudioRealtimeConcurrency',
-    'mappingAudioRealtimeConcurrencyRequired',
     'mappingAudioConcurrencyLimit',
     'mappingAudioConcurrencyLimitUnknown',
     'mappingAudioConcurrencyLimitPerformance',
@@ -4436,6 +4439,63 @@ describe('audio metrics (#340) i18n keys', () => {
     expect(messages.en.audioRealtimeConcurrency(0, 'performance')).toBe('not real-time');
   });
 
+  // Without one of the three limits no ramp result stands behind the count:
+  // the figure and the result line say "unknown", never a lower bound and
+  // never the cap. That holds for a limit this build does not know, too.
+  it('names a real-time concurrency without a known limit unknown, never a lower bound', () => {
+    const newer = 'thermal' as string as AudioConcurrencyLimit;
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const unknown = locale === 'de' ? 'unbekannt' : 'unknown';
+      for (const limit of ['', newer] as const) {
+        expect(t.audioRealtimeConcurrency(2, limit), `${locale} ${limit}`).toBe(unknown);
+        const line = t.benchmarkAudioCapacityResult(2, limit);
+        expect(line, `${locale} ${limit}`).toBe(`${t.modelServersAudioConcurrency}: ${unknown}`);
+        expect(line, `${locale} ${limit}`).not.toContain('≥');
+        expect(line, `${locale} ${limit}`).not.toContain(t.mappingAudioConcurrencyLimitCap);
+      }
+    }
+  });
+
+  // The limit is typed as the closed set the gateway writes plus '': a raw
+  // string from the wire has to be read through it first.
+  it('takes the limit only as one of the three or unknown', () => {
+    const raw: string = 'resources';
+    // @ts-expect-error a raw string is no limit
+    expect(messages.en.audioRealtimeConcurrency(2, raw)).toBe('≥ 2');
+    // @ts-expect-error a raw string is no limit
+    expect(messages.en.benchmarkAudioCapacityResult(2, raw)).toContain('≥ 2');
+    // @ts-expect-error a raw string is no limit
+    expect(messages.en.mappingAudioRealtimeConcurrencyRequired(raw)).toContain('≥ 0');
+  });
+
+  // The count's help texts say what a 0 is under the limit beside it: with
+  // performance a measured "not real-time", even one stream alone; with
+  // resources or the cap a lower bound, "≥ 0".
+  it('says per limit what a count of 0 means', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const notRealtime = t.audioRealtimeConcurrency(0, 'performance');
+      const performance = t.mappingAudioRealtimeConcurrencyRequired('performance');
+      expect(performance, locale).toContain(notRealtime);
+      expect(performance, locale).toMatch(locale === 'de' ? /einzelner Strom/ : /one stream alone/);
+      expect(performance, locale).not.toContain('≥');
+      for (const limit of ['resources', 'cap'] as const) {
+        const text = t.mappingAudioRealtimeConcurrencyRequired(limit);
+        expect(text, `${locale} ${limit}`).toContain(t.audioRealtimeConcurrency(0, limit));
+        expect(text, `${locale} ${limit}`).toContain('≥ 0');
+        expect(text, `${locale} ${limit}`).not.toContain(notRealtime);
+      }
+      const none = t.mappingAudioRealtimeConcurrencyRequired('');
+      expect(none, locale).not.toContain(notRealtime);
+      expect(none, locale).not.toContain('≥');
+      expect(t.mappingAudioMetricsHint, locale).toContain(notRealtime);
+      expect(t.mappingAudioMetricsHint, locale).toContain(
+        t.audioRealtimeConcurrency(0, 'resources'),
+      );
+    }
+  });
+
   it('names the figure and why the ramp stopped in the capacity result line', () => {
     const limitKeys = {
       performance: 'mappingAudioConcurrencyLimitPerformance',
@@ -4444,7 +4504,8 @@ describe('audio metrics (#340) i18n keys', () => {
     } as const;
     for (const locale of ['de', 'en'] as readonly Locale[]) {
       const t = messages[locale];
-      for (const [limit, key] of Object.entries(limitKeys)) {
+      for (const limit of AUDIO_CONCURRENCY_LIMITS) {
+        const key = limitKeys[limit];
         const line = t.benchmarkAudioCapacityResult(2, limit);
         expect(line, `${locale} ${limit}`).toContain(t.audioRealtimeConcurrency(2, limit));
         expect(line, `${locale} ${limit}`).toContain(t[key]);
@@ -4478,7 +4539,7 @@ describe('audio metrics (#340) i18n keys', () => {
       expect(t.mappingAudioMetricsHint, locale).toContain(
         t.audioRealtimeConcurrency(0, 'performance'),
       );
-      expect(t.mappingAudioRealtimeConcurrencyRequired, locale).toContain(
+      expect(t.mappingAudioRealtimeConcurrencyRequired('performance'), locale).toContain(
         t.audioRealtimeConcurrency(0, 'performance'),
       );
     }

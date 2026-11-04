@@ -999,7 +999,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const { submitted } = renderForm({ row: makeMapping() });
       await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitPerformance);
       expect(countField().value).toBe('');
-      expect(screen.getByText(t.mappingAudioRealtimeConcurrencyRequired)).toBeInTheDocument();
+      expect(
+        screen.getByText(t.mappingAudioRealtimeConcurrencyRequired('performance')),
+      ).toBeInTheDocument();
       expect(countField()).toHaveAttribute('aria-invalid', 'true');
       await save();
       await act(async () => {
@@ -1008,7 +1010,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(submitted).toHaveLength(0);
 
       fireEvent.change(countField(), { target: { value: '0' } });
-      expect(screen.queryByText(t.mappingAudioRealtimeConcurrencyRequired)).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(t.mappingAudioRealtimeConcurrencyRequired('performance')),
+      ).not.toBeInTheDocument();
       await save();
       await waitFor(() => expect(submitted).toHaveLength(1));
       expect(submitted[0]).toMatchObject({
@@ -1023,7 +1027,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     it('refuses to save a measured count cleared beside its limit', async () => {
       const { submitted } = renderForm({ row: measured() });
       fireEvent.change(countField(), { target: { value: '' } });
-      expect(screen.getByText(t.mappingAudioRealtimeConcurrencyRequired)).toBeInTheDocument();
+      expect(
+        screen.getByText(t.mappingAudioRealtimeConcurrencyRequired('resources')),
+      ).toBeInTheDocument();
       expect(countField()).toBeRequired();
       fireEvent.submit(countField().closest('form')!);
       await act(async () => {
@@ -1033,6 +1039,29 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(countField()).toHaveFocus();
     });
 
+    // The missing count is asked for in the words of the limit beside it: a
+    // 0 is "not real-time" only with performance, and a lower bound, "≥ 0",
+    // with resources or the cap.
+    it.each(['resources', 'cap'] as const)(
+      'says beside %s that a count of 0 is a lower bound',
+      async (limit) => {
+        renderForm({ row: makeMapping() });
+        await pickOption(
+          t.mappingAudioConcurrencyLimit,
+          limit === 'resources'
+            ? t.mappingAudioConcurrencyLimitResources
+            : t.mappingAudioConcurrencyLimitCap,
+        );
+        const help = screen.getByText(t.mappingAudioRealtimeConcurrencyRequired(limit));
+        expect(help.textContent).toContain('≥ 0');
+        expect(help.textContent).not.toContain(t.audioRealtimeConcurrency(0, 'performance'));
+        await pickOption(t.mappingAudioConcurrencyLimit, t.mappingAudioConcurrencyLimitPerformance);
+        expect(
+          screen.getByText(t.mappingAudioRealtimeConcurrencyRequired('performance')).textContent,
+        ).toContain(t.audioRealtimeConcurrency(0, 'performance'));
+      },
+    );
+
     // The hint says what an empty field or a 0 means per field: not measured
     // for the rate and the time, a result for the count.
     it('does not call a count of 0 unknown in its hint', () => {
@@ -1040,6 +1069,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const hint = screen.getByText(t.mappingAudioMetricsHint);
       expect(hint.textContent).not.toMatch(/0 = (unbekannt|unknown)/i);
       expect(hint.textContent).toContain(t.audioRealtimeConcurrency(0, 'performance'));
+      expect(hint.textContent).toContain(t.audioRealtimeConcurrency(0, 'resources'));
     });
   });
 }
