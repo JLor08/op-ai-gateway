@@ -396,6 +396,138 @@ func TestLiveCollisionReselects(t *testing.T) {
 	finishLiveSession(t, s)
 }
 
+// A live session that loses the race for the slot it selected treats that slot like
+// any other held one. The instance still exists and its slot will free, so it stays a
+// candidate -- the registry now reports it held, and every selection passes over it
+// until it frees. A session that finds every slot held that way, however it got there,
+// parks and signals live demand rather than being refused busy, and it takes the slot
+// it lost once that slot frees.
+func TestLiveLostRaceParksLikeAHeldSlot(t *testing.T) {
+	addressOf := map[string]string{"route-asr-inst#0": "asr-up", "route-asr-inst#1": "asr-up#1"}
+	cases := []struct {
+		name    string
+		running []int    // instances reported running
+		held    []string // slots other sessions hold before the session starts
+		races   int      // selections whose slot the hook takes before the acquire
+	}{
+		{"the only running instance", []int{0}, nil, 1},
+		{"the other slot is held", []int{0, 1}, []string{"route-asr-inst#1"}, 1},
+		{"every slot lost in a race", []int{0, 1}, nil, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newInstanceAgentRouter(t)
+			srv := newInstanceRouterServer(t, agent, true)
+			publishASRInstances(srv, tc.running...)
+			sink := &recordingDemandSink{}
+			srv.Resolver.SetDemandSink(sink)
+			// Closed last (cleanups run in reverse): every slot is released first, so a
+			// session still parked when the test fails is let go instead of holding Close.
+			ts := httptest.NewServer(srv)
+			t.Cleanup(ts.Close)
+			for _, key := range tc.held {
+				release, ok := srv.liveSessions.acquire(key)
+				if !ok {
+					t.Fatalf("could not take %s", key)
+				}
+				t.Cleanup(release)
+			}
+			var mu sync.Mutex
+			var raced []string
+			var racedReleases []func()
+			liveSlotAcquireHook = func(instanceKey string) {
+				mu.Lock()
+				defer mu.Unlock()
+				if len(raced) == tc.races {
+					return
+				}
+				if release, ok := srv.liveSessions.acquire(instanceKey); ok {
+					raced = append(raced, instanceKey)
+					racedReleases = append(racedReleases, release)
+				}
+			}
+			t.Cleanup(func() {
+				liveSlotAcquireHook = nil
+				mu.Lock()
+				defer mu.Unlock()
+				for _, release := range racedReleases {
+					release()
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			done := make(chan liveSessionResult, 1)
+			go func() { done <- startLiveSession(ctx, ts, "asr-inst") }()
+			select {
+			case s := <-done:
+				status := 0
+				if s.resp != nil {
+					status = s.resp.StatusCode
+				}
+				t.Fatalf("session answered (status %d, err %v) after losing its slot while no slot was free, want it to wait", status, s.err)
+			case <-time.After(400 * time.Millisecond):
+			}
+			mu.Lock()
+			lost := slices.Clone(raced)
+			mu.Unlock()
+			if len(lost) != tc.races {
+				t.Fatalf("the hook took %v, want %d slots", lost, tc.races)
+			}
+			signals := sink.signals()
+			if len(signals) == 0 || !signals[0].Live || signals[0].Model != "asr-inst" || !slices.Equal(signals[0].MappingIDs, []string{liveInstASRMap}) {
+				t.Fatalf("demand signals = %+v after the session lost %v, want a live signal for asr-inst naming %s", signals, lost, liveInstASRMap)
+			}
+
+			mu.Lock()
+			racedReleases[0]()
+			mu.Unlock()
+			var s liveSessionResult
+			select {
+			case s = <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("the parked session was not admitted after %s, the slot it lost, freed", lost[0])
+			}
+			if s.err != nil || s.resp.StatusCode != http.StatusOK {
+				t.Fatalf("admitted session: err %v status %v, want 200", s.err, s.resp)
+			}
+			if served := agent.servedModels(); !slices.Equal(served, []string{addressOf[lost[0]]}) {
+				t.Fatalf("live addresses served = %v, want only %s: the instance whose slot the session lost and then took", served, addressOf[lost[0]])
+			}
+			finishLiveSession(t, s)
+		})
+	}
+}
+
+// Without an admission queue a live session has nowhere to wait: with every slot
+// held it is answered busy, and it tries each held slot at most once more instead
+// of selecting it over and over.
+func TestLiveAllHeldWithoutAQueueAnswersBusy(t *testing.T) {
+	agent := newInstanceAgentRouter(t)
+	srv := newInstanceRouterServer(t, agent, true)
+	publishASRInstances(srv, 0, 1)
+	srv.Resolver.SetAdmissionController(nil)
+	release0, _ := srv.liveSessions.acquire("route-asr-inst#0")
+	release1, _ := srv.liveSessions.acquire("route-asr-inst#1")
+	defer release0()
+	defer release1()
+	selections := 0
+	liveSlotAcquireHook = func(string) { selections++ }
+	t.Cleanup(func() { liveSlotAcquireHook = nil })
+
+	rec := postBearerLiveRecorder(t, srv, bearerLiveQuery("asr-inst"), devBearerHeader)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), liveBearerBusyCode)
+	if selections > 3 {
+		t.Fatalf("%d selections, want at most one per held slot and one more", selections)
+	}
+	if served := agent.servedModels(); len(served) != 0 {
+		t.Fatalf("upstream reached for %v, want no relay", served)
+	}
+}
+
 // Every live slot of a replicable model held: the session waits in the admission
 // queue -- signalling demand for a live slot -- and is admitted once a slot frees.
 func TestLiveAllHeldReplicableParks(t *testing.T) {

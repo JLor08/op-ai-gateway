@@ -53,8 +53,9 @@ func reselectsLostInstance(target routing.Target, req inference.Request, err err
 	return target.Instance() >= 1 && len(req.ExcludeInstanceKeys) == 0 && isInstanceGoneError(err)
 }
 
-// withLostInstance returns req with lost's instance added to the instances its next
-// selection must not pick. The slice is copied, so the caller's request is untouched.
+// withLostInstance returns req with lost's instance, found gone, added to the instances
+// its selections must not pick. The slice is copied, so the caller's request is
+// untouched.
 func withLostInstance(req inference.Request, lost routing.Target) inference.Request {
 	req.ExcludeInstanceKeys = append(slices.Clone(req.ExcludeInstanceKeys), lost.InstanceKey)
 	return req

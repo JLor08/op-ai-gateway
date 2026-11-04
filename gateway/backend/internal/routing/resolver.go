@@ -779,7 +779,7 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		if err != nil {
 			return Target{}, err
 		}
-		// A pin to an instance this request already tried and lost
+		// A pin to an instance this request already tried and found gone
 		// (ExcludeInstanceKeys) is passed over, not deleted: the fresh selection below
 		// excludes that instance, and the pin stays for the session's next request.
 		if ok && !slices.Contains(req.ExcludeInstanceKeys, target.InstanceKey) {
@@ -1807,8 +1807,8 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	need := estInputTokens(req) + req.MaxTokens
 
 	// Pass 1: the reachable/selectable/non-busy candidates (the existing gates), less any
-	// instance the request already tried and lost (ExcludeInstanceKeys) -- a hard filter
-	// on every admission turn, so a parked request never comes back to it.
+	// instance the request already tried and found gone (ExcludeInstanceKeys) -- a hard
+	// filter on every admission turn, so a parked request never comes back to it.
 	reachable := make([]MappingCandidate, 0, len(candidates))
 	for _, c := range candidates {
 		if !serverSelectable(c.Server) {

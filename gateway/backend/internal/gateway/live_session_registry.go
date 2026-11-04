@@ -10,19 +10,23 @@ import "sync"
 // a mapping without instances has too: "<mapping_id>#0"). audio.cpp serves one
 // /live session per process at a time and nothing else serializes it, so the live
 // relay takes a slot here before relaying, and a session that finds its instance's
-// slot taken is re-selected onto a sibling or refused with a clean busy reject --
-// never left to collide at the backend. N running instances of a replicable spec
+// slot taken is selected again -- onto a sibling, or into the admission queue until a
+// slot frees -- or refused with a clean busy reject, never left to collide at the
+// backend. N running instances of a replicable spec
 // are N slots; a mapping without instances keeps its one. It is pure mutual
 // exclusion: no TTL, count or eviction, so a slot is held until its holder calls
 // the release it was handed. It is also the resolver's routing.LiveSlotChecker
 // (LiveHeld), so a live session's selection passes over a held instance.
 type liveSessionRegistry struct {
-	mu     sync.Mutex
-	active map[string]struct{}
+	mu sync.Mutex
+	// active maps a held instance key to its holder: the number claim gave the
+	// session holding it.
+	active map[string]uint64
+	issued uint64 // the last holder number claim gave
 }
 
 func newLiveSessionRegistry() *liveSessionRegistry {
-	return &liveSessionRegistry{active: make(map[string]struct{})}
+	return &liveSessionRegistry{active: make(map[string]uint64)}
 }
 
 // acquire claims the slot for instanceKey. When the instance already has an active
@@ -37,24 +41,38 @@ func newLiveSessionRegistry() *liveSessionRegistry {
 // resolved target's InstanceKey. A nil registry fails closed: it admits nothing, so a
 // missing registry can never let two sessions share a backend.
 func (r *liveSessionRegistry) acquire(instanceKey string) (release func(), ok bool) {
+	release, _, ok = r.claim(instanceKey)
+	return release, ok
+}
+
+// claim is acquire that also names the slot's holder: on success the number this
+// claim was given, and when the slot is taken the number of the session holding it.
+// Holder numbers are never reused, so a caller that finds the same slot taken twice
+// can tell whether the same session is still in its way or a later one took the slot
+// after it freed. A nil registry claims nothing and names holder 0.
+func (r *liveSessionRegistry) claim(instanceKey string) (release func(), holder uint64, ok bool) {
 	if r == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, busy := r.active[instanceKey]; busy {
-		return nil, false
+	if holder, busy := r.active[instanceKey]; busy {
+		return nil, holder, false
 	}
-	r.active[instanceKey] = struct{}{}
+	r.issued++
+	mine := r.issued
+	r.active[instanceKey] = mine
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			delete(r.active, instanceKey)
+			if r.active[instanceKey] == mine {
+				delete(r.active, instanceKey)
+			}
 		})
-	}, true
+	}, mine, true
 }
 
 // LiveHeld reports whether instanceKey currently has an active live session, WITHOUT
