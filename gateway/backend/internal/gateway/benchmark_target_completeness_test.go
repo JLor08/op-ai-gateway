@@ -23,6 +23,17 @@ var benchmarkOmits = map[string]bool{
 	// authoritative measurement -- must never trigger (see the RouteID comment
 	// in benchmarkTargetReq, benchmark_runner.go).
 	"RouteID": true,
+	// The instance key names an instance for what is held per instance -- in-flight
+	// requests, live slots -- and a benchmark stream holds none of it. It measures
+	// the mapping's instance 0 through the plain model name ProviderModel carries,
+	// and leaves the key empty for the reason RouteID is.
+	"InstanceKey": true,
+	// Whether the mapping runs instances matters only to what is held per instance and
+	// to re-selecting a request that lost its instance; a benchmark stream does neither.
+	"InstanceCapable": true,
+	// Whether the pool a selection picked from held an instance matters only to a
+	// live session that loses its slot; a benchmark stream takes none.
+	"InstancePool": true,
 	// No ActiveRequest is registered and no InferenceEvent emitted on the benchmark
 	// stream (streamOnce -> CompleteStream), so nothing reads Target.ServerID here.
 	"ServerID": true,

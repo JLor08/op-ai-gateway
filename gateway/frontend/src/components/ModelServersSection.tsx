@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState } from 'react';
-import { Tooltip } from '@mui/material';
+import { Box, Tooltip, Typography } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import {
   PortalApiError,
@@ -13,6 +13,8 @@ import {
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { StatusChip } from './shared/StatusChip';
+import { audioMetricColumns } from './shared/audioMetrics';
+import { runningInstanceCount, showsRunningInstances } from './shared/runtimeInstances';
 import { runtimeStateBadge } from './shared/runtimeState';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { makeVisionColumn } from './shared/visionColumn';
@@ -494,9 +496,24 @@ export function ModelServersSection({
       filter: 'enum',
       searchable: false,
       enumLabel: (v) => modelStatusLabel(v as ModelStatusKey, t),
-      render: (r) => (
-        <StatusChip status={modelStatusBadge(r)} label={modelStatusLabel(modelStatusKey(r), t)} />
-      ),
+      render: (r) => {
+        const chip = (
+          <StatusChip status={modelStatusBadge(r)} label={modelStatusLabel(modelStatusKey(r), t)} />
+        );
+        // #340: a replicable spec can run several instances of the model on
+        // this server, and the row says how many -- for a replicable spec
+        // always, for any other once more than one runs
+        // (showsRunningInstances).
+        if (!showsRunningInstances(r)) return chip;
+        return (
+          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+            {chip}
+            <Typography variant="caption" color="text.secondary">
+              {`${t.modelServersRunningInstances}: ${runningInstanceCount(r)}`}
+            </Typography>
+          </Box>
+        );
+      },
     },
     {
       // Live per-model load (SSE-fed): how many requests are in flight on this
@@ -564,6 +581,8 @@ export function ModelServersSection({
       value: (r) => String(r.context_size),
       render: (r) => (r.context_size > 0 ? String(r.context_size) : '—'),
     },
+    // #340: the audio metrics, offered while a row serves audio.
+    ...audioMetricColumns(t, rows),
     {
       // See liveProgressChipInfo above for why this is read straight off the
       // row's persisted field, not gated on any probe column.

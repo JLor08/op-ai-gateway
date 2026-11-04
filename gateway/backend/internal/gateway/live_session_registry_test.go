@@ -137,6 +137,31 @@ func TestLiveSessionRegistryEmptyRouteIDIsAnOrdinaryKey(t *testing.T) {
 	}
 }
 
+// A refused claim names the session holding the slot, and a later holder of the same
+// slot gets a number of its own; a stale release frees nothing a later holder holds.
+func TestLiveSessionRegistryClaimNamesTheHolder(t *testing.T) {
+	t.Parallel()
+	reg := newLiveSessionRegistry()
+
+	releaseA, a, ok := reg.claim("r1")
+	if !ok {
+		t.Fatal("first claim(r1) refused, want ok")
+	}
+	if _, holder, ok := reg.claim("r1"); ok || holder != a {
+		t.Fatalf("claim(r1) while A holds it = (holder %d, ok %v), want A's %d and refused", holder, ok, a)
+	}
+	releaseA()
+	releaseB, b, ok := reg.claim("r1")
+	if !ok || b == a {
+		t.Fatalf("claim(r1) after A released = (holder %d, ok %v), want ok with a number other than A's %d", b, ok, a)
+	}
+	defer releaseB()
+	releaseA()
+	if _, holder, ok := reg.claim("r1"); ok || holder != b {
+		t.Fatalf("claim(r1) after A's stale release = (holder %d, ok %v), want B's %d and refused", holder, ok, b)
+	}
+}
+
 func TestLiveSessionRegistryNilReceiverFailsClosed(t *testing.T) {
 	t.Parallel()
 	var reg *liveSessionRegistry

@@ -496,6 +496,9 @@ var vendorTargetMayBeZero = map[string]bool{
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
 	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
 	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
+	"InstanceKey":                 true, // names an instance of a mapping; a vendor target addresses none
+	"InstanceCapable":             true, // a vendor target runs no instances
+	"InstancePool":                true, // a vendor target is not selected from a pool of instances
 	"APITokenHeader":              true, // "" for an OpenAI vendor (Bearer default); set for Anthropic
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
@@ -517,6 +520,9 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
 	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
 	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
+	"InstanceKey":                 true, // names an instance of a mapping; a vendor target addresses none
+	"InstanceCapable":             true, // a vendor target runs no instances
+	"InstancePool":                true, // a vendor target is not selected from a pool of instances
 	"ExtraHeaders":                true, // ProxyNative sets anthropic-version itself; an API-KEY target carries no static headers
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only); the relay is verbatim
 	"Subscription":                true, // false on the API-KEY path -- its x-api-key rides in APIToken, not resolved at dispatch
@@ -537,6 +543,9 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
 	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
 	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
+	"InstanceKey":                 true, // names an instance of a mapping; a vendor target addresses none
+	"InstanceCapable":             true, // a vendor target runs no instances
+	"InstancePool":                true, // a vendor target is not selected from a pool of instances
 	"APITokenHeader":              true, // "" == Authorization: Bearer, which every compat vendor uses
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)

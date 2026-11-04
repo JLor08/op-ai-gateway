@@ -9,6 +9,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/portal"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -578,6 +580,81 @@ func TestIngestRuntimeReportPreservesMirrorFields(t *testing.T) {
 	}
 }
 
+// TestAgentRuntimeReportSpecMirrorsEveryNonSecretDTOField holds the mirror to
+// its own contract: agentRuntimeReportSpec carries every field of
+// portal.AgentRuntimeSpecDTO, by the same json name, except the two that can
+// carry a secret (api_token, config_files). A field the mirror lacks is
+// silently dropped from every stored file-mode report by the sanitizer's
+// re-parse -- the issue #64 class of bug, which the round-trip tests here
+// could only catch one field at a time, after someone noticed. It fails the
+// other way too: a mirror field the DTO does not have is a name no agent
+// sends, and a secret-bearing field in the mirror would be stored.
+func TestAgentRuntimeReportSpecMirrorsEveryNonSecretDTOField(t *testing.T) {
+	secret := map[string]bool{"api_token": true, "config_files": true}
+	dto := jsonFieldNames(t, reflect.TypeFor[portal.AgentRuntimeSpecDTO]())
+	mirror := jsonFieldNames(t, reflect.TypeFor[agentRuntimeReportSpec]())
+	for name := range dto {
+		switch {
+		case secret[name] && mirror[name]:
+			t.Errorf("agentRuntimeReportSpec carries %q, a field that can hold a secret: the stored report must never have it", name)
+		case !secret[name] && !mirror[name]:
+			t.Errorf("agentRuntimeReportSpec has no %q: the sanitizer drops that AgentRuntimeSpecDTO field from every stored report", name)
+		}
+	}
+	for name := range mirror {
+		if !dto[name] {
+			t.Errorf("agentRuntimeReportSpec carries %q, which AgentRuntimeSpecDTO does not have", name)
+		}
+	}
+}
+
+// jsonFieldNames returns the json names of typ's fields (the tag up to its
+// first option), failing on a field without a json tag.
+func jsonFieldNames(t *testing.T, typ reflect.Type) map[string]bool {
+	t.Helper()
+	names := make(map[string]bool, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		tag := typ.Field(i).Tag.Get("json")
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" {
+			t.Fatalf("%s.%s has no json name", typ.Name(), typ.Field(i).Name)
+		}
+		names[name] = true
+	}
+	return names
+}
+
+// TestIngestRuntimeReportPreservesRAMDemand: a file-mode spec's host-RAM
+// demand (AgentRuntimeSpecDTO.RAMMB) survives the sanitizer, so the stored
+// report shows the demand the agent admits the spec with.
+func TestIngestRuntimeReportPreservesRAMDemand(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	const body = `{"source":"file","collected_at":"2026-11-03T09:00:00Z","config":{"router_listen":8081,"max_processes":2,"gpu_budgets":[],"specs":[{"id":"with-ram","model":"m","upstream_model":"u","binary":"/usr/bin/x","args":[],"env":{},"ram_mb":6144,"gpus":[]}],"coresident":[]}}`
+	if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", json.RawMessage(body)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	report, ok, err := srv.Routes.ServerRuntimeReportByServer(ctx, "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("ServerRuntimeReportByServer ok=%v err=%v", ok, err)
+	}
+	var got agentRuntimeReport
+	if err := json.Unmarshal([]byte(report.ReportJSON), &got); err != nil {
+		t.Fatalf("canonical json not parseable: %v", err)
+	}
+	var cfg struct {
+		Specs []struct {
+			RAMMB *int `json:"ram_mb"`
+		} `json:"specs"`
+	}
+	if err := json.Unmarshal(got.Config, &cfg); err != nil {
+		t.Fatalf("config not parseable: %v", err)
+	}
+	if len(cfg.Specs) != 1 || cfg.Specs[0].RAMMB == nil || *cfg.Specs[0].RAMMB != 6144 {
+		t.Fatalf("stored report specs = %s, want the spec's ram_mb 6144 kept", got.Config)
+	}
+}
+
 // TestIngestRuntimeReportPreservesSpecRole: the report mirror carries a
 // file-mode spec's role (AgentRuntimeSpecDTO.Role), so the stored report shows
 // the role the agent evicts by, and a spec that reports none stays without one
@@ -614,5 +691,66 @@ func TestIngestRuntimeReportPreservesSpecRole(t *testing.T) {
 	}
 	if strings.Contains(report.ReportJSON, `"role":""`) {
 		t.Errorf("an absent role must not be stored as an empty string: %s", report.ReportJSON)
+	}
+}
+
+// TestIngestRuntimeReportKeepsInstanceKeysTyped pins the stored file-mode
+// report's three instance keys by type and tag, not only by name: the mirror's
+// fields carry the same Go type and the same json tag, omitempty included, as
+// AgentRuntimeSpecDTO's, so the sanitizer's re-parse keeps a replicable spec's
+// replicable / min_instances / max_instances as the bool and numbers the agent
+// sent, and writes none of the three for a spec that is not replicable -- an
+// absent key is not invented as false or 0 on the way through.
+func TestIngestRuntimeReportKeepsInstanceKeysTyped(t *testing.T) {
+	dtoType := reflect.TypeFor[portal.AgentRuntimeSpecDTO]()
+	mirrorType := reflect.TypeFor[agentRuntimeReportSpec]()
+	for _, name := range []string{"Replicable", "MinInstances", "MaxInstances"} {
+		dto, okDTO := dtoType.FieldByName(name)
+		mirror, okMirror := mirrorType.FieldByName(name)
+		if !okDTO || !okMirror {
+			t.Fatalf("field %s: in AgentRuntimeSpecDTO %v, in agentRuntimeReportSpec %v, want both", name, okDTO, okMirror)
+		}
+		if dto.Type != mirror.Type {
+			t.Errorf("field %s: mirror type %s, want the DTO's %s", name, mirror.Type, dto.Type)
+		}
+		if dto.Tag.Get("json") != mirror.Tag.Get("json") {
+			t.Errorf("field %s: mirror json tag %q, want the DTO's %q", name, mirror.Tag.Get("json"), dto.Tag.Get("json"))
+		}
+	}
+
+	ctx := context.Background()
+	srv := NewTestServer()
+	const body = `{"source":"file","collected_at":"2026-11-04T09:00:00Z","config":{"router_listen":8081,"max_processes":2,"gpu_budgets":[],"specs":[` +
+		`{"id":"replicable","model":"m","upstream_model":"u","binary":"/usr/bin/x","args":[],"env":{},"gpus":[],"replicable":true,"min_instances":1,"max_instances":3},` +
+		`{"id":"single","model":"m2","upstream_model":"u2","binary":"/usr/bin/x","args":[],"env":{},"gpus":[]}],"coresident":[]}}`
+	if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", json.RawMessage(body)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	report, ok, err := srv.Routes.ServerRuntimeReportByServer(ctx, "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("ServerRuntimeReportByServer ok=%v err=%v", ok, err)
+	}
+	var stored agentRuntimeReport
+	if err := json.Unmarshal([]byte(report.ReportJSON), &stored); err != nil {
+		t.Fatalf("canonical json not parseable: %v", err)
+	}
+	var cfg struct {
+		Specs []map[string]json.RawMessage `json:"specs"`
+	}
+	if err := json.Unmarshal(stored.Config, &cfg); err != nil {
+		t.Fatalf("config not parseable: %v", err)
+	}
+	if len(cfg.Specs) != 2 {
+		t.Fatalf("stored specs = %d, want 2", len(cfg.Specs))
+	}
+	for key, want := range map[string]string{"replicable": "true", "min_instances": "1", "max_instances": "3"} {
+		if got := string(cfg.Specs[0][key]); got != want {
+			t.Errorf("replicable spec: stored %s = %q, want %s", key, got, want)
+		}
+	}
+	for _, key := range []string{"replicable", "min_instances", "max_instances"} {
+		if v, present := cfg.Specs[1][key]; present {
+			t.Errorf("spec that is not replicable: stored %s = %s, want the key absent", key, v)
+		}
 	}
 }

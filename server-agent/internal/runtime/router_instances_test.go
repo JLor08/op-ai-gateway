@@ -1,0 +1,1045 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// Router tests for instance addresses (#340): a request naming "m#k" reaches
+// instance k, and the child -- launched with the base name m -- sees m in its
+// place, in a JSON body, in a multipart form, in a live transcription's query
+// and in an /upstream probe's query alike. Instance 0, which is every request
+// a spec that never replicates ever gets, passes byte for byte as it always
+// has. A plain request never starts a burst instance -- burst capacity is
+// started by an ensure, which is how the gateway decides to add it -- and the
+// two burst refusals are 409s.
+
+// redirectManager is a REAL manager whose admitted endpoint is swapped for a
+// recording child's: resolution, admission and refusals are the manager's own
+// -- the instance processes really start, and their rows can be read back --
+// while the process the router forwards to is the test's, so what a child
+// receives can be read back exactly. EnsureRunning (the /ensure route, which
+// forwards nothing) is the manager's own.
+type redirectManager struct {
+	managerPort
+	endpoint string
+}
+
+func (r redirectManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	_, release, err := r.managerPort.EnsureServing(ctx, model)
+	if err != nil {
+		return "", nil, err
+	}
+	return r.endpoint, release, nil
+}
+
+// instanceRouter applies specs to a real manager and returns it with a router
+// over it whose plain requests reach the returned recording child.
+func instanceRouter(t *testing.T, cfg Config) (*Manager, http.Handler, *editChild) {
+	t.Helper()
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(cfg)
+	child := newRecordingChild(t, `{"ok":true}`)
+	return m, newRouter(redirectManager{managerPort: m, endpoint: child.srv.URL}), child
+}
+
+// ensureThroughRouter starts address through the router's own /ensure route --
+// the way the gateway's scaler brings burst capacity up -- and fails the test
+// unless it answers 200.
+func ensureThroughRouter(t *testing.T, h http.Handler, address string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, ensurePathPrefix+url.PathEscape(address), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /ensure/%s = %d %s, want 200", address, rec.Code, rec.Body.String())
+	}
+}
+
+// postJSON sends body to /v1/chat/completions through h on the test goroutine.
+func postJSON(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// formPart is one part of a multipart body as it travels: its header and its
+// exact bytes.
+type formPart struct {
+	name   string
+	header map[string][]string
+	data   []byte
+}
+
+// formParts reads every part of a multipart body raw -- no transfer decoding --
+// so two bodies can be compared part by part, byte for byte.
+func formParts(t *testing.T, contentType string, body []byte) []formPart {
+	t.Helper()
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		t.Fatalf("parse Content-Type %q: %v", contentType, err)
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	var parts []formPart
+	for {
+		p, err := mr.NextRawPart()
+		if err == io.EOF {
+			return parts
+		}
+		if err != nil {
+			t.Fatalf("read part: %v", err)
+		}
+		data, err := io.ReadAll(p)
+		if err != nil {
+			t.Fatalf("read part %q: %v", p.FormName(), err)
+		}
+		parts = append(parts, formPart{name: p.FormName(), header: p.Header, data: data})
+	}
+}
+
+// TestRouterRewritesInstanceModelJSON: a JSON request for m#1 reaches instance 1
+// with its top-level model rewritten to m -- on the plain path and the
+// streaming one, and under a model key written with an escape -- and every other
+// byte exactly as sent: the keys in their order, the spacing, the HTML-sensitive
+// characters and the escapes unchanged, and the numbers with their digits (1.50
+// stays 1.50, 1e3 stays 1e3), so a child that hashes, signs or caches the body
+// sees what instance 0 would have seen.
+func TestRouterRewritesInstanceModelJSON(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m, h, child := instanceRouter(t, Config{Specs: []Spec{replicableSpec("S", "m")}})
+	ensureThroughRouter(t, h, "m#1")
+
+	for _, tc := range []struct{ name, body, want string }{
+		{"plain", `{"model":"m#1","n":1.50}`, `{"model":"m","n":1.50}`},
+		{"streaming", `{"model":"m#1","stream":true,"n":1.50}`, `{"model":"m","stream":true,"n":1.50}`},
+		{
+			"every other byte",
+			`{ "z": "<&>", "\u006dodel" : "m#1",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "v": "caf\u00e9", "q": "say \"hi\"", "tools": [{"model":"m#1"}] }`,
+			`{ "z": "<&>", "\u006dodel" : "m",` + "\n\t" + `"e": 1e3, "n": 1.50, "u": "é", "v": "caf\u00e9", "q": "say \"hi\"", "tools": [{"model":"m#1"}] }`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := postJSON(t, h, tc.body); rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if _, _, _, got := child.snapshot(); string(got) != tc.want {
+				t.Fatalf("the child received %s, want %s: the base model, every other value as sent", got, tc.want)
+			}
+		})
+	}
+	if st := mustInstance(t, m, "S", 1); st.State != StateRunning {
+		t.Errorf("instance 1 = %+v, want running", st)
+	}
+	if st := mustInstance(t, m, "S", 0); st.PID != 0 {
+		t.Errorf("instance 0 = %+v, want it never started: the requests named instance 1", st)
+	}
+}
+
+// TestRouterRewritesInstanceModelMultipart: a multipart request for m#1 reaches
+// instance 1 with its model field rewritten to m, and every other part -- its
+// headers and its bytes, the image included -- exactly as it was sent, in order.
+func TestRouterRewritesInstanceModelMultipart(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m, h, child := instanceRouter(t, Config{Specs: []Spec{replicableSpec("S", "m")}})
+	ensureThroughRouter(t, h, "m#1")
+
+	body, contentType := editBody(t, "m#1", "")
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	_, _, gotType, gotBody := child.snapshot()
+	sent, got := formParts(t, contentType, body), formParts(t, gotType, gotBody)
+	if len(got) != len(sent) {
+		t.Fatalf("the child received %d parts, want the %d sent", len(got), len(sent))
+	}
+	for i := range sent {
+		if sent[i].name == "model" {
+			if got[i].name != "model" || string(got[i].data) != "m" {
+				t.Errorf("part %d = %s %q, want the model field with the base name m", i, got[i].name, got[i].data)
+			}
+			continue
+		}
+		if got[i].name != sent[i].name || !bytes.Equal(got[i].data, sent[i].data) || fmt.Sprint(got[i].header) != fmt.Sprint(sent[i].header) {
+			t.Errorf("part %d = %s %v %q, want it as sent: %s %v %q", i, got[i].name, got[i].header, got[i].data, sent[i].name, sent[i].header, sent[i].data)
+		}
+	}
+	if st := mustInstance(t, m, "S", 1); st.State != StateRunning {
+		t.Errorf("instance 1 = %+v, want running", st)
+	}
+}
+
+// recordingTransport is a router transport that records the URL of every
+// request the router sends a child -- the whole URL, fragment included, as the
+// router built it -- and hands the request on to next, or, with next nil,
+// answers it 200 itself without reaching any process.
+type recordingTransport struct {
+	next http.RoundTripper
+	mu   sync.Mutex
+	urls []url.URL
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	rt.urls = append(rt.urls, *req.URL)
+	rt.mu.Unlock()
+	if rt.next != nil {
+		return rt.next.RoundTrip(req)
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+}
+
+// sent returns the URLs recorded so far.
+func (rt *recordingTransport) sent() []url.URL {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return append([]url.URL(nil), rt.urls...)
+}
+
+// recordTransport swaps rt's transport for a recording one in front of it.
+func recordTransport(rt *router) *recordingTransport {
+	rec := &recordingTransport{next: rt.transport}
+	rt.transport = rec
+	return rec
+}
+
+// TestRouterLiveInstanceQueryUsesBase: a live transcription for m#1 reaches
+// instance 1's child with model=m in its query, the inbound params unchanged.
+// The request is read off the router's transport, where the whole URL the
+// router built is still visible: appended unrewritten, "m#1" would parse as
+// model=m with the URL fragment "1", and as a fragment is never sent, the child
+// alone could not tell that apart from the base name.
+func TestRouterLiveInstanceQueryUsesBase(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}})
+	child, capCh := newLiveChild(t)
+	h := newRouter(redirectManager{managerPort: m, endpoint: child.URL})
+	sent := recordTransport(h)
+	ensureThroughRouter(t, h, "m#1")
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := srv.Client().Post(srv.URL+"/live/m%231?sample_rate=16000&language=de&model=m%231", "application/octet-stream", strings.NewReader("pcm"))
+	if err != nil {
+		t.Fatalf("POST /live/m%%231: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read the relayed stream: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var got liveCapture
+	select {
+	case got = <-capCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the child never reported what it received")
+	}
+	if got.model != "m" {
+		t.Errorf("child query model = %q, want the base name m", got.model)
+	}
+	if got.sampleRate != "16000" || got.language != "de" {
+		t.Errorf("forwarded params = {sample_rate:%q language:%q}, want {16000 de}", got.sampleRate, got.language)
+	}
+	urls := sent.sent()
+	if len(urls) != 1 {
+		t.Fatalf("the router sent %d requests to a child, want the one live relay", len(urls))
+	}
+	if u := urls[0]; u.RawQuery != "language=de&sample_rate=16000&model=m" || u.Fragment != "" {
+		t.Errorf("the router sent the child %s (query %q, fragment %q), want the query language=de&sample_rate=16000&model=m and no fragment: the base name in place of the address",
+			u.String(), u.RawQuery, u.Fragment)
+	}
+	if st := mustInstance(t, m, "S", 1); st.State != StateRunning {
+		t.Errorf("instance 1 = %+v, want running", st)
+	}
+}
+
+// TestRouterInstanceZeroUntouched: a request for instance 0 of a replicable spec
+// -- the address every request of a spec that never replicates has -- is
+// forwarded byte for byte: a JSON body whose spacing, key order, number and HTML
+// characters a re-serialization would all change, and a multipart body with its
+// own Content-Type, boundary and all.
+func TestRouterInstanceZeroUntouched(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m, h, child := instanceRouter(t, Config{Specs: []Spec{replicableSpec("S", "m")}})
+
+	const body = `{ "n": 1.50, "model" : "m", "html": "<&>" }`
+	if rec := postJSON(t, h, body); rec.Code != http.StatusOK {
+		t.Fatalf("JSON status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, _, got := child.snapshot(); string(got) != body {
+		t.Fatalf("the child received %s, want the body byte for byte: %s", got, body)
+	}
+
+	form, contentType := editBody(t, "m", "")
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(form))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("multipart status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, gotType, gotBody := child.snapshot(); gotType != contentType || !bytes.Equal(gotBody, form) {
+		t.Fatalf("the child received Content-Type %q and %d bytes, want %q and the %d bytes sent, unchanged", gotType, len(gotBody), contentType, len(form))
+	}
+
+	if st := mustInstance(t, m, "S", 0); st.State != StateRunning {
+		t.Errorf("instance 0 = %+v, want running: it served both requests", st)
+	}
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Errorf("instance 1 = %+v, want none", st)
+	}
+}
+
+// TestRouterLiteralHashModelWins: foo#2 is the literal upstream model of L,
+// while F (upstream foo) is replicable, so foo#2 also parses as F's instance 2.
+// The literal name wins on every route -- a real model whose name merely
+// contains '#' keeps reaching its own spec: a JSON request and a multipart one
+// reach L byte for byte, a live relay reaches L with the name as named in its
+// query, and an /upstream probe reaches L's running process with its query as
+// sent. F gets no instance 2, and F's instance 0 is never started.
+func TestRouterLiteralHashModelWins(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m, h, child := instanceRouter(t, Config{Specs: []Spec{replicableSpec("F", "foo"), baseSpec("L", "foo#2")}})
+	onlyLServes := func(t *testing.T) {
+		t.Helper()
+		if st := statusFor(m, "L"); st == nil || st.State != StateRunning {
+			t.Errorf("L = %+v, want running: it served the request", st)
+		}
+		if st := instanceStatus(m, "F", 2); st != nil {
+			t.Errorf("F instance 2 = %+v, want none", st)
+		}
+		if st := mustInstance(t, m, "F", 0); st.PID != 0 {
+			t.Errorf("F instance 0 = %+v, want it never started", st)
+		}
+	}
+
+	t.Run("json", func(t *testing.T) {
+		const body = `{"model":"foo#2","n":1.50}`
+		if rec := postJSON(t, h, body); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if _, _, _, got := child.snapshot(); string(got) != body {
+			t.Fatalf("the child received %s, want %s unchanged: foo#2 is L's own name, not an address to rewrite", got, body)
+		}
+		onlyLServes(t)
+	})
+
+	t.Run("multipart", func(t *testing.T) {
+		form, contentType := editBody(t, "foo#2", "")
+		req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(form))
+		req.Header.Set("Content-Type", contentType)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if _, _, gotType, gotBody := child.snapshot(); gotType != contentType || !bytes.Equal(gotBody, form) {
+			t.Fatalf("the child received Content-Type %q and %q, want the form exactly as sent: %q and %q", gotType, gotBody, contentType, form)
+		}
+		onlyLServes(t)
+	})
+
+	t.Run("live", func(t *testing.T) {
+		liveChild, capCh := newLiveChild(t)
+		lh := newRouter(redirectManager{managerPort: m, endpoint: liveChild.URL})
+		sent := recordTransport(lh)
+		srv := httptest.NewServer(lh)
+		defer srv.Close()
+		resp, err := srv.Client().Post(srv.URL+"/live/foo%232?sample_rate=16000", "application/octet-stream", strings.NewReader("pcm"))
+		if err != nil {
+			t.Fatalf("POST /live/foo%%232: %v", err)
+		}
+		defer resp.Body.Close()
+		if _, err := io.ReadAll(resp.Body); err != nil {
+			t.Fatalf("read the relayed stream: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		select {
+		case <-capCh:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the live child was never reached")
+		}
+		// The name the router put in the child's query, read back whole: a '#'
+		// in it starts the URL's fragment, so the query alone holds "foo". What
+		// must not happen is a rewrite to F's base name foo, which leaves no
+		// fragment at all. (The fragment is never sent, so audio.cpp, reading the
+		// query verbatim, receives such a name cut at its '#' -- see serveLive.)
+		urls := sent.sent()
+		if len(urls) != 1 {
+			t.Fatalf("the router sent %d requests to a child, want the one live relay", len(urls))
+		}
+		named := urls[0].Query().Get("model")
+		if urls[0].Fragment != "" {
+			named += "#" + urls[0].Fragment
+		}
+		if named != "foo#2" {
+			t.Errorf("the router named the model %q in the child's query (%s), want foo#2 as named: L's own name, not F's base", named, urls[0].String())
+		}
+		onlyLServes(t)
+	})
+
+	t.Run("upstream", func(t *testing.T) {
+		// A probe starts nothing, so L is brought up here -- by its literal
+		// name, through the router's own /ensure -- rather than relied on from
+		// an earlier subtest: run alone, this one must find L running too.
+		ensureThroughRouter(t, h, "foo#2")
+		ph := newRouter(m)
+		sent := &recordingTransport{} // answers itself: the stub child serves no /props
+		ph.transport = sent
+		rec := httptest.NewRecorder()
+		ph.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/foo%232/props?model=foo%232&x=1", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d %s, want 200", rec.Code, rec.Body.String())
+		}
+		lPort := mustInstance(t, m, "L", 0).Port
+		urls := sent.sent()
+		if len(urls) != 1 {
+			t.Fatalf("the router sent %d requests to a child, want the one probe", len(urls))
+		}
+		if u := urls[0]; u.Host != "127.0.0.1:"+strconv.Itoa(lPort) || u.Path != "/props" || u.RawQuery != "model=foo%232&x=1" {
+			t.Errorf("the probe went to %s, want L's process (port %d) at /props with the query as sent", u.String(), lPort)
+		}
+		onlyLServes(t)
+	})
+}
+
+// assertConflict fails the test unless rec is a 409 carrying code.
+func assertConflict(t *testing.T, status int, body io.Reader, code string) {
+	t.Helper()
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", status)
+	}
+	if got := decodeJSON[errorEnvelope](t, body).Error.Code; got != code {
+		t.Fatalf("code = %q, want %s", got, code)
+	}
+}
+
+// TestRouterBurstNoCapacityIs409: an ensure of a burst instance that does not
+// fit into free room -- here the one process slot instance 0 holds, and a
+// sibling is never evicted for it -- is 409 runtime.instance_no_capacity, the
+// gateway's cue to try another host. Nothing is created, nothing is evicted.
+func TestRouterBurstNoCapacityIs409(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}, MaxProcesses: 1})
+	h := NewRouter(m)
+	ensureThroughRouter(t, h, "m")
+	pid := mustInstance(t, m, "S", 0).PID
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ensure/m%231", nil))
+	assertConflict(t, rec.Code, rec.Body, "runtime.instance_no_capacity")
+
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Errorf("instance 1 = %+v, want none: a refused burst instance leaves no state", st)
+	}
+	if st := mustInstance(t, m, "S", 0); st.State != StateRunning || st.PID != pid {
+		t.Errorf("instance 0 = %+v, want still running as pid %d", st, pid)
+	}
+}
+
+// TestRouterBurstDemandUnknownIs409: an ensure of a burst instance whose demand
+// is unknown -- nothing declared, and no running sibling measured to inherit it
+// from -- is 409 runtime.instance_demand_unknown, which the gateway retries
+// shortly.
+func TestRouterBurstDemandUnknownIs409(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	spec := replicableSpec("S", "m")
+	spec.RAMMB = 0 // unknown
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	rec := httptest.NewRecorder()
+	NewRouter(m).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ensure/m%231", nil))
+	assertConflict(t, rec.Code, rec.Body, "runtime.instance_demand_unknown")
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Errorf("instance 1 = %+v, want none", st)
+	}
+}
+
+// TestSentinelCodeMapsInstanceRefusals pins the two burst refusals' wire codes
+// and their status, wrapped or not.
+func TestSentinelCodeMapsInstanceRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{ErrInstanceNoCapacity, "runtime.instance_no_capacity"},
+		{ErrInstanceDemandUnknown, "runtime.instance_demand_unknown"},
+		{fmt.Errorf("refused: %w", ErrInstanceNoCapacity), "runtime.instance_no_capacity"},
+		{fmt.Errorf("refused: %w", ErrInstanceDemandUnknown), "runtime.instance_demand_unknown"},
+	} {
+		if code, status := sentinelCode(tc.err); code != tc.code || status != http.StatusConflict {
+			t.Errorf("sentinelCode(%v) = (%s, %d), want (%s, 409)", tc.err, code, status, tc.code)
+		}
+	}
+}
+
+// TestRouterPlainRequestNeverStartsABurstInstance: a request that is not an
+// ensure -- JSON, streaming JSON, multipart, live -- naming a burst instance that
+// is not running is refused with 409 runtime.instance_no_capacity, starts
+// nothing and reaches no child; the gateway re-selects a running instance. Once
+// an ensure has started that instance, the same request is served by it.
+func TestRouterPlainRequestNeverStartsABurstInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m, h, child := instanceRouter(t, Config{Specs: []Spec{replicableSpec("S", "m")}})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	form, formType := editBody(t, "m#1", "")
+	for _, tc := range []struct {
+		name, path, contentType string
+		body                    []byte
+	}{
+		{"json", "/v1/chat/completions", "application/json", []byte(`{"model":"m#1"}`)},
+		{"streaming json", "/v1/chat/completions", "application/json", []byte(`{"model":"m#1","stream":true}`)},
+		{"multipart", "/v1/images/edits", formType, form},
+		{"live", "/live/m%231", "application/octet-stream", []byte("pcm")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := srv.Client().Post(srv.URL+tc.path, tc.contentType, bytes.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("POST %s: %v", tc.path, err)
+			}
+			defer resp.Body.Close()
+			assertConflict(t, resp.StatusCode, resp.Body, "runtime.instance_no_capacity")
+		})
+	}
+	if hits, _, _, _ := child.snapshot(); hits != 0 {
+		t.Errorf("the child was reached %d times, want never", hits)
+	}
+	if rows := m.Status(); len(rows) != 1 || rows[0].PID != 0 {
+		t.Fatalf("Status() = %+v, want instance 0 alone, not started: a plain request starts nothing", rows)
+	}
+
+	ensureThroughRouter(t, h, "m#1")
+	if rec := postJSON(t, h, `{"model":"m#1"}`); rec.Code != http.StatusOK {
+		t.Fatalf("status once instance 1 runs = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, _, got := child.snapshot(); string(got) != `{"model":"m"}` {
+		t.Errorf("the child received %s, want {\"model\":\"m\"}", got)
+	}
+}
+
+// TestRouterPlainRequestRetiresACrashedBurstInstance: a burst instance that
+// crashed rests at crashed -- it is never restarted on its own -- until it is
+// named again. A plain request naming it is refused with 409
+// runtime.instance_no_capacity like for any burst instance that is not up, and
+// the crashed row is retired in the same turn: retiring creates and starts
+// nothing, and without it a row the gateway keeps naming (its telemetry lags a
+// moment) would stay crashed until the next config push. The next ensure then
+// starts a fresh instance.
+func TestRouterPlainRequestRetiresACrashedBurstInstance(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{replicableSpec("S", "m")}})
+	h := NewRouter(m)
+	ensureThroughRouter(t, h, "m#1")
+	pid := killInstance(t, m, "S", 1)
+	waitUntil(t, 5*time.Second, "instance 1 crashed", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateCrashed
+	})
+
+	rec := postJSON(t, h, `{"model":"m#1"}`)
+	assertConflict(t, rec.Code, rec.Body, "runtime.instance_no_capacity")
+	if st := instanceStatus(m, "S", 1); st != nil {
+		t.Fatalf("instance 1 = %+v after a plain request named it, want the crashed row retired", st)
+	}
+	if st := mustInstance(t, m, "S", 0); st.PID != 0 {
+		t.Errorf("instance 0 = %+v, want it never started: the request named instance 1", st)
+	}
+
+	ensureThroughRouter(t, h, "m#1")
+	if st := mustInstance(t, m, "S", 1); st.State != StateRunning || st.PID == 0 || st.PID == pid || st.LastError != nil {
+		t.Errorf("instance 1 after the ensure = %+v, want a fresh instance running (not pid %d, no crash on record)", st, pid)
+	}
+}
+
+// TestRouterModelsListsBaseNamesRunningListsInstances: /v1/models names each
+// managed spec once, by its base name, whatever instances it runs -- it is the
+// gateway's model sync, and an instance is not a model -- while /running lists
+// every running instance by its address.
+func TestRouterModelsListsBaseNamesRunningListsInstances(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	spec := replicableSpec("S", "m")
+	spec.MinInstances = 2
+	m.Apply(Config{Specs: []Spec{spec, baseSpec("T", "t")}})
+	waitUntil(t, 5*time.Second, "instances 0 and 1 running", func() bool {
+		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
+		return s0 != nil && s0.State == StateRunning && s1 != nil && s1.State == StateRunning
+	})
+	h := NewRouter(m)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	var ids []string
+	for _, e := range decodeJSON[modelsResponse](t, rec.Body).Data {
+		ids = append(ids, e.ID)
+	}
+	sort.Strings(ids)
+	if fmt.Sprint(ids) != "[m t]" {
+		t.Errorf("/v1/models ids = %v, want [m t]: one entry per spec, by its base name", ids)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/running", nil))
+	var running []string
+	for _, e := range decodeJSON[runningResponse](t, rec.Body).Running {
+		running = append(running, e.Model)
+	}
+	sort.Strings(running)
+	if fmt.Sprint(running) != "[m m#1]" {
+		t.Errorf("/running models = %v, want [m m#1]: every running instance by its address", running)
+	}
+}
+
+// instanceStatusManager is a managerPort fake for the /upstream relay over
+// instance rows: Status is fixed, ResolveAddress answers from a fixed table the
+// way the manager resolves (and counts the calls), and an ensure is only
+// counted -- the relay never asks for one.
+type instanceStatusManager struct {
+	statuses  []Status
+	addresses map[string]resolvedAddress
+	ensures   atomic.Int64
+	resolves  atomic.Int64
+}
+
+func (m *instanceStatusManager) EnsureRunning(context.Context, string) (string, func(), error) {
+	m.ensures.Add(1)
+	return "", nil, ErrModelNotManaged
+}
+
+func (m *instanceStatusManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	return m.EnsureRunning(ctx, model)
+}
+
+func (m *instanceStatusManager) ResolveAddress(model string) (string, int, bool) {
+	m.resolves.Add(1)
+	r := m.addresses[model]
+	return r.base, r.k, r.ok
+}
+func (m *instanceStatusManager) LoadedModels() []string { return nil }
+func (m *instanceStatusManager) Status() []Status       { return m.statuses }
+
+// TestRouterUpstreamTargetsTheInstance: /upstream/{model} reaches the process of
+// exactly the instance the address resolves to, and a query that names the
+// model reaches an instance's child with the base name in it. An address the
+// spec allows but no process serves is managed and not running; one it does not
+// allow is not managed at all.
+func TestRouterUpstreamTargetsTheInstance(t *testing.T) {
+	type hit struct{ path, query string }
+	recording := func() (*httptest.Server, chan hit) {
+		hits := make(chan hit, 4)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits <- hit{r.URL.Path, r.URL.RawQuery}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+		return srv, hits
+	}
+	child0, hits0 := recording()
+	child1, hits1 := recording()
+	m := &instanceStatusManager{
+		statuses: []Status{
+			{SpecID: "S", Instance: 0, Model: "m", State: StateRunning, Port: childPort(t, child0.URL)},
+			{SpecID: "S", Instance: 1, Model: "m#1", State: StateRunning, Port: childPort(t, child1.URL)},
+		},
+		addresses: map[string]resolvedAddress{
+			"m":   {base: "m", k: 0, ok: true},
+			"m#1": {base: "m", k: 1, ok: true},
+			"m#3": {base: "m", k: 3, ok: true}, // allowed, but no process
+		},
+	}
+	h := newRouter(m)
+	get := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec
+	}
+	expect := func(hits chan hit, want hit) {
+		t.Helper()
+		select {
+		case got := <-hits:
+			if got != want {
+				t.Errorf("the child received %+v, want %+v", got, want)
+			}
+		default:
+			t.Errorf("the child was not reached; want %+v", want)
+		}
+	}
+
+	if rec := get("/upstream/m%231/props?model=m%231"); rec.Code != http.StatusOK {
+		t.Fatalf("instance 1 props = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	expect(hits1, hit{"/props", "model=m"})
+	if rec := get("/upstream/m%231/v1/models?include_params=true"); rec.Code != http.StatusOK {
+		t.Fatalf("instance 1 models = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	expect(hits1, hit{"/v1/models", "include_params=true"})
+	if rec := get("/upstream/m/props?model=m"); rec.Code != http.StatusOK {
+		t.Fatalf("instance 0 props = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	expect(hits0, hit{"/props", "model=m"})
+	if len(hits0)+len(hits1) != 0 {
+		t.Errorf("a further child was reached: %d / %d extra hits", len(hits0), len(hits1))
+	}
+
+	if rec := get("/upstream/m%233/props"); rec.Code != http.StatusNotFound || decodeErrorCode(t, rec) != "runtime.model_not_running" {
+		t.Errorf("an allowed instance with no process = %d %s, want 404 runtime.model_not_running", rec.Code, rec.Body.String())
+	}
+	if rec := get("/upstream/m%239/props"); rec.Code != http.StatusNotFound || decodeErrorCode(t, rec) != codeModelNotManaged {
+		t.Errorf("an address the spec does not allow = %d %s, want 404 %s", rec.Code, rec.Body.String(), codeModelNotManaged)
+	}
+	if n := m.ensures.Load(); n != 0 {
+		t.Errorf("an ensure was asked for %d times, want never: a probe starts nothing", n)
+	}
+}
+
+// TestRouterUpstreamRewritesOnlyTheModelParameter: an /upstream probe of an
+// instance address reaches the instance's child with the value of its model
+// parameter replaced by the base name, query-escaped, and every other parameter
+// exactly as sent -- its place, its encoding, a '+' and a bare key included.
+func TestRouterUpstreamRewritesOnlyTheModelParameter(t *testing.T) {
+	queries := make(chan string, 1)
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries <- r.URL.RawQuery
+	}))
+	t.Cleanup(child.Close)
+	m := &instanceStatusManager{
+		statuses:  []Status{{SpecID: "S", Instance: 1, Model: "org/m:q4#1", State: StateRunning, Port: childPort(t, child.URL)}},
+		addresses: map[string]resolvedAddress{"org/m:q4#1": {base: "org/m:q4", k: 1, ok: true}},
+	}
+
+	rec := httptest.NewRecorder()
+	newRouter(m).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/org/m:q4%231/props?b=2&model=org%2Fm%3Aq4%231&a=x%20y+z&c", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	want := "b=2&model=" + url.QueryEscape("org/m:q4") + "&a=x%20y+z&c"
+	select {
+	case got := <-queries:
+		if got != want {
+			t.Errorf("the child received the query %q, want %q", got, want)
+		}
+	default:
+		t.Fatal("the child was not reached")
+	}
+}
+
+// TestUpstreamChildQuery pins the /upstream relay's query rule: only the value
+// of a model parameter changes, and only for an instance address.
+func TestUpstreamChildQuery(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, base string
+		k               int
+		want            string
+	}{
+		{"instance 0 is untouched", "model=m&x=%2F", "m", 0, "model=m&x=%2F"},
+		{"no model parameter", "include_params=true&x=%2F", "m", 1, "include_params=true&x=%2F"},
+		{"only the model value", "b=2&model=m%231&a=x%20y+z&c", "org/m:q4", 1, "b=2&model=org%2Fm%3Aq4&a=x%20y+z&c"},
+		{"every model parameter, its key as written", "mod%65l=m%231&x=1&model=y", "m", 1, "mod%65l=m&x=1&model=m"},
+		{"a model parameter without a value", "model&x=1", "m", 1, "model=m&x=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstreamChildQuery(tc.raw, tc.base, tc.k); got != tc.want {
+				t.Errorf("upstreamChildQuery(%q, %q, %d) = %q, want %q", tc.raw, tc.base, tc.k, got, tc.want)
+			}
+		})
+	}
+}
+
+// shiftingAddressManager is a managerPort fake whose address rule changes its
+// answer while a request is inside the router -- the effect of a config push
+// landing between two owner turns: ResolveAddress answers from answers in
+// order, the last one repeating. Every ensure succeeds with endpoint and counts
+// each call of its release; Status reports statuses.
+type shiftingAddressManager struct {
+	endpoint string
+	statuses []Status
+	answers  []resolvedAddress
+
+	mu       sync.Mutex
+	resolves int
+	releases atomic.Int64
+}
+
+func (m *shiftingAddressManager) ResolveAddress(string) (string, int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a := m.answers[min(m.resolves, len(m.answers)-1)]
+	m.resolves++
+	return a.base, a.k, a.ok
+}
+
+func (m *shiftingAddressManager) EnsureServing(context.Context, string) (string, func(), error) {
+	return m.endpoint, func() { m.releases.Add(1) }, nil
+}
+
+func (m *shiftingAddressManager) EnsureRunning(ctx context.Context, model string) (string, func(), error) {
+	return m.EnsureServing(ctx, model)
+}
+func (m *shiftingAddressManager) LoadedModels() []string { return nil }
+func (m *shiftingAddressManager) Status() []Status       { return m.statuses }
+
+// TestRouterRefusesARequestWhoseAddressMovedDuringAdmission: the router reads
+// an address before admission, to choose the name the child receives, and the
+// admission resolves it again in a later owner turn. A push landing in between
+// can make the two readings disagree -- an instance address becomes another
+// spec's literal model, or the reverse -- and the child would then receive the
+// wrong name: the base name of one spec, or an address no child knows. So the
+// router reads the address again once the request is admitted and, when the
+// reading moved, releases the admission and answers 409
+// runtime.instance_no_capacity, the gateway's cue to select again: on every
+// route that forwards a request, and on /upstream, whose probe reads a running
+// row in between. The child is never reached. With nothing moved, the request
+// is served.
+func TestRouterRefusesARequestWhoseAddressMovedDuringAdmission(t *testing.T) {
+	child := newRecordingChild(t, `{"ok":true}`)
+	port := childPort(t, child.srv.URL)
+	form, formType := editBody(t, "m#1", "")
+	routes := []struct {
+		name      string
+		req       func() *http.Request
+		probe     bool // /upstream: nothing is admitted, so nothing is released
+		unmanaged bool // also run for a name that was not managed at first
+	}{
+		{name: "json", unmanaged: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m#1"}`))
+		}},
+		{name: "streaming json", unmanaged: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m#1","stream":true}`))
+		}},
+		{name: "multipart", unmanaged: true, req: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(form))
+			r.Header.Set("Content-Type", formType)
+			return r
+		}},
+		{name: "live", unmanaged: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, "/live/m%231?sample_rate=16000", strings.NewReader("pcm"))
+		}},
+		{name: "upstream", probe: true, req: func() *http.Request {
+			return httptest.NewRequest(http.MethodGet, "/upstream/m%231/props", nil)
+		}},
+	}
+	instance := resolvedAddress{base: "m", k: 1, ok: true}
+	literal := resolvedAddress{base: "m#1", k: 0, ok: true}
+	for _, tc := range []struct {
+		name          string
+		first, second resolvedAddress
+		unmanaged     bool
+	}{
+		{name: "an instance address became another spec's model", first: instance, second: literal},
+		{name: "a model became an instance address", first: literal, second: instance},
+		{name: "an unmanaged name became an instance address", first: resolvedAddress{}, second: instance, unmanaged: true},
+	} {
+		for _, route := range routes {
+			if tc.unmanaged && !route.unmanaged {
+				continue // /upstream answers an unmanaged name 404 at once, reaching nothing
+			}
+			t.Run(tc.name+"/"+route.name, func(t *testing.T) {
+				m := &shiftingAddressManager{
+					endpoint: child.srv.URL,
+					answers:  []resolvedAddress{tc.first, tc.second},
+					statuses: []Status{ // a running row for either reading of m#1
+						{SpecID: "S", Instance: 1, Model: "m#1", State: StateRunning, Port: port},
+						{SpecID: "L", Instance: 0, Model: "m#1", State: StateRunning, Port: port},
+					},
+				}
+				hitsBefore, _, _, _ := child.snapshot()
+				rec := httptest.NewRecorder()
+				newRouter(m).ServeHTTP(rec, route.req())
+
+				assertConflict(t, rec.Code, rec.Body, "runtime.instance_no_capacity")
+				if hits, _, _, _ := child.snapshot(); hits != hitsBefore {
+					t.Errorf("the child was reached %d times, want never", hits-hitsBefore)
+				}
+				wantReleases := int64(1)
+				if route.probe {
+					wantReleases = 0
+				}
+				if n := m.releases.Load(); n != wantReleases {
+					t.Errorf("release called %d times, want %d: the admission is given back when the address moved", n, wantReleases)
+				}
+			})
+		}
+	}
+	for _, route := range routes {
+		t.Run("nothing moved/"+route.name, func(t *testing.T) {
+			m := &shiftingAddressManager{
+				endpoint: child.srv.URL,
+				answers:  []resolvedAddress{instance},
+				statuses: []Status{{SpecID: "S", Instance: 1, Model: "m#1", State: StateRunning, Port: port}},
+			}
+			rec := httptest.NewRecorder()
+			newRouter(m).ServeHTTP(rec, route.req())
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d %s, want 200: the address read the same both times", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestRouterReadAddress pins the rewrite decision every route shares: only an
+// address the manager resolves to an instance k >= 1 is rewritten, to its base
+// name; instance 0 -- a literal name with '#' in it included -- an unmanaged
+// name and a nil manager are left alone. A name that cannot parse as an
+// instance address is read without asking the manager at all, so a request of a
+// spec that never replicates costs no extra owner round trip.
+func TestRouterReadAddress(t *testing.T) {
+	m := &instanceStatusManager{addresses: map[string]resolvedAddress{
+		"m":     {base: "m", k: 0, ok: true},
+		"m#1":   {base: "m", k: 1, ok: true},
+		"foo#2": {base: "foo#2", k: 0, ok: true}, // a literal upstream model
+	}}
+	for _, tc := range []struct {
+		model   string
+		base    string
+		rewrite bool
+		asked   bool
+	}{
+		{model: "m#1", base: "m", rewrite: true, asked: true},
+		{model: "m"},
+		{model: "foo#2", asked: true},
+		{model: "nope#1", asked: true},
+		{model: "m#01"}, // a leading zero: not an instance address
+	} {
+		before := m.resolves.Load()
+		if base, ok := newRouter(m).readAddress(tc.model).childModel(); base != tc.base || ok != tc.rewrite {
+			t.Errorf("readAddress(%q).childModel() = (%q, %v), want (%q, %v)", tc.model, base, ok, tc.base, tc.rewrite)
+		}
+		if asked := m.resolves.Load() != before; asked != tc.asked {
+			t.Errorf("readAddress(%q) asked the manager: %v, want %v", tc.model, asked, tc.asked)
+		}
+	}
+	if base, ok := newRouter(nil).readAddress("m#1").childModel(); ok || base != "" {
+		t.Errorf("readAddress with no manager = (%q, %v), want nothing rewritten", base, ok)
+	}
+}
+
+// TestRewriteModelFieldKeepsEveryOtherByte: only the value of the top-level
+// model changes; every other byte -- the key order, the spacing, a nested
+// "model", HTML-sensitive characters, escapes, a number's exact digits, a big
+// integer -- is exactly as it was. Every top-level key json.Unmarshal reads as
+// the model (any letter case, after unescaping) gets the base name, a value
+// that already names it keeps its bytes, and a body with no top-level model
+// string is an error rather than a body forwarded with the address in it.
+func TestRewriteModelFieldKeepsEveryOtherByte(t *testing.T) {
+	for _, tc := range []struct{ name, in, base, want string }{
+		{
+			"top level only",
+			`{ "z":"<&>" , "model" : "m#1",` + "\n" + `"tools":[{"model":"m#1"}], "n":1.50, "e":1e3, "seed":12345678901234567890, "u":"é" }`,
+			"m",
+			`{ "z":"<&>" , "model" : "m",` + "\n" + `"tools":[{"model":"m#1"}], "n":1.50, "e":1e3, "seed":12345678901234567890, "u":"é" }`,
+		},
+		{"the model key last", `{"n":1.50,"model":"m#1"}`, "m", `{"n":1.50,"model":"m"}`},
+		{"a key in another case", `{"Model":"m#1","n":1}`, "m", `{"Model":"m","n":1}`},
+		{
+			// The key is read after unescaping, as encoding/json routes on it, and
+			// every escape around the model's value -- in the key itself and in
+			// the other strings -- is kept exactly as it was written.
+			"an escaped key",
+			`{"u":"caf\u00e9","q":"say \"hi\"","\u006dodel":"m#1","p":"a\/b\\c"}`,
+			"m",
+			`{"u":"caf\u00e9","q":"say \"hi\"","\u006dodel":"m","p":"a\/b\\c"}`,
+		},
+		{"an escaped model value", `{"model":"m\u00231","n":1}`, "m", `{"model":"m","n":1}`},
+		{"an escaped value that already names the base", `{"model":"m#1","Model":"\u006d"}`, "m", `{"model":"m","Model":"\u006d"}`},
+		{"every key that reads as the model", `{"model":"m#1","MODEL":"m#1"}`, "m", `{"model":"m","MODEL":"m"}`},
+		{"a null model beside a string one", `{"model":null,"Model":"m#1"}`, "m", `{"model":null,"Model":"m"}`},
+		{"already the base", `{ "model" : "m" }`, "m", `{ "model" : "m" }`},
+		{"a base with HTML-sensitive characters", `{"model":"a<b>&c#1"}`, "a<b>&c", `{"model":"a<b>&c"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := rewriteModelField([]byte(tc.in), tc.base)
+			if err != nil || string(got) != tc.want {
+				t.Errorf("rewriteModelField(%s, %q) = %s, %v; want %s", tc.in, tc.base, got, err, tc.want)
+			}
+		})
+	}
+	for _, in := range []string{`["m#1"]`, `null`, `{"n":1}`, `{"model":5}`, `{"tools":[{"model":"m#1"}]}`, `{"model":"m#1"`} {
+		if got, err := rewriteModelField([]byte(in), "m"); err == nil {
+			t.Errorf("rewriteModelField(%s) = %s, want an error: there is no top-level model string to replace", in, got)
+		}
+	}
+}
+
+// TestRebuildMultipartModelCopiesPartsRaw: a part is copied as it travelled,
+// transfer encoding and all -- read decoded, a quoted-printable part would reach
+// the child with its bytes decoded and its Content-Transfer-Encoding header
+// gone -- while the model field is replaced, in its place.
+func TestRebuildMultipartModelCopiesPartsRaw(t *testing.T) {
+	body := crlf(`--b
+Content-Disposition: form-data; name="prompt"
+Content-Transfer-Encoding: quoted-printable
+
+a=3Db
+--b
+Content-Disposition: form-data; name="model"
+
+m#1
+--b
+Content-Disposition: form-data; name="image"; filename="in.png"
+Content-Type: application/octet-stream
+
+PNG-bytes
+--b--
+`)
+	out, contentType, err := rebuildMultipartModel(body, "b", "m")
+	if err != nil {
+		t.Fatalf("rebuildMultipartModel: %v", err)
+	}
+	sent, got := formParts(t, "multipart/form-data; boundary=b", body), formParts(t, contentType, out)
+	if len(got) != 3 || got[0].name != "prompt" || got[1].name != "model" || got[2].name != "image" {
+		t.Fatalf("parts = %+v, want prompt, model, image in that order", got)
+	}
+	for _, i := range []int{0, 2} {
+		if !bytes.Equal(got[i].data, sent[i].data) || fmt.Sprint(got[i].header) != fmt.Sprint(sent[i].header) {
+			t.Errorf("part %s = %v %q, want it as sent: %v %q", got[i].name, got[i].header, got[i].data, sent[i].header, sent[i].data)
+		}
+	}
+	if string(got[1].data) != "m" {
+		t.Errorf("model = %q, want m", got[1].data)
+	}
+}

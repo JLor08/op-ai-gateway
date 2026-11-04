@@ -1049,6 +1049,9 @@ func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 }
 
 func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) error {
+	if err := ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.mappings[mapping.ID]; ok {
@@ -1062,6 +1065,9 @@ func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) err
 }
 
 func (m *MemoryStore) UpdateMapping(_ context.Context, mapping ModelMapping) error {
+	if err := ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	stored, ok := m.mappings[mapping.ID]
@@ -1093,6 +1099,11 @@ func (m *MemoryStore) invalidateMappingCacheOnRenameLocked(stored ModelMapping, 
 // overlays the operator-editable columns, and overlays only the metric columns
 // the mask marks supplied plus the provenance stamp when any is (issue #65).
 func (m *MemoryStore) UpdateMappingEditable(_ context.Context, mapping ModelMapping, metrics MappingMetricsMask) error {
+	if metrics.AnyAudio() {
+		if err := ValidateMappingAudioMetrics(mapping); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	existing, ok := m.mappings[mapping.ID]
@@ -1132,6 +1143,19 @@ func (m *MemoryStore) UpdateMappingEditable(_ context.Context, mapping ModelMapp
 	}
 	if metrics.GenTokensPerSecondAtCapacity {
 		existing.GenTokensPerSecondAtCapacity = mapping.GenTokensPerSecondAtCapacity
+	}
+	if metrics.AudioRateX {
+		existing.AudioRateX = mapping.AudioRateX
+	}
+	if metrics.AudioTTFAMS {
+		existing.AudioTTFAMS = mapping.AudioTTFAMS
+	}
+	if metrics.AudioConcurrencyPair {
+		existing.AudioRealtimeConcurrency = mapping.AudioRealtimeConcurrency
+		existing.AudioConcurrencyLimit = mapping.AudioConcurrencyLimit
+	}
+	if metrics.AnyAudio() && mapping.AudioMetricsUpdatedAt != nil {
+		existing.AudioMetricsUpdatedAt = mapping.AudioMetricsUpdatedAt
 	}
 	if metrics.Any() {
 		existing.MetricsSource = mapping.MetricsSource
@@ -1462,6 +1486,63 @@ func (m *MemoryStore) UpdateMappingCapacityMetrics(_ context.Context, id string,
 	t := at
 	mapping.MetricsUpdatedAt = &t
 	m.mappings[id] = mapping
+	return nil
+}
+
+// ClearMappingAudioConcurrency writes the audio ramp pair back to unknown
+// (0, ""), leaving every other column and the provenance alone. A missing or
+// locked mapping is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
+func (m *MemoryStore) ClearMappingAudioConcurrency(_ context.Context, mappingID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapping, ok := m.mappings[mappingID]
+	if !ok || mapping.MetricsLocked {
+		return nil
+	}
+	mapping.AudioRealtimeConcurrency, mapping.AudioConcurrencyLimit = 0, ""
+	m.mappings[mappingID] = mapping
+	return nil
+}
+
+// UpdateMappingAudioMetrics writes one audio benchmark run's measurements, only
+// while the mapping is unlocked: a rate of 0, or a TTFA or load time of 0 or
+// below, is not measured and keeps the stored field, a positive LoadTimeMS
+// also writes LoadTimeMS, the ramp's count and limit are written as a pair, 0
+// included, exactly when the run carries a ramp result
+// (AudioMetrics.RampMeasured), and whatever is written is stamped with source
+// and with at in both MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that
+// measured nothing writes nothing, provenance included. A rate or limit
+// ValidateAudioMetrics refuses is an error before anything else, exactly as
+// the SQL store refuses it before any statement. A missing or locked mapping
+// is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
+func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID string, am AudioMetrics, source string, at time.Time) error {
+	if err := ValidateAudioMetrics(am); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapping, ok := m.mappings[mappingID]
+	if !ok || mapping.MetricsLocked || !am.Measured() {
+		return nil
+	}
+	if am.RateX > 0 {
+		mapping.AudioRateX = am.RateX
+	}
+	if am.TTFAMS > 0 {
+		mapping.AudioTTFAMS = am.TTFAMS
+	}
+	if am.RampMeasured() {
+		mapping.AudioRealtimeConcurrency = am.RealtimeConcurrency
+		mapping.AudioConcurrencyLimit = am.ConcurrencyLimit
+	}
+	if am.LoadTimeMS > 0 {
+		mapping.LoadTimeMS = int(am.LoadTimeMS)
+	}
+	stamp, audioStamp := at, at
+	mapping.MetricsSource = source
+	mapping.MetricsUpdatedAt = &stamp
+	mapping.AudioMetricsUpdatedAt = &audioStamp
+	m.mappings[mappingID] = mapping
 	return nil
 }
 
@@ -2688,10 +2769,12 @@ func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) err
 		if existing.MappingID == spec.MappingID {
 			spec.ID = existingID
 			spec.CreatedAt = existing.CreatedAt
-			// RAMMeasuredMB is agent-owned: the SQL update set list never
-			// touches ram_measured_mb, so an operator re-save (which always
-			// arrives with 0) must not erase the measurement here either.
+			// RAMMeasuredMB and StartupMeasuredMS are agent-owned: the SQL
+			// update set list never touches ram_measured_mb or
+			// startup_measured_ms, so an operator re-save (which always arrives
+			// with 0) must not erase a measurement here either.
 			spec.RAMMeasuredMB = existing.RAMMeasuredMB
+			spec.StartupMeasuredMS = existing.StartupMeasuredMS
 			m.runtimeSpecs[existingID] = spec
 			return nil
 		}
@@ -2832,6 +2915,22 @@ func (m *MemoryStore) UpdateRuntimeSpecRAMMeasured(_ context.Context, specID str
 		return storeerr.ErrNotFound
 	}
 	spec.RAMMeasuredMB = measuredMB
+	m.runtimeSpecs[specID] = spec
+	return nil
+}
+
+// UpdateRuntimeSpecStartupMeasured writes back the agent's measured startup
+// time for the spec, touching only StartupMeasuredMS (the operator-owned
+// instance settings are never written here). ErrNotFound when the spec does
+// not exist -- the in-memory mirror of the one-column SQL update.
+func (m *MemoryStore) UpdateRuntimeSpecStartupMeasured(_ context.Context, specID string, ms int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	spec, ok := m.runtimeSpecs[specID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	spec.StartupMeasuredMS = ms
 	m.runtimeSpecs[specID] = spec
 	return nil
 }

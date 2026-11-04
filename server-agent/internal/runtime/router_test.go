@@ -115,7 +115,17 @@ type countingManager struct {
 }
 
 func (c *countingManager) EnsureRunning(ctx context.Context, upstreamModel string) (string, func(), error) {
-	endpoint, release, err := c.inner.EnsureRunning(ctx, upstreamModel)
+	return c.counted(c.inner.EnsureRunning(ctx, upstreamModel))
+}
+
+// EnsureServing is counted exactly like EnsureRunning: it is the ensure every
+// proxied request makes.
+func (c *countingManager) EnsureServing(ctx context.Context, upstreamModel string) (string, func(), error) {
+	return c.counted(c.inner.EnsureServing(ctx, upstreamModel))
+}
+
+// counted wraps an ensure's release so every call of it is counted.
+func (c *countingManager) counted(endpoint string, release func(), err error) (string, func(), error) {
 	if release == nil {
 		return endpoint, nil, err
 	}
@@ -125,6 +135,9 @@ func (c *countingManager) EnsureRunning(ctx context.Context, upstreamModel strin
 	}, err
 }
 
+func (c *countingManager) ResolveAddress(model string) (string, int, bool) {
+	return c.inner.ResolveAddress(model)
+}
 func (c *countingManager) LoadedModels() []string { return c.inner.LoadedModels() }
 func (c *countingManager) Status() []Status       { return c.inner.Status() }
 
@@ -1176,8 +1189,14 @@ func (f fixedEndpointManager) EnsureRunning(context.Context, string) (string, fu
 	return f.endpoint, func() {}, nil
 }
 
-func (f fixedEndpointManager) LoadedModels() []string { return nil }
-func (f fixedEndpointManager) Status() []Status       { return nil }
+func (f fixedEndpointManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	return f.EnsureRunning(ctx, model)
+}
+
+// ResolveAddress names no instance address: every model is its own, instance 0.
+func (f fixedEndpointManager) ResolveAddress(string) (string, int, bool) { return "", 0, false }
+func (f fixedEndpointManager) LoadedModels() []string                    { return nil }
+func (f fixedEndpointManager) Status() []Status                          { return nil }
 
 // upgradingUpstream returns a server that answers EVERY request with a raw
 // "101 Switching Protocols" carrying a matching Upgrade token -- the shape
@@ -1288,6 +1307,24 @@ type statusManager struct {
 func (m *statusManager) EnsureRunning(context.Context, string) (string, func(), error) {
 	m.ensures.Add(1)
 	return "", nil, ErrModelNotManaged
+}
+
+// EnsureServing is counted with EnsureRunning: either is an ensure the
+// /upstream route must never make.
+func (m *statusManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	return m.EnsureRunning(ctx, model)
+}
+
+// ResolveAddress answers the way the real manager does for the rows these tests
+// hold, every one of them an instance 0: a model is managed exactly when a
+// status row reports it.
+func (m *statusManager) ResolveAddress(model string) (string, int, bool) {
+	for _, st := range m.statuses {
+		if st.Model == model {
+			return model, 0, true
+		}
+	}
+	return "", 0, false
 }
 func (m *statusManager) LoadedModels() []string { return nil }
 func (m *statusManager) Status() []Status       { return m.statuses }
@@ -1844,7 +1881,7 @@ func TestServeUpstreamModelsRelaysIncludeParams(t *testing.T) {
 	}
 }
 
-// TestServeUpstreamModelsNeverStartsAndKeepsSentinels: the Status-only,
+// TestServeUpstreamModelsNeverStartsAndKeepsSentinels: the read-only,
 // never-start contract is unchanged for the models read -- a managed child that
 // is not running answers 404 runtime.model_not_running with ZERO hits on its
 // port, and an unknown model, an empty model or a nil manager answers 404

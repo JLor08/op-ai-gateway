@@ -432,3 +432,43 @@ func TestScoreNoOpWhenNoCapacityMetrics(t *testing.T) {
 		t.Fatalf("no-capacity-metrics score must not depend on load: %v vs %v", s0, s8)
 	}
 }
+
+// A request that carries the speech or transcription capability scores a
+// mapping's measured audio rate as a third bounded tiebreak: 10 points per x of
+// real time, at most 50. Every other request -- and an unmeasured rate -- scores
+// exactly as before.
+func TestScoreAudioTiebreak(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	base := Route{ID: "a", Model: "tts", Priority: 1, Weight: 1, Healthy: true, TelemetryAt: now}
+	plain, ok := Score(base, "tts", now)
+	if !ok {
+		t.Fatal("base route not viable")
+	}
+	cases := []struct {
+		name  string
+		rate  float64
+		audio bool
+		bonus float64
+	}{
+		{"rate 3.0 on an audio route", 3.0, true, 30},
+		{"rate 9.0 is capped", 9.0, true, 50},
+		{"unmeasured rate", 0, true, 0},
+		{"chat route ignores the rate", 3.0, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			route := base
+			route.AudioRateX, route.Audio = tc.rate, tc.audio
+			got, ok := Score(route, "tts", now)
+			if !ok {
+				t.Fatal("route not viable")
+			}
+			if got-plain != tc.bonus {
+				t.Fatalf("audio bonus = %v, want %v", got-plain, tc.bonus)
+			}
+		})
+	}
+	if got := audioTiebreak(math.Inf(1)); got != 50 {
+		t.Fatalf("audioTiebreak(+Inf) = %v, want the cap 50", got)
+	}
+}

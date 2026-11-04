@@ -390,18 +390,26 @@ var errTranscriptionUnavailable = errors.New(codeTranscriptionUnavailable)
 // errImageEditTooLarge's twin, mapped in the same three places.
 var errTranscriptionTooLarge = errors.New(codeRequestBodyTooLarge)
 
-// errTranscriptionLiveBusy refuses a buffered transcription (or /details) whose
-// resolved single-slot model currently has an active live-transcription session:
-// audio.cpp serves one session per model, so proceeding would collide at the upstream
-// and bill an honest loud zero (§11.4(4)). Refusing cleanly with the live path's own
+// errTranscriptionLiveBusy refuses a transcription whose instance's one live slot is
+// taken: a buffered transcription (or /details) whose resolved instance currently has an
+// active live session -- audio.cpp serves one session per process, so proceeding would
+// collide at the upstream and bill an honest loud zero (§11.4(4)) -- and a live session
+// that found no instance with a free slot. Refusing cleanly with the live path's own
 // transcription.live_busy (liveBearerBusyCode, a transient 503) turns that collision
 // into an explicit, retryable signal; it is mapped to its status, code and message in
 // the same one place the other transcription refusals are (completionHTTPStatus,
 // completionErrorCode, completionErrorResponse), so the response and the usage row
-// cannot disagree. INTERIM until #340 (demand-driven multi-replica autoscaling): with N
-// instances, each its own live slot plus live failover, this contention largely
-// dissolves and a buffered request can be served beside a live one -- the clean 503
-// stays the right answer only when every slot is taken.
+// cannot disagree.
+//
+// It is rarely the answer for a model with instances. Each instance is its own slot,
+// and routing passes over a held slot for every transcription -- buffered, details and
+// live alike, whatever the spec's instance parallelism would leave room for, and a
+// mixed fleet's mapping without instances included -- so the request goes to a slot
+// that is free, or waits in the admission queue for one; a live session that loses the
+// race for a slot is selected again like one that found it held. The clean 503 stays
+// the answer for a model served only by mappings without instances, whose slot is
+// taken, and for the race the advisory check below cannot close: a session that takes
+// the slot between the resolve and the check.
 var errTranscriptionLiveBusy = errors.New(liveBearerBusyCode)
 
 // transcriptionInferenceShape is the shape serveTranscription hands the ONE
@@ -883,16 +891,20 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		s.recordTranscriptionRoutingFailure(w, r, att, errTranscriptionUnavailable)
 		return
 	}
-	// A live transcription session on this model holds audio.cpp's one slot. A buffered
-	// transcription (or /details) sent to it now would collide at the upstream and bill
-	// an honest loud zero (§11.4(4)); refuse it cleanly with the live path's own busy 503
-	// instead. Checked after the resolve and the served/multipart gates so a permanent
-	// refusal still wins, and before any upstream body is built. The check is an advisory
-	// snapshot (liveSessions.held), not a lock: a live session may start right after it,
+	// A live transcription session on this instance holds audio.cpp's one slot. A
+	// buffered transcription (or /details) sent to it now would collide at the upstream
+	// and bill an honest loud zero (§11.4(4)); refuse it cleanly with the live path's own
+	// busy 503 instead. Keyed by the instance, so a live session on one instance of a
+	// replicable spec never refuses a request routed to another -- and for a model with
+	// instances the resolve has already passed over every held slot, so this only
+	// catches a session that started after the resolve; for a model served only by
+	// mappings without instances it is the answer whenever the slot is taken. Checked after the
+	// resolve and the served/multipart gates so a permanent refusal still wins, and
+	// before any upstream body is built. The check is an advisory snapshot
+	// (liveSessions.LiveHeld), not a lock: a live session may start right after it,
 	// leaving the pre-existing loud zero as the fallback -- it only turns the common
-	// same-model collision into a clean refusal. INTERIM until #340 generalises this to
-	// per-instance slots + live failover.
-	if s.liveSessions.held(target.RouteID) {
+	// same-instance collision into a clean refusal.
+	if s.liveSessions.LiveHeld(target.InstanceKey) {
 		slog.Debug("transcription refused: a live session holds this model's slot",
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
 			"route_id", target.RouteID)
@@ -907,6 +919,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		pfReq:       req,
 		endpoint:    endpoint,
 		contentType: r.Header.Get(contentTypeHeader),
+		reselect:    relayAgain(req, func(again inference.Request) { s.relayTranscription(w, r, att.token, again, endpoint, form, raw) }),
 	}
 	// The stream-versus-buffered decision is made HERE, before the upstream body is
 	// built, because answering buffered means a body without the client's `stream` part.

@@ -112,6 +112,11 @@ func TestActiveRegistryTracksLiveRequest(t *testing.T) {
 	if row.TokenID != "tok_dev" || row.TokenName != "Dev Token" {
 		t.Fatalf("in-flight row token metadata wrong: %#v", row)
 	}
+	// The row names the instance it occupies, which is what the per-instance
+	// capacity counts.
+	if row.InstanceKey != "route_mock_qwen#0" {
+		t.Fatalf("in-flight InstanceKey = %q, want route_mock_qwen#0 (the target's)", row.InstanceKey)
+	}
 
 	// And it is visible through the HTTP endpoint.
 	getReq := httptest.NewRequest(http.MethodGet, "/api/portal/usage/active", nil)
@@ -221,6 +226,9 @@ func TestActiveRegistryTracksLiveStreamRequest(t *testing.T) {
 	// equals the effective model).
 	if snap[0].RequestedModel != "qwen-coder" {
 		t.Fatalf("streaming path RequestedModel = %q, want qwen-coder: %#v", snap[0].RequestedModel, snap[0])
+	}
+	if snap[0].InstanceKey != "route_mock_qwen#0" {
+		t.Fatalf("streaming path InstanceKey = %q, want route_mock_qwen#0 (the target's)", snap[0].InstanceKey)
 	}
 
 	close(prov.release)

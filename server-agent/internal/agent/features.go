@@ -212,7 +212,7 @@ var Features = []Feature{
 	// bump (see agent.go's Version block).
 	{Name: "runtime_config_files", Since: "0.10.0"},
 	// runtime_voices: this agent's runtime router serves
-	// GET /upstream/{model}/v1/audio/voices -- a Status-only passthrough to a
+	// GET /upstream/{model}/v1/audio/voices -- a read-only passthrough to a
 	// RUNNING audio.cpp child's voice listing (issue #251; it never starts a
 	// child, and the outbound path is exactly /v1/audio/voices, relayed
 	// byte-verbatim with the spec's token forwarded). Like runtime_upstream_props,
@@ -241,7 +241,7 @@ var Features = []Feature{
 	// bump (see agent.go's Version block).
 	{Name: "fullduplex_proxy", Since: "0.12.0"},
 	// runtime_model_params: this agent's runtime router serves
-	// GET /upstream/{model}/v1/models -- a Status-only passthrough to a
+	// GET /upstream/{model}/v1/models -- a read-only passthrough to a
 	// RUNNING audio.cpp child's model listing, relayed with the inbound query
 	// so ?include_params=true reaches the child and the gateway reads each
 	// model's declared request params (e.g. language); it never starts a child.
@@ -309,7 +309,40 @@ var Features = []Feature{
 	// Since is 0.15.0: agent.Features gains an entry, so the rule is a MINOR bump
 	// (see agent.go's Version block).
 	{Name: "runtime_role_eviction", Since: "0.15.0"},
+	// runtime_instances: this agent runs several instances (processes) of one
+	// runtime spec (#340). It reads the spec-level replicable/min_instances/
+	// max_instances fields of the runtime-config document, serves each extra
+	// instance under the model address "m#k" (k = 1...) -- its router hands the
+	// child the base name m in the address's place -- and reports one status
+	// row per instance (runtime.Status.Instance, with the process's measured
+	// startup_ms).
+	//
+	// The precondition runs the other way as well: the agent honours a spec's
+	// replicable flag only while the GATEWAY declares runtime_instances in its
+	// own feature set (runtime.Driver.Sync clears the flag otherwise, in file
+	// mode too, and applies the document again when the declaration changes).
+	// Several status rows under one spec_id are something only such a gateway
+	// knows how to fold, so instances run only when both sides declare the name;
+	// against any other gateway every spec runs as its single process.
+	//
+	// Unlike runtime_role_eviction, the GATEWAY gates real behavior on this flag,
+	// fail-closed: it expands a replicable model into "m#k" candidates, routes to
+	// them and starts one only on positive evidence the agent declared this name.
+	// An older agent decodes the document without error and silently ignores the
+	// unknown fields, which no probe of the agent can tell apart from one that
+	// honours them -- it would answer 404 runtime.model_not_managed for every
+	// "m#k", exactly the traffic a capability gate exists to prevent. The gateway
+	// spells the same string in its own constant for the reason
+	// runtimeManagerFeature is duplicated: this module cannot import it.
+	//
+	// Since is 0.16.0: agent.Features gains an entry, so the rule is a MINOR bump
+	// (see agent.go's Version block).
+	{Name: FeatureRuntimeInstances, Since: "0.16.0"},
 }
+
+// FeatureRuntimeInstances names the runtime_instances feature (see its registry
+// entry above): the agent runs several instances of one replicable runtime spec.
+const FeatureRuntimeInstances = "runtime_instances"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

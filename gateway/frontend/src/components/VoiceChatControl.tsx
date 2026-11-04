@@ -71,8 +71,33 @@ const REFUSAL_TEXT: Partial<Record<string, MessageKey>> = {
   'portal.voice_chat_ticket_failed': 'chatVoiceErrorTicket',
 };
 
+// voice_chat.no_realtime_model (#340): the voice gate found no model for a leg whose measured
+// rate keeps up with the real time a conversation needs. One code serves both legs; the gateway
+// names the leg in its message ("voice chat asr leg: ..."), and the sentence names it too when it
+// is there. A leg is read only beside the word "leg", so a model name ending in "-tts" is no leg.
+const NO_REALTIME_MODEL = 'voice_chat.no_realtime_model';
+const NO_REALTIME_TEXT = {
+  asr: 'chatVoiceErrorNoRealtimeAsr',
+  tts: 'chatVoiceErrorNoRealtimeTts',
+} satisfies Record<'asr' | 'tts', MessageKey>;
+const NO_REALTIME_LEG = /\b(asr|tts)\W{0,3}leg\b|\bleg\W{0,3}(asr|tts)\b/i;
+
+function noRealtimeSentence(message: string, t: Translation): string {
+  const match = NO_REALTIME_LEG.exec(message);
+  const leg = (match?.[1] ?? match?.[2])?.toLowerCase();
+  return leg === 'asr' || leg === 'tts'
+    ? t[NO_REALTIME_TEXT[leg]]
+    : t.chatVoiceErrorNoRealtimeModel;
+}
+
 // The sentence of ours for a gateway code, or undefined where none says more than the code does.
-function sentenceForCode(code: string | undefined, t: Translation): string | undefined {
+// `message` is read only for the leg a real-time refusal names, never shown.
+function sentenceForCode(
+  code: string | undefined,
+  message: string,
+  t: Translation,
+): string | undefined {
+  if (code === NO_REALTIME_MODEL) return noRealtimeSentence(message, t);
   const key = code ? REFUSAL_TEXT[code] : undefined;
   return key ? t[key] : undefined;
 }
@@ -92,11 +117,11 @@ function errorText(error: VoiceChatError, t: Translation): string {
     case 'dropped':
       // A failure a retry can get past; one that carries the gateway's code (a ticket the mint
       // failed to issue) is worded by it, and any other (a lost connection) is the generic one.
-      return sentenceForCode(error.code, t) ?? t.chatVoiceErrorDropped;
+      return sentenceForCode(error.code, error.message, t) ?? t.chatVoiceErrorDropped;
     case 'turn':
       return t.chatVoiceErrorTurn;
     case 'refused':
-      return sentenceForCode(error.code, t) ?? t.chatVoiceErrorRefused;
+      return sentenceForCode(error.code, error.message, t) ?? t.chatVoiceErrorRefused;
   }
 }
 

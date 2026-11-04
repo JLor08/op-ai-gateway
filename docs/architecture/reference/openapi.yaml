@@ -1935,7 +1935,15 @@ paths:
         speech relay is (the speech capability, a speech_streaming = yes verdict and an
         offerable model: a clone model only with a named preset voice); a refusal is 400
         `portal.voice_chat_asr_unavailable`, `portal.voice_chat_llm_unavailable` or
-        `portal.voice_chat_tts_unavailable`, naming no internal model or server. Step 2
+        `portal.voice_chat_tts_unavailable`, naming no internal model or server. The
+        transcription and speech legs must also keep up with real time: a leg whose every
+        candidate was measured slower than OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR
+        (default 1.2) is 409 `voice_chat.no_realtime_model`, whose message names the leg
+        (`voice chat asr leg: …` or `voice chat tts leg: …`); an unmeasured candidate is
+        never refused for it. Step 1 never waits in the admission queue: a leg whose every
+        instance is busy is selected onto the least loaded one at once, and the demand for
+        another instance is signalled (a voice chat about to start is demand already
+        known); the per-turn requests are the ones that queue. Step 2
         ensures each agent-managed leg one at a time (a start failure is that leg's
         unavailable code; an agent that will not admit the model,
         runtime.admission_blocked, is 409 `portal.voice_chat_coload_failed`). Step 3
@@ -2000,11 +2008,15 @@ paths:
         '405': { description: 'Any method other than POST (Allow: POST).' }
         '409':
           description: >
-            The Error envelope with code `portal.voice_chat_coload_failed`: the three
+            The Error envelope. `portal.voice_chat_coload_failed`: the three
             models cannot be held resident together (an agent refused to admit one,
             starting one evicted another, residency could not be verified, or the gate
-            outlived its deadline). The remedy is the operator's: the pairwise
+            outlived its deadline); the remedy is the operator's: the pairwise
             co-residency matrix and the GPU VRAM budgets.
+            `voice_chat.no_realtime_model`: every candidate of the transcription or the
+            speech leg was measured too slow for real time; the message names the leg
+            (`voice chat asr leg: …` / `voice chat tts leg: …`), and the remedy is
+            another model for that leg or a faster host.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2454,7 +2466,12 @@ paths:
         opening marker. On a spec that fails to start
         it is the entire content of this view. "dropped_bytes" on an entry means
         N bytes the process printed are missing immediately
-        before it. Nothing on this path is persisted -- not to disk, not to the
+        before it. "instance" names the spec instance whose generation produced
+        a text entry or marker; it is omitted for instance 0 (and by an agent
+        that predates instances), instance k's text keeps its "[#k] " line
+        prefix, and a gap belongs to no instance: an entry carrying only
+        "dropped_bytes" names none, and one that also carries text names the
+        instance of its text. Nothing on this path is persisted -- not to disk, not to the
         database. Subscribing is what makes the agent stream this spec, and
         unsubscribing is what stops it.
         Error codes: 400 runtime_logs.spec_required (spec_id absent),

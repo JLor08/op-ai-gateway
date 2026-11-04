@@ -97,6 +97,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // `load_refusal` reuses these labels as the disabled Load action's tooltip.
   'benchmark.images_only': 'errorBenchmarkImagesOnly',
   'benchmark.audio_only': 'errorBenchmarkAudioOnly',
+  // A run with nothing it can measure as audio: the speech run with no
+  // speech target, or a speed/capacity/both scope whose audio-only models
+  // cannot be measured yet (beside images-only ones or not). The gateway
+  // words those cases apart; this one label states them all.
+  'benchmark.speech_unavailable': 'errorBenchmarkSpeechUnavailable',
   'benchmark.agent_ensure_unsupported': 'errorBenchmarkAgentEnsureUnsupported',
   'benchmark.spec_force_stopped': 'errorBenchmarkSpecForceStopped',
   // The VRAM benchmark's precondition refusals (409 at the trigger), read
@@ -115,6 +120,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // file and the rule, but a mapped code renders THIS label instead of it, so
   // the label states every rule rather than one.
   'runtime_spec.config_files_invalid': 'errorRuntimeSpecConfigFilesInvalid',
+  // #340: the instance settings' two refusals (portalRuntimeSpecErrRows): a
+  // minimum above a set maximum or a count above the agent's cap of 64, and a
+  // replicable spec on a fixed listen_port.
+  'runtime_spec.instances_invalid': 'errorRuntimeSpecInstancesInvalid',
+  'runtime_spec.instances_need_ephemeral_port': 'errorRuntimeSpecInstancesNeedEphemeralPort',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',
@@ -264,6 +274,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'portal.chat_run_active': 'errorChatRunActive',
   'portal.chat_run_limit': 'errorChatRunLimit',
   'mapping.capability_reserved': 'errorMappingCapabilityReserved',
+  // A metric edit the gateway cannot store (portal.ErrMappingMetricInvalid,
+  // portal_mapping_endpoints.go): a negative text metric and, since #340, an
+  // invalid audio metric -- a negative value, or a real-time concurrency
+  // without one of the three limits it is measured with. Both share this code.
+  'mapping.metric_invalid': 'errorMappingMetricInvalid',
   'gateway.chat_run_timeout': 'errorChatRunTimeout',
   'gateway.chat_run_image_dispatch_failed': 'errorChatRunImageDispatchFailed',
   'gateway.chat_run_no_image': 'errorChatRunNoImage',
@@ -410,6 +425,18 @@ export function formatMetric(
     return placeholder;
   }
   return value.toFixed(decimals);
+}
+
+/**
+ * Read a metric the operator typed into a free-text numeric field: a
+ * non-negative number, and 0 for a blank, invalid or negative entry -- for
+ * the metrics read through here, 0 is how the backend stores "not measured".
+ * Not for an audio ramp's real-time concurrency, where 0 beside its limit is
+ * a result ("not real-time"); shared/audioMetrics.ts reads that count itself.
+ */
+export function parseMetricInput(text: string): number {
+  const n = Number(text.trim());
+  return text.trim() === '' || Number.isNaN(n) || n < 0 ? 0 : n;
 }
 
 export function formatDate(value: string | null | undefined, fallback: string): string {

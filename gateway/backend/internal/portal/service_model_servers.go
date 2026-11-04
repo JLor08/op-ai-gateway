@@ -38,6 +38,20 @@ type ModelServerDTO struct {
 	State          string `json:"state"`
 	ActiveRequests int    `json:"active_requests"`
 	QueueDepth     int    `json:"queue_depth"`
+	// RunningInstances is how many instances of the mapping's runtime spec run
+	// on this server (#340): one per running status row of the spec, so 1 for
+	// a running spec that is not replicable and 0 when none runs. Like State,
+	// Service.ModelServers leaves it 0 and the gateway layer injects it from
+	// the runtime-status registry.
+	RunningInstances int `json:"running_instances"`
+	// Replicable is the stored replicable flag of the mapping's runtime spec
+	// (#340): whether the agent may run several instances of it. False for a
+	// mapping without a spec. The portal shows the running-instance count when
+	// it is true or when RunningInstances is above 1, so a replicable spec
+	// with one instance up reads as one of possibly several. Like State,
+	// Service.ModelServers leaves it false and the gateway layer injects it,
+	// from the spec it already reads for the row.
+	Replicable bool `json:"replicable"`
 
 	// MetricsProbe/ContextProbe are the agent's last-reported reachability for its
 	// /metrics and context probes ("ok"/"unreachable"/"na", or "" when not reported).
@@ -65,6 +79,13 @@ type ModelServerDTO struct {
 	MaxConcurrency               int     `json:"max_concurrency"`
 	RecommendedConcurrency       int     `json:"recommended_concurrency"`
 	GenTokensPerSecondAtCapacity float64 `json:"gen_tokens_per_second_at_capacity"`
+	// The mapping's audio metrics (#340), as ModelMappingDTO carries them: what
+	// the audio score term and the voice real-time gate route on, and the scaler's
+	// ceiling for a speech or transcription model.
+	AudioRateX               float64 `json:"audio_rate_x"`
+	AudioTTFAMS              int64   `json:"audio_ttfa_ms"`
+	AudioRealtimeConcurrency int     `json:"audio_realtime_concurrency"`
+	AudioConcurrencyLimit    string  `json:"audio_concurrency_limit"`
 	// IsMtp/VisionCapable are convenience booleans folded from Capabilities
 	// below (the "mtp"/"vision" row's Verdict == CapabilityYes; a missing row
 	// is NOT capable, same fail-closed rule Capabilities itself carries).
@@ -298,6 +319,10 @@ func modelServerRow(view mappingView, loaded, canLoad bool, caps []routing.Capab
 		MaxConcurrency:               view.mapping.MaxConcurrency,
 		RecommendedConcurrency:       view.mapping.RecommendedConcurrency,
 		GenTokensPerSecondAtCapacity: view.mapping.GenTokensPerSecondAtCapacity,
+		AudioRateX:                   view.mapping.AudioRateX,
+		AudioTTFAMS:                  view.mapping.AudioTTFAMS,
+		AudioRealtimeConcurrency:     view.mapping.AudioRealtimeConcurrency,
+		AudioConcurrencyLimit:        view.mapping.AudioConcurrencyLimit,
 		IsMtp:                        byName[routing.CapabilityMTP].Verdict == routing.CapabilityYes,
 		VisionCapable:                byName[routing.CapabilityVision].Verdict == routing.CapabilityYes,
 		MetricsSource:                view.mapping.MetricsSource,

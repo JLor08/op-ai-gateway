@@ -72,12 +72,10 @@ func TestMigration95AddsAudioPerfMetricColumns(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create application: %v", err)
 		}
-		if err := s.CreateMapping(ctx, routing.ModelMapping{
+		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m95", ApplicationID: "app_m95", GatewayModelName: "m95-tts", AppModelName: "up-m95",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create mapping: %v", err)
-		}
+		})
 		if _, err := s.db.ExecContext(ctx, s.dl.rebind(
 			`insert into model_mapping_benchmarks (id, mapping_id, server_id, created_at, gen_tokens_per_second) values (?, ?, ?, ?, ?)`),
 			"bmk_old", "map_m95", "srv_m95", now, 42.5); err != nil {

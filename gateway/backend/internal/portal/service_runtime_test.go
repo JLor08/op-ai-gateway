@@ -7,11 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -3929,7 +3932,7 @@ func TestAgentRuntimeSpecDTOCarriesConfigFiles(t *testing.T) {
 			Args:        "[]",
 			Env:         "{}",
 			ConfigFiles: stored,
-		}, mapping, nil)
+		}, mapping, nil, 0)
 	}
 
 	t.Run("stored files appear on the DTO", func(t *testing.T) {
@@ -4008,4 +4011,655 @@ func TestAgentRuntimeSpecDTOCarriesConfigFiles(t *testing.T) {
 			t.Fatalf("agent wire ConfigFiles = %#v, want %#v", cfg.Specs[0].ConfigFiles, want)
 		}
 	})
+}
+
+// --- model-instance settings (#340) ------------------------------------------
+
+// instanceSpecFixture seeds a server with a server_agent application and one
+// mapping on it, and returns the service, the store, the mapping id and the
+// server id. With svc and routeStore nil it builds the default test service;
+// otherwise routeStore is the store behind svc.
+func instanceSpecFixture(t *testing.T, svc *Service, routeStore *routing.MemoryStore) (*Service, *routing.MemoryStore, string, string) {
+	t.Helper()
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	if svc == nil {
+		svc, routeStore = newServerTestService(t, now)
+	}
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "tts", AppModelName: "tts-upstream"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	// The server's agent runs instances, so the pushed document carries them;
+	// TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances covers
+	// the agents that do not.
+	svc.agentFeatures = fakeAgentFeatures{server.ID: {"runtime_manager", AgentFeatureRuntimeInstances}}
+	return svc, routeStore, mapping.ID, server.ID
+}
+
+// fakeAgentFeatures is an AgentFeatureReader over a fixed declared set per
+// server id. A server with an entry -- an empty one included -- has declared
+// its set; one without has not been heard from.
+type fakeAgentFeatures map[string][]string
+
+func (f fakeAgentFeatures) Has(serverID, feature string) bool {
+	return slices.Contains(f[serverID], feature)
+}
+
+func (f fakeAgentFeatures) Known(serverID string) bool {
+	_, ok := f[serverID]
+	return ok
+}
+
+// newInstanceIdleTestService is newServerTestService with the two idle-timeout
+// knobs set through ServiceDeps, as cmd/gateway sets them from the config.
+func newInstanceIdleTestService(t *testing.T, factor float64, floor int) (*Service, *routing.MemoryStore) {
+	t.Helper()
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	for _, u := range []string{"usr_admin", "usr_owner", "usr_other"} {
+		if err := dir.CreateUser(context.Background(), store.User{ID: u, Email: u + "@example.test", DisplayName: u, Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateUser %s: %v", u, err)
+		}
+	}
+	seedServerTestGroups(t, dir, now)
+	routeStore := routing.NewMemoryStore()
+	svc := NewService(ServiceDeps{
+		Users: dir, Groups: dir, Routes: routeStore, Clock: func() time.Time { return now },
+		InstanceIdleFactor: factor, InstanceIdleFloorSeconds: floor,
+	})
+	return svc, routeStore
+}
+
+// wireKeys returns v's JSON object as raw values by key.
+func wireKeys(t *testing.T, v any) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	return keys
+}
+
+// TestPutRuntimeSpecInstancesRoundTrip pins the four operator-owned instance
+// settings through the full-document PUT and the GET, by their JSON names,
+// and the two read-only echoes beside them: the agent's measured startup and
+// the idle timeout the runtime-config document pushes for the spec. A PUT
+// body carrying the read-only keys changes nothing -- the request has no such
+// fields -- and a re-save keeps the agent's measurement while the settings
+// follow the document, cleared when it omits them like any other field.
+func TestPutRuntimeSpecInstancesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+
+	empty, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec (unconfigured): %v", err)
+	}
+	emptyKeys := wireKeys(t, empty)
+	for key, want := range map[string]string{
+		"replicable": "false", "min_instances": "0", "max_instances": "0", "instance_parallelism": "0",
+		"startup_measured_ms": "0", "effective_idle_timeout_seconds": "0",
+	} {
+		if got := string(emptyKeys[key]); got != want {
+			t.Fatalf("unconfigured wire %s = %q, want %s (the keys are always present)", key, got, want)
+		}
+	}
+
+	var req PutRuntimeSpecRequest
+	body := `{"enabled":true,"binary":"/usr/local/bin/llama-server","replicable":true,"min_instances":1,"max_instances":3,` +
+		`"instance_parallelism":2,"startup_measured_ms":99999,"effective_idle_timeout_seconds":7}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	put, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if !put.Replicable || put.MinInstances != 1 || put.MaxInstances != 3 || put.InstanceParallelism != 2 {
+		t.Fatalf("PUT echo = replicable %v min %d max %d parallelism %d, want true 1 3 2",
+			put.Replicable, put.MinInstances, put.MaxInstances, put.InstanceParallelism)
+	}
+	if put.StartupMeasuredMS != 0 {
+		t.Fatalf("PUT echo startup_measured_ms = %d, want 0: nothing is measured yet and a request never sets it", put.StartupMeasuredMS)
+	}
+	// Nothing measured, no manual value: the floor, never 0 ("never unload").
+	if put.EffectiveIdleTimeoutSeconds != DefaultInstanceIdleFloorSeconds {
+		t.Fatalf("PUT echo effective_idle_timeout_seconds = %d, want the floor %d", put.EffectiveIdleTimeoutSeconds, DefaultInstanceIdleFloorSeconds)
+	}
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+	}
+	if !stored.Replicable || stored.MinInstances != 1 || stored.MaxInstances != 3 || stored.InstanceParallelism != 2 ||
+		stored.StartupMeasuredMS != 0 || stored.IdleTimeoutSeconds != 0 {
+		t.Fatalf("stored spec = %+v, want the four settings, no measurement and the manual idle timeout 0 (the effective value is never stored)", stored)
+	}
+
+	if err := routeStore.UpdateRuntimeSpecStartupMeasured(ctx, put.ID, 30000); err != nil {
+		t.Fatalf("UpdateRuntimeSpecStartupMeasured: %v", err)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	keys := wireKeys(t, got)
+	for key, want := range map[string]string{
+		"replicable": "true", "min_instances": "1", "max_instances": "3", "instance_parallelism": "2",
+		"startup_measured_ms": "30000", "effective_idle_timeout_seconds": "150",
+	} {
+		if gotValue := string(keys[key]); gotValue != want {
+			t.Fatalf("GET wire %s = %q, want %s", key, gotValue, want)
+		}
+	}
+
+	again, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true, MinInstances: 2, MaxInstances: 4, InstanceParallelism: 1,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (re-save): %v", err)
+	}
+	if again.MinInstances != 2 || again.MaxInstances != 4 || again.InstanceParallelism != 1 ||
+		again.StartupMeasuredMS != 30000 || again.EffectiveIdleTimeoutSeconds != 150 {
+		t.Fatalf("re-save echo = %+v, want the new settings, the kept measurement 30000 and its idle timeout 150", again)
+	}
+
+	cleared, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{Enabled: true, Binary: "/usr/local/bin/llama-server"})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (omitting the settings): %v", err)
+	}
+	if cleared.Replicable || cleared.MinInstances != 0 || cleared.MaxInstances != 0 || cleared.InstanceParallelism != 0 ||
+		cleared.StartupMeasuredMS != 30000 || cleared.EffectiveIdleTimeoutSeconds != 0 {
+		t.Fatalf("a PUT omitting the settings = %+v, want them cleared, the measurement kept, and the stored idle timeout 0 (never unload) for a spec that is not replicable", cleared)
+	}
+}
+
+// TestPutRuntimeSpecInstancesInvalid pins the two refusals of the instance
+// counts and that nothing is stored for either: a floor above the cap, when
+// both are set, is runtime_spec.instances_invalid -- whether or not the spec is
+// replicable, so an inconsistent pair is never stored to come back to life when
+// it is switched on -- and a negative count is the existing
+// runtime_spec.tuning_invalid. A floor equal to the cap, or either one unset
+// (0), is a valid pair.
+func TestPutRuntimeSpecInstancesInvalid(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+	base := func() PutRuntimeSpecRequest {
+		return PutRuntimeSpecRequest{Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true}
+	}
+
+	refused := []struct {
+		name   string
+		mutate func(*PutRuntimeSpecRequest)
+		want   error
+	}{
+		{"min above max", func(r *PutRuntimeSpecRequest) { r.MinInstances, r.MaxInstances = 3, 2 }, ErrRuntimeSpecInstancesInvalid},
+		{"min above max on a spec that is not replicable", func(r *PutRuntimeSpecRequest) {
+			r.Replicable, r.MinInstances, r.MaxInstances = false, 3, 2
+		}, ErrRuntimeSpecInstancesInvalid},
+		{"negative min", func(r *PutRuntimeSpecRequest) { r.MinInstances = -1 }, ErrRuntimeSpecTuningInvalid},
+		{"negative min below a max", func(r *PutRuntimeSpecRequest) { r.MinInstances, r.MaxInstances = -1, 2 }, ErrRuntimeSpecTuningInvalid},
+		{"negative max", func(r *PutRuntimeSpecRequest) { r.MaxInstances = -1 }, ErrRuntimeSpecTuningInvalid},
+		{"negative parallelism", func(r *PutRuntimeSpecRequest) { r.InstanceParallelism = -1 }, ErrRuntimeSpecTuningInvalid},
+	}
+	for _, tc := range refused {
+		req := base()
+		tc.mutate(&req)
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req); !errors.Is(err, tc.want) {
+			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.want)
+		}
+		if _, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID); err != nil || ok {
+			t.Fatalf("%s: a refused PUT stored a spec (ok=%v err=%v)", tc.name, ok, err)
+		}
+	}
+
+	for _, pair := range []struct{ min, max int }{{2, 2}, {3, 0}, {0, 2}, {0, 0}} {
+		req := base()
+		req.MinInstances, req.MaxInstances = pair.min, pair.max
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+		if err != nil {
+			t.Fatalf("min %d max %d: err = %v, want the pair accepted", pair.min, pair.max, err)
+		}
+		if dto.MinInstances != pair.min || dto.MaxInstances != pair.max {
+			t.Fatalf("min %d max %d: stored %d / %d", pair.min, pair.max, dto.MinInstances, dto.MaxInstances)
+		}
+	}
+}
+
+// TestPutRuntimeSpecReplicableNeedsEphemeralPort pins
+// runtime_spec.instances_need_ephemeral_port: every instance of a replicable
+// spec is its own process and needs its own port, so a replicable spec must
+// leave listen_port at 0 for the agent to pick one per instance. A fixed port
+// on a spec that is not replicable stays what it is today, and the refusal
+// stores nothing -- also over an existing spec, whose row stays as it was.
+func TestPutRuntimeSpecReplicableNeedsEphemeralPort(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true, ListenPort: 9000,
+	}); !errors.Is(err, ErrRuntimeSpecInstancesNeedEphemeralPort) {
+		t.Fatalf("replicable with listen_port 9000: err = %v, want ErrRuntimeSpecInstancesNeedEphemeralPort", err)
+	}
+	if _, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID); err != nil || ok {
+		t.Fatalf("a refused PUT stored a spec (ok=%v err=%v)", ok, err)
+	}
+
+	fixed, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", ListenPort: 9000,
+	})
+	if err != nil || fixed.ListenPort != 9000 || fixed.Replicable {
+		t.Fatalf("a fixed port on a spec that is not replicable: dto %+v err %v, want it stored as today", fixed, err)
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true, ListenPort: 9000,
+	}); !errors.Is(err, ErrRuntimeSpecInstancesNeedEphemeralPort) {
+		t.Fatalf("switching a fixed-port spec to replicable: err = %v, want ErrRuntimeSpecInstancesNeedEphemeralPort", err)
+	}
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok || stored.Replicable || stored.ListenPort != 9000 {
+		t.Fatalf("after a refused re-save the stored spec = %+v (ok=%v err=%v), want it unchanged", stored, ok, err)
+	}
+
+	ephemeral, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true,
+	})
+	if err != nil || !ephemeral.Replicable || ephemeral.ListenPort != 0 {
+		t.Fatalf("replicable with listen_port 0: dto %+v err %v, want it stored", ephemeral, err)
+	}
+}
+
+// TestPutRuntimeSpecInstanceChecksRunAfterThePreExistingValidations pins where
+// the instance checks sit in the request validation, whose order is part of
+// the API: after every validation that shipped before them. A body invalid for
+// a shipped reason AND for an instance reason keeps reporting the shipped
+// one -- before the instance settings existed, encoding/json dropped their
+// keys and such a body got exactly that answer.
+func TestPutRuntimeSpecInstanceChecksRunAfterThePreExistingValidations(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	legs := []struct {
+		name   string
+		mutate func(*PutRuntimeSpecRequest)
+		want   error
+	}{
+		{"binary", func(r *PutRuntimeSpecRequest) { r.Binary = ""; r.MinInstances, r.MaxInstances = 3, 2 }, ErrRuntimeSpecBinaryRequired},
+		{"admin-state", func(r *PutRuntimeSpecRequest) { r.AdminState = "bogus"; r.MinInstances = -1 }, ErrRuntimeSpecAdminStateInvalid},
+		{"gpus", func(r *PutRuntimeSpecRequest) {
+			r.GPUs = []RuntimeSpecGPUDTO{{Index: -1}}
+			r.Replicable, r.ListenPort = true, 9000
+		}, ErrRuntimeSpecGPUInvalid},
+		{"endpoint-mode", func(r *PutRuntimeSpecRequest) { r.ResponsesMode = "bogus"; r.MinInstances, r.MaxInstances = 3, 2 }, ErrRuntimeSpecEndpointModeInvalid},
+		{"flavor", func(r *PutRuntimeSpecRequest) {
+			r.APIFlavors = []string{"nope"}
+			r.Replicable, r.ListenPort = true, 9000
+		}, ErrRuntimeSpecFlavorInvalid},
+		{"live-timings", func(r *PutRuntimeSpecRequest) {
+			r.Binary, r.Type, r.ResponsesLiveTimingsEnabled = "/usr/local/bin/ollama", string(routing.RuntimeSpecTypeOllama), boolPtr(true)
+			r.InstanceParallelism = -1
+		}, ErrRuntimeSpecResponsesLiveTimingsUnsupported},
+		{"config-files", func(r *PutRuntimeSpecRequest) {
+			r.ConfigFiles = []ConfigFileDTO{{Name: "a/b.json", Content: "{}"}}
+			r.Replicable, r.ListenPort = true, 9000
+		}, ErrRuntimeSpecConfigFilesInvalid},
+	}
+	for _, leg := range legs {
+		req := PutRuntimeSpecRequest{Enabled: true, Binary: "/usr/local/bin/llama-server"}
+		leg.mutate(&req)
+		_, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping(leg.name), req)
+		if !errors.Is(err, leg.want) {
+			t.Errorf("%s: err = %v, want %v: an instance check must not pre-empt a shipped validation", leg.name, err, leg.want)
+		}
+	}
+}
+
+// TestAgentRuntimeDocCarriesInstanceFields pins the pushed document's side:
+// a replicable spec carries replicable, min_instances and max_instances, and
+// the effective idle timeout as idle_timeout_seconds; a spec that is not
+// replicable carries none of the three keys -- even with counts stored, which
+// mean nothing without replicable -- and its stored idle timeout as ever, so
+// its document is byte-for-byte what it was before instances existed. The
+// gateway-only settings never reach the agent: instance_parallelism (the
+// gateway's own per-instance cap) and the portal's two read-only echoes.
+func TestAgentRuntimeDocCarriesInstanceFields(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, replicableMapping, serverID := instanceSpecFixture(t, nil, nil)
+	apps, err := routeStore.ApplicationsByServer(ctx, serverID)
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("ApplicationsByServer: %d apps, err %v", len(apps), err)
+	}
+	plain, err := svc.CreateMapping(ctx, ownerToken(), apps[0].ID, CreateMappingRequest{GatewayModelName: "chat", AppModelName: "chat-upstream"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	replicable, err := svc.PutRuntimeSpec(ctx, ownerToken(), replicableMapping, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true, MinInstances: 1, MaxInstances: 3, InstanceParallelism: 2,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (replicable): %v", err)
+	}
+	if err := routeStore.UpdateRuntimeSpecStartupMeasured(ctx, replicable.ID, 30000); err != nil {
+		t.Fatalf("UpdateRuntimeSpecStartupMeasured: %v", err)
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), plain.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", IdleTimeoutSeconds: 900, MinInstances: 1, MaxInstances: 2, InstanceParallelism: 4,
+	}); err != nil {
+		t.Fatalf("PutRuntimeSpec (not replicable): %v", err)
+	}
+
+	doc, err := svc.AgentRuntimeConfig(ctx, serverID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	if len(doc.Specs) != 2 {
+		t.Fatalf("document specs = %d, want 2", len(doc.Specs))
+	}
+	byModel := map[string]map[string]json.RawMessage{}
+	for _, spec := range doc.Specs {
+		byModel[spec.Model] = wireKeys(t, spec)
+	}
+
+	rep := byModel["tts"]
+	for key, want := range map[string]string{"replicable": "true", "min_instances": "1", "max_instances": "3", "idle_timeout_seconds": "150"} {
+		if got := string(rep[key]); got != want {
+			t.Fatalf("replicable spec wire %s = %q, want %s", key, got, want)
+		}
+	}
+	notPushed := []string{"instance_parallelism", "startup_measured_ms", "effective_idle_timeout_seconds"}
+	for _, key := range notPushed {
+		if v, ok := rep[key]; ok {
+			t.Fatalf("replicable spec wire carries %s = %s, which is never pushed", key, v)
+		}
+	}
+
+	other := byModel["chat"]
+	for _, key := range append([]string{"replicable", "min_instances", "max_instances"}, notPushed...) {
+		if v, ok := other[key]; ok {
+			t.Fatalf("a spec that is not replicable carries %s = %s; its document must have none of the instance keys", key, v)
+		}
+	}
+	if got := string(other["idle_timeout_seconds"]); got != "900" {
+		t.Fatalf("spec that is not replicable: idle_timeout_seconds = %s, want its stored 900 unchanged", got)
+	}
+}
+
+// TestEffectiveIdleTimeout pins the idle timeout pushed for a spec, here at the
+// default factor 5 and floor 120: for a replicable spec the largest of its
+// manual value (0 = no manual override), factor times the slower of the two
+// startup figures in whole seconds rounded up -- the agent's measured startup
+// and the benchmark's cold start -- and the floor, so it is never 0; for a
+// spec that is not replicable the stored value as it is, 0 still meaning
+// "never unload".
+func TestEffectiveIdleTimeout(t *testing.T) {
+	cases := []struct {
+		name   string
+		spec   routing.RuntimeSpec
+		loadMS int64
+		want   int
+	}{
+		{"no manual value, measured startup", routing.RuntimeSpec{Replicable: true, StartupMeasuredMS: 30000}, 0, 150},
+		{"a manual value above the derived one wins", routing.RuntimeSpec{Replicable: true, IdleTimeoutSeconds: 600, StartupMeasuredMS: 30000}, 0, 600},
+		{"a short startup is lifted to the floor", routing.RuntimeSpec{Replicable: true, StartupMeasuredMS: 10000}, 0, 120},
+		{"the slower startup figure counts", routing.RuntimeSpec{Replicable: true, StartupMeasuredMS: 20000}, 40000, 200},
+		{"the benchmark's cold start alone", routing.RuntimeSpec{Replicable: true}, 40000, 200},
+		{"a manual value below the derived one is raised", routing.RuntimeSpec{Replicable: true, IdleTimeoutSeconds: 60, StartupMeasuredMS: 30000}, 0, 150},
+		{"a part of a second rounds up", routing.RuntimeSpec{Replicable: true, StartupMeasuredMS: 30001}, 0, 151},
+		{"nothing measured is the floor, never 0", routing.RuntimeSpec{Replicable: true}, 0, 120},
+		{"not replicable, 0 still means never", routing.RuntimeSpec{StartupMeasuredMS: 30000}, 40000, 0},
+		{"not replicable, the stored value as it is", routing.RuntimeSpec{IdleTimeoutSeconds: 45, StartupMeasuredMS: 30000}, 0, 45},
+	}
+	for _, tc := range cases {
+		if got := effectiveIdleTimeoutSeconds(tc.spec, tc.loadMS, 5, 120); got != tc.want {
+			t.Errorf("%s: effectiveIdleTimeoutSeconds(%+v, load %d) = %d, want %d", tc.name, tc.spec, tc.loadMS, got, tc.want)
+		}
+	}
+	if got := effectiveIdleTimeoutSeconds(routing.RuntimeSpec{Replicable: true, StartupMeasuredMS: 20000}, 0, 2.5, 30); got != 50 {
+		t.Errorf("factor 2.5, floor 30, startup 20 s: got %d, want 50", got)
+	}
+	// An absurd figure saturates instead of wrapping: an overflowed conversion
+	// could come out negative or small, and a pushed timeout too large for the
+	// agent's duration arithmetic wraps there, both an instance unloaded at once.
+	if got := effectiveIdleTimeoutSeconds(routing.RuntimeSpec{Replicable: true, StartupMeasuredMS: math.MaxInt64}, 0, 1e300, 120); got != math.MaxInt32 {
+		t.Errorf("an absurd startup and factor: got %d, want the saturated %d", got, math.MaxInt32)
+	}
+}
+
+// TestEffectiveIdleTimeoutIsWhatTheDocumentPushes pins that the portal's
+// read-only echo and the pushed document carry one value, derived under the
+// factor and floor the service was configured with (ServiceDeps, from
+// OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR / _FLOOR_SECONDS), from the spec's measured
+// startup and the mapping's benchmark cold start -- and that deriving it never
+// rewrites the stored manual value.
+func TestEffectiveIdleTimeoutIsWhatTheDocumentPushes(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	baseSvc, baseStore := newInstanceIdleTestService(t, 2, 30)
+	svc, routeStore, mappingID, serverID := instanceSpecFixture(t, baseSvc, baseStore)
+
+	if err := routeStore.UpdateMappingBenchmarkMetrics(ctx, mappingID, 0, 0, 40000, now); err != nil {
+		t.Fatalf("UpdateMappingBenchmarkMetrics: %v", err)
+	}
+	spec, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpdateRuntimeSpecStartupMeasured(ctx, spec.ID, 20000); err != nil {
+		t.Fatalf("UpdateRuntimeSpecStartupMeasured: %v", err)
+	}
+
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	doc, err := svc.AgentRuntimeConfig(ctx, serverID)
+	if err != nil || len(doc.Specs) != 1 {
+		t.Fatalf("AgentRuntimeConfig: %d specs, err %v", len(doc.Specs), err)
+	}
+	// factor 2 x the slower startup (the 40 s cold start) = 80 s, above the floor 30.
+	if got.EffectiveIdleTimeoutSeconds != 80 || doc.Specs[0].IdleTimeoutSeconds != 80 {
+		t.Fatalf("effective idle timeout: portal %d, pushed %d, want both 80", got.EffectiveIdleTimeoutSeconds, doc.Specs[0].IdleTimeoutSeconds)
+	}
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil || !ok || stored.IdleTimeoutSeconds != 0 {
+		t.Fatalf("stored idle timeout = %d (ok=%v err=%v), want the manual 0 untouched", stored.IdleTimeoutSeconds, ok, err)
+	}
+}
+
+// TestNewServiceDefaultsTheInstanceIdleSettings pins NewService's fallback for
+// the two idle knobs, the deps-literal rule the other config-derived deps
+// follow: a value that is not positive -- the zero value of a deps literal that
+// omits it included -- or a factor that is not a finite number uses the
+// default, DefaultInstanceIdleFactor and DefaultInstanceIdleFloorSeconds.
+func TestNewServiceDefaultsTheInstanceIdleSettings(t *testing.T) {
+	if DefaultInstanceIdleFactor != 5 || DefaultInstanceIdleFloorSeconds != 120 {
+		t.Fatalf("defaults = %v / %d, want 5 / 120", DefaultInstanceIdleFactor, DefaultInstanceIdleFloorSeconds)
+	}
+	cases := []struct {
+		name       string
+		factor     float64
+		floor      int
+		wantFactor float64
+		wantFloor  int
+	}{
+		{"omitted", 0, 0, 5, 120},
+		{"configured", 2.5, 30, 2.5, 30},
+		{"negative", -1, -5, 5, 120},
+		{"factor not a number", math.NaN(), 30, 5, 30},
+		{"factor infinite", math.Inf(1), 30, 5, 30},
+	}
+	for _, tc := range cases {
+		svc := NewService(ServiceDeps{InstanceIdleFactor: tc.factor, InstanceIdleFloorSeconds: tc.floor})
+		if svc.instanceIdleFactor != tc.wantFactor || svc.instanceIdleFloorSeconds != tc.wantFloor {
+			t.Errorf("%s: factor %v floor %d, want %v / %d", tc.name, svc.instanceIdleFactor, svc.instanceIdleFloorSeconds, tc.wantFactor, tc.wantFloor)
+		}
+	}
+}
+
+// An operator's write that changes whether the spec is replicable clears the
+// mapping's audio ramp result: a ramp of a replicable spec counts instances and
+// any other counts streams inside one process, so a one-process result kept
+// past the flip would read as a ceiling on the instance count it never
+// measured (the scaler would never start a second instance, and the warning
+// would fire). A write that keeps the shape keeps the result, and a locked
+// mapping keeps it whatever the write.
+func TestPutRuntimeSpecReplicableChangeForgetsTheAudioRamp(t *testing.T) {
+	ctx := context.Background()
+	put := func(t *testing.T, svc *Service, mappingID string, replicable bool) RuntimeSpecDTO {
+		t.Helper()
+		var req PutRuntimeSpecRequest
+		body := fmt.Sprintf(`{"enabled":true,"binary":"/usr/local/bin/audio-server","replicable":%v,"min_instances":2,"max_instances":4}`, replicable)
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		return dto
+	}
+	seedRamp := func(t *testing.T, routeStore *routing.MemoryStore, mappingID string, locked bool) {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit, m.MetricsLocked = 1, routing.AudioLimitPerformance, locked
+		if err := routeStore.UpdateMapping(ctx, m); err != nil {
+			t.Fatalf("UpdateMapping: %v", err)
+		}
+	}
+	pair := func(t *testing.T, routeStore *routing.MemoryStore, mappingID string) (int, string) {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		return m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit
+	}
+
+	t.Run("one process to replicable", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, false)
+		seedRamp(t, routeStore, mappingID, false)
+		dto := put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 0 || limit != "" {
+			t.Fatalf("pair after the flip = %d / %q, want it cleared", n, limit)
+		}
+		if dto.InstancesMinExceedsRealtime {
+			t.Fatal("the write-back still warns from the cleared pair")
+		}
+	})
+	t.Run("replicable to one process", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, true)
+		seedRamp(t, routeStore, mappingID, false)
+		put(t, svc, mappingID, false)
+		if n, limit := pair(t, routeStore, mappingID); n != 0 || limit != "" {
+			t.Fatalf("pair after the flip = %d / %q, want it cleared", n, limit)
+		}
+	})
+	t.Run("first write of a replicable spec", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		seedRamp(t, routeStore, mappingID, false)
+		put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 0 || limit != "" {
+			t.Fatalf("pair after the first replicable write = %d / %q, want it cleared", n, limit)
+		}
+	})
+	t.Run("the shape kept", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, true)
+		seedRamp(t, routeStore, mappingID, false)
+		dto := put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 1 || limit != routing.AudioLimitPerformance {
+			t.Fatalf("pair after a write that kept the shape = %d / %q, want 1 / performance kept", n, limit)
+		}
+		if !dto.InstancesMinExceedsRealtime {
+			t.Fatal("the write-back lost the warning of a kept pair")
+		}
+	})
+	t.Run("a locked mapping", func(t *testing.T) {
+		svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+		put(t, svc, mappingID, false)
+		seedRamp(t, routeStore, mappingID, true)
+		put(t, svc, mappingID, true)
+		if n, limit := pair(t, routeStore, mappingID); n != 1 || limit != routing.AudioLimitPerformance {
+			t.Fatalf("locked pair after the flip = %d / %q, want 1 / performance kept", n, limit)
+		}
+	})
+}
+
+// A spec whose minimum instance count is above the real-time concurrency its
+// mapping's audio ramp measured as a ceiling carries a warning (it is not
+// refused): only a ramp stopped by performance measured one, and a measured 0
+// counts. Read-only: derived on every read, never taken from a request.
+func TestRuntimeSpecMinExceedsRealtimeWarning(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, _ := instanceSpecFixture(t, nil, nil)
+	ramp := func(count int, limit string) {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit = count, limit
+		if err := routeStore.UpdateMapping(ctx, m); err != nil {
+			t.Fatalf("UpdateMapping: %v", err)
+		}
+	}
+	put := func(minInstances int) RuntimeSpecDTO {
+		t.Helper()
+		var req PutRuntimeSpecRequest
+		body := fmt.Sprintf(`{"enabled":true,"binary":"/usr/local/bin/audio-server","replicable":true,"min_instances":%d,"max_instances":8,"instances_min_exceeds_realtime":true}`, minInstances)
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		return dto
+	}
+	cases := []struct {
+		name     string
+		count    int
+		limit    string
+		min      int
+		expected bool
+	}{
+		{"no ramp yet", 0, "", 3, false},
+		{"min above a measured ceiling", 2, routing.AudioLimitPerformance, 3, true},
+		{"min at the ceiling", 2, routing.AudioLimitPerformance, 2, false},
+		{"a measured 0 counts", 0, routing.AudioLimitPerformance, 1, true},
+		{"no minimum", 0, routing.AudioLimitPerformance, 0, false},
+		{"a lower bound (resources)", 1, routing.AudioLimitResources, 3, false},
+		{"a lower bound (cap)", 1, routing.AudioLimitCap, 3, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ramp(tc.count, tc.limit)
+			if got := put(tc.min).InstancesMinExceedsRealtime; got != tc.expected {
+				t.Fatalf("PUT echo instances_min_exceeds_realtime = %v, want %v", got, tc.expected)
+			}
+			got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+			if err != nil {
+				t.Fatalf("GetRuntimeSpec: %v", err)
+			}
+			if got.InstancesMinExceedsRealtime != tc.expected {
+				t.Fatalf("GET instances_min_exceeds_realtime = %v, want %v", got.InstancesMinExceedsRealtime, tc.expected)
+			}
+			if raw := string(wireKeys(t, got)["instances_min_exceeds_realtime"]); raw != strconv.FormatBool(tc.expected) {
+				t.Fatalf("wire instances_min_exceeds_realtime = %q, want %v (always present)", raw, tc.expected)
+			}
+		})
+	}
 }

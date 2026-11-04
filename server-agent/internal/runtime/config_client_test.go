@@ -963,8 +963,9 @@ func configJSONWithSpecToken(routerListen int, etag, specID, apiToken string) st
 const runtimeConfigInsecureTokenLogMsg = "runtime: applying a runtime config that carries an API token over a non-https gateway URL; the token will cross the gateway<->agent channel in clear -- configure an https gateway URL"
 
 // TestGatewaySourceWarnsOnceForTokenOverInsecureBase is I2 (security review):
-// design §9 requires that any non-off token mode "requires or at minimum
-// LOUDLY WARNS for an https gateway URL". The agent is the only party that
+// any non-off token mode "requires or at minimum LOUDLY WARNS for an https
+// gateway URL" -- an API token must never cross the gateway<->agent channel in
+// clear unannounced. The agent is the only party that
 // reliably knows its own configured gateway scheme, so the warning lives
 // here. ApplyPushed is the easiest way to drive "a freshly-parsed config
 // becomes the applied desired state" without a real HTTP round trip; Load's

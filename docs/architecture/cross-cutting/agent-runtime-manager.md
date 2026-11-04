@@ -313,9 +313,11 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   with multi-device Metal support — the portal shows a hint when the placeholder
   is used against a non-macOS agent, since stock llama.cpp Metal builds expose
   one device.
-- `${CONFIG_DIR}` — an exact match substitutes the **absolute per-spec directory
-  the agent writes the spec's config files into**,
-  `<config_files_dir>/<spec-id>` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child), issue #257):
+- `${CONFIG_DIR}` — an exact match substitutes the **absolute per-instance
+  directory the agent writes the spec's config files into**,
+  `<config_files_dir>/<spec-id>` for instance 0 and
+  `<config_files_dir>/<spec-id>#<k>` for instance k ≥ 1 of a replicable spec
+  ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child), issue #257, §6.1):
   `["--config", "${CONFIG_DIR}/server.json"]`. It is a plain path the agent
   chose, **not a secret**: it records no secret span, and the reported launch
   command ([§14.7](#147-the-resolved-command-what-actually-ran)) shows the
@@ -1273,7 +1275,10 @@ on every host, outside the run-spec workflow, and the id in it drifted from the
 as `${MODEL}` in the file's content, the drift is impossible by construction.
 **One child still serves one spec**: each spec provisions its own files, port and
 GPU, and a shared server assembled from several specs was rejected because it
-would make lifecycle, admission and GPU accounting server-scoped (ADR-066).
+would make lifecycle, admission and GPU accounting server-scoped (ADR-066). A
+replicable spec runs one child per **instance** instead, and the rule holds per
+instance: each provisions its own config directory (`<S>#<k>` for k ≥ 1) and its
+own ephemeral port ([§6.1](#61-one-lifecycle-per-instance)).
 
 The facet is general, not audio.cpp-specific, and holds up to **16 files per
 spec**, so a server that needs a per-model or per-voice file as well is covered
@@ -1281,15 +1286,19 @@ without a second mechanism. A spec with none (`config_files: []`, the default of
 every spec that predates the facet) behaves byte-for-byte as before: the base
 directory is not even required.
 
-**Where the files go.** `<config_files_dir>/<spec-id>/<name>`, under an
-agent-owned base directory the operator sets on the agent
+**Where the files go.** `<config_files_dir>/<spec-id>/<name>` for instance 0 —
+every spec that is not replicable has no other — and
+`<config_files_dir>/<spec-id>#<k>/<name>` for instance k ≥ 1 of a replicable spec
+(§6.1: each instance is its own process with its own port, and a file may carry
+`${PORT}`), under an agent-owned base directory the operator sets on the agent
 (`config_files_dir`, [§15](#15-configuration-reference); default
 `server-agent-config-files` beside the binary). It is **never the spec's
 `work_dir`**: that is operator-chosen and may be a read-only mount or the
 binary's own directory, so the one place the agent can be sure to write is a
-directory it owns. The per-spec subdirectory, keyed by spec id, is what makes
-uniqueness structural — two specs that both name their file `server.json` land in
-different directories and can never overwrite each other. The gateway supplies a
+directory it owns. The per-instance subdirectory, keyed by the instance key
+(`S` or `S#k`), is what makes uniqueness structural — two specs, or two instances
+of one spec, that name their file `server.json` land in different directories and
+can never overwrite each other. The gateway supplies a
 file's relative name and content and **never where on the host it is written**,
 exactly as it never supplies the binary allowlist.
 
@@ -1299,7 +1308,7 @@ listen port is chosen and the placeholders are resolved, and **before** the
 atomic — a temp file created inside the target directory, `chmod 0600`, renamed
 into place, the same helper the runtime-config cache uses (§8.1) — so a child, or
 a crash mid-write, sees the old file or the new one and never a torn one. The
-per-spec directory is created `0755` if needed. The whole spec's files are
+per-instance directory is created `0755` if needed. The whole spec's files are
 validated and expanded **before the first byte is written**, so a bad second file
 cannot leave a half-provisioned directory behind. A change to a spec's
 `config_files` is **launch-affecting** ([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)):
@@ -1392,13 +1401,13 @@ to model routing.
 | Route | Answers | Blocks during a load? |
 |---|---|---|
 | `GET /health`, `GET /v1/health` | `200 {"status":"ok"}` as soon as the listener is bound, with nothing loaded. Never touches the process manager. | Never |
-| `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only** specs in state `running`. | Never |
-| `GET /v1/models` | OpenAI's shape, listing **every** managed spec including cold ones. | Never |
-| `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved via `Status()` **only** — a match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one. Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
-| `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved via `Status()` **only**, **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
-| `GET /upstream/{model}/v1/models` | The allowlist's third endpoint (issue #282, the `runtime_model_params` feature, `Since: "0.13.0"`): an audio.cpp child's model listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved via `Status()` **only**, **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Unlike the voices read it **forwards the inbound query string** (`forwardQuery`), because audio.cpp adds each model's declared request `params` array only when asked with `?include_params=true`; the outbound path is exactly `/v1/models`. **Not** the router's own `GET /v1/models` control route above, which lists the managed specs and answers for the router itself. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
-| `POST /ensure/{model}` | Starts the managed child for `model` and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
-| `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureRunning`, so the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
+| `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only** instances in state `running`, each by its instance address (`m`, `m#1`, …, [§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)), so a spec that never replicates is listed exactly as before. | Never |
+| `GET /v1/models` | OpenAI's shape, listing **every** managed spec including cold ones — **once, by its base name**, however many instances it runs (only the instance-0 rows, which every spec has, are listed: an instance is a process of a model, not a model of its own). | Never |
+| `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved by the manager's address rule (`ResolveAddress`, [§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) and then to the running row of the instance it names in `Status()` — a read-only lookup: a managed match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one, and an instance address whose reading moved between the two owner turns is refused with `409 runtime.instance_no_capacity`. For an instance address the forwarded query's `model=` value becomes the base name (`upstreamChildQuery`). Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
+| `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved by `ResolveAddress` and that instance's running row in `Status()` (as for `/props`), **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
+| `GET /upstream/{model}/v1/models` | The allowlist's third endpoint (issue #282, the `runtime_model_params` feature, `Since: "0.13.0"`): an audio.cpp child's model listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved by `ResolveAddress` and that instance's running row in `Status()` (as for `/props`), **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Unlike the voices read it **forwards the inbound query string** (`forwardQuery`), because audio.cpp adds each model's declared request `params` array only when asked with `?include_params=true`; the outbound path is exactly `/v1/models`. **Not** the router's own `GET /v1/models` control route above, which lists the managed specs and answers for the router itself. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
+| `POST /ensure/{model}` | Starts the managed child for `model` — for an instance address `m#k`, that instance, created on demand when its spec allows it ([§6.1](#61-one-lifecycle-per-instance)) — and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), `runtime.instance_no_capacity` / `runtime.instance_demand_unknown` (409) for a burst instance that does not fit into free room or whose demand is not measured yet ([§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. It is the only route that may start a **burst** instance, which is how the gateway's scaler adds capacity. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
+| `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureServing`, so a burst instance that is not up answers `409 runtime.instance_no_capacity`, §4.8, and the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
 "the router accepts requests", never "a model is warm". Making the health check
@@ -1442,7 +1451,7 @@ third, `/v1/models`; each
 table entry carries its own `forwardQuery`, true for `/props` (llama.cpp reads
 e.g. `?model=`) and for the models read (audio.cpp reads `?include_params=true`) and false for
 the voices read, which is why the three share one
-`serveUpstream` handler and one Status-only relay (`relayToRunningChild`) and still
+`serveUpstream` handler and one read-only relay (`relayToRunningChild`) and still
 differ in the outbound query. A non-`GET` on the same path falls through to the
 ordinary model-routed proxy, same as any other method on the other control routes
 above (the existing M9 rule) — there is no separate method check inside this
@@ -1451,7 +1460,7 @@ handler.
 **The voices route exists because audio.cpp lists voices only for a model it has
 loaded, and the child listens on a loopback port the gateway cannot reach**
 ([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)).
-It is the same Status-only, never-start read as `/props`: asking for the voices of a
+It is the same read-only, never-start read as `/props`: asking for the voices of a
 cold child answers `404 runtime.model_not_running`, which the gateway's agent-child
 voices pass (`probeAgentVoices`, in app health) treats as **"no voices this tick"** —
 it keeps the row already cached and backs off for that mapping — and never as a reason
@@ -1466,7 +1475,7 @@ response is the child's own `{"voices": [...]}`, relayed unmodified.
 **The models route exists because audio.cpp states a model's request parameters only in its
 own model listing, and the child listens on a loopback port the gateway cannot reach**
 ([ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)).
-`GET /upstream/{model}/v1/models?include_params=true` is the same Status-only, never-start read as
+`GET /upstream/{model}/v1/models?include_params=true` is the same read-only, never-start read as
 the other two, and what it returns is the child's own listing with each entry's `params` array
 (`name`, `type`, `default`, `required`), relayed unmodified. The gateway reads one thing out of
 it, the `language` param (whether the model declares it and the default it states), and caches
@@ -1509,14 +1518,14 @@ on the path precisely so it never has to buffer it**
 ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266). Model routing (§4.2) buffers the body because it must read `model`
 and `stream` out of it before it knows where to send the request; a live transcription's body is an
 audio upload that never ends until the user stops speaking, so buffering it would defeat the feature. The
-route is modelled on `/ensure/{model}`: the model comes from the decoded path, `EnsureRunning` admits
+route is modelled on `/ensure/{model}`: the model comes from the decoded path, `EnsureServing` (since 0.16.0; `EnsureRunning` before, the same for every instance but a burst one, §4.8) admits
 and, if needed, cold-starts the child, and what follows differs in three ways. The handler **defers
-`release()`** after a successful `EnsureRunning`, because the admission must be held for the whole relay
+`release()`** after a successful admission, because the admission must be held for the whole relay
 (`/ensure` forwards nothing and releases at once). It calls
 `http.NewResponseController(w).EnableFullDuplex()` so the server may write the response while it is
 still reading the request body on the one HTTP/1.1 connection (an error from it is tolerated: a writer
 that cannot do it is no worse off than before). That call is the handler's **first statement**, ahead of
-the model guard and `EnsureRunning`, and the order matters: on a connection that is not full-duplex,
+the model guard and the admission, and the order matters: on a connection that is not full-duplex,
 net/http drains up to about 256 KiB of the unread request body before it writes **any** response, a
 refusal included, so a refusal written while full duplex was still off would reach a client only after it
 had streamed seconds of audio into the void. With the call first, a `404 runtime.model_not_managed`, a
@@ -1550,7 +1559,8 @@ on the multipart branch below).
   buffered** — `httputil.ReverseProxy` with `FlushInterval: -1` on the plain
   path, a hand-rolled splice loop flushing after every write on the streaming
   path.
-- The `model` value resolves against the mapping's **`app_model_name`**, because
+- The `model` value resolves against the mapping's **`app_model_name`** — or names
+  one instance of it, `m#k` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) — because
   that is what the gateway actually sends upstream (`resolver.go` sets
   `ProviderModel = mapping.AppModelName`) — not the portal-facing gateway model
   name. Matching the wrong one of the two produces a 404 for every request.
@@ -1611,13 +1621,15 @@ request-id concept.
 
 | Code | Status | Meaning |
 |---|---|---|
-| `runtime.model_not_managed` | 404 | No active launch spec for this model. |
+| `runtime.model_not_managed` | 404 | No active launch spec for this model — including an instance address `m#k` its spec does not allow (not replicable, k at or above `max_instances`, k above 63, §4.8). |
 | `runtime.model_not_running` | 404 | Managed but not currently running — `/upstream/{model}/props`, `/upstream/{model}/v1/audio/voices` and `/upstream/{model}/v1/models` (§4.1) never start a child, so a cold match gets this instead of a boot. For the voices and the models read it is the gateway's "no voices (or no language fact) this tick", not an error to act on. |
 | `runtime.start_failed` | 502 | The process exited or never became healthy. |
 | `runtime.start_timeout` | 504 | `startup_timeout_seconds` elapsed — kept distinct from `start_failed` because it is a different diagnosis. |
 | `runtime.admission_blocked` | 503 | No slot freed within the wait window. |
 | `runtime.not_permitted` | 502 | Agent-local policy refused the binary, the directory or a placeholder — a configuration error, explicitly **not** transient. |
 | `runtime.request_too_large` | 413 | Body over the router's limit. |
+| `runtime.instance_no_capacity` | 409 | A **burst** instance (§5.8) that cannot run here right now: an ensure of one that does not fit into free room (nothing is evicted for it, nothing queues) or that is draining, a plain request naming one that is neither running nor starting (§4.8: only an ensure starts burst capacity), or a request whose instance address moved while it was admitted. Not an error to act on: the gateway re-selects or tries another host. |
+| `runtime.instance_demand_unknown` | 409 | An ensure of a burst instance whose demand is still unknown — no declared estimate and no sibling measured since it became ready (§5.8). Normally resolves within seconds of the first instance being ready; the gateway's scaler waits 5 s before asking that host again. |
 | `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props`, `/v1/audio/voices` or `/v1/models` — the passthrough allowlist (§4.1) is exactly those three endpoints. A router from 0.7.0 on that predates 0.13.0 answers this for `/v1/models` (and one that predates 0.11.0 for `/v1/audio/voices`). |
 | `runtime.upstream_gone` | 502 | The child died during the request — **and the fallthrough** for a raw connection failure, a non-2xx the router could not forward, or the manager-closed sentinel. |
 
@@ -1865,14 +1877,114 @@ proxy `Manager` with `SetLocalUpstream` to the router exactly as `main.go` does 
 dial. A refusal is covered too: `TestRouterLiveRefusalDoesNotDrainStreamedBody` asserts that a `404` is
 flushed after the server has read about one header-sized buffer, not 256 KiB, of an endless streamed body.
 
+### 4.8 Instance addresses and the in-place model rewrite
+
+A spec that opts in (`replicable`, agent 0.16.0, the `runtime_instances` feature,
+§7) may run **several processes of itself**, each one an *instance* with its own
+port, its own admission identity, its own lifecycle and its own measurements
+([ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place)).
+A spec that does not opt in has exactly one, instance 0, and everything below
+collapses to the behaviour of the sections above. Three names exist for one
+instance, and they are deliberately different:
+
+| Name | Form | Where it is used |
+|---|---|---|
+| **Instance address** | `m` for k = 0, `m#k` for k ≥ 1 (m is the spec's `upstream_model`) | The model name the gateway sends upstream, the `/ensure`, `/live` and `/upstream` path model, `/running`, `loaded_models` and the status row's `model`. Instance 0's address is byte-for-byte the name every spec has always had. |
+| **Agent instance key** | `S` for k = 0, `S#k` for k ≥ 1 (S is the spec id) | The manager's state map, the admission identity (`RunningProc.SpecID`), `${CONFIG_DIR}` and the config-file directory. |
+| **Gateway instance key** | `<mapping_id>#<k>` for **every** k, 0 included | Gateway-side per-instance slots (the in-flight count the capacity filter compares with `instance_parallelism`, the live slot). The routing `RouteID` stays the mapping id, so usage, metrics and scoring keep keying by mapping. |
+
+`k` is a plain decimal from 1 to 63 — no sign, no leading zero, nothing else
+(`ParseInstanceAddress`, `MaxInstanceIndex = 63` in
+`server-agent/internal/runtime/instance.go`, mirrored as
+`routing.MaxInstanceIndex` because the agent module imports nothing from the
+gateway), so a spec has at most 64 instances. `InstanceAddress`,
+`InstanceKey`, `InstanceBase`, `ProtectedCount`, `InstanceAllowed` and
+`IsBurst` are pure functions in that file, shared by the router, the manager and
+their tests.
+
+**One resolution rule, in one place.** `Manager.ResolveAddress` (served on the
+owner goroutine as `owner.resolveAddress`) is what the router and both ensures
+(`EnsureRunning`, `EnsureServing`) read a model name with:
+
+1. An **exact** match on a managed `upstream_model` wins first and is instance 0.
+   A real model whose name merely contains `#` (`foo#2`) therefore keeps routing
+   literally, even when `foo` is a replicable spec — the scaler skips an index
+   whose address is another mapping's literal upstream name for the same reason
+   (ADR-092).
+2. Otherwise the name is split at its **last** `#`; it is managed only when the
+   base is a managed, still-desired spec whose `InstanceAllowed` admits k: the
+   spec is replicable, k ≤ 63, and k < `max_instances` when that is set (the cap
+   counts instance 0, so `max_instances = 4` allows k = 0…3).
+
+Anything else — `m#k` for a spec that is not replicable, a k above the cap, a
+suffix that is not a plain index — is `404 runtime.model_not_managed`, exactly
+like an unknown model. A spec id that contains `#` is dropped with a Warn by both
+`ParseConfig` and `applyConfig` (`reservedSpecID`), so no other spec's state can
+ever sit under an instance key. The gateway never issues one (its ids are
+`rspec_` plus hex).
+
+**The child always sees the base name.** Every instance is launched from the
+same spec: `${MODEL}` expands to `m`, never `m#k` (`specForInstance` shares
+`UpstreamModel`), so the router hands an instance's child `m` in place of the
+address on every route:
+
+- **JSON body** — `rewriteModelField` splices the new value into the place of the
+  old one: the keys keep their order, the numbers their digits (`1.50` stays
+  `1.50`), the strings their escapes and the body its spacing. Every top-level
+  key that `encoding/json` would read as the model (any letter case) is
+  rewritten, so whichever one the router routed on, no instance address is left
+  for the child to read; a body with no top-level model string is refused. A
+  child that hashes, signs or caches a request body sees for instance k the
+  bytes instance 0 would have seen — the reason the body is not re-serialized.
+- **`multipart/form-data`** — `rebuildMultipartModel` re-encodes the form with the
+  `model` part replaced and every other part copied raw.
+- **`/live/{model}`** — the child query's `model=` carries the base name.
+- **`/upstream/{model}/…`** — the relay reaches exactly that instance's running
+  row, and `upstreamChildQuery` replaces the value of each `model` parameter of a
+  forwarded query with `url.QueryEscape(base)`, every other byte as sent.
+
+Instance 0 is never rewritten, and a name that does not even parse as an instance
+address is read without an owner round trip (`readAddress`), so every request of
+a spec that never replicates costs the owner exactly what it did before instances
+existed. Reading an address and admitting the request are two owner turns, and a
+config push can land between them, so a resolved address is read **again** after
+admission (`addressMoved`); a reading that moved releases the admission and
+answers `409 runtime.instance_no_capacity`, which the gateway re-selects on
+(the same holds for an `/upstream` read).
+
+**A plain request never starts burst capacity.** Requests the router forwards —
+JSON, streamed, multipart and `/live` — are admitted with `Manager.EnsureServing`,
+which is `EnsureRunning` with one exception decided on the owner goroutine in the
+same turn that resolves the address: a request naming a **burst** instance
+(`IsBurst`, §5.8) that is neither running nor starting is refused at once with
+`409 runtime.instance_no_capacity`, and nothing is created or started. A starting
+one has the request wait for that start; a running one serves it. A burst
+instance resting at a failure (`crashed`, `start_failed`, `not_permitted`) is
+retired by that refusal, and a draining one is left to its exit. Only
+`POST /ensure/{model}` (`EnsureRunning`) creates and starts a burst instance —
+that is how the gateway's scaler adds capacity on purpose, after deciding a model
+load on this host is worth it. A plain request names `m#k` only because the
+gateway saw it up a moment ago; starting it on the request path would add
+capacity nobody decided on and make the request wait out a cold start, where the
+refusal lets the gateway re-select a running instance at once. Instance 0 and the
+protected instances are baseline capacity and behave exactly as before.
+
+`/running` and `loaded_models` list running **instance addresses**; `/v1/models`
+lists every spec **once, by its base name**; the agent's own probes of a child
+(context size, capabilities, metrics) send the base model (`runtime.InstanceBase`)
+and cache per instance key.
+
 ## 5. Admission control
 
 ### 5.1 The per-GPU data model
 
 VRAM demand is **per GPU, not per spec**, because a tensor-parallel model may
 span GPUs unevenly. **Host RAM is the opposite and a second axis:** one process
-backs one spec, whatever GPUs it spans, so RAM is a single spec-level scalar and
-a **host-scoped** quantity, never a column of the per-GPU rows
+backs one instance of a spec, whatever GPUs it spans, and every instance runs the
+same model from the same spec, so RAM is a single spec-level scalar — the demand
+of **one** instance, charged once per instance admitted (§5.8), and for a
+replicable spec the largest figure any of its instances measured — and a
+**host-scoped** quantity, never a column of the per-GPU rows
 ([ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)).
 Every VRAM and RAM figure in this feature is **megabytes**; live GPU and host
 telemetry report bytes and must be converted at the boundary. Full column detail
@@ -2912,13 +3024,16 @@ reads a cached value, never polls hardware, and the owner loads the sample
 **once** per snapshot so the VRAM and RAM budgets of one admission come from the
 same sample.
 
-The ordering that guarantees at most one process per spec: inside the owner,
-`admitAndStart` runs Permit → `Admit` → mark victims draining or the target
-starting → `exec.Cmd.Start()` **synchronously**, and only afterwards spawns the
-health-poll and exit-wait goroutines, once the new generation is already
-recorded. A second concurrent attempt then sees a non-nil current process and
-no-ops. Moving the blocking `exec.Start` off the owner goroutine looks like an
-obvious latency win and silently permits two children for one spec.
+The ordering that guarantees at most one process per instance key — the spec
+id `S` for instance 0, `S#k` for instance k ≥ 1 (§4.8, §6.1), so a replicable
+spec runs one process per instance and never two for the same instance: inside
+the owner, `admitAndStart` runs Permit → `Admit` → mark victims draining or the
+target starting → `exec.Cmd.Start()` **synchronously**, and only afterwards
+spawns the health-poll and exit-wait goroutines, once the new generation is
+already recorded. A second concurrent attempt for the same instance key then sees
+a non-nil current process and no-ops. Moving the blocking `exec.Start` off the
+owner goroutine looks like an obvious latency win and silently permits two
+children for one instance key.
 
 The admission *policy* is a pure function over a snapshot —
 `Admit(PolicySnapshot, Spec) Decision` has no clocks, no I/O, no goroutines, no
@@ -3083,9 +3198,113 @@ launch input (`sameLaunchShape` ignores it, so a role change relaunches nothing)
 hand-written file-mode spec may declare it or omit it, and the upward report echoes
 it only when present.
 
+### 5.8 Instances of one spec: siblings, burst capacity and the protected floor
+
+Every instance (§4.8) is an ordinary occupant of its own: `RunningProc.SpecID`
+is the instance key, so the self-filter, the victim set and `Decision.Evict` all
+speak in instance keys, each instance's VRAM and RAM are **summed** like any
+other process's, and each counts toward `max_processes`. What makes the
+instances of one spec **siblings** is `RunningProc.Spec` (the base spec id) and
+`Instance` (`baseOf`; a process built without them reads as its own base at
+instance 0, exactly as before). Admission treats siblings differently from
+unrelated specs in exactly these places
+([ADR-091](../09-architecture-decisions.md#adr-091--burst-instances-take-only-free-room-surplus-instances-leave-first-and-the-highest-index-leaves-first)):
+
+- **Co-residency by base.** Siblings always co-reside; any other pair is looked
+  up as `PairKey(base(a), base(b))` (`pairAllowed`), so an instance inherits its
+  spec's verdicts, and `pinnedUnknownOccupantRefusal` reads the pair the same way.
+- **A sibling is never a victim** for a candidate of its own spec: evicting a warm
+  copy to start a cold one is never useful.
+- **Highest index leaves first.** An instance is not evictable while a sibling
+  with a higher index stays running (`higherSiblingStays`; a sibling already
+  queued to go no longer holds a lower one back, so one decision can evict
+  `S#2`, then `S#1`). The owner keeps the same invariant for its own picks
+  (`higherSiblingRuns`: idle unload in `scanIdle`, the bootstrap escalation's
+  `evictOneIdleForBootstrap`), so instance 0 is always the last instance of a
+  spec to go, and "instance 0 down while a sibling runs" only happens
+  transiently, after a crash or a restart of instance 0.
+- **Surplus first.** A running burst instance carries `RunningProc.Surplus` and is
+  drawn **before every other idle victim**, ahead of the role band of
+  [§5.4](#54-eviction-queueing-and-drain) (`orderVictims`): its spec keeps serving
+  from a lower sibling, so it is the cheapest victim there is and never strands a
+  role. Within one spec the order is then highest index first
+  (`siblingsHighestFirst`, applied as a permutation after the sort because a
+  comparator mixing "higher index first" with "least recently used first" is not a
+  strict weak order). It changes only *which* victim goes first, never *whether*
+  one may.
+
+**Baseline and burst, by index.** `ProtectedCount` P is the larger of the
+spec's `min_instances` (replicable specs only) and the one instance a `pinned` or
+`force_running` spec has always kept. Instances 0 … P−1 are **protected**;
+instance 0 and the protected instances are the **baseline**, admitted by every
+rule above unchanged (they may evict idle neighbours and bootstrap an unknown
+demand, like any spec). Every instance with k ≥ max(P, 1) is **burst** capacity
+(`IsBurst`):
+
+- **All-or-nothing and immediate.** The owner sets `PolicySnapshot.NoEvict` for a
+  burst candidate, and under it `Admit` answers OK or `Decision.NoCapacity` and
+  nothing else: no eviction, no queueing, no bootstrap shot spent. `NoCapacity`
+  is the first case `admitAndStart` handles — it carries no reason, no wait and an
+  empty eviction list, so every later case would read it as OK and start the
+  process it refuses. The refusal fails every queued waiter with
+  `ErrInstanceNoCapacity` (`409 runtime.instance_no_capacity`), moves no state
+  (no `not_permitted`, no `pending_vram_unknown` row), and the deferred
+  `retireIfSpent` removes the state the request created. The gateway then tries
+  another host.
+- **Protected = pinned.** A protected instance of a replicable spec — instance 0 of
+  a `force_running` replicable spec included — reports `Pinned = true` to
+  admission (`pinnedForAdmission`): the `min_instances` promise is worth nothing if
+  an admission may evict it. A spec that never replicates keeps `spec.Pinned`
+  exactly as before (a `force_running` one stays evictable as it always was).
+
+**An instance k ≥ 1 is never admitted with an unknown demand.** Siblings run the
+same model with the same arguments, so a measured sibling is the best estimate
+there is:
+
+- **As a candidate** every instance — instance 0 included, which may restart next
+  to a protected, measured sibling — is charged `demandSpec`: the pushed demand
+  raised to the largest **ready** measurement of any running sibling (per GPU for
+  VRAM, host-wide for RAM; `siblingPeak`). *Ready* means taken after the sibling
+  first passed its health probe (`readyVRAM`/`readyRAM`): a sibling still loading
+  holds a fraction of the model, and inheriting that would make an unknown demand
+  count as known. If the demand is still unknown, a **burst** instance is refused
+  at once with `ErrInstanceDemandUnknown` (`409 runtime.instance_demand_unknown`,
+  before `Admit` is even asked) and a **protected** one waits, queued, with the
+  reason on its row (`waitingOnDemand`), until a sibling's ready measurement lands
+  (`wantsDemandWake`). Instance 0 keeps the unknown-demand handling of §5.3 —
+  something has to run first to be measured.
+- **As an occupant** an instance is charged `chargeSpec`: its **own** ready figure
+  when it has one (floored at the declared demand, never raised to a sibling's
+  peak — two siblings measured at 3000 and 3500 MB count as 6500, not 7000), and the
+  inherited sibling peak only for what it has not measured of itself yet (a
+  starting instance, or a just-ready one whose RAM figure has not arrived).
+
+To make a sibling's figure available within seconds, a start measures the new
+process at its **first passing health probe** (`measureSoon`; never skipped), not
+at the next 15 s beat.
+
+**Protected instances start lowest index first.** `lowerSiblingWaiting` holds a
+protected instance k ≥ 1 back — silently, with nothing evicted for it — while a
+lower sibling still waits to start (stopped, or in crash backoff), whichever of
+them is asked first (a crash-loop timer, a request naming `m#k`, an exit's
+re-admission, the Apply start loop). A protected instance admitted ahead of a
+lower sibling would keep the room it took — a sibling is never a victim and a
+protected instance never idles out — so that sibling, instance 0 above all, would
+stay down for as long as it ran. The wait ends the moment the lower sibling gets a
+process **or is refused** (`wakeSiblingsWaitingFor`, called from the start and from
+`setNotPermitted`/`setPendingVRAMUnknown`), so two instances whose retries fell due
+in the wrong order still load side by side. A sibling resting at a refusal holds
+nothing back: siblings are admitted against the same demand and verdicts, so the
+held instance would be refused the same way, and holding it would only hide its
+own verdict. Burst instances are never held for a lower sibling: they take free
+room or are refused, and leave again by idle unload, so a lower sibling is kept
+down only transiently (the accepted case is in
+[Risks & Technical Debt §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
 ## 6. Process lifecycle
 
-Nine states are visible per spec, and they are a **wire contract** — portal
+Nine states are visible per instance (one status row per instance of a spec, §6.1
+and §10; a spec that never replicates has exactly one), and they are a **wire contract** — portal
 badges, the SSE status stream and the e2e assertions all key on these exact
 strings.
 
@@ -3101,7 +3320,7 @@ strings.
 | `pending_vram_unknown` | Cannot start because its VRAM demand is unknown and the GPU is occupied (§5.3). |
 | `not_permitted` | Agent-local policy or placeholder expansion refused it — including a config file whose name or content can never be written (§3.5) — or its own demand exceeds a GPU budget — or the host-RAM pool — outright. A configuration error. |
 
-A state transition rings the manager's buffered(1) `Transitions()` doorbell,
+A state transition — and every deletion of an instance's state (§6.1) — rings the manager's buffered(1) `Transitions()` doorbell,
 which makes the agent take an immediate coalesced telemetry sample instead of
 waiting for its tick — that is what makes a transient state such as `starting`
 observable on the portal's SSE stream at all. Because the channel is buffered(1)
@@ -3199,13 +3418,18 @@ that drain-stops specs which are `running`, **not pinned, not force-running**,
 have a positive `idle_timeout_seconds`, zero in-flight requests, and have been
 unused for at least that timeout. The exemption set and the zero-in-flight
 precondition are the difference between reclaiming a GPU and killing a live
-model.
+model. The scan is per instance: a protected instance (inside `min_instances`) is
+exempt like a pinned spec, and an instance is skipped while a sibling with a higher
+index still has a process, so a spec's instances idle out highest index first and
+instance 0 last (§6.1).
 
 **Logs are retained per spec and streamed on demand.** Each child's stdout and
 stderr are captured into one in-memory record buffer per **spec** — not per
 process — mutex-guarded because `os/exec` writes from two goroutines. Its tail
 is what populates `last_error.stderr_tail`, and a portal log view is what makes
-the agent stream it upward. Capacity is an operator setting
+the agent stream it upward. Every instance of a replicable spec writes into its
+spec's one buffer, lines of instance k ≥ 1 prefixed `[#k] ` and every entry
+naming its instance (§6.1). Capacity is an operator setting
 (`runtime_log_buffer_bytes`, default 1 MiB; `runtime_log_buffer_total_bytes`,
 default 16 MiB). Full description in [§14](#14-managed-process-logs-t3).
 
@@ -3253,6 +3477,91 @@ saw no recovery until an unrelated config edit; unbounded re-evaluation cost a
 external `nvidia-smi` invocation per request on the serialized owner goroutine
 with every other command queued behind it.
 
+### 6.1 One lifecycle per instance
+
+Everything above is per **instance**, not per spec: the manager's state table is
+keyed by instance key (§4.8), and each instance has its own `specState` — state,
+process, in-flight count, last use, failure streak and backoff, measurements,
+bootstrap guards — so the lifecycle, health, drain, backoff and measurement
+machinery runs per instance unchanged, and the generation-identity rule holds per
+instance. An instance k ≥ 1 runs as `specForInstance(base, k)`: a copy of the
+spec that differs only in identity (`ID` = `S#k`, `InstanceOf`, `Instance`), so
+it gets its own admission identity and its own `${CONFIG_DIR}` and config-file
+directory (`<configFilesDir>/S#k`, since config files may carry `${PORT}`), while
+the port is always ephemeral (a replicable spec with a fixed `listen_port` is
+demoted to non-replicable with a Warn, `sanitizeInstanceFields`, and the portal
+refuses the combination) and the work dir is shared. None of `replicable`,
+`min_instances`, `max_instances` is part of the launch shape, so changing them
+restarts no running child.
+
+**Where instances come from and where they go**
+(`manager.go`, `applyConfig`, `ensureProtectedFloor`, `instanceForRequest`,
+`retireIfSpent`):
+
+- **Instance 0** exists for every spec, as before.
+- **Protected instances 1 … P−1** are created on Apply and started like a pinned
+  spec, in instance order (`sortInstanceOrder`: numerically, `S`, `S#2`, `S#10`),
+  and restarted with crash backoff. The floor skips an instance whose address is
+  another spec's literal upstream model (`instanceAddressHolder`): every request
+  for it would reach the other spec, so it could never be reached.
+- **Burst instances** are created **on demand** when an ensure names `m#k` and
+  `InstanceAllowed` admits it. They are never retried after a failure: a burst
+  instance that crashes or fails to start stays visible at `crashed` /
+  `start_failed` (or `not_permitted`) so an operator can read why, until it is
+  named again or the next Apply. The gateway's instance scaler treats such an
+  index as free, so its next ensure for the spec names it again (routing never
+  sends a request to it). Named again by an ensure, a `crashed` /
+  `start_failed` row is retired and a fresh instance started in its place, and a
+  `not_permitted` row is re-evaluated in place behind the usual rate limit; named
+  by a plain request, it is retired and nothing is started (§4.8). A burst
+  instance that simply has nothing left — no process, no queued request, no
+  failure to show — is **retired** (its state deleted) at once, since burst
+  capacity exists only while it serves. Instance 0 and protected instances are
+  never retired.
+- **Apply transitions.** A launch-shape change drains and relaunches every
+  instance (each is reconciled against its re-derived copy, so an unchanged push
+  touches none). A removed spec takes all of its instances with it. An instance
+  the new push no longer allows — `replicable` turned off, `max_instances`
+  lowered — or whose address is now another spec's literal model **drains and is
+  removed**, its in-flight requests finishing first (bounded by the drain grace),
+  never cut off mid-response. A burst instance that was protected when it crashed
+  and is burst under the new push leaves its crash-loop wait. A spec pushed again
+  while a removal is still draining it is desired again, so none of its instances
+  is deleted on exit. `force_stopped` drains every instance; `force_running` and
+  `pinned` fold into P.
+- **Idle unload** applies per instance: an instance is unloaded only when it is
+  not protected and **no higher-index sibling still has a process**
+  (`higherSiblingRuns`), so with no `min_instances` instance 0 unloads too, last.
+  A replicable spec's idle timeout is the **effective** one the gateway pushes
+  (always > 0, [§9](#9-keeping-the-agent-current-the-notification-rule) and the
+  derivation in [§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
+
+**Measured startup.** At an instance's first passing health probe the owner
+records `startupMS`, the wall time from that start's exec to that probe (floored
+at 1 ms, 0 meaning unknown), before the transition to `running`, so the status the
+transition wakes a reader for already carries it. It describes the last
+successful start, not the live process, so it survives the exit. It is measured for
+**every** spec, replicable or not, and reported as the status row's `startup_ms`
+(§10).
+
+**Every deletion of a state rings the transitions doorbell** (`deleteState`, used
+by retirement, `removeState` and a removed state's exit): some deletions move no
+state on their way — a request retiring a spent burst row, a push removing a state
+with no process — and the gateway routes to the instance addresses it read off
+the rows, so it must learn of a vanished row as promptly as of a changed one, not
+at the next periodic sample while it keeps naming an address that is gone.
+
+**Output goes into the spec's one buffer.** Every instance writes into the log
+buffer of its **base** spec (`LogStore.newInstanceProc`); instance 0's lines are
+recorded exactly as written, and every line instance k ≥ 1 writes is prefixed
+`[#k] `. Every text entry and generation marker also carries the instance index
+itself (`instance`, omitted for instance 0), so the portal can show one
+instance's output alone without parsing the prefix back out of the text
+([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). The spec's log view, the gateway's watch command and `Retain` therefore
+cover every instance with nothing per instance to track, a crashed burst
+instance's output stays readable after its row is retired, and a spec running many
+instances holds one buffer of the per-spec budget ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)).
+
 ## 7. Feature negotiation
 
 Gateway and agent negotiate by **named feature flags whose intersection decides
@@ -3269,7 +3578,8 @@ agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`,
 `runtime_role_eviction`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
-only and read by the agent (below).
+only and read by the agent (below); and one, `runtime_instances`, is on **both** lists
+with a different fact behind each declaration, each side reading the other's (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
 | Direction | Channel |
@@ -3304,14 +3614,59 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_ram_measurement` ([§5.1](#51-the-per-gpu-data-model),
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.14.0"`, and
 `runtime_ram_accounting` ([§5.2](#52-the-three-gates)), `Since: "0.14.0"`, and
-`runtime_role_eviction` ([§5.4](#54-eviction-queueing-and-drain)), `Since: "0.15.0"`
+`runtime_role_eviction` ([§5.4](#54-eviction-queueing-and-drain)), `Since: "0.15.0"`, and
+`runtime_instances` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite),
+[§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
 `Since` because the agent's registry does not carry them. The gateway's own list is
-`runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp` and
-`capability_source_audiocpp` (`gatewayAgentFeatures`,
+`runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp`,
+`capability_source_audiocpp` and `runtime_instances` (`gatewayAgentFeatures`,
 `internal/gateway/agent_features.go`).
+
+`runtime_instances` (#340, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
+is the one name **both sides declare, each stating a different fact, and each
+reading the OTHER side's declaration as a precondition** — so the intersection
+rule above is not what decides either behaviour:
+
+- **The agent's declaration** (`FeatureRuntimeInstances`, `Since: "0.16.0"`) says it
+  runs several instances of a replicable spec and serves them as `m#k` (§4.8):
+  the spec fields `replicable`/`min_instances`/`max_instances`, instance
+  addressing and the model rewrite, sibling/burst/surplus admission (§5.8), and the
+  `instance`/`startup_ms` status fields (§10). The gateway reads it before it ever
+  expands a mapping into instance candidates, starts an instance, ramps an audio
+  benchmark by instance, or pushes the instance settings: for an agent **known to
+  lack it** the pushed document carries the spec with `replicable` cleared — no
+  instance keys, and the stored manual idle timeout rather than the derived one
+  ([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)) —
+  byte-for-byte the document it was before instances existed
+  (`Service.specAsPushed`). A gateway that has not heard from the agent since it
+  started (its features are **unknown**, not absent) holds a document that
+  carries an enabled replicable spec: the runtime-config fetch answers
+  `503 runtime_config.agent_features_pending` with `Retry-After` and no ETag, and
+  the agent keeps the document it applied; the agent's first readable telemetry
+  sample makes the declaration known, and the ingest pushes the document then.
+  Serving the instance-less document instead would tear down the protected
+  instances of an agent that does run them.
+- **The gateway's declaration** (`runtimeInstancesFeature` in
+  `gatewayAgentFeatures`) says it understands what such an agent reports — one
+  status row per instance, several rows under one `spec_id`. The agent reads it
+  on every `Driver.Sync` (`gatewayFeatureRuntimeInstances`) and honours a
+  document's `replicable` flag **only while the gateway declares it**, in file
+  mode as well as gateway mode, fail-closed: otherwise every spec runs as its one
+  process (logged once per transition), and a document re-applied under the same
+  ETag with only that opt-in changed is applied rather than short-circuited
+  (`sameReplicableOptIn`). A gateway build without the name therefore never
+  receives two rows for one spec, which it would read as one spec flapping
+  between them.
+
+Both spell the identical string, because the agent module imports nothing from the
+gateway (`portal.AgentFeatureRuntimeInstances` is the gateway module's one
+spelling; `TestAgentFeaturesDeclaresRuntimeInstances` pins the gateway's
+declaration). Mixed fleets degrade the safe way: an agent without the feature next
+to one with it gets no expansion, no `m#k`, no scale-up and its manual idle timeout;
+an old gateway never sends `replicable`, so a new agent runs one instance per spec.
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
 agent itself: the agent always honors whatever it receives — an explicit GPU
@@ -3525,7 +3880,7 @@ gateway. `server-agent`'s `Version` moved `0.11.1` → `0.12.0` for this entry, 
 `runtime_model_params` (issue #282, [ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)) has
 the `runtime_voices` shape: **the gateway gates real behavior on it, fail-closed, and that gate is
 the flag's purpose.** It says the router serves `GET /upstream/{model}/v1/models` (§4.1), the
-Status-only, never-start read of a running audio.cpp child's model listing that relays the inbound
+read-only, never-start read of a running audio.cpp child's model listing that relays the inbound
 query, so `?include_params=true` reaches the child and the listing carries each model's declared
 request params. The gateway's agent-child speech-language pull, which `probeAgentVoices` folds into
 its voices loop (`fetchAndCacheSpeechParams`), reads the flag off the agent's sample
@@ -3916,6 +4271,20 @@ older gateway receives the older default-deny list, which is correct for that ga
 no roles (every spec reads as `other`, so the order is plain least-recently-used), and
 still applies the grace window. The gateway side of the rework changed no wire shape
 that an older agent reads.
+
+**`0.15.0` → `0.16.0` (model-instance autoscaling, #340) is MINOR, and one bump
+for the whole branch.** `agent.Features` gained `runtime_instances` (§7), and the
+same change altered what the agent does in ways an operator observes: it reads the
+spec fields `replicable`, `min_instances` and `max_instances`, runs several
+instances of a replicable spec under the addresses `m#k` and rewrites the child's
+model to the base name (§4.8), admits further instances only into free room and
+evicts surplus instances first (§5.8), creates and retires instances
+(§6.1), and reports one status row per instance with `instance` and `startup_ms`
+(§10). The `Version` assertion lives in the newest feature's test. Compatibility
+needs **no upgrade order**: an older gateway never sends `replicable` (and does not
+declare `runtime_instances`, so a 0.16.0 agent would ignore it anyway), and an agent
+older than 0.16.0 behind this gateway is never expanded, scaled or sent an
+instance address, and gets its stored manual idle timeout.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -4565,6 +4934,34 @@ state `running` count, and `starting` explicitly does not. Counting `starting` a
 loaded — to make the portal look responsive — sends real traffic to a model that
 cannot answer yet, turning a warm-up into user-visible timeouts.
 
+**One status row per instance** (#340). `Status()` and the sample's `runtimes`
+carry a row per instance, identified by the pair (`spec_id`, `instance`), never by
+`spec_id` alone: `spec_id` is the **base** spec id on every row of a spec,
+`model` is the row's instance address (§4.8), `instance` is the index (always on
+the wire, `0` included) and `startup_ms` the instance's measured startup (§6.1,
+`omitempty`, `0` = unknown). A spec that never replicates has exactly its one
+instance-0 row, so an older gateway — which never makes the agent run instances,
+§7 — sees exactly the rows it always did. The gateway keeps **every** row in the
+volatile registry (`runtime_registry.go`) and folds them per spec where one figure
+is wanted (`foldInstanceRows`, `internal/gateway/agent_ingest.go`): the measured
+VRAM per GPU, the measured RAM and the measured startup are each the **maximum**
+over the spec's rows in a sample — the demand a new instance is admitted with must
+cover the hungriest instance, and a start is only as quick as the slowest — and are
+written back only when changed, so two instances taking turns cause no write churn.
+`startup_measured_ms` is written only when it moved by more than **10 %** of the
+stored value (or nothing is stored yet), because every start measures a little
+differently and the figure feeds a replicable spec's pushed idle timeout: a write
+for a replicable spec pushes that server's runtime config
+(`writeBackRuntimeStartup`), a non-replicable one pushes nothing. The context size
+and the capability verdicts are not figures to take a maximum of; they come from
+the spec's representative row (the running instance-0 row, else the running row
+with the lowest index, else the instance-0 row, else the lowest index). The
+portal's Models overview counts a server once in its loading count however many of
+its instances start, and not at all while an instance of the spec already runs there,
+so routine scale-up does not light the loading indicator (`startingCandidates`,
+`internal/gateway/portal_model_endpoints.go`); the model-servers row carries the
+number of running instances ([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
+
 **Per-child probing feeds three more fields onto this same channel** —
 `ContextSize`/`ActiveRequests`/`QueueDepth` — one of the two reasons
 [§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation) resolves a
@@ -5020,8 +5417,9 @@ Two honesty rules on those two fields, and both are contracts:
 
 **Host RAM rides the sample as one spec-level scalar, `ram_measured_mb`, and the
 live status frame forwards it.** RAM has no GPU axis and one process
-backs one spec, so the figure sits **beside** `gpus[]` on the runtime entry, not
-inside it: the managed child's resident RAM in MB (RSS, the private working set on
+backs one instance, so the figure sits **beside** `gpus[]` on the instance's
+runtime entry, not inside it (a replicable spec reports one entry per instance,
+and the gateway writes back the largest, `foldInstanceRows`): the managed child's resident RAM in MB (RSS, the private working set on
 Windows), declared by the agent feature `runtime_ram_measurement` (§7), `omitempty`,
 and `0` is *unknown* — never measured, no measurer on this host, or the process has
 exited — so an unmeasured spec and every agent that predates the field send no key at
@@ -7471,6 +7869,33 @@ force-stops every running model of the application in one write and clears
 that write again before the cold request. The decision and what it costs are
 [ADR-047](../09-architecture-decisions.md#adr-047--a-manual-speed-run-measures-every-agent-model-on-an-emptied-server-it-stops-the-servers-running-models-before-each-cold-pass-and-lifts-the-servers-pins-for-the-run).
 
+**Replicable specs are held as one process for the run** (#340). A replicable
+spec's protected instances start by themselves, like a pinned spec's one, so they
+would come up at a stop's clear inside a target's cold pass, and a target's own
+further instances would load beside the process being measured. A manual speed or
+both run that may stop the server's models therefore writes `replicable = false`
+for **every** enabled replicable spec of the server's agent application, measured or
+not, in one batch (`beginBenchmarkSingleProcess`,
+`internal/gateway/benchmark_pins.go`), after recording them in the override lease's
+`restore_replicable` list; the agent drains each one's further instances, the
+instance counts stay stored, and the run's end — or the lease reconcile after a
+crash — writes `replicable = true` again, by compare-and-set against `false`. A
+spec an operator gave a fixed listen port meanwhile is a conflict like one they
+turned back on (`replicableRestorable`): a replicable spec cannot have that port,
+so the write would fail validation on every attempt and pin the spec in the lease,
+whose leftover stops every later run's unpin and stop; the operator's port wins
+and the lease lets go of the spec. A lease write that fails writes nothing
+and turns the run's stops off, as does a batch that failed, since a spec that may
+still be replicable would restart its protected instances at a stop's clear. The
+VRAM run does the same for its replicable **target** alone (`vramRunAsOneProcess`),
+so the load it measures is one instance's. In a both run the audio concurrency
+ramp makes its own target replicable again before it measures instances and holds
+it as one process again afterwards while a later target may still stop the
+server's models ([Telemetry §8.6](telemetry-usage-observability.md#86-audio-performance-benchmarks));
+when that restore is a conflict that leaves the spec one process — the operator's
+fixed listen port — the ramp ends at once with an error naming the port and stores
+no result, since the agent would refuse every instance address of the spec.
+
 **One meaning for the column, whether a run stops or not.** A cold start is
 confirmed only when no other model of the server's agent application has a
 process or can start one by itself when the cold pass starts. On the target's
@@ -7798,6 +8223,99 @@ operator's later, deliberate `force_stopped` or unpin of one of them is undone
 at the next reconcile
 ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
+### 11.11 Instances in the portal, and the effective idle timeout
+
+**The spec's instance settings** (#340) are four operator-owned columns on
+`agent_runtime_specs` (migration 100, [Data Model](../reference/data-model.md))
+carried by the full-document spec `PUT` and its `GET` like every other field
+([HTTP API Surface](../reference/api-surface.md#agent-managed-model-runtime)):
+`replicable` (may the agent run several instances), `min_instances` (instances
+kept warm, 0 = none), `max_instances` (cap; `max_instances` 0 = no explicit limit —
+the agent still runs at most 64 instances of a spec, `MaxInstanceIndex` 63, the
+instance scaler and the audio concurrency ramp stop at the same bound, and below
+it the agent's free room and the server's `max_processes` are the bound) and
+`instance_parallelism` (requests one instance serves at once, 0 = 1). The last is **gateway-only** and
+never pushed: the routing capacity filter compares an instance's in-flight count
+with it. `min_instances` and `max_instances` are pushed only for a replicable spec
+on an agent that runs instances (§7), so every other document stays byte-for-byte
+the pre-instances one, ETag included. The portal service refuses, in this order,
+a negative `min_instances`, `max_instances` or `instance_parallelism`
+(`runtime_spec.tuning_invalid`), a `min_instances` or `max_instances` above 64
+(`MaxInstanceIndex` + 1) or a minimum above a set maximum
+(`runtime_spec.instances_invalid`; `instance_parallelism` has no upper bound;
+checked whether or not the spec is replicable, so a setting that can never be met is not stored to take effect
+the day the spec is switched on) and a replicable spec with a fixed `listen_port`
+(`runtime_spec.instances_need_ephemeral_port`) — the agent would repair the same
+shapes silently (§6.1), and a repair the operator never sees is a setting that
+does something else (`validateRuntimeSpecInstances`,
+`internal/portal/service_runtime.go`).
+
+**The effective idle timeout.** For a replicable spec the document pushes
+
+`idle_timeout_seconds = max(manual, ceil(factor × startup / 1000), floor)`, with
+`startup = max(startup_measured_ms, load_time_ms)`
+
+— the agent's measured startup (§10) and the mapping's benchmark cold start, the
+larger of the two — under `OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR` (default 5) and
+`OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS` (default 120), held at about 68 years
+(`math.MaxInt32` seconds) so the agent's `time.Duration` cannot wrap
+(`effectiveIdleTimeoutSeconds`). The product is rounded to the whole millisecond
+before it is rounded up to seconds, so a fractional factor such as 1.1 does not
+add a second through binary floating point. On a replicable spec a manual `0`
+means **no manual override**, not "never unload": a replicable spec is never pushed
+0, so its unprotected instances always idle out. A spec that is not replicable — and
+any spec on an agent known not to run instances — is pushed its stored value as
+before, `0` still meaning never. Because the two measurements are written outside
+the portal (the ingest writes the startup, a benchmark the load time), each of
+those writers pushes the server's document itself when the spec is replicable. The
+spec `GET` echoes both read-only: `startup_measured_ms` (agent-owned, kept across
+every write) and `effective_idle_timeout_seconds` (derived on every read from the
+same function as the pushed document, so the two cannot disagree); neither has a
+`PUT` counterpart.
+
+**What the screens show** (`RuntimeAdminSection.tsx`,
+`components/shared/runtimeInstances.ts`, `ModelServersSection.tsx`):
+
+- The spec editor has a **Multiple instances** checkbox; ticked, it shows the
+  minimum (empty = 0), the maximum (empty = unlimited) and the parallel requests
+  per instance (default 1), validated client-side (whole numbers 0…64, parallelism
+  1…1024, minimum ≤ a set maximum), and a read-only line with the measured startup
+  and, for a stored replicable spec, the idle timeout in effect (`0` read as
+  "never unloaded"). Unticked, it sends the three counts as 0 and validates none of
+  them.
+- The status tab lists **one row per instance**, keyed by spec id and instance,
+  with an **Instance** column (`#k`); the spec list's live-status column
+  aggregates (`2 running · min 1 · max ∞`). Where one row has to speak for a spec
+  — its state chip, RAM and probe columns, the spec-wide override actions — it is
+  the running instance-0 row, else the running row with the lowest index, else
+  the instance-0 row, else the row with the lowest index (`primaryStatusRows`,
+  the gateway's own rule, `representativeRowIndex`), so the runtime list never
+  shows a spec in a state the models catalog does not: a crashed instance 0
+  beside a burst instance that serves does not read the model as down. The restart sequence waits
+  for **every** row of the spec to stop (`specStopState`), since under
+  `force_stopped` all instances drain at once, so its state gate reads every row
+  too (`restartGate`): the speaking row must be in a restartable state, and every
+  other row of a protected instance either restartable or already `stopped`. A
+  protected sibling resting at `not_permitted` or `pending_vram_unknown` has no
+  process to drain and would never report `stopped`, so Restart stays disabled
+  there and says why on hover. A burst sibling in those states does not block:
+  the protected count under `force_stopped` is the larger of a replicable spec's
+  minimum, 1 for a pinned spec and 1 for instance 0 (`ProtectedCount`, with
+  `force_running` gone), and the `force_stopped` push retires every burst
+  instance with no process and nothing queued, so its row leaves the stream and
+  does not count in the wait. Without the stored spec every row counts as
+  protected.
+- The log view of a replicable spec — or of any spec once more than one instance
+  is known to it — offers tabs: **All** shows every instance's output as it
+  arrives, lines of instance k ≥ 1 prefixed `[#k]` (§6.1), and one tab per
+  instance shows only that instance's output, without the prefix
+  ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)). A spec that is
+  not replicable, and for which no instance k ≥ 1 is known, shows no tabs.
+- The Models catalog's model-servers row carries `running_instances` (one per
+  running status row of the spec, so 1 for a running spec that is not replicable)
+  and the spec's `replicable` flag; the count is shown for a replicable spec or
+  whenever more than one instance runs.
+
 ## 12. The timeout budget
 
 Five bounds sit on one request to a cold managed model, and they are only
@@ -7998,12 +8516,12 @@ operator meets first:
   the directory check, is the boundary.
 - **Config files are written, never garbage-collected, and never hold a secret**
   ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A file dropped from a spec's `config_files`, and the whole
-  `<spec-id>/` directory of a removed spec, stay on disk until an operator deletes
-  them: the write is overwrite-on-launch only. A secret cannot be placed in a file
+  `<spec-id>/` directory of a removed spec — and the `<spec-id>#<k>/` directory of
+  a retired instance — stay on disk until an operator deletes them: the write is overwrite-on-launch only. A secret cannot be placed in a file
   at all (`${API_TOKEN}` and `${AGENT_ENV:…}` are refused in content, by the
   gateway at submit time and again by the agent), so a server that can take a
   credential only from a file cannot be fully provisioned this way. Containment
-  of the per-spec directory is **lexical**, like the work-directory check: a
+  of the per-instance directory is **lexical**, like the work-directory check: a
   symlink an operator planted under their own `config_files_dir` is theirs to
   explain. And an agent older than `0.10.0` silently ignores the facet (the portal
   warns, §7), so a spec whose `args` reference `${CONFIG_DIR}` launches against a
@@ -8018,7 +8536,7 @@ operator meets first:
   `/v1/audio/voices` (since 0.11.0) and its `/v1/models` (since 0.13.0, added for
   the audio.cpp language param and read only for an audio.cpp child, [ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)),
   and vLLM serves neither of the first two. The `/v1/models` entry is a
-  generic Status-only relay, so it would reach a vLLM child too, but nothing in
+  generic read-only relay, so it would reach a vLLM child too, but nothing in
   the benchmark path reads it for one, so this gap is **not** closed by it: closing it
   would mean the gateway's vLLM benchmark asking for the listing through that route,
   as its own change, because the allowlist is a security
@@ -8111,6 +8629,51 @@ synthesized text: the event kind is a closed set — `started`, `exited`, and
 allow-lists on ingest, so an agent cannot put free text where an operator reads
 a portal-authored sentence.
 
+**Instances share their spec's buffer.** Every instance of a replicable spec
+writes into the one buffer of its **base** spec (`LogStore.newInstanceProc`), and
+each line instance k ≥ 1 writes is prefixed `[#k] ` while instance 0's output is
+recorded exactly as written; the typed markers need no prefix, they carry the pid.
+So the view, the watch command (which names spec ids) and `Retain` (which keeps
+spec ids) cover every instance with nothing per instance to track, a crashed burst
+instance's output survives the retirement of its row, and a spec running many
+instances spends one buffer of the per-spec budget, not one per instance.
+
+**Every entry names its instance.** Each text entry and each generation marker
+carries `instance`, the index of the instance whose generation produced it —
+omitted for instance 0, which is also what an agent from before instances sends.
+The text keeps its prefix, so the combined history reads the same to every
+consumer, the stderr tail included. A gap belongs to no instance: the bytes lost
+may have come from any of them. The agent stamps a gap onto the first entry after
+it, and that entry keeps naming the instance whose text it carries; only an entry
+the agent makes for a gap with nothing to stamp it onto carries `dropped_bytes`
+alone and names no instance. When a frame's room ends inside a record, the agent
+cuts the record's text but never inside the `[#k] ` opening one of its lines: a
+cut that would fall there moves back to the start of that line, so a reader can
+always find the prefix whole.
+
+**The portal's log view splits the history per instance.** For a replicable spec,
+or once more than one instance is known — the ones the opening row's spec lists,
+plus every one the stream names while the dialog is open, kept as a union — the
+view offers tabs. **All** (*Gesamt*) is selected each time the dialog opens and
+shows the history exactly as it arrives, prefixes included. Each **Instance k**
+tab shows only the entries of instance k, its generation markers and their
+resolved commands included, with the `[#k] ` prefix removed from every line the
+agent prefixed: at the start of a chunk and after every newline inside it. An
+entry is a chunk of output, not a line, so the view tracks per instance whether
+the previous chunk ended inside a line and leaves a continuing chunk's first
+bytes alone; a generation marker opens a new line. Where that state is unknown —
+at the head of the window and after a gap — a chunk is read as opening a line,
+which leaves one ambiguity the text cannot resolve: process output that itself
+begins with the exact prefix at such a boundary loses it in that tab (All still
+shows it). Gaps — `dropped_bytes` and the view's own trim notice
+([§14.5](#145-overflow-is-always-visible)) — appear in **every** tab, because a
+gap cannot be attributed to an instance, and a tab for an instance with no output
+in the history says so in a sentence rather than staying blank (a gap alone is no
+instance's output, instance 0's included). A replicable spec shows the tabs even
+while only instance 0 runs. A spec that is not replicable, and for which no
+instance k ≥ 1 is known — from the opening row or from the open stream — shows no
+tabs and looks exactly as before.
+
 ### 14.3 The memory bound is the operator's to set
 
 Capacity is an agent-local operator setting with the same provenance as
@@ -8145,7 +8708,7 @@ under 17 MiB while watching.
 | Frame | Direction | Payload |
 |---|---|---|
 | `runtime_log_config` | gateway → agent | `{"spec_ids":[…],"epochs":{…}}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing; the epoch adds no state to the frame, it makes "a viewer arrived" expressible. `epochs` is one counter per spec id, bumped whenever a **viewer arrives**, and the agent re-snapshots any spec whose epoch differs from the one its last snapshot was taken for — even one it is already streaming. That is the fact the agent cannot derive for itself: watching is a *set*, so a second viewer of the same spec produces a byte-identical `spec_ids`, and a rule keyed to "this id is new" leaves that viewer's window blank while the agent believes it delivered. Compared with `!=`, never `<`, because a gateway restart resets the counters. Re-sent on **every** new agent connection, including the empty set and with every epoch bumped, so neither a watch set nor a history the gateway owes can outlive the connection it was issued on. |
-| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). |
+| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command","instance"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). `instance` is the index of the spec instance that produced a text entry or marker, omitted for instance 0 ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)); the gateway relays it unchanged, reading a negative value as 0. |
 
 The markers are **typed records carrying no text** — `event` plus `pid`/
 `exit_code`/`command`, with the `── … ──` line written by the portal. That is
@@ -8207,7 +8770,10 @@ arrival paths raise it**: a live stream trimmed from the front as it grows, and
 a **scrollback longer than the cap**, which is trimmed from the front the moment
 it arrives. The scrollback path was silent once — it reset the counter to zero
 and sliced the tail — which is why the view now counts what it discards in one
-place that both paths go through, rather than once per path.
+place that both paths go through, rather than once per path. The cap applies to
+the one window all tabs of a replicable spec's view are filtered from, so the
+notice, like every `dropped_bytes` gap, is shown in every tab
+([§14.2](#142-retention-belongs-to-the-spec-not-the-process)).
 
 The count is **UTF-8 bytes**, the same quantity `dropped_bytes` carries
 (`len(e.Text)` in Go). The browser's obvious `String.length` is UTF-16 code
@@ -8484,7 +9050,10 @@ registers, over the authoritative table in
 | `OP_AGENT_EVICTION_GRACE_SECONDS` (**no flag form**, env-only) | `30` | Seconds after a managed model was last used during which it is never an eviction victim, so a bursty pipeline (a voice chat's speech models, idle between turns) is not broken by a start that needs the room; a start that could only be made room for by evicting one waits, and is woken when the window expires ([§5.4](#54-eviction-queueing-and-drain), [ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)). `0` turns the window off (an idle model is evictable at once); a negative, fractional, malformed or above-`86400` value falls back to the default. |
 
 Gateway-side knobs are per-server and per-spec database columns, not environment
-variables: `ai_servers.runtime_max_processes`,
+variables — apart from the two that derive a replicable spec's pushed idle timeout,
+`OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR` and `OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS`
+([§11.11](#1111-instances-in-the-portal-and-the-effective-idle-timeout)), and the
+scaler's `OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS`: `ai_servers.runtime_max_processes`,
 `ai_servers.managed_runtime_only`, `ai_server_gpu_budgets.budget_mb`, the per-spec
 timeouts, and the per-spec `ram_estimate_mb` (the operator's RAM floor). See [Data Model](../reference/data-model.md).
 
@@ -8514,5 +9083,6 @@ mechanics of the generated agent config document are in
 - [HTTP API Surface](../reference/api-surface.md) and
   [Data Model](../reference/data-model.md) — the wire contracts and the schema.
 - [Architecture Decisions](../09-architecture-decisions.md) — ADR-024 to
-  ADR-029, ADR-031 to ADR-036, and ADR-087 to ADR-089 (the co-residency mode,
-  the derived role and role-aware eviction).
+  ADR-029, ADR-031 to ADR-036, ADR-087 to ADR-089 (the co-residency mode,
+  the derived role and role-aware eviction), and ADR-090 to ADR-093 (model
+  instances: addressing, burst admission, the scaler, the audio benchmark).

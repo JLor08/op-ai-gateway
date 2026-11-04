@@ -4,8 +4,10 @@
 package runtime
 
 import (
+	"bytes"
 	"op-ai-server-agent/internal/gwapi"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -165,10 +167,10 @@ const (
 	logBatchWireOverhead = 96
 	// logEntryWireOverhead reserves ONE LogEntry's keys, punctuation and every
 	// numeric or timestamp field at its widest (a 20-digit pid, an RFC3339Nano
-	// timestamp, a 20-digit dropped_bytes, an 11-digit exit code): 162 bytes
-	// exactly, rounded up. The two variable-length fields it does NOT cover --
-	// text and the resolved command -- are measured.
-	logEntryWireOverhead = 192
+	// timestamp, a 20-digit dropped_bytes, an 11-digit exit code, a 20-digit
+	// instance): 194 bytes exactly, rounded up. The two variable-length fields
+	// it does NOT cover -- text and the resolved command -- are measured.
+	logEntryWireOverhead = 224
 	// logCommandWireOverhead reserves a ResolvedCommand's own keys and
 	// punctuation, its two bools included; its strings are measured.
 	logCommandWireOverhead = 96
@@ -206,6 +208,11 @@ type logRecord struct {
 	text     string
 	event    string // "" for process output; one of the logEvent* constants
 	exitCode int
+	// instance is the index of the spec instance whose generation produced
+	// this record (#340): 0 for the spec's own process. It is the same for
+	// every record of one generation, which is what lets same-generation
+	// coalescing ignore it.
+	instance int
 	// command is set ONLY on an opening marker (logEventStarted /
 	// logEventStartFailed): the masked launch command of the generation this
 	// marker opens. Attaching it here rather than keeping it per spec is what
@@ -236,6 +243,17 @@ func (r logRecord) size() int { return len(r.text) + r.command.bytes() + logReco
 // carries that generation's resolved, masked launch command (command.go). A
 // reader renders it as part of the marker block it belongs to: it describes the
 // process whose output follows, and only that one.
+//
+// Instance names the spec instance whose generation produced the entry (#340),
+// on every text entry and every generation marker: 0 for the spec's own
+// process -- omitted on the wire, which is also what an agent from before
+// instances existed sends -- and k for instance k. The text of instance k keeps
+// its "[#k] " line prefix (procLog.prefixLinesLocked), so a reader that ignores
+// the field still reads one combined, attributable history; the field is what
+// lets a reader show one instance's output alone. A gap cannot be attributed
+// to an instance, because the bytes lost may have come from any of them:
+// withDropped stamps it onto the first entry after it, which keeps naming the
+// instance of its own text, and an entry made for a gap alone names none.
 type LogEntry struct {
 	PID          int              `json:"pid,omitempty"`
 	At           time.Time        `json:"at"`
@@ -244,6 +262,7 @@ type LogEntry struct {
 	Event        string           `json:"event,omitempty"`
 	ExitCode     int              `json:"exit_code,omitempty"`
 	Command      *ResolvedCommand `json:"command,omitempty"`
+	Instance     int              `json:"instance,omitempty"`
 }
 
 // LogBatch is the payload of one agent->gateway runtime_log frame: the
@@ -423,8 +442,30 @@ func (s *LogStore) Capacity() (perSpec, total int) {
 // newProc opens a fresh generation for specID and returns the io.Writer that
 // startProcess assigns to BOTH exec.Cmd.Stdout and .Stderr. The requirement
 // says stdout and stderr both, and they deliberately share one writer so the
-// interleaving an operator reads is the interleaving the process produced.
+// interleaving an operator reads is the interleaving the process produced. It
+// is newInstanceProc for instance 0: the spec's own process, whose output is
+// recorded byte for byte.
 func (s *LogStore) newProc(specID string) *procLog {
+	return s.newInstanceProc(specID, 0)
+}
+
+// newInstanceProc opens a fresh generation for instance k of the spec specID
+// (#340). Every instance of a spec writes into the ONE buffer of its spec --
+// specID is always the BASE spec's ID, never an instance key -- so the spec's
+// log view, the gateway's watch command (which names spec IDs) and Retain
+// (which keeps spec IDs) all cover every instance with nothing per instance to
+// track, a crashed burst instance's output stays readable after its row is
+// retired, and a spec running many instances holds one buffer of the per-spec
+// budget, not one per instance.
+//
+// Instance 0's output is recorded exactly as it was written. Each line a
+// further instance writes is prefixed with "[#k] " (instanceLinePrefix), so the
+// operator can tell the instances apart in the one interleaved history. The
+// generation markers need no prefix: they are typed, and carry the pid. Every
+// record of the generation, text and markers alike, also carries k itself
+// (LogEntry.Instance), so a reader can tell the instances apart without parsing
+// the prefix back out of the text.
+func (s *LogStore) newInstanceProc(specID string, k int) *procLog {
 	if s == nil {
 		return &procLog{}
 	}
@@ -432,22 +473,36 @@ func (s *LogStore) newProc(specID string) *procLog {
 	s.nextGen++
 	gen := s.nextGen
 	s.mu.Unlock()
-	return &procLog{store: s, specID: specID, gen: gen}
+	return &procLog{store: s, specID: specID, gen: gen, instance: k, prefix: instanceLinePrefix(k)}
 }
 
-// write records p as this generation's output and, when the spec is watched,
+// instanceLinePrefix is the text that opens every line instance k of a spec
+// writes into the spec's buffer: none for instance 0, whose output is the
+// spec's own exactly as before instances existed, and "[#k] " for k >= 1.
+func instanceLinePrefix(k int) string {
+	if k <= 0 {
+		return ""
+	}
+	return "[#" + strconv.Itoa(k) + "] "
+}
+
+// write records b as p's generation's output and, when the spec is watched,
 // queues it for the next Drain. Never blocks on a reader and never fails:
 // there is no failure mode for a bounded in-memory append, and a log write
 // must never be able to stall the process it is reading from.
-func (s *LogStore) write(specID string, gen uint64, pid int, p []byte) {
-	if s == nil || specID == "" || len(p) == 0 {
+//
+// A further instance's text is prefixed line by line here (prefixLinesLocked),
+// under the same lock as the append, so the prefix state of a generation and
+// the order its chunks land in can never disagree.
+func (s *LogStore) write(p *procLog, b []byte) {
+	if s == nil || p.specID == "" || len(b) == 0 {
 		return
 	}
-	rec := logRecord{gen: gen, pid: pid, at: s.now(), text: string(p)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.appendLocked(specID, rec)
-	s.queueLocked(specID, rec)
+	rec := logRecord{gen: p.gen, pid: int(p.pid.Load()), at: s.now(), text: p.prefixLinesLocked(b), instance: p.instance}
+	s.appendLocked(p.specID, rec)
+	s.queueLocked(p.specID, rec)
 }
 
 // mark records a lifecycle marker (a generation boundary) in the same
@@ -459,11 +514,12 @@ func (s *LogStore) write(specID string, gen uint64, pid int, p []byte) {
 // carried on the record, so it is retained for exactly as long as that record
 // is and is delivered wherever that record is -- scrollback and live alike --
 // with no separate bookkeeping.
-func (s *LogStore) mark(specID string, gen uint64, pid int, event string, exitCode int, cmd *ResolvedCommand) {
-	if s == nil || specID == "" {
+func (s *LogStore) mark(p *procLog, pid int, event string, exitCode int, cmd *ResolvedCommand) {
+	if s == nil || p.specID == "" {
 		return
 	}
-	rec := logRecord{gen: gen, pid: pid, at: s.now(), event: event, exitCode: exitCode, command: cmd}
+	specID := p.specID
+	rec := logRecord{gen: p.gen, pid: pid, at: s.now(), event: event, exitCode: exitCode, command: cmd, instance: p.instance}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.appendLocked(specID, rec)
@@ -695,7 +751,10 @@ func (s *LogStore) Watching() []string {
 // from the manager's own config reconciliation: a spec removed from the
 // desired configuration has no row left in the portal to open a log view on,
 // so keeping its output would be memory held for something that no longer
-// exists.
+// exists. The keys are SPEC IDs, for a replicable spec too: every instance of
+// a spec writes into its spec's one buffer (newInstanceProc), so a spec's
+// output -- a retired burst instance's included -- lives exactly as long as
+// the spec does.
 func (s *LogStore) Retain(specIDs []string) {
 	if s == nil {
 		return
@@ -912,7 +971,7 @@ func (s *LogStore) replayChunkLocked(specID string) (LogBatch, int) {
 // written again, exactly like the immutable strings beside it, so the same
 // reasoning that makes the shallow scrollback snapshot safe applies here.
 func entryOf(r logRecord) LogEntry {
-	return LogEntry{PID: r.pid, At: r.at, Text: r.text, Event: r.event, ExitCode: r.exitCode, Command: r.command}
+	return LogEntry{PID: r.pid, At: r.at, Text: r.text, Event: r.event, ExitCode: r.exitCode, Command: r.command, Instance: r.instance}
 }
 
 // withDropped attaches dropped (bytes lost immediately BEFORE the first entry)
@@ -1016,12 +1075,37 @@ func splitRecord(r logRecord, budget int) (head, tail logRecord, ok bool) {
 	for n > 0 && n < len(r.text) && !utf8.RuneStart(r.text[n]) {
 		n--
 	}
+	n = outsideLinePrefix(r, n)
 	if n == 0 {
 		return logRecord{}, logRecord{}, false
 	}
 	head, tail = r, r
 	head.text, tail.text = r.text[:n], r.text[n:]
 	return head, tail, true
+}
+
+// outsideLinePrefix moves a cut at n in r's text back to the start of its line
+// when n falls inside the "[#k] " prefix the agent put there for instance k.
+// A reader that shows one instance on its own removes that prefix from the
+// start of each line, and it can only recognise the prefix whole: cut through
+// it, the head's last line ends in a fragment like "[#2" and the tail opens
+// with "] ", a line continued mid-way, so neither half is removed and the
+// fragment shows up in that view. Moving the cut to the line start keeps the
+// prefix whole in the tail. The cut only ever moves backwards, so the head
+// still fits the budget; n == 0 then means nothing of r fits before the
+// prefix, which defers r to the next chunk like any record too big for the
+// room left. (A record cannot be alone in a chunk with a budget that small:
+// alone, it has nearly the whole frame.)
+func outsideLinePrefix(r logRecord, n int) int {
+	prefix := instanceLinePrefix(r.instance)
+	if prefix == "" || n <= 0 || n >= len(r.text) {
+		return n
+	}
+	start := strings.LastIndexByte(r.text[:n], '\n') + 1
+	if n-start < len(prefix) && strings.HasPrefix(r.text[start:], prefix) {
+		return start
+	}
+	return n
 }
 
 // entryWireMax is an upper bound on the bytes one LogEntry costs inside a
@@ -1116,17 +1200,28 @@ func (s *LogStore) tail(specID string, gen uint64, n int) string {
 // exec.Cmd for both stdout and stderr, plus the two lifecycle markers the
 // manager records around the process's life.
 //
-// Write is called concurrently from os/exec's two copying goroutines (one per
-// stream), which is why every mutation goes through LogStore's mutex. The pid
-// is an atomic because it is stored by the owner goroutine immediately after
-// cmd.Start while those two goroutines may already be copying: output written
-// in that sliver carries pid 0, and the started marker that follows carries
-// the real one.
+// Write may be called concurrently from os/exec's copying goroutines, which is
+// why every mutation goes through LogStore's mutex. The pid is an atomic
+// because it is stored by the owner goroutine immediately after cmd.Start
+// while a copying goroutine may already be copying: output written in that
+// sliver carries pid 0, and the started marker that follows carries the real
+// one.
+//
+// specID is always the BASE spec's ID (#340): a further instance of a
+// replicable spec writes into its spec's buffer, every line opened by prefix
+// ("[#k] "; empty for instance 0, whose bytes pass through untouched), and
+// instance is that k, recorded on every record the generation produces.
+// midLine is whether the generation's last write ended inside a line, so the
+// next byte continues that line rather than opening a new one; it is guarded
+// by the store's mutex like everything else a write touches.
 type procLog struct {
-	store  *LogStore
-	specID string
-	gen    uint64
-	pid    atomic.Int64
+	store    *LogStore
+	specID   string
+	gen      uint64
+	pid      atomic.Int64
+	instance int
+	prefix   string
+	midLine  bool
 }
 
 // Write implements io.Writer. It never returns an error: there is no failure
@@ -1134,9 +1229,39 @@ type procLog struct {
 // stop copying the stream -- silencing the process the operator is reading.
 func (p *procLog) Write(b []byte) (int, error) {
 	if p.store != nil {
-		p.store.write(p.specID, p.gen, int(p.pid.Load()), b)
+		p.store.write(p, b)
 	}
 	return len(b), nil
+}
+
+// prefixLinesLocked returns b as the text to record: b itself for instance 0,
+// and for a further instance b with p.prefix opening every line that starts in
+// it. A line starts at the generation's first byte and after every '\n'; the
+// prefix is written when the line's first byte arrives, not when the newline
+// before it does, so output that ends with a newline leaves no dangling prefix
+// and a line split across two writes is prefixed once. The caller holds the
+// store's mutex.
+func (p *procLog) prefixLinesLocked(b []byte) string {
+	if p.prefix == "" {
+		return string(b)
+	}
+	var out strings.Builder
+	out.Grow(len(b) + len(p.prefix)*(1+bytes.Count(b, []byte{'\n'})))
+	for len(b) > 0 {
+		if !p.midLine {
+			out.WriteString(p.prefix)
+		}
+		i := bytes.IndexByte(b, '\n')
+		if i < 0 {
+			out.Write(b)
+			p.midLine = true
+			break
+		}
+		out.Write(b[:i+1])
+		b = b[i+1:]
+		p.midLine = false
+	}
+	return out.String()
 }
 
 // Started records the generation boundary that opens this process's output,
@@ -1146,7 +1271,7 @@ func (p *procLog) Write(b []byte) (int, error) {
 func (p *procLog) Started(pid int, cmd ResolvedCommand) {
 	p.pid.Store(int64(pid))
 	if p.store != nil {
-		p.store.mark(p.specID, p.gen, pid, logEventStarted, 0, &cmd)
+		p.store.mark(p, pid, logEventStarted, 0, &cmd)
 	}
 }
 
@@ -1158,7 +1283,7 @@ func (p *procLog) Started(pid int, cmd ResolvedCommand) {
 // would claim output begins here; see logEventStartFailed.
 func (p *procLog) StartFailed(cmd ResolvedCommand) {
 	if p.store != nil {
-		p.store.mark(p.specID, p.gen, 0, logEventStartFailed, 0, &cmd)
+		p.store.mark(p, 0, logEventStartFailed, 0, &cmd)
 	}
 }
 
@@ -1167,7 +1292,7 @@ func (p *procLog) StartFailed(cmd ResolvedCommand) {
 // several attempts, with the exit code of each one in its right place.
 func (p *procLog) Exited(exitCode int) {
 	if p.store != nil {
-		p.store.mark(p.specID, p.gen, int(p.pid.Load()), logEventExited, exitCode, nil)
+		p.store.mark(p, int(p.pid.Load()), logEventExited, exitCode, nil)
 	}
 }
 

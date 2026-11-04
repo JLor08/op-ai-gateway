@@ -92,6 +92,19 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// A document that depends on what this agent declares, before the
+	// declaration is known (after a gateway start, until the agent's first
+	// telemetry sample), is held: 503, no document, no ETag. The agent's
+	// runtime-config source keeps the document it applied on every status but
+	// 200, and the ingest pushes the document once the declaration arrives
+	// (portal.AgentRuntimeConfigDTO.AwaitsAgentFeatures says why serving the
+	// document of an agent without the feature instead would be destructive).
+	if dto.AwaitsAgentFeatures {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, apierror.Response("runtime_config.agent_features_pending", "runtime config is held until the agent declares its features", ""))
+		return
+	}
+
 	etag := `"` + dto.ETag + `"`
 	w.Header().Set("ETag", etag)
 	if etagMatches(r.Header.Get("If-None-Match"), dto.ETag) {
@@ -238,6 +251,14 @@ func (s *Server) pushRuntimeConfigPass(serverID string) (sent bool) {
 		slog.Debug("push runtime config: derive failed", "server_id", serverID, "err", err)
 		return false
 	}
+	if dto.AwaitsAgentFeatures {
+		// Held until the agent's declaration is known -- which a declared
+		// runtime_manager normally implies, so only a declaration forgotten
+		// between the gate above and the derive lands here. The ingest pushes
+		// once a readable declaration arrives.
+		slog.Debug("push runtime config: held until the agent declares its features", "server_id", serverID)
+		return false
+	}
 	b, err := json.Marshal(dto)
 	if err != nil {
 		slog.Debug("push runtime config: marshal failed", "server_id", serverID, "err", err)
@@ -366,7 +387,9 @@ type agentRuntimeReportSpecGPU struct {
 // sanitizeRuntimeReportConfig. Every OTHER non-secret DTO field must appear
 // here, or the sanitizer's re-parse silently drops it from the stored report
 // (issue #64: visible_devices_mode, type and the probe paths were each lost
-// this way, so an args-mode spec showed as env in the report view).
+// this way, so an args-mode spec showed as env in the report view, and later
+// ram_mb). TestAgentRuntimeReportSpecMirrorsEveryNonSecretDTOField holds the
+// two field lists together.
 type agentRuntimeReportSpec struct {
 	ID                          string                      `json:"id"`
 	Model                       string                      `json:"model"`
@@ -376,6 +399,7 @@ type agentRuntimeReportSpec struct {
 	Env                         map[string]string           `json:"env"`
 	WorkDir                     string                      `json:"work_dir,omitempty"`
 	GPUs                        []agentRuntimeReportSpecGPU `json:"gpus"`
+	RAMMB                       int                         `json:"ram_mb"` // host-RAM demand, AgentRuntimeSpecDTO.RAMMB; 0 = unknown
 	ListenPort                  int                         `json:"listen_port"`
 	HealthPath                  string                      `json:"health_path"`
 	HealthTimeoutSeconds        int                         `json:"health_timeout_seconds"`
@@ -399,6 +423,12 @@ type agentRuntimeReportSpec struct {
 	// file says, which may be nothing, so unlike the DTO it is omitempty here:
 	// an absent role stays absent in the stored report instead of becoming "".
 	Role string `json:"role,omitempty"`
+	// Replicable / MinInstances / MaxInstances are the spec's instance settings
+	// (AgentRuntimeSpecDTO's), omitempty like the DTO's, so a stored report of
+	// a spec that is not replicable carries none of the keys.
+	Replicable   bool `json:"replicable,omitempty"`
+	MinInstances int  `json:"min_instances,omitempty"`
+	MaxInstances int  `json:"max_instances,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

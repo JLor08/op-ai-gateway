@@ -204,7 +204,7 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 // (run.publishAudio, the standalone speech run); a VOICE section leg passes its ordered sink so
 // the client sees one monotonic, section-serialized stream across all the turn's legs.
 func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) (json.RawMessage, string, string, bool) {
-	out := s.speechTurnAttempt(ctx, owner, run, prep, liftDeadline, stampTTFT, audioSink)
+	out := s.speechTurnAttempt(ctx, owner, run, prep, speechAttemptOptions{liftDeadline: liftDeadline, stampTTFT: stampTTFT, audioSink: audioSink})
 	return out.parts, out.status, out.errMsg, out.streamed
 }
 
@@ -226,9 +226,24 @@ type speechAttemptResult struct {
 	transient bool
 }
 
+// speechAttemptOptions is how one speech synthesis attempt (speechTurnAttempt) is made and
+// relayed. liftDeadline, stampTTFT and audioSink are generateSpeechTurn's. realtime marks the
+// request as a voice chat's TTS leg (realtimeRequiredHeaderName), which /v1 then routes under
+// the real-time gate; a standalone speech run sets it false. sticky is the voice chat session's
+// instance memory: the request names the instance the speech leg ran on last, and a 2xx records
+// the one it was served on. A standalone speech run passes nil.
+type speechAttemptOptions struct {
+	liftDeadline func()
+	stampTTFT    bool
+	audioSink    func(runAudio)
+	realtime     bool
+	sticky       *voiceStickiness
+}
+
 // speechTurnAttempt is generateSpeechTurn's body: one loopback synthesis request and its outcome,
-// with the retry classification (speechAttemptResult.transient) generateSpeechTurn drops.
-func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) speechAttemptResult {
+// with the retry classification (speechAttemptResult.transient) generateSpeechTurn drops; opts
+// says how it is made and relayed (speechAttemptOptions).
+func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, opts speechAttemptOptions) speechAttemptResult {
 	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
 	build := buildSpeechBody
 	if streaming {
@@ -248,6 +263,10 @@ func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *C
 		return speechAttemptResult{status: "error", errMsg: speechRunDispatchFailedMessage}
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
+	if opts.realtime {
+		req.Header.Set(realtimeRequiredHeaderName, "1")
+	}
+	opts.sticky.prefer(req, voiceLegTTS)
 
 	dispatchedAt := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -262,6 +281,9 @@ func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *C
 		return speechAttemptResult{status: "error", errMsg: speechRunDispatchFailedMessage, transient: true}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		opts.sticky.observe(resp, voiceLegTTS)
+	}
 
 	// The gateway answered the stream request with an event stream: read it as it
 	// comes. (Only a 2xx can be one; anything else, and a one-shot WAV, is read whole
@@ -270,9 +292,9 @@ func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *C
 		parts, status, msg := s.consumeSpeechStream(ctx, run, resp, speechStreamRead{
 			sampleRate:   sampleRate,
 			dispatchedAt: dispatchedAt,
-			liftDeadline: liftDeadline,
-			stampTTFT:    stampTTFT,
-			audioSink:    audioSink,
+			liftDeadline: opts.liftDeadline,
+			stampTTFT:    opts.stampTTFT,
+			audioSink:    opts.audioSink,
 		})
 		// A stream that was accepted is never "transient": audio may already have been
 		// relayed and billed, so its failure is not one a retry could take back.

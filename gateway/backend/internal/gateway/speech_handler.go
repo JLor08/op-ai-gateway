@@ -420,6 +420,7 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 		raw:      raw,
 		pfReq:    req,
 		endpoint: endpointSpeech,
+		reselect: relayAgain(req, func(again inference.Request) { s.relaySpeech(w, r, token, again, raw) }),
 	}
 	_, wantsStream := sniffRoutingModel(raw)
 	if wantsStream {

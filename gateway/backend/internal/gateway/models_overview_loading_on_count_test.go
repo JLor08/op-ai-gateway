@@ -724,3 +724,81 @@ func TestLoadingOnCountFollowsAGeneratedClaudeAlias(t *testing.T) {
 		t.Fatalf("unrelated row loading_on_count = %d, want 0", rows[3].LoadingOnCount)
 	}
 }
+
+// TestLoadingCountCountsServerOnce pins the loading count over a replicable
+// spec: two starting instances of one spec on one server are one server
+// loading the model, counted once, and the server's starting spec is resolved
+// once however many of its instances start.
+func TestLoadingCountCountsServerOnce(t *testing.T) {
+	s := newLoadingOnCountFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ml_a"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: mlMappingA, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}", Replicable: true,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	counting := &countingRuntimeSpecStore{MemoryStore: s.Routes.(*routing.MemoryStore)}
+	s.Routes = counting
+	s.RuntimeStatus.publish(mlServerA, []RuntimeStatusDTO{
+		{SpecID: specID, Instance: 0, Model: mlAppModel, State: "starting"},
+		{SpecID: specID, Instance: 1, Model: mlAppModel + "#1", State: "starting"},
+	})
+
+	dto := fetchModelsOverview(t, s, "/api/portal/models")[mlModel]
+	if dto.LoadingOnCount != 1 {
+		t.Fatalf("loading_on_count = %d, want 1: two starting instances on one server are one server", dto.LoadingOnCount)
+	}
+	if got := counting.runtimeSpecByIDCalls.Load(); got != 1 {
+		t.Fatalf("RuntimeSpecByID calls = %d, want 1: the server's starting spec is resolved once", got)
+	}
+}
+
+// TestLoadingCountIgnoresAScaleUpBesideARunningInstance pins what "loading"
+// means for a replicable spec: the server is loading the model only while no
+// instance of the spec runs there. A burst instance starting beside a running
+// one is a scale-up of a model that already serves, not a load, so routine
+// autoscaling never lights the loading indicator; a starting instance with
+// none running -- instance 0 stopped or crashed -- still is a load.
+func TestLoadingCountIgnoresAScaleUpBesideARunningInstance(t *testing.T) {
+	s := newLoadingOnCountFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ml_scale"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: mlMappingA, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}", Replicable: true,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	cases := []struct {
+		name string
+		rows []RuntimeStatusDTO
+		want int
+	}{
+		{"a burst instance starts beside a running instance 0", []RuntimeStatusDTO{
+			{SpecID: specID, Instance: 1, Model: mlAppModel + "#1", State: "starting"},
+			{SpecID: specID, Instance: 0, Model: mlAppModel, State: "running"},
+		}, 0},
+		{"a burst instance starts beside a running burst instance", []RuntimeStatusDTO{
+			{SpecID: specID, Instance: 0, Model: mlAppModel, State: "crashed"},
+			{SpecID: specID, Instance: 1, Model: mlAppModel + "#1", State: "running"},
+			{SpecID: specID, Instance: 2, Model: mlAppModel + "#2", State: "starting"},
+		}, 0},
+		{"a burst instance starts with nothing running", []RuntimeStatusDTO{
+			{SpecID: specID, Instance: 0, Model: mlAppModel, State: "stopped"},
+			{SpecID: specID, Instance: 1, Model: mlAppModel + "#1", State: "starting"},
+		}, 1},
+		{"instance 0 starts", []RuntimeStatusDTO{
+			{SpecID: specID, Instance: 0, Model: mlAppModel, State: "starting"},
+		}, 1},
+	}
+	for _, tc := range cases {
+		s.RuntimeStatus.publish(mlServerA, tc.rows)
+		if got := fetchModelsOverview(t, s, "/api/portal/models")[mlModel].LoadingOnCount; got != tc.want {
+			t.Errorf("%s: loading_on_count = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

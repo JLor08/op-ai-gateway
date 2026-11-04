@@ -100,6 +100,12 @@ type benchmarkTarget struct {
 	// attaches it to each server_agent target with mayPreStop; it is nil on
 	// every other target.
 	overrides *benchmarkOverrides
+	// stopsFollow marks a target after which a later target of the same run may
+	// still stop the server's running agent models: one with mayPreStop on a
+	// server_agent application (benchmarkStopApplication). runBenchmark sets it
+	// beside overrides. An audio ramp that made its spec replicable again holds
+	// it as one process again only then (audioRampOneProcessAgain).
+	stopsFollow bool
 	// rateIdentity is the loaded-model identity the app-health loop observed when it
 	// started a speech rate benchmark for this target (TriggerSpeechRateBenchmark):
 	// the string runSpeechTarget records beside the output byte rate it caches, so a
@@ -111,8 +117,17 @@ type benchmarkTarget struct {
 	// (#306): the first preset of a configured clone model's voices cache, decided once in
 	// partitionSpeechBenchmarkViews (speechBenchmarkPresetVoice) so the manual run and the
 	// health loop's trigger send the same request. Empty on every other target -- a plain
-	// speech model speaks in its own default voice -- and then the request names none.
+	// speech model speaks in its own default voice -- and then the request names none. The
+	// audio benchmark's targets carry it the same way (benchmarkViewTarget): a clone model
+	// synthesizes the audio passage in that preset.
 	voice string
+	// audio marks an audio-only mapping whose role is speech or transcription, whose speed,
+	// capacity and both runs measure its audio (measureAudioTarget) instead of sending it a
+	// chat prompt: its role and whether it streams. It is decided once, from the mapping's
+	// flavors and capability rows, by the view partition of those modes, the scheduler and
+	// the automatic audio run (benchmarkViewTarget); the zero value is a text target, which a
+	// mapping that serves chat stays even with a speech or transcription verdict.
+	audio audioTarget
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -497,13 +512,14 @@ var (
 type coldStart struct {
 	// confirmed: the next request starts the target from cold, so the cold-minus-warm delta is its
 	// load time. For a server_agent target whose run stops (preStopServer) that means that no
-	// model of the application had a process and the target's own row read stopped, or that the
-	// agent reported every model the stop-all stopped without a process, the target's own row
-	// stopped with pid 0 when it had read backoff, start_failed or crashed, and the clear was
-	// written. When every row was quiet at the selection, every launch spec the run unpinned, the
-	// target aside, also read stopped with pid 0. For one whose run does not stop it means that
-	// the router does not list it, its own status row reads stopped with pid 0 or is absent, and
-	// every other row of a non-empty status snapshot reads stopped with pid 0 (agentColdStart).
+	// model of the application had a process and every row of the target read stopped, or that
+	// the agent reported every model the stop-all stopped without a process, the target's
+	// instance-0 row stopped with pid 0 when it had read backoff, start_failed or crashed, and
+	// the clear was written. When every row was quiet at the selection, every launch spec the run
+	// unpinned, the target aside, also read stopped with pid 0. For one whose run does not stop it
+	// means that the router does not list it, its own instance-0 status row reads stopped with
+	// pid 0 or is absent, and every other row of a non-empty status snapshot reads stopped with
+	// pid 0 (agentColdStart).
 	// For any other target the loaded-models probe confirmed it absent (ensureColdLoadByEviction).
 	confirmed bool
 	// rideOutStop: the target's own force_stopped was or may have been written, so the cold
@@ -640,7 +656,7 @@ func modelLoaded(ctx context.Context, lister provider.LoadedModelLister, target 
 //     under a closed co-residency matrix, and one that can start by itself might start inside
 //     it. This branch writes nothing and returns no error.
 func (s *Server) agentColdStart(ctx context.Context, tgt benchmarkTarget) (coldStart, error) {
-	if tgt.mayPreStop && tgt.overrides != nil && tgt.overrides.stopsAllowed {
+	if coldLoadStopsAll(tgt) {
 		return s.preStopServer(ctx, tgt)
 	}
 	resident, known := s.agentTargetResident(ctx, tgt)
@@ -648,6 +664,14 @@ func (s *Server) agentColdStart(ctx context.Context, tgt benchmarkTarget) (coldS
 		return coldStart{}, nil
 	}
 	return coldStart{confirmed: true}, nil
+}
+
+// coldLoadStopsAll reports whether ensureColdLoad, asked now, runs the stop-all for tgt
+// (preStopServer): a server_agent target of a manual speed or both run that may stop
+// (mayPreStop) while the run's benchmarkOverrides still allow stops. Such a cold start does
+// not depend on what the target held before it, since the stop-all stops the target too.
+func coldLoadStopsAll(tgt benchmarkTarget) bool {
+	return tgt.app.Type == routing.ProviderServerAgent && tgt.mayPreStop && tgt.overrides != nil && tgt.overrides.stopsAllowed
 }
 
 // agentTargetResident reports whether tgt's model is resident on its server_agent application,
@@ -683,9 +707,18 @@ func (s *Server) agentTargetResident(ctx context.Context, tgt benchmarkTarget) (
 // nothing: a request for it starts a genuine cold load at once.
 const agentSpecStateStopped = "stopped"
 
+// agentSpecStateRunning and agentSpecStateStarting are the runtime-status states of an
+// instance whose child serves, and of one whose child is up but not yet healthy.
+const (
+	agentSpecStateRunning  = "running"
+	agentSpecStateStarting = "starting"
+)
+
 // agentSpecResidency is agentTargetResident's reading of the agent's most recent runtime-status
 // snapshot, once the router's loaded set has not listed tgt's model. The row is matched by spec
-// id, never by model name:
+// id, never by model name, and it is the spec's instance-0 row, the one tgt's model name
+// reaches: another instance of a replicable target is one of the others benchmarkOthersStopped
+// reads.
 //   - a state with a live process (vramStatesWithProcess: running, starting, draining), or any
 //     process id, is resident: a child /running does not list yet or no longer lists, or a
 //     start_failed child whose process is still up;
@@ -699,7 +732,7 @@ func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) 
 		return false, true
 	}
 	for _, row := range s.RuntimeStatus.statusSnapshot(tgt.server.ID) {
-		if row.SpecID != tgt.spec.ID {
+		if row.SpecID != tgt.spec.ID || row.Instance != 0 {
 			continue
 		}
 		switch {
@@ -715,7 +748,9 @@ func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) 
 }
 
 // benchmarkOthersStopped reports whether rows is not empty and every row of it reads stopped
-// with pid 0, except the row of specID itself, which agentSpecResidency has already read. A
+// with pid 0, except the row of specID itself, which agentSpecResidency has already read. That
+// row is specID's instance-0 row: every other instance of a replicable target is an other here,
+// since a burst instance that runs holds the memory a cold pass would be measured against. A
 // target without a spec (specID "") has no row of its own, so every row counts, one without a
 // spec id included. A neighbour in backoff, not_permitted or pending_vram_unknown has no process
 // now, but a pinned or force_running one can start one by itself: when its backoff timer fires,
@@ -731,7 +766,7 @@ func benchmarkOthersStopped(rows []RuntimeStatusDTO, specID string) bool {
 		return false
 	}
 	for _, row := range rows {
-		if specID != "" && row.SpecID == specID {
+		if specID != "" && row.SpecID == specID && row.Instance == 0 {
 			continue
 		}
 		if row.State != agentSpecStateStopped || row.PID != 0 {
@@ -857,7 +892,8 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 // finishes the run (clearing the server-busy state) even on error/cancel. mode selects
 // what is measured per target: "speed" (throughput/load, the pre-CP2 behavior), "capacity"
 // (the OOM-safe concurrency ramp), "both" (speed then capacity, so metrics_source ends
-// "capacity"), or "vision" (the image-acceptance probe: on a definitive verdict, writes
+// "capacity") -- for an audio target (benchmarkTarget.audio) these three measure its audio
+// instead (measureAudioTarget, benchmark_audio.go) -- or "vision" (the image-acceptance probe: on a definitive verdict, writes
 // the mapping's `vision` capability row, sourced vision_benchmark, subject to the same
 // precedence rank every capability writer obeys -- routing.WritableCapabilityRows -- so
 // it never overwrites an operator's CapabilitySourceManual verdict; always appends a
@@ -883,13 +919,22 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 	// server's reservation and operator writes to its launch specs stay refused.
 	ov := s.beginBenchmarkUnpin(ctx, run, serverID, targets)
 	defer s.endBenchmarkUnpin(ctx, run, serverID, ov, &runErr)
-	for _, tgt := range targets {
+	for i, tgt := range targets {
 		if tgt.mayPreStop && tgt.app.Type == routing.ProviderServerAgent {
 			tgt.overrides = ov
+			_, tgt.stopsFollow = benchmarkStopApplication(targets[i+1:])
 		}
 		if ctx.Err() != nil {
 			runErr = "canceled"
 			return
+		}
+		if tgt.audio.role != "" && benchmarkModeMeasuresAudio(mode) {
+			// An audio target's speed, capacity and both modes measure its audio instead of
+			// sending it a chat prompt, and record their own history rows.
+			res, _ := s.measureAudioTarget(ctx, run, tgt, mode)
+			run.addResult(res)
+			s.Benchmarks.publish(serverID, run.snapshot())
+			continue
 		}
 		var res BenchmarkResult
 		// speedErr is the SPEED measurement's own error, captured before a "both" run
@@ -1164,14 +1209,22 @@ func (s *Server) benchmarkTelemetryContextSize(ctx context.Context, tgt benchmar
 	}
 }
 
-// benchmarkSpecStatus returns specID's row of one status frame.
+// benchmarkSpecStatus returns specID's row of one status frame: the spec's representative row
+// (runtimeRowRepresentative: the running instance-0 row, else the running row with the lowest
+// index, else the instance-0 row, else the lowest index), the row every other view of the spec
+// reads too. A replicable spec reports a row per instance under the one spec id; ok is false
+// only when the frame has none of them. Two questions are about instance 0 alone, the instance
+// the target's plain model name reaches and a benchmark's requests go to, and read its row
+// directly instead: whether the target is resident (agentSpecResidency) and whether the
+// stop-all's quiet wait also waits for the target to read stopped (benchmarkStopSelectionOf).
 func benchmarkSpecStatus(frame []RuntimeStatusDTO, specID string) (RuntimeStatusDTO, bool) {
+	var rows []RuntimeStatusDTO
 	for _, row := range frame {
 		if row.SpecID == specID {
-			return row, true
+			rows = append(rows, row)
 		}
 	}
-	return RuntimeStatusDTO{}, false
+	return runtimeRowRepresentative(rows)
 }
 
 // benchmarkSnapshotContextSize decides on the snapshot a subscription starts
@@ -1281,6 +1334,7 @@ func (s *Server) measureSpeedTarget(ctx context.Context, tgt benchmarkTarget) Be
 		// Both writes skip a locked mapping. This write never touches
 		// context_size, so a probed context survives.
 		_ = s.Routes.UpdateMappingBenchmarkMetrics(ctx, tgt.mapping.ID, res.GenTokensPerSecond, res.PromptTokensPerSecond, res.LoadTimeMS, time.Now().UTC())
+		s.pushBenchmarkLoadTime(tgt, res.LoadTimeMS)
 	}
 	return res
 }

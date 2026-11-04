@@ -73,12 +73,10 @@ func TestMigration94CreatesModelMappingCache(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create application: %v", err)
 		}
-		if err := s.CreateMapping(ctx, routing.ModelMapping{
+		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m94", ApplicationID: "app_m94", GatewayModelName: "m94-model", AppModelName: "up-m94",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create mapping: %v", err)
-		}
+		})
 
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatalf("migrate to head: %v", err)

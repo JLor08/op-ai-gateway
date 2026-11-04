@@ -47,8 +47,16 @@ func (m *ensureStubManager) EnsureRunning(_ context.Context, model string) (stri
 		}
 	}, nil
 }
-func (m *ensureStubManager) LoadedModels() []string { return nil }
-func (m *ensureStubManager) Status() []Status       { return nil }
+
+// EnsureServing records like EnsureRunning; the /ensure tests never make it.
+func (m *ensureStubManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	return m.EnsureRunning(ctx, model)
+}
+
+// ResolveAddress names no instance address: every model is its own, instance 0.
+func (m *ensureStubManager) ResolveAddress(string) (string, int, bool) { return "", 0, false }
+func (m *ensureStubManager) LoadedModels() []string                    { return nil }
+func (m *ensureStubManager) Status() []Status                          { return nil }
 
 // readRequestLog returns the lines of a stubchild -request-log file, or none
 // when the child never wrote one.

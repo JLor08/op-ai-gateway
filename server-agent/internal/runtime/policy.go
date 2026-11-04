@@ -6,6 +6,7 @@ package runtime
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -15,8 +16,29 @@ import (
 // else the spec's estimate. Admit trusts this number exactly as given; it
 // never re-derives or looks up an estimate elsewhere.
 type RunningProc struct {
+	// SpecID is the process's unique key: the spec ID for instance 0 (and for
+	// every spec that never replicates), the instance key S#k for instance k
+	// >= 1 (#340). The self-filter, the victim set and Decision.Evict all speak
+	// in it, so two instances of one spec are two distinct occupants.
 	SpecID string
-	GPUs   map[int]int // gpu index -> effective VRAM MB
+	// Spec is the BASE spec ID the process is an instance of, and Instance its
+	// index k. They are what makes instances of one spec SIBLINGS to admission
+	// (baseOf): siblings always co-reside, a sibling is never a victim for a
+	// candidate of its own spec, a pair is looked up by base so an instance
+	// inherits its spec's matrix verdicts, and an instance is not evictable
+	// while a higher-index sibling stays running (the "highest index leaves
+	// first" ordering invariant). Spec == "" reads as SpecID, so a process built
+	// without it -- any snapshot that predates instances, every table test --
+	// is its own base at instance 0, exactly as before instances existed.
+	Spec     string
+	Instance int
+	// Surplus marks a running BURST instance (IsBurst): capacity above the
+	// spec's protected floor, started on demand. Evicting one costs the least
+	// of any victim, since its spec keeps serving from a lower sibling, so
+	// orderVictims draws surplus instances before every other idle victim. It
+	// changes only WHICH victim goes first, never WHETHER one may go.
+	Surplus bool
+	GPUs    map[int]int // gpu index -> effective VRAM MB
 	// RAMMB is the EFFECTIVE host RAM the process occupies, in MB: the live
 	// measurement when the agent has one, floored at the spec's pushed demand.
 	// It is host-scoped -- one number per process, not per GPU -- and Admit
@@ -182,6 +204,16 @@ type PolicySnapshot struct {
 	// order), so false -- the default every table test and every already-measured
 	// spec gets -- is pure ADR-032.
 	VRAMBootstrapEligible bool
+	// NoEvict makes this admission all-or-nothing and immediate: the candidate
+	// may start only into room that is free RIGHT NOW. It is a per-candidate
+	// setting like VRAMBootstrapEligible, which the owner sets for a BURST
+	// instance (#340, IsBurst): burst capacity is opportunistic, so it must
+	// never drain-stop a neighbour, queue behind one, or spend a bootstrap shot
+	// to get in -- the gateway would rather place it on another host. Under it
+	// Admit answers OK or Decision.NoCapacity and nothing else (step 8 in
+	// Admit). false -- every baseline instance, every spec that never
+	// replicates, every table test -- leaves Admit exactly as it was.
+	NoEvict bool
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
@@ -191,11 +223,13 @@ type PolicySnapshot struct {
 	Allowed map[[2]string]bool
 }
 
-// Decision is Admit's answer. Exactly one of four shapes holds:
+// Decision is Admit's answer. Exactly one of four shapes holds, plus a fifth,
+// NoCapacity (see that field), that only a NoEvict admission answers:
 //   - OK: spec may start now. Evict is empty, Wait is false, Reason is "".
 //   - Evict-then-retry: OK is false, Evict names the idle victims to
-//     drain-stop first, oldest LastUsed first. Once they are gone, Admit
-//     applied again to the reduced running set is expected to return OK.
+//     drain-stop first, oldest LastUsed first (the instances of one spec
+//     highest index first, see siblingsHighestFirst). Once they are gone,
+//     Admit applied again to the reduced running set is expected to return OK.
 //   - Wait: OK is false, Wait is true, Evict is empty. Nothing MAY be evicted
 //     to help right now, so the caller queues the request and re-asks on the
 //     next completion. Two different situations reach that, and only the
@@ -265,7 +299,7 @@ type Decision struct {
 	// that need never resolve by itself. "" otherwise -- and in particular on
 	// every ordinary Wait.
 	Message string
-	Evict   []string // spec IDs to drain-stop first, oldest LastUsed first; never nil
+	Evict   []string // spec IDs (instance keys) to drain-stop first, oldest LastUsed first, siblings highest index first; never nil
 	Wait    bool
 	// WaitOnRAM is set only together with Wait, and only when rule 6 (the
 	// host-RAM pool) was among what blocked: the idle processes could not free
@@ -305,6 +339,37 @@ type Decision struct {
 	// or the process limit leaves it false, so the owner burns the shot only when
 	// the bootstrap actually used it.
 	VRAMBootstrap bool
+	// NoCapacity is the fifth shape, and the only non-OK one a NoEvict
+	// admission answers (PolicySnapshot.NoEvict): OK, Wait, WaitOnRAM,
+	// WaitOnGrace and VRAMBootstrap are false, Reason is "", Evict is empty, and
+	// Message names what the pipeline would otherwise have answered -- the
+	// victims it would have evicted, what it would have waited for, or the
+	// terminal cause. It replaces every one of those, terminals included,
+	// because a burst instance is never queued, never evicts and never parks in
+	// a durable state: the caller refuses the start at once and the gateway
+	// tries another host. Never set without NoEvict.
+	NoCapacity bool
+}
+
+// baseOf returns the base spec ID r is an instance of: r.Spec, or r.SpecID
+// when Spec is unset -- a process built without instance fields is its own
+// base, which keeps every non-replicable spec (and every snapshot that never
+// heard of instances) exactly as it was. See RunningProc.Spec.
+func baseOf(r RunningProc) string {
+	if r.Spec == "" {
+		return r.SpecID
+	}
+	return r.Spec
+}
+
+// specBase is baseOf's candidate-side twin: the base spec ID spec is an
+// instance of -- spec.InstanceOf for an instance copy k >= 1, else spec.ID
+// itself (instance 0, and every spec that never replicates).
+func specBase(spec Spec) string {
+	if spec.InstanceOf == "" {
+		return spec.ID
+	}
+	return spec.InstanceOf
 }
 
 // PairKey canonicalizes an (a, b) spec-ID pair to lexical a<=b order, so an
@@ -684,6 +749,10 @@ func ramOwnDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
 // is only what rule 5 itself introduced: before rule 5 existed, this exact
 // snapshot answered Wait, which queued the request to its admission timeout;
 // rule 5 turned it into a terminal naming a cause that resolves nothing.
+//
+// The pair is read exactly as rule 1 reads it (pairAllowed): by base spec, with
+// siblings always open, so a pinned sibling of unknown demand is reported as
+// the missing number it is, never as a closed cell the matrix cannot even hold.
 func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []RunningProc, gpuIdx []int) (Decision, bool) {
 	var (
 		blocker    RunningProc
@@ -691,6 +760,7 @@ func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []Runn
 		pairClosed bool
 		found      bool
 	)
+	base := specBase(spec)
 	for _, r := range running {
 		if !r.Pinned || !procHasUnknownVRAM(r) {
 			continue
@@ -699,7 +769,7 @@ func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []Runn
 		if !shares {
 			continue
 		}
-		closed := !snap.Allowed[PairKey(spec.ID, r.SpecID)]
+		closed := !pairAllowed(snap.Allowed, base, r)
 		if found && !outranksAsBlocker(closed, r.SpecID, pairClosed, blocker.SpecID) {
 			continue
 		}
@@ -737,6 +807,17 @@ func outranksAsBlocker(closed bool, id string, bestClosed bool, bestID string) b
 		return closed
 	}
 	return id < bestID
+}
+
+// pairAllowed reports whether a candidate of base spec candidateBase may run
+// next to r. Siblings (r is an instance of the same spec) always may: the
+// gateway's matrix never holds a self-pair, so reading one would make every
+// spec matrix-incompatible with its own instances. Any other pair is looked up
+// by BASE spec IDs, so an instance inherits its spec's verdicts on either side
+// of the pair and the matrix needs no entries per instance (#340).
+func pairAllowed(allowed map[[2]string]bool, candidateBase string, r RunningProc) bool {
+	occupantBase := baseOf(r)
+	return occupantBase == candidateBase || allowed[PairKey(candidateBase, occupantBase)]
 }
 
 // sortOldestFirst orders procs by LastUsed ascending (ties on SpecID): the order
@@ -777,8 +858,19 @@ func sortOldestFirst(procs []RunningProc) {
 // The candidate's role is a.candidateRole (roleOf(spec.Role)), normalized once in
 // newAdmission so this comparison matches the already-normalized
 // RunningProc.Role every occupant carries (buildSnapshot sets it through roleOf).
+//
+// SURPLUS INSTANCES COME FIRST, ahead of the role band (#340): a running burst
+// instance is the cheapest victim there is, because its spec keeps serving
+// from a lower sibling -- so it also never strands a role, which is what the
+// role band protects. Within the surplus band the existing
+// keys apply. Within ONE spec the instances then go highest index first
+// (siblingsHighestFirst): the draw loops ask evictable as they go, and a lower
+// instance only qualifies once every higher running sibling is queued.
 func (a *admission) orderVictims(procs []RunningProc) {
 	sort.Slice(procs, func(i, j int) bool {
+		if procs[i].Surplus != procs[j].Surplus {
+			return procs[i].Surplus // a burst instance is drawn first
+		}
 		iSame := procs[i].Role == a.candidateRole
 		jSame := procs[j].Role == a.candidateRole
 		if iSame != jSame {
@@ -789,6 +881,45 @@ func (a *admission) orderVictims(procs []RunningProc) {
 		}
 		return procs[i].SpecID < procs[j].SpecID
 	})
+	siblingsHighestFirst(procs)
+}
+
+// siblingsHighestFirst reorders the instances of each spec within the
+// positions they already hold in procs, highest index first, leaving every
+// other entry where it is. The order procs was sorted into decides WHEN a
+// spec's turn comes (its best-placed instance sets it); the ordering invariant
+// decides WHICH instance takes that turn -- always the highest one still there.
+//
+// It is a permutation applied after the sort rather than an instance key inside
+// the comparator because the latter is not a strict weak order: "higher index
+// first within a spec" next to "least recently used first across specs" can
+// cycle (A#2 before A#1 by index, A#1 before B by age, B before A#2 by age), and
+// sort.Slice's result is undefined for such a comparator. A no-op for a list
+// with no two siblings, i.e. for every spec that never replicates.
+func siblingsHighestFirst(procs []RunningProc) {
+	slots := make(map[string][]int)
+	for i, r := range procs {
+		base := baseOf(r)
+		slots[base] = append(slots[base], i)
+	}
+	for _, idx := range slots {
+		if len(idx) < 2 {
+			continue
+		}
+		members := make([]RunningProc, len(idx))
+		for j, i := range idx {
+			members[j] = procs[i]
+		}
+		sort.Slice(members, func(x, y int) bool {
+			if members[x].Instance != members[y].Instance {
+				return members[x].Instance > members[y].Instance
+			}
+			return members[x].SpecID < members[y].SpecID
+		})
+		for j, i := range idx {
+			procs[i] = members[j]
+		}
+	}
 }
 
 // admission carries the mutable state Admit accumulates as it walks its
@@ -806,11 +937,18 @@ func (a *admission) orderVictims(procs []RunningProc) {
 // order Admit calls them; each one's doc comment carries the reasoning that was
 // inline in the single function before the extraction.
 type admission struct {
-	snap        PolicySnapshot
-	spec        Spec
-	running     []RunningProc // self-filtered: never a RunningProc sharing spec.ID
+	snap PolicySnapshot
+	spec Spec
+	// running is self-filtered -- never a RunningProc sharing spec.ID (the
+	// instance key) -- and ordered siblings-highest-index-first (newAdmission),
+	// so a rule that walks it and queues every qualifying occupant meets S#2
+	// before S#1 before S, and each finds its higher siblings already queued.
+	running     []RunningProc
 	unknownVRAM bool
 	gpuIdx      []int
+	// base is specBase(spec): the spec the candidate is an instance of, the side
+	// every sibling test and every matrix lookup uses (#340).
+	base string
 	// candidateRole is roleOf(spec.Role): the candidate's model role, normalized
 	// once here so orderVictims can compare it against each occupant's already-
 	// normalized RunningProc.Role (buildSnapshot sets that through the same roleOf).
@@ -843,18 +981,67 @@ type admission struct {
 // evictable is isEvictable against this admission's snapshot: the one gate every
 // rule asks, so the grace window (snap.Now, snap.EvictionGrace) is applied to
 // each of them identically and cannot be forgotten by a rule added later.
+//
+// Two instance clauses (#340) live here for the same reason.
+// A SIBLING is never a victim for a candidate of its own spec: evicting a warm
+// instance to start a cold one of the same model is never useful. And an
+// instance is not evictable while a HIGHER-INDEX sibling runs -- the "highest
+// index leaves first" ordering invariant, which keeps instance 0 the last of a
+// spec to go and lets the burst/baseline split be decided by index alone. Both
+// only shrink the victim set, so a blocker they spare reads exactly like a busy
+// one: the start Waits.
+//
+// The invariant clause reads toEvict, so evictable is a question about NOW, in
+// the middle of the pipeline: a sibling already queued to go no longer holds a
+// lower one back (higherSiblingStays). That is what lets one decision evict a
+// whole run of idle siblings, highest first, when the start needs all of them
+// gone. Callers therefore ask it at the moment they would queue a victim, and
+// walk siblings highest index first (newAdmission, orderVictims) so the higher
+// ones are queued by the time the lower ones are asked about.
 func (a *admission) evictable(r RunningProc) bool {
-	return isEvictable(r, a.snap.Now, a.snap.EvictionGrace)
+	return a.mayEvict(r) && !a.higherSiblingStays(r)
 }
 
-// evictableOf returns the subset of procs that may be drained now (evictable),
-// preserving input order. It is the idle-victim filter rule 3 (chargeGPUBudget)
-// and rule 6 (ruleHostRAM) share before ordering victims with orderVictims
-// (the candidate's own role first, then least-recently-used).
+// mayEvict is evictable without the ordering-invariant clause: the part that
+// does not change as victims are queued -- isEvictable, and never a sibling of
+// the candidate. It is the prefilter for victim lists (evictableOf and rule 2's
+// candidates); whether a listed victim may go yet is evictable's call, asked
+// when it is drawn.
+func (a *admission) mayEvict(r RunningProc) bool {
+	return isEvictable(r, a.snap.Now, a.snap.EvictionGrace) && baseOf(r) != a.base
+}
+
+// higherSiblingStays reports whether a sibling of r with a higher index is
+// running and NOT already queued in toEvict -- i.e. whether evicting r now would
+// break "highest index leaves first".
+//
+// Discounting the queued ones is a liveness requirement, not an optimisation.
+// Without it one admission could evict at most the highest instance of each
+// spec, so a start that needs S#2 AND S#1 gone found S#1 unevictable, blocked,
+// and answered Wait -- and a Wait evicts nothing, so S#2 was never drained either
+// and the start sat until an idle unload happened to run.
+func (a *admission) higherSiblingStays(r RunningProc) bool {
+	base := baseOf(r)
+	for _, o := range a.running {
+		if o.Instance <= r.Instance || baseOf(o) != base {
+			continue
+		}
+		if _, going := a.toEvict[o.SpecID]; !going {
+			return true
+		}
+	}
+	return false
+}
+
+// evictableOf returns the subset of procs that may be victims of this admission
+// at all (mayEvict), preserving input order. It is the idle-victim prefilter
+// rule 3 (chargeGPUBudget) and rule 6 (ruleHostRAM) share before ordering
+// victims with orderVictims; each draw then asks evictable for the ordering
+// invariant against what is already queued.
 func (a *admission) evictableOf(procs []RunningProc) []RunningProc {
 	var out []RunningProc
 	for _, r := range procs {
-		if a.evictable(r) {
+		if a.mayEvict(r) {
 			out = append(out, r)
 		}
 	}
@@ -865,7 +1052,16 @@ func (a *admission) evictableOf(procs []RunningProc) []RunningProc {
 // self-filter: a RunningProc sharing spec.ID -- e.g. a double-start race, or a
 // snapshot assembled a moment too early or late -- is never a blocker or a
 // victim for its own candidate (see Admit's step 0), so it is dropped once, up
-// front, and none of the rules below can see it.
+// front, and none of the rules below can see it. The filter is by SpecID, the
+// instance key, so a SIBLING stays in: it is an ordinary occupant whose VRAM and
+// RAM are summed and which counts toward max_processes (#340).
+//
+// The kept set is then put in a total order -- by base spec, highest instance
+// first, then SpecID -- so that the rules which queue EVERY qualifying occupant
+// (1, 4's bootstrap arm, 5) meet a spec's instances highest index first and each
+// lower one finds its higher siblings already queued (see evictable). Snapshot
+// order carried no meaning to lose: it is Go map order (owner.buildSnapshot
+// ranges over o.specs), and every rule's verdict was already independent of it.
 func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 	running := make([]RunningProc, 0, len(snap.Running))
 	for _, r := range snap.Running {
@@ -873,12 +1069,23 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 			running = append(running, r)
 		}
 	}
+	sort.Slice(running, func(i, j int) bool {
+		bi, bj := baseOf(running[i]), baseOf(running[j])
+		if bi != bj {
+			return bi < bj
+		}
+		if running[i].Instance != running[j].Instance {
+			return running[i].Instance > running[j].Instance
+		}
+		return running[i].SpecID < running[j].SpecID
+	})
 	return &admission{
 		snap:          snap,
 		spec:          spec,
 		running:       running,
 		unknownVRAM:   specHasUnknownVRAM(spec),
 		gpuIdx:        specGPUIndexes(spec),
+		base:          specBase(spec),
 		candidateRole: roleOf(spec.Role),
 		toEvict:       make(map[string]RunningProc),
 	}
@@ -904,8 +1111,9 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //
 // Kept as a small, deliberately linear pipeline rather than a clever one,
 // since it will be read far more often than it will be changed. Each numbered
-// step is a method on admission (step 0 is newAdmission), run here in the one
-// order the shared-state chaining makes correct:
+// step is a method on admission (step 0 is newAdmission), run by admitSteps in
+// the one order the shared-state chaining makes correct; step 8 is applied here
+// to whatever they answer:
 //
 //  0. Self-filter. A RunningProc sharing spec.ID -- e.g. a double-start
 //     race, or a snapshot assembled a moment too early or late -- is never
@@ -914,7 +1122,10 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     matrix never contains a self-pair, so leaving it in would read as
 //     matrix-incompatible with itself). Filtered out once, up front, so
 //     none of the rules below can propose evicting the very process being
-//     started or wait on it forever.
+//     started or wait on it forever. spec.ID is the INSTANCE key (#340), so
+//     the candidate's siblings stay in as ordinary occupants -- summed into
+//     every resource rule, counted toward the process limit, but always
+//     matrix-compatible (pairAllowed) and never victims (evictable).
 //  1. Rule 3's own-demand half, hoisted ahead of everything that reads
 //     the running set: a declared demand that exceeds its own GPU's
 //     budget by itself refuses terminally, because no running set, no
@@ -979,7 +1190,65 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     of the blockers would not actually unblock a retry. Otherwise an
 //     empty evict set means OK; a non-empty one means Evict-then-retry,
 //     ordered oldest LastUsed first.
+//  8. NoEvict gate (snap.NoEvict -- a burst instance, #340). That admission
+//     is all-or-nothing and immediate, so anything but a plain OK -- an
+//     Evict, any Wait, a VRAM bootstrap, or a terminal from step 1 or 2 --
+//     becomes Decision.NoCapacity, with a Message naming what steps 0-7
+//     answered (noEvictGate). It only rewrites the finished answer, so no
+//     rule's verdict depends on it, and without NoEvict it is a no-op.
 func Admit(snap PolicySnapshot, spec Spec) Decision {
+	dec := admitSteps(snap, spec)
+	if snap.NoEvict {
+		return noEvictGate(spec, dec)
+	}
+	return dec
+}
+
+// noEvictGate is Admit's step 8: under PolicySnapshot.NoEvict, an OK passes
+// and every other answer becomes Decision.NoCapacity. Terminals are mapped too
+// (the own-demand refusals of step 1 included): a burst instance never parks in
+// a durable state, and another host may well have the room this one lacks, so
+// the one useful answer is "not here, now". The Message keeps the cause an
+// operator needs -- the victims, the wait, or the terminal's own explanation.
+// Evict is set to an empty slice, never nil, as on every other shape.
+func noEvictGate(spec Spec, dec Decision) Decision {
+	if dec.OK {
+		return dec
+	}
+	return Decision{
+		NoCapacity: true,
+		Message: fmt.Sprintf(
+			"spec %s: no free capacity to start without evicting or waiting: %s",
+			spec.ID, noCapacityCause(dec),
+		),
+		Evict: []string{},
+	}
+}
+
+// noCapacityCause names what a non-OK Decision would have done, for
+// noEvictGate's Message.
+func noCapacityCause(dec Decision) string {
+	switch {
+	case dec.Reason != "" && dec.Message != "":
+		return fmt.Sprintf("%s (%s)", dec.Reason, dec.Message)
+	case dec.Reason != "":
+		return string(dec.Reason)
+	case len(dec.Evict) > 0:
+		return "it would evict " + strings.Join(dec.Evict, ", ")
+	case dec.Message != "":
+		return "it would wait: " + dec.Message
+	case dec.WaitOnRAM:
+		return "it would wait for host RAM"
+	case dec.WaitOnGrace:
+		return "it would wait for an occupant's eviction grace to expire"
+	default:
+		return "it would wait for an occupant that cannot be evicted now"
+	}
+}
+
+// admitSteps runs Admit's steps 0-7 -- everything but the NoEvict gate -- in
+// the order Admit documents.
+func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	a := newAdmission(snap, spec)
 
 	// Step 1. Spec's own declared demand against its own budgets, which is
@@ -1048,10 +1317,11 @@ func pinnedUnknownCandidateRefusal(running []RunningProc, gpuIdx []int) (Decisio
 
 // ruleMatrix is rule 1: matrix compatibility. Every running process whose pair
 // with spec is not allowed must go -- queued if evictable, otherwise it blocks
-// the whole decision.
+// the whole decision. Siblings are always allowed and every other pair is read
+// by base spec (pairAllowed), so an instance carries its spec's verdicts.
 func (a *admission) ruleMatrix() {
 	for _, r := range a.running {
-		if a.snap.Allowed[PairKey(a.spec.ID, r.SpecID)] {
+		if pairAllowed(a.snap.Allowed, a.base, r) {
 			continue
 		}
 		if a.evictable(r) {
@@ -1322,6 +1592,9 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 		if sum <= budget {
 			break
 		}
+		if !a.evictable(r) {
+			continue // a higher sibling stays running (higherSiblingStays)
+		}
 		a.toEvict[r.SpecID] = r
 		sum -= r.GPUs[g.Index]
 	}
@@ -1425,6 +1698,9 @@ func (a *admission) ruleHostRAM() {
 		if sum <= a.snap.HostRAMBudgetMB {
 			break
 		}
+		if !a.evictable(r) {
+			continue // a higher sibling stays running (higherSiblingStays)
+		}
 		a.toEvict[r.SpecID] = r
 		sum -= r.RAMMB
 	}
@@ -1451,23 +1727,32 @@ func (a *admission) ruleProcessCount() {
 		if _, already := a.toEvict[r.SpecID]; already {
 			continue
 		}
-		if a.evictable(r) {
+		if a.mayEvict(r) {
 			candidates = append(candidates, r)
 		}
 	}
 	a.orderVictims(candidates)
-	if len(candidates) < deficit {
-		a.blocked = true
+	drawn := 0
+	for _, r := range candidates {
+		if drawn == deficit {
+			break
+		}
+		if !a.evictable(r) {
+			continue // a higher sibling stays running (higherSiblingStays)
+		}
+		a.toEvict[r.SpecID] = r
+		drawn++
 	}
-	for i := 0; i < deficit && i < len(candidates); i++ {
-		a.toEvict[candidates[i].SpecID] = candidates[i]
+	if drawn < deficit {
+		a.blocked = true
 	}
 }
 
 // decide builds the final Decision from the accumulated state (step 7). Any
 // non-evictable blocker anywhere makes the answer Wait with an empty Evict list;
 // otherwise an empty toEvict means OK and a non-empty one means
-// Evict-then-retry, ordered oldest LastUsed first.
+// Evict-then-retry, ordered oldest LastUsed first -- except that the instances
+// of one spec take that spec's places highest index first.
 func (a *admission) decide() Decision {
 	if a.blocked {
 		return Decision{
@@ -1487,6 +1772,9 @@ func (a *admission) decide() Decision {
 		victims = append(victims, r)
 	}
 	sortOldestFirst(victims)
+	// The drain order keeps "highest index leaves first" too: the owner begins
+	// the drains in list order, so S#2 is asked to leave before S#1.
+	siblingsHighestFirst(victims)
 	evict := make([]string, len(victims))
 	for i, r := range victims {
 		evict[i] = r.SpecID
@@ -1521,13 +1809,18 @@ func (a *admission) decide() Decision {
 // bounded: the counterfactual snapshot has grace 0, so the EvictionGrace > 0
 // guard below stops it recursing a second time. It runs only on the already-rare
 // blocked path, and only when a grace window is actually configured.
+//
+// The counterfactual runs steps 0-7 only (admitSteps), never the NoEvict gate:
+// that gate would rewrite every non-OK answer into a NoCapacity that reads as
+// "proceeds". Under NoEvict the flag never reaches the caller as a wake (step 8
+// replaces the Wait), but it still names the cause in NoCapacity's Message.
 func (a *admission) blockedSolelyByGrace() bool {
 	if a.snap.EvictionGrace <= 0 {
 		return false
 	}
 	noGrace := a.snap
 	noGrace.EvictionGrace = 0
-	alt := Admit(noGrace, a.spec)
+	alt := admitSteps(noGrace, a.spec)
 	// Proceeds == not a Wait and not a terminal: an OK or an Evict. A terminal
 	// cannot actually arise here (no terminal fired on the grace-on run, and
 	// terminals are grace-independent), but requiring Reason == "" states the

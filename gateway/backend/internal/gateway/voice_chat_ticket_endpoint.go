@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
@@ -92,6 +93,8 @@ func voiceChatRefusal(code string) (int, apierror.Body) {
 		return http.StatusBadRequest, apierror.Response(code, "the chat's speech settings cannot be used for a voice chat: they are unreadable or too large", "")
 	case voiceChatCoLoadFailed:
 		return http.StatusConflict, apierror.Response(code, "the chosen models could not be loaded together", "")
+	case voiceChatNoRealtimeModel:
+		return http.StatusConflict, apierror.Response(code, voiceNoRealtimeMessage, "")
 	default:
 		return http.StatusInternalServerError, apierror.Response(voiceChatTicketFailed, "voice chat ticket could not be issued", "")
 	}
@@ -100,6 +103,18 @@ func voiceChatRefusal(code string) (int, apierror.Body) {
 func writeVoiceChatRefusal(w http.ResponseWriter, code string) {
 	status, body := voiceChatRefusal(code)
 	writeJSON(w, status, body)
+}
+
+// voiceNoRealtimeMessage is the wording of voiceChatNoRealtimeModel. The gate's answer
+// prefixes the leg ("voice chat tts leg: ..."), the form the portal reads the leg from;
+// the leg is the gate's own constant, so nothing of the cause reaches the client.
+const voiceNoRealtimeMessage = "no server of the chosen model is measured fast enough to keep up with real time"
+
+// voiceLegNoRealtimeMessage is voiceNoRealtimeMessage naming leg ("voice chat tts leg: ..."):
+// the gate's refusal at the ticket mint and a turn's error frame when /v1 refuses the leg's
+// per-turn request as too slow, so the portal reads the leg the same way from either.
+func voiceLegNoRealtimeMessage(leg voiceLeg) string {
+	return fmt.Sprintf("voice chat %s leg: %s", leg, voiceNoRealtimeMessage)
 }
 
 // voiceCoLoadBound is the deadline the gate runs under: the configured one, or the default
@@ -237,7 +252,7 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 	}
 	// The ticket is issued, so a session will open on this speech target and voice: warm them in
 	// the background. It returns at once and the ticket never waits for it or depends on it.
-	s.startVoicePrewarm(tts, audio.Voice)
+	s.startVoicePrewarm(tts, audio.Voice, voicePrewarmOwner{token: token, reqPath: r.URL.Path})
 	writeJSON(w, http.StatusOK, voiceChatTicketResponse{Ticket: ticket})
 }
 
@@ -278,6 +293,11 @@ func (s *Server) writeVoiceCoLoadRefusal(gateCtx context.Context, w http.Respons
 		code = voiceChatCoLoadFailed
 	} else {
 		slog.Debug("voice chat ticket refused", "code", code, "chat", chatID, "err", err)
+	}
+	var legErr *voiceLegError
+	if code == voiceChatNoRealtimeModel && errors.As(err, &legErr) {
+		writeJSON(w, http.StatusConflict, apierror.Response(code, voiceLegNoRealtimeMessage(legErr.leg), ""))
+		return
 	}
 	writeVoiceChatRefusal(w, code)
 }

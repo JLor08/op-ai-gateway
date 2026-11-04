@@ -424,6 +424,31 @@ describe('VoiceChatControl errors', () => {
     expect(screen.queryByText('raw')).not.toBeInTheDocument();
   });
 
+  // #340: the voice gate refuses the ticket when every model of a leg was measured below the
+  // real time a conversation needs. The gateway names the leg in its message ("voice chat asr
+  // leg: ..."); the sentence names it too, and stays general when no leg is named -- a model
+  // name that merely ends in "-tts" is no leg.
+  it.each([
+    ['voice chat asr leg: no real-time candidate', 'chatVoiceErrorNoRealtimeAsr'],
+    ['voice chat tts leg: no real-time candidate', 'chatVoiceErrorNoRealtimeTts'],
+    ['no real-time candidate (leg=tts)', 'chatVoiceErrorNoRealtimeTts'],
+    ['no real-time candidate {"leg":"asr"}', 'chatVoiceErrorNoRealtimeAsr'],
+    ['no real-time candidate left', 'chatVoiceErrorNoRealtimeModel'],
+    ['no real-time candidate for pocket-tts', 'chatVoiceErrorNoRealtimeModel'],
+    ['', 'chatVoiceErrorNoRealtimeModel'],
+  ] as const)('words voice_chat.no_realtime_model from "%s"', (message, key) => {
+    renderControl(
+      makeVoice({
+        error: { kind: 'refused', code: 'voice_chat.no_realtime_model', message },
+      }),
+    );
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent(t[key]);
+    expect(alert).not.toHaveTextContent(t.chatVoiceErrorRefused);
+    // The same request would be refused again: the toggle stays closed until it is dismissed.
+    expect(screen.getByRole('switch', { name: t.chatVoice })).toBeDisabled();
+  });
+
   // The gateway's own 500 (portal.voice_chat_ticket_failed) reaches the control as a failure a
   // retry can get past ("dropped") that carries its code: it has a sentence of its own, and the
   // switch stays open. A "dropped" with no code (a lost connection) keeps the generic sentence.

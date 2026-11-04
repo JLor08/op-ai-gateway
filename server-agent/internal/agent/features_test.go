@@ -335,12 +335,12 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 
 // TestFeaturesDeclareRuntimeVoices pins the voices-route capability: this
 // agent's runtime router serves GET /upstream/{model}/v1/audio/voices (#251), a
-// Status-only passthrough to a RUNNING audio.cpp child's voice listing, and the
-// GATEWAY fetches a child's voices only from an agent that declares this exact
-// name, fail-closed -- an older router never serves the route and answers a 404
-// (runtime.upstream_endpoint_not_allowed from 0.7.0 on, runtime.model_not_managed
-// before 0.7.0) for every such read -- so a rename here silently stops every
-// agent child's voices from being cached.
+// read-only, never-start passthrough to a RUNNING audio.cpp child's voice
+// listing, and the GATEWAY fetches a child's voices only from an agent that
+// declares this exact name, fail-closed -- an older router never serves the
+// route and answers a 404 (runtime.upstream_endpoint_not_allowed from 0.7.0 on,
+// runtime.model_not_managed before 0.7.0) for every such read -- so a rename
+// here silently stops every agent child's voices from being cached.
 // The gateway spells the same string in its own constant
 // (RuntimeVoicesFeature, gateway/backend/internal/gateway/agent_features.go);
 // this module cannot import it.
@@ -394,14 +394,14 @@ func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 
 // TestFeaturesDeclareRuntimeModelParams pins the model-params-route capability.
 // This agent's runtime router serves GET /upstream/{model}/v1/models, a
-// Status-only passthrough to a RUNNING audio.cpp child's model listing relayed
-// with the inbound query (so ?include_params=true reaches the child), and the
-// GATEWAY pulls each model's declared request params (e.g. language) only from
-// an agent that declares this exact name, fail-closed -- an older router answers
-// a 404 (runtime.upstream_endpoint_not_allowed) for the route -- so a rename here
-// silently stops every agent child's declared params from being read. The
-// gateway spells the same string in its own constant; this module cannot import
-// it.
+// read-only, never-start passthrough to a RUNNING audio.cpp child's model
+// listing relayed with the inbound query (so ?include_params=true reaches the
+// child), and the GATEWAY pulls each model's declared request params (e.g.
+// language) only from an agent that declares this exact name, fail-closed -- an
+// older router answers a 404 (runtime.upstream_endpoint_not_allowed) for the
+// route -- so a rename here silently stops every agent child's declared params
+// from being read. The gateway spells the same string in its own constant; this
+// module cannot import it.
 func TestFeaturesDeclareRuntimeModelParams(t *testing.T) {
 	found := false
 	for _, f := range Features {
@@ -479,22 +479,51 @@ func TestFeaturesDeclareRuntimeRAMAccounting(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_ram_accounting") {
 		t.Fatal("FeatureNames() does not carry runtime_ram_accounting, so it never reaches the gateway in capabilities.features")
 	}
-	// The Version assertion moved to TestFeaturesDeclareRuntimeRoleEviction,
+	// The Version assertion moved to TestFeaturesDeclareRuntimeInstances,
 	// beside the newest feature (see the bump-rule note there).
 }
 
-// TestFeaturesDeclareRuntimeRoleEviction pins the role-aware eviction capability
-// and the version assertion that ships with it. This agent captures each spec's
-// pushed model role onto its admission snapshot and protects a model used within
-// the eviction grace window from being a victim. The flag is declared for
-// telemetry and visibility only (so the portal can show that a connected agent
-// evicts that way) and gates nothing: the runtime-config document stays one
-// shared, non-feature-gated document per server, the role field degrades safely
-// on an agent that ignores it, and co-residency stays on the existing wire
-// field. A rename here silently turns the portal's knowledge off. The gateway
-// spells the same string in its own constant (RuntimeRoleEvictionFeature,
+// TestFeaturesDeclareRuntimeRoleEviction pins the role-aware eviction capability.
+// This agent captures each spec's pushed model role onto its admission snapshot
+// and protects a model used within the eviction grace window from being a
+// victim. The flag is declared for telemetry and visibility only (so the portal
+// can show that a connected agent evicts that way) and gates nothing: the
+// runtime-config document stays one shared, non-feature-gated document per
+// server, the role field degrades safely on an agent that ignores it, and
+// co-residency stays on the existing wire field. A rename here silently turns
+// the portal's knowledge off. The gateway spells the same string in its own
+// constant (RuntimeRoleEvictionFeature,
 // gateway/backend/internal/gateway/agent_features.go); this module cannot
 // import it.
+func TestFeaturesDeclareRuntimeRoleEviction(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_role_eviction" {
+			found = true
+			if f.Since != "0.15.0" {
+				t.Fatalf("runtime_role_eviction Since = %q, want 0.15.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_role_eviction")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_role_eviction") {
+		t.Fatal("FeatureNames() does not carry runtime_role_eviction, so it never reaches the gateway in capabilities.features")
+	}
+}
+
+// TestFeaturesDeclareRuntimeInstances pins the multi-instance capability and the
+// version assertion that ships with it. This agent runs several instances
+// (processes) of one replicable runtime spec: it reads the spec-level
+// replicable/min_instances/max_instances fields, serves each extra instance
+// under the model address "m#k" and reports one status row per instance. The
+// GATEWAY gates real behavior on the name, fail-closed (it expands a replicable
+// model into "m#k" candidates only on an agent that declared it), because an
+// older agent silently ignores the unknown fields and answers 404
+// runtime.model_not_managed for every "m#k" -- so a rename here silently turns
+// the whole feature off. The gateway spells the same string in its own constant;
+// this module cannot import it.
 //
 // The version assertion lives here, beside the newest feature, and it is the
 // forcing function for the repository's bump rule: a change that moves Version
@@ -521,30 +550,36 @@ func TestFeaturesDeclareRuntimeRAMAccounting(t *testing.T) {
 // one bump covers both, because a bump is per shipped change and the RunSpec
 // RAM-accounting branch is one change (AGENTS.md, ServerAgent Version Rule), so
 // the accounting flag declares Since 0.14.0 and Version did not move again;
-// 0.15.0 is MINOR because agent.Features gained runtime_role_eviction -- the one
-// bump for the co-residency rework branch, whatever its commit count. A Since
-// records the version a feature shipped in, so runtime_ensure's stays 0.8.0,
-// multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0,
+// 0.15.0 was MINOR because agent.Features gained runtime_role_eviction -- the
+// one bump for the co-residency rework branch, whatever its commit count;
+// 0.16.0 is MINOR because agent.Features gained runtime_instances -- the one
+// bump for the model-instance autoscaling branch (#340), whatever its commit
+// count. A Since records the version a feature shipped in, so runtime_ensure's
+// stays 0.8.0, multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0,
 // runtime_voices' stays 0.11.0, fullduplex_proxy's stays 0.12.0,
 // runtime_model_params' stays 0.13.0, runtime_ram_measurement's and
-// runtime_ram_accounting's stay 0.14.0 and runtime_role_eviction's is 0.15.0.
-func TestFeaturesDeclareRuntimeRoleEviction(t *testing.T) {
+// runtime_ram_accounting's stay 0.14.0, runtime_role_eviction's stays 0.15.0 and
+// runtime_instances' is 0.16.0.
+func TestFeaturesDeclareRuntimeInstances(t *testing.T) {
+	if FeatureRuntimeInstances != "runtime_instances" {
+		t.Fatalf("FeatureRuntimeInstances = %q, want the wire literal runtime_instances", FeatureRuntimeInstances)
+	}
 	found := false
 	for _, f := range Features {
-		if f.Name == "runtime_role_eviction" {
+		if f.Name == "runtime_instances" {
 			found = true
-			if f.Since != "0.15.0" {
-				t.Fatalf("runtime_role_eviction Since = %q, want 0.15.0", f.Since)
+			if f.Since != "0.16.0" {
+				t.Fatalf("runtime_instances Since = %q, want 0.16.0", f.Since)
 			}
 		}
 	}
 	if !found {
-		t.Fatal("Features does not declare runtime_role_eviction")
+		t.Fatal("Features does not declare runtime_instances")
 	}
-	if !slices.Contains(FeatureNames(), "runtime_role_eviction") {
-		t.Fatal("FeatureNames() does not carry runtime_role_eviction, so it never reaches the gateway in capabilities.features")
+	if !slices.Contains(FeatureNames(), "runtime_instances") {
+		t.Fatal("FeatureNames() does not carry runtime_instances, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.15.0" {
-		t.Fatalf("Version = %q, want 0.15.0 (runtime_role_eviction is a new agent.Features entry, so the rule is MINOR, and it is the co-residency rework branch's single bump from 0.14.0)", Version)
+	if Version != "0.16.0" {
+		t.Fatalf("Version = %q, want 0.16.0 (runtime_instances is a new agent.Features entry, so the rule is MINOR, and it is the model-instance autoscaling branch's single bump from 0.15.0)", Version)
 	}
 }

@@ -58,9 +58,10 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 //     flip between the trigger and here, and for an ensure plan the agent's
 //     runtime_ensure, which it can flip the same way;
 //  2. record the drain in the server's override lease (vramOpenLease), read
-//     which specs have a process to stop, then drain EVERY enabled spec
-//     including the target, in one batch -- a baseline taken while the target
-//     is resident measures nothing at all;
+//     which specs have a process to stop, run a replicable target as one
+//     process (vramRunAsOneProcess), then drain EVERY enabled spec including
+//     the target, in one batch -- a baseline taken while the target is
+//     resident measures nothing at all;
 //  3. confirm the drain against this run's own evidence, never against a 200
 //     from a write;
 //  4. baseline: K consecutive stable samples, or inconclusive;
@@ -79,8 +80,9 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 //     restarted at the clear; an API-set loaded_models_path replaces /running
 //     and answers whatever that path lists;
 //  7. settle, then the same stability gate, then the floor gate;
-//  8. restore every override, target included, on a context that is not this
-//     run's, and rewrite the lease to what the restore could not clear.
+//  8. restore every override, target included, and make a replicable target
+//     replicable again, on a context that is not this run's, and rewrite the
+//     lease to what the restore could not settle.
 //
 // Like runLoadModel and runContextProbe it does NOT call Release: the
 // terminal status must LINGER so the frontend's poll can read the result.
@@ -115,7 +117,8 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// written, so a gateway that dies before the restore clears the overrides
 	// when it starts again (ReconcileBenchmarkOverrideLeases). A lease the run
 	// cannot read or write drains nothing.
-	carried, err := s.vramOpenLease(ctx, serverID, plan.specIDs)
+	singleProcess := vramSingleProcessTarget(tgt, plan)
+	carried, err := s.vramOpenLease(ctx, serverID, plan.specIDs, singleProcess)
 	if err != nil {
 		res.Error = err.Error()
 		return
@@ -128,6 +131,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// two reads of the plan -- see vramIsolationPolicyOf for why that is the
 	// one divergence this feature may not have.
 	policy := vramIsolationPolicyOf(plan)
+	singleProcess = s.vramRunAsOneProcess(ctx, serverID, singleProcess)
 	drained, drainErr := s.vramDrain(ctx, serverID, plan.specIDs)
 	// DrainedSpecIDs is the AUDIT set -- everything this run force-stopped or
 	// may have force-stopped (a write that failed after it stored the
@@ -166,9 +170,19 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// diverges from the portal's own start/stop discipline, which cannot tell
 	// a wedged child from a slow one: this run wrote these overrides, so
 	// leaving them is strictly worse.
+	//
+	// A replicable target the run ran as one process is made replicable again
+	// after the overrides are cleared (restoreBenchmarkReplicable). One whose
+	// restore failed stays in the lease, and the result's error names it.
 	defer func() {
 		report.RestoreFailed, report.RestoreTakenOver = s.restoreBenchmarkOverrides(ctx, pendingRestore)
-		s.vramRecordLease(ctx, serverID, carried, report.RestoreFailed)
+		if len(singleProcess) > 0 {
+			singleProcess = s.restoreBenchmarkReplicable(ctx, serverID, singleProcess)
+			if len(singleProcess) > 0 {
+				res.Error = benchmarkJoinRunError(res.Error, benchmarkReplicableRestoreFailed(singleProcess))
+			}
+		}
+		s.vramRecordLease(ctx, serverID, carried, report.RestoreFailed, singleProcess)
 	}()
 	// From the drain batch's return on, the lease names what the drain wrote
 	// or may have written instead of every spec the plan enumerated. A spec
@@ -176,7 +190,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// -- one an operator set between the plan at the trigger and the
 	// reservation -- and a reconcile that cleared it would undo that
 	// operator's decision.
-	s.vramRecordLease(ctx, serverID, carried, drained)
+	s.vramRecordLease(ctx, serverID, carried, drained, singleProcess)
 	if drainErr != nil {
 		// Not every spec was written -- a concurrent operator override, a spec
 		// deleted or retyped between the enumeration and the write, or a store
@@ -244,7 +258,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// overrides, the row now names only those the restore still owes, next to
 	// what it carried over. Narrowed before the clear, a crash in between
 	// would leave the target force_stopped with no entry to clear it.
-	s.vramRecordLease(ctx, serverID, carried, pendingRestore)
+	s.vramRecordLease(ctx, serverID, carried, pendingRestore, singleProcess)
 
 	// (6) What the load proved about contamination, and about whether it could
 	// be asked at all. An ensure plan's target is loaded without generating.
@@ -280,8 +294,9 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 // vramOpenLease reads serverID's leftover override lease and records the drain
 // in it before a single spec is written: what it carried over, unchanged, plus
-// every spec the drain is about to force-stop (specIDs). It returns what it
-// carried over, which every later rewrite of this run keeps.
+// every spec the drain is about to force-stop (specIDs) and the replicable
+// target the run is about to run as one process (singleProcess). It returns
+// what it carried over, which every later rewrite of this run keeps.
 //
 // The run does not settle a leftover itself. Its plan refused every enabled
 // spec that still carries an override, so a leftover clear entry for one is
@@ -294,41 +309,76 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 // written without a lease entry that names it. A failed write may still have
 // stored the row (a commit whose answer was lost), so the row is then put back
 // to what was carried over.
-func (s *Server) vramOpenLease(ctx context.Context, serverID string, specIDs []string) (portal.BenchmarkOverrideLease, error) {
+func (s *Server) vramOpenLease(ctx context.Context, serverID string, specIDs, singleProcess []string) (portal.BenchmarkOverrideLease, error) {
 	leases, err := s.Portal.BenchmarkOverrideLeases(ctx)
 	if err != nil {
 		return portal.BenchmarkOverrideLease{}, err
 	}
 	carried := leases[serverID]
-	if err := s.Portal.SetBenchmarkOverrideLease(ctx, serverID, vramLeaseWith(carried, specIDs)); err != nil {
-		s.vramRecordLease(ctx, serverID, carried, nil)
+	if err := s.Portal.SetBenchmarkOverrideLease(ctx, serverID, vramLeaseWith(carried, specIDs, singleProcess)); err != nil {
+		s.vramRecordLease(ctx, serverID, carried, nil, nil)
 		return portal.BenchmarkOverrideLease{}, err
 	}
 	return carried, nil
 }
 
+// vramSingleProcessTarget is the target's spec id when the run measures a
+// replicable target, which it runs as one process (vramRunAsOneProcess), and
+// nil otherwise. It decides on the starter's read of the target's spec; the
+// write's compare-and-set settles a spec that changed since.
+func vramSingleProcessTarget(tgt benchmarkTarget, plan vramRunPlanned) []string {
+	if tgt.spec.Replicable && tgt.spec.ID != "" && tgt.spec.ID == plan.targetSpecID {
+		return []string{plan.targetSpecID}
+	}
+	return nil
+}
+
+// vramRunAsOneProcess writes replicable = false for ids, the run's replicable
+// target, before the drain: the agent then runs the target as one process, so
+// the clear of its override before the load starts the instance the run
+// measures and not, beside it, the floor of protected instances the spec keeps
+// running. The lease already names it (vramOpenLease). It returns what the
+// restore owes: the specs the batch wrote or may have written (a failed write
+// may have stored false). A failure is logged and the run goes on: a target
+// that is still replicable starts its other instances with the load, which the
+// end-of-run isolation recheck catches.
+func (s *Server) vramRunAsOneProcess(ctx context.Context, serverID string, ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out, err := s.Portal.SetBenchmarkRuntimeSpecsReplicable(ctx, ids, true, false)
+	if err != nil {
+		slog.Warn("vram benchmark: could not run the replicable target as one process", "server_id", serverID, "spec_ids", out.Failed, "err", err)
+	}
+	return benchmarkUnion(out.Written, out.Failed)
+}
+
 // vramRecordLease rewrites serverID's override lease row to what this run
-// still owes, owed, besides what it carried over (vramLeaseWith). It writes on
+// still owes, owed and singleProcess, besides what it carried over
+// (vramLeaseWith). It writes on
 // a context of its own, bounded by vramRestoreTimeout and not cancelled with
 // the run, because the row has to follow the restore of a cancelled run too.
 // A failure is a Warn: the row then keeps an earlier, larger set, and the
 // reconciler's compare-and-set skips every spec whose override is already
 // cleared.
-func (s *Server) vramRecordLease(ctx context.Context, serverID string, carried portal.BenchmarkOverrideLease, owed []string) {
+func (s *Server) vramRecordLease(ctx context.Context, serverID string, carried portal.BenchmarkOverrideLease, owed, singleProcess []string) {
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
 	defer cancel()
-	if err := s.Portal.SetBenchmarkOverrideLease(lctx, serverID, vramLeaseWith(carried, owed)); err != nil {
+	if err := s.Portal.SetBenchmarkOverrideLease(lctx, serverID, vramLeaseWith(carried, owed, singleProcess)); err != nil {
 		slog.Warn("vram benchmark: could not update the override lease; the row may name more than the run still owes", "server_id", serverID, "err", err)
 	}
 }
 
-// vramLeaseWith is the lease row while a VRAM run owes owed: what it carried
-// over, with owed added to the overrides to clear, sorted and without
+// vramLeaseWith is the lease row while a VRAM run owes owed and singleProcess:
+// what it carried over, with owed added to the overrides to clear and
+// singleProcess to the replicable restores, each sorted and without
 // duplicates.
-func vramLeaseWith(carried portal.BenchmarkOverrideLease, owed []string) portal.BenchmarkOverrideLease {
+func vramLeaseWith(carried portal.BenchmarkOverrideLease, owed, singleProcess []string) portal.BenchmarkOverrideLease {
 	ids := slices.Concat(carried.ClearForceStopped, owed)
 	slices.Sort(ids)
-	return portal.BenchmarkOverrideLease{Repin: carried.Repin, ClearForceStopped: slices.Compact(ids)}
+	replicable := slices.Concat(carried.RestoreReplicable, singleProcess)
+	slices.Sort(replicable)
+	return portal.BenchmarkOverrideLease{Repin: carried.Repin, ClearForceStopped: slices.Compact(ids), RestoreReplicable: slices.Compact(replicable)}
 }
 
 // vramPublishOutcome is the run's terminal bookkeeping: attach the report to
@@ -516,7 +566,9 @@ func vramRecordResidency(alreadyResident, residencyProbed bool, err error) vramR
 // the STORED payload names what broke the isolation rather than only saying
 // that it broke, and Isolated is then recomputed through the one function that
 // owns that field. The lost-set conjunct is what covers a spec created AFTER
-// the enumeration: that one is in no list vramIsolationConfirmed reads.
+// the enumeration: that one is in no list vramIsolationConfirmed reads. The
+// target itself is named when another of its instances broke the isolation
+// (vramIsolationLost), so its entry then says restarted_during_run too.
 func (s *Server) vramRecheckIsolation(serverID string, plan vramRunPlanned, report *VRAMReport) bool {
 	lost := s.vramIsolationLost(serverID, plan)
 	for _, specID := range lost {
@@ -758,11 +810,15 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 // ONE status frame, and returns nil when the frame carries none -- which is
 // what keeps the caller waiting rather than answering early.
 //
-// Two things disqualify a row before its numbers are read. A DIFFERENT spec,
-// because a frame carries the whole server. And a zero MeasuredAt: a spec the
-// agent has never measured still reports a GPU array, all zeros, and reading
-// that as a measurement of nothing is exactly the mistake this whole feature
-// refuses to make.
+// Three things disqualify a row before its numbers are read. A DIFFERENT spec,
+// because a frame carries the whole server. ANOTHER INSTANCE of the target: a
+// replicable spec reports one row per instance under its one spec id, and the
+// run loads and measures instance 0 -- another instance's figure, in whichever
+// order the rows arrive, is not the target's cost (and that instance holding a
+// process is what the isolation recheck refuses). And a zero MeasuredAt: a
+// spec the agent has never measured still reports a GPU array, all zeros, and
+// reading that as a measurement of nothing is exactly the mistake this whole
+// feature refuses to make.
 //
 // A measured 0 is likewise UNKNOWN -- the same rule the ingest and the
 // write-back apply to this very array -- so a card at 0 is DROPPED, never
@@ -772,7 +828,7 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 // on a host that has no per-process measurer at all.
 func vramMeasuredFromFrame(frame []RuntimeStatusDTO, specID string) map[int]int {
 	for _, status := range frame {
-		if status.SpecID != specID || status.MeasuredAt.IsZero() {
+		if status.SpecID != specID || status.Instance != 0 || status.MeasuredAt.IsZero() {
 			continue
 		}
 		out := map[int]int{}

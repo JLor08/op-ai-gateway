@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -129,6 +130,38 @@ type Spec struct {
 	// ignores it): the policy reads it to choose WHICH idle model to evict, and
 	// it changes nothing about how a process is exec'd.
 	Role string `json:"role,omitempty"`
+	// Replicable opts the spec into running SEVERAL instances (processes) of
+	// itself (#340): instance 0 is the spec's one process as ever, and further
+	// instances (k = 1...) are started on demand as burst capacity. False -- the
+	// default, and every document an older gateway sends -- keeps exactly the
+	// single process of today. Every instance needs its own port, so ParseConfig
+	// demotes a spec that pins a fixed ListenPort to non-replicable.
+	Replicable bool `json:"replicable,omitempty"`
+	// MinInstances is the number of instances a replicable spec keeps up as its
+	// protected floor (never reclaimed by idle timeout or eviction); 0 = no
+	// floor beyond the pin/force_running baseline. MaxInstances caps how many
+	// instances the spec may have; 0 = no cap beyond MaxInstanceIndex. Read both
+	// through ProtectedCount and InstanceAllowed, never raw: ParseConfig only
+	// sanitises them (negative reads as 0, a floor above the cap is clamped to
+	// the cap) and they mean nothing for a non-replicable spec.
+	//
+	// Like Replicable they decide HOW MANY processes run, never what a process
+	// is, so sameLaunchShape ignores all three.
+	MinInstances int `json:"min_instances,omitempty"`
+	MaxInstances int `json:"max_instances,omitempty"`
+	// InstanceOf and Instance mark the per-instance copy of a replicable spec
+	// the manager admits and starts for instance k >= 1 (#340): its ID is then
+	// the instance key S#k, InstanceOf the base spec's ID S, and Instance k.
+	// Instance 0 is the spec itself and keeps both at the zero value, which is
+	// also what every spec that never replicates has. Admission reads the base
+	// through InstanceOf -- an instance co-resides with its siblings, never
+	// evicts them, and inherits its spec's co-residency verdicts (see Admit) --
+	// so the copy needs no matrix entries of its own.
+	//
+	// The agent derives both; they are never on the wire, because the gateway
+	// pushes base specs only.
+	InstanceOf string `json:"-"`
+	Instance   int    `json:"-"`
 }
 
 // RoleOther is the role of a spec that has none the agent recognises: the value
@@ -346,6 +379,14 @@ func ClassifyParseError(err error) ParseErrorCode {
 //     specs, other pairs -- remains usable. This is reachable from an
 //     ordinary stale/racy read on the gateway side, not a defect worth
 //     failing the whole config over.
+//   - a spec whose ID contains the instance separator '#' is dropped, with a
+//     Warn naming it, and the rest of the document stays usable (#340):
+//     "S#k" is the agent's key for instance k of spec S (InstanceKey), so such
+//     an ID would name another spec's instance -- its state, its config
+//     directory, its admission identity -- and could never be told apart from
+//     it. A gateway-issued spec ID never contains '#'; only a hand-written
+//     file-mode document can reach this, so one bad spec costs that spec, not
+//     the whole document. Its coresident pairs go with it.
 //
 // Every collection-shaped field (Specs, GPUBudgets, Coresident, and each
 // Spec's Args/Env/GPUs/ConfigFiles) is normalized to non-nil, so a caller that
@@ -362,6 +403,12 @@ func ParseConfig(raw []byte) (Config, error) {
 			return Config{}, &ParseError{Code: ParseErrorDuplicateSpecID, Err: fmt.Errorf("duplicate spec id %q", spec.ID)}
 		}
 		specIDs[spec.ID] = true
+	}
+	cfg.Specs = withoutReservedSpecIDs(cfg.Specs)
+	for id := range specIDs {
+		if reservedSpecID(id) {
+			delete(specIDs, id)
+		}
 	}
 
 	if cfg.Specs == nil {
@@ -395,9 +442,86 @@ func ParseConfig(raw []byte) (Config, error) {
 		if err := checkConfigFileNames(cfg.Specs[i]); err != nil {
 			return Config{}, err
 		}
+		sanitizeInstanceFields(&cfg.Specs[i])
 	}
 
 	return cfg, nil
+}
+
+// reservedSpecID reports whether id cannot be a spec ID because it contains
+// the instance separator: "S#k" is the agent's key for instance k of spec S
+// (InstanceKey), so a spec with such an ID would collide with another spec's
+// instance. The gateway never issues one (its spec IDs are "rspec_" plus hex).
+func reservedSpecID(id string) bool {
+	return strings.Contains(id, instanceSeparator)
+}
+
+// withoutReservedSpecIDs returns specs without any whose ID is reserved
+// (reservedSpecID), logging a Warn naming each one it drops. It is the one rule
+// both entry points apply: ParseConfig, for every document a Source parses, and
+// the manager's applyConfig, for a Config handed to Apply directly. specs
+// itself is never modified; when nothing is dropped it is returned as is.
+func withoutReservedSpecIDs(specs []Spec) []Spec {
+	dropped := false
+	for _, spec := range specs {
+		if reservedSpecID(spec.ID) {
+			dropped = true
+			break
+		}
+	}
+	if !dropped {
+		return specs
+	}
+	kept := make([]Spec, 0, len(specs))
+	for _, spec := range specs {
+		if reservedSpecID(spec.ID) {
+			slog.Warn("runtime: spec id contains '#', which the agent reserves for instance keys (S#k); ignoring the spec",
+				"spec", spec.ID)
+			continue
+		}
+		kept = append(kept, spec)
+	}
+	return kept
+}
+
+// sanitizeInstanceFields normalises a spec's multi-instance opt-in (#340) so
+// nothing downstream has to defend against a contradictory document. It never
+// fails the document: every repair is a demotion to the safer, more
+// conservative reading, logged at Warn so the operator can learn why the spec
+// does not scale the way they wrote it (the gateway rejects the same inputs at
+// submit time; only a hand-written file-mode document, or a gateway that
+// predates the rule, can reach here).
+//
+//   - A replicable spec with a fixed listen_port is demoted to non-replicable:
+//     every instance needs its own port, and one pinned port can serve one
+//     process.
+//   - A negative min_instances or max_instances reads as unset (0).
+//   - A min_instances above a set max_instances is clamped to max_instances.
+//   - A min_instances above the addressable range (MaxInstanceIndex+1
+//     instances, 0..MaxInstanceIndex) is clamped to it, so the protected floor
+//     (ProtectedCount) can never name an instance that cannot exist.
+func sanitizeInstanceFields(spec *Spec) {
+	if spec.Replicable && spec.ListenPort != 0 {
+		slog.Warn("runtime: spec is replicable but pins a fixed listen_port; treating it as non-replicable (every instance needs its own port)",
+			"spec", spec.ID, "listen_port", spec.ListenPort)
+		spec.Replicable = false
+	}
+	if spec.MinInstances < 0 || spec.MaxInstances < 0 {
+		slog.Warn("runtime: spec has a negative min_instances/max_instances; reading it as unset",
+			"spec", spec.ID, "min_instances", spec.MinInstances, "max_instances", spec.MaxInstances)
+		spec.MinInstances = max(spec.MinInstances, 0)
+		spec.MaxInstances = max(spec.MaxInstances, 0)
+	}
+	if spec.MaxInstances > 0 && spec.MinInstances > spec.MaxInstances {
+		slog.Warn("runtime: spec has min_instances above max_instances; clamping min_instances to max_instances",
+			"spec", spec.ID, "min_instances", spec.MinInstances, "max_instances", spec.MaxInstances)
+		spec.MinInstances = spec.MaxInstances
+	}
+	if limit := MaxInstanceIndex + 1; spec.MinInstances > limit {
+		slog.Warn("runtime: spec has min_instances above the instance limit; clamping it to the limit",
+			"spec", spec.ID, "min_instances", spec.MinInstances, "limit", limit)
+		spec.MinInstances = limit
+	}
 }
 
 // checkConfigFileNames validates spec's config_files names: each one plain
@@ -504,9 +628,15 @@ type LastError struct {
 	StderrTail string    `json:"stderr_tail,omitempty"` // bounded, ~2 KiB
 }
 
-// Status is one spec's current runtime status, as tracked by the process
-// manager and reported upward. JSON tags mirror sample.RuntimeSample
-// field-for-field, EXCEPT MeasuredVRAM and the Type/MetricsPath/
+// Status is one INSTANCE's current runtime status, as tracked by the process
+// manager and reported upward: one row per process the manager keeps (#340).
+// A row is identified by the pair (SpecID, Instance), never by SpecID alone --
+// SpecID is the BASE spec's ID on every instance's row, so a replicable spec
+// running several instances reports several rows with one SpecID, told apart
+// by Instance (and Model). A spec that never replicates has exactly one row,
+// Instance 0, exactly as before instances existed. JSON tags mirror
+// sample.RuntimeSample field-for-field, EXCEPT MeasuredVRAM and the
+// Type/MetricsPath/
 // ContextProbePath trio below: the sample maps MeasuredVRAM to
 // RuntimeSample.GPUs ([]RuntimeGPUSample), so "measured_vram" here is not
 // itself part of that wire contract -- the tag exists so Status marshals
@@ -524,11 +654,17 @@ type LastError struct {
 // (ContextSize/ActiveRequests/QueueDepth) land there. This is a second,
 // documented exception to the "mirrors sample.RuntimeSample field-for-field"
 // contract, alongside MeasuredVRAM above. MeasuredRAMMB, by contrast, IS part of
-// the mirror: it is a spec-level scalar that rides RuntimeSample.RAMMeasuredMB
-// under the same JSON key (internal/agent copies it across).
+// the mirror: it is a per-row scalar -- one row's process -- that rides
+// RuntimeSample.RAMMeasuredMB under the same JSON key (internal/agent copies it
+// across).
 type Status struct {
-	SpecID       string      `json:"spec_id"`
-	Model        string      `json:"model"` // upstream model name
+	// SpecID is the BASE spec's ID, the same on every instance row of a spec
+	// (#340); a row is keyed by (SpecID, Instance).
+	SpecID string `json:"spec_id"`
+	// Model is the row's INSTANCE ADDRESS (InstanceAddress): the spec's upstream
+	// model name for instance 0, "m#k" for instance k >= 1 -- the name that
+	// reaches that very process through the router.
+	Model        string      `json:"model"`
 	State        State       `json:"state"`
 	Since        time.Time   `json:"since"`
 	PID          int         `json:"pid,omitempty"`
@@ -536,14 +672,23 @@ type Status struct {
 	InFlight     int         `json:"in_flight"`
 	Restarts     int         `json:"restarts"`
 	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
-	// MeasuredRAMMB is the spec's current process's resident host RAM in MB, as
+	// MeasuredRAMMB is the row's current process's resident host RAM in MB, as
 	// the recurring RAM measurement last observed it; 0 means unknown (never
 	// measured, no RAM measurer, or the process has exited) and is never "needs
-	// no RAM". A spec-level scalar -- RAM has no per-GPU axis, and one process
-	// backs one spec -- carried to the wire as RuntimeSample.RAMMeasuredMB under
-	// the same JSON key.
+	// no RAM". A per-row scalar -- RAM has no per-GPU axis, and one process
+	// backs one row (one instance, #340) -- carried to the wire as
+	// RuntimeSample.RAMMeasuredMB under the same JSON key.
 	MeasuredRAMMB int        `json:"ram_measured_mb,omitempty"`
 	LastError     *LastError `json:"last_error,omitempty"`
+	// Instance is this row's instance index within its spec (#340): 0 for the
+	// spec's one ordinary process, k >= 1 for a further (burst) instance. It is
+	// always on the wire, 0 included.
+	Instance int `json:"instance"`
+	// StartupMS is how long this process took to become healthy, in
+	// milliseconds, measured by the agent on its last successful start; 0 means
+	// unknown (never started, or a start that did not finish). It is the
+	// gateway's cold-start figure for the instance.
+	StartupMS int `json:"startup_ms,omitempty"`
 
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by

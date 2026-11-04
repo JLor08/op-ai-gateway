@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/portal"
 )
 
 // gatewayAgentFeatures is the gateway's declared feature set for agents
@@ -61,7 +62,38 @@ import (
 // rather than a reuse of the sdcpp one because the two acceptances are
 // independent facts: a gateway build can accept one source and not the other,
 // and the agent must not send a source its gateway would drop.
-var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature}
+//
+// runtime_instances is one-sided on this list too, even though the agent's
+// declared set carries the same string: the two declarations state different
+// facts, and each side reads the OTHER side's as a precondition, so the
+// intersection rule above is not what decides either behaviour. The agent's
+// declaration says it runs several instances of a replicable spec and serves
+// them as "m#k"; this gateway reads it before it ever expands a mapping into
+// instance candidates. This gateway's declaration (runtimeInstancesFeature)
+// says it understands what such an agent reports -- one status row per
+// instance, several rows under one spec_id -- and the AGENT reads it as a
+// precondition: it honours a document's replicable flag only while this list
+// carries the name, in file mode as well as gateway mode, and otherwise runs
+// every spec as its one process (runtime.Driver.Sync). A gateway build without
+// the name therefore never receives two rows for one spec, which it would read
+// as one spec flapping between them.
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature, runtimeInstancesFeature}
+
+// runtimeInstancesFeature says this gateway understands the status of an agent
+// that runs several instances of one replicable runtime spec (#340): one status
+// row per instance, sharing the spec's spec_id and told apart by the instance
+// index. The agent honours a spec's replicable flag only when this name is
+// declared (its gatewayFeatureRuntimeInstances), so an older gateway never sees
+// those rows. The agent declares the identical string for its own capability
+// (server-agent/internal/agent/features.go, FeatureRuntimeInstances); the agent
+// module cannot import this package, so both spell it, and
+// TestAgentFeaturesDeclaresRuntimeInstances pins this side's literal.
+//
+// Within this module the name has one source, the portal's
+// AgentFeatureRuntimeInstances, which the runtime-config document reads the
+// agent's declaration by: this gateway's own declaration, the ingest's push on
+// a changed declaration and the portal's document cannot spell it apart.
+const runtimeInstancesFeature = portal.AgentFeatureRuntimeInstances
 
 // capabilitySourceSdcppFeature says this gateway's capability ingest accepts
 // the sdcpp_capabilities source from an agent (rowSource), for the image row

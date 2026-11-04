@@ -12,12 +12,20 @@ import {
 } from '@mui/material';
 import type { ApplicationStatus, CapabilityVerdictInput, PortalModelMapping } from '../api';
 import type { Translation, PortalApi } from './shared/types';
-import { formatPortalError } from './shared/format';
+import { formatPortalError, parseMetricInput } from './shared/format';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { useToast } from './shared/ToastProvider';
 import { BenchmarkPollTimeoutError, pollBenchmarkStatus } from './shared/benchmark';
+import {
+  audioMetricsBody,
+  audioMetricsForm,
+  AUDIO_COUNT_MAX,
+  audioPairIncomplete,
+  type AudioConcurrencyLimit,
+  type AudioMetricsForm,
+} from './shared/audioMetrics';
 
 /**
  * Everything the mask edits, named exactly like the mapping API's fields so a
@@ -67,13 +75,13 @@ export type MappingFormValues = {
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
-};
-
-// Parse a free-text numeric input into a non-negative number; blank/invalid → 0
-// (the backend treats 0 as "unknown").
-const num = (s: string) => {
-  const n = Number(s.trim());
-  return s.trim() === '' || Number.isNaN(n) || n < 0 ? 0 : n;
+  // The audio metrics (#340), emitted by the same changed-only rule as the
+  // eight above and on the edit form only; the real-time concurrency and its
+  // limit as one pair (audioMetricsBody).
+  audio_rate_x?: number;
+  audio_ttfa_ms?: number;
+  audio_realtime_concurrency?: number;
+  audio_concurrency_limit?: string;
 };
 
 const text = (n: number | undefined) => (n ? String(n) : '');
@@ -343,6 +351,12 @@ export function MappingForm({
     recommended_concurrency: text(row?.recommended_concurrency),
     gen_tokens_per_second_at_capacity: text(row?.gen_tokens_per_second_at_capacity),
   }));
+  // The audio metrics (#340): the same seed diff as the text metrics above, a
+  // second lazy initializer for the seed rather than a shared object, so the
+  // two can never alias.
+  const [audioSeed] = useState<AudioMetricsForm>(() => audioMetricsForm(row));
+  const [audio, setAudio] = useState<AudioMetricsForm>(() => audioMetricsForm(row));
+  const audioCountRef = useRef<HTMLInputElement>(null);
 
   // Manual context-size probe: running state + whether this server is busy with
   // a benchmark/probe run (polled while editing so the button disables).
@@ -465,13 +479,23 @@ export function MappingForm({
       { key: 'gen_tokens_per_second_at_capacity', value: genTpsAtCapacity },
     ] as const) {
       if (m.value.trim() === metricSeeds[m.key].trim()) continue;
-      metrics[m.key] = num(m.value);
+      metrics[m.key] = parseMetricInput(m.value);
+    }
+    // A limit without its count is half a result, and a blank read as 0
+    // would store "not real-time": the count field already names what is
+    // missing, so the save stops there and takes the operator to it. (The
+    // field's own required/min/step stop this in a browser first; this is
+    // the check for one that skips them.)
+    if (audioPairIncomplete(audio)) {
+      audioCountRef.current?.focus();
+      return;
     }
     onSubmit({
       gateway_model_name: gatewayName,
       app_model_name: appName,
       status,
       ...metrics,
+      ...audioMetricsBody(audio, audioSeed),
       ...capabilities,
       metrics_locked: metricsLocked,
     });
@@ -597,6 +621,70 @@ export function MappingForm({
           onChange={(e) => setGenTpsAtCapacity(e.target.value)}
           inputProps={{ min: 0, step: 'any' }}
         />
+        {/* The audio metrics (#340), on the edit form only: the create request
+            carries none, so a value typed there would be dropped without a
+            word. The count is entered only beside a limit, because the two are
+            one result -- choosing "unknown" empties and locks the field and
+            clears both on save, while the count it held comes back with a
+            limit chosen again, so a detour through "unknown" loses nothing.
+            Beside a limit the count is required (audioPairIncomplete): there
+            a 0 is a result, so a blank cannot stand for "unknown". */}
+        {editing && (
+          <>
+            <Typography variant="subtitle2" component="h4" sx={{ mt: 0.5 }}>
+              {t.mappingAudioMetricsSection}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {t.mappingAudioMetricsHint}
+            </Typography>
+            <Field
+              id="mapping-audio-rate-x"
+              type="number"
+              label={t.mappingAudioRateX}
+              value={audio.rateText}
+              onChange={(e) => setAudio({ ...audio, rateText: e.target.value })}
+              inputProps={{ min: 0, step: 'any' }}
+            />
+            <Field
+              id="mapping-audio-ttfa-ms"
+              type="number"
+              label={t.mappingAudioTtfaMs}
+              value={audio.ttfaText}
+              onChange={(e) => setAudio({ ...audio, ttfaText: e.target.value })}
+              inputProps={{ min: 0, step: 1 }}
+            />
+            <SelectField
+              id="mapping-audio-concurrency-limit"
+              label={t.mappingAudioConcurrencyLimit}
+              value={audio.limit}
+              onChange={(e) =>
+                setAudio({ ...audio, limit: e.target.value as AudioConcurrencyLimit | '' })
+              }
+            >
+              <option value="">{t.mappingAudioConcurrencyLimitUnknown}</option>
+              <option value="performance">{t.mappingAudioConcurrencyLimitPerformance}</option>
+              <option value="resources">{t.mappingAudioConcurrencyLimitResources}</option>
+              <option value="cap">{t.mappingAudioConcurrencyLimitCap}</option>
+            </SelectField>
+            <Field
+              id="mapping-audio-realtime-concurrency"
+              type="number"
+              label={t.mappingAudioRealtimeConcurrency}
+              value={audio.limit === '' ? '' : audio.countText}
+              onChange={(e) => setAudio({ ...audio, countText: e.target.value })}
+              disabled={audio.limit === ''}
+              required={audio.limit !== ''}
+              inputRef={audioCountRef}
+              inputProps={{ min: 0, max: AUDIO_COUNT_MAX, step: 1 }}
+              {...(audioPairIncomplete(audio)
+                ? {
+                    error: true,
+                    helperText: t.mappingAudioRealtimeConcurrencyRequired(audio.limit),
+                  }
+                : {})}
+            />
+          </>
+        )}
         {/* THREE states, not a checkbox, and `unknown` is the empty option --
             the shared SelectField renders it as a real, selectable value with
             a permanently shrunk label, exactly as three other screens already

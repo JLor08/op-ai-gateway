@@ -347,6 +347,9 @@ var vendorSubscriptionTargetMayBeZero = map[string]bool{
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only; N/A
 	"LiveProgressSupport":         true, // mapping-persisted; a vendor carries none
 	"LiveProgressSpecType":        true, // server_agent-only; N/A
+	"InstanceKey":                 true, // names an instance of a mapping; a vendor target addresses none
+	"InstanceCapable":             true, // a vendor target runs no instances
+	"InstancePool":                true, // a vendor target is not selected from a pool of instances
 	"OpenAIPathPrefix":            true, // an Anthropic subscription upstream is not OpenAI-dialect; the prefix is N/A
 }
 
@@ -365,6 +368,9 @@ var vendorSubscriptionOpenAITargetMayBeZero = map[string]bool{
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only; N/A
 	"LiveProgressSupport":         true, // mapping-persisted; a vendor carries none
 	"LiveProgressSpecType":        true, // server_agent-only; N/A
+	"InstanceKey":                 true, // names an instance of a mapping; a vendor target addresses none
+	"InstanceCapable":             true, // a vendor target runs no instances
+	"InstancePool":                true, // a vendor target is not selected from a pool of instances
 	"OpenAIPathPrefix":            true, // the ChatGPT backend is reached at a bare /responses; no OpenAI-dialect prefix applies
 }
 

@@ -93,6 +93,26 @@ import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
+import {
+  INSTANCE_PARALLELISM_MAX,
+  INSTANCES_MAX,
+  instanceAddress,
+  instanceCountFromText,
+  instanceCountText,
+  instanceIndex,
+  instanceSettingsBody,
+  instancesSummary,
+  listedIdleTimeout,
+  logInstanceIndexes,
+  primaryStatusRows,
+  runningInstancesBySpec,
+  showsAllInstanceLogs,
+  restartGate,
+  specStopState,
+  validateInstances,
+  type InstanceForm,
+} from './shared/runtimeInstances';
+import { minRealtimeWarning } from './shared/audioMetrics';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
@@ -244,6 +264,13 @@ function emptySpec(mappingId: string): RuntimeSpec {
     gpus: [],
     ram_estimate_mb: 0,
     ram_measured_mb: 0,
+    replicable: false,
+    min_instances: 0,
+    max_instances: 0,
+    instance_parallelism: 0,
+    startup_measured_ms: 0,
+    effective_idle_timeout_seconds: 0,
+    instances_min_exceeds_realtime: false,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -409,7 +436,9 @@ const restartableStates = new Set([
 // One restart sequence. There is no restart endpoint (design §10.1: every
 // action is state-shaped), so a restart is a three-step UI sequence:
 //   stopping -> the force_stopped PUT is in flight
-//   waiting  -> the stream has to report this spec `stopped`
+//   waiting  -> the stream has to report this spec `stopped`: every one of
+//               its instance rows, since force_stopped drains them all at
+//               once and in no fixed order (specStopState)
 //   clearing -> the admin_state="" PUT is in flight
 // `deadline` is absolute so the overall wait stays bounded even though the
 // timer is re-armed on each phase change.
@@ -585,7 +614,12 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // the same reason: the PUT applies an absent estimate as 0 and clears the
   // stored one, so an override click must restate it. ram_measured_mb is the
   // opposite: agent-owned with no request counterpart (PutRuntimeSpecRequest
-  // excludes it), so it is dropped here rather than echoed back.
+  // excludes it), so it is dropped here rather than echoed back. The instance
+  // settings split the same way: replicable/min_instances/max_instances/
+  // instance_parallelism are the operator's and ride `rest`, while
+  // startup_measured_ms (agent-owned), effective_idle_timeout_seconds and
+  // instances_min_exceeds_realtime (both derived on every read) have no
+  // request counterpart and are dropped.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -607,6 +641,9 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     role,
     responses_live_timings_enabled,
     ram_measured_mb,
+    startup_measured_ms,
+    effective_idle_timeout_seconds,
+    instances_min_exceeds_realtime,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -2109,7 +2146,12 @@ export function RuntimeAdminSection({
   // first viewer and stops on the last), so it is deliberately per-row state
   // that clears on close rather than a mounted-but-hidden panel: a hidden
   // panel would keep an agent streaming output nobody is reading.
-  const [logSpec, setLogSpec] = useState<{ specId: string; title: string } | null>(null);
+  const [logSpec, setLogSpec] = useState<{
+    specId: string;
+    title: string;
+    allInstances: boolean;
+    instances: number[];
+  } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   const [restart, setRestart] = useState<RestartFlow | null>(null);
   const [restartNotice, setRestartNotice] = useState<
@@ -2198,12 +2240,16 @@ export function RuntimeAdminSection({
     return () => clearTimeout(timer);
   }, [restart]);
 
-  // Advances the sequence from the live stream: a `stopped` frame for THIS
-  // spec is the only signal that force_stopped actually took effect.
+  // Advances the sequence from the live stream: a frame in which THIS spec is
+  // `stopped` is the only signal that force_stopped actually took effect.
   useEffect(() => {
     if (restart === null || restart.phase !== 'waiting') return;
-    const row = statusRows.find((r) => r.spec_id === restart.specId);
-    if (row === undefined) {
+    // Every instance's row, not one of them: force_stopped drains all of a
+    // spec's instances at once, in no fixed order, so neither instance 0 nor
+    // any other stopping first says the spec is down -- clearing the override
+    // then would let a sibling still draining start again (specStopState).
+    const stop = specStopState(statusRows, restart.specId);
+    if (stop === 'absent') {
       // Absence is not immediately "deleted": the gateway holds runtime
       // status in volatile RAM (spec §7), so a gateway restart empties the
       // list and the next sample (<= 1 s) refills it. Only a SUSTAINED
@@ -2228,7 +2274,7 @@ export function RuntimeAdminSection({
     // watermark accepts only a strictly later frame -- without it a restart
     // of an already-resting spec fires both PUTs back to back, starts
     // nothing, and reports success.
-    if (row.state === 'stopped' && frameSeqRef.current > restart.waitFrom) {
+    if (stop === 'stopped' && frameSeqRef.current > restart.waitFrom) {
       // A spec DELETE for this mapping still in flight holds the clear: the
       // clear's own read can still answer the configured document while the
       // DELETE is in flight, and the spec PUT is an upsert, so a clear handled
@@ -2372,9 +2418,11 @@ export function RuntimeAdminSection({
     // `pending_vram_unknown` / `not_permitted` row start the sequence anyway --
     // the exact harm the gate exists to prevent: a force_stopped override that
     // no `stopped` frame can ever clear, leaving the model admission-blocked
-    // behind a timeout notice. Read the LIVE frame, not the captured row.
-    const live = statusRowsRef.current.find((r) => r.spec_id === specId);
-    if (live === undefined || !restartableStates.has(live.state)) return;
+    // behind a timeout notice. Read the LIVE frame, not the captured row: the
+    // row the action is offered on (the one that speaks for the spec,
+    // primaryStatusRows) and every other instance row of the spec, since the
+    // wait needs all of them `stopped` (restartGate).
+    if (restartGate(statusRowsRef.current, specId, restartableStates, spec) !== 'open') return;
     const run = ++restartRunRef.current;
     absentSinceRef.current = null;
     setRestartNotice(null);
@@ -2508,6 +2556,17 @@ export function RuntimeAdminSection({
   const [idleTimeoutSeconds, setIdleTimeoutSeconds] = useState(0);
   const [admissionWaitTimeoutSeconds, setAdmissionWaitTimeoutSeconds] = useState(0);
   const [pinned, setPinned] = useState(false);
+  // The instance settings. Bound to state and emitted by buildSpecBody on
+  // every save, for the same full-document reason as ramEstimateMb below: an
+  // absent field is applied as its zero value. Unticked, the save sends the
+  // backend's neutral 0/0/0 instead of the hidden fields (instanceSettingsBody).
+  // The two counts are held as the field's TEXT, because an empty field is a
+  // value of its own (0: none / unlimited); the parallelism too, so a field
+  // cleared while typing is not forced back to a number.
+  const [replicable, setReplicable] = useState(false);
+  const [minInstancesText, setMinInstancesText] = useState('');
+  const [maxInstancesText, setMaxInstancesText] = useState('');
+  const [instanceParallelismText, setInstanceParallelismText] = useState('1');
   const [adminState, setAdminState] = useState('');
   // The spec's operator RAM estimate in MB: ONE spec-level scalar (RAM is
   // host-scoped, so it is not a GpuRow field). It must be bound to state and
@@ -2669,6 +2728,10 @@ export function RuntimeAdminSection({
     setIdleTimeoutSeconds(0);
     setAdmissionWaitTimeoutSeconds(0);
     setPinned(false);
+    setReplicable(false);
+    setMinInstancesText('');
+    setMaxInstancesText('');
+    setInstanceParallelismText('1');
     setAdminState('');
     setRamEstimateMb(0);
     setRamMeasuredMb(0);
@@ -2704,6 +2767,11 @@ export function RuntimeAdminSection({
     setIdleTimeoutSeconds(spec.idle_timeout_seconds);
     setAdmissionWaitTimeoutSeconds(spec.admission_wait_timeout_seconds);
     setPinned(spec.pinned);
+    setReplicable(spec.replicable);
+    setMinInstancesText(instanceCountText(spec.min_instances));
+    setMaxInstancesText(instanceCountText(spec.max_instances));
+    // 0 is the backend's "default", which is 1: shown as what it means.
+    setInstanceParallelismText(String(spec.instance_parallelism || 1));
     setAdminState(spec.admin_state);
     setRamEstimateMb(spec.ram_estimate_mb);
     setRamMeasuredMb(spec.ram_measured_mb);
@@ -3062,6 +3130,17 @@ export function RuntimeAdminSection({
     return gpuOptionsFor(rowIdx).some((g) => g.index === row.index) ? String(row.index) : '';
   }
 
+  // The instance settings as typed, for instanceSettingsBody and
+  // validateInstances.
+  function instanceForm(): InstanceForm {
+    return {
+      replicable,
+      minText: minInstancesText,
+      maxText: maxInstancesText,
+      parallelismText: instanceParallelismText,
+    };
+  }
+
   function buildSpecBody(args: string[], env: Record<string, string>): PutRuntimeSpecRequest {
     // Write-only token sentinel, mirroring ApplicationSection's own
     // apiToken/buildBody: cleared -> '' (clear the stored token); a typed
@@ -3103,6 +3182,7 @@ export function RuntimeAdminSection({
       idle_timeout_seconds: idleTimeoutSeconds,
       admission_wait_timeout_seconds: admissionWaitTimeoutSeconds,
       pinned,
+      ...instanceSettingsBody(instanceForm()),
       admin_state: adminState,
       ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,
@@ -3241,6 +3321,11 @@ export function RuntimeAdminSection({
       showError(visibleDevicesError);
       return;
     }
+    const instancesError = validateInstances(instanceForm(), listenPort, t);
+    if (instancesError) {
+      showError(instancesError);
+      return;
+    }
     setBusy(true);
     let mapping: PortalModelMapping;
     try {
@@ -3335,6 +3420,11 @@ export function RuntimeAdminSection({
     );
     if (visibleDevicesError) {
       showError(visibleDevicesError);
+      return;
+    }
+    const instancesError = validateInstances(instanceForm(), listenPort, t);
+    if (instancesError) {
+      showError(instancesError);
       return;
     }
     setBusy(true);
@@ -3569,7 +3659,11 @@ export function RuntimeAdminSection({
     }
   }
 
-  const statusBySpecId = new Map(statusRows.map((row) => [row.spec_id, row]));
+  // The row that speaks for each spec (primaryStatusRows): the spec list's
+  // state, and the one status row that carries the spec-wide overrides.
+  const statusBySpecId = primaryStatusRows(statusRows);
+  // Running instances per spec id, for the spec list's summary.
+  const runningInstancesBySpecId = runningInstancesBySpec(statusRows);
   function statusForMapping(m: PortalModelMapping): RuntimeStatus | undefined {
     const specId = specsById[m.id]?.id;
     return specId ? statusBySpecId.get(specId) : undefined;
@@ -3670,9 +3764,12 @@ export function RuntimeAdminSection({
       render: (m) => renderBoolChip(Boolean(specsById[m.id]?.pinned), t.runtimeSpecPinned),
     },
     {
+      // For a spec stored as replicable, the idle timeout in effect (0:
+      // never unloaded), not the manual override the form edits
+      // (listedIdleTimeout).
       id: 'idle_timeout',
       label: t.runtimeSpecIdleTimeout,
-      value: (m) => formatMetric(specsById[m.id]?.idle_timeout_seconds, 0),
+      value: (m) => listedIdleTimeout(specsById[m.id], t.runtimeSpecIdleTimeoutNever),
       filter: 'text',
       numeric: true,
     },
@@ -3694,13 +3791,27 @@ export function RuntimeAdminSection({
       searchable: false,
       render: (m) => {
         const live = statusForMapping(m);
-        return live ? (
+        if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
+        const chip = (
           <StatusChip
             status={runtimeStateBadge(live.state)}
             label={runtimeStateLabel(live.state, t)}
           />
-        ) : (
-          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+        );
+        // A replicable spec's chip is the state of the row that speaks for it
+        // (a running one first, see primaryStatusRows); how many instances run,
+        // against the bounds, is the line under it. Only once the agent
+        // reports the spec at all -- with no row, "0 running" would be a
+        // claim nobody made.
+        const spec = specsById[m.id];
+        if (!spec?.replicable || spec.id === undefined) return chip;
+        return (
+          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+            {chip}
+            <Typography variant="caption" color="text.secondary">
+              {instancesSummary(spec.id, spec, runningInstancesBySpecId, t)}
+            </Typography>
+          </Box>
         );
       },
     },
@@ -3916,7 +4027,7 @@ export function RuntimeAdminSection({
                   not against the gateway name, which is a different name by
                   design. A disagreement here means the spec launches a
                   different model than the mapping routes to. */}
-              {row.model !== '' && row.model !== mapping.app_model_name && (
+              {row.model !== '' && row.model !== instanceAddress(mapping.app_model_name, row) && (
                 <WarningAmberIcon
                   fontSize="small"
                   color="warning"
@@ -3930,6 +4041,17 @@ export function RuntimeAdminSection({
           </Box>
         );
       },
+    },
+    {
+      // Which process of its spec the row is. Instance 0 -- the only row of a
+      // spec that is not replicable -- reads #0 like any other, so the column
+      // says the same thing on every row.
+      id: 'instance',
+      label: t.runtimeStatusInstance,
+      value: (row) => String(instanceIndex(row)),
+      render: (row) => `#${instanceIndex(row)}`,
+      numeric: true,
+      searchable: false,
     },
     {
       id: 'state',
@@ -4063,6 +4185,18 @@ export function RuntimeAdminSection({
           setLogSpec({
             specId: row.spec_id,
             title: gatewayNameFor(row) || row.model || row.spec_id,
+            // The view is spec-wide: every instance writes into the spec's
+            // one buffer, so for a replicable spec it says whose lines are
+            // whose -- from whichever instance row it is opened.
+            allInstances: showsAllInstanceLogs(
+              specByRuntimeId.get(row.spec_id),
+              statusRows,
+              row.spec_id,
+            ),
+            // The view's per-instance tabs start from the instances the
+            // stream lists for the spec now, and grow with every instance its
+            // log entries name while it is open.
+            instances: logInstanceIndexes(statusRows, row.spec_id),
           }),
       },
     ];
@@ -4077,6 +4211,11 @@ export function RuntimeAdminSection({
     // buttons rather than synthesizing a full-document body that would
     // overwrite the operator's command line.
     if (spec === undefined) return actions;
+    // Every override acts on the whole spec, all of its instances at once, so
+    // it is offered once, on the row that speaks for the spec: a Force stop
+    // beside instance 1 would read as stopping instance 1 alone.
+    const primary = statusBySpecId.get(row.spec_id);
+    if (primary === undefined || instanceIndex(primary) !== instanceIndex(row)) return actions;
     if (spec.admin_state !== 'force_running') {
       actions.push({
         key: 'force-start',
@@ -4110,7 +4249,19 @@ export function RuntimeAdminSection({
     // forgotten. While this row's own sequence runs the action stays visible
     // but disabled, so it is obvious why nothing else responds.
     if (spec.admin_state === '' || restart?.specId === row.spec_id) {
-      const restartBlocked = !restartableStates.has(row.state);
+      // Over every instance row of the spec, not this row alone: the wait
+      // needs all of them `stopped` (restartGate).
+      const gate = restartGate(statusRows, row.spec_id, restartableStates, spec);
+      const restartBlocked = gate !== 'open';
+      // A successful restart ends with the row `stopped`, where Restart is
+      // disabled -- so this is the RESTING state of a healthy row, not an edge
+      // case, and every operator meets it. An unexplained grey button is what
+      // makes a correct gate look like a portal bug. (`overridesLocked` gets
+      // no reason of its own: it is transient and already narrated by the
+      // row's own "stopping…" / "clearing…" chip.)
+      let restartTitle: string | undefined;
+      if (gate === 'state') restartTitle = t.runtimeRestartUnavailable;
+      else if (gate === 'instance') restartTitle = t.runtimeRestartUnavailableInstance;
       actions.push({
         key: 'restart',
         label: t.runtimeRestart,
@@ -4125,14 +4276,8 @@ export function RuntimeAdminSection({
         // a portal bug -- but never clickable there. `force_running`, offered
         // above, is the action that does something on those three.
         disabled: overridesLocked || restartBlocked,
-        // …and SAY so on hover. A successful restart ends with the row
-        // `stopped`, where Restart is disabled -- so this is the RESTING state
-        // of a healthy row, not an edge case, and every operator meets it. An
-        // unexplained grey button is what makes a correct gate look like a
-        // portal bug. (`overridesLocked` gets no reason of its own: it is
-        // transient and already narrated by the row's own "stopping…" /
-        // "clearing…" chip.)
-        title: restartBlocked ? t.runtimeRestartUnavailable : undefined,
+        // …and SAY so on hover (restartTitle).
+        title: restartTitle,
         onClick: () => void startRestart(row.spec_id, spec),
       });
     }
@@ -4735,8 +4880,29 @@ export function RuntimeAdminSection({
               onChange={(e) =>
                 setIdleTimeoutSeconds(e.target.value === '' ? 0 : Number(e.target.value))
               }
+              // With several instances this field is the manual override of
+              // an automatic timeout, and its 0 changes meaning from "never
+              // unload" to "no override" -- said where the 0 is typed.
+              helperText={replicable ? t.runtimeSpecIdleTimeoutOverrideHint : undefined}
               inputProps={{ min: 0 }}
             />
+            {/* While the box is ticked: the measured startup, which the agent
+                measures for every spec (none yet on Create), and beside it the
+                timeout the gateway actually pushes -- only for a spec STORED
+                as replicable: for any other the figure is the stored manual
+                value, not an automatic one, so ticking the box on such a spec
+                shows the startup alone until a save has made the gateway
+                derive it. A timeout in effect of 0 reads "never unloaded". */}
+            {replicable && (
+              <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                {currentSpec?.configured && currentSpec.replicable
+                  ? t.runtimeSpecAutoIdleTimeout(
+                      currentSpec.effective_idle_timeout_seconds,
+                      currentSpec.startup_measured_ms,
+                    )
+                  : t.runtimeSpecMeasuredStartup(currentSpec?.startup_measured_ms ?? 0)}
+              </Typography>
+            )}
             <Field
               id="runtime-spec-admission-wait-timeout"
               type="number"
@@ -4751,6 +4917,62 @@ export function RuntimeAdminSection({
               control={<Checkbox checked={pinned} onChange={(e) => setPinned(e.target.checked)} />}
               label={t.runtimeSpecPinned}
             />
+            {/* Opt-in: unticked, the spec runs exactly one process, as it did
+                before instances existed. The bounds and the parallelism mean
+                nothing without it, so they are shown only with it, and
+                unticked a save sends the neutral 0/0/0 in their place and
+                never checks them (instanceSettingsBody, validateInstances). */}
+            <FormControlLabel
+              control={
+                <Checkbox checked={replicable} onChange={(e) => setReplicable(e.target.checked)} />
+              }
+              label={t.runtimeSpecReplicable}
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              {t.runtimeSpecReplicableHint}
+            </Typography>
+            {replicable && (
+              <>
+                <Field
+                  id="runtime-spec-min-instances"
+                  type="number"
+                  label={t.runtimeSpecMinInstances}
+                  value={minInstancesText}
+                  onChange={(e) => setMinInstancesText(e.target.value)}
+                  inputProps={{ min: 0, max: INSTANCES_MAX }}
+                />
+                {/* The minimum is above the real-time concurrency the audio
+                    ramp measured as a ceiling for this mapping (#340). A
+                    warning, never a refusal -- an operator may keep instances
+                    up for other reasons. It follows the minimum as typed,
+                    because the save closes this editor: the stored spec's
+                    flag speaks for the stored minimum, and an edited one is
+                    judged by the gateway's rule against the mapping's
+                    measured figures (minRealtimeWarning). */}
+                {minRealtimeWarning(
+                  instanceCountFromText(minInstancesText),
+                  currentSpec,
+                  editingSpecMappingId ? mappingById.get(editingSpecMappingId) : undefined,
+                ) && <Alert severity="warning">{t.runtimeSpecMinExceedsRealtime}</Alert>}
+                <Field
+                  id="runtime-spec-max-instances"
+                  type="number"
+                  label={t.runtimeSpecMaxInstances}
+                  value={maxInstancesText}
+                  onChange={(e) => setMaxInstancesText(e.target.value)}
+                  helperText={t.runtimeSpecMaxInstancesUnlimited}
+                  inputProps={{ min: 0, max: INSTANCES_MAX }}
+                />
+                <Field
+                  id="runtime-spec-instance-parallelism"
+                  type="number"
+                  label={t.runtimeSpecInstanceParallelism}
+                  value={instanceParallelismText}
+                  onChange={(e) => setInstanceParallelismText(e.target.value)}
+                  inputProps={{ min: 1, max: INSTANCE_PARALLELISM_MAX }}
+                />
+              </>
+            )}
             {/* Without this, the GPU rows below are a DECLARATION: they drive
                 the admission arithmetic and the VRAM measurement mapping, and
                 nothing stops the process from landing on a different card --
@@ -5726,7 +5948,9 @@ export function RuntimeAdminSection({
             <ListTable
               rows={statusRows}
               columns={statusColumns}
-              rowKey={(row) => row.spec_id}
+              // A spec's instances share its spec_id, so the id alone would
+              // fold them into one row.
+              rowKey={(row) => `${row.spec_id}#${instanceIndex(row)}`}
               actions={statusActions}
               storageKey="op.runtimeStatus"
               minWidth={980}
@@ -5763,6 +5987,8 @@ export function RuntimeAdminSection({
           serverId={server.id}
           specId={logSpec.specId}
           title={logSpec.title}
+          allInstances={logSpec.allInstances}
+          instances={logSpec.instances}
         />
       )}
     </>

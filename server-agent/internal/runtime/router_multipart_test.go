@@ -89,8 +89,17 @@ func (m *recordingManager) EnsureRunning(_ context.Context, model string) (strin
 	m.mu.Unlock()
 	return m.endpoint, func() {}, nil
 }
-func (m *recordingManager) LoadedModels() []string { return nil }
-func (m *recordingManager) Status() []Status       { return nil }
+
+// EnsureServing records like EnsureRunning: it is the ensure a multipart
+// request makes.
+func (m *recordingManager) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	return m.EnsureRunning(ctx, model)
+}
+
+// ResolveAddress names no instance address: every model is its own, instance 0.
+func (m *recordingManager) ResolveAddress(string) (string, int, bool) { return "", 0, false }
+func (m *recordingManager) LoadedModels() []string                    { return nil }
+func (m *recordingManager) Status() []Status                          { return nil }
 
 func (m *recordingManager) asked() []string {
 	m.mu.Lock()

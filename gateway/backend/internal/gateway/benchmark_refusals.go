@@ -38,7 +38,11 @@ const (
 
 	// codeBenchmarkAudioOnly is codeBenchmarkImagesOnly for a mapping that
 	// serves only audio, speech or transcription (mappingSpecIsAudioOnly): the
-	// same refusals, for the same reason.
+	// refusal of the runs that would send it a chat prompt -- the vision probe,
+	// the context probe and a Load that cannot start it without one. The speed,
+	// capacity and both modes measure such a mapping's audio instead
+	// (benchmarkViewTarget) and never answer it: one they cannot measure is
+	// refused with codeBenchmarkSpeechUnavailable (msgBenchmarkAudioUnmeasurable).
 	codeBenchmarkAudioOnly = "benchmark.audio_only"
 	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"
 
@@ -51,6 +55,24 @@ const (
 	// run answers it too when every mapping in its scope is skipped.
 	codeBenchmarkSpeechUnavailable = "benchmark.speech_unavailable"
 	msgBenchmarkSpeechUnavailable  = "this model, or every model in the run's scope, cannot be benchmarked for speech: it does not synthesize speech, or it clones a voice and needs a reference"
+
+	// msgBenchmarkAudioUnmeasurable is codeBenchmarkSpeechUnavailable's message for the
+	// speed, capacity and both modes: every view of the run's scope serves audio only, and
+	// none of them can be measured as audio (refuseNothingRunnable) -- the gateway routes it
+	// no audio request, it has no speech or transcription verdict yet, or it is a clone model
+	// that lists no preset voice, so it cannot synthesize without a reference.
+	msgBenchmarkAudioUnmeasurable = "this model, or every model in the run's scope, serves audio only and cannot be measured yet: it has no speech or transcription verdict, or it clones a voice and lists no preset voice"
+
+	// msgBenchmarkScopeUnmeasurable is codeBenchmarkSpeechUnavailable's message for a
+	// speed, capacity or both run whose scope has nothing runnable and mixes the two kinds
+	// that cannot be measured (refuseNothingRunnable): views that serve only images and
+	// audio-only views whose audio cannot be measured yet. Neither single-kind answer would
+	// be true -- images_only would tell the operator that the audio model serves images --
+	// so the message names both, under the audio code: an audio model is in the scope, and
+	// what it lacks (a verdict, a preset voice) is what can still change. The portal shows
+	// one label for this code that states all three cases, so the wording here is for API
+	// clients and logs.
+	msgBenchmarkScopeUnmeasurable = "no model in the run's scope can be measured: each serves only images, or serves audio only and cannot be measured yet (it has no speech or transcription verdict, or it clones a voice and lists no preset voice)"
 
 	// codeBenchmarkAgentEnsureUnsupported: an images-only agent child loads
 	// only through the agent's ensure route, and the server's agent has not
@@ -74,6 +96,8 @@ var (
 	errBenchmarkImagesOnly             = errors.New(codeBenchmarkImagesOnly)
 	errBenchmarkAudioOnly              = errors.New(codeBenchmarkAudioOnly)
 	errBenchmarkSpeechUnavailable      = errors.New(codeBenchmarkSpeechUnavailable)
+	errBenchmarkAudioUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (audio)")
+	errBenchmarkScopeUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (images and audio)")
 	errBenchmarkAgentEnsureUnsupported = errors.New(codeBenchmarkAgentEnsureUnsupported)
 	errBenchmarkSpecForceStopped       = errors.New(codeBenchmarkSpecForceStopped)
 )
@@ -103,7 +127,10 @@ var loadRefusalErrs = map[string]error{
 const benchmarkSkippedImagesOnly = "images_only"
 
 // benchmarkSkippedAudioOnly is benchmarkSkippedImagesOnly for a mapping that
-// serves only audio (speech or transcription).
+// serves only audio (speech or transcription): the vision probe's skip of every
+// such mapping, and the speed, capacity and both modes' skip of one they cannot
+// measure as audio either -- no speech or transcription verdict, or no audio
+// request routed to it (benchmarkViewTarget).
 const benchmarkSkippedAudioOnly = "audio_only"
 
 // The two values of BenchmarkResult.Skipped a speech run (?mode=speech) records,
@@ -152,6 +179,19 @@ func mappingSpecIsImagesOnly(app routing.Application, spec routing.RuntimeSpec, 
 // whenever it has one and the application's list stands otherwise.
 func mappingSpecIsAudioOnly(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) bool {
 	return routing.FlavorsAreAudioOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors)
+}
+
+// AudioTargetFlavors is the flavor half of the decision whether a mapping is an audio target
+// of the speed, capacity and both modes (benchmarkViewTarget): its EFFECTIVE flavors serve
+// audio only -- not images-only, and no text flavor, so a chat model that also transcribes
+// or speaks keeps its text benchmark -- and the gateway routes it audio requests
+// (routing.MappingServesAPIFlavor for openai_audio). Whether it is one then depends on its
+// capability rows. It reads nothing but its arguments (the spec the caller read, hasSpec
+// whether the mapping has one), so the app-health loop applies it before it reads any
+// capability row of a mapping it asks the automatic audio run about.
+func AudioTargetFlavors(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) bool {
+	return !mappingSpecIsImagesOnly(app, spec, hasSpec) && mappingSpecIsAudioOnly(app, spec, hasSpec) &&
+		routing.MappingServesAPIFlavor(app, routing.EffectiveFields(app, spec, hasSpec), routing.APIFlavorOpenAIAudio)
 }
 
 // loadRefusal is the one decision whether a Load of a mapping can succeed:
@@ -239,53 +279,165 @@ type benchmarkViewPartition struct {
 	runnable []benchmarkTarget
 	// recorded are the results the run records before it measures anything,
 	// in view order: a skip for each view that serves only images or only
-	// audio, and an error for each view whose spec read failed. Neither gets a
-	// history row.
+	// audio it cannot measure, and an error for each view a read failed for.
+	// Neither gets a history row.
 	recorded []BenchmarkResult
-	// unreadable counts the views whose spec read failed.
+	// unreadable counts the views a read failed for: the runtime spec, or for
+	// an audio view of the speed, capacity and both modes its capability rows
+	// or voices cache.
 	unreadable int
-	// imagesOnly and audioOnly count the views skipped because they serve only
-	// images, or only audio. refuseNothingRunnable names the kind.
-	imagesOnly, audioOnly int
+	// imagesOnly counts the views skipped because they serve only images.
+	// audioOnly counts the views the vision probe skips because they serve only
+	// audio, and audioUnmeasurable the audio-only views the speed, capacity and
+	// both modes skip because they cannot measure their audio either (no speech
+	// or transcription verdict, or a clone model without a preset voice).
+	// refuseNothingRunnable names the kind.
+	imagesOnly, audioOnly, audioUnmeasurable int
 }
 
-// partitionBenchmarkViews reads each view's runtime spec once
-// (mappingRuntimeSpec) and sorts the view into runnable, skipped (it serves
-// only images or only audio, so it cannot answer the run's chat prompt) or
-// unreadable (the read failed, so whether it serves only images or only audio is
-// unknown). A view naming both non-text flavors is skipped as images-only. A
-// runnable target is built from the spec that was read. An unreadable view is
-// logged with its mapping id.
-func (s *Server) partitionBenchmarkViews(ctx context.Context, views []portal.BenchmarkTargetView) benchmarkViewPartition {
+// partitionBenchmarkViews sorts each view (benchmarkViewTarget) into runnable,
+// skipped (it serves only images, or only audio it cannot be measured on, so it
+// cannot answer the run's chat prompt) or unreadable (a read failed, so whether
+// it serves only images or only audio, or what audio it serves, is unknown). With
+// measureAudio -- the speed, capacity and both modes -- an audio-only speech or
+// transcription mapping is a runnable audio target, and an audio-only view it
+// cannot measure is counted as audioUnmeasurable; without it, the vision probe's
+// partition, every audio-only view is skipped and counted as audioOnly. A view
+// naming both non-text flavors is skipped as images-only. A runnable target is
+// built from the spec that was read. An unreadable view is logged with its
+// mapping id.
+func (s *Server) partitionBenchmarkViews(ctx context.Context, views []portal.BenchmarkTargetView, measureAudio bool) benchmarkViewPartition {
 	var p benchmarkViewPartition
 	for _, v := range views {
-		spec, hasSpec, err := s.mappingRuntimeSpec(ctx, v.App, v.Mapping.ID)
+		tgt, skipped, err := s.benchmarkViewTarget(ctx, v, measureAudio)
+		var unreadable *benchmarkViewUnreadable
 		switch {
-		case err != nil:
-			slog.Warn("benchmark: runtime spec read failed; mapping not benchmarked", "mapping_id", v.Mapping.ID, "err", err)
+		case errors.As(err, &unreadable) && unreadable.what == benchmarkViewSpec:
+			slog.Warn("benchmark: runtime spec read failed; mapping not benchmarked", "mapping_id", v.Mapping.ID, "err", unreadable.err)
 			p.unreadable++
-			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Error: benchmarkSpecUnreadable + err.Error()})
-		case mappingSpecIsImagesOnly(v.App, spec, hasSpec):
+			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Error: benchmarkSpecUnreadable + unreadable.err.Error()})
+		case err != nil:
+			slog.Warn("audio benchmark: a read failed; mapping not benchmarked", "mapping_id", v.Mapping.ID, "err", err)
+			p.unreadable++
+			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Error: err.Error()})
+		case skipped == benchmarkSkippedImagesOnly:
 			p.imagesOnly++
-			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: benchmarkSkippedImagesOnly})
-		case mappingSpecIsAudioOnly(v.App, spec, hasSpec):
-			p.audioOnly++
-			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: benchmarkSkippedAudioOnly})
+			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: skipped})
+		case skipped != "":
+			if measureAudio {
+				p.audioUnmeasurable++
+			} else {
+				p.audioOnly++
+			}
+			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: skipped})
 		default:
-			p.runnable = append(p.runnable, s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec))
+			p.runnable = append(p.runnable, tgt)
 		}
 	}
 	return p
 }
 
-// partitionBenchmarkViewsFor is the split a run of mode makes: the speech
-// benchmark's own (partitionSpeechBenchmarkViews), where audio is what runs, and for
-// every other mode partitionBenchmarkViews, where audio is what is refused.
-func (s *Server) partitionBenchmarkViewsFor(ctx context.Context, views []portal.BenchmarkTargetView, mode string) benchmarkViewPartition {
-	if mode == benchmarkModeSpeech {
-		return s.partitionSpeechBenchmarkViews(ctx, views)
+// What a view's classification could not read (benchmarkViewUnreadable.what).
+const (
+	benchmarkViewSpec         = "runtime spec"
+	benchmarkViewCapabilities = "capability"
+	benchmarkViewVoices       = "voices cache"
+)
+
+// benchmarkViewUnreadable is a view benchmarkViewTarget cannot classify because a read
+// failed: what it read, and why that failed.
+type benchmarkViewUnreadable struct {
+	what string
+	err  error
+}
+
+func (e *benchmarkViewUnreadable) Error() string {
+	if e.what == benchmarkViewSpec {
+		return benchmarkSpecUnreadable + e.err.Error()
 	}
-	return s.partitionBenchmarkViews(ctx, views)
+	return "audio benchmark: " + e.what + " unreadable; not benchmarked: " + e.err.Error()
+}
+
+func (e *benchmarkViewUnreadable) Unwrap() error { return e.err }
+
+// benchmarkViewTarget is the one classification of a view the speed, capacity and both modes
+// make, shared by the manual starter's partition, the scheduler and the health loop's
+// automatic audio run. It answers the view's target, or why it is skipped (one of the closed
+// BenchmarkResult.Skipped values), or a *benchmarkViewUnreadable when a read it decides on
+// failed -- what the view is is then unknown, and is not guessed at. The runtime spec is read
+// once (mappingRuntimeSpec) and the target is built from it.
+//   - A view that serves only images is skipped (benchmarkSkippedImagesOnly).
+//   - A view that serves a text flavor (it is not audio-only, mappingSpecIsAudioOnly) is a
+//     chat model and a text target, exactly as before audio was measured: one with a speech
+//     or transcription verdict as well -- an omni model that also transcribes, say -- keeps
+//     its text benchmark, and its capability rows are not read.
+//   - With measureAudio, an audio-only view the gateway would route audio to
+//     (AudioTargetFlavors) has its capability rows read: one whose role is speech or
+//     transcription is an audio target
+//     (audioTargetOf), and a TTS clone model synthesizes with its preset voice
+//     (speechBenchmarkPresetVoice) -- one with no preset cannot synthesize without a
+//     reference and is skipped (benchmarkSkippedSpeechClone).
+//   - Every other audio-only view -- no speech or transcription verdict, no audio request
+//     routed to it, or measureAudio off -- is skipped (benchmarkSkippedAudioOnly): it cannot
+//     answer a chat prompt either.
+func (s *Server) benchmarkViewTarget(ctx context.Context, v portal.BenchmarkTargetView, measureAudio bool) (benchmarkTarget, string, error) {
+	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, v.App, v.Mapping.ID)
+	if err != nil {
+		return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewSpec, err: err}
+	}
+	if mappingSpecIsImagesOnly(v.App, spec, hasSpec) {
+		return benchmarkTarget{}, benchmarkSkippedImagesOnly, nil
+	}
+	if !mappingSpecIsAudioOnly(v.App, spec, hasSpec) {
+		return s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec), "", nil
+	}
+	if measureAudio && AudioTargetFlavors(v.App, spec, hasSpec) {
+		return s.benchmarkAudioViewTarget(ctx, v, spec, hasSpec)
+	}
+	return benchmarkTarget{}, benchmarkSkippedAudioOnly, nil
+}
+
+// benchmarkAudioViewTarget is benchmarkViewTarget for an audio-only view the gateway routes
+// audio to, with audio measured: its capability rows decide whether it is an audio target, a
+// TTS clone model without a preset voice is skipped (benchmarkSkippedSpeechClone), and a view
+// with no speech or transcription role is skipped as audio-only (benchmarkSkippedAudioOnly).
+func (s *Server) benchmarkAudioViewTarget(ctx context.Context, v portal.BenchmarkTargetView, spec routing.RuntimeSpec, hasSpec bool) (benchmarkTarget, string, error) {
+	rows, err := s.Routes.MappingCapabilities(ctx, v.Mapping.ID)
+	if err != nil {
+		return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewCapabilities, err: err}
+	}
+	at := audioTargetOf(rows, routing.EffectiveRuntimeSpecType(spec))
+	if at.role == "" {
+		return benchmarkTarget{}, benchmarkSkippedAudioOnly, nil
+	}
+	voice := ""
+	if at.role == routing.RoleTTS {
+		if voice, err = s.speechBenchmarkPresetVoice(ctx, v.Mapping.ID, rows); err != nil {
+			return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewVoices, err: err}
+		}
+		if !routing.CapabilityRowsOfferableTTS(rows, voice != "") {
+			return benchmarkTarget{}, benchmarkSkippedSpeechClone, nil
+		}
+	}
+	tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
+	tgt.audio, tgt.voice = at, voice
+	return tgt, "", nil
+}
+
+// partitionBenchmarkViewsFor is the split a run of mode makes: the speech
+// benchmark's own (partitionSpeechBenchmarkViews), where only speech runs; the
+// vision probe's, where audio is refused; and for the speed, capacity and both
+// modes the one where a speech or transcription mapping is measured as audio
+// (partitionBenchmarkViews with measureAudio).
+func (s *Server) partitionBenchmarkViewsFor(ctx context.Context, views []portal.BenchmarkTargetView, mode string) benchmarkViewPartition {
+	switch mode {
+	case benchmarkModeSpeech:
+		return s.partitionSpeechBenchmarkViews(ctx, views)
+	case "vision":
+		return s.partitionBenchmarkViews(ctx, views, false)
+	default:
+		return s.partitionBenchmarkViews(ctx, views, true)
+	}
 }
 
 // refuseNothingRunnableFor answers a partition with no runnable view the way the
@@ -299,18 +451,33 @@ func (p benchmarkViewPartition) refuseNothingRunnableFor(w http.ResponseWriter, 
 }
 
 // refuseNothingRunnable answers a partition with no runnable view, and
-// reports whether it did: 409 benchmark.audio_only when every skipped view
-// serves only audio, 409 benchmark.images_only otherwise (a skipped
-// images-only view among them, or none skipped at all), and 500
-// benchmark.request_failed when a spec read failed, because then either
-// refusal would be a guess.
+// reports whether it did, with the answer that is true of the whole scope:
+//   - 500 benchmark.request_failed when a read failed, because then any
+//     refusal would be a guess;
+//   - for the speed, capacity and both modes, 409 benchmark.speech_unavailable
+//     whenever a skipped view serves only audio they cannot measure: with the
+//     audio message (msgBenchmarkAudioUnmeasurable) when every skipped view
+//     is such audio, and with the message that names both kinds
+//     (msgBenchmarkScopeUnmeasurable) when images-only views are skipped
+//     beside it -- images_only would claim the audio model serves images;
+//   - 409 benchmark.audio_only when every skipped view serves only audio and
+//     the run is the vision probe;
+//   - 409 benchmark.images_only otherwise: every skipped view serves only
+//     images, or the vision probe skipped images-only views beside audio-only
+//     ones (both refuse its chat prompt), or none was skipped at all.
 func (p benchmarkViewPartition) refuseNothingRunnable(w http.ResponseWriter) bool {
 	switch {
 	case len(p.runnable) > 0:
 		return false
 	case p.unreadable > 0:
 		writeBenchmarkRequestFailed(w)
-	case p.audioOnly > 0 && p.imagesOnly == 0:
+	case p.audioUnmeasurable > 0 && p.imagesOnly > 0:
+		writeBenchmarkError(w, errBenchmarkScopeUnmeasurable)
+	case p.imagesOnly > 0:
+		writeBenchmarkError(w, errBenchmarkImagesOnly)
+	case p.audioUnmeasurable > 0:
+		writeBenchmarkError(w, errBenchmarkAudioUnmeasurable)
+	case p.audioOnly > 0:
 		writeBenchmarkError(w, errBenchmarkAudioOnly)
 	default:
 		writeBenchmarkError(w, errBenchmarkImagesOnly)

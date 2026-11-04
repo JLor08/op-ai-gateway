@@ -268,13 +268,21 @@ func vramStateNoProcess(state string) bool { return vramStatesNoProcess[state] }
 // snapshot, which carries the same rows -- by spec id, so the two isolation
 // checks read a spec's state by lookup instead of by scanning.
 //
-// A repeated spec id keeps the LAST row, which is the registry's own
-// last-write-wins view of a spec: a frame is a snapshot of distinct specs, so
-// a duplicate is either an update or malformed, and in both readings the later
-// row is the one to believe.
+// A replicable spec reports one row per instance under its one spec id, and
+// a VRAM run needs every instance of every spec drained, the target's own
+// included: a burst instance that still runs holds VRAM the measurement would
+// count. So a spec reads as one of its rows in a state this gateway does not
+// recognize as process-free (vramStateNoProcess) whenever it has one -- the
+// first such row, in frame order -- and only otherwise as a no-process state,
+// the last row's. In whatever order the instances arrive, a spec is quiet here
+// only when all of them are, and an unrecognized state keeps it pending, the
+// fail-closed direction. A spec with one row reads as that row, as before.
 func vramStateBySpec(statuses []RuntimeStatusDTO) map[string]string {
 	out := make(map[string]string, len(statuses))
 	for _, status := range statuses {
+		if state, seen := out[status.SpecID]; seen && !vramStateNoProcess(state) {
+			continue
+		}
 		out[status.SpecID] = status.State
 	}
 	return out

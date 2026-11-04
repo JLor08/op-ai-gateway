@@ -44,9 +44,28 @@ type RuntimeGPUStatusDTO struct {
 // published to live SSE subscribers (mirrors agentRuntimeSample's json tags
 // for every field it carries, except ImageOptions, which is in-process only --
 // see that field).
+//
+// A replicable spec (#340) has one row for every instance the agent reports,
+// whatever its state -- running, starting, stopped, draining, crashed or any
+// other -- all under the spec's own SpecID: SpecID is the BASE spec id,
+// Instance tells the rows apart, and Model is the instance's address ("m" for
+// instance 0, "m#k" for instance k). A reader that needs ONE row to speak for
+// the spec takes its representative row (representativeRowIndex); a reader
+// that indexes rows by SpecID alone has to say what it does with the others.
+// A spec that is not replicable, and every row of an agent without the
+// runtime_instances feature, is instance 0 alone: exactly the one row per
+// spec there always was.
 type RuntimeStatusDTO struct {
-	SpecID         string    `json:"spec_id"`
-	Model          string    `json:"model"`
+	SpecID string `json:"spec_id"`
+	Model  string `json:"model"`
+	// Instance is the instance index k this row describes: 0 for instance 0
+	// and for every spec that is not replicable.
+	Instance int `json:"instance"`
+	// StartupMS is this instance's measured startup in ms: from the start of
+	// its most recent successful start to its first healthy probe. 0 (and
+	// omitted) = not measured yet. The ingest folds it per spec into the
+	// stored startup_measured_ms (writeBackRuntimeStartup).
+	StartupMS      int       `json:"startup_ms,omitempty"`
 	State          string    `json:"state"`
 	Since          time.Time `json:"since"`
 	PID            int       `json:"pid,omitempty"`
@@ -208,6 +227,38 @@ func (r *agentFeaturesRegistry) Has(serverID, feature string) bool {
 		}
 	}
 	return false
+}
+
+// Known reports whether serverID's agent has declared its feature set since
+// this registry was built -- an empty set included -- as distinct from a
+// server not heard from yet, or whose last declaration could not be read
+// (Forget). Has answers false for both; the runtime-config document tells them
+// apart, holding a document that depends on a feature of an agent that is not
+// known rather than serving it the document of an agent without it
+// (portal.AgentRuntimeConfigDTO.AwaitsAgentFeatures). false for a nil
+// registry.
+func (r *agentFeaturesRegistry) Known(serverID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.features[serverID]
+	return ok
+}
+
+// Forget drops serverID's declared feature set, so the server reads as not
+// heard from (Known false, Has false). The telemetry ingest calls it for a
+// sample whose capabilities could not be read: such a sample says nothing
+// about the agent's binary, which an empty set would claim lacks every
+// feature. No-op on a nil registry or an empty server id.
+func (r *agentFeaturesRegistry) Forget(serverID string) {
+	if r == nil || serverID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.features, serverID)
 }
 
 // Retain evicts the declared feature sets of servers no longer in live
@@ -426,6 +477,28 @@ func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusD
 	return append([]RuntimeStatusDTO(nil), r.statuses[serverID]...)
 }
 
+// statusRows returns serverID's most recent published runtime-status snapshot
+// itself, not a copy, holding the lock for the map read alone -- for a reader
+// on the request path (routing's instance expansion) that must not hold this
+// lock any longer. It is safe to read without the lock only because nothing
+// writes to a published slice: publish stores a fresh slice on every call and
+// never touches one it has published (a later publish replaces the map entry
+// and leaves the rows a reader holds as they were), AND every holder of that
+// same slice treats it as read-only -- publish hands the very slice it stores
+// to each subscriber as a frame, so a subscriber that modified its frame
+// would change the rows under this reader. Every subscriber only reads its
+// frames; one that needs to change them must copy first. The caller must not
+// modify the rows either; statusSnapshot is the copy for one that would. Nil
+// for a nil registry and for a server that has never reported.
+func (r *runtimeStatusRegistry) statusRows(serverID string) []RuntimeStatusDTO {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.statuses[serverID]
+}
+
 // serverIDs returns every server id that has a published runtime-status
 // snapshot, in no particular order. Bounded to the deployment's GPU-box
 // count (servers running agent-managed models), pruned by Retain below as
@@ -510,5 +583,56 @@ func (r *runtimeStatusRegistry) Retain(live map[string]struct{}) {
 		if _, ok := live[id]; !ok {
 			delete(r.appliedETag, id)
 		}
+	}
+}
+
+// representativeRowIndex is the rule for which of one spec's status rows on
+// a server speaks for the spec, wherever a reader needs one row: the running
+// instance-0 row; else the running row with the lowest instance index; else
+// the instance-0 row; else the row with the lowest instance index. Among rows
+// the rule cannot tell apart (a malformed frame repeating an instance) the
+// first wins. row reads the instance index and state of row i of n rows, all
+// of one spec, so the one function serves the status rows and the raw
+// telemetry samples alike. It returns -1 when n is 0.
+//
+// Every reader that lets one row stand for the spec goes through it: the
+// context and capability write-backs (primaryRowIndexes), the model-servers
+// row's state and probe states (runtimeRowRepresentative), the image options
+// (specImageOptions) and a benchmark's reading of its target
+// (benchmarkSpecStatus). So no two views of one spec disagree about which row
+// is the spec's.
+//
+// A running row first, because it is the one serving: a crashed or idled-out
+// instance 0 beside a burst instance that serves must not stand for the spec,
+// or it would silence the write-backs while the model serves and read the
+// model as down. Among the running rows and among the rest, instance 0 first,
+// because it is the instance the spec's plain address names and the only one
+// an agent without instances ever had; then the lowest index, so the choice
+// does not depend on the order the agent lists its rows in.
+func representativeRowIndex(n int, row func(i int) (instance int, state string)) int {
+	best, bestRank, bestInstance := -1, 0, 0
+	for i := range n {
+		instance, state := row(i)
+		rank := representativeRank(instance, state)
+		if best < 0 || rank < bestRank || (rank == bestRank && instance < bestInstance) {
+			best, bestRank, bestInstance = i, rank, instance
+		}
+	}
+	return best
+}
+
+// representativeRank orders a row for representativeRowIndex, lower first:
+// running instance 0, another running instance, instance 0, any other row.
+func representativeRank(instance int, state string) int {
+	running := state == agentSpecStateRunning
+	switch {
+	case running && instance == 0:
+		return 0
+	case running:
+		return 1
+	case instance == 0:
+		return 2
+	default:
+		return 3
 	}
 }

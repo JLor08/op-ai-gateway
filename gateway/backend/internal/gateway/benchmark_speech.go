@@ -434,10 +434,11 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 	if err := checkSpeechBenchmarkResponse(resp); err != nil {
 		return speechMeasurement{}, err
 	}
-	audio, wall, err := readSpeechBenchmarkAudio(resp.Body, start)
+	audio, end, err := readBenchmarkAnswer(resp.Body, speechBenchmarkMaxAudioBytes, time.Now)
 	if err != nil {
-		return speechMeasurement{}, err
+		return speechMeasurement{}, fmt.Errorf("speech benchmark: %w", err)
 	}
+	wall := end.Sub(start)
 	format, ok := wavFormatFromReader(bytes.NewReader(audio))
 	if !ok {
 		return speechMeasurement{}, errors.New("speech benchmark: the answer is not a WAV whose header states a consistent byte rate")
@@ -472,9 +473,8 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 // measured: a non-2xx status (with the upstream's error text) or a Content-Type that
 // does not label the body as WAV. It reads the body only to quote an error answer.
 func checkSpeechBenchmarkResponse(resp *provider.ProxyResponse) error {
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
-		return fmt.Errorf("speech benchmark: the upstream answered HTTP %d: %s", resp.StatusCode, speechBenchmarkErrorText(errBody))
+	if refusal, refused := readBenchmarkRefusal(resp); refused {
+		return fmt.Errorf("speech benchmark: the upstream answered HTTP %d: %s", refusal.status, refusal.text)
 	}
 	if contentType := resp.Header.Get("Content-Type"); !speechAudioMediaTypeOf(contentType) {
 		return fmt.Errorf("speech benchmark: the answer is not labelled as WAV (Content-Type %q)", contentType)
@@ -482,23 +482,57 @@ func checkSpeechBenchmarkResponse(resp *provider.ProxyResponse) error {
 	return nil
 }
 
-// readSpeechBenchmarkAudio reads a benchmark answer's body to its end (bounded by
-// speechBenchmarkMaxAudioBytes) and returns it with the elapsed time since start,
-// taken the instant the read returns, before any check of what was read. An unreadable,
-// empty or oversized body is an error.
-func readSpeechBenchmarkAudio(body io.Reader, start time.Time) ([]byte, time.Duration, error) {
-	audio, err := io.ReadAll(io.LimitReader(body, speechBenchmarkMaxAudioBytes+1))
-	wall := time.Since(start)
+// benchmarkRefusal is what a non-2xx benchmark answer said: its HTTP status, the stable
+// error code its body names when it is an error envelope ({"error":{"code":...}}, the
+// shape the agent's runtime router answers in, liveErrorCode), and the text a result
+// quotes (speechBenchmarkErrorText).
+type benchmarkRefusal struct {
+	status int
+	code   string
+	text   string
+}
+
+// readBenchmarkRefusal reports whether a benchmark answer is a refusal -- a status outside
+// 2xx -- and, when it is, what it said. It is the one reading of a refused answer that the
+// speech benchmark and the audio measurements share: the body is read, bounded by
+// speechBenchmarkErrorBytes, only to quote a refusal, and a 2xx answer is not read at all.
+func readBenchmarkRefusal(resp *provider.ProxyResponse) (benchmarkRefusal, bool) {
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return benchmarkRefusal{}, false
+	}
+	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
+	return benchmarkRefusal{status: resp.StatusCode, code: liveErrorCode(errBody), text: speechBenchmarkErrorText(errBody)}, true
+}
+
+// The two ways a one-shot benchmark answer read to its end is still no answer
+// (readBenchmarkAnswer): it is empty, or it runs past the bound. They are sentinels, so a
+// caller can tell them from a body that broke off, whose error wraps the read's cause.
+var (
+	errBenchmarkAnswerEmpty    = errors.New("the answer is empty")
+	errBenchmarkAnswerTooLarge = errors.New("the answer exceeds")
+)
+
+// readBenchmarkAnswer reads a one-shot benchmark answer's body to its end, bounded by
+// limit, and returns it with the moment the read returned, taken from now before anything
+// read is checked. It is the one reading of a whole answer that the speech benchmark and
+// the audio measurements share. An unreadable body is an error wrapping the read's cause;
+// an empty one is errBenchmarkAnswerEmpty (a 2xx with nothing in it is no answer, and
+// would otherwise surface far from its cause as an answer with no audio or no text); one
+// past the bound is errBenchmarkAnswerTooLarge. The errors name no caller: each prefixes
+// its own.
+func readBenchmarkAnswer(body io.Reader, limit int64, now func() time.Time) ([]byte, time.Time, error) {
+	answer, err := io.ReadAll(io.LimitReader(body, limit+1))
+	end := now()
 	if err != nil {
-		return nil, wall, fmt.Errorf("speech benchmark: the answer could not be read to its end: %w", err)
+		return nil, end, fmt.Errorf("the answer could not be read to its end: %w", err)
 	}
 	switch {
-	case len(audio) == 0:
-		return nil, wall, errors.New("speech benchmark: the answer is empty")
-	case len(audio) > speechBenchmarkMaxAudioBytes:
-		return nil, wall, fmt.Errorf("speech benchmark: the answer exceeds %d bytes", speechBenchmarkMaxAudioBytes)
+	case len(answer) == 0:
+		return nil, end, errBenchmarkAnswerEmpty
+	case int64(len(answer)) > limit:
+		return nil, end, fmt.Errorf("%w %d bytes", errBenchmarkAnswerTooLarge, limit)
 	}
-	return audio, wall, nil
+	return answer, end, nil
 }
 
 // speechBenchmarkAudioSeconds is the length of audio a benchmark answer holds: the

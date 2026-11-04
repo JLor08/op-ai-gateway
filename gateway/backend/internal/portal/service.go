@@ -443,6 +443,23 @@ type AgentTransportReader interface {
 	LatestTransport(serverID string) (transport string, at time.Time, ok bool)
 }
 
+// AgentFeatureReader exposes the feature names each server's ServerAgent
+// declared in its last telemetry sample, so the runtime-config document can
+// carry what only an agent with a given feature understands
+// (AgentFeatureRuntimeInstances). Has is false for a server never heard from
+// and for an agent that does not declare the name. Known tells the two apart:
+// it is true once serverID's agent has declared its set since this gateway
+// started -- an empty set included -- and false before that, and after a
+// declaration that could not be read. A document that depends on a feature of
+// an agent that is not Known is held rather than served as the older agent's
+// (AgentRuntimeConfigDTO.AwaitsAgentFeatures). A nil reader counts every
+// agent as known, without any feature. Satisfied by the gateway's
+// agent-features registry.
+type AgentFeatureReader interface {
+	Has(serverID, feature string) bool
+	Known(serverID string) bool
+}
+
 type ServiceDeps struct {
 	Users          UserReader
 	Tokens         TokenRepository
@@ -566,6 +583,22 @@ type ServiceDeps struct {
 	// it needs no special-casing) falls back to DefaultMaxRunHistoryBytes
 	// (32 MiB) in NewService.
 	MaxRunHistoryBytes int
+	// AgentFeatures lets the runtime-config document tell an agent that runs
+	// several instances of a replicable spec from one that does not (see
+	// AgentFeatureReader and Service.specAsPushed). nil = no agent declares
+	// anything: every document is the one an agent without runtime_instances
+	// understands.
+	AgentFeatures AgentFeatureReader
+	// InstanceIdleFactor and InstanceIdleFloorSeconds are the factor and floor
+	// a replicable runtime spec's idle timeout is derived with
+	// (effectiveIdleTimeout): config.Config's InstanceIdleFactor and
+	// InstanceIdleFloorSeconds. A factor that is not a positive, finite number
+	// and a floor that is not positive -- the zero value included, so a
+	// test/deps literal that omits them needs no special-casing -- fall back to
+	// DefaultInstanceIdleFactor (5) and DefaultInstanceIdleFloorSeconds (120)
+	// in NewService.
+	InstanceIdleFactor       float64
+	InstanceIdleFloorSeconds int
 	// OnNetbirdDomainChanged, when set, is invoked (best-effort) after a NetBird
 	// account dns_domain change so the caller can trigger an immediate peer→domain
 	// sync pass. Nil = no trigger (the periodic sync loop is the backstop).
@@ -812,6 +845,7 @@ type Service struct {
 	agentPresence    AgentPresenceReader
 	agentCertReports AgentCertReportReader
 	agentTransport   AgentTransportReader
+	agentFeatures    AgentFeatureReader
 	proxyStatus      ProxyRouteStatusReader
 	groups           GroupStore
 	groupCache       GroupCache
@@ -848,6 +882,11 @@ type Service struct {
 	// carries (see ServiceDeps.MaxRunHistoryBytes); always > 0 after NewService.
 	maxRunHistoryBytes int
 	settingsVolatile   bool
+	// instanceIdleFactor / instanceIdleFloorSeconds derive a replicable spec's
+	// pushed idle timeout (see ServiceDeps.InstanceIdleFactor); a positive,
+	// finite factor and a positive floor after NewService.
+	instanceIdleFactor       float64
+	instanceIdleFloorSeconds int
 	// runtimeChanged is the best-effort agent-runtime-spec-write hook (see
 	// ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook).
 	// nil-safe: called only through notifyRuntimeChanged (service_runtime.go).
@@ -947,6 +986,7 @@ func NewService(deps ServiceDeps) *Service {
 	if maxRunHistoryBytes <= 0 {
 		maxRunHistoryBytes = DefaultMaxRunHistoryBytes
 	}
+	instanceIdleFactor, instanceIdleFloor := instanceIdleDefaults(deps.InstanceIdleFactor, deps.InstanceIdleFloorSeconds)
 	themes := deps.Themes
 	if themes == nil {
 		themes = &theme.Registry{}
@@ -978,6 +1018,7 @@ func NewService(deps ServiceDeps) *Service {
 		agentPresence:    deps.AgentPresence,
 		agentCertReports: deps.AgentCertReports,
 		agentTransport:   deps.AgentTransport,
+		agentFeatures:    deps.AgentFeatures,
 		proxyStatus:      deps.ProxyStatus,
 		groups:           deps.Groups,
 		groupCache:       deps.GroupCache,
@@ -1011,6 +1052,8 @@ func NewService(deps ServiceDeps) *Service {
 		agentPresenceTimeoutDefault: agentPresenceDefault,
 		maxChatBlobBytes:            maxChatBlobBytes,
 		maxRunHistoryBytes:          maxRunHistoryBytes,
+		instanceIdleFactor:          instanceIdleFactor,
+		instanceIdleFloorSeconds:    instanceIdleFloor,
 		settingsVolatile:            deps.SettingsVolatile,
 		runtimeChanged:              deps.OnRuntimeConfigChanged,
 		clock:                       clock,

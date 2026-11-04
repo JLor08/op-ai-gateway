@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -4388,5 +4389,151 @@ func TestNormalizeLoadedModelsFormatKeepsSdcppModels(t *testing.T) {
 		if got := normalizeLoadedModelsFormat(in); got != "sdcpp_models" {
 			t.Fatalf("normalizeLoadedModelsFormat(%q) = %q, want sdcpp_models", in, got)
 		}
+	}
+}
+
+// The audio metrics are editable like the text metrics: a mapping update writes
+// each one it carries with manual provenance, under the same metrics_locked lock a
+// later benchmark write respects. The real-time count and its limit are one pair:
+// a count needs one of the three limits beside it, and a limit of "" sent alone
+// clears both. Anything else is ErrMappingMetricInvalid and writes nothing.
+func TestMappingAudioMetricsEditable(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	created, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "tts", AppModelName: "tts-up"})
+	if err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	update := func(body string) (ModelMappingDTO, error) {
+		t.Helper()
+		var req UpdateMappingRequest
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatalf("decode %s: %v", body, err)
+		}
+		return svc.UpdateMapping(ctx, ownerToken(), created.ID, req)
+	}
+	type audio struct {
+		rate  float64
+		ttfa  int64
+		count int
+		limit string
+	}
+	stored := func() audio {
+		t.Helper()
+		m, err := routeStore.MappingByID(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("MappingByID: %v", err)
+		}
+		return audio{m.AudioRateX, m.AudioTTFAMS, m.AudioRealtimeConcurrency, m.AudioConcurrencyLimit}
+	}
+
+	dto, err := update(`{"audio_rate_x":2.5,"audio_ttfa_ms":300,"audio_realtime_concurrency":3,"audio_concurrency_limit":"performance","metrics_locked":true}`)
+	if err != nil {
+		t.Fatalf("UpdateMapping (audio): %v", err)
+	}
+	keys := map[string]json.RawMessage{}
+	raw, _ := json.Marshal(dto)
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("DTO wire: %v", err)
+	}
+	for key, want := range map[string]string{"audio_rate_x": "2.5", "audio_ttfa_ms": "300", "audio_realtime_concurrency": "3", "audio_concurrency_limit": `"performance"`} {
+		if got := string(keys[key]); got != want {
+			t.Fatalf("DTO %s = %s, want %s", key, got, want)
+		}
+	}
+	if dto.MetricsSource != "manual" || dto.AudioMetricsUpdatedAt == nil || !dto.AudioMetricsUpdatedAt.Equal(now) {
+		t.Fatalf("provenance = %q @ %v, want manual @ %v", dto.MetricsSource, dto.AudioMetricsUpdatedAt, now)
+	}
+	want := audio{2.5, 300, 3, routing.AudioLimitPerformance}
+	if got := stored(); got != want {
+		t.Fatalf("stored = %+v, want %+v", got, want)
+	}
+
+	// A later benchmark run respects the lock the edit set.
+	if err := routeStore.UpdateMappingAudioMetrics(ctx, created.ID, routing.AudioMetrics{RateX: 9, TTFAMS: 50, RealtimeConcurrency: 7, ConcurrencyLimit: routing.AudioLimitCap}, "audio_benchmark", now.Add(time.Hour)); err != nil {
+		t.Fatalf("UpdateMappingAudioMetrics: %v", err)
+	}
+	if got := stored(); got != want {
+		t.Fatalf("after a locked benchmark write: stored = %+v, want %+v", got, want)
+	}
+
+	// An edit of something else leaves the audio metrics alone.
+	if _, err := update(`{"context_size":4096}`); err != nil {
+		t.Fatalf("UpdateMapping (context_size): %v", err)
+	}
+	if got := stored(); got != want {
+		t.Fatalf("after an unrelated edit: stored = %+v, want %+v", got, want)
+	}
+
+	// Refused requests write nothing.
+	for _, body := range []string{
+		`{"audio_realtime_concurrency":2}`,
+		`{"audio_concurrency_limit":"performance"}`,
+		`{"audio_realtime_concurrency":2,"audio_concurrency_limit":"bogus"}`,
+		`{"audio_realtime_concurrency":2,"audio_concurrency_limit":""}`,
+		`{"audio_realtime_concurrency":-1,"audio_concurrency_limit":"performance"}`,
+		// The count is an int4 column: one past its range would fail the
+		// write on PostgreSQL (and wrap nowhere else), so it is refused here.
+		`{"audio_realtime_concurrency":2147483648,"audio_concurrency_limit":"performance"}`,
+		`{"audio_rate_x":-0.5}`,
+		`{"audio_ttfa_ms":-1}`,
+		// So are the text metrics' int4 columns, edited in the same request.
+		`{"load_time_ms":2147483648}`,
+		`{"context_size":2147483648}`,
+		`{"max_concurrency":2147483648}`,
+		`{"recommended_concurrency":2147483648}`,
+	} {
+		if _, err := update(body); !errors.Is(err, ErrMappingMetricInvalid) {
+			t.Fatalf("UpdateMapping(%s) err = %v, want ErrMappingMetricInvalid", body, err)
+		}
+		if got := stored(); got != want {
+			t.Fatalf("refused %s changed the mapping: stored = %+v, want %+v", body, got, want)
+		}
+	}
+	for _, rate := range []float64{math.NaN(), math.Inf(1)} {
+		if _, err := svc.UpdateMapping(ctx, ownerToken(), created.ID, UpdateMappingRequest{AudioRateX: &rate}); !errors.Is(err, ErrMappingMetricInvalid) {
+			t.Fatalf("UpdateMapping(rate %v) err = %v, want ErrMappingMetricInvalid", rate, err)
+		}
+		if got := stored(); got != want {
+			t.Fatalf("refused rate %v changed the mapping: stored = %+v, want %+v", rate, got, want)
+		}
+	}
+
+	// A measured 0 beside a limit is a result, kept as one.
+	if _, err := update(`{"audio_realtime_concurrency":0,"audio_concurrency_limit":"performance"}`); err != nil {
+		t.Fatalf("UpdateMapping (measured 0): %v", err)
+	}
+	want = audio{2.5, 300, 0, routing.AudioLimitPerformance}
+	if got := stored(); got != want {
+		t.Fatalf("after a measured 0: stored = %+v, want %+v", got, want)
+	}
+
+	// The limit "" sent alone clears the pair, and only the pair.
+	if _, err := update(`{"audio_realtime_concurrency":2,"audio_concurrency_limit":"resources"}`); err != nil {
+		t.Fatalf("UpdateMapping (resources): %v", err)
+	}
+	if _, err := update(`{"audio_concurrency_limit":""}`); err != nil {
+		t.Fatalf("UpdateMapping (clear the pair): %v", err)
+	}
+	want = audio{2.5, 300, 0, ""}
+	if got := stored(); got != want {
+		t.Fatalf("after clearing the pair: stored = %+v, want %+v", got, want)
+	}
+
+	// Unlocked again, the next benchmark run writes as before.
+	if _, err := update(`{"metrics_locked":false}`); err != nil {
+		t.Fatalf("UpdateMapping (unlock): %v", err)
+	}
+	if err := routeStore.UpdateMappingAudioMetrics(ctx, created.ID, routing.AudioMetrics{RateX: 1.75}, "audio_speed", now.Add(2*time.Hour)); err != nil {
+		t.Fatalf("UpdateMappingAudioMetrics (unlocked): %v", err)
+	}
+	if got := stored(); got.rate != 1.75 {
+		t.Fatalf("after an unlocked benchmark write: rate = %v, want 1.75", got.rate)
 	}
 }

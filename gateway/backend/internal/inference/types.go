@@ -3,7 +3,10 @@
 
 package inference
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 type Role string
 
@@ -286,6 +289,68 @@ type Request struct {
 	// never parsed from or serialized to a client body, so a direct OpenAI chat
 	// request that merely sets reasoning_effort stays top-level only.
 	ReasoningEffortViaTemplateKwargs bool `json:"-"`
+	// LiveSession marks the resolve of a live-transcription session, which
+	// holds its instance's one live slot for its whole life. Routing then
+	// passes over an instance whose live slot is already held, and parks the
+	// session when every instance's slot is. Internal only: set by the live
+	// endpoint, never parsed from a client body.
+	LiveSession bool `json:"-"`
+	// ExcludeInstanceKeys are gateway instance keys (routing.InstanceKey)
+	// routing must not select for this request, on any admission turn:
+	// instances it already tried and found gone -- retired between the
+	// telemetry that reported them running and the dispatch. An instance
+	// that is only busy is never listed: a live slot another session took
+	// first is held, routing passes over a held slot by itself, and the
+	// session may still take that slot once it frees. Internal only: set by
+	// the gateway when it re-selects, never parsed from a client body.
+	ExcludeInstanceKeys []string `json:"-"`
+	// AdmissionStart, when set, is when this request's admission began (wall
+	// clock): a bounded admission-queue timeout counts from it instead of from
+	// the resolve's own start, so one client call that resolves more than once
+	// -- a live session that loses races for a slot -- waits at most one
+	// timeout in all, and is refused without another wait once it has run out.
+	// Zero: the resolve's own start, as for every request that resolves once.
+	// Internal only: set by the gateway, never parsed from a client body.
+	AdmissionStart time.Time `json:"-"`
+	// NoPark marks a resolve that must never wait in the admission queue: a
+	// gate that only selects -- the voice-chat gate, the live-transcription
+	// ticket mint -- answers a browser POST, which must not block behind the
+	// requests that will actually use the model. With every candidate at its
+	// cap it is served by the least loaded instance anyway, and signals the
+	// demand for another instance itself, since no park turn will. Internal
+	// only: set by the gateway, never parsed from a client body.
+	NoPark bool `json:"-"`
+	// CheckOnly marks a resolve that only checks which target a request about
+	// to follow would get -- the voice-chat replay's synth pre-check, before
+	// its own admitted relay. Like NoPark it never waits in the admission
+	// queue (with every candidate at its cap it is answered from them), but it
+	// signals no demand either: the request it checks for resolves, parks and
+	// signals on its own. Internal only: set by the gateway, never parsed from
+	// a client body.
+	CheckOnly bool `json:"-"`
+	// RealtimeRequired marks a request that must keep up with real time: a
+	// voice chat's speech or transcription leg, at the ticket mint and on
+	// every turn. Routing then drops every candidate whose mapping was
+	// measured slower than the real-time threshold (an unmeasured one stays),
+	// and refuses with routing.ErrNoRealtimeCandidate when none is left.
+	// Internal only: set by the gateway -- by the voice gate itself, and from
+	// the X-OP-Realtime-Required header on the internal loopback pair a voice
+	// turn calls the gateway with -- never parsed from a client body.
+	RealtimeRequired bool `json:"-"`
+	// PreferredInstanceKey names the gateway instance (routing.InstanceKey) this
+	// request would like to be served on: a voice chat's leg, the instance its
+	// previous turn used, so a conversation stays on the process that already holds
+	// its model warm. It is advisory: routing selects it only when it is an instance
+	// of a replicable spec among the candidates the selection chooses from -- through
+	// every filter they pass, the real-time gate and a held live slot included --
+	// under its cap, and in the partition the selection settles on (the swap
+	// protection, and its model loaded or starting where a sibling's is), where it
+	// wins over the score; otherwise routing selects as it would without it, and a
+	// mapping without instances is never preferred. It never refuses a request
+	// because of it. Internal only: set by the gateway from the X-OP-Preferred-Instance
+	// header on the internal loopback pair a voice turn calls the gateway with,
+	// never parsed from a client body.
+	PreferredInstanceKey string `json:"-"`
 }
 
 func (r Request) Validate() *Error {

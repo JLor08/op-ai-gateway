@@ -7442,6 +7442,69 @@ func TestBuildGatewayServerBindsTheSpeechRateTrigger(t *testing.T) {
 	}
 }
 
+// TestBuildGatewayServerBindsTheAudioBenchmarkTrigger drives the production wiring of the
+// one-time automatic audio benchmark: the app-health runner is built before the gateway
+// Server, so its trigger is bound late (ServerDeps.SetAudioBenchmarkTrigger, called by
+// buildGatewayServer once srv exists). A runner whose trigger never reached the Server
+// would see every call refused, and no audio mapping would ever be measured automatically,
+// with every unit test green. The call below is accepted only by a Server that is bound:
+// it reserves the server and starts the both run of scope audio-auto.
+func TestBuildGatewayServerBindsTheAudioBenchmarkTrigger(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_DEV_TOKEN", "dev-secret")
+	var runner *appHealthRunner
+	orig := startAppHealthLoop
+	startAppHealthLoop = func(r *appHealthRunner, serverTrigger <-chan string) context.CancelFunc {
+		runner = r
+		return func() {}
+	}
+	t.Cleanup(func() { startAppHealthLoop = orig })
+
+	srv, cleanup, err := buildGatewayServer(config.Config{
+		Addr: "127.0.0.1:8080", DBDriver: "memory", AppHealthProbeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("buildGatewayServer returned %v", err)
+	}
+	t.Cleanup(func() { _ = cleanup() })
+	if runner == nil || runner.audioBenchmark == nil {
+		t.Fatal("the app-health loop was started with no automatic audio benchmark trigger")
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	// A closed port: the run the trigger starts fails fast on connection refused.
+	server := routing.AIServer{ID: "s1", Name: "S1", Domain: "127.0.0.1", Provider: routing.ProviderAudioCpp, Endpoint: "http://127.0.0.1:1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}
+	app := routing.Application{ID: "a1", ServerID: "s1", Type: routing.ProviderAudioCpp, Port: 1, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1, TimeoutMS: 1000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+	mp := routing.ModelMapping{ID: "m1", ApplicationID: "a1", GatewayModelName: "tts", AppModelName: "tts_oneshot", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+	if err := srv.Routes.CreateAIServer(ctx, server); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := srv.Routes.CreateApplication(ctx, app); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+	if err := srv.Routes.CreateMapping(ctx, mp); err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	if err := srv.Routes.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{
+		{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+		{Capability: routing.CapabilitySpeechClone, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+		{Capability: routing.CapabilitySpeechStreaming, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("seed capabilities: %v", err)
+	}
+
+	if runner.audioBenchmark(ctx, server, app, mp) != gateway.AudioAutoRunStarted {
+		t.Fatal("the runner's trigger was refused by a Server with an eligible mapping: it is not bound to srv.TriggerAudioBenchmark")
+	}
+	if st := srv.Benchmarks.Status("s1"); st.Mode != "both" || st.Scope != "audio-auto" {
+		t.Fatalf("benchmark status after the trigger = %+v, want an audio-auto both run on s1", st)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.Benchmarks.Status("s1").Running && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestSpeechRateLoopGateAgreesWithTheBenchmarkPartition is the invariant of #306 over the real
 // wiring (the runner is the production one, its trigger is bound to the real gateway Server and so
 // to partitionSpeechBenchmarkViews): for every mapping the loop's gate and the partition's gate

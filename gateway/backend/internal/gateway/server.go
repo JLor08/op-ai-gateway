@@ -124,8 +124,20 @@ type ServerDeps struct {
 	CapacityVRAMSafetyMarginPercent int
 	CapacityMaxConcurrency          int
 	CapacitySettleSeconds           int
-	// AdmissionQueueMaxDepth bounds how many unpinned requests can park in the CP4
-	// admission queue at once; the (maxDepth+1)-th waiter is rejected with a 503.
+	// Audio-benchmark tuning (config OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR and
+	// OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX): the rate a concurrency ramp level's slowest
+	// stream must reach to count as real-time, and the highest level the ramp measures.
+	// Each <= 0 defaults in New (1.2 / 8).
+	AudioRealtimeMinFactor float64
+	AudioConcurrencyMax    int
+	// InstanceScaleCooldown is how long the instance scaler leaves a server's spec
+	// alone after its agent refused another instance for lack of room, or failed to
+	// start one (config OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS). <= 0 defaults
+	// to 60 s.
+	InstanceScaleCooldown time.Duration
+	// AdmissionQueueMaxDepth bounds how many requests can park in the CP4 admission
+	// queue at once -- unpinned ones, and pinned ones that need a free live slot on their
+	// pinned server; the (maxDepth+1)-th waiter is rejected with a 503.
 	// <= 0 defaults to 128 in newAdmissionQueue.
 	AdmissionQueueMaxDepth int
 	// NetbirdSyncInterval is the cadence of the background NetBird peer-sync loop
@@ -297,6 +309,13 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetAudioBenchmarkTrigger is the same wiring conduit for the app-health loop's
+	// one-time automatic audio benchmark: cmd/gateway's buildGatewayServer calls it ONCE
+	// with the just-built Server's TriggerAudioBenchmark, and until then the loop's
+	// trigger answers AudioAutoRunDeferred (nothing started, ask again). Server never
+	// stores or reads this field.
+	// nil is correct for any Server built without cmd/gateway.
+	SetAudioBenchmarkTrigger func(AudioBenchmarkTrigger)
 	// SetSpeechRateTrigger is the same wiring conduit for the app-health loop: it
 	// binds the trigger the loop starts the speech rate benchmark with (#263). The
 	// loop is built together with the portal Service, before this Server exists, so
@@ -458,12 +477,18 @@ type Server struct {
 	// per-process key; a bare &Server{} leaves it nil, which the ticket endpoint
 	// answers as a failed mint rather than a panic.
 	liveTickets *liveTicketStore
-	// liveSessions enforces one live-transcription session per route
-	// (live_session_registry.go): the WebSocket handler acquires the route's slot
-	// before relaying and releases it once. Built in New; a bare &Server{} leaves
-	// it nil, which acquire treats as fail-closed (every session rejected busy), so
+	// liveSessions enforces one live-transcription session per instance
+	// (live_session_registry.go): the live relay acquires the selected instance's
+	// slot before relaying and releases it once. Built in New, which also hands it
+	// to the resolver as its routing.LiveSlotChecker; a bare &Server{} leaves it
+	// nil, which acquire treats as fail-closed (every session rejected busy), so
 	// the handler must be wired with a constructed registry.
 	liveSessions *liveSessionRegistry
+	// instanceScaler starts another instance of a replicable spec when requests
+	// park because every instance of their model is busy (instance_scaler.go).
+	// New builds it whenever it builds the resolver's instance source and installs
+	// it as the resolver's demand sink; nil otherwise, and on a bare &Server{}.
+	instanceScaler *instanceScaler
 	// voiceTickets mints and redeems the Voice Chat tickets (voice_chat_ticket.go): the
 	// authenticated, CSRF-protected ticket POST mints one after the co-load gate, the
 	// WebSocket upgrade redeems it. Built in New with a fresh per-process key; a bare
@@ -483,6 +508,11 @@ type Server struct {
 	// ServerDeps.VoicePrewarmEnabled and voicePrewarmEnabled). A bare &Server{} leaves it
 	// off, so no test that mints a voice ticket primes the TTS unless it asks to.
 	voicePrewarm bool
+	// voicePrewarmDone, when non-nil, is called by the pre-warm's goroutine
+	// (startVoicePrewarm) once its priming synthesis has returned, its in-flight request
+	// already removed. It is a TEST SEAM only: it lets a test run a turn after the
+	// pre-warm has finished, without sleeping; production leaves it nil.
+	voicePrewarmDone func()
 	// voiceOnPending, when non-nil, is called by the Voice Chat state machine after each
 	// chunk is appended to the session's pendingText, with the buffer's new value. It is a
 	// TEST SEAM only (pendingText is not otherwise on the wire); production leaves it nil.
@@ -492,6 +522,20 @@ type Server struct {
 	// test land a cancel in exactly the window between the run finishing its TTS leg and its
 	// commit claim, deterministically. Production leaves it nil.
 	voiceBeforeCommitClaim func(run *ChatRun)
+	// audioRealtimeMinFactor and audioConcurrencyMax tune the audio benchmark's
+	// concurrency ramp (see ServerDeps.AudioRealtimeMinFactor), defaulted in New. A
+	// bare &Server{} leaves them 0, which the ramp reads as their defaults
+	// (audioRealtimeThreshold, audioRampCap).
+	audioRealtimeMinFactor float64
+	audioConcurrencyMax    int
+	// audioMeasureSeam, when non-nil, takes every audio benchmark measurement in place
+	// of the real ones (takeAudioMeasurement). It is a TEST SEAM only: it lets a test
+	// script the exact figures a run stores. Production leaves it nil.
+	audioMeasureSeam func(ctx context.Context, call audioMeasureCall) (audioMeasurement, error)
+	// audioAutoRuns remembers the mappings the health loop's one-time automatic audio
+	// benchmark was started for in this process (TriggerAudioBenchmark). The refusals the
+	// trigger settles are remembered by the loop, not here. Its zero value is ready.
+	audioAutoRuns audioAutoRunMarker
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -948,10 +992,12 @@ func New(deps ServerDeps) *Server {
 	// model from eviction.
 	active := newActiveRegistry(broker)
 	// CP4 admission queue: an unpinned request whose every candidate is at its
-	// effective concurrency cap parks here until a slot frees. active.Remove feeds
+	// effective concurrency cap parks here until a slot frees, and so does a pinned one
+	// that needs a free live slot on its pinned server. active.Remove feeds
 	// the slot-free signal (release) via the attached queue.
 	admission := newAdmissionQueue(deps.AdmissionQueueMaxDepth)
 	active.setAdmission(admission)
+	liveSessions := newLiveSessionRegistry()
 	swapProtectWindow := deps.SwapProtectWindow
 	if swapProtectWindow <= 0 {
 		swapProtectWindow = 30 * time.Second
@@ -985,6 +1031,9 @@ func New(deps ServerDeps) *Server {
 		energyIdleWindow = time.Hour
 	}
 	energyIdle := newIdleTracker(energyIdleWindow)
+	// The instance source the resolver expands candidates with; the instance
+	// scaler (wired below, once s exists) counts instances through the same one.
+	var instances *instanceSource
 	// A running benchmark reserves its server in this registry; wiring it as the
 	// resolver's ServerBusyChecker excludes that server from new routing while a
 	// run is in flight. SetServerBusyChecker accepts the same instance the
@@ -999,6 +1048,12 @@ func New(deps ServerDeps) *Server {
 		resolver.SetServerBusyChecker(benchmarks)
 		resolver.SetLoadedModelChecker(loadedModels)
 		resolver.SetServerActivityChecker(active, swapProtectWindow)
+		// The same registry counts in-flight requests per instance key, which caps
+		// each instance of a replicable spec at its instance_parallelism.
+		resolver.SetInstanceActivityChecker(active)
+		// A live session's resolve passes over an instance whose one live slot the
+		// SAME registry the live relay acquires from already holds.
+		resolver.SetLiveSlotChecker(liveSessions)
 		// The runtime-status registry (Task 13) is wired as the resolver's
 		// RuntimeModelStateChecker so scoring uses live PER-MODEL active/queue counts
 		// (not just the whole server's telemetry) and selection can prefer an
@@ -1006,6 +1061,14 @@ func New(deps ServerDeps) *Server {
 		// runtimeModelStateChecker wraps the SAME registry instance the Server publishes
 		// agent telemetry into, so the resolver's view stays consistent with it.
 		resolver.SetRuntimeModelStateChecker(newRuntimeModelStateChecker(runtimeStatus, agentFeatures))
+		// The same two registries feed the resolver's InstanceSource, which expands a
+		// replicable spec's mapping into the instances its agent reports running. It
+		// reads the spec through deps.Routes, so without a store nothing is expanded
+		// and every candidate stays its mapping's instance 0.
+		if deps.Routes != nil {
+			instances = newInstanceSource(deps.Routes, agentFeatures, runtimeStatus)
+			resolver.SetInstanceSource(instances)
+		}
 		resolver.SetSessionReservation(sessionReservationWindow)
 		resolver.SetAdmissionController(admission)
 		resolver.SetGroupResolver(groups)
@@ -1058,6 +1121,8 @@ func New(deps ServerDeps) *Server {
 		capacityMaxConcurrency:      capacityMaxConcurrency,
 		capacitySettleSeconds:       capacitySettleSeconds,
 		capacitySettle:              time.Duration(capacitySettleSeconds) * time.Second,
+		audioRealtimeMinFactor:      positiveOr(deps.AudioRealtimeMinFactor, defaultAudioRealtimeMinFactor),
+		audioConcurrencyMax:         positiveOr(deps.AudioConcurrencyMax, defaultAudioConcurrencyMax),
 		mux:                         http.NewServeMux(),
 		agentMux:                    http.NewServeMux(),
 		baseCtx:                     context.Background(),
@@ -1095,7 +1160,7 @@ func New(deps ServerDeps) *Server {
 		maxChatAudioBytes:              maxChatAudioBytes,
 		maxChatBlobBytes:               maxChatBlobBytes,
 		liveTickets:                    newLiveTicketStore(),
-		liveSessions:                   newLiveSessionRegistry(),
+		liveSessions:                   liveSessions,
 		voiceTickets:                   newVoiceTicketStore(),
 		voiceCoLoadTimeout:             voiceCoLoadTimeout,
 		voiceTiming:                    voiceTiming,
@@ -1121,6 +1186,31 @@ func New(deps ServerDeps) *Server {
 			func() string { return s.vendorAccountRoutingModeCached(context.Background()) },
 			func() bool { return s.vendorSubscriptionsEnabledCached(context.Background()) },
 		)
+		// A voice chat's speech and transcription legs are gated by the real-time factor
+		// the audio benchmark judges a ramp level by, so "real time" means one thing.
+		resolver.SetAudioRealtimeMinFactor(s.audioRealtimeMinFactor)
+	}
+	// The instance scaler is the resolver's demand sink: a request about to park
+	// because every instance of its model is busy asks it for another. It needs
+	// the built Server for the provider (read at each signal, so a provider without
+	// the ensure route starts nothing), the upstream credential and the shutdown
+	// context, and it counts instances through the resolver's own instance source.
+	if resolver != nil && instances != nil {
+		s.instanceScaler = newInstanceScaler(instanceScalerDeps{
+			store:     deps.Routes,
+			routing:   resolver,
+			instances: instances,
+			statuses:  runtimeStatus,
+			ensurer: func() provider.RuntimeEnsurer {
+				ensurer, _ := s.Provider.(provider.RuntimeEnsurer)
+				return ensurer
+			},
+			authCtx: s.upstreamAuthCtx,
+			wake:    admission.release,
+			base:    func() context.Context { return s.baseCtx },
+			now:     time.Now,
+		}, deps.InstanceScaleCooldown)
+		resolver.SetDemandSink(s.instanceScaler)
 	}
 	s.routes()
 	return s

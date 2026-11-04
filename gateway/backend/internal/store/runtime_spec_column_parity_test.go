@@ -14,35 +14,36 @@ import (
 
 // runtimeSpecParityRows is how many agent_runtime_specs rows the column-parity
 // fixture seeds, computed the same way as applicationParityRows: the readers
-// carry FOUR integer-boolean columns (enabled, pinned, set_visible_devices,
-// responses_live_timings_enabled), two same-typed columns are only
+// carry FIVE integer-boolean columns (enabled, pinned, set_visible_devices,
+// responses_live_timings_enabled, replicable), two same-typed columns are only
 // distinguishable by value if they differ in at least one seeded row, so each
 // needs its own DISTINCT pattern. With r rows there are 2^r patterns, so r must
-// satisfy 2^r >= 4 -- three rows suffice (2^3 = 8 >= 4).
+// satisfy 2^r >= 5 -- three rows suffice (2^3 = 8 >= 5).
 const runtimeSpecParityRows = 3
 
 // runtimeSpecParityBools is the bit-pattern table, one row per integer-boolean
 // column of agent_runtime_specs in scan order (enabled, pinned,
-// set_visible_devices, responses_live_timings_enabled) and one array slot per
-// seeded spec. Its two load-bearing properties -- every row true somewhere, and
-// every pair of rows distinct -- are pinned by
+// set_visible_devices, responses_live_timings_enabled, replicable) and one
+// array slot per seeded spec. Its two load-bearing properties -- every row true
+// somewhere, and every pair of rows distinct -- are pinned by
 // TestRuntimeSpecParityFixtureDistinguishesEverySameTypedPair, so the table
 // cannot degrade into an all-true fixture that catches nothing. Before this
 // fixture existed, TestRoutingStoreRuntimeSpecs flipped ONLY
 // responses_live_timings_enabled and left the others true in every row, so a
 // swap among those was invisible.
-var runtimeSpecParityBools = [4][runtimeSpecParityRows]bool{
+var runtimeSpecParityBools = [5][runtimeSpecParityRows]bool{
 	{true, true, false},  // enabled
 	{false, true, true},  // pinned
 	{false, false, true}, // set_visible_devices
 	{true, false, false}, // responses_live_timings_enabled
+	{true, false, true},  // replicable
 }
 
 // runtimeSpecParityBoolNames names the runtimeSpecParityBools rows in scan
 // order -- the ONE list of the agent_runtime_specs integer-boolean columns,
 // shared by the distinguishability guard and the schema-coverage guard.
 var runtimeSpecParityBoolNames = []string{
-	"enabled", "pinned", "set_visible_devices", "responses_live_timings_enabled",
+	"enabled", "pinned", "set_visible_devices", "responses_live_timings_enabled", "replicable",
 }
 
 // TestConformanceRuntimeSpecReadersAgreeOnEveryColumn is the agent_runtime_specs
@@ -151,6 +152,11 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				ContextProbePath:            "/ctx-" + idx,
 				RAMEstimateMB:               4096 + i,
 				RAMMeasuredMB:               6000 + i,
+				Replicable:                  runtimeSpecParityBools[4][i],
+				MinInstances:                1 + i,
+				MaxInstances:                8 + i,
+				InstanceParallelism:         4 + i,
+				StartupMeasuredMS:           45000 + int64(i),
 				APIFlavors:                  apiFlavors[i],
 				ResponsesMode:               responsesModes[i],
 				MessagesMode:                messagesModes[i],
@@ -249,8 +255,9 @@ func TestAgentRuntimeSpecsSchemaColumnsAllCovered(t *testing.T) {
 				"admin_state", "admission_wait_timeout_seconds", "api_flavors", "api_token",
 				"api_token_header", "api_token_header_source", "api_token_mode", "args", "binary_path",
 				"config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
-				"id", "idle_timeout_seconds", "listen_port", "mapping_id", "messages_mode",
-				"metrics_path", "ram_estimate_mb", "ram_measured_mb", "responses_mode", "startup_timeout_seconds",
+				"id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
+				"max_instances", "messages_mode", "metrics_path", "min_instances", "ram_estimate_mb",
+				"ram_measured_mb", "responses_mode", "startup_measured_ms", "startup_timeout_seconds",
 				"type", "updated_at", "visible_devices_mode", "work_dir",
 			},
 			ignored: map[string]string{},

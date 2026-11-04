@@ -57,22 +57,33 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 // mode is "speed"|"capacity"|"both"|"vision"|"speech" (already validated by
 // parseBenchmarkMode).
 //
-// Every mode but speech sends each target a chat prompt, so before the reservation the
-// scope's views are partitioned (partitionBenchmarkViews): a view that serves
-// only images or only audio (speech, transcription) is skipped, and one whose runtime spec cannot be
-// read is not measured either, because the answer is unknown and is not
-// guessed at. The speech benchmark inverts the audio half of that split
+// Before the reservation the scope's views are partitioned
+// (partitionBenchmarkViewsFor). The speed, capacity and both modes send a
+// mapping that serves chat a chat prompt -- one with a speech or transcription
+// verdict as well included -- and measure an audio-only speech or
+// transcription mapping's audio (benchmarkViewTarget, measureAudioTarget); the
+// vision probe sends every target a chat prompt. A view the mode cannot
+// measure -- one that serves only images, or only audio it has no audio
+// measurement for -- is skipped, and one whose runtime spec (or, for an audio
+// view, capability rows or voices cache) cannot be read is not measured
+// either, because the answer is unknown and is not guessed at. The speech benchmark inverts the audio half of that split
 // (partitionSpeechBenchmarkViews): it synthesizes a clip on each plain
 // text-to-speech mapping, the audio-only ones included, and on each configured
 // clone model that lists a preset voice (with that preset named in the request,
 // #306), and skips every mapping that does not synthesize speech or that clones
 // a voice from a reference alone; a scope with
 // no such mapping answers 409 benchmark.speech_unavailable
-// (refuseNothingRunnableSpeech). Nothing else about the starter differs. A scope with no runnable view reserves nothing and answers 409
-// benchmark.images_only when every view serves only images (or images and
-// audio), 409 benchmark.audio_only when every view serves only audio, else
-// 500 benchmark.request_failed (refuseNothingRunnable); a mapping scope's
-// single view therefore gets exactly those answers. Otherwise the skipped and
+// (refuseNothingRunnableSpeech). Nothing else about the starter differs. A
+// scope with no runnable view reserves nothing and answers what is true of the
+// whole scope (refuseNothingRunnable): 500 benchmark.request_failed when a read
+// failed; for the speed, capacity and both modes, 409
+// benchmark.speech_unavailable when a skipped view serves only audio whose
+// audio cannot be measured yet, with a message that names images-only views
+// too when the scope also holds some; 409 benchmark.audio_only for the vision
+// probe when every skipped view serves only audio; and 409
+// benchmark.images_only otherwise (a skipped view serves only images, or
+// images and audio). A mapping scope's single view therefore gets exactly
+// those answers. Otherwise the skipped and
 // unreadable views are recorded as the run's first results, before it measures
 // anything, so Total counts every view and Done reaches it.
 //
@@ -352,6 +363,8 @@ var benchmarkErrRows = []errRow{
 	{err: errBenchmarkImagesOnly, status: http.StatusConflict, code: codeBenchmarkImagesOnly, msg: msgBenchmarkImagesOnly},
 	{err: errBenchmarkAudioOnly, status: http.StatusConflict, code: codeBenchmarkAudioOnly, msg: msgBenchmarkAudioOnly},
 	{err: errBenchmarkSpeechUnavailable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkSpeechUnavailable},
+	{err: errBenchmarkAudioUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkAudioUnmeasurable},
+	{err: errBenchmarkScopeUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkScopeUnmeasurable},
 	{err: errBenchmarkAgentEnsureUnsupported, status: http.StatusConflict, code: codeBenchmarkAgentEnsureUnsupported, msg: msgBenchmarkAgentEnsureUnsupported},
 	{err: errBenchmarkSpecForceStopped, status: http.StatusConflict, code: codeBenchmarkSpecForceStopped, msg: msgBenchmarkSpecForceStopped},
 }

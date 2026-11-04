@@ -36,6 +36,11 @@ type ActiveRequest struct {
 	ServiceName string
 	ServerName  string
 	ServerID    string // resolved routing target server id (swap-protection key)
+	// InstanceKey is the target's gateway instance key ("<mapping_id>#<k>",
+	// routing.Target.InstanceKey): the instance this request occupies, which
+	// the per-instance capacity counts. "" for a target that addresses no
+	// mapping instance (a vendor account).
+	InstanceKey string
 	Model       string
 	// RequestedModel is the model name as the client sent it, BEFORE a token
 	// model override rewrote Model; equal to Model when no override fired.
@@ -74,9 +79,14 @@ type activeRegistry struct {
 	mu            sync.RWMutex
 	items         map[string]ActiveRequest
 	lastCompleted map[string]time.Time
-	broker        *usage.Broker
-	now           func() time.Time
-	admission     *admissionQueue
+	// byInstance counts the items per non-empty InstanceKey, kept in step
+	// with items by Add and Remove: the resolver asks for it once per
+	// instance candidate of every request, so it is a lookup, not a scan.
+	// A key whose count drops to zero is deleted.
+	byInstance map[string]int
+	broker     *usage.Broker
+	now        func() time.Time
+	admission  *admissionQueue
 }
 
 // setAdmission attaches the CP4 admission queue so Remove can wake a parked waiter
@@ -91,6 +101,7 @@ func newActiveRegistry(b *usage.Broker) *activeRegistry {
 	return &activeRegistry{
 		items:         make(map[string]ActiveRequest),
 		lastCompleted: make(map[string]time.Time),
+		byInstance:    make(map[string]int),
 		broker:        b,
 		now:           func() time.Time { return time.Now().UTC() },
 	}
@@ -102,7 +113,14 @@ func (a *activeRegistry) Add(req ActiveRequest) {
 		return
 	}
 	a.mu.Lock()
+	// An id added again replaces its earlier record, so its count moves with it.
+	if prev, ok := a.items[req.ID]; ok {
+		a.uncountInstance(prev.InstanceKey)
+	}
 	a.items[req.ID] = req
+	if req.InstanceKey != "" {
+		a.byInstance[req.InstanceKey]++
+	}
 	a.mu.Unlock()
 	if a.broker != nil {
 		a.broker.Publish()
@@ -116,9 +134,12 @@ func (a *activeRegistry) Remove(id string) {
 	}
 	a.mu.Lock()
 	freedServer := ""
-	if req, ok := a.items[id]; ok && req.ServerID != "" {
-		freedServer = req.ServerID
-		a.lastCompleted[req.ServerID] = a.now()
+	if req, ok := a.items[id]; ok {
+		a.uncountInstance(req.InstanceKey)
+		if req.ServerID != "" {
+			freedServer = req.ServerID
+			a.lastCompleted[req.ServerID] = a.now()
+		}
 	}
 	delete(a.items, id)
 	a.mu.Unlock()
@@ -162,6 +183,34 @@ func (a *activeRegistry) ServerActivity(serverID string) (int, time.Time) {
 		}
 	}
 	return inFlight, a.lastCompleted[serverID]
+}
+
+// uncountInstance drops one request from key's in-flight count. The caller
+// holds a.mu for writing.
+func (a *activeRegistry) uncountInstance(key string) {
+	if key == "" {
+		return
+	}
+	if a.byInstance[key] <= 1 {
+		delete(a.byInstance, key)
+		return
+	}
+	a.byInstance[key]--
+}
+
+// InstanceActivity reports, for routing's per-instance capacity, how many
+// requests are in flight on the instance with the given gateway instance key
+// ("<mapping_id>#<k>"). Its requests also count in ServerActivity: an
+// instance's load is part of its server's. Releasing one wakes the admission
+// queue for its server (Remove), where a request parked on its instances
+// waits. 0 for "" -- no instance -- and for a nil registry.
+func (a *activeRegistry) InstanceActivity(instanceKey string) int {
+	if a == nil || instanceKey == "" {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.byInstance[instanceKey]
 }
 
 // Snapshot returns a copy of the current in-flight requests. A nil registry

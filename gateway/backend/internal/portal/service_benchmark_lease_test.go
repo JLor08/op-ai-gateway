@@ -158,3 +158,33 @@ func TestBenchmarkOverrideLease(t *testing.T) {
 		}
 	})
 }
+
+// TestBenchmarkOverrideLeaseRestoreReplicable: the replicable specs a run
+// measures as one process are a third list of the lease, stored under
+// restore_replicable, and a lease that owes only them is held, not released.
+func TestBenchmarkOverrideLeaseRestoreReplicable(t *testing.T) {
+	ctx := context.Background()
+	settings := NewMemorySystemSettings()
+	svc := NewService(ServiceDeps{SystemSettings: settings, Clock: func() time.Time { return time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC) }})
+	lease := BenchmarkOverrideLease{RestoreReplicable: []string{"rs_a"}}
+	if lease.Empty() {
+		t.Fatal("a lease that owes a replicable restore reads as empty")
+	}
+	if err := svc.SetBenchmarkOverrideLease(ctx, "srv1", lease); err != nil {
+		t.Fatalf("SetBenchmarkOverrideLease: %v", err)
+	}
+	values, err := settings.SystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("SystemSettings: %v", err)
+	}
+	if got := values["benchmark_override_lease:srv1"]; got != `{"restore_replicable":["rs_a"]}` {
+		t.Fatalf("stored row = %q", got)
+	}
+	leases, err := svc.BenchmarkOverrideLeases(ctx)
+	if err != nil {
+		t.Fatalf("BenchmarkOverrideLeases: %v", err)
+	}
+	if !reflect.DeepEqual(leases, map[string]BenchmarkOverrideLease{"srv1": lease}) {
+		t.Fatalf("leases = %#v, want %#v", leases, lease)
+	}
+}

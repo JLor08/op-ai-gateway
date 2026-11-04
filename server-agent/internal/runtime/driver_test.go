@@ -99,6 +99,12 @@ func (f *fakeManager) EnsureRunning(context.Context, string) (string, func(), er
 	return "", nil, ErrModelNotManaged
 }
 
+func (f *fakeManager) EnsureServing(context.Context, string) (string, func(), error) {
+	return "", nil, ErrModelNotManaged
+}
+
+func (f *fakeManager) ResolveAddress(string) (string, int, bool) { return "", 0, false }
+
 func (f *fakeManager) LoadedModels() []string { return nil }
 
 // AppliedETag mirrors the real Manager's contract: the ETag of the LAST

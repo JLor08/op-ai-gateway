@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -11,6 +11,8 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Tab,
+  Tabs,
   Typography,
 } from '@mui/material';
 import type { RuntimeLogBatch, RuntimeLogCommand, RuntimeLogEntry, RuntimeLogState } from '../api';
@@ -57,6 +59,14 @@ import type { PortalApi, Translation } from './shared/types';
  * boundary and carries its pid. In a crash loop the operator then reads each
  * attempt's own command beside its own output -- including that `${PORT}`
  * differed between attempts, which a single "latest command" view cannot show.
+ *
+ * A replicable spec runs several instances, and every one of them writes into
+ * the spec's one buffer: the agent prefixes each line of instance k >= 1 with
+ * `[#k] ` and names the instance on every entry (`instance`). The view then
+ * offers tabs. "All" shows the interleaved history exactly as it arrives,
+ * prefixes included; one tab per instance shows only that instance's entries,
+ * its prefix removed -- see `instanceView`. A gap belongs to no instance (the
+ * bytes lost may have come from any of them), so every tab shows every gap.
  */
 
 /**
@@ -130,6 +140,127 @@ function appendBounded(prev: LogWindow, incoming: readonly RuntimeLogEntry[]): L
     trimmedEntries: prev.trimmedEntries + cut.length,
     trimmedBytes: prev.trimmedBytes + cut.reduce((sum, e) => sum + utf8ByteLength(e.text ?? ''), 0),
   };
+}
+
+/** Which part of the history the view shows: everything, or one instance's. */
+type LogTab = 'all' | number;
+
+/**
+ * The instance an entry belongs to. An agent from before instances sends no
+ * field, and its output is the spec's own process: instance 0.
+ */
+function entryInstance(entry: RuntimeLogEntry): number {
+  const k = entry.instance;
+  return typeof k === 'number' && Number.isInteger(k) && k > 0 ? k : 0;
+}
+
+function hasGap(entry: RuntimeLogEntry): boolean {
+  return (entry.dropped_bytes ?? 0) > 0;
+}
+
+/**
+ * The instance indexes the view knows, ascending: instance 0, which every spec
+ * has, the ones the opening row listed, and every one the stream has named
+ * since the dialog opened.
+ */
+function knownInstances(listed: readonly number[], seen: ReadonlySet<number>): number[] {
+  const all = new Set<number>([0, ...seen]);
+  for (const k of listed) if (Number.isInteger(k) && k >= 0) all.add(k);
+  return [...all].sort((a, b) => a - b);
+}
+
+/** `seen` plus every instance `entries` name -- `seen` itself when none is new. */
+function withInstancesOf(
+  seen: ReadonlySet<number>,
+  entries: readonly RuntimeLogEntry[],
+): ReadonlySet<number> {
+  let next: Set<number> | null = null;
+  for (const e of entries) {
+    const k = entryInstance(e);
+    if (k > 0 && !seen.has(k) && !next?.has(k)) {
+      next ??= new Set(seen);
+      next.add(k);
+    }
+  }
+  return next ?? seen;
+}
+
+/**
+ * Removes `prefix` from the start of every line of `text`, except the first
+ * when `midLine` says the text continues a line an earlier chunk opened. Only a
+ * prefix that is actually there is removed.
+ */
+function stripLinePrefixes(text: string, prefix: string, midLine: boolean): string {
+  return text
+    .split('\n')
+    .map((line, i) =>
+      (i === 0 && midLine) || !line.startsWith(prefix) ? line : line.slice(prefix.length),
+    )
+    .join('\n');
+}
+
+/**
+ * What instance k's tab shows: instance k's own output and generation markers,
+ * with the `[#k] ` prefix the agent put at the start of each of its lines
+ * removed, plus every gap in the history as a gap alone. `own` counts the
+ * entries that are instance k's, which is what tells "this instance has printed
+ * nothing yet" apart from a tab that shows only gaps.
+ *
+ * An entry is a CHUNK of output, not a line: a chunk can continue the line the
+ * previous chunk of the same generation began, and the agent prefixes a line
+ * only once, when its first byte arrives. So the line state is tracked per
+ * instance here -- a chunk after one that did not end in a newline continues
+ * that line and keeps its first bytes -- and a generation marker opens a new
+ * line, as the agent's prefixing does. Where the state is not known -- at the
+ * start of the window, and after a gap, whose lost bytes may have ended the
+ * line -- a chunk is read as opening a line. That leaves one ambiguity, and it
+ * cannot be resolved from the text: process output that itself begins with the
+ * exact prefix right where an unknown chunk boundary falls loses those bytes in
+ * this tab ("All" still shows them as written).
+ */
+function instanceView(
+  entries: readonly RuntimeLogEntry[],
+  k: number,
+): { entries: RuntimeLogEntry[]; own: number } {
+  const prefix = k > 0 ? `[#${k}] ` : '';
+  const out: RuntimeLogEntry[] = [];
+  let own = 0;
+  let midLine = false;
+  for (const e of entries) {
+    const gap = hasGap(e);
+    if (gap) midLine = false;
+    // An entry that is only a gap names no instance, which on the wire reads
+    // as instance 0 -- but a gap is nobody's output, so it is shown in every
+    // tab and counted as none, instance 0's no more than any other's.
+    const gapOnly = gap && !e.text && !e.event;
+    if (gapOnly || entryInstance(e) !== k) {
+      if (gap) out.push({ dropped_bytes: e.dropped_bytes });
+      continue;
+    }
+    own++;
+    const shown = ownEntryInTab(e, prefix, midLine);
+    out.push(shown.entry);
+    midLine = shown.midLine;
+  }
+  return { entries: out, own };
+}
+
+/**
+ * One of instance k's own entries as its tab shows it, and the line state after
+ * it: a generation marker opens a new line, an empty chunk leaves the state as
+ * it was, and a text chunk loses the prefixes of the lines it opens and leaves
+ * the line open unless it ends in a newline.
+ */
+function ownEntryInTab(
+  e: RuntimeLogEntry,
+  prefix: string,
+  midLine: boolean,
+): { entry: RuntimeLogEntry; midLine: boolean } {
+  if (e.event) return { entry: e, midLine: false };
+  const text = e.text ?? '';
+  if (text === '') return { entry: e, midLine };
+  const entry = prefix === '' ? e : { ...e, text: stripLinePrefixes(text, prefix, midLine) };
+  return { entry, midLine: !text.endsWith('\n') };
 }
 
 /**
@@ -390,6 +521,8 @@ export function RuntimeLogView({
   serverId,
   specId,
   title,
+  allInstances = false,
+  instances = [],
 }: Readonly<{
   open: boolean;
   onClose: () => void;
@@ -401,8 +534,20 @@ export function RuntimeLogView({
   serverId: string;
   specId: string;
   title: string;
+  // #340: the spec runs several instances, which all write into its one log
+  // buffer -- instance k's lines prefixed [#k] -- so the view offers one tab
+  // per instance beside "All", and says whose lines are whose.
+  allInstances?: boolean;
+  // The instance indexes the opening row's spec lists now. The view adds every
+  // instance the stream names while it is open.
+  instances?: readonly number[];
 }>) {
   const [win, setWin] = useState<LogWindow>(emptyLogWindow);
+  // Every instance the stream has named since the dialog opened. Kept across a
+  // scrollback: an instance that has left the retained history keeps its tab
+  // while the dialog is open, so a tab never vanishes under the operator.
+  const [seenInstances, setSeenInstances] = useState<ReadonlySet<number>>(() => new Set());
+  const [tab, setTab] = useState<LogTab>('all');
   const [state, setState] = useState<RuntimeLogState | null>(null);
   // `scrollbackSeen` is what separates "the agent's buffer is empty" from
   // "nothing has arrived yet". The agent always sends a scrollback batch on
@@ -416,6 +561,9 @@ export function RuntimeLogView({
   // purpose.
   const followRef = useRef(true);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  // Every tab filters the one log region below it, so each tab names that
+  // region as the one it controls.
+  const logId = useId();
 
   useEffect(() => {
     if (!open) return undefined;
@@ -423,9 +571,12 @@ export function RuntimeLogView({
     setState(null);
     setScrollbackSeen(false);
     setConnectionError(false);
+    setSeenInstances(new Set());
+    setTab('all');
     followRef.current = true;
 
     const onBatch = (batch: RuntimeLogBatch) => {
+      setSeenInstances((prev) => withInstancesOf(prev, batch.entries));
       if (batch.scrollback) {
         // REPLACE, never append: a reconnect delivers a fresh scrollback and
         // appending it to what is on screen would duplicate the history. The
@@ -444,14 +595,32 @@ export function RuntimeLogView({
     );
   }, [api, open, serverId, specId]);
 
+  const tabInstances = useMemo(
+    () => knownInstances(instances, seenInstances),
+    [instances, seenInstances],
+  );
+  // A replicable spec always offers its tabs, even while only instance 0 runs.
+  // A spec that is not replicable, and for which no instance k >= 1 is known
+  // (from the opening row or the open stream), looks exactly as it did before
+  // instances existed: no tabs, and nothing said about instances.
+  const showTabs = allInstances || tabInstances.length > 1;
+  const activeTab: LogTab = showTabs ? tab : 'all';
+  const shown = useMemo(
+    () =>
+      activeTab === 'all'
+        ? { entries: win.entries, own: win.entries.length }
+        : instanceView(win.entries, activeTab),
+    [win.entries, activeTab],
+  );
+
   useEffect(() => {
     if (!followRef.current) return;
     const el = boxRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [win.entries]);
+  }, [shown.entries]);
 
-  const entries = win.entries;
-  const hasOutput = entries.length > 0;
+  const entries = shown.entries;
+  const hasOutput = win.entries.length > 0;
   const commandGap = opensWithoutACommand(entries);
   const notice = (() => {
     if (connectionError) return { severity: 'warning' as const, text: t.runtimeLogsDisconnected };
@@ -464,6 +633,10 @@ export function RuntimeLogView({
       return { severity: 'info' as const, text: t.runtimeLogsEmptyBuffer };
     if (!scrollbackSeen && !hasOutput)
       return { severity: 'info' as const, text: t.runtimeLogsWaiting };
+    // The history has output, just none of this instance's: say so, or the
+    // tab reads as "this instance prints nothing".
+    if (activeTab !== 'all' && shown.own === 0)
+      return { severity: 'info' as const, text: t.runtimeLogsInstanceEmpty(activeTab) };
     return null;
   })();
 
@@ -471,9 +644,33 @@ export function RuntimeLogView({
     <Dialog open={open} onClose={onClose} fullWidth maxWidth="lg">
       <DialogTitle>{`${t.runtimeLogsTitle} — ${title}`}</DialogTitle>
       <DialogContent>
+        {showTabs && (
+          <Tabs
+            value={activeTab}
+            onChange={(_event, value: LogTab) => {
+              // A different tab is a different view: start it at its tail.
+              followRef.current = true;
+              setTab(value);
+            }}
+            variant="scrollable"
+            scrollButtons="auto"
+            aria-label={t.runtimeLogsTabsLabel}
+            sx={{ mb: 1, borderBottom: 1, borderColor: 'divider' }}
+          >
+            <Tab label={t.runtimeLogsTabAll} value="all" aria-controls={logId} />
+            {tabInstances.map((k) => (
+              <Tab key={k} label={t.runtimeLogsTabInstance(k)} value={k} aria-controls={logId} />
+            ))}
+          </Tabs>
+        )}
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
           {t.runtimeLogsIntro}
         </Typography>
+        {showTabs && (
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            {t.runtimeLogsAllInstances}
+          </Typography>
+        )}
         {notice && (
           <Alert severity={notice.severity} sx={{ mb: 1 }}>
             {notice.text}
@@ -499,6 +696,7 @@ export function RuntimeLogView({
         )}
         <Box
           ref={boxRef}
+          id={logId}
           role="log"
           aria-label={t.runtimeLogsTitle}
           aria-live="polite"

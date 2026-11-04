@@ -115,6 +115,16 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// carry. This guard also fails the other way round -- a request field
 		// named role would have no DTO counterpart to round-trip.
 		"role": true,
+		// startup_measured_ms is agent-owned like ram_measured_mb (the store
+		// keeps it across every upsert), and effective_idle_timeout_seconds is
+		// derived on every read from the spec, the mapping and the gateway's
+		// configuration, never stored: two read-only echoes a request never
+		// carries.
+		"startup_measured_ms":            true,
+		"effective_idle_timeout_seconds": true,
+		// instances_min_exceeds_realtime is derived on every read from the spec's
+		// minimum and the mapping's audio ramp, never stored: a read-only warning.
+		"instances_min_exceeds_realtime": true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only
@@ -175,6 +185,12 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 3, VRAMEstimateMB: 12000, VRAMMeasuredMB: 11500}},
 		RAMEstimateMB:               4096,
 		RAMMeasuredMB:               3900, // read-only; must NOT appear in want below
+		Replicable:                  true,
+		MinInstances:                1,
+		MaxInstances:                3,
+		InstanceParallelism:         2,
+		StartupMeasuredMS:           30000, // read-only; must NOT appear in want below
+		EffectiveIdleTimeoutSeconds: 150,   // read-only; must NOT appear in want below
 		ConfigFiles:                 []ConfigFileDTO{{Name: "server.json", Content: `{"threads":8}`}},
 		APIFlavors:                  []string{routing.APIFlavorOpenAI},
 		ResponsesMode:               string(routing.EndpointModeDisabled),
@@ -210,6 +226,10 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
 		RAMEstimateMB:               dto.RAMEstimateMB,
+		Replicable:                  dto.Replicable,
+		MinInstances:                dto.MinInstances,
+		MaxInstances:                dto.MaxInstances,
+		InstanceParallelism:         dto.InstanceParallelism,
 		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
@@ -402,5 +422,63 @@ func TestSetBenchmarkRuntimeSpecAdminStateGatesTheApplicationType(t *testing.T) 
 
 	if _, err := svc.SetBenchmarkRuntimeSpecAdminState(ctx, spec.ID, "", "force_stopped"); !errors.Is(err, ErrRuntimeSpecNotServerAgent) {
 		t.Fatalf("err = %v, want ErrRuntimeSpecNotServerAgent", err)
+	}
+}
+
+// TestBenchmarkWritePreservesInstanceFields pins the instance settings through
+// a benchmark's own write path, which is a read-modify-write of the whole
+// launch spec: putRequestFromDTO carries all four settings across, and an
+// admin-state drain and restore on a replicable spec leave them -- and the
+// agent's startup measurement, which no request carries -- exactly as stored.
+// A spread that dropped one would turn a replicable spec back into one
+// process, or reset its floor, every time a benchmark ran next to it.
+func TestBenchmarkWritePreservesInstanceFields(t *testing.T) {
+	req := putRequestFromDTO(RuntimeSpecDTO{
+		Binary: "/usr/local/bin/llama-server", Replicable: true, MinInstances: 1, MaxInstances: 3, InstanceParallelism: 2,
+		StartupMeasuredMS: 30000, EffectiveIdleTimeoutSeconds: 150,
+	})
+	if !req.Replicable || req.MinInstances != 1 || req.MaxInstances != 3 || req.InstanceParallelism != 2 {
+		t.Fatalf("putRequestFromDTO = replicable %v min %d max %d parallelism %d, want true 1 3 2",
+			req.Replicable, req.MinInstances, req.MaxInstances, req.InstanceParallelism)
+	}
+
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	svc.agentFeatures = fakeAgentFeatures{server.ID: {AgentFeatureRuntimeInstances}}
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "tts", AppModelName: "tts"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	spec, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true, MinInstances: 1, MaxInstances: 3, InstanceParallelism: 2,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpdateRuntimeSpecStartupMeasured(ctx, spec.ID, 30000); err != nil {
+		t.Fatalf("UpdateRuntimeSpecStartupMeasured: %v", err)
+	}
+
+	drained, err := svc.SetBenchmarkRuntimeSpecAdminState(ctx, spec.ID, "", "force_stopped")
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if !drained.Replicable || drained.MinInstances != 1 || drained.MaxInstances != 3 || drained.InstanceParallelism != 2 ||
+		drained.StartupMeasuredMS != 30000 || drained.EffectiveIdleTimeoutSeconds != 150 {
+		t.Fatalf("the drain's write-back = %+v, want the four settings, the measurement 30000 and its idle timeout 150", drained)
+	}
+	if _, err := svc.SetBenchmarkRuntimeSpecsAdminState(ctx, []string{spec.ID}, "force_stopped", ""); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	stored, ok, err := routeStore.RuntimeSpecByID(ctx, spec.ID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByID: ok=%v err=%v", ok, err)
+	}
+	if !stored.Replicable || stored.MinInstances != 1 || stored.MaxInstances != 3 || stored.InstanceParallelism != 2 ||
+		stored.StartupMeasuredMS != 30000 || stored.AdminState != "" {
+		t.Fatalf("after the benchmark's drain and restore the stored spec = %+v, want the instance settings and the measurement untouched", stored)
 	}
 }

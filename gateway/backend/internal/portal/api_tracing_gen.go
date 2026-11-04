@@ -2116,6 +2116,18 @@ func (_d *APIWithTracing) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, sa
 	return _d.API.SetBenchmarkRuntimeSpecsPinned(ctx, sa1, b1, b2)
 }
 
+func (_d *APIWithTracing) SetBenchmarkRuntimeSpecsReplicable(ctx context.Context, sa1 []string, b1 bool, b2 bool) (b3 BenchmarkSpecsOutcome, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkRuntimeSpecsReplicable")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetBenchmarkRuntimeSpecsReplicable(ctx, sa1, b1, b2)
+}
+
 func (_d *APIWithTracing) SetCaptureSecret(t1 auth.Token, s1 string, b1 bool) (err error) {
 	return _d.API.SetCaptureSecret(t1, s1, b1)
 }

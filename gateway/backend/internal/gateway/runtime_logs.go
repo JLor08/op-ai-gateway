@@ -144,6 +144,12 @@ const (
 // kind is -- stripped from any entry that is not an opening marker -- so a
 // command can never appear attached to a line of process output, where it would
 // describe nothing and could only mislead.
+//
+// Instance names the spec instance whose generation produced the entry, on
+// every text entry and every generation marker: 0 (omitted) for the spec's own
+// process and for an agent that predates instances, k for instance k, whose
+// text still carries its "[#k] " line prefix. The portal uses it to show one
+// instance's output on its own. A negative index is read as 0 on ingest.
 type RuntimeLogEntryDTO struct {
 	PID          int                   `json:"pid,omitempty"`
 	At           string                `json:"at,omitempty"`
@@ -152,6 +158,7 @@ type RuntimeLogEntryDTO struct {
 	Event        string                `json:"event,omitempty"`
 	ExitCode     int                   `json:"exit_code,omitempty"`
 	Command      *RuntimeLogCommandDTO `json:"command,omitempty"`
+	Instance     int                   `json:"instance,omitempty"`
 }
 
 // RuntimeLogCommandDTO is the RESOLVED launch command of ONE generation: what
@@ -774,6 +781,9 @@ func (s *Server) ingestRuntimeLog(serverID string, raw json.RawMessage) {
 		}
 		if batch.Entries[i].DroppedBytes < 0 {
 			batch.Entries[i].DroppedBytes = 0
+		}
+		if batch.Entries[i].Instance < 0 {
+			batch.Entries[i].Instance = 0
 		}
 		if !runtimeLogOpeningEvents[batch.Entries[i].Event] {
 			batch.Entries[i].Command = nil

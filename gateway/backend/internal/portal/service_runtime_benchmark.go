@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"op-ai-gateway/internal/routing"
 	"slices"
@@ -34,7 +35,11 @@ import (
 // RAMEstimateMB is operator-owned and spreads like any other field: leaving it
 // out would let a benchmark's admin-state write reset the operator's estimate
 // to 0 (unknown). The DTO's RAMMeasuredMB has no request counterpart at all --
-// the store keeps the agent's measurement across the upsert.
+// the store keeps the agent's measurement across the upsert. The four instance
+// settings spread the same way -- dropping them would turn a replicable spec
+// back into one process whenever a benchmark wrote next to it -- and the
+// read-only StartupMeasuredMS and EffectiveIdleTimeoutSeconds, like
+// RAMMeasuredMB, have no request counterpart.
 func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 	liveTimings := dto.ResponsesLiveTimingsEnabled
 	return PutRuntimeSpecRequest{
@@ -55,6 +60,10 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
 		RAMEstimateMB:               dto.RAMEstimateMB,
+		Replicable:                  dto.Replicable,
+		MinInstances:                dto.MinInstances,
+		MaxInstances:                dto.MaxInstances,
+		InstanceParallelism:         dto.InstanceParallelism,
 		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
@@ -201,6 +210,50 @@ func (s *Service) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, specIDs []
 	return out, out.firstFailure()
 }
 
+// SetBenchmarkRuntimeSpecsReplicable sets replicable on every launch spec in
+// specIDs, each keyed by the spec's own id and each a compare-and-set against
+// expectedReplicable: a spec whose stored replicable is not expectedReplicable
+// is a Conflict (ErrRuntimeSpecReplicableConflict) and is not written. It is
+// the only benchmark writer of replicable. Only the flag moves: the instance
+// counts stay on the row (a spec that is not replicable pushes none of them),
+// so the inverse batch brings the spec back exactly as it was. The batch
+// notifies after its last write, once for each server a write stored to
+// (setBenchmarkRuntimeSpecs). The error return is the first Failed spec's
+// error, and nil when nothing failed. specIDs must not repeat an id, as for
+// SetBenchmarkRuntimeSpecsPinned.
+//
+// Writing true -- the restore -- is also a Conflict for a spec that can no
+// longer be replicable (replicableRestorable): an operator gave it a fixed
+// listen port while the run held it as one process. Its write would fail
+// validation on every attempt, and a Failed spec stays in the override lease,
+// whose leftover stops every later run on the server from unpinning or
+// stopping anything; the operator's port is the newer intent, so the restore
+// leaves the spec as they set it.
+//
+// A run writes false so that its replicable target runs as one process while
+// it is measured alone: the agent drains the target's other instances and its
+// floor of protected instances, which would otherwise start beside the
+// measured one, or start by themselves once a stop is cleared. A manual speed
+// or both run that may stop the server's models writes it for every enabled
+// replicable spec of the server, its neighbours' included, whose protected
+// instances would start by themselves at a stop's clear just the same.
+//
+// WHO AUTHORIZED THIS: its callers, exactly as for
+// SetBenchmarkRuntimeSpecsPinned, and it is not gated by serverIsBenchmarking
+// either. Its callers, and what authorized each: beginBenchmarkUnpin and
+// endBenchmarkUnpin, for a manual speed or both run behind
+// AuthorizeBenchmarkScope in startBenchmark; the VRAM run, behind
+// startVRAMProbe's gate; and reconcileBenchmarkOverrideLease, which only
+// undoes, by compare-and-set, what such a run wrote.
+func (s *Service) SetBenchmarkRuntimeSpecsReplicable(ctx context.Context, specIDs []string, expectedReplicable, replicable bool) (BenchmarkSpecsOutcome, error) {
+	expect := expectReplicable(expectedReplicable)
+	if replicable {
+		expect = replicableRestorable(expect)
+	}
+	out := s.setBenchmarkRuntimeSpecs(ctx, specIDs, expect, withReplicable(replicable))
+	return out, out.firstFailure()
+}
+
 // SetBenchmarkRuntimeSpecsAdminState sets admin_state on every launch spec in
 // specIDs, each keyed by the spec's own id and each a compare-and-set against
 // expectedAdminState, both sides trimmed: a mismatch is a Conflict
@@ -296,7 +349,7 @@ func (o *BenchmarkSpecsOutcome) record(specID string, err error) {
 	case errors.Is(err, ErrRuntimeSpecNotServerAgent):
 		slog.Warn("benchmark: a launch spec's application is no longer server_agent; its stored pinned and admin_state stay on the row and act again if the application is retyped back", "spec_id", specID)
 		o.Gone = append(o.Gone, specID)
-	case errors.Is(err, ErrRuntimeSpecPinnedConflict), errors.Is(err, ErrRuntimeSpecAdminStateConflict):
+	case errors.Is(err, ErrRuntimeSpecPinnedConflict), errors.Is(err, ErrRuntimeSpecAdminStateConflict), errors.Is(err, ErrRuntimeSpecReplicableConflict):
 		o.Conflict = append(o.Conflict, specID)
 	default:
 		o.Failed = append(o.Failed, specID)
@@ -355,7 +408,7 @@ func (s *Service) resolveBenchmarkSpecWrite(ctx context.Context, specID string, 
 	if err != nil {
 		return benchmarkSpecWrite{}, err
 	}
-	dto, err := runtimeSpecDTO(spec, gpus, app)
+	dto, err := runtimeSpecDTO(spec, gpus, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	if err != nil {
 		return benchmarkSpecWrite{}, err
 	}
@@ -385,6 +438,39 @@ func expectPinned(expected bool) func(routing.RuntimeSpec) error {
 		}
 		return nil
 	}
+}
+
+// expectReplicable is SetBenchmarkRuntimeSpecsReplicable's compare-and-set:
+// the stored replicable must equal expected.
+func expectReplicable(expected bool) func(routing.RuntimeSpec) error {
+	return func(spec routing.RuntimeSpec) error {
+		if spec.Replicable != expected {
+			return ErrRuntimeSpecReplicableConflict
+		}
+		return nil
+	}
+}
+
+// replicableRestorable is expect, then the one stored setting a replicable
+// spec cannot have: a fixed listen port (validateRuntimeSpecInstances, which
+// refuses it for a replicable spec only). A spec that has one is a
+// ErrRuntimeSpecReplicableConflict: making it replicable would fail validation
+// for as long as the port stays, so it is not a write that can succeed later.
+func replicableRestorable(expect func(routing.RuntimeSpec) error) func(routing.RuntimeSpec) error {
+	return func(spec routing.RuntimeSpec) error {
+		if err := expect(spec); err != nil {
+			return err
+		}
+		if spec.ListenPort != 0 {
+			return fmt.Errorf("%w: it now listens on fixed port %d, which a replicable spec cannot", ErrRuntimeSpecReplicableConflict, spec.ListenPort)
+		}
+		return nil
+	}
+}
+
+// withReplicable replaces replicable in a spread request.
+func withReplicable(replicable bool) func(*PutRuntimeSpecRequest) {
+	return func(req *PutRuntimeSpecRequest) { req.Replicable = replicable }
 }
 
 // withAdminState replaces admin_state in a spread request.

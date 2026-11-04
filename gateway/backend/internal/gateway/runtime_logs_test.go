@@ -995,3 +995,45 @@ func TestRuntimeLogCommandSurvivesTheWireVerbatim(t *testing.T) {
 		}
 	}
 }
+
+// TestRuntimeLogInstanceIsRelayed: the agent names the spec instance that
+// produced each entry, text and generation markers alike, and the gateway
+// passes it through to the portal, which shows one instance's output on its
+// own from it. Instance 0 stays omitted on the way out, exactly as an older
+// agent that knows no instances sends it, and a negative index -- which no
+// agent produces -- is read as the spec's own process rather than relayed.
+func TestRuntimeLogInstanceIsRelayed(t *testing.T) {
+	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	defer unsub()
+
+	srv.ingestRuntimeLog("srv-1", json.RawMessage(`{"spec_id":"spec-a","entries":[`+
+		`{"pid":102,"event":"started","instance":2,"command":{"binary":"srv"}},`+
+		`{"pid":102,"text":"[#2] up\n","instance":2},`+
+		`{"pid":100,"text":"zero\n"},`+
+		`{"pid":102,"event":"exited","exit_code":1,"instance":2},`+
+		`{"text":"bogus\n","instance":-4}]}`))
+
+	var got RuntimeLogBatchDTO
+	select {
+	case got = <-sub.ch:
+	case <-time.After(time.Second):
+		t.Fatal("nothing delivered")
+	}
+	want := []int{2, 2, 0, 2, 0}
+	if len(got.Entries) != len(want) {
+		t.Fatalf("entries = %+v, want %d", got.Entries, len(want))
+	}
+	for i, w := range want {
+		if got.Entries[i].Instance != w {
+			t.Errorf("entry %d instance = %d, want %d", i, got.Entries[i].Instance, w)
+		}
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if n := strings.Count(string(raw), `"instance":`); n != 3 {
+		t.Errorf("relayed batch %s carries %d instance keys, want 3 (instance 0 omitted)", raw, n)
+	}
+}

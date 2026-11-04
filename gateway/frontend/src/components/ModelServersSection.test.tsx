@@ -64,6 +64,9 @@ function makeRows(): ModelServerRow[] {
       // every other verdict field's default here -- individual tests below
       // override this to exercise one determined scenario at a time.
       capabilities: [],
+      // #340: the running instances of the mapping's spec on this server --
+      // rowA's one process, none on the other two.
+      running_instances: 1,
       priority: 1,
     },
     {
@@ -91,6 +94,7 @@ function makeRows(): ModelServerRow[] {
       live_progress_support: 'unsupported',
       live_progress_checked_at: '2026-08-01T07:00:00Z',
       capabilities: [],
+      running_instances: 0,
       priority: 3,
     },
     {
@@ -121,6 +125,7 @@ function makeRows(): ModelServerRow[] {
       live_progress_support: '',
       live_progress_checked_at: null,
       capabilities: [],
+      running_instances: 0,
       priority: 2,
     },
   ];
@@ -1603,6 +1608,184 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         t.modelServerCapabilitiesCheckedAt(new Date('2026-07-01T00:00:00Z').toLocaleString()),
       );
       expect(tooltip).not.toHaveTextContent(t.modelServerCapabilitiesSource('llama_cpp_props'));
+    });
+
+    // #340: a replicable spec runs several processes of one model on a server.
+    // The row says how many while more than one runs; one running process is
+    // what every other model has, so it adds nothing.
+    it('names the running instances once more than one runs', async () => {
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) => (r.mapping_id === 'map-a' ? { ...r, running_instances: 3 } : r)),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColStatus);
+      expect(cell).toHaveTextContent(t.tableModelLoaded);
+      expect(cell).toHaveTextContent(`${t.modelServersRunningInstances}: 3`);
+    });
+
+    // A replicable spec names its count even with one instance running (or
+    // none): that one is a count of instances, not the model's only process.
+    it.each([1, 0])(
+      'names the running instances of a replicable spec with %i running',
+      async (running) => {
+        const { api } = makeApi({
+          modelServers: vi
+            .fn()
+            .mockResolvedValue(
+              makeRows().map((r) =>
+                r.mapping_id === 'map-a'
+                  ? { ...r, replicable: true, running_instances: running }
+                  : r,
+              ),
+            ),
+        } as Partial<ModelServersSectionApi>);
+        renderSection(api);
+        await screen.findByText('GPU-Box-C');
+
+        expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).toHaveTextContent(
+          `${t.modelServersRunningInstances}: ${running}`,
+        );
+      },
+    );
+
+    it('says nothing about instances for a spec that is not replicable with one running', async () => {
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) =>
+              r.mapping_id === 'map-a' ? { ...r, replicable: false, running_instances: 1 } : r,
+            ),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).not.toHaveTextContent(
+        t.modelServersRunningInstances,
+      );
+    });
+
+    // A row without the field (a gateway that predates instances) reads as 0
+    // running: never "undefined", and no count for a spec not known as
+    // replicable.
+    it('reads a row without running_instances as none running, never as "undefined"', async () => {
+      const withoutCount = (r: ModelServerRow, replicable?: boolean) => {
+        const { running_instances: _dropped, ...rest } = r;
+        return (replicable === undefined ? rest : { ...rest, replicable }) as ModelServerRow;
+      };
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) =>
+              r.mapping_id === 'map-a'
+                ? withoutCount(r)
+                : r.mapping_id === 'map-b'
+                  ? withoutCount(r, true)
+                  : r,
+            ),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(screen.queryByText(/undefined/)).toBeNull();
+      expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).not.toHaveTextContent(
+        t.modelServersRunningInstances,
+      );
+      expect(cellForColumn('GPU-Box-B', t.modelServerColStatus)).toHaveTextContent(
+        `${t.modelServersRunningInstances}: 0`,
+      );
+    });
+
+    it('says nothing about instances while one or none runs, until a live frame reports a second', async () => {
+      const { api, getOnData } = makeApi();
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(screen.queryByText(new RegExp(t.modelServersRunningInstances))).toBeNull();
+
+      act(() =>
+        getOnData()!(
+          makeRows().map((r) => (r.mapping_id === 'map-a' ? { ...r, running_instances: 2 } : r)),
+        ),
+      );
+      expect(cellForColumn('GPU-Box-A', t.modelServerColStatus)).toHaveTextContent(
+        `${t.modelServersRunningInstances}: 2`,
+      );
+    });
+
+    // #340: an audio model's rows carry its audio metrics. The real-time
+    // concurrency is a measured count only when the ramp stopped on
+    // performance; resources or the cap ended it early, so it is a lower bound.
+    it('shows the audio metrics of an audio model, a lower bound as "≥ k"', async () => {
+      const audio: Record<string, Partial<ModelServerRow>> = {
+        'map-a': {
+          audio_rate_x: 3,
+          audio_ttfa_ms: 250,
+          audio_realtime_concurrency: 2,
+          audio_concurrency_limit: 'resources',
+        },
+        'map-b': {
+          audio_rate_x: 1.4,
+          audio_ttfa_ms: 600,
+          audio_realtime_concurrency: 2,
+          audio_concurrency_limit: 'performance',
+        },
+      };
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(makeRows().map((r) => ({ ...r, ...audio[r.mapping_id] }))),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioRate)).toHaveTextContent('3.0×');
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioTtft)).toHaveTextContent('250');
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioConcurrency)).toHaveTextContent('≥ 2');
+      expect(cellForColumn('GPU-Box-B', t.modelServersAudioConcurrency).textContent).toBe('2');
+      // A row nothing measured reads as unknown, never as 0.
+      expect(cellForColumn('GPU-Box-C', t.modelServersAudioRate).textContent).toBe('—');
+      expect(cellForColumn('GPU-Box-C', t.modelServersAudioConcurrency).textContent).toBe('—');
+    });
+
+    it('names a measured real-time concurrency of 0 as not real-time', async () => {
+      const { api } = makeApi({
+        modelServers: vi
+          .fn()
+          .mockResolvedValue(
+            makeRows().map((r) =>
+              r.mapping_id === 'map-a'
+                ? { ...r, audio_realtime_concurrency: 0, audio_concurrency_limit: 'performance' }
+                : r,
+            ),
+          ),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(cellForColumn('GPU-Box-A', t.modelServersAudioConcurrency).textContent).toBe(
+        t.audioRealtimeConcurrency(0, 'performance'),
+      );
+    });
+
+    it('leaves the audio columns out for a text model', async () => {
+      const { api } = makeApi();
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      expect(screen.queryByRole('columnheader', { name: t.modelServersAudioRate })).toBeNull();
+      expect(
+        screen.queryByRole('columnheader', { name: t.modelServersAudioConcurrency }),
+      ).toBeNull();
     });
   });
 }

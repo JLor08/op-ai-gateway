@@ -207,6 +207,7 @@ type API interface {
 	SetBenchmarkRuntimeSpecAdminState(context.Context, string, string, string) (RuntimeSpecDTO, error)
 	SetBenchmarkRuntimeSpecsAdminState(context.Context, []string, string, string) (BenchmarkSpecsOutcome, error)
 	SetBenchmarkRuntimeSpecsPinned(context.Context, []string, bool, bool) (BenchmarkSpecsOutcome, error)
+	SetBenchmarkRuntimeSpecsReplicable(context.Context, []string, bool, bool) (BenchmarkSpecsOutcome, error)
 	SetCaptureSecret(auth.Token, string, bool) error
 	SetCoResidency(context.Context, auth.Token, string, SetCoResidencyRequest) (CoResidencyDTO, error)
 	SetManagerPermissions(context.Context, auth.Token, string, string, ManagerPermissions) error

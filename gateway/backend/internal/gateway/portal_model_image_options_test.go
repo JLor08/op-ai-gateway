@@ -193,6 +193,30 @@ func TestModelImageOptionsAgentOnlyReadsRuntimeSnapshotBySpecID(t *testing.T) {
 	}
 }
 
+// A replicable agent spec reports a row per instance, and the options are
+// read from the spec's representative row (representativeRowIndex), the row
+// every other reader of the spec picks too: a crashed instance 0 that still
+// carries the options of its last start does not speak while a burst instance
+// serves, and the spec is collected once however many rows carry options.
+func TestModelImageOptionsReadsTheRepresentativeInstanceRow(t *testing.T) {
+	f := newImageOptionsFixture(t)
+	_, _, specID := f.offering(t, "srv_agent", routing.ProviderServerAgent)
+	stale := externalSdOptions()
+	serving := agentSdOptions()
+	other := agentSdOptions()
+	other.Samplers = []string{"heun"}
+	f.s.RuntimeStatus.publish("srv_agent", []RuntimeStatusDTO{
+		{SpecID: specID, Instance: 0, State: "crashed", ImageOptions: &stale},
+		{SpecID: specID, Instance: 3, State: "running", ImageOptions: &other},
+		{SpecID: specID, Instance: 2, State: "running", ImageOptions: &serving},
+	})
+
+	got := decodeImageOptions(t, f.get(ioModel))
+	if !reflect.DeepEqual(got.Samplers, []string{"dpm++2m", "euler"}) || got.MaxBatchCount != 4 {
+		t.Fatalf("data = %+v, want the options of instance 2, the running row with the lowest index", got)
+	}
+}
+
 // One external and one agent-launched server offering the same model: the
 // answer is what BOTH can do (intersected lists, tightest envelope, smallest
 // batch), not either one's own options.

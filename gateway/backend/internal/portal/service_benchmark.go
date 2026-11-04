@@ -53,14 +53,36 @@ type BenchmarkRunDTO struct {
 	// vram_measured_mb.
 	VRAM *VRAMReportDTO `json:"vram,omitempty"`
 	// TTFTMS, WallMS and RTF are the audio perf metrics of a kind=="speech" row
-	// (routing.BenchmarkRun documents each): the time to the first response byte
-	// and the synthesis wall time in milliseconds, and the real-time factor. Set
-	// only for that kind, and omitted for a speech row that failed or measured
-	// none, which carries its Error instead.
+	// and of a kind=="audio" row (routing.BenchmarkRun documents each): the time
+	// to the first response byte (speech) or to the first usable output (audio),
+	// the wall time in milliseconds, and the real-time factor. Set only for those
+	// kinds, and omitted for a row that failed or measured none, which carries its
+	// Error instead.
 	TTFTMS int64   `json:"ttft_ms,omitempty"`
 	WallMS int64   `json:"wall_ms,omitempty"`
 	RTF    float64 `json:"rtf,omitempty"`
+	// The audio benchmark's figures (#340), decoded from the JSON a row of
+	// either audio kind holds in its capacity_curve column
+	// (routing.AudioSpeedHistory, routing.AudioCapacityHistory, the types the
+	// gateway writes it with). A kind=="audio" row (an audio speed run) carries
+	// TTFTMS, WallMS, RTF and LoadTimeMS above -- its time to first audio or
+	// text, wall time, real-time factor and confirmed cold start -- plus
+	// AudioRateX, its single-stream rate. A kind=="audio_capacity" row (the
+	// concurrency ramp) carries AudioConcurrencyLimit, why the ramp stopped
+	// ("performance" | "resources" | "cap"), with AudioRealtimeConcurrency, the
+	// last good level, which is then always served, a measured 0 included (0
+	// under "performance": not real-time even alone); and AudioCurve, one entry
+	// per level. A ramp that failed has no limit, and neither field is served:
+	// its count means nothing. Every other kind carries none of them.
+	AudioRateX               float64         `json:"audio_rate_x,omitempty"`
+	AudioRealtimeConcurrency *int            `json:"audio_realtime_concurrency,omitempty"`
+	AudioConcurrencyLimit    string          `json:"audio_concurrency_limit,omitempty"`
+	AudioCurve               []AudioLevelDTO `json:"audio_curve,omitempty"`
 }
+
+// AudioLevelDTO is one level k of an audio concurrency ramp
+// (routing.AudioLevel, the type the gateway writes the curve with).
+type AudioLevelDTO = routing.AudioLevel
 
 // CapacityLevelDTO / CapacityReportDTO are the decoded capacity curve for a
 // kind=="capacity" benchmark-history row (decoded from BenchmarkRun.CapacityCurve).
@@ -214,8 +236,33 @@ func benchmarkRunDTO(r routing.BenchmarkRun) BenchmarkRunDTO {
 		dto.VRAM = decodeVRAMReport(r.VRAMJSON)
 	case "speech":
 		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
+	case routing.BenchmarkKindAudio:
+		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
+		dto.AudioRateX = decodeAudioHistory[routing.AudioSpeedHistory](r.CapacityCurve).RateX
+	case routing.BenchmarkKindAudioCapacity:
+		h := decodeAudioHistory[routing.AudioCapacityHistory](r.CapacityCurve)
+		if h.ConcurrencyLimit != "" {
+			count := h.RealtimeConcurrency
+			dto.AudioRealtimeConcurrency, dto.AudioConcurrencyLimit = &count, h.ConcurrencyLimit
+		}
+		if len(h.Curve) > 0 {
+			dto.AudioCurve = h.Curve
+		}
 	}
 	return dto
+}
+
+// decodeAudioHistory decodes an audio history row's opaque payload into its
+// kind's type, tolerating a blank or malformed one as no figures for the same
+// reason decodeCapacityReport does: the row's own columns and Error still make
+// a usable history entry.
+func decodeAudioHistory[T routing.AudioSpeedHistory | routing.AudioCapacityHistory](raw string) T {
+	var payload T
+	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &payload) != nil {
+		var none T
+		return none
+	}
+	return payload
 }
 
 // decodeCapacityReport decodes a kind=="capacity" row's opaque curve column.

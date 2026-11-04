@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -839,5 +840,248 @@ func TestLogCommandIsReleasedWithTheSpec(t *testing.T) {
 	}
 	if len(batches[0].Entries) != 0 {
 		t.Fatalf("a removed spec kept entries: %+v", batches[0].Entries)
+	}
+}
+
+// TestInstanceOutputGoesToTheSpecBufferPrefixed is the store half of how a
+// replicable spec's instances share one log view (#340): every instance writes
+// into the BASE spec's buffer, instance 0 byte for byte as a spec that never
+// replicates, and a further instance k with "[#k] " opening each of its lines.
+// A line is prefixed once however the pipe splits it, output that ends with a
+// newline leaves no dangling prefix, and two instances writing in turn
+// interleave in the one history, each line still marked by its own instance.
+func TestInstanceOutputGoesToTheSpecBufferPrefixed(t *testing.T) {
+	s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+	p0 := s.newInstanceProc("S", 0)
+	p2 := s.newInstanceProc("S", 2)
+	p0.Started(100, ResolvedCommand{})
+	p2.Started(102, ResolvedCommand{})
+
+	p0.Write([]byte("zero a\nzero "))
+	p2.Write([]byte("two a\ntwo b"))
+	p2.Write([]byte(" continued\n"))
+	p0.Write([]byte("b\n"))
+	p2.Write([]byte("\n"))
+	p2.Write([]byte("two c\n"))
+
+	s.SetWatch([]string{"S"}, nil)
+	batches := s.Drain()
+	if len(batches) != 1 || batches[0].SpecID != "S" || !batches[0].Scrollback {
+		t.Fatalf("drain = %+v, want one scrollback batch for the BASE spec S", batches)
+	}
+	const want = "zero a\nzero " +
+		"[#2] two a\n[#2] two b" +
+		" continued\n" +
+		"b\n" +
+		"[#2] \n" +
+		"[#2] two c\n"
+	if got := batchText(batches[0]); got != want {
+		t.Fatalf("history text =\n%q\nwant\n%q", got, want)
+	}
+
+	// Each generation's tail is still its own, prefix included for instance 2.
+	if got := p0.Tail(1024); got != "zero a\nzero b\n" {
+		t.Errorf("instance 0 tail = %q, want its own bytes unchanged", got)
+	}
+	if got := p2.Tail(1024); got != "[#2] two a\n[#2] two b continued\n[#2] \n[#2] two c\n" {
+		t.Errorf("instance 2 tail = %q, want its own lines, each prefixed", got)
+	}
+
+	// No buffer is keyed by an instance: Retain with the spec ID keeps them all.
+	s.Retain([]string{"S"})
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.logs))
+	for k := range s.logs {
+		keys = append(keys, k)
+	}
+	s.mu.Unlock()
+	if len(keys) != 1 || keys[0] != "S" {
+		t.Fatalf("retained buffers = %v, want only the spec's own [S]", keys)
+	}
+}
+
+// TestInstanceZeroOutputIsUnprefixed: newInstanceProc for instance 0 is
+// exactly newProc -- the spec's own process writes what it wrote.
+func TestInstanceZeroOutputIsUnprefixed(t *testing.T) {
+	for name, open := range map[string]func(*LogStore) *procLog{
+		"newProc":           func(s *LogStore) *procLog { return s.newProc("S") },
+		"newInstanceProc 0": func(s *LogStore) *procLog { return s.newInstanceProc("S", 0) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+			p := open(s)
+			p.Write([]byte("[#1] not mine\nplain"))
+			if got := p.Tail(1024); got != "[#1] not mine\nplain" {
+				t.Fatalf("tail = %q, want the bytes exactly as written", got)
+			}
+		})
+	}
+}
+
+// TestInstanceIsCarriedOnEveryEntryOfAGeneration: each text entry and each
+// generation marker names the instance that produced it, so a reader can show
+// one instance's output on its own without parsing the "[#k] " prefix back out
+// of the text. Instance 0 carries 0, which the wire omits -- exactly what an
+// agent from before instances existed sends -- and the text keeps its prefix,
+// so a reader that ignores the field sees the combined history unchanged. Both
+// paths a reader receives entries on are covered: the scrollback replay of the
+// retained history and the live drain of the queue.
+func TestInstanceIsCarriedOnEveryEntryOfAGeneration(t *testing.T) {
+	write := func(p0, p3 *procLog) {
+		p0.Started(100, ResolvedCommand{Binary: "srv"})
+		p3.Started(103, ResolvedCommand{Binary: "srv"})
+		p0.Write([]byte("zero\n"))
+		p3.Write([]byte("three\n"))
+		p3.Exited(1)
+		p0.Exited(0)
+	}
+	check := func(t *testing.T, entries []LogEntry) {
+		t.Helper()
+		type seen struct {
+			event, text string
+			instance    int
+		}
+		var got []seen
+		for _, e := range entries {
+			got = append(got, seen{e.Event, e.Text, e.Instance})
+		}
+		want := []seen{
+			{logEventStarted, "", 0},
+			{logEventStarted, "", 3},
+			{"", "zero\n", 0},
+			{"", "[#3] three\n", 3},
+			{logEventExited, "", 3},
+			{logEventExited, "", 0},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("entries = %+v, want %+v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	}
+
+	t.Run("scrollback replay", func(t *testing.T) {
+		s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+		write(s.newInstanceProc("S", 0), s.newInstanceProc("S", 3))
+		s.SetWatch([]string{"S"}, nil)
+		batches := s.Drain()
+		if len(batches) != 1 || !batches[0].Scrollback {
+			t.Fatalf("drain = %+v, want one scrollback batch", batches)
+		}
+		check(t, batches[0].Entries)
+	})
+	t.Run("live drain", func(t *testing.T) {
+		s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+		s.SetWatch([]string{"S"}, nil)
+		if b := s.Drain(); len(b) != 1 || !b[0].Scrollback || len(b[0].Entries) != 0 {
+			t.Fatalf("first drain = %+v, want the one empty scrollback", b)
+		}
+		write(s.newInstanceProc("S", 0), s.newInstanceProc("S", 3))
+		batches := s.Drain()
+		if len(batches) != 1 || batches[0].Scrollback {
+			t.Fatalf("drain = %+v, want one live batch", batches)
+		}
+		check(t, batches[0].Entries)
+	})
+	t.Run("wire omits instance 0", func(t *testing.T) {
+		for _, c := range []struct {
+			entry LogEntry
+			want  bool
+		}{
+			{LogEntry{Text: "zero\n"}, false},
+			{LogEntry{Text: "[#3] three\n", Instance: 3}, true},
+			{LogEntry{DroppedBytes: 4096}, false},
+		} {
+			raw, err := json.Marshal(c.entry)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got := strings.Contains(string(raw), `"instance"`); got != c.want {
+				t.Errorf("%s: instance key present = %v, want %v", raw, got, c.want)
+			}
+		}
+	})
+}
+
+// TestADropStampedOntoAnInstanceEntryKeepsItsInstance: a gap is stamped onto
+// the first entry after it, and that entry still names the instance whose
+// output it carries. The gap itself belongs to no instance -- the lost bytes
+// may have come from any of them -- which is why a reader shows it in every
+// view while the entry's text stays with its instance. Both places output can
+// be lost are covered: the retention buffer evicting the oldest history (seen
+// in the scrollback) and the live queue overflowing between two drains.
+func TestADropStampedOntoAnInstanceEntryKeepsItsInstance(t *testing.T) {
+	line := strings.Repeat("x", 4095) + "\n"
+	t.Run("scrollback after eviction", func(t *testing.T) {
+		s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+		p := s.newInstanceProc("S", 2)
+		// 160 KiB into a 64 KiB buffer.
+		for range 40 {
+			p.Write([]byte(line))
+		}
+		s.SetWatch([]string{"S"}, nil)
+		batches := s.Drain()
+		if len(batches) != 1 || len(batches[0].Entries) == 0 {
+			t.Fatalf("drain = %+v, want one scrollback batch with entries", batches)
+		}
+		first := batches[0].Entries[0]
+		if first.DroppedBytes <= 0 || first.Instance != 2 || first.Text == "" {
+			t.Fatalf("first entry = {dropped %d, instance %d, %d text bytes}, want the gap stamped onto instance 2's text",
+				first.DroppedBytes, first.Instance, len(first.Text))
+		}
+	})
+	t.Run("live queue overflow", func(t *testing.T) {
+		s := newTestLogStore(t, 1<<20, 1<<20)
+		p := s.newInstanceProc("S", 2)
+		s.SetWatch([]string{"S"}, nil)
+		s.Drain() // consume the (empty) scrollback
+		// 512 KiB into a 64 KiB live queue.
+		for range 128 {
+			p.Write([]byte(line))
+		}
+		batches := s.Drain()
+		if len(batches) != 1 || len(batches[0].Entries) == 0 {
+			t.Fatalf("drain = %+v, want one live batch with entries", batches)
+		}
+		first := batches[0].Entries[0]
+		if first.DroppedBytes <= 0 || first.Instance != 2 || first.Text == "" {
+			t.Fatalf("first entry = {dropped %d, instance %d, %d text bytes}, want the gap stamped onto instance 2's text",
+				first.DroppedBytes, first.Instance, len(first.Text))
+		}
+	})
+}
+
+// TestASplitNeverCutsThroughAnInstancePrefix: a record too big for the room
+// left in a frame is cut, and the cut never falls inside the "[#k] " prefix
+// that opens one of instance k's lines -- a reader removing that prefix to show
+// the instance on its own can only recognise it whole. Every budget that cuts
+// the record is tried, so whichever byte the room ends at, the head ends before
+// a prefix or after it, never in the middle.
+func TestASplitNeverCutsThroughAnInstancePrefix(t *testing.T) {
+	const prefix = "[#2] "
+	r := logRecord{instance: 2, text: prefix + "first\n" + prefix + "second\n" + prefix + "third"}
+	splits := 0
+	for budget := logEntryWireOverhead; budget < logEntryWireOverhead+2*len(r.text); budget++ {
+		head, tail, ok := splitRecord(r, budget)
+		if !ok {
+			continue
+		}
+		splits++
+		if head.text+tail.text != r.text {
+			t.Fatalf("budget %d: halves %q + %q do not rejoin to the record", budget, head.text, tail.text)
+		}
+		lastLine := head.text[strings.LastIndexByte(head.text, '\n')+1:]
+		if lastLine != "" && len(lastLine) < len(prefix) && strings.HasPrefix(prefix, lastLine) {
+			t.Errorf("budget %d: head ends %q, inside the prefix; tail opens %q", budget, lastLine, tail.text)
+		}
+		if head.instance != 2 || tail.instance != 2 {
+			t.Errorf("budget %d: halves name instances %d and %d, want 2 for both", budget, head.instance, tail.instance)
+		}
+	}
+	if splits == 0 {
+		t.Fatal("no budget split the record; the test exercises nothing")
 	}
 }

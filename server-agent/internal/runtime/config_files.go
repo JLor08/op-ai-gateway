@@ -14,6 +14,9 @@ import (
 // the model process is exec'd, each ConfigFile is placeholder-expanded and
 // written to <configFilesDir>/<spec.ID>/<name>, the same directory
 // ${CONFIG_DIR} resolves to, so the spec's Args/Env can point the server at it.
+// spec.ID is the INSTANCE key for a further instance of a replicable spec
+// (#340): <configFilesDir>/<S>#<k>, its own directory, because a file may hold
+// that instance's own ${PORT} and two instances must never share one.
 //
 // THE DESIGN RULES, because each one is a decision and not an accident:
 //

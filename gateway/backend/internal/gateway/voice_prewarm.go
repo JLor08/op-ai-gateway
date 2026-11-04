@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"time"
@@ -34,7 +34,22 @@ import (
 // benchmark result) and a pre-warm is not worth a change to that path. What the two do share is
 // the pieces that define the request itself -- the body type (speechBenchmarkRequest), the
 // upstream path (upstreamPath for the speech flavor), the content type and the credential
-// (upstreamAuthCtx).
+// (upstreamAuthCtx) -- and the reading of the answer (readBenchmarkRefusal, readBenchmarkAnswer).
+//
+// Unbilled is not invisible: while it runs the synthesis is an in-flight request on the target's
+// instance (an ActiveRequest on its InstanceKey), so the per-instance cap counts it and routing does
+// not send a session's first turn to an instance busy priming as if it were free. That row is the
+// session's own (voicePrewarmOwner): attributed to the ticket's caller and naming the ticket
+// endpoint as its request path, so the Active Requests view lists it to that user, with an owner
+// and a path, like any other request of theirs.
+
+// voicePrewarmOwner is who the priming's in-flight row is attributed to: the token that asked for
+// the ticket (its user, token and service, as the session's own turns are attributed) and the
+// ticket endpoint's path, which is what the Active Requests view shows as the row's request path.
+type voicePrewarmOwner struct {
+	token   auth.Token
+	reqPath string
+}
 
 // voicePrimingText is what the priming synthesis speaks: a few words, enough for the model to run
 // its whole synthesis path once and short enough that the clip is quick. It is fixed so every
@@ -61,7 +76,7 @@ func (s *Server) voicePrewarmEnabled() bool {
 
 // startVoicePrewarm is the ticket endpoint's one call into the pre-warm: it launches the priming of tts
 // and voice (the speech target the co-load gate resolved and the voice the ticket carries) in the
-// background and returns at once. It is gated -- nothing starts with the knob off or with no voice
+// background, on owner's behalf, and returns at once. It is gated -- nothing starts with the knob off or with no voice
 // to warm -- and best-effort in every other respect: the synthesis is never awaited, so the ticket's
 // latency and success cannot depend on it, and its failure (no native relay, a transport error, a
 // non-2xx answer, the timeout) is logged here and goes no further, so it can never fail the ticket
@@ -73,31 +88,37 @@ func (s *Server) voicePrewarmEnabled() bool {
 // done any of the work being warmed. And it carries the request's state -- among it a
 // payload-capture sink, which would record the priming's request and response and so store them,
 // where the priming must store nothing. A clean context carries none of that.
-func (s *Server) startVoicePrewarm(tts routing.Target, voice string) {
+func (s *Server) startVoicePrewarm(tts routing.Target, voice string, owner voicePrewarmOwner) {
 	if !s.voicePrewarmEnabled() || voice == "" {
 		return
 	}
+	done := s.voicePrewarmDone
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), voicePrimingTimeout)
 		defer cancel()
-		if err := s.primeSpeechVoice(ctx, tts, voice); err != nil {
+		if err := s.primeSpeechVoice(ctx, tts, voice, owner); err != nil {
 			slog.Warn("voice prewarm: priming synthesis failed", "model", tts.Model, "route", tts.RouteID, "voice", voice, "err", err)
+		}
+		if done != nil {
+			done()
 		}
 	}()
 }
 
 // primeSpeechVoice fires ONE short synthesis for tts and voice straight at the target's upstream, to
 // make its first real synthesis warm. It reads the answer to its end and discards it, and returns
-// nil on a 2xx answer; any failure (no native relay, a transport error, a non-2xx answer, an
-// unreadable body) is returned for the caller to log -- priming is best-effort and must never fail
-// the ticket or the session, so there is nothing here to retry or recover.
+// nil on a 2xx answer with audio in it; any failure (no native relay, a transport error, a non-2xx
+// answer, an unreadable, empty or oversized body) is returned for the caller to log -- priming is
+// best-effort and must never fail the ticket or the session, so there is nothing here to retry or
+// recover. From the call to the end of the answer it is an in-flight request on tts's instance,
+// attributed to owner.
 //
 // It runs on ctx as given: the caller bounds it (voicePrimingTimeout) and ends it. It writes no
 // usage row and stores nothing (see the file comment): the one request is a plain non-stream
 // synthesis naming the application's own model id -- what the speech relay would rewrite the
 // client's name to (effectiveProviderModel) -- the fixed priming text and the one voice, and
 // nothing else.
-func (s *Server) primeSpeechVoice(ctx context.Context, tts routing.Target, voice string) error {
+func (s *Server) primeSpeechVoice(ctx context.Context, tts routing.Target, voice string, owner voicePrewarmOwner) error {
 	proxy, ok := s.Provider.(provider.NativeProxyClient)
 	if !ok {
 		return errVoicePrimingNoNativeProxy
@@ -107,21 +128,31 @@ func (s *Server) primeSpeechVoice(ctx context.Context, tts routing.Target, voice
 		return fmt.Errorf("voice prewarm: build request: %w", err)
 	}
 	ctx = s.upstreamAuthCtx(ctx, tts)
+	path := upstreamPath(tts, apiFlavorSpeech, endpointSpeech)
 
-	resp, err := proxy.ProxyNative(ctx, tts, upstreamPath(tts, apiFlavorSpeech, endpointSpeech), body, jsonContentType)
+	id := nextRequestID()
+	s.Active.Add(ActiveRequest{
+		ID: id, UserID: owner.token.UserID, TokenID: owner.token.ID, TokenName: owner.token.Name,
+		ServiceID: owner.token.ServiceID, ServiceName: owner.token.ServiceName,
+		ServerName: s.serverName(tts.ServerID), ServerID: tts.ServerID, InstanceKey: tts.InstanceKey,
+		Model: tts.Model, APIFlavor: apiFlavorSpeech, BillingUnit: billingUnitFor(apiFlavorSpeech),
+		ReqPath: owner.reqPath, ProviderPath: path, ProviderModel: effectiveProviderModel(tts, tts.Model), StartedAt: time.Now(),
+	})
+	defer s.Active.Remove(id)
+
+	resp, err := proxy.ProxyNative(ctx, tts, path, body, jsonContentType)
 	if err != nil {
 		return fmt.Errorf("voice prewarm: synthesis request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
-		return fmt.Errorf("voice prewarm: the upstream answered HTTP %d: %s", resp.StatusCode, speechBenchmarkErrorText(errBody))
+	if refusal, refused := readBenchmarkRefusal(resp); refused {
+		return fmt.Errorf("voice prewarm: the upstream answered HTTP %d: %s", refusal.status, refusal.text)
 	}
-	// The clip is only discarded, so it is not held (no size cap is needed: nothing accumulates, and
-	// ctx bounds the time). It is read to the end because the upstream's synthesis is the point.
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return fmt.Errorf("voice prewarm: the answer could not be read to its end: %w", err)
+	// The clip is read to its end because the upstream's synthesis is the point, then dropped; the
+	// benchmark's bound keeps a runaway answer from accumulating, and ctx bounds the time.
+	if _, _, err := readBenchmarkAnswer(resp.Body, speechBenchmarkMaxAudioBytes, time.Now); err != nil {
+		return fmt.Errorf("voice prewarm: %w", err)
 	}
 	return nil
 }

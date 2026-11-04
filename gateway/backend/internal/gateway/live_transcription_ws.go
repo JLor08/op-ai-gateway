@@ -119,7 +119,7 @@ type liveUpControl struct {
 // text down). It is a thin ADAPTER: after the ticket is redeemed and the socket
 // upgraded, it loops the session back to the gateway's own public endpoint,
 // /v1/audio/transcriptions/live (relayLiveTranscription), exactly as a portal chat
-// run loops back to /v1/chat/completions. Admission, the per-route session guard
+// run loops back to /v1/chat/completions. Admission, the per-instance session slot
 // and billing all live at that one canonical relay now, so the portal mic exercises
 // the very endpoint a programmatic client would -- one relay, zero drift.
 //
@@ -165,11 +165,11 @@ func (s *Server) handleLiveTranscription(w http.ResponseWriter, r *http.Request)
 	}
 	conn.SetReadLimit(maxLiveFrameBytes)
 
-	// The per-route session guard is NOT taken here any more: it is acquired at
+	// The per-instance session slot is NOT taken here: it is acquired at
 	// /v1/audio/transcriptions/live, so a second concurrent portal session on the
-	// same model is refused there (a 503 busy) and surfaced to the browser as an
-	// error down-frame, never a silent collision -- the same guard a bearer client
-	// meets.
+	// same instance is moved to a free sibling, waits for one, or is refused there
+	// (a 503 busy, surfaced to the browser as an error down-frame) -- never a silent
+	// collision, and the same slot a bearer client meets.
 	s.relayLiveTranscription(r, conn, claims)
 }
 
@@ -190,7 +190,7 @@ func extractLiveTicket(header string) string {
 // hops. It does NOT touch the backend, bill, or guard the route: it relays the
 // browser's WebSocket through an internal loopback to the gateway's own
 // /v1/audio/transcriptions/live, which performs the resolve, the admission, the
-// per-route session guard, the real upstream relay and the one usage row (as the
+// per-instance session slot, the real upstream relay and the one usage row (as the
 // ticket user, over the trusted-loopback pair). It owns only the browser-side
 // lifecycle: ONE context cancelled on any exit; a single writer goroutine that owns
 // every WS write (data frames, the keepalive ping, the connection close); a read
@@ -257,7 +257,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	// Open the full-duplex loopback to the gateway's own /v1 endpoint. Do returns as
 	// soon as the response headers arrive, with the SSE body still open and the
 	// request body (pr) still streaming.
-	resp, err := s.openLiveLoopback(ctx, claims, pr)
+	resp, err := s.openLiveLoopback(ctx, claims, pr, false, nil)
 	if err != nil {
 		if ctx.Err() == nil {
 			writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription unavailable"}))
@@ -286,6 +286,10 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // the browser session cookie (requireInternalOrBearerAnyScope). The model name and
 // the PCM params the ticket sealed become the query the public endpoint re-resolves
 // and re-gates, so the portal path runs the exact same relay a bearer client would.
+// realtime marks the request as a voice chat turn's ASR leg (realtimeRequiredHeaderName),
+// which /v1 then routes under the real-time gate; a live session sets it false. sticky is the
+// voice chat session's instance memory, whose ASR leg's last instance the request names; a
+// live session passes nil.
 //
 // The body is an io.PipeReader -- not one of the length-carrying reader types
 // net/http special-cases -- so the request is sent chunked and streamed, never
@@ -306,7 +310,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // body, #333) or answers a final status (the refusal, which Do then returns at once).
 // DefaultTransport's ExpectContinueTimeout bounds the wait, so a /v1 that somehow neither
 // reads nor refuses cannot stall the dial forever.
-func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, pr io.Reader) (*http.Response, error) {
+func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, pr io.Reader, realtime bool, sticky *voiceStickiness) (*http.Response, error) {
 	q := url.Values{}
 	q.Set("model", claims.Target.Model)
 	q.Set("sample_rate", strconv.Itoa(claims.SampleRate))
@@ -324,6 +328,10 @@ func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, 
 	req.Header.Set(csrfHeaderName, "1")
 	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
 	req.Header.Set(internalUserHeaderName, claims.UserID)
+	if realtime {
+		req.Header.Set(realtimeRequiredHeaderName, "1")
+	}
+	sticky.prefer(req, voiceLegASR)
 	return http.DefaultClient.Do(req)
 }
 

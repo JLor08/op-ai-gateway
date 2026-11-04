@@ -305,6 +305,7 @@ func sniffRoutingModel(raw []byte) (model string, stream bool) {
 // chain into proxyNative.
 func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, endpoint sessionEndpoint, pf preflight) bool {
 	start := time.Now()
+	pr := passthroughRequest{token: token, raw: raw, apiFlavor: apiFlavor, endpoint: endpoint, pf: pf}
 	req := pf.Req
 	model := req.Model
 	// The native decision must be made BEFORE the lossy compat parse (which would
@@ -327,12 +328,8 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 		// record it exactly like the translate error path so the usage row + capture are
 		// consistent. Mark the request handled (true).
 		if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
-			id := nextRequestID()
-			capturing := s.capturingEnabled(*token)
-			ireq := req
 			slog.Warn("native passthrough admission rejected", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "code", completionErrorCode(err), "status", completionHTTPStatus(err))
-			body := writeCompletionErrorCaptured(w, err)
-			s.recordUsage(start, *token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor), nil)
+			s.failPassthrough(w, r, pr, start, routing.Target{}, err)
 			return true
 		}
 		// Routing failed (no route for the model, or the application is currently
@@ -342,6 +339,28 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 		slog.Debug("native passthrough not applied: routing failed", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "err", err)
 		return false
 	}
+	return s.relayPassthroughTarget(w, r, pr, target, start)
+}
+
+// passthroughRequest is one /v1/responses or /v1/messages request tryProxyNative handles:
+// the caller's token snapshot, the client's raw body, the request's flavor and session
+// endpoint (tryProxyNative says why those are two), and its preflight.
+type passthroughRequest struct {
+	token     *auth.Token
+	raw       []byte
+	apiFlavor string
+	endpoint  sessionEndpoint
+	pf        preflight
+}
+
+// relayPassthroughTarget is tryProxyNative past its resolve: it relays pr's request to
+// target, already resolved, when target passes this endpoint through, refuses it when
+// the endpoint is disabled there, and returns false -- having written nothing -- when
+// target serves the endpoint by translate.
+func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, pr passthroughRequest, target routing.Target, start time.Time) bool {
+	token, raw, apiFlavor := pr.token, pr.raw, pr.apiFlavor
+	req := pr.pf.Req
+	model := req.Model
 	path, mode := endpointModeFor(target, apiFlavor)
 	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
 	// AND mode != disabled. endpointModeFor above only ever answers the mode half;
@@ -369,7 +388,10 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 			path:     path,
 			raw:      raw,
 			pfReq:    req,
-			endpoint: endpoint,
+			endpoint: pr.endpoint,
+			reselect: func(lost routing.Target, gone error) {
+				s.reselectPassthrough(w, r, pr, lost, gone)
+			},
 		})
 		return true
 	case routing.EndpointModeDisabled:
@@ -401,6 +423,46 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 			"responses_mode", string(target.ResponsesMode), "messages_mode", string(target.MessagesMode))
 		return false
 	}
+}
+
+// reselectPassthrough moves a /v1/responses or /v1/messages passthrough whose instance
+// lost was refused as gone (gone, the refusal as an error) to another instance: it
+// resolves pr's request again with lost excluded and relays it there
+// (relayPassthroughTarget), and always answers. A re-resolve that routing refuses -- no
+// host left, a full or timed-out queue -- is answered with that routing error. A
+// re-selected instance that serves this endpoint by translate (another mapping of the
+// model, or a spec switched meanwhile) cannot take a relay that has already chosen to
+// pass the client's body through, and the translate path's lossy parse may refuse a
+// body this one accepted, so the request is answered with gone's own gateway error
+// (provider.unavailable) -- never with the agent's envelope, whose runtime.* code is the
+// agent's internals.
+func (s *Server) reselectPassthrough(w http.ResponseWriter, r *http.Request, pr passthroughRequest, lost routing.Target, gone error) {
+	start := time.Now()
+	again := pr
+	again.pf.Req = withLostInstance(pr.pf.Req, lost)
+	target, err := s.resolveTarget(r.Context(), again.token, again.pf.Req)
+	if err != nil {
+		slog.Warn("native passthrough: the routed instance is gone and re-selection failed", "path", r.URL.Path, "api_flavor", again.apiFlavor, "model", again.pf.Req.Model, "instance", lost.InstanceKey, "code", completionErrorCode(err), "err", err)
+		s.failPassthrough(w, r, again, start, routing.Target{}, err)
+		return
+	}
+	if s.relayPassthroughTarget(w, r, again, target, start) {
+		return
+	}
+	slog.Warn("native passthrough: the routed instance is gone and the instance re-selected serves this endpoint by translate only", "path", r.URL.Path, "api_flavor", again.apiFlavor, "model", again.pf.Req.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
+	s.failPassthrough(w, r, again, start, lost, gone)
+}
+
+// failPassthrough answers a /v1/responses or /v1/messages request that ends before any
+// relay -- an admission refusal, or a re-selection off a gone instance that found
+// nothing it can relay to -- with the gateway's error for err, and records its usage row
+// against target (routing.Target{} when routing resolved none).
+func (s *Server) failPassthrough(w http.ResponseWriter, r *http.Request, pr passthroughRequest, start time.Time, target routing.Target, err error) {
+	token, req, raw, apiFlavor := *pr.token, pr.pf.Req, pr.raw, pr.apiFlavor
+	id := nextRequestID()
+	capturing := s.capturingEnabled(token)
+	body := writeCompletionErrorCaptured(w, err)
+	s.recordUsage(start, token, req, target, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor), nil)
 }
 
 // proxyNative forwards the raw client body to the upstream's native endpoint and
@@ -646,7 +708,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		progress = &requestProgress{}
 	}
 
-	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
+	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, InstanceKey: rel.target.InstanceKey, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
 	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings, "reasoning_effort_injected", injectedReasoningEffort)
@@ -659,17 +721,35 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody, relayContentType)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
-		code := completionErrorCode(err)
-		httpStatus := completionHTTPStatus(err)
-		slog.Error("inference native passthrough failed", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "server", serverName, "code", code, "err", err)
-		body := writeCompletionErrorCaptured(w, err)
-		// Same reasoning as the provider.unavailable branch above: this is a
-		// pre-response failure (nothing came back from sd-server at all), and
-		// it is still a non-token images request when pfReq.APIFlavor says so.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), Endpoint: rel.endpoint}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor), nil)
+		// Same reasoning as the provider.unavailable branch above: this is a pre-response
+		// failure (nothing came back from sd-server at all), and it is still a non-token
+		// images request when pfReq.APIFlavor says so.
+		s.failNativeExchange(w, r, ex, err)
 		return
 	}
 	defer resp.Body.Close()
+
+	// An instance k >= 1 the agent refuses as gone (instance_reselect.go): nothing has
+	// been written to the client and nothing recorded. Under the once-rule the request
+	// is re-selected: this attempt leaves the instance first -- its active row removed,
+	// which frees its count and wakes a request parked for its server -- and the
+	// caller's path (rel.reselect) runs again with the instance excluded and answers in
+	// this attempt's place. A request that may not be re-selected again is answered with
+	// the gateway's own error for the refusal (goneError), not the agent's envelope.
+	if rel.target.Instance() >= 1 && peekInstanceGone(resp) {
+		if watchdog != nil {
+			watchdog.Stop()
+		}
+		gone := goneError(resp)
+		if rel.reselect != nil && reselectable(rel.target, rel.pfReq) {
+			slog.Info("inference native passthrough: the routed instance is gone; re-selecting once", "path", r.URL.Path, "model", rel.pfReq.Model, "server", serverName, "instance", rel.target.InstanceKey, "status", resp.StatusCode)
+			s.Active.Remove(id)
+			rel.reselect(rel.target, gone)
+			return
+		}
+		s.failNativeExchange(w, r, ex, gone)
+		return
+	}
 
 	// A STREAMED audio request (bufferedRetry is set only for a transcription or a speech
 	// synthesis) that the upstream refuses because the mapped model is not in streaming
@@ -863,6 +943,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		relayBody = io.LimitReader(resp.Body, dataSize)
 	}
 
+	markServedInstance(w, rel.pfReq, rel.target)
 	w.Header().Set("Content-Type", contentType)
 	if rel.pfReq.Stream {
 		w.Header().Set("Cache-Control", "no-cache")
@@ -1091,6 +1172,28 @@ type nativeRelay struct {
 	// a request the client did not ask to stream, and never on a streamed relay or its
 	// buffered downgrade (which relays the WAV as it is). Nil/false everywhere else.
 	speechPCMStrip bool
+	// reselect sends the request again, through the caller's whole resolve-and-relay
+	// path, with lost's instance excluded (withLostInstance), when the upstream refuses
+	// an instance k >= 1 as gone (peekInstanceGone) and the once-rule allows it
+	// (reselectable on pfReq: no exclusion yet). gone is that refusal as an error
+	// (goneError). It always answers: it writes the response and records the usage row
+	// itself -- the re-selected attempt's, the routing error when the re-resolve is
+	// refused, or gone's own gateway error when it finds only an instance this relay
+	// cannot take. Set by every relay caller; nil for a relay that is never re-selected,
+	// whose gone refusal proxyNative answers with gone's error itself.
+	reselect func(lost routing.Target, gone error)
+}
+
+// failNativeExchange answers a relay that ends before any upstream answer reached the
+// client -- the upstream call failed, or a gone instance's refusal could not be moved
+// to another instance -- with the gateway's error for err, and records its usage row
+// against the relay's target, in the caller's billing unit and endpoint.
+func (s *Server) failNativeExchange(w http.ResponseWriter, r *http.Request, ex nativeExchange, err error) {
+	code := completionErrorCode(err)
+	httpStatus := completionHTTPStatus(err)
+	slog.Error("inference native passthrough failed", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "code", code, "err", err)
+	body := writeCompletionErrorCaptured(w, err)
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(ex.req.APIFlavor), Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), body, httpStatus, ex.req.APIFlavor), nil)
 }
 
 // nativeExchange is the request-scoped state proxyNative COMPUTES once and then

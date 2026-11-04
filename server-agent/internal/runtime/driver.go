@@ -23,7 +23,9 @@
 //     reconciling until it reappears. Deliberately NOT gated by config
 //     source (gateway vs file): feature negotiation governs whether this
 //     Driver does anything at all, independent of where the desired-state
-//     document comes from.
+//     document comes from. The same fetch says whether the gateway declares
+//     runtime_instances, which decides whether step 3 honours the
+//     document's replicable flags (#340) -- fail-closed, in both modes.
 //  2. Load the desired config: source.Load(ctx), UNLESS pushed carries a
 //     real WS-delivered document and the source is a *GatewaySource, in
 //     which case ApplyPushed consumes it directly (zero extra round trip).
@@ -68,6 +70,19 @@ import (
 // contract.
 const runtimeManagerFeature = "runtime_manager"
 
+// gatewayFeatureRuntimeInstances is the gateway-declared feature that says the
+// gateway understands what an agent running several instances of a spec
+// reports (#340): one status row per instance, several rows sharing one
+// spec_id. The agent honours a document's replicable flag only while the
+// gateway declares it -- see Driver.Sync -- so an older gateway, which would
+// read those rows as one spec flapping between them, never sees more than one
+// row per spec. It is checked on the gateway's list exactly like
+// runtimeManagerFeature (Driver.featureActive), and it is the same string as
+// the agent's own registry entry (internal/agent's FeatureRuntimeInstances):
+// each side declares it, and each reads the other's declaration as a
+// precondition of its own.
+const gatewayFeatureRuntimeInstances = "runtime_instances"
+
 // RuntimeReporter is the upward file-mode report sink: both *client.Client
 // and *client.WSSender satisfy it already via their existing
 // PostRuntimeReport methods (Task 17). A nil RuntimeReporter simply means
@@ -97,6 +112,8 @@ type driverManager interface {
 	Status() []Status
 	Transitions() <-chan struct{}
 	EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	EnsureServing(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error)
+	ResolveAddress(model string) (base string, k int, ok bool)
 	LoadedModels() []string
 	AppliedETag() string
 }
@@ -166,6 +183,14 @@ type Driver struct {
 	// what this provides -- diagnosis, with no second opinion about
 	// whether to obey.
 	appliedSpecCount int
+	// appliedInstances is whether the LAST applied config honoured its
+	// specs' replicable flag -- whether the gateway declared runtime_instances
+	// at that Sync (see Sync). A change of it is a reason to apply again even
+	// when the document itself has not changed. instancesWithheld is whether
+	// that config actually had a replicable flag cleared, kept only to Warn
+	// once per transition into that state rather than on every Sync.
+	appliedInstances  bool
+	instancesWithheld bool
 	// active is the CURRENT feature-negotiation outcome (Sync step 1),
 	// read from a different goroutine (Active, called from
 	// internal/agent.collectOnce on whatever goroutine is building a
@@ -339,7 +364,8 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 		return
 	}
 
-	if !d.featureActive(ctx) {
+	active, instances := d.featureActive(ctx)
+	if !active {
 		d.stopAll()
 		return
 	}
@@ -373,8 +399,10 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	// only coincide within a single process's uptime against a config that
 	// never repeats. Apply whenever the config differs OR nothing has ever
 	// actually been applied yet in this Driver's lifetime (a fresh
-	// process, or recovering from a drain via stopAll clearing applied).
-	if !changed && d.applied {
+	// process, or recovering from a drain via stopAll clearing applied) OR
+	// the gateway's runtime_instances declaration changed since the last
+	// apply: what the manager is handed depends on that too (below).
+	if !changed && d.applied && instances == d.appliedInstances {
 		return
 	}
 
@@ -382,26 +410,79 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 		slog.Warn("runtime: the desired config now contains NO specs; every managed model will be drained and the router will unbind",
 			"previous_specs", d.appliedSpecCount, "router_listen", cfg.RouterListen, "etag", cfg.ETag, "source", fmt.Sprintf("%T", d.src))
 	}
-	d.mgr.Apply(cfg)
+	// Several instances of one spec report several status rows under one
+	// spec_id (#340), which only a gateway that declares runtime_instances
+	// understands. Until it does, every spec runs as the single process it
+	// would be without the opt-in -- fail-closed, and in file mode too, where
+	// the document is the operator's and may opt in whatever the gateway is.
+	// A later Sync that sees the declaration applies the same document again
+	// with the opt-in honoured (the condition above), and the manager takes
+	// that re-application even under an unchanged ETag (applyConfig).
+	effective, withheld := cfg, false
+	if !instances {
+		effective, withheld = withoutReplicable(cfg)
+	}
+	d.noteInstancesWithheld(withheld)
+	d.mgr.Apply(effective)
 	d.applied = true
 	d.appliedSpecCount = len(cfg.Specs)
+	d.appliedInstances = instances
 
 	if _, isFile := d.src.(*FileSource); isFile {
 		d.sendReport(ctx, cfg)
 	}
 }
 
+// withoutReplicable returns cfg with every spec's replicable flag cleared, and
+// whether any was set. cfg itself is never modified -- its Specs slice is the
+// Source's cached, last known-good document -- so the cleared specs are a copy;
+// when no spec opts in, cfg is returned as is.
+func withoutReplicable(cfg Config) (Config, bool) {
+	opted := false
+	for _, spec := range cfg.Specs {
+		if spec.Replicable {
+			opted = true
+			break
+		}
+	}
+	if !opted {
+		return cfg, false
+	}
+	specs := make([]Spec, len(cfg.Specs))
+	copy(specs, cfg.Specs)
+	for i := range specs {
+		specs[i].Replicable = false
+	}
+	cfg.Specs = specs
+	return cfg, true
+}
+
+// noteInstancesWithheld logs the transition into, and out of, a state in which
+// the applied config had its replicable flags cleared because the gateway does
+// not declare runtime_instances -- once per transition, not on every Sync.
+func (d *Driver) noteInstancesWithheld(withheld bool) {
+	switch {
+	case withheld && !d.instancesWithheld:
+		slog.Warn("runtime: the gateway does not declare runtime_instances; every replicable spec runs as a single instance until it does")
+	case !withheld && d.instancesWithheld:
+		slog.Info("runtime: replicable specs are honoured again (the gateway declares runtime_instances, or no spec opts in any more)")
+	}
+	d.instancesWithheld = withheld
+}
+
 // featureActive fetches the gateway's currently declared feature set and
-// reports whether runtime_manager is present in it. FeaturesClient.Fetch
-// already implements the ETag-conditional-GET / last-known-good discipline
-// (a transient gateway hiccup returns the LAST fetched set, never an empty
-// one caused only by a network blip) -- Sync trusts that contract exactly
-// as every other caller of Fetch in this module does. A nil features client
-// (never constructed this way in production; defensive only) is treated as
-// inactive rather than panicking.
-func (d *Driver) featureActive(ctx context.Context) bool {
+// reports whether runtime_manager is present in it (active), and whether
+// runtime_instances is (instances: honour the replicable flag, see Sync).
+// FeaturesClient.Fetch already implements the ETag-conditional-GET /
+// last-known-good discipline (a transient gateway hiccup returns the LAST
+// fetched set, never an empty one caused only by a network blip) -- Sync
+// trusts that contract exactly as every other caller of Fetch in this module
+// does. A nil features client (never constructed this way in production;
+// defensive only) is treated as inactive rather than panicking, and a gateway
+// that declares nothing declares neither name: both answers fail closed.
+func (d *Driver) featureActive(ctx context.Context) (active, instances bool) {
 	if d.features == nil {
-		return false
+		return false, false
 	}
 	names, err := d.features.Fetch(ctx)
 	if err != nil {
@@ -416,11 +497,14 @@ func (d *Driver) featureActive(ctx context.Context) bool {
 		slog.Warn("runtime: gateway features fetch failed; treating runtime_manager as inactive until the next check", "error", err)
 	}
 	for _, n := range names {
-		if n == runtimeManagerFeature {
-			return true
+		switch n {
+		case runtimeManagerFeature:
+			active = true
+		case gatewayFeatureRuntimeInstances:
+			instances = true
 		}
 	}
-	return false
+	return active, instances
 }
 
 // stopAll drains every managed process (an empty Apply, reusing Manager's
@@ -433,6 +517,9 @@ func (d *Driver) stopAll() {
 	d.mgr.Apply(emptyConfig())
 	d.applied = false
 	d.appliedSpecCount = 0
+	// The empty document withholds nothing; the next active Sync's apply
+	// starts the withheld-instances bookkeeping over.
+	d.instancesWithheld = false
 	if err := d.StartRouter(0); err != nil {
 		slog.Debug("runtime: router stop failed", "error", err)
 	}
@@ -584,9 +671,11 @@ func (d *Driver) ResendReport(ctx context.Context) {
 	d.sendReport(ctx, cfg)
 }
 
-// Status returns the manager's current per-spec status snapshot, or nil
-// when there is no manager (the NewDriver(nil, ...) defensive case, never
-// hit in production).
+// Status returns the manager's current status snapshot -- one row per
+// managed instance, keyed by (SpecID, Instance), so a replicable spec running
+// several instances has several rows under one SpecID (#340) -- or nil when
+// there is no manager (the NewDriver(nil, ...) defensive case, never hit in
+// production).
 func (d *Driver) Status() []Status {
 	if d.mgr == nil {
 		return nil

@@ -177,8 +177,10 @@ describe('frontend architecture: layer boundaries', () => {
   });
 
   it('i18n.ts and currency.ts are dependency-free leaves', () => {
-    // Verified: both files have zero relative imports today (not merely "no
-    // components/api" — they import nothing of ours at all).
+    // Verified: currency.ts has zero relative imports, and i18n.ts imports
+    // only audioFigures.ts, itself a leaf (next rule) -- the audio rate
+    // formatter and ramp limits (#340) that the messages and the cells share,
+    // so a figure is written one way. Neither reaches components/** or api/**.
     const matches = internalEdges.filter(
       (e) =>
         (e.from === 'i18n.ts' || e.from === 'currency.ts') &&
@@ -187,6 +189,19 @@ describe('frontend architecture: layer boundaries', () => {
     assertNoViolations(
       matches,
       'src/i18n.ts and src/currency.ts must not import from src/components/** or src/api/**',
+    );
+  });
+
+  it('audioFigures.ts imports nothing of ours, and i18n.ts imports nothing else', () => {
+    // i18n.ts stays a leaf through its one import only while that import is
+    // a leaf too: audioFigures.ts has zero relative imports, and anything
+    // else i18n.ts would import needs its own reason here.
+    const matches = internalEdges.filter(
+      (e) => e.from === 'audioFigures.ts' || (e.from === 'i18n.ts' && e.to !== 'audioFigures.ts'),
+    );
+    assertNoViolations(
+      matches,
+      'src/audioFigures.ts must import nothing of ours, and src/i18n.ts nothing but it',
     );
   });
 

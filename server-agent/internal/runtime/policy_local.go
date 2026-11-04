@@ -571,7 +571,10 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // ${PORT} becomes the decimal port chosen for this process. ${MODEL} becomes
 // spec.UpstreamModel, the application-side model name (see the ${MODEL}
 // paragraph further down for why it is that one and not spec.Model, and why
-// it has no near-miss rule). ${AGENT_ENV:NAME}
+// it has no near-miss rule). For a further instance of a replicable spec
+// (#340) that is still the BASE model name: the per-instance copy
+// (specForInstance in manager.go) shares UpstreamModel with its spec, so a
+// child never sees an instance address "m#k". ${AGENT_ENV:NAME}
 // resolves NAME from the agent's own process environment via getenv -- this
 // is the only path a secret takes to reach a model process without ever
 // being stored in the gateway database or sent over the wire. An unset (or
@@ -781,7 +784,10 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 //
 // ${CONFIG_DIR} is the FIFTH token (#257), exact match only for the same reason
 // as ${MODEL}. It resolves to filepath.Join(configFilesDir, spec.ID): the
-// per-spec directory the agent writes spec.ConfigFiles into, so a spec can
+// per-spec directory the agent writes spec.ConfigFiles into -- per INSTANCE
+// for a replicable spec (#340), whose further instances carry their instance
+// key S#k as spec.ID, because a config file may hold that instance's own
+// ${PORT} -- so a spec can
 // point its model server at them (["--models-preset", "${CONFIG_DIR}/models.ini"])
 // without hard-coding an agent-side path that differs per host. configFilesDir
 // is the agent's config_files_dir setting, passed in rather than read from
@@ -919,7 +925,8 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
 	// friends are plausible pass-through tokens. The per-spec directory
 	// the agent provisions this spec's config_files into (#257):
-	// <config_files_dir>/<spec.ID>. NOT a secret -- it is an agent-chosen
+	// <config_files_dir>/<spec.ID> (the instance key for a further instance
+	// of a replicable spec, #340). NOT a secret -- it is an agent-chosen
 	// path the operator needs to read in the reported command -- so it
 	// records no secretSpan and is never masked, exactly like ${PORT}
 	// and ${MODEL}. No empty-value refusal: configFilesDir has a

@@ -70,11 +70,15 @@ var allowedDeps = map[string][]string{
 		"internal/store",
 		"internal/totp",
 	},
-	"internal/apierror":  {},
-	"internal/archtest":  {},
-	"internal/auth":      {},
-	"internal/capture":   {},
-	"internal/certissue": {},
+	"internal/apierror": {},
+	"internal/archtest": {},
+	"internal/auth":     {},
+	// benchaudio is the audio benchmark's bundled speech clip, embedded with go:embed.
+	// A leaf of the standard library alone (TestForbiddenEdges holds it to that), so the
+	// gateway's benchmark can import it without a cycle.
+	"internal/benchaudio": {},
+	"internal/capture":    {},
+	"internal/certissue":  {},
 	"internal/compat": {
 		"internal/inference",
 	},
@@ -83,6 +87,7 @@ var allowedDeps = map[string][]string{
 		"internal/account",
 		"internal/apierror",
 		"internal/auth",
+		"internal/benchaudio",
 		"internal/capture",
 		"internal/certissue",
 		"internal/compat",
@@ -167,8 +172,20 @@ var allowedDeps = map[string][]string{
 func TestAllowlistFrozen(t *testing.T) {
 	graph := loadInternalGraph(t)
 
-	// Forward direction: every edge that exists today must be allowed.
+	// Forward direction: every package that exists today must be listed, and every edge
+	// it has must be allowed. A package with no internal imports has no edge to fail on,
+	// so without the first check a new leaf package would sit outside the contract
+	// unnoticed, free to grow its first internal import with no allowlist entry to compare
+	// it against.
 	for pkg, imports := range graph {
+		if _, listed := allowedDeps[pkg]; !listed {
+			t.Errorf(
+				"package %s is not in the allowedDeps allowlist "+
+					"(gateway/backend/internal/archtest/arch_test.go). "+
+					"Add allowedDeps[%q] with the internal packages it imports (an empty slice for a leaf).",
+				pkg, pkg,
+			)
+		}
 		allowed := make(map[string]bool, len(allowedDeps[pkg]))
 		for _, a := range allowedDeps[pkg] {
 			allowed[a] = true
@@ -327,7 +344,7 @@ func TestForbiddenEdges(t *testing.T) {
 	t.Run("leaf packages import nothing internal", func(t *testing.T) {
 		// Verified against `go list -f '{{join .Imports "\n"}}'` for each of
 		// these before encoding: none of them has a legit internal edge
-		// today, so all six are held to the strict leaf rule rather than
+		// today, so all seven are held to the strict leaf rule rather than
 		// added to an exception list.
 		leaves := []string{
 			"internal/inference",
@@ -336,10 +353,23 @@ func TestForbiddenEdges(t *testing.T) {
 			"internal/storeerr",
 			"internal/theme",
 			"internal/auth",
+			"internal/benchaudio",
 		}
 		for _, leaf := range leaves {
 			if edges := graph[leaf]; len(edges) != 0 {
 				t.Errorf("%s is documented as a leaf package (no internal imports) but imports %v", leaf, edges)
+			}
+		}
+	})
+
+	t.Run("benchaudio imports the standard library alone", func(t *testing.T) {
+		// internal/benchaudio is data: the bundled clip and the reading of its WAV
+		// header. It needs nothing but the standard library (embed included), and a
+		// third-party import would put a dependency into every gateway binary for a
+		// header parse; the internal side is the leaf rule above.
+		for _, imp := range loadProductionImports(t, "internal/benchaudio") {
+			if !isStdlibPkg(imp) {
+				t.Errorf("forbidden import internal/benchaudio -> %s: benchaudio may import only the standard library", imp)
 			}
 		}
 	})

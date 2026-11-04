@@ -1242,9 +1242,9 @@ func TestSpeechPCMRefusesANonConformingModel(t *testing.T) {
 	}
 }
 
-// Review Focus 3: a pcm request whose upstream answers non-2xx goes through the
-// normal error relay (needsSpeechErrorRelay runs before the strip), billed 0 — the
-// strip never runs, so a pcm error behaves exactly like a wav error.
+// A pcm request whose upstream answers non-2xx goes through the normal error relay
+// (needsSpeechErrorRelay runs before the strip), billed 0 — the strip never runs, so
+// a pcm error behaves exactly like a wav error.
 func TestSpeechPCMUpstreamErrorIsRelayedNormally(t *testing.T) {
 	up := newSpeechErrorUpstream(t, http.StatusInternalServerError, "application/json", `{"error":{"message":"boom"}}`)
 	srv, _ := newSpeechCapableTestServer(t, up.URL)
@@ -1263,8 +1263,8 @@ func TestSpeechPCMUpstreamErrorIsRelayedNormally(t *testing.T) {
 	}
 }
 
-// Review Focus 2: a stream request downgraded to a non-streaming route stays WAV,
-// not stripped PCM (the route-tts mapping has no speech_streaming verdict).
+// A stream request downgraded to a non-streaming route stays WAV, not stripped PCM
+// (the route-tts mapping has no speech_streaming verdict).
 func TestSpeechStreamPCMDowngradeStaysWAV(t *testing.T) {
 	up, calls := newSpeechUpstream(t, speechTestWAV())
 	srv, _ := newSpeechCapableTestServer(t, up.URL)
@@ -1285,8 +1285,8 @@ func TestSpeechStreamPCMDowngradeStaysWAV(t *testing.T) {
 	}
 }
 
-// Review Focus 4: the octet-stream pcm response is captured as a redacted summary,
-// not as raw PCM bytes.
+// The octet-stream pcm response is captured as a redacted summary, not as raw PCM
+// bytes.
 func TestSpeechPCMCaptureIsRedacted(t *testing.T) {
 	up, _ := newSpeechUpstream(t, speechTestWAV())
 	srv, cs := newSpeechCaptureServer(t, up.URL)

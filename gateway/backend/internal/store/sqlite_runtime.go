@@ -17,6 +17,12 @@ import (
 // the binary_path column backs the RuntimeSpec.Binary field — it is not
 // named `binary` because BINARY is a reserved PostgreSQL keyword (see
 // migration65Up's doc comment).
+//
+// The two agent-owned measurements, ram_measured_mb and startup_measured_ms,
+// are written by the insert and deliberately absent from the update set list:
+// the portal's save is a full-document upsert built from the request alone,
+// so it always carries 0 for them and would otherwise erase the agent's
+// figures on every operator save.
 func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.RuntimeSpec) error {
 	apiFlavors, err := encodeAPIFlavors(spec.APIFlavors)
 	if err != nil {
@@ -31,8 +37,9 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
 			type, metrics_path, context_probe_path, responses_live_timings_enabled,
 			ram_estimate_mb, ram_measured_mb,
+			replicable, min_instances, max_instances, instance_parallelism, startup_measured_ms,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env,
@@ -54,6 +61,10 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			context_probe_path = excluded.context_probe_path,
 			responses_live_timings_enabled = excluded.responses_live_timings_enabled,
 			ram_estimate_mb = excluded.ram_estimate_mb,
+			replicable = excluded.replicable,
+			min_instances = excluded.min_instances,
+			max_instances = excluded.max_instances,
+			instance_parallelism = excluded.instance_parallelism,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.ConfigFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
@@ -63,6 +74,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 		string(spec.VisibleDevicesMode), spec.APITokenMode, spec.APIToken, spec.APITokenHeaderSource, spec.APITokenHeader,
 		spec.Type, spec.MetricsPath, spec.ContextProbePath, spec.ResponsesLiveTimingsEnabled,
 		spec.RAMEstimateMB, spec.RAMMeasuredMB,
+		spec.Replicable, spec.MinInstances, spec.MaxInstances, spec.InstanceParallelism, spec.StartupMeasuredMS,
 		spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
@@ -86,6 +98,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config
 	visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
 	type, metrics_path, context_probe_path, responses_live_timings_enabled,
 	ram_estimate_mb, ram_measured_mb,
+	replicable, min_instances, max_instances, instance_parallelism, startup_measured_ms,
 	created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
@@ -99,6 +112,7 @@ const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s
 	s.visible_devices_mode, s.api_token_mode, s.api_token, s.api_token_header_source, s.api_token_header,
 	s.type, s.metrics_path, s.context_probe_path, s.responses_live_timings_enabled,
 	s.ram_estimate_mb, s.ram_measured_mb,
+	s.replicable, s.min_instances, s.max_instances, s.instance_parallelism, s.startup_measured_ms,
 	s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
@@ -239,6 +253,20 @@ func (s *SQLiteStore) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID s
 		where id = ?`, measuredMB, specID)
 	if err != nil {
 		return fmt.Errorf("update measured ram: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateRuntimeSpecStartupMeasured writes back the agent's measured startup
+// time for the spec. One column on purpose, like UpdateRuntimeSpecRAMMeasured:
+// it never touches the operator-owned instance settings beside it.
+// ErrNotFound when no spec has that id (requireAffected).
+func (s *SQLiteStore) UpdateRuntimeSpecStartupMeasured(ctx context.Context, specID string, ms int64) error {
+	result, err := s.exec(ctx, `
+		update agent_runtime_specs set startup_measured_ms = ?
+		where id = ?`, ms, specID)
+	if err != nil {
+		return fmt.Errorf("update measured startup: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -430,7 +458,7 @@ func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]
 
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
-	var enabled, pinned, setVisibleDevices, liveTimings int64
+	var enabled, pinned, setVisibleDevices, liveTimings, replicable int64
 	var apiFlavors string
 	err := row.Scan(&spec.ID, &spec.MappingID, &enabled, &spec.Binary, &spec.Args,
 		&spec.Env, &spec.ConfigFiles, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
@@ -442,6 +470,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		&spec.APITokenMode, &spec.APIToken, &spec.APITokenHeaderSource, &spec.APITokenHeader,
 		&spec.Type, &spec.MetricsPath, &spec.ContextProbePath, &liveTimings,
 		&spec.RAMEstimateMB, &spec.RAMMeasuredMB,
+		&replicable, &spec.MinInstances, &spec.MaxInstances, &spec.InstanceParallelism, &spec.StartupMeasuredMS,
 		&spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound
@@ -452,6 +481,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	spec.Enabled, spec.Pinned = enabled != 0, pinned != 0
 	spec.SetVisibleDevices = setVisibleDevices != 0
 	spec.ResponsesLiveTimingsEnabled = liveTimings != 0
+	spec.Replicable = replicable != 0
 	flavors, err := decodeAPIFlavors(apiFlavors)
 	if err != nil {
 		return routing.RuntimeSpec{}, err

@@ -338,3 +338,72 @@ func TestRuntimeSubtreeShapesAllResolve(t *testing.T) {
 		t.Fatalf("/runtime/report status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestRuntimeEventsFramesCarryInstanceAndStartup pins the status stream's
+// wire shape of the two per-instance fields, on both frame kinds: instance is
+// always on the wire, 0 included -- the portal keys a row by spec id and
+// instance, and a missing key would read as a row it cannot place -- while
+// startup_ms is there only once measured, so an unmeasured startup never
+// reads as a real 0 ms.
+func TestRuntimeEventsFramesCarryInstanceAndStartup(t *testing.T) {
+	srv := newRuntimeEventsTestServer(t)
+	srv.RuntimeStatus.publish(runtimeEventsServerID, []RuntimeStatusDTO{
+		{SpecID: "spec-1", Model: "m", Instance: 0, State: "running", StartupMS: 1500},
+		{SpecID: "spec-1", Model: "m#2", Instance: 2, State: "starting"},
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/portal/servers/"+runtimeEventsServerID+"/runtime/events", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+runtimeEventsOwnerSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	reader := bufio.NewReader(resp.Body)
+
+	check := func(wantEvent string, want []map[string]string, absent map[int]string) {
+		t.Helper()
+		event, data := readPerfSSEFrame(t, reader, 3*time.Second)
+		if event != wantEvent {
+			t.Fatalf("event = %q, want %q", event, wantEvent)
+		}
+		var frame struct {
+			Runtimes []map[string]json.RawMessage `json:"runtimes"`
+		}
+		if err := json.Unmarshal([]byte(data), &frame); err != nil || len(frame.Runtimes) != len(want) {
+			t.Fatalf("%s frame = %s (err %v), want %d rows", wantEvent, data, err, len(want))
+		}
+		for i, keys := range want {
+			for key, value := range keys {
+				if got, ok := frame.Runtimes[i][key]; !ok || string(got) != value {
+					t.Errorf("%s row %d: %s = %s (present %v), want %s on the wire (%s)", wantEvent, i, key, got, ok, value, data)
+				}
+			}
+		}
+		for i, key := range absent {
+			if got, ok := frame.Runtimes[i][key]; ok {
+				t.Errorf("%s row %d: %s = %s, want the key absent (%s)", wantEvent, i, key, got, data)
+			}
+		}
+	}
+
+	check("snapshot",
+		[]map[string]string{{"instance": "0", "startup_ms": "1500"}, {"instance": "2"}},
+		map[int]string{1: "startup_ms"})
+
+	srv.RuntimeStatus.publish(runtimeEventsServerID, []RuntimeStatusDTO{
+		{SpecID: "spec-1", Model: "m", Instance: 0, State: "stopped"},
+		{SpecID: "spec-1", Model: "m#2", Instance: 2, State: "running", StartupMS: 2100},
+	})
+	check("update",
+		[]map[string]string{{"instance": "0"}, {"instance": "2", "startup_ms": "2100"}},
+		map[int]string{0: "startup_ms"})
+}
