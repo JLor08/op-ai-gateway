@@ -533,6 +533,9 @@ func TestMeasureBufferedRefusals(t *testing.T) {
 		{"TTS: the answer takes no time", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "audio/wav", measureAt(0, string(wav)))
 		}, tts, "no measurable time", false},
+		{"TTS: the answer is empty", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "audio/wav")
+		}, tts, "the answer is empty", false},
 		{"ASR: the clip is no WAV", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(900, `{"text":"hallo"}`))
 		}, func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
@@ -556,6 +559,9 @@ func TestMeasureBufferedRefusals(t *testing.T) {
 		{"ASR: the answer takes no time", func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "application/json", measureAt(0, `{"text":"hallo"}`))
 		}, asr, "no measurable time", false},
+		{"ASR: the answer is empty", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "application/json")
+		}, asr, "the answer is empty", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -567,14 +573,41 @@ func TestMeasureBufferedRefusals(t *testing.T) {
 	}
 }
 
-// TestMeasureReadsBoundedAnswers: a one-shot answer is read whole up to its bound and refused
-// past it, so a runaway upstream cannot fill memory before the deadline ends the call.
+// TestMeasureReadsBoundedAnswers: a one-shot answer -- the speech benchmark's and the audio
+// measurements' alike, read by the one helper they share -- is read whole up to its bound,
+// refused past it (a runaway upstream cannot fill memory before the deadline ends the call)
+// and refused when it is empty; a body that breaks off is an error that still carries its
+// cause. The end is taken once, when the read returns, before anything read is checked.
 func TestMeasureReadsBoundedAnswers(t *testing.T) {
-	if got, err := readAudioAnswer(strings.NewReader("1234"), 4); err != nil || string(got) != "1234" {
-		t.Fatalf("readAudioAnswer at the bound = %q, %v; want the whole answer", got, err)
+	clock := &measureClock{}
+	nows := 0
+	now := func() time.Time { nows++; return clock.now() }
+	read := func(body io.Reader) ([]byte, time.Time, error) {
+		nows = 0
+		got, end, err := readBenchmarkAnswer(body, 4, now)
+		if nows != 1 {
+			t.Fatalf("readBenchmarkAnswer read the clock %d times, want once", nows)
+		}
+		return got, end, err
 	}
-	if got, err := readAudioAnswer(strings.NewReader("12345"), 4); err == nil || !strings.Contains(err.Error(), "exceeds 4 bytes") {
-		t.Fatalf("readAudioAnswer past the bound = %q, %v; want an error naming the bound", got, err)
+	at := func(ms int, data string) io.Reader {
+		return &measureBody{clock: clock, chunks: []measureChunk{measureAt(ms, data)}}
+	}
+
+	if got, end, err := read(at(700, "1234")); err != nil || string(got) != "1234" || end != measureEpoch.Add(700*time.Millisecond) {
+		t.Fatalf("readBenchmarkAnswer at the bound = %q, %v, %v; want the whole answer, ending at 700 ms", got, end, err)
+	}
+	if got, _, err := read(at(700, "12345")); !errors.Is(err, errBenchmarkAnswerTooLarge) || err.Error() != "the answer exceeds 4 bytes" || got != nil {
+		t.Fatalf("readBenchmarkAnswer past the bound = %q, %v; want an error naming the bound", got, err)
+	}
+	if got, _, err := read(strings.NewReader("")); !errors.Is(err, errBenchmarkAnswerEmpty) || err.Error() != "the answer is empty" || got != nil {
+		t.Fatalf("readBenchmarkAnswer of an empty body = %q, %v; want the empty answer refused", got, err)
+	}
+	cut := errors.New("connection reset by peer")
+	broken := &measureBody{clock: clock, chunks: []measureChunk{measureAt(300, "12")}, end: cut}
+	if got, _, err := read(broken); !errors.Is(err, cut) || errors.Is(err, errBenchmarkAnswerEmpty) || got != nil ||
+		err.Error() != "the answer could not be read to its end: connection reset by peer" {
+		t.Fatalf("readBenchmarkAnswer of a body that broke off = %q, %v; want its cause", got, err)
 	}
 }
 

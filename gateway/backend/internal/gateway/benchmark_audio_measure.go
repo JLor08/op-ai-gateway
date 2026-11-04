@@ -246,10 +246,9 @@ func (m audioMeasurer) measureTTSBuffered(ctx context.Context, client provider.N
 	if contentType := resp.Header.Get(contentTypeHeader); !speechAudioMediaTypeOf(contentType) {
 		return audioMeasurement{}, fmt.Errorf("audio benchmark: the synthesis answer is not labelled as WAV (Content-Type %q)", contentType)
 	}
-	audio, err := readAudioAnswer(resp.Body, audioBenchmarkMaxAnswerBytes)
-	end := m.now()
+	audio, end, err := readBenchmarkAnswer(resp.Body, audioBenchmarkMaxAnswerBytes, m.now)
 	if err != nil {
-		return audioMeasurement{}, err
+		return audioMeasurement{}, fmt.Errorf("audio benchmark: %w", err)
 	}
 	audioSeconds, ok := speechBenchmarkAudioSeconds(resp.Header, audio)
 	if !ok {
@@ -282,10 +281,9 @@ func (m audioMeasurer) measureASRBuffered(ctx context.Context, client provider.N
 	if err := checkAudioAnswerStatus(resp); err != nil {
 		return audioMeasurement{}, err
 	}
-	answer, err := readAudioAnswer(resp.Body, audioBenchmarkMaxAnswerBytes)
-	end := m.now()
+	answer, end, err := readBenchmarkAnswer(resp.Body, audioBenchmarkMaxAnswerBytes, m.now)
 	if err != nil {
-		return audioMeasurement{}, err
+		return audioMeasurement{}, fmt.Errorf("audio benchmark: %w", err)
 	}
 	var transcription struct {
 		Text *string `json:"text"`
@@ -439,13 +437,12 @@ func bufferedAudioMeasurement(sent, end time.Time, audioSeconds float64) (audioM
 }
 
 // checkAudioAnswerStatus is the error of a non-2xx answer, quoting what the upstream said
-// (speechBenchmarkErrorText), or nil.
+// (readBenchmarkRefusal, the speech benchmark's reading of it), or nil.
 func checkAudioAnswerStatus(resp *provider.ProxyResponse) error {
-	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-		return nil
+	if refusal, refused := readBenchmarkRefusal(resp); refused {
+		return fmt.Errorf("audio benchmark: the upstream answered HTTP %d: %s", refusal.status, refusal.text)
 	}
-	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
-	return fmt.Errorf("audio benchmark: the upstream answered HTTP %d: %s", resp.StatusCode, speechBenchmarkErrorText(errBody))
+	return nil
 }
 
 // checkAudioEventStream is the error of an answer that is not an event stream. A streamed
@@ -463,17 +460,4 @@ func checkAudioEventStream(resp *provider.ProxyResponse) error {
 func sseLineIsDone(line []byte) bool {
 	payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
 	return ok && string(bytes.TrimSpace(payload)) == sseDoneSentinel
-}
-
-// readAudioAnswer reads a one-shot answer whole, up to limit bytes; an answer past the
-// bound or one that cannot be read to its end is an error.
-func readAudioAnswer(r io.Reader, limit int64) ([]byte, error) {
-	answer, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil {
-		return nil, fmt.Errorf("audio benchmark: the answer could not be read to its end: %w", err)
-	}
-	if int64(len(answer)) > limit {
-		return nil, fmt.Errorf("audio benchmark: the answer exceeds %d bytes", limit)
-	}
-	return answer, nil
 }
