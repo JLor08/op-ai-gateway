@@ -3205,7 +3205,9 @@ server's reservation, which keeps routed requests away.
 | ASR, otherwise | One buffered transcription of the bundled clip | audio ÷ wall time | the whole answer (its text is usable only whole) |
 
 A streamed synthesis needs the mapping's output byte rate; when none is cached the
-speech benchmark runs first and caches it (writing its own `speech` history row).
+speech benchmark measures and caches it (writing its own `speech` history row) — in a
+speed part before the stop-all when the run stops the server's models, else after the
+cold pass (**speed**, below).
 A clone model synthesizes with its preset voice. A live measurement is taken only
 through a provider that relays a full-duplex body and, on an agent, only when the
 agent declared `fullduplex_proxy`.
@@ -3232,7 +3234,11 @@ first output minus the warm pass's, recorded only when the cold start was
 confirmed and the cold pass was the slower — unknown, never bogus, exactly the text
 rule — and stored in the mapping's existing `load_time_ms`. When the stop-all wrote
 the target's own `force_stopped`, the cold pass rides out the router's `503` until
-the clear reaches the agent.
+the clear reaches the agent. A missing byte rate is learned before the stop-all when
+the run stops the server's models, so a speech benchmark that fails stops nothing; a
+run that does not stop takes the cold pass first, timed to its first audio without
+counting audio, and learns the rate after it, so its own synthesis cannot warm the
+target it is about to judge cold.
 
 **capacity** — the concurrency ramp. Level k = 1, 2, 3, … runs k measurements at
 once; a level is **good** when its slowest stream's rate reaches

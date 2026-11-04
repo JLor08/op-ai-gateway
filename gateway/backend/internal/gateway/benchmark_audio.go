@@ -289,8 +289,9 @@ type audioPrepared struct {
 }
 
 // audioPreparer prepares an audio target's measurement once per run, on its first ask
-// (audioCallFor), and hands every later ask the same outcome. The speed part asks only after
-// its cold pass, since the preparation may send the target a request of its own.
+// (audioCallFor), and hands every later ask the same outcome. Since the preparation may send
+// the target a request of its own, the speed part asks before its stop-all when it runs one,
+// and otherwise only after its cold pass (measureAudioSpeed).
 type audioPreparer struct {
 	s    *Server
 	tgt  benchmarkTarget
@@ -375,14 +376,28 @@ func (s *Server) runAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep *a
 // rides the router's 503 until the clear reaches the agent (audioColdPassAfterStop). An error
 // from ensureColdLoad, a stop-all's failed clear, ends the measurement before any pass.
 //
-// Nothing is sent to the target before the cold pass: the cold start is judged and taken first,
-// and only then is the measurement prepared (prep), which for a streamed synthesis without a
-// cached byte rate runs the speech benchmark -- a synthesis on the target, which a run that does
-// not stop the server would otherwise find resident and judge warm. That cold pass is timed
-// without counting its audio (audioMeasureCall.timesOnly), all its part of the load time needs;
-// a measurement that could not be prepared then ends the run before the warm pass.
+// When the measurement is prepared (prep) depends on the stop-all. Its one request of its own
+// -- for a streamed synthesis without a cached byte rate the speech benchmark, a synthesis on
+// the target -- warms the target:
+//   - a run that will stop the server's models (coldLoadStopsAll) prepares first: the stop-all
+//     makes the target cold anyway, and a preparation that fails then fails the run before
+//     anything is stopped;
+//   - any other run judges the cold start as it finds the server, so nothing is sent to the
+//     target before the cold pass: the cold start is judged and taken first, and only then is
+//     the measurement prepared, since the target would otherwise be found resident and judged
+//     warm. That cold pass is timed without counting its audio (audioMeasureCall.timesOnly),
+//     all its part of the load time needs, and a measurement that could not be prepared ends
+//     the run after the cold pass, before the warm pass.
 func (s *Server) measureAudioSpeed(ctx context.Context, tgt benchmarkTarget, prep *audioPreparer) (audioMeasurement, int64, error) {
+	preparedFirst := coldLoadStopsAll(tgt)
+	var prepared audioPrepared
 	coldCall := s.audioCallPlan(ctx, tgt)
+	if preparedFirst {
+		if prepared = prep.prepared(ctx); prepared.err != nil {
+			return audioMeasurement{}, 0, prepared.err
+		}
+		coldCall = prepared.call
+	}
 	coldCall.timesOnly = coldCall.needsByteRate()
 	cold, err := s.ensureColdLoad(ctx, tgt)
 	if err != nil {
@@ -397,9 +412,10 @@ func (s *Server) measureAudioSpeed(ctx context.Context, tgt benchmarkTarget, pre
 	if err != nil {
 		return audioMeasurement{}, 0, err
 	}
-	prepared := prep.prepared(ctx)
-	if prepared.err != nil {
-		return audioMeasurement{}, 0, prepared.err
+	if !preparedFirst {
+		if prepared = prep.prepared(ctx); prepared.err != nil {
+			return audioMeasurement{}, 0, prepared.err
+		}
 	}
 	call := prepared.call
 	warm, err := s.takeAudioMeasurement(ctx, call)

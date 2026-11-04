@@ -656,7 +656,7 @@ func modelLoaded(ctx context.Context, lister provider.LoadedModelLister, target 
 //     under a closed co-residency matrix, and one that can start by itself might start inside
 //     it. This branch writes nothing and returns no error.
 func (s *Server) agentColdStart(ctx context.Context, tgt benchmarkTarget) (coldStart, error) {
-	if tgt.mayPreStop && tgt.overrides != nil && tgt.overrides.stopsAllowed {
+	if coldLoadStopsAll(tgt) {
 		return s.preStopServer(ctx, tgt)
 	}
 	resident, known := s.agentTargetResident(ctx, tgt)
@@ -664,6 +664,14 @@ func (s *Server) agentColdStart(ctx context.Context, tgt benchmarkTarget) (coldS
 		return coldStart{}, nil
 	}
 	return coldStart{confirmed: true}, nil
+}
+
+// coldLoadStopsAll reports whether ensureColdLoad, asked now, runs the stop-all for tgt
+// (preStopServer): a server_agent target of a manual speed or both run that may stop
+// (mayPreStop) while the run's benchmarkOverrides still allow stops. Such a cold start does
+// not depend on what the target held before it, since the stop-all stops the target too.
+func coldLoadStopsAll(tgt benchmarkTarget) bool {
+	return tgt.app.Type == routing.ProviderServerAgent && tgt.mayPreStop && tgt.overrides != nil && tgt.overrides.stopsAllowed
 }
 
 // agentTargetResident reports whether tgt's model is resident on its server_agent application,

@@ -508,6 +508,35 @@ func TestAudioSpeedColdStartPrecedesTheByteRateBenchmark(t *testing.T) {
 	}
 }
 
+// TestAudioSpeedStopAllRunPreparesBeforeItStops: a manual speed run that stops the server's
+// models makes the target cold by itself, so a streamed synthesis without a cached byte rate
+// runs the speech benchmark before the stop-all. A benchmark that fails then fails the run
+// before anything is destroyed: no stop batch is written, and no pass is taken.
+func TestAudioSpeedStopAllRunPreparesBeforeItStops(t *testing.T) {
+	f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map1", "running", 741)}})
+	targets := f.targets(t, "speed", "map1")
+	targets[0].audio = audioTarget{role: routing.RoleTTS, streaming: true}
+	f.srv.audioMeasureSeam = func(_ context.Context, call audioMeasureCall) (audioMeasurement, error) {
+		f.events.add("audio %s", call.target.ProviderModel)
+		return audioFigures(3, 300), nil
+	}
+
+	status := f.run(t, "speed", targets)
+
+	if len(status.Results) != 1 || !strings.Contains(status.Results[0].Error, "output byte rate") {
+		t.Fatalf("status = %+v, want one result failed on the byte rate", status)
+	}
+	if f.events.index("other POST /v1/audio/speech", 0) < 0 {
+		t.Fatalf("events = %v, want the speech benchmark sent to the target", f.events.list())
+	}
+	if got := f.batches(); len(got) != 0 {
+		t.Fatalf("batches = %v, want none: the failed preparation comes before the stop-all", got)
+	}
+	if got := f.events.with("audio "); len(got) != 0 {
+		t.Fatalf("passes = %v, want none", got)
+	}
+}
+
 // TestAudioSpeedLoadTimeIsTheFirstOutputOfEachKind: the load time is the cold pass's time to
 // its first output minus the warm pass's, and what counts as the first output depends on the
 // measurement: the first response byte of a one-shot synthesis, the first transcript text of a
