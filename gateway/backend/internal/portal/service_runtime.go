@@ -504,9 +504,10 @@ type RuntimeSpecDTO struct {
 	// StartupMeasuredMS is the agent's measured startup time of the spec in ms
 	// (0 = nothing measured yet), and EffectiveIdleTimeoutSeconds is the idle
 	// timeout the runtime-config document pushes for the spec: for a
-	// replicable spec derived from that measurement and the mapping's
-	// benchmark cold start (effectiveIdleTimeout), otherwise the stored
-	// idle_timeout_seconds. Both are READ-ONLY echoes with no
+	// replicable spec on a server whose agent declares runtime_instances
+	// derived from that measurement and the mapping's benchmark cold start
+	// (effectiveIdleTimeout), otherwise the stored idle_timeout_seconds. Both
+	// are READ-ONLY echoes with no
 	// PutRuntimeSpecRequest counterpart -- the first is agent-owned and the
 	// store keeps it across every write, the second is derived on every read
 	// and never stored -- so the portal shows the value the agent gets
@@ -734,7 +735,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	dto, err := runtimeSpecDTO(spec, gpus, app, s.effectiveIdleTimeout(spec, mapping))
+	dto, err := runtimeSpecDTO(spec, gpus, app, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -907,7 +908,7 @@ func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMap
 	if err != nil {
 		return RuntimeSpecDTO{}, true, err
 	}
-	dto, err = runtimeSpecDTO(spec, storedGPUs, app, s.effectiveIdleTimeout(spec, mapping))
+	dto, err = runtimeSpecDTO(spec, storedGPUs, app, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	return dto, true, err
 }
 
@@ -2487,6 +2488,13 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     not an operator action, and nothing safety-relevant waits on them: the
 //     role only ORDERS eviction victims that are already evictable, it never
 //     decides whether one is. The agent's poll reconciles the new role.
+//
+// One input of the document is not a row: whether the server's agent declares
+// the runtime_instances feature (AgentFeatureReader, Service.specAsPushed),
+// which decides whether a replicable spec goes out with its instance settings.
+// The agent declares it in its telemetry, outside this service, so the
+// gateway's ingest pushes that server's document itself when the declaration
+// changes (gateway.Server.ingestTelemetrySample).
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
@@ -2593,8 +2601,9 @@ type AgentRuntimeSpecGPUDTO struct {
 // ${MODEL} placeholders the agent resolves locally at launch time -- this
 // DTO, like RuntimeSpecDTO, passes them through untouched: never validated or
 // rewritten here. IdleTimeoutSeconds is the EFFECTIVE idle timeout
-// (effectiveIdleTimeout): the stored value for a spec that is not replicable,
-// and for a replicable one at least a floor, derived from its measured
+// (effectiveIdleTimeout): the stored value for a spec that is not replicable
+// or goes to an agent without the runtime_instances feature, and for a
+// replicable one at least a floor, derived from its measured
 // startup -- never 0 there, so a replicable spec's unprotected instances
 // always idle out. The instances it protects (min_instances, and instance 0
 // while pinned) never idle out, whatever this says.
@@ -2672,12 +2681,13 @@ type AgentRuntimeSpecDTO struct {
 	// settings (#340; the agent-side runtime.Spec pairs these exact json
 	// tags): whether the agent may run several instances of the spec, how
 	// many it keeps up (0 = none) and how many it may run (0 = unbounded).
-	// All three are omitempty and set only for a replicable spec, so the
-	// document of a spec that is not replicable is the one it was before
-	// instances existed. Every agent gets them: one without the
-	// runtime_instances feature decodes past the keys, and one with it honours
-	// replicable only while this gateway declares that feature too. The
-	// per-instance parallelism is the gateway's own cap and is never pushed.
+	// All three are omitempty and set only for a replicable spec pushed to an
+	// agent that declares the runtime_instances feature (Service.specAsPushed),
+	// so the document of a spec that is not replicable, and every document an
+	// older agent gets, is the one it was before instances existed. An agent
+	// with the feature honours replicable only while this gateway declares
+	// that feature too. The per-instance parallelism is the gateway's own cap
+	// and is never pushed.
 	Replicable   bool `json:"replicable,omitempty"`
 	MinInstances int  `json:"min_instances,omitempty"`
 	MaxInstances int  `json:"max_instances,omitempty"`
@@ -2867,7 +2877,10 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
-		specDTO, err := agentRuntimeSpecDTO(spec, mapping, gpus, s.effectiveIdleTimeout(spec, mapping))
+		// The spec as this server's agent can run it: without the instance
+		// settings for an agent that does not declare runtime_instances.
+		pushed := s.specAsPushed(serverID, spec)
+		specDTO, err := agentRuntimeSpecDTO(pushed, mapping, gpus, s.effectiveIdleTimeout(serverID, spec, mapping))
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
@@ -3167,11 +3180,38 @@ func derivedIdleSeconds(factor float64, startupMS int64) int {
 	return int((ms + 999) / 1000)
 }
 
-// effectiveIdleTimeout is effectiveIdleTimeoutSeconds for spec on mapping,
-// under this gateway's configured factor and floor. The pushed document and the
-// portal's read-only echo both derive the value here, so they cannot disagree.
-func (s *Service) effectiveIdleTimeout(spec routing.RuntimeSpec, mapping routing.ModelMapping) int {
-	return effectiveIdleTimeoutSeconds(spec, int64(mapping.LoadTimeMS), s.instanceIdleFactor, s.instanceIdleFloorSeconds)
+// AgentFeatureRuntimeInstances is the feature an agent declares when it runs
+// several instances of a replicable spec and serves them as "m#k". The gateway
+// package spells the same string for its own declaration
+// (runtimeInstancesFeature) and pins the two together.
+const AgentFeatureRuntimeInstances = "runtime_instances"
+
+// specAsPushed is spec as serverID's runtime-config document carries it:
+// unchanged for an agent that declares AgentFeatureRuntimeInstances, and
+// otherwise with Replicable cleared, so the document has no instance keys and
+// pushes the stored manual idle timeout -- exactly the document it was before
+// instances existed. An agent without the feature runs every spec as one
+// process whatever the document says, so a derived idle timeout would only
+// unload that one process after a span the operator never set, where a manual
+// 0 meant "never". An agent the gateway has not heard from yet counts as one
+// without the feature; its first telemetry sample declares it, and that change
+// is pushed (gateway.Server.ingestTelemetrySample).
+//
+// The stored spec, and the portal's view of its settings, keep Replicable as
+// the operator saved it; only the derived values follow this.
+func (s *Service) specAsPushed(serverID string, spec routing.RuntimeSpec) routing.RuntimeSpec {
+	if s.agentFeatures == nil || !s.agentFeatures.Has(serverID, AgentFeatureRuntimeInstances) {
+		spec.Replicable = false
+	}
+	return spec
+}
+
+// effectiveIdleTimeout is effectiveIdleTimeoutSeconds for spec on mapping, as
+// serverID's document pushes it (specAsPushed), under this gateway's configured
+// factor and floor. The pushed document and the portal's read-only echo both
+// derive the value here, so they cannot disagree.
+func (s *Service) effectiveIdleTimeout(serverID string, spec routing.RuntimeSpec, mapping routing.ModelMapping) int {
+	return effectiveIdleTimeoutSeconds(s.specAsPushed(serverID, spec), int64(mapping.LoadTimeMS), s.instanceIdleFactor, s.instanceIdleFloorSeconds)
 }
 
 // agentRuntimeConfigDTO assembles the wire DTO, normalizing every

@@ -443,6 +443,7 @@ func TestBenchmarkWritePreservesInstanceFields(t *testing.T) {
 	ctx := context.Background()
 	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
+	svc.agentFeatures = fakeAgentFeatures{server.ID: {AgentFeatureRuntimeInstances}}
 	app := seedServerAgentApplication(t, routeStore, server.ID, now)
 	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "tts", AppModelName: "tts"})
 	if err != nil {

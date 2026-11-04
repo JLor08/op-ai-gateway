@@ -2016,7 +2016,19 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// (PushRuntimeConfig then correctly withholds delivery) rather than
 	// rejecting the whole sample -- see parseAgentCapabilities. Reuses caps
 	// (parsed once, above) rather than re-parsing req.Capabilities.
+	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
 	s.AgentFeatures.Set(serverID, caps)
+	// The runtime-config document carries a replicable spec's instance
+	// settings only for an agent that declares runtime_instances
+	// (portal.Service.specAsPushed), so a change of that declaration changes
+	// the document, and a document input that changed is pushed (THE RULE on
+	// portal.Service.notifyRuntimeChanged). The common case is the first
+	// sample after a gateway start, before which nothing was known: without
+	// the push an agent that fetched its document in that window would run
+	// its replicable specs as single processes until its next poll.
+	if slices.Contains(caps, runtimeInstancesFeature) != hadInstances {
+		s.PushRuntimeConfig(serverID)
+	}
 	// Record WHICH runtime-config document this agent says it has APPLIED, and
 	// do it BEFORE the status publish two lines below. That ordering is a
 	// contract, not tidiness: the VRAM benchmark's isolation wait is woken by

@@ -443,6 +443,17 @@ type AgentTransportReader interface {
 	LatestTransport(serverID string) (transport string, at time.Time, ok bool)
 }
 
+// AgentFeatureReader exposes the feature names each server's ServerAgent
+// declared in its last telemetry sample, so the runtime-config document can
+// carry what only an agent with a given feature understands
+// (AgentFeatureRuntimeInstances). false -- for a nil reader, a server never
+// heard from, and an agent that does not declare the name -- is the safe
+// default: the document then stays the one every agent understands.
+// Satisfied by the gateway's agent-features registry.
+type AgentFeatureReader interface {
+	Has(serverID, feature string) bool
+}
+
 type ServiceDeps struct {
 	Users          UserReader
 	Tokens         TokenRepository
@@ -566,6 +577,12 @@ type ServiceDeps struct {
 	// it needs no special-casing) falls back to DefaultMaxRunHistoryBytes
 	// (32 MiB) in NewService.
 	MaxRunHistoryBytes int
+	// AgentFeatures lets the runtime-config document tell an agent that runs
+	// several instances of a replicable spec from one that does not (see
+	// AgentFeatureReader and Service.specAsPushed). nil = no agent declares
+	// anything: every document is the one an agent without runtime_instances
+	// understands.
+	AgentFeatures AgentFeatureReader
 	// InstanceIdleFactor and InstanceIdleFloorSeconds are the factor and floor
 	// a replicable runtime spec's idle timeout is derived with
 	// (effectiveIdleTimeout): config.Config's InstanceIdleFactor and
@@ -822,6 +839,7 @@ type Service struct {
 	agentPresence    AgentPresenceReader
 	agentCertReports AgentCertReportReader
 	agentTransport   AgentTransportReader
+	agentFeatures    AgentFeatureReader
 	proxyStatus      ProxyRouteStatusReader
 	groups           GroupStore
 	groupCache       GroupCache
@@ -994,6 +1012,7 @@ func NewService(deps ServiceDeps) *Service {
 		agentPresence:    deps.AgentPresence,
 		agentCertReports: deps.AgentCertReports,
 		agentTransport:   deps.AgentTransport,
+		agentFeatures:    deps.AgentFeatures,
 		proxyStatus:      deps.ProxyStatus,
 		groups:           deps.Groups,
 		groupCache:       deps.GroupCache,

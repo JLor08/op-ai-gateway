@@ -172,3 +172,62 @@ func TestRuntimeSpecDTOKeepsTheManualIdleTimeoutBesideTheEffectiveOne(t *testing
 		t.Fatalf("putRequestFromDTO idle_timeout_seconds = %d, want the manual 60", req.IdleTimeoutSeconds)
 	}
 }
+
+// TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances pins which
+// agents get a replicable spec's instance settings: only one that declares
+// runtime_instances gets replicable / min_instances / max_instances and the
+// derived idle timeout. An older agent -- and an agent the gateway has not
+// heard from yet, whose features are unknown -- gets exactly the document it
+// got before instances existed: none of the three keys and the stored manual
+// idle timeout, which it reads as it always did (here 45 s; 0 would mean never
+// unload). The portal's read-only effective_idle_timeout_seconds reports what
+// that server's document actually carries, while the spec's own replicable
+// setting stays as the operator saved it.
+func TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, serverID := instanceSpecFixture(t, nil, nil)
+	put, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", Replicable: true, MinInstances: 1, MaxInstances: 3, IdleTimeoutSeconds: 45,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpdateRuntimeSpecStartupMeasured(ctx, put.ID, 30000); err != nil {
+		t.Fatalf("UpdateRuntimeSpecStartupMeasured: %v", err)
+	}
+	cases := []struct {
+		name      string
+		features  AgentFeatureReader
+		instances bool
+		wantIdle  int
+	}{
+		{"an agent that runs instances", fakeAgentFeatures{serverID: {"runtime_manager", AgentFeatureRuntimeInstances}}, true, 150},
+		{"an older agent", fakeAgentFeatures{serverID: {"runtime_manager"}}, false, 45},
+		{"another server's agent runs instances", fakeAgentFeatures{"srv_other": {AgentFeatureRuntimeInstances}}, false, 45},
+		{"no feature reader", nil, false, 45},
+	}
+	for _, tc := range cases {
+		svc.agentFeatures = tc.features
+		doc, err := svc.AgentRuntimeConfig(ctx, serverID)
+		if err != nil || len(doc.Specs) != 1 {
+			t.Fatalf("%s: AgentRuntimeConfig: %d specs, err %v", tc.name, len(doc.Specs), err)
+		}
+		keys := wireKeys(t, doc.Specs[0])
+		for _, key := range []string{"replicable", "min_instances", "max_instances"} {
+			if _, present := keys[key]; present != tc.instances {
+				t.Errorf("%s: pushed key %s present = %v, want %v", tc.name, key, present, tc.instances)
+			}
+		}
+		if got := doc.Specs[0].IdleTimeoutSeconds; got != tc.wantIdle {
+			t.Errorf("%s: pushed idle_timeout_seconds = %d, want %d", tc.name, got, tc.wantIdle)
+		}
+		dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+		if err != nil {
+			t.Fatalf("%s: GetRuntimeSpec: %v", tc.name, err)
+		}
+		if dto.EffectiveIdleTimeoutSeconds != tc.wantIdle || dto.IdleTimeoutSeconds != 45 || !dto.Replicable {
+			t.Errorf("%s: portal effective %d manual %d replicable %v, want effective %d (the pushed value), manual 45, replicable true",
+				tc.name, dto.EffectiveIdleTimeoutSeconds, dto.IdleTimeoutSeconds, dto.Replicable, tc.wantIdle)
+		}
+	}
+}
