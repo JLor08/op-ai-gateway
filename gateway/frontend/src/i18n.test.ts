@@ -4140,6 +4140,9 @@ describe('Voice Chat (#312) i18n keys', () => {
     'chatVoiceErrorCoLoad',
     'chatVoiceErrorAudioSettings',
     'chatVoiceErrorTicket',
+    'chatVoiceErrorNoRealtimeModel',
+    'chatVoiceErrorNoRealtimeAsr',
+    'chatVoiceErrorNoRealtimeTts',
     'chatVoiceErrorRefused',
     'chatVoiceErrorUnsupported',
     'chatVoiceErrorCapture',
@@ -4155,6 +4158,28 @@ describe('Voice Chat (#312) i18n keys', () => {
         expect(text.length).toBeGreaterThan(0);
       }
       expect(messages.de[key]).not.toBe(messages.en[key]);
+    }
+  });
+
+  // #340: voice_chat.no_realtime_model -- every model of a leg measured below the real time a
+  // conversation needs. The leg's sentence names the leg's model, the general one both, and every
+  // one says what is missing: real time.
+  it('words the real-time refusal per leg in de and en', () => {
+    const de = messages.de;
+    const en = messages.en;
+    expect(de.chatVoiceErrorNoRealtimeAsr).toMatch(/Transkriptionsmodell/);
+    expect(en.chatVoiceErrorNoRealtimeAsr).toMatch(/transcription model/);
+    expect(de.chatVoiceErrorNoRealtimeTts).toMatch(/Sprachmodell/);
+    expect(en.chatVoiceErrorNoRealtimeTts).toMatch(/speech model/);
+    expect(de.chatVoiceErrorNoRealtimeModel).toMatch(/Transkriptions- oder Sprachmodell/);
+    expect(en.chatVoiceErrorNoRealtimeModel).toMatch(/transcription or speech model/);
+    for (const key of [
+      'chatVoiceErrorNoRealtimeModel',
+      'chatVoiceErrorNoRealtimeAsr',
+      'chatVoiceErrorNoRealtimeTts',
+    ] as const) {
+      expect(de[key], key).toMatch(/Echtzeit/);
+      expect(en[key], key).toMatch(/real time/);
     }
   });
 

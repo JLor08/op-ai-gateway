@@ -603,6 +603,14 @@ const de = {
     'Die zu diesem Chat gespeicherten Spracheinstellungen sind ungültig oder zu umfangreich. Nutzen Sie den Sprachchat in einem neuen Chat.',
   chatVoiceErrorTicket:
     'Der Sprachchat konnte nicht gestartet werden. Versuchen Sie es in einem Moment erneut.',
+  // #340: voice_chat.no_realtime_model -- every model of a leg was measured slower than the real
+  // time a conversation needs. The leg's own sentence when the gateway names the leg.
+  chatVoiceErrorNoRealtimeModel:
+    'Für den Sprachchat ist kein Modell schnell genug: Das Transkriptions- oder Sprachmodell hält laut Messung auf keinem Server mit der Echtzeit Schritt, die ein Gespräch braucht. Wählen Sie ein schnelleres Modell oder wenden Sie sich an Ihren Administrator.',
+  chatVoiceErrorNoRealtimeAsr:
+    'Das Transkriptionsmodell ist für den Sprachchat zu langsam: Es hält laut Messung auf keinem Server mit der Echtzeit Schritt, die ein Gespräch braucht. Wählen Sie ein schnelleres Transkriptionsmodell oder wenden Sie sich an Ihren Administrator.',
+  chatVoiceErrorNoRealtimeTts:
+    'Das Sprachmodell ist für den Sprachchat zu langsam: Es hält laut Messung auf keinem Server mit der Echtzeit Schritt, die ein Gespräch braucht. Wählen Sie ein schnelleres Sprachmodell oder wenden Sie sich an Ihren Administrator.',
   chatVoiceErrorRefused: 'Das Gateway hat den Sprachchat abgelehnt.',
   chatVoiceErrorUnsupported:
     'Der Sprachchat ist in diesem Browser nicht verfügbar: Er braucht einen aktuellen Browser, Zugriff auf das Mikrofon und eine sichere Verbindung (HTTPS).',
@@ -4172,6 +4180,12 @@ const en: PortalMessages = {
   chatVoiceErrorAudioSettings:
     'The speech settings stored with this chat are invalid or too large. Use Voice Chat in a new chat.',
   chatVoiceErrorTicket: 'Voice Chat could not be started. Try again in a moment.',
+  chatVoiceErrorNoRealtimeModel:
+    'No model is fast enough for Voice Chat: the transcription or speech model keeps up with the real time a conversation needs on no server, as measured. Pick a faster model, or contact your administrator.',
+  chatVoiceErrorNoRealtimeAsr:
+    'The transcription model is too slow for Voice Chat: as measured, it keeps up with the real time a conversation needs on no server. Pick a faster transcription model, or contact your administrator.',
+  chatVoiceErrorNoRealtimeTts:
+    'The speech model is too slow for Voice Chat: as measured, it keeps up with the real time a conversation needs on no server. Pick a faster speech model, or contact your administrator.',
   chatVoiceErrorRefused: 'The gateway refused Voice Chat.',
   chatVoiceErrorUnsupported:
     'Voice Chat is not available in this browser: it needs a current browser, microphone access and a secure connection (HTTPS).',
