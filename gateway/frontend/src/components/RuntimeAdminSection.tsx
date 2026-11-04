@@ -265,6 +265,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     instance_parallelism: 0,
     startup_measured_ms: 0,
     effective_idle_timeout_seconds: 0,
+    instances_min_exceeds_realtime: false,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -611,8 +612,9 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // excludes it), so it is dropped here rather than echoed back. The instance
   // settings split the same way: replicable/min_instances/max_instances/
   // instance_parallelism are the operator's and ride `rest`, while
-  // startup_measured_ms (agent-owned) and effective_idle_timeout_seconds
-  // (derived on every read) have no request counterpart and are dropped.
+  // startup_measured_ms (agent-owned), effective_idle_timeout_seconds and
+  // instances_min_exceeds_realtime (both derived on every read) have no
+  // request counterpart and are dropped.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -636,6 +638,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     ram_measured_mb,
     startup_measured_ms,
     effective_idle_timeout_seconds,
+    instances_min_exceeds_realtime,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };

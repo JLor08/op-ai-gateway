@@ -121,6 +121,11 @@ export interface RuntimeSpec {
   // unload"), otherwise the stored idle_timeout_seconds as is.
   startup_measured_ms: number;
   effective_idle_timeout_seconds: number;
+  // READ-ONLY too, derived on every read: true when the mapping's audio ramp
+  // stopped on performance (a measured ceiling) and min_instances is above the
+  // real-time concurrency it measured -- that many instances busy at once no
+  // longer all keep up with real time. The form warns; nothing refuses it.
+  instances_min_exceeds_realtime: boolean;
   // How this mapping authenticates to its agent-managed process (Runtime-Spec
   // API Token feature). 'off' sends no auth; 'set' sends the operator's own
   // spec-level token (api_token_set says whether one is stored, never the
@@ -211,8 +216,9 @@ export interface RuntimeSpec {
 // so it is excluded from this shape below instead of being carried and
 // ignored; ram_estimate_mb is the operator's and is applied verbatim. The same
 // split for the instance settings: the four operator fields are carried, and
-// startup_measured_ms (agent-owned) and effective_idle_timeout_seconds
-// (derived on every read) have no request counterpart and are excluded.
+// startup_measured_ms (agent-owned), effective_idle_timeout_seconds and
+// instances_min_exceeds_realtime (both derived on every read) have no request
+// counterpart and are excluded.
 //
 // The three api_token_set/app_api_token_set/app_api_token_header fields (and
 // the derived `role`) are READ-ONLY echoes (server state, never
@@ -234,6 +240,7 @@ export type PutRuntimeSpecRequest = Omit<
   | 'ram_measured_mb'
   | 'startup_measured_ms'
   | 'effective_idle_timeout_seconds'
+  | 'instances_min_exceeds_realtime'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).

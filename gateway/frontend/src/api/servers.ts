@@ -406,6 +406,19 @@ export type BenchmarkResult = {
   ttft_ms?: number;
   wall_ms?: number;
   rtf?: number;
+  // The audio measurement's figures (#340): present only on the result of a
+  // speech or transcription mapping, whose speed, capacity or both run measures
+  // its audio instead of sending a chat prompt. A speed run fills the
+  // single-stream rate (seconds of audio per wall second), the time to the
+  // first audio or text and, when the cold start was confirmed, the load time
+  // (cold minus warm; 0 = not measured); a capacity run fills the real-time
+  // concurrency and why its ramp stopped ("performance" | "resources" | "cap",
+  // see PortalModelMapping); a both run fills all of them.
+  audio_rate_x?: number;
+  audio_ttft_ms?: number;
+  audio_load_time_ms?: number;
+  audio_realtime_concurrency?: number;
+  audio_concurrency_limit?: string;
   error?: string;
 };
 
@@ -451,6 +464,15 @@ export type CapacityLevelDTO = {
   requests_processing?: number;
   total_slots?: number;
   stop_reason?: string;
+};
+
+// One level k of an audio capacity ramp (#340): k simultaneous streams, the
+// slowest one's and the mean rate in seconds of audio per wall second. The
+// level was good when the slowest one kept up with the real-time threshold.
+export type AudioLevelDTO = {
+  k: number;
+  min_rate_x: number;
+  mean_rate_x: number;
 };
 
 // A decoded capacity report attached to a kind:"capacity" benchmark run
@@ -574,6 +596,15 @@ export type BenchmarkRunDTO = {
   ttft_ms?: number;
   wall_ms?: number;
   rtf?: number;
+  // #340: a kind==="audio" row (the speed run of a speech or transcription
+  // mapping) carries ttft_ms (the time to the first audio or text), wall_ms,
+  // rtf and load_time_ms above, plus its single-stream rate here. A
+  // kind==="audio_capacity" row (the ramp) carries the real-time concurrency,
+  // why the ramp stopped (see PortalModelMapping) and one entry per level.
+  audio_rate_x?: number;
+  audio_realtime_concurrency?: number;
+  audio_concurrency_limit?: string;
+  audio_curve?: AudioLevelDTO[];
 };
 
 // The optional `?mode=...` query suffix shared by the three benchmark-start

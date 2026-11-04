@@ -229,6 +229,25 @@ export type PortalModelMapping = {
   // openai_images and openai_audio is both. Same advisory contract and the
   // same optionality as images_only.
   audio_only?: boolean;
+  // The audio performance metrics (#340), written by the audio measurement a
+  // speed, capacity or both run takes on a speech or transcription mapping and
+  // editable like the text metrics above, under the same metrics_locked:
+  // audio_rate_x is the single-stream rate in seconds of audio per wall
+  // second, audio_ttfa_ms the time to the first audio (speech) or text
+  // (transcription), and audio_realtime_concurrency the last level of the
+  // concurrency ramp whose slowest stream still kept up with real time. That
+  // count is one result with audio_concurrency_limit, why the ramp stopped:
+  // "performance" makes it a measured ceiling (0 = not real-time even alone),
+  // "resources" and "cap" a lower bound, and "" means no ramp ran, so the
+  // count means nothing. 0 is "not measured" for the other two.
+  // audio_metrics_updated_at is when a run or an edit last wrote them.
+  // Optional, like images_only, so existing fixtures compile unchanged; read
+  // through shared/audioMetrics.ts, which takes an absent value as unknown.
+  audio_rate_x?: number;
+  audio_ttfa_ms?: number;
+  audio_realtime_concurrency?: number;
+  audio_concurrency_limit?: string;
+  audio_metrics_updated_at?: string | null;
 };
 
 export type PortalMappingListResponse = { data: PortalModelMapping[] };
@@ -293,6 +312,15 @@ export type UpdateMappingRequest = {
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
+  // The audio metrics (#340), each written only when present, like the text
+  // metrics above. The real-time concurrency and its limit are one pair: a
+  // count needs one of the three limits beside it, and a limit of "" clears
+  // both, so it is sent alone. Anything else is a 400
+  // mapping.audio_metrics_invalid.
+  audio_rate_x?: number;
+  audio_ttfa_ms?: number;
+  audio_realtime_concurrency?: number;
+  audio_concurrency_limit?: string;
   // The AUTHORITATIVE per-capability field, keyed by capability name, and the
   // only one that can express all three states:
   //
@@ -601,6 +629,13 @@ export type ModelServerRow = {
   // names its running instances even while one (or none) runs. Optional: a
   // gateway that does not send it leaves the count to show only above one.
   replicable?: boolean;
+  // The mapping's audio metrics (#340), as PortalModelMapping carries and
+  // explains them. Optional for the same reason: an absent value reads as
+  // unknown.
+  audio_rate_x?: number;
+  audio_ttfa_ms?: number;
+  audio_realtime_concurrency?: number;
+  audio_concurrency_limit?: string;
   // Whether the agent's last per-model probe of its metrics/context endpoints
   // actually reached the server -- mirrors RuntimeStatusDTO's own closed set
   // (api/runtime.ts): "ok" (reachable) / "unreachable" (configured but the

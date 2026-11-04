@@ -167,6 +167,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     instance_parallelism: 0,
     startup_measured_ms: 0,
     effective_idle_timeout_seconds: 0,
+    instances_min_exceeds_realtime: false,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',

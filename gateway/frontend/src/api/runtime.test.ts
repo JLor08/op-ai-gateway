@@ -223,7 +223,7 @@ describe('runtimeApi runtime spec instance settings', () => {
     });
   });
 
-  it('keeps the two read-only figures out of the PUT request shape', () => {
+  it('keeps the read-only figures and the real-time warning out of the PUT request shape', () => {
     // Compile-time: each is an excess-property error on the request.
     const base: Parameters<ReturnType<typeof createPortalApi>['putRuntimeSpec']>[1] = {
       enabled: true,
@@ -267,8 +267,14 @@ describe('runtimeApi runtime spec instance settings', () => {
       // @ts-expect-error effective_idle_timeout_seconds is derived, not part of the request
       effective_idle_timeout_seconds: 150,
     };
+    const withRealtimeWarning: typeof base = {
+      ...base,
+      // @ts-expect-error instances_min_exceeds_realtime is derived, not part of the request
+      instances_min_exceeds_realtime: true,
+    };
     expect(withStartup).toBeDefined();
     expect(withEffective).toBeDefined();
+    expect(withRealtimeWarning).toBeDefined();
   });
 });
 

@@ -8,6 +8,7 @@ import {
   formatDate,
   formatMetric,
   formatPortalError,
+  parseMetricInput,
 } from './format';
 import { PortalApiError } from '../../api';
 import { messages } from '../../i18n';
@@ -44,6 +45,17 @@ describe('formatMetric', () => {
     expect(formatMetric(0, 2)).toBe('—');
     expect(formatMetric(null, 2)).toBe('—');
     expect(formatMetric(undefined, 2)).toBe('—');
+  });
+});
+
+describe('parseMetricInput', () => {
+  it('reads a typed number, and a blank, invalid or negative entry as 0 (unknown)', () => {
+    expect(parseMetricInput('42')).toBe(42);
+    expect(parseMetricInput(' 2.5 ')).toBe(2.5);
+    expect(parseMetricInput('')).toBe(0);
+    expect(parseMetricInput('   ')).toBe(0);
+    expect(parseMetricInput('abc')).toBe(0);
+    expect(parseMetricInput('-3')).toBe(0);
   });
 });
 
@@ -129,6 +141,22 @@ describe('formatPortalError', () => {
     const err = new PortalApiError(409, code, 'raw server text');
     expect(formatPortalError(err, messages.de)).toBe(`${code}: ${messages.de[key]}`);
     expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
+  });
+
+  // #340: the mapping editor's refusal of its audio metrics -- a negative
+  // value, or a real-time concurrency without one of the three limits. The
+  // label carries both rules, since a mapped code renders it instead of the
+  // server's English text.
+  it('labels mapping.audio_metrics_invalid with its own label, in both locales', () => {
+    const err = new PortalApiError(400, 'mapping.audio_metrics_invalid', 'raw server text');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale].errorMappingAudioMetricsInvalid;
+      expect(formatPortalError(err, messages[locale])).toBe(
+        `mapping.audio_metrics_invalid: ${label}`,
+      );
+    }
+    expect(messages.de.errorMappingAudioMetricsInvalid).toMatch(/Echtzeit-Parallelität/);
+    expect(messages.en.errorMappingAudioMetricsInvalid).toMatch(/real-time concurrency/);
   });
 
   // #257: the gateway's refusal of a runtime spec's config_files (a bad or

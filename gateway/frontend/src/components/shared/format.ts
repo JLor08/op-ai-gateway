@@ -269,6 +269,9 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'portal.chat_run_active': 'errorChatRunActive',
   'portal.chat_run_limit': 'errorChatRunLimit',
   'mapping.capability_reserved': 'errorMappingCapabilityReserved',
+  // #340: the mapping editor's audio metrics -- a negative value, or a
+  // real-time concurrency without one of the three limits it is measured with.
+  'mapping.audio_metrics_invalid': 'errorMappingAudioMetricsInvalid',
   'gateway.chat_run_timeout': 'errorChatRunTimeout',
   'gateway.chat_run_image_dispatch_failed': 'errorChatRunImageDispatchFailed',
   'gateway.chat_run_no_image': 'errorChatRunNoImage',
@@ -415,6 +418,16 @@ export function formatMetric(
     return placeholder;
   }
   return value.toFixed(decimals);
+}
+
+/**
+ * Read a metric the operator typed into a free-text numeric field: a
+ * non-negative number, and 0 for a blank, invalid or negative entry -- 0 is
+ * how the backend stores "unknown".
+ */
+export function parseMetricInput(text: string): number {
+  const n = Number(text.trim());
+  return text.trim() === '' || Number.isNaN(n) || n < 0 ? 0 : n;
 }
 
 export function formatDate(value: string | null | undefined, fallback: string): string {

@@ -4328,3 +4328,116 @@ describe('instance settings (#340) i18n keys', () => {
     expect(messages.en.runtimeSpecMaxInstancesUnlimited).toMatch(/Empty = unlimited/);
   });
 });
+
+// The audio performance metrics (#340): the benchmark panel's result lines and
+// history, the models catalog's three columns, the mapping editor's four
+// fields, the runtime spec's warning and the editor's refusal -- every key in
+// both languages.
+describe('audio metrics (#340) i18n keys', () => {
+  const stringKeys = [
+    'modelServersAudioRate',
+    'modelServersAudioTtft',
+    'modelServersAudioConcurrency',
+    'mappingAudioMetricsSection',
+    'mappingAudioMetricsHint',
+    'mappingAudioRateX',
+    'mappingAudioTtfaMs',
+    'mappingAudioRealtimeConcurrency',
+    'mappingAudioConcurrencyLimit',
+    'mappingAudioConcurrencyLimitUnknown',
+    'mappingAudioConcurrencyLimitPerformance',
+    'mappingAudioConcurrencyLimitResources',
+    'mappingAudioConcurrencyLimitCap',
+    'benchmarkAudioRuns',
+    'benchmarkAudioCapacityRuns',
+    'benchmarkAudioColSlowest',
+    'benchmarkAudioColMean',
+    'runtimeSpecMinExceedsRealtime',
+    'errorMappingAudioMetricsInvalid',
+  ] as const;
+
+  it('defines every string key in de and en, in different words', () => {
+    for (const key of stringKeys) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale][key].length, `${locale} ${key}`).toBeGreaterThan(0);
+      }
+      expect(messages.de[key], key).not.toBe(messages.en[key]);
+    }
+  });
+
+  it('names the single-stream rate as a multiple of real time and the first output in ms', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const line = messages[locale].benchmarkAudioResult(3, 250);
+      expect(line, locale).toContain('3.0×');
+      expect(line, locale).toContain('250 ms');
+      // An unmeasured first output is left out, never shown as 0 ms.
+      expect(messages[locale].benchmarkAudioResult(3, 0), locale).not.toContain('0 ms');
+    }
+    expect(messages.de.benchmarkAudioResult(3, 250)).toBe(
+      '3.0× Echtzeit, erste Ausgabe nach 250 ms',
+    );
+    expect(messages.en.benchmarkAudioResult(3, 250)).toBe(
+      '3.0× real time, first output after 250 ms',
+    );
+  });
+
+  it('names the load time of an audio run', () => {
+    expect(messages.de.benchmarkAudioLoadTime(5000)).toBe('Ladezeit 5000 ms');
+    expect(messages.en.benchmarkAudioLoadTime(5000)).toBe('load time 5000 ms');
+  });
+
+  // Only a ramp stopped by performance measured a ceiling; resources and the
+  // cap end it early, so the count is a lower bound.
+  it('shows the real-time concurrency as a count, a lower bound or not real-time', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const figure = messages[locale].audioRealtimeConcurrency;
+      expect(figure(2, 'performance'), locale).toBe('2');
+      expect(figure(2, 'resources'), locale).toBe('≥ 2');
+      expect(figure(3, 'cap'), locale).toBe('≥ 3');
+      expect(figure(0, 'performance'), locale).not.toMatch(/^0$|≥/);
+    }
+    expect(messages.de.audioRealtimeConcurrency(0, 'performance')).toBe('nicht echtzeitfähig');
+    expect(messages.en.audioRealtimeConcurrency(0, 'performance')).toBe('not real-time');
+  });
+
+  it('names the figure and why the ramp stopped in the capacity result line', () => {
+    const limitKeys = {
+      performance: 'mappingAudioConcurrencyLimitPerformance',
+      resources: 'mappingAudioConcurrencyLimitResources',
+      cap: 'mappingAudioConcurrencyLimitCap',
+    } as const;
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      for (const [limit, key] of Object.entries(limitKeys)) {
+        const line = t.benchmarkAudioCapacityResult(2, limit);
+        expect(line, `${locale} ${limit}`).toContain(t.audioRealtimeConcurrency(2, limit));
+        expect(line, `${locale} ${limit}`).toContain(t[key]);
+        expect(line, `${locale} ${limit}`).toContain(t.modelServersAudioConcurrency);
+      }
+    }
+    expect(messages.en.benchmarkAudioCapacityResult(2, 'resources')).toBe(
+      `Real-time concurrency: ≥ 2 – ${messages.en.mappingAudioConcurrencyLimitResources}`,
+    );
+  });
+
+  // A lower bound is said in words where the limit is chosen, too.
+  it('says which limits make the count a lower bound', () => {
+    for (const key of [
+      'mappingAudioConcurrencyLimitResources',
+      'mappingAudioConcurrencyLimitCap',
+    ] as const) {
+      expect(messages.de[key], key).toMatch(/Untergrenze/);
+      expect(messages.en[key], key).toMatch(/lower bound/);
+    }
+    expect(messages.de.mappingAudioConcurrencyLimitPerformance).toMatch(/gemessene Obergrenze/);
+    expect(messages.en.mappingAudioConcurrencyLimitPerformance).toMatch(/measured ceiling/);
+  });
+
+  // The warning never refuses: the setting stays saved.
+  it('warns of a minimum above the measured real-time concurrency without refusing it', () => {
+    expect(messages.de.runtimeSpecMinExceedsRealtime).toMatch(/Mindestanzahl/);
+    expect(messages.de.runtimeSpecMinExceedsRealtime).toMatch(/Echtzeit-Parallelität/);
+    expect(messages.en.runtimeSpecMinExceedsRealtime).toMatch(/minimum/);
+    expect(messages.en.runtimeSpecMinExceedsRealtime).toMatch(/real-time concurrency/);
+  });
+});

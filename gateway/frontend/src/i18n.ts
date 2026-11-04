@@ -10,6 +10,7 @@ type PortalMessageValue =
   | ((a: string, b: number) => string)
   | ((a: number) => string)
   | ((a: number, b: number) => string)
+  | ((a: number, b: string) => string)
   | ((a: number, b: number, c: number | null) => string);
 
 // A measured startup in ms as the launch-spec form names it (#340), shared by
@@ -25,6 +26,36 @@ function measuredStartupEn(startupMs: number): string {
   return startupMs > 0
     ? `Measured startup: ${(startupMs / 1000).toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })} s`
     : 'Startup not measured yet';
+}
+
+// The real-time concurrency an audio ramp measured (#340), as a figure, in
+// every language: only a ramp stopped by performance measured a ceiling (0:
+// not even one stream kept up with real time); one stopped by resources or by
+// its cap ended before the model ran out of speed, so its count is a lower
+// bound. Callers pass one of the three limits (shared/audioMetrics.ts shows an
+// unknown one as a dash).
+function audioConcurrencyFigure(k: number, limit: string, notRealtime: string): string {
+  if (limit === 'performance') return k > 0 ? String(k) : notRealtime;
+  return `≥ ${k}`;
+}
+
+// Why an audio ramp stopped, named once per language for the mapping editor's
+// choice and the benchmark result line.
+function audioLimitDe(limit: string): string {
+  if (limit === 'performance') return 'Leistung (gemessene Obergrenze)';
+  if (limit === 'resources') return 'Ressourcen (Untergrenze: kein Platz für eine weitere Instanz)';
+  return 'Höchstzahl erreicht (Untergrenze: Instanz- oder Messobergrenze)';
+}
+
+function audioLimitEn(limit: string): string {
+  if (limit === 'performance') return 'Performance (a measured ceiling)';
+  if (limit === 'resources') return 'Resources (a lower bound: no room for another instance)';
+  return 'Cap reached (a lower bound: the instance or ramp maximum)';
+}
+
+// The single-stream rate a speed run measured, as a multiple of real time.
+function audioRateX(rate: number): string {
+  return `${rate.toFixed(1)}×`;
 }
 
 const de = {
@@ -1082,6 +1113,18 @@ const de = {
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
   mappingGenTpsAtCapacity: 'Tokens/s (max. Kapazität)',
+  // #340: die Audio-Metriken, neben den Text-Metriken und unter derselben Sperre.
+  mappingAudioMetricsSection: 'Audio-Metriken',
+  mappingAudioMetricsHint:
+    'Optional. 0 = unbekannt. Die Audio-Messung (Geschwindigkeit, Kapazität, Beide) füllt diese Werte, sofern die Metriken nicht gesperrt sind. Die Echtzeit-Parallelität gilt nur zusammen mit ihrer Begrenzung; „Unbekannt“ löscht beide.',
+  mappingAudioRateX: '× Echtzeit (ein Strom)',
+  mappingAudioTtfaMs: 'Zeit bis zur ersten Ausgabe (ms)',
+  mappingAudioRealtimeConcurrency: 'Echtzeit-Parallelität',
+  mappingAudioConcurrencyLimit: 'Begrenzt durch',
+  mappingAudioConcurrencyLimitUnknown: 'Unbekannt',
+  mappingAudioConcurrencyLimitPerformance: audioLimitDe('performance'),
+  mappingAudioConcurrencyLimitResources: audioLimitDe('resources'),
+  mappingAudioConcurrencyLimitCap: audioLimitDe('cap'),
   mappingProbeContext: 'Kontextgröße ermitteln',
   mappingProbeContextRunning: 'Wird ermittelt…',
   mappingProbeContextFailed: 'Kontextgröße konnte nicht ermittelt werden',
@@ -1137,6 +1180,9 @@ const de = {
   runtimeSpecMaxInstancesUnlimited:
     'Leer = unbegrenzt: Instanzen kommen hinzu, solange freie Ressourcen und das Prozesslimit des Servers es erlauben.',
   runtimeSpecInstanceParallelism: 'Parallele Anfragen pro Instanz',
+  // A warning, never a refusal: the minimum stays as saved.
+  runtimeSpecMinExceedsRealtime:
+    'Die Mindestanzahl liegt über der für dieses Modell gemessenen Echtzeit-Parallelität: Sind so viele Instanzen gleichzeitig ausgelastet, hält mindestens eine nicht mehr mit der Echtzeit Schritt. Das ist nur ein Hinweis – die Einstellung bleibt gültig.',
   // The measured startup (measured for every spec), shown on its own while
   // the box is ticked on a spec not STORED with instances.
   runtimeSpecMeasuredStartup: (startupMs: number) => measuredStartupDe(startupMs),
@@ -1687,6 +1733,17 @@ const de = {
   benchmarkSpeechByteRate: 'Ausgaberate',
   benchmarkSpeechTtftNote:
     'Die Messung streamt nicht: Das Audio kommt erst nach der ganzen Synthese, und ein vom Agenten gestartetes Modell wird hinter der Anfrage geladen. Die Zeit bis zum ersten Byte umfasst daher Synthese und einen etwaigen Modellstart, nicht die Zeit bis zum ersten gestreamten Audio.',
+  // #340: die Audio-Messung eines Audio-Modells über Geschwindigkeit,
+  // Kapazität und Beide -- die Ergebniszeile und die Verlaufsabschnitte.
+  benchmarkAudioResult: (rate: number, ttftMs: number) =>
+    `${audioRateX(rate)} Echtzeit${ttftMs > 0 ? `, erste Ausgabe nach ${Math.round(ttftMs)} ms` : ''}`,
+  benchmarkAudioLoadTime: (ms: number) => `Ladezeit ${ms} ms`,
+  benchmarkAudioCapacityResult: (k: number, limit: string) =>
+    `Echtzeit-Parallelität: ${audioConcurrencyFigure(k, limit, 'nicht echtzeitfähig')} – ${audioLimitDe(limit)}`,
+  benchmarkAudioRuns: 'Audio-Messungen',
+  benchmarkAudioCapacityRuns: 'Audio-Kapazitäts-Messungen',
+  benchmarkAudioColSlowest: 'Langsamster Strom (× Echtzeit)',
+  benchmarkAudioColMean: 'Mittelwert (× Echtzeit)',
   benchmarkMemoryObserved: 'Speicher beobachtet',
   benchmarkColConcurrency: 'Parallel',
   benchmarkColAggregateTps: 'Gesamt tok/s',
@@ -1821,6 +1878,12 @@ const de = {
   modelServerColStatus: 'Status',
   // #340: how many instances of the mapping's spec run on this server.
   modelServersRunningInstances: 'Laufende Instanzen',
+  // #340: die Audio-Spalten des Modellkatalogs.
+  modelServersAudioRate: '× Echtzeit',
+  modelServersAudioTtft: 'Erste Ausgabe (ms)',
+  modelServersAudioConcurrency: 'Echtzeit-Parallelität',
+  audioRealtimeConcurrency: (k: number, limit: string) =>
+    audioConcurrencyFigure(k, limit, 'nicht echtzeitfähig'),
   modelServerColActive: 'Aktiv',
   modelServerColQueue: 'Warteschlange',
   // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
@@ -2058,6 +2121,8 @@ const de = {
     'Zu viele Antworten laufen gleichzeitig. Bitte warten Sie, bis eine davon fertig ist.',
   errorMappingCapabilityReserved:
     '„live_progress“ darf nicht auf „no“ gesetzt werden, und „speculation_observed“ akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
+  errorMappingAudioMetricsInvalid:
+    'Die Audio-Metriken sind ungültig: Kein Wert darf negativ sein, die Echtzeit-Parallelität ist eine ganze Zahl und braucht eine Begrenzung (Leistung, Ressourcen oder Höchstzahl erreicht).',
   errorChatRunTimeout:
     'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
   // Die Anfrage hat das Gateway nie verlassen (Marshalling, Request-Bau oder
@@ -4513,6 +4578,17 @@ const en: PortalMessages = {
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
   mappingGenTpsAtCapacity: 'Tokens/s (max capacity)',
+  mappingAudioMetricsSection: 'Audio metrics',
+  mappingAudioMetricsHint:
+    'Optional. 0 = unknown. The audio measurement (Speed, Capacity, Both) fills these in unless the metrics are locked. The real-time concurrency holds only together with its limit; "Unknown" clears both.',
+  mappingAudioRateX: '× real time (one stream)',
+  mappingAudioTtfaMs: 'Time to first output (ms)',
+  mappingAudioRealtimeConcurrency: 'Real-time concurrency',
+  mappingAudioConcurrencyLimit: 'Limited by',
+  mappingAudioConcurrencyLimitUnknown: 'Unknown',
+  mappingAudioConcurrencyLimitPerformance: audioLimitEn('performance'),
+  mappingAudioConcurrencyLimitResources: audioLimitEn('resources'),
+  mappingAudioConcurrencyLimitCap: audioLimitEn('cap'),
   mappingProbeContext: 'Determine context size',
   mappingProbeContextRunning: 'Determining…',
   mappingProbeContextFailed: 'Could not determine context size',
@@ -4565,6 +4641,8 @@ const en: PortalMessages = {
   runtimeSpecMaxInstancesUnlimited:
     "Empty = unlimited: instances are added while free resources and the server's process limit allow.",
   runtimeSpecInstanceParallelism: 'Parallel requests per instance',
+  runtimeSpecMinExceedsRealtime:
+    'The minimum is above the real-time concurrency measured for this model: with that many instances busy at once, at least one no longer keeps up with real time. This is a warning only – the setting stays valid.',
   runtimeSpecMeasuredStartup: (startupMs: number) => measuredStartupEn(startupMs),
   runtimeSpecAutoIdleTimeout: (seconds: number, startupMs: number) =>
     `${measuredStartupEn(startupMs)} · idle timeout in effect: ${
@@ -5078,6 +5156,15 @@ const en: PortalMessages = {
   benchmarkSpeechByteRate: 'Output rate',
   benchmarkSpeechTtftNote:
     'The measurement does not stream: the audio arrives only after the whole synthesis, and a model the agent launches is loaded behind the request. The time to the first byte therefore covers the synthesis and any model start, not the time to the first streamed audio.',
+  benchmarkAudioResult: (rate: number, ttftMs: number) =>
+    `${audioRateX(rate)} real time${ttftMs > 0 ? `, first output after ${Math.round(ttftMs)} ms` : ''}`,
+  benchmarkAudioLoadTime: (ms: number) => `load time ${ms} ms`,
+  benchmarkAudioCapacityResult: (k: number, limit: string) =>
+    `Real-time concurrency: ${audioConcurrencyFigure(k, limit, 'not real-time')} – ${audioLimitEn(limit)}`,
+  benchmarkAudioRuns: 'Audio runs',
+  benchmarkAudioCapacityRuns: 'Audio capacity runs',
+  benchmarkAudioColSlowest: 'Slowest stream (× real time)',
+  benchmarkAudioColMean: 'Mean (× real time)',
   benchmarkMemoryObserved: 'Memory observed',
   benchmarkColConcurrency: 'Parallel',
   benchmarkColAggregateTps: 'Total tok/s',
@@ -5201,6 +5288,11 @@ const en: PortalMessages = {
   modelServerColModel: 'Model',
   modelServerColStatus: 'Status',
   modelServersRunningInstances: 'Running instances',
+  modelServersAudioRate: '× real time',
+  modelServersAudioTtft: 'First output (ms)',
+  modelServersAudioConcurrency: 'Real-time concurrency',
+  audioRealtimeConcurrency: (k: number, limit: string) =>
+    audioConcurrencyFigure(k, limit, 'not real-time'),
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
   modelServerColLiveProgress: 'Live progress',
@@ -5401,6 +5493,8 @@ const en: PortalMessages = {
   errorChatRunLimit: 'Too many responses are running at once. Please wait for one to finish.',
   errorMappingCapabilityReserved:
     '"live_progress" cannot be set to "no", and "speculation_observed" accepts no manual verdict at all — an empty verdict resets either.',
+  errorMappingAudioMetricsInvalid:
+    'The audio metrics are invalid: no value may be negative, and the real-time concurrency is a whole number that needs a limit (Performance, Resources or Cap reached).',
   errorChatRunTimeout: 'This response took too long and was stopped. Please try again.',
   // The request never left the gateway (marshalling, request construction,
   // or the loopback call itself). The Go error names the internal address

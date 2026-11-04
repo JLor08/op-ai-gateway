@@ -12,7 +12,7 @@ import {
 } from '@mui/material';
 import type { ApplicationStatus, CapabilityVerdictInput, PortalModelMapping } from '../api';
 import type { Translation, PortalApi } from './shared/types';
-import { formatPortalError } from './shared/format';
+import { formatPortalError, parseMetricInput } from './shared/format';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
@@ -67,13 +67,6 @@ export type MappingFormValues = {
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
-};
-
-// Parse a free-text numeric input into a non-negative number; blank/invalid → 0
-// (the backend treats 0 as "unknown").
-const num = (s: string) => {
-  const n = Number(s.trim());
-  return s.trim() === '' || Number.isNaN(n) || n < 0 ? 0 : n;
 };
 
 const text = (n: number | undefined) => (n ? String(n) : '');
@@ -465,7 +458,7 @@ export function MappingForm({
       { key: 'gen_tokens_per_second_at_capacity', value: genTpsAtCapacity },
     ] as const) {
       if (m.value.trim() === metricSeeds[m.key].trim()) continue;
-      metrics[m.key] = num(m.value);
+      metrics[m.key] = parseMetricInput(m.value);
     }
     onSubmit({
       gateway_model_name: gatewayName,
