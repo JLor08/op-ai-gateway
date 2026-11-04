@@ -312,6 +312,14 @@ type Request struct {
 	// Zero: the resolve's own start, as for every request that resolves once.
 	// Internal only: set by the gateway, never parsed from a client body.
 	AdmissionStart time.Time `json:"-"`
+	// NoPark marks a resolve that must never wait in the admission queue: a
+	// gate that only selects -- the voice-chat gate, the live-transcription
+	// ticket mint -- answers a browser POST, which must not block behind the
+	// requests that will actually use the model. With every candidate at its
+	// cap it is served by the least loaded instance anyway, and signals the
+	// demand for another instance itself, since no park turn will. Internal
+	// only: set by the gateway, never parsed from a client body.
+	NoPark bool `json:"-"`
 }
 
 func (r Request) Validate() *Error {

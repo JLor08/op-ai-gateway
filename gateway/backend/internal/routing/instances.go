@@ -102,8 +102,10 @@ type InstanceActivityChecker interface {
 func (r *Resolver) SetInstanceActivityChecker(c InstanceActivityChecker) { r.instanceActivity = c }
 
 // DemandSignal says a gateway model needs another instance: a request is
-// about to wait in the admission queue because every candidate it could use
-// was at capacity, at least one of them an instance.
+// about to wait in the admission queue -- or, one that must not wait
+// (inference.Request.NoPark), is about to be served on a busy instance --
+// because every candidate it could use was at capacity, at least one of them
+// an instance.
 type DemandSignal struct {
 	// Model is the gateway model whose instances were all busy -- a group
 	// member's own name, never the group's.
@@ -131,9 +133,10 @@ type DemandSignal struct {
 // scale-up per need coalesces them. It is called only for a request that
 // actually parks: not on the fail-open path without a queue, not when the
 // request's admission deadline has passed, and not when the queue has no
-// room for it (AdmissionRoom). It must not block: the request is about to
-// wait, and a sink that blocked would hold it before it ever reached the
-// queue.
+// room for it (AdmissionRoom) -- and once for a request that must not park
+// (inference.Request.NoPark) where it would have parked, for the one member
+// it is then served by. It must not block: the request is about to wait, or
+// to be served, and a sink that blocked would hold it there.
 type DemandSink interface {
 	Signal(DemandSignal)
 }

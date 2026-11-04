@@ -74,9 +74,14 @@ var errAllAtCapacity = errors.New("routing: all candidates at capacity")
 // atCapacityError is errAllAtCapacity together with what the request would ask the
 // demand sink for, decided where the capped set was built and sent only where the
 // request is about to wait (signalDemand). demand is nil when no candidate at capacity
-// was an instance: another instance could not serve the request sooner.
+// was an instance: another instance could not serve the request sooner. pool is the
+// capped set itself -- every candidate that passed the gates, all at their cap -- and
+// instancePool whether it holds an instance candidate: a request that must not park
+// is served from it (selectWithoutParking) instead of waiting.
 type atCapacityError struct {
-	demand *DemandSignal
+	demand       *DemandSignal
+	pool         []MappingCandidate
+	instancePool bool
 }
 
 func (e *atCapacityError) Error() string { return errAllAtCapacity.Error() }
@@ -101,6 +106,9 @@ func parkDemand(err error) (DemandSignal, bool) {
 // on the fail-open path a resolver without a queue takes, never for a request whose
 // deadline has already passed, and never for one the queue has no room for
 // (AdmissionRoom) -- a request about to be refused as full must not start an instance.
+// The one other sender is selectWithoutParking, for a request that must not park
+// (inference.Request.NoPark): it is served on a busy instance at once, so it signals once
+// where it would otherwise have parked.
 func (r *Resolver) signalDemand(demands ...DemandSignal) {
 	if r.demand == nil || len(demands) == 0 {
 		return
@@ -939,6 +947,10 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		// capacity filter in selectCandidate therefore judges this turn's instances.
 		turn := expandInstances(ctx, candidates, r.instances)
 		selected, ok, err := r.selectCandidate(ctx, turn, req, now)
+		var ac *atCapacityError
+		if req.NoPark && errors.As(err, &ac) {
+			selected, ok, err = r.selectWithoutParking(ctx, ac, req.Model, now)
+		}
 		if errors.Is(err, errAllAtCapacity) {
 			// All candidates at cap + a wired controller: park until a slot frees, then retry.
 			wait := queueTimeout // 0 => unbounded (ctx-only)
@@ -1935,7 +1947,8 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 	// under-cap subset is empty the request queues if an admission controller is wired --
 	// with an instance among the candidates it does so even though no mapping sets a
 	// max_concurrency, and carries the demand it signals once it actually parks
-	// (atCapacityError, signalDemand) -- and fails open onto the full pool otherwise.
+	// (atCapacityError, signalDemand), with the capped pool a request that must not park
+	// is served from (selectWithoutParking) -- and fails open onto the full pool otherwise.
 	// When the subset is non-empty but yields no Score-viable pick, it also fails open
 	// rather than refuse a request an at-capacity-but-viable server could still serve.
 	// The emptiness-only variant was a verification-caught MAJOR: it could strip the sole
@@ -1956,7 +1969,7 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 				// instead of failing open. Pinned requests never reach here (resolveAffinity
 				// returns earlier), so only unpinned traffic queues. A nil controller keeps the
 				// CP3 fail-open below.
-				return MappingCandidate{}, false, &atCapacityError{demand: instanceDemand(pool, req)}
+				return MappingCandidate{}, false, &atCapacityError{demand: instanceDemand(pool, req), pool: pool, instancePool: instancePool}
 			}
 			slog.Warn("capacity-cap filter empty; routing without it (all candidates at capacity)", "model", model)
 		} else if len(capped) < len(pool) {
@@ -1967,6 +1980,60 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 		}
 	}
 	return r.selectWithSwapProtection(ctx, pool, model, now)
+}
+
+// selectWithoutParking selects for a request that must not park (inference.Request.NoPark)
+// from ac's pool, whose every candidate is at its cap. It prefers the least loaded
+// instance candidates (leastLoadedInstances) and falls back to the whole pool -- the way
+// a resolver without a queue fails open -- when there is none, or none of them is
+// viable. It first hands the sink ac's demand, once and without asking the queue for
+// room (signalDemand does both for a parking request): the request is served now, so no
+// park turn will signal for it, and a selection that found no free instance is demand
+// already known. model only labels the log lines of the selection.
+func (r *Resolver) selectWithoutParking(ctx context.Context, ac *atCapacityError, model string, now time.Time) (MappingCandidate, bool, error) {
+	if ac.demand != nil && r.demand != nil {
+		r.demand.Signal(*ac.demand)
+	}
+	var sel MappingCandidate
+	ok := false
+	var err error
+	if least := leastLoadedInstances(ac.pool, r.instanceActivity); len(least) > 0 {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, least, model, now); err != nil {
+			return MappingCandidate{}, false, err
+		}
+	}
+	if !ok {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, now); err != nil || !ok {
+			return MappingCandidate{}, false, err
+		}
+	}
+	sel.InstancePool = ac.instancePool
+	return sel, true, nil
+}
+
+// leastLoadedInstances is the instance candidates of pool with the fewest requests in
+// flight (activity; with no source every instance's load is unknown and they all tie),
+// so a request that must be served while every instance is busy queues inside the one
+// closest to taking it. nil when pool holds no instance candidate.
+func leastLoadedInstances(pool []MappingCandidate, activity InstanceActivityChecker) []MappingCandidate {
+	var least []MappingCandidate
+	low := 0
+	for _, c := range pool {
+		if !c.InstanceCapable {
+			continue
+		}
+		load := 0
+		if activity != nil {
+			load = activity.InstanceActivity(InstanceKey(c.Mapping.ID, c.Instance))
+		}
+		switch {
+		case least == nil || load < low:
+			least, low = []MappingCandidate{c}, load
+		case load == low:
+			least = append(least, c)
+		}
+	}
+	return least
 }
 
 // needsFreeLiveSlot reports whether req can only be served by an instance whose live
@@ -2544,19 +2611,33 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 // parks: the distinct candidate server ids to watch, the MAX
 // admission_queue_timeout_seconds across their candidates (mirroring the main Resolve
 // admission-param computation), and the demand each member whose candidates include an
-// instance signals -- one per member, by its own model and mappings.
+// instance signals -- one per member, by its own model and mappings. first is the
+// earliest at-capacity member in walk order, with its capped selection: what a request
+// that must not park is served from instead of waiting.
 type parkMaterial struct {
 	servers   []string
 	queueSecs int
 	demand    []DemandSignal
+	first     *atCapacityMember
+}
+
+// atCapacityMember is one group member found at capacity: its name and the capped
+// selection selectCandidate refused it with.
+type atCapacityMember struct {
+	name string
+	ac   *atCapacityError
 }
 
 // add folds one more at-capacity member's material into p: its servers, its queue
-// timeout if larger, and its demand unless a member of the same model already gave one
-// (a duplicated member name is walked twice but needs one more instance once).
+// timeout if larger, its demand unless a member of the same model already gave one
+// (a duplicated member name is walked twice but needs one more instance once), and the
+// member itself when it is the first.
 func (p *parkMaterial) add(m parkMaterial) {
 	p.servers = append(p.servers, m.servers...)
 	p.queueSecs = max(p.queueSecs, m.queueSecs)
+	if p.first == nil {
+		p.first = m.first
+	}
 	for _, d := range m.demand {
 		if !slices.ContainsFunc(p.demand, func(have DemandSignal) bool { return have.Model == d.Model }) {
 			p.demand = append(p.demand, d)
@@ -2590,6 +2671,10 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 		pm := parkMaterial{servers: distinctServerIDs(cands), queueSecs: maxQueueTimeoutSecs(cands)}
 		if d, has := parkDemand(serr); has {
 			pm.demand = []DemandSignal{d}
+		}
+		var ac *atCapacityError
+		if errors.As(serr, &ac) {
+			pm.first = &atCapacityMember{name: name, ac: ac}
 		}
 		return MappingCandidate{}, memberAtCapacity, pm, nil
 	}
@@ -2917,6 +3002,18 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		}
 		if name != "" {
 			return serve(name, sel)
+		}
+		if g.req.NoPark && park.first != nil {
+			// Every member at capacity and the request must not wait: it is served by
+			// the first of them in walk order, which signals its own demand.
+			sel, ok, serr := r.selectWithoutParking(ctx, park.first.ac, park.first.name, g.now)
+			if serr != nil {
+				return Target{}, serr
+			}
+			if !ok {
+				return Target{}, ErrNoHealthyHost
+			}
+			return serve(park.first.name, sel)
 		}
 		if len(park.servers) > 0 && r.admission != nil {
 			queueTimeout := time.Duration(park.queueSecs) * time.Second
