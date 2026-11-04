@@ -446,12 +446,18 @@ type AgentTransportReader interface {
 // AgentFeatureReader exposes the feature names each server's ServerAgent
 // declared in its last telemetry sample, so the runtime-config document can
 // carry what only an agent with a given feature understands
-// (AgentFeatureRuntimeInstances). false -- for a nil reader, a server never
-// heard from, and an agent that does not declare the name -- is the safe
-// default: the document then stays the one every agent understands.
-// Satisfied by the gateway's agent-features registry.
+// (AgentFeatureRuntimeInstances). Has is false for a server never heard from
+// and for an agent that does not declare the name. Known tells the two apart:
+// it is true once serverID's agent has declared its set since this gateway
+// started -- an empty set included -- and false before that, and after a
+// declaration that could not be read. A document that depends on a feature of
+// an agent that is not Known is held rather than served as the older agent's
+// (AgentRuntimeConfigDTO.AwaitsAgentFeatures). A nil reader counts every
+// agent as known, without any feature. Satisfied by the gateway's
+// agent-features registry.
 type AgentFeatureReader interface {
 	Has(serverID, feature string) bool
+	Known(serverID string) bool
 }
 
 type ServiceDeps struct {

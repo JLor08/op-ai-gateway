@@ -227,6 +227,38 @@ func (r *agentFeaturesRegistry) Has(serverID, feature string) bool {
 	return false
 }
 
+// Known reports whether serverID's agent has declared its feature set since
+// this registry was built -- an empty set included -- as distinct from a
+// server not heard from yet, or whose last declaration could not be read
+// (Forget). Has answers false for both; the runtime-config document tells them
+// apart, holding a document that depends on a feature of an agent that is not
+// known rather than serving it the document of an agent without it
+// (portal.AgentRuntimeConfigDTO.AwaitsAgentFeatures). false for a nil
+// registry.
+func (r *agentFeaturesRegistry) Known(serverID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.features[serverID]
+	return ok
+}
+
+// Forget drops serverID's declared feature set, so the server reads as not
+// heard from (Known false, Has false). The telemetry ingest calls it for a
+// sample whose capabilities could not be read: such a sample says nothing
+// about the agent's binary, which an empty set would claim lacks every
+// feature. No-op on a nil registry or an empty server id.
+func (r *agentFeaturesRegistry) Forget(serverID string) {
+	if r == nil || serverID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.features, serverID)
+}
+
 // Retain evicts the declared feature sets of servers no longer in live
 // (mirrors runtimeStatusRegistry.Retain below and AgentCertReportRegistry.
 // Retain, called at the end of every app-health cycle): a deleted server's

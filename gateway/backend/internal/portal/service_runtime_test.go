@@ -4037,11 +4037,17 @@ func instanceSpecFixture(t *testing.T, svc *Service, routeStore *routing.MemoryS
 }
 
 // fakeAgentFeatures is an AgentFeatureReader over a fixed declared set per
-// server id.
+// server id. A server with an entry -- an empty one included -- has declared
+// its set; one without has not been heard from.
 type fakeAgentFeatures map[string][]string
 
 func (f fakeAgentFeatures) Has(serverID, feature string) bool {
 	return slices.Contains(f[serverID], feature)
+}
+
+func (f fakeAgentFeatures) Known(serverID string) bool {
+	_, ok := f[serverID]
+	return ok
 }
 
 // newInstanceIdleTestService is newServerTestService with the two idle-timeout

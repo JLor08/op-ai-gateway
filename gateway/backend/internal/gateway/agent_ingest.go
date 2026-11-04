@@ -2071,7 +2071,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// aggregate -- see runtimeModelProbeFeature's doc for why this
 	// agent-declared capability is checked via membership rather than
 	// advertised in gatewayAgentFeatures.
-	caps := parseAgentCapabilities(req.Capabilities)
+	caps, capsReadable := parseAgentCapabilities(req.Capabilities)
 	telemetry, err := telemetryFromRequest(req, raw, now)
 	if err != nil {
 		return &invalidPayloadError{cause: err}
@@ -2154,21 +2154,32 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// AgentCertReports/AgentProxyStatus above: a report is evidence about
 	// this agent's own binary, and stamping it while the sample itself
 	// failed to persist would claim freshness the gateway does not have.
-	// Tolerant: a malformed capabilities blob yields an empty feature set
-	// (PushRuntimeConfig then correctly withholds delivery) rather than
-	// rejecting the whole sample -- see parseAgentCapabilities. Reuses caps
-	// (parsed once, above) rather than re-parsing req.Capabilities.
+	// Tolerant: a malformed capabilities blob does not reject the whole
+	// sample -- see parseAgentCapabilities. It forgets the server's
+	// declaration instead, so the server reads as not heard from: no feature
+	// is declared (PushRuntimeConfig then correctly withholds delivery), and a
+	// runtime-config document that depends on what the agent declares is held
+	// rather than derived from a declaration of nothing. Reuses caps (parsed
+	// once, above) rather than re-parsing req.Capabilities.
+	knewFeatures := s.AgentFeatures.Known(serverID)
 	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
-	s.AgentFeatures.Set(serverID, caps)
+	if capsReadable {
+		s.AgentFeatures.Set(serverID, caps)
+	} else {
+		s.AgentFeatures.Forget(serverID)
+	}
 	// The runtime-config document carries a replicable spec's instance
 	// settings only for an agent that declares runtime_instances
-	// (portal.Service.specAsPushed), so a change of that declaration changes
-	// the document, and a document input that changed is pushed (THE RULE on
-	// portal.Service.notifyRuntimeChanged). The common case is the first
-	// sample after a gateway start, before which nothing was known: without
-	// the push an agent that fetched its document in that window would run
-	// its replicable specs as single processes until its next poll.
-	if slices.Contains(caps, runtimeInstancesFeature) != hadInstances {
+	// (portal.Service.specAsPushed), and is held while the declaration is not
+	// known (portal.AgentRuntimeConfigDTO.AwaitsAgentFeatures): the agent's
+	// fetch is answered 503 and it keeps the document it applied. So a sample
+	// that makes the declaration known -- the first after a gateway start, or
+	// the first readable one after a blob that could not be read -- pushes the
+	// document, which may have been held until now, and so does one that
+	// changes runtime_instances, since a document input that changed is pushed
+	// (THE RULE on portal.Service.notifyRuntimeChanged). An unreadable sample
+	// pushes nothing: it holds the document.
+	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances) {
 		s.PushRuntimeConfig(serverID)
 	}
 	// Record WHICH runtime-config document this agent says it has APPLIED, and
@@ -2259,15 +2270,21 @@ type agentCapabilitiesReport struct {
 // ingestTelemetrySample): a garbled or forward-incompatible capabilities blob
 // from a future agent build must not stop routing telemetry from reaching
 // the gateway.
-func parseAgentCapabilities(raw json.RawMessage) []string {
+//
+// readable tells the two nil sets apart. An absent blob, or one that parses,
+// is a readable declaration: the agent declares exactly that, possibly
+// nothing (an older binary). A blob that does not parse is not, and says
+// nothing about the agent's binary, so the ingest forgets the server's
+// declaration rather than recording an empty one (agentFeaturesRegistry.Forget).
+func parseAgentCapabilities(raw json.RawMessage) (features []string, readable bool) {
 	if len(raw) == 0 {
-		return nil
+		return nil, true
 	}
 	var report agentCapabilitiesReport
 	if err := json.Unmarshal(raw, &report); err != nil {
-		return nil
+		return nil, false
 	}
-	return report.Features
+	return report.Features, true
 }
 
 // proxyRouteStatusesFromSamples maps the wire-decoded ProxyRouteSample slice to

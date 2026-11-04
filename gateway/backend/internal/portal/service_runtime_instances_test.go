@@ -5,9 +5,11 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"testing"
 )
 
@@ -195,22 +197,30 @@ func TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances(t *testing
 	if err := routeStore.UpdateRuntimeSpecStartupMeasured(ctx, put.ID, 30000); err != nil {
 		t.Fatalf("UpdateRuntimeSpecStartupMeasured: %v", err)
 	}
+	// An agent not heard from yet is neither: its document is derived as
+	// stored and held (AwaitsAgentFeatures), never served as the older
+	// agent's -- TestAgentRuntimeDocHeldUntilTheAgentDeclaresItsFeatures.
 	cases := []struct {
 		name      string
 		features  AgentFeatureReader
 		instances bool
 		wantIdle  int
+		held      bool
 	}{
-		{"an agent that runs instances", fakeAgentFeatures{serverID: {"runtime_manager", AgentFeatureRuntimeInstances}}, true, 150},
-		{"an older agent", fakeAgentFeatures{serverID: {"runtime_manager"}}, false, 45},
-		{"another server's agent runs instances", fakeAgentFeatures{"srv_other": {AgentFeatureRuntimeInstances}}, false, 45},
-		{"no feature reader", nil, false, 45},
+		{"an agent that runs instances", fakeAgentFeatures{serverID: {"runtime_manager", AgentFeatureRuntimeInstances}}, true, 150, false},
+		{"an older agent", fakeAgentFeatures{serverID: {"runtime_manager"}}, false, 45, false},
+		{"an agent that declared nothing", fakeAgentFeatures{serverID: nil}, false, 45, false},
+		{"an agent not heard from yet", fakeAgentFeatures{"srv_other": {AgentFeatureRuntimeInstances}}, true, 150, true},
+		{"no feature reader", nil, false, 45, false},
 	}
 	for _, tc := range cases {
 		svc.agentFeatures = tc.features
 		doc, err := svc.AgentRuntimeConfig(ctx, serverID)
 		if err != nil || len(doc.Specs) != 1 {
 			t.Fatalf("%s: AgentRuntimeConfig: %d specs, err %v", tc.name, len(doc.Specs), err)
+		}
+		if doc.AwaitsAgentFeatures != tc.held {
+			t.Errorf("%s: AwaitsAgentFeatures = %v, want %v", tc.name, doc.AwaitsAgentFeatures, tc.held)
 		}
 		keys := wireKeys(t, doc.Specs[0])
 		for _, key := range []string{"replicable", "min_instances", "max_instances"} {
@@ -229,5 +239,72 @@ func TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances(t *testing
 			t.Errorf("%s: portal effective %d manual %d replicable %v, want effective %d (the pushed value), manual 45, replicable true",
 				tc.name, dto.EffectiveIdleTimeoutSeconds, dto.IdleTimeoutSeconds, dto.Replicable, tc.wantIdle)
 		}
+	}
+}
+
+// TestAgentRuntimeDocHeldUntilTheAgentDeclaresItsFeatures pins the document of
+// a server whose agent the gateway has not heard from -- after a gateway
+// start, until the agent's first telemetry sample. Serving it the older
+// agent's document would tell an agent that runs instances that no spec is
+// replicable, and it would retire every instance beyond the first, the
+// protected ones included, until the declaration arrived. So a document that
+// depends on the declaration (an enabled replicable spec) is held, derived as
+// stored, and the hold is not part of the wire document or its ETag: once the
+// declaration is known, the document an instance agent gets is the same one,
+// byte for byte. A document that does not depend on it -- no replicable
+// spec, or the replicable spec disabled -- is never held.
+func TestAgentRuntimeDocHeldUntilTheAgentDeclaresItsFeatures(t *testing.T) {
+	ctx := context.Background()
+	svc, _, mappingID, serverID := instanceSpecFixture(t, nil, nil)
+	put := func(t *testing.T, enabled, replicable bool) {
+		t.Helper()
+		req := PutRuntimeSpecRequest{Enabled: enabled, Binary: "/usr/local/bin/llama-server", IdleTimeoutSeconds: 45}
+		if replicable {
+			req.Replicable, req.MinInstances, req.MaxInstances = true, 2, 3
+		}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req); err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+	}
+	doc := func(t *testing.T, features AgentFeatureReader) AgentRuntimeConfigDTO {
+		t.Helper()
+		svc.agentFeatures = features
+		dto, err := svc.AgentRuntimeConfig(ctx, serverID)
+		if err != nil {
+			t.Fatalf("AgentRuntimeConfig: %v", err)
+		}
+		return dto
+	}
+	unknown := fakeAgentFeatures{}
+	instanceAgent := fakeAgentFeatures{serverID: {"runtime_manager", AgentFeatureRuntimeInstances}}
+
+	put(t, true, true)
+	held := doc(t, unknown)
+	if !held.AwaitsAgentFeatures {
+		t.Fatal("a replicable spec's document for an agent not heard from: AwaitsAgentFeatures = false, want held")
+	}
+	if len(held.Specs) != 1 || !held.Specs[0].Replicable || held.Specs[0].MinInstances != 2 || held.Specs[0].MaxInstances != 3 {
+		t.Fatalf("held document specs = %+v, want the spec as stored (replicable 2..3)", held.Specs)
+	}
+	known := doc(t, instanceAgent)
+	if known.AwaitsAgentFeatures || known.ETag != held.ETag {
+		t.Fatalf("an instance agent's document: held %v etag %s, want served with the held document's etag %s",
+			known.AwaitsAgentFeatures, known.ETag, held.ETag)
+	}
+	raw, err := json.Marshal(held)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(strings.ToLower(string(raw)), "await") {
+		t.Fatalf("the hold reached the wire document: %s", raw)
+	}
+
+	put(t, false, true)
+	if doc(t, unknown).AwaitsAgentFeatures {
+		t.Fatal("a disabled replicable spec held the document")
+	}
+	put(t, true, false)
+	if doc(t, unknown).AwaitsAgentFeatures {
+		t.Fatal("a document without a replicable spec was held")
 	}
 }

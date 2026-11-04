@@ -92,29 +92,42 @@ func TestAgentFeatureRuntimeInstancesNamesOneFeature(t *testing.T) {
 // follows a change of the agent's runtime_instances declaration: the
 // runtime-config document carries a replicable spec's instance settings only
 // for an agent that declares it, so the declaration is an input of the
-// document, and a sample that changes it -- the first sample after a gateway
-// start included, before which nothing was known -- pushes the new document
-// at once instead of leaving it to the agent's next poll. A sample that
-// repeats the declaration pushes nothing.
+// document, and a sample that changes it pushes the new document at once
+// instead of leaving it to the agent's next poll. A sample that makes the
+// declaration known pushes too, whatever it declares -- the first sample after
+// a gateway start, or the first readable one after a blob that could not be
+// read -- because a document that depends on it was held until then. A sample
+// that repeats the declaration pushes nothing, and neither does an unreadable
+// one: it makes the declaration unknown, which holds the document.
 func TestIngestPushesTheRuntimeConfigWhenRuntimeInstancesFlips(t *testing.T) {
 	srv := NewTestServer()
 	spy := spyRuntimeConfigPushes(srv)
-	ingest := func(t *testing.T, features string) {
+	ingestCaps := func(t *testing.T, capabilities string) {
 		t.Helper()
-		req, raw := ingestReq(t, `{"host":{"cpu_util_pct":1},"capabilities":{"features":[`+features+`]}}`)
+		req, raw := ingestReq(t, `{"host":{"cpu_util_pct":1},"capabilities":`+capabilities+`}`)
 		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
 			t.Fatalf("ingest: %v", err)
 		}
 	}
+	ingest := func(t *testing.T, features string) {
+		t.Helper()
+		ingestCaps(t, `{"features":[`+features+`]}`)
+	}
 
 	ingest(t, `"runtime_manager"`)
-	spy.expectNoPush(t, "a first sample without runtime_instances", "mock-host-qwen")
+	spy.expectPush(t, "a first sample, which makes the declaration known", "mock-host-qwen")
+	ingest(t, `"runtime_manager"`)
+	spy.expectNoPush(t, "the same declaration again", "mock-host-qwen")
 	ingest(t, `"runtime_manager","runtime_instances"`)
 	spy.expectPush(t, "runtime_instances declared", "mock-host-qwen")
 	ingest(t, `"runtime_manager","runtime_instances"`)
 	spy.expectNoPush(t, "the same declaration again", "mock-host-qwen")
 	ingest(t, `"runtime_manager"`)
 	spy.expectPush(t, "runtime_instances withdrawn", "mock-host-qwen")
+	ingestCaps(t, `"not-an-object"`)
+	spy.expectNoPush(t, "an unreadable declaration", "mock-host-qwen")
+	ingest(t, `"runtime_manager"`)
+	spy.expectPush(t, "a readable declaration after an unreadable one", "mock-host-qwen")
 }
 
 // instanceIngestStore wraps a MemoryStore and records every write the

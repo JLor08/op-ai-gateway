@@ -504,9 +504,11 @@ type RuntimeSpecDTO struct {
 	// StartupMeasuredMS is the agent's measured startup time of the spec in ms
 	// (0 = nothing measured yet), and EffectiveIdleTimeoutSeconds is the idle
 	// timeout the runtime-config document pushes for the spec: for a
-	// replicable spec on a server whose agent declares runtime_instances
-	// derived from that measurement and the mapping's benchmark cold start
-	// (effectiveIdleTimeout), otherwise the stored idle_timeout_seconds. Both
+	// replicable spec on a server whose agent declares runtime_instances (or
+	// has not declared its features yet, while its document is held -- see
+	// AgentRuntimeConfigDTO.AwaitsAgentFeatures) derived from that measurement
+	// and the mapping's benchmark cold start (effectiveIdleTimeout), otherwise
+	// the stored idle_timeout_seconds. Both
 	// are READ-ONLY echoes with no
 	// PutRuntimeSpecRequest counterpart -- the first is agent-owned and the
 	// store keeps it across every write, the second is derived on every read
@@ -2505,10 +2507,13 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //
 // One input of the document is not a row: whether the server's agent declares
 // the runtime_instances feature (AgentFeatureReader, Service.specAsPushed),
-// which decides whether a replicable spec goes out with its instance settings.
-// The agent declares it in its telemetry, outside this service, so the
-// gateway's ingest pushes that server's document itself when the declaration
-// changes (gateway.Server.ingestTelemetrySample).
+// which decides whether a replicable spec goes out with its instance settings,
+// and whether the gateway knows that declaration at all -- a document that
+// depends on it is held until it is known (AgentRuntimeConfigDTO.
+// AwaitsAgentFeatures). The agent declares it in its telemetry, outside this
+// service, so the gateway's ingest pushes that server's document itself when
+// the declaration becomes known or changes (gateway.Server.
+// ingestTelemetrySample).
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
@@ -2696,9 +2701,11 @@ type AgentRuntimeSpecDTO struct {
 	// tags): whether the agent may run several instances of the spec, how
 	// many it keeps up (0 = none) and how many it may run (0 = unbounded).
 	// All three are omitempty and set only for a replicable spec pushed to an
-	// agent that declares the runtime_instances feature (Service.specAsPushed),
-	// so the document of a spec that is not replicable, and every document an
-	// older agent gets, is the one it was before instances existed. An agent
+	// agent that declares the runtime_instances feature (Service.specAsPushed;
+	// a document held for an agent not heard from yet carries them too, and
+	// reaches no agent), so the document of a spec that is not replicable, and
+	// every document an older agent gets, is the one it was before instances
+	// existed. An agent
 	// with the feature honours replicable only while this gateway declares
 	// that feature too. The per-instance parallelism is the gateway's own cap
 	// and is never pushed.
@@ -2729,6 +2736,24 @@ type AgentRuntimeConfigDTO struct {
 	Specs        []AgentRuntimeSpecDTO `json:"specs"`
 	Coresident   [][2]string           `json:"coresident"`
 	ETag         string                `json:"etag"`
+	// AwaitsAgentFeatures marks a document that depends on what serverID's
+	// agent declares while the gateway has not heard that declaration: an
+	// enabled replicable spec, whose instance settings and idle timeout differ
+	// between an agent that runs instances and one that does not, on a server
+	// whose agent has not declared its features since this gateway started (or
+	// whose last declaration could not be read). Such a document is HELD, not
+	// delivered: the gateway answers the agent's fetch with a 503, which the
+	// agent meets by keeping the document it applied, and the push path sends
+	// nothing; the telemetry ingest pushes the document once the declaration is
+	// known. Serving the older agent's document instead would make an agent
+	// that runs instances retire every instance beyond the first -- the
+	// protected ones included -- until the declaration arrived.
+	//
+	// The specs of a held document are derived as stored, as for an agent that
+	// runs instances (Service.specAsPushed). The flag itself is never on the
+	// wire, and so not in the ETag: the document an instance agent gets once
+	// the declaration is known is the held one, byte for byte.
+	AwaitsAgentFeatures bool `json:"-"`
 }
 
 // AgentRuntimeConfig derives serverID's runtime-config document -- the server
@@ -2876,6 +2901,11 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	}
 	specIDByMapping := make(map[string]string, len(specs))
 	specDTOs := make([]AgentRuntimeSpecDTO, 0, len(specs))
+	// A replicable spec makes the document depend on the agent's
+	// runtime_instances declaration, so while that is unknown the document is
+	// held (AgentRuntimeConfigDTO.AwaitsAgentFeatures).
+	_, featuresKnown := s.agentRunsInstances(serverID)
+	awaitsFeatures := false
 	for _, spec := range specs {
 		if !spec.Enabled {
 			continue
@@ -2894,6 +2924,7 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		// The spec as this server's agent can run it: without the instance
 		// settings for an agent that does not declare runtime_instances.
 		pushed := s.specAsPushed(serverID, spec)
+		awaitsFeatures = awaitsFeatures || (spec.Replicable && !featuresKnown)
 		specDTO, err := agentRuntimeSpecDTO(pushed, mapping, gpus, s.effectiveIdleTimeout(serverID, spec, mapping))
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
@@ -2928,7 +2959,9 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		return AgentRuntimeConfigDTO{}, err
 	}
 	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
-	return agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses), nil
+	dto := agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses)
+	dto.AwaitsAgentFeatures = awaitsFeatures
+	return dto, nil
 }
 
 // effectiveAllowedPairs computes the list of spec-id pairs the agent may keep
@@ -3200,21 +3233,41 @@ func derivedIdleSeconds(factor float64, startupMS int64) int {
 // (runtimeInstancesFeature) and pins the two together.
 const AgentFeatureRuntimeInstances = "runtime_instances"
 
+// agentRunsInstances reports whether serverID's agent declares
+// AgentFeatureRuntimeInstances, and whether this gateway knows its declaration
+// at all (AgentFeatureReader.Known). A nil reader knows every agent, as one
+// without the feature.
+func (s *Service) agentRunsInstances(serverID string) (runs, known bool) {
+	if s.agentFeatures == nil {
+		return false, true
+	}
+	if !s.agentFeatures.Known(serverID) {
+		return false, false
+	}
+	return s.agentFeatures.Has(serverID, AgentFeatureRuntimeInstances), true
+}
+
 // specAsPushed is spec as serverID's runtime-config document carries it:
-// unchanged for an agent that declares AgentFeatureRuntimeInstances, and
-// otherwise with Replicable cleared, so the document has no instance keys and
-// pushes the stored manual idle timeout -- exactly the document it was before
-// instances existed. An agent without the feature runs every spec as one
-// process whatever the document says, so a derived idle timeout would only
-// unload that one process after a span the operator never set, where a manual
-// 0 meant "never". An agent the gateway has not heard from yet counts as one
-// without the feature; its first telemetry sample declares it, and that change
-// is pushed (gateway.Server.ingestTelemetrySample).
+// unchanged for an agent that declares AgentFeatureRuntimeInstances, and for
+// an agent known to lack it with Replicable cleared, so the document has no
+// instance keys and pushes the stored manual idle timeout -- exactly the
+// document it was before instances existed. An agent without the feature runs
+// every spec as one process whatever the document says, so a derived idle
+// timeout would only unload that one process after a span the operator never
+// set, where a manual 0 meant "never".
+//
+// An agent the gateway has not heard from yet (after a gateway start, until
+// its first telemetry sample) is neither, and keeps the spec as stored: a
+// document with a replicable spec is then held rather than served
+// (AgentRuntimeConfigDTO.AwaitsAgentFeatures), and the portal's echo of the
+// effective idle timeout shows the value the operator's settings derive. Its
+// first telemetry sample makes the declaration known, and the ingest pushes
+// the document then (gateway.Server.ingestTelemetrySample).
 //
 // The stored spec, and the portal's view of its settings, keep Replicable as
 // the operator saved it; only the derived values follow this.
 func (s *Service) specAsPushed(serverID string, spec routing.RuntimeSpec) routing.RuntimeSpec {
-	if s.agentFeatures == nil || !s.agentFeatures.Has(serverID, AgentFeatureRuntimeInstances) {
+	if runs, known := s.agentRunsInstances(serverID); known && !runs {
 		spec.Replicable = false
 	}
 	return spec
