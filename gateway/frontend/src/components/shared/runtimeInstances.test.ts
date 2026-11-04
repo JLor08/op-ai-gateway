@@ -53,20 +53,30 @@ describe('instanceIndex', () => {
   });
 });
 
+// The gateway's representative-row rule (representativeRowIndex in
+// runtime_registry.go), so the portal's runtime list and the models catalog
+// read the same row as a spec's.
 describe('primaryStatusRows', () => {
-  it('picks instance 0 wherever the stream lists it', () => {
-    const picked = primaryStatusRows([row('s', 1), row('s', 2), row('s', 0, 'starting')]);
+  it('picks the running instance 0 first, wherever the stream lists it', () => {
+    const picked = primaryStatusRows([row('s', 1), row('s', 2), row('s', 0)]);
+    expect(picked.get('s')?.instance).toBe(0);
+  });
+
+  it('prefers a running instance over an instance 0 that does not run', () => {
+    // A crashed instance 0 beside a burst instance that serves must not read
+    // the model as down.
+    const picked = primaryStatusRows([row('s', 0, 'crashed'), row('s', 3), row('s', 2)]);
+    expect(picked.get('s')?.instance).toBe(2);
+  });
+
+  it('without a running row, picks instance 0', () => {
+    const picked = primaryStatusRows([row('s', 1, 'starting'), row('s', 0, 'starting')]);
     expect(picked.get('s')).toMatchObject({ instance: 0, state: 'starting' });
   });
 
-  it('without an instance-0 row, picks the first running instance', () => {
-    const picked = primaryStatusRows([row('s', 1, 'starting'), row('s', 2), row('s', 3)]);
-    expect(picked.get('s')?.instance).toBe(2);
-  });
-
-  it('with neither, falls back to the first row, so the spec still has a state to show', () => {
+  it('with neither, picks the lowest instance, so the spec still has a state to show', () => {
     const picked = primaryStatusRows([row('s', 2, 'starting'), row('s', 1, 'crashed')]);
-    expect(picked.get('s')?.instance).toBe(2);
+    expect(picked.get('s')?.instance).toBe(1);
   });
 
   it('picks per spec id', () => {
@@ -91,8 +101,14 @@ describe('restartGate', () => {
 
   it('is closed on the state of the row that speaks for the spec', () => {
     expect(restartGate([row('s', 0, 'stopped')], 's', restartable, undefined)).toBe('state');
+    // Instance 0 speaks while no row runs.
     expect(
-      restartGate([row('s', 0, 'not_permitted'), row('s', 1)], 's', restartable, undefined),
+      restartGate(
+        [row('s', 0, 'not_permitted'), row('s', 1, 'starting')],
+        's',
+        restartable,
+        undefined,
+      ),
     ).toBe('state');
     expect(restartGate([row('t', 0)], 's', restartable, undefined)).toBe('state');
   });

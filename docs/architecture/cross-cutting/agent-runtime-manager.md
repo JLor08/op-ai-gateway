@@ -8280,8 +8280,11 @@ same function as the pushed document, so the two cannot disagree); neither has a
   with an **Instance** column (`#k`); the spec list's live-status column
   aggregates (`2 running · min 1 · max ∞`). Where one row has to speak for a spec
   — its state chip, RAM and probe columns, the spec-wide override actions — it is
-  the instance-0 row, else the first running row, else the first row
-  (`primaryStatusRows`, the gateway's own fold pick). The restart sequence waits
+  the running instance-0 row, else the running row with the lowest index, else
+  the instance-0 row, else the row with the lowest index (`primaryStatusRows`,
+  the gateway's own rule, `representativeRowIndex`), so the runtime list never
+  shows a spec in a state the models catalog does not: a crashed instance 0
+  beside a burst instance that serves does not read the model as down. The restart sequence waits
   for **every** row of the spec to stop (`specStopState`), since under
   `force_stopped` all instances drain at once, so its state gate reads every row
   too (`restartGate`): the speaking row must be in a restartable state, and every

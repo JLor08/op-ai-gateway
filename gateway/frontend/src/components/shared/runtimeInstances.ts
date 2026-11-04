@@ -34,14 +34,17 @@ export function instanceIndex(row: Pick<RuntimeStatus, 'instance'>): number {
  * carries the spec-wide override actions, and the first half of the restart
  * action's state gate (restartGate, which also reads every other row).
  *
- * The pick, per spec id: the first instance-0 row wherever the stream lists
- * it; else the first `running` row; else the first row. The first two steps
- * are the gateway's own fold pick (foldInstanceRows / primaryRowIndexes in
- * agent_ingest.go), which reads its context size and capability verdicts from
- * that row; the gateway stops there and leaves a spec with neither without a
- * speaking row, while the portal falls back to the first row so the spec still
- * shows a state. Instance 0 first because it is the only row a spec that is not
- * replicable has, and the one its plain address names.
+ * The gateway's representative-row rule (representativeRowIndex in
+ * runtime_registry.go), which every gateway view of a spec reads -- the models
+ * catalog's state and probes, the context and capability write-backs -- so the
+ * portal never shows a spec in a state the catalog does not: the running
+ * instance-0 row; else the running row with the lowest instance index; else
+ * the instance-0 row; else the row with the lowest index; the first listed
+ * among rows the rule cannot tell apart. A running row first, because it is
+ * the one serving: a crashed or idled-out instance 0 beside a burst instance
+ * that serves must not read the model as down. Instance 0 first among equals,
+ * because it is the only row a spec that is not replicable has, and the one
+ * its plain address names.
  *
  * It is NOT the spec's stop signal: under force_stopped every instance drains
  * at once, so instance 0 need not stop last -- the restart sequence waits on
@@ -49,13 +52,17 @@ export function instanceIndex(row: Pick<RuntimeStatus, 'instance'>): number {
  */
 export function primaryStatusRows(rows: readonly RuntimeStatus[]): Map<string, RuntimeStatus> {
   const rank = (row: RuntimeStatus) => {
-    if (instanceIndex(row) === 0) return 0;
-    return row.state === 'running' ? 1 : 2;
+    const running = row.state === 'running';
+    const first = instanceIndex(row) === 0;
+    if (running) return first ? 0 : 1;
+    return first ? 2 : 3;
   };
+  const before = (a: RuntimeStatus, b: RuntimeStatus) =>
+    rank(a) < rank(b) || (rank(a) === rank(b) && instanceIndex(a) < instanceIndex(b));
   const bySpec = new Map<string, RuntimeStatus>();
   for (const row of rows) {
     const current = bySpec.get(row.spec_id);
-    if (current === undefined || rank(row) < rank(current)) bySpec.set(row.spec_id, row);
+    if (current === undefined || before(row, current)) bySpec.set(row.spec_id, row);
   }
   return bySpec;
 }

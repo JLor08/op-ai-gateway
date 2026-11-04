@@ -3797,7 +3797,7 @@ export function RuntimeAdminSection({
           />
         );
         // A replicable spec's chip is the state of the row that speaks for it
-        // (instance 0's, see primaryStatusRows); how many instances run,
+        // (a running one first, see primaryStatusRows); how many instances run,
         // against the bounds, is the line under it. Only once the agent
         // reports the spec at all -- with no row, "0 running" would be a
         // claim nobody made.

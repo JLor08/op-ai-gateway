@@ -11275,7 +11275,10 @@ describe('RuntimeAdminSection per-instance live status', () => {
     expect(screen.queryByText(t.runtimeLogsAllInstances)).not.toBeInTheDocument();
   });
 
-  it("shows instance 0's state for the spec, whichever instance the stream lists last", async () => {
+  // The gateway's representative-row rule: a running instance speaks for the
+  // spec before an instance 0 that does not run yet, so the chip agrees with
+  // the models catalog and a serving model never reads as down.
+  it('shows a running instance as the spec state while instance 0 is still starting', async () => {
     renderInstances([instanceRow(0, { state: 'starting' }), instanceRow(1)]);
 
     await screen.findByText(t.runtimeInstancesSummary(1, 1, null));
@@ -11285,7 +11288,7 @@ describe('RuntimeAdminSection per-instance live status', () => {
     // by letter case.
     const chips = cell.querySelectorAll('[data-status]');
     expect(chips).toHaveLength(1);
-    expect(chips[0].textContent).toBe(t.runtimeStateStarting);
+    expect(chips[0].textContent).toBe(t.runtimeStateRunning);
   });
 
   // The override actions build their PUT from the loaded spec: a replicable
