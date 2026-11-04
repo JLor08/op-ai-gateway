@@ -1524,7 +1524,21 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 	if !r.overrideServes(pinned.Server, pinned.Application.ID, req) {
 		return Target{}, ErrServerOverrideServerUnavailable
 	}
-	servesNow := func(ctx context.Context) error {
+	c, _, err := r.selectPinned(ctx, pinned, req, req.PreferredInstanceKey, now, r.overrideServesNow(pinned, req))
+	if errors.Is(err, errPinnedInstancesGone) {
+		return Target{}, ErrNoHealthyHost
+	}
+	if err != nil {
+		return Target{}, err
+	}
+	return r.targetFrom(ctx, c, apiFlavor)
+}
+
+// overrideServesNow is the re-check selectPinned runs on an overridden request after
+// every wait: it reloads pinned's server and answers ErrServerOverrideServerUnavailable
+// when the server is gone or no longer passes overrideServes.
+func (r *Resolver) overrideServesNow(pinned MappingCandidate, req inference.Request) func(context.Context) error {
+	return func(ctx context.Context) error {
 		server, err := r.store.AIServerByID(ctx, pinned.Server.ID)
 		if errors.Is(err, storeerr.ErrNotFound) || (err == nil && !r.overrideServes(server, pinned.Application.ID, req)) {
 			return ErrServerOverrideServerUnavailable
@@ -1534,14 +1548,6 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 		}
 		return nil
 	}
-	c, _, err := r.selectPinned(ctx, pinned, req, req.PreferredInstanceKey, now, servesNow)
-	if errors.Is(err, errPinnedInstancesGone) {
-		return Target{}, ErrNoHealthyHost
-	}
-	if err != nil {
-		return Target{}, err
-	}
-	return r.targetFrom(ctx, c, apiFlavor)
 }
 
 // overrideServes reports whether a server override may route to server, whose
@@ -1821,29 +1827,9 @@ func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID stri
 // the principal is neither served nor touched (its LastUsedAt/UpdatedAt stay as they
 // were), and the request never waits for an instance there.
 func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key AffinityKey, req inference.Request, now time.Time) (Target, bool, error) {
-	fineFlavor, required := req.APIFlavor, req.RequiredCapabilities
-	affinity, ok, err := r.store.Affinity(ctx, key)
-	if err != nil {
-		return Target{}, false, fmt.Errorf("lookup affinity: %w", err)
-	}
-	if !ok {
-		return Target{}, false, nil
-	}
-	if !affinity.ExpiresAt.After(now) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
-	}
-	app, err := r.store.ApplicationByID(ctx, affinity.ApplicationID)
-	if errors.Is(err, storeerr.ErrNotFound) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
-	}
-	if err != nil {
-		return Target{}, false, fmt.Errorf("load affinity application: %w", err)
-	}
-	if r.affinityApplicationStale(app, affinity, fineFlavor) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
+	affinity, app, ok, err := r.loadAffinity(ctx, key, req.APIFlavor, now)
+	if err != nil || !ok {
+		return Target{}, false, err
 	}
 	server, usable, err := r.affinityServer(ctx, app)
 	if err != nil {
@@ -1891,39 +1877,30 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 	// one of the pinned mapping's own on the pinned server) -- so unlike the two
 	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
 	// on the capability list, and does not need to be.
-	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, required)
+	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, req.RequiredCapabilities)
 	if !capable {
 		return Target{}, false, nil
 	}
-	if r.provisioning != nil {
-		allowed, perr := r.provisioning.AllowedServerIDs(ctx, token, []string{server.ID})
-		if perr != nil {
-			return Target{}, false, perr
-		}
-		if !allowed[server.ID] {
-			// The pinned server is no longer provisioned for this principal: ignore the
-			// pin (keep it, do not serve it) and let the caller select afresh, which
-			// itself re-applies filterProvisioned so a blocked server is excluded there
-			// too. Checked before an instance is chosen, so such a request never waits
-			// for an instance there.
-			return Target{}, false, nil
-		}
+	provisioned, err := r.serverProvisioned(ctx, token, server.ID)
+	if err != nil {
+		return Target{}, false, err
+	}
+	if !provisioned {
+		// The pinned server is no longer provisioned for this principal: ignore the
+		// pin (keep it, do not serve it) and let the caller select afresh, which
+		// itself re-applies filterProvisioned so a blocked server is excluded there
+		// too. Checked before an instance is chosen, so such a request never waits
+		// for an instance there.
+		return Target{}, false, nil
 	}
 	// A request parked for a slot re-checks the pinned server after every wait, with the
-	// same gates as above (affinityServer).
-	servesNow := func(ctx context.Context) error {
-		_, usable, err := r.affinityServer(ctx, app)
-		if err == nil && !usable {
-			return errPinServerUnusable
-		}
-		return err
-	}
+	// same gates as above (affinityServesNow).
 	sel, parked, err := r.selectPinned(ctx, MappingCandidate{
 		Server:              server,
 		Application:         app,
 		Mapping:             mapping,
 		LiveProgressSupport: liveProgressSupport,
-	}, req, InstanceKey(mapping.ID, affinity.Instance), now, servesNow)
+	}, req, InstanceKey(mapping.ID, affinity.Instance), now, r.affinityServesNow(app))
 	if errors.Is(err, errPinServerUnusable) {
 		// The pinned server stopped passing its gates while the request waited: pass the
 		// pin over to the fresh selection, which leaves that server out as well. The next
@@ -1941,6 +1918,63 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 		return Target{}, false, err
 	}
 	return target, true, nil
+}
+
+// loadAffinity reads the pin under key together with its application, for a request of
+// the fine flavor fineFlavor. ok is false when there is no pin, and when the pin went
+// stale and was deleted: it expired, its application is gone, or the application no
+// longer serves it (affinityApplicationStale).
+func (r *Resolver) loadAffinity(ctx context.Context, key AffinityKey, fineFlavor string, now time.Time) (affinity RouteAffinity, app Application, ok bool, err error) {
+	affinity, ok, err = r.store.Affinity(ctx, key)
+	if err != nil {
+		return RouteAffinity{}, Application{}, false, fmt.Errorf("lookup affinity: %w", err)
+	}
+	if !ok {
+		return RouteAffinity{}, Application{}, false, nil
+	}
+	if !affinity.ExpiresAt.After(now) {
+		_ = r.store.DeleteAffinity(ctx, key)
+		return RouteAffinity{}, Application{}, false, nil
+	}
+	app, err = r.store.ApplicationByID(ctx, affinity.ApplicationID)
+	if errors.Is(err, storeerr.ErrNotFound) {
+		_ = r.store.DeleteAffinity(ctx, key)
+		return RouteAffinity{}, Application{}, false, nil
+	}
+	if err != nil {
+		return RouteAffinity{}, Application{}, false, fmt.Errorf("load affinity application: %w", err)
+	}
+	if r.affinityApplicationStale(app, affinity, fineFlavor) {
+		_ = r.store.DeleteAffinity(ctx, key)
+		return RouteAffinity{}, Application{}, false, nil
+	}
+	return affinity, app, true, nil
+}
+
+// serverProvisioned reports whether resource-group provisioning lets principal use
+// serverID; without a provisioning gate every server is provisioned.
+func (r *Resolver) serverProvisioned(ctx context.Context, principal auth.Token, serverID string) (bool, error) {
+	if r.provisioning == nil {
+		return true, nil
+	}
+	allowed, err := r.provisioning.AllowedServerIDs(ctx, principal, []string{serverID})
+	if err != nil {
+		return false, err
+	}
+	return allowed[serverID], nil
+}
+
+// affinityServesNow is the re-check selectPinned runs on a request parked for a slot on
+// app's pinned server, after every wait: the gates resolveAffinity applied first
+// (affinityServer), answering errPinServerUnusable when the server no longer passes them.
+func (r *Resolver) affinityServesNow(app Application) func(context.Context) error {
+	return func(ctx context.Context) error {
+		_, usable, err := r.affinityServer(ctx, app)
+		if err == nil && !usable {
+			return errPinServerUnusable
+		}
+		return err
+	}
 }
 
 // refreshAffinity records on affinity -- key's pin, as resolveAffinity read it -- the
@@ -2022,19 +2056,9 @@ func (r *Resolver) selectPinned(ctx context.Context, pinned MappingCandidate, re
 		if len(pool) == 0 {
 			return MappingCandidate{}, parked, errPinnedInstancesGone
 		}
-		if free := slices.DeleteFunc(slices.Clone(pool), func(c MappingCandidate) bool { return !r.underCap(c, now, judgeLive) }); len(free) > 0 {
-			return r.pinnedChoice(free, preferred), parked, nil
-		}
-		slotFree := r.liveSlotFree(pool, judgeLive)
-		d := instanceDemand(pool, req)
-		d.ServerID = pinned.Server.ID
-		waits := req.LiveSession || len(slotFree) == 0
-		if !waits || neverParks(req) || r.admission == nil {
-			if len(slotFree) == 0 {
-				slotFree = pool
-			}
-			r.signalOverflow(req, *d)
-			return r.pinnedChoice(slotFree, preferred), parked, nil
+		sel, d, served := r.pinnedTurn(pool, req, preferred, now, judgeLive, pinned.Server.ID)
+		if served {
+			return sel, parked, nil
 		}
 		if err := r.parkTurn(ctx, deadline, []string{pinned.Server.ID}, *d); err != nil {
 			return MappingCandidate{}, parked, err
@@ -2045,6 +2069,28 @@ func (r *Resolver) selectPinned(ctx context.Context, pinned MappingCandidate, re
 		}
 		now = r.clock()
 	}
+}
+
+// pinnedTurn is one turn of selectPinned over pool, the pinned request's instance
+// candidates on serverID that are not passed over. served reports that the request is
+// served at once by sel (steps 1 to 3, signalling overflow demand when every instance is
+// at its cap); otherwise it parks for a slot on serverID, carrying demand.
+func (r *Resolver) pinnedTurn(pool []MappingCandidate, req inference.Request, preferred string, now time.Time, judgeLive bool, serverID string) (sel MappingCandidate, demand *DemandSignal, served bool) {
+	if free := slices.DeleteFunc(slices.Clone(pool), func(c MappingCandidate) bool { return !r.underCap(c, now, judgeLive) }); len(free) > 0 {
+		return r.pinnedChoice(free, preferred), nil, true
+	}
+	slotFree := r.liveSlotFree(pool, judgeLive)
+	d := instanceDemand(pool, req)
+	d.ServerID = serverID
+	waits := req.LiveSession || len(slotFree) == 0
+	if !waits || neverParks(req) || r.admission == nil {
+		if len(slotFree) == 0 {
+			slotFree = pool
+		}
+		r.signalOverflow(req, *d)
+		return r.pinnedChoice(slotFree, preferred), nil, true
+	}
+	return MappingCandidate{}, d, false
 }
 
 // liveSlotFree is the candidates of pool whose live slot is free when judgeLive says the
@@ -2214,12 +2260,7 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 	judgeLive := instancePool && r.liveSlots != nil && needsFreeLiveSlot(req)
 	preferred := r.preferredInstance(pool, req, now, judgeLive)
 	if r.activity != nil || r.instanceActivity != nil || judgeLive {
-		capped := make([]MappingCandidate, 0, len(pool))
-		for _, c := range pool {
-			if r.underCap(c, now, judgeLive) {
-				capped = append(capped, c)
-			}
-		}
+		capped := r.underCapPool(pool, now, judgeLive)
 		if len(capped) == 0 {
 			if r.admission != nil {
 				// Every candidate is at its effective cap: let Resolve queue + retry (CP4)
@@ -2238,6 +2279,17 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 		}
 	}
 	return r.selectWithSwapProtection(ctx, pool, model, audio, now, preferred)
+}
+
+// underCapPool is the candidates of pool under their cap (underCap), in pool's order.
+func (r *Resolver) underCapPool(pool []MappingCandidate, now time.Time, judgeLive bool) []MappingCandidate {
+	capped := make([]MappingCandidate, 0, len(pool))
+	for _, c := range pool {
+		if r.underCap(c, now, judgeLive) {
+			capped = append(capped, c)
+		}
+	}
+	return capped
 }
 
 // preferredInstance is the gateway instance key req prefers
@@ -2451,16 +2503,9 @@ func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, 
 	// Score-viable it spills over to the full pool rather than refuse a request an
 	// unloaded server could serve.
 	if r.loaded != nil {
-		loadedPool := make([]MappingCandidate, 0, len(pool))
-		for _, c := range pool {
-			if modelLoadedOn(r.loaded, c) {
-				loadedPool = append(loadedPool, c)
-			}
-		}
-		if len(loadedPool) > 0 {
-			if sel, ok, err := r.preferScored(ctx, loadedPool, model, audio, now, preferred); err != nil || ok {
-				return sel, ok, err
-			}
+		loadedHere := func(c MappingCandidate) bool { return modelLoadedOn(r.loaded, c) }
+		if sel, ok, err := r.preferPartition(ctx, pool, loadedHere, model, audio, now, preferred); err != nil || ok {
+			return sel, ok, err
 		}
 	}
 	// Prefer a model instance that is already STARTING (loading) over cold-starting a
@@ -2471,19 +2516,27 @@ func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, 
 	// guarantees "running beats starting". Fail-open: spills to the full pool if the
 	// starting subset is non-viable (or empty / no checker installed).
 	if r.runtimeState != nil {
-		startingPool := make([]MappingCandidate, 0, len(pool))
-		for _, c := range pool {
-			if r.modelStartingOn(c) {
-				startingPool = append(startingPool, c)
-			}
-		}
-		if len(startingPool) > 0 {
-			if sel, ok, err := r.preferScored(ctx, startingPool, model, audio, now, preferred); err != nil || ok {
-				return sel, ok, err
-			}
+		if sel, ok, err := r.preferPartition(ctx, pool, r.modelStartingOn, model, audio, now, preferred); err != nil || ok {
+			return sel, ok, err
 		}
 	}
 	return r.preferScored(ctx, pool, model, audio, now, preferred)
+}
+
+// preferPartition selects (preferScored) from the candidates of pool that in accepts, in
+// pool's order: ok=false when there are none or none is viable, so the caller spills
+// over to a wider pool.
+func (r *Resolver) preferPartition(ctx context.Context, pool []MappingCandidate, in func(MappingCandidate) bool, model string, audio bool, now time.Time, preferred string) (MappingCandidate, bool, error) {
+	part := make([]MappingCandidate, 0, len(pool))
+	for _, c := range pool {
+		if in(c) {
+			part = append(part, c)
+		}
+	}
+	if len(part) == 0 {
+		return MappingCandidate{}, false, nil
+	}
+	return r.preferScored(ctx, part, model, audio, now, preferred)
 }
 
 // swapProtected reports whether routing to candidate c would evict a live model: c's
