@@ -60,6 +60,40 @@ func loadInternalGraph(t *testing.T) map[string][]string {
 	return graph
 }
 
+// loadProductionImports returns the sorted import paths of one op-ai-gateway package's
+// PRODUCTION (non-test) source files -- every import, standard library and third-party
+// included, not only the module's own -- for the rules that constrain more than the
+// internal graph. pkg is relative to the module root, e.g. "internal/benchaudio".
+func loadProductionImports(t *testing.T, pkg string) []string {
+	t.Helper()
+
+	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedImports, Tests: false}
+	pkgs, err := packages.Load(cfg, modulePath+"/"+pkg)
+	if err != nil {
+		t.Fatalf("packages.Load(%s): %v", pkg, err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		t.Fatalf("packages.Load(%s) reported %d error(s); see stderr above", pkg, n)
+	}
+	if len(pkgs) != 1 {
+		t.Fatalf("packages.Load(%s) = %d packages, want exactly one", pkg, len(pkgs))
+	}
+	imports := make([]string, 0, len(pkgs[0].Imports))
+	for imp := range pkgs[0].Imports {
+		imports = append(imports, imp)
+	}
+	sort.Strings(imports)
+	return imports
+}
+
+// isStdlibPkg reports whether pkgPath is a standard-library package: the go command's
+// rule, a path whose first element has no dot -- except this module's own, whose path
+// ("op-ai-gateway") has none either.
+func isStdlibPkg(pkgPath string) bool {
+	first, _, _ := strings.Cut(pkgPath, "/")
+	return !strings.Contains(first, ".") && !isModulePkg(pkgPath)
+}
+
 // isModulePkg reports whether pkgPath is op-ai-gateway itself or one of its
 // internal/cmd sub-packages (as opposed to a third-party or stdlib import).
 func isModulePkg(pkgPath string) bool {
