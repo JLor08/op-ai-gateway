@@ -1167,22 +1167,34 @@ func TestMeasureAudioEntryPointsReadTheRealClock(t *testing.T) {
 		// the end
 		firstByte, ttft, wall time.Duration
 	}{
-		{"measureTTSStream", "text/event-stream", []string{sseSpeechDelta(48000), sseSpeechDone},
+		{
+			"measureTTSStream", "text/event-stream",
+			[]string{sseSpeechDelta(48000), sseSpeechDone},
 			func(up *measureUpstream) (audioMeasurement, error) {
 				return measureTTSStream(ctx, up, audioMeasureTarget(), audioBenchmarkPassage, "", 48000)
-			}, gap, 2 * gap, 3 * gap},
-		{"measureTTSBuffered", "audio/wav", []string{string(wav[:44]), string(wav[44:])},
+			}, gap, 2 * gap, 3 * gap,
+		},
+		{
+			"measureTTSBuffered", "audio/wav",
+			[]string{string(wav[:44]), string(wav[44:])},
 			func(up *measureUpstream) (audioMeasurement, error) {
 				return measureTTSBuffered(ctx, up, audioMeasureTarget(), audioBenchmarkPassage, "")
-			}, gap, 3 * gap, 3 * gap},
-		{"measureASRBuffered", "application/json", []string{`{"text":"der schutz"}`},
+			}, gap, 3 * gap, 3 * gap,
+		},
+		{
+			"measureASRBuffered", "application/json",
+			[]string{`{"text":"der schutz"}`},
 			func(up *measureUpstream) (audioMeasurement, error) {
 				return measureASRBuffered(ctx, up, audioMeasureTarget(), benchaudio.WAV(), benchaudio.Language)
-			}, gap, 2 * gap, 2 * gap},
-		{"measureASRLive", "text/event-stream", []string{sseTranscriptDelta("der"), sseTranscriptDone("der")},
+			}, gap, 2 * gap, 2 * gap,
+		},
+		{
+			"measureASRLive", "text/event-stream",
+			[]string{sseTranscriptDelta("der"), sseTranscriptDone("der")},
 			func(up *measureUpstream) (audioMeasurement, error) {
 				return measureASRLive(ctx, up, audioMeasureTarget(), pcm, sampleRate, benchaudio.Language)
-			}, gap, 2 * gap, 3 * gap},
+			}, gap, 2 * gap, 3 * gap,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
