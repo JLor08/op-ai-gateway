@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"op-ai-gateway/internal/config"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"testing"
 	"time"
@@ -20,9 +21,17 @@ import (
 // drives the real production deps builder (memoryDeps -> buildRuntime, the
 // call every DB driver ends in) and reads the configured derivation back out
 // of the runtime-config document the agent fetches. The derivation itself is
-// pinned in the portal package (TestEffectiveIdleTimeout).
+// pinned in the portal package (TestEffectiveIdleTimeout), and so is the
+// agent-feature gate (TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances).
 func TestBuildRuntimeWiresTheInstanceIdleSettings(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_DEV_TOKEN", "")
+	// The app-health loop prunes the agent-features registry to the servers it
+	// last listed, which can be before this test created its server; a cycle
+	// landing between the Set below and the read would drop the declaration.
+	// The loop is not what this test is about, so it does not run.
+	orig := startAppHealthLoop
+	startAppHealthLoop = func(*appHealthRunner, <-chan string) context.CancelFunc { return func() {} }
+	t.Cleanup(func() { startAppHealthLoop = orig })
 	cases := []struct {
 		name   string
 		factor float64
@@ -77,6 +86,10 @@ func TestBuildRuntimeWiresTheInstanceIdleSettings(t *testing.T) {
 			if err := deps.Routes.UpdateRuntimeSpecStartupMeasured(ctx, specID, 20000); err != nil {
 				t.Fatalf("seed measured startup: %v", err)
 			}
+			// The derived value goes only to an agent that runs instances, as
+			// recorded by the ingest in the registry the portal reads -- which
+			// also pins that buildRuntime hands the portal that same registry.
+			deps.AgentFeatures.Set(serverID, []string{"runtime_manager", portal.AgentFeatureRuntimeInstances})
 
 			doc, err := deps.Portal.AgentRuntimeConfig(ctx, serverID)
 			if err != nil {

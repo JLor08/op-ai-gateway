@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/portal"
 )
 
 // gatewayAgentFeatures is the gateway's declared feature set for agents
@@ -87,7 +88,12 @@ var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runti
 // (server-agent/internal/agent/features.go, FeatureRuntimeInstances); the agent
 // module cannot import this package, so both spell it, and
 // TestAgentFeaturesDeclaresRuntimeInstances pins this side's literal.
-const runtimeInstancesFeature = "runtime_instances"
+//
+// Within this module the name has one source, the portal's
+// AgentFeatureRuntimeInstances, which the runtime-config document reads the
+// agent's declaration by: this gateway's own declaration, the ingest's push on
+// a changed declaration and the portal's document cannot spell it apart.
+const runtimeInstancesFeature = portal.AgentFeatureRuntimeInstances
 
 // capabilitySourceSdcppFeature says this gateway's capability ingest accepts
 // the sdcpp_capabilities source from an agent (rowSource), for the image row

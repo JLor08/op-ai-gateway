@@ -89,7 +89,8 @@ func benchmarkRowQuiet(row RuntimeStatusDTO) bool {
 // The sequence, each step on the target's own decision:
 //   - the selection frame and the stop set (benchmarkStopSet): a fresh status
 //     frame without traffic in flight, and the spec ids that are not quiet,
-//     plus the target whenever its own row reads anything other than stopped.
+//     plus the target whenever any of its rows reads anything other than
+//     stopped.
 //     Without a row in the stop set that is not quiet (benchmarkRowQuiet: a
 //     process, or a state this gateway does not recognize), the run has no
 //     sign that the agent holds the lifted pins, so every formerly pinned
@@ -104,11 +105,11 @@ func benchmarkRowQuiet(row RuntimeStatusDTO) bool {
 //   - one force_stopped batch with one notification, and a deferred clear of
 //     every spec it wrote or may have written (clearBenchmarkStop);
 //   - the wait (benchmarkAwaitQuiet), only when every spec was written. When
-//     the target's own row read backoff, start_failed or crashed, it also
-//     waits for that row to read stopped with pid 0;
+//     the target's instance-0 row read backoff, start_failed or crashed, it
+//     also waits for that row to read stopped with pid 0;
 //   - after a partial stop or a late start, when the target's own write
-//     succeeded, a wait until the target's own row reads quiet
-//     (benchmarkAwaitSpecQuiet), so the stop lands before the cold pass. An
+//     succeeded, a wait until the target's row (benchmarkSpecStatus) reads
+//     quiet (benchmarkAwaitSpecQuiet), so the stop lands before the cold pass. An
 //     expired wait, like an expired benchmarkAwaitQuiet, turns stops off.
 //
 // Neither an ineligible stop, nor an unconfirmed or taken-over one, is an
@@ -171,7 +172,7 @@ func (s *Server) preStopServer(ctx context.Context, tgt benchmarkTarget) (cs col
 	// reached the agent yet. A cold pass the still-running target served now
 	// would leave the stop to land between the cold and the warm pass, and the
 	// warm pass would fail on the router's 503. So the cold pass starts only
-	// once the target's own row reads quiet.
+	// once the target's row (benchmarkSpecStatus) reads quiet.
 	if (reason == benchmarkStopReasonPartialStop || reason == benchmarkStopReasonLateStart) && slices.Contains(out.Written, tgt.spec.ID) && !s.benchmarkAwaitSpecQuiet(ctx, serverID, tgt.spec.ID) {
 		ov.stopsAllowed = false
 	}
@@ -229,8 +230,8 @@ func (s *Server) clearBenchmarkStop(ctx context.Context, serverID string, ov *be
 // that are not quiet (benchmarkRowQuiet), which are running, starting or
 // draining, carry a pid, or read a state this gateway does not recognize.
 //
-// The target is in it when it is resident, and also whenever its own row reads
-// anything other than stopped (backoff, start_failed, crashed, not_permitted,
+// The target is in it when it is resident, and also whenever any of its rows
+// reads anything other than stopped (backoff, start_failed, crashed, not_permitted,
 // pending_vram_unknown). A request for a spec in backoff waits for its backoff
 // timer, which would land in the cold pass. The agent resets backoff,
 // start_failed and crashed to stopped when it applies the stop's document,
@@ -252,21 +253,34 @@ func (s *Server) benchmarkStopSet(ctx context.Context, tgt benchmarkTarget) (sel
 	if reason != "" {
 		return sel, reason
 	}
-	own, ok := benchmarkSpecStatus(rows, tgt.spec.ID)
-	if !ok {
+	return benchmarkStopSelectionOf(rows, tgt.spec.ID, tgt.overrides.unpinned)
+}
+
+// benchmarkStopSelectionOf is benchmarkStopSet's reading of its selection
+// frame rows for the target targetID, with unpinned the specs the run
+// unpinned; see benchmarkStopSet for what it selects and why.
+//
+// Whether the quiet wait also waits for the target to read stopped is decided
+// on the target's instance-0 row, not on its representative row
+// (benchmarkSpecStatus): the cold pass's request reaches instance 0, so it is
+// instance 0's backoff timer that would land in the load time, even while a
+// burst instance of the target serves. benchmarkStopFrameVerdict waits for
+// that same row.
+func benchmarkStopSelectionOf(rows []RuntimeStatusDTO, targetID string, unpinned []string) (sel benchmarkStopSelection, reason string) {
+	if _, ok := benchmarkSpecStatus(rows, targetID); !ok {
 		return sel, benchmarkStopReasonNoStatus
 	}
 	var stopSet []string
 	for _, row := range rows {
-		if !benchmarkRowQuiet(row) || (row.SpecID == tgt.spec.ID && row.State != agentSpecStateStopped) {
+		if !benchmarkRowQuiet(row) || (row.SpecID == targetID && row.State != agentSpecStateStopped) {
 			stopSet = append(stopSet, row.SpecID)
 		}
-	}
-	if benchmarkStatesAwaitStopped[own.State] {
-		sel.awaitStopped = tgt.spec.ID
+		if row.SpecID == targetID && row.Instance == 0 && benchmarkStatesAwaitStopped[row.State] {
+			sel.awaitStopped = targetID
+		}
 	}
 	drains := slices.ContainsFunc(rows, func(row RuntimeStatusDTO) bool { return !benchmarkRowQuiet(row) })
-	sel.formerPins = benchmarkFormerPinsNotStopped(rows, tgt.overrides.unpinned, tgt.spec.ID)
+	sel.formerPins = benchmarkFormerPinsNotStopped(rows, unpinned, targetID)
 	sel.pinsSettled = drains || len(sel.formerPins) == 0
 	if len(stopSet) == 0 && !sel.pinsSettled {
 		return sel, benchmarkStopReasonFormerlyPinned
@@ -300,8 +314,9 @@ type benchmarkStopSelection struct {
 	// aside, whose rows read other than stopped with pid 0
 	// (benchmarkFormerPinsNotStopped).
 	formerPins []string
-	// awaitStopped is the target's spec id when its own row read backoff,
-	// start_failed or crashed (benchmarkStatesAwaitStopped), and "" otherwise.
+	// awaitStopped is the target's spec id when its instance-0 row, the
+	// instance the cold pass's request reaches, read backoff, start_failed or
+	// crashed (benchmarkStatesAwaitStopped), and "" otherwise.
 	// The quiet wait then also needs that row to read stopped with pid 0
 	// (benchmarkStopFrameVerdict): a request for a spec in backoff waits behind
 	// its backoff timer, and that wait would land in the load time.
@@ -327,15 +342,17 @@ var benchmarkStatesAwaitStopped = map[string]bool{"backoff": true, "start_failed
 // benchmarkFormerPinsNotStopped returns the sorted ids of the specs in
 // unpinned, the specs the run unpinned, whose rows read other than stopped
 // with pid 0, the row of targetID aside: the rule benchmarkOthersStopped
-// applies to every neighbour of a run without a stop. It judges only the specs
-// the run unpinned, so a spec somebody else unpinned just before or during the
-// run, whose document the agent has not applied yet, is not judged. A formerly
-// pinned spec the frame has no row for is not in the agent's document, so the
-// agent does not run it.
+// applies to every neighbour of a run without a stop. The target's own row is
+// its instance-0 row, so another instance of the target is judged like a
+// neighbour, and a spec is named once however many of its instance rows read
+// otherwise. It judges only the specs the run unpinned, so a spec somebody
+// else unpinned just before or during the run, whose document the agent has
+// not applied yet, is not judged. A formerly pinned spec the frame has no row
+// for is not in the agent's document, so the agent does not run it.
 func benchmarkFormerPinsNotStopped(rows []RuntimeStatusDTO, unpinned []string, targetID string) []string {
 	var ids []string
 	for _, row := range rows {
-		if row.SpecID == targetID || !slices.Contains(unpinned, row.SpecID) {
+		if (row.SpecID == targetID && row.Instance == 0) || !slices.Contains(unpinned, row.SpecID) {
 			continue
 		}
 		if row.State != agentSpecStateStopped || row.PID != 0 {
@@ -343,7 +360,7 @@ func benchmarkFormerPinsNotStopped(rows []RuntimeStatusDTO, unpinned []string, t
 		}
 	}
 	slices.Sort(ids)
-	return ids
+	return slices.Compact(ids)
 }
 
 // benchmarkSelectionFrame subscribes to serverID's runtime status, discards the
@@ -442,8 +459,8 @@ func benchmarkSpecStopRefusal(byID map[string]routing.RuntimeSpec, id string) st
 //   - The first frame that has a row for every stopSet spec and in which every
 //     row is quiet returns (true, ""). backoff with pid 0 counts: it turns
 //     stopped when its timer fires, and the clear resets it at once. Only the
-//     target's own row, when awaitStopped names it, has to read stopped with
-//     pid 0 as well (benchmarkStopSelection.awaitStopped).
+//     target's instance-0 row, when awaitStopped names it, has to read stopped
+//     with pid 0 as well (benchmarkStopSelection.awaitStopped).
 //   - A frame in which a row outside stopSet is not quiet returns (false,
 //     late_start) at once: the run has unpinned every enabled pinned spec, and
 //     an unpinned spec without force_running starts only on a request, so a
@@ -489,21 +506,38 @@ func (s *Server) benchmarkAwaitQuiet(ctx context.Context, serverID string, stopS
 // done when the frame settles the wait, quiet when it settles it as quiet. A
 // late start anywhere in the frame settles it, whatever the stop set's rows
 // read. When awaitStopped names a spec, the frame settles the wait as quiet
-// only once that spec's row reads stopped. The spec is the target, which is in
-// the stop set, so its row is then also quiet, pid 0 included.
+// only once that spec's instance-0 row -- the instance the cold pass's
+// request reaches, whose state benchmarkStopSelectionOf decided on -- reads
+// stopped. The spec is the target, which is in the stop set, so its row is
+// then also quiet, pid 0 included.
+//
+// The stop set names specs, and a replicable spec has a row per instance, so
+// a spec of the set counts as quiet when the frame has a row for it and every
+// one of its rows is quiet. Counting quiet rows instead would let two quiet
+// rows of one spec stand in for another spec that still runs, and would
+// never settle once one spec reported more rows than the set has specs.
 func benchmarkStopFrameVerdict(frame []RuntimeStatusDTO, stopSet []string, awaitStopped string) (done, quiet bool, reason string) {
-	quietInSet := 0
+	present := make(map[string]bool, len(stopSet))
+	loud := make(map[string]bool, len(stopSet))
 	stoppedAwaited := awaitStopped == ""
 	for _, row := range frame {
 		inSet := slices.Contains(stopSet, row.SpecID)
-		switch {
-		case !inSet && !benchmarkRowQuiet(row):
+		rowQuiet := benchmarkRowQuiet(row)
+		if !inSet && !rowQuiet {
 			return true, false, benchmarkStopReasonLateStart
-		case inSet && benchmarkRowQuiet(row):
-			quietInSet++
 		}
-		if row.SpecID == awaitStopped && row.State == agentSpecStateStopped {
+		if inSet {
+			present[row.SpecID] = true
+			loud[row.SpecID] = loud[row.SpecID] || !rowQuiet
+		}
+		if row.SpecID == awaitStopped && row.Instance == 0 && row.State == agentSpecStateStopped {
 			stoppedAwaited = true
+		}
+	}
+	quietInSet := 0
+	for _, specID := range stopSet {
+		if present[specID] && !loud[specID] {
+			quietInSet++
 		}
 	}
 	settled := quietInSet == len(stopSet) && stoppedAwaited
@@ -511,9 +545,9 @@ func benchmarkStopFrameVerdict(frame []RuntimeStatusDTO, stopSet []string, await
 }
 
 // benchmarkAwaitSpecQuiet waits, within benchmarkStopWaitBound, for a fresh
-// frame in which specID's own row is quiet (benchmarkRowQuiet), whatever the
-// other rows read. It reports false when the bound ran out first, or when ctx
-// ended or the stream closed.
+// frame in which specID's row -- its representative row, benchmarkSpecStatus's
+// -- is quiet (benchmarkRowQuiet), whatever the other rows read. It reports
+// false when the bound ran out first, or when ctx ended or the stream closed.
 func (s *Server) benchmarkAwaitSpecQuiet(ctx context.Context, serverID, specID string) bool {
 	_, frames, unsub := s.RuntimeStatus.subscribe(serverID)
 	defer unsub()

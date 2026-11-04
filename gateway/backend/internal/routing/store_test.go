@@ -4,6 +4,8 @@
 package routing
 
 import (
+	"errors"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -595,6 +597,68 @@ func TestValidateAudioMetrics(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), strconv.Quote(bad.ConcurrencyLimit)) {
 			t.Errorf("ValidateAudioMetrics(%+v) = %q, want the message to name the refused limit", bad, err)
+		}
+		if !errors.Is(err, ErrAudioMetricsInvalid) {
+			t.Errorf("ValidateAudioMetrics(%+v) = %q, want it to wrap ErrAudioMetricsInvalid", bad, err)
+		}
+	}
+}
+
+// TestValidateAudioMetricsRefusesAnUnusableRate pins the rate's half of
+// ValidateAudioMetrics: a rate that is not a number, infinite or negative is
+// no measurement any audio benchmark can produce -- the "keep the stored
+// column unless measured" rule would skip NaN and a negative quietly, but an
+// infinite rate passes "> 0", reaches the column, and fails every JSON
+// encoding of the mapping afterwards -- so the whole call is refused, like an
+// unknown limit, whatever the other figures hold. 0 is "not measured" and
+// passes.
+func TestValidateAudioMetricsRefusesAnUnusableRate(t *testing.T) {
+	for _, rate := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1, -0.001} {
+		if err := ValidateAudioMetrics(AudioMetrics{RateX: rate, TTFAMS: 380}); !errors.Is(err, ErrAudioMetricsInvalid) {
+			t.Errorf("ValidateAudioMetrics(rate %v) = %v, want the rate refused with ErrAudioMetricsInvalid", rate, err)
+		}
+	}
+	for _, rate := range []float64{0, 0.5, 2.5} {
+		if err := ValidateAudioMetrics(AudioMetrics{RateX: rate}); err != nil {
+			t.Errorf("ValidateAudioMetrics(rate %v) = %v, want nil", rate, err)
+		}
+	}
+}
+
+// TestValidateMappingAudioMetrics pins the full-row writers' check of a
+// mapping's stored audio figures: the rate and limit rules of
+// ValidateAudioMetrics, the ramp pair as the one result it is -- a count
+// needs the reason the ramp stopped beside it, and no ramp ends on a negative
+// level -- and no negative TTFA or load time, which no measurement yields and
+// which a full row would otherwise store as a figure. A row with no audio
+// figures at all is valid, and so is every shape the audio writer itself can
+// store. Every refusal wraps ErrAudioMetricsInvalid, so a caller can tell it
+// from a store failure.
+func TestValidateMappingAudioMetrics(t *testing.T) {
+	for _, ok := range []ModelMapping{
+		{},
+		{AudioRateX: 2.5, AudioTTFAMS: 380, LoadTimeMS: 4800},
+		{AudioRealtimeConcurrency: 0, AudioConcurrencyLimit: AudioLimitPerformance},
+		{AudioRealtimeConcurrency: 3, AudioConcurrencyLimit: AudioLimitResources},
+		{AudioRealtimeConcurrency: 8, AudioConcurrencyLimit: AudioLimitCap},
+	} {
+		if err := ValidateMappingAudioMetrics(ok); err != nil {
+			t.Errorf("ValidateMappingAudioMetrics(%+v) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []ModelMapping{
+		{AudioConcurrencyLimit: "throughput"},
+		{AudioRealtimeConcurrency: 2},
+		{AudioRealtimeConcurrency: -1, AudioConcurrencyLimit: AudioLimitCap},
+		{AudioRateX: math.NaN()},
+		{AudioRateX: math.Inf(1)},
+		{AudioRateX: -1},
+		{AudioTTFAMS: -1},
+		{AudioRateX: 2.5, AudioTTFAMS: -380},
+		{LoadTimeMS: -1},
+	} {
+		if err := ValidateMappingAudioMetrics(bad); !errors.Is(err, ErrAudioMetricsInvalid) {
+			t.Errorf("ValidateMappingAudioMetrics(%+v) = %v, want it refused with ErrAudioMetricsInvalid", bad, err)
 		}
 	}
 }

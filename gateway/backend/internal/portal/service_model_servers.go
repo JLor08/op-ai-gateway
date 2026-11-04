@@ -38,6 +38,20 @@ type ModelServerDTO struct {
 	State          string `json:"state"`
 	ActiveRequests int    `json:"active_requests"`
 	QueueDepth     int    `json:"queue_depth"`
+	// RunningInstances is how many instances of the mapping's runtime spec run
+	// on this server (#340): one per running status row of the spec, so 1 for
+	// a running spec that is not replicable and 0 when none runs. Like State,
+	// Service.ModelServers leaves it 0 and the gateway layer injects it from
+	// the runtime-status registry.
+	RunningInstances int `json:"running_instances"`
+	// Replicable is the stored replicable flag of the mapping's runtime spec
+	// (#340): whether the agent may run several instances of it. False for a
+	// mapping without a spec. The portal shows the running-instance count when
+	// it is true or when RunningInstances is above 1, so a replicable spec
+	// with one instance up reads as one of possibly several. Like State,
+	// Service.ModelServers leaves it false and the gateway layer injects it,
+	// from the spec it already reads for the row.
+	Replicable bool `json:"replicable"`
 
 	// MetricsProbe/ContextProbe are the agent's last-reported reachability for its
 	// /metrics and context probes ("ok"/"unreachable"/"na", or "" when not reported).

@@ -443,6 +443,23 @@ type AgentTransportReader interface {
 	LatestTransport(serverID string) (transport string, at time.Time, ok bool)
 }
 
+// AgentFeatureReader exposes the feature names each server's ServerAgent
+// declared in its last telemetry sample, so the runtime-config document can
+// carry what only an agent with a given feature understands
+// (AgentFeatureRuntimeInstances). Has is false for a server never heard from
+// and for an agent that does not declare the name. Known tells the two apart:
+// it is true once serverID's agent has declared its set since this gateway
+// started -- an empty set included -- and false before that, and after a
+// declaration that could not be read. A document that depends on a feature of
+// an agent that is not Known is held rather than served as the older agent's
+// (AgentRuntimeConfigDTO.AwaitsAgentFeatures). A nil reader counts every
+// agent as known, without any feature. Satisfied by the gateway's
+// agent-features registry.
+type AgentFeatureReader interface {
+	Has(serverID, feature string) bool
+	Known(serverID string) bool
+}
+
 type ServiceDeps struct {
 	Users          UserReader
 	Tokens         TokenRepository
@@ -566,6 +583,12 @@ type ServiceDeps struct {
 	// it needs no special-casing) falls back to DefaultMaxRunHistoryBytes
 	// (32 MiB) in NewService.
 	MaxRunHistoryBytes int
+	// AgentFeatures lets the runtime-config document tell an agent that runs
+	// several instances of a replicable spec from one that does not (see
+	// AgentFeatureReader and Service.specAsPushed). nil = no agent declares
+	// anything: every document is the one an agent without runtime_instances
+	// understands.
+	AgentFeatures AgentFeatureReader
 	// InstanceIdleFactor and InstanceIdleFloorSeconds are the factor and floor
 	// a replicable runtime spec's idle timeout is derived with
 	// (effectiveIdleTimeout): config.Config's InstanceIdleFactor and
@@ -822,6 +845,7 @@ type Service struct {
 	agentPresence    AgentPresenceReader
 	agentCertReports AgentCertReportReader
 	agentTransport   AgentTransportReader
+	agentFeatures    AgentFeatureReader
 	proxyStatus      ProxyRouteStatusReader
 	groups           GroupStore
 	groupCache       GroupCache
@@ -994,6 +1018,7 @@ func NewService(deps ServiceDeps) *Service {
 		agentPresence:    deps.AgentPresence,
 		agentCertReports: deps.AgentCertReports,
 		agentTransport:   deps.AgentTransport,
+		agentFeatures:    deps.AgentFeatures,
 		proxyStatus:      deps.ProxyStatus,
 		groups:           deps.Groups,
 		groupCache:       deps.GroupCache,

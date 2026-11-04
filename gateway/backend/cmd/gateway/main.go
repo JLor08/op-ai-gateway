@@ -903,6 +903,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// agentFeatures is ONE shared registry too (agent-runtime-manager): the
 	// agent-telemetry ingest path records each agent's declared capabilities
 	// in it, PushRuntimeConfig reads it to gate the runtime_config WS push,
+	// the portal service reads it to build each agent's runtime-config
+	// document for what that agent understands (runtime_instances),
 	// and the app-health loop prunes it to live servers -- same shape as
 	// runtimeStatus above. Constructed HERE (not left to gateway.New's
 	// default) precisely so the pruned instance and the written instance are
@@ -975,7 +977,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SystemSettings: b.SystemSettings, UIPrefs: b.UIPrefs, Captures: b.Captures, Chats: b.Chats,
 		Cipher: b.Cipher, CertCipher: b.CertCipher,
 		CertEdgeOutputDir: cfg.CertEdgeOutputDir, CertEdgeProbeTarget: cfg.CertEdgeProbeTarget,
-		Reachability: appHealth, LoadedModels: loadedModels, AgentPresence: agentPresence,
+		Reachability: appHealth, LoadedModels: loadedModels, AgentPresence: agentPresence, AgentFeatures: agentFeatures,
 		AgentCertReports: agentCertReports, AgentTransport: agentTransport,
 		ProxyStatus: proxyStatusReader{reg: agentProxyStatus},
 		Groups:      b.Groups, GroupCache: groups, Projects: b.Projects,

@@ -92,6 +92,19 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// A document that depends on what this agent declares, before the
+	// declaration is known (after a gateway start, until the agent's first
+	// telemetry sample), is held: 503, no document, no ETag. The agent's
+	// runtime-config source keeps the document it applied on every status but
+	// 200, and the ingest pushes the document once the declaration arrives
+	// (portal.AgentRuntimeConfigDTO.AwaitsAgentFeatures says why serving the
+	// document of an agent without the feature instead would be destructive).
+	if dto.AwaitsAgentFeatures {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, apierror.Response("runtime_config.agent_features_pending", "runtime config is held until the agent declares its features", ""))
+		return
+	}
+
 	etag := `"` + dto.ETag + `"`
 	w.Header().Set("ETag", etag)
 	if etagMatches(r.Header.Get("If-None-Match"), dto.ETag) {
@@ -236,6 +249,14 @@ func (s *Server) pushRuntimeConfigPass(serverID string) (sent bool) {
 	dto, err := s.Portal.AgentRuntimeConfig(ctx, serverID)
 	if err != nil {
 		slog.Debug("push runtime config: derive failed", "server_id", serverID, "err", err)
+		return false
+	}
+	if dto.AwaitsAgentFeatures {
+		// Held until the agent's declaration is known -- which a declared
+		// runtime_manager normally implies, so only a declaration forgotten
+		// between the gate above and the derive lands here. The ingest pushes
+		// once a readable declaration arrives.
+		slog.Debug("push runtime config: held until the agent declares its features", "server_id", serverID)
 		return false
 	}
 	b, err := json.Marshal(dto)

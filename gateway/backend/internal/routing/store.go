@@ -6,7 +6,9 @@ package routing
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"op-ai-gateway/internal/inference"
 	"strconv"
 	"strings"
@@ -2208,10 +2210,12 @@ func (m MappingMetricsMask) Any() bool {
 // AudioMetrics is what one audio benchmark run measured, for
 // UpdateMappingAudioMetrics: a speed run yields RateX and TTFAMS (and
 // LoadTimeMS from a confirmed cold start), a capacity ramp yields
-// RealtimeConcurrency and ConcurrencyLimit. A rate, TTFA or load time of 0 or
-// below means "this run did not measure it" and keeps the stored column, so a
-// speed-only run never erases the capacity figures and a capacity-only run
-// never erases the speed ones.
+// RealtimeConcurrency and ConcurrencyLimit. A rate of 0, or a TTFA or load
+// time of 0 or below, means "this run did not measure it" and keeps the
+// stored column, so a speed-only run never erases the capacity figures and a
+// capacity-only run never erases the speed ones. A negative or non-finite
+// rate is no measurement any run yields, and ValidateAudioMetrics refuses
+// the whole call.
 //
 // The ramp's two fields are one result and follow their own rule
 // (RampMeasured): the level and the reason the ramp stopped there are written
@@ -2223,7 +2227,8 @@ func (m MappingMetricsMask) Any() bool {
 // could be measured. Judging the count by its own sign instead would keep a
 // stored count next to the new limit and stamp: a fresh-looking ceiling, or
 // lower bound, that the latest ramp contradicts. ConcurrencyLimit is "" or
-// one of the three stop reasons; ValidateAudioMetrics refuses anything else.
+// one of the three stop reasons; ValidateAudioMetrics refuses anything else,
+// wrapping ErrAudioMetricsInvalid.
 type AudioMetrics struct {
 	RateX               float64 // -> ModelMapping.AudioRateX
 	TTFAMS              int64   // -> ModelMapping.AudioTTFAMS
@@ -2246,23 +2251,66 @@ const (
 	AudioLimitCap         = "cap"
 )
 
+// ErrAudioMetricsInvalid is wrapped by every refusal of ValidateAudioMetrics
+// and ValidateMappingAudioMetrics, so a caller can tell an audio figure no
+// measurement could yield -- a request's fault, answered as a bad request --
+// from a store failure with errors.Is.
+var ErrAudioMetricsInvalid = errors.New("audio metrics invalid")
+
 // ValidateAudioMetrics rejects a run that could not have come from a caller
-// behaving correctly: a ConcurrencyLimit that is neither "" (no ramp result)
-// nor one of the three stop reasons. Both UpdateMappingAudioMetrics
-// implementations call this exact function before they write anything, so
-// the drivers cannot disagree about which strings are a limit, and
-// audio_concurrency_limit only ever holds a value its readers -- the scaler
-// and the portal -- know how to read. The call is refused rather than its
-// ramp half dropped, the rule ValidateCapabilityRow follows: the benchmark
-// passes one of the constants, so anything else is a bug worth surfacing,
-// and a broken producer's other figures are not worth storing either.
+// behaving correctly: a RateX that is not a finite number of 0 or more, or a
+// ConcurrencyLimit that is neither "" (no ramp result) nor one of the three
+// stop reasons. Both UpdateMappingAudioMetrics implementations call this
+// exact function before they write anything, so the drivers cannot disagree
+// about which strings are a limit, and audio_concurrency_limit only ever
+// holds a value its readers -- the scaler and the portal -- know how to
+// read. The call is refused rather than its bad half dropped, the rule
+// ValidateCapabilityRow follows: the benchmark passes one of the constants
+// and a rate it divided out of two positive durations, so anything else is a
+// bug worth surfacing, and a broken producer's other figures are not worth
+// storing either. An infinite rate in particular would pass the writers'
+// "> 0" measured test, reach the column, and then fail every JSON encoding of
+// the mapping that carries it.
 func ValidateAudioMetrics(m AudioMetrics) error {
+	if math.IsNaN(m.RateX) || math.IsInf(m.RateX, 0) || m.RateX < 0 {
+		return fmt.Errorf("%w: rate must be a finite number of 0 or more, got %v", ErrAudioMetricsInvalid, m.RateX)
+	}
 	switch m.ConcurrencyLimit {
 	case "", AudioLimitPerformance, AudioLimitResources, AudioLimitCap:
 		return nil
 	}
-	return fmt.Errorf("audio metrics: concurrency limit must be %q, %q or %q, got %q",
+	return fmt.Errorf("%w: concurrency limit must be %q, %q or %q, got %q", ErrAudioMetricsInvalid,
 		AudioLimitPerformance, AudioLimitResources, AudioLimitCap, m.ConcurrencyLimit)
+}
+
+// ValidateMappingAudioMetrics is ValidateAudioMetrics for a whole mapping
+// row, the check the full-row writers (CreateMapping, UpdateMapping) make in
+// every driver before they store one, so the audio columns hold only what
+// UpdateMappingAudioMetrics itself could have written: a usable rate, a known
+// limit, the ramp's count and limit as the one result they are -- a count
+// beside the reason the ramp stopped, never a count without one, and never a
+// negative level, which no ramp ends on -- and a TTFA and load time of 0 (not
+// measured) or more. The narrow writer skips a negative TTFA or load time as
+// "not measured"; a full row has no "keep the stored column" to fall back on,
+// so it would store the figure, and is refused instead. Every refusal wraps
+// ErrAudioMetricsInvalid.
+func ValidateMappingAudioMetrics(m ModelMapping) error {
+	if err := ValidateAudioMetrics(AudioMetrics{RateX: m.AudioRateX, ConcurrencyLimit: m.AudioConcurrencyLimit}); err != nil {
+		return err
+	}
+	if m.AudioTTFAMS < 0 {
+		return fmt.Errorf("%w: time to first audio must be 0 or more ms, got %d", ErrAudioMetricsInvalid, m.AudioTTFAMS)
+	}
+	if m.LoadTimeMS < 0 {
+		return fmt.Errorf("%w: load time must be 0 or more ms, got %d", ErrAudioMetricsInvalid, m.LoadTimeMS)
+	}
+	if m.AudioRealtimeConcurrency < 0 {
+		return fmt.Errorf("%w: realtime concurrency must be 0 or more, got %d", ErrAudioMetricsInvalid, m.AudioRealtimeConcurrency)
+	}
+	if m.AudioConcurrencyLimit == "" && m.AudioRealtimeConcurrency != 0 {
+		return fmt.Errorf("%w: a realtime concurrency of %d needs the concurrency limit the ramp stopped at", ErrAudioMetricsInvalid, m.AudioRealtimeConcurrency)
+	}
+	return nil
 }
 
 // RampMeasured reports whether the run carries a concurrency-ramp result: a
@@ -2298,6 +2346,10 @@ func (m AudioMetrics) Measured() bool {
 // table's capability columns and migrations 76/77/78 all cite. See
 // CapabilityRow.
 type MappingStore interface {
+	// CreateMapping and UpdateMapping write the whole row, its audio columns
+	// included, so both refuse a row ValidateMappingAudioMetrics refuses
+	// before they write anything: those columns hold only what
+	// UpdateMappingAudioMetrics could have stored.
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	// UpdateMapping, like UpdateMappingEditable below, is one of the two
 	// writers of app_model_name, and both drop the mapping's model_mapping_cache
@@ -2344,18 +2396,20 @@ type MappingStore interface {
 	// (migration 101), the audio counterpart of UpdateMappingBenchmarkMetrics:
 	// atomically and ONLY when metrics_locked is false (a no-op, non-error, when
 	// the mapping is missing or locked). A run writes only what it measured: a
-	// rate, TTFA or load time of 0 or below keeps the stored column, and a
-	// positive LoadTimeMS also writes load_time_ms. The ramp's count and limit
-	// are one result, written together -- a 0 included -- when the run carries
-	// one (AudioMetrics.RampMeasured) and both kept otherwise, so the stored
-	// pair never mixes two ramps. A write is stamped with metrics_source =
-	// source and with at in both metrics_updated_at and
-	// audio_metrics_updated_at, like the text writers' at; a call that measured
-	// nothing (AudioMetrics.Measured) writes nothing, provenance included. A
-	// limit other than "" and the three stop reasons is refused with an error
-	// before anything is written (ValidateAudioMetrics), also for a missing or
-	// locked mapping. It touches only those columns, so it cannot clobber a
-	// concurrent edit of other fields.
+	// rate of 0, or a TTFA or load time of 0 or below, keeps the stored
+	// column, and a positive LoadTimeMS also writes load_time_ms. The ramp's
+	// count and limit are one result, written together -- a 0 included --
+	// when the run carries one (AudioMetrics.RampMeasured) and both kept
+	// otherwise, so the stored pair never mixes two ramps. A write is
+	// stamped with metrics_source = source and with at in both
+	// metrics_updated_at and audio_metrics_updated_at, like the text writers'
+	// at; a call that measured nothing (AudioMetrics.Measured) writes
+	// nothing, provenance included. A negative or non-finite rate, and a
+	// limit other than "" and the three stop reasons, are refused with an
+	// error wrapping ErrAudioMetricsInvalid before anything is written
+	// (ValidateAudioMetrics), also for a missing or locked mapping. It
+	// touches only those columns, so it cannot clobber a concurrent edit of
+	// other fields.
 	UpdateMappingAudioMetrics(ctx context.Context, mappingID string, m AudioMetrics, source string, at time.Time) error
 	// UpdateMappingEnergyEWMA EWMA-blends energy_wh_per_token from a live per-request
 	// energy sample (watt-hours/token), atomically and ONLY when metrics_locked is
@@ -2769,8 +2823,8 @@ type RuntimeSpec struct {
 	Replicable bool
 	// MinInstances is how many instances are kept warm (0 = none) and
 	// MaxInstances caps how many may run (0 = unbounded; the agent's absolute
-	// per-spec index cap still applies). Both only mean something while
-	// Replicable. Operator-owned (migration 100).
+	// per-spec index cap, MaxInstanceIndex+1 instances, still applies). Both
+	// only mean something while Replicable. Operator-owned (migration 100).
 	MinInstances int
 	MaxInstances int
 	// InstanceParallelism is how many requests one instance serves at once
@@ -2853,6 +2907,13 @@ type RuntimeSpec struct {
 	CreatedAt                   time.Time
 	UpdatedAt                   time.Time
 }
+
+// MaxInstanceIndex is the highest instance index k an instance address
+// (`<app model name>#k`) can carry, so a replicable spec has at most
+// MaxInstanceIndex+1 instances, 0 to MaxInstanceIndex. It is a wire constant
+// shared with the agent (server-agent/internal/runtime.MaxInstanceIndex), which
+// this module cannot import, so both spell it.
+const MaxInstanceIndex = 63
 
 // RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec
 // (agent_runtime_spec_gpus, migration 65), keyed by (SpecID, GPUIndex).

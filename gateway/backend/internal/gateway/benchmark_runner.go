@@ -497,13 +497,14 @@ var (
 type coldStart struct {
 	// confirmed: the next request starts the target from cold, so the cold-minus-warm delta is its
 	// load time. For a server_agent target whose run stops (preStopServer) that means that no
-	// model of the application had a process and the target's own row read stopped, or that the
-	// agent reported every model the stop-all stopped without a process, the target's own row
-	// stopped with pid 0 when it had read backoff, start_failed or crashed, and the clear was
-	// written. When every row was quiet at the selection, every launch spec the run unpinned, the
-	// target aside, also read stopped with pid 0. For one whose run does not stop it means that
-	// the router does not list it, its own status row reads stopped with pid 0 or is absent, and
-	// every other row of a non-empty status snapshot reads stopped with pid 0 (agentColdStart).
+	// model of the application had a process and every row of the target read stopped, or that
+	// the agent reported every model the stop-all stopped without a process, the target's
+	// instance-0 row stopped with pid 0 when it had read backoff, start_failed or crashed, and
+	// the clear was written. When every row was quiet at the selection, every launch spec the run
+	// unpinned, the target aside, also read stopped with pid 0. For one whose run does not stop it
+	// means that the router does not list it, its own instance-0 status row reads stopped with
+	// pid 0 or is absent, and every other row of a non-empty status snapshot reads stopped with
+	// pid 0 (agentColdStart).
 	// For any other target the loaded-models probe confirmed it absent (ensureColdLoadByEviction).
 	confirmed bool
 	// rideOutStop: the target's own force_stopped was or may have been written, so the cold
@@ -683,9 +684,18 @@ func (s *Server) agentTargetResident(ctx context.Context, tgt benchmarkTarget) (
 // nothing: a request for it starts a genuine cold load at once.
 const agentSpecStateStopped = "stopped"
 
+// agentSpecStateRunning and agentSpecStateStarting are the runtime-status states of an
+// instance whose child serves, and of one whose child is up but not yet healthy.
+const (
+	agentSpecStateRunning  = "running"
+	agentSpecStateStarting = "starting"
+)
+
 // agentSpecResidency is agentTargetResident's reading of the agent's most recent runtime-status
 // snapshot, once the router's loaded set has not listed tgt's model. The row is matched by spec
-// id, never by model name:
+// id, never by model name, and it is the spec's instance-0 row, the one tgt's model name
+// reaches: another instance of a replicable target is one of the others benchmarkOthersStopped
+// reads.
 //   - a state with a live process (vramStatesWithProcess: running, starting, draining), or any
 //     process id, is resident: a child /running does not list yet or no longer lists, or a
 //     start_failed child whose process is still up;
@@ -699,7 +709,7 @@ func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) 
 		return false, true
 	}
 	for _, row := range s.RuntimeStatus.statusSnapshot(tgt.server.ID) {
-		if row.SpecID != tgt.spec.ID {
+		if row.SpecID != tgt.spec.ID || row.Instance != 0 {
 			continue
 		}
 		switch {
@@ -715,7 +725,9 @@ func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) 
 }
 
 // benchmarkOthersStopped reports whether rows is not empty and every row of it reads stopped
-// with pid 0, except the row of specID itself, which agentSpecResidency has already read. A
+// with pid 0, except the row of specID itself, which agentSpecResidency has already read. That
+// row is specID's instance-0 row: every other instance of a replicable target is an other here,
+// since a burst instance that runs holds the memory a cold pass would be measured against. A
 // target without a spec (specID "") has no row of its own, so every row counts, one without a
 // spec id included. A neighbour in backoff, not_permitted or pending_vram_unknown has no process
 // now, but a pinned or force_running one can start one by itself: when its backoff timer fires,
@@ -731,7 +743,7 @@ func benchmarkOthersStopped(rows []RuntimeStatusDTO, specID string) bool {
 		return false
 	}
 	for _, row := range rows {
-		if specID != "" && row.SpecID == specID {
+		if specID != "" && row.SpecID == specID && row.Instance == 0 {
 			continue
 		}
 		if row.State != agentSpecStateStopped || row.PID != 0 {
@@ -1164,14 +1176,22 @@ func (s *Server) benchmarkTelemetryContextSize(ctx context.Context, tgt benchmar
 	}
 }
 
-// benchmarkSpecStatus returns specID's row of one status frame.
+// benchmarkSpecStatus returns specID's row of one status frame: the spec's representative row
+// (runtimeRowRepresentative: the running instance-0 row, else the running row with the lowest
+// index, else the instance-0 row, else the lowest index), the row every other view of the spec
+// reads too. A replicable spec reports a row per instance under the one spec id; ok is false
+// only when the frame has none of them. Two questions are about instance 0 alone, the instance
+// the target's plain model name reaches and a benchmark's requests go to, and read its row
+// directly instead: whether the target is resident (agentSpecResidency) and whether the
+// stop-all's quiet wait also waits for the target to read stopped (benchmarkStopSelectionOf).
 func benchmarkSpecStatus(frame []RuntimeStatusDTO, specID string) (RuntimeStatusDTO, bool) {
+	var rows []RuntimeStatusDTO
 	for _, row := range frame {
 		if row.SpecID == specID {
-			return row, true
+			rows = append(rows, row)
 		}
 	}
-	return RuntimeStatusDTO{}, false
+	return runtimeRowRepresentative(rows)
 }
 
 // benchmarkSnapshotContextSize decides on the snapshot a subscription starts
@@ -1281,6 +1301,14 @@ func (s *Server) measureSpeedTarget(ctx context.Context, tgt benchmarkTarget) Be
 		// Both writes skip a locked mapping. This write never touches
 		// context_size, so a probed context survives.
 		_ = s.Routes.UpdateMappingBenchmarkMetrics(ctx, tgt.mapping.ID, res.GenTokensPerSecond, res.PromptTokensPerSecond, res.LoadTimeMS, time.Now().UTC())
+		// A replicable spec's pushed idle timeout is derived from its mapping's
+		// load_time_ms, and this write is outside the portal service, whose
+		// write paths push a changed document themselves, so it pushes here.
+		// A spec that is not replicable is pushed its stored idle timeout,
+		// which a load time does not change.
+		if res.LoadTimeMS > 0 && tgt.spec.Replicable {
+			s.PushRuntimeConfig(tgt.server.ID)
+		}
 	}
 	return res
 }

@@ -9,6 +9,7 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"strings"
 )
@@ -126,11 +127,18 @@ func (s *Server) handlePortalMappingItem(w http.ResponseWriter, r *http.Request)
 // sharedErrorMap instead. portal.ErrMappingStatusInvalid maps to a different
 // code in writePortalModelGroupError, and store.ErrNotFound maps to a
 // different code in other mappers, so both must stay here.
+//
+// routing.ErrAudioMetricsInvalid is the store's refusal of a mapping row
+// whose audio figures no measurement yields (a negative or non-finite rate, a
+// negative TTFA or load time, a ramp count without its limit, an unknown
+// limit). It is the request's fault like any other invalid metric, so it
+// answers the same 400 mapping.metric_invalid rather than the fallback 500.
 var portalMappingErrRows = []errRow{
 	{err: portal.ErrMappingGatewayNameRequired, status: http.StatusBadRequest, code: "mapping.gateway_name_required", msg: "mapping gateway model name is required"},
 	{err: portal.ErrMappingAppNameRequired, status: http.StatusBadRequest, code: "mapping.app_name_required", msg: "mapping app model name is required"},
 	{err: portal.ErrMappingStatusInvalid, status: http.StatusBadRequest, code: "mapping.status_invalid", msg: "mapping status is invalid"},
 	{err: portal.ErrMappingMetricInvalid, status: http.StatusBadRequest, code: "mapping.metric_invalid", msg: "mapping metric value is invalid"},
+	{err: routing.ErrAudioMetricsInvalid, status: http.StatusBadRequest, code: "mapping.metric_invalid", msg: "mapping metric value is invalid"},
 	{err: portal.ErrMappingCapabilityNameRequired, status: http.StatusBadRequest, code: "mapping.capability_name_required", msg: "capability_verdicts must not contain an empty capability name"},
 	{err: portal.ErrMappingCapabilityVerdictInvalid, status: http.StatusBadRequest, code: "mapping.capability_verdict_invalid", msg: `capability_verdicts values must be "yes", "no" or "" (unknown)`},
 	{err: portal.ErrMappingCapabilityConflict, status: http.StatusBadRequest, code: "mapping.capability_conflict", msg: "a capability cannot be stated in capability_verdicts and in its is_mtp/vision_capable boolean in the same request"},

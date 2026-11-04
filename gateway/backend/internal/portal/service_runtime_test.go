@@ -4029,7 +4029,25 @@ func instanceSpecFixture(t *testing.T, svc *Service, routeStore *routing.MemoryS
 	if err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
+	// The server's agent runs instances, so the pushed document carries them;
+	// TestAgentRuntimeDocInstanceFieldsOnlyForAnAgentThatRunsInstances covers
+	// the agents that do not.
+	svc.agentFeatures = fakeAgentFeatures{server.ID: {"runtime_manager", AgentFeatureRuntimeInstances}}
 	return svc, routeStore, mapping.ID, server.ID
+}
+
+// fakeAgentFeatures is an AgentFeatureReader over a fixed declared set per
+// server id. A server with an entry -- an empty one included -- has declared
+// its set; one without has not been heard from.
+type fakeAgentFeatures map[string][]string
+
+func (f fakeAgentFeatures) Has(serverID, feature string) bool {
+	return slices.Contains(f[serverID], feature)
+}
+
+func (f fakeAgentFeatures) Known(serverID string) bool {
+	_, ok := f[serverID]
+	return ok
 }
 
 // newInstanceIdleTestService is newServerTestService with the two idle-timeout

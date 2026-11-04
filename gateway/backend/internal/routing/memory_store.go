@@ -1049,6 +1049,9 @@ func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 }
 
 func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) error {
+	if err := ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.mappings[mapping.ID]; ok {
@@ -1062,6 +1065,9 @@ func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) err
 }
 
 func (m *MemoryStore) UpdateMapping(_ context.Context, mapping ModelMapping) error {
+	if err := ValidateMappingAudioMetrics(mapping); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	stored, ok := m.mappings[mapping.ID]
@@ -1466,16 +1472,16 @@ func (m *MemoryStore) UpdateMappingCapacityMetrics(_ context.Context, id string,
 }
 
 // UpdateMappingAudioMetrics writes one audio benchmark run's measurements, only
-// while the mapping is unlocked: a rate, TTFA or load time of 0 or below is not
-// measured and keeps the stored field, a positive LoadTimeMS also writes
-// LoadTimeMS, the ramp's count and limit are written as a pair, 0 included,
-// exactly when the run carries a ramp result (AudioMetrics.RampMeasured), and
-// whatever is written is stamped with source and with at in both
-// MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that measured nothing
-// writes nothing, provenance included. A limit ValidateAudioMetrics refuses is
-// an error before anything else, exactly as the SQL store refuses it before
-// any statement. A missing or locked mapping is a benign no-op (mirrors the
-// SQL metrics_locked = 0 guard).
+// while the mapping is unlocked: a rate of 0, or a TTFA or load time of 0 or
+// below, is not measured and keeps the stored field, a positive LoadTimeMS
+// also writes LoadTimeMS, the ramp's count and limit are written as a pair, 0
+// included, exactly when the run carries a ramp result
+// (AudioMetrics.RampMeasured), and whatever is written is stamped with source
+// and with at in both MetricsUpdatedAt and AudioMetricsUpdatedAt. A call that
+// measured nothing writes nothing, provenance included. A rate or limit
+// ValidateAudioMetrics refuses is an error before anything else, exactly as
+// the SQL store refuses it before any statement. A missing or locked mapping
+// is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
 func (m *MemoryStore) UpdateMappingAudioMetrics(_ context.Context, mappingID string, am AudioMetrics, source string, at time.Time) error {
 	if err := ValidateAudioMetrics(am); err != nil {
 		return err
