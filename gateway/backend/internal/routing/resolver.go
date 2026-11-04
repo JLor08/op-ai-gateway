@@ -106,9 +106,10 @@ func parkDemand(err error) (DemandSignal, bool) {
 // on the fail-open path a resolver without a queue takes, never for a request whose
 // deadline has already passed, and never for one the queue has no room for
 // (AdmissionRoom) -- a request about to be refused as full must not start an instance.
-// The one other sender is selectWithoutParking, for a request that must not park
-// (inference.Request.NoPark): it is served on a busy instance at once, so it signals once
-// where it would otherwise have parked.
+// The one other sender is signalOverflow, for a request that must not park
+// (inference.Request.NoPark): once it has been served on a busy candidate instead, it
+// signals once where it would otherwise have parked. A check-only resolve
+// (inference.Request.CheckOnly) signals nowhere.
 func (r *Resolver) signalDemand(demands ...DemandSignal) {
 	if r.demand == nil || len(demands) == 0 {
 		return
@@ -572,6 +573,7 @@ type Resolver struct {
 	instanceActivity  InstanceActivityChecker
 	demand            DemandSink
 	liveSlots         LiveSlotChecker
+	realtimeMinFactor float64     // SetAudioRealtimeMinFactor; 0 gates nothing
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
 	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
 	// the per-user vendor-account branch (resolveVendorAccount). All three are
@@ -908,6 +910,13 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		return Target{}, err
 	}
 	candidates = voice.restrict(candidates)
+	// The real-time gate of a voice chat's legs, a hard filter that never fails open:
+	// after the voice, so a voice whose servers are all too slow is refused as too slow,
+	// and before the admission parameters, so the request never queues on a server it
+	// may not use.
+	if candidates, err = r.filterRealtime(candidates, req); err != nil {
+		return Target{}, err
+	}
 
 	// Admission-queue params (CP4): the servers to watch for a freeing slot, and the wait
 	// timeout = the MAX admission_queue_timeout_seconds across the candidate apps (0 = at
@@ -948,8 +957,11 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		turn := expandInstances(ctx, candidates, r.instances)
 		selected, ok, err := r.selectCandidate(ctx, turn, req, now)
 		var ac *atCapacityError
-		if req.NoPark && errors.As(err, &ac) {
-			selected, ok, err = r.selectWithoutParking(ctx, ac, req.Model, now)
+		if neverParks(req) && errors.As(err, &ac) {
+			selected, ok, err = r.selectWithoutParking(ctx, ac, req.Model, audioRequest(req), now)
+			if ok && ac.demand != nil {
+				r.signalOverflow(req, *ac.demand)
+			}
 		}
 		if errors.Is(err, errAllAtCapacity) {
 			// All candidates at cap + a wired controller: park until a slot frees, then retry.
@@ -1485,6 +1497,11 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 	if len(mine) == 0 {
 		return Target{}, ErrServerOverrideModelUnavailable
 	}
+	// Unlike the voice, the real-time gate does veto the override: it is a hard gate,
+	// and a server measured too slow for a conversation is no better for being named.
+	if mine, err = r.filterRealtime(mine, req); err != nil {
+		return Target{}, err
+	}
 	server := mine[0].Server
 	if server.Status == ServerStatusDisabled {
 		return Target{}, ErrServerOverrideServerUnavailable
@@ -1666,42 +1683,42 @@ func NormalizeAPIFlavor(apiFlavor string) string {
 
 // affinityApplicationStale reports whether a stored affinity's application is no
 // longer a usable target for it — affinity disabled, moved to another server,
-// inactive, no longer serving the request's endpoint, or currently unreachable —
-// in which case the caller drops the affinity. Extracted from resolveAffinity so
-// that method's cognitive complexity stays within budget.
+// inactive, or no longer serving the request's endpoint — in which case the
+// caller drops the affinity. Whether it is reachable right now is one of the
+// gates every candidate passes, and affinityServer asks those. Extracted from
+// resolveAffinity so that method's cognitive complexity stays within budget.
 func (r *Resolver) affinityApplicationStale(app Application, affinity RouteAffinity, fineFlavor string) bool {
 	return app.AffinityTTLSeconds <= 0 ||
 		app.ServerID != affinity.ServerID ||
 		app.Status != ServerStatusActive ||
-		!applicationServesEndpoint(app, fineFlavor) ||
-		(r.checker != nil && !r.checker.Reachable(app.ID))
+		!applicationServesEndpoint(app, fineFlavor)
 }
 
-// affinityServer loads the AI server a stored affinity's application sits on and
-// decides whether that server is still a usable destination for the pin -- it
-// must exist, be selectable (active and not unhealthy), and not be temporarily
-// busy. Extracted from resolveAffinity, alongside affinityApplicationStale
-// above, so that method's cognitive complexity stays within budget.
+// affinityServer loads the AI server a stored affinity's application app sits on
+// and decides whether the pin may still be served there -- the server must
+// exist, and the two must pass the gates every request's candidates pass first
+// (CandidateServesNow: the server selectable, the application reachable, the
+// server not held by a benchmark), so a pin is kept exactly where a fresh
+// selection could go. Extracted from resolveAffinity, alongside
+// affinityApplicationStale above, so that method's cognitive complexity stays
+// within budget.
 //
 // The three-way result is what resolveAffinity's own three-way handling needs,
-// and the split is deliberate: usable == false is a DROP -- the server is gone,
-// unselectable or busy, and the caller deletes the affinity row -- while a
-// non-nil error is a store failure that says nothing about the pin, so the
-// caller surfaces it and leaves the row alone. A vanished server
+// and the split is deliberate: usable == false is a DROP -- the server is gone
+// or fails a gate, and the caller deletes the affinity row -- while a non-nil
+// error is a store failure that says nothing about the pin, so the caller
+// surfaces it and leaves the row alone. A vanished server
 // (storeerr.ErrNotFound) is a drop, not an error, for the same reason a
 // vanished application is.
-func (r *Resolver) affinityServer(ctx context.Context, serverID string) (server AIServer, usable bool, err error) {
-	server, err = r.store.AIServerByID(ctx, serverID)
+func (r *Resolver) affinityServer(ctx context.Context, app Application) (server AIServer, usable bool, err error) {
+	server, err = r.store.AIServerByID(ctx, app.ServerID)
 	if errors.Is(err, storeerr.ErrNotFound) {
 		return AIServer{}, false, nil
 	}
 	if err != nil {
 		return AIServer{}, false, fmt.Errorf("load affinity server: %w", err)
 	}
-	if !serverSelectable(server) {
-		return AIServer{}, false, nil
-	}
-	if r.busy != nil && r.busy.ServerBusy(server.ID) {
+	if !r.CandidateServesNow(MappingCandidate{Server: server, Application: app}) {
 		return AIServer{}, false, nil
 	}
 	return server, true, nil
@@ -1775,7 +1792,7 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
-	server, usable, err := r.affinityServer(ctx, app.ServerID)
+	server, usable, err := r.affinityServer(ctx, app)
 	if err != nil {
 		return Target{}, false, err
 	}
@@ -1867,21 +1884,16 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	// route anyway; no clamp is needed.
 	need := estInputTokens(req) + req.MaxTokens
 
-	// Pass 1: the reachable/selectable/non-busy candidates (the existing gates), less any
-	// instance the request already tried and found gone (ExcludeInstanceKeys) -- a hard
-	// filter on every admission turn, so a parked request never comes back to it.
+	// Pass 1: the reachable/selectable/non-busy candidates (CandidateServesNow, the one
+	// statement of these gates), less any instance the request already tried and found
+	// gone (ExcludeInstanceKeys) -- a hard filter on every admission turn, so a parked
+	// request never comes back to it.
 	reachable := make([]MappingCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if !serverSelectable(c.Server) {
-			continue
-		}
 		if len(req.ExcludeInstanceKeys) > 0 && slices.Contains(req.ExcludeInstanceKeys, InstanceKey(c.Mapping.ID, c.Instance)) {
 			continue
 		}
-		if r.checker != nil && !r.checker.Reachable(c.Application.ID) {
-			continue
-		}
-		if r.busy != nil && r.busy.ServerBusy(c.Server.ID) {
+		if !r.CandidateServesNow(c) {
 			continue
 		}
 		reachable = append(reachable, c)
@@ -1918,7 +1930,7 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 // that passed every gate, preferring the ones under their cap. instancePool says pool
 // holds an instance candidate.
 func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, req inference.Request, now time.Time, instancePool bool) (MappingCandidate, bool, error) {
-	model := req.Model
+	model, audio := req.Model, audioRequest(req)
 	// Capacity cap, CP3/CP4: PREFER the candidates under their cap (underCap); when none
 	// is, queue the request (CP4) if an admission controller is wired. The caps:
 	//
@@ -1973,37 +1985,54 @@ func (r *Resolver) selectUnderCap(ctx context.Context, pool []MappingCandidate, 
 			}
 			slog.Warn("capacity-cap filter empty; routing without it (all candidates at capacity)", "model", model)
 		} else if len(capped) < len(pool) {
-			if sel, ok, err := r.selectWithSwapProtection(ctx, capped, model, now); err != nil || ok {
+			if sel, ok, err := r.selectWithSwapProtection(ctx, capped, model, audio, now); err != nil || ok {
 				return sel, ok, err
 			}
 			slog.Warn("capacity-cap survivors non-viable; routing without it", "model", model)
 		}
 	}
-	return r.selectWithSwapProtection(ctx, pool, model, now)
+	return r.selectWithSwapProtection(ctx, pool, model, audio, now)
 }
 
-// selectWithoutParking selects for a request that must not park (inference.Request.NoPark)
-// from ac's pool, whose every candidate is at its cap. It prefers the least loaded
-// instance candidates (leastLoadedInstances) and falls back to the whole pool -- the way
-// a resolver without a queue fails open -- when there is none, or none of them is
-// viable. It first hands the sink ac's demand, once and without asking the queue for
-// room (signalDemand does both for a parking request): the request is served now, so no
-// park turn will signal for it, and a selection that found no free instance is demand
-// already known. model only labels the log lines of the selection.
-func (r *Resolver) selectWithoutParking(ctx context.Context, ac *atCapacityError, model string, now time.Time) (MappingCandidate, bool, error) {
-	if ac.demand != nil && r.demand != nil {
-		r.demand.Signal(*ac.demand)
+// neverParks reports whether req must be answered without waiting in the admission
+// queue: a gate that only selects (inference.Request.NoPark) or a check-only resolve
+// (inference.Request.CheckOnly). Either is served from the capped pool when every
+// candidate is at its cap (selectWithoutParking).
+func neverParks(req inference.Request) bool {
+	return req.NoPark || req.CheckOnly
+}
+
+// signalOverflow hands the sink d for a request that must not park and was just
+// served on a busy candidate (selectWithoutParking found a selection), once and
+// without asking the queue for room -- signalDemand does both for a parking request:
+// the request is served now, so no park turn will signal for it, and a selection
+// that found no free instance is demand already known. A check-only resolve signals
+// nothing: the request it checks for resolves, parks and signals on its own.
+func (r *Resolver) signalOverflow(req inference.Request, d DemandSignal) {
+	if r.demand == nil || !req.NoPark || req.CheckOnly {
+		return
 	}
+	r.demand.Signal(d)
+}
+
+// selectWithoutParking selects, for a request that never parks (neverParks), from ac's
+// pool, whose every candidate is at its cap. It prefers the least loaded instance
+// candidates (leastLoadedInstances) and falls back to the whole pool -- the way a
+// resolver without a queue fails open -- when there is none, or none of them is
+// viable. It signals nothing: its caller hands the sink the demand once the selection
+// succeeded (signalOverflow), so a request that could not be served signals no demand.
+// model only labels the log lines of the selection; audio is as for argmaxByScore.
+func (r *Resolver) selectWithoutParking(ctx context.Context, ac *atCapacityError, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
 	var sel MappingCandidate
 	ok := false
 	var err error
 	if least := leastLoadedInstances(ac.pool, r.instanceActivity); len(least) > 0 {
-		if sel, ok, err = r.selectWithSwapProtection(ctx, least, model, now); err != nil {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, least, model, audio, now); err != nil {
 			return MappingCandidate{}, false, err
 		}
 	}
 	if !ok {
-		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, now); err != nil || !ok {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, audio, now); err != nil || !ok {
 			return MappingCandidate{}, false, err
 		}
 	}
@@ -2099,7 +2128,7 @@ func instanceDemand(pool []MappingCandidate, req inference.Request) *DemandSigna
 // viability: if protection removes some candidates but the survivors yield no viable pick
 // (or it removes them all), fall back to the full pool rather than refuse a request a busy
 // server could still serve. Gated on r.activity != nil (the no-op invariant).
-func (r *Resolver) selectWithSwapProtection(ctx context.Context, pool []MappingCandidate, model string, now time.Time) (MappingCandidate, bool, error) {
+func (r *Resolver) selectWithSwapProtection(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
 	if r.activity != nil {
 		protected := make([]MappingCandidate, 0, len(pool))
 		for _, c := range pool {
@@ -2110,19 +2139,19 @@ func (r *Resolver) selectWithSwapProtection(ctx context.Context, pool []MappingC
 		if len(protected) == 0 {
 			slog.Warn("swap-protection filter empty; routing without it", "model", model)
 		} else if len(protected) < len(pool) {
-			if sel, ok, err := r.selectFromPool(ctx, protected, model, now); err != nil || ok {
+			if sel, ok, err := r.selectFromPool(ctx, protected, model, audio, now); err != nil || ok {
 				return sel, ok, err
 			}
 			slog.Warn("swap-protection survivors non-viable; routing without it", "model", model)
 		}
 	}
-	return r.selectFromPool(ctx, pool, model, now)
+	return r.selectFromPool(ctx, pool, model, audio, now)
 }
 
 // selectFromPool applies the prefer-loaded partition (dominant, fail-open) and then the
 // bounded-tiebreak score to choose a candidate from pool. Returns ok=false if no
 // candidate in pool is viable (Score gate).
-func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, model string, now time.Time) (MappingCandidate, bool, error) {
+func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
 	// Prefer already-loaded (DOMINANT over the score): if any candidate in the pool has
 	// the requested model resident on its server, prefer that partition — avoiding a cold
 	// load/swap. When loaded state is unknown (nil checker / no data), no candidate is
@@ -2140,7 +2169,7 @@ func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, 
 			}
 		}
 		if len(loadedPool) > 0 {
-			if sel, ok, err := r.argmaxByScore(ctx, loadedPool, model, now); err != nil || ok {
+			if sel, ok, err := r.argmaxByScore(ctx, loadedPool, model, audio, now); err != nil || ok {
 				return sel, ok, err
 			}
 		}
@@ -2160,12 +2189,12 @@ func (r *Resolver) selectFromPool(ctx context.Context, pool []MappingCandidate, 
 			}
 		}
 		if len(startingPool) > 0 {
-			if sel, ok, err := r.argmaxByScore(ctx, startingPool, model, now); err != nil || ok {
+			if sel, ok, err := r.argmaxByScore(ctx, startingPool, model, audio, now); err != nil || ok {
 				return sel, ok, err
 			}
 		}
 	}
-	return r.argmaxByScore(ctx, pool, model, now)
+	return r.argmaxByScore(ctx, pool, model, audio, now)
 }
 
 // swapProtected reports whether routing to candidate c would evict a live model: c's
@@ -2279,7 +2308,7 @@ func (p *telemetryPass) read(ctx context.Context, serverID string) (ServerTeleme
 	return telemetry, ok, nil
 }
 
-func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, model string, now time.Time) (MappingCandidate, bool, error) {
+func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
 	var selected MappingCandidate
 	bestScore := 0.0
 	found := false
@@ -2295,7 +2324,7 @@ func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, m
 			k = inflight
 		}
 		telemetry, ok = r.mergeRuntimeModelMetrics(candidate, telemetry, ok, now)
-		route := scoringRoute(candidate, telemetry, ok, k, model)
+		route := scoringRoute(candidate, telemetry, ok, k, model, audio)
 		score, ok := Score(route, model, now)
 		if !ok {
 			continue
@@ -2323,7 +2352,7 @@ func (r *Resolver) candidateEffectiveGenTPS(ctx context.Context, pass *telemetry
 		inflight, _ := r.activity.ServerActivity(c.Server.ID)
 		k = inflight
 	}
-	return effectiveGenTPS(scoringRoute(c, telemetry, ok, k, model)), nil
+	return effectiveGenTPS(scoringRoute(c, telemetry, ok, k, model, false)), nil
 }
 
 func (r *Resolver) activeMappingForApplication(ctx context.Context, applicationID string, gatewayModel string) (ModelMapping, bool, error) {
@@ -2483,6 +2512,16 @@ func (r *Resolver) groupVoiceScope(ctx context.Context, g groupResolve) (*voiceS
 	if g.req.RequiredVoice == "" {
 		return nil, nil
 	}
+	pool, err := r.flatGroupPool(ctx, g)
+	if err != nil {
+		return nil, err
+	}
+	return r.voiceScopeFor(ctx, g.req.RequiredVoice, pool)
+}
+
+// flatGroupPool is every distinct member's memberPool of g, one flat set of mappings: what
+// the group as a whole could serve the request on before any policy narrows it.
+func (r *Resolver) flatGroupPool(ctx context.Context, g groupResolve) ([]MappingCandidate, error) {
 	var pool []MappingCandidate
 	seen := make(map[string]struct{}, len(g.members))
 	for _, m := range g.members {
@@ -2496,18 +2535,37 @@ func (r *Resolver) groupVoiceScope(ctx context.Context, g groupResolve) (*voiceS
 		}
 		pool = append(pool, cands...)
 	}
-	return r.voiceScopeFor(ctx, g.req.RequiredVoice, pool)
+	return pool, nil
+}
+
+// groupRealtimeCheck is the group-level real-time PRE-PASS, for a request that must keep
+// up with real time: over the flattened group, restricted to g's voice scope, it refuses
+// with ErrNoRealtimeCandidate when there were candidates and every one is too slow --
+// the answer the walk could not give, since a member it finds too slow reads as one
+// without candidates. Nil, without reading anything, for every other request.
+func (r *Resolver) groupRealtimeCheck(ctx context.Context, g groupResolve) error {
+	if !g.req.RealtimeRequired {
+		return nil
+	}
+	pool, err := r.flatGroupPool(ctx, g)
+	if err != nil {
+		return err
+	}
+	_, err = r.filterRealtime(g.voice.restrict(pool), g.req)
+	return err
 }
 
 // groupWalk carries the two things threaded unchanged through ONE group resolution
 // attempt: the policy (which the relaxation ladder rewrites between attempts) and the voice
 // pre-pass scope (which it must NOT). Keeping voice a sibling field here, never a
 // GroupPolicy field, preserves the invariant that the ladder can relax the policy but never
-// the voice. It is built from a groupResolve at each call site (groupWalk{policy: g.policy,
-// voice: g.voice}), so the voice is only ever copied, never recomputed between attempts.
+// the voice. It is built from a groupResolve at each call site (groupResolve.walk), so the
+// voice is only ever copied, never recomputed between attempts. realtime is the request's
+// real-time marker (inference.Request.RealtimeRequired), which no attempt relaxes either.
 type groupWalk struct {
-	policy GroupPolicy
-	voice  *voiceScope
+	policy   GroupPolicy
+	voice    *voiceScope
+	realtime bool
 }
 
 // eligibleCandidates resolves one group member's candidates and applies every
@@ -2549,6 +2607,13 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 	// groupWalk, never a GroupPolicy field, so the relaxation ladder (which only ever
 	// rewrites the policy) cannot relax it.
 	cands = gw.voice.restrict(cands)
+	// The real-time gate, applied like the voice and for the same reason before live is
+	// taken: a member measured too slow for a voice chat has nothing to offer one.
+	// resolveGroup's pre-pass (groupRealtimeCheck) has already refused a group whose
+	// every candidate is too slow, so this only narrows.
+	if gw.realtime {
+		cands = slices.DeleteFunc(slices.Clone(cands), r.tooSlowForRealtime)
+	}
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
@@ -2867,6 +2932,11 @@ type groupResolve struct {
 	voice *voiceScope
 }
 
+// walk is the groupWalk of g's current attempt.
+func (g groupResolve) walk() groupWalk {
+	return groupWalk{policy: g.policy, voice: g.voice, realtime: g.req.RealtimeRequired}
+}
+
 // resolveGroup runs resolveGroupOnce under progressively relaxed eligibility filters.
 // The order encodes the spec's precedence: the loaded-only filter is dropped before the
 // speed floor is, and the floor is dropped only when min_speed_fallback says so. Each
@@ -2892,6 +2962,9 @@ func (r *Resolver) resolveGroup(ctx context.Context, g groupResolve) (Target, er
 		return Target{}, err
 	}
 	g.voice = voice
+	if err := r.groupRealtimeCheck(ctx, g); err != nil {
+		return Target{}, err
+	}
 	// Latch the configured loaded_only BEFORE any relaxation, so the climb_up warm gate
 	// keeps reading the group's own setting on every attempt (see GroupPolicy.suppressWarm).
 	g.policy.suppressWarm = g.policy.LoadedOnly
@@ -2962,7 +3035,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
 	// the candidates it can actually use.
 	if g.policy.MemberOrder == MemberOrderSpeed {
-		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, groupWalk{policy: g.policy, voice: g.voice})
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, g.walk())
 		if err != nil {
 			return Target{}, err
 		}
@@ -2996,22 +3069,28 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, park, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
+		name, sel, park, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.walk())
 		if err != nil {
 			return Target{}, err
 		}
 		if name != "" {
 			return serve(name, sel)
 		}
-		if g.req.NoPark && park.first != nil {
+		if neverParks(g.req) && park.first != nil {
 			// Every member at capacity and the request must not wait: it is served by
-			// the first of them in walk order, which signals its own demand.
-			sel, ok, serr := r.selectWithoutParking(ctx, park.first.ac, park.first.name, g.now)
+			// the first of them in walk order. The demand it signals is the walk's
+			// first at-capacity member with instance candidates -- the served member's
+			// own when it has them, a later one's behind a plain model -- since that
+			// is the member another instance would relieve.
+			sel, ok, serr := r.selectWithoutParking(ctx, park.first.ac, park.first.name, audioRequest(g.req), g.now)
 			if serr != nil {
 				return Target{}, serr
 			}
 			if !ok {
 				return Target{}, ErrNoHealthyHost
+			}
+			if len(park.demand) > 0 {
+				r.signalOverflow(g.req, park.demand[0])
 			}
 			return serve(park.first.name, sel)
 		}
@@ -3062,7 +3141,7 @@ func (r *Resolver) pinnedMember(ctx context.Context, g groupResolve) (string, Ma
 	if pinned == "" {
 		return "", MappingCandidate{}, nil
 	}
-	pinSel, pinStatus, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
+	pinSel, pinStatus, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, g.walk())
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}
@@ -3096,7 +3175,7 @@ func (r *Resolver) climbTarget(ctx context.Context, g groupResolve, pinned strin
 	// Is a better-ranked member available? The pin is memberOK, so firstAvailable stops
 	// at-or-before it in the effective order → best index <= pin index (the memberIndex
 	// guard below is belt-and-suspenders for that invariant).
-	best, bestSel, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
+	best, bestSel, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.walk())
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}

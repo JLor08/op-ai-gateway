@@ -320,6 +320,23 @@ type Request struct {
 	// demand for another instance itself, since no park turn will. Internal
 	// only: set by the gateway, never parsed from a client body.
 	NoPark bool `json:"-"`
+	// CheckOnly marks a resolve that only checks which target a request about
+	// to follow would get -- the voice-chat replay's synth pre-check, before
+	// its own admitted relay. Like NoPark it never waits in the admission
+	// queue (with every candidate at its cap it is answered from them), but it
+	// signals no demand either: the request it checks for resolves, parks and
+	// signals on its own. Internal only: set by the gateway, never parsed from
+	// a client body.
+	CheckOnly bool `json:"-"`
+	// RealtimeRequired marks a request that must keep up with real time: a
+	// voice chat's speech or transcription leg, at the ticket mint and on
+	// every turn. Routing then drops every candidate whose mapping was
+	// measured slower than the real-time threshold (an unmeasured one stays),
+	// and refuses with routing.ErrNoRealtimeCandidate when none is left.
+	// Internal only: set by the gateway -- by the voice gate itself, and from
+	// the X-OP-Realtime-Required header on the internal loopback pair a voice
+	// turn calls the gateway with -- never parsed from a client body.
+	RealtimeRequired bool `json:"-"`
 }
 
 func (r Request) Validate() *Error {

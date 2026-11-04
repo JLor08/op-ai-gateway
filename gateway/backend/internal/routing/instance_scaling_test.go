@@ -11,7 +11,8 @@ import (
 
 // CandidateServesNow is the first pass of selectCandidate, read from outside a
 // request: for every gate, a lone candidate it passes is the one a request
-// selects, and one it fails is not selected. A gate added to the pass and not
+// selects, and one it fails is not selected -- and a sticky pin to it is kept
+// exactly when it passes (affinityServer). A gate added to the pass and not
 // to CandidateServesNow (or the reverse) breaks a row here.
 func TestCandidateServesNowMatchesSelection(t *testing.T) {
 	now := instanceCapacityNow
@@ -58,6 +59,12 @@ func TestCandidateServesNowMatchesSelection(t *testing.T) {
 			}
 			if selected != tc.want {
 				t.Fatalf("selectCandidate selected = %v, CandidateServesNow = %v: the two disagree", selected, tc.want)
+			}
+			if err := store.UpdateAIServer(context.Background(), c.Server); err != nil {
+				t.Fatalf("UpdateAIServer: %v", err)
+			}
+			if _, usable, err := r.affinityServer(context.Background(), c.Application); err != nil || usable != tc.want {
+				t.Fatalf("affinityServer usable = %v, %v; CandidateServesNow = %v: the pin and the selection disagree", usable, err, tc.want)
 			}
 		})
 	}

@@ -50,7 +50,7 @@ func (r *Resolver) ScoreModelServers(ctx context.Context, model string, now time
 				k = inflight
 			}
 			telemetry, ok = r.mergeRuntimeModelMetrics(candidate, telemetry, ok, now)
-			route := scoringRoute(candidate, telemetry, ok, k, model)
+			route := scoringRoute(candidate, telemetry, ok, k, model, flavor == APIFlavorOpenAIAudio)
 			score, viable := Score(route, model, now)
 			available := viable
 			if maxC := candidate.Mapping.MaxConcurrency; available && maxC > 0 && k >= maxC {

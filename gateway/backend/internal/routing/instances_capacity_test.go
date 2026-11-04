@@ -500,7 +500,7 @@ func TestScoringReadsEachServersTelemetryOncePerPass(t *testing.T) {
 		store.reads = map[string]int{}
 	}
 
-	if _, ok, err := r.argmaxByScore(context.Background(), pool, "qwen-coder", now); err != nil || !ok {
+	if _, ok, err := r.argmaxByScore(context.Background(), pool, "qwen-coder", false, now); err != nil || !ok {
 		t.Fatalf("argmaxByScore = ok %v, err %v", ok, err)
 	}
 	wantOncePerServer("argmaxByScore")
