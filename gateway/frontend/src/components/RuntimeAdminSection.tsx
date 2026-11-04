@@ -2151,6 +2151,7 @@ export function RuntimeAdminSection({
     title: string;
     allInstances: boolean;
     instances: number[];
+    initialTab: number;
   } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   const [restart, setRestart] = useState<RestartFlow | null>(null);
@@ -4197,6 +4198,8 @@ export function RuntimeAdminSection({
             // stream lists for the spec now, and grow with every instance its
             // log entries name while it is open.
             instances: logInstanceIndexes(statusRows, row.spec_id),
+            // It opens on the tab of the instance whose row was clicked.
+            initialTab: instanceIndex(row),
           }),
       },
     ];
@@ -5989,6 +5992,7 @@ export function RuntimeAdminSection({
           title={logSpec.title}
           allInstances={logSpec.allInstances}
           instances={logSpec.instances}
+          initialTab={logSpec.initialTab}
         />
       )}
     </>

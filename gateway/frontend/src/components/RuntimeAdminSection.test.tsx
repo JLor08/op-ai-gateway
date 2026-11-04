@@ -11284,6 +11284,20 @@ describe('RuntimeAdminSection per-instance live status', () => {
     ]);
   });
 
+  it("opens the log view on the tab of the instance whose row's button was clicked", async () => {
+    renderInstances([instanceRow(0), instanceRow(1), instanceRow(2)]);
+    await openStatusTab();
+    await screen.findByText('4102');
+
+    fireEvent.click(inRowWith('4102').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('tab', { name: t.runtimeLogsTabInstance(2) })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+
   it('says nothing about instances in the log view of a spec that does not opt in', async () => {
     renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
     await openStatusTab();

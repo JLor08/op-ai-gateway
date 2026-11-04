@@ -743,6 +743,67 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
     });
 
+    it("opens on the opening row's instance tab every time, whichever tab was selected when it closed", () => {
+      const api = { subscribeRuntimeLogs: vi.fn(() => () => {}) };
+      const props = {
+        onClose: () => {},
+        api,
+        t,
+        serverId: 'srv-1',
+        specId: 'spec-a',
+        title: 'qwen-coder',
+        allInstances: true,
+        instances: [0, 1, 2],
+        initialTab: 1,
+      };
+      const view = render(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabInstance(1) })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      selectTab(t.runtimeLogsTabAll);
+      view.rerender(<RuntimeLogView open={false} {...props} />);
+      view.rerender(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabInstance(1) })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+    });
+
+    it('opens a single-instance spec on All, so All is selected once the stream names a further instance', () => {
+      // No tabs at opening: the opening row's instance tab falls back to All,
+      // and stays there when tabs appear later, rather than jumping to it.
+      let pushBatch: (batch: RuntimeLogBatch) => void = () => {};
+      const api = {
+        subscribeRuntimeLogs: vi.fn(
+          (_serverId: string, _specId: string, onBatch: (batch: RuntimeLogBatch) => void) => {
+            pushBatch = onBatch;
+            return () => {};
+          },
+        ),
+      };
+      render(
+        <RuntimeLogView
+          open
+          onClose={() => {}}
+          api={api}
+          t={t}
+          serverId="srv-1"
+          specId="spec-a"
+          title="qwen-coder"
+          instances={[0]}
+          initialTab={0}
+        />,
+      );
+      expect(screen.queryAllByRole('tab')).toHaveLength(0);
+
+      act(() => pushBatch({ spec_id: 'spec-a', entries: [{ text: '[#3] three\n', instance: 3 }] }));
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabAll })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+    });
+
     it("does not open a new generation's command block because it landed on an expanded row's index", () => {
       const h = renderLogView();
       h.state('streaming');

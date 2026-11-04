@@ -65,7 +65,8 @@ import type { PortalApi, Translation } from './shared/types';
  * `[#k] ` and names the instance on every entry (`instance`). The view then
  * offers tabs. "All" shows the interleaved history exactly as it arrives,
  * prefixes included; one tab per instance shows only that instance's entries,
- * its prefix removed -- see `instanceView`. A gap belongs to no instance (the
+ * its prefix removed -- see `instanceView`. Opened from an instance's row, the
+ * view starts on that instance's tab. A gap belongs to no instance (the
  * bytes lost may have come from any of them), so every tab shows every gap.
  */
 
@@ -168,6 +169,18 @@ function knownInstances(listed: readonly number[], seen: ReadonlySet<number>): n
   for (const k of listed) if (Number.isInteger(k) && k >= 0) all.add(k);
   return [...all].sort((a, b) => a - b);
 }
+
+/**
+ * Whether the view offers tabs. A replicable spec always does, even while only
+ * instance 0 runs. A spec that is not replicable, and for which no instance
+ * k >= 1 is known (from the opening row or the open stream), looks exactly as
+ * it did before instances existed: no tabs, and nothing said about instances.
+ */
+function showsTabs(allInstances: boolean, known: readonly number[]): boolean {
+  return allInstances || known.length > 1;
+}
+
+const noInstancesSeen: ReadonlySet<number> = new Set();
 
 /** `seen` plus every instance `entries` name -- `seen` itself when none is new. */
 function withInstancesOf(
@@ -523,6 +536,7 @@ export function RuntimeLogView({
   title,
   allInstances = false,
   instances = [],
+  initialTab = 'all',
 }: Readonly<{
   open: boolean;
   onClose: () => void;
@@ -541,13 +555,23 @@ export function RuntimeLogView({
   // The instance indexes the opening row's spec lists now. The view adds every
   // instance the stream names while it is open.
   instances?: readonly number[];
+  // The tab the view opens on: the instance whose row the operator opened it
+  // from, or "All". A view that opens without tabs opens on "All".
+  initialTab?: LogTab;
 }>) {
+  // The tab every opening starts on. Whether the view shows tabs at that
+  // moment depends on the props alone, because the instances the stream names
+  // are forgotten on every opening. A view without tabs opens on "All", and
+  // stays there when the stream later names a further instance.
+  const openingTab: LogTab = showsTabs(allInstances, knownInstances(instances, noInstancesSeen))
+    ? initialTab
+    : 'all';
   const [win, setWin] = useState<LogWindow>(emptyLogWindow);
   // Every instance the stream has named since the dialog opened. Kept across a
   // scrollback: an instance that has left the retained history keeps its tab
   // while the dialog is open, so a tab never vanishes under the operator.
   const [seenInstances, setSeenInstances] = useState<ReadonlySet<number>>(() => new Set());
-  const [tab, setTab] = useState<LogTab>('all');
+  const [tab, setTab] = useState<LogTab>(openingTab);
   const [state, setState] = useState<RuntimeLogState | null>(null);
   // `scrollbackSeen` is what separates "the agent's buffer is empty" from
   // "nothing has arrived yet". The agent always sends a scrollback batch on
@@ -572,7 +596,6 @@ export function RuntimeLogView({
     setScrollbackSeen(false);
     setConnectionError(false);
     setSeenInstances(new Set());
-    setTab('all');
     followRef.current = true;
 
     const onBatch = (batch: RuntimeLogBatch) => {
@@ -595,15 +618,18 @@ export function RuntimeLogView({
     );
   }, [api, open, serverId, specId]);
 
+  // Every opening starts on the opening tab, whichever tab was selected when
+  // the dialog last closed. Its own effect, because changing it must not
+  // re-subscribe.
+  useEffect(() => {
+    if (open) setTab(openingTab);
+  }, [open, openingTab]);
+
   const tabInstances = useMemo(
     () => knownInstances(instances, seenInstances),
     [instances, seenInstances],
   );
-  // A replicable spec always offers its tabs, even while only instance 0 runs.
-  // A spec that is not replicable, and for which no instance k >= 1 is known
-  // (from the opening row or the open stream), looks exactly as it did before
-  // instances existed: no tabs, and nothing said about instances.
-  const showTabs = allInstances || tabInstances.length > 1;
+  const showTabs = showsTabs(allInstances, tabInstances);
   const activeTab: LogTab = showTabs ? tab : 'all';
   const shown = useMemo(
     () =>
