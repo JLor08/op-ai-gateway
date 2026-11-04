@@ -63,9 +63,10 @@ import type { PortalApi, Translation } from './shared/types';
  * A replicable spec runs several instances, and every one of them writes into
  * the spec's one buffer: the agent prefixes each line of instance k >= 1 with
  * `[#k] ` and names the instance on every entry (`instance`). The view then
- * offers tabs. "All" shows the interleaved history exactly as it arrives,
- * prefixes included; one tab per instance shows only that instance's entries,
- * its prefix removed -- see `instanceView`. Opened from an instance's row, the
+ * offers tabs. "All" shows the interleaved history as it arrives, prefixes
+ * included, and marks instance 0's unprefixed lines `[#0] ` -- see `allView`;
+ * one tab per instance shows only that instance's entries, its prefix removed
+ * -- see `instanceView`. Opened from an instance's row, the
  * view starts on that instance's tab. A gap belongs to no instance (the
  * bytes lost may have come from any of them), so every tab shows every gap.
  */
@@ -213,6 +214,46 @@ function stripLinePrefixes(text: string, prefix: string, midLine: boolean): stri
 }
 
 /**
+ * Puts `prefix` at the start of every line of `text`, except the first when
+ * `midLine` says the text continues a line an earlier chunk opened, and except
+ * the empty piece after a trailing newline: a line is prefixed when its first
+ * byte arrives, so a blank line gets one and the line not begun yet does not.
+ */
+function addLinePrefixes(text: string, prefix: string, midLine: boolean): string {
+  const lines = text.split('\n');
+  return lines
+    .map((line, i) =>
+      (i === 0 && midLine) || (i === lines.length - 1 && line === '') ? line : prefix + line,
+    )
+    .join('\n');
+}
+
+/**
+ * What the "All" tab shows while the view offers tabs: the interleaved history
+ * as it arrives, except that instance 0's lines -- which the agent writes
+ * unprefixed, as before instances existed -- get the `[#0] ` prefix the others
+ * carry, so no line in the tab is left unattributed. Gaps and generation
+ * markers are the portal's own notices and stay as they are.
+ *
+ * The line state is instance 0's, tracked exactly as `instanceView` tracks it:
+ * a chunk that continues instance 0's open line keeps its first bytes
+ * unprefixed, and a gap or one of instance 0's generation markers opens a new
+ * line. Other instances' chunks interleave without touching it.
+ */
+function allView(entries: readonly RuntimeLogEntry[]): RuntimeLogEntry[] {
+  let midLine = false;
+  return entries.map((e) => {
+    const gap = hasGap(e);
+    if (gap) midLine = false;
+    const gapOnly = gap && !e.text && !e.event;
+    if (gapOnly || entryInstance(e) !== 0) return e;
+    const shown = ownEntryShown(e, midLine, (text, mid) => addLinePrefixes(text, '[#0] ', mid));
+    midLine = shown.midLine;
+    return shown.entry;
+  });
+}
+
+/**
  * What instance k's tab shows: instance k's own output and generation markers,
  * with the `[#k] ` prefix the agent put at the start of each of its lines
  * removed, plus every gap in the history as a gap alone. `own` counts the
@@ -235,7 +276,12 @@ function instanceView(
   entries: readonly RuntimeLogEntry[],
   k: number,
 ): { entries: RuntimeLogEntry[]; own: number } {
-  const prefix = k > 0 ? `[#${k}] ` : '';
+  // Instance 0's lines carry no prefix from the agent, so nothing is removed.
+  const prefix = `[#${k}] `;
+  const rewrite =
+    k > 0
+      ? (text: string, mid: boolean) => stripLinePrefixes(text, prefix, mid)
+      : (text: string) => text;
   const out: RuntimeLogEntry[] = [];
   let own = 0;
   let midLine = false;
@@ -251,7 +297,7 @@ function instanceView(
       continue;
     }
     own++;
-    const shown = ownEntryInTab(e, prefix, midLine);
+    const shown = ownEntryShown(e, midLine, rewrite);
     out.push(shown.entry);
     midLine = shown.midLine;
   }
@@ -259,20 +305,22 @@ function instanceView(
 }
 
 /**
- * One of instance k's own entries as its tab shows it, and the line state after
- * it: a generation marker opens a new line, an empty chunk leaves the state as
- * it was, and a text chunk loses the prefixes of the lines it opens and leaves
- * the line open unless it ends in a newline.
+ * One of an instance's own entries as a tab shows it, and that instance's line
+ * state after it: a generation marker opens a new line, an empty chunk leaves
+ * the state as it was, and a text chunk is passed through `rewrite` (which
+ * removes or adds the line prefixes) and leaves the line open unless it ends in
+ * a newline.
  */
-function ownEntryInTab(
+function ownEntryShown(
   e: RuntimeLogEntry,
-  prefix: string,
   midLine: boolean,
+  rewrite: (text: string, midLine: boolean) => string,
 ): { entry: RuntimeLogEntry; midLine: boolean } {
   if (e.event) return { entry: e, midLine: false };
   const text = e.text ?? '';
   if (text === '') return { entry: e, midLine };
-  const entry = prefix === '' ? e : { ...e, text: stripLinePrefixes(text, prefix, midLine) };
+  const rewritten = rewrite(text, midLine);
+  const entry = rewritten === text ? e : { ...e, text: rewritten };
   return { entry, midLine: !text.endsWith('\n') };
 }
 
@@ -549,8 +597,9 @@ export function RuntimeLogView({
   specId: string;
   title: string;
   // #340: the spec runs several instances, which all write into its one log
-  // buffer -- instance k's lines prefixed [#k] -- so the view offers one tab
-  // per instance beside "All", and says whose lines are whose.
+  // buffer -- instance k's lines prefixed [#k], instance 0's marked [#0] in
+  // "All" -- so the view offers one tab per instance beside "All", and says
+  // whose lines are whose.
   allInstances?: boolean;
   // The instance indexes the opening row's spec lists now. The view adds every
   // instance the stream names while it is open.
@@ -634,9 +683,9 @@ export function RuntimeLogView({
   const shown = useMemo(
     () =>
       activeTab === 'all'
-        ? { entries: win.entries, own: win.entries.length }
+        ? { entries: showTabs ? allView(win.entries) : win.entries, own: win.entries.length }
         : instanceView(win.entries, activeTab),
-    [win.entries, activeTab],
+    [win.entries, activeTab, showTabs],
   );
 
   useEffect(() => {

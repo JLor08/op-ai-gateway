@@ -1674,9 +1674,10 @@ const de = {
   runtimeLogs: 'Protokoll',
   runtimeLogsTitle: 'Prozessausgabe',
   // #340: every instance of a spec writes into its one log buffer; "Gesamt"
-  // shows it as it is, each instance's tab only that instance's lines.
+  // shows it with every line's instance prefixed, each instance's tab only
+  // that instance's lines.
   runtimeLogsAllInstances:
-    'Der Reiter „Gesamt“ zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Zeilen von Instanz k ≥ 1 beginnen mit [#k], die von Instanz 0 haben kein Präfix. Der Reiter einer Instanz zeigt nur deren Ausgabe, ohne Präfix. Fehlende Ausgabe wird in jedem Reiter gemeldet, weil sie keiner Instanz zugeordnet werden kann.',
+    'Der Reiter „Gesamt“ zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Jede Zeile beginnt mit [#k], wobei k die Nummer ihrer Instanz ist. Der Reiter einer Instanz zeigt nur deren Ausgabe, ohne Präfix. Fehlende Ausgabe wird in jedem Reiter gemeldet, weil sie keiner Instanz zugeordnet werden kann.',
   runtimeLogsTabsLabel: 'Instanzen',
   runtimeLogsTabAll: 'Gesamt',
   runtimeLogsTabInstance: (k: number) => `Instanz ${k}`,
@@ -5136,7 +5137,7 @@ const en: PortalMessages = {
   runtimeLogs: 'Logs',
   runtimeLogsTitle: 'Process output',
   runtimeLogsAllInstances:
-    'The "All" tab shows the output of every instance of this launch spec: lines of instance k ≥ 1 start with [#k], instance 0\'s carry no prefix. An instance\'s own tab shows only its output, without the prefix. Missing output is reported in every tab, because it cannot be attributed to one instance.',
+    'The "All" tab shows the output of every instance of this launch spec: every line starts with [#k], k being the number of its instance. An instance\'s own tab shows only its output, without the prefix. Missing output is reported in every tab, because it cannot be attributed to one instance.',
   runtimeLogsTabsLabel: 'Instances',
   runtimeLogsTabAll: 'All',
   runtimeLogsTabInstance: (k: number) => `Instance ${k}`,
