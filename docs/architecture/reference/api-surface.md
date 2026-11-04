@@ -706,7 +706,9 @@ Conventions worth stating, because each is a judgement call a client depends on:
   are four operator-owned members of both `RuntimeSpecDTO` and
   `PutRuntimeSpecRequest`, always present on the GET and applied verbatim by the
   PUT (absent = not replicable and `0`): `replicable` (bool), `min_instances`
-  (instances kept warm, `0` = none), `max_instances` (cap, `0` = unbounded) and
+  (instances kept warm, `0` = none), `max_instances` (cap; `max_instances` `0` = no explicit limit,
+  but the agent still runs at most 64 instances of a spec — `MaxInstanceIndex` 63 —
+  and the instance scaler and the audio concurrency ramp stop at the same bound) and
   `instance_parallelism` (requests one instance serves at once, `0` = 1;
   gateway-only, never pushed to the agent). Beside them the GET carries two
   **read-only** echoes with no PUT counterpart — a body that sends them sets
@@ -718,11 +720,13 @@ Conventions worth stating, because each is a judgement call a client depends on:
   max(startup_measured_ms, load_time_ms) / 1000), floor)`, a manual `0` then
   meaning "no override"; otherwise the stored `idle_timeout_seconds`), derived on
   every read from the same function as the pushed document. The PUT refuses, in
-  this order: a negative count `400 runtime_spec.tuning_invalid`; a count above 64
-  or `min_instances` above a set `max_instances` `400
-  runtime_spec.instances_invalid` (checked whether or not the spec is
-  replicable); `replicable` with a non-zero `listen_port` `400
-  runtime_spec.instances_need_ephemeral_port`.
+  this order: a negative `min_instances`, `max_instances` or
+  `instance_parallelism` `400 runtime_spec.tuning_invalid`; a `min_instances` or
+  `max_instances` above 64 (`MaxInstanceIndex` + 1), or `min_instances` above a
+  set `max_instances`, `400 runtime_spec.instances_invalid` (checked whether or
+  not the spec is replicable; `instance_parallelism` has no upper bound);
+  `replicable` with a non-zero `listen_port` `400
+  runtime_spec.instances_need_ephemeral_port` (`validateRuntimeSpecInstances`).
 - **The VRAM benchmark writes neither of those two fields**, and its six
   refusals are all `409` — none of them is a malformed request; each is a
   conflict with the server's current state. They are checked **before** the
@@ -874,7 +878,7 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.not_found` | 404 |
 | `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
-| `runtime_spec.instances_invalid`, `runtime_spec.instances_need_ephemeral_port` | 400 — the instance settings (#340): a count above 64 or a minimum above a set maximum; `replicable` with a fixed `listen_port` |
+| `runtime_spec.instances_invalid`, `runtime_spec.instances_need_ephemeral_port` | 400 — the instance settings (#340): `min_instances` or `max_instances` above 64 (`MaxInstanceIndex` + 1; `instance_parallelism` has no upper bound), or `min_instances` above a set `max_instances`; `replicable` with a fixed `listen_port`. A negative `min_instances`, `max_instances` or `instance_parallelism` is `runtime_spec.tuning_invalid` |
 | `runtime_coresidency.pair_invalid`, `runtime_coresidency.mode_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
 | `application.api_token_key_required` | 400 — the application-surface twin of `runtime_spec.api_token_key_required` above: `capture.SealSecret` returned `capture.ErrKeyRequired` sealing a non-empty `api_token` on a disk-backed store with no encryption key. Mapped from the shared `capture.ErrKeyRequired`; before #85 it had no row here (nor in `sharedErrorMap`) and fell through to the 500 `application.request_failed` fallback below |

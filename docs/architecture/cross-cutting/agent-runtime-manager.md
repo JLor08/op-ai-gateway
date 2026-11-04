@@ -8213,16 +8213,20 @@ at the next reconcile
 carried by the full-document spec `PUT` and its `GET` like every other field
 ([HTTP API Surface](../reference/api-surface.md#agent-managed-model-runtime)):
 `replicable` (may the agent run several instances), `min_instances` (instances
-kept warm, 0 = none), `max_instances` (cap, 0 = unbounded — the agent's free room
-and the server's `max_processes` are then the bound) and `instance_parallelism`
-(requests one instance serves at once, 0 = 1). The last is **gateway-only** and
+kept warm, 0 = none), `max_instances` (cap; `max_instances` 0 = no explicit limit —
+the agent still runs at most 64 instances of a spec, `MaxInstanceIndex` 63, the
+instance scaler and the audio concurrency ramp stop at the same bound, and below
+it the agent's free room and the server's `max_processes` are the bound) and
+`instance_parallelism` (requests one instance serves at once, 0 = 1). The last is **gateway-only** and
 never pushed: the routing capacity filter compares an instance's in-flight count
 with it. `min_instances` and `max_instances` are pushed only for a replicable spec
 on an agent that runs instances (§7), so every other document stays byte-for-byte
 the pre-instances one, ETag included. The portal service refuses, in this order,
-a negative count (`runtime_spec.tuning_invalid`), a count above 64 or a minimum
-above a set maximum (`runtime_spec.instances_invalid`, checked whether or not the
-spec is replicable, so a setting that can never be met is not stored to take effect
+a negative `min_instances`, `max_instances` or `instance_parallelism`
+(`runtime_spec.tuning_invalid`), a `min_instances` or `max_instances` above 64
+(`MaxInstanceIndex` + 1) or a minimum above a set maximum
+(`runtime_spec.instances_invalid`; `instance_parallelism` has no upper bound;
+checked whether or not the spec is replicable, so a setting that can never be met is not stored to take effect
 the day the spec is switched on) and a replicable spec with a fixed `listen_port`
 (`runtime_spec.instances_need_ephemeral_port`) — the agent would repair the same
 shapes silently (§6.1), and a repair the operator never sees is a setting that
