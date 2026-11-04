@@ -2,8 +2,10 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // How an audio figure is written (#340), in the one place both the cells
-// (audioMetrics.ts) and the sentences (i18n.ts) take it from. It imports
-// nothing, so the messages can use it without pulling in the components.
+// (components/shared/audioMetrics.ts) and the sentences (i18n.ts) take it
+// from: the rate formatter and the closed set of ramp limits. Like
+// currency.ts it is a dependency-free leaf at the src root, so i18n.ts can
+// use it and stay one (arch.test.ts holds both to that).
 
 /** Why an audio concurrency ramp stopped: the closed set the gateway writes. */
 export const AUDIO_CONCURRENCY_LIMITS = ['performance', 'resources', 'cap'] as const;

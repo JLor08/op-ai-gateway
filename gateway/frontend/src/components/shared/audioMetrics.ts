@@ -18,7 +18,7 @@ import {
   formatRateX,
   isAudioConcurrencyLimit,
   type AudioConcurrencyLimit,
-} from './audioFigures';
+} from '../../audioFigures';
 import { parseMetricInput } from './format';
 import type { Translation } from './types';
 
@@ -27,7 +27,7 @@ export {
   audioLimitOf,
   isAudioConcurrencyLimit,
   type AudioConcurrencyLimit,
-} from './audioFigures';
+} from '../../audioFigures';
 
 /** The four audio metrics as a mapping and a model-servers row carry them. */
 export type AudioMetrics = Pick<

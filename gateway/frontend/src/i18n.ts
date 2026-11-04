@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import {
-  formatRateX,
-  isAudioConcurrencyLimit,
-  type AudioConcurrencyLimit,
-} from './components/shared/audioFigures';
+import { formatRateX, isAudioConcurrencyLimit, type AudioConcurrencyLimit } from './audioFigures';
 
 export type Locale = 'de' | 'en';
 
