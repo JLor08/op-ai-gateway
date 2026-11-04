@@ -18,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // A voice chat's speech and transcription legs must keep up with real time: at the
@@ -109,23 +111,69 @@ func (h *headerRecorder) requests() []string {
 }
 
 func TestVoicePerTurnLegCarriesRealtime(t *testing.T) {
-	t.Run("asr turn loopback", func(t *testing.T) {
-		rec := &headerRecorder{}
-		ts := httptest.NewServer(rec)
-		t.Cleanup(ts.Close)
-		srv := &Server{selfBaseURL: ts.URL, internalAuthSecret: "s"}
-		claims := liveTicketClaims{Target: routing.Target{Model: "asr"}, SampleRate: 16000, Channels: 1, Format: "s16le", UserID: "u"}
-		for _, realtime := range []bool{true, false} {
-			resp, err := srv.openLiveLoopback(context.Background(), claims, strings.NewReader("pcm"), realtime)
-			if err != nil {
-				t.Fatalf("openLiveLoopback: %v", err)
-			}
-			_ = resp.Body.Close()
+	t.Run("asr leg of a voice turn", func(t *testing.T) {
+		// The ticket is minted directly (no gate), then the transcription mapping is
+		// re-measured too slow: the turn's own loopback must carry the marker, and
+		// /v1/audio/transcriptions/live must refuse it under the real-time gate.
+		child := newFakeVoiceASRChild(t)
+		h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+		rec := &headerRecorder{next: h.srv}
+		loop := httptest.NewServer(rec)
+		t.Cleanup(loop.Close)
+		h.srv.selfBaseURL = loop.URL
+		setVoiceAudioRate(t, h.srv, "route-asr", 0.5)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		conn := h.dial(t, ctx)
+		readVoiceUntilState(t, ctx, conn, voiceStateListening)
+		sendVoicePCM(t, ctx, conn, 320)
+
+		if !voicePoll(5*time.Second, func() bool { return len(rec.requests()) > 0 }) {
+			t.Fatal("the turn dialled no loopback")
 		}
-		want := []string{"/v1/audio/transcriptions/live 1", "/v1/audio/transcriptions/live "}
-		if got := rec.requests(); strings.Join(got, "|") != strings.Join(want, "|") {
-			t.Fatalf("loopback requests = %q, want %q: a voice turn's ASR leg is marked, a live session's is not", got, want)
+		if got := rec.requests(); got[0] != "/v1/audio/transcriptions/live 1" {
+			t.Fatalf("turn loopback = %q, want a marked /v1/audio/transcriptions/live", got)
 		}
+		errFrame := readVoiceUntil(t, ctx, conn, voiceDownError)
+		if errFrame.Code != voiceChatNoRealtimeModel || errFrame.Message == "" {
+			t.Fatalf("error frame = code %q message %q, want /v1's %s for a model measured too slow", errFrame.Code, errFrame.Message, voiceChatNoRealtimeModel)
+		}
+		readVoiceUntilState(t, ctx, conn, voiceStateIdle)
+		if n, _ := child.snapshot(); n != 0 {
+			t.Fatalf("ASR child connections = %d, want 0: a gate refusal never reaches the child", n)
+		}
+	})
+
+	t.Run("asr leg of a live session", func(t *testing.T) {
+		// A live transcription session is no voice chat: its loopback carries no marker,
+		// so a mapping measured too slow still serves it.
+		child := newMockLiveChild(t)
+		srv, ts := newLiveLoopbackTestServer(t, child)
+		rec := &headerRecorder{next: srv}
+		loop := httptest.NewServer(rec)
+		t.Cleanup(loop.Close)
+		srv.selfBaseURL = loop.URL
+		setVoiceAudioRate(t, srv, "route-asr", 0.5)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		conn, _, err := dialLive(t, ctx, ts.URL, mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", ""), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.CloseNow()
+		if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 1600)); err != nil {
+			t.Fatalf("send pcm: %v", err)
+		}
+		m, err := readLiveMsg(t, ctx, conn)
+		if err != nil || m.Type != "delta" {
+			t.Fatalf("first message = %+v, %v; want a delta: a live session is not held to real time", m, err)
+		}
+		if got := rec.requests(); len(got) != 1 || got[0] != "/v1/audio/transcriptions/live " {
+			t.Fatalf("live session loopback = %q, want one unmarked /v1/audio/transcriptions/live", got)
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "")
 	})
 
 	t.Run("tts leg of a voice run", func(t *testing.T) {
