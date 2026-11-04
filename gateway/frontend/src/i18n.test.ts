@@ -4273,6 +4273,14 @@ describe('instance settings (#340) i18n keys', () => {
     expect(messages.en.runtimeSpecIdleTimeoutOverrideHint).toMatch(/0 = no manual override/);
   });
 
+  // One message for every refusal of the instance fields, so it names each rule.
+  it('names every instance-settings rule in the refusal', () => {
+    expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ganze Zahlen von 0 bis 64/);
+    expect(messages.de.errorRuntimeSpecInstancesInvalid).toMatch(/ab 1/);
+    expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/whole numbers from 0 to 64/);
+    expect(messages.en.errorRuntimeSpecInstancesInvalid).toMatch(/at least 1/);
+  });
+
   it('says the maximum field left empty means unlimited', () => {
     expect(messages.de.runtimeSpecMaxInstancesUnlimited).toMatch(/Leer = unbegrenzt/);
     expect(messages.en.runtimeSpecMaxInstancesUnlimited).toMatch(/Empty = unlimited/);

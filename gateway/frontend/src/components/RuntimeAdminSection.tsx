@@ -96,13 +96,14 @@ import { RuntimeLogView } from './RuntimeLogView';
 import {
   INSTANCES_MAX,
   instanceAddress,
-  instanceCountFromText,
   instanceCountText,
   instanceIndex,
+  instanceSettingsBody,
   primaryStatusRows,
   runningInstancesBySpec,
   specStopState,
   validateInstances,
+  type InstanceForm,
 } from './shared/runtimeInstances';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
@@ -2540,11 +2541,12 @@ export function RuntimeAdminSection({
   const [admissionWaitTimeoutSeconds, setAdmissionWaitTimeoutSeconds] = useState(0);
   const [pinned, setPinned] = useState(false);
   // The instance settings. Bound to state and emitted by buildSpecBody on
-  // every save, whether "Multiple instances" is ticked or not, for the same
-  // full-document reason as ramEstimateMb below: an absent field is applied as
-  // its zero value. The two counts are held as the field's TEXT, because an
-  // empty field is a value of its own (0: none / unlimited); the parallelism
-  // too, so a field cleared while typing is not forced back to a number.
+  // every save, for the same full-document reason as ramEstimateMb below: an
+  // absent field is applied as its zero value. Unticked, the save sends the
+  // backend's neutral 0/0/0 instead of the hidden fields (instanceSettingsBody).
+  // The two counts are held as the field's TEXT, because an empty field is a
+  // value of its own (0: none / unlimited); the parallelism too, so a field
+  // cleared while typing is not forced back to a number.
   const [replicable, setReplicable] = useState(false);
   const [minInstancesText, setMinInstancesText] = useState('');
   const [maxInstancesText, setMaxInstancesText] = useState('');
@@ -3112,6 +3114,17 @@ export function RuntimeAdminSection({
     return gpuOptionsFor(rowIdx).some((g) => g.index === row.index) ? String(row.index) : '';
   }
 
+  // The instance settings as typed, for instanceSettingsBody and
+  // validateInstances.
+  function instanceForm(): InstanceForm {
+    return {
+      replicable,
+      minText: minInstancesText,
+      maxText: maxInstancesText,
+      parallelismText: instanceParallelismText,
+    };
+  }
+
   function buildSpecBody(args: string[], env: Record<string, string>): PutRuntimeSpecRequest {
     // Write-only token sentinel, mirroring ApplicationSection's own
     // apiToken/buildBody: cleared -> '' (clear the stored token); a typed
@@ -3153,10 +3166,7 @@ export function RuntimeAdminSection({
       idle_timeout_seconds: idleTimeoutSeconds,
       admission_wait_timeout_seconds: admissionWaitTimeoutSeconds,
       pinned,
-      replicable,
-      min_instances: instanceCountFromText(minInstancesText),
-      max_instances: instanceCountFromText(maxInstancesText),
-      instance_parallelism: instanceCountFromText(instanceParallelismText) || 1,
+      ...instanceSettingsBody(instanceForm()),
       admin_state: adminState,
       ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,
@@ -3295,13 +3305,7 @@ export function RuntimeAdminSection({
       showError(visibleDevicesError);
       return;
     }
-    const instancesError = validateInstances(
-      replicable,
-      listenPort,
-      instanceCountFromText(minInstancesText),
-      instanceCountFromText(maxInstancesText),
-      t,
-    );
+    const instancesError = validateInstances(instanceForm(), listenPort, t);
     if (instancesError) {
       showError(instancesError);
       return;
@@ -3402,13 +3406,7 @@ export function RuntimeAdminSection({
       showError(visibleDevicesError);
       return;
     }
-    const instancesError = validateInstances(
-      replicable,
-      listenPort,
-      instanceCountFromText(minInstancesText),
-      instanceCountFromText(maxInstancesText),
-      t,
-    );
+    const instancesError = validateInstances(instanceForm(), listenPort, t);
     if (instancesError) {
       showError(instancesError);
       return;
@@ -4884,8 +4882,9 @@ export function RuntimeAdminSection({
             />
             {/* Opt-in: unticked, the spec runs exactly one process, as it did
                 before instances existed. The bounds and the parallelism mean
-                nothing without it, so they are shown only with it -- and sent
-                on every save regardless (buildSpecBody). */}
+                nothing without it, so they are shown only with it, and
+                unticked a save sends the neutral 0/0/0 in their place and
+                never checks them (instanceSettingsBody, validateInstances). */}
             <FormControlLabel
               control={
                 <Checkbox checked={replicable} onChange={(e) => setReplicable(e.target.checked)} />

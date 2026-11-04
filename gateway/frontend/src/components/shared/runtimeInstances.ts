@@ -5,7 +5,7 @@
 // rows the agent reports, and the launch-spec form's instance settings. Kept
 // out of RuntimeAdminSection so each rule is testable on its own.
 
-import type { RuntimeStatus } from '../../api';
+import type { PutRuntimeSpecRequest, RuntimeStatus } from '../../api';
 import type { Translation } from './types';
 
 // The agent's cap on a spec's instances (indexes 0..63); the backend refuses a
@@ -116,33 +116,87 @@ export function instanceCountText(count: number): string {
   return count > 0 ? String(count) : '';
 }
 
+/** The launch-spec form's instance settings as typed: the box and three fields' text. */
+export type InstanceForm = {
+  replicable: boolean;
+  minText: string;
+  maxText: string;
+  parallelismText: string;
+};
+
+/** The four instance settings as the spec PUT carries them. */
+export type InstanceSettings = Pick<
+  PutRuntimeSpecRequest,
+  'replicable' | 'min_instances' | 'max_instances' | 'instance_parallelism'
+>;
+
+// The parallelism field's text as a number: empty is its default, 1.
+function parallelismFromText(text: string): number {
+  return text.trim() === '' ? 1 : Number(text);
+}
+
 /**
- * The instance settings' two refusals, checked before the round trip for the
+ * The four settings a form save sends. Unticked, "Multiple instances" hides
+ * the three fields and they mean nothing, so the save sends the backend's
+ * neutral values -- 0 for both counts and for the parallelism -- never what
+ * the hidden fields still hold: a value nobody can see is no setting. Ticked,
+ * it sends what is typed (validateInstances has checked it): an empty count is
+ * 0 (none / unlimited), an empty parallelism its default 1.
+ */
+export function instanceSettingsBody(form: InstanceForm): InstanceSettings {
+  if (!form.replicable) {
+    return { replicable: false, min_instances: 0, max_instances: 0, instance_parallelism: 0 };
+  }
+  return {
+    replicable: true,
+    min_instances: instanceCountFromText(form.minText),
+    max_instances: instanceCountFromText(form.maxText),
+    instance_parallelism: parallelismFromText(form.parallelismText),
+  };
+}
+
+function isWholeIn(n: number, min: number, max: number): boolean {
+  return Number.isInteger(n) && n >= min && n <= max;
+}
+
+/**
+ * The instance settings' refusals, checked before the round trip for the
  * same reason as the visible-devices pair: on Create a refused spec write would
- * leave the mapping behind without its spec. The backend refuses both too, in
- * this order, and checks the counts whether or not "Multiple instances" is
- * ticked -- the four settings are sent either way, so a pair that can never be
- * met would otherwise be stored to take effect the day the box is ticked.
+ * leave the mapping behind without its spec.
  *
- *  - A count above the cap, or a minimum above a set maximum (an empty maximum
- *    is unlimited, so no minimum exceeds it).
+ * Only while "Multiple instances" is ticked: unticked, the fields are hidden
+ * and the save sends the neutral 0/0/0 (instanceSettingsBody), so nothing in
+ * them can be wrong -- an error about fields that are not on screen would be
+ * one the operator cannot act on. Ticked, in this order:
+ *
+ *  - Each count a whole number from 0 to the cap (empty is 0), the
+ *    parallelism a whole number of at least 1 (empty is its default 1), and a
+ *    minimum no higher than the maximum when both are set (an empty maximum is
+ *    unlimited, so no minimum exceeds it). The backend refuses a negative
+ *    count as a tuning value and a count above the cap or a minimum above the
+ *    maximum as `runtime_spec.instances_invalid`; the form names all of them
+ *    with that one message, since they are all the instance fields' own.
  *  - Several instances on a fixed listen port: every instance is its own
  *    process on its own port, so only the agent's free-port pick (0) works.
  */
 export function validateInstances(
-  replicable: boolean,
+  form: InstanceForm,
   listenPort: number,
-  minInstances: number,
-  maxInstances: number,
   t: Pick<
     Translation,
     'errorRuntimeSpecInstancesInvalid' | 'errorRuntimeSpecInstancesNeedEphemeralPort'
   >,
 ): string | undefined {
-  if (minInstances > INSTANCES_MAX || maxInstances > INSTANCES_MAX) {
+  if (!form.replicable) return undefined;
+  const min = instanceCountFromText(form.minText);
+  const max = instanceCountFromText(form.maxText);
+  if (!isWholeIn(min, 0, INSTANCES_MAX) || !isWholeIn(max, 0, INSTANCES_MAX)) {
     return t.errorRuntimeSpecInstancesInvalid;
   }
-  if (maxInstances > 0 && minInstances > maxInstances) return t.errorRuntimeSpecInstancesInvalid;
-  if (replicable && listenPort !== 0) return t.errorRuntimeSpecInstancesNeedEphemeralPort;
+  if (!isWholeIn(parallelismFromText(form.parallelismText), 1, Number.MAX_SAFE_INTEGER)) {
+    return t.errorRuntimeSpecInstancesInvalid;
+  }
+  if (min > 0 && max > 0 && min > max) return t.errorRuntimeSpecInstancesInvalid;
+  if (listenPort !== 0) return t.errorRuntimeSpecInstancesNeedEphemeralPort;
   return undefined;
 }

@@ -10594,6 +10594,8 @@ describe('RuntimeAdminSection instance settings', () => {
     });
   });
 
+  // Unticked, the three settings are not on screen and mean nothing: the form
+  // sends the backend's neutral values, never what the hidden fields hold.
   it('saves a spec that does not opt in as one instance with no bounds', async () => {
     const { putSpecs } = await openFilledCreate();
 
@@ -10604,7 +10606,110 @@ describe('RuntimeAdminSection instance settings', () => {
       replicable: false,
       min_instances: 0,
       max_instances: 0,
+      instance_parallelism: 0,
     });
+  });
+
+  it('sends the neutral 0/0/0 once unticked, and never refuses what the hidden fields hold', async () => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '2' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
+      target: { value: '4' },
+    });
+    tickReplicable();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(created).toHaveLength(1);
+    expect(screen.queryByText(t.errorRuntimeSpecInstancesInvalid)).not.toBeInTheDocument();
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+  });
+
+  it('saves a stored replicable spec unticked as the neutral 0/0/0', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 4,
+    });
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+  });
+
+  // Ticked, every setting is checked before the round trip. The fields' own
+  // min/max/step attributes stop most of these in a browser already, so the
+  // form is submitted directly here: the submit event reaches the handler
+  // without the browser's constraint validation, which is what proves the
+  // handler's own check (and what a browser that skips it relies on).
+  const invalidTicked = [
+    ['a negative minimum', { min: '-1' }],
+    ['a negative maximum', { max: '-2' }],
+    ['a fractional minimum', { min: '1.5' }],
+    ['a fractional maximum', { max: '2.5' }],
+    ['a minimum above 64', { min: '65' }],
+    ['a maximum above 64', { max: '65' }],
+    ['a minimum above the maximum', { min: '3', max: '2' }],
+    ['a parallelism of 0', { parallelism: '0' }],
+    ['a negative parallelism', { parallelism: '-1' }],
+    ['a fractional parallelism', { parallelism: '1.5' }],
+  ] as const;
+
+  function typeInstanceSettings(values: { min?: string; max?: string; parallelism?: string }) {
+    if (values.min !== undefined)
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), {
+        target: { value: values.min },
+      });
+    if (values.max !== undefined)
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), {
+        target: { value: values.max },
+      });
+    if (values.parallelism !== undefined)
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
+        target: { value: values.parallelism },
+      });
+  }
+
+  function submitSpecForm() {
+    fireEvent.submit(screen.getByLabelText(t.runtimeSpecBinary).closest('form')!);
+  }
+
+  it.each(invalidTicked)('refuses %s on Create before ever calling the API', async (_, values) => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    typeInstanceSettings(values);
+
+    submitSpecForm();
+
+    expect(await screen.findByText(t.errorRuntimeSpecInstancesInvalid)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it.each(invalidTicked)('refuses %s on Edit before ever calling the API', async (_, values) => {
+    const { putSpecs } = await openApiTokenSpecEdit({ replicable: true });
+    typeInstanceSettings(values);
+
+    submitSpecForm();
+
+    expect(await screen.findByText(t.errorRuntimeSpecInstancesInvalid)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
   });
 
   // The agent caps a spec at 64 instances and the backend refuses a count

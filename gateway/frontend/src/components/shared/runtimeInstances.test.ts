@@ -8,11 +8,15 @@ import {
   instanceCountFromText,
   instanceCountText,
   instanceIndex,
+  instanceSettingsBody,
   primaryStatusRows,
   runningInstancesBySpec,
   specStopState,
+  validateInstances,
+  type InstanceForm,
 } from './runtimeInstances';
 import type { RuntimeStatus } from '../../api';
+import { messages } from '../../i18n';
 
 function row(specId: string, instance: number, state = 'running'): RuntimeStatus {
   return {
@@ -105,6 +109,85 @@ describe('runningInstancesBySpec', () => {
     ]);
     expect(counts.get('a')).toBe(2);
     expect(counts.get('b')).toBeUndefined();
+  });
+});
+
+function form(overrides: Partial<InstanceForm> = {}): InstanceForm {
+  return { replicable: true, minText: '', maxText: '', parallelismText: '1', ...overrides };
+}
+
+describe('instanceSettingsBody', () => {
+  it('sends the neutral 0/0/0 while "Multiple instances" is unticked, whatever the fields hold', () => {
+    expect(
+      instanceSettingsBody(
+        form({ replicable: false, minText: '3', maxText: '2', parallelismText: '4' }),
+      ),
+    ).toEqual({ replicable: false, min_instances: 0, max_instances: 0, instance_parallelism: 0 });
+  });
+
+  it('sends the typed settings while ticked: empty counts as 0, an empty parallelism as 1', () => {
+    expect(instanceSettingsBody(form())).toEqual({
+      replicable: true,
+      min_instances: 0,
+      max_instances: 0,
+      instance_parallelism: 1,
+    });
+    expect(
+      instanceSettingsBody(form({ minText: '1', maxText: '3', parallelismText: '2' })),
+    ).toEqual({ replicable: true, min_instances: 1, max_instances: 3, instance_parallelism: 2 });
+    expect(instanceSettingsBody(form({ parallelismText: '' })).instance_parallelism).toBe(1);
+  });
+});
+
+describe('validateInstances', () => {
+  const t = messages.en;
+  const invalid = t.errorRuntimeSpecInstancesInvalid;
+
+  it('never checks the hidden fields of a spec that does not opt in', () => {
+    for (const hidden of [
+      { minText: '-1' },
+      { maxText: '65' },
+      { minText: '3', maxText: '2' },
+      { minText: '1.5' },
+      { parallelismText: '0' },
+      { parallelismText: 'abc' },
+    ]) {
+      expect(validateInstances(form({ replicable: false, ...hidden }), 0, t)).toBeUndefined();
+    }
+    // A fixed listen port is fine for a spec that runs one process.
+    expect(validateInstances(form({ replicable: false }), 9000, t)).toBeUndefined();
+  });
+
+  it.each([
+    ['a negative minimum', { minText: '-1' }],
+    ['a negative maximum', { maxText: '-1' }],
+    ['a fractional minimum', { minText: '0.5' }],
+    ['a fractional maximum', { maxText: '2.5' }],
+    ['a minimum that is no number', { minText: 'abc' }],
+    ['a minimum above 64', { minText: '65' }],
+    ['a maximum above 64', { maxText: '65' }],
+    ['a minimum above a set maximum', { minText: '3', maxText: '2' }],
+    ['a parallelism of 0', { parallelismText: '0' }],
+    ['a negative parallelism', { parallelismText: '-2' }],
+    ['a fractional parallelism', { parallelismText: '1.5' }],
+  ])('refuses %s while ticked', (_, fields) => {
+    expect(validateInstances(form(fields), 0, t)).toBe(invalid);
+  });
+
+  it.each([
+    ['empty bounds and the default parallelism', {}],
+    ['an empty parallelism, read as its default 1', { parallelismText: '' }],
+    ['a minimum with an unlimited maximum', { minText: '5' }],
+    ['a maximum with no minimum', { maxText: '5' }],
+    ['equal bounds at the cap', { minText: '64', maxText: '64' }],
+    ['a minimum below the maximum', { minText: '1', maxText: '3', parallelismText: '8' }],
+  ])('accepts %s while ticked', (_, fields) => {
+    expect(validateInstances(form(fields), 0, t)).toBeUndefined();
+  });
+
+  it('refuses several instances on a fixed listen port, after the counts', () => {
+    expect(validateInstances(form(), 9000, t)).toBe(t.errorRuntimeSpecInstancesNeedEphemeralPort);
+    expect(validateInstances(form({ minText: '-1' }), 9000, t)).toBe(invalid);
   });
 });
 

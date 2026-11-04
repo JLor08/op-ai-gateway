@@ -2006,7 +2006,7 @@ const de = {
   errorRuntimeSpecConfigFilesInvalid:
     'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
   errorRuntimeSpecInstancesInvalid:
-    'Ungültige Instanzanzahl: Die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und keine Anzahl darf über 64 liegen.',
+    'Ungültige Instanzeinstellungen: Mindest- und Höchstanzahl müssen ganze Zahlen von 0 bis 64 sein, die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und die parallelen Anfragen pro Instanz müssen eine ganze Zahl ab 1 sein.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
     'Mehrere Instanzen brauchen Listen-Port 0: Jede Instanz lauscht auf ihrem eigenen Port, den der Agent wählt.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
@@ -5350,7 +5350,7 @@ const en: PortalMessages = {
   errorRuntimeSpecConfigFilesInvalid:
     'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
   errorRuntimeSpecInstancesInvalid:
-    'Invalid instance count: the minimum must not exceed a set maximum, and no count may be above 64.',
+    'Invalid instance settings: the minimum and maximum must be whole numbers from 0 to 64, the minimum must not exceed a set maximum, and the parallel requests per instance must be a whole number of at least 1.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
     'Multiple instances need listen port 0: every instance listens on its own port, picked by the agent.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
