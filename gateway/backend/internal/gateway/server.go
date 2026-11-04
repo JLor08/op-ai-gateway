@@ -489,6 +489,11 @@ type Server struct {
 	// New builds it whenever it builds the resolver's instance source and installs
 	// it as the resolver's demand sink; nil otherwise, and on a bare &Server{}.
 	instanceScaler *instanceScaler
+	// instanceClaims is the instance index claim set the scaler and the portal's
+	// manual start share (instance_claims.go), so the two never ask an agent for
+	// one instance index at the same time. Built in New; a bare &Server{} leaves
+	// it nil, which holds nothing.
+	instanceClaims *instanceClaims
 	// voiceTickets mints and redeems the Voice Chat tickets (voice_chat_ticket.go): the
 	// authenticated, CSRF-protected ticket POST mints one after the co-load gate, the
 	// WebSocket upgrade redeems it. Built in New with a fresh per-process key; a bare
@@ -1195,6 +1200,7 @@ func New(deps ServerDeps) *Server {
 	// the built Server for the provider (read at each signal, so a provider without
 	// the ensure route starts nothing), the upstream credential and the shutdown
 	// context, and it counts instances through the resolver's own instance source.
+	s.instanceClaims = newInstanceClaims()
 	if resolver != nil && instances != nil {
 		s.instanceScaler = newInstanceScaler(instanceScalerDeps{
 			store:     deps.Routes,
@@ -1209,6 +1215,7 @@ func New(deps ServerDeps) *Server {
 			wake:    admission.release,
 			base:    func() context.Context { return s.baseCtx },
 			now:     time.Now,
+			claims:  s.instanceClaims,
 		}, deps.InstanceScaleCooldown)
 		resolver.SetDemandSink(s.instanceScaler)
 	}
