@@ -1097,6 +1097,38 @@ function validateVisibleDevices(
   return undefined;
 }
 
+// The agent's cap on a spec's instances (indexes 0..63); the backend refuses a
+// minimum or maximum above it.
+const INSTANCES_MAX = 64;
+
+/**
+ * The instance settings' two refusals, checked before the round trip for the
+ * same reason as the visible-devices pair: on Create a refused spec write would
+ * leave the mapping behind without its spec. The backend refuses both too, in
+ * this order, and checks the counts whether or not "Multiple instances" is
+ * ticked -- the four settings are sent either way, so a pair that can never be
+ * met would otherwise be stored to take effect the day the box is ticked.
+ *
+ *  - A count above the cap, or a minimum above a set maximum (an empty maximum
+ *    is unlimited, so no minimum exceeds it).
+ *  - Several instances on a fixed listen port: every instance is its own
+ *    process on its own port, so only the agent's free-port pick (0) works.
+ */
+function validateInstances(
+  replicable: boolean,
+  listenPort: number,
+  minInstances: number,
+  maxInstances: number,
+  t: Translation,
+): string | undefined {
+  if (minInstances > INSTANCES_MAX || maxInstances > INSTANCES_MAX) {
+    return t.errorRuntimeSpecInstancesInvalid;
+  }
+  if (maxInstances > 0 && minInstances > maxInstances) return t.errorRuntimeSpecInstancesInvalid;
+  if (replicable && listenPort !== 0) return t.errorRuntimeSpecInstancesNeedEphemeralPort;
+  return undefined;
+}
+
 /**
  * The first GPU index that appears more than once, or `null`.
  *
@@ -3289,6 +3321,17 @@ export function RuntimeAdminSection({
       showError(visibleDevicesError);
       return;
     }
+    const instancesError = validateInstances(
+      replicable,
+      listenPort,
+      instanceCountFromText(minInstancesText),
+      instanceCountFromText(maxInstancesText),
+      t,
+    );
+    if (instancesError) {
+      showError(instancesError);
+      return;
+    }
     setBusy(true);
     let mapping: PortalModelMapping;
     try {
@@ -3383,6 +3426,17 @@ export function RuntimeAdminSection({
     );
     if (visibleDevicesError) {
       showError(visibleDevicesError);
+      return;
+    }
+    const instancesError = validateInstances(
+      replicable,
+      listenPort,
+      instanceCountFromText(minInstancesText),
+      instanceCountFromText(maxInstancesText),
+      t,
+    );
+    if (instancesError) {
+      showError(instancesError);
       return;
     }
     setBusy(true);
@@ -4783,8 +4837,25 @@ export function RuntimeAdminSection({
               onChange={(e) =>
                 setIdleTimeoutSeconds(e.target.value === '' ? 0 : Number(e.target.value))
               }
+              // With several instances this field is the manual override of
+              // an automatic timeout, and its 0 changes meaning from "never
+              // unload" to "no override" -- said where the 0 is typed.
+              helperText={replicable ? t.runtimeSpecIdleTimeoutOverrideHint : undefined}
               inputProps={{ min: 0 }}
             />
+            {/* The timeout the gateway actually pushes, beside the field that
+                overrides it. Only for a spec STORED as replicable: for any
+                other the figure is the stored manual value, not an automatic
+                one, so ticking the box on such a spec shows nothing until a
+                save has made the gateway derive it. */}
+            {replicable && currentSpec?.configured && currentSpec.replicable && (
+              <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                {t.runtimeSpecAutoIdleTimeout(
+                  currentSpec.effective_idle_timeout_seconds,
+                  currentSpec.startup_measured_ms,
+                )}
+              </Typography>
+            )}
             <Field
               id="runtime-spec-admission-wait-timeout"
               type="number"
@@ -4799,6 +4870,48 @@ export function RuntimeAdminSection({
               control={<Checkbox checked={pinned} onChange={(e) => setPinned(e.target.checked)} />}
               label={t.runtimeSpecPinned}
             />
+            {/* Opt-in: unticked, the spec runs exactly one process, as it did
+                before instances existed. The bounds and the parallelism mean
+                nothing without it, so they are shown only with it -- and sent
+                on every save regardless (buildSpecBody). */}
+            <FormControlLabel
+              control={
+                <Checkbox checked={replicable} onChange={(e) => setReplicable(e.target.checked)} />
+              }
+              label={t.runtimeSpecReplicable}
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              {t.runtimeSpecReplicableHint}
+            </Typography>
+            {replicable && (
+              <>
+                <Field
+                  id="runtime-spec-min-instances"
+                  type="number"
+                  label={t.runtimeSpecMinInstances}
+                  value={minInstancesText}
+                  onChange={(e) => setMinInstancesText(e.target.value)}
+                  inputProps={{ min: 0, max: INSTANCES_MAX }}
+                />
+                <Field
+                  id="runtime-spec-max-instances"
+                  type="number"
+                  label={t.runtimeSpecMaxInstances}
+                  value={maxInstancesText}
+                  onChange={(e) => setMaxInstancesText(e.target.value)}
+                  helperText={t.runtimeSpecMaxInstancesUnlimited}
+                  inputProps={{ min: 0, max: INSTANCES_MAX }}
+                />
+                <Field
+                  id="runtime-spec-instance-parallelism"
+                  type="number"
+                  label={t.runtimeSpecInstanceParallelism}
+                  value={instanceParallelismText}
+                  onChange={(e) => setInstanceParallelismText(e.target.value)}
+                  inputProps={{ min: 1 }}
+                />
+              </>
+            )}
             {/* Without this, the GPU rows below are a DECLARATION: they drive
                 the admission arithmetic and the VRAM measurement mapping, and
                 nothing stops the process from landing on a different card --

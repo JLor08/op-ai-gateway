@@ -10517,3 +10517,210 @@ describe('RuntimeAdminSection spec-level RAM estimate', () => {
     expect(putSpecs[0].body.ram_estimate_mb).toBe(12288);
   });
 });
+
+// Instance settings (#340). A spec opts into several instances (processes) with
+// "Multiple instances"; the bounds and the per-instance parallelism mean
+// nothing without it, so they are shown only with it ticked -- and sent on
+// every save regardless, because the PUT is a full document.
+describe('RuntimeAdminSection instance settings', () => {
+  async function openFilledCreate() {
+    const handles = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/audio-server' },
+    });
+    return handles;
+  }
+
+  function tickReplicable() {
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+  }
+
+  it('reveals min, max and the parallel requests per instance only with "Multiple instances" ticked', async () => {
+    await openFilledCreate();
+    expect(screen.queryByLabelText(t.runtimeSpecMinInstances)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecMaxInstances)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecInstanceParallelism)).not.toBeInTheDocument();
+
+    tickReplicable();
+
+    expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveValue(null);
+    expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveValue(null);
+    // An empty maximum is "unlimited", and the field says so.
+    expect(screen.getByText(t.runtimeSpecMaxInstancesUnlimited)).toBeInTheDocument();
+    expect(screen.getByLabelText(t.runtimeSpecInstanceParallelism)).toHaveValue(1);
+    // Pinned stays beside it: it is what keeps instance 0 up.
+    expect(screen.getByLabelText(t.runtimeSpecPinned)).toBeInTheDocument();
+
+    tickReplicable();
+    expect(screen.queryByLabelText(t.runtimeSpecMinInstances)).not.toBeInTheDocument();
+  });
+
+  it('sends an empty min and max as 0 -- none and unlimited -- and the parallelism as 1', async () => {
+    const { putSpecs } = await openFilledCreate();
+    tickReplicable();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body.replicable).toBe(true);
+    expect(body.min_instances).toBe(0);
+    expect(body.max_instances).toBe(0);
+    expect(body.instance_parallelism).toBe(1);
+  });
+
+  it('sends the typed bounds and parallelism', async () => {
+    const { putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '1' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
+      target: { value: '2' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: true,
+      min_instances: 1,
+      max_instances: 3,
+      instance_parallelism: 2,
+    });
+  });
+
+  it('saves a spec that does not opt in as one instance with no bounds', async () => {
+    const { putSpecs } = await openFilledCreate();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: false,
+      min_instances: 0,
+      max_instances: 0,
+    });
+  });
+
+  // The agent caps a spec at 64 instances and the backend refuses a count
+  // above it; the fields carry the same bound, so the form never submits one.
+  it.each([
+    ['minimum', 'runtimeSpecMinInstances'],
+    ['maximum', 'runtimeSpecMaxInstances'],
+  ] as const)('never sends a %s above 64', async (_which, label) => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t[label]), { target: { value: '65' } });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // Both are refused by the backend too; checked first for the same reason as
+  // the visible-devices pair: on Create a refused spec write would leave the
+  // mapping behind without its spec.
+  it('refuses a minimum above the maximum before ever calling the API', async () => {
+    const { created, putSpecs } = await openFilledCreate();
+    tickReplicable();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '2' } });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(await screen.findByText(t.errorRuntimeSpecInstancesInvalid)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('refuses multiple instances on a fixed listen port before ever calling the API', async () => {
+    const { created, putSpecs } = await openFilledCreate();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecListenPort), { target: { value: '9000' } });
+    tickReplicable();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(
+      await screen.findByText(t.errorRuntimeSpecInstancesNeedEphemeralPort),
+    ).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('opens a stored replicable spec as stored: an empty max for unlimited, parallelism 0 as 1', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 1,
+      max_instances: 0,
+      instance_parallelism: 0,
+    });
+
+    expect(screen.getByLabelText(t.runtimeSpecReplicable)).toBeChecked();
+    expect(screen.getByLabelText(t.runtimeSpecMinInstances)).toHaveValue(1);
+    expect(screen.getByLabelText(t.runtimeSpecMaxInstances)).toHaveValue(null);
+    expect(screen.getByLabelText(t.runtimeSpecInstanceParallelism)).toHaveValue(1);
+  });
+
+  it('replays the stored settings on an untouched save, and never the two read-only figures', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 4,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      replicable: true,
+      min_instances: 2,
+      max_instances: 5,
+      instance_parallelism: 4,
+    });
+    expect(putSpecs[0].body).not.toHaveProperty('startup_measured_ms');
+    expect(putSpecs[0].body).not.toHaveProperty('effective_idle_timeout_seconds');
+  });
+
+  it('shows the measured startup and the idle timeout in effect, and what 0 means for the manual field', async () => {
+    await openApiTokenSpecEdit({
+      replicable: true,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 150,
+    });
+
+    expect(screen.getByText(t.runtimeSpecAutoIdleTimeout(150, 30000))).toBeInTheDocument();
+    // The idle-timeout field stays, as the manual override.
+    expect(screen.getByLabelText(t.runtimeSpecIdleTimeout)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeSpecIdleTimeoutOverrideHint)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+
+    expect(screen.queryByText(t.runtimeSpecAutoIdleTimeout(150, 30000))).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecIdleTimeoutOverrideHint)).not.toBeInTheDocument();
+  });
+
+  // The figure is the idle timeout the gateway pushes for the STORED spec, and
+  // for a spec stored without instances that is its manual value, not an
+  // automatic one -- so ticking the box there shows no figure until a save.
+  it('shows no idle-timeout figure for a spec stored without instances', async () => {
+    await openApiTokenSpecEdit({
+      idle_timeout_seconds: 600,
+      startup_measured_ms: 30000,
+      effective_idle_timeout_seconds: 600,
+    });
+
+    fireEvent.click(screen.getByLabelText(t.runtimeSpecReplicable));
+
+    expect(screen.getByText(t.runtimeSpecIdleTimeoutOverrideHint)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecAutoIdleTimeout(600, 30000))).not.toBeInTheDocument();
+  });
+});
