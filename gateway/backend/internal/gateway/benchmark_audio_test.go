@@ -565,6 +565,23 @@ func TestAudioCapacityStopsOnPerformance(t *testing.T) {
 	}
 }
 
+// TestAudioCapacityJudgesALevelByItsSlowestStream: a level whose mean rate is real-time but
+// whose slowest stream is not (0.9 and 3.0 at k=2, mean 1.95) is bad: one stream that
+// stutters is a stuttering session, so the ramp stops at 1 with the limit performance.
+func TestAudioCapacityJudgesALevelByItsSlowestStream(t *testing.T) {
+	f := newAudioFixture(t, audioFixtureOpts{})
+	f.script.answer = levelRates(map[int][]float64{1: {3.0}, 2: {0.9, 3.0}})
+
+	res := f.run(t, "capacity")
+
+	if res.Error != "" || res.AudioRealtimeConcurrency != 1 || res.AudioConcurrencyLimit != routing.AudioLimitPerformance {
+		t.Fatalf("result = %d / %q, error %q; want 1 / performance", res.AudioRealtimeConcurrency, res.AudioConcurrencyLimit, res.Error)
+	}
+	if _, payload := f.capacityRow(t); len(payload.Curve) != 2 || payload.Curve[1] != (audioLevel{K: 2, MinRateX: 0.9, MeanRateX: 1.95}) {
+		t.Fatalf("curve = %+v, want level 2 at 0.9 slowest, 1.95 mean", payload.Curve)
+	}
+}
+
 // TestAudioCapacityNotRealTimeEvenAlone: a model too slow at k=1 stores a measured 0 with the
 // limit performance -- not real-time even alone, which is a result, not "unknown".
 func TestAudioCapacityNotRealTimeEvenAlone(t *testing.T) {
