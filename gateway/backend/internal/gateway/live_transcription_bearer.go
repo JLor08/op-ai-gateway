@@ -146,7 +146,7 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	s.Active.Add(ActiveRequest{
 		ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name,
 		ServiceID: token.ServiceID, ServiceName: token.ServiceName,
-		ServerName: s.serverName(target.ServerID), ServerID: target.ServerID,
+		ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey,
 		Model: target.Model, RequestedModel: strings.TrimSpace(r.URL.Query().Get("model")),
 		APIFlavor: target.APIFlavor, BillingUnit: usage.BillingUnitAudioSecond,
 		ReqPath: r.URL.Path, ProviderPath: liveUpstreamPath(target, params),

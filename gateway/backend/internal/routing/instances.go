@@ -4,6 +4,7 @@
 package routing
 
 import (
+	"context"
 	"strconv"
 	"strings"
 )
@@ -79,11 +80,52 @@ type InstanceView struct {
 
 // InstanceSource reports the instances of mapping m on serverID. ok is false
 // when the mapping is not instance-capable there: no runtime spec, a spec that
-// is not replicable, or an agent not known to run instances. Satisfied by the
-// gateway's adapter over its runtime-status and agent-feature registries.
+// is not replicable, or an agent not known to run instances. ctx is the
+// request's, so a store read the source makes is traced under the request and
+// ends with it. Satisfied by the gateway's adapter over its runtime-status and
+// agent-feature registries.
 type InstanceSource interface {
-	InstanceView(serverID string, m ModelMapping) (InstanceView, bool)
+	InstanceView(ctx context.Context, serverID string, m ModelMapping) (InstanceView, bool)
 }
+
+// InstanceActivityChecker reports how many requests are in flight on one
+// instance, by its gateway instance key (InstanceKey). Satisfied by the
+// gateway's active-request registry.
+type InstanceActivityChecker interface {
+	InstanceActivity(instanceKey string) int
+}
+
+// SetInstanceActivityChecker installs the per-instance in-flight count the
+// capacity filter judges instance candidates by. Leaving it unset (nil) means
+// an instance's load is unknown, so no instance candidate is ever at capacity
+// -- the same lenience a nil ServerActivityChecker gives the server cap.
+func (r *Resolver) SetInstanceActivityChecker(c InstanceActivityChecker) { r.instanceActivity = c }
+
+// DemandSignal says a gateway model needs another instance: every instance
+// candidate the resolver had for it was at capacity.
+type DemandSignal struct {
+	// Model is the gateway model whose instances were all busy -- a group
+	// member's own name, never the group's.
+	Model string
+	// APIFlavor is the coarse flavor (NormalizeAPIFlavor) the model was
+	// resolved under, the one ActiveMappingsForModel keys by.
+	APIFlavor string
+	// ServerID restricts the new instance to one server; "" = any server.
+	ServerID string
+	// Live is true when the demand is for a live slot (a live session).
+	Live bool
+}
+
+// DemandSink receives demand signals. Signal is called on the request path,
+// so it must not block.
+type DemandSink interface {
+	Signal(DemandSignal)
+}
+
+// SetDemandSink installs the receiver of demand signals. Leaving it unset
+// (nil) drops them: an all-busy request still queues, nothing starts another
+// instance for it.
+func (r *Resolver) SetDemandSink(s DemandSink) { r.demand = s }
 
 // SetInstanceSource installs the instance source candidate expansion reads.
 // Leaving it unset (nil) means no mapping is instance-capable, so every
@@ -101,20 +143,31 @@ func (r *Resolver) SetInstanceSource(s InstanceSource) { r.instances = s }
 // candidate is asked about; that also keeps the source's spec lookup off every
 // request for a model served without an agent. An index no address can carry,
 // or one the source repeats, adds nothing.
-func expandInstances(cands []MappingCandidate, src InstanceSource) []MappingCandidate {
+//
+// Every candidate of a capable mapping, instance 0 included, carries the
+// view's facts (InstanceCapable, InstanceParallelism): the source is asked
+// once per mapping per call, and the capacity filter judges the candidates by
+// the very view that produced them.
+func expandInstances(ctx context.Context, cands []MappingCandidate, src InstanceSource) []MappingCandidate {
 	if src == nil {
 		return cands
 	}
 	out := make([]MappingCandidate, 0, len(cands))
 	for _, c := range cands {
-		out = append(out, c)
 		if c.Application.Type != ProviderServerAgent {
+			out = append(out, c)
 			continue
 		}
-		view, ok := src.InstanceView(c.Server.ID, c.Mapping)
+		view, ok := src.InstanceView(ctx, c.Server.ID, c.Mapping)
 		if !ok {
+			out = append(out, c)
 			continue
 		}
+		c.InstanceCapable = true
+		// An unset parallelism is one request at a time; never 0, which
+		// would leave the instance at capacity with nothing in flight.
+		c.InstanceParallelism = max(view.Parallelism, 1)
+		out = append(out, c)
 		seen := make(map[int]struct{}, len(view.Running))
 		for _, k := range view.Running {
 			if k < 1 || k > MaxInstanceIndex {

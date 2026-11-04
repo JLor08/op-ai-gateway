@@ -22,10 +22,17 @@ type countingSpecReader struct {
 	specs map[string]routing.RuntimeSpec
 	err   error
 	reads []string
+	ctxs  []context.Context
 }
 
-func (c *countingSpecReader) RuntimeSpecByMapping(_ context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
+// RuntimeSpecByMapping fails like a store would with a context that is
+// already done.
+func (c *countingSpecReader) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
 	c.reads = append(c.reads, mappingID)
+	c.ctxs = append(c.ctxs, ctx)
+	if err := ctx.Err(); err != nil {
+		return routing.RuntimeSpec{}, false, err
+	}
 	if c.err != nil {
 		return routing.RuntimeSpec{}, false, c.err
 	}
@@ -63,7 +70,7 @@ func TestInstanceSourceReportsRunningAndPresentInstances(t *testing.T) {
 		specRow("T", "t", 5, "running"),                                // another spec's instance
 		{SpecID: "S", Model: "other#6", Instance: 6, State: "running"}, // not an address this mapping sends
 	})
-	view, ok := src.InstanceView("srv1", m)
+	view, ok := src.InstanceView(context.Background(), "srv1", m)
 	if !ok {
 		t.Fatal("InstanceView ok = false, want true for a replicable spec on an agent that runs instances")
 	}
@@ -81,7 +88,7 @@ func TestInstanceSourceReportsRunningAndPresentInstances(t *testing.T) {
 func TestInstanceSourceParallelismDefaultsToOne(t *testing.T) {
 	src, reader, m := instanceSourceFixture()
 	reader.specs["map_m"] = routing.RuntimeSpec{ID: "S", MappingID: "map_m", Replicable: true}
-	if view, ok := src.InstanceView("srv1", m); !ok || view.Parallelism != 1 {
+	if view, ok := src.InstanceView(context.Background(), "srv1", m); !ok || view.Parallelism != 1 {
 		t.Fatalf("view = %+v (ok %v), want parallelism 1 for an unset instance_parallelism", view, ok)
 	}
 }
@@ -91,16 +98,16 @@ func TestInstanceSourceParallelismDefaultsToOne(t *testing.T) {
 func TestInstanceSourceDropsVanishedRows(t *testing.T) {
 	src, _, m := instanceSourceFixture()
 	src.registry.publish("srv1", []RuntimeStatusDTO{specRow("S", "m", 0, "running"), specRow("S", "m", 2, "running")})
-	if view, _ := src.InstanceView("srv1", m); !slices.Equal(view.Running, []int{2}) {
+	if view, _ := src.InstanceView(context.Background(), "srv1", m); !slices.Equal(view.Running, []int{2}) {
 		t.Fatalf("Running = %v before the restart, want [2]", view.Running)
 	}
 	src.registry.publish("srv1", []RuntimeStatusDTO{specRow("S", "m", 0, "running")})
-	view, ok := src.InstanceView("srv1", m)
+	view, ok := src.InstanceView(context.Background(), "srv1", m)
 	if !ok || len(view.Running) != 0 || len(view.Present) != 0 {
 		t.Fatalf("view = %+v (ok %v) after a snapshot without S#2, want ok with no instance running or present", view, ok)
 	}
 	src.registry.publish("srv1", nil)
-	if view, ok := src.InstanceView("srv1", m); !ok || len(view.Running) != 0 {
+	if view, ok := src.InstanceView(context.Background(), "srv1", m); !ok || len(view.Running) != 0 {
 		t.Fatalf("view = %+v (ok %v) after an empty snapshot, want ok with nothing running", view, ok)
 	}
 }
@@ -113,16 +120,16 @@ func TestInstanceSourceRequiresFeature(t *testing.T) {
 	src.registry.publish("srv_old", []RuntimeStatusDTO{specRow("S", "m", 2, "running")})
 	src.features.Set("srv_old", []string{"runtime_manager", "runtime_model_probe"})
 
-	if _, ok := src.InstanceView("srv_old", m); ok {
+	if _, ok := src.InstanceView(context.Background(), "srv_old", m); ok {
 		t.Fatal("agent without runtime_instances: ok = true, want false")
 	}
-	if _, ok := src.InstanceView("srv_unknown", m); ok {
+	if _, ok := src.InstanceView(context.Background(), "srv_unknown", m); ok {
 		t.Fatal("agent whose features are not known: ok = true, want false")
 	}
 	if len(reader.reads) != 0 {
 		t.Fatalf("spec reads = %v, want none for an agent that runs no instances", reader.reads)
 	}
-	if _, ok := src.InstanceView("srv1", m); !ok {
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
 		t.Fatal("agent with runtime_instances: ok = false, want true")
 	}
 }
@@ -130,22 +137,97 @@ func TestInstanceSourceRequiresFeature(t *testing.T) {
 func TestInstanceSourceNeedsReplicableSpec(t *testing.T) {
 	src, reader, m := instanceSourceFixture()
 	reader.specs["map_plain"] = routing.RuntimeSpec{ID: "P", MappingID: "map_plain"}
-	if _, ok := src.InstanceView("srv1", routing.ModelMapping{ID: "map_plain", AppModelName: "p"}); ok {
+	if _, ok := src.InstanceView(context.Background(), "srv1", routing.ModelMapping{ID: "map_plain", AppModelName: "p"}); ok {
 		t.Fatal("spec not replicable: ok = true, want false")
 	}
-	if _, ok := src.InstanceView("srv1", routing.ModelMapping{ID: "map_nospec", AppModelName: "n"}); ok {
+	if _, ok := src.InstanceView(context.Background(), "srv1", routing.ModelMapping{ID: "map_nospec", AppModelName: "n"}); ok {
 		t.Fatal("no spec: ok = true, want false")
 	}
-	failing := &countingSpecReader{err: errors.New("store down")}
-	src.store = failing
+	src.store = &countingSpecReader{err: errors.New("store down")}
 	src.specs = map[string]instanceSpecEntry{}
-	if _, ok := src.InstanceView("srv1", m); ok {
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok {
 		t.Fatal("spec read failed: ok = true, want false")
 	}
-	// A failed read is not remembered: the next request asks again.
-	src.InstanceView("srv1", m)
+}
+
+// A failed spec read is remembered for a second: a degraded store is asked
+// (and its failure logged) once a second per mapping, not on every admission
+// turn of every request; once that second has passed it is asked again, and
+// a store that has recovered answers.
+func TestInstanceSourceRemembersAFailedReadForASecond(t *testing.T) {
+	src, _, m := instanceSourceFixture()
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	src.now = func() time.Time { return now }
+	failing := &countingSpecReader{err: errors.New("store down")}
+	src.store = failing
+
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok {
+		t.Fatal("spec read failed: ok = true, want false")
+	}
+	now = now.Add(900 * time.Millisecond)
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok || len(failing.reads) != 1 {
+		t.Fatalf("within a second of the failure: ok %v after %d reads, want false after 1", ok, len(failing.reads))
+	}
+	now = now.Add(100 * time.Millisecond)
+	src.InstanceView(context.Background(), "srv1", m)
 	if len(failing.reads) != 2 {
-		t.Fatalf("spec reads after two failures = %d, want 2", len(failing.reads))
+		t.Fatalf("spec reads a second after the failure = %d, want 2", len(failing.reads))
+	}
+	failing.err = nil
+	failing.specs = map[string]routing.RuntimeSpec{"map_m": {ID: "S", MappingID: "map_m", Replicable: true}}
+	now = now.Add(time.Second)
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
+		t.Fatal("after the store recovered: ok = false, want the replicable spec")
+	}
+}
+
+// The spec is read under the request's context, so the read is traced under
+// the request and ends with it. A read that failed because its request was
+// already gone says nothing about the store: it is not remembered, and the
+// next request reads the spec afresh.
+func TestInstanceSourceReadsSpecUnderRequestContext(t *testing.T) {
+	type ctxKey struct{}
+	src, reader, m := instanceSourceFixture()
+	ctx := context.WithValue(context.Background(), ctxKey{}, "req")
+	if _, ok := src.InstanceView(ctx, "srv1", m); !ok {
+		t.Fatal("InstanceView ok = false, want true")
+	}
+	if len(reader.ctxs) != 1 || reader.ctxs[0].Value(ctxKey{}) != "req" {
+		t.Fatalf("spec read under %d contexts, want 1 derived from the request's", len(reader.ctxs))
+	}
+
+	src.specs = map[string]instanceSpecEntry{}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := src.InstanceView(gone, "srv1", m); ok {
+		t.Fatal("cancelled request: ok = true, want false")
+	}
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
+		t.Fatal("the next request: ok = false, want the spec read afresh, not the cancelled read's failure")
+	}
+	if len(reader.reads) != 3 {
+		t.Fatalf("spec reads = %d, want 3 (the cancelled read is not remembered)", len(reader.reads))
+	}
+}
+
+// The server's resolver judges an instance by the active registry's count of
+// requests in flight on it: with instance 0 holding a request at its
+// parallelism of one, the running instance 2 serves although instance 0
+// reports the lighter load.
+func TestInstanceCapIsWiredEndToEnd(t *testing.T) {
+	srv := NewTestServer()
+	seedReplicableRuntimeSpec(t, srv)
+	ctx := context.Background()
+	req := inference.Request{Model: "inst-model", APIFlavor: "openai_chat"}
+	ingestInstanceRows(t, srv, `"runtime_manager","runtime_model_probe","runtime_instances"`, instRow(0, "running", 0, 0), instRow(2, "running", 5, 3))
+
+	if target, err := srv.Resolver.Resolve(ctx, auth.Token{}, req); err != nil || target.InstanceKey != "map_rspec_inst#0" {
+		t.Fatalf("nothing in flight: target %q, err %v; want the lighter instance 0, map_rspec_inst#0", target.InstanceKey, err)
+	}
+	srv.Active.Add(ActiveRequest{ID: "held", ServerID: "mock-host-qwen", InstanceKey: "map_rspec_inst#0"})
+	defer srv.Active.Remove("held")
+	if target, err := srv.Resolver.Resolve(ctx, auth.Token{}, req); err != nil || target.InstanceKey != "map_rspec_inst#2" {
+		t.Fatalf("instance 0 at capacity: target %q, err %v; want map_rspec_inst#2", target.InstanceKey, err)
 	}
 }
 
@@ -157,28 +239,28 @@ func TestInstanceSourceCachesSpecForFiveSeconds(t *testing.T) {
 	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
 	src.now = func() time.Time { return now }
 
-	src.InstanceView("srv1", m)
+	src.InstanceView(context.Background(), "srv1", m)
 	now = now.Add(4900 * time.Millisecond)
-	src.InstanceView("srv1", m)
+	src.InstanceView(context.Background(), "srv1", m)
 	if len(reader.reads) != 1 {
 		t.Fatalf("spec reads within 5s = %d, want 1", len(reader.reads))
 	}
 	now = now.Add(100 * time.Millisecond)
-	src.InstanceView("srv1", m)
+	src.InstanceView(context.Background(), "srv1", m)
 	if len(reader.reads) != 2 {
 		t.Fatalf("spec reads after 5s = %d, want 2", len(reader.reads))
 	}
-	src.InstanceView("srv1", routing.ModelMapping{ID: "map_other", AppModelName: "o"})
+	src.InstanceView(context.Background(), "srv1", routing.ModelMapping{ID: "map_other", AppModelName: "o"})
 	if !slices.Equal(reader.reads, []string{"map_m", "map_m", "map_other"}) {
 		t.Fatalf("spec reads = %v, want one per mapping", reader.reads)
 	}
 	// A spec switched off replicable is seen once the cached read expires.
 	reader.specs["map_m"] = routing.RuntimeSpec{ID: "S", MappingID: "map_m"}
-	if _, ok := src.InstanceView("srv1", m); !ok {
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); !ok {
 		t.Fatal("within 5s of the last read: ok = false, want the cached replicable spec")
 	}
 	now = now.Add(5 * time.Second)
-	if _, ok := src.InstanceView("srv1", m); ok {
+	if _, ok := src.InstanceView(context.Background(), "srv1", m); ok {
 		t.Fatal("after 5s: ok = true, want the re-read spec that is no longer replicable")
 	}
 	src.mu.Lock()

@@ -467,6 +467,8 @@ type Resolver struct {
 	groups            GroupResolver
 	warmer            ModelWarmer
 	instances         InstanceSource
+	instanceActivity  InstanceActivityChecker
+	demand            DemandSink
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
 	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
 	// the per-user vendor-account branch (resolveVendorAccount). All three are
@@ -835,7 +837,7 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		// mappings: a request parked below because every candidate was at capacity must
 		// be offered, on its next turn, an instance that started while it waited. The
 		// capacity filter in selectCandidate therefore judges this turn's instances.
-		turn := expandInstances(candidates, r.instances)
+		turn := expandInstances(ctx, candidates, r.instances)
 		selected, ok, err := r.selectCandidate(ctx, turn, req, now)
 		if errors.Is(err, errAllAtCapacity) {
 			// All candidates at cap + a wired controller: park until a slot frees, then retry.
@@ -1795,21 +1797,35 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	// verification-caught MAJOR: it could strip the sole viable-but-at-cap candidate and
 	// leave only under-cap non-viable ones → ErrNoHealthyHost. So max_concurrency==0
 	// everywhere (the under-cap subset == the full pool) is exactly the pre-CP3 behaviour.
-	if r.activity != nil {
+	//
+	// An instance candidate -- every candidate of a mapping expandInstances found
+	// instance-capable, instance 0 included -- is judged by its OWN in-flight count against
+	// the spec's instance parallelism instead (underCap). Its instances share the server, so
+	// the server's count cannot say whether this one instance takes another request, and the
+	// parallelism is always known (at least 1), so with the instance activity source wired
+	// an instance's cap is always defined: when every candidate is at its cap and at least
+	// one is an instance, the request queues even though the mapping sets no
+	// max_concurrency, and the demand sink hears that the model needs another instance --
+	// the one thing that would serve it sooner.
+	if r.activity != nil || r.instanceActivity != nil {
 		capped := make([]MappingCandidate, 0, len(pool))
+		demandModel := ""
 		for _, c := range pool {
-			maxC := c.Mapping.MaxConcurrency
-			if maxC <= 0 {
-				capped = append(capped, c) // unknown capacity => no cap
-				continue
+			if c.InstanceCapable && demandModel == "" {
+				// The mapping's own gateway model, so a group member names itself
+				// rather than the group req.Model carries.
+				demandModel = c.Mapping.GatewayModelName
 			}
-			k, _ := r.activity.ServerActivity(c.Server.ID)
-			effectiveCap := maxC - r.reservation.activeCount(c.Server.ID, now)
-			if k < effectiveCap {
+			if r.underCap(c, now) {
 				capped = append(capped, c)
 			}
 		}
 		if len(capped) == 0 {
+			// Signalled whether or not a queue is wired: the demand is the same either way,
+			// and the sink must not block, so this costs the request nothing.
+			if demandModel != "" && r.demand != nil {
+				r.demand.Signal(DemandSignal{Model: demandModel, APIFlavor: NormalizeAPIFlavor(req.APIFlavor)})
+			}
 			if r.admission != nil {
 				// Every candidate is at its effective cap: let Resolve queue + retry (CP4)
 				// instead of failing open. Pinned requests never reach here (resolveAffinity
@@ -1826,6 +1842,24 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 		}
 	}
 	return r.selectWithSwapProtection(ctx, pool, model, now)
+}
+
+// underCap reports whether candidate c can take another request now. An instance
+// candidate is under its cap while its own in-flight count is below the parallelism its
+// expansion carried; with no instance activity source its load is unknown and it is never
+// capped. Every other candidate keeps the server cap: in-flight on its server below
+// max_concurrency minus the server's reserved sessions, and no cap at all when
+// max_concurrency is unset (<= 0) or no server activity source is wired.
+func (r *Resolver) underCap(c MappingCandidate, now time.Time) bool {
+	if c.InstanceCapable {
+		return r.instanceActivity == nil || r.instanceActivity.InstanceActivity(InstanceKey(c.Mapping.ID, c.Instance)) < c.InstanceParallelism
+	}
+	maxC := c.Mapping.MaxConcurrency
+	if maxC <= 0 || r.activity == nil {
+		return true
+	}
+	k, _ := r.activity.ServerActivity(c.Server.ID)
+	return k < maxC-r.reservation.activeCount(c.Server.ID, now)
 }
 
 // selectWithSwapProtection applies the swap-protection filter to pool, then selects.
@@ -2258,7 +2292,7 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 	// the group walk calls this afresh on each admission turn, so a parked group request
 	// sees an instance that started while it waited. Expanded BEFORE the loaded-only
 	// filter, which then keeps an instance by its own address.
-	cands = expandInstances(cands, r.instances)
+	cands = expandInstances(ctx, cands, r.instances)
 	cands, err = r.filterBySpeedFloor(ctx, cands, name, gw.policy.MinTokensPerSecond)
 	if err != nil {
 		return nil, true, err

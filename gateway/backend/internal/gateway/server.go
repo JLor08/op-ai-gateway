@@ -999,6 +999,9 @@ func New(deps ServerDeps) *Server {
 		resolver.SetServerBusyChecker(benchmarks)
 		resolver.SetLoadedModelChecker(loadedModels)
 		resolver.SetServerActivityChecker(active, swapProtectWindow)
+		// The same registry counts in-flight requests per instance key, which caps
+		// each instance of a replicable spec at its instance_parallelism.
+		resolver.SetInstanceActivityChecker(active)
 		// The runtime-status registry (Task 13) is wired as the resolver's
 		// RuntimeModelStateChecker so scoring uses live PER-MODEL active/queue counts
 		// (not just the whole server's telemetry) and selection can prefer an

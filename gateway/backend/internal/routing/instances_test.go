@@ -21,7 +21,7 @@ type fakeInstanceSource struct {
 	asked []string
 }
 
-func (f *fakeInstanceSource) InstanceView(_ string, m ModelMapping) (InstanceView, bool) {
+func (f *fakeInstanceSource) InstanceView(_ context.Context, _ string, m ModelMapping) (InstanceView, bool) {
 	f.asked = append(f.asked, m.ID)
 	v, ok := f.views[m.ID]
 	return v, ok
@@ -87,7 +87,7 @@ func TestExpandInstancesAddsRunningInstances(t *testing.T) {
 	src := &fakeInstanceSource{views: map[string]InstanceView{
 		"map_m": {Replicable: true, Parallelism: 1, Running: []int{2, 3}, Present: []int{1, 2, 3}},
 	}}
-	got := expandInstances([]MappingCandidate{agentCandidate()}, src)
+	got := expandInstances(context.Background(), []MappingCandidate{agentCandidate()}, src)
 	if instances := candidateInstances(got); !slices.Equal(instances, []int{0, 2, 3}) {
 		t.Fatalf("instances = %v, want [0 2 3] (instance 0 and every running instance, never a starting one)", instances)
 	}
@@ -112,7 +112,7 @@ func TestExpandInstancesIgnoresInvalidRunningIndexes(t *testing.T) {
 	src := &fakeInstanceSource{views: map[string]InstanceView{
 		"map_m": {Replicable: true, Running: []int{0, -1, 2, 2, MaxInstanceIndex + 1, MaxInstanceIndex}},
 	}}
-	got := candidateInstances(expandInstances([]MappingCandidate{agentCandidate()}, src))
+	got := candidateInstances(expandInstances(context.Background(), []MappingCandidate{agentCandidate()}, src))
 	if !slices.Equal(got, []int{0, 2, MaxInstanceIndex}) {
 		t.Fatalf("instances = %v, want [0 2 %d]", got, MaxInstanceIndex)
 	}
@@ -123,10 +123,10 @@ func TestExpandInstancesNoViewUnchanged(t *testing.T) {
 	// ok=false: a spec that is not replicable, or an agent without instances
 	// beside one with them -- instance 0 alone, exactly the candidate it was.
 	src := &fakeInstanceSource{views: map[string]InstanceView{}}
-	if got := expandInstances(cands, src); len(got) != 1 || got[0].Instance != 0 || got[0].Mapping.ID != "map_m" {
+	if got := expandInstances(context.Background(), cands, src); len(got) != 1 || got[0].Instance != 0 || got[0].Mapping.ID != "map_m" {
 		t.Fatalf("expandInstances without a view = %+v, want the one candidate, instance 0", got)
 	}
-	if got := expandInstances(cands, nil); len(got) != 1 || got[0].Instance != 0 {
+	if got := expandInstances(context.Background(), cands, nil); len(got) != 1 || got[0].Instance != 0 {
 		t.Fatalf("expandInstances with no source = %+v, want the one candidate, instance 0", got)
 	}
 	// Only an agent runs instances: a candidate of any other application is
@@ -134,7 +134,7 @@ func TestExpandInstancesNoViewUnchanged(t *testing.T) {
 	direct := agentCandidate()
 	direct.Application.Type = ProviderMock
 	src = &fakeInstanceSource{views: map[string]InstanceView{"map_m": {Replicable: true, Running: []int{1}}}}
-	if got := expandInstances([]MappingCandidate{direct}, src); len(got) != 1 || len(src.asked) != 0 {
+	if got := expandInstances(context.Background(), []MappingCandidate{direct}, src); len(got) != 1 || len(src.asked) != 0 {
 		t.Fatalf("expandInstances(direct application) = %+v, asked %v, want the one candidate and no question", got, src.asked)
 	}
 }
@@ -245,22 +245,23 @@ func TestResolveRoutesToRunningInstance(t *testing.T) {
 
 // A request parked in the admission queue is offered, on the turn after its
 // wait, an instance that started while it waited: every turn of the admission
-// loop expands the candidates afresh. The server's own concurrency cap parks
-// the request here; the loaded partition then picks the new instance.
+// loop expands the candidates afresh. Instance 0's own cap parks the request;
+// during the wait instance 1 starts and instance 0 frees, and the loaded
+// partition, reading each instance by its own address, picks the new one.
 func TestResolveSeesInstanceStartedDuringAdmissionWait(t *testing.T) {
 	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
-	r := NewResolver(instanceCandidateStore(t, now, 1), func() time.Time { return now }, nil)
-	src := &fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true}}}
+	r := NewResolver(instanceCandidateStore(t, now, 0), func() time.Time { return now }, nil)
+	src := &fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Parallelism: 1}}}
 	loaded := &fakeLoaded{byServer: map[string][]string{"srv_inst": {"qwen2.5"}}}
-	activity := &fakeActivity{inFlight: map[string]int{"srv_inst": 1}} // at cap
+	activity := &fakeInstanceActivity{byKey: map[string]int{"map_inst#0": 1}} // at its parallelism
 	r.SetInstanceSource(src)
 	r.SetLoadedModelChecker(loaded)
-	r.SetServerActivityChecker(activity, 0)
+	r.SetInstanceActivityChecker(activity)
 	adm := &fakeAdmission{onWait: func(int) error {
-		// While the request waits, instance 1 reaches running and a slot frees.
-		src.views["map_inst"] = InstanceView{Replicable: true, Running: []int{1}}
+		// While the request waits, instance 1 reaches running and instance 0 frees.
+		src.views["map_inst"] = InstanceView{Replicable: true, Parallelism: 1, Running: []int{1}}
 		loaded.byServer["srv_inst"] = []string{"qwen2.5#1"}
-		activity.inFlight["srv_inst"] = 0
+		activity.byKey["map_inst#0"] = 0
 		return nil
 	}}
 	r.SetAdmissionController(adm)

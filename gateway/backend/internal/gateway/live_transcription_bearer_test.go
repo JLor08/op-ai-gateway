@@ -540,6 +540,9 @@ func TestBearerLiveTranscriptionRegistersActiveRequest(t *testing.T) {
 	if got.Model == "" || got.UserID == "" || got.TokenID == "" {
 		t.Errorf("live row not fully attributed: Model=%q UserID=%q TokenID=%q", got.Model, got.UserID, got.TokenID)
 	}
+	if got.InstanceKey != "route-asr#0" {
+		t.Errorf("InstanceKey = %q, want route-asr#0 (the target's)", got.InstanceKey)
+	}
 
 	// AFTER the relay ends the deferred Remove has run: no live session lingers in the view.
 	if after := srv.Active.Snapshot(); len(after) != 0 {
