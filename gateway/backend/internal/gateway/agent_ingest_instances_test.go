@@ -380,14 +380,14 @@ func TestIngestStartupWriteOfAReplicableSpecPushesTheRuntimeConfig(t *testing.T)
 	spy.expectNoPush(t, "jitter, which writes nothing", "mock-host-qwen")
 }
 
-// TestIngestContextFromInstanceZero pins the context write-back over instance
-// rows: the mapping's context size comes from the spec's representative row
-// (representativeRowIndex) -- its running instance-0 row whatever order the
-// rows arrive in, else its running row with the lowest index -- and a sample
-// whose representative probed nothing (only a starting burst instance, which
-// carries no context size yet) writes nothing. Writing every row in turn
-// would flip the column between the instances' values.
-func TestIngestContextFromInstanceZero(t *testing.T) {
+// TestIngestContextFromRepresentativeRow pins the context write-back over
+// instance rows: the mapping's context size comes from the spec's
+// representative row (representativeRowIndex) -- its running instance-0 row
+// whatever order the rows arrive in, else its running row with the lowest
+// index -- and a sample whose representative probed nothing (only a starting
+// burst instance, which carries no context size yet) writes nothing. Writing
+// every row in turn would flip the column between the instances' values.
+func TestIngestContextFromRepresentativeRow(t *testing.T) {
 	srv := NewTestServer()
 	seedRuntimeIngestSpec(t, srv, "rspec_ctx")
 	st := wrapInstanceIngestStore(srv)
