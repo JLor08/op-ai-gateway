@@ -93,6 +93,16 @@ import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
+import {
+  INSTANCES_MAX,
+  instanceAddress,
+  instanceCountFromText,
+  instanceCountText,
+  instanceIndex,
+  primaryStatusRows,
+  runningInstancesBySpec,
+  validateInstances,
+} from './shared/runtimeInstances';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
@@ -412,40 +422,6 @@ const restartableStates = new Set([
   'crashed',
 ]);
 
-/**
- * The row that speaks for its whole spec wherever one row has to, per spec id.
- *
- * Every instance of a replicable spec reports its own row under the spec's id,
- * but the spec-level facts -- the spec list's state, the override actions, the
- * restart sequence's `stopped` -- belong to one of them: instance 0's. It is
- * the only row a spec that is not replicable has, and the LAST of a spec's
- * instances to go (an instance unloads only while no higher-index sibling
- * runs), so its `stopped` is the spec's. Only while it is missing -- instance
- * 0 crashed or restarting with a sibling up -- does the first running
- * instance speak instead, else the first row; the gateway folds instance rows
- * with the same pick.
- */
-function primaryStatusRows(rows: RuntimeStatus[]): Map<string, RuntimeStatus> {
-  const rank = (row: RuntimeStatus) => {
-    if (row.instance === 0) return 0;
-    return row.state === 'running' ? 1 : 2;
-  };
-  const bySpec = new Map<string, RuntimeStatus>();
-  for (const row of rows) {
-    const current = bySpec.get(row.spec_id);
-    if (current === undefined || rank(row) < rank(current)) bySpec.set(row.spec_id, row);
-  }
-  return bySpec;
-}
-
-// The upstream name a status row reports when it runs what its mapping says:
-// the mapping's own name for instance 0, `<name>#<k>` -- the instance's
-// address -- for instance k. Only the row's own suffix counts, so on instance 0
-// a name that merely looks like an address is still a different name.
-function instanceAddress(mapping: PortalModelMapping, row: RuntimeStatus): string {
-  return row.instance > 0 ? `${mapping.app_model_name}#${row.instance}` : mapping.app_model_name;
-}
-
 // One restart sequence. There is no restart endpoint (design §10.1: every
 // action is state-shaped), so a restart is a three-step UI sequence:
 //   stopping -> the force_stopped PUT is in flight
@@ -743,19 +719,6 @@ function effectiveRam(spec: RuntimeSpec | undefined, live?: RuntimeStatus): numb
 function formatGpus(spec: RuntimeSpec | undefined): string {
   if (!spec || spec.gpus.length === 0) return '—';
   return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g)} MB`).join(', ');
-}
-
-// An instance-count field's text as the request's number: an empty field is 0,
-// which the backend reads as "none" for the minimum and "unlimited" for the
-// maximum -- so the form never has to show a 0 that means "no limit".
-function instanceCountFromText(text: string): number {
-  return text.trim() === '' ? 0 : Number(text);
-}
-
-// The other direction, for a stored count: 0 shows as the empty field it is
-// sent from.
-function instanceCountText(count: number): string {
-  return count > 0 ? String(count) : '';
 }
 
 // A megabyte quantity for the two summary columns: the em-dash when nothing is
@@ -1128,38 +1091,6 @@ function validateVisibleDevices(
     }
   }
   if (gpuCount === 0) return t.errorRuntimeSpecVisibleDevicesNoGpus;
-  return undefined;
-}
-
-// The agent's cap on a spec's instances (indexes 0..63); the backend refuses a
-// minimum or maximum above it.
-const INSTANCES_MAX = 64;
-
-/**
- * The instance settings' two refusals, checked before the round trip for the
- * same reason as the visible-devices pair: on Create a refused spec write would
- * leave the mapping behind without its spec. The backend refuses both too, in
- * this order, and checks the counts whether or not "Multiple instances" is
- * ticked -- the four settings are sent either way, so a pair that can never be
- * met would otherwise be stored to take effect the day the box is ticked.
- *
- *  - A count above the cap, or a minimum above a set maximum (an empty maximum
- *    is unlimited, so no minimum exceeds it).
- *  - Several instances on a fixed listen port: every instance is its own
- *    process on its own port, so only the agent's free-port pick (0) works.
- */
-function validateInstances(
-  replicable: boolean,
-  listenPort: number,
-  minInstances: number,
-  maxInstances: number,
-  t: Translation,
-): string | undefined {
-  if (minInstances > INSTANCES_MAX || maxInstances > INSTANCES_MAX) {
-    return t.errorRuntimeSpecInstancesInvalid;
-  }
-  if (maxInstances > 0 && minInstances > maxInstances) return t.errorRuntimeSpecInstancesInvalid;
-  if (replicable && listenPort !== 0) return t.errorRuntimeSpecInstancesNeedEphemeralPort;
   return undefined;
 }
 
@@ -3711,13 +3642,8 @@ export function RuntimeAdminSection({
   // The row that speaks for each spec (primaryStatusRows): the spec list's
   // state, and the one status row that carries the spec-wide overrides.
   const statusBySpecId = primaryStatusRows(statusRows);
-  // Instances counted per spec id for the spec list's summary: only `running`
-  // ones, since a starting instance serves nothing yet.
-  const runningInstancesBySpecId = new Map<string, number>();
-  for (const row of statusRows) {
-    if (row.state !== 'running') continue;
-    runningInstancesBySpecId.set(row.spec_id, (runningInstancesBySpecId.get(row.spec_id) ?? 0) + 1);
-  }
+  // Running instances per spec id, for the spec list's summary.
+  const runningInstancesBySpecId = runningInstancesBySpec(statusRows);
   function statusForMapping(m: PortalModelMapping): RuntimeStatus | undefined {
     const specId = specsById[m.id]?.id;
     return specId ? statusBySpecId.get(specId) : undefined;
@@ -4081,7 +4007,7 @@ export function RuntimeAdminSection({
                   not against the gateway name, which is a different name by
                   design. A disagreement here means the spec launches a
                   different model than the mapping routes to. */}
-              {row.model !== '' && row.model !== instanceAddress(mapping, row) && (
+              {row.model !== '' && row.model !== instanceAddress(mapping.app_model_name, row) && (
                 <WarningAmberIcon
                   fontSize="small"
                   color="warning"
@@ -4102,8 +4028,8 @@ export function RuntimeAdminSection({
       // says the same thing on every row.
       id: 'instance',
       label: t.runtimeStatusInstance,
-      value: (row) => String(row.instance),
-      render: (row) => `#${row.instance}`,
+      value: (row) => String(instanceIndex(row)),
+      render: (row) => `#${instanceIndex(row)}`,
       numeric: true,
       searchable: false,
     },
@@ -4256,7 +4182,8 @@ export function RuntimeAdminSection({
     // Every override acts on the whole spec, all of its instances at once, so
     // it is offered once, on the row that speaks for the spec: a Force stop
     // beside instance 1 would read as stopping instance 1 alone.
-    if (statusBySpecId.get(row.spec_id)?.instance !== row.instance) return actions;
+    const primary = statusBySpecId.get(row.spec_id);
+    if (primary === undefined || instanceIndex(primary) !== instanceIndex(row)) return actions;
     if (spec.admin_state !== 'force_running') {
       actions.push({
         key: 'force-start',
@@ -5967,7 +5894,7 @@ export function RuntimeAdminSection({
               columns={statusColumns}
               // A spec's instances share its spec_id, so the id alone would
               // fold them into one row.
-              rowKey={(row) => `${row.spec_id}#${row.instance}`}
+              rowKey={(row) => `${row.spec_id}#${instanceIndex(row)}`}
               actions={statusActions}
               storageKey="op.runtimeStatus"
               minWidth={980}
