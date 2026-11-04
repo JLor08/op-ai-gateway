@@ -3166,7 +3166,159 @@ attributes that are already known token-free, so the buffer itself has nothing t
 redact. Records also carry the active OTel trace/span id when one is present, so a
 log line and its mirrored trace span can be correlated.
 
-## 8.6 Configuration reference
+## 8.6 Audio performance benchmarks
+
+A speech (TTS) or transcription (ASR) model has no token throughput, so the text
+benchmark's figures mean nothing for it. The audio benchmark (#340,
+[ADR-093](../09-architecture-decisions.md#adr-093--audio-benchmarks-mirror-the-text-modes-a-real-time-threshold-and-a-concurrency-ceiling))
+measures what decides whether a voice pipeline keeps up: **real-time throughput**
+(seconds of audio produced or transcribed per wall second, `rate_x`), **time to
+first output** (first audio of a synthesis, first text of a transcription), the
+**cold start**, and **how many concurrent streams a host keeps above real time**.
+Orchestration is `internal/gateway/benchmark_audio.go`; the four single
+measurements, on an injectable clock, are `internal/gateway/benchmark_audio_measure.go`.
+
+**No new mode: the text modes apply.** `POST …/benchmark?mode=speed|capacity|both`
+on a mapping, application or server runs the audio measurement on each **audio
+target** and the text measurement on every other mapping, with the same buttons,
+reservation, idle gate, SSE progress and history
+([HTTP API Surface](../reference/api-surface.md#benchmark-load-and-context-probe-runs)).
+A mapping is an audio target when its effective flavors serve audio only (no text
+flavor, not images-only — a chat model that also speaks or transcribes keeps its
+text benchmark, `AudioTargetFlavors`) and its capability rows give it the TTS or ASR
+role (`routing.DeriveRole`; a mapping with both is measured as the transcriber it is
+grouped as). A clone model needs a cached preset voice; an audio-only mapping that
+cannot be measured yet (no speech or transcription verdict, a clone without a
+preset) is skipped, and a scope with nothing else answers
+`409 benchmark.speech_unavailable`. The separate `speech` mode (the byte-rate
+benchmark, ADR-068) is unchanged. Every measurement goes **straight to its target**
+through the provider's native relay, never through routing: the run holds the
+server's reservation, which keeps routed requests away.
+
+**What one measurement is** (`audioCallFor`, decided once per target and run):
+
+| Target | Request | `rate_x` | Time to first output |
+|---|---|---|---|
+| TTS, `speech_streaming` yes | One streamed synthesis of a fixed English passage (~55 words, ~20 s of speech, no digits or names) | decoded PCM ÷ the cached output byte rate, over the time from the first `speech.audio.delta` to the end — the production speed once audio flows, which is what decides whether playback stutters | first `speech.audio.delta` |
+| TTS, not streaming | One non-streamed synthesis of the passage | audio ÷ wall time | first response byte |
+| ASR, `transcription_streaming` yes, live route served | The bundled clip sent **unpaced** over the live endpoint | audio ÷ wall time | first frame carrying transcript text (a delta or a partial) before the final one |
+| ASR, otherwise | One buffered transcription of the bundled clip | audio ÷ wall time | the whole answer (its text is usable only whole) |
+
+A streamed synthesis needs the mapping's output byte rate; when none is cached the
+speech benchmark runs first and caches it (writing its own `speech` history row).
+A clone model synthesizes with its preset voice. A live measurement is taken only
+through a provider that relays a full-duplex body and, on an agent, only when the
+agent declared `fullduplex_proxy`.
+
+**The bundled clip** (`internal/benchaudio`) is six sentences of the
+**Thorsten-Voice** dataset (German, single speaker, **CC0 1.0**;
+`Thorsten-Voice/TV-44kHz-Full`, subset `TV-2022.10-Neutral`), joined with 0.35 s
+pauses into one ≈ 22.9 s clip, stored as 16 kHz mono 16-bit PCM WAV and embedded
+with `go:embed`, with its transcript and a `SOURCE.md` naming the recordings. It is
+embedded rather than synthesized or fetched, so every run of every gateway
+transcribes the same audio — an ASR rate is comparable only over a fixed input —
+and a benchmark needs no network and no TTS model. The request states
+`language=de`, so language detection is not part of the measurement. `WAV()` and
+`PCM()` hand out copies; a test pins the clip by SHA-256, and `.gitattributes`
+keeps the binary out of line-ending conversion. The data asset is recorded in
+[Licensing](licensing.md).
+
+**speed** — the text benchmark's cold-start technique: `ensureColdLoad` (the same
+stop-all, temporary unpin and override lease, [Agent-Managed Model Runtime
+§11.10](agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)),
+a cold pass, then a warm pass of the same measurement. The warm pass is the
+result; the cold pass is its warm-up. `load_time_ms` = the cold pass's time to
+first output minus the warm pass's, recorded only when the cold start was
+confirmed and the cold pass was the slower — unknown, never bogus, exactly the text
+rule — and stored in the mapping's existing `load_time_ms`. When the stop-all wrote
+the target's own `force_stopped`, the cold pass rides out the router's `503` until
+the clear reaches the agent.
+
+**capacity** — the concurrency ramp. Level k = 1, 2, 3, … runs k measurements at
+once; a level is **good** when its slowest stream's rate reaches
+`OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR` (default 1.2, a 20 % margin over real
+time), counted from the send, so a stream its process held back behind the others
+is slower by exactly that wait. For a streamed synthesis, whose rate runs only from
+its first audio, the wait for first audio beyond the lone stream's is counted as
+production time (`audioRampRate`), so a process that serves the level's streams one
+after another is not read as fast as a lone stream. A replicable target on an agent
+known to declare `runtime_instances` is ramped **one instance per stream**: level k
+first ensures instance k−1 through the agent's ensure route (`m`, `m#1`, …, which
+starts a burst instance only into free room) and sends its k streams to instances
+0 … k−1; any other target gets its k streams on its one process, the same
+"concurrency inside one process" a text capacity run measures (audio.cpp serializes,
+so that normally yields 1). Every process a level adds gets one warm-up first, so a
+start is not part of its rate. The ramp stops, and stores **why**:
+
+| Stop reason (`audio_concurrency_limit`) | When | What the count means |
+|---|---|---|
+| `performance` | the first level whose slowest stream is below the threshold | a **measured ceiling**: the last good level, `0` when not even one stream is real-time |
+| `resources` | the agent refused an instance for lack of room (`runtime.instance_no_capacity` or `runtime.instance_demand_unknown`, decided by code), at the ensure or at a stream | a **lower bound**: the room its neighbours held at that moment |
+| `cap` | level k reached `OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX` (default 8) or, by instance, the spec's `max_instances` or 64 instances | a **lower bound** |
+
+Any other failure fails the ramp, which then stores no pair: it established no
+reason to stop, and a partial count would read as a lower bound it never found.
+Only a `performance` stop is a ceiling the scaler honours (ADR-092). The ramp
+writes no override of its own: the instances it starts are ordinary burst instances
+afterwards and idle out. Before ramping by instance it ensures the spec's protected
+instances (lowest first), so no level is measured while one of them still loads
+beside the measured process; in a both run that held the spec as one process for
+its speed part, it makes the spec replicable again first and holds it as one
+process again afterwards while a later target may still stop the server's models.
+
+**both** — speed, then capacity, so the ramp's write comes last and
+`metrics_source` ends `capacity`, as a text both run's does. The measurement is
+prepared once and shared; a failed preparation fails both parts with one error.
+
+**Storage on the mapping, like the text metrics.** Each part writes its figures
+through `UpdateMappingAudioMetrics` under the mapping's `metrics_locked` guard (a
+locked mapping keeps its figures), stamping `metrics_source` (`benchmark` for a
+speed part, `capacity` for a ramp) and `metrics_updated_at` like the text writers
+plus `audio_metrics_updated_at` (migration 101, [Data Model](../reference/data-model.md)):
+the speed part `audio_rate_x`, `audio_ttfa_ms` (the time to first audio or text)
+and a confirmed `load_time_ms`; the ramp the pair `audio_realtime_concurrency` +
+`audio_concurrency_limit`, **always written together** — the limit is what marks a
+ramp result, so a count is read only beside its limit and a measured 0 counts
+(`RampMeasured`, `ValidateAudioMetrics` refuses a non-finite or negative rate and
+an unknown limit, wrapping `routing.ErrAudioMetricsInvalid`). Routing and the
+scaler read them from the mapping, so they apply whether or not the model is
+loaded. A load time written for a replicable spec pushes the server's runtime
+config, because the effective idle timeout is derived from it
+([Agent-Managed Model Runtime §11.11](agent-runtime-manager.md#1111-instances-in-the-portal-and-the-effective-idle-timeout)).
+
+**History: two kinds, mirroring the text `speed`/`capacity` kinds.** Each part
+appends one `model_mapping_benchmarks` row, on success and failure alike:
+`kind = "audio"` for a speed part (`ttft_ms`, `wall_ms`, `rtf`, `load_time_ms` in
+their columns, and `{"audio_rate_x": …}` as JSON in `capacity_curve`) and
+`kind = "audio_capacity"` for a ramp (`{"audio_realtime_concurrency": …, "audio_concurrency_limit": …, "audio_curve": [{"k": …, "min_rate_x": …, "mean_rate_x": …}, …]}` in
+`capacity_curve`). The payload types are `routing.AudioSpeedHistory` and
+`routing.AudioCapacityHistory`, the one definition the gateway writes and the
+portal decodes. The run's live result carries `audio_rate_x`, `audio_ttft_ms`,
+`audio_load_time_ms` and the ramp's pair (`BenchmarkResult`, whose `MarshalJSON`
+serves a measured 0 count whenever its limit is set); the portal's benchmark panel
+shows an audio result line and the audio history rows.
+
+**Scheduler.** The per-application scheduled run is a speed run, and it classifies
+each mapping as a manual speed run does, so audio mappings take part (their speed
+measured as audio); a mapping that could be measured neither way is skipped rather
+than failing unattended every interval. A scheduled run stops nothing: its cold
+start is confirmed only when the server is found quiet.
+
+**One automatic first run.** The app-health loop asks `TriggerAudioBenchmark` about
+an audio mapping that still lacks what the run measures (`AudioAutoRunWanted`: no
+audio metrics at all, or — for a replicable spec — no ramp result, so a measured 0
+never asks again) and that is active and unlocked. The trigger starts one `both` run
+with no principal and no stop-all, only on an idle server, at most **once per
+mapping per gateway process**: a run that fails does not start again every tick.
+It answers *settled* — the loop stops asking — for a mapping whose run was started
+already or that is no audio target for what it is (a chat model, images-only, a
+clone without a preset; a changed voices list asks again), and *deferred* — asked on
+a later tick, the one run not used up — when a read failed, no verdict has arrived
+yet, the agent has not declared its features since the gateway started (whether a
+replicable spec is ramped by instance depends on them), or the server is busy. Normally
+this measures a model right after the operator sets it up, before real use.
+
+## 8.7 Configuration reference
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -3187,8 +3339,10 @@ log line and its mirrored trace span can be correlated.
 | `OP_AI_GATEWAY_OTLP_ENDPOINT` | unset | OTLP-HTTP exporter target; unset = logbuffer mirror only |
 | `OP_AI_GATEWAY_LOG_LEVEL` | `info` | Initial live log level (`trace`\|`debug`\|`info`\|`warn`\|`error`) |
 | `OP_AI_GATEWAY_LOG_BUFFER_SIZE` | 5000 | Log ring capacity |
+| `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR` | 1.2 | Rate (× real time) an audio ramp level's slowest stream must reach to be good (§8.6) |
+| `OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX` | 8 | Highest level the audio concurrency ramp measures (§8.6) |
 
-## 8.7 Cross-references
+## 8.8 Cross-references
 
 - Agent-token issuance, scoping, and the mesh-vs-public transport gate:
   [Security, Auth & RBAC](security-auth-rbac.md).

@@ -1541,7 +1541,7 @@ audio.cpp cannot disagree:
   the row on file stays the last fact learned while the model was loaded.
 - **Agent-launched child.** The gateway cannot read the child's `/v1/models` directly, and the
   agent's verdict wire is yes/no by design (a default language is a string), so the gateway pulls
-  the fact through the agent router's Status-only passthrough
+  the fact through the agent router's read-only passthrough
   (`GET /upstream/<model>/v1/models?include_params=true`,
   [Agent-Managed Model Runtime §4.1](agent-runtime-manager.md#41-control-routes)). The pull is folded
   into `probeAgentVoices` (`fetchAndCacheSpeechParams`), so it reuses that pass's eligible set

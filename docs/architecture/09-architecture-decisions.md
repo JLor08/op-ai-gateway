@@ -6889,7 +6889,7 @@ gave.
   `GET /upstream/{model}/v1/audio/voices`: the second endpoint on the `/upstream`
   allowlist beside `/props`
   ([ADR-037](#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)),
-  **Status-only and never-start** (a cold child answers 404
+  **read-only and never-start** (a cold child answers 404
   `runtime.model_not_running`, never a boot), outbound path exactly `/v1/audio/voices`,
   relayed verbatim, the spec's token forwarded as for `/props`. The allowlist is now a
   table of two endpoints with a **per-endpoint `forwardQuery`**: `/props` keeps the
@@ -8855,11 +8855,11 @@ unchanged.**
   (`probeAudioCppModels` → `cacheAudioCppSpeechParams`) takes the fact from the listing it already reads
   for the verdicts, now asked with `?include_params=true`, and makes no request or back-off of its own.
   The **agent-managed** path is the next choice.
-- **(c) An agent child's fact is pulled through a new Status-only passthrough, behind its own feature,
+- **(c) An agent child's fact is pulled through a new read-only passthrough, behind its own feature,
   fail-closed.** The gateway cannot see an agent child's `params` by telemetry (a default language is a
   string and the verdict wire is yes/no by design), so the agent router allowlists
   `GET /upstream/{model}/v1/models` with `forwardQuery` (so `?include_params=true` reaches the child),
-  a Status-only, never-start read like `/props` and the voices read. It is declared as the agent feature
+  a read-only, never-start read like `/props` and the voices read. It is declared as the agent feature
   **`runtime_model_params`** (`Since: "0.13.0"`, agent-only, so `gateway.RuntimeModelParamsFeature` is a
   mirror constant outside `gatewayAgentFeatures`, as `RuntimeVoicesFeature` is), with **one MINOR bump**
   of `ServerAgent` `0.12.0` → `0.13.0` for the branch (ADR-025: negotiate by name, never by version).
@@ -11226,3 +11226,244 @@ host-tuning knob the gateway cannot know, and a document field every agent versi
 [§5.7](cross-cutting/agent-runtime-manager.md#57-co-residency-mode-verdicts-and-the-derived-role),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Configuration & Environment Variables](reference/config-env.md), [HTTP API Surface](reference/api-surface.md).
+
+## ADR-090 — Model instances are gateway-named addresses: `m` for instance 0, `m#k` for instance k, and the agent rewrites the child model in place
+**Context:** a model the agent manages ran as exactly one process per runtime spec. audio.cpp serves one request
+per process at a time, so one transcription and one speech process capped the gateway at one concurrent voice chat:
+a second user got `503 transcription.live_busy` or queued behind the first user's synthesis (#340, first consumer
+Voice Chat, #312). Running several processes of one model needs a way to name each of them through every layer
+that already names a model — routing candidates, the per-model loaded state, swap protection, the live slot, the
+body and multipart rewrites, the `/ensure`, `/live` and `/upstream` paths — without changing anything for a spec
+that does not opt in, an older gateway or an older agent. The longer-term direction (the gateway is handed hosts
+and places models itself) must not be dead-ended either: an instance has to be an individually addressable routing
+candidate that the gateway names, not something the agent multiplexes behind one name.
+
+**Decision — five choices, taken together. Agent `0.16.0`; migrations 100–102.**
+
+- **(a) Opt-in per spec.** `agent_runtime_specs.replicable` (with `min_instances`, `max_instances` and the
+  gateway-only `instance_parallelism`, migration 100). Off, a spec runs exactly one instance, as before; none of
+  the fields is part of the launch shape, so changing them restarts no child.
+- **(b) The instance address is the model name with a `#k` suffix.** Instance 0 is the bare upstream name `m`,
+  byte-for-byte the address every spec has always had; instance k ≥ 1 is `m#k`, k a plain decimal 1…63 (no sign,
+  no leading zero; `MaxInstanceIndex`, 64 instances per spec). The agent's instance key is `S` / `S#k` (state map,
+  admission identity, `${CONFIG_DIR}`); the gateway's is `<mapping_id>#<k>` for every k (per-instance in-flight
+  count and live slot), and the routing `RouteID` stays the mapping id, so usage, metrics and scoring key by mapping.
+  The gateway names the instance it routes to; the agent never picks one behind a name.
+- **(c) One resolution rule, exact match first.** `Manager.ResolveAddress` resolves a name for the router and both
+  ensures: an exact match on a managed upstream model wins and is instance 0 (a real model named `foo#2` keeps
+  routing literally), otherwise the name is split at its last `#` and is managed only when the spec is replicable
+  and allows k (`InstanceAllowed`). Everything else is `404 runtime.model_not_managed`, like an unknown model. A spec
+  id containing `#` is dropped, so no spec can collide with an instance key.
+- **(d) The child always sees the base name, and only instance addresses are rewritten — in place.** Every instance
+  is launched from the same spec, `${MODEL}` = `m`. The router splices the base name into the JSON body's top-level
+  model (`rewriteModelField`: every other byte as sent — key order, number digits, string escapes), re-encodes a
+  multipart form's `model` part with every other part copied raw, sets a live relay's `model=`, and replaces the
+  `model` value of a forwarded `/upstream` query. Instance 0 passes byte for byte, without even an owner round trip.
+  A resolved address is read again after admission; a reading a config push moved in between answers
+  `409 runtime.instance_no_capacity`, which the gateway re-selects on.
+- **(e) Negotiated both ways by one name, `runtime_instances`.** The agent declares it (`Since: "0.16.0"`) and the
+  gateway reads it before it expands, scales, ramps by instance or pushes instance settings; the gateway declares it
+  too, and the agent honours `replicable` only while the gateway does (fail-closed, file mode included), because an
+  older gateway would read several rows under one `spec_id` as one spec flapping. While the gateway does not yet
+  know an agent's features (after its own start), a document carrying a replicable spec is held
+  (`503 runtime_config.agent_features_pending`) rather than served without instances.
+
+**Consequence:**
+
+- **Every name-keyed lookup becomes per instance for free.** Loaded state, swap protection and the per-model
+  runtime overlay read the instance address; `/running` and `loaded_models` list instance addresses, `/v1/models`
+  lists each spec once by its base name, and the agent reports one status row per instance under the base
+  `spec_id` with `instance` and `startup_ms`.
+- **The cost is one contained rewrite in the agent router**, and the splice rather than a re-serialization is what
+  keeps a child that hashes, signs or caches a body seeing the bytes instance 0 would have seen.
+- **Mixed fleets need no upgrade order.** An old gateway never sends `replicable` and does not declare the name; an
+  agent older than 0.16.0 is never expanded, scaled or sent `m#k`, and gets its stored idle timeout.
+- **A gateway process that never ingests an agent's telemetry answers it `503` for a replicable spec** (one
+  process per store is the deployment assumption, [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+**Rejected:** **An instance header** beside the model name (every upstream path already carries `ProviderModel`, so
+a header would have to be threaded through each of them, and every name-keyed lookup would still read one row per
+model). **Agent-side multiplexing behind one name** (the agent would pick the instance, the gateway could neither
+keep a voice chat's turns on a warm instance nor count a live slot per instance, and placement could never move to
+the gateway). **Re-serializing the JSON body** (it keeps every value but reorders keys and rewrites escapes, so the
+child sees different bytes per instance). **Treating `#` as always an instance separator** (a literal model name
+containing `#` would stop routing).
+→ [Agent-Managed Model Runtime §4.8](cross-cutting/agent-runtime-manager.md#48-instance-addresses-and-the-in-place-model-rewrite),
+[§6.1](cross-cutting/agent-runtime-manager.md#61-one-lifecycle-per-instance),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[§10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
+[Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).
+
+## ADR-091 — Burst instances take only free room, surplus instances leave first, and the highest index leaves first
+**Context:** with several instances per spec ([ADR-090](#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
+admission has to decide which instances may displace whom. Scaling one model out must never evict another model
+that is in use or was just used, and an instance beyond what the operator promised must be the first thing to go
+when another model needs room. The operator's `min_instances` is a promise, like `pinned`. And two instances
+starting side by side with an unknown demand would both bootstrap on the same card.
+
+**Decision — six choices, taken together.**
+
+- **(a) Baseline and burst, by index.** `P = max(min_instances, pinned || force_running ? 1 : 0)`; instances
+  `0 … P−1` are protected, and instance 0 plus the protected ones are the **baseline**, admitted by every existing
+  rule unchanged (they may evict idle neighbours and bootstrap). Every k ≥ max(P, 1) is **burst** capacity.
+- **(b) Burst admission is all-or-nothing and immediate.** The owner sets `PolicySnapshot.NoEvict`; `Admit` then
+  answers OK or `Decision.NoCapacity` and nothing else — no eviction, no queueing, no bootstrap shot.
+  `NoCapacity` is handled first in `admitAndStart`, because it carries no reason, no wait and no victims and every
+  later case would read it as OK. The refusal is `409 runtime.instance_no_capacity`, and the state a request created
+  for it is retired. A plain request never starts burst capacity (`EnsureServing`); only an ensure does.
+- **(c) Siblings are occupants, never victims, and co-reside by base.** Each instance is summed and counts toward
+  `max_processes`; a pair is looked up by base spec; a sibling is never evicted for a candidate of its own spec.
+- **(d) Surplus first, highest index first.** A running burst instance is `Surplus` and is drawn before every other
+  idle victim, ahead of the role band; within one spec the highest index goes first, and an instance is not evictable
+  — nor idle-unloadable — while a higher-index sibling runs, so instance 0 is the last instance of a spec to go.
+- **(e) Protected instances are pinned and start lowest index first.** A protected instance reports `Pinned` to
+  admission (never a victim, never idled out, restarted with backoff). A protected instance k ≥ 1 waits while a lower
+  sibling still waits to start, and is re-asked the moment that sibling gets a process or is refused.
+- **(f) No instance k ≥ 1 starts blind, and every occupant is charged its own figure.** A candidate inherits the
+  largest **post-ready** measurement of a running sibling (per GPU, host-wide for RAM); still unknown, a burst
+  instance is refused with `409 runtime.instance_demand_unknown` and a protected one waits for a measurement, which
+  the agent takes at a new instance's first passing probe. An occupant with its own post-ready figure is charged
+  that figure (floored at the declared demand), not the sibling peak; only what it has not measured of itself
+  inherits the peak.
+
+**Consequence:**
+
+- **Scaling out never displaces a neighbour**, and scaling in costs nothing first: the cheapest victim is an instance
+  whose spec keeps serving from a lower sibling.
+- **The classification by index is sound only because of (d)**: "instance 0 cold while a burst sibling runs" happens
+  only transiently after a crash or restart of instance 0, which then restarts the baseline way. A burst instance may
+  take room while instance 0 waits out a crash backoff, and instance 0 then stays down until that burst instance idles
+  out — accepted ([§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **The gateway owns the retry.** A refused burst start is answered at once, so the scaler tries another host.
+- **Charging each occupant its own figure** keeps two measured siblings at 3000 and 3500 MB counted as 6500, not
+  7000, so a third that fits is not refused; the conservative peak covers only what is not yet measured.
+
+**Rejected:** **Letting a burst instance evict idle neighbours** (scaling one model out would push out another that
+was just used — the anti-goal). **Queueing a burst start** (the request would wait for room another host may have
+now). **Charging every sibling the sibling peak** (over-charges measured siblings and refuses instances that fit).
+**Classifying burst by start order instead of index** (it needs state the snapshot does not carry, and the ordering
+invariant makes the index enough).
+→ [Agent-Managed Model Runtime §5.8](cross-cutting/agent-runtime-manager.md#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor),
+[§6.1](cross-cutting/agent-runtime-manager.md#61-one-lifecycle-per-instance).
+
+## ADR-092 — The gateway scales up on parked demand and the agent decides the fit; the agent alone scales down
+**Context:** with instances addressable ([ADR-090](#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
+and burst admission safe ([ADR-091](#adr-091--burst-instances-take-only-free-room-surplus-instances-leave-first-and-the-highest-index-leaves-first)),
+something has to decide when to add one and where. The gateway sees demand (requests waiting in its admission queue
+because every instance they could use is busy) and the routing score of every host; only the agent knows what fits
+on its host right now. Scaling down needs neither: an idle instance can leave on its own.
+
+**Decision — six choices, taken together. No migration beyond 100; gateway env
+`OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS` (default 60).**
+
+- **(a) Demand is a parked request.** The resolver hands its `DemandSink` a `routing.DemandSignal` only where a
+  request is about to wait in the admission queue (`resolveStandard`'s and `resolveGroupOnce`'s `WaitForSlot`), once
+  per turn it spends parked, when at least one at-capacity candidate is an instance candidate. The signal names the
+  gateway model, the coarse API flavor, the instance-capable mappings the request passed every filter for
+  (`MappingIDs`) and, for a pinned request, the server (`ServerID`); a group request signals once per at-capacity
+  member with instance candidates. `Signal` never blocks.
+- **(b) One scale-up per model at a time** (`internal/gateway/instance_scaler.go`, `instanceScaler`, one per gateway
+  process, wired as the resolver's sink). Signals for a model whose scale-up runs with the same pin are folded into
+  it; one with another pin is queued (one per pin) and gets its own pass afterwards unless an instance started
+  meanwhile serves it. Scale-ups end with the server's lifetime.
+- **(c) Hosts are the signal's mappings, filtered by the gates routing applies, best score first.** A host is passed
+  over when its application is not an agent's, when routing would not send it a request (`CandidateServesNow`: a
+  selectable server, a reachable application, no benchmark), when the resolver's instance source does not expand the
+  mapping there (no replicable spec, or an agent not known to declare `runtime_instances`), at a ceiling — present
+  instances (instance 0 counted) at `max_instances`, or at the audio ramp's measured real-time concurrency when its
+  limit is `performance` (a measured 0 included; `resources` and `cap` are lower bounds, not ceilings) — while it is
+  held off after a refusal, and while **any** instance of the spec is starting (a new sibling would start beside one
+  whose demand is not measured yet). The rest are ordered by `Resolver.ScoreModelServers`, the score the resolver
+  itself ranks with, re-picked before each ask, and each host is asked at most once per scale-up.
+- **(d) The index is the lowest free one.** The lowest k ≥ 1 that the agent does not report in **any** state (a
+  draining or crashed row's index is not free), that no ensure is under way for, and whose address `m#k` is not
+  another mapping's literal upstream name on the same agent (the agent would resolve that name to the other spec,
+  ADR-090 (c)); none below `max_instances` and 64 → the host is passed over quietly.
+- **(e) The agent has the final say.** The scaler asks `POST /ensure/m#k` with the target's upstream credential and a
+  bound of the spec's startup timeout (agent default 30 s) plus 10 s. `409 runtime.instance_no_capacity` → that
+  (server, mapping) is held off for the cooldown and the next host is asked; `409 runtime.instance_demand_unknown` →
+  held off for 5 s only (a sibling's measurement normally lands within seconds) and the next host is asked; any other
+  error → cooldown and a Warn. On success the scaler waits (≤ 5 s) until routing **sees** the instance running —
+  routing reads the telemetry-fed status registry, and waking parked requests before that would make each re-signal
+  and re-ensure the same instance — then releases one admission slot per `instance_parallelism`; an instance that
+  never shows up wakes no one and holds the host off for 5 s. There is no retry loop beyond the next demand signal:
+  parked requests keep waiting for the instances there are until their queue timeout.
+- **(f) Scale-down is agent-local.** The scaler never stops an instance. The agent idle-unloads unprotected instances,
+  highest index first, after the effective idle timeout the gateway pushes for a replicable spec:
+  `max(manual, ceil(OP_AI_GATEWAY_INSTANCE_IDLE_FACTOR × max(startup_measured_ms, load_time_ms) / 1000),
+  OP_AI_GATEWAY_INSTANCE_IDLE_FLOOR_SECONDS)` (defaults 5 and 120 s), so an instance that is slow to start is kept
+  longer and none leaves sooner than the floor; on a replicable spec a manual 0 means "no override".
+
+**Consequence:**
+
+- **A parked request takes whichever frees first** — an existing instance or the new one; starting instances are not
+  routing candidates.
+- **There is a telemetry-lag window.** A new instance becomes a candidate at the agent's next sample (default 1 s),
+  which is why the scaler waits for visibility before it wakes anyone; the queue's periodic recheck covers the rest
+  ([§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **The scaler holds no state that outlives a process** — holds, cooldowns and in-flight ensures are memory — and keeps
+  no copies of routing's rules: it reads the resolver's own gates, score, instance source and target builder.
+- **`min_instances` are not the scaler's business**: the agent keeps them up.
+
+**Rejected:** **A gateway-side model of each host's free room** (the agent holds the real measurements; a second copy
+would disagree with it). **Scaling on a request rate or a timer** (demand that parks is the one signal that more
+capacity would have served someone sooner). **A retry loop after a refusal** (the next parked turn is the retry; a loop
+would hammer a host that just said no). **Waking the queue the moment the agent answers** (the instance is not routable
+yet, and every woken request would ensure it again). **Gateway-driven scale-down** (an idle instance can leave on its
+own; the gateway would need per-instance idle tracking for nothing).
+→ [Agent-Managed Model Runtime §4.8](cross-cutting/agent-runtime-manager.md#48-instance-addresses-and-the-in-place-model-rewrite),
+[§11.11](cross-cutting/agent-runtime-manager.md#1111-instances-in-the-portal-and-the-effective-idle-timeout),
+[Configuration & Environment Variables](reference/config-env.md).
+
+## ADR-093 — Audio benchmarks mirror the text modes, a real-time threshold and a concurrency ceiling
+**Context:** routing, the scaler and the operator need reference figures for speech and transcription models — how
+much faster than real time a model produces or transcribes, how soon its first output arrives, how long it takes to
+load, and how many concurrent streams a host keeps above real time — before a model is ever loaded on the request
+path. The text benchmarks already have modes, buttons, a reservation, a scheduler, a history and a metrics lock on the
+mapping; a parallel audio-only mechanism would duplicate all of it.
+
+**Decision — six choices, taken together. Migration 101; gateway env `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR`
+(default 1.2) and `OP_AI_GATEWAY_AUDIO_CONCURRENCY_MAX` (default 8).**
+
+- **(a) No new mode.** `speed`, `capacity` and `both` run the audio measurement on an audio-only speech or
+  transcription mapping and the text measurement on every other one; the existing `speech` mode (the byte-rate
+  benchmark) stays as it is. `speed` = one stream with the text benchmark's cold-start technique
+  (`ensureColdLoad`, cold pass, warm pass, `load_time_ms` = cold − warm time to first output for a confirmed cold
+  start, stored in the mapping's existing column); `capacity` = the concurrency ramp; `both` = speed, then capacity.
+- **(b) Throughput is real-time factor.** `rate_x` = seconds of audio per wall second: for a streamed synthesis from its
+  first audio to its end (the speed that decides whether playback stutters), for everything else from the send.
+- **(c) Fixed inputs.** A fixed English passage of about 20 s for TTS; for ASR a bundled clip of real German speech
+  (six Thorsten-Voice sentences, CC0 1.0, `internal/benchaudio`, embedded) with `language=de`, so every run of every
+  gateway measures the same audio, and no network or TTS model is needed.
+- **(d) The ramp records why it stopped.** Level k runs k streams — one per instance for a replicable spec on an agent
+  that runs instances (burst rules: free room only), else k streams on the one process — and is good while its slowest
+  stream reaches the threshold (1.2× real time). It stops at `performance` (a measured ceiling), `resources` (an
+  instance refused for room — a lower bound) or `cap` (`max_instances`, 64 or the ramp cap — a lower bound). Count and
+  reason are one result, written together; a failed ramp writes neither.
+- **(e) Stored on the mapping like the text metrics.** `audio_rate_x`, `audio_ttfa_ms`, `audio_realtime_concurrency`,
+  `audio_concurrency_limit`, `audio_metrics_updated_at` (migration 101), written under `metrics_locked` with the text
+  writers' provenance stamps; two history kinds mirror the text ones, `audio` and `audio_capacity`, their figures as
+  JSON in `capacity_curve`.
+- **(f) Measured once automatically.** The health loop starts one `both` run per audio mapping per gateway process on
+  an idle server when the mapping has no audio metrics, or is replicable and has no ramp result; the scheduled speed
+  run includes audio mappings.
+
+**Consequence:**
+
+- **Reference values exist before real use**, and apply whether or not the model is loaded: the scaler reads the
+  `performance` ceiling from the mapping (ADR-092), and the effective idle timeout reads `load_time_ms`.
+- **A measured ceiling is per spec, in isolation**: the ramp measures one model's instances, not contention with other
+  models on the same GPU ([§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **The ramp's instances are ordinary burst instances** afterwards and idle out normally.
+- **A manual cold-start run holds every replicable spec of its server as one process** for the run (and a VRAM run its
+  target), so a measured start is one instance's; a both run's ramp makes its own target replicable again before it
+  measures instances.
+
+**Rejected:** **A separate audio benchmark mode** (a second set of buttons, endpoints and history for what the existing
+modes already express). **Synthesizing the ASR input with a TTS model** (the input would vary with the TTS model and
+need one to exist). **The mean stream rate as a level's verdict** (one stuttering stream is a stuttering voice chat).
+**Treating any ramp stop as a ceiling** (a refusal for room says what the neighbours held at that moment, not what the
+model can do).
+→ [Telemetry, Usage Analytics & Observability §8.6](cross-cutting/telemetry-usage-observability.md#86-audio-performance-benchmarks),
+[Agent-Managed Model Runtime §11.10](cross-cutting/agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease),
+[Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).
