@@ -681,9 +681,14 @@ type stopAllPortal struct {
 	// onReplicableBatch runs before every replicable batch reaches the
 	// service ("single" turns replicable off, "replicable" back on), and
 	// failReplicableRestore makes a batch that turns it back on report its
-	// specs as Failed with this error, writing nothing.
+	// specs as Failed with this error, writing nothing. failSingleFrom, when
+	// positive, makes every batch that turns replicable off from the n-th one
+	// on (1-based; singleBatches counts them) report its specs as Failed,
+	// writing nothing.
 	onReplicableBatch     func(kind string, ids []string)
 	failReplicableRestore map[string]error
+	failSingleFrom        int
+	singleBatches         int
 }
 
 func (p *stopAllPortal) SetBenchmarkRuntimeSpecsAdminState(ctx context.Context, specIDs []string, expectedAdminState, adminState string) (portal.BenchmarkSpecsOutcome, error) {

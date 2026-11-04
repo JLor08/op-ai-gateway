@@ -144,8 +144,10 @@ type benchmarkOverrides struct {
 	// singleProcess is what the run owes a replicable restore and what the
 	// lease's restore_replicable names, sorted: the run's replicable targets
 	// it runs as one process (beginBenchmarkSingleProcess), the specs the
-	// batch wrote or may have written; after the run's restore, the specs it
-	// could not restore.
+	// batch wrote or may have written, less a spec an audio ramp made
+	// replicable again (audioRampReplicableAgain) until it is held as one
+	// process again (audioRampOneProcessAgain); after the run's restore, the
+	// specs it could not restore.
 	singleProcess []string
 }
 
@@ -257,7 +259,9 @@ func benchmarkReplicableTargets(targets []benchmarkTarget, specs []routing.Runti
 // a cold start or a load is measured on the instance alone. The instance counts
 // stay stored, and endBenchmarkUnpin writes replicable = true again -- or, in a
 // both run, the target's audio concurrency ramp does, before it measures the
-// instances (audioRampReplicableAgain).
+// instances (audioRampReplicableAgain), and holds the spec as one process again
+// after them while a later target may still stop the server's models
+// (audioRampOneProcessAgain).
 //   - A lease write that fails writes nothing, and the targets keep their
 //     instances: their load time is then not confirmed while another instance
 //     runs.

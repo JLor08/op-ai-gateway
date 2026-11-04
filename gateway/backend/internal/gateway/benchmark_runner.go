@@ -100,6 +100,12 @@ type benchmarkTarget struct {
 	// attaches it to each server_agent target with mayPreStop; it is nil on
 	// every other target.
 	overrides *benchmarkOverrides
+	// stopsFollow marks a target after which a later target of the same run may
+	// still stop the server's running agent models: one with mayPreStop on a
+	// server_agent application (benchmarkStopApplication). runBenchmark sets it
+	// beside overrides. An audio ramp that made its spec replicable again holds
+	// it as one process again only then (audioRampOneProcessAgain).
+	stopsFollow bool
 	// rateIdentity is the loaded-model identity the app-health loop observed when it
 	// started a speech rate benchmark for this target (TriggerSpeechRateBenchmark):
 	// the string runSpeechTarget records beside the output byte rate it caches, so a
@@ -904,9 +910,10 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 	// server's reservation and operator writes to its launch specs stay refused.
 	ov := s.beginBenchmarkUnpin(ctx, run, serverID, targets)
 	defer s.endBenchmarkUnpin(ctx, run, serverID, ov, &runErr)
-	for _, tgt := range targets {
+	for i, tgt := range targets {
 		if tgt.mayPreStop && tgt.app.Type == routing.ProviderServerAgent {
 			tgt.overrides = ov
+			_, tgt.stopsFollow = benchmarkStopApplication(targets[i+1:])
 		}
 		if ctx.Err() != nil {
 			runErr = "canceled"
