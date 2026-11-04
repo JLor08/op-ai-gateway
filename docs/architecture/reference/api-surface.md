@@ -675,15 +675,21 @@ Conventions worth stating, because each is a judgement call a client depends on:
   persistent override** ([ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)).
   Both authorize as the spec PUT and answer its refusals first
   (`404 mapping.not_found`, `400 runtime_spec.application_not_server_agent`,
-  `409 runtime_spec.server_benchmarking`, `404 runtime_spec.not_found`), then
-  `503 runtime.agent_unavailable` for an agent that has not reported since the
-  gateway started.
-  - **Start** refuses a `force_stopped` spec (`409 runtime.admin_stopped`), an
-    agent without `runtime_ensure` or, for an instance k ≥ 1, without
-    `runtime_instances` (`409 runtime.agent_feature_missing`, with the missing
-    name in `error.feature`), and a spec with no free index below its
+  `409 runtime_spec.server_benchmarking`, `404 runtime_spec.not_found`,
+  `500 runtime_spec.request_failed`), so a caller without a claim to the
+  mapping learns nothing else. "Not connected" means an agent that has not
+  reported since the gateway started (`503 runtime.agent_unavailable`); one
+  that reported and has since gone away is found out by the agent call itself
+  (`503 runtime.agent_unavailable` when it refuses the connection, `504
+  runtime.agent_timeout` when it does not answer).
+  - **Start** then refuses, in this order, a `force_stopped` spec (`409
+    runtime.admin_stopped`), an agent not heard from (`503`), an agent without
+    `runtime_ensure` (`409 runtime.agent_feature_missing`, with the missing
+    name in `error.feature`), a spec with no free index below its
     `max_instances` (`409 runtime.max_instances_reached`; 0 = no cap of its
-    own, at most 63). The instance is the scaler's index rule with instance 0
+    own, indexes up to 63, so 64 instances), a store read that fails while it
+    picks (`500 runtime.action_failed`), and an instance k ≥ 1 on an agent
+    without `runtime_instances` (`409 runtime.agent_feature_missing`). The instance is the scaler's index rule with instance 0
     included ([Routing & Model Selection §10.4](../cross-cutting/routing-and-model-selection.md#104-the-instance-scaler)):
     instance 0 of a spec that is not replicable (an ensure of a running one is
     a no-op); for a replicable spec instance 0 unless the agent reports it
@@ -697,11 +703,12 @@ Conventions worth stating, because each is a judgement call a client depends on:
     explicit choice, and the agent still has the final say on room. The ensure
     runs in the background, bounded by the spec's startup timeout (agent
     default 30 s) plus 10 s and by the gateway's lifetime; an outcome nobody
-    waits for any more is logged, a failure at warn, and shows on the
-    instance's status row.
-  - **Stop** checks only what the agent cannot: the body
-    (`400 runtime.instance_invalid`) and `runtime_stop`
-    (`409 runtime.agent_feature_missing`). Whether the instance may stop is the
+    waits for any more — the window ran out, or the client left — is logged, a
+    failure at warn, and shows on the instance's status row.
+  - **Stop** then checks, in this order, only what the agent cannot: the body
+    (`400 request.invalid_json`, `413 request.body_too_large`, `400
+    runtime.instance_invalid`), an agent not heard from (`503`) and
+    `runtime_stop` (`409 runtime.agent_feature_missing`). Whether the instance may stop is the
     agent's to decide, and its refusals pass through: `409
     runtime.instance_protected` (below the spec's protected floor: the agent
     would restart it at once), `409 runtime.instance_not_highest` (a higher

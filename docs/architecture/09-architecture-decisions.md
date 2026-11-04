@@ -11613,7 +11613,7 @@ the order the agent retires instances in.
   timeout plus 10 s and by the gateway's lifetime. The request waits up to 5 s: an agent refusal is answered with
   its code, a ready instance with `200 {"instance":k,"state":"running"}`, and anything slower with
   `202 {"instance":k,"state":"starting"}`; the status stream shows the progress, and a failure nobody waits for any
-  more is logged at warn and visible on the row.
+  more — the window ran out, or the client left — is logged at warn and visible on the row.
 - **(e) A stop goes highest index first and never below the protected floor.** The agent refuses a stop of an
   instance below `ProtectedCount` — `max(min_instances of a replicable spec, 1 for a pinned or force_running spec)` —
   with `409 runtime.instance_protected`, because it would restart it at once, and a stop while a higher sibling has a

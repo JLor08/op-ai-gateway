@@ -341,6 +341,14 @@ func TestRuntimeStartPicksTheInstance(t *testing.T) {
 			want: 2,
 		},
 		{name: "not replicable", spec: func(s *routing.RuntimeSpec) { s.Replicable = false }, rows: []string{"0:running"}, want: 0},
+		// Instance 0 is taken only while it is starting or running.
+		{name: "instance 0 draining", rows: []string{"0:draining", "1:running"}, want: 0},
+		{
+			name: "max instances 0 has no cap of its own",
+			spec: func(s *routing.RuntimeSpec) { s.MaxInstances = 0 },
+			rows: []string{"0:running", "1:running", "2:running", "3:running", "4:running", "5:running"},
+			want: 6,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -456,30 +464,112 @@ func TestRuntimeStartAnswers202AndCompletesInTheBackground(t *testing.T) {
 	}
 }
 
-// A background start that succeeds holds its index until the agent's status
-// reports the instance, then releases it.
+// A background start that succeeds holds its index past the ensure's success
+// until the agent's status reports the instance, then releases it at once,
+// not at the end of the visible wait.
 func TestRuntimeStartHoldsTheIndexUntilReported(t *testing.T) {
+	logs := withCapturedSlogAtTheDefaultLevel(t)
 	agent := newActionAgent()
 	agent.gate = make(chan struct{})
 	srv := newActionServer(t, agent, 20*time.Millisecond)
-	srv.runtimeStartVisibleWait = 10 * time.Second
+	const visibleWait = 10 * time.Second
+	srv.runtimeStartVisibleWait = visibleWait
 	actionRows(srv, "0:running")
 	key := scaleKey{serverID: actionServer, mappingID: actionMapping}
 	if rec := postAction(srv, "start", ""); rec.Code != http.StatusAccepted {
 		t.Fatalf("start = %d %s, want 202", rec.Code, rec.Body.String())
 	}
 	close(agent.gate)
-	deadline := time.Now().Add(2 * time.Second)
-	for !srv.instanceClaims.heldBy(key)[1] {
-		if time.Now().After(deadline) {
-			t.Fatal("index 1 is not held while the agent has not reported it")
+	// The success record is written once the ensure has returned.
+	waitFor(t, func() bool { return findLogRecord(logs.Snapshot(), "INFO", "runtime start: started an instance") })
+	for range 10 {
+		if !srv.instanceClaims.heldBy(key)[1] {
+			t.Fatal("index 1 was released after the ensure succeeded, before the agent reported the instance")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	reported := time.Now()
 	actionRows(srv, "0:running", "1:running")
+	waitFor(t, func() bool { return len(srv.instanceClaims.heldBy(key)) == 0 })
+	if took := time.Since(reported); took > visibleWait/4 {
+		t.Fatalf("the claim was released %v after the instance was reported, want at once (visible wait %v)", took, visibleWait)
+	}
 	srv.waitRuntimeStarts()
-	if held := srv.instanceClaims.heldBy(key); len(held) != 0 {
-		t.Fatalf("claims after the instance was reported = %v, want none", held)
+}
+
+// A client that leaves before the agent answers gets nothing, and the start
+// goes on: its outcome is logged, a failure at warn.
+func TestRuntimeStartGoesOnWhenTheClientLeaves(t *testing.T) {
+	logs := withCapturedSlogAtTheDefaultLevel(t)
+	agent := newActionAgent()
+	agent.gate = make(chan struct{})
+	srv := newActionServer(t, agent, time.Hour)
+	actionRows(srv, "0:running")
+	ctx, cancel := context.WithCancel(context.Background())
+	req := newJSONRequest(http.MethodPost, "/api/portal/mappings/"+actionMapping+"/runtime/start", "").WithContext(ctx)
+	rec := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		srv.ServeHTTP(rec, req)
+	}()
+	<-agent.arrived
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not return once its client left")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("a client that left was answered %d %s, want nothing", rec.Code, rec.Body.String())
+	}
+	agent.mu.Lock()
+	agent.ensureErr = provider.RouterStatusError(http.StatusConflict, []byte(`{"error":{"code":"runtime.instance_no_capacity","message":"no room"}}`))
+	agent.mu.Unlock()
+	close(agent.gate)
+	srv.waitRuntimeStarts()
+	if got := agent.ensured(); !slices.Equal(got, []string{actionModel + "#1"}) {
+		t.Fatalf("ensures = %v, want the start to go on for %s#1", got, actionModel)
+	}
+	if !findLogRecord(logs.Snapshot(), "WARN", "runtime start: starting an instance failed") {
+		t.Fatalf("the refusal of a start whose client left was not logged at warn: %+v", logs.Snapshot())
+	}
+}
+
+// When the client leaves just as the agent answers, the handler may take the
+// leaving: the background ensure has handed its answer over by then, so the
+// handler logs it, a failure at warn as the background ensure would.
+func TestRuntimeStartLogsAnAnswerItsClientLeftBehind(t *testing.T) {
+	logs := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	srv.runtimeStartWindow = time.Hour
+	scope := portal.RuntimeActionScope{Mapping: routing.ModelMapping{ID: actionMapping, AppModelName: actionModel}, Server: routing.AIServer{ID: actionServer}}
+	refusal := provider.RouterStatusError(http.StatusConflict, []byte(`{"error":{"code":"runtime.instance_no_capacity","message":"no room"}}`))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	left := 0
+	for range 64 {
+		start := newRuntimeStart(scope, 1)
+		if !start.deliver(refusal) {
+			t.Fatal("deliver to a waiting handler = false")
+		}
+		rec := httptest.NewRecorder()
+		srv.awaitRuntimeStart(rec, newJSONRequest(http.MethodPost, "/", "").WithContext(ctx), 1, start)
+		if rec.Body.Len() == 0 {
+			left++
+		}
+	}
+	if left == 0 {
+		t.Skip("the handler never took its client's leaving in 64 tries")
+	}
+	warned := 0
+	for _, r := range logs.Snapshot() {
+		if r.Level == "WARN" && strings.Contains(r.Msg, "runtime start: starting an instance failed") {
+			warned++
+		}
+	}
+	if warned != left {
+		t.Fatalf("%d answers whose client left were logged at warn, want %d", warned, left)
 	}
 }
 
@@ -506,6 +596,54 @@ func TestRuntimeStartEndsWithShutdown(t *testing.T) {
 	}
 }
 
+// With max_instances 0 a spec may use every index an address can carry, 0 to
+// 63, and no more.
+func TestRuntimeStartUncappedStopsAtTheLastIndex(t *testing.T) {
+	agent := newActionAgent()
+	srv := newActionServer(t, agent, time.Second, func(s *routing.RuntimeSpec) { s.MaxInstances = 0 })
+	rows := make([]RuntimeStatusDTO, 0, routing.MaxInstanceIndex+1)
+	for k := 0; k < routing.MaxInstanceIndex; k++ {
+		rows = append(rows, RuntimeStatusDTO{SpecID: actionSpec, Model: routing.InstanceAddress(actionModel, k), Instance: k, State: agentSpecStateRunning})
+	}
+	srv.RuntimeStatus.publish(actionServer, rows)
+	rec := postAction(srv, "start", "")
+	if got := decodeAnswer(t, rec); rec.Code != http.StatusOK || got.Instance != routing.MaxInstanceIndex {
+		t.Fatalf("start with 0..62 running = %d %s, want 200 for instance %d", rec.Code, rec.Body.String(), routing.MaxInstanceIndex)
+	}
+	srv.waitRuntimeStarts()
+	rows = append(rows, RuntimeStatusDTO{SpecID: actionSpec, Model: routing.InstanceAddress(actionModel, routing.MaxInstanceIndex), Instance: routing.MaxInstanceIndex, State: agentSpecStateRunning})
+	srv.RuntimeStatus.publish(actionServer, rows)
+	rec = postAction(srv, "start", "")
+	if rec.Code != http.StatusConflict || errorBodyOf(t, rec) != codeRuntimeMaxInstancesReached {
+		t.Fatalf("start with 0..63 running = %d %s, want 409 %s", rec.Code, rec.Body.String(), codeRuntimeMaxInstancesReached)
+	}
+}
+
+// failingMappingsStore fails the read the start picks its instance from.
+type failingMappingsStore struct{ routing.Store }
+
+func (failingMappingsStore) MappingsByApplication(context.Context, string) ([]routing.ModelMapping, error) {
+	return nil, errors.New("store down")
+}
+
+// A store read that fails while the start picks its instance answers 500 and
+// asks the agent for nothing.
+func TestRuntimeStartStoreFailure(t *testing.T) {
+	agent := newActionAgent()
+	srv := newActionServer(t, agent, time.Second)
+	srv.Routes = failingMappingsStore{Store: srv.Routes}
+	rec := postAction(srv, "start", "")
+	if rec.Code != http.StatusInternalServerError || errorBodyOf(t, rec) != codeRuntimeActionFailed {
+		t.Fatalf("start = %d %s, want 500 %s", rec.Code, rec.Body.String(), codeRuntimeActionFailed)
+	}
+	if got := agent.ensured(); len(got) != 0 {
+		t.Fatalf("a failed pick asked the agent for %v", got)
+	}
+	if held := srv.instanceClaims.heldBy(scaleKey{serverID: actionServer, mappingID: actionMapping}); len(held) != 0 {
+		t.Fatalf("a failed pick left claims %v", held)
+	}
+}
+
 func TestRuntimeStopPassesThrough(t *testing.T) {
 	agent := newActionAgent()
 	agent.stopState = provider.RuntimeStopStopped
@@ -520,9 +658,12 @@ func TestRuntimeStopPassesThrough(t *testing.T) {
 	if got := agent.stopped(); !slices.Equal(got, []string{actionModel + "#2"}) {
 		t.Fatalf("stops = %v, want [%s#2]", got, actionModel)
 	}
+	agent.mu.Lock()
+	agent.stopState = provider.RuntimeStopStopping
+	agent.mu.Unlock()
 	rec = postAction(srv, "stop", `{"instance":0}`)
-	if got := decodeAnswer(t, rec); rec.Code != http.StatusOK || got.Instance != 0 {
-		t.Fatalf("stop of instance 0 = %d %s", rec.Code, rec.Body.String())
+	if got := decodeAnswer(t, rec); rec.Code != http.StatusOK || got.Instance != 0 || got.State != provider.RuntimeStopStopping {
+		t.Fatalf("stop of instance 0 = %d %s, want 200 instance 0 stopping", rec.Code, rec.Body.String())
 	}
 	if got := agent.stopped(); got[len(got)-1] != actionModel {
 		t.Fatalf("instance 0's stop addressed %q, want %q", got[len(got)-1], actionModel)
@@ -571,6 +712,21 @@ func TestRuntimeStopRefusals(t *testing.T) {
 		{name: "no instance", body: `{}`, wantStatus: http.StatusBadRequest, wantCode: codeRuntimeInstanceInvalid},
 		{name: "negative instance", body: `{"instance":-1}`, wantStatus: http.StatusBadRequest, wantCode: codeRuntimeInstanceInvalid},
 		{name: "instance beyond 63", body: `{"instance":64}`, wantStatus: http.StatusBadRequest, wantCode: codeRuntimeInstanceInvalid},
+		{name: "malformed body", body: `{"instance":`, wantStatus: http.StatusBadRequest, wantCode: codeRequestInvalidJSON},
+		{name: "empty body", body: ``, wantStatus: http.StatusBadRequest, wantCode: codeRequestInvalidJSON},
+		{name: "instance not a number", body: `{"instance":"1"}`, wantStatus: http.StatusBadRequest, wantCode: codeRequestInvalidJSON},
+		{name: "body over the cap", body: `{"instance":1,"pad":"` + strings.Repeat("x", int(maxJSONBodyBytes)) + `"}`, wantStatus: http.StatusRequestEntityTooLarge, wantCode: codeRequestBodyTooLarge},
+		{
+			// Authorization comes before the body: a caller without a claim to
+			// the mapping is told it does not exist, whatever it sent.
+			name: "caller without a claim sending a malformed body", body: `{"instance":`,
+			setup: func(t *testing.T, srv *Server) {
+				if err := srv.Routes.SetServerOwners(context.Background(), actionServer, []string{"usr_other"}); err != nil {
+					t.Fatalf("set owners: %v", err)
+				}
+			},
+			wantStatus: http.StatusNotFound, wantCode: "mapping.not_found",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

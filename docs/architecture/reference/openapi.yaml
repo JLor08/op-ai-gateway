@@ -2363,7 +2363,7 @@ paths:
       resting at crashed, start_failed or not_permitted is free), that is not
       another mapping's upstream name on the agent and that no ensure of the
       scaler or another start is under way for, below max_instances (0 = no
-      cap of its own, at most 63). It asks the agent's ensure route for it in
+      cap of its own: indexes up to 63, so 64 instances). It asks the agent's ensure route for it in
       the background, bounded by the spec's startup timeout plus 10 s, and
       waits up to 5 s for an early answer.
     parameters:
@@ -2413,6 +2413,14 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: >
+            The Error envelope with `runtime_spec.request_failed` (a store read
+            failed while authorizing) or `runtime.action_failed` (a store read
+            failed while the start picked its instance).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '502':
           description: >
             The Error envelope with the agent's `runtime.start_failed`,
@@ -2438,8 +2446,8 @@ paths:
     description: >
       Transient manual stop (the live-status Stop): asks the agent to drain one
       instance now and writes nothing, so demand can start it again.
-      Authorized as the runtime-spec PUT. Needs the agent feature runtime_stop
-      (agent 0.17.0). Whether the instance may stop is the agent's decision: it
+      Authorized as the runtime-spec PUT, before the body is read. Needs the
+      agent feature runtime_stop (agent 0.17.0). Whether the instance may stop is the agent's decision: it
       refuses an instance inside the spec's protected floor and one with a
       higher sibling running.
     parameters:
@@ -2490,6 +2498,16 @@ paths:
             or the agent's `runtime.instance_protected` (the instance is below
             the spec's protected floor) / `runtime.instance_not_highest` (a higher
             instance of the spec runs).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The Error envelope with `request.body_too_large` (a body over 1 MiB).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: The Error envelope with `runtime_spec.request_failed` (a store read failed while authorizing).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

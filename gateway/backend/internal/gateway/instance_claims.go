@@ -21,9 +21,11 @@ import (
 //     callers started it.
 //
 // The claim set is what keeps the two from asking for one index at the same
-// time: an index is claimed before its ensure is sent and held until routing
-// sees the instance (or the ensure failed), so neither caller hands it out a
-// second time while the agent's status does not report it yet.
+// time: an index is claimed before its ensure is sent and held past the
+// ensure's success until routing sees the instance (or the ensure failed), so
+// neither caller hands it out a second time while the agent's status does not
+// report it yet. Each caller bounds that wait; the scaler keeps the claim of an
+// instance that did not show up within it a while longer (keepUnseenClaim).
 
 // instanceClaims is the set of instance indexes an ensure is under way for,
 // per (server, mapping). One set is shared by the scaler and the manual start.

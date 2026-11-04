@@ -2312,9 +2312,12 @@ one more instance where routing would send the waiting request and leaves the fi
   [ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)),
   which applies it with instance 0 included. The "ensure under way" set is one claim set per
   gateway process, built in `gateway.New` and handed to the scaler: an index is claimed right
-  before its ensure and held until the instance source (the scaler) or the agent's status (the
-  manual start) reports the instance, or the ensure failed, so the two never ask an agent for one
-  index at the same time. The scaler's pick claims nothing; an index a manual start claimed
+  before its ensure and held past the ensure's success until the instance source (the scaler) or
+  the agent's status (the manual start) reports the instance, or the ensure failed, so the two
+  never ask an agent for one index at the same time. Each bounds that wait by 5 s; an instance the
+  scaler started that does not show up within it keeps its claim, in the background, for one more
+  such wait, because the agent already runs it and a manual start that took the index would ask
+  for a running instance and report one more started. The scaler's pick claims nothing; an index a manual start claimed
   between the pick and the ask is not asked for, and the next pick gives the host its next free
   index without counting it as asked.
 - **The ask.** `POST /ensure/m#k` through the provider's ensure route

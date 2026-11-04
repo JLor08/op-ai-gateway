@@ -14,6 +14,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"sync"
 	"time"
 )
@@ -158,7 +159,7 @@ func (s *Server) startRuntimeInstance(w http.ResponseWriter, r *http.Request, to
 		writeFeatureMissing(w, runtimeInstancesFeature)
 		return
 	}
-	start := &runtimeStart{answer: make(chan error, 1), waiting: true}
+	start := newRuntimeStart(scope, k)
 	s.runtimeStarts.Add(1)
 	go func() {
 		defer s.runtimeStarts.Done()
@@ -217,11 +218,34 @@ func (s *Server) claimStartInstance(ctx context.Context, scope portal.RuntimeAct
 // waits for the agent's answer for the early-answer window, and the background
 // ensure. waiting is true while the handler still takes the answer; once it
 // has left (the window ran out, or its client went away) the background ensure
-// logs its outcome instead.
+// logs its outcome instead. attrs name the start in those log records.
 type runtimeStart struct {
 	mu      sync.Mutex
 	waiting bool
 	answer  chan error // buffered 1
+	attrs   []any
+}
+
+func newRuntimeStart(scope portal.RuntimeActionScope, k int) *runtimeStart {
+	return &runtimeStart{
+		answer:  make(chan error, 1),
+		waiting: true,
+		attrs:   []any{"mapping_id", scope.Mapping.ID, "server_id", scope.Server.ID, "instance", routing.InstanceAddress(scope.Mapping.AppModelName, k)},
+	}
+}
+
+// logOutcome logs the outcome of a start nobody waits for any more: a success
+// at info, a failure at warn, and one the gateway's shutdown (base ended) cut
+// short at debug.
+func (st *runtimeStart) logOutcome(base context.Context, err error) {
+	switch {
+	case err == nil:
+		slog.Info("runtime start: started an instance", st.attrs...)
+	case base.Err() != nil:
+		slog.Debug("runtime start: the gateway's shutdown ended a start", st.attrs...)
+	default:
+		slog.Warn("runtime start: starting an instance failed", append(slices.Clone(st.attrs), "err", err)...)
+	}
 }
 
 // deliver hands err to the waiting handler and reports whether it did.
@@ -261,24 +285,13 @@ func (s *Server) runRuntimeStart(ensurer provider.RuntimeEnsurer, scope portal.R
 	if claimed {
 		defer s.instanceClaims.release(key, k)
 	}
-	base := s.baseCtx
-	if base == nil {
-		base = context.Background()
-	}
+	base := s.lifetime()
 	ctx, cancel := context.WithTimeout(base, instanceEnsureTimeout(scope.Spec))
 	defer cancel()
 	target := runtimeInstanceTarget(scope, k)
 	err := ensurer.EnsureRuntimeModel(s.upstreamAuthCtx(ctx, target), target)
 	if !start.deliver(err) {
-		attrs := []any{"mapping_id", scope.Mapping.ID, "server_id", scope.Server.ID, "instance", target.ProviderModel}
-		switch {
-		case err == nil:
-			slog.Info("runtime start: started an instance", attrs...)
-		case base.Err() != nil:
-			slog.Debug("runtime start: the gateway's shutdown ended a start", attrs...)
-		default:
-			slog.Warn("runtime start: starting an instance failed", append(attrs, "err", err)...)
-		}
+		start.logOutcome(base, err)
 	}
 	if err == nil && claimed {
 		s.awaitInstanceReported(base, scope.Server.ID, scope.Spec.ID, k)
@@ -287,7 +300,9 @@ func (s *Server) runRuntimeStart(ensurer provider.RuntimeEnsurer, scope portal.R
 
 // awaitRuntimeStart answers the manual start: the agent's answer when it
 // arrives within the early-answer window, else 202 starting. A client that
-// leaves first gets nothing; the start goes on either way.
+// leaves first gets nothing; the start goes on either way. An answer that
+// arrived while the client left is logged here as the background ensure would
+// have logged it, since that ensure already handed it over (deliver).
 func (s *Server) awaitRuntimeStart(w http.ResponseWriter, r *http.Request, k int, start *runtimeStart) {
 	window := s.runtimeStartWindow
 	if window <= 0 {
@@ -305,8 +320,8 @@ func (s *Server) awaitRuntimeStart(w http.ResponseWriter, r *http.Request, k int
 			return
 		}
 	case <-r.Context().Done():
-		if answered, err := start.detach(); answered && err != nil {
-			slog.Debug("runtime start: the agent refused a start whose client had left", "instance", k, "err", err)
+		if answered, err := start.detach(); answered {
+			start.logOutcome(s.lifetime(), err)
 		}
 		return
 	}
@@ -371,14 +386,21 @@ type runtimeActionAnswer struct {
 // stopRuntimeInstance serves POST .../runtime/stop: it asks the agent to drain
 // instance k now and answers 200 with the agent's state, stopping or stopped.
 // It changes nothing in the config, so demand can start the instance again.
-// The gateway checks only what the agent cannot: the body (400
-// runtime.instance_invalid for a missing index or one outside 0..63), an agent
-// not heard from (503) and the agent feature runtime_stop (409
-// runtime.agent_feature_missing). Whether the instance may stop -- the
+// Authorization comes first, so a caller without a claim to the mapping learns
+// nothing from its body. The gateway then checks, in this order, only what the
+// agent cannot: the body (400 request.invalid_json, 413
+// request.body_too_large, 400 runtime.instance_invalid for a missing index or
+// one outside 0..63), an agent not heard from (503) and the agent feature
+// runtime_stop (409 runtime.agent_feature_missing). Whether the instance may stop -- the
 // protected floor, highest index first -- is the agent's to decide, and its
 // 409 runtime.instance_protected / runtime.instance_not_highest and 404
 // runtime.model_not_managed pass through.
 func (s *Server) stopRuntimeInstance(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID string) {
+	scope, err := s.Portal.AuthorizeRuntimeAction(r.Context(), token, mappingID)
+	if err != nil {
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
 	raw, ok := readRawJSON(w, r)
 	if !ok {
 		return
@@ -386,11 +408,6 @@ func (s *Server) stopRuntimeInstance(w http.ResponseWriter, r *http.Request, tok
 	var req runtimeStopRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
-		return
-	}
-	scope, err := s.Portal.AuthorizeRuntimeAction(r.Context(), token, mappingID)
-	if err != nil {
-		writePortalRuntimeSpecError(w, err)
 		return
 	}
 	if req.Instance == nil || *req.Instance < 0 || *req.Instance > routing.MaxInstanceIndex {
@@ -498,6 +515,16 @@ func runtimeInstanceTarget(scope portal.RuntimeActionScope, k int) routing.Targe
 	}
 }
 
+// lifetime is the server's lifetime context (baseCtx), or the background
+// context on a server built without one.
+func (s *Server) lifetime() context.Context {
+	if s.baseCtx == nil {
+		return context.Background()
+	}
+	return s.baseCtx
+}
+
 // waitRuntimeStarts returns once every manual start's background ensure has
-// ended.
+// ended. Only tests join them: the shutdown cancels baseCtx, which ends each
+// ensure, and does not wait for the goroutines.
 func (s *Server) waitRuntimeStarts() { s.runtimeStarts.Wait() }

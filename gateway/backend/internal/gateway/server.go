@@ -495,8 +495,10 @@ type Server struct {
 	// it nil, which holds nothing.
 	instanceClaims *instanceClaims
 	// runtimeStarts counts the portal's manual starts whose ensure runs in the
-	// background (runtime_actions.go); each ends with the server's lifetime
-	// (baseCtx) at the latest. runtimeStartWindow and runtimeStartVisibleWait
+	// background (runtime_actions.go); cancelling the server's lifetime
+	// (baseCtx) ends each one's ensure. Only tests join them
+	// (waitRuntimeStarts): the shutdown does not wait for them, as it does not
+	// for the scaler's scale-ups. runtimeStartWindow and runtimeStartVisibleWait
 	// are the start's early-answer window and how long a started instance's
 	// index stays claimed waiting for the agent to report it; 0 (a bare
 	// &Server{}, and New) means the defaults, and a test shortens them.

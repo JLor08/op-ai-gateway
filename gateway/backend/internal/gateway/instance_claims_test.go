@@ -6,6 +6,7 @@ package gateway
 import (
 	"op-ai-gateway/internal/routing"
 	"testing"
+	"time"
 )
 
 func TestInstanceClaimsClaimLowest(t *testing.T) {
@@ -113,6 +114,69 @@ func TestManualClaimSkipsAnIndexTheScalerEnsures(t *testing.T) {
 	f.scaler.wait()
 	if got := f.scaler.claims.heldBy(key); len(got) != 0 {
 		t.Fatalf("claims after the scale-up = %v, want none left", got)
+	}
+}
+
+// The scaler holds the index past the ensure's success, through the wait for
+// routing to see the instance: a manual start in between, while the agent's
+// status does not report the instance yet, picks the next index.
+func TestScalerHoldsItsClaimUntilRoutable(t *testing.T) {
+	logs := withCapturedSlogAtTheDefaultLevel(t)
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 50)
+	f.ensurer.started = nil // the agent's status does not report the instance yet
+	f.scaler.visibleWait = time.Hour
+	key := scaleKey{serverID: "srv_a", mappingID: "map_srv_a"}
+	f.scaler.Signal(f.demand("map_srv_a"))
+	// The success record is written once the ensure has returned.
+	waitFor(t, func() bool { return findLogRecord(logs.Snapshot(), "INFO", "instance scaler: started an instance") })
+	k, ok := f.scaler.claims.claimLowest(key, 1, routing.MaxInstanceIndex+1, nil)
+	if !ok || k != 2 {
+		t.Fatalf("manual claim after the scaler's ensure of m#1 succeeded = (%d, %v), want (2, true): m#1 is not routable yet", k, ok)
+	}
+	f.scaler.claims.release(key, k)
+	f.report("srv_a", instancesOf("srv_a", agentSpecStateRunning, 1)...)
+	f.scaler.wait()
+	if got := f.scaler.claims.heldBy(key); len(got) != 0 {
+		t.Fatalf("claims once m#1 is routable = %v, want none", got)
+	}
+}
+
+// An instance that started but did not show up within the wait keeps its
+// claim until routing sees it: the agent runs it, so a manual start must not
+// pick its index and report it as one more started.
+func TestScalerKeepsTheClaimOfAnUnseenInstance(t *testing.T) {
+	logs := withCapturedSlogAtTheDefaultLevel(t)
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 50)
+	f.ensurer.started = nil
+	f.scaler.visibleWait = time.Millisecond
+	f.scaler.unseenClaimWait = time.Hour
+	key := scaleKey{serverID: "srv_a", mappingID: "map_srv_a"}
+	f.scaler.Signal(f.demand("map_srv_a"))
+	waitFor(t, func() bool { return findLogRecord(logs.Snapshot(), "WARN", "did not show up") })
+	for range 10 {
+		if !f.scaler.claims.heldBy(key)[1] {
+			t.Fatal("index 1 was released once the wait for routing ran out, while the agent runs m#1")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.report("srv_a", instancesOf("srv_a", agentSpecStateRunning, 1)...)
+	waitFor(t, func() bool { return len(f.scaler.claims.heldBy(key)) == 0 })
+	f.scaler.wait()
+}
+
+// The kept claim of an unseen instance runs out with its own bound.
+func TestScalerReleasesTheClaimOfAnUnseenInstanceAtItsBound(t *testing.T) {
+	f := newScalerFixture(t)
+	f.addHost("srv_a", 50)
+	f.ensurer.started = nil
+	f.scaler.visibleWait = time.Millisecond
+	f.scaler.unseenClaimWait = 20 * time.Millisecond
+	key := scaleKey{serverID: "srv_a", mappingID: "map_srv_a"}
+	f.signal(f.demand("map_srv_a"))
+	if got := f.scaler.claims.heldBy(key); len(got) != 0 {
+		t.Fatalf("claims after the kept claim's bound = %v, want none", got)
 	}
 }
 

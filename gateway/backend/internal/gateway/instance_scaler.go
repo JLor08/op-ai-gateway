@@ -174,6 +174,10 @@ type instanceScaler struct {
 	cooldown    time.Duration
 	visibleWait time.Duration // instanceVisibleWait; a test changes it
 	readTimeout time.Duration // instanceScaleReadTimeout; a test changes it
+	// unseenClaimWait bounds how long an instance that started but did not show
+	// up within visibleWait keeps its index claimed (keepUnseenClaim); 0 means
+	// visibleWait. A test changes it.
+	unseenClaimWait time.Duration
 
 	mu sync.Mutex
 	// scaling holds the gateway models with a scale-up running, each with the
@@ -196,7 +200,7 @@ type instanceScaler struct {
 	// take the index in between the pick and the ask. nil in production.
 	beforeClaim func(scaleCandidate)
 
-	wg sync.WaitGroup // one per running scale-up
+	wg sync.WaitGroup // one per running scale-up, and one per claim keepUnseenClaim holds
 }
 
 // newInstanceScaler returns a scaler that leaves a refused host alone for cooldown,
@@ -368,7 +372,10 @@ const (
 // The index is claimed (instanceClaims) before the ask and held until routing
 // sees the instance or the ensure failed, so a manual start never asks for it
 // meanwhile; an index a manual start claimed first is startLost, and nothing is
-// sent.
+// sent. An instance that started but did not show up within the wait keeps its
+// claim a while longer (keepUnseenClaim): the agent runs it, and a manual start
+// that took the index would ask for a running instance and report it as one
+// more started.
 func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsurer, model string, c scaleCandidate) startOutcome {
 	if s.beforeClaim != nil {
 		s.beforeClaim(c)
@@ -376,7 +383,12 @@ func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsu
 	if !s.claims.tryClaim(c.key, c.index) {
 		return startLost
 	}
-	defer s.claims.release(c.key, c.index)
+	release := true
+	defer func() {
+		if release {
+			s.claims.release(c.key, c.index)
+		}
+	}()
 	ensureCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	err := ensurer.EnsureRuntimeModel(s.deps.authCtx(ensureCtx, c.target), c.target)
 	cancel()
@@ -388,6 +400,8 @@ func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsu
 			if ctx.Err() == nil {
 				slog.Warn("instance scaler: a started instance did not show up in the agent's status; waking no request and leaving the host alone briefly", append(attrs, "delay", instanceUnseenDelay)...)
 				s.holdOff(c.key, instanceUnseenDelay)
+				release = false
+				s.keepUnseenClaim(ctx, c)
 			}
 			return startStarted
 		}
@@ -418,14 +432,36 @@ func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsu
 	return startFailed
 }
 
+// keepUnseenClaim holds c's claim, in the background, until routing sees c's
+// instance or unseenClaimWait ran out (the server's shutdown ends it too), and
+// then releases it. The scale-up goes on meanwhile: the host is held off, so
+// the claim only keeps a manual start from picking the index.
+func (s *instanceScaler) keepUnseenClaim(ctx context.Context, c scaleCandidate) {
+	wait := s.unseenClaimWait
+	if wait <= 0 {
+		wait = s.visibleWait
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.claims.release(c.key, c.index)
+		s.awaitRoutableWithin(ctx, c, wait)
+	}()
+}
+
 // awaitRoutable reports whether routing sees c's new instance running -- the
 // instance source reports it -- within s.visibleWait; it returns false at the
 // bound or when ctx ends. It subscribes to the server's status before it looks,
 // so a sample published in between is not missed.
 func (s *instanceScaler) awaitRoutable(ctx context.Context, c scaleCandidate) bool {
+	return s.awaitRoutableWithin(ctx, c, s.visibleWait)
+}
+
+// awaitRoutableWithin is awaitRoutable bounded by wait.
+func (s *instanceScaler) awaitRoutableWithin(ctx context.Context, c scaleCandidate, wait time.Duration) bool {
 	_, updates, unsubscribe := s.deps.statuses.subscribe(c.key.serverID)
 	defer unsubscribe()
-	timer := time.NewTimer(s.visibleWait)
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for !s.routable(ctx, c) {
 		select {
