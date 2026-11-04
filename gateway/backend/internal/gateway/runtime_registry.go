@@ -44,9 +44,26 @@ type RuntimeGPUStatusDTO struct {
 // published to live SSE subscribers (mirrors agentRuntimeSample's json tags
 // for every field it carries, except ImageOptions, which is in-process only --
 // see that field).
+//
+// A replicable spec (#340) has one row per running or starting instance, all
+// under the spec's own SpecID: SpecID is the BASE spec id, Instance tells the
+// rows apart, and Model is the instance's address ("m" for instance 0,
+// "m#k" for instance k). So "a spec's row" is the instance-0 row, and every
+// reader that indexes rows by SpecID alone has to say what it does with the
+// others. A spec that is not replicable, and every row of an agent without
+// the runtime_instances feature, is instance 0 alone: exactly the one row per
+// spec there always was.
 type RuntimeStatusDTO struct {
-	SpecID         string    `json:"spec_id"`
-	Model          string    `json:"model"`
+	SpecID string `json:"spec_id"`
+	Model  string `json:"model"`
+	// Instance is the instance index k this row describes: 0 for instance 0
+	// and for every spec that is not replicable.
+	Instance int `json:"instance"`
+	// StartupMS is this instance's measured startup in ms: from the start of
+	// its most recent successful start to its first healthy probe. 0 (and
+	// omitted) = not measured yet. The ingest folds it per spec into the
+	// stored startup_measured_ms (writeBackRuntimeStartup).
+	StartupMS      int       `json:"startup_ms,omitempty"`
 	State          string    `json:"state"`
 	Since          time.Time `json:"since"`
 	PID            int       `json:"pid,omitempty"`

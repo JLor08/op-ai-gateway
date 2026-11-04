@@ -683,6 +683,13 @@ func (s *Server) agentTargetResident(ctx context.Context, tgt benchmarkTarget) (
 // nothing: a request for it starts a genuine cold load at once.
 const agentSpecStateStopped = "stopped"
 
+// agentSpecStateRunning and agentSpecStateStarting are the runtime-status states of an
+// instance whose child serves, and of one whose child is up but not yet healthy.
+const (
+	agentSpecStateRunning  = "running"
+	agentSpecStateStarting = "starting"
+)
+
 // agentSpecResidency is agentTargetResident's reading of the agent's most recent runtime-status
 // snapshot, once the router's loaded set has not listed tgt's model. The row is matched by spec
 // id, never by model name:
@@ -1281,6 +1288,14 @@ func (s *Server) measureSpeedTarget(ctx context.Context, tgt benchmarkTarget) Be
 		// Both writes skip a locked mapping. This write never touches
 		// context_size, so a probed context survives.
 		_ = s.Routes.UpdateMappingBenchmarkMetrics(ctx, tgt.mapping.ID, res.GenTokensPerSecond, res.PromptTokensPerSecond, res.LoadTimeMS, time.Now().UTC())
+		// A replicable spec's pushed idle timeout is derived from its mapping's
+		// load_time_ms, and this write is outside the portal service, whose
+		// write paths push a changed document themselves, so it pushes here.
+		// A spec that is not replicable is pushed its stored idle timeout,
+		// which a load time does not change.
+		if res.LoadTimeMS > 0 && tgt.spec.Replicable {
+			s.PushRuntimeConfig(tgt.server.ID)
+		}
 	}
 	return res
 }

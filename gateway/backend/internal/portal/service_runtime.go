@@ -2489,6 +2489,20 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     role only ORDERS eviction victims that are already evictable, it never
 //     decides whether one is. The agent's poll reconciles the new role.
 //
+// Two writes outside this service DO push, because each moves a document
+// field the agent does not already hold: a replicable spec's pushed idle
+// timeout is derived (effectiveIdleTimeoutSeconds) from the spec's
+// startup_measured_ms (row 4) and its mapping's load_time_ms (row 3), and
+// neither figure is the agent's own value for that field. The telemetry
+// ingest writes startup_measured_ms (gateway.Server.writeBackRuntimeStartup,
+// only on a move of more than 10 %, so jitter pushes nothing) and the speed
+// benchmark writes load_time_ms (gateway.Server.measureSpeedTarget); each
+// pushes that server's document after a write for a replicable spec, through
+// gateway.Server.PushRuntimeConfig -- the push this hook runs -- and only for
+// a replicable spec, since the derived timeout is the one field either moves.
+// Any other writer of load_time_ms, an audio benchmark included, pushes the
+// same way.
+//
 // One input of the document is not a row: whether the server's agent declares
 // the runtime_instances feature (AgentFeatureReader, Service.specAsPushed),
 // which decides whether a replicable spec goes out with its instance settings.

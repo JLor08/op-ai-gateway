@@ -372,8 +372,13 @@ func (c *agentRuntimeCapabilitiesSample) capabilityRows(source string, at time.T
 // agent, so there is no ambiguity about which mapping/model this entry
 // describes even when the agent has not (yet) resolved Model.
 type agentRuntimeSample struct {
-	SpecID         string    `json:"spec_id"`
-	Model          string    `json:"model"`
+	SpecID string `json:"spec_id"`
+	Model  string `json:"model"`
+	// Instance and StartupMS: see RuntimeStatusDTO's fields of the same name.
+	// An agent without the runtime_instances feature sends neither, which
+	// decodes to instance 0 and "not measured".
+	Instance       int       `json:"instance"`
+	StartupMS      int       `json:"startup_ms,omitempty"`
 	State          string    `json:"state"`
 	Since          time.Time `json:"since"`
 	PID            int       `json:"pid,omitempty"`
@@ -591,6 +596,7 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 		dto := RuntimeStatusDTO{
 			SpecID:              rt.SpecID,
 			Model:               rt.Model,
+			Instance:            rt.Instance,
 			State:               rt.State,
 			Since:               rt.Since,
 			PID:                 rt.PID,
@@ -623,6 +629,11 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 		// deliberately does not stamp MeasuredAt -- that is the per-GPU watermark.
 		if rt.RAMMeasuredMB > 0 {
 			dto.RAMMeasuredMB = rt.RAMMeasuredMB
+		}
+		// The startup measurement rides on the same rule: 0 or less is "not
+		// measured yet" and stays off the wire.
+		if rt.StartupMS > 0 {
+			dto.StartupMS = rt.StartupMS
 		}
 		if rt.LastError != nil {
 			dto.LastError = &RuntimeErrorDTO{
@@ -682,6 +693,111 @@ const maxRuntimeSamplesPerSample = 256
 // DISTINCT/total sample entries considered, not the GPU fan-out within a
 // single one).
 const maxRuntimeGPUsPerSample = 64
+
+// foldedSpec is one spec's measurements folded over its instance rows in one
+// telemetry sample (foldInstanceRows): what the spec-level columns the ingest
+// writes back are compared with and written from.
+type foldedSpec struct {
+	// MaxGPU is the largest measured VRAM per GPU index over the spec's rows
+	// (only measured, > 0, figures; nil when no row measured any).
+	MaxGPU map[int]int
+	// MaxRAM is the largest measured host RAM over the spec's rows, 0 when no
+	// row measured any.
+	MaxRAM int
+	// MaxStartupMS is the largest measured startup over the spec's rows, 0
+	// when no row measured one.
+	MaxStartupMS int
+	// Primary is the row that speaks for the spec where only one row can:
+	// the probed context size and the capability verdicts. It is the
+	// instance-0 row, else the first running row, else nil (only starting or
+	// otherwise idle burst instances: nothing that speaks for the spec yet).
+	Primary *RuntimeStatusDTO
+}
+
+// foldInstanceRows folds a sample's status rows per spec id. A replicable
+// spec reports one row per instance under its one spec id, and the spec-level
+// columns the ingest writes back -- the measured VRAM per GPU, the measured
+// RAM and startup -- hold ONE figure for all of them: the demand the agent
+// admits a new instance with must cover the hungriest one, and a startup is
+// only as quick as the slowest. So each takes the maximum over the spec's
+// rows. Writing the rows one by one instead would write each column twice a
+// second as two instances took turns, and the change detection that keeps a
+// stable measurement from being rewritten would never hold. The context size
+// and the capability verdicts are not figures to take a maximum of; they come
+// from Primary.
+//
+// A spec that is not replicable has one row, so its fold is that row's own
+// figures -- exactly what the write-backs wrote before instances existed. A
+// row without a spec id is skipped, as every write-back skips it. rows is
+// expected to be capped at maxRuntimeSamplesPerSample by the caller; each
+// row's GPUs are capped here at maxRuntimeGPUsPerSample, so one row cannot
+// drive an unbounded number of per-GPU writes.
+func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
+	out := make(map[string]foldedSpec, len(rows))
+	for _, row := range rows {
+		specID := strings.TrimSpace(row.SpecID)
+		if specID == "" {
+			continue
+		}
+		f := out[specID]
+		gpus := row.GPUs
+		if len(gpus) > maxRuntimeGPUsPerSample {
+			gpus = gpus[:maxRuntimeGPUsPerSample]
+		}
+		for _, g := range gpus {
+			if g.VRAMMeasuredMB <= 0 {
+				continue
+			}
+			if f.MaxGPU == nil {
+				f.MaxGPU = make(map[int]int, len(gpus))
+			}
+			f.MaxGPU[g.Index] = max(f.MaxGPU[g.Index], g.VRAMMeasuredMB)
+		}
+		f.MaxRAM = max(f.MaxRAM, row.RAMMeasuredMB)
+		f.MaxStartupMS = max(f.MaxStartupMS, row.StartupMS)
+		out[specID] = f
+	}
+	for specID, i := range primaryRowIndexes(len(rows), func(i int) (string, int, string) {
+		return rows[i].SpecID, rows[i].Instance, rows[i].State
+	}) {
+		f := out[specID]
+		f.Primary = &rows[i]
+		out[specID] = f
+	}
+	return out
+}
+
+// primaryRowIndexes picks, per spec id, the index of the row that speaks for
+// the spec (foldedSpec.Primary): the first instance-0 row wherever it sits,
+// else the first running row. A spec with neither has no entry. row reads
+// the spec id, instance index and state of row i of a slice of n, so the rule
+// is one function for the status rows and for the raw samples the capability
+// write-back reads.
+//
+// Instance 0 first because it is the instance the spec's plain address names
+// and the one an agent without instances ever had: what it probed is what the
+// mapping described before instances existed. A burst instance runs the same
+// command line, so while instance 0 is down a running one is as good a
+// witness; one that is merely starting has probed nothing yet.
+func primaryRowIndexes(n int, row func(i int) (specID string, instance int, state string)) map[string]int {
+	picked := make(map[string]int)
+	isZero := make(map[string]bool)
+	for i := range n {
+		specID, instance, state := row(i)
+		specID = strings.TrimSpace(specID)
+		if specID == "" || isZero[specID] {
+			continue
+		}
+		_, seen := picked[specID]
+		switch {
+		case instance == 0:
+			picked[specID], isZero[specID] = i, true
+		case !seen && state == agentSpecStateRunning:
+			picked[specID] = i
+		}
+	}
+	return picked
+}
 
 // runtimeWriteBackLogPrefix is the fixed lead-in of resolveRuntimeSpecOwned's
 // log messages; the axis name ("vram", "ram") is spliced in after it, so the
@@ -748,18 +864,19 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 	return spec, true
 }
 
-// writeBackRuntimeVRAM writes each sample GPU's measured VRAM back to its
-// launch spec (agent-runtime-manager Task 9), but only for a spec
+// writeBackRuntimeVRAM writes each spec's measured VRAM per GPU back to its
+// launch spec (agent-runtime-manager Task 9), folded over the spec's instance
+// rows (foldInstanceRows: the largest per GPU), but only for a spec
 // resolveRuntimeSpecOwned confirms belongs to serverID and still exists. That
 // resolution happens with exactly ONE set of reads (RuntimeSpecByID +
-// MappingByID + ApplicationByID) per DISTINCT spec_id in the sample: the
-// outcome -- owned or not, for WHATEVER reason -- is memoized in owned below,
-// so a sample repeating the same spec_id (owned or not) never re-resolves it.
-// There is no operator lock on this write: the measurement is always recorded,
-// and it is the effective-VRAM computation (max of measured and estimate) that
-// keeps a low measurement from lowering a reservation. runtimes and
-// each entry's GPUs are both length-capped (maxRuntimeSamplesPerSample,
-// maxRuntimeGPUsPerSample) before any store call, bounding the worst case
+// MappingByID + ApplicationByID) per spec in the fold -- one entry per
+// DISTINCT spec_id, so a sample repeating a spec_id (several instances, or a
+// malformed payload) never re-resolves it. There is no operator lock on this
+// write: the measurement is always recorded, and it is the effective-VRAM
+// computation (max of measured and estimate) that keeps a low measurement
+// from lowering a reservation. The caller caps the folded rows at
+// maxRuntimeSamplesPerSample and the fold caps each row's GPUs at
+// maxRuntimeGPUsPerSample before any store call, bounding the worst case
 // regardless of how many distinct ids a hostile/buggy sample names.
 //
 // AN UNCHANGED MEASUREMENT IS NOT REWRITTEN, and that is a cost fix rather
@@ -769,19 +886,21 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 // UPDATE per second per (spec, gpu), indefinitely. An idle overnight server
 // with a handful of measured specs across two cards produced on the order of
 // a million identical UPDATEs a day: WAL growth on SQLite, dead-tuple churn
-// and autovacuum pressure on PostgreSQL, for a table with a dozen rows.
+// and autovacuum pressure on PostgreSQL, for a table with a dozen rows. The
+// fold is what keeps this true for a replicable spec: written row by row, two
+// instances measuring different figures would each overwrite the other's
+// every second.
 //
-// The comparison is against WHAT IS STORED, read once per distinct owned
-// spec_id and memoized next to the ownership verdict, rather than against
-// what the agent last sent. Suppressing at the agent would be cheaper still
-// (it would save the report as well as the write) but it cannot converge: the
-// stored row can change out from under a long-running agent -- an operator
-// deleting and re-adding a GPU row resets vram_measured_mb to 0 -- and an
-// agent that had suppressed its unchanged report would never resend, leaving
-// the portal showing 0 for a spec that is measured and running. Comparing
-// here costs one extra read per owned spec per sample and converges no
-// matter what happened to the row; a read is also far cheaper than the write
-// it replaces on both engines.
+// The comparison is against WHAT IS STORED, read once per owned spec in the
+// fold, rather than against what the agent last sent. Suppressing at the
+// agent would be cheaper still (it would save the report as well as the
+// write) but it cannot converge: the stored row can change out from under a
+// long-running agent -- an operator deleting and re-adding a GPU row resets
+// vram_measured_mb to 0 -- and an agent that had suppressed its unchanged
+// report would never resend, leaving the portal showing 0 for a spec that is
+// measured and running. Comparing here costs one extra read per owned spec
+// per sample and converges no matter what happened to the row; a read is also
+// far cheaper than the write it replaces on both engines.
 //
 // Best-effort throughout, matching the "a report is evidence, not a
 // transaction" ingest discipline this whole file follows: nothing here is
@@ -790,56 +909,27 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 // unconditionally", never to "skip the write": staleness must not be able to
 // suppress a real measurement. Called only AFTER every store write in
 // ingestTelemetrySample has succeeded.
-func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, folded map[string]foldedSpec) {
 	if s.Routes == nil {
 		return
 	}
-	if len(runtimes) > maxRuntimeSamplesPerSample {
-		runtimes = runtimes[:maxRuntimeSamplesPerSample]
-	}
-	owned := make(map[string]bool, len(runtimes))
-	// stored[specID][gpuIndex] is the measured value already on file. Only
-	// populated for an owned spec, and only once per distinct spec_id.
-	stored := make(map[string]map[int]int, len(runtimes))
-	for _, rt := range runtimes {
-		specID := strings.TrimSpace(rt.SpecID)
-		if specID == "" || len(rt.GPUs) == 0 {
+	for specID, f := range folded {
+		if len(f.MaxGPU) == 0 {
 			continue
 		}
-		ok, seen := owned[specID]
-		if !seen {
-			_, ok = s.resolveRuntimeSpecOwned(ctx, serverID, specID, "vram")
-			owned[specID] = ok
-			if ok {
-				stored[specID] = s.storedMeasuredVRAM(ctx, serverID, specID)
-			}
-		}
-		if !ok {
+		if _, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, "vram"); !ok {
 			continue
 		}
-		gpus := rt.GPUs
-		if len(gpus) > maxRuntimeGPUsPerSample {
-			gpus = gpus[:maxRuntimeGPUsPerSample]
-		}
-		for _, g := range gpus {
-			if g.VRAMMeasuredMB <= 0 {
-				continue
-			}
-			if was, known := stored[specID][g.Index]; known && was == g.VRAMMeasuredMB {
+		stored := s.storedMeasuredVRAM(ctx, serverID, specID)
+		for index, measured := range f.MaxGPU {
+			if was, known := stored[index]; known && was == measured {
 				continue // already on file, byte for byte
 			}
-			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, g.Index, g.VRAMMeasuredMB); err != nil {
+			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, index, measured); err != nil {
 				// Tolerates ErrNotFound (a GPU row deleted out from under an
 				// in-flight sample) the same as any other failure here: log
 				// and move on, never reject the sample.
-				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", g.Index, "err", err)
-				continue
-			}
-			if stored[specID] != nil {
-				// Keep the memo truthful for the rest of THIS sample: a
-				// malformed payload naming the same (spec, gpu) twice must
-				// not write twice.
-				stored[specID][g.Index] = g.VRAMMeasuredMB
+				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", index, "err", err)
 			}
 		}
 	}
@@ -864,11 +954,12 @@ func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string
 	return out
 }
 
-// writeBackRuntimeRAM writes each sample runtime's measured resident host RAM
-// back onto its launch spec (agent_runtime_specs.ram_measured_mb), the spec-level
-// sibling of writeBackRuntimeVRAM's per-GPU write: RAM is host-scoped, so there
-// is one scalar per spec and no GPU index, and a spec with no GPU rows (CPU-only,
-// or one a sample reports no gpus array for) still lands its measurement.
+// writeBackRuntimeRAM writes each spec's measured resident host RAM back onto
+// its launch spec (agent_runtime_specs.ram_measured_mb), the spec-level sibling
+// of writeBackRuntimeVRAM's per-GPU write: RAM is host-scoped, so there is one
+// scalar per spec and no GPU index, and a spec with no GPU rows (CPU-only, or
+// one a sample reports no gpus array for) still lands its measurement. A
+// replicable spec's figure is the largest of its instances' (foldInstanceRows).
 //
 // Mirrors writeBackRuntimeVRAM's discipline, deliberately:
 //
@@ -876,81 +967,136 @@ func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string
 //     dropped before it reaches the store. An absent key -- an agent that
 //     predates the field, or a spec with no process measured yet -- decodes to
 //     the same 0, so it is a no-op too and never zeroes a stored value.
-//   - Ownership is checked once per DISTINCT spec_id (resolveRuntimeSpecOwned:
+//   - Ownership is checked once per spec in the fold (resolveRuntimeSpecOwned:
 //     the spec exists and belongs to serverID, with the cross-server Warn),
-//     memoized together with the stored value, and runtimes is length-capped
-//     (maxRuntimeSamplesPerSample) before any store call.
+//     through memo, which writeBackRuntimeStartup shares, so the two
+//     spec-level write-backs of one sample resolve a spec once between them.
 //   - An unchanged measurement is NOT rewritten. Telemetry arrives once per
 //     second as a full snapshot, so a merely stable value would otherwise cost
 //     one UPDATE per second per spec indefinitely (the cost argument
 //     writeBackRuntimeVRAM documents at length). The comparison is against
-//     WHAT IS STORED -- read once per distinct owned spec_id, on the spec the
-//     ownership check already fetched -- not against what the agent last sent,
-//     so it converges even if the stored value changed out from under a
-//     long-running agent.
+//     WHAT IS STORED -- the spec the ownership check already fetched -- not
+//     against what the agent last sent, so it converges even if the stored
+//     value changed out from under a long-running agent.
 //
 // Best-effort throughout, like every write-back here: nothing is returned as an
 // error and this must NEVER reject the telemetry sample it rode in on. Called
 // only AFTER every store write in ingestTelemetrySample has succeeded.
-func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, folded map[string]foldedSpec, memo runtimeSpecMemo) {
 	if s.Routes == nil {
 		return
 	}
-	if len(runtimes) > maxRuntimeSamplesPerSample {
-		runtimes = runtimes[:maxRuntimeSamplesPerSample]
-	}
-	// stored[specID] is the measured RAM already on file for a spec this server
-	// owns, present only for an owned spec and read once per distinct spec_id.
-	// A spec that is not owned (or no longer exists) is memoized as absent in
-	// owned, so a sample repeating its id never re-resolves it.
-	stored := make(map[string]int, len(runtimes))
-	owned := make(map[string]bool, len(runtimes))
-	for _, rt := range runtimes {
-		if rt.RAMMeasuredMB <= 0 {
+	for specID, f := range folded {
+		if f.MaxRAM <= 0 {
 			continue
 		}
-		specID := strings.TrimSpace(rt.SpecID)
-		if specID == "" {
-			continue
+		spec, ok := s.ownedRuntimeSpec(ctx, serverID, specID, "ram", memo)
+		if !ok || spec.RAMMeasuredMB == f.MaxRAM {
+			continue // not owned, or already on file byte for byte
 		}
-		if !s.ownedRuntimeSpecRAM(ctx, serverID, specID, owned, stored) {
-			continue
-		}
-		if was := stored[specID]; was == rt.RAMMeasuredMB {
-			continue // already on file, byte for byte
-		}
-		if err := s.Routes.UpdateRuntimeSpecRAMMeasured(ctx, specID, rt.RAMMeasuredMB); err != nil {
+		if err := s.Routes.UpdateRuntimeSpecRAMMeasured(ctx, specID, f.MaxRAM); err != nil {
 			// Tolerates ErrNotFound (the spec deleted out from under an
 			// in-flight sample) the same as any other failure: log and move on.
 			slog.Debug("runtime ram write-back failed", "server_id", serverID, "spec_id", specID, "err", err)
 			continue
 		}
-		// Keep the memo truthful for the rest of THIS sample: a malformed
-		// payload naming the same spec twice must not write twice.
-		stored[specID] = rt.RAMMeasuredMB
+		spec.RAMMeasuredMB = f.MaxRAM
 	}
 }
 
-// ownedRuntimeSpecRAM reports whether specID is a spec serverID owns, for
-// writeBackRuntimeRAM, resolving it AT MOST ONCE per distinct spec_id per
-// sample: the first call runs resolveRuntimeSpecOwned and memoizes the verdict
-// in owned -- owned or not, for whatever reason -- and every later call for the
-// same id answers from the memo without touching the store. For an owned spec
-// the first call also records the spec's currently stored measured RAM in
-// stored (the spec the ownership check already fetched, so no extra read), which
-// the caller compares against to skip an unchanged measurement; a spec that is
-// not owned never gets a stored entry. owned and stored are the caller's
-// per-sample memo maps and are mutated here.
-func (s *Server) ownedRuntimeSpecRAM(ctx context.Context, serverID, specID string, owned map[string]bool, stored map[string]int) bool {
-	if ok, seen := owned[specID]; seen {
-		return ok
+// startupWriteBackThresholdPercent is how far, in percent of the stored value,
+// a measured startup has to move before writeBackRuntimeStartup writes it.
+const startupWriteBackThresholdPercent = 10
+
+// writeBackRuntimeStartup writes each spec's measured startup back onto its
+// launch spec (agent_runtime_specs.startup_measured_ms): the largest non-zero
+// startup_ms of the spec's instance rows in the sample (foldInstanceRows) --
+// an instance is only as quick to bring up as the slowest has been.
+//
+// The figure is an input of a replicable spec's pushed idle timeout
+// (portal effectiveIdleTimeoutSeconds), so it is written only when it moved
+// by more than startupWriteBackThresholdPercent of the stored value, or when
+// nothing is stored yet: every start measures a little differently, and
+// writing that jitter would push the agent a new document each time.
+// Ownership, change detection against what is stored, and best-effort
+// failure handling are writeBackRuntimeRAM's, through the same memo.
+//
+// The ingest writes this outside the portal service, whose write paths push a
+// changed document themselves, so a write for a replicable spec pushes
+// serverID's runtime config here, once per sample however many specs moved.
+// A spec that is not replicable is pushed its stored idle timeout, which the
+// measurement does not change, so its write pushes nothing.
+func (s *Server) writeBackRuntimeStartup(ctx context.Context, serverID string, folded map[string]foldedSpec, memo runtimeSpecMemo) {
+	if s.Routes == nil {
+		return
 	}
-	spec, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, "ram")
-	owned[specID] = ok
-	if ok {
-		stored[specID] = spec.RAMMeasuredMB
+	push := false
+	for specID, f := range folded {
+		if f.MaxStartupMS <= 0 {
+			continue
+		}
+		measured := int64(f.MaxStartupMS)
+		spec, ok := s.ownedRuntimeSpec(ctx, serverID, specID, "startup", memo)
+		if !ok || !startupMovedEnough(spec.StartupMeasuredMS, measured) {
+			continue
+		}
+		if err := s.Routes.UpdateRuntimeSpecStartupMeasured(ctx, specID, measured); err != nil {
+			slog.Debug("runtime startup write-back failed", "server_id", serverID, "spec_id", specID, "err", err)
+			continue
+		}
+		spec.StartupMeasuredMS = measured
+		push = push || spec.Replicable
 	}
-	return ok
+	if push {
+		s.PushRuntimeConfig(serverID)
+	}
+}
+
+// startupMovedEnough reports whether a measured startup differs from the
+// stored one by more than startupWriteBackThresholdPercent of the stored
+// value, or nothing is stored yet (0). Integer arithmetic, so exactly the
+// threshold is not more; a figure large enough to overflow it is no real
+// startup and counts as moved.
+func startupMovedEnough(stored, measured int64) bool {
+	if stored <= 0 {
+		return true
+	}
+	diff := measured - stored
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > math.MaxInt64/100 || stored > math.MaxInt64/startupWriteBackThresholdPercent {
+		return true
+	}
+	return diff*100 > stored*startupWriteBackThresholdPercent
+}
+
+// runtimeSpecMemo is one telemetry sample's memo of the spec-level
+// write-backs' ownership resolution (ownedRuntimeSpec): per spec id, the spec
+// row resolveRuntimeSpecOwned read, or a nil entry when the spec is not
+// serverID's (for whatever reason). It is per sample, never longer: the
+// stored row can change between samples, and the next sample must compare
+// against what is stored then.
+type runtimeSpecMemo map[string]*routing.RuntimeSpec
+
+// ownedRuntimeSpec reports whether specID is a spec serverID owns and returns
+// its stored row, resolving it AT MOST ONCE per sample: the first call runs
+// resolveRuntimeSpecOwned (axis names the write-back in its log lines) and
+// memoizes the verdict -- owned or not -- in memo, and every later call
+// answers from the memo without touching the store. The returned row is the
+// memo's own, so a caller that writes a column updates it there and a later
+// caller in the same sample compares against what it wrote.
+func (s *Server) ownedRuntimeSpec(ctx context.Context, serverID, specID, axis string, memo runtimeSpecMemo) (*routing.RuntimeSpec, bool) {
+	if spec, seen := memo[specID]; seen {
+		return spec, spec != nil
+	}
+	spec, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, axis)
+	if !ok {
+		memo[specID] = nil
+		return nil, false
+	}
+	memo[specID] = &spec
+	return &spec, true
 }
 
 // resolveRuntimeSpecMapping reports whether specID's owning mapping may have
@@ -1012,20 +1158,23 @@ func (s *Server) resolveRuntimeSpecMapping(ctx context.Context, serverID, specID
 	return mapping.ID, mapping.ContextSize, true
 }
 
-// writeBackRuntimeContext writes each sample runtime's probed context window
-// back onto its owning mapping's context_size (Task 12, Option B: persist
-// only the STABLE context size onto the mapping -- no per-mapping active/queue
-// storage, no migration, no new store method; UpdateMappingContextProbe
-// already exists and already sets context_size + metrics_source="probe" +
-// metrics_updated_at, no-oping on a locked or missing mapping).
+// writeBackRuntimeContext writes each spec's probed context window back onto
+// its owning mapping's context_size (Task 12, Option B: persist only the
+// STABLE context size onto the mapping -- no per-mapping active/queue storage,
+// no migration, no new store method; UpdateMappingContextProbe already exists
+// and already sets context_size + metrics_source="probe" + metrics_updated_at,
+// no-oping on a locked or missing mapping). The size is the spec's Primary
+// row's (foldInstanceRows: instance 0's, else the first running instance's):
+// every instance runs the same command line, so one row speaks for the
+// mapping, and taking each row in turn would flip the column between two
+// instances that probed differently.
 //
-// Mirrors writeBackRuntimeVRAM's discipline throughout: runtimes is length-capped
-// at maxRuntimeSamplesPerSample before any store call; resolution
-// (resolveRuntimeSpecMapping) is memoized per DISTINCT spec_id, so a sample
-// repeating the same spec_id -- a full snapshot arrives roughly once a second --
-// never re-resolves it; and AN UNCHANGED VALUE IS NOT REWRITTEN, comparing
-// against the mapping's CURRENTLY STORED context_size (read once per distinct
-// resolvable spec_id, memoized alongside the resolution) rather than against
+// Mirrors writeBackRuntimeVRAM's discipline throughout: the caller caps the
+// folded rows at maxRuntimeSamplesPerSample before any store call; the fold
+// has one entry per DISTINCT spec_id, so a sample repeating a spec_id -- a
+// full snapshot arrives roughly once a second -- never re-resolves it; and AN
+// UNCHANGED VALUE IS NOT REWRITTEN, comparing against the mapping's CURRENTLY
+// STORED context_size (resolveRuntimeSpecMapping) rather than against
 // whatever this same spec_id reported last sample -- the same reasoning
 // writeBackRuntimeVRAM documents at length: without it, a model whose context
 // window is simply stable (the normal case) would drive one unconditional
@@ -1039,45 +1188,23 @@ func (s *Server) resolveRuntimeSpecMapping(ctx context.Context, serverID, specID
 // ingestTelemetrySample), and only AFTER every store write in
 // ingestTelemetrySample has succeeded, mirroring writeBackRuntimeVRAM's own
 // placement.
-func (s *Server) writeBackRuntimeContext(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+func (s *Server) writeBackRuntimeContext(ctx context.Context, serverID string, folded map[string]foldedSpec) {
 	if s.Routes == nil {
 		return
 	}
-	if len(runtimes) > maxRuntimeSamplesPerSample {
-		runtimes = runtimes[:maxRuntimeSamplesPerSample]
-	}
 	now := time.Now().UTC()
-	type resolution struct {
-		mappingID     string
-		storedContext int
-		ok            bool
-	}
-	resolved := make(map[string]resolution, len(runtimes))
-	for _, rt := range runtimes {
-		specID := strings.TrimSpace(rt.SpecID)
-		if specID == "" || rt.ContextSize <= 0 {
+	for specID, f := range folded {
+		if f.Primary == nil || f.Primary.ContextSize <= 0 {
 			continue
 		}
-		r, seen := resolved[specID]
-		if !seen {
-			mappingID, storedContext, ok := s.resolveRuntimeSpecMapping(ctx, serverID, specID)
-			r = resolution{mappingID: mappingID, storedContext: storedContext, ok: ok}
-			resolved[specID] = r
+		size := f.Primary.ContextSize
+		mappingID, storedContext, ok := s.resolveRuntimeSpecMapping(ctx, serverID, specID)
+		if !ok || storedContext == size {
+			continue // not writable, or already on file: no write amplification
 		}
-		if !r.ok {
-			continue
+		if err := s.Routes.UpdateMappingContextProbe(ctx, mappingID, size, now); err != nil {
+			slog.Debug("runtime context write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", mappingID, "err", err)
 		}
-		if r.storedContext == rt.ContextSize {
-			continue // already on file, no write amplification
-		}
-		if err := s.Routes.UpdateMappingContextProbe(ctx, r.mappingID, rt.ContextSize, now); err != nil {
-			slog.Debug("runtime context write-back failed", "server_id", serverID, "spec_id", specID, "mapping_id", r.mappingID, "err", err)
-			continue
-		}
-		// Keep the memo truthful for the rest of THIS sample: a malformed
-		// payload naming the same spec_id twice must not write twice.
-		r.storedContext = rt.ContextSize
-		resolved[specID] = r
 	}
 }
 
@@ -1158,6 +1285,10 @@ func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, s
 // nothing left to keep them apart -- live-progress is simply the
 // routing.CapabilityLiveProgress row (see runtimeSampleCapabilityRows).
 //
+// A replicable spec reports one row per instance; only its primary row's
+// verdicts are written (primaryRowIndexes, the rule foldedSpec.Primary
+// follows for the context size).
+//
 // Mirrors writeBackRuntimeContext's discipline throughout: runtimes is
 // length-capped at maxRuntimeSamplesPerSample before any store call;
 // resolution (resolveRuntimeSpecCapabilities) is memoized per DISTINCT
@@ -1209,7 +1340,18 @@ func (s *Server) writeBackRuntimeCapabilities(ctx context.Context, serverID stri
 	// carried across the loop so a spec_id repeated inside ONE sample sees
 	// what the earlier iteration already wrote -- see capabilityResolution.
 	resolved := make(map[string]capabilityResolution, len(runtimes))
-	for _, rt := range runtimes {
+	// Only each spec's primary row speaks (primaryRowIndexes: instance 0,
+	// else the first running instance), for the reason writeBackRuntimeContext
+	// gives: every instance probes the same build, and taking each row in
+	// turn would write one instance's verdicts over another's. In input order,
+	// so a spec without instances is handled exactly as before.
+	primary := primaryRowIndexes(len(runtimes), func(i int) (string, int, string) {
+		return runtimes[i].SpecID, runtimes[i].Instance, runtimes[i].State
+	})
+	for i, rt := range runtimes {
+		if j, ok := primary[strings.TrimSpace(rt.SpecID)]; !ok || j != i {
+			continue
+		}
 		s.writeBackOneRuntimeCapabilities(ctx, serverID, rt, resolved, now)
 	}
 }
@@ -2046,16 +2188,26 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// registry update in this block: a report is evidence about what the
 	// agent is running RIGHT NOW, and stamping it while the sample itself
 	// failed to persist would claim freshness the gateway does not have.
-	s.RuntimeStatus.publish(serverID, runtimeStatusDTOsFromSamples(req.Runtimes, now))
-	// Best-effort write-back of each managed process's measured VRAM onto its
-	// launch spec -- see writeBackRuntimeVRAM. Never rejects the sample; a
-	// failure here is logged and dropped.
-	s.writeBackRuntimeVRAM(ctx, serverID, req.Runtimes)
-	// Best-effort write-back of each managed process's measured host RAM onto
-	// its launch spec -- see writeBackRuntimeRAM. A no-op for an agent that sends
-	// no ram_measured_mb. Never rejects the sample; a failure here is logged and
-	// dropped.
-	s.writeBackRuntimeRAM(ctx, serverID, req.Runtimes)
+	//
+	// The registry keeps every row as the agent sent it, one per instance of a
+	// replicable spec; only the store write-backs below fold them per spec.
+	statuses := runtimeStatusDTOsFromSamples(req.Runtimes, now)
+	s.RuntimeStatus.publish(serverID, statuses)
+	// One fold of the sample's rows per spec (foldInstanceRows), which every
+	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.
+	folded := foldInstanceRows(statuses[:min(len(statuses), maxRuntimeSamplesPerSample)])
+	// Best-effort write-back of each spec's measured VRAM onto its launch
+	// spec -- see writeBackRuntimeVRAM. Never rejects the sample; a failure
+	// here is logged and dropped.
+	s.writeBackRuntimeVRAM(ctx, serverID, folded)
+	// Best-effort write-back of each spec's measured host RAM and startup onto
+	// its launch spec -- see writeBackRuntimeRAM and writeBackRuntimeStartup,
+	// which share one ownership resolution per spec. A no-op for an agent that
+	// sends neither figure. Never rejects the sample; a failure here is logged
+	// and dropped.
+	specMemo := runtimeSpecMemo{}
+	s.writeBackRuntimeRAM(ctx, serverID, folded, specMemo)
+	s.writeBackRuntimeStartup(ctx, serverID, folded, specMemo)
 	// Best-effort write-back of each managed process's probed context window
 	// onto its owning mapping (Task 12, Option B) -- see writeBackRuntimeContext.
 	// Gated on THIS sample's own parsed caps (reused from above), NOT on a
@@ -2069,7 +2221,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// touched from this path. Never rejects the sample; a failure here is
 	// logged and dropped.
 	if slices.Contains(caps, runtimeModelProbeFeature) {
-		s.writeBackRuntimeContext(ctx, serverID, req.Runtimes)
+		s.writeBackRuntimeContext(ctx, serverID, folded)
 		// Best-effort write-back of everything this pass determined about
 		// each managed process's BUILD -- the auto-detected capability
 		// verdicts and the live-progress verdict alike, as
