@@ -419,6 +419,12 @@ export interface RuntimeStatus {
 // needs to know the gap is there. It must always be rendered: a gap shown as
 // silence is a lie about what the process printed, and silence is what the
 // operator is trying to interpret.
+//
+// `instance` names the spec instance whose generation produced the entry, on
+// every text entry and every generation marker: absent for instance 0 (and from
+// an agent that predates instances), k for instance k, whose `text` still
+// carries its "[#k] " line prefix. An entry that only carries `dropped_bytes`
+// names no instance: a gap cannot be attributed to one.
 export interface RuntimeLogEntry {
   pid?: number;
   at?: string;
@@ -427,6 +433,7 @@ export interface RuntimeLogEntry {
   event?: string;
   exit_code?: number;
   command?: RuntimeLogCommand;
+  instance?: number;
 }
 
 // The RESOLVED launch command of ONE generation: what the agent actually

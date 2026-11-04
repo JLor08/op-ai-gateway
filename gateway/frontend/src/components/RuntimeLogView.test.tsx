@@ -20,7 +20,7 @@ afterEach(cleanup);
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
 
-  function renderLogView(allInstances?: boolean) {
+  function renderLogView(allInstances?: boolean, instances?: readonly number[]) {
     let pushBatch: (batch: RuntimeLogBatch) => void = () => {};
     let pushState: (state: RuntimeLogState) => void = () => {};
     let unsubscribes = 0;
@@ -54,6 +54,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         specId="spec-a"
         title="qwen-coder"
         allInstances={allInstances}
+        instances={instances}
       />,
     );
     return {
@@ -504,6 +505,208 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }));
       expect(screen.getByText(t.runtimeCommandMasked)).toBeInTheDocument();
       expect(screen.getByText(t.runtimeCommandEnvRedacted)).toBeInTheDocument();
+    });
+
+    // --- per-instance tabs ---------------------------------------------------
+    //
+    // Every instance of a replicable spec writes into the spec's one buffer, and
+    // each entry names its instance. "All" shows the interleaved history exactly
+    // as it arrives, [#k] prefixes included; one tab per instance shows that
+    // instance's output alone, the prefix the agent put there removed.
+
+    const tabNames = () => screen.queryAllByRole('tab').map((tab) => tab.textContent);
+    const logText = () => screen.getByRole('log').textContent ?? '';
+    const selectTab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }));
+
+    it('shows no tabs for a single-process spec, nor for an older agent without the instance field', () => {
+      const h = renderLogView();
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ event: 'started', pid: 7 }, { text: 'plain output\n' }],
+      });
+      expect(screen.queryAllByRole('tab')).toHaveLength(0);
+      expect(logText()).toContain('plain output');
+    });
+
+    it('offers All and one tab per instance of a replicable spec, in ascending order, All selected', () => {
+      renderLogView(true, [2, 0, 1]);
+      expect(tabNames()).toEqual([
+        t.runtimeLogsTabAll,
+        t.runtimeLogsTabInstance(0),
+        t.runtimeLogsTabInstance(1),
+        t.runtimeLogsTabInstance(2),
+      ]);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabAll })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+    });
+
+    it("shows only an instance's own output in its tab, the [#k] prefix removed, and everything in All", () => {
+      const h = renderLogView(true, [0, 1]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'started', pid: 100 },
+          { event: 'started', pid: 101, instance: 1, command: { binary: '/opt/one' } },
+          { text: 'zero says hi\n' },
+          { text: '[#1] first\n[#1] second\n', instance: 1 },
+          { event: 'exited', exit_code: 3, instance: 1 },
+        ],
+      });
+
+      // All: unchanged, prefixes and every instance's markers included.
+      expect(logText()).toContain('zero says hi');
+      expect(logText()).toContain('[#1] first\n[#1] second\n');
+      expect(logText()).toContain(t.runtimeLogsProcessStarted(100));
+      expect(logText()).toContain(t.runtimeLogsProcessStarted(101));
+
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(logText()).toContain('first\nsecond\n');
+      expect(logText()).not.toContain('[#1]');
+      expect(logText()).not.toContain('zero says hi');
+      expect(logText()).toContain(t.runtimeLogsProcessStarted(101));
+      expect(logText()).toContain(t.runtimeLogsProcessExited(3));
+      expect(logText()).not.toContain(t.runtimeLogsProcessStarted(100));
+      // The marker keeps its command in its instance's tab.
+      expect(
+        screen.getByRole('button', { name: `▸ ${t.runtimeCommandTitle}` }),
+      ).toBeInTheDocument();
+
+      selectTab(t.runtimeLogsTabInstance(0));
+      expect(logText()).toContain('zero says hi');
+      expect(logText()).toContain(t.runtimeLogsProcessStarted(100));
+      expect(logText()).not.toContain('first');
+      expect(logText()).not.toContain(t.runtimeLogsProcessStarted(101));
+    });
+
+    it('does not strip a chunk that continues a line, even when it starts with the prefix text', () => {
+      // The agent prefixes a line once, when its first byte arrives. A later
+      // chunk of the same line carries no prefix of its own, so text there that
+      // looks like one is the process's own output and stays.
+      const h = renderLogView(true, [0, 2]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'started', pid: 102, instance: 2 },
+          { text: '[#2] head ', instance: 2 },
+          { text: 'interleaved zero\n' },
+        ],
+      });
+      h.batch({
+        spec_id: 'spec-a',
+        entries: [{ text: '[#2] literal\n[#2] next line\n', instance: 2 }],
+      });
+      selectTab(t.runtimeLogsTabInstance(2));
+      expect(logText()).toContain('head [#2] literal\nnext line\n');
+      expect(logText()).not.toContain('interleaved zero');
+    });
+
+    it('shows every gap in every tab, because a gap cannot be attributed to an instance', () => {
+      const h = renderLogView(true, [0, 1]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { text: '[#1] after the gap\n', instance: 1, dropped_bytes: 4096 },
+          { text: 'zero\n' },
+        ],
+      });
+      h.batch({ spec_id: 'spec-a', entries: [{ dropped_bytes: 77 }] });
+      for (const tab of [
+        t.runtimeLogsTabAll,
+        t.runtimeLogsTabInstance(0),
+        t.runtimeLogsTabInstance(1),
+      ]) {
+        selectTab(tab);
+        expect(logText()).toContain(t.runtimeLogsDropped(4096));
+        expect(logText()).toContain(t.runtimeLogsDropped(77));
+      }
+      selectTab(t.runtimeLogsTabInstance(0));
+      expect(logText()).not.toContain('after the gap');
+    });
+
+    it("states the view's own trim in every tab", () => {
+      const h = renderLogView(true, [0, 1]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: Array.from({ length: maxRenderedEntries + 2 }, () => ({ text: wideLine })),
+      });
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(screen.getByText(t.runtimeLogsTrimmed(2 * wideLineBytes))).toBeInTheDocument();
+    });
+
+    it('grows the tab set with every instance the stream names, and keeps it across a scrollback', () => {
+      const h = renderLogView();
+      h.state('streaming');
+      h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: 'zero\n' }] });
+      expect(screen.queryAllByRole('tab')).toHaveLength(0);
+      expect(screen.queryByText(t.runtimeLogsAllInstances)).not.toBeInTheDocument();
+
+      h.batch({ spec_id: 'spec-a', entries: [{ text: '[#3] three\n', instance: 3 }] });
+      expect(tabNames()).toEqual([
+        t.runtimeLogsTabAll,
+        t.runtimeLogsTabInstance(0),
+        t.runtimeLogsTabInstance(3),
+      ]);
+      // Once instances are told apart, the view also says how.
+      expect(screen.getByText(t.runtimeLogsAllInstances)).toBeInTheDocument();
+
+      // A reconnect's fresh history no longer holds instance 3; its tab stays.
+      h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: 'zero\n' }] });
+      expect(tabNames()).toContain(t.runtimeLogsTabInstance(3));
+    });
+
+    it('explains an instance tab that has no output yet instead of leaving it blank', () => {
+      const h = renderLogView(true, [0, 1]);
+      h.state('streaming');
+      h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: 'zero\n' }] });
+      expect(screen.queryByText(t.runtimeLogsInstanceEmpty(1))).not.toBeInTheDocument();
+
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(screen.getByText(t.runtimeLogsInstanceEmpty(1))).toBeInTheDocument();
+
+      // A gap alone is not the instance's output: the sentence stays.
+      h.batch({ spec_id: 'spec-a', entries: [{ dropped_bytes: 10 }] });
+      expect(screen.getByText(t.runtimeLogsInstanceEmpty(1))).toBeInTheDocument();
+
+      h.batch({ spec_id: 'spec-a', entries: [{ text: '[#1] up\n', instance: 1 }] });
+      expect(screen.queryByText(t.runtimeLogsInstanceEmpty(1))).not.toBeInTheDocument();
+    });
+
+    it('opens on All every time, whichever tab was selected when it closed', () => {
+      const api = { subscribeRuntimeLogs: vi.fn(() => () => {}) };
+      const props = {
+        onClose: () => {},
+        api,
+        t,
+        serverId: 'srv-1',
+        specId: 'spec-a',
+        title: 'qwen-coder',
+        allInstances: true,
+        instances: [0, 1],
+      };
+      const view = render(<RuntimeLogView open {...props} />);
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabInstance(1) })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      view.rerender(<RuntimeLogView open={false} {...props} />);
+      view.rerender(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabAll })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
     });
 
     it("does not open a new generation's command block because it landed on an expanded row's index", () => {

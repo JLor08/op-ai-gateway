@@ -1673,9 +1673,14 @@ const de = {
   // Frage, die der Betreiber hier beantworten will.
   runtimeLogs: 'Protokoll',
   runtimeLogsTitle: 'Prozessausgabe',
-  // #340: every instance of a spec writes into its one log buffer.
+  // #340: every instance of a spec writes into its one log buffer; "Gesamt"
+  // shows it as it is, each instance's tab only that instance's lines.
   runtimeLogsAllInstances:
-    'Zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Zeilen von Instanz k ≥ 1 beginnen mit [#k], die von Instanz 0 haben kein Präfix.',
+    'Der Reiter „Gesamt“ zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Zeilen von Instanz k ≥ 1 beginnen mit [#k], die von Instanz 0 haben kein Präfix. Der Reiter einer Instanz zeigt nur deren Ausgabe, ohne Präfix. Fehlende Ausgabe wird in jedem Reiter gemeldet, weil sie keiner Instanz zugeordnet werden kann.',
+  runtimeLogsTabAll: 'Gesamt',
+  runtimeLogsTabInstance: (k: number) => `Instanz ${k}`,
+  runtimeLogsInstanceEmpty: (k: number) =>
+    `Von Instanz ${k} enthält der vorgehaltene Verlauf noch keine Ausgabe: Sie hat seither nichts geschrieben, oder ihre Ausgabe wird nicht mehr vorgehalten. Neue Ausgabe erscheint hier, sobald sie eintrifft.`,
   runtimeLogsIntro:
     'Standardausgabe und Standardfehlerausgabe des Modellprozesses – bei mehreren Instanzen die jeder Instanz –, so wie sie geschrieben wurden. Der Agent hält sie im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird gespeichert — weder auf der Festplatte noch in der Datenbank.',
   runtimeLogsWaiting: 'Verbindung wird aufgebaut…',
@@ -5130,7 +5135,11 @@ const en: PortalMessages = {
   runtimeLogs: 'Logs',
   runtimeLogsTitle: 'Process output',
   runtimeLogsAllInstances:
-    "Shows the output of every instance of this launch spec: lines of instance k ≥ 1 start with [#k], instance 0's carry no prefix.",
+    'The "All" tab shows the output of every instance of this launch spec: lines of instance k ≥ 1 start with [#k], instance 0\'s carry no prefix. An instance\'s own tab shows only its output, without the prefix. Missing output is reported in every tab, because it cannot be attributed to one instance.',
+  runtimeLogsTabAll: 'All',
+  runtimeLogsTabInstance: (k: number) => `Instance ${k}`,
+  runtimeLogsInstanceEmpty: (k: number) =>
+    `The retained history holds no output from instance ${k} yet: it has written nothing since, or its output is no longer retained. New output appears here as it arrives.`,
   runtimeLogsIntro:
     "The stdout and stderr of this model's process (with several instances, of every instance), as they were written. The agent keeps them in memory (across a crash, too) and only transmits them while this window is open. None of it is stored — not on disk, not in the database.",
   runtimeLogsWaiting: 'Connecting…',
