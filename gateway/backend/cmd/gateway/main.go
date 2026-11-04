@@ -1127,6 +1127,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		CapacitySettleSeconds:           cfg.CapacitySettleSeconds,
 		AudioRealtimeMinFactor:          cfg.AudioRealtimeMinFactor,
 		AudioConcurrencyMax:             cfg.AudioConcurrencyMax,
+		InstanceScaleCooldown:           time.Duration(cfg.InstanceScaleCooldownSeconds) * time.Second,
 		AdmissionQueueMaxDepth:          cfg.AdmissionQueueMaxDepth,
 		NetbirdSyncInterval:             time.Duration(cfg.NetbirdSyncIntervalSeconds) * time.Second,
 		ACMEChallenges:                  acmeChallenges,
