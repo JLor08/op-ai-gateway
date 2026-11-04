@@ -412,6 +412,40 @@ const restartableStates = new Set([
   'crashed',
 ]);
 
+/**
+ * The row that speaks for its whole spec wherever one row has to, per spec id.
+ *
+ * Every instance of a replicable spec reports its own row under the spec's id,
+ * but the spec-level facts -- the spec list's state, the override actions, the
+ * restart sequence's `stopped` -- belong to one of them: instance 0's. It is
+ * the only row a spec that is not replicable has, and the LAST of a spec's
+ * instances to go (an instance unloads only while no higher-index sibling
+ * runs), so its `stopped` is the spec's. Only while it is missing -- instance
+ * 0 crashed or restarting with a sibling up -- does the first running
+ * instance speak instead, else the first row; the gateway folds instance rows
+ * with the same pick.
+ */
+function primaryStatusRows(rows: RuntimeStatus[]): Map<string, RuntimeStatus> {
+  const rank = (row: RuntimeStatus) => {
+    if (row.instance === 0) return 0;
+    return row.state === 'running' ? 1 : 2;
+  };
+  const bySpec = new Map<string, RuntimeStatus>();
+  for (const row of rows) {
+    const current = bySpec.get(row.spec_id);
+    if (current === undefined || rank(row) < rank(current)) bySpec.set(row.spec_id, row);
+  }
+  return bySpec;
+}
+
+// The upstream name a status row reports when it runs what its mapping says:
+// the mapping's own name for instance 0, `<name>#<k>` -- the instance's
+// address -- for instance k. Only the row's own suffix counts, so on instance 0
+// a name that merely looks like an address is still a different name.
+function instanceAddress(mapping: PortalModelMapping, row: RuntimeStatus): string {
+  return row.instance > 0 ? `${mapping.app_model_name}#${row.instance}` : mapping.app_model_name;
+}
+
 // One restart sequence. There is no restart endpoint (design §10.1: every
 // action is state-shaped), so a restart is a three-step UI sequence:
 //   stopping -> the force_stopped PUT is in flight
@@ -2259,7 +2293,10 @@ export function RuntimeAdminSection({
   // spec is the only signal that force_stopped actually took effect.
   useEffect(() => {
     if (restart === null || restart.phase !== 'waiting') return;
-    const row = statusRows.find((r) => r.spec_id === restart.specId);
+    // The spec's own row, not any instance's: a burst instance that stopped
+    // first says nothing about the spec, and clearing the override then would
+    // let the instances still draining restart into it.
+    const row = primaryStatusRows(statusRows).get(restart.specId);
     if (row === undefined) {
       // Absence is not immediately "deleted": the gateway holds runtime
       // status in volatile RAM (spec §7), so a gateway restart empties the
@@ -2430,7 +2467,7 @@ export function RuntimeAdminSection({
     // the exact harm the gate exists to prevent: a force_stopped override that
     // no `stopped` frame can ever clear, leaving the model admission-blocked
     // behind a timeout notice. Read the LIVE frame, not the captured row.
-    const live = statusRowsRef.current.find((r) => r.spec_id === specId);
+    const live = primaryStatusRows(statusRowsRef.current).get(specId);
     if (live === undefined || !restartableStates.has(live.state)) return;
     const run = ++restartRunRef.current;
     absentSinceRef.current = null;
@@ -3671,7 +3708,16 @@ export function RuntimeAdminSection({
     }
   }
 
-  const statusBySpecId = new Map(statusRows.map((row) => [row.spec_id, row]));
+  // The row that speaks for each spec (primaryStatusRows): the spec list's
+  // state, and the one status row that carries the spec-wide overrides.
+  const statusBySpecId = primaryStatusRows(statusRows);
+  // Instances counted per spec id for the spec list's summary: only `running`
+  // ones, since a starting instance serves nothing yet.
+  const runningInstancesBySpecId = new Map<string, number>();
+  for (const row of statusRows) {
+    if (row.state !== 'running') continue;
+    runningInstancesBySpecId.set(row.spec_id, (runningInstancesBySpecId.get(row.spec_id) ?? 0) + 1);
+  }
   function statusForMapping(m: PortalModelMapping): RuntimeStatus | undefined {
     const specId = specsById[m.id]?.id;
     return specId ? statusBySpecId.get(specId) : undefined;
@@ -3796,13 +3842,30 @@ export function RuntimeAdminSection({
       searchable: false,
       render: (m) => {
         const live = statusForMapping(m);
-        return live ? (
+        if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
+        const chip = (
           <StatusChip
             status={runtimeStateBadge(live.state)}
             label={runtimeStateLabel(live.state, t)}
           />
-        ) : (
-          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+        );
+        // A replicable spec's chip is its instance 0's state (the row that
+        // speaks for it); how many instances run, against the bounds, is the
+        // line under it. Only once the agent reports the spec at all -- with
+        // no row, "0 running" would be a claim nobody made.
+        const spec = specsById[m.id];
+        if (!spec?.replicable || spec.id === undefined) return chip;
+        return (
+          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+            {chip}
+            <Typography variant="caption" color="text.secondary">
+              {t.runtimeInstancesSummary(
+                runningInstancesBySpecId.get(spec.id) ?? 0,
+                spec.min_instances,
+                spec.max_instances > 0 ? spec.max_instances : null,
+              )}
+            </Typography>
+          </Box>
         );
       },
     },
@@ -4018,7 +4081,7 @@ export function RuntimeAdminSection({
                   not against the gateway name, which is a different name by
                   design. A disagreement here means the spec launches a
                   different model than the mapping routes to. */}
-              {row.model !== '' && row.model !== mapping.app_model_name && (
+              {row.model !== '' && row.model !== instanceAddress(mapping, row) && (
                 <WarningAmberIcon
                   fontSize="small"
                   color="warning"
@@ -4032,6 +4095,17 @@ export function RuntimeAdminSection({
           </Box>
         );
       },
+    },
+    {
+      // Which process of its spec the row is. Instance 0 -- the only row of a
+      // spec that is not replicable -- reads #0 like any other, so the column
+      // says the same thing on every row.
+      id: 'instance',
+      label: t.runtimeStatusInstance,
+      value: (row) => String(row.instance),
+      render: (row) => `#${row.instance}`,
+      numeric: true,
+      searchable: false,
     },
     {
       id: 'state',
@@ -4179,6 +4253,10 @@ export function RuntimeAdminSection({
     // buttons rather than synthesizing a full-document body that would
     // overwrite the operator's command line.
     if (spec === undefined) return actions;
+    // Every override acts on the whole spec, all of its instances at once, so
+    // it is offered once, on the row that speaks for the spec: a Force stop
+    // beside instance 1 would read as stopping instance 1 alone.
+    if (statusBySpecId.get(row.spec_id)?.instance !== row.instance) return actions;
     if (spec.admin_state !== 'force_running') {
       actions.push({
         key: 'force-start',
@@ -5887,7 +5965,9 @@ export function RuntimeAdminSection({
             <ListTable
               rows={statusRows}
               columns={statusColumns}
-              rowKey={(row) => row.spec_id}
+              // A spec's instances share its spec_id, so the id alone would
+              // fold them into one row.
+              rowKey={(row) => `${row.spec_id}#${row.instance}`}
               actions={statusActions}
               storageKey="op.runtimeStatus"
               minWidth={980}

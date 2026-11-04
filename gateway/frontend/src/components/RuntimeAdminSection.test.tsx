@@ -10724,3 +10724,148 @@ describe('RuntimeAdminSection instance settings', () => {
     expect(screen.queryByText(t.runtimeSpecAutoIdleTimeout(600, 30000))).not.toBeInTheDocument();
   });
 });
+
+// One status row per instance (#340): every instance of a replicable spec is
+// its own process, reported under the spec's id with its own instance number.
+describe('RuntimeAdminSection per-instance live status', () => {
+  function replicableSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+    return fullSpec({ listen_port: 0, replicable: true, min_instances: 1, ...overrides });
+  }
+
+  function instanceRow(instance: number, overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
+    return makeStatus({
+      spec_id: 'spec_1',
+      instance,
+      model: instance === 0 ? 'app-model' : `app-model#${instance}`,
+      pid: 4100 + instance,
+      ...overrides,
+    });
+  }
+
+  function renderInstances(statusRows: RuntimeStatus[], spec: RuntimeSpec = replicableSpec()) {
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: { map_1: spec },
+      statusRows,
+    });
+    handles.stream.setStatus('open');
+    return handles;
+  }
+
+  it('renders one row per instance, keyed by spec id and instance, with an Instance column', async () => {
+    const consoleError = vi.spyOn(console, 'error');
+    try {
+      const { stream } = renderInstances([instanceRow(0), instanceRow(1)]);
+      await openStatusTab();
+
+      expect(await screen.findByText('4100')).toBeInTheDocument();
+      expect(cellForColumn('4100', t.runtimeStatusInstance)).toHaveTextContent('#0');
+      expect(cellForColumn('4101', t.runtimeStatusInstance)).toHaveTextContent('#1');
+
+      // A later frame with a third instance must not fold any two together.
+      stream.push([instanceRow(0), instanceRow(1), instanceRow(2)]);
+      expect(await screen.findByText('4102')).toBeInTheDocument();
+      expect(cellForColumn('4102', t.runtimeStatusInstance)).toHaveTextContent('#2');
+      expect(screen.getByText('4100')).toBeInTheDocument();
+      expect(screen.getByText('4101')).toBeInTheDocument();
+
+      // Two rows under one React key is reported as a console error.
+      const logged = consoleError.mock.calls.map((call) => call.map(String).join(' ')).join('\n');
+      expect(logged).not.toMatch(/same key/);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('reads an instance address as its upstream name: no mismatch marker on instance 1', async () => {
+    renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+
+    await screen.findByText('4101');
+    expect(screen.queryByTitle(t.runtimeStatusNameMismatch)).not.toBeInTheDocument();
+  });
+
+  // Only the exact suffix of the row's own instance is an address: on instance
+  // 0 a name that merely contains a `#` is the name itself.
+  it('still marks a mismatch on instance 0 whose name only looks like an address', async () => {
+    renderInstances([instanceRow(0, { model: 'app-model#1' })]);
+    await openStatusTab();
+
+    await screen.findByText('4100');
+    expect(screen.getByTitle(t.runtimeStatusNameMismatch)).toBeInTheDocument();
+  });
+
+  // The overrides act on the whole spec, every instance at once, so a Force
+  // stop beside instance 1 would read as stopping instance 1 alone.
+  it('offers the spec-wide overrides once, on instance 0, and only the log view on another instance', async () => {
+    renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop })).toBeEnabled(),
+    );
+    expect(inRowWith('4100').getByRole('button', { name: t.runtimeRestart })).toBeInTheDocument();
+    expect(inRowWith('4101').getByRole('button', { name: t.runtimeLogs })).toBeInTheDocument();
+    expect(
+      inRowWith('4101').queryByRole('button', { name: t.runtimeForceStop }),
+    ).not.toBeInTheDocument();
+    expect(
+      inRowWith('4101').queryByRole('button', { name: t.runtimeRestart }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("clears a restart's override on instance 0's stop, not on another instance's", async () => {
+    const { putSpecs, stream } = renderInstances([instanceRow(0), instanceRow(1)]);
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeRestart })).toBeEnabled(),
+    );
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.admin_state).toBe('force_stopped');
+    await screen.findAllByText(t.runtimeRestartStopping);
+
+    // Instance 1 is listed first and has stopped; instance 0 is still draining.
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'draining' })]);
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    expect(putSpecs).toHaveLength(1);
+
+    stream.push([instanceRow(1, { state: 'stopped' }), instanceRow(0, { state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.admin_state).toBe('');
+  });
+
+  it("sums up a replicable spec's running instances in the launch-specs list", async () => {
+    renderInstances([instanceRow(0), instanceRow(1)]);
+
+    expect(await screen.findByText(t.runtimeInstancesSummary(2, 1, null))).toBeInTheDocument();
+  });
+
+  it('counts only running instances, and names a set maximum', async () => {
+    renderInstances(
+      [instanceRow(0), instanceRow(1, { state: 'starting' }), instanceRow(2)],
+      replicableSpec({ min_instances: 1, max_instances: 3 }),
+    );
+
+    expect(await screen.findByText(t.runtimeInstancesSummary(2, 1, 3))).toBeInTheDocument();
+  });
+
+  it('keeps a spec that does not opt in to its single state', async () => {
+    renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
+
+    await screen.findByText(t.runtimeStateRunning);
+    expect(screen.queryByText(t.runtimeInstancesSummary(1, 0, null))).not.toBeInTheDocument();
+  });
+
+  it("shows instance 0's state for the spec, whichever instance the stream lists last", async () => {
+    renderInstances([instanceRow(0, { state: 'starting' }), instanceRow(1)]);
+
+    await screen.findByText(t.runtimeInstancesSummary(1, 1, null));
+    const cell = cellForColumn('Alpha', t.runtimeLiveStatus);
+    expect(cell).toHaveTextContent(t.runtimeStateStarting);
+    expect(cell).not.toHaveTextContent(t.runtimeStateRunning);
+  });
+});
