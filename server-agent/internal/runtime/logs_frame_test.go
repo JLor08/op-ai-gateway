@@ -6,6 +6,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-server-agent/internal/gwapi"
@@ -231,6 +232,7 @@ func TestLogWireReservesAreNeverUnderTheTruth(t *testing.T) {
 		at:       mustParseWidestTime(t),
 		text:     "output <&> \"quoted\"\n\x00\xff",
 		exitCode: -2147483648,
+		instance: math.MinInt64,
 	}
 	marker := widest
 	marker.event = logEventStartFailed
@@ -267,6 +269,17 @@ func TestLogWireReservesAreNeverUnderTheTruth(t *testing.T) {
 			}
 			if n := len(logFrame(t, LogBatch{SpecID: specID, Entries: entries})); n > used+logFrameEnvelopeBytes {
 				t.Fatalf("the frame comes to %d bytes, over the %d reserved for it", n, used+logFrameEnvelopeBytes)
+			}
+			// Per entry too: the batch reserve's own slack must not be what
+			// absorbs an entry reserve that is short by a field.
+			for _, r := range recs {
+				raw, err := json.Marshal(entryOf(r))
+				if err != nil {
+					t.Fatalf("marshal entry: %v", err)
+				}
+				if n := len(raw) + 1; n > entryWireMax(r) { // + the separating comma
+					t.Fatalf("an entry marshals to %d bytes with its comma but entryWireMax reserves only %d", n, entryWireMax(r))
+				}
 			}
 		})
 	}

@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -914,5 +915,103 @@ func TestInstanceZeroOutputIsUnprefixed(t *testing.T) {
 				t.Fatalf("tail = %q, want the bytes exactly as written", got)
 			}
 		})
+	}
+}
+
+// TestInstanceIsCarriedOnEveryEntryOfAGeneration: each text entry and each
+// generation marker names the instance that produced it, so a reader can show
+// one instance's output on its own without parsing the "[#k] " prefix back out
+// of the text. Instance 0 carries 0, which the wire omits -- exactly what an
+// agent from before instances existed sends -- and the text keeps its prefix,
+// so a reader that ignores the field sees the combined history unchanged. Both
+// paths a reader receives entries on are covered: the scrollback replay of the
+// retained history and the live drain of the queue.
+func TestInstanceIsCarriedOnEveryEntryOfAGeneration(t *testing.T) {
+	write := func(p0, p3 *procLog) {
+		p0.Started(100, ResolvedCommand{Binary: "srv"})
+		p3.Started(103, ResolvedCommand{Binary: "srv"})
+		p0.Write([]byte("zero\n"))
+		p3.Write([]byte("three\n"))
+		p3.Exited(1)
+		p0.Exited(0)
+	}
+	check := func(t *testing.T, entries []LogEntry) {
+		t.Helper()
+		type seen struct {
+			event, text string
+			instance    int
+		}
+		var got []seen
+		for _, e := range entries {
+			got = append(got, seen{e.Event, e.Text, e.Instance})
+		}
+		want := []seen{
+			{logEventStarted, "", 0},
+			{logEventStarted, "", 3},
+			{"", "zero\n", 0},
+			{"", "[#3] three\n", 3},
+			{logEventExited, "", 3},
+			{logEventExited, "", 0},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("entries = %+v, want %+v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	}
+
+	t.Run("scrollback replay", func(t *testing.T) {
+		s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+		write(s.newInstanceProc("S", 0), s.newInstanceProc("S", 3))
+		s.SetWatch([]string{"S"}, nil)
+		batches := s.Drain()
+		if len(batches) != 1 || !batches[0].Scrollback {
+			t.Fatalf("drain = %+v, want one scrollback batch", batches)
+		}
+		check(t, batches[0].Entries)
+	})
+	t.Run("live drain", func(t *testing.T) {
+		s := newTestLogStore(t, minLogBufferBytes, minLogBufferBytes)
+		s.SetWatch([]string{"S"}, nil)
+		if b := s.Drain(); len(b) != 1 || !b[0].Scrollback || len(b[0].Entries) != 0 {
+			t.Fatalf("first drain = %+v, want the one empty scrollback", b)
+		}
+		write(s.newInstanceProc("S", 0), s.newInstanceProc("S", 3))
+		batches := s.Drain()
+		if len(batches) != 1 || batches[0].Scrollback {
+			t.Fatalf("drain = %+v, want one live batch", batches)
+		}
+		check(t, batches[0].Entries)
+	})
+	t.Run("wire omits instance 0", func(t *testing.T) {
+		for _, c := range []struct {
+			entry LogEntry
+			want  bool
+		}{
+			{LogEntry{Text: "zero\n"}, false},
+			{LogEntry{Text: "[#3] three\n", Instance: 3}, true},
+			{LogEntry{DroppedBytes: 4096}, false},
+		} {
+			raw, err := json.Marshal(c.entry)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got := strings.Contains(string(raw), `"instance"`); got != c.want {
+				t.Errorf("%s: instance key present = %v, want %v", raw, got, c.want)
+			}
+		}
+	})
+}
+
+// TestADropOnlyEntryCarriesNoInstance: a gap cannot be attributed to any one
+// instance -- the bytes lost may have come from any of them -- so the entry the
+// store synthesizes for a loss with nothing to stamp it onto names none.
+func TestADropOnlyEntryCarriesNoInstance(t *testing.T) {
+	got := withDropped(nil, 4096)
+	if len(got) != 1 || got[0].DroppedBytes != 4096 || got[0].Instance != 0 {
+		t.Fatalf("withDropped(nil, 4096) = %+v, want one entry carrying only the drop", got)
 	}
 }
