@@ -2019,12 +2019,44 @@ func (r *Resolver) mergeRuntimeModelMetrics(c MappingCandidate, tel ServerTeleme
 	return tel, true
 }
 
+// telemetryPass reads each server's telemetry at most once for one pass over a set of
+// candidates. The instances of a mapping share their server, so without it a pass over N
+// instances would read the same row N times; one pass scores them all against the one
+// reading. A failed read is returned, never remembered: it ends the pass.
+type telemetryPass struct {
+	store resolverStore
+	rows  map[string]telemetryRow
+}
+
+type telemetryRow struct {
+	telemetry ServerTelemetry
+	ok        bool
+}
+
+func (r *Resolver) newTelemetryPass() *telemetryPass {
+	return &telemetryPass{store: r.store, rows: map[string]telemetryRow{}}
+}
+
+// read returns serverID's telemetry, from the store on the pass's first ask for it.
+func (p *telemetryPass) read(ctx context.Context, serverID string) (ServerTelemetry, bool, error) {
+	if row, hit := p.rows[serverID]; hit {
+		return row.telemetry, row.ok, nil
+	}
+	telemetry, ok, err := p.store.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return ServerTelemetry{}, false, err
+	}
+	p.rows[serverID] = telemetryRow{telemetry: telemetry, ok: ok}
+	return telemetry, ok, nil
+}
+
 func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, model string, now time.Time) (MappingCandidate, bool, error) {
 	var selected MappingCandidate
 	bestScore := 0.0
 	found := false
+	pass := r.newTelemetryPass()
 	for _, candidate := range pool {
-		telemetry, ok, err := r.store.TelemetryByServer(ctx, candidate.Server.ID)
+		telemetry, ok, err := pass.read(ctx, candidate.Server.ID)
 		if err != nil {
 			return MappingCandidate{}, false, fmt.Errorf("load server telemetry: %w", err)
 		}
@@ -2050,9 +2082,10 @@ func (r *Resolver) argmaxByScore(ctx context.Context, pool []MappingCandidate, m
 
 // candidateEffectiveGenTPS is a candidate's load-aware effective generation speed,
 // assembled exactly as argmaxByScore assembles its scoring route so the floor and
-// the ordering agree with the scorer. An unmeasured mapping yields 0.
-func (r *Resolver) candidateEffectiveGenTPS(ctx context.Context, c MappingCandidate, model string) (float64, error) {
-	telemetry, ok, err := r.store.TelemetryByServer(ctx, c.Server.ID)
+// the ordering agree with the scorer. An unmeasured mapping yields 0. pass is the
+// caller's telemetry pass, so a loop over a server's instances reads it once.
+func (r *Resolver) candidateEffectiveGenTPS(ctx context.Context, pass *telemetryPass, c MappingCandidate, model string) (float64, error) {
+	telemetry, ok, err := pass.read(ctx, c.Server.ID)
 	if err != nil {
 		return 0, fmt.Errorf("load server telemetry: %w", err)
 	}
@@ -2312,8 +2345,9 @@ func (r *Resolver) filterBySpeedFloor(ctx context.Context, cands []MappingCandid
 		return cands, nil
 	}
 	kept := make([]MappingCandidate, 0, len(cands))
+	pass := r.newTelemetryPass()
 	for _, c := range cands {
-		tps, err := r.candidateEffectiveGenTPS(ctx, c, name)
+		tps, err := r.candidateEffectiveGenTPS(ctx, pass, c, name)
 		if err != nil {
 			return nil, err
 		}
@@ -2394,6 +2428,7 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // ordering, and only groups that opt into it pay it.
 func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, gw groupWalk) ([]GroupMember, error) {
 	speed := make(map[string]float64, len(members))
+	pass := r.newTelemetryPass()
 	for _, m := range members {
 		if _, done := speed[m.MemberGatewayName]; done {
 			continue // a duplicated member name is scored once
@@ -2404,7 +2439,7 @@ func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, me
 			return nil, err
 		}
 		for _, c := range cands {
-			tps, tErr := r.candidateEffectiveGenTPS(ctx, c, m.MemberGatewayName)
+			tps, tErr := r.candidateEffectiveGenTPS(ctx, pass, c, m.MemberGatewayName)
 			if tErr != nil {
 				return nil, tErr
 			}
@@ -2427,14 +2462,15 @@ func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, me
 // wins; only a negative margin is clamped. An unmeasured pin (<= 0) always yields true —
 // anything measurable beats unknown.
 func (r *Resolver) speedMarginMet(ctx context.Context, best, pinned MappingCandidate, bestModel, pinnedModel string, policy GroupPolicy) (bool, error) {
-	pinnedTPS, err := r.candidateEffectiveGenTPS(ctx, pinned, pinnedModel)
+	pass := r.newTelemetryPass()
+	pinnedTPS, err := r.candidateEffectiveGenTPS(ctx, pass, pinned, pinnedModel)
 	if err != nil {
 		return false, err
 	}
 	if pinnedTPS <= 0 {
 		return true, nil
 	}
-	bestTPS, err := r.candidateEffectiveGenTPS(ctx, best, bestModel)
+	bestTPS, err := r.candidateEffectiveGenTPS(ctx, pass, best, bestModel)
 	if err != nil {
 		return false, err
 	}

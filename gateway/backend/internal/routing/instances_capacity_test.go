@@ -439,3 +439,52 @@ func TestMixedFleetCapacity(t *testing.T) {
 		}
 	})
 }
+
+// countingTelemetryStore counts TelemetryByServer reads per server.
+type countingTelemetryStore struct {
+	*MemoryStore
+	reads map[string]int
+}
+
+func (s *countingTelemetryStore) TelemetryByServer(ctx context.Context, serverID string) (ServerTelemetry, bool, error) {
+	s.reads[serverID]++
+	return s.MemoryStore.TelemetryByServer(ctx, serverID)
+}
+
+// The instances of one mapping share their server, so one scoring pass reads
+// that server's telemetry once however many instances it scores.
+func TestScoringReadsEachServersTelemetryOncePerPass(t *testing.T) {
+	now := instanceCapacityNow
+	store := &countingTelemetryStore{MemoryStore: mixedFleetStore(t, now, 0), reads: map[string]int{}}
+	r := NewResolver(store, func() time.Time { return now }, nil)
+	cands, err := store.ActiveMappingsForModel(context.Background(), "qwen-coder", APIFlavorOpenAI)
+	if err != nil {
+		t.Fatalf("ActiveMappingsForModel: %v", err)
+	}
+	pool := expandInstances(context.Background(), cands, &fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Running: []int{2, 3}}}})
+	if len(pool) != 4 {
+		t.Fatalf("pool = %d candidates, want 4", len(pool))
+	}
+	wantOncePerServer := func(pass string) {
+		t.Helper()
+		if store.reads["srv_inst"] != 1 || store.reads["srv_old"] != 1 {
+			t.Fatalf("%s: telemetry reads = %v, want one per server", pass, store.reads)
+		}
+		store.reads = map[string]int{}
+	}
+
+	if _, ok, err := r.argmaxByScore(context.Background(), pool, "qwen-coder", now); err != nil || !ok {
+		t.Fatalf("argmaxByScore = ok %v, err %v", ok, err)
+	}
+	wantOncePerServer("argmaxByScore")
+	if _, err := r.filterBySpeedFloor(context.Background(), pool, "qwen-coder", 1); err != nil {
+		t.Fatalf("filterBySpeedFloor: %v", err)
+	}
+	wantOncePerServer("filterBySpeedFloor")
+	r.SetInstanceSource(&fakeInstanceSource{views: map[string]InstanceView{"map_inst": {Replicable: true, Running: []int{2, 3}}}})
+	members := []GroupMember{{ID: "gm_q", GroupID: "grp1", MemberGatewayName: "qwen-coder"}}
+	if _, err := r.orderMembersBySpeed(context.Background(), auth.Token{}, members, APIFlavorOpenAI, "openai_chat", nil, groupWalk{}); err != nil {
+		t.Fatalf("orderMembersBySpeed: %v", err)
+	}
+	wantOncePerServer("orderMembersBySpeed")
+}
