@@ -23,18 +23,34 @@ type CandidateScore struct {
 // model is ranked too; a mapping offered under several flavors is scored once),
 // reusing the same Route/Score path as routing (shares scoringRoute with
 // argmaxByScore).
+// A mapping offered under openai_audio is scored with the audio term (Route.Audio)
+// whichever flavor lists it first: that flavor is how every speech and
+// transcription request reaches it, and live routing scores those with the term,
+// so a mapping also offered as text would otherwise rank, here and in the instance
+// scaler that reads this ranking, below where the router puts it for audio.
 // Available = the candidate passes the Score viability gate AND (MaxConcurrency == 0 OR
 // in-flight k < MaxConcurrency). Per-session swap-protection / reservation / affinity is
 // intentionally NOT applied: this is the GENERAL live order shown in the UI, not a
 // specific request's pinned choice. Read-only — mutates no resolver state.
 func (r *Resolver) ScoreModelServers(ctx context.Context, model string, now time.Time) ([]CandidateScore, error) {
-	seen := make(map[string]struct{})
-	out := make([]CandidateScore, 0)
-	for _, flavor := range []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, APIFlavorOpenAIAudio} {
+	flavors := []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, APIFlavorOpenAIAudio}
+	pools := make([][]MappingCandidate, len(flavors))
+	audio := make(map[string]bool)
+	for i, flavor := range flavors {
 		pool, err := r.store.ActiveMappingsForModel(ctx, model, flavor)
 		if err != nil {
 			return nil, err
 		}
+		pools[i] = pool
+		if flavor == APIFlavorOpenAIAudio {
+			for _, candidate := range pool {
+				audio[candidate.Mapping.ID] = true
+			}
+		}
+	}
+	seen := make(map[string]struct{})
+	out := make([]CandidateScore, 0)
+	for _, pool := range pools {
 		for _, candidate := range pool {
 			if _, dup := seen[candidate.Mapping.ID]; dup {
 				continue
@@ -50,7 +66,7 @@ func (r *Resolver) ScoreModelServers(ctx context.Context, model string, now time
 				k = inflight
 			}
 			telemetry, ok = r.mergeRuntimeModelMetrics(candidate, telemetry, ok, now)
-			route := scoringRoute(candidate, telemetry, ok, k, model, flavor == APIFlavorOpenAIAudio)
+			route := scoringRoute(candidate, telemetry, ok, k, model, audio[candidate.Mapping.ID])
 			score, viable := Score(route, model, now)
 			available := viable
 			if maxC := candidate.Mapping.MaxConcurrency; available && maxC > 0 && k >= maxC {

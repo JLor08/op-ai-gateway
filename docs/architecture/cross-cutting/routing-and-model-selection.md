@@ -2413,8 +2413,9 @@ Routing reads them from the mapping, so they apply whether or not the model is l
   adds `audioTiebreak(audio_rate_x)` = `clampBonus(rate, 10, 50)`: 10 points per × real time, at
   most 50 (`internal/routing/scorer.go`; `Route.Audio`). The whole tiebreak is then bounded by
   120 points, still below the 200-point error-rate penalty, and an unmeasured rate earns nothing.
-  `ScoreModelServers` scores the `openai_audio` flavor with the same term, so the portal's ranking
-  and the scaler's host order agree with routing.
+  `ScoreModelServers` scores every mapping offered under `openai_audio` with the same term,
+  also one its application offers under a text flavor too (scored once, whichever flavor lists it
+  first), so the portal's ranking and the scaler's host order agree with routing.
 - **The real-time gate.** A request that must keep up with real time
   (`inference.Request.RealtimeRequired`) drops every candidate whose **measured** rate is below
   `OP_AI_GATEWAY_AUDIO_REALTIME_MIN_FACTOR` (default 1.2, the factor the ramp judges a level by)

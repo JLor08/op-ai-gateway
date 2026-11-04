@@ -245,3 +245,47 @@ func TestScoreModelServersRanksAnAudioOnlyModel(t *testing.T) {
 		t.Fatalf("scores = %+v, want one available score for map_tts", scores)
 	}
 }
+
+// A mapping offered under openai_audio is ranked with the audio term live
+// routing gives it on a speech or transcription request, even when it is also
+// offered under a text flavor the loop meets first: the ranking (and the
+// instance scaler, which reads it) must not order an audio model's servers
+// differently from the router.
+func TestScoreModelServersAppliesTheAudioTermToAMappingAlsoOfferedAsText(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	for _, s := range []struct {
+		server, app, mapping string
+		flavors              []string
+	}{
+		{"srv_dual", "app_dual", "map_dual", []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}},
+		{"srv_audio", "app_audio", "map_audio", []string{APIFlavorOpenAIAudio}},
+	} {
+		if err := store.CreateAIServer(ctx, AIServer{ID: s.server, Name: s.server, Domain: s.server + ".test", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer: %v", err)
+		}
+		if err := store.CreateApplication(ctx, Application{ID: s.app, ServerID: s.server, Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: s.flavors, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication: %v", err)
+		}
+		if err := store.CreateMapping(ctx, ModelMapping{ID: s.mapping, ApplicationID: s.app, GatewayModelName: "voice", AppModelName: "voice", Status: ServerStatusActive, AudioRateX: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+		if err := store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: s.server, ReportedAt: now, LatencyMS: 100, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertTelemetry: %v", err)
+		}
+	}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+
+	scores, err := resolver.ScoreModelServers(ctx, "voice", now)
+	if err != nil {
+		t.Fatalf("ScoreModelServers: %v", err)
+	}
+	byID := map[string]float64{}
+	for _, s := range scores {
+		byID[s.MappingID] = s.Score
+	}
+	if len(byID) != 2 || byID["map_dual"] != byID["map_audio"] {
+		t.Fatalf("scores = %+v, want map_dual and map_audio scored alike (both with the audio term)", scores)
+	}
+}
