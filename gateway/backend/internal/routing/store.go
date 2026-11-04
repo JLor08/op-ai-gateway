@@ -2277,12 +2277,28 @@ type MappingMetricsMask struct {
 	MaxConcurrency               bool
 	RecommendedConcurrency       bool
 	GenTokensPerSecondAtCapacity bool
+
+	// The audio metrics (migration 101). AudioConcurrencyPair supplies
+	// audio_realtime_concurrency and audio_concurrency_limit together: they are one
+	// result (the count means nothing without the reason the ramp stopped), so they
+	// are written as a pair or not at all, exactly as the benchmark writes them.
+	AudioRateX           bool
+	AudioTTFAMS          bool
+	AudioConcurrencyPair bool
 }
 
 // Any reports whether the mask supplies at least one metric column.
 func (m MappingMetricsMask) Any() bool {
 	return m.GenTokensPerSecond || m.PromptTokensPerSecond || m.LoadTimeMS || m.ContextSize ||
-		m.EnergyWhPerToken || m.MaxConcurrency || m.RecommendedConcurrency || m.GenTokensPerSecondAtCapacity
+		m.EnergyWhPerToken || m.MaxConcurrency || m.RecommendedConcurrency || m.GenTokensPerSecondAtCapacity ||
+		m.AnyAudio()
+}
+
+// AnyAudio reports whether the mask supplies at least one audio metric column,
+// which also gates whether audio_metrics_updated_at is (re)stamped and whether the
+// writer validates the audio columns (ValidateMappingAudioMetrics) before it writes.
+func (m MappingMetricsMask) AnyAudio() bool {
+	return m.AudioRateX || m.AudioTTFAMS || m.AudioConcurrencyPair
 }
 
 // AudioMetrics is what one audio benchmark run measured, for
@@ -2443,7 +2459,10 @@ type MappingStore interface {
 	// caller supplies in metrics — plus metrics_source/metrics_updated_at when
 	// metrics.Any(). Every unsupplied metric column is left exactly as stored,
 	// so a portal edit that carries a stale metric value can no longer revert a
-	// concurrently probed one (issue #65). ErrNotFound on a missing row. It
+	// concurrently probed one (issue #65). With an audio metric supplied
+	// (metrics.AnyAudio) it also stamps audio_metrics_updated_at, and refuses
+	// a mapping ValidateMappingAudioMetrics refuses (ErrAudioMetricsInvalid)
+	// before it writes anything. ErrNotFound on a missing row. It
 	// invalidates the mapping's cache rows on an app_model_name change exactly
 	// as UpdateMapping above documents.
 	UpdateMappingEditable(ctx context.Context, mapping ModelMapping, metrics MappingMetricsMask) error

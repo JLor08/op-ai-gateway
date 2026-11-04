@@ -335,17 +335,32 @@ func ptrWhen[T any](cond bool, v T) *T {
 // metrics express). Like UpdateMapping it drops the mapping's cache rows when
 // app_model_name changes -- see updateMappingRow.
 func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing.ModelMapping, metrics routing.MappingMetricsMask) error {
+	// The audio columns hold only what the benchmark itself could write
+	// (ValidateMappingAudioMetrics, the full-row writers' check), so a supplied
+	// one is validated before anything is written.
+	if metrics.AnyAudio() {
+		if err := routing.ValidateMappingAudioMetrics(mapping); err != nil {
+			return err
+		}
+	}
 	// A per-column COALESCE(?, col): a NULL arg keeps the stored value, a
 	// non-NULL one writes it. Passing a nil pointer for an unsupplied metric is
 	// what keeps a config edit from touching a probe-owned column -- and it
 	// avoids feeding a bool into a `case when ?`, which pgx cannot type in the
 	// binary protocol. metrics_source/metrics_updated_at ride the same rule,
-	// stamped only when at least one metric is supplied.
+	// stamped only when at least one metric is supplied, and
+	// audio_metrics_updated_at when an audio one is. The two nullable audio
+	// columns add a NULLIF(..., 0): a supplied 0 ("not measured") is stored as
+	// the NULL every other writer stores for it, and an unsupplied column keeps
+	// its NULL or its value.
 	var src *string
-	var srcAt *time.Time
+	var srcAt, audioAt *time.Time
 	if metrics.Any() {
 		src = &mapping.MetricsSource
 		srcAt = mapping.MetricsUpdatedAt
+	}
+	if metrics.AnyAudio() {
+		audioAt = mapping.AudioMetricsUpdatedAt
 	}
 	return s.updateMappingRow(ctx, mapping, "update mapping editable", `
 		update model_mappings
@@ -359,6 +374,11 @@ func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing
 			max_concurrency = coalesce(?, max_concurrency),
 			recommended_concurrency = coalesce(?, recommended_concurrency),
 			gen_tokens_per_second_at_capacity = coalesce(?, gen_tokens_per_second_at_capacity),
+			audio_rate_x = nullif(coalesce(?, audio_rate_x), 0),
+			audio_ttfa_ms = nullif(coalesce(?, audio_ttfa_ms), 0),
+			audio_realtime_concurrency = coalesce(?, audio_realtime_concurrency),
+			audio_concurrency_limit = coalesce(?, audio_concurrency_limit),
+			audio_metrics_updated_at = coalesce(?, audio_metrics_updated_at),
 			metrics_source = coalesce(?, metrics_source),
 			metrics_updated_at = coalesce(?, metrics_updated_at)
 		where id = ?`,
@@ -376,6 +396,11 @@ func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing
 		ptrWhen(metrics.MaxConcurrency, mapping.MaxConcurrency),
 		ptrWhen(metrics.RecommendedConcurrency, mapping.RecommendedConcurrency),
 		ptrWhen(metrics.GenTokensPerSecondAtCapacity, mapping.GenTokensPerSecondAtCapacity),
+		ptrWhen(metrics.AudioRateX, mapping.AudioRateX),
+		ptrWhen(metrics.AudioTTFAMS, mapping.AudioTTFAMS),
+		ptrWhen(metrics.AudioConcurrencyPair, mapping.AudioRealtimeConcurrency),
+		ptrWhen(metrics.AudioConcurrencyPair, mapping.AudioConcurrencyLimit),
+		audioAt,
 		src, srcAt,
 		mapping.ID,
 	)

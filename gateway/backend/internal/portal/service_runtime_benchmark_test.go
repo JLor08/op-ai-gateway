@@ -122,6 +122,9 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// carries.
 		"startup_measured_ms":            true,
 		"effective_idle_timeout_seconds": true,
+		// instances_min_exceeds_realtime is derived on every read from the spec's
+		// minimum and the mapping's audio ramp, never stored: a read-only warning.
+		"instances_min_exceeds_realtime": true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only

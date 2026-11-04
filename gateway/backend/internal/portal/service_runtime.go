@@ -519,6 +519,13 @@ type RuntimeSpecDTO struct {
 	// without re-deriving the gateway's factor and floor itself.
 	StartupMeasuredMS           int64 `json:"startup_measured_ms"`
 	EffectiveIdleTimeoutSeconds int   `json:"effective_idle_timeout_seconds"`
+	// InstancesMinExceedsRealtime warns (it never refuses) that MinInstances is
+	// above the real-time concurrency the mapping's audio ramp measured as a
+	// ceiling (minInstancesExceedRealtime): the scaler keeps a speech model's
+	// instances under that ceiling, and the minimum would hold more warm than one
+	// host keeps up with. Read-only and derived on every read, like the two echoes
+	// above.
+	InstancesMinExceedsRealtime bool `json:"instances_min_exceeds_realtime"`
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of
 	// the three-state endpoint control (mirrors the same trio on
 	// ApplicationDTO), stored explicitly on this spec rather than inherited
@@ -740,7 +747,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	dto, err := runtimeSpecDTO(spec, gpus, app, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
+	dto, err := runtimeSpecDTO(spec, gpus, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -913,7 +920,7 @@ func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMap
 	if err != nil {
 		return RuntimeSpecDTO{}, true, err
 	}
-	dto, err = runtimeSpecDTO(spec, storedGPUs, app, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
+	dto, err = runtimeSpecDTO(spec, storedGPUs, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	return dto, true, err
 }
 
@@ -1820,9 +1827,20 @@ func validateRuntimeSpecGPUs(gpus []RuntimeSpecGPUDTO) error {
 	return nil
 }
 
+// minInstancesExceedRealtime reports whether a spec's minimum instance count is
+// above the real-time concurrency of its mapping's audio ramp
+// (RuntimeSpecDTO.InstancesMinExceedsRealtime). Only a ramp stopped by performance
+// measured a ceiling, and its count counts even at 0 (not real-time with one
+// stream); a ramp stopped by resources or the cap left a lower bound, which no
+// minimum is known to exceed, and no ramp at all leaves nothing to compare.
+func minInstancesExceedRealtime(minInstances int, mapping routing.ModelMapping) bool {
+	return mapping.AudioConcurrencyLimit == routing.AudioLimitPerformance && minInstances > mapping.AudioRealtimeConcurrency
+}
+
 // runtimeSpecDTO builds the wire DTO from a stored spec + its GPU rows, plus
 // the parent application (for the read-only api-token echoes — see
-// RuntimeSpecDTO.AppAPITokenSet/AppAPITokenHeader) and the spec's effective
+// RuntimeSpecDTO.AppAPITokenSet/AppAPITokenHeader), its mapping (for the
+// real-time warning, minInstancesExceedRealtime) and the spec's effective
 // idle timeout, which its callers derive with effectiveIdleTimeout, the one
 // derivation the pushed document uses too. Args/Env are opaque JSON
 // strings at the store layer (the netbird_group_ids pattern) — an unmarshal
@@ -1830,7 +1848,7 @@ func validateRuntimeSpecGPUs(gpus []RuntimeSpecGPUDTO) error {
 // but still surfaces as the matching domain sentinel
 // (ErrRuntimeSpecArgsInvalid / ErrRuntimeSpecEnvInvalid) rather than a raw
 // JSON error or a 500.
-func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app routing.Application, effectiveIdleSeconds int) (RuntimeSpecDTO, error) {
+func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app routing.Application, mapping routing.ModelMapping, effectiveIdleSeconds int) (RuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
@@ -1886,6 +1904,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		InstanceParallelism:         spec.InstanceParallelism,
 		StartupMeasuredMS:           spec.StartupMeasuredMS,
 		EffectiveIdleTimeoutSeconds: effectiveIdleSeconds,
+		InstancesMinExceedsRealtime: minInstancesExceedRealtime(spec.MinInstances, mapping),
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
