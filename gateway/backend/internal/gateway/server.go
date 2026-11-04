@@ -130,6 +130,11 @@ type ServerDeps struct {
 	// Each <= 0 defaults in New (1.2 / 8).
 	AudioRealtimeMinFactor float64
 	AudioConcurrencyMax    int
+	// InstanceScaleCooldown is how long the instance scaler leaves a server's spec
+	// alone after its agent refused another instance for lack of room, or failed to
+	// start one (config OP_AI_GATEWAY_INSTANCE_SCALE_COOLDOWN_SECONDS). <= 0 defaults
+	// to 60 s.
+	InstanceScaleCooldown time.Duration
 	// AdmissionQueueMaxDepth bounds how many unpinned requests can park in the CP4
 	// admission queue at once; the (maxDepth+1)-th waiter is rejected with a 503.
 	// <= 0 defaults to 128 in newAdmissionQueue.
@@ -478,6 +483,11 @@ type Server struct {
 	// nil, which acquire treats as fail-closed (every session rejected busy), so
 	// the handler must be wired with a constructed registry.
 	liveSessions *liveSessionRegistry
+	// instanceScaler starts another instance of a replicable spec when requests
+	// park because every instance of their model is busy (instance_scaler.go).
+	// New builds it whenever it builds the resolver's instance source and installs
+	// it as the resolver's demand sink; nil otherwise, and on a bare &Server{}.
+	instanceScaler *instanceScaler
 	// voiceTickets mints and redeems the Voice Chat tickets (voice_chat_ticket.go): the
 	// authenticated, CSRF-protected ticket POST mints one after the co-load gate, the
 	// WebSocket upgrade redeems it. Built in New with a fresh per-process key; a bare
@@ -1014,6 +1024,9 @@ func New(deps ServerDeps) *Server {
 		energyIdleWindow = time.Hour
 	}
 	energyIdle := newIdleTracker(energyIdleWindow)
+	// The instance source the resolver expands candidates with; the instance
+	// scaler (wired below, once s exists) counts instances through the same one.
+	var instances *instanceSource
 	// A running benchmark reserves its server in this registry; wiring it as the
 	// resolver's ServerBusyChecker excludes that server from new routing while a
 	// run is in flight. SetServerBusyChecker accepts the same instance the
@@ -1046,7 +1059,8 @@ func New(deps ServerDeps) *Server {
 		// reads the spec through deps.Routes, so without a store nothing is expanded
 		// and every candidate stays its mapping's instance 0.
 		if deps.Routes != nil {
-			resolver.SetInstanceSource(newInstanceSource(deps.Routes, agentFeatures, runtimeStatus))
+			instances = newInstanceSource(deps.Routes, agentFeatures, runtimeStatus)
+			resolver.SetInstanceSource(instances)
 		}
 		resolver.SetSessionReservation(sessionReservationWindow)
 		resolver.SetAdmissionController(admission)
@@ -1165,6 +1179,30 @@ func New(deps ServerDeps) *Server {
 			func() string { return s.vendorAccountRoutingModeCached(context.Background()) },
 			func() bool { return s.vendorSubscriptionsEnabledCached(context.Background()) },
 		)
+	}
+	// The instance scaler is the resolver's demand sink: a request about to park
+	// because every instance of its model is busy asks it for another. It needs
+	// the built Server for the provider (read at each signal, so a provider without
+	// the ensure route starts nothing), the upstream credential and the shutdown
+	// context, and it counts instances through the resolver's own instance source.
+	if resolver != nil && instances != nil {
+		s.instanceScaler = newInstanceScaler(instanceScalerDeps{
+			store:     deps.Routes,
+			scorer:    resolver,
+			instances: instances,
+			statuses:  runtimeStatus,
+			busy:      benchmarks,
+			reachable: appHealth,
+			ensurer: func() provider.RuntimeEnsurer {
+				ensurer, _ := s.Provider.(provider.RuntimeEnsurer)
+				return ensurer
+			},
+			authCtx: s.upstreamAuthCtx,
+			wake:    admission.release,
+			base:    func() context.Context { return s.baseCtx },
+			now:     time.Now,
+		}, deps.InstanceScaleCooldown)
+		resolver.SetDemandSink(s.instanceScaler)
 	}
 	s.routes()
 	return s
