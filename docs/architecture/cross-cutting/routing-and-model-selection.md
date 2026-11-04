@@ -2237,7 +2237,9 @@ most the queue's 250 ms recheck interval
 
 The voice pre-warm's priming synthesis is unbilled, but it is an in-flight request on its
 instance (`ActiveRequest.InstanceKey`, `internal/gateway/voice_prewarm.go`), so the cap counts
-it and a session's first turn is not sent to an instance busy priming as if it were free.
+it and a session's first turn is not sent to an instance busy priming as if it were free. Its
+row is attributed to the ticket's caller (user, token, service) and names the ticket endpoint as
+its request path, so the Active Requests view lists it to that user like their other requests.
 
 ### 10.3 The demand signal
 

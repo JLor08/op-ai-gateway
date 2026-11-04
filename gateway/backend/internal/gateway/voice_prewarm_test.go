@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -133,7 +134,7 @@ func TestPrimeSpeechVoiceDispatchesDirectlyAndRecordsNothing(t *testing.T) {
 	s := &Server{Provider: prov, Usage: recorder}
 	tts := primingTarget()
 
-	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice); err != nil {
+	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice, voicePrewarmOwner{}); err != nil {
 		t.Fatalf("primeSpeechVoice returned %v, want nil", err)
 	}
 
@@ -187,7 +188,7 @@ func TestPrimeSpeechVoiceModelFallsBackToTheGatewayName(t *testing.T) {
 	tts := primingTarget()
 	tts.ProviderModel = ""
 
-	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice); err != nil {
+	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice, voicePrewarmOwner{}); err != nil {
 		t.Fatalf("primeSpeechVoice returned %v, want nil", err)
 	}
 	calls := prov.received()
@@ -211,7 +212,7 @@ func TestPrimeSpeechVoiceAttachesTheUpstreamCredential(t *testing.T) {
 	tts := primingTarget()
 	tts.APIToken = "plain:upstream-secret"
 
-	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice); err != nil {
+	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice, voicePrewarmOwner{}); err != nil {
 		t.Fatalf("primeSpeechVoice returned %v, want nil", err)
 	}
 	calls := prov.received()
@@ -232,7 +233,7 @@ func TestPrimeSpeechVoiceReturnsTheUpstreamFailure(t *testing.T) {
 		prov := &primingProvider{answer: func(context.Context) (*provider.ProxyResponse, error) { return nil, boom }}
 		s := &Server{Provider: prov, Usage: usage.NewRecorder()}
 
-		err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice)
+		err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice, voicePrewarmOwner{})
 		if !errors.Is(err, boom) {
 			t.Fatalf("primeSpeechVoice = %v, want it to wrap the transport error", err)
 		}
@@ -249,7 +250,7 @@ func TestPrimeSpeechVoiceReturnsTheUpstreamFailure(t *testing.T) {
 		recorder := usage.NewRecorder()
 		s := &Server{Provider: prov, Usage: recorder}
 
-		err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice)
+		err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice, voicePrewarmOwner{})
 		if err == nil {
 			t.Fatal("primeSpeechVoice = nil, want the upstream's HTTP 500 as an error")
 		}
@@ -271,7 +272,7 @@ func TestPrimeSpeechVoiceReturnsTheUpstreamFailure(t *testing.T) {
 // to the billing loopback and never a panic.
 func TestPrimeSpeechVoiceNeedsTheNativeRelay(t *testing.T) {
 	s := &Server{Provider: nativeOnlyProvider{}}
-	if err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice); err == nil {
+	if err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice, voicePrewarmOwner{}); err == nil {
 		t.Fatal("primeSpeechVoice = nil for a provider without ProxyNative, want an error")
 	}
 }
@@ -287,7 +288,7 @@ func TestPrimeSpeechVoiceHonorsTheCallersContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
-	go func() { done <- s.primeSpeechVoice(ctx, primingTarget(), primingVoice) }()
+	go func() { done <- s.primeSpeechVoice(ctx, primingTarget(), primingVoice, voicePrewarmOwner{}) }()
 	cancel()
 
 	select {
@@ -746,7 +747,7 @@ func TestPrimeSpeechVoiceCountsOnItsInstance(t *testing.T) {
 	tts := primingTarget()
 	tts.InstanceKey = instanceKey
 
-	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice); err != nil {
+	if err := s.primeSpeechVoice(context.Background(), tts, primingVoice, voicePrewarmOwner{}); err != nil {
 		t.Fatalf("primeSpeechVoice returned %v, want nil", err)
 	}
 	if inFlight != 1 {
@@ -763,7 +764,37 @@ func TestPrimeSpeechVoiceEmptyAnswerIsAFailure(t *testing.T) {
 		return &provider.ProxyResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}}
 	s := &Server{Provider: prov}
-	if err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice); !errors.Is(err, errBenchmarkAnswerEmpty) {
+	if err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice, voicePrewarmOwner{}); !errors.Is(err, errBenchmarkAnswerEmpty) {
 		t.Fatalf("primeSpeechVoice = %v, want errBenchmarkAnswerEmpty", err)
+	}
+}
+
+// The priming's in-flight row is attributed to whoever opened the session -- the ticket's
+// caller -- and names the ticket endpoint as its request path, so the Active Requests view
+// shows it to that user with an owner and a path instead of as an anonymous, pathless row
+// only an admin's all-scope view lists.
+func TestPrimeSpeechVoiceRowNamesItsOwnerAndPath(t *testing.T) {
+	s := &Server{Active: newActiveRegistry(nil)}
+	var seen []ActiveRequest
+	s.Provider = &primingProvider{answer: func(context.Context) (*provider.ProxyResponse, error) {
+		seen = s.Active.Snapshot()
+		return &provider.ProxyResponse{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: io.NopCloser(strings.NewReader("RIFF"))}, nil
+	}}
+	owner := voicePrewarmOwner{
+		token:   auth.Token{ID: "tok-1", Name: "browser", UserID: "user-1", ServiceID: "svc-1", ServiceName: "Voice svc"},
+		reqPath: "/api/portal/voice-chat/ticket",
+	}
+	if err := s.primeSpeechVoice(context.Background(), primingTarget(), primingVoice, owner); err != nil {
+		t.Fatalf("primeSpeechVoice returned %v, want nil", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("in-flight rows during the synthesis = %+v, want one", seen)
+	}
+	row := seen[0]
+	if row.UserID != "user-1" || row.TokenID != "tok-1" || row.TokenName != "browser" || row.ServiceID != "svc-1" || row.ServiceName != "Voice svc" {
+		t.Errorf("row owner = user %q token %q/%q service %q/%q, want the ticket caller's", row.UserID, row.TokenID, row.TokenName, row.ServiceID, row.ServiceName)
+	}
+	if row.ReqPath != owner.reqPath {
+		t.Errorf("row ReqPath = %q, want the ticket endpoint %q", row.ReqPath, owner.reqPath)
 	}
 }

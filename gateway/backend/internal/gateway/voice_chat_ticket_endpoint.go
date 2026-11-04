@@ -252,7 +252,7 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 	}
 	// The ticket is issued, so a session will open on this speech target and voice: warm them in
 	// the background. It returns at once and the ticket never waits for it or depends on it.
-	s.startVoicePrewarm(tts, audio.Voice)
+	s.startVoicePrewarm(tts, audio.Voice, voicePrewarmOwner{token: token, reqPath: r.URL.Path})
 	writeJSON(w, http.StatusOK, voiceChatTicketResponse{Ticket: ticket})
 }
 
