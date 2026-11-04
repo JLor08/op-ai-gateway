@@ -306,6 +306,12 @@ func TestMeasureTTSStreamTimesFirstAudio(t *testing.T) {
 			measureAt(1200, "data: {\"type\":\"speech.audio.done\"}\n\n"),
 			measureAt(1700, "data: [DONE]\n\n"),
 		}, audioMeasurement{TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
+		{"audio after done is not part of the synthesis", []measureChunk{
+			measureAt(200, delta),
+			measureAt(1200, "data: {\"type\":\"speech.audio.done\"}\n\n"),
+			measureAt(1300, delta),
+			measureAt(1400, "data: [DONE]\n\n"),
+		}, audioMeasurement{TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -348,6 +354,18 @@ func TestMeasureTTSStreamRefusals(t *testing.T) {
 		{"done without audio", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(800, sseSpeechDone))
 		}, "no audio"},
+		{"audio only after done", 48000, func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream",
+				measureAt(800, "data: {\"type\":\"speech.audio.done\"}\n\n"),
+				measureAt(900, sseSpeechDelta(48000)),
+				measureAt(1000, "data: [DONE]\n\n"))
+		}, "no audio"},
+		{"a frame past the line bound", 48000, func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream",
+				measureAt(300, sseSpeechDelta(48000)),
+				measureAt(500, "data: {\"type\":\"speech.audio.delta\",\"audio\":\""+strings.Repeat("A", speechStreamMaxLine)+"\"}\n\n"),
+				measureAt(800, sseSpeechDone))
+		}, "could not be counted"},
 		{"all the audio at once", 48000, func(c *measureClock) *measureUpstream {
 			return scriptedAudioUpstream(c, "text/event-stream", measureAt(800, sseSpeechDelta(48000)+sseSpeechDone))
 		}, "no measurable time"},
@@ -418,6 +436,55 @@ func TestMeasureStreamsStopAtDone(t *testing.T) {
 			}
 			if up.body.spentReads != 0 {
 				t.Fatalf("the body was read %d time(s) after [DONE], want never", up.body.spentReads)
+			}
+		})
+	}
+}
+
+// TestMeasureStreamsStopAtAnyDONE: [DONE] ends the reading of a stream wherever it comes. One
+// that arrives before the done event is a stream that broke its protocol -- there is no
+// done, so there is no measurement -- and an upstream that sends it first and keeps the
+// connection open cannot hold the measurement until its deadline: nothing after it is read.
+func TestMeasureStreamsStopAtAnyDONE(t *testing.T) {
+	pcm, sampleRate, _ := benchaudio.PCM()
+	cases := map[string]struct {
+		chunks  []measureChunk
+		measure func(audioMeasurer, *measureUpstream) (audioMeasurement, error)
+		want    string
+	}{
+		"TTS": {
+			[]measureChunk{
+				measureAt(300, sseSpeechDelta(48000)),
+				measureAt(500, "data: [DONE]\n\n"),
+				measureAt(2000, sseSpeechDelta(48000)+sseSpeechDone),
+			},
+			func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+				return m.measureTTSStream(context.Background(), up, audioMeasureTarget(), audioBenchmarkPassage, "", 48000)
+			},
+			"ended before speech.audio.done",
+		},
+		"live ASR": {
+			[]measureChunk{
+				measureAt(300, sseTranscriptDelta("der")),
+				measureAt(500, "data: [DONE]\n\n"),
+				measureAt(2000, sseTranscriptDone("der")),
+			},
+			func(m audioMeasurer, up *measureUpstream) (audioMeasurement, error) {
+				return m.measureASRLive(context.Background(), up, audioMeasureTarget(), pcm, sampleRate, benchaudio.Language)
+			},
+			"ended before transcript.text.done",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "text/event-stream", tc.chunks...)
+			up.body.end = errors.New("read past the end of the stream")
+			got, err := tc.measure(clock.measurer(), up)
+			checkAudioRefusal(t, got, err, tc.want, up, false)
+			if len(up.body.chunks) != 1 || up.body.spentReads != 0 {
+				t.Fatalf("%d chunk(s) left unread and %d read(s) past the end; want the stream read up to its [DONE] and not one read further",
+					len(up.body.chunks), up.body.spentReads)
 			}
 		})
 	}

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"mime/multipart"
 	"op-ai-gateway/internal/provider"
@@ -57,8 +56,9 @@ const audioBenchmarkPassage = "Every morning the harbor town wakes slowly. Fishi
 // call.
 const audioBenchmarkMaxAnswerBytes = speechBenchmarkMaxAudioBytes
 
-// audioStreamReadBytes is the size of one read of a streamed synthesis. A delta frame may
-// be larger; speechStreamScan carries a frame across reads.
+// audioStreamReadBytes is the buffer a streamed synthesis is first read into. A delta frame
+// may be larger: the line reader grows the buffer up to speechStreamMaxLine, the relay's
+// own bound on one frame.
 const audioStreamReadBytes = 32 << 10
 
 // liveSampleFormatS16 is the sample format the live measurement states: the bundled
@@ -135,10 +135,14 @@ type audioStreamSpeechRequest struct {
 //     production speed once audio flows, which is what decides whether playback stutters;
 //   - WallMS from the send to speech.audio.done, and RTF that time over the audio.
 //
+// The stream is read line by line, each line by the relay's own parser (speechStreamScan),
+// and a moment is the arrival of the read that completed its line. The synthesis ends at
+// speech.audio.done: a delta after it is not part of what was timed and is not counted.
 // The stream must end the way a whole synthesis does, speech.audio.done and then [DONE],
-// with every delta counted; reading stops at [DONE], so an upstream that keeps the
-// connection open after it cannot hold the measurement until its deadline. voice is a
-// clone model's preset voice, "" for a model that needs none.
+// with every delta before done counted. Reading stops at any [DONE], so an upstream that
+// keeps the connection open after it cannot hold the measurement until its deadline; one
+// that comes before speech.audio.done ends a stream that has no done, and so no
+// measurement. voice is a clone model's preset voice, "" for a model that needs none.
 func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string, byteRate int) (audioMeasurement, error) {
 	if byteRate <= 0 {
 		return audioMeasurement{}, errors.New("audio benchmark: no output byte rate to count the streamed audio with")
@@ -166,44 +170,45 @@ func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.Nat
 
 	scan := &speechStreamScan{maxLine: speechStreamMaxLine}
 	var first, done time.Time
-	// observe stamps the moments the scan just reached: its first counted audio and its done
-	// event. It runs after every read, so a moment is the arrival of the read that completed
-	// the frame.
-	observe := func() {
+	ended := false
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, audioStreamReadBytes), speechStreamMaxLine)
+	for sc.Scan() {
+		if sseLineIsDone(sc.Bytes()) {
+			ended = true
+			break
+		}
+		if !done.IsZero() {
+			// The synthesis ended at its done event; what follows up to [DONE] is not part
+			// of what was timed.
+			continue
+		}
+		scan.scanLine(sc.Bytes())
+		if scan.lost {
+			break
+		}
 		at := m.now()
 		if first.IsZero() && scan.pcmBytes() > 0 {
 			first = at
 		}
-		if done.IsZero() && scan.sawDone {
+		if scan.sawDone {
 			done = at
 		}
 	}
-	buf := make([]byte, audioStreamReadBytes)
-	for !scan.complete() {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			scan.feed(buf[:n])
-			observe()
-		}
-		if errors.Is(readErr, io.EOF) {
-			// A stream may end on `data: [DONE]` with no line break after it.
-			scan.finish()
-			observe()
-			break
-		}
-		if readErr != nil {
-			return audioMeasurement{}, fmt.Errorf("audio benchmark: the synthesis stream broke off: %w", readErr)
-		}
-		if scan.lost {
-			break
+	if err := sc.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			// A frame past the relay's own bound is one the relay could not count either.
+			scan.lost = true
+		} else {
+			return audioMeasurement{}, fmt.Errorf("audio benchmark: the synthesis stream broke off: %w", err)
 		}
 	}
 	switch {
 	case scan.lost:
 		return audioMeasurement{}, errors.New("audio benchmark: the streamed audio could not be counted (a frame or a delta was unreadable)")
-	case !scan.sawDone:
+	case done.IsZero():
 		return audioMeasurement{}, errors.New("audio benchmark: the synthesis stream ended before speech.audio.done")
-	case !scan.sawEnd:
+	case !ended:
 		return audioMeasurement{}, errors.New("audio benchmark: the synthesis stream ended without [DONE] after speech.audio.done")
 	case scan.pcmBytes() == 0:
 		return audioMeasurement{}, errors.New("audio benchmark: the synthesis stream carried no audio")
