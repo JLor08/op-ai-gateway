@@ -81,8 +81,8 @@ imports via the TypeScript compiler API, and asserts:
 | Rule | Why |
 |---|---|
 | `src/api/**` imports nothing from `components/**`, `App.tsx`, `i18n.ts`, `theme/**` | the HTTP client layer is a leaf over `fetch` |
-| `currency.ts` has no relative imports at all, and `i18n.ts` imports nothing but `./audioFigures` | pure vocabulary leaves: `i18n.ts` stays one only while its one import is a leaf too |
-| `audioFigures.ts` imports nothing of ours | the one place an audio figure's wording comes from — the rate formatter (`formatRateX`, cut, never rounded up, so a rate below the real-time threshold never reads as one that passes it) and the closed set of ramp limits — shared by the cells (`components/shared/audioMetrics.ts`) and the sentences (`i18n.ts`); a dependency-free leaf at the `src` root like `currency.ts` |
+| `i18n.ts` and `currency.ts` import nothing from `components/**`, `src/api/**` or the `api.ts` barrel; `i18n.ts` additionally imports nothing of ours but `./audioFigures` (the next rule) | vocabulary below the views and the client: `currency.ts` has no relative imports today, but the test only keeps it out of components and api, so a sibling helper at the `src` root would pass; `i18n.ts` is held to its one import, and stays a leaf only while that import is a leaf too |
+| `audioFigures.ts` imports nothing of ours | the one place an audio figure's wording comes from — the rate formatter (`formatRateX`, cut, never rounded up, so a rate below the real-time threshold never reads as one that passes it) and the closed set of ramp limits — shared by the cells (`components/shared/audioMetrics.ts`) and the sentences (`i18n.ts`); a dependency-free leaf at the `src` root, which is what keeps `i18n.ts` one |
 | `theme/**` may use the `api` barrel and `components/shared/**`, but no views | theming is a peer of the shared layer |
 | `components/shared/**` imports no non-shared component | shared is a lower layer than the views |
 | only `src/api.ts` may deep-import `src/api/<module>` | the barrel is the single client surface; `PortalApi` stays one type |
