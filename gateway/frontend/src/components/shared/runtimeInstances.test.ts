@@ -9,6 +9,7 @@ import {
   instanceCountText,
   instanceIndex,
   instanceSettingsBody,
+  instancesSummary,
   listedIdleTimeout,
   primaryStatusRows,
   runningInstanceCount,
@@ -269,6 +270,24 @@ describe('running instances on a model-server row', () => {
     // A spec turned off while its burst instances still drain.
     expect(showsRunningInstances({ replicable: false, running_instances: 2 })).toBe(true);
     expect(showsRunningInstances({ running_instances: 2 })).toBe(true);
+  });
+});
+
+describe('instancesSummary', () => {
+  const t = messages.en;
+
+  it('sums up the running instances against the bounds, an unset maximum as unlimited', () => {
+    const counts = new Map([['s', 2]]);
+    expect(instancesSummary('s', { min_instances: 1, max_instances: 0 }, counts, t)).toBe(
+      t.runtimeInstancesSummary(2, 1, null),
+    );
+    expect(instancesSummary('s', { min_instances: 0, max_instances: 3 }, counts, t)).toBe(
+      t.runtimeInstancesSummary(2, 0, 3),
+    );
+    // A spec with none running has no count entry.
+    expect(instancesSummary('t', { min_instances: 1, max_instances: 0 }, counts, t)).toBe(
+      t.runtimeInstancesSummary(0, 1, null),
+    );
   });
 });
 

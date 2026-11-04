@@ -99,6 +99,7 @@ import {
   instanceCountText,
   instanceIndex,
   instanceSettingsBody,
+  instancesSummary,
   listedIdleTimeout,
   primaryStatusRows,
   runningInstancesBySpec,
@@ -3799,11 +3800,7 @@ export function RuntimeAdminSection({
           <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
             {chip}
             <Typography variant="caption" color="text.secondary">
-              {t.runtimeInstancesSummary(
-                runningInstancesBySpecId.get(spec.id) ?? 0,
-                spec.min_instances,
-                spec.max_instances > 0 ? spec.max_instances : null,
-              )}
+              {instancesSummary(spec.id, spec, runningInstancesBySpecId, t)}
             </Typography>
           </Box>
         );

@@ -173,6 +173,22 @@ export function runningInstancesBySpec(rows: readonly RuntimeStatus[]): Map<stri
   return counts;
 }
 
+// The spec list's line under a replicable spec's state chip: how many of its
+// instances run (runningInstancesBySpec's counts, none when the spec has no
+// entry) against its bounds, a maximum of 0 being unlimited.
+export function instancesSummary(
+  specId: string,
+  spec: Pick<RuntimeSpec, 'min_instances' | 'max_instances'>,
+  runningBySpec: ReadonlyMap<string, number>,
+  t: Pick<Translation, 'runtimeInstancesSummary'>,
+): string {
+  return t.runtimeInstancesSummary(
+    runningBySpec.get(specId) ?? 0,
+    spec.min_instances,
+    spec.max_instances > 0 ? spec.max_instances : null,
+  );
+}
+
 // An instance-count field's text as the request's number: an empty field is 0,
 // which the backend reads as "none" for the minimum and "unlimited" for the
 // maximum -- so the form never has to show a 0 that means "no limit".
