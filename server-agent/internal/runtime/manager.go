@@ -1974,6 +1974,18 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Replicable = false
 		s.MinInstances = 0
 		s.MaxInstances = 0
+		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
+		// decide what is exec'd and how (a member's bind and port, a head's
+		// ordered endpoint list). The one exception is the connection
+		// allowlist (RPC.HeadIPs/HeadDomain), which the agent applies to a
+		// running member live, so an allowlist edit must not bounce it. The
+		// RPC struct is copied before clearing: the Spec shares the pointer.
+		if s.RPC != nil {
+			rpc := *s.RPC
+			rpc.HeadIPs = nil
+			rpc.HeadDomain = ""
+			s.RPC = &rpc
+		}
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy

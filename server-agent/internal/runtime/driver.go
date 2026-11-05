@@ -83,6 +83,15 @@ const runtimeManagerFeature = "runtime_manager"
 // precondition of its own.
 const gatewayFeatureRuntimeInstances = "runtime_instances"
 
+// gatewayFeatureRPCCluster is the gateway-declared feature that says the
+// gateway understands llama.cpp RPC cluster specs: rpc_server members (kind),
+// cluster heads (cluster) and the member settings (rpc), plus the status and
+// error-code fields they report. The agent honours those only while it is
+// declared (fail-closed, like runtime_instances), so an old gateway or a
+// file-mode document can never make the agent start a member as if it were a
+// model. It is one-sided: the agent's own registry entry is a separate feature.
+const gatewayFeatureRPCCluster = "rpc_cluster"
+
 // RuntimeReporter is the upward file-mode report sink: both *client.Client
 // and *client.WSSender satisfy it already via their existing
 // PostRuntimeReport methods (Task 17). A nil RuntimeReporter simply means
@@ -190,6 +199,7 @@ type Driver struct {
 	// that config actually had a replicable flag cleared, kept only to Warn
 	// once per transition into that state rather than on every Sync.
 	appliedInstances  bool
+	appliedRPC        bool
 	instancesWithheld bool
 	// active is the CURRENT feature-negotiation outcome (Sync step 1),
 	// read from a different goroutine (Active, called from
@@ -364,7 +374,7 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 		return
 	}
 
-	active, instances := d.featureActive(ctx)
+	active, instances, rpc := d.featureActive(ctx)
 	if !active {
 		d.stopAll()
 		return
@@ -402,7 +412,7 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	// process, or recovering from a drain via stopAll clearing applied) OR
 	// the gateway's runtime_instances declaration changed since the last
 	// apply: what the manager is handed depends on that too (below).
-	if !changed && d.applied && instances == d.appliedInstances {
+	if !changed && d.applied && instances == d.appliedInstances && rpc == d.appliedRPC {
 		return
 	}
 
@@ -422,11 +432,18 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	if !instances {
 		effective, withheld = withoutReplicable(cfg)
 	}
+	if !rpc {
+		var dropped bool
+		if effective, dropped = withoutRPCCluster(effective); dropped {
+			slog.Warn("runtime: the gateway does not declare rpc_cluster; rpc_server members and cluster heads are not run until it does")
+		}
+	}
 	d.noteInstancesWithheld(withheld)
 	d.mgr.Apply(effective)
 	d.applied = true
 	d.appliedSpecCount = len(cfg.Specs)
 	d.appliedInstances = instances
+	d.appliedRPC = rpc
 
 	if _, isFile := d.src.(*FileSource); isFile {
 		d.sendReport(ctx, cfg)
@@ -457,6 +474,45 @@ func withoutReplicable(cfg Config) (Config, bool) {
 	return cfg, true
 }
 
+// withoutRPCCluster returns cfg without the specs that only make sense with
+// RPC cluster support -- rpc_server members and cluster heads -- and whether any
+// was dropped. A head is dropped whole rather than demoted to a plain model: it
+// offloads to remote devices, so launching it alone would load the model
+// without them (or fail confusingly), and the gateway only routes it as a
+// cluster. Coresident pairs naming a dropped spec are removed with it. cfg
+// itself is never modified (its Specs are the Source's cached document).
+func withoutRPCCluster(cfg Config) (Config, bool) {
+	drop := func(s Spec) bool { return s.Kind == SpecKindRPCServer || s.IsClusterHead() }
+	found := false
+	for _, spec := range cfg.Specs {
+		if drop(spec) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return cfg, false
+	}
+	removed := map[string]bool{}
+	specs := make([]Spec, 0, len(cfg.Specs))
+	for _, spec := range cfg.Specs {
+		if drop(spec) {
+			removed[spec.ID] = true
+			continue
+		}
+		specs = append(specs, spec)
+	}
+	pairs := make([][2]string, 0, len(cfg.Coresident))
+	for _, pair := range cfg.Coresident {
+		if !removed[pair[0]] && !removed[pair[1]] {
+			pairs = append(pairs, pair)
+		}
+	}
+	cfg.Specs = specs
+	cfg.Coresident = pairs
+	return cfg, true
+}
+
 // noteInstancesWithheld logs the transition into, and out of, a state in which
 // the applied config had its replicable flags cleared because the gateway does
 // not declare runtime_instances -- once per transition, not on every Sync.
@@ -472,7 +528,8 @@ func (d *Driver) noteInstancesWithheld(withheld bool) {
 
 // featureActive fetches the gateway's currently declared feature set and
 // reports whether runtime_manager is present in it (active), and whether
-// runtime_instances is (instances: honour the replicable flag, see Sync).
+// runtime_instances is (instances: honour the replicable flag, see Sync), and
+// whether rpc_cluster is (rpc: run member and head specs, see Sync).
 // FeaturesClient.Fetch already implements the ETag-conditional-GET /
 // last-known-good discipline (a transient gateway hiccup returns the LAST
 // fetched set, never an empty one caused only by a network blip) -- Sync
@@ -480,9 +537,9 @@ func (d *Driver) noteInstancesWithheld(withheld bool) {
 // does. A nil features client (never constructed this way in production;
 // defensive only) is treated as inactive rather than panicking, and a gateway
 // that declares nothing declares neither name: both answers fail closed.
-func (d *Driver) featureActive(ctx context.Context) (active, instances bool) {
+func (d *Driver) featureActive(ctx context.Context) (active, instances, rpc bool) {
 	if d.features == nil {
-		return false, false
+		return false, false, false
 	}
 	names, err := d.features.Fetch(ctx)
 	if err != nil {
@@ -502,9 +559,11 @@ func (d *Driver) featureActive(ctx context.Context) (active, instances bool) {
 			active = true
 		case gatewayFeatureRuntimeInstances:
 			instances = true
+		case gatewayFeatureRPCCluster:
+			rpc = true
 		}
 	}
-	return active, instances
+	return active, instances, rpc
 }
 
 // stopAll drains every managed process (an empty Apply, reusing Manager's

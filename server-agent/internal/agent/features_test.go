@@ -615,7 +615,7 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.17.0" {
-		t.Fatalf("Version = %q, want 0.17.0 (runtime_stop is a new agent.Features entry, so the rule is MINOR, and it is the live-status row actions branch's single bump from 0.16.0)", Version)
+	if Version != "0.18.0" {
+		t.Fatalf("Version = %q, want 0.18.0 (the RPC cluster branch's single MINOR bump from 0.17.0; runtime_stop keeps Since 0.17.0)", Version)
 	}
 }

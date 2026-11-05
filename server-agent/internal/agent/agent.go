@@ -392,7 +392,15 @@ import (
 // the operator's request without persisting anything -- a change to the wire
 // contract and to observable runtime behaviour. This is the ONE bump for the
 // whole branch; later commits on it do not bump again.
-const Version = "0.17.0"
+//
+// 0.17.0 -> 0.18.0 is the single bump for the llama.cpp RPC cluster mode branch.
+// MINOR, and the rule decides it: the agent accepts new spec-level wire fields
+// (kind, device_backend, cluster, rpc) and honours them only while the gateway
+// declares rpc_cluster, runs rpc-server members and cluster heads, reports new
+// status fields (kind, rpc, cluster, admission_blocked_by, last_error.code),
+// serves new router routes (/rpc/...) and gains an agent.Features entry. This is
+// the ONE bump for the whole branch; later commits on it do not bump again.
+const Version = "0.18.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

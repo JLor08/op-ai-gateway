@@ -162,6 +162,78 @@ type Spec struct {
 	// pushes base specs only.
 	InstanceOf string `json:"-"`
 	Instance   int    `json:"-"`
+
+	// Kind says what the spec runs: SpecKindModel ("", every document an older
+	// gateway sends) is an ordinary model process; SpecKindRPCServer is a
+	// llama.cpp rpc-server member of another spec's cluster, which serves no
+	// model, has no upstream and no health/metrics surface of its own. The
+	// agent honours it only while the gateway declares rpc_cluster
+	// (withoutRPCCluster).
+	Kind string `json:"kind,omitempty"`
+	// DeviceBackend names the compute backend an rpc_server member's binary
+	// was built for ("", "auto", "cuda", "rocm", "vulkan", "metal", "sycl";
+	// "" means "auto"). It decides which device names the member and the head
+	// must agree on, so it is launch-affecting.
+	DeviceBackend string `json:"device_backend,omitempty"`
+	// Cluster, on a model spec, makes it a cluster HEAD: its llama-server
+	// offloads to the remote rpc-server endpoints listed here, in order (the
+	// order fixes the RPC<n> device numbering, so reordering is a relaunch).
+	Cluster *ClusterHead `json:"cluster,omitempty"`
+	// RPC, on an rpc_server spec, carries the member's network settings: the
+	// head it serves, how it is exposed, where it binds and who may connect.
+	RPC *RPCMember `json:"rpc,omitempty"`
+}
+
+// SpecKindModel is the Kind of an ordinary model spec (the zero value, so a
+// document without the field decodes to it); SpecKindRPCServer is the Kind of
+// a llama.cpp rpc-server cluster member.
+const (
+	SpecKindModel     = ""
+	SpecKindRPCServer = "rpc_server"
+)
+
+// ClusterEndpoint is one remote rpc-server a head offloads to: Address is
+// "host:port" as the head's llama-server receives it in --rpc, DeviceCount how
+// many devices that server exposes (it contributes RPC<n>.. device names).
+type ClusterEndpoint struct {
+	Address     string `json:"address"`
+	DeviceCount int    `json:"device_count"`
+}
+
+// ClusterHead is a head spec's cluster description: the ordered endpoints, how
+// the members are reached (Transport "direct" | "relay") and over which network
+// ("mesh" | "lan"). It is carried verbatim; the vocabulary is the gateway's.
+type ClusterHead struct {
+	Endpoints []ClusterEndpoint `json:"endpoints"`
+	Transport string            `json:"transport"`
+	Network   string            `json:"network"`
+}
+
+// RPCMember is an rpc_server spec's network settings. Port is the rpc-server's
+// own port (direct) or the relay's listen port (relay). HeadIPs and HeadDomain
+// are the connection ALLOWLIST (HeadDomain is resolved by the agent when the
+// head's address is only known by name); both are applied live, so changing
+// them never relaunches the member (sameLaunchShape).
+type RPCMember struct {
+	HeadSpecID   string   `json:"head_spec_id"`
+	Transport    string   `json:"transport"`
+	BindIP       string   `json:"bind_ip"`
+	Port         int      `json:"port"`
+	HeadIPs      []string `json:"head_ips"`
+	HeadDomain   string   `json:"head_domain"`
+	CacheEnabled bool     `json:"cache_enabled"`
+}
+
+// IsClusterHead reports whether the spec is a cluster head: it lists at least
+// one remote rpc-server endpoint.
+func (s Spec) IsClusterHead() bool {
+	return s.Cluster != nil && len(s.Cluster.Endpoints) > 0
+}
+
+// IsRPCServer reports whether the spec is a usable rpc_server member: its kind
+// says so and it carries the member settings.
+func (s Spec) IsRPCServer() bool {
+	return s.Kind == SpecKindRPCServer && s.RPC != nil
 }
 
 // RoleOther is the role of a spec that has none the agent recognises: the value
@@ -411,6 +483,12 @@ func ParseConfig(raw []byte) (Config, error) {
 		}
 	}
 
+	var invalid []string
+	cfg.Specs, invalid = withoutInvalidKinds(cfg.Specs)
+	for _, id := range invalid {
+		delete(specIDs, id)
+	}
+
 	if cfg.Specs == nil {
 		cfg.Specs = []Spec{}
 	}
@@ -482,6 +560,54 @@ func withoutReservedSpecIDs(specs []Spec) []Spec {
 		kept = append(kept, spec)
 	}
 	return kept
+}
+
+// withoutInvalidKinds returns specs without any whose Kind the agent cannot run
+// safely, logging a Warn naming each one, and the IDs it dropped. It never
+// fails the document (one bad spec costs that spec, like a reserved ID), and a
+// dropped spec's coresident pairs go with it (the caller removes its ID from
+// the known set). An rpc_server member is invalid without member settings, with
+// a port outside 1..65535, or with fields that only make sense on a model
+// (listen_port, upstream_model): starting it as the model it half-describes
+// would exec the rpc-server binary behind a proxy route. An unknown kind is
+// dropped too, since a newer gateway's kind may need handling this agent lacks
+// and falling back to "a model" would launch it wrongly.
+func withoutInvalidKinds(specs []Spec) ([]Spec, []string) {
+	var dropped []string
+	kept := make([]Spec, 0, len(specs))
+	for _, spec := range specs {
+		if reason := invalidKindReason(spec); reason != "" {
+			slog.Warn("runtime: ignoring spec with an invalid kind configuration", "spec", spec.ID, "kind", spec.Kind, "reason", reason)
+			dropped = append(dropped, spec.ID)
+			continue
+		}
+		kept = append(kept, spec)
+	}
+	if len(dropped) == 0 {
+		return specs, nil
+	}
+	return kept, dropped
+}
+
+// invalidKindReason names why spec's kind configuration is unusable, or ""
+// when it is fine. See withoutInvalidKinds.
+func invalidKindReason(spec Spec) string {
+	switch spec.Kind {
+	case SpecKindModel:
+		return ""
+	case SpecKindRPCServer:
+		switch {
+		case spec.RPC == nil:
+			return "rpc_server spec has no rpc settings"
+		case spec.RPC.Port <= 0 || spec.RPC.Port > 65535:
+			return "rpc_server spec has an invalid rpc port"
+		case spec.ListenPort != 0 || spec.UpstreamModel != "":
+			return "rpc_server spec sets listen_port or upstream_model, which only a model has"
+		}
+		return ""
+	default:
+		return "unknown spec kind"
+	}
 }
 
 // sanitizeInstanceFields normalises a spec's multi-instance opt-in (#340) so
@@ -626,6 +752,10 @@ type LastError struct {
 	ExitCode   int       `json:"exit_code"`
 	Failures   int       `json:"failures"`
 	StderrTail string    `json:"stderr_tail,omitempty"` // bounded, ~2 KiB
+	// Code is a stable machine-readable error code (for example
+	// runtime.device_backend_mismatch) for lifecycle failures the gateway maps
+	// to a specific operator message; empty for a plain start failure or crash.
+	Code string `json:"code,omitempty"`
 }
 
 // Status is one INSTANCE's current runtime status, as tracked by the process
@@ -697,6 +827,45 @@ type Status struct {
 	Type             string `json:"type"`
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+
+	// Kind mirrors the spec's Kind (omitted for a model). RPC is an rpc_server
+	// member's live state, Cluster a head's launch facts, and AdmissionBlockedBy
+	// names, on a waiting spec, the held member that blocks its admission. All
+	// four ride RuntimeSample under the same JSON keys.
+	Kind               string         `json:"kind,omitempty"`
+	RPC                *RPCStatus     `json:"rpc,omitempty"`
+	Cluster            *ClusterStatus `json:"cluster,omitempty"`
+	AdmissionBlockedBy string         `json:"admission_blocked_by,omitempty"`
+}
+
+// RPCStatus is an rpc_server member's live state: which head holds it and since
+// when, the end of an armed reservation, the rpc-server protocol version, the
+// device count it announced, whether it listens on an address other than the
+// configured one, peers that connected without being allowlisted, the on-disk
+// tensor cache size, and whether the member has stopped making progress.
+type RPCStatus struct {
+	HeldBy        string      `json:"held_by,omitempty"`
+	HeldSince     time.Time   `json:"held_since,omitzero"`
+	ReservedUntil time.Time   `json:"reserved_until,omitzero"`
+	Protocol      string      `json:"protocol,omitempty"`
+	DeviceCount   int         `json:"device_count"`
+	BindMismatch  bool        `json:"bind_mismatch"`
+	Breaches      []RPCBreach `json:"breaches,omitempty"`
+	CacheMB       int         `json:"cache_mb"`
+	Stalled       bool        `json:"stalled"`
+}
+
+// RPCBreach records one connection from a peer outside the member's allowlist.
+type RPCBreach struct {
+	Peer string    `json:"peer"`
+	At   time.Time `json:"at"`
+}
+
+// ClusterStatus is what a head's last launch used: the endpoint addresses it
+// was started against and the llama.cpp build version the cluster agreed on.
+type ClusterStatus struct {
+	Launched []string `json:"launched"`
+	Version  string   `json:"version"`
 }
 
 // statusAlias is Status under a different name, used only to marshal
