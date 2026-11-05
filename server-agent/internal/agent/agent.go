@@ -894,6 +894,12 @@ type Agent struct {
 	runtimeLogWake   <-chan json.RawMessage
 	runtimeLogPort   runtimeLogPort
 	runtimeLogPoster runtimeLogPoster
+
+	// relays runs the relays of this host's relay-mode RPC cluster members
+	// (see relayLink); nil when there is no runtime driver or no member sink
+	// to report holds to, which disables relay mode entirely. Its own locks
+	// make it safe from every goroutine that drives it.
+	relays *relayLink
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -940,6 +946,11 @@ type Deps struct {
 	// only a proven-non-nil value (main.go's *runtimectl.FeaturesClient
 	// always is), never a possibly-nil concrete pointer.
 	GatewayFeatures gatewayFeatureSource
+	// RPCMembers receives the relay's member holds and installs its
+	// readiness gate (see rpcMemberSink); with RuntimeDriver set it enables
+	// the relays of relay-mode RPC members. Same typed-nil caveat: assign
+	// only a proven-non-nil value (main.go's *runtimectl.Manager always is).
+	RPCMembers rpcMemberSink
 }
 
 // New builds an Agent from the resolved config and its collectors/poster. The
@@ -1040,6 +1051,10 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		a.runtimeLogPoster = logPoster
 		a.runtimeLogPort = logPort
 	}
+	if d.RuntimeDriver != nil && d.RPCMembers != nil {
+		a.relays = newRelayLink(d.RuntimeDriver.Status, d.RPCMembers)
+		d.RPCMembers.SetMemberRelayGate(a.relays.ready)
+	}
 	return a
 }
 
@@ -1049,6 +1064,9 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 // Returns nil on graceful shutdown; a single failed collect/push/report never stops
 // the loop.
 func (a *Agent) Run(ctx context.Context) error {
+	// The relays close with the run: every session ends and every hold the
+	// relay reported is released while the runtime is still there to hear it.
+	defer a.relays.close()
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
@@ -1132,6 +1150,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-logTickerC:
 			a.flushRuntimeLogs(ctx)
 		case <-a.runtimeTransitions:
+			// A member that started, stopped or began draining gains or
+			// loses its relay first: a drain must close the head's session
+			// before anything else.
+			a.relays.sync()
 			// Immediate coalesced sample on a spec state transition or a row
 			// leaving the runtime status (design spec §7): a portal click
 			// should feel like network latency, not the next 1s telemetry
@@ -1327,6 +1349,9 @@ func (a *Agent) runRuntimeSyncs(ctx context.Context, data json.RawMessage) {
 	s := &a.runtimeSync
 	for {
 		a.runtimeDriver.Sync(ctx, data)
+		// An applied document can change a member's relay settings in place
+		// (its allowlist) without any state transition.
+		a.relays.sync()
 		s.mu.Lock()
 		if !s.owed || ctx.Err() != nil {
 			s.running, s.owed, s.next = false, false, nil

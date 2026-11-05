@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -357,4 +359,51 @@ func TestMemberCacheFreeDiskFloor(t *testing.T) {
 	if s.LastError == nil || !strings.Contains(s.LastError.Message, filepath.Join(root, "rpc", "rspec_h1")) {
 		t.Fatalf("last error = %+v, want a message naming the cache path", s.LastError)
 	}
+}
+
+// TestRelayMemberReadyOnlyOnceRelayListens: a relay-mode member is not ready
+// (so EnsureMember does not return, and its state stays starting) until the
+// relay gate reports the relay listening, even though the child accepts TCP;
+// the gate is asked for that member, and a direct member never consults it.
+func TestRelayMemberReadyOnlyOnceRelayListens(t *testing.T) {
+	shrinkTimings(t)
+	spec := memberSpec("rpcm_a", "rspec_h", "-tcp-listen")
+	spec.RPC.Transport = "relay"
+	spec.RPC.Port = freeTCPPort(t)
+	spec.AdminState = "force_running"
+	direct := onDemandMember(t, "rpcm_d")
+	direct.AdminState = "force_running"
+
+	m := newTestManager(t, allowlistPolicy())
+	var listening atomic.Bool
+	var asked sync.Map
+	m.SetMemberRelayGate(func(specID string) bool {
+		asked.Store(specID, true)
+		return listening.Load()
+	})
+	m.Apply(Config{Specs: []Spec{spec, direct}})
+
+	waitUntil(t, 5*time.Second, "direct member running", func() bool {
+		s := statusFor(m, "rpcm_d")
+		return s != nil && s.State == StateRunning
+	})
+	waitUntil(t, 5*time.Second, "relay gate asked for the relay member", func() bool {
+		_, ok := asked.Load("rpcm_a")
+		return ok
+	})
+	time.Sleep(200 * time.Millisecond) // many poll ticks with the child up
+	if s := statusFor(m, "rpcm_a"); s.State != StateStarting {
+		t.Fatalf("relay member state = %s while its relay is down, want starting", s.State)
+	}
+	if _, ok := asked.Load("rpcm_d"); ok {
+		t.Fatal("the relay gate was consulted for a direct member")
+	}
+	if s := statusFor(m, "rpcm_a"); s.RPCMember == nil || s.RPCMember.Transport != "relay" || s.RPCMember.Port != spec.RPC.Port {
+		t.Fatalf("status RPCMember = %+v, want the member's relay settings", s.RPCMember)
+	}
+
+	listening.Store(true)
+	waitUntil(t, 5*time.Second, "relay member running once its relay listens", func() bool {
+		return statusFor(m, "rpcm_a").State == StateRunning
+	})
 }

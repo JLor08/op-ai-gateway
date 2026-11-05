@@ -268,6 +268,9 @@ func main() {
 	deps.HostInfo = mgr
 	// The capability probe sends the sdcpp source only if the gateway declares it.
 	deps.GatewayFeatures = featuresClient
+	// Relay-mode RPC members: the relay reports the head's holds to the
+	// manager and holds a member's readiness until its relay listens.
+	deps.RPCMembers = mgr
 	// The one wire that closes the cert_mode=proxy gap: the gateway publishes
 	// every proxy route with a hard-wired "http://127.0.0.1:<app.Port>"
 	// upstream, but under cert_mode=proxy the router above binds the agent's

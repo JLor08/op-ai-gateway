@@ -831,6 +831,10 @@ type Status struct {
 	// announced in its startup banner; empty otherwise. It is not part of the
 	// status wire form itself: telemetry reports it under the member's rpc block.
 	RPCProtocol string `json:"-"`
+	// RPCMember is a copy of an rpc_server member's current settings, the
+	// allowlist included as last applied: the agent builds the member's relay
+	// from it. Not part of the status wire form.
+	RPCMember *RPCMember `json:"-"`
 
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by

@@ -59,6 +59,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -370,6 +371,11 @@ type Manager struct {
 	// result the beat stored (specState.measuredRAM), so the admission path pays
 	// no measurement.
 	ramMeasurer atomic.Pointer[ramMeasurerFunc]
+
+	// relayGate is the agent's word on whether a relay-mode member's relay is
+	// listening (SetMemberRelayGate). Written by its installer, read by the
+	// member's readiness poll off the owner goroutine; nil means no gate.
+	relayGate atomic.Pointer[func(specID string) bool]
 
 	// hostInfo is the latest hardware figures the agent's collect loop pushed
 	// (SetHostInfo): device totals and live available RAM. Same discipline as
@@ -5421,6 +5427,9 @@ func (o *owner) snapshotStatus() []Status {
 			s.Port = st.proc.port
 		}
 		if st.spec.IsRPCServer() {
+			member := *st.spec.RPC
+			member.HeadIPs = slices.Clone(member.HeadIPs)
+			s.RPCMember = &member
 			s.RPC = &RPCStatus{
 				HeldBy:        st.claim.heldBy,
 				HeldSince:     st.claim.heldSince,

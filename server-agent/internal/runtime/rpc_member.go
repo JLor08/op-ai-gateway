@@ -203,15 +203,17 @@ func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (ar
 }
 
 // pollMemberReady is the member's pollHealth: ready as soon as a TCP connect
-// to its probe address succeeds. A member serves no HTTP, so there is no
-// health path to wait on. It stops silently when the process exits (waitForExit
+// to its probe address succeeds and, in relay mode, the relay listens (see
+// SetMemberRelayGate). A member serves no HTTP, so there is no health path to
+// wait on. It stops silently when the process exits (waitForExit
 // reports that) and fails with ErrStartTimeout at the startup deadline.
 func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, deadline time.Time) {
 	addr := memberReadyAddr(spec, proc.port)
 	ticker := time.NewTicker(healthPollInterval)
 	defer ticker.Stop()
 	for {
-		if probeTCP(addr, 2*time.Second) {
+		childUp := probeTCP(addr, 2*time.Second)
+		if childUp && o.m.relayListening(spec) {
 			res := cmdStartResult{specID: specID, proc: proc, ok: true}
 			if banner, found := awaitMemberBanner(proc, deadline); found {
 				res.rpcProtocol = banner.Protocol
@@ -224,6 +226,10 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 			return
 		}
 		if time.Now().After(deadline) {
+			if childUp {
+				slog.Warn("runtime: rpc-server is up but its relay is not listening; is the relay bind address an address of this host?",
+					"spec", specID, "bind_ip", spec.RPC.BindIP, "port", spec.RPC.Port)
+			}
 			o.m.postCmd(cmdStartResult{specID: specID, proc: proc, err: ErrStartTimeout})
 			return
 		}
@@ -284,4 +290,33 @@ func permitMember(spec Spec) error {
 		return validMemberHeadID(spec.RPC.HeadSpecID)
 	}
 	return nil
+}
+
+// SetMemberRelayGate installs the check that holds a relay-mode member's
+// readiness until its relay listens. The head can reach a relay member only
+// through the relay, so a member whose child is up but whose relay is not
+// listening (its bind address is not an address of this host, or the address
+// is still in use) is not ready: it stays starting, EnsureMember does not
+// return, and the start times out like any other that never became healthy.
+// The gate is asked from the member's readiness poll, off the owner goroutine,
+// with the member's spec ID, once its child accepts TCP; it may call back into
+// the Manager (Status) to bring the relay up. nil removes it, and with none
+// installed a relay member is ready on its child alone. Direct members never
+// consult it.
+func (m *Manager) SetMemberRelayGate(gate func(specID string) bool) {
+	if gate == nil {
+		m.relayGate.Store(nil)
+		return
+	}
+	m.relayGate.Store(&gate)
+}
+
+// relayListening reports whether spec passes the relay gate: always for a
+// direct member or with no gate installed.
+func (m *Manager) relayListening(spec Spec) bool {
+	if spec.RPC == nil || spec.RPC.Transport != "relay" {
+		return true
+	}
+	gate := m.relayGate.Load()
+	return gate == nil || (*gate)(spec.ID)
 }
