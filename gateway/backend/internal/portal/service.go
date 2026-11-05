@@ -4065,6 +4065,12 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	// row change has already landed, and owners are no part of the document, so
 	// a failing owner write must not swallow the announcement.
 	s.notifyRuntimeChanged(server.ID)
+	// The row is also an input of every cluster the server takes part in: its
+	// mesh IP, LAN address and bind switch, Domain, NetBird enablement, RPC
+	// membership and consent shape the head's endpoints and every member's
+	// network settings, and decide whether the cluster is pushed at all. The
+	// fan-out runs after the peer rename below, which can move the Domain.
+	defer s.NotifyClustersOfServer(ctx, server.ID)
 	if req.OwnerIDs != nil {
 		if err := s.routes.SetServerOwners(ctx, server.ID, ownerIDs); err != nil {
 			return ServerDTO{}, err
@@ -4118,6 +4124,10 @@ func (s *Service) SetServerAdminGroups(ctx context.Context, principal auth.Token
 	if server.SystemGroupID != "" && systemGroupID != server.SystemGroupID {
 		return ServerDTO{}, ErrServerAdminGroupParentMismatch
 	}
+	// The admin groups are the default consent of a cluster member and the
+	// groups a head is admitted by, so every cluster of the server follows
+	// them -- also after a partial write.
+	defer s.NotifyClustersOfServer(ctx, server.ID)
 	current, err := s.routes.ServerAdminGroups(ctx, id)
 	if err != nil {
 		return ServerDTO{}, err
@@ -4260,6 +4270,16 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 	if err != nil {
 		return false, err
 	}
+	// A cluster member is refused like its manual member spec: the delete
+	// would take the membership row with it, and the head would then run on
+	// fewer members than its operator configured. Remove the member from the
+	// head first.
+	if err := s.clusterMemberServerInUse(ctx, principal, server.ID); err != nil {
+		return false, err
+	}
+	// The server's own cluster heads go with it, and with them the members
+	// derived into their member servers' documents.
+	clusterServers := s.clusterServersOfServer(ctx, server.ID)
 	// Best-effort: delete the per-server tracking group ("op-gw-<id>") from NetBird
 	// before removing the row. A NetBird error must NOT fail the delete (log + drop).
 	if server.NetbirdGroupID != "" {
@@ -4295,6 +4315,11 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 	}
 	if err := s.routes.DeleteAIServer(ctx, server.ID); err != nil {
 		return false, err
+	}
+	for _, sid := range clusterServers {
+		if sid != server.ID {
+			s.notifyRuntimeChanged(sid)
+		}
 	}
 	return netbirdCleanupFailed, nil
 }

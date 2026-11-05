@@ -126,6 +126,9 @@ func (s *Service) RegenerateNetbirdKey(ctx context.Context, principal auth.Token
 	// server / first enrollment skips this entirely). Best-effort throughout — a
 	// NetBird error is Debug-logged and never aborts key generation.
 	if server.NetbirdPeerID != "" || server.NetbirdGroupID != "" {
+		// Clearing the peer linkage clears the mesh IP every cluster of the
+		// server addresses it by.
+		defer s.NotifyClustersOfServer(ctx, server.ID)
 		ncfg := netbird.Config{URL: cfg.URL, Token: cfg.Token}
 		if server.NetbirdGroupID != "" {
 			if g, gErr := netbird.GetGroup(ctx, ncfg, netbirdCallTimeout, server.NetbirdGroupID); gErr == nil {
@@ -497,6 +500,10 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 	if !enabled && strings.TrimSpace(server.Domain) == "" {
 		return ServerDTO{}, ErrServerDomainRequired
 	}
+	// NetBird enablement, the tracking group, the mesh IP and the Domain shape
+	// every cluster of the server (NotifyClustersOfServer); each write below
+	// can move one, also when a later step fails.
+	defer s.NotifyClustersOfServer(ctx, id)
 	// Uniqueness: a peer id must not be linked to another server.
 	if peerID != "" {
 		servers, err := s.routes.AIServers(ctx)

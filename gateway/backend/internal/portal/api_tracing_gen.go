@@ -1491,6 +1491,13 @@ func (_d *APIWithTracing) NetbirdTokenStatus(ctx context.Context) (n1 NetbirdTok
 	return _d.API.NetbirdTokenStatus(ctx)
 }
 
+func (_d *APIWithTracing) NotifyClustersOfServer(ctx context.Context, s1 string) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.NotifyClustersOfServer")
+	defer span.End()
+	_d.API.NotifyClustersOfServer(ctx, s1)
+	return
+}
+
 func (_d *APIWithTracing) PollVendorAccountDeviceConnect(ctx context.Context, t1 auth.Token, s1 string) (b1 bool, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PollVendorAccountDeviceConnect")
 	defer span.End()

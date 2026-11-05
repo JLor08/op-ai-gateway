@@ -982,3 +982,33 @@ func TestSyncPersistsPeerIP(t *testing.T) {
 		t.Fatalf("unchanged IP wrote %+v, want no write", writes)
 	}
 }
+
+// TestClusterNotifyingStoreNotifiesAfterAStateWrite: the peer sync's state
+// write notifies the written server's clusters once it has landed, and a
+// failed write notifies nothing.
+func TestClusterNotifyingStoreNotifiesAfterAStateWrite(t *testing.T) {
+	ctx := context.Background()
+	mem := routing.NewMemoryStore()
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: "srv_a", Name: "A", Domain: "a.example.test", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	var notified []string
+	s := clusterNotifyingStore{Store: mem, notify: func(_ context.Context, id string) { notified = append(notified, id) }}
+	if err := s.UpdateServerNetbirdState(ctx, "srv_a", "a.netbird.test", "peer", "100.64.0.5", true); err != nil {
+		t.Fatal(err)
+	}
+	if len(notified) != 1 || notified[0] != "srv_a" {
+		t.Fatalf("notified = %v, want srv_a once", notified)
+	}
+	if got, _ := mem.AIServerByID(ctx, "srv_a"); got.NetbirdIP != "100.64.0.5" {
+		t.Fatalf("state not written: %+v", got)
+	}
+	notified = nil
+	if err := s.UpdateServerNetbirdState(ctx, "srv_missing", "", "", "", false); err == nil {
+		t.Fatal("write to an unknown server succeeded")
+	}
+	if len(notified) != 0 {
+		t.Fatalf("failed write notified %v", notified)
+	}
+}

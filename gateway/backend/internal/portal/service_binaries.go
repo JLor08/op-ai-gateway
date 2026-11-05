@@ -153,6 +153,10 @@ func (s *Service) CreateManualServerBinary(ctx context.Context, p auth.Token, se
 	if !validBinaryText(req.Version, req.Build, req.Commit, req.VersionOverride) {
 		return ServerBinaryDTO{}, ErrBinaryVersionInvalid
 	}
+	// The inventory decides an automatic member's binary and every member's
+	// version in its head's generation, so each cluster of the server follows
+	// a write -- also a partial one.
+	defer s.NotifyClustersOfServer(ctx, server.ID)
 	row := routing.ServerBinary{ServerID: server.ID, Path: req.Path, Kind: kind, ReportedAt: s.clock().UTC()}
 	if req.Version != nil {
 		row.Version = *req.Version
@@ -200,6 +204,7 @@ func (s *Service) UpdateServerBinary(ctx context.Context, p auth.Token, serverID
 	if !ok {
 		return ServerBinaryDTO{}, ErrBinaryNotFound
 	}
+	defer s.NotifyClustersOfServer(ctx, server.ID) // as in CreateManualServerBinary
 	if req.Kind != nil || req.Version != nil || req.Build != nil || req.Commit != nil {
 		if row.Source != routing.BinarySourceManual {
 			return ServerBinaryDTO{}, ErrBinaryAgentOwned
@@ -245,7 +250,11 @@ func (s *Service) DeleteManualServerBinary(ctx context.Context, p auth.Token, se
 	if row.Source != routing.BinarySourceManual {
 		return ErrBinaryAgentOwned
 	}
-	return mapBinaryStoreErr(s.routes.DeleteManualServerBinary(ctx, server.ID, binaryPath))
+	if err := s.routes.DeleteManualServerBinary(ctx, server.ID, binaryPath); err != nil {
+		return mapBinaryStoreErr(err)
+	}
+	s.NotifyClustersOfServer(ctx, server.ID) // as in CreateManualServerBinary
+	return nil
 }
 
 func mapBinaryStoreErr(err error) error {

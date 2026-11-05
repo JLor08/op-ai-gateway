@@ -203,9 +203,19 @@ func (s *Service) PutRPCMemberSpec(ctx context.Context, p auth.Token, serverID, 
 		gpuRows[i] = routing.RPCMemberSpecGPU{SpecID: row.ID, GPUIndex: g.Index, Position: i, VRAMEstimateMB: g.VRAMEstimateMB}
 	}
 	if err := s.routes.SetRPCMemberSpecGPUs(ctx, row.ID, gpuRows); err != nil {
+		s.notifyRPCMemberChanged(ctx, server.ID, row.ID)
 		return RPCMemberSpecDTO{}, err
 	}
+	// The membership of the head using the spec holds the measured usage per
+	// GPU, so it follows the spec's GPU rows. Serialized with the head writes,
+	// which replace the same membership.
+	s.clusterWriteMu.Lock()
+	_, err = s.resyncManualMemberGPUs(ctx, row.ID, gpuRows)
+	s.clusterWriteMu.Unlock()
 	s.notifyRPCMemberChanged(ctx, server.ID, row.ID)
+	if err != nil {
+		return RPCMemberSpecDTO{}, err
+	}
 	stored, _, err := s.routes.RPCMemberSpecByID(ctx, row.ID)
 	if err != nil {
 		return RPCMemberSpecDTO{}, err
@@ -353,6 +363,23 @@ func (s *Service) rpcMemberInUseError(ctx context.Context, p auth.Token, specID 
 	return ErrRPCMemberInUse
 }
 
+// clusterMemberServerInUse returns ErrRPCMemberInUse when serverID is a
+// member of a cluster head; the message names the head's server only when
+// the caller may see it.
+func (s *Service) clusterMemberServerInUse(ctx context.Context, p auth.Token, serverID string) error {
+	memberships, err := s.routes.ClusterMembershipsByServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if len(memberships) == 0 {
+		return nil
+	}
+	if name := s.visibleHeadServerName(ctx, p, memberships[0].HeadSpecID); name != "" {
+		return &RPCMemberInUseError{HeadServerName: name}
+	}
+	return ErrRPCMemberInUse
+}
+
 // RPCMemberInUseError is ErrRPCMemberInUse carrying the name of the head's
 // server; it is only built for callers who may see that server.
 type RPCMemberInUseError struct{ HeadServerName string }
@@ -394,16 +421,21 @@ func (s *Service) visibleHeadServerName(ctx context.Context, p auth.Token, headS
 	return server.Name
 }
 
-// notifyRPCMemberChanged tells the member's agent and, when a head references
-// the spec, the head's agent that their runtime document changed.
+// notifyRPCMemberChanged tells the member's agent and, when a head uses the
+// spec, every server of that head's cluster that their runtime document
+// changed: the spec's settings move the head's generation and device count,
+// and its consent or its enabled flag decide whether the cluster is pushed
+// at all, which every member's document follows.
 func (s *Service) notifyRPCMemberChanged(ctx context.Context, serverID, specID string) {
 	s.notifyRuntimeChanged(serverID)
 	head, ok, err := s.routes.ClusterMemberBySpec(ctx, specID)
 	if err != nil || !ok {
 		return
 	}
-	if headServer, ok := s.headServerID(ctx, head.HeadSpecID); ok && headServer != serverID {
-		s.notifyRuntimeChanged(headServer)
+	for _, id := range s.clusterServers(ctx, head.HeadSpecID) {
+		if id != serverID {
+			s.notifyRuntimeChanged(id)
+		}
 	}
 }
 

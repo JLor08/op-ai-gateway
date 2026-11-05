@@ -30,6 +30,7 @@ type API interface {
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
+	NotifyClustersOfServer(context.Context, string)
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AnthropicPromptCachingEnabled(context.Context) bool
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)

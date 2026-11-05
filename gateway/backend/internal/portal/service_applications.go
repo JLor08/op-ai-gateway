@@ -1363,8 +1363,19 @@ func (s *Service) DeleteApplication(ctx context.Context, principal auth.Token, a
 	if err != nil {
 		return err
 	}
+	// Read before the delete, which cascades the server's cluster heads: their
+	// member servers' documents lose the members derived from them, and a
+	// server_agent application is what a member's document needs at all.
+	clusterServers := s.clusterServersOfServer(ctx, server.ID)
 	if err := s.routes.DeleteApplication(ctx, app.ID); err != nil {
 		return err
+	}
+	if app.Type == routing.ProviderServerAgent {
+		for _, id := range clusterServers {
+			if id != server.ID {
+				s.notifyRuntimeChanged(id)
+			}
+		}
 	}
 	// Best-effort: deleting the server_agent application empties the server's
 	// runtime-config document (AgentRuntimeConfig's "no server_agent
@@ -2683,8 +2694,19 @@ func (s *Service) DeleteMapping(ctx context.Context, principal auth.Token, mappi
 	if err != nil {
 		return err
 	}
+	// A cluster head's spec cascades with the mapping, and with it the member
+	// processes derived into each member server's document.
+	var clusterServers []string
+	if spec, ok, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID); err == nil && ok && spec.ClusterEnabled {
+		clusterServers = s.clusterServers(ctx, spec.ID)
+	}
 	if err := s.routes.DeleteMapping(ctx, mapping.ID); err != nil {
 		return err
+	}
+	for _, id := range clusterServers {
+		if id != server.ID {
+			s.notifyRuntimeChanged(id)
+		}
 	}
 	// Best-effort, after the successful store write: the store cascades the
 	// mapping's runtime spec, its GPU rows and its co-residency pairs, so

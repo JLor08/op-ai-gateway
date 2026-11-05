@@ -92,5 +92,12 @@ func (s *Server) writeBackBinaries(ctx context.Context, serverID string, reporte
 	rows := sanitizeBinarySamples(*reported, serverID, now)
 	if err := s.Routes.ReplaceAgentServerBinaries(ctx, serverID, rows); err != nil {
 		slog.Warn("agent binary inventory write failed", "server_id", serverID, "err", err)
+		return
+	}
+	// The inventory decides an automatic cluster member's binary and every
+	// member's version in its head's generation; the agent sends it only when
+	// it changed, so every server sharing a cluster with this one is pushed.
+	if s.Portal != nil {
+		s.Portal.NotifyClustersOfServer(ctx, serverID)
 	}
 }

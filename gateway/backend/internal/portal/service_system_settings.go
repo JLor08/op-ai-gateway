@@ -2531,6 +2531,9 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 	if err := s.persistSystemSettings(ctx, writes); err != nil {
 		return SystemSettingsDTO{}, err
 	}
+	// The NetBird policy settings decide whether a direct mesh cluster may be
+	// pushed; every cluster is re-derived (a no-op where nothing moved).
+	s.notifyAllClusterServers(ctx)
 	// A NetBird token was just (re)stored. Keep netbird_token_id/_expires_at in sync:
 	// clearing the token clears them synchronously; a new non-empty token is resolved
 	// best-effort (single-token users get instant expiry display + auto-rotation).

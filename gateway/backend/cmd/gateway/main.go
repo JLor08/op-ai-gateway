@@ -1060,7 +1060,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// access-policy reconcile. Both are no-ops until the NetBird module is
 	// enabled. The online callback is async so an online burst never blocks
 	// Loop A (ReconcileServerNetbird is concurrency-safe).
-	cancelNetbirdA := startNetbirdSyncLoop(b.Routes, portalService, func(id string) {
+	netbirdStateStore := clusterNotifyingStore{Store: b.Routes, notify: portalService.NotifyClustersOfServer}
+	cancelNetbirdA := startNetbirdSyncLoop(netbirdStateStore, portalService, func(id string) {
 		go portalService.ReconcileServerNetbird(context.Background(), id)
 	}, portalService, cfg.NetbirdSyncIntervalSeconds, netbirdCallTimeout, netbirdDomainSyncTrigger)
 	cancelNetbirdB := startNetbirdReconcileLoop(portalService, portalService, cfg.NetbirdSyncIntervalSeconds)
@@ -1076,7 +1077,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// block.
 	onAgentReactivated := func(serverID string) {
 		go handleAgentReactivation(context.Background(), serverID, reactivationDeps{
-			store: b.Routes, settings: portalService, reconciler: portalService,
+			store: netbirdStateStore, settings: portalService, reconciler: portalService,
 			syncOne: syncServerNetbirdOnce, timeout: netbirdCallTimeout,
 		}, appHealthServerTrigger, certReconcileTrigger)
 	}

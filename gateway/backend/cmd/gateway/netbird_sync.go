@@ -35,6 +35,29 @@ type serverStore interface {
 	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
 }
 
+// clusterNotifyingStore is the routing store the NetBird peer sync and the
+// agent reactivation write through: after every successful
+// UpdateServerNetbirdState it notifies every server sharing a llama.cpp RPC
+// cluster with the written one (portal.Service.NotifyClustersOfServer). The
+// peer sync is the writer of a server's mesh IP and its NetBird Domain, and a
+// cluster's endpoints, bind addresses and head identity are derived from
+// both, so without it a moved mesh IP would only reach the cluster's agents
+// on their next poll. Both writers write only on a real change.
+type clusterNotifyingStore struct {
+	routing.Store
+	notify func(ctx context.Context, serverID string)
+}
+
+func (s clusterNotifyingStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error {
+	if err := s.Store.UpdateServerNetbirdState(ctx, id, domain, peerID, ip, connected); err != nil {
+		return err
+	}
+	if s.notify != nil {
+		s.notify(ctx, id)
+	}
+	return nil
+}
+
 // netbirdSettings is the settings source the peer loop reads the resolved NetBird
 // config from each cycle. *portal.Service satisfies it.
 type netbirdSettings interface {

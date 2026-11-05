@@ -1227,8 +1227,15 @@ func (s *Service) loadClusterMembers(ctx context.Context, headSpecID string) ([]
 				st.gpuRows = append(st.gpuRows, g)
 			}
 		}
-		if srv, err := s.routes.AIServerByID(ctx, row.ServerID); err == nil {
+		// A server that is gone leaves found false; any other failed read is
+		// an error, never a missing member (the runtime document withholds a
+		// cluster with a missing member).
+		srv, err := s.routes.AIServerByID(ctx, row.ServerID)
+		switch {
+		case err == nil:
 			st.server, st.found = srv, true
+		case !errors.Is(err, store.ErrNotFound):
+			return nil, err
 		}
 		if row.MemberSpecID != "" {
 			spec, ok, err := s.routes.RPCMemberSpecByID(ctx, row.MemberSpecID)
@@ -1289,6 +1296,9 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 		dto.ClusterTransportDefault = s.defaultRPCTransport(ctx, network)
 	}
 	if dto.ClusterEnabled {
+		if dto.ClusterWithheldReason, err = s.clusterWithheldReason(ctx, dto.ID, headServer); err != nil {
+			return dto, err
+		}
 		transport := dto.RPCTransport
 		if transport == "" {
 			transport = dto.ClusterTransportDefault

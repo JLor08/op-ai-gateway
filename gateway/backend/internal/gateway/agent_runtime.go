@@ -429,6 +429,13 @@ type agentRuntimeReportSpec struct {
 	Replicable   bool `json:"replicable,omitempty"`
 	MinInstances int  `json:"min_instances,omitempty"`
 	MaxInstances int  `json:"max_instances,omitempty"`
+	// Kind, DeviceBackend, Cluster and RPC are the llama.cpp RPC cluster
+	// fields (AgentRuntimeSpecDTO's), omitempty like the DTO's. None carries a
+	// secret: addresses, ports and the head's identity.
+	Kind          string                      `json:"kind,omitempty"`
+	DeviceBackend string                      `json:"device_backend,omitempty"`
+	Cluster       *portal.AgentClusterHeadDTO `json:"cluster,omitempty"`
+	RPC           *portal.AgentRPCMemberDTO   `json:"rpc,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

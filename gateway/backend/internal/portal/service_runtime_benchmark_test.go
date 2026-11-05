@@ -127,13 +127,15 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		"instances_min_exceeds_realtime": true,
 		// The cluster totals, the network/transport defaults and the warnings
 		// are derived on every read from the membership, the servers and the
-		// settings, never stored: read-only echoes.
+		// settings, never stored: read-only echoes. So is the reason a head is
+		// withheld from its runtime document.
 		"cluster_vram_total_mb":     true,
 		"cluster_ram_total_mb":      true,
 		"cluster_totals_complete":   true,
 		"cluster_network_default":   true,
 		"cluster_transport_default": true,
 		"cluster_warnings":          true,
+		"cluster_withheld_reason":   true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only

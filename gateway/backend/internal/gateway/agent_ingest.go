@@ -1042,10 +1042,11 @@ const startupWriteBackThresholdPercent = 10
 // failure handling are writeBackRuntimeRAM's, through the same memo.
 //
 // The ingest writes this outside the portal service, whose write paths push a
-// changed document themselves, so a write for a replicable spec pushes
-// serverID's runtime config here, once per sample however many specs moved.
-// A spec that is not replicable is pushed its stored idle timeout, which the
-// measurement does not change, so its write pushes nothing.
+// changed document themselves, so a write for a replicable spec or a cluster
+// head (portal.DerivesIdleTimeout) pushes serverID's runtime config here, once
+// per sample however many specs moved. Any other spec is pushed its stored
+// idle timeout, which the measurement does not change, so its write pushes
+// nothing.
 func (s *Server) writeBackRuntimeStartup(ctx context.Context, serverID string, folded map[string]foldedSpec, memo runtimeSpecMemo) {
 	if s.Routes == nil {
 		return
@@ -1065,7 +1066,7 @@ func (s *Server) writeBackRuntimeStartup(ctx context.Context, serverID string, f
 			continue
 		}
 		spec.StartupMeasuredMS = measured
-		push = push || spec.Replicable
+		push = push || portal.DerivesIdleTimeout(*spec)
 	}
 	if push {
 		s.PushRuntimeConfig(serverID)
@@ -2185,6 +2186,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// once, above) rather than re-parsing req.Capabilities.
 	knewFeatures := s.AgentFeatures.Known(serverID)
 	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
+	hadRPCCluster := s.AgentFeatures.Has(serverID, rpcClusterFeature)
 	if capsReadable {
 		s.AgentFeatures.Set(serverID, caps)
 	} else {
@@ -2203,6 +2205,13 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// pushes nothing: it holds the document.
 	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances) {
 		s.PushRuntimeConfig(serverID)
+	}
+	// A cluster is pushed only while every agent of it declares rpc_cluster,
+	// and every server's document of it is held while one declaration is
+	// unknown, so the same two moves push every server sharing a cluster with
+	// this one (the server's own document included).
+	if capsReadable && s.Portal != nil && (!knewFeatures || slices.Contains(caps, rpcClusterFeature) != hadRPCCluster) {
+		s.Portal.NotifyClustersOfServer(ctx, serverID)
 	}
 	// Record WHICH runtime-config document this agent says it has APPLIED, and
 	// do it BEFORE the status publish two lines below. That ordering is a

@@ -622,6 +622,13 @@ type RuntimeSpecDTO struct {
 	ClusterNetworkDefault   string   `json:"cluster_network_default"`
 	ClusterTransportDefault string   `json:"cluster_transport_default"`
 	ClusterWarnings         []string `json:"cluster_warnings"`
+	// ClusterWithheldReason is why an enabled cluster head is not in its
+	// server's runtime document (a ClusterWithheld* code: an agent too old
+	// or not heard from, a member missing, disabled or no longer
+	// consenting, an unknown address or port, NetBird preconditions, no
+	// matching member binary); "" when it is pushed. READ-ONLY, derived on
+	// every read.
+	ClusterWithheldReason string `json:"cluster_withheld_reason,omitempty"`
 }
 
 // ConfigFileDTO is one operator-supplied config file of a runtime spec: a
@@ -2651,7 +2658,7 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //	request happened to change.
 //
 // A new write path can be checked against that one sentence, because
-// AgentRuntimeConfig (below) derives the whole document from exactly seven
+// AgentRuntimeConfig (below) derives the whole document from exactly eight
 // kinds of row. A path needs a notification if and only if it writes one of
 // them:
 //
@@ -2668,6 +2675,16 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     batched read) -> each spec's role (routing.DeriveRole). The role is a
 //     document field like any other, so a verdict write moves the document
 //     and its ETag
+//  8. the llama.cpp RPC CLUSTERS the server takes part in, as a head or a
+//     member -> a head's cluster block and the rpc_server member specs
+//     (deriveCluster). A cluster is derived from rows of EVERY server in it:
+//     the membership rows and their GPU rows, the manual member specs and
+//     their GPU rows, each server's row (addresses, bind switch, Domain,
+//     NetBird state, RPC membership, consent), its admin groups (consent),
+//     its server_agent application, its binary inventory and GPU budgets and
+//     hardware report (a stale member value's ceiling), the head spec, and
+//     the NetBird policy settings. So a write to any of them notifies every
+//     server of every cluster it touches, not only the server it writes.
 //
 // Call sites, by row: (1) UpdateServer; (2) CreateApplication /
 // UpdateApplication / DeleteApplication, via
@@ -2680,7 +2697,19 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // setBenchmarkRuntimeSpecs, after the batch's last write, once for each server
 // a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets; (7) the
 // operator's verdicts are written by CreateMapping / UpdateMapping, which are
-// already row 3's call sites and notify after the capability write has landed.
+// already row 3's call sites and notify after the capability write has landed;
+// (8) every server of the cluster (clusterServers, NotifyClustersOfServer)
+// from PutRuntimeSpec and DeleteRuntimeSpec (the head and its membership),
+// DeleteMapping / DeleteApplication / DeleteServer (a cascaded head),
+// PutRPCMemberSpec (a manual member, and the membership GPU rows it re-syncs),
+// UpdateServer, SetServerAdminGroups, SetServerNetbird, RegenerateNetbirdKey,
+// the manual binary inventory writers and UpdateSystemSettings; outside this
+// service the NetBird peer sync (cmd/gateway clusterNotifyingStore), the
+// telemetry ingest's inventory write and its rpc_cluster declaration push
+// through NotifyClustersOfServer too. The agent's usage writeback onto the
+// membership rows is exempt like the VRAM writeback below; a benchmark write
+// on a head notifies only the head's server, since a member's document never
+// reads the head's admin_state or pinned flag.
 //
 // The "never which field" half is the load-bearing half. A "relevant fields"
 // allow-list inside a write path would be a second, uncompiled copy of
@@ -2716,16 +2745,17 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     decides whether one is. The agent's poll reconciles the new role.
 //
 // Two writes outside this service DO push, because each moves a document
-// field the agent does not already hold: a replicable spec's pushed idle
-// timeout is derived (effectiveIdleTimeoutSeconds) from the spec's
+// field the agent does not already hold: the pushed idle timeout of a
+// replicable spec or a cluster head (DerivesIdleTimeout) is derived
+// (effectiveIdleTimeoutSeconds) from the spec's
 // startup_measured_ms (row 4) and its mapping's load_time_ms (row 3), and
 // neither figure is the agent's own value for that field. The telemetry
 // ingest writes startup_measured_ms (gateway.Server.writeBackRuntimeStartup,
 // only on a move of more than 10 %, so jitter pushes nothing) and the speed
 // benchmark writes load_time_ms (gateway.Server.measureSpeedTarget); each
-// pushes that server's document after a write for a replicable spec, through
+// pushes that server's document after a write for such a spec, through
 // gateway.Server.PushRuntimeConfig -- the push this hook runs -- and only for
-// a replicable spec, since the derived timeout is the one field either moves.
+// such a spec, since the derived timeout is the one field either moves.
 // Any other writer of load_time_ms, an audio benchmark included, pushes the
 // same way.
 //
@@ -2737,7 +2767,11 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // AwaitsAgentFeatures). The agent declares it in its telemetry, outside this
 // service, so the gateway's ingest pushes that server's document itself when
 // the declaration becomes known or changes (gateway.Server.
-// ingestTelemetrySample).
+// ingestTelemetrySample). Likewise whether every agent of a cluster the server
+// takes part in declares rpc_cluster, and whether all those declarations are
+// known (deriveCluster): the ingest notifies every server of those clusters
+// (NotifyClustersOfServer) when a declaration becomes known or rpc_cluster
+// changes.
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
@@ -2935,6 +2969,19 @@ type AgentRuntimeSpecDTO struct {
 	Replicable   bool `json:"replicable,omitempty"`
 	MinInstances int  `json:"min_instances,omitempty"`
 	MaxInstances int  `json:"max_instances,omitempty"`
+	// Kind is "" for a model spec and AgentSpecKindRPCServer for a llama.cpp
+	// RPC cluster member, which runs no model: it has no model names, listen
+	// port or probe paths, and carries RPC instead. DeviceBackend is the
+	// compute backend the agent renders device placeholders (and a member's
+	// -d) for; omitted for "auto", which an absent field means. Cluster makes
+	// a model spec a cluster head. All four are omitempty, so the document of
+	// a spec that uses none of them is the one it was before clusters
+	// existed; the agent honours them only while this gateway declares
+	// rpc_cluster.
+	Kind          string               `json:"kind,omitempty"`
+	DeviceBackend string               `json:"device_backend,omitempty"`
+	Cluster       *AgentClusterHeadDTO `json:"cluster,omitempty"`
+	RPC           *AgentRPCMemberDTO   `json:"rpc,omitempty"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -2972,6 +3019,12 @@ type AgentRuntimeConfigDTO struct {
 	// that runs instances retire every instance beyond the first -- the
 	// protected ones included -- until the declaration arrived.
 	//
+	// A document is held, too, while it would carry a llama.cpp RPC cluster
+	// head or member and the declaration of any agent of that cluster is not
+	// known (ClusterWithheldFeaturesPending): serving it without the cluster
+	// would make the agent stop a running head or member after a gateway
+	// restart, until the other agents' declarations arrived.
+	//
 	// The specs of a held document are derived as stored, as for an agent that
 	// runs instances (Service.specAsPushed). The flag itself is never on the
 	// wire, and so not in the ETag: the document an instance agent gets once
@@ -3003,6 +3056,11 @@ type AgentRuntimeConfigDTO struct {
 //
 // Per-GPU VRAMMB: max(measured, estimate) -- see agentRuntimeSpecDTO. 0 means
 // unknown (both source fields are 0).
+//
+// A llama.cpp RPC cluster head goes out with its cluster block or not at all
+// (deriveCluster withholds the whole cluster rather than push a partial
+// endpoint list), and after the server's own specs come the rpc_server
+// members it runs for heads on other servers (memberSpecsForServer).
 //
 // The empty document means exactly one thing: "this server is genuinely not
 // running anything managed" -- an empty serverID, no such AIServer row
@@ -3144,6 +3202,24 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
+		// A cluster head goes out with its cluster block, or not at all: a
+		// head whose cluster cannot be derived in full is withheld (and its
+		// member specs with it), and one whose agents' features are not all
+		// known holds the document.
+		var cluster *AgentClusterHeadDTO
+		if spec.ClusterEnabled {
+			block, reason, err := s.clusterHeadBlock(ctx, spec, server)
+			if err != nil {
+				return AgentRuntimeConfigDTO{}, err
+			}
+			if reason == ClusterWithheldFeaturesPending {
+				awaitsFeatures = true
+			}
+			if reason != "" {
+				continue
+			}
+			cluster = block
+		}
 		// The spec as this server's agent can run it: without the instance
 		// settings for an agent that does not declare runtime_instances.
 		pushed := s.specAsPushed(serverID, spec)
@@ -3166,6 +3242,12 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		specDTO.Role = string(routing.DeriveRole(et, routing.YesCapabilities(capsByMapping[spec.MappingID])))
 		specDTO.MetricsPath = mp
 		specDTO.ContextProbePath = cp
+		specDTO.Cluster = cluster
+		// "auto" is what an absent device_backend means to the agent, so the
+		// document of a spec that never chose a backend stays as it was.
+		if backend := normalizeDeviceBackend(spec.DeviceBackend); backend != deviceBackendAuto {
+			specDTO.DeviceBackend = backend
+		}
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}
@@ -3181,6 +3263,15 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
+	// The rpc_server members this server runs for other servers' cluster
+	// heads. They are exempt from co-residency pairs (the agent admits them
+	// by VRAM and RAM alone), so they join the specs after the pairs' input.
+	members, membersPending, err := s.memberSpecsForServer(ctx, serverID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	specDTOs = append(specDTOs, members...)
+	awaitsFeatures = awaitsFeatures || membersPending
 	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
 	dto := agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses)
 	dto.AwaitsAgentFeatures = awaitsFeatures
@@ -3409,8 +3500,10 @@ func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 
 // effectiveIdleTimeoutSeconds is the idle timeout the runtime-config document
 // pushes for spec, whose mapping's benchmark cold start is loadTimeMS. A spec
-// that is not replicable gets its stored IdleTimeoutSeconds as it is, 0 still
-// meaning "never unload". A replicable one gets the largest of its stored
+// that is neither replicable nor a cluster head (DerivesIdleTimeout) gets its
+// stored IdleTimeoutSeconds as it is, 0 still meaning "never unload". A
+// replicable one, and a cluster head, whose cold start waits for every member
+// first, gets the largest of its stored
 // value -- where 0 means "no manual override", not "never" -- factor times its
 // startup in seconds, rounded up, and floorSec. The startup is the slower of
 // the agent's measured startup and the benchmark's cold start, so an instance
@@ -3419,7 +3512,7 @@ func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 // replicable spec is never pushed 0, so its unprotected instances always idle
 // out. The result is held at maxDerivedIdleTimeoutSeconds.
 func effectiveIdleTimeoutSeconds(spec routing.RuntimeSpec, loadTimeMS int64, factor float64, floorSec int) int {
-	if !spec.Replicable {
+	if !DerivesIdleTimeout(spec) {
 		return spec.IdleTimeoutSeconds
 	}
 	derivedSec := derivedIdleSeconds(factor, max(spec.StartupMeasuredMS, loadTimeMS))

@@ -461,6 +461,9 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrNetbirdKeyFileNotConfigured, status: http.StatusConflict, code: "netbird.key_file_not_configured", msg: "netbird key file is not configured"},
 	{err: portal.ErrNetbirdNetworkRangeInvalid, status: http.StatusBadRequest, code: "system.netbird_network_range_invalid", msg: "network range must be a valid CIDR"},
 	{err: netbird.ErrAuth, status: http.StatusBadGateway, code: "netbird.auth_failed", msg: "netbird authentication failed"},
+	// Deleting a server that is a cluster member is refused like deleting its
+	// manual member spec.
+	{err: portal.ErrRPCMemberInUse, status: http.StatusConflict, code: "runtime.cluster_member_in_use", msg: "member is used by a cluster head", msgFn: rpcMemberInUseMessage},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeServerNotFound, msg: msgServerNotFound},
 }
 
