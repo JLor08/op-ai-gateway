@@ -2348,6 +2348,7 @@ const de = {
   rpcMemberBinary: 'Pfad zum ggml-rpc-server (absolut)',
   rpcMemberCache: 'RPC-Cache aktivieren',
   rpcMemberBackend: 'Geräte-Backend',
+  rpcMemberGpuLabel: 'GPU',
   rpcMemberGpuVram: 'VRAM-Schätzung (MB)',
   rpcMemberGpuHint:
     'Ohne GPU-Zeilen läuft das Mitglied auf der CPU. Die Reihenfolge der Zeilen ist die Reihenfolge der Geräte.',
@@ -5955,6 +5956,7 @@ const en: PortalMessages = {
   rpcMemberBinary: 'Path to ggml-rpc-server (absolute)',
   rpcMemberCache: 'Enable RPC cache',
   rpcMemberBackend: 'Device backend',
+  rpcMemberGpuLabel: 'GPU',
   rpcMemberGpuVram: 'VRAM estimate (MB)',
   rpcMemberGpuHint:
     'Without GPU rows the member runs on the CPU. The row order is the device order.',

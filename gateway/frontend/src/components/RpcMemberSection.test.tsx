@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RpcMemberSection } from './RpcMemberSection';
 import { ToastProvider } from './shared/ToastProvider';
@@ -80,12 +81,19 @@ function setup(
       return () => {};
     }),
   };
-  render(
+  const view = render(
     <ToastProvider>
       <RpcMemberSection t={t} api={api} server={server} />
     </ToastProvider>,
   );
-  return api;
+  return Object.assign(api, {
+    rerenderServer: (next: PortalServer) =>
+      view.rerender(
+        <ToastProvider>
+          <RpcMemberSection t={t} api={api} server={next} />
+        </ToastProvider>,
+      ),
+  });
 }
 
 afterEach(cleanup);
@@ -124,8 +132,12 @@ describe('RpcMemberSection manual member specs', () => {
       target: { value: 'FOO=bar' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
-    fireEvent.change(screen.getByLabelText(t.runtimeSpecGpuIndex), { target: { value: '1' } });
-    fireEvent.change(screen.getByLabelText(t.rpcMemberGpuVram), { target: { value: '8000' } });
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.runtimeSpecGpuIndex}`), {
+      target: { value: '1' },
+    });
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.rpcMemberGpuVram}`), {
+      target: { value: '8000' },
+    });
     fireEvent.click(screen.getByLabelText(t.rpcMemberCache));
     fireEvent.change(screen.getByLabelText(t.runtimeSpecRamEstimate), {
       target: { value: '4096' },
@@ -162,7 +174,9 @@ describe('RpcMemberSection manual member specs', () => {
     fireEvent.click(
       await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
     );
-    fireEvent.click(screen.getByRole('button', { name: `${t.modelGroupMoveDown}: GPU 0` }));
+    fireEvent.click(
+      screen.getByRole('button', { name: `${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} 1` }),
+    );
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalled());
     const body = api.updateRPCMemberSpec.mock.calls[0][2];
@@ -272,6 +286,67 @@ describe('RpcMemberSection member status', () => {
   it('ignores model rows', async () => {
     setup({ rows: [memberRow({ spec_id: 'model_x', kind: undefined })] });
     expect(await screen.findByText(t.rpcStatusEmpty)).toBeTruthy();
-    await act(async () => {});
+  });
+});
+
+describe('RpcMemberSection settings state', () => {
+  it('keeps unsaved edits when a new server object with equal content arrives', async () => {
+    const api = setup();
+    fireEvent.click(await screen.findByLabelText('Ops'));
+    api.rerenderServer({ ...server, rpc_allowed_head_groups: [] });
+    expect(screen.getByLabelText('Ops')).toBeChecked();
+  });
+
+  it('only sends the fields that differ from the seed', async () => {
+    const api = setup();
+    fireEvent.click(await screen.findByLabelText(t.rpcMemberEnabledLabel));
+    fireEvent.click(screen.getByRole('button', { name: t.rpcSettingsSave }));
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalled());
+    expect(api.updateServer.mock.calls[0][1]).toEqual({ rpc_member_enabled: true });
+  });
+
+  it('shows the saved value after a remount when the parent feeds the result back', async () => {
+    const api = setup();
+    api.updateServer.mockResolvedValue({
+      ...server,
+      rpc_member_enabled: true,
+      rpc_allowed_head_groups: ['g1'],
+    });
+    function Harness() {
+      const [saved, setSaved] = useState<PortalServer | null>(null);
+      const [shown, setShown] = useState(true);
+      return (
+        <ToastProvider>
+          <button onClick={() => setShown((v) => !v)}>toggle</button>
+          {shown && (
+            <RpcMemberSection t={t} api={api} server={saved ?? server} onServerSaved={setSaved} />
+          )}
+        </ToastProvider>
+      );
+    }
+    cleanup();
+    render(<Harness />);
+    fireEvent.click(await screen.findByLabelText('Ops'));
+    fireEvent.click(screen.getByRole('button', { name: t.rpcSettingsSave }));
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalled());
+    fireEvent.click(screen.getByText('toggle'));
+    fireEvent.click(screen.getByText('toggle'));
+    expect(await screen.findByLabelText('Ops')).toBeChecked();
+    expect(screen.getByLabelText(t.rpcMemberEnabledLabel)).toBeChecked();
+  });
+
+  it('drops the stored measured VRAM when a GPU index is edited', async () => {
+    const api = setup({
+      specs: [spec({ gpus: [{ index: 0, vram_estimate_mb: 100, vram_measured_mb: 777 }] })],
+    });
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
+    );
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.runtimeSpecGpuIndex}`), {
+      target: { value: '2' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalled());
+    expect(api.updateRPCMemberSpec.mock.calls[0][2].gpus[0].vram_measured_mb).toBe(0);
   });
 });

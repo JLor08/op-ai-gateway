@@ -5,7 +5,7 @@
 // settings, the manual member specs an operator configures by hand, and the
 // live state of the RPC members running on the server.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -26,6 +26,7 @@ import type {
   PutRPCMemberSpecRequest,
   RPCMemberSpec,
   RuntimeStatus,
+  UpdateServerRequest,
 } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
@@ -118,6 +119,10 @@ function editorFor(spec: RPCMemberSpec): EditorState {
   };
 }
 
+function groupsKey(groups: string[]): string {
+  return [...groups].sort().join(',');
+}
+
 function toggle(list: string[], value: string): string[] {
   return list.includes(value) ? list.filter((v) => v !== value) : [...list, value];
 }
@@ -193,6 +198,7 @@ export function RpcMemberSection({
   t,
   api,
   server,
+  onServerSaved,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -205,6 +211,9 @@ export function RpcMemberSection({
     | 'subscribeRuntimeStatus'
   >;
   server: PortalServer;
+  // Receives the server returned by a settings save, so a parent that keeps
+  // the tab's state across switches can feed it back as `server`.
+  onServerSaved?: (server: PortalServer) => void;
 }>) {
   const { showError, showSuccess } = useToast();
   const groupOptions = useMemo(
@@ -213,21 +222,46 @@ export function RpcMemberSection({
   );
 
   // ---- 1. Server RPC settings ---------------------------------------------
-  const [memberEnabled, setMemberEnabled] = useState(Boolean(server.rpc_member_enabled));
-  const [headGroups, setHeadGroups] = useState<string[]>(server.rpc_allowed_head_groups ?? []);
+  // The form holds unsaved edits; the seed is the last known saved state
+  // (the server prop, which the parent replaces by the updateServer result
+  // after a save). A new server object with equal content, as the server list
+  // poll produces, must not touch the edits, so everything compares by content.
+  const seedEnabled = Boolean(server.rpc_member_enabled);
+  const seedGroups = server.rpc_allowed_head_groups ?? [];
+  const seedKey = `${server.id}|${seedEnabled}|${groupsKey(seedGroups)}`;
+  const [memberEnabled, setMemberEnabled] = useState(seedEnabled);
+  const [headGroups, setHeadGroups] = useState<string[]>(seedGroups);
   const [settingsBusy, setSettingsBusy] = useState(false);
+  const settingsDirty =
+    memberEnabled !== seedEnabled || groupsKey(headGroups) !== groupsKey(seedGroups);
+  const settingsDirtyRef = useRef(false);
+  settingsDirtyRef.current = settingsDirty;
+  const seededKeyRef = useRef(seedKey);
   useEffect(() => {
-    setMemberEnabled(Boolean(server.rpc_member_enabled));
-    setHeadGroups(server.rpc_allowed_head_groups ?? []);
-  }, [server.id, server.rpc_member_enabled, server.rpc_allowed_head_groups]);
+    if (seededKeyRef.current === seedKey) return;
+    const idChanged = seededKeyRef.current.split('|')[0] !== server.id;
+    seededKeyRef.current = seedKey;
+    // Re-seed on a server switch, or when the saved state changed and nothing
+    // is being edited; otherwise keep the operator's unsaved edits.
+    if (idChanged || !settingsDirtyRef.current) {
+      setMemberEnabled(seedEnabled);
+      setHeadGroups(seedGroups);
+    }
+    // seedGroups is covered by seedKey (content).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seedKey]);
 
   async function saveSettings() {
+    // Each field goes in the PATCH only when it differs from its seed, so a
+    // save never restates a value another operator changed meanwhile.
+    const body: UpdateServerRequest = {};
+    if (memberEnabled !== seedEnabled) body.rpc_member_enabled = memberEnabled;
+    if (groupsKey(headGroups) !== groupsKey(seedGroups)) body.rpc_allowed_head_groups = headGroups;
+    if (Object.keys(body).length === 0) return;
     setSettingsBusy(true);
     try {
-      await api.updateServer(server.id, {
-        rpc_member_enabled: memberEnabled,
-        rpc_allowed_head_groups: headGroups,
-      });
+      const updated = await api.updateServer(server.id, body);
+      onServerSaved?.(updated);
       showSuccess(t.rpcSettingsSaved);
     } catch (err) {
       showError(formatPortalError(err, t));
@@ -349,9 +383,11 @@ export function RpcMemberSection({
             selected={headGroups}
             onToggle={(v) => setHeadGroups((g) => toggle(g, v))}
           />
-          <Typography variant="caption" color="text.secondary">
-            {t.rpcAllowedHeadGroupsDefault}
-          </Typography>
+          {headGroups.length === 0 && (
+            <Typography variant="caption" color="text.secondary">
+              {t.rpcAllowedHeadGroupsDefault}
+            </Typography>
+          )}
           <Box>
             <Button variant="contained" onClick={saveSettings} disabled={settingsBusy}>
               {t.rpcSettingsSave}
@@ -487,7 +523,7 @@ export function RpcMemberSection({
                 >
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveUp}: GPU ${row.index}`}
+                    aria-label={`${t.modelGroupMoveUp}: ${t.rpcMemberGpuLabel} ${idx + 1}`}
                     disabled={idx === 0}
                     onClick={() => moveGpu(idx, -1)}
                   >
@@ -495,7 +531,7 @@ export function RpcMemberSection({
                   </IconButton>
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveDown}: GPU ${row.index}`}
+                    aria-label={`${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} ${idx + 1}`}
                     disabled={idx === editor.gpuRows.length - 1}
                     onClick={() => moveGpu(idx, 1)}
                   >
@@ -503,15 +539,15 @@ export function RpcMemberSection({
                   </IconButton>
                   <Field
                     id={`rpc-member-gpu-index-${row.rowKey}`}
-                    label={t.runtimeSpecGpuIndex}
+                    label={`${t.rpcMemberGpuLabel} ${idx + 1}: ${t.runtimeSpecGpuIndex}`}
                     type="number"
                     value={row.index}
-                    onChange={(e) => patchGpu(idx, { index: e.target.value })}
+                    onChange={(e) => patchGpu(idx, { index: e.target.value, measured: 0 })}
                     sx={{ maxWidth: 160 }}
                   />
                   <Field
                     id={`rpc-member-gpu-vram-${row.rowKey}`}
-                    label={t.rpcMemberGpuVram}
+                    label={`${t.rpcMemberGpuLabel} ${idx + 1}: ${t.rpcMemberGpuVram}`}
                     type="number"
                     value={row.vramMb}
                     onChange={(e) => patchGpu(idx, { vramMb: e.target.value })}
@@ -519,6 +555,7 @@ export function RpcMemberSection({
                   />
                   <Button
                     size="small"
+                    aria-label={`${t.runtimeSpecGpuRemove}: ${t.rpcMemberGpuLabel} ${idx + 1}`}
                     onClick={() =>
                       patchEditor({ gpuRows: editor.gpuRows.filter((_, i) => i !== idx) })
                     }
@@ -573,9 +610,11 @@ export function RpcMemberSection({
               selected={editor.groups}
               onToggle={(v) => patchEditor({ groups: toggle(editor.groups, v) })}
             />
-            <Typography variant="caption" color="text.secondary">
-              {t.rpcAllowedHeadGroupsDefault}
-            </Typography>
+            {editor.groups.length === 0 && (
+              <Typography variant="caption" color="text.secondary">
+                {t.rpcAllowedHeadGroupsDefault}
+              </Typography>
+            )}
             <Box sx={{ display: 'flex', gap: 1 }}>
               <Button type="submit" variant="contained" disabled={saving}>
                 {t.save}

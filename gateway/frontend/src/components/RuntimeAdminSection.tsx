@@ -1812,6 +1812,9 @@ export function RuntimeAdminSection({
     );
   }, [gpuBudgetsData]);
 
+  // The server as the RPC tab last saved it: the tab remounts on every tab
+  // switch and the `server` prop is only as fresh as the parent's last fetch.
+  const [rpcSavedServer, setRpcSavedServer] = useState<PortalServer | null>(null);
   const [maxProcesses, setMaxProcesses] = useState(() => server.runtime_max_processes ?? 0);
   const [limitsBusy, setLimitsBusy] = useState(false);
 
@@ -5814,7 +5817,14 @@ export function RuntimeAdminSection({
           {renderCoresidencyBody()}
         </Panel>
       )}
-      {tab === 'rpc' && !fileMode && <RpcMemberSection t={t} api={api} server={server} />}
+      {tab === 'rpc' && !fileMode && (
+        <RpcMemberSection
+          t={t}
+          api={api}
+          server={rpcSavedServer?.id === server.id ? rpcSavedServer : server}
+          onServerSaved={setRpcSavedServer}
+        />
+      )}
       {tab === 'limits' && (
         <Panel
           titleId="runtime-limits-heading"
