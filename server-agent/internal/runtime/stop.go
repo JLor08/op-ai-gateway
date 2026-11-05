@@ -57,7 +57,10 @@ type cmdStop struct {
 	reply chan stopOutcome
 }
 
-func (cmdStop) isCommand() {}
+// isCommand marks cmdStop as an owner command; the marker has no body.
+func (cmdStop) isCommand() {
+	// Intentionally empty: it only places cmdStop in the command set.
+}
 
 // stopOutcome is cmdStop's answer: a state, or one of the refusals.
 type stopOutcome struct {

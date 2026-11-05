@@ -179,35 +179,55 @@ export function runtimeRowPlan(
   const primary = primaryStatusRows(rows).get(row.spec_id);
   const isPrimary = primary !== undefined && instanceIndex(primary) === k;
   if (isPrimary && (spec.replicable || !live)) {
-    const more = spec.replicable && live;
-    // The gateway picks instance 0 while it neither runs nor starts, and a
-    // burst instance k >= 1 otherwise (claimStartInstance).
-    const startsBurst =
-      spec.replicable &&
-      rows.some(
-        (r) => r.spec_id === row.spec_id && instanceIndex(r) === 0 && instanceIsLive(r.state),
-      );
-    if (startsBurst && !agentFeatures.includes(RUNTIME_INSTANCES_FEATURE)) {
-      plan.start = { disabled: 'feature', more };
-    } else if (spec.admin_state === 'force_stopped') {
-      plan.start = { disabled: 'force_stopped', more };
-    } else if (spec.replicable && !startRoomLeft(spec, rows, row.spec_id)) {
-      plan.start = { disabled: 'max_instances', more };
-    } else {
-      plan.start = { more };
-    }
+    plan.start = startPlan(row.spec_id, spec, rows, agentFeatures, live);
   }
   if (instanceIsLive(row.state) && k === highest) {
-    if (!agentFeatures.includes(RUNTIME_STOP_FEATURE)) plan.stop = { disabled: 'feature' };
-    else if (k < manualStopProtectedCount(spec)) plan.stop = { disabled: 'protected' };
-    // Under force_stopped the agent drains every instance at once and takes a
-    // stop of any of them, so the order does not hold there.
-    else if (spec.admin_state !== 'force_stopped' && higherSiblingDraining(rows, row.spec_id, k)) {
-      plan.stop = { disabled: 'draining' };
-    } else plan.stop = {};
+    plan.stop = stopPlan(row.spec_id, k, spec, rows, agentFeatures);
   }
   if (isPrimary && spec.admin_state === '') {
     plan.pin = live ? 'force_running' : 'force_stopped';
   }
   return plan;
+}
+
+/** The primary row's Start, given whether any instance of the spec runs or starts. */
+function startPlan(
+  specId: string,
+  spec: RowPlanSpec,
+  rows: readonly RuntimeStatus[],
+  agentFeatures: readonly string[],
+  live: boolean,
+): NonNullable<RuntimeRowPlan['start']> {
+  const more = spec.replicable && live;
+  // The gateway picks instance 0 while it neither runs nor starts, and a
+  // burst instance k >= 1 otherwise (claimStartInstance).
+  const startsBurst =
+    spec.replicable &&
+    rows.some((r) => r.spec_id === specId && instanceIndex(r) === 0 && instanceIsLive(r.state));
+  if (startsBurst && !agentFeatures.includes(RUNTIME_INSTANCES_FEATURE)) {
+    return { disabled: 'feature', more };
+  }
+  if (spec.admin_state === 'force_stopped') return { disabled: 'force_stopped', more };
+  if (spec.replicable && !startRoomLeft(spec, rows, specId)) {
+    return { disabled: 'max_instances', more };
+  }
+  return { more };
+}
+
+/** Stop on the row of instance k, the spec's highest running or starting one. */
+function stopPlan(
+  specId: string,
+  k: number,
+  spec: RowPlanSpec,
+  rows: readonly RuntimeStatus[],
+  agentFeatures: readonly string[],
+): NonNullable<RuntimeRowPlan['stop']> {
+  if (!agentFeatures.includes(RUNTIME_STOP_FEATURE)) return { disabled: 'feature' };
+  if (k < manualStopProtectedCount(spec)) return { disabled: 'protected' };
+  // Under force_stopped the agent drains every instance at once and takes a
+  // stop of any of them, so the order does not hold there.
+  if (spec.admin_state !== 'force_stopped' && higherSiblingDraining(rows, specId, k)) {
+    return { disabled: 'draining' };
+  }
+  return {};
 }

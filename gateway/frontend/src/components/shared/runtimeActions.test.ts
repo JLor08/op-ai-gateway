@@ -58,9 +58,9 @@ describe('highestLiveInstance', () => {
   });
 
   it('is undefined while no instance of the spec runs or starts', () => {
-    expect(highestLiveInstance([row('s', 0, 'stopped'), row('s', 1, 'draining')], 's')).toBe(
-      undefined,
-    );
+    expect(
+      highestLiveInstance([row('s', 0, 'stopped'), row('s', 1, 'draining')], 's'),
+    ).toBeUndefined();
   });
 });
 
