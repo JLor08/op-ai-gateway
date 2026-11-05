@@ -38,8 +38,9 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			type, metrics_path, context_probe_path, responses_live_timings_enabled,
 			ram_estimate_mb, ram_measured_mb,
 			replicable, min_instances, max_instances, instance_parallelism, startup_measured_ms,
+			cluster_enabled, member_mode, cluster_network, rpc_transport, lan_exposure_ack, device_backend,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env,
@@ -65,6 +66,12 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			min_instances = excluded.min_instances,
 			max_instances = excluded.max_instances,
 			instance_parallelism = excluded.instance_parallelism,
+			cluster_enabled = excluded.cluster_enabled,
+			member_mode = excluded.member_mode,
+			cluster_network = excluded.cluster_network,
+			rpc_transport = excluded.rpc_transport,
+			lan_exposure_ack = excluded.lan_exposure_ack,
+			device_backend = excluded.device_backend,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.ConfigFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
@@ -75,6 +82,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 		spec.Type, spec.MetricsPath, spec.ContextProbePath, spec.ResponsesLiveTimingsEnabled,
 		spec.RAMEstimateMB, spec.RAMMeasuredMB,
 		spec.Replicable, spec.MinInstances, spec.MaxInstances, spec.InstanceParallelism, spec.StartupMeasuredMS,
+		spec.ClusterEnabled, spec.MemberMode, spec.ClusterNetwork, spec.RPCTransport, spec.LANExposureAck, spec.DeviceBackend,
 		spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
@@ -99,6 +107,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config
 	type, metrics_path, context_probe_path, responses_live_timings_enabled,
 	ram_estimate_mb, ram_measured_mb,
 	replicable, min_instances, max_instances, instance_parallelism, startup_measured_ms,
+	cluster_enabled, member_mode, cluster_network, rpc_transport, lan_exposure_ack, device_backend,
 	created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
@@ -113,6 +122,7 @@ const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s
 	s.type, s.metrics_path, s.context_probe_path, s.responses_live_timings_enabled,
 	s.ram_estimate_mb, s.ram_measured_mb,
 	s.replicable, s.min_instances, s.max_instances, s.instance_parallelism, s.startup_measured_ms,
+	s.cluster_enabled, s.member_mode, s.cluster_network, s.rpc_transport, s.lan_exposure_ack, s.device_backend,
 	s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
@@ -458,7 +468,7 @@ func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]
 
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
-	var enabled, pinned, setVisibleDevices, liveTimings, replicable int64
+	var enabled, pinned, setVisibleDevices, liveTimings, replicable, clusterEnabled, lanExposureAck int64
 	var apiFlavors string
 	err := row.Scan(&spec.ID, &spec.MappingID, &enabled, &spec.Binary, &spec.Args,
 		&spec.Env, &spec.ConfigFiles, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
@@ -471,6 +481,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		&spec.Type, &spec.MetricsPath, &spec.ContextProbePath, &liveTimings,
 		&spec.RAMEstimateMB, &spec.RAMMeasuredMB,
 		&replicable, &spec.MinInstances, &spec.MaxInstances, &spec.InstanceParallelism, &spec.StartupMeasuredMS,
+		&clusterEnabled, &spec.MemberMode, &spec.ClusterNetwork, &spec.RPCTransport, &lanExposureAck, &spec.DeviceBackend,
 		&spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound
@@ -482,6 +493,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	spec.SetVisibleDevices = setVisibleDevices != 0
 	spec.ResponsesLiveTimingsEnabled = liveTimings != 0
 	spec.Replicable = replicable != 0
+	spec.ClusterEnabled, spec.LANExposureAck = clusterEnabled != 0, lanExposureAck != 0
 	flavors, err := decodeAPIFlavors(apiFlavors)
 	if err != nil {
 		return routing.RuntimeSpec{}, err
@@ -556,4 +568,144 @@ func scanServerRuntimeReport(row rowScanner) (routing.ServerRuntimeReport, error
 		return routing.ServerRuntimeReport{}, fmt.Errorf("scan server runtime report: %w", err)
 	}
 	return report, nil
+}
+
+// ServerBinaries lists serverID's binary inventory ordered by path. Always
+// non-nil, empty when none.
+func (s *SQLiteStore) ServerBinaries(ctx context.Context, serverID string) ([]routing.ServerBinary, error) {
+	rows, err := s.query(ctx, `
+		select server_id, path, kind, version, version_override, build, "commit", version_source, source, allowed, reported_at
+		from server_binaries where server_id = ? order by path`, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("list server binaries: %w", err)
+	}
+	defer rows.Close()
+	out := make([]routing.ServerBinary, 0)
+	for rows.Next() {
+		var b routing.ServerBinary
+		var allowed int64
+		if err := rows.Scan(&b.ServerID, &b.Path, &b.Kind, &b.Version, &b.VersionOverride, &b.Build, &b.Commit,
+			&b.VersionSource, &b.Source, &allowed, &b.ReportedAt); err != nil {
+			return nil, fmt.Errorf("scan server binary: %w", err)
+		}
+		b.Allowed = allowed != 0
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate server binaries: %w", err)
+	}
+	return out, nil
+}
+
+// ReplaceAgentServerBinaries makes rows the complete set of source='agent'
+// entries for serverID in one transaction. Agent rows whose path is no longer
+// reported are deleted; the rest are inserted or refreshed in place, so a
+// surviving row keeps its version_override. A manual row is never touched: a
+// reported path it already owns is skipped (the conflict update is guarded by
+// source = 'agent').
+func (s *SQLiteStore) ReplaceAgentServerBinaries(ctx context.Context, serverID string, rows []routing.ServerBinary) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin replace server binaries: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, s.dl.rebind(`select count(*) from ai_servers where id = ?`), serverID).Scan(&exists); err != nil {
+		return fmt.Errorf("check server: %w", err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	reported := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		reported[r.Path] = struct{}{}
+	}
+	existing, err := tx.QueryContext(ctx, s.dl.rebind(`select path from server_binaries where server_id = ? and source = 'agent'`), serverID)
+	if err != nil {
+		return fmt.Errorf("list agent binaries: %w", err)
+	}
+	var stale []string
+	for existing.Next() {
+		var path string
+		if err := existing.Scan(&path); err != nil {
+			_ = existing.Close()
+			return fmt.Errorf("scan agent binary: %w", err)
+		}
+		if _, keep := reported[path]; !keep {
+			stale = append(stale, path)
+		}
+	}
+	if err := existing.Err(); err != nil {
+		_ = existing.Close()
+		return fmt.Errorf("iterate agent binaries: %w", err)
+	}
+	_ = existing.Close()
+	for _, path := range stale {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from server_binaries where server_id = ? and path = ? and source = 'agent'`), serverID, path); err != nil {
+			return fmt.Errorf("delete stale agent binary: %w", err)
+		}
+	}
+	for _, r := range rows {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
+			insert into server_binaries (server_id, path, kind, version, build, "commit", version_source, source, allowed, reported_at)
+			values (?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?)
+			on conflict(server_id, path) do update set
+				kind = excluded.kind, version = excluded.version, build = excluded.build,
+				"commit" = excluded."commit", version_source = excluded.version_source,
+				allowed = excluded.allowed, reported_at = excluded.reported_at
+			where server_binaries.source = 'agent'`),
+			sanitizeArgs([]any{serverID, r.Path, r.Kind, r.Version, r.Build, r.Commit, r.VersionSource, r.Allowed, r.ReportedAt})...); err != nil {
+			return fmt.Errorf("upsert agent binary: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// UpsertManualServerBinary inserts or updates the operator-entered row at
+// (b.ServerID, b.Path). The conflict update is guarded by source = 'manual',
+// so a path an agent row owns affects no row and surfaces as ErrConflict; an
+// existing manual row keeps its version_override.
+func (s *SQLiteStore) UpsertManualServerBinary(ctx context.Context, b routing.ServerBinary) error {
+	res, err := s.exec(ctx, `
+		insert into server_binaries (server_id, path, kind, version, version_override, build, "commit", version_source, source, allowed, reported_at)
+		values (?, ?, ?, ?, ?, ?, ?, 'manual', 'manual', ?, ?)
+		on conflict(server_id, path) do update set
+			kind = excluded.kind, version = excluded.version, build = excluded.build,
+			"commit" = excluded."commit", allowed = excluded.allowed, reported_at = excluded.reported_at
+		where server_binaries.source = 'manual'`,
+		b.ServerID, b.Path, b.Kind, b.Version, b.VersionOverride, b.Build, b.Commit, b.Allowed, b.ReportedAt)
+	if err != nil {
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("upsert manual server binary: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// DeleteManualServerBinary removes the manual row at (serverID, path); an
+// agent row is never deleted here, and a missing row is ErrNotFound.
+func (s *SQLiteStore) DeleteManualServerBinary(ctx context.Context, serverID, path string) error {
+	res, err := s.exec(ctx, `delete from server_binaries where server_id = ? and path = ? and source = 'manual'`, serverID, path)
+	if err != nil {
+		return fmt.Errorf("delete manual server binary: %w", err)
+	}
+	return requireAffected(res)
+}
+
+// SetServerBinaryVersionOverride writes only version_override on the row at
+// (serverID, path), whichever source owns it.
+func (s *SQLiteStore) SetServerBinaryVersionOverride(ctx context.Context, serverID, path, version string) error {
+	res, err := s.exec(ctx, `update server_binaries set version_override = ? where server_id = ? and path = ?`, version, serverID, path)
+	if err != nil {
+		return fmt.Errorf("set server binary version override: %w", err)
+	}
+	return requireAffected(res)
 }

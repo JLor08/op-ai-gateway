@@ -71,20 +71,17 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 // both directions, for all eight callers. The application row is therefore
 // what it always was here: an FK parent whose own shape is not the subject of
 // any migration-78 or -79 test, and any future applications column needs no
-// edit here. ai_servers carries the same latent coupling through
-// CreateAIServer, and the same fix applies once a post-77 migration touches it.
-// model_mappings already did -- migration 101's audio metric columns made
-// CreateMapping name columns a v77 database lacks -- so the mapping rows go
-// through seedBaselineMapping, the same version-independent insert for that
-// table.
+// edit here. ai_servers had the same coupling through CreateAIServer (migration
+// 103's RPC columns made it name columns a v77 database lacks), and
+// model_mappings through CreateMapping (migration 101's audio metric columns),
+// so the server and mapping rows go through seedBaselineServer and
+// seedBaselineMapping, the same version-independent inserts for those tables.
 func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now time.Time, ids ...string) {
 	t.Helper()
-	if err := s.CreateAIServer(ctx, routing.AIServer{
+	seedBaselineServer(ctx, t, s, routing.AIServer{
 		ID: "srv_m78", Name: "M78", Provider: routing.ProviderVLLM, Endpoint: "http://m78:8000",
 		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create server: %v", err)
-	}
+	})
 	mustExec(ctx, t, s, `insert into applications (
 		id, server_id, type, port, scheme, api_flavors, priority, weight,
 		timeout_ms, affinity_ttl_seconds, status, created_at, updated_at

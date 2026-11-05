@@ -57,14 +57,12 @@ func TestMigration95AddsAudioPerfMetricColumns(t *testing.T) {
 		// A speed-history row written before the columns existed. Raw SQL on
 		// purpose: at v94 InsertBenchmarkRun would name columns that are not
 		// there yet, and the whole point is a row the new columns are added UNDER.
-		if err := s.CreateAIServer(ctx, routing.AIServer{
+		seedBaselineServer(ctx, t, s, routing.AIServer{
 			ID: "srv_m95", Name: "m95", Provider: routing.ProviderAudioCpp,
 			Endpoint: "http://srv_m95:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create server: %v", err)
-		}
+		})
 		if err := s.CreateApplication(ctx, routing.Application{
 			ID: "app_m95", ServerID: "srv_m95", Type: routing.ProviderAudioCpp, Port: 8095, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive,

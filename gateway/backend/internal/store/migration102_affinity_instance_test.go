@@ -60,14 +60,12 @@ func seedMigration102Pin(ctx context.Context, t *testing.T, s *SQLStore, now tim
 	if err := s.CreatePlainToken(ctx, TokenRecord{ID: "tok_m102", UserID: "u_m102", Name: "m102", CreatedAt: now, UpdatedAt: now}, "m102-affinity-secret"); err != nil {
 		t.Fatalf("create token: %v", err)
 	}
-	if err := s.CreateAIServer(ctx, routing.AIServer{
+	seedBaselineServer(ctx, t, s, routing.AIServer{
 		ID: "srv_m102", Name: "m102", Provider: routing.ProviderVLLM,
 		Endpoint: "http://srv_m102:8000",
 		Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 		CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create server: %v", err)
-	}
+	})
 	if err := s.CreateApplication(ctx, routing.Application{
 		ID: "app_m102", ServerID: "srv_m102", Type: routing.ProviderServerAgent, Port: 8102, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

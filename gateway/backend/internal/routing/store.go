@@ -225,13 +225,30 @@ type AIServer struct {
 	// created on it (migration 66, Task 3; enforced in Task 6+). Routing
 	// never reads it (absent from the candidate join).
 	ManagedRuntimeOnly bool
-	Provider           string
-	Endpoint           string
-	Status             string
-	HealthStatus       string
-	LastSeenAt         *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// NetbirdIP is the server's NetBird mesh address (migration 103), the
+	// address an RPC cluster head reaches the server's members on over the
+	// mesh. "" = unknown. Routing never reads it.
+	NetbirdIP string
+	// LANAddress is the server's LAN address (migration 103) for cluster
+	// networks that bypass NetBird. "" = none. Routing never reads it.
+	LANAddress string
+	// LANBindOnly makes a member listen on LANAddress only instead of every
+	// interface (migration 103).
+	LANBindOnly bool
+	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
+	// cluster member (migration 103).
+	RPCMemberEnabled bool
+	// RPCAllowedHeadGroups is the member side's consent (migration 103): an
+	// opaque JSON array of user-group ids whose cluster heads may use this
+	// server as a member. "[]" = none.
+	RPCAllowedHeadGroups string
+	Provider             string
+	Endpoint             string
+	Status               string
+	HealthStatus         string
+	LastSeenAt           *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 const (
@@ -2950,6 +2967,24 @@ type RuntimeSpec struct {
 	// insert and PRESERVED on every later update, so an operator's
 	// full-document save -- which arrives with 0 -- never erases it.
 	StartupMeasuredMS int64
+	// ClusterEnabled marks a head spec that spans llama.cpp RPC members
+	// (migration 103). Operator-owned.
+	ClusterEnabled bool
+	// MemberMode is how members are chosen for a head: "automatic" (the
+	// default; the gateway selects them) or "manual" (migration 103).
+	MemberMode string
+	// ClusterNetwork is the network a head reaches its members on: "mesh" or
+	// "lan"; "" = not chosen (migration 103).
+	ClusterNetwork string
+	// RPCTransport is how head and member talk: "direct" or "relay"; "" = not
+	// chosen (migration 103).
+	RPCTransport string
+	// LANExposureAck records the operator's acknowledgement that a member
+	// reachable on the LAN is exposed outside NetBird (migration 103).
+	LANExposureAck bool
+	// DeviceBackend is the GPU backend the binary was built for: "auto" (the
+	// default), "cuda", "rocm", "vulkan", "metal" or "sycl" (migration 103).
+	DeviceBackend string
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
@@ -3148,6 +3183,43 @@ type ServerGPUBudget struct {
 	UpdatedAt    time.Time
 }
 
+// ServerBinary is one entry of a server's llama.cpp binary inventory
+// (server_binaries, migration 103). Source says who owns the row: "agent" rows
+// are the agent's reported allowlist, replaced on every report; "manual" rows
+// are operator entries. Version is the detected (or entered) version and
+// VersionOverride the operator's correction of it, kept apart so a fresh
+// agent report never erases it; use EffectiveVersion for the one to act on.
+// VersionSource is how Version was determined: "agent", "path" or "manual".
+// Allowed is the agent-reported allowlist status.
+type ServerBinary struct {
+	ServerID        string
+	Path            string
+	Kind            string
+	Version         string
+	VersionOverride string
+	Build           string
+	Commit          string
+	VersionSource   string
+	Source          string
+	Allowed         bool
+	ReportedAt      time.Time
+}
+
+// The server_binaries.source values.
+const (
+	BinarySourceAgent  = "agent"
+	BinarySourceManual = "manual"
+)
+
+// EffectiveVersion is the operator's override when set, else the detected
+// version.
+func (b ServerBinary) EffectiveVersion() string {
+	if b.VersionOverride != "" {
+		return b.VersionOverride
+	}
+	return b.Version
+}
+
 // ServerRuntimeReport is the latest agent-managed runtime configuration
 // reported UPWARD by a server's ServerAgent when it is configured from a
 // local file on the AI server instead of from the gateway
@@ -3265,6 +3337,29 @@ type RuntimeStore interface {
 	// for its server (1:1, upsert-overwrite — mirrors UpsertServerHardware).
 	// An unknown ServerID is ErrNotFound (FK violation).
 	UpsertServerRuntimeReport(ctx context.Context, report ServerRuntimeReport) error
+	// ServerBinaries lists serverID's binary inventory (agent-reported and
+	// manual rows), ordered by path. Always non-nil, empty when none.
+	ServerBinaries(ctx context.Context, serverID string) ([]ServerBinary, error)
+	// ReplaceAgentServerBinaries makes rows the complete set of
+	// source='agent' entries for serverID in one transaction: agent rows
+	// absent from rows are deleted, the rest are inserted or refreshed. It
+	// never touches source='manual' rows, never changes VersionOverride of a
+	// surviving row, and skips a reported path a manual row already owns.
+	// rows' ServerID and Source are ignored (forced to serverID and 'agent').
+	// Unknown serverID is ErrNotFound.
+	ReplaceAgentServerBinaries(ctx context.Context, serverID string, rows []ServerBinary) error
+	// UpsertManualServerBinary inserts or updates the operator-entered row at
+	// (b.ServerID, b.Path) with source='manual' and version_source='manual'.
+	// A path an agent row owns is ErrConflict (override its version with
+	// SetServerBinaryVersionOverride instead); unknown server is ErrNotFound.
+	UpsertManualServerBinary(ctx context.Context, b ServerBinary) error
+	// DeleteManualServerBinary removes the manual row at (serverID, path);
+	// ErrNotFound when there is none (an agent row is never deleted here).
+	DeleteManualServerBinary(ctx context.Context, serverID, path string) error
+	// SetServerBinaryVersionOverride sets (or, with "", clears) the operator's
+	// version correction on the row at (serverID, path) of either source;
+	// ErrNotFound when the row does not exist.
+	SetServerBinaryVersionOverride(ctx context.Context, serverID, path, version string) error
 	// ServerRuntimeReportByServer returns the latest runtime report for
 	// serverID; ok is false when no report has ever been stored for that
 	// server (not an error) — mirrors ServerHardwareByServer.

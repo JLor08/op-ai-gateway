@@ -46,14 +46,12 @@ func TestMigration97DropsVRAMLockedFromAnUpgradedDatabase(t *testing.T) {
 			t.Fatalf("agent_runtime_specs has no vram_locked at v96, so this test does not start from an upgrade shape; got %v", sortedColumnNames(before))
 		}
 
-		if err := s.CreateAIServer(ctx, routing.AIServer{
+		seedBaselineServer(ctx, t, s, routing.AIServer{
 			ID: "srv_m97", Name: "m97", Provider: routing.ProviderVLLM,
 			Endpoint: "http://srv_m97:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create server: %v", err)
-		}
+		})
 		if err := s.CreateApplication(ctx, routing.Application{
 			ID: "app_m97", ServerID: "srv_m97", Type: routing.ProviderServerAgent, Port: 8097, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

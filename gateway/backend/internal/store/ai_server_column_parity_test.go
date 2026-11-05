@@ -14,10 +14,10 @@ import (
 
 // aiServerParityRows is how many ai_servers rows the column-parity fixture
 // seeds, and it is a computed minimum, not a round number: the select list
-// carries SIX bool columns, and two same-typed columns are only
+// carries EIGHT bool columns, and two same-typed columns are only
 // distinguishable by value if they differ in at least one seeded row, so each
 // bool column needs its own DISTINCT pattern across the rows. With r rows
-// there are 2^r patterns, so r must satisfy 2^r >= 6 — three rows.
+// there are 2^r patterns, so r must satisfy 2^r - 1 >= 8 (all-false is not a usable pattern) — four rows.
 //
 // One row cannot work at all (every bool would have to hold the same value as
 // its neighbours), and two rows cover only 4 of the 6 columns' worth of
@@ -25,11 +25,12 @@ import (
 // interchangeable. That was the actual defect: the original single-row fixture
 // set all six bools to true, so swapping netbird_allow_ping and
 // netbird_ping_exclude in one reader's select list was invisible.
-const aiServerParityRows = 3
+const aiServerParityRows = 4
 
 // aiServerParityBools is the bit-pattern table, one row per bool column in
 // SELECT-LIST order (netbird_enabled, netbird_connected, netbird_peer_managed,
-// netbird_allow_ping, netbird_ping_exclude, managed_runtime_only) and one
+// netbird_allow_ping, netbird_ping_exclude, managed_runtime_only, lan_bind_only,
+// rpc_member_enabled) and one
 // column per seeded server.
 //
 // Two properties are load-bearing and both are asserted by
@@ -42,13 +43,15 @@ const aiServerParityRows = 3
 //   - every row is true in at least one column, so a column dropped from a
 //     reader's select list (coming back as the false zero value) still shows
 //     up as a mismatch somewhere.
-var aiServerParityBools = [6][aiServerParityRows]bool{
-	{true, true, false},  // netbird_enabled
-	{true, false, true},  // netbird_connected
-	{true, false, false}, // netbird_peer_managed
-	{false, true, true},  // netbird_allow_ping
-	{false, true, false}, // netbird_ping_exclude
-	{false, false, true}, // managed_runtime_only
+var aiServerParityBools = [8][aiServerParityRows]bool{
+	{true, true, false, false},  // netbird_enabled
+	{true, false, true, false},  // netbird_connected
+	{true, false, false, false}, // netbird_peer_managed
+	{false, true, true, false},  // netbird_allow_ping
+	{false, true, false, false}, // netbird_ping_exclude
+	{false, false, true, false}, // managed_runtime_only
+	{false, false, false, true}, // lan_bind_only
+	{true, true, true, true},    // rpc_member_enabled
 }
 
 // aiServerParityOverrides is the same table for the three 3-state override
@@ -59,9 +62,9 @@ var aiServerParityBools = [6][aiServerParityRows]bool{
 // zero value, so a row carrying it could not catch an omitted column. Three
 // distinct patterns over three rows, so every pair differs somewhere.
 var aiServerParityOverrides = [3][aiServerParityRows]string{
-	{"include", "include", "exclude"}, // netbird_policy_override
-	{"include", "exclude", "include"}, // certificate_override
-	{"exclude", "include", "include"}, // https_switch_override
+	{"include", "include", "exclude", "exclude"}, // netbird_policy_override
+	{"include", "exclude", "include", "exclude"}, // certificate_override
+	{"exclude", "include", "include", "include"}, // https_switch_override
 }
 
 // aiServerParityBoolNames names the aiServerParityBools rows in select-list
@@ -71,6 +74,7 @@ var aiServerParityOverrides = [3][aiServerParityRows]string{
 var aiServerParityBoolNames = []string{
 	"netbird_enabled", "netbird_connected", "netbird_peer_managed",
 	"netbird_allow_ping", "netbird_ping_exclude", "managed_runtime_only",
+	"lan_bind_only", "rpc_member_enabled",
 }
 
 // TestConformanceAIServerReadersAgreeOnEveryColumn closes a PRE-EXISTING
@@ -156,7 +160,10 @@ func TestConformanceAIServerReadersAgreeOnEveryColumn(t *testing.T) {
 				PriceUnit: "eur", SystemGroupID: sysGroup.ID,
 				CertificateOverride: aiServerParityOverrides[1][i], HTTPSSwitchOverride: aiServerParityOverrides[2][i],
 				RuntimeMaxProcesses: 7 + i, ManagedRuntimeOnly: aiServerParityBools[5][i],
-				Provider: routing.ProviderVLLM, Endpoint: "http://cols" + idx + ".example.test:800" + idx,
+				NetbirdIP: "100.64.0." + strconv.Itoa(10+i), LANAddress: "192.168.1." + strconv.Itoa(20+i),
+				LANBindOnly: aiServerParityBools[6][i], RPCMemberEnabled: aiServerParityBools[7][i],
+				RPCAllowedHeadGroups: `["ugrp_head_` + idx + `"]`,
+				Provider:             routing.ProviderVLLM, Endpoint: "http://cols" + idx + ".example.test:800" + idx,
 				Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 				LastSeenAt: &lastSeen, CreatedAt: now, UpdatedAt: now,
 			})
@@ -317,9 +324,9 @@ func TestAIServersSchemaColumnsAllCovered(t *testing.T) {
 			seeded: []string{
 				"agent_presence_timeout_seconds", "certificate_override", "created_at", "domain",
 				"endpoint", "estimated_watts", "health_status", "https_switch_override", "id",
-				"idle_watts", "last_seen_at", "name", "netbird_group_id", "netbird_group_ids",
-				"netbird_peer_id", "netbird_policy_override", "netbird_setup_key_id", "price_per_kwh",
-				"price_unit", "provider", "pue", "runtime_max_processes", "server_path_suffix",
+				"idle_watts", "lan_address", "last_seen_at", "name", "netbird_group_id", "netbird_group_ids",
+				"netbird_ip", "netbird_peer_id", "netbird_policy_override", "netbird_setup_key_id", "price_per_kwh",
+				"price_unit", "provider", "pue", "rpc_allowed_head_groups", "runtime_max_processes", "server_path_suffix",
 				"status", "system_group_id", "updated_at",
 			},
 			ignored: map[string]string{},

@@ -48,14 +48,12 @@ func TestMigration93AddsRuntimeSpecConfigFiles(t *testing.T) {
 		// A spec written before the column existed. Raw SQL on purpose: at v92
 		// UpsertRuntimeSpec would name the column that is not there yet, and
 		// the whole point is a row the new column has to be added UNDER.
-		if err := s.CreateAIServer(ctx, routing.AIServer{
+		seedBaselineServer(ctx, t, s, routing.AIServer{
 			ID: "srv_m93", Name: "m93", Provider: routing.ProviderVLLM,
 			Endpoint: "http://srv_m93:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create server: %v", err)
-		}
+		})
 		if err := s.CreateApplication(ctx, routing.Application{
 			ID: "app_m93", ServerID: "srv_m93", Type: routing.ProviderServerAgent, Port: 8093, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

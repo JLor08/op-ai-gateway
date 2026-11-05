@@ -340,6 +340,18 @@ func (_d *RoutingStoreWithTracing) DeleteCertificate(ctx context.Context, domain
 	return _d.Store.DeleteCertificate(ctx, domain)
 }
 
+func (_d *RoutingStoreWithTracing) DeleteManualServerBinary(ctx context.Context, serverID string, path string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteManualServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteManualServerBinary(ctx, serverID, path)
+}
+
 func (_d *RoutingStoreWithTracing) DeleteMapping(ctx context.Context, id string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.DeleteMapping")
 	defer span.End()
@@ -808,6 +820,18 @@ func (_d *RoutingStoreWithTracing) RemoveVendorAccountAdminGroup(ctx context.Con
 	return _d.Store.RemoveVendorAccountAdminGroup(ctx, accountID, groupID)
 }
 
+func (_d *RoutingStoreWithTracing) ReplaceAgentServerBinaries(ctx context.Context, serverID string, rows []_sourceRouting.ServerBinary) (err error) {
+	ctx, span := Start(ctx, "routing.Store.ReplaceAgentServerBinaries")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ReplaceAgentServerBinaries(ctx, serverID, rows)
+}
+
 func (_d *RoutingStoreWithTracing) ResourceGroupAdminGroups(ctx context.Context, rgID string) (sa1 []string, err error) {
 	ctx, span := Start(ctx, "routing.Store.ResourceGroupAdminGroups")
 	defer span.End()
@@ -998,6 +1022,18 @@ func (_d *RoutingStoreWithTracing) ServerAvailabilitySamples(ctx context.Context
 		}
 	}()
 	return _d.Store.ServerAvailabilitySamples(ctx, serverID, from, to, limit)
+}
+
+func (_d *RoutingStoreWithTracing) ServerBinaries(ctx context.Context, serverID string) (sa1 []_sourceRouting.ServerBinary, err error) {
+	ctx, span := Start(ctx, "routing.Store.ServerBinaries")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ServerBinaries(ctx, serverID)
 }
 
 func (_d *RoutingStoreWithTracing) ServerGPUBudgets(ctx context.Context, serverID string) (sa1 []_sourceRouting.ServerGPUBudget, err error) {
@@ -1286,6 +1322,18 @@ func (_d *RoutingStoreWithTracing) SetServerAdminGroup(ctx context.Context, serv
 		}
 	}()
 	return _d.Store.SetServerAdminGroup(ctx, serverID, groupID)
+}
+
+func (_d *RoutingStoreWithTracing) SetServerBinaryVersionOverride(ctx context.Context, serverID string, path string, version string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetServerBinaryVersionOverride")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetServerBinaryVersionOverride(ctx, serverID, path, version)
 }
 
 func (_d *RoutingStoreWithTracing) SetServerGPUBudgets(ctx context.Context, serverID string, budgets []_sourceRouting.ServerGPUBudget) (err error) {
@@ -1874,6 +1922,18 @@ func (_d *RoutingStoreWithTracing) UpsertCertificate(ctx context.Context, cert _
 		}
 	}()
 	return _d.Store.UpsertCertificate(ctx, cert)
+}
+
+func (_d *RoutingStoreWithTracing) UpsertManualServerBinary(ctx context.Context, b _sourceRouting.ServerBinary) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertManualServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertManualServerBinary(ctx, b)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []_sourceRouting.CapabilityRow) (err error) {

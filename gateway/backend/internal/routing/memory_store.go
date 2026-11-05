@@ -138,6 +138,9 @@ type MemoryStore struct {
 	// write; ServerGPUBudgets sorts by GPUIndex on read, mirroring the SQL
 	// `order by gpu_index` (same pattern as runtimeSpecGPUs/coresidency above).
 	gpuBudgets map[string][]ServerGPUBudget
+	// serverBinaries mirrors server_binaries (migration 103): serverID -> path
+	// -> row. Deleted with the server, like the table's cascading FK.
+	serverBinaries map[string]map[string]ServerBinary
 	// runtimeReports mirrors server_runtime_reports (migration 67, Task 4):
 	// the latest file-mode runtime report per server. 1:1, upsert-overwrite —
 	// same shape as `hardware` above.
@@ -218,6 +221,7 @@ func NewMemoryStore() *MemoryStore {
 		coresidency:              map[string][]CoResidencyRule{},
 		coresidencyMode:          map[string]CoResidencyMode{},
 		gpuBudgets:               map[string][]ServerGPUBudget{},
+		serverBinaries:           map[string]map[string]ServerBinary{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
 		mappingCache:             map[string]map[modelMappingCacheKey]ModelMappingCacheRow{},
@@ -451,6 +455,7 @@ func (m *MemoryStore) DeleteAIServer(_ context.Context, id string) error {
 	delete(m.samples, id)                 // server_telemetry_samples
 	delete(m.availSamples, id)            // server_availability_samples
 	delete(m.gpuBudgets, id)              // ai_server_gpu_budgets
+	delete(m.serverBinaries, id)          // server_binaries
 	delete(m.runtimeReports, id)          // server_runtime_reports
 	m.deleteAffinitiesForServerLocked(id) // route_affinity.server_id
 	// resourceGroupServers is keyed resourceGroupID -> serverID (the REVERSE
@@ -3110,6 +3115,104 @@ func (m *MemoryStore) ServerGPUBudgets(_ context.Context, serverID string) ([]Se
 	copy(out, m.gpuBudgets[serverID])
 	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
 	return out, nil
+}
+
+// --- RuntimeStore: per-server binary inventory (migration 103) ---------------
+
+// ServerBinaries lists serverID's inventory ordered by path, always non-nil.
+func (m *MemoryStore) ServerBinaries(_ context.Context, serverID string) ([]ServerBinary, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]ServerBinary, 0, len(m.serverBinaries[serverID]))
+	for _, b := range m.serverBinaries[serverID] {
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+// ReplaceAgentServerBinaries mirrors the SQL transaction: agent rows missing
+// from rows go, surviving paths refresh in place keeping their
+// VersionOverride, and a path a manual row owns is skipped.
+func (m *MemoryStore) ReplaceAgentServerBinaries(_ context.Context, serverID string, rows []ServerBinary) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[serverID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	existing := m.serverBinaries[serverID]
+	reported := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		reported[r.Path] = struct{}{}
+	}
+	next := make(map[string]ServerBinary, len(existing)+len(rows))
+	for path, b := range existing {
+		if _, keep := reported[path]; b.Source == BinarySourceManual || keep {
+			next[path] = b
+		}
+	}
+	for _, r := range rows {
+		prev, had := next[r.Path]
+		if had && prev.Source == BinarySourceManual {
+			continue
+		}
+		r.ServerID, r.Source = serverID, BinarySourceAgent
+		if had {
+			r.VersionOverride = prev.VersionOverride
+		} else {
+			r.VersionOverride = ""
+		}
+		next[r.Path] = r
+	}
+	m.serverBinaries[serverID] = next
+	return nil
+}
+
+// UpsertManualServerBinary mirrors the SQL upsert guarded by source='manual'.
+func (m *MemoryStore) UpsertManualServerBinary(_ context.Context, b ServerBinary) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[b.ServerID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	prev, had := m.serverBinaries[b.ServerID][b.Path]
+	if had && prev.Source != BinarySourceManual {
+		return storeerr.ErrConflict
+	}
+	b.Source, b.VersionSource = BinarySourceManual, BinarySourceManual
+	if had {
+		b.VersionOverride = prev.VersionOverride
+	}
+	if m.serverBinaries[b.ServerID] == nil {
+		m.serverBinaries[b.ServerID] = map[string]ServerBinary{}
+	}
+	m.serverBinaries[b.ServerID][b.Path] = b
+	return nil
+}
+
+// DeleteManualServerBinary removes a manual row only.
+func (m *MemoryStore) DeleteManualServerBinary(_ context.Context, serverID, path string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.serverBinaries[serverID][path]
+	if !ok || b.Source != BinarySourceManual {
+		return storeerr.ErrNotFound
+	}
+	delete(m.serverBinaries[serverID], path)
+	return nil
+}
+
+// SetServerBinaryVersionOverride sets the override on an existing row.
+func (m *MemoryStore) SetServerBinaryVersionOverride(_ context.Context, serverID, path, version string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.serverBinaries[serverID][path]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	b.VersionOverride = version
+	m.serverBinaries[serverID][path] = b
+	return nil
 }
 
 // --- RuntimeStore: file-mode runtime reports (agent-runtime-manager, Task 4) ---
