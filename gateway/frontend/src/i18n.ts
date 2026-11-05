@@ -2259,6 +2259,113 @@ const de = {
     'Das Modell konnte nicht gestartet werden. Die Logs der Zeile zeigen, warum.',
   errorRuntimeNotPermitted: 'Der Agent hat den Start dieses Modells nicht zugelassen.',
   errorRuntimeUpstreamGone: 'Der Agent konnte die Anfrage nicht abschließen.',
+  errorClusterMemberModeInvalid: 'Der Mitgliedsmodus muss „automatisch“ oder „manuell“ sein.',
+  errorClusterNetworkInvalid:
+    'Das Cluster-Netz muss „Mesh“ oder „LAN“ sein (oder leer für den Standard).',
+  errorClusterTransportInvalid:
+    'Der RPC-Transport muss „direkt“ oder „Relay“ sein (oder leer für den Standard).',
+  errorClusterTypeInvalid: 'Ein Cluster-Head muss eine llama.cpp-Runtime-Spezifikation sein.',
+  errorClusterRpcPlaceholderMissing:
+    'Ein Cluster-Head braucht ${RPC_SERVERS} als Wert von --rpc in den Argumenten oder von LLAMA_ARG_RPC in der Umgebung.',
+  errorClusterRpcTwice:
+    'Die RPC-Server genau einmal setzen: ${RPC_SERVERS} einmal, entweder über --rpc oder LLAMA_ARG_RPC, nie beides.',
+  errorClusterRpcPlaceholderWithoutCluster:
+    '${RPC_SERVERS} und ${RPC_DEVICES} setzen den Cluster-Modus voraus.',
+  errorClusterDeviceListMissingRpc:
+    'Die Geräteliste eines Cluster-Heads muss die RPC-Geräte mit ${DEVICES} oder ${RPC_DEVICES} nennen, sonst werden die Mitglieder nie genutzt.',
+  errorClusterDeviceOrder:
+    'Die Geräteliste wird geparst, bevor die RPC-Server existieren: --device nach --rpc in die Argumente schreiben oder die RPC-Server über LLAMA_ARG_RPC setzen.',
+  errorClusterMembersRequired: 'Ein Cluster-Head braucht mindestens ein Mitglied.',
+  errorClusterHeadReplicable:
+    'Ein Cluster-Head kann nicht replizierbar sein: jedes Mitglied bedient genau einen Head.',
+  errorClusterStartupTimeoutRequired:
+    'Ein Cluster-Head braucht ein explizites Start-Timeout (startup_timeout_seconds).',
+  errorClusterMemberServerTwice:
+    'Ein Server kann nur einmal Mitglied eines Heads sein; die GPUs in einem Mitglied zusammenfassen.',
+  errorClusterMemberOnHeadServer:
+    'Ein Mitglied muss auf einem anderen Server als sein Head laufen.',
+  errorClusterMemberSpecTaken:
+    'Die Mitglieds-Spezifikation bedient bereits einen anderen Cluster-Head.',
+  errorClusterMemberSpecDisabled: 'Die Mitglieds-Spezifikation ist deaktiviert.',
+  errorClusterMemberRpcDisabled:
+    'Der Server bietet in seinen Runtime-Einstellungen keine RPC-Mitgliedschaft an.',
+  errorClusterMemberNoMatchingBinary:
+    'Der Mitglieds-Server hat keinen ggml-rpc-server in der Version des Head-Binaries.',
+  errorClusterVersionMismatch:
+    'Die Version des Mitglieds-Binaries weicht von der des Head-Binaries ab.',
+  errorClusterMeshUnavailable:
+    'Ein Mesh-Cluster braucht NetBird mit Tracking-Gruppe und bekannter Mesh-IP bei Head und allen Mitgliedern.',
+  errorClusterLanAddressRequired:
+    'Ein LAN-Cluster braucht auf jedem Server eine LAN-Adresse (und lan_address auf NetBird-Servern).',
+  errorClusterDirectUnavailable:
+    'Direkter Transport im Mesh-Cluster braucht NetBird-Richtlinienverwaltung mit aktivem Deny-by-default und die als deaktiviert gesehene Default-Richtlinie; stattdessen Relay verwenden.',
+  errorClusterMemberBudgetRequired:
+    'Ein Mitglied auf einer Apple-GPU braucht ein GPU-Budget auf seinem Server.',
+  errorClusterTensorSplitRequired:
+    'Ein Head mit einem Nicht-NVIDIA-Mitglied braucht --tensor-split.',
+  errorClusterPortExhausted:
+    'Auf dem Mitglieds-Server ist im RPC-Portbereich 47000-47999 kein Port mehr frei.',
+  errorClusterFlagEqualsForm:
+    'Cluster-Flags in den Argumenten müssen als getrennte Tokens stehen (--rpc ${RPC_SERVERS}), nicht in der Form --rpc=…',
+  errorRuntimeSpecPortConflictsRpcMember:
+    'Der feste Port liegt im RPC-Portbereich 47000-47999 und kollidiert mit einem RPC-Mitglied auf diesem Server.',
+  errorRuntimeSpecDeviceBackendInvalid:
+    'Das Geräte-Backend muss auto, cuda, rocm, vulkan, metal oder sycl sein.',
+  errorRuntimeSpecMemberFlagReserved:
+    '-H/--host, -p/--port, -d/--device und -c/--cache setzt der Agent und sind in Mitglieds-Argumenten nicht erlaubt.',
+  errorRuntimeSpecMemberVramEstimateRequired:
+    'Auf einem Server ohne NVIDIA-GPUs ist für jede GPU eine VRAM-Schätzung nötig.',
+  errorRpcMemberSpecNotFound: 'RPC-Mitglieds-Spezifikation nicht gefunden.',
+  errorRpcMemberSpecRequestFailed:
+    'Die Anfrage zur RPC-Mitglieds-Spezifikation ist fehlgeschlagen.',
+  errorBinaryPathInvalid: 'Der Pfad muss ein absoluter Pfad mit höchstens 4096 Zeichen sein.',
+  errorBinaryKindInvalid: 'Die Art muss llama_server, rpc_server oder other sein.',
+  errorBinaryVersionInvalid: 'Version, Build und Commit dürfen höchstens 256 Zeichen lang sein.',
+  errorBinaryNotFound: 'Binary auf diesem Server nicht gefunden.',
+  errorBinaryAgentOwned:
+    'Der Agent meldet dieses Binary; nur die Versionsüberschreibung ist änderbar.',
+  errorBinaryRequestFailed: 'Die Binary-Anfrage ist fehlgeschlagen.',
+  errorServerLanAddressInvalid: 'Die LAN-Adresse muss leer oder eine IPv4-Adresse sein.',
+  errorClusterLanAckRequired:
+    'Direkter Transport in einem LAN-Cluster legt den RPC-Port jedes Mitglieds ohne Authentifizierung offen; mit der Bestätigung (lan_exposure_ack) zustimmen.',
+  errorClusterMemberInUse: 'Das Mitglied wird von einem Cluster-Head verwendet.',
+  errorClusterStartFailed:
+    'Der Cluster konnte nicht gestartet werden. Die Logs der Mitglieder und des Heads zeigen den Grund.',
+  errorClusterUnavailable:
+    'Der Cluster ist gerade nicht verfügbar (ein Mitglied ist nicht erreichbar oder nicht bereit).',
+  errorClusterMemberUnused: 'Ein Mitglied des Clusters wird vom Head nicht genutzt.',
+  errorClusterAgentTooOld:
+    'Der Agent auf Head oder Mitglied ist zu alt für RPC-Cluster. Agent aktualisieren.',
+  errorClusterHeadUnsupported:
+    'Dieser Head kann nicht als Cluster laufen (Agent oder Binary unterstützt das nicht).',
+  errorRuntimeDeviceBackendMismatch:
+    'Das gewählte Geräte-Backend passt nicht zu den GPUs dieses Servers.',
+  errorRuntimeRpcDeviceCountMismatch:
+    'Der RPC-Server meldet eine andere Anzahl Geräte als konfiguriert.',
+  errorRuntimeRpcUnsupportedBuild: 'Dieses Binary wurde ohne RPC-Unterstützung gebaut.',
+  errorRuntimeClusterVersionMismatch: 'Die Versionen von Head und Mitglied stimmen nicht überein.',
+  errorRuntimeClusterMemberUnreachable:
+    'Ein Cluster-Mitglied war vor dem Start des Heads nicht erreichbar.',
+  errorRuntimeBindMismatch: 'Der RPC-Server lauscht nicht auf der konfigurierten Adresse.',
+  errorRuntimeClusterNotReady:
+    'Der Cluster-Head startet nur über den Cluster-Start; die Mitglieder sind noch nicht bereit.',
+  errorRuntimeInstanceBusy: 'Die Instanz ist beschäftigt und wird jetzt nicht gestoppt.',
+  errorRuntimeCachePurgeFailed: 'Der RPC-Cache des Mitglieds konnte nicht geleert werden.',
+  clusterWarnRpcDevicesNotFirst: 'Die RPC-Geräte stehen nicht an erster Stelle der Geräteliste.',
+  clusterWarnMmdevMissing:
+    'Für den Multimodal-Projektor ist kein Gerät gesetzt (--mmproj-device fehlt).',
+  clusterWarnCpuMemberWithoutTensorSplit:
+    'Ein CPU-Mitglied ohne --tensor-split bekommt womöglich zu viel oder gar nichts.',
+  clusterWarnSharedHostWithoutEstimate:
+    'Ein Mitglied teilt sich den Host mit anderen Modellen, ohne VRAM-Schätzung.',
+  clusterWarnBudgetBelowDevice:
+    'Das GPU-Budget eines Mitglieds liegt unter dem Speicher des Geräts.',
+  clusterWarnGpuOverlap:
+    'Die GPUs eines Mitglieds überschneiden sich mit denen anderer Mitglieder oder Modelle auf demselben Server.',
+  clusterWarnRelayMeshDenyOff:
+    'Relay im Mesh ohne aktives Deny-by-default schützt die Mitglieder nicht vor anderen Peers.',
+  clusterWarnMemberVersionUnknown:
+    'Die Version eines Mitglieds-Binaries ist unbekannt; die Übereinstimmung mit dem Head ist ungeprüft.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -5723,6 +5830,102 @@ const en: PortalMessages = {
   errorRuntimeStartFailed: "The model failed to start. The row's logs show why.",
   errorRuntimeNotPermitted: 'The agent did not permit this model to start.',
   errorRuntimeUpstreamGone: 'The agent could not complete the request.',
+  errorClusterMemberModeInvalid: 'The member mode must be "automatic" or "manual".',
+  errorClusterNetworkInvalid:
+    'The cluster network must be "mesh" or "lan" (or empty for the default).',
+  errorClusterTransportInvalid:
+    'The RPC transport must be "direct" or "relay" (or empty for the default).',
+  errorClusterTypeInvalid: 'A cluster head must be a llama.cpp runtime spec.',
+  errorClusterRpcPlaceholderMissing:
+    'A cluster head needs ${RPC_SERVERS} as the value of --rpc in args or of LLAMA_ARG_RPC in env.',
+  errorClusterRpcTwice:
+    'Set the RPC servers exactly once: ${RPC_SERVERS} once, through either --rpc or LLAMA_ARG_RPC, never both.',
+  errorClusterRpcPlaceholderWithoutCluster: '${RPC_SERVERS} and ${RPC_DEVICES} need cluster mode.',
+  errorClusterDeviceListMissingRpc:
+    "A cluster head's device list must name the RPC devices with ${DEVICES} or ${RPC_DEVICES}, otherwise the members are never used.",
+  errorClusterDeviceOrder:
+    'The device list is parsed before the RPC servers exist: put --device after --rpc in args, or set the RPC servers through LLAMA_ARG_RPC.',
+  errorClusterMembersRequired: 'A cluster head needs at least one member.',
+  errorClusterHeadReplicable:
+    'A cluster head cannot be replicable: each member serves exactly one head.',
+  errorClusterStartupTimeoutRequired:
+    'A cluster head needs an explicit startup timeout (startup_timeout_seconds).',
+  errorClusterMemberServerTwice:
+    'A server can be a member of a head only once; combine its GPUs into one member.',
+  errorClusterMemberOnHeadServer: 'A member must run on a different server than its head.',
+  errorClusterMemberSpecTaken: 'The member spec already serves another cluster head.',
+  errorClusterMemberSpecDisabled: 'The member spec is disabled.',
+  errorClusterMemberRpcDisabled:
+    'The server does not offer RPC membership in its runtime settings.',
+  errorClusterMemberNoMatchingBinary:
+    "The member server has no ggml-rpc-server of the head binary's version.",
+  errorClusterVersionMismatch: "The member binary's version differs from the head binary's.",
+  errorClusterMeshUnavailable:
+    'A mesh cluster needs NetBird with a tracking group and a known mesh IP on the head and every member.',
+  errorClusterLanAddressRequired:
+    'A LAN cluster needs a LAN address on every server (and lan_address on NetBird-enabled ones).',
+  errorClusterDirectUnavailable:
+    'Direct transport in a mesh cluster needs NetBird policy management with deny-by-default on and enforced, and the Default policy seen disabled; use relay instead.',
+  errorClusterMemberBudgetRequired: 'A member on an Apple GPU needs a GPU budget on its server.',
+  errorClusterTensorSplitRequired: 'A head with a non-NVIDIA member needs --tensor-split.',
+  errorClusterPortExhausted:
+    'The member server has no free port left in the RPC range 47000-47999.',
+  errorClusterFlagEqualsForm:
+    'Cluster flags in args must be separate tokens (--rpc ${RPC_SERVERS}), not the --rpc=… form.',
+  errorRuntimeSpecPortConflictsRpcMember:
+    'The fixed port lies in the RPC range 47000-47999 and collides with an RPC member on this server.',
+  errorRuntimeSpecDeviceBackendInvalid:
+    'The device backend must be one of auto, cuda, rocm, vulkan, metal, sycl.',
+  errorRuntimeSpecMemberFlagReserved:
+    '-H/--host, -p/--port, -d/--device and -c/--cache are set by the agent and cannot be used in member args.',
+  errorRuntimeSpecMemberVramEstimateRequired:
+    'A VRAM estimate is required for every GPU on a server without NVIDIA GPUs.',
+  errorRpcMemberSpecNotFound: 'RPC member spec not found.',
+  errorRpcMemberSpecRequestFailed: 'The RPC member spec request failed.',
+  errorBinaryPathInvalid: 'The path must be an absolute path of at most 4096 characters.',
+  errorBinaryKindInvalid: 'The kind must be one of llama_server, rpc_server, other.',
+  errorBinaryVersionInvalid: 'Version, build and commit must be at most 256 characters.',
+  errorBinaryNotFound: 'Binary not found on this server.',
+  errorBinaryAgentOwned: 'The agent reports this binary; only its version override can be changed.',
+  errorBinaryRequestFailed: 'The binary request failed.',
+  errorServerLanAddressInvalid: 'The LAN address must be empty or an IPv4 address.',
+  errorClusterLanAckRequired:
+    "Direct transport in a LAN cluster exposes each member's RPC port unauthenticated; acknowledge it with lan_exposure_ack.",
+  errorClusterMemberInUse: 'The member is used by a cluster head.',
+  errorClusterStartFailed:
+    "The cluster failed to start. The members' and the head's logs show why.",
+  errorClusterUnavailable:
+    'The cluster is not available right now (a member is unreachable or not ready).',
+  errorClusterMemberUnused: 'A cluster member is not used by the head.',
+  errorClusterAgentTooOld:
+    'The agent on the head or a member is too old for RPC clusters. Update the agent.',
+  errorClusterHeadUnsupported:
+    'This head cannot run as a cluster (the agent or binary does not support it).',
+  errorRuntimeDeviceBackendMismatch: "The chosen device backend does not match this server's GPUs.",
+  errorRuntimeRpcDeviceCountMismatch:
+    'The RPC server reports a different number of devices than configured.',
+  errorRuntimeRpcUnsupportedBuild: 'This binary was built without RPC support.',
+  errorRuntimeClusterVersionMismatch: "The head's and the member's versions do not match.",
+  errorRuntimeClusterMemberUnreachable: 'A cluster member was unreachable before the head started.',
+  errorRuntimeBindMismatch: 'The RPC server is not listening on the configured address.',
+  errorRuntimeClusterNotReady:
+    'The cluster head only starts through a cluster start; the members are not ready yet.',
+  errorRuntimeInstanceBusy: 'The instance is busy and is not stopped right now.',
+  errorRuntimeCachePurgeFailed: "The member's RPC cache could not be purged.",
+  clusterWarnRpcDevicesNotFirst: 'The RPC devices are not first in the device list.',
+  clusterWarnMmdevMissing:
+    'No device is set for the multimodal projector (--mmproj-device is missing).',
+  clusterWarnCpuMemberWithoutTensorSplit:
+    'A CPU member without --tensor-split may get too much or nothing.',
+  clusterWarnSharedHostWithoutEstimate:
+    'A member shares its host with other models without a VRAM estimate.',
+  clusterWarnBudgetBelowDevice: "A member's GPU budget is below the device's memory.",
+  clusterWarnGpuOverlap:
+    "A member's GPUs overlap with those of other members or models on the same server.",
+  clusterWarnRelayMeshDenyOff:
+    'Relay in the mesh without deny-by-default on does not protect members from other peers.',
+  clusterWarnMemberVersionUnknown:
+    "A member binary's version is unknown; the match with the head is unchecked.",
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the

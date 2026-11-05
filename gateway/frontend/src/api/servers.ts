@@ -124,6 +124,18 @@ export type PortalServer = {
   // "out_of_scope": an older backend or a DTO that lost the field must SHOW
   // the control, never hide it.
   tls_proxy_state?: 'out_of_scope' | 'unknown' | 'agent_off' | 'proxy';
+  // RPC cluster settings. netbird_ip is the peer's mesh address as last
+  // synced (read-only, "" until known). lan_address is the optional IPv4 the
+  // server uses for LAN cluster traffic; lan_bind_only makes an RPC member
+  // listen on it only. rpc_member_enabled offers the server as an automatic
+  // RPC member to heads of the admin groups in rpc_allowed_head_groups.
+  // Optional so existing PortalServer fixtures compile unchanged; always
+  // present on the real wire DTO.
+  netbird_ip?: string;
+  lan_address?: string;
+  lan_bind_only?: boolean;
+  rpc_member_enabled?: boolean;
+  rpc_allowed_head_groups?: string[];
 };
 
 // CreateServer response = the server DTO plus the display-once setup key and a
@@ -210,6 +222,13 @@ export type CreateServerRequest = {
 };
 
 export type UpdateServerRequest = {
+  // RPC cluster settings (all "leave unchanged" when undefined). lan_address
+  // must be empty or an IPv4 literal (else server.lan_address_invalid); an
+  // empty lan_address or head-group list clears the value.
+  lan_address?: string;
+  lan_bind_only?: boolean;
+  rpc_member_enabled?: boolean;
+  rpc_allowed_head_groups?: string[];
   name?: string;
   domain?: string;
   server_path_suffix?: string;
