@@ -14,9 +14,9 @@ Branch-local working file (removed before the PR).
 ## Tasks
 | Task | State |
 |---|---|
-| A1–A10 agent | A1–A6 done; A7 in progress |
+| A1–A10 agent | done, merged (f69800e1) |
 | B1–B4 store | done |
-| C1–C5 portal service | C1, C5 done; C2 in progress (order C1,C5,C2,C3,C4) |
+| C1–C5 portal service | C1, C5, C2 done; C3 in progress; C4 next |
 | D1–D5 gateway runtime | pending |
-| E1–E5 portal UI | pending |
+| E1–E5 portal UI | E1, E2 done (lane .worktrees/rpc-365-fe, branch claude/rpc-365-fe); E3 in progress |
 | F1–F3 e2e, docs, finish | pending |
