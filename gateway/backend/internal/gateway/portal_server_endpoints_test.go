@@ -298,3 +298,18 @@ func TestHandleServerAdminGroupCandidatesReturnsSeededAdminGroup(t *testing.T) {
 		t.Fatalf("seeded admin group %q not in candidates: %+v", testAdminGroupID, body.Data)
 	}
 }
+
+// TestHandlePortalServerUpdateLANAddressInvalidReturns400 proves a malformed
+// lan_address on the server update maps to server.lan_address_invalid.
+func TestHandlePortalServerUpdateLANAddressInvalidReturns400(t *testing.T) {
+	env := newServerOverrideGatewayEnv(t)
+	rec := httptest.NewRecorder()
+	env.srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/servers/"+env.srvHealthy,
+		`{"lan_address":"not-an-ip"}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "server.lan_address_invalid" {
+		t.Fatalf("error code = %q, want server.lan_address_invalid", code)
+	}
+}

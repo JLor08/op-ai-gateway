@@ -133,6 +133,7 @@ type stateWrite struct {
 	id        string
 	domain    string
 	peerID    string
+	ip        string
 	connected bool
 }
 
@@ -152,10 +153,10 @@ func (f *fakeServerStore) AIServers(context.Context) ([]routing.AIServer, error)
 	return append([]routing.AIServer(nil), f.servers...), nil
 }
 
-func (f *fakeServerStore) UpdateServerNetbirdState(_ context.Context, id, domain, peerID string, connected bool) error {
+func (f *fakeServerStore) UpdateServerNetbirdState(_ context.Context, id, domain, peerID, ip string, connected bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.writes = append(f.writes, stateWrite{id: id, domain: domain, peerID: peerID, connected: connected})
+	f.writes = append(f.writes, stateWrite{id: id, domain: domain, peerID: peerID, ip: ip, connected: connected})
 	return nil
 }
 
@@ -947,5 +948,37 @@ func TestSyncServerNetbirdOnceReturnsConnected(t *testing.T) {
 	}
 	if after := fake.requestCount(); after != before {
 		t.Fatalf("non-netbird server must make no NetBird calls, got %d extra", after-before)
+	}
+}
+
+// TestSyncPersistsPeerIP: the peer's mesh IP is written with the state, an
+// IP-only change alone triggers a write, and an unchanged IP does not.
+func TestSyncPersistsPeerIP(t *testing.T) {
+	fake := newFakeNetbird()
+	fake.peers["p1"] = netbird.Peer{ID: "p1", Name: "srv-1", DNSLabel: "p1.netbird.cloud", IP: "100.64.0.7", Connected: true}
+	ts := httptest.NewServer(fake.handler())
+	defer ts.Close()
+
+	store := &fakeServerStore{servers: []routing.AIServer{{
+		ID: "srv-1", Name: "srv-1", Domain: "p1.netbird.cloud",
+		NetbirdEnabled: true, NetbirdGroupID: "g1", NetbirdPeerID: "p1", NetbirdConnected: true,
+		NetbirdIP: "100.64.0.1",
+	}}}
+
+	runNetbirdSyncOnce(context.Background(), store, settingsFor(ts.URL), netbirdCallTimeout, nowUTC, nil)
+
+	writes := store.stateWrites()
+	want := stateWrite{id: "srv-1", domain: "p1.netbird.cloud", peerID: "p1", ip: "100.64.0.7", connected: true}
+	if len(writes) != 1 || writes[0] != want {
+		t.Fatalf("state writes = %+v, want exactly [%+v] (IP-only change)", writes, want)
+	}
+
+	store.servers[0].NetbirdIP = "100.64.0.7"
+	store.mu.Lock()
+	store.writes = nil
+	store.mu.Unlock()
+	runNetbirdSyncOnce(context.Background(), store, settingsFor(ts.URL), netbirdCallTimeout, nowUTC, nil)
+	if writes := store.stateWrites(); len(writes) != 0 {
+		t.Fatalf("unchanged IP wrote %+v, want no write", writes)
 	}
 }

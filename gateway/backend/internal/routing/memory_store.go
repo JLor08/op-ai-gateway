@@ -327,8 +327,8 @@ func (m *MemoryStore) UpdateServerNetbirdKey(_ context.Context, id string, enabl
 }
 
 // UpdateServerNetbirdLink mirrors the SQL targeted UPDATE: it sets only the
-// enabled flag + peer id and RESETS connected to false. An unknown id is
-// ErrNotFound.
+// enabled flag + peer id and RESETS connected to false and the mesh IP to "".
+// An unknown id is ErrNotFound.
 func (m *MemoryStore) UpdateServerNetbirdLink(_ context.Context, id string, enabled bool, peerID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -338,14 +338,15 @@ func (m *MemoryStore) UpdateServerNetbirdLink(_ context.Context, id string, enab
 	}
 	server.NetbirdEnabled = enabled
 	server.NetbirdPeerID = peerID
+	server.NetbirdIP = ""
 	server.NetbirdConnected = false
 	m.servers[id] = server
 	return nil
 }
 
 // UpdateServerNetbirdState mirrors the SQL targeted UPDATE: it sets only the
-// domain, peer id, and connected flag. An unknown id is ErrNotFound.
-func (m *MemoryStore) UpdateServerNetbirdState(_ context.Context, id, domain, peerID string, connected bool) error {
+// domain, peer id, mesh IP, and connected flag. An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateServerNetbirdState(_ context.Context, id, domain, peerID, ip string, connected bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	server, ok := m.servers[id]
@@ -354,6 +355,7 @@ func (m *MemoryStore) UpdateServerNetbirdState(_ context.Context, id, domain, pe
 	}
 	server.Domain = domain
 	server.NetbirdPeerID = peerID
+	server.NetbirdIP = ip
 	server.NetbirdConnected = connected
 	m.servers[id] = server
 	return nil

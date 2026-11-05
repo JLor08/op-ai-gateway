@@ -204,13 +204,14 @@ func (s *SQLiteStore) UpdateServerNetbirdKey(ctx context.Context, id string, ena
 }
 
 // UpdateServerNetbirdLink is the system-admin linkage editor: it sets the
-// NetBird enabled flag + peer id and RESETS netbird_connected to 0 with a
-// targeted UPDATE (only those three columns), so a stale connection state is
-// not shown until the sync loop re-confirms from the new peer id.
+// NetBird enabled flag + peer id and RESETS netbird_connected to 0 and
+// netbird_ip to "" with a targeted UPDATE (only those four columns), so a stale
+// connection state or mesh address is not shown until the sync loop re-confirms
+// from the new peer id.
 func (s *SQLiteStore) UpdateServerNetbirdLink(ctx context.Context, id string, enabled bool, peerID string) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
-		set netbird_enabled = ?, netbird_peer_id = ?, netbird_connected = 0
+		set netbird_enabled = ?, netbird_peer_id = ?, netbird_ip = '', netbird_connected = 0
 		where id = ?`,
 		enabled,
 		peerID,
@@ -223,16 +224,17 @@ func (s *SQLiteStore) UpdateServerNetbirdLink(ctx context.Context, id string, en
 }
 
 // UpdateServerNetbirdState writes the peer-synced server state — the domain
-// (from the peer's DNS name), the peer id, and the connected flag — with a
-// targeted UPDATE (only those three columns), so the peer-sync loop cannot race
-// a concurrent full-row write.
-func (s *SQLiteStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error {
+// (from the peer's DNS name), the peer id, the peer's mesh IP, and the
+// connected flag — with a targeted UPDATE (only those four columns), so the
+// peer-sync loop cannot race a concurrent full-row write.
+func (s *SQLiteStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
-		set domain = ?, netbird_peer_id = ?, netbird_connected = ?
+		set domain = ?, netbird_peer_id = ?, netbird_ip = ?, netbird_connected = ?
 		where id = ?`,
 		domain,
 		peerID,
+		ip,
 		connected,
 		id,
 	)

@@ -65,17 +65,20 @@ func TestMemoryStoreNetbirdNarrowWrites(t *testing.T) {
 	}
 
 	// UpdateServerNetbirdState touches only domain + peer_id + connected.
-	if err := store.UpdateServerNetbirdState(ctx, "srvnb", "peer.nb.cloud", "peer-2", false); err != nil {
+	if err := store.UpdateServerNetbirdState(ctx, "srvnb", "peer.nb.cloud", "peer-2", "100.64.0.5", false); err != nil {
 		t.Fatalf("UpdateServerNetbirdState: %v", err)
 	}
 	got, _ = store.AIServerByID(ctx, "srvnb")
+	if got.NetbirdIP != "100.64.0.5" {
+		t.Fatalf("after state write: netbird_ip = %q, want 100.64.0.5", got.NetbirdIP)
+	}
 	if got.Domain != "peer.nb.cloud" || got.NetbirdPeerID != "peer-2" || got.NetbirdConnected || got.NetbirdSetupKeyID != "sk-2" || got.NetbirdGroupID != "grp-2" {
 		t.Fatalf("after state write: %#v", got)
 	}
 
 	// UpdateServerNetbirdLink sets enabled + peer_id and RESETS connected (here the
 	// prior state left connected=false; set it true first to prove the reset).
-	if err := store.UpdateServerNetbirdState(ctx, "srvnb", "peer.nb.cloud", "peer-2", true); err != nil {
+	if err := store.UpdateServerNetbirdState(ctx, "srvnb", "peer.nb.cloud", "peer-2", "", true); err != nil {
 		t.Fatalf("seed connected: %v", err)
 	}
 	if err := store.UpdateServerNetbirdLink(ctx, "srvnb", true, "peer-3"); err != nil {
@@ -113,7 +116,7 @@ func TestMemoryStoreNetbirdNarrowWrites(t *testing.T) {
 	if err := store.UpdateServerNetbirdKey(ctx, "missing", true, "x", "y"); !errors.Is(err, storeerr.ErrNotFound) {
 		t.Fatalf("UpdateServerNetbirdKey(unknown) = %v, want ErrNotFound", err)
 	}
-	if err := store.UpdateServerNetbirdState(ctx, "missing", "d", "p", true); !errors.Is(err, storeerr.ErrNotFound) {
+	if err := store.UpdateServerNetbirdState(ctx, "missing", "d", "p", "", true); !errors.Is(err, storeerr.ErrNotFound) {
 		t.Fatalf("UpdateServerNetbirdState(unknown) = %v, want ErrNotFound", err)
 	}
 	if err := store.UpdateServerNetbirdAllowPing(ctx, "missing", true); !errors.Is(err, storeerr.ErrNotFound) {

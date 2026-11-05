@@ -147,7 +147,7 @@ func (s *Service) RegenerateNetbirdKey(ctx context.Context, principal auth.Token
 		}
 		// Clear the local linkage so the sync doesn't keep resolving the deleted peer;
 		// the domain is preserved (never-clear-domain).
-		if uErr := s.routes.UpdateServerNetbirdState(ctx, server.ID, server.Domain, "", false); uErr != nil {
+		if uErr := s.routes.UpdateServerNetbirdState(ctx, server.ID, server.Domain, "", "", false); uErr != nil {
 			slog.Debug("netbird: clear peer linkage on regenerate failed", "server_id", server.ID, "error", uErr)
 		}
 	}
@@ -588,7 +588,7 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 				if peer.DNSLabel != "" {
 					domain = peer.DNSLabel
 				}
-				_ = s.routes.UpdateServerNetbirdState(ctx, id, domain, peer.ID, peer.Connected)
+				_ = s.routes.UpdateServerNetbirdState(ctx, id, domain, peer.ID, peer.IP, peer.Connected)
 				// Tracking group create-on-link: reuse the stored id, else find-or-create
 				// "op-gw-<id>" and persist it (keeping the setup-key id).
 				trackingID := server.NetbirdGroupID

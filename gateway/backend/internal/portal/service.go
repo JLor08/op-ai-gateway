@@ -1631,6 +1631,18 @@ type ServerDTO struct {
 	// secret in either field.
 	SystemGroupID   string `json:"system_group_id"`
 	SystemGroupName string `json:"system_group_name"`
+	// NetbirdIP is the peer's mesh address as last synced; read-only (never
+	// accepted in a request), "" when unknown or NetBird is off.
+	NetbirdIP string `json:"netbird_ip"`
+	// LANAddress is the optional IPv4 LAN address the server uses for RPC
+	// cluster traffic; LANBindOnly makes an RPC member listen on it only.
+	LANAddress  string `json:"lan_address"`
+	LANBindOnly bool   `json:"lan_bind_only"`
+	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
+	// member; RPCAllowedHeadGroups are the admin-group ids whose heads may
+	// use it. Always a non-nil list.
+	RPCMemberEnabled     bool     `json:"rpc_member_enabled"`
+	RPCAllowedHeadGroups []string `json:"rpc_allowed_head_groups"`
 }
 
 type ServerListResponse struct {
@@ -1678,6 +1690,13 @@ type CreateServerRequest struct {
 	// set (system-scope only), every chosen AdminGroupIDs entry's parent must
 	// equal it, or the create is rejected as a parent mismatch.
 	SystemGroupID string `json:"system_group_id"`
+	// RPC cluster settings (nil = default: empty / false / no head groups).
+	// LANAddress must be empty or an IPv4 literal; every RPCAllowedHeadGroups
+	// entry must be an existing admin group.
+	LANAddress           *string   `json:"lan_address,omitempty"`
+	LANBindOnly          *bool     `json:"lan_bind_only,omitempty"`
+	RPCMemberEnabled     *bool     `json:"rpc_member_enabled,omitempty"`
+	RPCAllowedHeadGroups *[]string `json:"rpc_allowed_head_groups,omitempty"`
 }
 
 type UpdateServerRequest struct {
@@ -1707,6 +1726,12 @@ type UpdateServerRequest struct {
 	// PriceUnit is the display unit for PricePerKwh; a supplied "" normalizes
 	// to the default ("eur_cent" via NormalizePriceUnit).
 	PriceUnit *string `json:"price_unit,omitempty"`
+	// RPC cluster settings; same validation as on create. A supplied empty
+	// LANAddress or head-group list clears the value.
+	LANAddress           *string   `json:"lan_address,omitempty"`
+	LANBindOnly          *bool     `json:"lan_bind_only,omitempty"`
+	RPCMemberEnabled     *bool     `json:"rpc_member_enabled,omitempty"`
+	RPCAllowedHeadGroups *[]string `json:"rpc_allowed_head_groups,omitempty"`
 }
 
 func (s *Service) CurrentUser(ctx context.Context, token auth.Token) (CurrentUser, error) {
@@ -3791,6 +3816,19 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		priceUnit = *req.PriceUnit
 	}
 	priceUnit = NormalizePriceUnit(priceUnit)
+	// RPC cluster settings are validated last, after every pre-existing check.
+	lanAddress := ""
+	if req.LANAddress != nil {
+		if lanAddress, err = normalizeLANAddress(*req.LANAddress); err != nil {
+			return ServerDTO{}, err
+		}
+	}
+	var headGroups []string
+	if req.RPCAllowedHeadGroups != nil {
+		if headGroups, err = s.validateRPCHeadGroups(ctx, *req.RPCAllowedHeadGroups); err != nil {
+			return ServerDTO{}, err
+		}
+	}
 	now := s.clock().UTC()
 	server := routing.AIServer{
 		ID: "srv_" + compactRandomHex(16), Name: name, Domain: domain, ServerPathSuffix: serverPath,
@@ -3804,6 +3842,10 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		PricePerKwh:                 pricePerKwh,
 		Pue:                         pue,
 		PriceUnit:                   priceUnit,
+		LANAddress:                  lanAddress,
+		LANBindOnly:                 req.LANBindOnly != nil && *req.LANBindOnly,
+		RPCMemberEnabled:            req.RPCMemberEnabled != nil && *req.RPCMemberEnabled,
+		RPCAllowedHeadGroups:        encodeRPCHeadGroups(headGroups),
 		CreatedAt:                   now, UpdatedAt: now,
 	}
 	if err := s.routes.CreateAIServer(ctx, server); err != nil {
@@ -3951,6 +3993,29 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	}
 	if req.PriceUnit != nil {
 		server.PriceUnit = NormalizePriceUnit(*req.PriceUnit)
+	}
+	// RPC cluster settings: validated after every pre-existing check.
+	if req.LANAddress != nil {
+		v, err := normalizeLANAddress(*req.LANAddress)
+		if err != nil {
+			return ServerDTO{}, err
+		}
+		server.LANAddress = v
+	}
+	if req.LANBindOnly != nil {
+		server.LANBindOnly = *req.LANBindOnly
+	}
+	if req.RPCMemberEnabled != nil {
+		server.RPCMemberEnabled = *req.RPCMemberEnabled
+	}
+	if req.RPCAllowedHeadGroups != nil {
+		ids, err := s.validateRPCHeadGroups(ctx, *req.RPCAllowedHeadGroups)
+		if err != nil {
+			return ServerDTO{}, err
+		}
+		server.RPCAllowedHeadGroups = encodeRPCHeadGroups(ids)
+	} else if server.RPCAllowedHeadGroups == "" {
+		server.RPCAllowedHeadGroups = "[]"
 	}
 	// A non-NetBird server must have a domain (mirrors the create-path guard). Only
 	// a NetBird-enabled server may have an empty domain (auto-managed by the sync
@@ -4168,7 +4233,7 @@ func (s *Service) reconcileServerPeerName(ctx context.Context, id, peerID, serve
 	if peer.DNSLabel != "" {
 		newDomain = peer.DNSLabel
 	}
-	if uErr := s.routes.UpdateServerNetbirdState(ctx, id, newDomain, peer.ID, peer.Connected); uErr != nil {
+	if uErr := s.routes.UpdateServerNetbirdState(ctx, id, newDomain, peer.ID, peer.IP, peer.Connected); uErr != nil {
 		slog.Debug("netbird: server-rename reconcile: persist state failed", "server_id", id, "error", uErr)
 		return domain, connected
 	}
@@ -4563,6 +4628,11 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		AdminGroups:                 adminGroups,
 		SystemGroupID:               server.SystemGroupID,
 		SystemGroupName:             systemGroupName,
+		NetbirdIP:                   server.NetbirdIP,
+		LANAddress:                  server.LANAddress,
+		LANBindOnly:                 server.LANBindOnly,
+		RPCMemberEnabled:            server.RPCMemberEnabled,
+		RPCAllowedHeadGroups:        decodeRPCHeadGroups(server.RPCAllowedHeadGroups),
 		// NetbirdSetupKey / NetbirdSetupCommand are display-once and deliberately
 		// NOT set here — a Get/List DTO must never carry them.
 	}, nil

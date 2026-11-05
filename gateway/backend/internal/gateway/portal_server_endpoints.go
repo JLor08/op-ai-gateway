@@ -438,6 +438,7 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrServerRuntimeLimitInvalid, status: http.StatusBadRequest, code: "server.runtime_limit_invalid", msg: "runtime_max_processes must be >= 0"},
 	{err: portal.ErrGPUBudgetInvalid, status: http.StatusBadRequest, code: "server.gpu_budget_invalid", msg: "gpu budget index/budget_mb must be >= 0 and index must be unique"},
 	{err: portal.ErrServerEnergyConfigInvalid, status: http.StatusBadRequest, code: "server.energy_config_invalid", msg: "estimated_watts, idle_watts, price_per_kwh and pue must be >= 0"},
+	{err: portal.ErrServerLANAddressInvalid, status: http.StatusBadRequest, code: "server.lan_address_invalid", msg: "lan_address must be empty or an IPv4 address"},
 	{err: portal.ErrServerAdminGroupRequired, status: http.StatusBadRequest, code: "server.admin_group_required", msg: "at least one admin group is required"},
 	{err: portal.ErrServerAdminGroupInvalid, status: http.StatusBadRequest, code: "server.admin_group_invalid", msg: "admin group is invalid"},
 	{err: portal.ErrServerAdminGroupParentMismatch, status: http.StatusBadRequest, code: "server.admin_group_parent_mismatch", msg: "admin groups must share one parent system group"},

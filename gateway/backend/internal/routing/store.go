@@ -1391,15 +1391,15 @@ type NetbirdStateStore interface {
 	// non-NetBird server flips the flag on).
 	UpdateServerNetbirdKey(ctx context.Context, id string, enabled bool, setupKeyID, groupID string) error
 	// UpdateServerNetbirdLink is the system-admin linkage editor: it sets the
-	// NetBird enabled flag + peer id and RESETS netbird_connected (a targeted
-	// UPDATE), so a stale connection state is not shown until the sync loop
+	// NetBird enabled flag + peer id and RESETS netbird_connected and netbird_ip
+	// (a targeted UPDATE), so a stale connection state or mesh address is not shown until the sync loop
 	// re-confirms from the new peer id.
 	UpdateServerNetbirdLink(ctx context.Context, id string, enabled bool, peerID string) error
 	// UpdateServerNetbirdState writes the peer-synced server state — the domain
-	// (from the peer's DNS name), the peer id, and the connected flag — as a
-	// targeted UPDATE (only those three columns), so it cannot race a concurrent
-	// full-row write.
-	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error
+	// (from the peer's DNS name), the peer id, the peer's mesh IP, and the
+	// connected flag — as a targeted UPDATE (only those four columns), so it
+	// cannot race a concurrent full-row write. An empty ip clears netbird_ip.
+	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
 	// UpdateServerNetbirdGroups writes only netbird_group_ids — the opaque JSON
 	// mirror of the peer's policy groups (a targeted UPDATE that touches only that
 	// one column), so it cannot race a concurrent full-row or state write.

@@ -1948,7 +1948,7 @@ func (_d *RoutingStoreWithTracing) UpdateServerNetbirdPolicyOverride(ctx context
 	return _d.Store.UpdateServerNetbirdPolicyOverride(ctx, id, override)
 }
 
-func (_d *RoutingStoreWithTracing) UpdateServerNetbirdState(ctx context.Context, id string, domain string, peerID string, connected bool) (err error) {
+func (_d *RoutingStoreWithTracing) UpdateServerNetbirdState(ctx context.Context, id string, domain string, peerID string, ip string, connected bool) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateServerNetbirdState")
 	defer span.End()
 	defer func() {
@@ -1957,7 +1957,7 @@ func (_d *RoutingStoreWithTracing) UpdateServerNetbirdState(ctx context.Context,
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.Store.UpdateServerNetbirdState(ctx, id, domain, peerID, connected)
+	return _d.Store.UpdateServerNetbirdState(ctx, id, domain, peerID, ip, connected)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateServerSystemGroup(ctx context.Context, serverID string, systemGroupID string) (err error) {

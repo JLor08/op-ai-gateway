@@ -14,7 +14,7 @@ import (
 // reactivationStore is what the reactivation coordinator reads/writes.
 type reactivationStore interface {
 	AIServerByID(ctx context.Context, id string) (routing.AIServer, error)
-	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error
+	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
 }
 
 // serverReconciler runs the per-server NetBird group/policy reconcile.
