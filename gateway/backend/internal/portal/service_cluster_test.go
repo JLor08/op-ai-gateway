@@ -860,12 +860,13 @@ func TestClusterCandidatesFiltersByAuthAndConsent(t *testing.T) {
 	if auto[0].ServerID != good.ID || auto[0].RPCBinary != clusterRPCBinary {
 		t.Fatalf("candidate = %+v", auto[0])
 	}
-	// System scope needs no consent and manages every server.
+	// System scope manages every server, but consent binds it like anyone:
+	// the server that does not consent to the head is not offered.
 	sys, err := f.svc.ClusterCandidates(f.ctx, systemToken(), f.mappingID, "automatic")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names(sys); !slices.Equal(got, []string{"Foreign", "Good", "NoConsent"}) {
+	if got := names(sys); !slices.Equal(got, []string{"Foreign", "Good"}) {
 		t.Fatalf("system candidates = %v", got)
 	}
 

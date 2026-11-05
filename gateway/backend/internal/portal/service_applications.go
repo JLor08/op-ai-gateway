@@ -883,6 +883,11 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	// exist). Fired BEFORE reconcileServerPolicy so a slow NetBird round trip
 	// cannot delay the push this fix exists to make prompt.
 	s.notifyRuntimeChangedForApplication(server.ID, "", app.Type)
+	// A server_agent application is what a cluster member's document needs at
+	// all, so a head withheld for a member without one can now be pushed.
+	if app.Type == routing.ProviderServerAgent {
+		s.NotifyClustersOfServer(ctx, server.ID)
+	}
 	// Best-effort: a new application changes the server's active port set, so its
 	// NetBird access policy (if managed) may need to grow. reconcileServerPolicy
 	// gates internally on the module + policy management and never errors.
@@ -910,6 +915,14 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// notifyRuntimeChangedForApplication -- retyping AWAY from server_agent
 	// must notify too).
 	previousType := app.Type
+	// The server's clusters, read before a retype away from server_agent
+	// hides its own heads from clusterServersOfServer: a server_agent
+	// application decides whether the server's member processes and heads can
+	// be pushed, so a retype either way notifies every server of them.
+	var clusterServers []string
+	if previousType == routing.ProviderServerAgent {
+		clusterServers = s.clusterServersOfServer(ctx, server.ID)
+	}
 	// Captured for the same reason, and read only by the warning below: once
 	// applyProxyExclusion has run, the port it released is gone from app.
 	previousProxyListenPort := app.ProxyListenPort
@@ -1350,6 +1363,14 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// see notifyRuntimeChangedForApplication for why over-notifying is the
 	// deliberate choice here.
 	s.notifyRuntimeChangedForApplication(server.ID, previousType, app.Type)
+	if previousType == routing.ProviderServerAgent || app.Type == routing.ProviderServerAgent {
+		for _, id := range s.clusterServersOfServer(ctx, server.ID) {
+			clusterServers = appendUnique(clusterServers, id)
+		}
+		for _, id := range clusterServers {
+			s.notifyRuntimeChanged(id)
+		}
+	}
 	// Best-effort: a port/status change may alter the server's active port set, so
 	// its NetBird access policy (if managed) may need to be updated. Gates
 	// internally on the module + policy management and never errors.

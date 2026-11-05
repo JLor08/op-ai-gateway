@@ -2206,10 +2206,10 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances) {
 		s.PushRuntimeConfig(serverID)
 	}
-	// A cluster is pushed only while every agent of it declares rpc_cluster,
-	// and every server's document of it is held while one declaration is
-	// unknown, so the same two moves push every server sharing a cluster with
-	// this one (the server's own document included).
+	// A cluster is pushed only while every agent of it declares rpc_cluster
+	// and every declaration is known (an unknown one withholds the cluster
+	// from the other servers' documents), so the same two moves push every
+	// server sharing a cluster with this one (its own document included).
 	if capsReadable && s.Portal != nil && (!knewFeatures || slices.Contains(caps, rpcClusterFeature) != hadRPCCluster) {
 		s.Portal.NotifyClustersOfServer(ctx, serverID)
 	}

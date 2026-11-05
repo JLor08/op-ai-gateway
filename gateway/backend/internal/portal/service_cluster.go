@@ -282,8 +282,9 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 //     and every member consents to the head (its member spec's
 //     allowed_head_groups in manual mode, the server's rpc_allowed_head_groups
 //     in automatic mode, intersected with the head server's admin groups; an
-//     empty list means the member server's own admin groups; system scope
-//     needs no consent). Both answer server-not-found, so a
+//     empty list means the member server's own admin groups; consent binds
+//     every caller, system scope included, since the runtime document
+//     re-checks it on every derivation). Both answer server-not-found, so a
 //     caller learns nothing about a server it may not use. They run before
 //     the member checks below, which would otherwise tell such a caller
 //     about that server's settings.
@@ -593,7 +594,7 @@ func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, hea
 			}
 			consentRaw = spec.AllowedHeadGroups
 		}
-		admits, err := s.memberConsentAdmits(ctx, p, consentRaw, e.server.ID, headGroups)
+		admits, err := s.memberConsentAdmits(ctx, consentRaw, e.server.ID, headGroups)
 		if err != nil {
 			return err
 		}
@@ -606,11 +607,11 @@ func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, hea
 
 // memberConsentAdmits reports whether a member's stored consent list admits
 // a head whose server is linked to headGroups. An empty list means the
-// member server's own admin groups (the default consent).
-func (s *Service) memberConsentAdmits(ctx context.Context, p auth.Token, consentRaw, memberServerID string, headGroups []string) (bool, error) {
-	if isSystem(p) {
-		return true, nil
-	}
+// member server's own admin groups (the default consent). Consent is the
+// member side's standing permission and binds every caller, system scope
+// included: the runtime document re-checks it on every derivation, so a
+// save past it would only store a head that is never pushed.
+func (s *Service) memberConsentAdmits(ctx context.Context, consentRaw, memberServerID string, headGroups []string) (bool, error) {
 	consent := decodeRPCHeadGroups(consentRaw)
 	if len(consent) == 0 {
 		var err error
@@ -618,7 +619,7 @@ func (s *Service) memberConsentAdmits(ctx context.Context, p auth.Token, consent
 			return false, err
 		}
 	}
-	return consentAdmits(p, consent, headGroups), nil
+	return consentAdmits(consent, headGroups), nil
 }
 
 // authorizeFormerMembers requires the caller's rights on every former member
@@ -638,11 +639,8 @@ func (s *Service) authorizeFormerMembers(ctx context.Context, p auth.Token, prev
 }
 
 // consentAdmits reports whether a member's consent groups admit a head whose
-// server is linked to headGroups. System scope needs no consent.
-func consentAdmits(p auth.Token, consent, headGroups []string) bool {
-	if isSystem(p) {
-		return true
-	}
+// server is linked to headGroups.
+func consentAdmits(consent, headGroups []string) bool {
 	for _, g := range consent {
 		if slices.Contains(headGroups, g) {
 			return true
@@ -1537,9 +1535,9 @@ func (s *Service) otherGPUUses(ctx context.Context, headSpecID string, m cluster
 
 // ClusterCandidates lists the servers the head on headMappingID may add as
 // members in mode ("automatic" when empty): servers other than the head's
-// that the caller manages and whose consent admits the head (system scope
-// needs no consent; an empty consent list means the member server's own
-// admin groups). In automatic mode a server must offer RPC membership
+// that the caller manages and whose consent admits the head (for every
+// caller, system scope included; an empty consent list means the member
+// server's own admin groups). In automatic mode a server must offer RPC membership
 // and have a ggml-rpc-server matching the head binary's version, which needs
 // the stored head spec's version known; in manual mode it must have enabled
 // member specs that serve no other head, which are listed. Sorted by server
@@ -1584,7 +1582,7 @@ func (s *Service) ClusterCandidates(ctx context.Context, p auth.Token, headMappi
 			if !srv.RPCMemberEnabled || !headKnown {
 				continue
 			}
-			admits, err := s.memberConsentAdmits(ctx, p, srv.RPCAllowedHeadGroups, srv.ID, headGroups)
+			admits, err := s.memberConsentAdmits(ctx, srv.RPCAllowedHeadGroups, srv.ID, headGroups)
 			if err != nil {
 				return nil, err
 			}
@@ -1630,7 +1628,7 @@ func (s *Service) freeMemberSpecs(ctx context.Context, p auth.Token, serverID, h
 		if !spec.Enabled {
 			continue
 		}
-		admits, err := s.memberConsentAdmits(ctx, p, spec.AllowedHeadGroups, serverID, headGroups)
+		admits, err := s.memberConsentAdmits(ctx, spec.AllowedHeadGroups, serverID, headGroups)
 		if err != nil {
 			return nil, err
 		}

@@ -1150,6 +1150,11 @@ func (s *Service) DeleteGroup(ctx context.Context, principal auth.Token, id stri
 		}
 		return err
 	}
+	// The cascade removes server admin-group links (of this group and of its
+	// children), which are a cluster member's default consent and the groups
+	// a head is admitted by. Which servers lost a link is gone with the rows,
+	// and a group delete is rare, so every cluster is re-derived.
+	s.notifyAllClusterServers(ctx)
 	return nil
 }
 

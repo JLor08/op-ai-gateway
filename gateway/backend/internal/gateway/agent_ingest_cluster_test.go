@@ -48,8 +48,8 @@ func TestAgentFeaturesDeclaresRPCCluster(t *testing.T) {
 }
 
 // TestIngestNotifiesClustersWhenRPCClusterFlips: whether a cluster is pushed
-// depends on every agent of it declaring rpc_cluster, and every document of it
-// is held while one declaration is unknown, so a sample that makes the
+// depends on every agent of it declaring rpc_cluster, and the cluster is
+// withheld while one declaration is unknown, so a sample that makes the
 // declaration known or changes rpc_cluster pushes every server sharing a
 // cluster with the agent's server.
 func TestIngestNotifiesClustersWhenRPCClusterFlips(t *testing.T) {

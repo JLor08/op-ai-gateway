@@ -291,15 +291,17 @@ func TestAgentRuntimeConfigWithholdsClusterForOldAgents(t *testing.T) {
 			t.Fatalf("reason = %q", got)
 		}
 	})
+	// An unknown REMOTE agent withholds the cluster from a document; only the
+	// document's own unknown agent holds it.
 	t.Run("member agent not heard from", func(t *testing.T) {
 		f, a, head := setup(t)
 		delete(f.svc.agentFeatures.(fakeAgentFeatures), a.ID)
 		doc := f.config(f.head.ID)
-		if !doc.AwaitsAgentFeatures {
-			t.Fatal("head document served while a member agent's features are unknown")
+		if doc.AwaitsAgentFeatures {
+			t.Fatal("head document held for a remote member agent's unknown features")
 		}
 		if _, ok := specByID(doc, head.ID); ok {
-			t.Fatal("held document carries the head")
+			t.Fatal("head pushed while a member agent's features are unknown")
 		}
 		if got := f.withheldReason(); got != ClusterWithheldFeaturesPending {
 			t.Fatalf("reason = %q", got)
@@ -311,8 +313,26 @@ func TestAgentRuntimeConfigWithholdsClusterForOldAgents(t *testing.T) {
 	t.Run("head agent not heard from", func(t *testing.T) {
 		f, a, _ := setup(t)
 		delete(f.svc.agentFeatures.(fakeAgentFeatures), f.head.ID)
-		if !f.config(a.ID).AwaitsAgentFeatures {
-			t.Fatal("member document served while the head agent's features are unknown")
+		doc := f.config(a.ID)
+		if doc.AwaitsAgentFeatures {
+			t.Fatal("member document held for the remote head agent's unknown features")
+		}
+		if got := rpcServerSpecs(doc); len(got) != 0 {
+			t.Fatalf("member pushed while the head agent's features are unknown: %+v", got)
+		}
+		if !f.config(f.head.ID).AwaitsAgentFeatures {
+			t.Fatal("head document served while its own agent's features are unknown")
+		}
+	})
+	t.Run("another member agent not heard from", func(t *testing.T) {
+		f := newClusterFixture(t)
+		a, b := f.member("A"), f.member("B")
+		f.clusterAgents(a.ID, b.ID)
+		f.mustPut(clusterHeadRequest(autoMember(a.ID), autoMember(b.ID)))
+		delete(f.svc.agentFeatures.(fakeAgentFeatures), b.ID)
+		doc := f.config(a.ID)
+		if doc.AwaitsAgentFeatures || len(rpcServerSpecs(doc)) != 0 {
+			t.Fatalf("member A document held=%v specs=%+v, want served without the member", doc.AwaitsAgentFeatures, rpcServerSpecs(doc))
 		}
 	})
 	t.Run("no feature reader", func(t *testing.T) {
@@ -624,9 +644,151 @@ func TestMemberEditNotifiesHeadAndMemberServers(t *testing.T) {
 		t.Fatalf("member inventory write notified %v, want %v", got, all)
 	}
 
+	// A member's server_agent application: deleting it withholds the head,
+	// creating it again lets it be pushed; both notify every server.
+	apps, _ := f.routes.ApplicationsByServer(f.ctx, b.ID)
+	reset()
+	for _, app := range apps {
+		if err := f.svc.DeleteApplication(f.ctx, ownerToken(), app.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.notifiedServers(); !slices.Equal(got, all) {
+		t.Fatalf("member application delete notified %v, want %v", got, all)
+	}
+	if _, ok := specByID(f.config(f.head.ID), head.ID); ok {
+		t.Fatal("head pushed with a member without a server_agent application")
+	}
+	reset()
+	if _, err := f.svc.CreateApplication(f.ctx, ownerToken(), b.ID, CreateApplicationRequest{Type: routing.ProviderServerAgent, Port: 9000, Scheme: "http"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.notifiedServers(); !slices.Equal(got, all) {
+		t.Fatalf("member application create notified %v, want %v", got, all)
+	}
+	if _, ok := specByID(f.config(f.head.ID), head.ID); !ok {
+		t.Fatal("head withheld after the member's server_agent application came back")
+	}
+
+	reset()
+	if _, err := f.svc.SetServerGPUBudgets(f.ctx, ownerToken(), b.ID, SetGPUBudgetsRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.notifiedServers(); !slices.Equal(got, all) {
+		t.Fatalf("member budget write notified %v, want %v", got, all)
+	}
+
+	reset()
+	if err := f.svc.DeleteGroup(f.ctx, systemToken(), f.foreignGroup()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.notifiedServers(); !slices.Equal(got, all) {
+		t.Fatalf("group delete notified %v, want %v", got, all)
+	}
+
 	reset()
 	f.svc.NotifyClustersOfServer(f.ctx, f.head.ID)
 	if got := f.notifiedServers(); !slices.Equal(got, all) {
 		t.Fatalf("head fan-out notified %v, want %v", got, all)
+	}
+}
+
+// TestPutClusterConsentBindsSystemScope: consent has no system-scope bypass,
+// at save as in the runtime document. A member whose consent list names
+// another group, or whose empty list (the member server's own admin groups)
+// does not meet the head server's, is refused like for any caller.
+func TestPutClusterConsentBindsSystemScope(t *testing.T) {
+	f := newClusterFixture(t)
+	named := f.member("Named")
+	f.updateServer(named.ID, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = encodeRPCHeadGroups([]string{f.foreignGroup()}) })
+	if _, err := f.put(systemToken(), clusterHeadRequest(autoMember(named.ID))); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("system save past a named consent = %v, want %v", err, ErrServerNotFound)
+	}
+	foreign := f.foreignServer("Foreign")
+	f.updateServer(foreign.ID, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = "[]" })
+	if _, err := f.put(systemToken(), clusterHeadRequest(autoMember(foreign.ID))); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("system save past the default consent = %v, want %v", err, ErrServerNotFound)
+	}
+	// The default consent of a member in the head's own admin group admits.
+	own := f.member("Own")
+	f.updateServer(own.ID, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = "[]" })
+	if _, err := f.put(systemToken(), clusterHeadRequest(autoMember(own.ID))); err != nil {
+		t.Fatalf("system save with the default consent of the same group: %v", err)
+	}
+}
+
+// TestAgentRuntimeConfigGenerationFollowsMemberLaunch: a manual member's args
+// and an automatic member's device backend are part of the head's generation.
+func TestAgentRuntimeConfigGenerationFollowsMemberLaunch(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	f.clusterAgents(a.ID, b.ID)
+	spec := f.manualSpec(a.ID, RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 5000})
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID})
+	req.MemberMode = "manual"
+	head := f.mustPut(req)
+	generation := func() string {
+		t.Helper()
+		hs, ok := specByID(f.config(f.head.ID), head.ID)
+		if !ok || hs.Cluster == nil {
+			t.Fatalf("head withheld: %q", f.withheldReason())
+		}
+		return hs.Cluster.Generation
+	}
+	before := generation()
+	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID, PutRPCMemberSpecRequest{
+		Binary: clusterRPCBinary, Args: []string{"-t", "6"}, GPUs: []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 5000}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if after := generation(); after == before {
+		t.Fatal("generation unchanged by the manual member's args")
+	}
+
+	second, err := f.svc.CreateMapping(f.ctx, ownerToken(), f.app.ID, CreateMappingRequest{GatewayModelName: "big2", AppModelName: "big2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto := f.putFor(second.ID, clusterHeadRequest(autoMember(b.ID, 0)))
+	autoGen := func() string {
+		hs, _ := specByID(f.config(f.head.ID), auto.ID)
+		return hs.Cluster.Generation
+	}
+	before = autoGen()
+	vulkan := clusterHeadRequest(autoMember(b.ID, 0))
+	vulkan.ClusterMembers[0].DeviceBackend = "vulkan"
+	f.putFor(second.ID, vulkan)
+	if autoGen() == before {
+		t.Fatal("generation unchanged by the automatic member's device backend")
+	}
+}
+
+// TestAgentRuntimeConfigWithholdsOnCorruptMemberSpec: a manual member spec
+// whose stored args cannot be read withholds its head with a reason; the
+// documents and the head's read view are still served.
+func TestAgentRuntimeConfigWithholdsOnCorruptMemberSpec(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.clusterAgents(a.ID)
+	spec := f.manualSpec(a.ID)
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID})
+	req.MemberMode = "manual"
+	head := f.mustPut(req)
+	row, _, err := f.routes.RPCMemberSpecByID(f.ctx, spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Args = "{not json"
+	if err := f.routes.UpsertRPCMemberSpec(f.ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := specByID(f.config(f.head.ID), head.ID); ok {
+		t.Fatal("head pushed with an unreadable member spec")
+	}
+	if got := rpcServerSpecs(f.config(a.ID)); len(got) != 0 {
+		t.Fatalf("member pushed from an unreadable spec: %+v", got)
+	}
+	if got := f.withheldReason(); got != ClusterWithheldMemberSpecInvalid {
+		t.Fatalf("reason = %q", got)
 	}
 }

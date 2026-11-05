@@ -11,7 +11,6 @@ import (
 	"errors"
 	"log/slog"
 	"net"
-	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"slices"
@@ -33,10 +32,11 @@ const AgentSpecKindRPCServer = "rpc_server"
 // Reasons a cluster head is withheld from its server's runtime document
 // (RuntimeSpecDTO.ClusterWithheldReason). The head and every member spec
 // derived from it are withheld together, so an agent never receives a
-// partial endpoint list. ClusterWithheldFeaturesPending is not a withholding
-// of its own: the documents of every server of the cluster are held
-// (AgentRuntimeConfigDTO.AwaitsAgentFeatures) until every agent involved has
-// declared its features.
+// partial endpoint list. ClusterWithheldFeaturesPending withholds the
+// cluster while the declaration of an agent of it is unknown; a server whose
+// OWN agent's declaration is unknown has its whole document held instead
+// (AgentRuntimeConfigDTO.AwaitsAgentFeatures), while the other servers'
+// documents go out without that cluster's head or member.
 const (
 	ClusterWithheldFeaturesPending   = "runtime_config.agent_features_pending"
 	ClusterWithheldAgentTooOld       = "runtime.cluster_agent_too_old"
@@ -50,6 +50,9 @@ const (
 	ClusterWithheldMeshUnavailable   = "runtime.cluster_mesh_unavailable"
 	ClusterWithheldDirectUnavailable = "runtime.cluster_direct_unavailable"
 	ClusterWithheldLANAckRequired    = "runtime.cluster_lan_ack_required"
+	// ClusterWithheldMemberSpecInvalid: a manual member spec's stored args or
+	// env cannot be read (store data, not operator input).
+	ClusterWithheldMemberSpecInvalid = "runtime.cluster_member_spec_invalid"
 )
 
 // Member process defaults: a member has no startup timeout of its own (a
@@ -71,8 +74,9 @@ type AgentClusterEndpointDTO struct {
 // AgentClusterHeadDTO makes a model spec a cluster head: its members in
 // member order (the order fixes the RPC<n> numbering), the transport and the
 // network. Generation is a digest of the member configuration that the
-// endpoints do not show (binaries and their versions, GPU selections, bind
-// addresses), so a member-side change relaunches the head.
+// endpoints do not show (binaries and their versions, args, device backends,
+// GPU selections, bind addresses), so a member-side change relaunches the
+// head.
 type AgentClusterHeadDTO struct {
 	Endpoints  []AgentClusterEndpointDTO `json:"endpoints"`
 	Transport  string                    `json:"transport"`
@@ -110,6 +114,9 @@ type clusterDerivation struct {
 	reason  string
 	head    *AgentClusterHeadDTO
 	members map[string]AgentRuntimeSpecDTO
+	// hold: the viewing server's own agent declaration is unknown, so its
+	// document is held rather than served without the cluster.
+	hold bool
 }
 
 func withheld(reason string) clusterDerivation { return clusterDerivation{reason: reason} }
@@ -123,10 +130,12 @@ type derivedMember struct {
 }
 
 // clusterHeadBlock returns head's cluster block for headServer's document,
-// or the reason it is withheld. head must be an enabled cluster head.
-func (s *Service) clusterHeadBlock(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer) (*AgentClusterHeadDTO, string, error) {
-	d, err := s.deriveCluster(ctx, head, headServer)
-	return d.head, d.reason, err
+// or the reason it is withheld; hold reports that headServer's own agent
+// declaration is unknown, which holds its document. head must be an enabled
+// cluster head.
+func (s *Service) clusterHeadBlock(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer) (block *AgentClusterHeadDTO, reason string, hold bool, err error) {
+	d, err := s.deriveCluster(ctx, head, headServer, headServer.ID)
+	return d.head, d.reason, d.hold, err
 }
 
 // deriveCluster derives head's cluster from its stored membership -- never
@@ -140,7 +149,10 @@ func (s *Service) clusterHeadBlock(ctx context.Context, head routing.RuntimeSpec
 // binary's version); the network (every address known, in mesh NetBird on
 // every server) and the transport (direct mesh needs the NetBird policy
 // preconditions, direct lan the operator's exposure acknowledgement).
-func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer) (clusterDerivation, error) {
+//
+// viewerID is the server whose document the derivation is for; only its own
+// unknown declaration holds that document (clusterDerivation.hold).
+func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer, viewerID string) (clusterDerivation, error) {
 	states, err := s.loadClusterMembers(ctx, head.ID)
 	if err != nil {
 		return clusterDerivation{}, err
@@ -152,8 +164,10 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 	for _, m := range states {
 		serverIDs = append(serverIDs, m.row.ServerID)
 	}
-	if reason := s.clusterFeatureReason(serverIDs); reason != "" {
-		return withheld(reason), nil
+	if reason, hold := s.clusterFeatureReason(viewerID, serverIDs); reason != "" {
+		d := withheld(reason)
+		d.hold = hold
+		return d, nil
 	}
 	headGroups, err := s.routes.ServerAdminGroups(ctx, headServer.ID)
 	if err != nil {
@@ -206,9 +220,19 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 // server of the cluster: pending while any agent's declaration is unknown,
 // too old when one is known to lack rpc_cluster. Without a feature reader
 // every agent counts as known and without the feature.
-func (s *Service) clusterFeatureReason(serverIDs []string) string {
+//
+// hold is set only when viewerID's own declaration is unknown. That is the
+// gateway restart case the hold exists for: until the agent fetching the
+// document has declared, the gateway cannot tell what it runs. A REMOTE
+// unknown agent only withholds the cluster from the viewer's document --
+// holding the whole document for it would freeze every other model on the
+// viewer for as long as that other host stays away.
+func (s *Service) clusterFeatureReason(viewerID string, serverIDs []string) (reason string, hold bool) {
 	if s.agentFeatures == nil {
-		return ClusterWithheldAgentTooOld
+		return ClusterWithheldAgentTooOld, false
+	}
+	if !s.agentFeatures.Known(viewerID) {
+		return ClusterWithheldFeaturesPending, true
 	}
 	pending, old := false, false
 	for _, id := range serverIDs {
@@ -220,18 +244,17 @@ func (s *Service) clusterFeatureReason(serverIDs []string) string {
 		}
 	}
 	if pending {
-		return ClusterWithheldFeaturesPending
+		return ClusterWithheldFeaturesPending, false
 	}
 	if old {
-		return ClusterWithheldAgentTooOld
+		return ClusterWithheldAgentTooOld, false
 	}
-	return ""
+	return "", false
 }
 
 // checkDerivedMember is the membership part of deriveCluster for the member
-// at index i. Consent is checked as for a caller without system scope: it is
-// the member side's standing permission, and withdrawing it takes the
-// member away from the head.
+// at index i. Consent is the member side's standing permission: withdrawing
+// it takes the member away from the head.
 func (s *Service) checkDerivedMember(ctx context.Context, i int, m clusterMemberState, headGroups []string) (string, error) {
 	// Positions are stored 0..n-1; a gap is a member that went away.
 	if m.row.Position != i || !m.found {
@@ -249,7 +272,7 @@ func (s *Service) checkDerivedMember(ctx context.Context, i int, m clusterMember
 	} else if !m.server.RPCMemberEnabled {
 		return ClusterWithheldMemberDisabled, nil
 	}
-	admits, err := s.memberConsentAdmits(ctx, auth.Token{}, consentRaw, m.server.ID, headGroups)
+	admits, err := s.memberConsentAdmits(ctx, consentRaw, m.server.ID, headGroups)
 	if err != nil {
 		return "", err
 	}
@@ -377,21 +400,25 @@ func clusterHeadIdentity(headServer routing.AIServer, network string) (ips []str
 	return []string{addr}, "", ""
 }
 
-// memberGenerationPart is one member's share of the head's generation.
+// memberGenerationPart is one member's share of the head's generation:
+// everything of the member's launch that decides what devices the head sees
+// and whether its build talks to the head's.
 type memberGenerationPart struct {
-	Kind        string `json:"kind"`
-	ID          string `json:"id"`
-	Server      string `json:"server"`
-	Binary      string `json:"binary"`
-	Version     string `json:"version"`
-	Commit      string `json:"commit"`
-	Build       string `json:"build"`
-	DeviceCount int    `json:"device_count"`
-	GPUs        []int  `json:"gpus"`
-	Transport   string `json:"transport"`
-	Network     string `json:"network"`
-	Bind        string `json:"bind"`
-	Port        int    `json:"port"`
+	Kind          string   `json:"kind"`
+	ID            string   `json:"id"`
+	Server        string   `json:"server"`
+	Binary        string   `json:"binary"`
+	Args          []string `json:"args"`
+	DeviceBackend string   `json:"device_backend"`
+	Version       string   `json:"version"`
+	Commit        string   `json:"commit"`
+	Build         string   `json:"build"`
+	DeviceCount   int      `json:"device_count"`
+	GPUs          []int    `json:"gpus"`
+	Transport     string   `json:"transport"`
+	Network       string   `json:"network"`
+	Bind          string   `json:"bind"`
+	Port          int      `json:"port"`
 }
 
 // buildCluster assembles a derivable cluster: the head's block and each
@@ -402,6 +429,11 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 	out := clusterDerivation{head: block, members: make(map[string]AgentRuntimeSpecDTO, len(members))}
 	for _, m := range members {
 		spec, err := s.memberAgentSpec(ctx, head.ID, m, transport, headIPs, headDomain)
+		if errors.Is(err, ErrRuntimeSpecArgsInvalid) || errors.Is(err, ErrRuntimeSpecEnvInvalid) {
+			// One member's unreadable row withholds its cluster; it must not
+			// fail the documents (and the read view) the cluster is part of.
+			return withheld(ClusterWithheldMemberSpecInvalid), nil
+		}
 		if err != nil {
 			return clusterDerivation{}, err
 		}
@@ -422,8 +454,9 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			kind = memberModeManual
 		}
 		parts = append(parts, memberGenerationPart{
-			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Version: m.binary.EffectiveVersion(),
-			Commit: commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: transport, Network: network,
+			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Args: spec.Args, DeviceBackend: spec.DeviceBackend,
+			Version: m.binary.EffectiveVersion(),
+			Commit:  commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: transport, Network: network,
 			Bind: m.bindIP, Port: m.row.Port,
 		})
 		out.members[m.server.ID] = spec
@@ -563,9 +596,10 @@ func (s *Service) serverMemoryCeilings(ctx context.Context, serverID string) (ma
 
 // memberSpecsForServer derives the rpc_server specs serverID runs for the
 // cluster heads it is a member of, in head spec id order. A head that is
-// disabled or withheld contributes nothing; pending reports that a head's
-// cluster waits for an agent's features, which holds serverID's document.
-func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (specs []AgentRuntimeSpecDTO, pending bool, err error) {
+// disabled or withheld contributes nothing; hold reports that serverID's own
+// agent declaration is unknown while it is a member of an enabled head,
+// which holds serverID's document.
+func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (specs []AgentRuntimeSpecDTO, hold bool, err error) {
 	memberships, err := s.routes.ClusterMembershipsByServer(ctx, serverID)
 	if err != nil {
 		return nil, false, err
@@ -586,23 +620,21 @@ func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (sp
 		if !ok {
 			continue
 		}
-		d, err := s.deriveCluster(ctx, head, headServer)
+		d, err := s.deriveCluster(ctx, head, headServer, serverID)
 		if err != nil {
 			return nil, false, err
 		}
-		if d.reason == ClusterWithheldFeaturesPending {
-			pending = true
-			continue
-		}
+		hold = hold || d.hold
 		if spec, ok := d.members[serverID]; ok && d.reason == "" {
 			specs = append(specs, spec)
 		}
 	}
-	return specs, pending, nil
+	return specs, hold, nil
 }
 
 // specServer resolves spec -> mapping -> application -> server; ok is false
-// when a link is gone. Any other store error is returned.
+// when a link is gone or the application is no server_agent one (its specs
+// run nowhere). Any other store error is returned.
 func (s *Service) specServer(ctx context.Context, spec routing.RuntimeSpec) (routing.AIServer, bool, error) {
 	mapping, err := s.routes.MappingByID(ctx, spec.MappingID)
 	if err != nil {
@@ -611,6 +643,9 @@ func (s *Service) specServer(ctx context.Context, spec routing.RuntimeSpec) (rou
 	app, err := s.routes.ApplicationByID(ctx, mapping.ApplicationID)
 	if err != nil {
 		return routing.AIServer{}, false, ignoreNotFound(err)
+	}
+	if app.Type != routing.ProviderServerAgent {
+		return routing.AIServer{}, false, nil
 	}
 	server, err := s.routes.AIServerByID(ctx, app.ServerID)
 	if err != nil {
@@ -633,7 +668,7 @@ func (s *Service) clusterWithheldReason(ctx context.Context, headSpecID string, 
 	if err != nil || !ok || !head.Enabled || !head.ClusterEnabled {
 		return "", err
 	}
-	d, err := s.deriveCluster(ctx, head, headServer)
+	d, err := s.deriveCluster(ctx, head, headServer, headServer.ID)
 	return d.reason, err
 }
 
@@ -752,7 +787,7 @@ func (s *Service) clusterHeadsOfServer(ctx context.Context, serverID string) []s
 // (addresses, bind addresses, consent, member binaries, the feature gate).
 // Best-effort, like every notification.
 func (s *Service) NotifyClustersOfServer(ctx context.Context, serverID string) {
-	if s.runtimeChanged == nil || serverID == "" {
+	if s.runtimeChanged == nil || s.routes == nil || serverID == "" {
 		return
 	}
 	for _, id := range s.clusterServersOfServer(ctx, serverID) {
@@ -764,7 +799,7 @@ func (s *Service) NotifyClustersOfServer(ctx context.Context, serverID string) {
 // NetBird policy settings decide whether any direct mesh cluster may be
 // pushed. Best-effort.
 func (s *Service) notifyAllClusterServers(ctx context.Context) {
-	if s.runtimeChanged == nil {
+	if s.runtimeChanged == nil || s.routes == nil {
 		return
 	}
 	servers, err := s.routes.AIServers(ctx)

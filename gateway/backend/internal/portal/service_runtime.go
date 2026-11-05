@@ -2429,6 +2429,9 @@ func (s *Service) SetServerGPUBudgets(ctx context.Context, principal auth.Token,
 		return nil, err
 	}
 	s.notifyRuntimeChanged(server.ID)
+	// A budget is also the ceiling of a stale cluster member value on this
+	// server (memberDemand), which the member's document carries.
+	s.NotifyClustersOfServer(ctx, server.ID)
 	stored, err := s.routes.ServerGPUBudgets(ctx, server.ID)
 	if err != nil {
 		return nil, err
@@ -2702,14 +2705,21 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // from PutRuntimeSpec and DeleteRuntimeSpec (the head and its membership),
 // DeleteMapping / DeleteApplication / DeleteServer (a cascaded head),
 // PutRPCMemberSpec (a manual member, and the membership GPU rows it re-syncs),
-// UpdateServer, SetServerAdminGroups, SetServerNetbird, RegenerateNetbirdKey,
-// the manual binary inventory writers and UpdateSystemSettings; outside this
-// service the NetBird peer sync (cmd/gateway clusterNotifyingStore), the
-// telemetry ingest's inventory write and its rpc_cluster declaration push
-// through NotifyClustersOfServer too. The agent's usage writeback onto the
-// membership rows is exempt like the VRAM writeback below; a benchmark write
-// on a head notifies only the head's server, since a member's document never
-// reads the head's admin_state or pinned flag.
+// CreateApplication / UpdateApplication (a server_agent application, which
+// a member needs), UpdateServer, SetServerAdminGroups, SetServerNetbird,
+// RegenerateNetbirdKey, SetServerGPUBudgets, the manual binary inventory
+// writers and UpdateSystemSettings; outside this service the NetBird peer
+// sync (cmd/gateway clusterNotifyingStore), the telemetry ingest's inventory
+// write and its rpc_cluster declaration push through NotifyClustersOfServer
+// too. A benchmark write on a head notifies only the head's server, since a
+// member's document never reads the head's admin_state or pinned flag.
+// DeleteGroup re-derives every cluster (notifyAllClusterServers): its cascade
+// removes server admin-group links, which are consent inputs. Two cluster
+// inputs are deliberately left to the agents' 60 s poll, each a whole write
+// path: the agent's own usage writeback onto the membership rows (exempt like
+// the VRAM writeback below), and the agent's hardware report (the gateway's
+// ingest writes it; it only moves the card and host-memory ceiling of a STALE
+// member value, a figure the agent reports itself).
 //
 // The "never which field" half is the load-bearing half. A "relevant fields"
 // allow-list inside a write path would be a second, uncompiled copy of
@@ -3020,10 +3030,13 @@ type AgentRuntimeConfigDTO struct {
 	// protected ones included -- until the declaration arrived.
 	//
 	// A document is held, too, while it would carry a llama.cpp RPC cluster
-	// head or member and the declaration of any agent of that cluster is not
-	// known (ClusterWithheldFeaturesPending): serving it without the cluster
-	// would make the agent stop a running head or member after a gateway
-	// restart, until the other agents' declarations arrived.
+	// head or member and serverID's OWN agent declaration is not known:
+	// serving it without the cluster would make the agent stop a running
+	// head or member after a gateway restart, until its declaration arrived.
+	// An unknown declaration of ANOTHER server of the cluster does not hold
+	// the document; it only withholds that cluster's head or member from it
+	// (ClusterWithheldFeaturesPending), so a member host that stays away
+	// cannot freeze every other model on the head's server.
 	//
 	// The specs of a held document are derived as stored, as for an agent that
 	// runs instances (Service.specAsPushed). The flag itself is never on the
@@ -3204,17 +3217,15 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		}
 		// A cluster head goes out with its cluster block, or not at all: a
 		// head whose cluster cannot be derived in full is withheld (and its
-		// member specs with it), and one whose agents' features are not all
-		// known holds the document.
+		// member specs with it); while this server's own agent has not
+		// declared its features, the document is held.
 		var cluster *AgentClusterHeadDTO
 		if spec.ClusterEnabled {
-			block, reason, err := s.clusterHeadBlock(ctx, spec, server)
+			block, reason, hold, err := s.clusterHeadBlock(ctx, spec, server)
 			if err != nil {
 				return AgentRuntimeConfigDTO{}, err
 			}
-			if reason == ClusterWithheldFeaturesPending {
-				awaitsFeatures = true
-			}
+			awaitsFeatures = awaitsFeatures || hold
 			if reason != "" {
 				continue
 			}
@@ -3266,12 +3277,12 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	// The rpc_server members this server runs for other servers' cluster
 	// heads. They are exempt from co-residency pairs (the agent admits them
 	// by VRAM and RAM alone), so they join the specs after the pairs' input.
-	members, membersPending, err := s.memberSpecsForServer(ctx, serverID)
+	members, membersHold, err := s.memberSpecsForServer(ctx, serverID)
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
 	specDTOs = append(specDTOs, members...)
-	awaitsFeatures = awaitsFeatures || membersPending
+	awaitsFeatures = awaitsFeatures || membersHold
 	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
 	dto := agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses)
 	dto.AwaitsAgentFeatures = awaitsFeatures
