@@ -64,6 +64,7 @@ function setup(
     specs?: RPCMemberSpec[];
     rows?: RuntimeStatus[];
     deleteError?: unknown;
+    server?: PortalServer;
   } = {},
 ) {
   const api = {
@@ -83,7 +84,7 @@ function setup(
   };
   const view = render(
     <ToastProvider>
-      <RpcMemberSection t={t} api={api} server={server} />
+      <RpcMemberSection t={t} api={api} server={opts.server ?? server} />
     </ToastProvider>,
   );
   return Object.assign(api, {
@@ -132,7 +133,7 @@ describe('RpcMemberSection manual member specs', () => {
       target: { value: 'FOO=bar' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
-    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.runtimeSpecGpuIndex}`), {
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 0: ${t.runtimeSpecGpuIndex}`), {
       target: { value: '1' },
     });
     fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.rpcMemberGpuVram}`), {
@@ -175,7 +176,7 @@ describe('RpcMemberSection manual member specs', () => {
       await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
     );
     fireEvent.click(
-      screen.getByRole('button', { name: `${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} 1` }),
+      screen.getByRole('button', { name: `${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} 0` }),
     );
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalled());
@@ -290,11 +291,37 @@ describe('RpcMemberSection member status', () => {
 });
 
 describe('RpcMemberSection settings state', () => {
-  it('keeps unsaved edits when a new server object with equal content arrives', async () => {
+  it('keeps an unsaved edit when a new server object with equal non-empty content arrives', async () => {
+    const api = setup({ server: { ...server, rpc_allowed_head_groups: ['g1'] } });
+    fireEvent.click(await screen.findByLabelText('Research'));
+    api.rerenderServer({ ...server, rpc_allowed_head_groups: ['g1'] });
+    expect(screen.getByLabelText('Research')).toBeChecked();
+    expect(screen.getByLabelText('Ops')).toBeChecked();
+  });
+
+  it('shows an external change on a clean form', async () => {
+    const api = setup();
+    await screen.findByLabelText('Ops');
+    api.rerenderServer({ ...server, rpc_member_enabled: true, rpc_allowed_head_groups: ['g2'] });
+    await waitFor(() => expect(screen.getByLabelText('Research')).toBeChecked());
+    expect(screen.getByLabelText(t.rpcMemberEnabledLabel)).toBeChecked();
+  });
+
+  it('keeps the unsaved edit and sends only it when the saved state changes externally', async () => {
     const api = setup();
     fireEvent.click(await screen.findByLabelText('Ops'));
-    api.rerenderServer({ ...server, rpc_allowed_head_groups: [] });
+    api.rerenderServer({ ...server, rpc_member_enabled: true });
     expect(screen.getByLabelText('Ops')).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.rpcSettingsSave }));
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalled());
+    expect(api.updateServer.mock.calls[0][1]).toEqual({ rpc_allowed_head_groups: ['g1'] });
+  });
+
+  it('says so when there is nothing to save', async () => {
+    const api = setup();
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcSettingsSave }));
+    expect(await screen.findByText(t.rpcSettingsNoChanges)).toBeTruthy();
+    expect(api.updateServer).not.toHaveBeenCalled();
   });
 
   it('only sends the fields that differ from the seed', async () => {
@@ -342,7 +369,7 @@ describe('RpcMemberSection settings state', () => {
     fireEvent.click(
       await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
     );
-    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.runtimeSpecGpuIndex}`), {
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 0: ${t.runtimeSpecGpuIndex}`), {
       target: { value: '2' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));

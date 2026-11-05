@@ -222,42 +222,47 @@ export function RpcMemberSection({
   );
 
   // ---- 1. Server RPC settings ---------------------------------------------
-  // The form holds unsaved edits; the seed is the last known saved state
-  // (the server prop, which the parent replaces by the updateServer result
-  // after a save). A new server object with equal content, as the server list
-  // poll produces, must not touch the edits, so everything compares by content.
+  // The form holds unsaved edits. `seed` is the saved state the server prop
+  // currently reports; `base` is the saved state the form was last aligned
+  // with. A new server object with equal content (the server list poll) changes
+  // nothing; changed content re-aligns the form only if it had no unsaved edits
+  // against `base`, so an external change never overwrites an edit, and a save
+  // only sends what the operator changed relative to `base`.
   const seedEnabled = Boolean(server.rpc_member_enabled);
   const seedGroups = server.rpc_allowed_head_groups ?? [];
-  const seedKey = `${server.id}|${seedEnabled}|${groupsKey(seedGroups)}`;
+  const seedKey = `${seedEnabled}|${groupsKey(seedGroups)}`;
+  const [base, setBase] = useState({ id: server.id, enabled: seedEnabled, groups: seedGroups });
   const [memberEnabled, setMemberEnabled] = useState(seedEnabled);
   const [headGroups, setHeadGroups] = useState<string[]>(seedGroups);
   const [settingsBusy, setSettingsBusy] = useState(false);
-  const settingsDirty =
-    memberEnabled !== seedEnabled || groupsKey(headGroups) !== groupsKey(seedGroups);
-  const settingsDirtyRef = useRef(false);
-  settingsDirtyRef.current = settingsDirty;
-  const seededKeyRef = useRef(seedKey);
+  const formRef = useRef({ enabled: memberEnabled, groups: headGroups });
+  formRef.current = { enabled: memberEnabled, groups: headGroups };
+  const baseKey = `${base.enabled}|${groupsKey(base.groups)}`;
   useEffect(() => {
-    if (seededKeyRef.current === seedKey) return;
-    const idChanged = seededKeyRef.current.split('|')[0] !== server.id;
-    seededKeyRef.current = seedKey;
-    // Re-seed on a server switch, or when the saved state changed and nothing
-    // is being edited; otherwise keep the operator's unsaved edits.
-    if (idChanged || !settingsDirtyRef.current) {
+    if (base.id === server.id && baseKey === seedKey) return;
+    const form = formRef.current;
+    const formKey = `${form.enabled}|${groupsKey(form.groups)}`;
+    // Align on a server switch, when the form is clean against its base, or
+    // when the form already equals the new saved state (a save landing).
+    if (base.id !== server.id || formKey === baseKey || formKey === seedKey) {
       setMemberEnabled(seedEnabled);
       setHeadGroups(seedGroups);
+      setBase({ id: server.id, enabled: seedEnabled, groups: seedGroups });
     }
-    // seedGroups is covered by seedKey (content).
+    // seedEnabled/seedGroups are covered by seedKey (content).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seedKey]);
+  }, [seedKey, server.id]);
 
   async function saveSettings() {
-    // Each field goes in the PATCH only when it differs from its seed, so a
+    // Each field goes in the PATCH only when the operator changed it, so a
     // save never restates a value another operator changed meanwhile.
     const body: UpdateServerRequest = {};
-    if (memberEnabled !== seedEnabled) body.rpc_member_enabled = memberEnabled;
-    if (groupsKey(headGroups) !== groupsKey(seedGroups)) body.rpc_allowed_head_groups = headGroups;
-    if (Object.keys(body).length === 0) return;
+    if (memberEnabled !== base.enabled) body.rpc_member_enabled = memberEnabled;
+    if (groupsKey(headGroups) !== groupsKey(base.groups)) body.rpc_allowed_head_groups = headGroups;
+    if (Object.keys(body).length === 0) {
+      showSuccess(t.rpcSettingsNoChanges);
+      return;
+    }
     setSettingsBusy(true);
     try {
       const updated = await api.updateServer(server.id, body);
@@ -523,7 +528,7 @@ export function RpcMemberSection({
                 >
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveUp}: ${t.rpcMemberGpuLabel} ${idx + 1}`}
+                    aria-label={`${t.modelGroupMoveUp}: ${t.rpcMemberGpuLabel} ${row.index}`}
                     disabled={idx === 0}
                     onClick={() => moveGpu(idx, -1)}
                   >
@@ -531,7 +536,7 @@ export function RpcMemberSection({
                   </IconButton>
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} ${idx + 1}`}
+                    aria-label={`${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} ${row.index}`}
                     disabled={idx === editor.gpuRows.length - 1}
                     onClick={() => moveGpu(idx, 1)}
                   >
@@ -539,7 +544,10 @@ export function RpcMemberSection({
                   </IconButton>
                   <Field
                     id={`rpc-member-gpu-index-${row.rowKey}`}
-                    label={`${t.rpcMemberGpuLabel} ${idx + 1}: ${t.runtimeSpecGpuIndex}`}
+                    label={t.runtimeSpecGpuIndex}
+                    inputProps={{
+                      'aria-label': `${t.rpcMemberGpuLabel} ${row.index}: ${t.runtimeSpecGpuIndex}`,
+                    }}
                     type="number"
                     value={row.index}
                     onChange={(e) => patchGpu(idx, { index: e.target.value, measured: 0 })}
@@ -547,7 +555,10 @@ export function RpcMemberSection({
                   />
                   <Field
                     id={`rpc-member-gpu-vram-${row.rowKey}`}
-                    label={`${t.rpcMemberGpuLabel} ${idx + 1}: ${t.rpcMemberGpuVram}`}
+                    label={t.rpcMemberGpuVram}
+                    inputProps={{
+                      'aria-label': `${t.rpcMemberGpuLabel} ${row.index}: ${t.rpcMemberGpuVram}`,
+                    }}
                     type="number"
                     value={row.vramMb}
                     onChange={(e) => patchGpu(idx, { vramMb: e.target.value })}
@@ -555,7 +566,7 @@ export function RpcMemberSection({
                   />
                   <Button
                     size="small"
-                    aria-label={`${t.runtimeSpecGpuRemove}: ${t.rpcMemberGpuLabel} ${idx + 1}`}
+                    aria-label={`${t.runtimeSpecGpuRemove}: ${t.rpcMemberGpuLabel} ${row.index}`}
                     onClick={() =>
                       patchEditor({ gpuRows: editor.gpuRows.filter((_, i) => i !== idx) })
                     }
