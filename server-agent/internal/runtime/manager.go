@@ -1171,6 +1171,13 @@ type specState struct {
 	// announced in its startup banner; empty when none was seen.
 	rpcProtocol string
 
+	// terminalSpec is a snapshot of the spec as it was when a cluster process
+	// earned a terminal verdict (terminalCode): retrying the same spec cannot
+	// end differently, so admission, wakes and ensures leave it resting at
+	// not_permitted until the spec itself changes. Nil when there is none.
+	terminalSpec *Spec
+	terminalCode string
+
 	// instance is this state's instance index k: 0 for the spec's own process
 	// (and for every spec that never replicates), k >= 1 for a further
 	// instance. Fixed for the state's lifetime; spec.Instance carries the same
@@ -1886,6 +1893,9 @@ func (o *owner) reconcileSpec(st *specState, spec Spec) {
 	changed := !reflect.DeepEqual(st.spec, spec)
 	prevSpec := st.spec
 	st.spec = spec
+	if changed {
+		st.terminalSpec, st.terminalCode = nil, ""
+	}
 	switch {
 	case changed && st.proc == nil:
 		switch st.state {
@@ -2138,6 +2148,10 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		st.inFlight++
 		st.lastUsed = time.Now()
 		c.reply <- ensureOutcome{endpoint: endpointFor(st.proc.port), specID: specID, proc: st.proc}
+		return
+	}
+	if terminalHeld(st) {
+		c.reply <- ensureOutcome{err: ErrNotPermitted}
 		return
 	}
 	if st.state == StateNotPermitted && time.Since(st.notPermittedAt) < notPermittedRetryInterval {
@@ -2455,6 +2469,20 @@ func (o *owner) deleteState(id string) {
 // goes through here or through setPendingVRAMUnknown.
 func (o *owner) setNotPermitted(st *specState, message string) {
 	o.setNotPermittedCode(st, message, "")
+}
+
+// terminalHeld reports whether st rests under a terminal verdict that its
+// current spec still matches.
+func terminalHeld(st *specState) bool {
+	return st.terminalSpec != nil && reflect.DeepEqual(*st.terminalSpec, st.spec)
+}
+
+// setTerminalVerdict is setNotPermittedCode for a verdict that no retry can
+// change: the spec is remembered, and stays refused until it differs.
+func (o *owner) setTerminalVerdict(st *specState, message, code string) {
+	snapshot := st.spec
+	st.terminalSpec, st.terminalCode = &snapshot, code
+	o.setNotPermittedCode(st, message, code)
 }
 
 // setNotPermittedCode is setNotPermitted for a verdict that carries a stable
@@ -2870,6 +2898,10 @@ func (o *owner) admitAndStart(specID string) {
 	defer o.retireIfSpent(specID)
 	st := o.specs[specID]
 	if st == nil || st.proc != nil || st.state == StateBackoff {
+		return
+	}
+	if terminalHeld(st) {
+		o.failPending(st, ErrNotPermitted)
 		return
 	}
 	// Every verdict below rewrites these from scratch, and so does every return
@@ -4148,12 +4180,13 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// The member is listening but exposes the wrong devices: serving
 		// requests with it would silently shrink the cluster. Refuse it before
 		// it is ever reported running; only a config change can fix it.
-		o.setNotPermittedCode(st, c.deviceMismatch, codeRPCDeviceCountMismatch)
+		o.setTerminalVerdict(st, c.deviceMismatch, codeRPCDeviceCountMismatch)
 		o.terminateNow(st, c.proc)
 		return
 	}
 	if c.ok {
 		st.rpcProtocol = c.rpcProtocol
+		st.terminalSpec, st.terminalCode = nil, ""
 		if st.hasRunBefore {
 			st.restarts++
 		}
@@ -4440,9 +4473,10 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// healthy cannot be fixed by retrying, so it rests as not_permitted without
 	// backoff; every other classified exit keeps the ordinary handling below
 	// and only gains its error code.
-	class, classified := classifyExit(st.spec, tail)
+	rule, classified := matchExitRule(st.spec, tail)
+	class := rule.class
 	if classified && class.Terminal && !wasHealthy {
-		o.setNotPermittedCode(st, exitClassMessage(st.spec, tail, exitCode), class.Code)
+		o.setTerminalVerdict(st, exitClassMessage(rule, exitCode), class.Code)
 		st.lastError.ExitCode, st.lastError.StderrTail = exitCode, tail
 		o.wakeAdmissionCandidates()
 		return
@@ -5140,7 +5174,7 @@ type wakeCandidate struct {
 // in the ordering below -- so keeping it in step with admitAndStart's rule is
 // what makes the wake fair, not what makes it correct.
 func wantsWake(st *specState) bool {
-	if st.proc != nil || st.state == StateBackoff {
+	if st.proc != nil || st.state == StateBackoff || terminalHeld(st) {
 		return false
 	}
 	return len(st.pending) > 0 || st.protected()

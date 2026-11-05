@@ -77,31 +77,31 @@ var rpcExitRules = []rpcExitRule{
 	},
 }
 
-// classifyExit reads the tail of a failed cluster process's output. It reports
-// false for anything that is not a cluster head or rpc_server member, and for
-// output that matches no rule.
-func classifyExit(spec Spec, tail string) (exitClass, bool) {
+// matchExitRule returns the first rule that applies to spec and whose message
+// appears in tail. It reports false for anything that is not a cluster head or
+// rpc_server member, and for output that matches no rule.
+func matchExitRule(spec Spec, tail string) (rpcExitRule, bool) {
 	head, member := spec.IsClusterHead(), spec.IsRPCServer()
 	if !head && !member {
-		return exitClass{}, false
+		return rpcExitRule{}, false
 	}
 	for _, r := range rpcExitRules {
 		if (head && r.head || member && r.member) && strings.Contains(tail, r.needle) {
-			return r.class, true
+			return r, true
 		}
 	}
-	return exitClass{}, false
+	return rpcExitRule{}, false
+}
+
+// classifyExit reads the tail of a failed cluster process's output.
+func classifyExit(spec Spec, tail string) (exitClass, bool) {
+	r, ok := matchExitRule(spec, tail)
+	return r.class, ok
 }
 
 // exitClassMessage is the LastError message for a classified exit.
-func exitClassMessage(spec Spec, tail string, exitCode int) string {
-	head, member := spec.IsClusterHead(), spec.IsRPCServer()
-	for _, r := range rpcExitRules {
-		if (head && r.head || member && r.member) && strings.Contains(tail, r.needle) {
-			return fmt.Sprintf("runtime: %s (exit code %d)", r.describe, exitCode)
-		}
-	}
-	return fmt.Sprintf("runtime: process exited (exit code %d)", exitCode)
+func exitClassMessage(r rpcExitRule, exitCode int) string {
+	return fmt.Sprintf("runtime: %s (exit code %d)", r.describe, exitCode)
 }
 
 // memberBanner is what an rpc-server prints at startup: its protocol version
