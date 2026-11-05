@@ -35,7 +35,27 @@ const (
 	binaryRescanInterval = 5 * time.Minute
 	// binaryVersionTimeout bounds one `--version` run.
 	binaryVersionTimeout = 10 * time.Second
+	// binaryOutputLimit caps the captured --version output; the version line
+	// is at the top and a runaway child must not fill memory.
+	binaryOutputLimit = 64 << 10
 )
+
+// binaryWaitDelay bounds how long a --version run may linger after its
+// context ends: CommandContext kills only the direct child, and a wrapper
+// whose grandchild keeps the output pipe open would otherwise block Wait (and
+// with it the whole rescan) forever.
+var binaryWaitDelay = 5 * time.Second
+
+// limitedBuffer keeps the first binaryOutputLimit bytes and silently drops the
+// rest, always reporting a full write so the child is never blocked on a pipe.
+type limitedBuffer struct{ buf bytes.Buffer }
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if room := binaryOutputLimit - l.buf.Len(); room > 0 {
+		l.buf.Write(p[:min(room, len(p))])
+	}
+	return len(p), nil
+}
 
 // BinaryInfo is the wire form of one inventory entry.
 type BinaryInfo = sample.BinaryInfo
@@ -117,8 +137,13 @@ func scanBinariesCtx(ctx context.Context, allowed []string, stat func(string) (f
 		}
 		seen[p] = true
 		bi := BinaryInfo{Path: p, Kind: binaryKind(p), Allowed: true}
+		fi, err := stat(p)
+		if err == nil && !fi.Mode().IsRegular() {
+			// With runtime_allow_binary_dirs an entry may name a directory;
+			// it is not expanded and is not a binary.
+			continue
+		}
 		if bi.Kind == binaryKindLlamaServer {
-			fi, err := stat(p)
 			if err == nil && ctx.Err() == nil {
 				cv, hit := cache[p]
 				if !hit || cv.size != fi.Size() || !cv.mtime.Equal(fi.ModTime()) {
@@ -187,10 +212,11 @@ func minimalEnv() []string {
 func execVersion(ctx context.Context, path string) (string, error) {
 	cmd := exec.CommandContext(ctx, path, "--version")
 	cmd.Env = minimalEnv()
-	var buf bytes.Buffer
+	cmd.WaitDelay = binaryWaitDelay
+	var buf limitedBuffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf
 	err := cmd.Run()
-	return buf.String(), err
+	return buf.buf.String(), err
 }
 
 // binaryInventory keeps the last computed inventory and decides whether a

@@ -9,7 +9,12 @@ import (
 	"errors"
 	"io/fs"
 	"op-ai-server-agent/internal/config"
+	"op-ai-server-agent/internal/sample"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,11 +24,12 @@ const stage0Output = "version: 0.9.0-dev (build 1, commit 2bc46ba)\nbuilt with A
 type fakeFileInfo struct {
 	size  int64
 	mtime time.Time
+	mode  fs.FileMode
 }
 
 func (f fakeFileInfo) Name() string       { return "x" }
 func (f fakeFileInfo) Size() int64        { return f.size }
-func (f fakeFileInfo) Mode() fs.FileMode  { return 0o755 }
+func (f fakeFileInfo) Mode() fs.FileMode  { return f.mode }
 func (f fakeFileInfo) ModTime() time.Time { return f.mtime }
 func (f fakeFileInfo) IsDir() bool        { return false }
 func (f fakeFileInfo) Sys() any           { return nil }
@@ -180,5 +186,97 @@ func TestExecVersionRunsWithoutShellAndMinimalEnv(t *testing.T) {
 	}
 	if _, err := execVersion(context.Background(), os.DevNull); err == nil {
 		t.Fatal("expected an error executing a non-binary")
+	}
+}
+
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script helper")
+	}
+	p := filepath.Join(t.TempDir(), "llama-server")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestExecVersionReturnsWhenGrandchildHoldsStdout(t *testing.T) {
+	p := writeScript(t, "sleep 30 &\nsleep 30\n")
+	orig := binaryWaitDelay
+	binaryWaitDelay = 200 * time.Millisecond
+	defer func() { binaryWaitDelay = orig }()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _, _ = execVersion(ctx, p); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("execVersion blocked on a grandchild holding the output pipe")
+	}
+}
+
+func TestExecVersionCapsOutput(t *testing.T) {
+	p := writeScript(t, "yes x | head -c 1000000\n")
+	out, _ := execVersion(context.Background(), p)
+	if len(out) != binaryOutputLimit {
+		t.Fatalf("captured %d bytes, want %d", len(out), binaryOutputLimit)
+	}
+}
+
+func TestExecVersionChildEnvHasNoAgentSettings(t *testing.T) {
+	t.Setenv("OP_AGENT_API_TOKEN", "hunter2")
+	t.Setenv("OP_AI_OTHER", "x")
+	p := writeScript(t, "env\n")
+	out, err := execVersion(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "OP_AGENT_") || strings.Contains(out, "OP_AI_") || strings.Contains(out, "hunter2") {
+		t.Fatalf("child env leaked agent settings:\n%s", out)
+	}
+}
+
+func TestScanSkipsNonRegularEntries(t *testing.T) {
+	stat := statFake(fakeFileInfo{mode: fs.ModeDir})
+	got := scanBinaries([]string{"/opt/llama-dir"}, stat, func(context.Context, string) (string, error) { return "", nil }, nil)
+	if len(got) != 0 {
+		t.Fatalf("directory listed: %+v", got)
+	}
+}
+
+type flakyPoster struct {
+	fail    atomic.Bool
+	samples []*sample.Sample
+}
+
+func (p *flakyPoster) Post(_ context.Context, s *sample.Sample) error {
+	p.samples = append(p.samples, s)
+	if p.fail.Load() {
+		return errors.New("down")
+	}
+	return nil
+}
+
+func TestFailedPostDoesNotMarkBinariesDelivered(t *testing.T) {
+	poster := &flakyPoster{}
+	a := NewFromDeps(config.Config{Interval: time.Hour, RuntimeAllowedBinaries: []string{"/opt/l/llama-server"}}, Deps{Poster: poster})
+	a.binaries.stat = statFake(fakeFileInfo{size: 1})
+	a.binaries.runVersion = func(context.Context, string) (string, error) { return stage0Output, nil }
+	a.binaries.rescan(context.Background())
+	poster.fail.Store(true)
+	a.collectOnce(context.Background())
+	poster.fail.Store(false)
+	a.collectOnce(context.Background())
+	a.collectOnce(context.Background())
+	if len(poster.samples) != 3 {
+		t.Fatalf("samples = %d", len(poster.samples))
+	}
+	if poster.samples[0].Binaries == nil || poster.samples[1].Binaries == nil {
+		t.Fatal("inventory not resent after a failed post")
+	}
+	if poster.samples[2].Binaries != nil {
+		t.Fatal("inventory resent after a successful post")
 	}
 }

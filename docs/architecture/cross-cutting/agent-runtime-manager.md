@@ -1531,10 +1531,11 @@ render exactly what the spec declares, so nothing here has to change for it.
 
 - A **member's `rpc` block**: `held_by`/`held_since` (the head holding it),
   `reserved_until`, `protocol` and `device_count` (the count the spec implies,
-  verified against the startup banner only when the build prints one), `bind_mismatch`, `breaches`, `cache_mb` and `stalled`. The block is
-  merged from three sources: the runtime's own state, the relay's counters and
-  the connection observer. `bind_mismatch` is true when **either** the runtime
-  or the relay says so. `breaches` is the union of the relay's refused peers and
+  verified against the startup banner only when the build prints one),
+  `bind_mismatch`, `breaches`, `cache_mb` and `stalled`. The block is merged
+  from three sources: the runtime's own state, the relay's counters and the
+  connection observer. `bind_mismatch` is true when **either** the runtime or
+  the relay says so. `breaches` is the union of the relay's refused peers and
   the observer's unexpected peers, deduplicated by peer address (the newest
   sighting wins), the newest sixteen. `cache_mb` is the size of the member's
   cache directory, measured **off the collect loop** and reused for 60 s: the
@@ -1716,15 +1717,19 @@ case-insensitive, without `.exe`), `version`, `build`, `commit`,
 gateway: only a `llama-server` is ever executed, as `<path> --version` with no
 shell, a 10 s timeout and a minimal environment (only what is needed to find
 shared libraries, so no secret reaches the child); its `version: X (build N,
-commit H)` line gives `version_source: agent`. An `rpc-server` is never
-executed: it inherits the version of a `llama-server` in the same directory
-(`agent`), else whatever its path says (`path`: a `b<digits>` tag as the build, a
-7 to 40 character hex segment containing at least one a-f letter as the commit),
-else it has no version. Results are cached by (path, size, mtime). The
-inventory is rescanned every 5 minutes on its own goroutine, off the collect
-loop, and each sample carries the last computed result. The list is sent on the
-first sample after a scan and then only when its hash changes; an empty list
-means the agent allows no binaries, and an unchanged inventory omits the field.
+commit H)` line gives `version_source: agent`; when the run fails or prints no
+such line, the path-derived version below applies instead. An `rpc-server` is
+never executed: it inherits the version of a `llama-server` in the same
+directory (`agent`), else whatever its path says (`path`: a `b<digits>` tag as
+the build, a 7 to 40 character hex segment containing at least one a-f letter as
+the commit), else it has no version. Results are cached by (path, size, mtime).
+The inventory is rescanned every 5 minutes on its own goroutine, off the collect
+loop, and each sample carries the last computed result. Entries that are not
+regular files are skipped: with `runtime_allow_binary_dirs` an allowed entry may
+name a directory, which is not expanded. The list is sent on the first sample
+after the first completed scan and then only when its hash changes; an empty
+list means the agent allows no binaries, and an unchanged inventory omits the
+field.
 
 #### Shutdown
 

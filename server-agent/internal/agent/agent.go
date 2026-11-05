@@ -1115,7 +1115,9 @@ func (a *Agent) Run(ctx context.Context) error {
 			waitBounded(&obsWG, observerShutdownWait)
 		}()
 	}
-	go a.binaries.run(ctx)
+	if a.binaries != nil {
+		go a.binaries.run(ctx)
+	}
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
