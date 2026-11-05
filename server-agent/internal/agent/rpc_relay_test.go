@@ -11,6 +11,7 @@ import (
 	"op-ai-server-agent/internal/config"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ import (
 type fakeMembers struct {
 	mu    sync.Mutex
 	holds []string
-	gate  func(string) bool
+	gate  func(string) error
 }
 
 func (f *fakeMembers) SetMemberHold(specID, holder string, since time.Time) {
@@ -34,7 +35,7 @@ func (f *fakeMembers) SetMemberHold(specID, holder string, since time.Time) {
 	f.holds = append(f.holds, specID+"="+holder)
 }
 
-func (f *fakeMembers) SetMemberRelayGate(gate func(string) bool) {
+func (f *fakeMembers) SetMemberRelayGate(gate func(string) error) {
 	f.mu.Lock()
 	f.gate = gate
 	f.mu.Unlock()
@@ -236,21 +237,21 @@ func TestRelayLinkGateWaitsForListener(t *testing.T) {
 	table.set(relayMemberRow("rpcm_a", runtimectl.StateStarting, echoChild(t), port, "127.0.0.1"))
 	l := newTestRelayLink(t, table, members)
 
-	if !l.ready("rpcm_a") {
-		t.Fatal("gate = false for a member whose relay can bind")
+	if err := l.ready("rpcm_a"); err != nil {
+		t.Fatalf("gate = %v for a member whose relay can bind", err)
 	}
 	if !relayAccepts(port) {
 		t.Fatal("gate answered true but nothing listens")
 	}
-	if l.ready("rpcm_unknown") {
-		t.Fatal("gate = true for a member without a relay")
+	if l.ready("rpcm_unknown") == nil {
+		t.Fatal("gate passed a member without a relay")
 	}
 
 	mismatch := relayMemberRow("rpcm_b", runtimectl.StateStarting, echoChild(t), relayPort(t), "127.0.0.1")
 	mismatch.RPCMember.BindIP = "192.0.2.10" // TEST-NET-1, never an address of this host
 	table.set(mismatch)
-	if l.ready("rpcm_b") {
-		t.Fatal("gate = true for a relay whose bind address is not local")
+	if err := l.ready("rpcm_b"); err == nil || !strings.Contains(err.Error(), "192.0.2.10") {
+		t.Fatalf("gate = %v for a relay whose bind address is not local; want an error naming it", err)
 	}
 	if tel, ok := l.telemetry("rpcm_b"); !ok || !tel.BindMismatch {
 		t.Fatalf("telemetry = %+v, %v; want bind_mismatch", tel, ok)
@@ -371,7 +372,7 @@ func TestAgentWiresRelayGate(t *testing.T) {
 	defer cancel()
 	a.triggerRuntimeSync(ctx, json.RawMessage(nil))
 	waitFor(t, "relay up after a runtime sync", func() bool { return relayAccepts(port) })
-	if !gate("rpcm_a") {
-		t.Fatal("gate = false for a listening relay")
+	if err := gate("rpcm_a"); err != nil {
+		t.Fatalf("gate = %v for a listening relay", err)
 	}
 }

@@ -375,7 +375,7 @@ type Manager struct {
 	// relayGate is the agent's word on whether a relay-mode member's relay is
 	// listening (SetMemberRelayGate). Written by its installer, read by the
 	// member's readiness poll off the owner goroutine; nil means no gate.
-	relayGate atomic.Pointer[func(specID string) bool]
+	relayGate atomic.Pointer[func(specID string) error]
 
 	// hostInfo is the latest hardware figures the agent's collect loop pushed
 	// (SetHostInfo): device totals and live available RAM. Same discipline as
@@ -1005,6 +1005,9 @@ type cmdStartResult struct {
 	// lists a different number of devices than the spec selects.
 	rpcProtocol    string
 	deviceMismatch string
+	// relayDown, when set, is why a relay member's relay was still not
+	// listening at the startup deadline although its child was up.
+	relayDown string
 }
 
 func (cmdStartResult) isCommand() {}
@@ -1191,6 +1194,10 @@ type specState struct {
 	// rpcProtocol is the RPC protocol version the running rpc_server member
 	// announced in its startup banner; empty when none was seen.
 	rpcProtocol string
+	// bindMismatch: this member's bind address was not an address of this
+	// host at its last start attempt, or its relay never listened. Cleared
+	// by the next start that passes the check.
+	bindMismatch bool
 
 	// terminalSpec is a snapshot of the spec as it was when a cluster process
 	// earned a terminal verdict (terminalCode): retrying the same spec cannot
@@ -3027,6 +3034,17 @@ func (o *owner) admitAndStart(specID string) {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
+	// Checked before admission, so nothing is evicted for a member that
+	// cannot bind; refused like a Permit failure, so a retry is rate-limited
+	// and nothing loops.
+	if st.spec.IsRPCServer() {
+		if err := memberBindLocal(st.spec); err != nil {
+			st.bindMismatch = true
+			o.setNotPermittedCode(st, err.Error(), codeBindMismatch)
+			return
+		}
+		st.bindMismatch = false
+	}
 
 	// The protected instances of a spec start lowest index first, on every path
 	// that asks: Apply and the wakes ask in that order already, but a
@@ -4343,6 +4361,19 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		return
 	}
 
+	if c.relayDown != "" {
+		// The rpc-server came up but its relay never listened, so the head
+		// could not have reached it.
+		o.setState(st, StateStartFailed)
+		o.recordFailure(st, c.relayDown, 0, "")
+		st.lastError.Code = codeBindMismatch
+		st.bindMismatch = true
+		o.failPending(st, ErrStartFailed)
+		o.terminateNow(st, c.proc)
+		o.enterBackoff(st)
+		return
+	}
+
 	// c.err is ErrStartTimeout: the child never became healthy in time.
 	tail := c.proc.log.Tail(2048)
 	o.setState(st, StateStartFailed)
@@ -5434,6 +5465,7 @@ func (o *owner) snapshotStatus() []Status {
 				HeldBy:        st.claim.heldBy,
 				HeldSince:     st.claim.heldSince,
 				ReservedUntil: st.claim.reservedUntil,
+				BindMismatch:  st.bindMismatch,
 			}
 		}
 		s.AdmissionBlockedBy = st.admissionBlockedBy

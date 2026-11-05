@@ -24,6 +24,42 @@ const memberCacheMinFreeMB = 5120
 // nothing holds it, when the spec does not say.
 const defaultMemberIdleTimeout = 60 * time.Second
 
+// codeBindMismatch reports a member that cannot listen where the head dials it:
+// its bind address is not an address of this host, or its relay never listened.
+// Not a terminal verdict: the address may appear later (a mesh coming up).
+const codeBindMismatch = "runtime.bind_mismatch"
+
+// interfaceAddrs lists this host's addresses; a variable so tests can make an
+// address appear or vanish.
+var interfaceAddrs = net.InterfaceAddrs
+
+// memberBindLocal returns nil when the member's bind address can be bound
+// here: "0.0.0.0", or an address assigned to this host. Otherwise it returns
+// the refusal; an address list that cannot be read counts as not local.
+func memberBindLocal(spec Spec) error {
+	bind := spec.RPC.BindIP
+	if bind == "0.0.0.0" {
+		return nil
+	}
+	if want := net.ParseIP(bind); want != nil {
+		if addrs, err := interfaceAddrs(); err == nil {
+			for _, a := range addrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip != nil && ip.Equal(want) {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("runtime: the rpc bind address %q is not an address of this host; the member is not started until it is", bind)
+}
+
 // freeDiskMB reports the free space on a path's volume; a variable so tests
 // can simulate a full disk.
 var freeDiskMB = diskFreeMB
@@ -213,7 +249,11 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 	defer ticker.Stop()
 	for {
 		childUp := probeTCP(addr, 2*time.Second)
-		if childUp && o.m.relayListening(spec) {
+		var relayErr error
+		if childUp {
+			relayErr = o.m.relayListening(spec)
+		}
+		if childUp && relayErr == nil {
 			res := cmdStartResult{specID: specID, proc: proc, ok: true}
 			if banner, found := awaitMemberBanner(proc, deadline); found {
 				res.rpcProtocol = banner.Protocol
@@ -226,11 +266,13 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 			return
 		}
 		if time.Now().After(deadline) {
-			if childUp {
-				slog.Warn("runtime: rpc-server is up but its relay is not listening; is the relay bind address an address of this host?",
-					"spec", specID, "bind_ip", spec.RPC.BindIP, "port", spec.RPC.Port)
+			res := cmdStartResult{specID: specID, proc: proc, err: ErrStartTimeout}
+			if relayErr != nil {
+				res.err = ErrStartFailed
+				res.relayDown = fmt.Sprintf("runtime: the rpc-server is up but its relay is not listening on %s: %v",
+					net.JoinHostPort(spec.RPC.BindIP, strconv.Itoa(spec.RPC.Port)), relayErr)
 			}
-			o.m.postCmd(cmdStartResult{specID: specID, proc: proc, err: ErrStartTimeout})
+			o.m.postCmd(res)
 			return
 		}
 		select {
@@ -303,7 +345,7 @@ func permitMember(spec Spec) error {
 // the Manager (Status) to bring the relay up. nil removes it, and with none
 // installed a relay member is ready on its child alone. Direct members never
 // consult it.
-func (m *Manager) SetMemberRelayGate(gate func(specID string) bool) {
+func (m *Manager) SetMemberRelayGate(gate func(specID string) error) {
 	if gate == nil {
 		m.relayGate.Store(nil)
 		return
@@ -311,12 +353,15 @@ func (m *Manager) SetMemberRelayGate(gate func(specID string) bool) {
 	m.relayGate.Store(&gate)
 }
 
-// relayListening reports whether spec passes the relay gate: always for a
-// direct member or with no gate installed.
-func (m *Manager) relayListening(spec Spec) bool {
+// relayListening returns nil when spec passes the relay gate (always for a
+// direct member or with no gate installed), else why its relay is not
+// listening.
+func (m *Manager) relayListening(spec Spec) error {
 	if spec.RPC == nil || spec.RPC.Transport != "relay" {
-		return true
+		return nil
 	}
-	gate := m.relayGate.Load()
-	return gate == nil || (*gate)(spec.ID)
+	if gate := m.relayGate.Load(); gate != nil {
+		return (*gate)(spec.ID)
+	}
+	return nil
 }

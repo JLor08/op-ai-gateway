@@ -228,6 +228,7 @@ func TestRPCServerRelayReadyOnChildPort(t *testing.T) {
 	shrinkTimings(t)
 	spec := memberSpec("rpcm_a", "rspec_h", "-tcp-listen")
 	spec.RPC.Transport = "relay"
+	spec.RPC.BindIP = "127.0.0.1"  // must be an address of this host
 	spec.RPC.Port = freeTCPPort(t) // the relay's port, not the child's
 	spec.AdminState = "force_running"
 
@@ -369,6 +370,7 @@ func TestRelayMemberReadyOnlyOnceRelayListens(t *testing.T) {
 	shrinkTimings(t)
 	spec := memberSpec("rpcm_a", "rspec_h", "-tcp-listen")
 	spec.RPC.Transport = "relay"
+	spec.RPC.BindIP = "127.0.0.1"
 	spec.RPC.Port = freeTCPPort(t)
 	spec.AdminState = "force_running"
 	direct := onDemandMember(t, "rpcm_d")
@@ -377,9 +379,12 @@ func TestRelayMemberReadyOnlyOnceRelayListens(t *testing.T) {
 	m := newTestManager(t, allowlistPolicy())
 	var listening atomic.Bool
 	var asked sync.Map
-	m.SetMemberRelayGate(func(specID string) bool {
+	m.SetMemberRelayGate(func(specID string) error {
 		asked.Store(specID, true)
-		return listening.Load()
+		if listening.Load() {
+			return nil
+		}
+		return errors.New("not yet")
 	})
 	m.Apply(Config{Specs: []Spec{spec, direct}})
 
@@ -406,4 +411,95 @@ func TestRelayMemberReadyOnlyOnceRelayListens(t *testing.T) {
 	waitUntil(t, 5*time.Second, "relay member running once its relay listens", func() bool {
 		return statusFor(m, "rpcm_a").State == StateRunning
 	})
+}
+
+// withHostAddrs makes the host's address list addrs for the test.
+func withHostAddrs(t *testing.T, addrs func() ([]net.Addr, error)) {
+	t.Helper()
+	orig := interfaceAddrs
+	interfaceAddrs = addrs
+	t.Cleanup(func() { interfaceAddrs = orig })
+}
+
+// TestMemberBindNotLocalIsNotExecuted: a member whose bind_ip is not an
+// address of this host is never exec'd, in either transport. It is refused
+// with runtime.bind_mismatch, fast and without a retry loop, and starts on the
+// first ensure after the address has appeared.
+func TestMemberBindNotLocalIsNotExecuted(t *testing.T) {
+	for _, transport := range []string{"direct", "relay"} {
+		t.Run(transport, func(t *testing.T) {
+			shrinkTimings(t)
+			origRetry := notPermittedRetryInterval
+			notPermittedRetryInterval = 300 * time.Millisecond
+			t.Cleanup(func() { notPermittedRetryInterval = origRetry })
+			var local atomic.Bool
+			withHostAddrs(t, func() ([]net.Addr, error) {
+				if !local.Load() {
+					return []net.Addr{&net.IPNet{IP: net.ParseIP("10.9.8.7"), Mask: net.CIDRMask(8, 32)}}, nil
+				}
+				return []net.Addr{&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)}}, nil
+			})
+			argvLog := filepath.Join(t.TempDir(), "argv")
+			spec := onDemandMember(t, "rpcm_a")
+			spec.Args = []string{"-tcp-listen", "-argv-log", argvLog}
+			spec.RPC.Transport = transport
+
+			m := newTestManager(t, allowlistPolicy())
+			m.Apply(Config{Specs: []Spec{spec}})
+			ctx := t.Context()
+			if err := m.EnsureMember(ctx, "rpcm_a", 0); !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("EnsureMember = %v, want ErrNotPermitted", err)
+			}
+			s := statusFor(m, "rpcm_a")
+			if s.State != StateNotPermitted || s.LastError == nil || s.LastError.Code != "runtime.bind_mismatch" ||
+				!strings.Contains(s.LastError.Message, "127.0.0.1") {
+				t.Fatalf("status = %+v, last_error %+v; want not_permitted with runtime.bind_mismatch naming the address", s, s.LastError)
+			}
+			if s.RPC == nil || !s.RPC.BindMismatch {
+				t.Fatalf("rpc status = %+v, want bind_mismatch set", s.RPC)
+			}
+			start := time.Now()
+			if err := m.EnsureMember(ctx, "rpcm_a", 0); !errors.Is(err, ErrNotPermitted) || time.Since(start) > 100*time.Millisecond {
+				t.Fatalf("second EnsureMember = %v after %v, want a fast ErrNotPermitted", err, time.Since(start))
+			}
+			if _, err := os.Stat(argvLog); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the member was exec'd (argv log: %v)", err)
+			}
+
+			local.Store(true)
+			time.Sleep(notPermittedRetryInterval + 50*time.Millisecond)
+			ensureMember(t, m, "rpcm_a", 0)
+			s = statusFor(m, "rpcm_a")
+			if s.State != StateRunning || s.LastError != nil || s.RPC.BindMismatch {
+				t.Fatalf("status = %+v, rpc %+v; want running with the mismatch cleared", s, s.RPC)
+			}
+		})
+	}
+}
+
+// TestRelayMemberNotListeningAtDeadlineIsBindMismatch: a relay member whose
+// child came up but whose relay never listened fails with runtime.bind_mismatch
+// and the relay's own error, not the generic start timeout.
+func TestRelayMemberNotListeningAtDeadlineIsBindMismatch(t *testing.T) {
+	shrinkTimings(t)
+	spec := onDemandMember(t, "rpcm_a")
+	spec.RPC.Transport = "relay"
+	spec.StartupTimeoutSeconds = 1
+	m := newTestManager(t, allowlistPolicy())
+	m.SetMemberRelayGate(func(string) error {
+		return errors.New("listen tcp4 127.0.0.1:47001: bind: address already in use")
+	})
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	err := m.EnsureMember(t.Context(), "rpcm_a", 0)
+	if err == nil || errors.Is(err, ErrStartTimeout) {
+		t.Fatalf("EnsureMember = %v, want a failure other than the generic start timeout", err)
+	}
+	s := statusFor(m, "rpcm_a")
+	if s.LastError == nil || s.LastError.Code != "runtime.bind_mismatch" || !strings.Contains(s.LastError.Message, "address already in use") {
+		t.Fatalf("last_error = %+v, want runtime.bind_mismatch carrying the relay's listen error", s.LastError)
+	}
+	if s.RPC == nil || !s.RPC.BindMismatch {
+		t.Fatalf("rpc status = %+v, want bind_mismatch set", s.RPC)
+	}
 }

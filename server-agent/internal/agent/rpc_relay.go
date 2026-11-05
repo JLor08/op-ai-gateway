@@ -22,7 +22,7 @@ import (
 // readiness until its relay listens.
 type rpcMemberSink interface {
 	SetMemberHold(specID, holder string, since time.Time)
-	SetMemberRelayGate(gate func(specID string) bool)
+	SetMemberRelayGate(gate func(specID string) error)
 }
 
 // maxRelayBreaches is how many refused peers a member's telemetry keeps (the
@@ -190,11 +190,22 @@ func (l *relayLink) telemetry(specID string) (relayTelemetry, bool) {
 }
 
 // ready is the runtime's relay gate: it brings the relays up to date and
-// reports whether member specID's relay listens.
-func (l *relayLink) ready(specID string) bool {
+// returns nil when member specID's relay listens, else why it does not (the
+// relay's last listen error when there is one). The runtime reports that text
+// if the member's start gives up on it.
+func (l *relayLink) ready(specID string) error {
 	l.sync()
 	st, ok := l.relay.Status(specID)
-	return ok && st.Listening
+	switch {
+	case !ok:
+		return errors.New("no relay is configured for the member")
+	case st.Listening:
+		return nil
+	case st.Err != "":
+		return errors.New(st.Err)
+	default:
+		return errors.New("the relay is not listening yet")
+	}
 }
 
 // running reports whether member specID is running now, read live: a head

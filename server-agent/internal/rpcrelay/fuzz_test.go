@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -34,6 +35,12 @@ func FuzzRelayFirstBytes(f *testing.F) {
 	if err := m.Apply([]Config{refused, allowed}); err != nil {
 		f.Fatal(err)
 	}
+	f.Cleanup(func() {
+		time.Sleep(50 * time.Millisecond)
+		if n := refusedTarget.accepted.Load(); n != 0 {
+			f.Errorf("an unlisted source reached the member (%d connection(s))", n)
+		}
+	})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Unlisted: closed without a byte either way.
@@ -47,10 +54,11 @@ func FuzzRelayFirstBytes(f *testing.F) {
 			t.Fatal("an unlisted source received bytes")
 		}
 		c.Close()
-		select {
-		case got := <-refusedTarget.conns:
-			t.Fatalf("an unlisted source reached the member with %d byte(s)", len(got))
-		default:
+		// The relay decides before it reads, so a leak would show up at the
+		// latest while the allowlisted half below runs; it is checked again
+		// after that, and once more when fuzzing ends.
+		if n := refusedTarget.accepted.Load(); n != 0 {
+			t.Fatalf("an unlisted source reached the member (%d connection(s))", n)
 		}
 
 		// Allowlisted: delivered unaltered. The member reads exactly what was
@@ -84,6 +92,9 @@ func FuzzRelayFirstBytes(f *testing.F) {
 		if n, err := c.Read(make([]byte, 1)); n != 0 || err == nil {
 			t.Fatalf("session not closed after the member closed (n=%d, err=%v)", n, err)
 		}
+		if n := refusedTarget.accepted.Load(); n != 0 {
+			t.Fatalf("an unlisted source reached the member (%d connection(s))", n)
+		}
 	})
 }
 
@@ -91,9 +102,10 @@ func FuzzRelayFirstBytes(f *testing.F) {
 // target must never happen; each one to the allowed member's target reads the
 // number of bytes announced on want, delivers them on conns and closes.
 type fuzzTarget struct {
-	ln    net.Listener
-	want  chan int
-	conns chan []byte
+	ln       net.Listener
+	accepted atomic.Int32
+	want     chan int
+	conns    chan []byte
 }
 
 func newFuzzTarget(f *testing.F) *fuzzTarget {
@@ -108,6 +120,7 @@ func newFuzzTarget(f *testing.F) *fuzzTarget {
 			if err != nil {
 				return
 			}
+			ft.accepted.Add(1)
 			go func() {
 				defer c.Close()
 				n := 0

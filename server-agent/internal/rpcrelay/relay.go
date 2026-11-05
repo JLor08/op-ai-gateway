@@ -116,6 +116,9 @@ type ListenerStatus struct {
 	// BindMismatch: the bind address is not an address of this host, so the
 	// relay cannot listen on it; it retries every BindRetryInterval.
 	BindMismatch bool
+	// Err is why the last bind attempt failed, while the relay is not
+	// listening; empty once it is.
+	Err string
 }
 
 // Manager runs one relay listener per member. It is safe for concurrent use.
@@ -134,6 +137,9 @@ type Manager struct {
 	isLocal          func(net.IP) bool
 	retryEvery       time.Duration
 	firstByteTimeout time.Duration
+	// admitHook, when set, runs between a connection's allowlist check and
+	// its registration.
+	admitHook func()
 }
 
 // NewManager returns a Manager reporting to ev. running reports whether a
@@ -222,7 +228,7 @@ func (m *Manager) Status(specID string) (ListenerStatus, bool) {
 	}
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
-	return ListenerStatus{Listening: mem.ln != nil, BindMismatch: mem.bindMismatch}, true
+	return ListenerStatus{Listening: mem.ln != nil, BindMismatch: mem.bindMismatch, Err: mem.bindErr}, true
 }
 
 // Close stops every relay and closes every session; later Applies fail with
@@ -366,12 +372,17 @@ type member struct {
 	mu           sync.Mutex
 	ln           net.Listener
 	bindMismatch bool
-	bindErr      string // the last listen error logged, so a retry repeats none
-	sockets      map[*session]struct{}
-	active       *session // the session forwarding to the member
-	held         bool     // a hold has been reported and not released
-	lastNotice   time.Time
-	suppressed   int
+	bindErr      string // why the last bind attempt failed; "" once bound
+	// allowGen counts allowlist changes. A connection is checked against the
+	// list of one generation and registered only while that generation still
+	// stands, so a change that lands in between cannot miss it: the change
+	// bumps the generation before it closes the registered sessions.
+	allowGen   uint64
+	sockets    map[*session]struct{}
+	active     *session // the session forwarding to the member
+	held       bool     // a hold has been reported and not released
+	lastNotice time.Time
+	suppressed int
 }
 
 func newMember(m *Manager, cfg Config, allowed []string) *member {
@@ -390,10 +401,14 @@ func (mem *member) sameShape(cfg Config) bool {
 // differs from the last one, every session is closed, so no connection admitted
 // under the old list outlives it.
 func (mem *member) updateAllowlist(f func() []net.IP, allowed []string) {
+	changed := !slices.Equal(mem.allowed, allowed)
 	mem.mu.Lock()
 	mem.cfg.AllowedIPs = f
+	if changed {
+		mem.allowGen++
+	}
 	mem.mu.Unlock()
-	if slices.Equal(mem.allowed, allowed) {
+	if !changed {
 		return
 	}
 	mem.allowed = allowed
@@ -432,11 +447,7 @@ func (mem *member) retryBind() {
 func (mem *member) bind() bool {
 	host, _, _ := net.SplitHostPort(mem.cfg.Bind)
 	if !mem.m.isLocal(net.ParseIP(host)) {
-		mem.mu.Lock()
-		first := !mem.bindMismatch
-		mem.bindMismatch = true
-		mem.mu.Unlock()
-		if first {
+		if mem.bindFailed(true, "bind address "+host+" is not an address of this host") {
 			slog.Warn("rpcrelay: bind address is not an address of this host; retrying",
 				"spec", mem.cfg.SpecID, "bind", mem.cfg.Bind, "retry_every", mem.m.retryEvery)
 		}
@@ -447,12 +458,7 @@ func (mem *member) bind() bool {
 	}}
 	ln, err := lc.Listen(mem.ctx, "tcp4", mem.cfg.Bind)
 	if err != nil {
-		mem.mu.Lock()
-		mem.bindMismatch = false
-		repeated := mem.bindErr == err.Error()
-		mem.bindErr = err.Error()
-		mem.mu.Unlock()
-		if !repeated {
+		if mem.bindFailed(false, err.Error()) {
 			slog.Warn("rpcrelay: cannot listen; retrying", "spec", mem.cfg.SpecID, "bind", mem.cfg.Bind, "err", err, "retry_every", mem.m.retryEvery)
 		}
 		return mem.ctx.Err() != nil
@@ -463,10 +469,21 @@ func (mem *member) bind() bool {
 		ln.Close()
 		return true
 	}
-	mem.ln, mem.bindMismatch = ln, false
+	mem.ln, mem.bindMismatch, mem.bindErr = ln, false, ""
 	mem.mu.Unlock()
 	mem.wg.Go(func() { mem.acceptLoop(ln) })
 	return true
+}
+
+// bindFailed records a failed bind attempt and reports whether its error is
+// new, so a retry that fails the same way is not logged again.
+func (mem *member) bindFailed(mismatch bool, msg string) bool {
+	mem.mu.Lock()
+	defer mem.mu.Unlock()
+	mem.bindMismatch = mismatch
+	repeated := mem.bindErr == msg
+	mem.bindErr = msg
+	return !repeated
 }
 
 func (mem *member) acceptLoop(ln net.Listener) {
@@ -495,15 +512,21 @@ func (mem *member) admit(c net.Conn) {
 	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
 		peer = a.IP
 	}
-	if !mem.allows(peer) {
+	allowed, gen := mem.allows(peer)
+	if !allowed {
 		c.Close()
 		mem.m.ev.Refused(mem.cfg.SpecID, peer)
 		mem.notice("rpcrelay: refused a connection from a source outside the allowlist", "peer", peer.String())
 		return
 	}
-	s := &session{mem: mem, client: c}
+	if hook := mem.m.admitHook; hook != nil {
+		hook()
+	}
+	s := &session{mem: mem, client: c, allowGen: gen}
 	mem.mu.Lock()
-	if mem.ctx.Err() != nil {
+	if mem.ctx.Err() != nil || mem.allowGen != gen {
+		// Removed, or the allowlist this peer was checked against was
+		// replaced meanwhile: the peer is not re-checked, it reconnects.
 		mem.mu.Unlock()
 		c.Close()
 		return
@@ -519,23 +542,21 @@ func (mem *member) admit(c net.Conn) {
 	mem.wg.Go(s.serve)
 }
 
-// allows reports whether peer is on the allowlist, evaluated now.
-func (mem *member) allows(peer net.IP) bool {
-	if peer == nil {
-		return false
-	}
+// allows reports whether peer is on the allowlist, evaluated now, and the
+// allowlist generation it was evaluated against.
+func (mem *member) allows(peer net.IP) (bool, uint64) {
 	mem.mu.Lock()
-	f := mem.cfg.AllowedIPs
+	f, gen := mem.cfg.AllowedIPs, mem.allowGen
 	mem.mu.Unlock()
-	if f == nil {
-		return false
+	if peer == nil || f == nil {
+		return false, gen
 	}
 	for _, ip := range f() {
 		if ip != nil && !ip.IsUnspecified() && ip.Equal(peer) {
-			return true
+			return true, gen
 		}
 	}
-	return false
+	return false, gen
 }
 
 // notice logs a refusal at Warn, at most once per noticeEvery per member,
@@ -588,6 +609,8 @@ func (mem *member) stop() {
 type session struct {
 	mem    *member
 	client net.Conn
+	// allowGen is the allowlist generation the peer was admitted under.
+	allowGen uint64
 
 	mu         sync.Mutex
 	target     net.Conn
@@ -636,11 +659,11 @@ func (s *session) serve() {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		pump(s.client, tc, s.noteTarget)
+		pump(s.client, tc, make([]byte, copyBufferSize), s.noteTarget)
 		s.closeConns()
 	})
 	wg.Go(func() { s.watchStall(done) })
-	pump(tc, s.client, s.noteClient)
+	pump(tc, s.client, buf, s.noteClient)
 	s.closeConns()
 	close(done)
 	wg.Wait()
@@ -653,7 +676,7 @@ func (s *session) promote(tc net.Conn) bool {
 	mem.evMu.Lock()
 	defer mem.evMu.Unlock()
 	mem.mu.Lock()
-	if mem.ctx.Err() != nil || !s.attach(tc) {
+	if mem.ctx.Err() != nil || mem.allowGen != s.allowGen || !s.attach(tc) {
 		mem.mu.Unlock()
 		return false
 	}
@@ -778,10 +801,9 @@ func (s *session) reportStall() {
 	}
 }
 
-// pump copies src to dst until either fails, calling note for every chunk read
-// from src before it is written on.
-func pump(dst, src net.Conn, note func()) {
-	buf := make([]byte, copyBufferSize)
+// pump copies src to dst through buf until either fails, calling note for
+// every chunk read from src before it is written on.
+func pump(dst, src net.Conn, buf []byte, note func()) {
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {

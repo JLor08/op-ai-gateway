@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -549,8 +550,8 @@ func TestRelayBindMismatchRetries(t *testing.T) {
 	cfg := relayConfig(t, "rpcm_a", tg, allow("127.0.0.1"))
 	mustApply(t, m, cfg)
 
-	if st, ok := m.Status("rpcm_a"); !ok || st.Listening || !st.BindMismatch {
-		t.Fatalf("Status = %+v, %v; want a bind mismatch while the address is not local", st, ok)
+	if st, ok := m.Status("rpcm_a"); !ok || st.Listening || !st.BindMismatch || !strings.Contains(st.Err, "127.0.0.1") {
+		t.Fatalf("Status = %+v, %v; want a bind mismatch naming the address while it is not local", st, ok)
 	}
 	if c, err := net.DialTimeout("tcp4", cfg.Bind, 200*time.Millisecond); err == nil {
 		c.Close()
@@ -560,7 +561,7 @@ func TestRelayBindMismatchRetries(t *testing.T) {
 	local.Store(true)
 	waitUntil(t, 3*time.Second, "relay bound after the address became local", func() bool {
 		st, _ := m.Status("rpcm_a")
-		return st.Listening && !st.BindMismatch
+		return st.Listening && !st.BindMismatch && st.Err == ""
 	})
 	c := dial(t, cfg.Bind)
 	roundTrip(t, c, []byte("bound"))
@@ -664,10 +665,17 @@ func TestRelayCloseEndsSessions(t *testing.T) {
 	cfg := relayConfig(t, "rpcm_a", tg, allow("127.0.0.1"))
 	mustApply(t, m, cfg)
 
+	baseline := runtime.NumGoroutine()
 	c := dial(t, cfg.Bind)
 	roundTrip(t, c, []byte("x"))
 	m.Close()
 	wantClosed(t, c)
+	c.Close()
+	// Every relay goroutine (accept loop, session, pumps, stall watcher) has
+	// ended, and so has the target's echo of the closed session.
+	waitUntil(t, 3*time.Second, fmt.Sprintf("goroutines back to %d after Close", baseline), func() bool {
+		return runtime.NumGoroutine() <= baseline
+	})
 	if ev.count("released:rpcm_a") != 1 {
 		t.Fatalf("events = %v, want the hold released on shutdown", ev.snapshot())
 	}
@@ -733,5 +741,38 @@ func TestRelaySoak(t *testing.T) {
 	}
 	if ev.count("held:rpcm_a:rspec_head") != 1 || ev.count("stalled:rpcm_a") != 0 {
 		t.Fatalf("events = %v, want one hold and no stall over the soak", ev.snapshot())
+	}
+}
+
+// TestRelayAllowlistRevokedDuringAdmit: a connection admitted under an
+// allowlist that an Apply replaces before the connection is registered must
+// not survive the change: it is closed, and the member is never dialled.
+func TestRelayAllowlistRevokedDuringAdmit(t *testing.T) {
+	ev := &recEvents{}
+	tg := newTarget(t, nil)
+	m := newTestManager(t, ev, always)
+	cfg := relayConfig(t, "rpcm_a", tg, allow("127.0.0.1"))
+	revoked := cfg
+	revoked.AllowedIPs = allow("192.0.2.1")
+	applied := make(chan error, 1)
+	var once sync.Once
+	m.admitHook = func() {
+		// Between the allowlist check and the registration of the session.
+		once.Do(func() { applied <- m.Apply([]Config{revoked}) })
+	}
+	mustApply(t, m, cfg)
+
+	c := dial(t, cfg.Bind)
+	if err := <-applied; err != nil {
+		t.Fatalf("Apply with the revoked allowlist: %v", err)
+	}
+	c.Write([]byte("after revocation"))
+	wantClosed(t, c)
+	time.Sleep(100 * time.Millisecond)
+	if n := tg.accepted.Load(); n != 0 {
+		t.Fatalf("target dialled %d time(s) for a connection whose allowlist entry was revoked", n)
+	}
+	if ev.count("held:rpcm_a:rspec_head") != 0 {
+		t.Fatalf("revoked connection took the hold (events %v)", ev.snapshot())
 	}
 }
