@@ -659,6 +659,8 @@ semantics.
 | Path | Methods | Scope | Purpose |
 |---|---|---|---|
 | `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
+| `/api/portal/mappings/{id}/runtime/start` | POST | mapping | **Transient manual start** (the live-status Play): starts one more instance of the mapping's managed model and writes nothing, so it then follows the normal idle, eviction and burst rules. No body. Refused while a benchmark run holds the server (`409 runtime_spec.server_benchmarking`, as the spec PUT). `200 {"instance":k,"state":"running"}` when the agent reports it running within 5 s, the agent's refusal when it answers within 5 s, otherwise `202 {"instance":k,"state":"starting"}` while the start completes in the background. See the start and stop conventions below |
+| `/api/portal/mappings/{id}/runtime/stop` | POST | mapping | **Transient manual stop** (the live-status Stop): `{"instance":k}` (required, 0–63) drains that one instance now and writes nothing, so demand can start it again. Needs the agent feature `runtime_stop` (agent 0.17.0). `200 {"instance":k,"state":"stopping"\|"stopped"}`, the agent's answer passed through. Refused while a benchmark run holds the server, like the start |
 | `/api/portal/mappings/{id}/probe-vram` | POST | mapping (`AuthorizeBenchmarkScope`, **not** the mapping write rule above) | The **VRAM benchmark**: force-stop every managed spec on the server (*the target included*), load this one model, and report its VRAM. `202` + the initial `BenchmarkStatus`; the result arrives on the benchmark status poll / SSE as `results[].vram`. Reserves the server like any benchmark (`409 benchmark.already_running`, checked before the refusals below, and `409 benchmark.server_in_use`). See the six refusals below and [§11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs) |
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's co-residency document, `{"mode":"opt_out"\|"opt_in","pairs":[{"a","b","verdict":"allow"\|"forbid"}]}`: its per-server **mode** (what a pair with no entry means, default `opt_out`) and the complete set of its **explicit** pair verdicts, each canonical (`a < b`). `pairs` is always a non-nil array; the effective allowed-pair list the agent receives is derived from both and is not part of this document ([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)). The PUT is a full replace of the explicit pairs; an empty or absent `mode` leaves the stored mode unchanged, an empty `verdict` is an `allow`, and `400` `runtime_coresidency.mode_invalid` / `runtime_coresidency.pair_invalid` reject an unknown mode / a bad pair or verdict |
 | `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout`, `binary_path_os_mismatch`, `api_flavors_not_on_application` and `api_flavors_text_on_stable_diffusion` ([Agent-Managed Model Runtime §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows)) |
@@ -669,6 +671,55 @@ semantics.
 
 Conventions worth stating, because each is a judgement call a client depends on:
 
+- **The manual start and stop are transient; the spec's `admin_state` is the
+  persistent override** ([ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)).
+  Both authorize as the spec PUT and answer its refusals first
+  (`404 mapping.not_found`, `400 runtime_spec.application_not_server_agent`,
+  `409 runtime_spec.server_benchmarking`, `404 runtime_spec.not_found`,
+  `500 runtime_spec.request_failed`), so a caller without a claim to the
+  mapping learns nothing else. "Not connected" means an agent that has not
+  reported since the gateway started (`503 runtime.agent_unavailable`); one
+  that reported and has since gone away is found out by the agent call itself
+  (`503 runtime.agent_unavailable` when it refuses the connection, `504
+  runtime.agent_timeout` when it does not answer).
+  - **Start** then refuses, in this order, a `force_stopped` spec (`409
+    runtime.admin_stopped`), an agent not heard from (`503`), an agent without
+    `runtime_ensure` (`409 runtime.agent_feature_missing`, with the missing
+    name in `error.feature`), a spec with no free index below its
+    `max_instances` (`409 runtime.max_instances_reached`; 0 = no cap of its
+    own, indexes up to 63, so 64 instances), a store read that fails while it
+    picks (`500 runtime.action_failed`), and an instance k ≥ 1 on an agent
+    without `runtime_instances` (`409 runtime.agent_feature_missing`). The instance is the scaler's index rule with instance 0
+    included ([Routing & Model Selection §10.4](../cross-cutting/routing-and-model-selection.md#104-the-instance-scaler)):
+    instance 0 of a spec that is not replicable (an ensure of a running one is
+    a no-op); for a replicable spec instance 0 unless the agent reports it
+    starting or running, else the lowest k ≥ 1 the agent reports in no state
+    that keeps the index (a row resting at `crashed`, `start_failed` or
+    `not_permitted` is free), that is not another mapping's upstream name on the
+    agent, and that no ensure — the scaler's or another start's — is under way
+    for. The index is claimed in the claim set the scaler shares, so the two
+    never ask for one index at the same time. The scaler's performance ceiling,
+    hold-offs and starting-sibling rule do **not** apply: it is the operator's
+    explicit choice, and the agent still has the final say on room. The ensure
+    runs in the background, bounded by the spec's startup timeout (agent
+    default 30 s) plus 10 s and by the gateway's lifetime; an outcome nobody
+    waits for any more — the window ran out, or the client left — is logged, a
+    failure at warn, and shows on the instance's status row.
+  - **Stop** then checks, in this order, only what the agent cannot: the body
+    (`400 request.invalid_json`, `413 request.body_too_large`, `400
+    runtime.instance_invalid`), an agent not heard from (`503`) and
+    `runtime_stop` (`409 runtime.agent_feature_missing`). Whether the instance may stop is the
+    agent's to decide, and its refusals pass through: `409
+    runtime.instance_protected` (below the spec's protected floor: the agent
+    would restart it at once), `409 runtime.instance_not_highest` (a higher
+    instance of the spec runs) and `404 runtime.model_not_managed`.
+  - **An agent refusal keeps the agent's code** at the router's status
+    (`runtime.instance_no_capacity`, `runtime.instance_demand_unknown`,
+    `runtime.admission_blocked`, `runtime.start_timeout`, `runtime.start_failed`,
+    `runtime.not_permitted`, `runtime.upstream_gone` and the three above); any
+    other router code is `502 runtime.agent_error`, a deadline `504
+    runtime.agent_timeout`, and an agent the gateway could not reach `503
+    runtime.agent_unavailable`.
 - **Every write is a full-document replace, not a delta** — the spec PUT applies
   the whole spec verbatim (never merged against the stored row), and the two list
   PUTs replace the entire list (the co-residency PUT also carries a mode; an
@@ -789,7 +840,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   server** — and this is the *only* write it gates, which a client
   reasoning about a run's isolation has to know. The endpoint is a full-document replace with `admin_state` among
   its fields, so it is an override action as much as an edit, and one
-  "Force start" on a spec a VRAM run has drained puts a sibling's allocation
+  "Pin as running" on a spec a VRAM run has drained puts a sibling's allocation
   inside the measurement window. The gate is the benchmark reservation — the
   same fact that already excludes the server from routing — checked after
   authorization, so an unauthorized caller learns nothing from it. `GET` and
@@ -904,6 +955,23 @@ sentinel is a breaking API change that must be applied in both places):
 | `application.proxy_listen_port_invalid` | 400 |
 | `application.proxy_excluded_port_conflict`, `application.proxy_entry_scheme`, `application.proxy_listen_port_conflict` | **409** — the request shape is valid, it conflicts with the target's own state |
 | unmapped | 500 `runtime_spec.request_failed` |
+
+The manual start and stop (`POST …/runtime/start`, `…/runtime/stop`) answer the
+spec PUT's authorization and benchmark refusals above, and these codes of their own:
+
+| Code | Status |
+|---|---|
+| `runtime.admin_stopped` | 409 — start of a spec pinned as stopped (`force_stopped`) |
+| `runtime.max_instances_reached` | 409 — start with no free index below the spec's `max_instances` |
+| `runtime.agent_feature_missing` | 409 — the agent does not declare the feature the action needs; `error.feature` names it (`runtime_ensure`, `runtime_instances` for an instance k ≥ 1, `runtime_stop`) |
+| `runtime.instance_invalid` | 400 — stop without an `instance`, or one outside 0–63 |
+| `runtime.agent_unavailable` | 503 — the agent has not reported since the gateway started, or could not be reached |
+| `runtime.agent_timeout` | 504 — the agent call's deadline ran out |
+| `runtime.agent_error` | 502 — any other agent failure, a router code this gateway does not know included |
+| `runtime.action_failed` | 500 — a store read failed while the start picked its instance |
+| the agent's `runtime.instance_no_capacity`, `.instance_demand_unknown`, `.instance_protected`, `.instance_not_highest` | 409 — passed through |
+| the agent's `runtime.model_not_managed` | 404 — passed through |
+| the agent's `runtime.admission_blocked` / `.start_timeout` / `.start_failed`, `.not_permitted`, `.upstream_gone` | 503 / 504 / 502 — passed through |
 
 The application endpoints' unmapped fallback is **500 `application.request_failed`**
 (`writePortalApplicationError`), not the `runtime_spec.request_failed` in the row
@@ -1584,7 +1652,12 @@ sample's `capabilities.features` and not in this document; the newest are
 `runtime_role_eviction` (it captures each spec's pushed `role` and protects a
 recently used model from eviction, agent 0.15.0, [ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)), which is
 declared for **visibility only** and gates nothing: the document below is one
-shared shape for every agent whether or not it declares it. `runtime_instances`
+shared shape for every agent whether or not it declares it. `runtime_stop`
+(agent 0.17.0, [ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor))
+says the router serves `POST /stop/{model}`; unlike `runtime_role_eviction` it
+gates real behaviour, fail-closed: the gateway forwards the portal's manual stop
+of an instance only to an agent that declares it, and the portal shows Stop
+disabled on a server whose runtime report lacks it. `runtime_instances`
 (agent 0.16.0, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
 is on **both** lists with a different fact behind each: the gateway's says it
 understands one status row per instance, and the agent honours a spec's
@@ -1749,6 +1822,7 @@ route**, `/live/{model}` (agent 0.12.0), and routes everything else on a `model`
 | `GET /upstream/{model}/v1/audio/voices` | The allowlist's second endpoint (issue #251, the `runtime_voices` feature, agent 0.11.0): an audio.cpp child's voice listing, `{"voices": [...]}`, relayed unmodified. The same read-only, never-start shape as `/props` — a managed-but-cold match answers `404 runtime.model_not_running`, which the gateway reads as "no voices this tick" — with the outbound path exactly `/v1/audio/voices` and the **inbound query string dropped** (audio.cpp ignores `?model=`; `/props` keeps its query). The gateway asks only an agent whose reported features name `runtime_voices` (fail-closed: an older router never serves the route and answers a 404, `runtime.upstream_endpoint_not_allowed` from 0.7.0 on and `runtime.model_not_managed` before 0.7.0, so the read cannot succeed there). |
 | `GET /upstream/{model}/v1/models` | The allowlist's third endpoint (issue #282, the `runtime_model_params` feature, agent 0.13.0, [ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)): an audio.cpp child's model listing, relayed unmodified, which the gateway reads with `?include_params=true` to learn each model's declared request params (the `language` param among them: whether a model takes one and its default). The same read-only, never-start shape as `/props` — a managed-but-cold match answers `404 runtime.model_not_running`, which the gateway reads as "no language fact this tick" — with the outbound path exactly `/v1/models` and the **inbound query string forwarded** (audio.cpp adds the `params` array only when asked; the voices read drops its query). Not the router's own `GET /v1/models` control route above, which lists the managed specs. The gateway asks only an agent whose reported features name `runtime_model_params`, **checked on its own, not under `runtime_voices`** (fail-closed: an older router never serves the route and answers a 404, `runtime.upstream_endpoint_not_allowed` from 0.7.0 on and `runtime.model_not_managed` before 0.7.0, so the read cannot succeed there). |
 | `POST /ensure/{model}` | Starts the managed child for `model` and forwards nothing; bodiless (any body a caller sends is read and discarded, never forwarded, and one over 32 MiB gets `413 runtime.request_too_large`), and answered once the outcome is known: `200 {"status":"running"}`, or `404 runtime.model_not_managed` (also for an empty model), `503 runtime.admission_blocked`, `504 runtime.start_timeout`, `502 runtime.start_failed` or `502 runtime.not_permitted`, `409 runtime.instance_no_capacity` or `409 runtime.instance_demand_unknown` for a burst instance `m#k` that does not fit into free room or whose demand is not measured yet (agent 0.16.0), or `502 runtime.upstream_gone` for any other failure, such as the manager shutting down. It is the only route that starts a burst instance (a plain request naming one that is not up answers `409 runtime.instance_no_capacity`). No heartbeat. The agent declares it as the feature `runtime_ensure`; an older router answers `404 runtime.model_not_managed` without starting anything |
+| `POST /stop/{model}` | Begins a graceful drain of **one** instance (`m` or `m#k`, the `#` percent-encoded) and persists nothing (agent 0.17.0, the feature `runtime_stop`): `200 {"state":"stopping"}` when a drain began or was already running, `200 {"state":"stopped"}` when the instance has no process, `404 runtime.model_not_managed` for an address that is not managed, `409 runtime.instance_protected` for an instance inside the spec's protected floor, `409 runtime.instance_not_highest` while a higher instance of the spec has a process, or `502 runtime.upstream_gone` for any other failure. Bodiless like `/ensure`. The gateway calls it only for the portal's manual stop (`POST /api/portal/mappings/{id}/runtime/stop`) and only on an agent that declared `runtime_stop`: an older router hands the POST to its proxy, which answers `404 runtime.model_not_managed` and stops nothing |
 | `POST /live/{model}` | The **full-duplex** relay for live transcription ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266): routed on the **decoded path** (an id containing `/` works), so the router never buffers the body, it starts the child like an inference request (`EnsureRunning`, held for the whole relay) and streams the inbound chunked PCM body to `{child}/v1/audio/transcriptions/live?<inbound query>&model=<path model>` (the path model is authoritative), relaying the child's SSE back flushed per write. Errors are the proxy paths' (`404 runtime.model_not_managed` for an unmanaged or empty model, `503`/`504`/`502` for admission and start, `502 runtime.upstream_gone` for an unreachable child); no heartbeat. The agent declares it as the feature `fullduplex_proxy` (0.12.0); an older router answers `404 runtime.model_not_managed`, so the gateway sends a live session only to an agent that declared it. Full duplex is enabled before any response on **both** ways in (the in-process path, where the agent's TLS proxy hands the router the same `(w, r)`, and the dialed fallback, which enables it per request), so a refusal is answered promptly and no PCM is drained |
 
 Any other method on those paths falls through to model routing. A request

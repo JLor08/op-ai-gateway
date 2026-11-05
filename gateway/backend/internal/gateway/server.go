@@ -489,6 +489,22 @@ type Server struct {
 	// New builds it whenever it builds the resolver's instance source and installs
 	// it as the resolver's demand sink; nil otherwise, and on a bare &Server{}.
 	instanceScaler *instanceScaler
+	// instanceClaims is the instance index claim set the scaler and the portal's
+	// manual start share (instance_claims.go), so the two never ask an agent for
+	// one instance index at the same time. Built in New; a bare &Server{} leaves
+	// it nil, which holds nothing.
+	instanceClaims *instanceClaims
+	// runtimeStarts counts the portal's manual starts whose ensure runs in the
+	// background (runtime_actions.go); cancelling the server's lifetime
+	// (baseCtx) ends each one's ensure. Only tests join them
+	// (waitRuntimeStarts): the shutdown does not wait for them, as it does not
+	// for the scaler's scale-ups. runtimeStartWindow and runtimeStartVisibleWait
+	// are the start's early-answer window and how long a started instance's
+	// index stays claimed waiting for the agent to report it; 0 (a bare
+	// &Server{}, and New) means the defaults, and a test shortens them.
+	runtimeStarts           sync.WaitGroup
+	runtimeStartWindow      time.Duration
+	runtimeStartVisibleWait time.Duration
 	// voiceTickets mints and redeems the Voice Chat tickets (voice_chat_ticket.go): the
 	// authenticated, CSRF-protected ticket POST mints one after the co-load gate, the
 	// WebSocket upgrade redeems it. Built in New with a fresh per-process key; a bare
@@ -1195,6 +1211,7 @@ func New(deps ServerDeps) *Server {
 	// the built Server for the provider (read at each signal, so a provider without
 	// the ensure route starts nothing), the upstream credential and the shutdown
 	// context, and it counts instances through the resolver's own instance source.
+	s.instanceClaims = newInstanceClaims()
 	if resolver != nil && instances != nil {
 		s.instanceScaler = newInstanceScaler(instanceScalerDeps{
 			store:     deps.Routes,
@@ -1209,6 +1226,7 @@ func New(deps ServerDeps) *Server {
 			wake:    admission.release,
 			base:    func() context.Context { return s.baseCtx },
 			now:     time.Now,
+			claims:  s.instanceClaims,
 		}, deps.InstanceScaleCooldown)
 		resolver.SetDemandSink(s.instanceScaler)
 	}

@@ -11,12 +11,16 @@ export type Fetcher = typeof fetch;
 export class PortalApiError extends Error {
   status: number;
   code: string;
+  // The agent feature a runtime.agent_feature_missing refusal names beside its
+  // code (error.feature on the wire); undefined for every other error.
+  feature?: string;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, feature?: string) {
     super(message);
     this.name = 'PortalApiError';
     this.status = status;
     this.code = code;
+    if (feature !== undefined) this.feature = feature;
   }
 }
 
@@ -117,6 +121,7 @@ export async function request<T>(
       response.status,
       error?.code ?? fallbackCode,
       error?.message ?? (response.statusText || 'request failed'),
+      typeof error?.feature === 'string' ? error.feature : undefined,
     );
   }
   if (payload === null) {
@@ -201,7 +206,7 @@ async function readJSON(response: Response): Promise<unknown> {
 
 function isErrorPayload(
   payload: unknown,
-): payload is { error: { code?: string; message?: string } } {
+): payload is { error: { code?: string; message?: string; feature?: unknown } } {
   if (!payload || typeof payload !== 'object' || !('error' in payload)) {
     return false;
   }

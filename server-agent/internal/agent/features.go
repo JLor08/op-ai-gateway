@@ -338,11 +338,38 @@ var Features = []Feature{
 	// Since is 0.16.0: agent.Features gains an entry, so the rule is a MINOR bump
 	// (see agent.go's Version block).
 	{Name: FeatureRuntimeInstances, Since: "0.16.0"},
+	// runtime_stop: this agent's runtime router serves POST /stop/{model} -- a
+	// bodiless request that begins a graceful drain of ONE instance ("m" or
+	// "m#k") and persists nothing: no admin state, no pin, nothing in the
+	// runtime-config document. Demand may start the instance again afterwards,
+	// exactly as after an idle unload. It refuses an instance inside the
+	// spec's protected floor (409 runtime.instance_protected: the agent would
+	// restart it at once) and one with a higher sibling that still has a
+	// process (409 runtime.instance_not_highest: the highest index leaves
+	// first), and is idempotent -- an instance with no process answers 200
+	// {"state":"stopped"}.
+	//
+	// Like runtime_ensure, the GATEWAY gates real behavior on this flag,
+	// fail-closed: the portal's transient Stop action calls the route only on
+	// an agent that declares this name. Trying the route instead cannot tell
+	// the two apart: a router without it hands the bodiless POST to the
+	// model-routed proxy, which answers 404 runtime.model_not_managed, the same
+	// status and code it answers an unmanaged model with. The gateway spells
+	// the same string in its own constant for the reason runtimeManagerFeature
+	// is duplicated: this module cannot import it.
+	//
+	// Since is 0.17.0: agent.Features gains an entry, so the rule is a MINOR bump
+	// (see agent.go's Version block).
+	{Name: FeatureRuntimeStop, Since: "0.17.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
 // entry above): the agent runs several instances of one replicable runtime spec.
 const FeatureRuntimeInstances = "runtime_instances"
+
+// FeatureRuntimeStop names the runtime_stop feature (see its registry entry
+// above): the router serves POST /stop/{model}, a transient stop of one instance.
+const FeatureRuntimeStop = "runtime_stop"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

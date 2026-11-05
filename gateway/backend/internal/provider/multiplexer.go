@@ -514,6 +514,38 @@ func (m *Multiplexer) dispatchEnsureRuntimeModel(ctx context.Context, target rou
 	return fmt.Errorf("%w: runtime ensure not supported for provider %q", ErrUnavailable, target.Provider)
 }
 
+var _ RuntimeStopper = (*Multiplexer)(nil)
+
+// StopRuntimeModel routes the agent router's stop call to the provider's
+// client, falling back to the fallback client, as EnsureRuntimeModel does. A
+// provider whose client does not implement RuntimeStopper yields
+// ErrUnavailable: an empty state with a nil error would read as an answer.
+func (m *Multiplexer) StopRuntimeModel(ctx context.Context, target routing.Target) (string, error) {
+	ctx, span := tracing.Start(ctx, "provider.StopRuntimeModel")
+	defer span.End()
+	state, err := m.dispatchStopRuntimeModel(ctx, target)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return state, err
+}
+
+func (m *Multiplexer) dispatchStopRuntimeModel(ctx context.Context, target routing.Target) (string, error) {
+	if m == nil {
+		return "", ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if s, ok := client.(RuntimeStopper); ok {
+			return s.StopRuntimeModel(ctx, target)
+		}
+	}
+	if s, ok := m.fallback.(RuntimeStopper); ok {
+		return s.StopRuntimeModel(ctx, target)
+	}
+	return "", fmt.Errorf("%w: runtime stop not supported for provider %q", ErrUnavailable, target.Provider)
+}
+
 var _ MemoryProber = (*Multiplexer)(nil)
 
 // ProbeServerMemory routes the upstream saturation probe to the provider's client

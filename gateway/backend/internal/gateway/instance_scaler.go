@@ -117,6 +117,10 @@ type instanceScalerDeps struct {
 	// base is the server's lifetime: its end ends every scale-up.
 	base func() context.Context
 	now  func() time.Time
+	// claims is the index claim set the scaler shares with the portal's manual
+	// start (instance_claims.go), so the two never ask for one index at the
+	// same time. Optional: nil gives the scaler a set of its own.
+	claims *instanceClaims
 }
 
 // scaleKey names one spec on one server by its mapping: a spec belongs to exactly
@@ -170,6 +174,10 @@ type instanceScaler struct {
 	cooldown    time.Duration
 	visibleWait time.Duration // instanceVisibleWait; a test changes it
 	readTimeout time.Duration // instanceScaleReadTimeout; a test changes it
+	// unseenClaimWait bounds how long an instance that started but did not show
+	// up within visibleWait keeps its index claimed (keepUnseenClaim); 0 means
+	// visibleWait. A test changes it.
+	unseenClaimWait time.Duration
 
 	mu sync.Mutex
 	// scaling holds the gateway models with a scale-up running, each with the
@@ -181,13 +189,18 @@ type instanceScaler struct {
 	followUps map[string][]routing.DemandSignal
 	// notBefore holds each host left alone after a refusal or a failure, until when.
 	notBefore map[scaleKey]time.Time
-	// ensuring holds the index an ensure is under way for, per host, which no pick
-	// gives out a second time. A host's mapping serves one model and a model's
-	// scale-ups run one at a time, so no other pick of that host runs meanwhile
-	// today; the set keeps the index rule from depending on that.
-	ensuring map[scaleKey]int
+	// claims holds the indexes an ensure is under way for, per host, which no
+	// pick gives out a second time -- this scaler's and the manual start's
+	// (deps.claims). A host's mapping serves one model and a model's scale-ups
+	// run one at a time, so no other scale-up of that host runs meanwhile; the
+	// set is what keeps a manual start from asking for the same index.
+	claims *instanceClaims
+	// beforeClaim is a TEST-ONLY seam: when non-nil, start calls it with the
+	// candidate right before it claims the candidate's index, so a test can
+	// take the index in between the pick and the ask. nil in production.
+	beforeClaim func(scaleCandidate)
 
-	wg sync.WaitGroup // one per running scale-up
+	wg sync.WaitGroup // one per running scale-up, and one per claim keepUnseenClaim holds
 }
 
 // newInstanceScaler returns a scaler that leaves a refused host alone for cooldown,
@@ -195,6 +208,10 @@ type instanceScaler struct {
 func newInstanceScaler(deps instanceScalerDeps, cooldown time.Duration) *instanceScaler {
 	if cooldown <= 0 {
 		cooldown = defaultInstanceScaleCooldown
+	}
+	claims := deps.claims
+	if claims == nil {
+		claims = newInstanceClaims()
 	}
 	return &instanceScaler{
 		deps:        deps,
@@ -204,7 +221,7 @@ func newInstanceScaler(deps instanceScalerDeps, cooldown time.Duration) *instanc
 		scaling:     map[string]signalKey{},
 		followUps:   map[string][]routing.DemandSignal{},
 		notBefore:   map[scaleKey]time.Time{},
-		ensuring:    map[scaleKey]int{},
+		claims:      claims,
 	}
 }
 
@@ -304,6 +321,11 @@ func (s *instanceScaler) followUp(ctx context.Context, model string, started sca
 // is asked brings no host back -- so the scale-up ends once a host started an
 // instance or none is left, and parked requests then wait for the instances
 // there are. There is no retry beyond the next demand signal.
+//
+// A host whose picked index a manual start claimed between the pick and the ask
+// (startLost) is not counted as asked: the next pick sees that claim and gives
+// the host its next free index. Every such round follows a claim some manual
+// start made meanwhile, so the loop ends with them.
 func (s *instanceScaler) scaleUp(ctx context.Context, ensurer provider.RuntimeEnsurer, d routing.DemandSignal) scaleKey {
 	asked := map[scaleKey]bool{}
 	for ctx.Err() == nil {
@@ -312,13 +334,30 @@ func (s *instanceScaler) scaleUp(ctx context.Context, ensurer provider.RuntimeEn
 		if i < 0 {
 			return scaleKey{}
 		}
-		asked[cands[i].key] = true
-		if s.start(ctx, ensurer, d.Model, cands[i]) {
+		switch s.start(ctx, ensurer, d.Model, cands[i]) {
+		case startStarted:
 			return cands[i].key
+		case startFailed:
+			asked[cands[i].key] = true
+		case startLost:
 		}
 	}
 	return scaleKey{}
 }
+
+// startOutcome is what one ask of a host came to.
+type startOutcome int
+
+const (
+	// startFailed: the agent refused or the ensure failed (or the shutdown cut
+	// it short); the host is not asked again in this scale-up.
+	startFailed startOutcome = iota
+	// startStarted: the instance runs.
+	startStarted
+	// startLost: the picked index was claimed by a manual start before the ask;
+	// nothing was sent.
+	startLost
+)
 
 // start asks c's agent for instance c.index and reports whether it runs. Once it
 // runs and routing sees it (awaitRoutable), as many requests parked on c's server
@@ -329,16 +368,30 @@ func (s *instanceScaler) scaleUp(ctx context.Context, ensurer provider.RuntimeEn
 // cooldown when the agent has no room, for instanceDemandUnknownDelay while a
 // sibling's demand is unmeasured -- and so does any other failure, which is also
 // logged. An ensure the server's shutdown cut short says nothing about the host.
-func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsurer, model string, c scaleCandidate) bool {
-	s.mu.Lock()
-	s.ensuring[c.key] = c.index
-	s.mu.Unlock()
+//
+// The index is claimed (instanceClaims) before the ask and held until routing
+// sees the instance or the ensure failed, so a manual start never asks for it
+// meanwhile; an index a manual start claimed first is startLost, and nothing is
+// sent. An instance that started but did not show up within the wait keeps its
+// claim a while longer (keepUnseenClaim): the agent runs it, and a manual start
+// that took the index would ask for a running instance and report it as one
+// more started.
+func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsurer, model string, c scaleCandidate) startOutcome {
+	if s.beforeClaim != nil {
+		s.beforeClaim(c)
+	}
+	if !s.claims.tryClaim(c.key, c.index) {
+		return startLost
+	}
+	release := true
+	defer func() {
+		if release {
+			s.claims.release(c.key, c.index)
+		}
+	}()
 	ensureCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	err := ensurer.EnsureRuntimeModel(s.deps.authCtx(ensureCtx, c.target), c.target)
 	cancel()
-	s.mu.Lock()
-	delete(s.ensuring, c.key)
-	s.mu.Unlock()
 
 	attrs := []any{"model", model, "server_id", c.key.serverID, "instance", c.target.ProviderModel}
 	if err == nil {
@@ -347,16 +400,18 @@ func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsu
 			if ctx.Err() == nil {
 				slog.Warn("instance scaler: a started instance did not show up in the agent's status; waking no request and leaving the host alone briefly", append(attrs, "delay", instanceUnseenDelay)...)
 				s.holdOff(c.key, instanceUnseenDelay)
+				release = false
+				s.keepUnseenClaim(ctx, c)
 			}
-			return true
+			return startStarted
 		}
 		for range c.parallelism {
 			s.deps.wake(c.key.serverID)
 		}
-		return true
+		return startStarted
 	}
 	if ctx.Err() != nil {
-		return false
+		return startFailed
 	}
 	var re *provider.RouterError
 	code := ""
@@ -374,7 +429,24 @@ func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsu
 		slog.Warn("instance scaler: starting an instance failed; leaving the host alone for the cooldown", append(attrs, "cooldown", s.cooldown, "err", err)...)
 		s.holdOff(c.key, s.cooldown)
 	}
-	return false
+	return startFailed
+}
+
+// keepUnseenClaim holds c's claim, in the background, until routing sees c's
+// instance or unseenClaimWait ran out (the server's shutdown ends it too), and
+// then releases it. The scale-up goes on meanwhile: the host is held off, so
+// the claim only keeps a manual start from picking the index.
+func (s *instanceScaler) keepUnseenClaim(ctx context.Context, c scaleCandidate) {
+	wait := s.unseenClaimWait
+	if wait <= 0 {
+		wait = s.visibleWait
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.claims.release(c.key, c.index)
+		s.awaitRoutableWithin(ctx, c, wait)
+	}()
 }
 
 // awaitRoutable reports whether routing sees c's new instance running -- the
@@ -382,9 +454,14 @@ func (s *instanceScaler) start(ctx context.Context, ensurer provider.RuntimeEnsu
 // bound or when ctx ends. It subscribes to the server's status before it looks,
 // so a sample published in between is not missed.
 func (s *instanceScaler) awaitRoutable(ctx context.Context, c scaleCandidate) bool {
+	return s.awaitRoutableWithin(ctx, c, s.visibleWait)
+}
+
+// awaitRoutableWithin is awaitRoutable bounded by wait.
+func (s *instanceScaler) awaitRoutableWithin(ctx context.Context, c scaleCandidate, wait time.Duration) bool {
 	_, updates, unsubscribe := s.deps.statuses.subscribe(c.key.serverID)
 	defer unsubscribe()
-	timer := time.NewTimer(s.visibleWait)
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for !s.routable(ctx, c) {
 		select {
@@ -537,18 +614,25 @@ func (s *instanceScaler) candidate(ctx context.Context, c routing.MappingCandida
 		slog.Debug("instance scaler: building the instance's target failed", "mapping_id", c.Mapping.ID, "err", err)
 		return scaleCandidate{}, false
 	}
-	startup := time.Duration(spec.StartupTimeoutSeconds) * time.Second
-	if startup <= 0 {
-		startup = agentDefaultStartupTimeout
-	}
 	return scaleCandidate{
 		key:         key,
 		mapping:     c.Mapping,
 		index:       k,
 		parallelism: max(view.Parallelism, 1),
-		timeout:     startup + instanceEnsureMargin,
+		timeout:     instanceEnsureTimeout(spec),
 		target:      target,
 	}, true
+}
+
+// instanceEnsureTimeout bounds an ensure of an instance of spec: its startup
+// timeout (the agent's default when it sets none) plus instanceEnsureMargin.
+// The scaler's ensure and the portal's manual start are bounded alike.
+func instanceEnsureTimeout(spec routing.RuntimeSpec) time.Duration {
+	startup := time.Duration(spec.StartupTimeoutSeconds) * time.Second
+	if startup <= 0 {
+		startup = agentDefaultStartupTimeout
+	}
+	return startup + instanceEnsureMargin
 }
 
 // atInstanceCeiling reports whether the spec view describes is at a ceiling, counting
@@ -575,48 +659,25 @@ func (s *instanceScaler) candidateSpec(ctx context.Context, mappingID string) (r
 	return spec, found
 }
 
-// specInstances reads serverID's status rows of spec specID: whether any instance
-// of it is starting, instance 0 included, and every index k >= 1 the agent
-// reports for it in a state that keeps the index taken. An index the agent
-// still reports draining, stopped or waiting is not one an ensure can start
-// afresh. An index resting at a failure (instanceReusableStates) is: the agent
-// keeps that row only for the operator to read, until it is named again or
-// the next Apply, and an ensure of it is exactly what names it again -- it
-// retires a crashed or start_failed row and starts a fresh instance there, and
-// runs admission on a not_permitted one again (behind the agent's refusal rate
-// limit). Routing never names such a row, so were its index counted as taken
-// nothing would ever free it, and every failure would use up one index for
-// good -- the last one below max_instances included.
+// specInstances reads serverID's status rows of spec specID by the index
+// rule's reading (specInstanceRows): whether any instance of it is starting,
+// and the indexes k >= 1 the agent reports in a state that keeps them taken.
 func (s *instanceScaler) specInstances(serverID, specID string) (starting bool, reported []int) {
-	rows := s.deps.statuses.statusRows(serverID)
-	for i := range rows {
-		row := &rows[i] // read-only: the published snapshot itself
-		if row.SpecID != specID {
-			continue
-		}
-		if row.State == agentSpecStateStarting {
-			starting = true
-		}
-		if row.Instance >= 1 && !instanceReusableStates[row.State] {
-			reported = append(reported, row.Instance)
-		}
-	}
-	return starting, reported
+	return specInstanceRows(s.deps.statuses.statusRows(serverID), specID)
 }
 
-// instanceReusableStates are the states a burst instance rests at after a
-// failure, which the agent keeps until the index is named again: an ensure of
-// such an index is the retry, so the scaler treats it as free.
-var instanceReusableStates = map[string]bool{"crashed": true, "start_failed": true, "not_permitted": true}
-
-// instanceIndex is the index c's next instance gets (nextInstanceIndex), 0 for none.
-// Besides the indexes taken (taken: present, or reported in a state that keeps
-// the index -- specInstances) and the one an ensure is under way for, it skips
-// every index whose address is another mapping's upstream model on the same
-// agent: the agent resolves a literal upstream name before it reads an instance
-// address, so an ensure of that address would start the other spec, and the
-// agent never runs that instance of this one.
+// instanceIndex is the index c's next instance gets (nextInstanceIndex), 0 for none,
+// by the index rule shared with the manual start (instance_claims.go). Besides the
+// indexes taken (present, or reported in a state that keeps the index --
+// specInstances) and those an ensure is under way for (instanceClaims, the
+// scaler's and the manual start's), it skips every index whose address is
+// another mapping's upstream model on the same agent (otherMappingIndexes): the
+// agent resolves a literal upstream name before it reads an instance address,
+// so an ensure of that address would start the other spec, and the agent never
+// runs that instance of this one.
 // The agent's specs are the mappings of the server's server_agent application.
+// The pick claims nothing: start claims the index right before it asks, and a
+// claim taken in between makes that ask startLost.
 func (s *instanceScaler) instanceIndex(ctx context.Context, c routing.MappingCandidate, key scaleKey, present []int) int {
 	readCtx, cancel := s.bounded(ctx)
 	mappings, err := s.deps.store.MappingsByApplication(readCtx, c.Application.ID)
@@ -625,22 +686,9 @@ func (s *instanceScaler) instanceIndex(ctx context.Context, c routing.MappingCan
 		slog.Debug("instance scaler: reading the agent's mappings failed", "application_id", c.Application.ID, "err", err)
 		return 0
 	}
-	taken := map[int]bool{}
-	s.mu.Lock()
-	if k, ok := s.ensuring[key]; ok {
+	taken := otherMappingIndexes(mappings, c.Mapping)
+	for k := range s.claims.heldBy(key) {
 		taken[k] = true
-	}
-	s.mu.Unlock()
-	others := make(map[string]bool, len(mappings))
-	for _, m := range mappings {
-		if m.ID != c.Mapping.ID {
-			others[m.AppModelName] = true
-		}
-	}
-	for k := 1; k <= routing.MaxInstanceIndex && len(others) > 0; k++ {
-		if others[routing.InstanceAddress(c.Mapping.AppModelName, k)] {
-			taken[k] = true
-		}
 	}
 	return nextInstanceIndex(present, taken)
 }

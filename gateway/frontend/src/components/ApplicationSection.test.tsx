@@ -254,6 +254,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       })),
       subscribeRuntimeStatus: vi.fn(() => () => {}),
       subscribeRuntimeLogs: vi.fn(() => () => {}),
+      startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
+      stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
       // Task 21 (matrix + server limits): unused defaults for every test here
       // (reached only by RuntimeAdminSection's own tests), mirroring the
       // runtime* defaults above.

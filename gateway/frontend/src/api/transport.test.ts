@@ -81,3 +81,32 @@ describe('requestBinary', () => {
     });
   });
 });
+
+describe('request error feature', () => {
+  it('carries a string feature the error body names beside its code', async () => {
+    const fetcher = async () =>
+      new Response(
+        JSON.stringify({ error: { code: 'x.y', message: 'nope', feature: 'runtime_stop' } }),
+        { status: 409 },
+      );
+    const err = await request(fetcher, '/x').catch((e: unknown) => e);
+    expect((err as PortalApiError).feature).toBe('runtime_stop');
+  });
+
+  it('leaves feature unset for an error body that names none', async () => {
+    const fetcher = async () =>
+      new Response(JSON.stringify({ error: { code: 'x.y', message: 'nope' } }), { status: 409 });
+    const err = await request(fetcher, '/x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PortalApiError);
+    expect((err as PortalApiError).feature).toBeUndefined();
+  });
+
+  it('ignores a feature that is not a string', async () => {
+    const fetcher = async () =>
+      new Response(JSON.stringify({ error: { code: 'x.y', message: 'nope', feature: 7 } }), {
+        status: 409,
+      });
+    const err = await request(fetcher, '/x').catch((e: unknown) => e);
+    expect((err as PortalApiError).feature).toBeUndefined();
+  });
+});

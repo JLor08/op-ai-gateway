@@ -30,6 +30,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
 import ClearIcon from '@mui/icons-material/Clear';
 import ReplayIcon from '@mui/icons-material/Replay';
+import PushPinIcon from '@mui/icons-material/PushPin';
 import ArticleIcon from '@mui/icons-material/Article';
 import SpeedIcon from '@mui/icons-material/Speed';
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
@@ -46,6 +47,7 @@ import type {
   PortalModelMapping,
   PortalServer,
   PutRuntimeSpecRequest,
+  RuntimeActionAnswer,
   RuntimeError,
   RuntimeSpec,
   RuntimeSpecGPU,
@@ -113,6 +115,7 @@ import {
   type InstanceForm,
 } from './shared/runtimeInstances';
 import { minRealtimeWarning } from './shared/audioMetrics';
+import { runtimeRowPlan, startInstanceLimit } from './shared/runtimeActions';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
@@ -586,6 +589,12 @@ function narrowReportConfig(config: unknown): ReportConfig {
     out.unrecognised = true;
   }
   return out;
+}
+
+// The busy key of a live-status Start or Stop: a start is the spec's (the
+// gateway picks the instance), a stop the instance's.
+function runtimeActionKey(action: 'start' | 'stop', row: RuntimeStatus): string {
+  return action === 'start' ? `start:${row.spec_id}` : `stop:${row.spec_id}#${instanceIndex(row)}`;
 }
 
 // The override actions' PUT body. putRuntimeSpec takes the ENTIRE spec
@@ -1308,6 +1317,9 @@ export function RuntimeAdminSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    // The live-status Start and Stop: transient, nothing is written.
+    | 'startRuntime'
+    | 'stopRuntime'
     // T3: the live-status tab's per-row log view.
     | 'subscribeRuntimeLogs'
     // Task 21 (server limits): the process-limit field is saved
@@ -1547,7 +1559,7 @@ export function RuntimeAdminSection({
    *    save's spec PUT failing) permanently discarded an earlier
    *    abandoned-then-successful write, leaving the cache at `admin_state: ''`
    *    while the server held `force_stopped`. That is precisely the N1 defect,
-   *    back again: the row then offers Force start / Force stop / Restart and
+   *    back again: the row then offers Pin / Restart and
    *    NO Clear override while the model is admission-blocked, with the write
    *    timeout notice on screen telling the operator to clear by hand an
    *    override the row denies exists. A failure must NOT retire its ticket by
@@ -1622,7 +1634,7 @@ export function RuntimeAdminSection({
    *
    * The issue counter only catches writes STARTED after the read started, and
    * a write already in flight when the read starts is invisible to it -- the
-   * mirror image of C2, and the same poison: Force stop takes ticket 1, the
+   * mirror image of C2, and the same poison: an override write takes ticket 1, the
    * operator switches tab (never disabled) and hits Edit, the PUT commits
    * `force_stopped`, and the GET lands with `issued(1) === seen(1)` and writes
    * its pre-PUT snapshot over it. Snapshotting `committed` refuses that: the
@@ -2151,8 +2163,16 @@ export function RuntimeAdminSection({
     title: string;
     allInstances: boolean;
     instances: number[];
+    initialTab: number;
   } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
+  // The live-status Start and Stop requests in flight, keyed per action and
+  // row (runtimeActionKey). Each disables its own button, and a start the
+  // spec's Stop as well; a start or stop writes nothing, so it does not take
+  // the override lock the PUTs share.
+  const [runtimeActionsBusy, setRuntimeActionsBusy] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [restart, setRestart] = useState<RestartFlow | null>(null);
   const [restartNotice, setRestartNotice] = useState<
     'timeout' | 'clear-timeout' | 'vanished' | null
@@ -2339,6 +2359,73 @@ export function RuntimeAdminSection({
     return cachedSpecsRef.current.get(mappingId) ?? emptySpec(mappingId);
   }
 
+  /**
+   * Runs one live-status Start or Stop: marks `key` busy while the request is
+   * in flight, then says what the agent answered, or why it refused, through
+   * the screen's toasts. Bounded by the gateway, which answers a start within
+   * its early-answer window (a longer start answers 202 and goes on in the
+   * background) and bounds a stop's agent call, so it needs no watchdog of
+   * its own.
+   */
+  async function runRuntimeAction(
+    key: string,
+    call: () => Promise<RuntimeActionAnswer>,
+    describe: (answer: RuntimeActionAnswer) => string,
+  ) {
+    setRuntimeActionsBusy((busy) => new Set(busy).add(key));
+    try {
+      const answer = await call();
+      if (mountedRef.current) showSuccess(describe(answer));
+    } catch (err) {
+      if (mountedRef.current) showError(formatPortalError(err, t));
+    } finally {
+      if (mountedRef.current) {
+        setRuntimeActionsBusy((busy) => {
+          const next = new Set(busy);
+          next.delete(key);
+          return next;
+        });
+      }
+    }
+  }
+
+  /**
+   * The name a start's or stop's message gives the instance: the mapping's
+   * gateway name, with the instance index for a replicable spec, whose
+   * instances are told apart by it.
+   */
+  function instanceTargetName(row: RuntimeStatus, spec: RuntimeSpec, k: number): string {
+    const name = gatewayNameFor(row) || row.model || row.spec_id;
+    return spec.replicable || k > 0 ? `${name} #${k}` : name;
+  }
+
+  function startRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec) {
+    void runRuntimeAction(
+      runtimeActionKey('start', row),
+      () => api.startRuntime(spec.mapping_id),
+      (answer) => {
+        const target = instanceTargetName(row, spec, answer.instance);
+        return answer.state === 'starting'
+          ? t.runtimeStartedStarting(target)
+          : t.runtimeStartedRunning(target);
+      },
+    );
+  }
+
+  function stopRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec) {
+    const k = instanceIndex(row);
+    void runRuntimeAction(
+      runtimeActionKey('stop', row),
+      () => api.stopRuntime(spec.mapping_id, k),
+      (answer) => {
+        const target = instanceTargetName(row, spec, answer.instance);
+        return answer.state === 'stopped'
+          ? t.runtimeStopStopped(target)
+          : t.runtimeStopStopping(target);
+      },
+    );
+  }
+
   async function setOverride(spec: RuntimeSpec, adminState: string) {
     // A timeout/aborted notice tells the operator an override was left in
     // place; acting on any override is exactly the moment it stops being
@@ -2385,7 +2472,7 @@ export function RuntimeAdminSection({
       // server truth with no user-visible side effect of its own, and the
       // server has just told us what it now holds. Behind the token, a write
       // abandoned by its watchdog that then resolved left the cache stale
-      // forever: the row kept `admin_state: ''`, so it offered Force stop and
+      // forever: the row kept `admin_state: ''`, so it offered Pin and
       // Restart and NO Clear override, while the server actually held
       // force_stopped -- and the timeout notice was simultaneously telling the
       // operator to clear an override by hand that the row denied existed.
@@ -4197,6 +4284,8 @@ export function RuntimeAdminSection({
             // stream lists for the spec now, and grow with every instance its
             // log entries name while it is open.
             instances: logInstanceIndexes(statusRows, row.spec_id),
+            // It opens on the tab of the instance whose row was clicked.
+            initialTab: instanceIndex(row),
           }),
       },
     ];
@@ -4211,29 +4300,69 @@ export function RuntimeAdminSection({
     // buttons rather than synthesizing a full-document body that would
     // overwrite the operator's command line.
     if (spec === undefined) return actions;
-    // Every override acts on the whole spec, all of its instances at once, so
-    // it is offered once, on the row that speaks for the spec: a Force stop
-    // beside instance 1 would read as stopping instance 1 alone.
+    // Start, Stop and Pin, on the rows runtimeRowPlan puts them on: Start and
+    // Pin on the row that speaks for the spec, Stop on its highest running or
+    // starting instance. Start and Stop act once and write nothing; Pin sets
+    // the persistent override through the same full-spec PUT as Clear
+    // override. All of them wait while a restart or an override write runs:
+    // the restart drives admin_state itself, and a start under its
+    // force_stopped would only be refused.
+    const plan = runtimeRowPlan(row, spec, statusRows, agentFeatures);
+    if (plan.start) {
+      const startKey = runtimeActionKey('start', row);
+      let startTitle: string | undefined;
+      if (plan.start.disabled === 'feature') startTitle = t.runtimeStartFeatureMissing;
+      else if (plan.start.disabled === 'force_stopped') startTitle = t.runtimeStartForceStopped;
+      else if (plan.start.disabled === 'max_instances') {
+        startTitle = t.runtimeStartMaxInstances(startInstanceLimit(spec));
+      } else if (plan.start.more) startTitle = t.runtimeStartMore;
+      actions.push({
+        key: 'start',
+        label: t.runtimeStart,
+        icon: <PlayArrowIcon fontSize="small" />,
+        disabled:
+          plan.start.disabled !== undefined || overridesLocked || runtimeActionsBusy.has(startKey),
+        title: startTitle,
+        onClick: () => startRuntimeInstance(row, spec),
+      });
+    }
+    if (plan.stop) {
+      const stopKey = runtimeActionKey('stop', row);
+      let stopTitle: string | undefined;
+      if (plan.stop.disabled === 'feature') stopTitle = t.runtimeStopFeatureMissing;
+      else if (plan.stop.disabled === 'protected') stopTitle = t.runtimeStopProtected;
+      else if (plan.stop.disabled === 'draining') stopTitle = t.runtimeStopHigherDraining;
+      actions.push({
+        key: 'stop',
+        label: t.runtimeStop,
+        icon: <StopIcon fontSize="small" />,
+        // It also waits while a Start of the spec is in flight: the agent
+        // answers a stop of the instance that start is waiting on by failing
+        // the start, which would then read as a refusal for lack of room.
+        disabled:
+          plan.stop.disabled !== undefined ||
+          overridesLocked ||
+          runtimeActionsBusy.has(stopKey) ||
+          runtimeActionsBusy.has(runtimeActionKey('start', row)),
+        title: stopTitle,
+        onClick: () => stopRuntimeInstance(row, spec),
+      });
+    }
+    const pin = plan.pin;
+    if (pin) {
+      actions.push({
+        key: 'pin',
+        label: pin === 'force_running' ? t.runtimePinRunning : t.runtimePinStopped,
+        icon: <PushPinIcon fontSize="small" />,
+        disabled: overridesLocked,
+        onClick: () => void setOverride(spec, pin),
+      });
+    }
+    // Clear override and Restart act on the whole spec, all of its instances
+    // at once, so they are offered once, on the row that speaks for the spec:
+    // a Restart beside instance 1 would read as restarting instance 1 alone.
     const primary = statusBySpecId.get(row.spec_id);
     if (primary === undefined || instanceIndex(primary) !== instanceIndex(row)) return actions;
-    if (spec.admin_state !== 'force_running') {
-      actions.push({
-        key: 'force-start',
-        label: t.runtimeForceStart,
-        icon: <PlayArrowIcon fontSize="small" />,
-        disabled: overridesLocked,
-        onClick: () => void setOverride(spec, 'force_running'),
-      });
-    }
-    if (spec.admin_state !== 'force_stopped') {
-      actions.push({
-        key: 'force-stop',
-        label: t.runtimeForceStop,
-        icon: <StopIcon fontSize="small" />,
-        disabled: overridesLocked,
-        onClick: () => void setOverride(spec, 'force_stopped'),
-      });
-    }
     if (spec.admin_state !== '') {
       actions.push({
         key: 'clear-override',
@@ -4273,8 +4402,8 @@ export function RuntimeAdminSection({
         // leave the model admission-blocked behind a force_stopped override.
         // Kept VISIBLE rather than hidden -- the row's own state is the
         // explanation, and an action that silently comes and goes reads like
-        // a portal bug -- but never clickable there. `force_running`, offered
-        // above, is the action that does something on those three.
+        // a portal bug -- but never clickable there. Start, offered above, is
+        // the action that does something on those three.
         disabled: overridesLocked || restartBlocked,
         // …and SAY so on hover (restartTitle).
         title: restartTitle,
@@ -5952,6 +6081,9 @@ export function RuntimeAdminSection({
               // fold them into one row.
               rowKey={(row) => `${row.spec_id}#${instanceIndex(row)}`}
               actions={statusActions}
+              // The primary row of a replicable spec carries five: Logs,
+              // Start, Stop, Pin and Restart. Kept inline, one click each.
+              maxInlineActions={5}
               storageKey="op.runtimeStatus"
               minWidth={980}
               // "Nothing is running" and "we cannot see what is running" are
@@ -5989,6 +6121,7 @@ export function RuntimeAdminSection({
           title={logSpec.title}
           allInstances={logSpec.allInstances}
           instances={logSpec.instances}
+          initialTab={logSpec.initialTab}
         />
       )}
     </>

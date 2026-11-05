@@ -1549,6 +1549,8 @@ func (o *owner) handle(cmd command) {
 		c.reply <- o.snapshotStatus()
 	case cmdLoadedModels:
 		c.reply <- o.loadedModels()
+	case cmdStop:
+		c.reply <- o.stopInstance(c.model)
 	case cmdResolve:
 		_, base, k, ok := o.resolveAddress(c.model)
 		c.reply <- resolvedAddress{base: base, k: k, ok: ok}

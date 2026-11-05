@@ -367,6 +367,8 @@ function baseServerListApi(): ServerListApi {
     subscribeBenchmark: vi.fn(() => () => {}),
     subscribeRuntimeStatus: vi.fn(() => () => {}),
     subscribeRuntimeLogs: vi.fn(() => () => {}),
+    startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
+    stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     subscribeServerPerf: vi.fn(() => () => {}),
     syncApplicationModels: vi.fn(async () => ({
       added: 0,

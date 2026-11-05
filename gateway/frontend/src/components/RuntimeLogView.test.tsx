@@ -510,9 +510,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // --- per-instance tabs ---------------------------------------------------
     //
     // Every instance of a replicable spec writes into the spec's one buffer, and
-    // each entry names its instance. "All" shows the interleaved history exactly
-    // as it arrives, [#k] prefixes included; one tab per instance shows that
-    // instance's output alone, the prefix the agent put there removed.
+    // each entry names its instance. "All" shows the interleaved history as it
+    // arrives, [#k] prefixes included and instance 0's lines marked [#0]; one tab
+    // per instance shows that instance's output alone, the prefix the agent put
+    // there removed.
 
     const tabNames = () => screen.queryAllByRole('tab').map((tab) => tab.textContent);
     const logText = () => screen.getByRole('log').textContent ?? '';
@@ -572,7 +573,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         ],
       });
 
-      // All: unchanged, prefixes and every instance's markers included.
+      // All: the agent's prefixes and every instance's markers included.
       expect(logText()).toContain('zero says hi');
       expect(logText()).toContain('[#1] first\n[#1] second\n');
       expect(logText()).toContain(t.runtimeLogsProcessStarted(100));
@@ -619,6 +620,65 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       selectTab(t.runtimeLogsTabInstance(2));
       expect(logText()).toContain('head [#2] literal\nnext line\n');
       expect(logText()).not.toContain('interleaved zero');
+    });
+
+    it('prefixes the lines of instance 0 with [#0] in All, opening each line once, and not in its tab', () => {
+      // The agent writes instance 0's bytes unprefixed. Beside the [#k] lines of
+      // the others, All marks them [#0], tracking the line state the way the
+      // agent's own prefixing does.
+      const h = renderLogView(true, [0, 1]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'started', pid: 100 },
+          { text: 'zero a\nzero b ' },
+          { text: '[#1] one\n', instance: 1 },
+          // Continues instance 0's open line: no prefix on its first line.
+          { text: 'continued\nzero c\n' },
+          { text: 'half ' },
+          // A gap may have ended the line: the next chunk opens one.
+          { dropped_bytes: 50 },
+          { text: 'after gap\n' },
+          { text: 'open ' },
+          // A generation marker opens a new line too.
+          { event: 'exited', exit_code: 1 },
+          { event: 'started', pid: 101 },
+        ],
+      });
+      // A blank line is a line; the empty piece after the final newline is not.
+      h.batch({ spec_id: 'spec-a', entries: [{ text: 'next gen\n\n' }] });
+
+      expect(logText()).toContain('[#0] zero a\n[#0] zero b [#1] one\ncontinued\n[#0] zero c\n');
+      expect(logText()).toContain(`[#0] half \n${t.runtimeLogsDropped(50)}\n[#0] after gap\n`);
+      expect(logText()).toContain('[#0] open ');
+      expect(logText()).toMatch(/\[#0\] next gen\n\[#0\] \n$/);
+      // Markers and gap notices are the portal's own text, never prefixed.
+      expect(logText()).not.toContain('[#0] ──');
+      expect(logText()).not.toContain(`[#0] ${t.runtimeLogsDropped(50)}`);
+
+      selectTab(t.runtimeLogsTabInstance(0));
+      expect(logText()).not.toContain('[#0]');
+      expect(logText()).toContain('zero a\nzero b continued\nzero c\nhalf ');
+      expect(logText()).toMatch(/next gen\n\n$/);
+
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(logText()).toContain('one\n');
+      expect(logText()).not.toContain('[#');
+    });
+
+    it('adds no [#0] prefix for a spec whose view shows no tabs', () => {
+      const h = renderLogView(false, [0]);
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ event: 'started', pid: 7 }, { text: 'plain output\nsecond line\n' }],
+      });
+      expect(screen.queryAllByRole('tab')).toHaveLength(0);
+      expect(logText()).toContain('plain output\nsecond line\n');
+      expect(logText()).not.toContain('[#0]');
     });
 
     it('shows every gap in every tab, because a gap cannot be attributed to an instance', () => {
@@ -737,6 +797,67 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
       view.rerender(<RuntimeLogView open={false} {...props} />);
       view.rerender(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabAll })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+    });
+
+    it("opens on the opening row's instance tab every time, whichever tab was selected when it closed", () => {
+      const api = { subscribeRuntimeLogs: vi.fn(() => () => {}) };
+      const props = {
+        onClose: () => {},
+        api,
+        t,
+        serverId: 'srv-1',
+        specId: 'spec-a',
+        title: 'qwen-coder',
+        allInstances: true,
+        instances: [0, 1, 2],
+        initialTab: 1,
+      };
+      const view = render(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabInstance(1) })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      selectTab(t.runtimeLogsTabAll);
+      view.rerender(<RuntimeLogView open={false} {...props} />);
+      view.rerender(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabInstance(1) })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+    });
+
+    it('opens a single-instance spec on All, so All is selected once the stream names a further instance', () => {
+      // No tabs at opening: the opening row's instance tab falls back to All,
+      // and stays there when tabs appear later, rather than jumping to it.
+      let pushBatch: (batch: RuntimeLogBatch) => void = () => {};
+      const api = {
+        subscribeRuntimeLogs: vi.fn(
+          (_serverId: string, _specId: string, onBatch: (batch: RuntimeLogBatch) => void) => {
+            pushBatch = onBatch;
+            return () => {};
+          },
+        ),
+      };
+      render(
+        <RuntimeLogView
+          open
+          onClose={() => {}}
+          api={api}
+          t={t}
+          serverId="srv-1"
+          specId="spec-a"
+          title="qwen-coder"
+          instances={[0]}
+          initialTab={0}
+        />,
+      );
+      expect(screen.queryAllByRole('tab')).toHaveLength(0);
+
+      act(() => pushBatch({ spec_id: 'spec-a', entries: [{ text: '[#3] three\n', instance: 3 }] }));
       expect(screen.getByRole('tab', { name: t.runtimeLogsTabAll })).toHaveAttribute(
         'aria-selected',
         'true',

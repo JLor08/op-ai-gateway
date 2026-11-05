@@ -233,6 +233,18 @@ func (_d *APIWithTracing) AuthorizeRunAsToken(ctx context.Context, t1 auth.Token
 	return _d.API.AuthorizeRunAsToken(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) AuthorizeRuntimeAction(ctx context.Context, t1 auth.Token, s1 string) (r1 RuntimeActionScope, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeRuntimeAction")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AuthorizeRuntimeAction(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) AuthorizeServerManage(ctx context.Context, t1 auth.Token, s1 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeServerManage")
 	defer span.End()
@@ -391,6 +403,18 @@ func (_d *APIWithTracing) CommitAssistant(ctx context.Context, t1 auth.Token, s1
 		}
 	}()
 	return _d.API.CommitAssistant(ctx, t1, s1, a1, s2)
+}
+
+func (_d *APIWithTracing) CommitVoiceTurn(ctx context.Context, t1 auth.Token, s1 string, s2 string, a1 AssistantTurn, s3 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CommitVoiceTurn")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.CommitVoiceTurn(ctx, t1, s1, s2, a1, s3)
 }
 
 func (_d *APIWithTracing) CompleteVendorAccountConnect(ctx context.Context, t1 auth.Token, s1 string, s2 string) (v1 VendorAccountDTO, err error) {
@@ -2704,4 +2728,16 @@ func (_d *APIWithTracing) VisionProbeMode(ctx context.Context) (s1 string) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VisionProbeMode")
 	defer span.End()
 	return _d.API.VisionProbeMode(ctx)
+}
+
+func (_d *APIWithTracing) VoiceRunHistory(ctx context.Context, t1 auth.Token, s1 string, s2 string) (ca1 []ChatAPIMessage, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VoiceRunHistory")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VoiceRunHistory(ctx, t1, s1, s2)
 }

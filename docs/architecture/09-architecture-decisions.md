@@ -11580,3 +11580,71 @@ loopback** (a client could choose an instance and read instance keys back).
 [§10.10](cross-cutting/routing-and-model-selection.md#1010-pinned-requests-on-instances),
 [§4](cross-cutting/routing-and-model-selection.md#4-route-affinity),
 [Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).
+
+## ADR-095 — Manual start and stop are transient, Pin is the persistent override, and a stop goes highest index first, never below the protected floor
+**Context:** the portal's live-status view offered Force start and Force stop on every row, and both wrote the spec's
+`admin_state` — a persistent override that outlives the moment. An operator who wants one more instance now, or one
+fewer, wants the opposite: an action that happens once and leaves the model to its normal idle, eviction and burst
+rules afterwards. With replicable specs
+([ADR-090](#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place)
+to [ADR-092](#adr-092--the-gateway-scales-up-on-parked-demand-and-the-agent-decides-the-fit-the-agent-alone-scales-down))
+a manual start also has to choose an instance, without colliding with the scaler, and a manual stop has to respect
+the order the agent retires instances in.
+
+**Decision — five choices, taken together. No migration; agent 0.17.0 (feature `runtime_stop`).**
+
+- **(a) Play and Stop are transient.** `POST /api/portal/mappings/{id}/runtime/start` asks the agent's ensure route
+  for one instance; `POST /api/portal/mappings/{id}/runtime/stop` asks the agent's new `POST /stop/{model}` route to
+  drain one. Neither writes anything, so demand can start a stopped instance again and an idle started one leaves on
+  its own. Both authorize as the spec PUT and are refused while a benchmark run holds the server, like the PUT.
+- **(b) Pin is the persistent override.** The live view's Pin button writes `force_running` when any instance of the
+  spec is running or starting and `force_stopped` otherwise, through the existing full-spec PUT; Clear override is the
+  unpin. The rows' Force start and Force stop go away; the form keeps all three admin states. A start of a
+  `force_stopped` spec is refused (`409 runtime.admin_stopped`): the agent refuses every start while it is set.
+- **(c) A start picks the instance by the scaler's index rule, with instance 0 included, and shares its claims.**
+  Instance 0 for a spec that is not replicable; for a replicable one the lowest free index — instance 0 while the
+  agent reports it neither starting nor running, else the lowest k ≥ 1 the scaler would pick — below `max_instances`
+  (`409 runtime.max_instances_reached`). The rule and the set of ensures under way are one helper the scaler uses too
+  (`internal/gateway/instance_claims.go`), so the two never ask for one index at the same time. The scaler's
+  performance ceiling, hold-offs and starting-sibling rule do not apply — the start is the operator's explicit choice
+  — but the agent still has the final say: a burst instance starts only into free room, and its
+  `409 runtime.instance_no_capacity` / `runtime.instance_demand_unknown` reach the operator.
+- **(d) A start answers early or hands off.** The ensure runs in the background, bounded by the spec's startup
+  timeout plus 10 s and by the gateway's lifetime. The request waits up to 5 s: an agent refusal is answered with
+  its code, a ready instance with `200 {"instance":k,"state":"running"}`, and anything slower with
+  `202 {"instance":k,"state":"starting"}`; the status stream shows the progress, and a failure nobody waits for any
+  more — the window ran out, or the client left — is logged at warn and visible on the row.
+- **(e) A stop goes highest index first and never below the protected floor.** The agent refuses a stop of an
+  instance below `ProtectedCount` — `max(min_instances of a replicable spec, 1 for a pinned or force_running spec)` —
+  with `409 runtime.instance_protected`, because it would restart it at once, and a stop while a higher sibling has a
+  process (starting, running or draining) with `409 runtime.instance_not_highest`; the gateway passes both through.
+  The portal offers Stop only on the highest running or starting instance and shows it disabled, with the way out, on
+  a protected one, and with a reason while a higher instance still drains. A stop needs the
+  agent feature `runtime_stop` (`409 runtime.agent_feature_missing` naming it): an older router hands the bodiless
+  POST to its proxy, which answers `404 runtime.model_not_managed`, indistinguishable from an unknown address.
+
+**Consequence:**
+
+- **A stopped instance can come back at once** when requests are queued on it or demand parks; that is the point of a
+  transient stop, and Pin as stopped is the way to keep a model down.
+- **A stop below the floor has a named way out** — clear the override, lower `min_instances`, untick Pinned, or set
+  the form's admin override to Force stop — instead of a stop the agent would undo.
+- **Start and Stop are the stated exception to
+  [ADR-026](#adr-026--gatewayagent-control-is-desired-state-not-commands)'s desired-state rule.** They persist
+  nothing, so there is no state a reconnect could lose, and they travel as request-scoped calls on the agent's router,
+  like the ensure route
+  ([ADR-046](#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)): the
+  caller gets the answer or the error, never a silently dropped frame. The desired state stays in `admin_state`, which
+  Pin writes.
+- **The claim set is process memory**: a start that the gateway's restart cut short leaves nothing behind, and the
+  agent's status is the truth on the next sample.
+
+**Rejected:** **Keeping Force start/stop as the row actions** (an operator who stops one instance does not mean "never
+again"). **A gateway-side protected-floor check** (the agent owns the floor and the order; a second copy would drift).
+**Starting the next instance from the gateway's own count** (the agent's status plus the shared claim set is what the
+scaler already trusts; a third view would collide). **Holding the request until the start ends** (a model can take
+minutes to load; the status stream already shows the progress).
+→ [Routing & Model Selection §10.4](cross-cutting/routing-and-model-selection.md#104-the-instance-scaler),
+[Agent-Managed Model Runtime §4.1](cross-cutting/agent-runtime-manager.md#41-control-routes) and
+[§5.8](cross-cutting/agent-runtime-manager.md#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor),
+[HTTP API Surface](reference/api-surface.md).

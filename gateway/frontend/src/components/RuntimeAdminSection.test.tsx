@@ -10,6 +10,7 @@ import {
   RuntimeAdminSection,
 } from './RuntimeAdminSection';
 import { ToastProvider } from './shared/ToastProvider';
+import { errorLabelByCode } from './shared/format';
 import { PortalApiError } from '../api/transport';
 import type { PortalApi } from './shared/types';
 import { messages } from '../i18n';
@@ -392,6 +393,10 @@ function renderSection(
     // Pushed synchronously from inside the subscribe call, i.e. exactly like
     // the stream's `snapshot` frame arriving on connect.
     statusRows?: RuntimeStatus[];
+    // The live-status Start and Stop. By default a start answers its instance
+    // running and a stop answers stopping.
+    startRuntime?: PortalApi['startRuntime'];
+    stopRuntime?: PortalApi['stopRuntime'];
   } = {},
 ) {
   const mappings = opts.mappings ?? [];
@@ -616,6 +621,16 @@ function renderSection(
       return { ...serverForTest, id, runtime_max_processes: body.runtime_max_processes };
     }),
     serverHardware: vi.fn(async () => opts.hardware ?? ({ available: false } as HardwareResponse)),
+    startRuntime: vi.fn(
+      opts.startRuntime ?? (async () => ({ instance: 0, state: 'running' as const })),
+    ),
+    stopRuntime: vi.fn(
+      opts.stopRuntime ??
+        (async (_mappingId: string, instance: number) => ({
+          instance,
+          state: 'stopping' as const,
+        })),
+    ),
     // The model-mapping tab reuses `MappingForm`, whose context-size probe polls
     // the server's running benchmarks to gate its button. `activeBenchmarks`
     // must RESOLVE (to an empty list) rather than be absent: a rejection lands
@@ -754,7 +769,7 @@ function renderSection(
  *    name therefore MATCHES the disabled control (Testing Library's role
  *    queries do not filter on `disabled`), and React drops `onClick` on a
  *    disabled `<button>`: the click is swallowed and no confirm dialog opens.
- *  - The live-status row's **override actions** (Force stop / Force start /
+ *  - The live-status row's **write actions** (Start / Stop / Pin /
  *    Clear override / Restart). `statusActions` looks the row up in
  *    `specByRuntimeId`, which is built from `specsById`, and returns only the
  *    log view when there is no entry — so here the control is ABSENT rather
@@ -1538,6 +1553,8 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       benchmarkMapping: vi.fn(async () => idleBenchmark),
       mappingBenchmarks: vi.fn(async () => []),
       subscribeBenchmark: vi.fn(() => () => {}),
+      startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
+      stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     };
 
     render(
@@ -3744,7 +3761,7 @@ describe('RuntimeAdminSection admin overrides', () => {
   // operator's configured command line. Comparing the whole body field by
   // field is the only assertion that can see that; checking admin_state alone
   // cannot.
-  it('force-stop PUTs the loaded spec verbatim with ONLY admin_state changed', async () => {
+  it('Pin PUTs the loaded spec verbatim with ONLY admin_state changed', async () => {
     const spec = fullSpec();
     const { putSpecs, stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
@@ -3754,11 +3771,11 @@ describe('RuntimeAdminSection admin overrides', () => {
     stream.setStatus('open');
     await openStatusTab();
 
-    fireEvent.click(await screen.findByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimePinRunning }));
 
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].mappingId).toBe('map_1');
-    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_running'));
   });
 
   it('clear-override PUTs the loaded spec verbatim with admin_state emptied', async () => {
@@ -3795,8 +3812,8 @@ describe('RuntimeAdminSection admin overrides', () => {
     stream.setStatus('open');
     await openStatusTab();
 
-    await waitForEnabledButton(t.runtimeForceStop);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await waitForEnabledButton(t.runtimePinRunning);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.api_flavors).toEqual([]);
     expect(putSpecs[0].body.responses_mode).toBe('');
@@ -3824,11 +3841,17 @@ describe('RuntimeAdminSection admin overrides', () => {
     stream.setStatus('open');
     await openStatusTab();
 
-    expect(await screen.findByRole('button', { name: t.runtimeForceStart })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-    // Already force_stopped -- forcing it again is a no-op, and a restart
+    expect(await screen.findByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    // Start stays visible, disabled: the gateway refuses every start while
+    // the spec is pinned as stopped.
+    expect(screen.getByRole('button', { name: t.runtimeStart })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+    // An override is already set -- there is nothing to pin, and a restart
     // would silently end with a DIFFERENT override than it started with.
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinStopped })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
   });
 
@@ -3871,7 +3894,9 @@ describe('RuntimeAdminSection admin overrides', () => {
     await openStatusTab();
     await screen.findByText('app-model');
 
-    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    for (const name of [t.runtimeStart, t.runtimeStop, t.runtimePinRunning, t.runtimeRestart]) {
+      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
+    }
     fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
     expect(logs.subscribedSpecIds).toEqual(['spec_1']);
   });
@@ -3888,9 +3913,9 @@ describe('RuntimeAdminSection admin overrides', () => {
     await openStatusTab();
 
     expect(await screen.findByText('orphan')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
+    for (const name of [t.runtimeStart, t.runtimeStop, t.runtimePinRunning, t.runtimeRestart]) {
+      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
+    }
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
   });
 
@@ -3917,7 +3942,9 @@ describe('RuntimeAdminSection admin overrides', () => {
     // the pre-resolution node that the resolved re-render then replaces.
     expect(await screen.findByText('gw-model')).toBeInTheDocument();
     expect(screen.getByText('app-model', { exact: false })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    for (const name of [t.runtimeStop, t.runtimePinRunning, t.runtimeRestart]) {
+      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
+    }
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
   });
 });
@@ -4139,7 +4166,7 @@ describe('RuntimeAdminSection restart sequence', () => {
     fireEvent.click(busyButton);
     // Every other override write is locked too: any admin_state change
     // during the sequence would fight it.
-    expect(screen.getByRole('button', { name: t.runtimeForceStart })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toHaveAttribute(
       'aria-disabled',
       'true',
     );
@@ -4294,33 +4321,33 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
       });
   }
 
-  it('Force stop PUTs the pinned value the server holds, not the cached one', async () => {
+  it('Pin PUTs the pinned value the server holds, not the cached one', async () => {
     const { fakeApi, storedSpecs, putSpecs } = setup();
     await openStatusTab();
-    await waitForEnabledButton(t.runtimeForceStop);
+    await waitForEnabledButton(t.runtimePinRunning);
     // The run has ended and pinned the spec again; the cache still says false.
     storedSpecs.map_1 = fullSpec({ pinned: true });
 
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
 
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.pinned).toBe(true);
-    expect(putSpecs[0].body).toEqual(expectedBody(fullSpec({ pinned: true }), 'force_stopped'));
+    expect(putSpecs[0].body).toEqual(expectedBody(fullSpec({ pinned: true }), 'force_running'));
     expect(fakeApi.runtimeSpec).toHaveBeenLastCalledWith('map_1');
   });
 
-  it('Force stop PUTs nothing when its read fails, says why and releases the lock', async () => {
+  it('Pin PUTs nothing when its read fails, says why and releases the lock', async () => {
     const { fakeApi, putSpecs } = setup();
     await openStatusTab();
-    await waitForEnabledButton(t.runtimeForceStop);
+    await waitForEnabledButton(t.runtimePinRunning);
     fakeApi.runtimeSpec.mockRejectedValueOnce(new Error('runtime spec unavailable'));
 
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
 
     expect(await screen.findByText('runtime spec unavailable')).toBeInTheDocument();
     expect(putSpecs).toHaveLength(0);
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: t.runtimeForceStart })).not.toHaveAttribute(
+      expect(screen.getByRole('button', { name: t.runtimePinRunning })).not.toHaveAttribute(
         'aria-disabled',
       ),
     );
@@ -4328,19 +4355,20 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
 
   // The read is committed to the cache like any other read, so the row shows
   // what it found even when the write it was made for then fails.
-  it('shows what Force stop read even when its write then fails', async () => {
+  it('shows what Pin read even when its write then fails', async () => {
     const { fakeApi, storedSpecs } = setup();
     await openStatusTab();
-    await waitForEnabledButton(t.runtimeForceStop);
+    await waitForEnabledButton(t.runtimePinRunning);
     storedSpecs.map_1 = fullSpec({ pinned: false, admin_state: 'force_running' });
     fakeApi.putRuntimeSpec.mockRejectedValueOnce(new Error('write refused'));
 
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
 
     expect(await screen.findByText('write refused')).toBeInTheDocument();
     expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(1);
     expect(await screen.findByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    // An override is in force now: there is nothing left to pin.
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
   });
 
   // A form save that commits while the read is in flight makes the cache
@@ -4349,7 +4377,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
   // survives. A write takes its cache ticket when it is sent, after its read,
   // so the form save is the older write, and the override's answer, which
   // the server now holds, still becomes the row.
-  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+  it.each(['runtimePinRunning', 'runtimeRestart'] as const)(
     '%s builds on a form save that commits during its read and keeps its answer in the row',
     async (action) => {
       const { fakeApi, putSpecs, storedSpecs } = setup();
@@ -4373,13 +4401,15 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
       // Served before the save, so it still carries the old binary.
       await landRead(fullSpec({ pinned: false }));
       await waitFor(() => expect(putSpecs).toHaveLength(2));
-      expect(putSpecs[1].body).toEqual(expectedBody(saved, 'force_stopped'));
+      // Pin on a running spec pins it running; a restart begins with force_stopped.
+      const written = action === 'runtimeRestart' ? 'force_stopped' : 'force_running';
+      expect(putSpecs[1].body).toEqual(expectedBody(saved, written));
 
       await openStatusTab();
       expect(
         await screen.findByRole('button', { name: t.runtimeClearOverride }),
       ).toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
     },
   );
 
@@ -4389,12 +4419,12 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
   // this section after the save, and an Edit opened and cancelled reads it, so
   // the action whose own read the save made the cache refuse keeps the pin
   // rather than writing the save's `pinned: false` back.
-  it('Force stop builds on a read that committed after the form save, not on the save', async () => {
+  it('Pin builds on a read that committed after the form save, not on the save', async () => {
     const { fakeApi, putSpecs, storedSpecs } = setup();
     await openStatusTab();
-    await waitForEnabledButton(t.runtimeForceStop);
+    await waitForEnabledButton(t.runtimePinRunning);
     const landRead = holdNextSpecRead(fakeApi);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
@@ -4418,7 +4448,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
     // Served before the save, so the cache refuses it.
     await landRead(fullSpec({ pinned: false }));
     await waitFor(() => expect(putSpecs).toHaveLength(2));
-    expect(putSpecs[1].body).toEqual(expectedBody(repinned, 'force_stopped'));
+    expect(putSpecs[1].body).toEqual(expectedBody(repinned, 'force_running'));
     expect(putSpecs[1].body.pinned).toBe(true);
   });
 
@@ -4514,7 +4544,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
   // nothing and ends, whether the DELETE is still in flight when the read
   // lands or has already committed (the cache then holds the unconfigured
   // document, which the action takes over the refused read).
-  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+  it.each(['runtimePinRunning', 'runtimeRestart'] as const)(
     '%s writes nothing while a spec delete confirmed during its read is in flight',
     async (action) => {
       const { fakeApi, putSpecs, deletedSpecIds, storedSpecs } = setup();
@@ -4536,7 +4566,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
     },
   );
 
-  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+  it.each(['runtimePinRunning', 'runtimeRestart'] as const)(
     '%s writes nothing when a spec delete commits during its read',
     async (action) => {
       const { fakeApi, putSpecs, deletedSpecIds, storedSpecs } = setup();
@@ -4561,12 +4591,12 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
 
   // A mapping delete leaves no cache entry at all, which the action reads as
   // the unconfigured document too.
-  it('Force stop writes nothing when the spec and then its mapping are deleted during its read', async () => {
+  it('Pin writes nothing when the spec and then its mapping are deleted during its read', async () => {
     const { fakeApi, putSpecs, deletedSpecIds, deletedMappingIds, storedSpecs } = setup();
     await openStatusTab();
-    await waitForEnabledButton(t.runtimeForceStop);
+    await waitForEnabledButton(t.runtimePinRunning);
     const landRead = holdNextSpecRead(fakeApi);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
     const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
     await settleDelete('ok');
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
@@ -4629,7 +4659,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
 
   // An action whose section unmounts while its read is in flight sends
   // nothing when the read then lands.
-  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+  it.each(['runtimePinRunning', 'runtimeRestart'] as const)(
     '%s sends nothing when the section unmounts during its read',
     async (action) => {
       const { fakeApi, putSpecs, detachSection } = setup();
@@ -4648,7 +4678,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
   // Each read runs inside its write's existing bound. A read that lands after
   // the bound gave the write up sends nothing: the operator has already been
   // told it was abandoned, and the lock is free for another action.
-  it('sends no Force stop whose read landed after the watchdog gave it up', async () => {
+  it('sends no Pin whose read landed after the watchdog gave it up', async () => {
     vi.useFakeTimers();
     try {
       const { fakeApi, putSpecs } = setup();
@@ -4657,7 +4687,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
       });
       fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
       const landRead = holdNextSpecRead(fakeApi);
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
         vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
         await Promise.resolve();
@@ -4816,7 +4846,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     stream.setStatus('open');
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
     expect(await screen.findByText('file-alpha')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
   });
 
@@ -5220,8 +5250,10 @@ describe('RuntimeAdminSection restart-state gate (fix round 1, I1)', () => {
         'aria-disabled',
         'true',
       );
-      // "Force start" is the action that does something on all three.
-      expect(row.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
+      // Start is the action that does something on all three.
+      expect(row.getByRole('button', { name: t.runtimeStart })).not.toHaveAttribute(
+        'aria-disabled',
+      );
     }
   });
 
@@ -5339,7 +5371,7 @@ describe('RuntimeAdminSection failing runtime report (fix round 1, I3)', () => {
     await openStatusTab();
 
     expect(await screen.findByText(t.runtimeModeUnknown)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
   });
 
@@ -5366,7 +5398,7 @@ describe('RuntimeAdminSection failing runtime report (fix round 1, I3)', () => {
     stream.setStatus('open');
     await openStatusTab();
     // The first server resolved: writable, no banner.
-    expect(await screen.findByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: t.runtimePinRunning })).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeModeUnknown)).not.toBeInTheDocument();
 
     rerenderWithServer('srv_other');
@@ -5376,7 +5408,7 @@ describe('RuntimeAdminSection failing runtime report (fix round 1, I3)', () => {
     stream.push([makeStatus({ spec_id: 'spec_1', state: 'running' })]);
 
     expect(await screen.findByText(t.runtimeModeUnknown)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
     // And it must not read as "still loading" either.
     expect(screen.queryByText(t.loading)).not.toBeInTheDocument();
   });
@@ -5401,11 +5433,11 @@ describe('RuntimeAdminSection bounded override writes (fix round 1, M4)', () => 
       });
       fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
       fakeApi.putRuntimeSpec.mockImplementationOnce(() => new Promise<RuntimeSpec>(() => {}));
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
         await Promise.resolve();
       });
-      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toHaveAttribute(
+      expect(screen.getByRole('button', { name: t.runtimePinRunning })).toHaveAttribute(
         'aria-disabled',
         'true',
       );
@@ -5415,7 +5447,9 @@ describe('RuntimeAdminSection bounded override writes (fix round 1, M4)', () => 
         await Promise.resolve();
       });
       expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
+      expect(screen.getByRole('button', { name: t.runtimePinRunning })).not.toHaveAttribute(
+        'aria-disabled',
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -5452,7 +5486,7 @@ describe('RuntimeAdminSection bounded override writes (fix round 1, M4)', () => 
       });
       expect(screen.getByText(t.runtimeRestartClearTimeout)).toBeInTheDocument();
       expect(screen.queryByText(t.runtimeRestartClearing)).not.toBeInTheDocument();
-      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
+      expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeEnabled();
     } finally {
       vi.useRealTimers();
     }
@@ -5464,7 +5498,7 @@ describe('RuntimeAdminSection abandoned writes still refresh the cache (fix roun
   // lock release behind it -- but it also gated `setSpecsById`, which is a
   // CACHE OF SERVER TRUTH. So a write abandoned by its watchdog that then
   // resolved left the row claiming the opposite of the facts: `admin_state:
-  // ''`, i.e. Force stop and Restart offered and NO Clear override, while the
+  // ''`, i.e. Pin and Restart offered and NO Clear override, while the
   // server actually held force_stopped -- with the timeout notice at the same
   // time telling the operator that an override is in effect and must be
   // cleared by hand. The row pointed away from the only action that fixes it.
@@ -5486,7 +5520,7 @@ describe('RuntimeAdminSection abandoned writes still refresh the cache (fix roun
       });
       fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
       fakeApi.putRuntimeSpec.mockImplementationOnce(() => write);
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
         await Promise.resolve();
       });
@@ -5509,7 +5543,7 @@ describe('RuntimeAdminSection abandoned writes still refresh the cache (fix roun
       // told the operator to use it -- so the row has to offer it.
       expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
       // And must no longer offer the write that already happened.
-      expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
       // The user-visible halves stay abandoned: no success toast for a flow
       // the operator has already been told is over.
       expect(screen.queryByText(t.systemSaved)).not.toBeInTheDocument();
@@ -5624,7 +5658,7 @@ describe('RuntimeAdminSection unmount guard (fix round 1)', () => {
     stream.setStatus('open');
     await openStatusTab();
     fakeApi.putRuntimeSpec.mockImplementationOnce(() => write);
-    fireEvent.click(await screen.findByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimePinRunning }));
     await waitFor(() => expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(1));
 
     detachSection();
@@ -5704,7 +5738,7 @@ describe('RuntimeAdminSection status row identity (fix round 1, accepted design 
 
     expect(await screen.findByText(t.runtimeStatusUnresolvedShort)).toBeInTheDocument();
     expect(screen.getByText('orphan')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
   });
 });
 
@@ -5878,7 +5912,7 @@ describe('RuntimeAdminSection failing mappings GET (task 22b, C1 / N3)', () => {
     await waitFor(() => expect(fakeApi.mappings).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('gw-model')).toBeInTheDocument();
     expect(screen.queryByText(t.runtimeMappingsUnavailable)).not.toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: t.runtimePinRunning })).toBeInTheDocument();
   });
 });
 
@@ -5938,7 +5972,7 @@ describe('RuntimeAdminSection overlapping writes to one mapping (task 22b, C6)',
       const { fakeApi, stream } = renderSection({
         mappings: [makeMapping({ id: 'map_1' })],
         specsByMappingId: { map_1: fullSpec() },
-        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+        statusRows: [makeStatus({ spec_id: 'spec_1', state: 'stopped' })],
       });
       stream.setStatus('open');
       await act(async () => {
@@ -5946,9 +5980,9 @@ describe('RuntimeAdminSection overlapping writes to one mapping (task 22b, C6)',
       });
       fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
 
-      // Write A: force_stopped, and it hangs past its watchdog.
+      // Write A: Pin as stopped (force_stopped), and it hangs past its watchdog.
       fakeApi.putRuntimeSpec.mockImplementationOnce(() => first);
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinStopped }));
       await act(async () => {
         await Promise.resolve();
       });
@@ -5958,25 +5992,39 @@ describe('RuntimeAdminSection overlapping writes to one mapping (task 22b, C6)',
       });
       expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
 
-      // Write B on the SAME mapping, issued after A was given up on, and it
-      // resolves normally. The server now holds force_running.
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStart }));
+      // Write B on the SAME mapping, issued after A was given up on, once the
+      // model runs: Pin as running, and it resolves normally. The server now
+      // holds force_running.
+      stream.push([makeStatus({ spec_id: 'spec_1', state: 'running' })]);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+
+      // The model stops (an idle unload, say): under B's force_running the
+      // row's Start is usable, under A's force_stopped it would be refused.
+      stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+      expect(screen.getByRole('button', { name: t.runtimeStart })).not.toHaveAttribute(
+        'aria-disabled',
+      );
 
       // ...and only THEN does A land. Its payload is older than B's and must
-      // not become the cache: the row would offer Force start (a write that
-      // undoes B) and hide Force stop (the write that was already abandoned).
+      // not become the cache: the row would refuse Start as pinned stopped,
+      // which the server no longer holds.
       await act(async () => {
         landFirst(fullSpec({ admin_state: 'force_stopped' }));
         await Promise.resolve();
       });
 
-      expect(screen.getByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.runtimeStart })).not.toHaveAttribute(
+        'aria-disabled',
+      );
+      expect(screen.getByRole('button', { name: t.runtimeStart })).not.toHaveAccessibleDescription(
+        t.runtimeStartForceStopped,
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -6166,17 +6214,18 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     // timeout even when their condition ALREADY holds (measured: 5.01 s at
     // every slowness step, including 0). Hence real timers here, fake ones
     // below.
-    await waitForEnabledButton(t.runtimeForceStop);
+    await waitForEnabledButton(t.runtimePinRunning);
 
     // From here the fake clock, for the 30 s override watchdog. Late enough to
     // be free: the only two timers this component arms are that watchdog and
     // the restart deadline, and both are armed by a click, never at mount.
     vi.useFakeTimers();
     try {
-      // Write A: force_stopped, hangs past its 30 s watchdog. The row unlocks
-      // and the operator is told the outcome is unknown.
+      // Write A: Pin as running (force_running), hangs past its 30 s
+      // watchdog. The row unlocks and the operator is told the outcome is
+      // unknown.
       fakeApi.putRuntimeSpec.mockImplementationOnce(() => first);
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
         await Promise.resolve();
       });
@@ -6197,26 +6246,26 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
       fakeApi.putRuntimeSpec.mockImplementationOnce(() =>
         Promise.reject(new Error('write B failed')),
       );
-      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
         await Promise.resolve();
       });
 
-      // ...and only now does A land, having actually stored force_stopped.
+      // ...and only now does A land, having actually stored force_running.
       await act(async () => {
-        landFirst(fullSpec({ admin_state: 'force_stopped' }));
+        landFirst(fullSpec({ admin_state: 'force_running' }));
         await Promise.resolve();
         await Promise.resolve();
       });
 
-      // The row has to follow the server, or it offers Force stop / Force start
-      // / Restart and NO Clear override while the model is admission-blocked --
-      // with the write-timeout notice on screen telling the operator to clear
-      // by hand an override the row denies exists.
+      // The row has to follow the server, or it offers Pin / Restart and NO
+      // Clear override for the override the server now holds -- with the
+      // write-timeout notice on screen telling the operator to clear by hand
+      // an override the row denies exists.
       expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
       // The user-visible half stays abandoned: no success toast for a write the
       // operator was already told had been given up on.
       expect(screen.queryByText(t.systemSaved)).not.toBeInTheDocument();
@@ -6250,8 +6299,8 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     // this row's per-row spec GET -- and the override actions are rendered
     // only once that GET has landed. Measured without this gate: 4/5 runs
     // failed with `Unable to find ... "Stopp erzwingen"` at slowness step 5.
-    await waitForEnabledButton(t.runtimeForceStop);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await waitForEnabledButton(t.runtimePinRunning);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
     await act(async () => {
       await Promise.resolve();
     });
@@ -6283,14 +6332,14 @@ describe('RuntimeAdminSection ticket compares against the last COMMITTED write (
     // Now the override write lands. Its run token was never bumped, so it
     // toasts success -- and the row must agree with that toast.
     await act(async () => {
-      landOverride(fullSpec({ admin_state: 'force_stopped' }));
+      landOverride(fullSpec({ admin_state: 'force_running' }));
       await Promise.resolve();
       await Promise.resolve();
     });
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
     expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
   });
 });
 
@@ -6333,8 +6382,8 @@ describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', ()
     // is slow in this test), and it usually has; measured without the gate,
     // 1/5 runs still failed with `Unable to find ... "Stopp erzwingen"` at
     // slowness step 5. "Usually" is what this whole change is about.
-    await waitForEnabledButton(t.runtimeForceStop);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await waitForEnabledButton(t.runtimePinRunning);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -6355,7 +6404,7 @@ describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', ()
 
     // The CACHE, though, must still hold the override the server actually has.
     expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
   });
 });
 
@@ -6389,11 +6438,11 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
       await Promise.resolve();
     });
 
-    // 1. Force stop. Its ticket is ISSUED and the PUT is outstanding, so
+    // 1. Pin. Its ticket is ISSUED and the PUT is outstanding, so
     //    `overrideBusy` locks the status table -- and only the status table.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
     fakeApi.putRuntimeSpec.mockImplementationOnce(() => put);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
     await act(async () => {
       await Promise.resolve();
     });
@@ -6432,10 +6481,10 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
 
     // The CACHE must still hold what the server acknowledged. Otherwise the row
-    // offers Force stop on an already-force-stopped model and denies the Clear
+    // offers Pin on an already-pinned model and denies the Clear
     // override that is the only way out of it.
     expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
   });
 
   // The other half of the same one-word change, and the mirror of C1 for
@@ -6481,7 +6530,7 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
     fakeApi.putRuntimeSpec.mockImplementationOnce(() =>
       Promise.reject(new Error('override failed')),
     );
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimePinRunning }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -6503,7 +6552,7 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
     // the Clear override that is the only way out of a force_running.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
     expect(screen.getByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
   });
 });
 
@@ -6568,7 +6617,7 @@ describe('RuntimeAdminSection failing mappings RELOAD (fix round 1, C4)', () => 
     // Resolved and unresolved row side by side, both named.
     expect(await screen.findByText('gw-model')).toBeInTheDocument();
     expect(screen.getByText(t.runtimeStatusUnresolvedShort)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: t.runtimeForceStop })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.runtimePinRunning })).toBeInTheDocument();
 
     // The language switch: `t` is a dep of every loader here, so this re-runs
     // the mappings GET with the component mounted -- and it fails, leaving the
@@ -6583,7 +6632,7 @@ describe('RuntimeAdminSection failing mappings RELOAD (fix round 1, C4)', () => 
     // The row still resolves and still offers its overrides, so a banner
     // claiming otherwise would be the misleading half.
     expect(screen.getByText('gw-model')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: en.runtimeForceStop })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: en.runtimePinRunning })).toBeInTheDocument();
     // ...and the genuinely unmatched row keeps its marker rather than going
     // quietly blank.
     expect(screen.getByText(en.runtimeStatusUnresolvedShort)).toBeInTheDocument();
@@ -6652,7 +6701,7 @@ describe('RuntimeAdminSection mapping delete takes a ticket (fix round 1, M5)', 
     // a row `mappingForStatus` can no longer even name.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
     expect(screen.getByText('orphan-model')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeRestart })).not.toBeInTheDocument();
   });
 });
@@ -10309,11 +10358,11 @@ describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, (
       stream.setStatus('open');
       await openStatusTab();
 
-      fireEvent.click(await screen.findByRole('button', { name: t.runtimeForceStop }));
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimePinRunning }));
 
       await waitFor(() => expect(putSpecs).toHaveLength(1));
       expect(putSpecs[0].body.config_files).toEqual(filesOnTheServer);
-      expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
+      expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_running'));
     });
   });
 
@@ -11090,23 +11139,26 @@ describe('RuntimeAdminSection per-instance live status', () => {
     expect(screen.getByTitle(t.runtimeStatusNameMismatch)).toBeInTheDocument();
   });
 
-  // The overrides act on the whole spec, every instance at once, so a Force
-  // stop beside instance 1 would read as stopping instance 1 alone.
-  it('offers the spec-wide overrides once, on instance 0, and only the log view on another instance', async () => {
+  // The overrides act on the whole spec, every instance at once, so Pin and
+  // Restart are offered once, on instance 0: beside instance 1 they would read
+  // as acting on instance 1 alone. Stop is the exception, since it does act on
+  // one instance: it sits on the highest running one.
+  it('offers the spec-wide overrides once, on instance 0, and Stop on the highest instance', async () => {
     renderInstances([instanceRow(0), instanceRow(1)]);
     await openStatusTab();
 
     await waitFor(() =>
-      expect(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop })).toBeEnabled(),
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimePinRunning })).toBeEnabled(),
     );
     expect(inRowWith('4100').getByRole('button', { name: t.runtimeRestart })).toBeInTheDocument();
+    expect(
+      inRowWith('4100').queryByRole('button', { name: t.runtimeStop }),
+    ).not.toBeInTheDocument();
     expect(inRowWith('4101').getByRole('button', { name: t.runtimeLogs })).toBeInTheDocument();
-    expect(
-      inRowWith('4101').queryByRole('button', { name: t.runtimeForceStop }),
-    ).not.toBeInTheDocument();
-    expect(
-      inRowWith('4101').queryByRole('button', { name: t.runtimeRestart }),
-    ).not.toBeInTheDocument();
+    expect(inRowWith('4101').getByRole('button', { name: t.runtimeStop })).toBeInTheDocument();
+    for (const name of [t.runtimePinRunning, t.runtimeRestart, t.runtimeStart]) {
+      expect(inRowWith('4101').queryByRole('button', { name })).not.toBeInTheDocument();
+    }
   });
 
   // Under force_stopped every instance drains at once, so they stop in any
@@ -11284,6 +11336,20 @@ describe('RuntimeAdminSection per-instance live status', () => {
     ]);
   });
 
+  it("opens the log view on the tab of the instance whose row's button was clicked", async () => {
+    renderInstances([instanceRow(0), instanceRow(1), instanceRow(2)]);
+    await openStatusTab();
+    await screen.findByText('4102');
+
+    fireEvent.click(inRowWith('4102').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('tab', { name: t.runtimeLogsTabInstance(2) })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+
   it('says nothing about instances in the log view of a spec that does not opt in', async () => {
     renderInstances([instanceRow(0)], fullSpec({ listen_port: 0 }));
     await openStatusTab();
@@ -11313,7 +11379,7 @@ describe('RuntimeAdminSection per-instance live status', () => {
   });
 
   // The override actions build their PUT from the loaded spec: a replicable
-  // spec's instance settings must ride along verbatim, or a Force stop would
+  // spec's instance settings must ride along verbatim, or a Pin would
   // silently turn a spec of several instances back into one.
   it("replays a replicable spec's instance settings on an override click", async () => {
     const spec = replicableSpec({
@@ -11326,19 +11392,627 @@ describe('RuntimeAdminSection per-instance live status', () => {
     const { putSpecs } = renderInstances([instanceRow(0), instanceRow(1)], spec);
     await openStatusTab();
     await waitFor(() =>
-      expect(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop })).toBeEnabled(),
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimePinRunning })).toBeEnabled(),
     );
 
-    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeForceStop }));
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimePinRunning }));
 
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body).toMatchObject({
-      admin_state: 'force_stopped',
+      admin_state: 'force_running',
       replicable: true,
       min_instances: 2,
       max_instances: 5,
       instance_parallelism: 3,
     });
-    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
+    expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_running'));
+  });
+});
+
+describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
+  // An agent that declares what Start and Stop need: the default report
+  // declares nothing.
+  const stopReport = makeReport({
+    agent_features: ['runtime_manager', 'runtime_ensure', 'runtime_instances', 'runtime_stop'],
+  });
+
+  function instanceRow(instance: number, overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
+    return makeStatus({
+      spec_id: 'spec_1',
+      instance,
+      model: instance === 0 ? 'app-model' : `app-model#${instance}`,
+      pid: 4100 + instance,
+      ...overrides,
+    });
+  }
+
+  function renderActions(
+    statusRows: RuntimeStatus[],
+    spec: RuntimeSpec,
+    extra: Partial<Parameters<typeof renderSection>[0]> = {},
+  ) {
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: { map_1: spec },
+      statusRows,
+      report: stopReport,
+      ...extra,
+    });
+    handles.stream.setStatus('open');
+    return handles;
+  }
+
+  // A spec that keeps nothing up: not pinned, no override, not replicable.
+  const single = () => fullSpec({ pinned: false });
+  const replicable = (overrides: Partial<RuntimeSpec> = {}) =>
+    fullSpec({
+      pinned: false,
+      listen_port: 0,
+      replicable: true,
+      min_instances: 0,
+      max_instances: 4,
+      ...overrides,
+    });
+
+  // The spec's rows have settled once the log view's neighbours rendered: the
+  // per-mapping spec GET lands after the first paint.
+  async function waitForRowActions(rowText: string, name: string) {
+    // An inline action marks itself disabled with aria-disabled (IconAction),
+    // which toBeEnabled does not read.
+    await waitFor(() =>
+      expect(inRowWith(rowText).getByRole('button', { name })).not.toHaveAttribute('aria-disabled'),
+    );
+  }
+
+  it('offers Start and Pin as stopped on a stopped single instance, and no Stop', async () => {
+    renderActions([instanceRow(0, { state: 'stopped' })], single());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    const row = inRowWith('4100');
+    expect(row.getByRole('button', { name: t.runtimeLogs })).toBeInTheDocument();
+    expect(row.getByRole('button', { name: t.runtimePinStopped })).not.toHaveAttribute(
+      'aria-disabled',
+    );
+    expect(row.queryByRole('button', { name: t.runtimeStop })).not.toBeInTheDocument();
+    expect(row.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
+    // The persistent row overrides are gone; Pin and Clear override replace them.
+    expect(row.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+    expect(row.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+  });
+
+  it('offers Stop and Pin as running on a running single instance, and no Start', async () => {
+    renderActions([instanceRow(0)], single());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStop);
+
+    const row = inRowWith('4100');
+    expect(row.getByRole('button', { name: t.runtimePinRunning })).not.toHaveAttribute(
+      'aria-disabled',
+    );
+    expect(row.queryByRole('button', { name: t.runtimeStart })).not.toBeInTheDocument();
+    expect(row.queryByRole('button', { name: t.runtimePinStopped })).not.toBeInTheDocument();
+    expect(row.getByRole('button', { name: t.runtimeRestart })).toBeInTheDocument();
+  });
+
+  it('treats a starting single instance as live: Stop, no Start', async () => {
+    renderActions([instanceRow(0, { state: 'starting' })], single());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStop);
+    expect(
+      inRowWith('4100').queryByRole('button', { name: t.runtimeStart }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('Start POSTs the mapping and says the instance runs', async () => {
+    const { fakeApi, putSpecs } = renderActions([instanceRow(0, { state: 'stopped' })], single());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+
+    await waitFor(() => expect(fakeApi.startRuntime).toHaveBeenCalledTimes(1));
+    expect(fakeApi.startRuntime).toHaveBeenCalledWith('map_1');
+    expect(await screen.findByText(t.runtimeStartedRunning('Alpha'))).toBeInTheDocument();
+    // Transient: nothing is written to the spec.
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('a 202 starting says the instance is starting and the rows show its progress', async () => {
+    renderActions([instanceRow(0), instanceRow(1)], replicable(), {
+      startRuntime: async () => ({ instance: 2, state: 'starting' }),
+    });
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+
+    expect(await screen.findByText(t.runtimeStartedStarting('Alpha #2'))).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeStartedRunning('Alpha #2'))).not.toBeInTheDocument();
+  });
+
+  it('Stop POSTs the mapping and the instance index and says it is stopping', async () => {
+    const { fakeApi, putSpecs } = renderActions([instanceRow(0)], single());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStop);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStop }));
+
+    await waitFor(() => expect(fakeApi.stopRuntime).toHaveBeenCalledTimes(1));
+    expect(fakeApi.stopRuntime).toHaveBeenCalledWith('map_1', 0);
+    expect(await screen.findByText(t.runtimeStopStopping('Alpha'))).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('says an instance that has no process is already stopped', async () => {
+    renderActions([instanceRow(0)], single(), {
+      stopRuntime: async (_m, instance) => ({ instance, state: 'stopped' }),
+    });
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStop);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStop }));
+
+    expect(await screen.findByText(t.runtimeStopStopped('Alpha'))).toBeInTheDocument();
+  });
+
+  it('keeps Start on the primary row of a replicable spec, Stop on the highest instance only', async () => {
+    const { fakeApi } = renderActions(
+      [instanceRow(0), instanceRow(1), instanceRow(2, { state: 'starting' })],
+      replicable(),
+    );
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    const primary = inRowWith('4100');
+    // Its hover says it starts one more instance.
+    expect(primary.getByRole('button', { name: t.runtimeStart })).toHaveAccessibleDescription(
+      t.runtimeStartMore,
+    );
+    expect(primary.queryByRole('button', { name: t.runtimeStop })).not.toBeInTheDocument();
+    expect(primary.getByRole('button', { name: t.runtimePinRunning })).toBeInTheDocument();
+
+    // The middle instance carries only the log view.
+    const middle = inRowWith('4101');
+    expect(middle.getAllByRole('button').map((b) => b.getAttribute('aria-label'))).toEqual([
+      t.runtimeLogs,
+    ]);
+
+    const highest = inRowWith('4102');
+    expect(highest.getByRole('button', { name: t.runtimeStop })).not.toHaveAttribute(
+      'aria-disabled',
+    );
+    expect(highest.queryByRole('button', { name: t.runtimeStart })).not.toBeInTheDocument();
+    expect(highest.queryByRole('button', { name: t.runtimePinRunning })).not.toBeInTheDocument();
+
+    fireEvent.click(highest.getByRole('button', { name: t.runtimeStop }));
+    await waitFor(() => expect(fakeApi.stopRuntime).toHaveBeenCalledWith('map_1', 2));
+  });
+
+  it('says nothing on the Start hover of a replicable spec with nothing running', async () => {
+    renderActions([instanceRow(0, { state: 'stopped' })], replicable());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    expect(
+      inRowWith('4100').getByRole('button', { name: t.runtimeStart }),
+    ).not.toHaveAccessibleDescription(t.runtimeStartMore);
+  });
+
+  it('keeps every action of a replicable primary row inline, one click each', async () => {
+    renderActions([instanceRow(0)], replicable());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    expect(
+      inRowWith('4100')
+        .getAllByRole('button')
+        .map((b) => b.getAttribute('aria-label')),
+    ).toEqual([
+      t.runtimeLogs,
+      t.runtimeStart,
+      t.runtimeStop,
+      t.runtimePinRunning,
+      t.runtimeRestart,
+    ]);
+  });
+
+  it('disables Start at max_instances and says why', async () => {
+    const { fakeApi } = renderActions(
+      [instanceRow(0), instanceRow(1)],
+      replicable({ max_instances: 2 }),
+    );
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStart })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const start = inRowWith('4100').getByRole('button', { name: t.runtimeStart });
+    expect(start).toHaveAccessibleDescription(t.runtimeStartMaxInstances(2));
+    fireEvent.click(start);
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+  });
+
+  it('counts an instance that still drains as taken in the max_instances hover', () => {
+    for (const m of [messages.de, messages.en]) {
+      expect(m.runtimeStartMaxInstances(2)).not.toBe(m.runtimeStartMaxInstances(1));
+    }
+    expect(messages.en.runtimeStartMaxInstances(2)).toMatch(/still shutting down/);
+    expect(messages.en.errorRuntimeMaxInstancesReached).toMatch(/still shutting down/);
+    expect(messages.de.runtimeStartMaxInstances(2)).toMatch(/fahren noch herunter/);
+    expect(messages.de.errorRuntimeMaxInstancesReached).toMatch(/fahren noch herunter/);
+  });
+
+  it('disables a Start of one more instance on an agent without runtime_instances', async () => {
+    const { fakeApi } = renderActions([instanceRow(0)], replicable(), {
+      report: makeReport({ agent_features: ['runtime_manager', 'runtime_ensure', 'runtime_stop'] }),
+    });
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStart })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const start = inRowWith('4100').getByRole('button', { name: t.runtimeStart });
+    expect(start).toHaveAccessibleDescription(t.runtimeStartFeatureMissing);
+    fireEvent.click(start);
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+  });
+
+  it('disables Stop on the next instance down while a higher one still drains', async () => {
+    const { fakeApi } = renderActions(
+      [instanceRow(0), instanceRow(1), instanceRow(2, { state: 'draining' })],
+      replicable(),
+    );
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4101').getByRole('button', { name: t.runtimeStop })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const stop = inRowWith('4101').getByRole('button', { name: t.runtimeStop });
+    expect(stop).toHaveAccessibleDescription(t.runtimeStopHigherDraining);
+    fireEvent.click(stop);
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+    expect(
+      inRowWith('4102').queryByRole('button', { name: t.runtimeStop }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('holds Start and Stop while an override write runs', async () => {
+    const { fakeApi } = renderActions([instanceRow(0)], replicable());
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimePinRunning);
+    await waitForRowActions('4100', t.runtimeStart);
+    await waitForRowActions('4100', t.runtimeStop);
+
+    // The Pin's PUT never answers, so the override lock stays on.
+    fakeApi.putRuntimeSpec.mockImplementationOnce(() => new Promise<RuntimeSpec>(() => {}));
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimePinRunning }));
+
+    for (const name of [t.runtimeStart, t.runtimeStop]) {
+      await waitFor(() =>
+        expect(inRowWith('4100').getByRole('button', { name })).toHaveAttribute(
+          'aria-disabled',
+          'true',
+        ),
+      );
+      fireEvent.click(inRowWith('4100').getByRole('button', { name }));
+    }
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+  });
+
+  it('disables Start on a spec pinned as stopped and says to clear the override first', async () => {
+    const { fakeApi } = renderActions(
+      [instanceRow(0, { state: 'stopped' })],
+      fullSpec({ pinned: false, admin_state: 'force_stopped' }),
+    );
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeClearOverride);
+
+    const start = inRowWith('4100').getByRole('button', { name: t.runtimeStart });
+    expect(start).toHaveAttribute('aria-disabled', 'true');
+    expect(start).toHaveAccessibleDescription(t.runtimeStartForceStopped);
+    fireEvent.click(start);
+    expect(fakeApi.startRuntime).not.toHaveBeenCalled();
+    // An override is set: nothing to pin.
+    expect(
+      inRowWith('4100').queryByRole('button', { name: t.runtimePinStopped }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['pinned', fullSpec({ pinned: true })],
+    ['force_running', fullSpec({ pinned: false, admin_state: 'force_running' })],
+  ])('disables Stop on the instance a %s spec keeps up, naming the ways out', async (_, spec) => {
+    const { fakeApi } = renderActions([instanceRow(0)], spec);
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStop })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const stop = inRowWith('4100').getByRole('button', { name: t.runtimeStop });
+    expect(stop).toHaveAccessibleDescription(t.runtimeStopProtected);
+    fireEvent.click(stop);
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+  });
+
+  it('disables Stop on an instance below min_instances, and offers it above', async () => {
+    renderActions([instanceRow(0), instanceRow(1)], replicable({ min_instances: 2 }));
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4101').getByRole('button', { name: t.runtimeStop })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    expect(
+      inRowWith('4101').getByRole('button', { name: t.runtimeStop }),
+    ).toHaveAccessibleDescription(t.runtimeStopProtected);
+  });
+
+  it('names the ways out of a protected instance in both locales', () => {
+    for (const m of [messages.de, messages.en]) {
+      expect(m.runtimeStopProtected).toContain(m.runtimeClearOverride);
+      expect(m.runtimeStopProtected).toContain(m.runtimeSpecMinInstances);
+      // The way to force_stopped there is the form's override select: the row
+      // offers "Pin as running" while the instance runs, never "Pin as stopped".
+      expect(m.runtimeStopProtected).toContain(m.runtimeSpecAdminState);
+      expect(m.runtimeStopProtected).toContain(m.runtimeForceStop);
+      expect(m.runtimeStopProtected).not.toContain(m.runtimePinStopped);
+    }
+    expect(messages.de.runtimeStopProtected).toContain('Angeheftet');
+    expect(messages.en.runtimeStopProtected).toContain('Pinned');
+  });
+
+  it('disables Stop when the agent does not declare runtime_stop', async () => {
+    const { fakeApi } = renderActions([instanceRow(0)], single(), {
+      report: makeReport({ agent_features: ['runtime_manager'] }),
+    });
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStop })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    const stop = inRowWith('4100').getByRole('button', { name: t.runtimeStop });
+    expect(stop).toHaveAccessibleDescription(t.runtimeStopFeatureMissing);
+    fireEvent.click(stop);
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['running', instanceRow(0), 'runtimePinRunning', 'force_running'],
+    ['stopped', instanceRow(0, { state: 'stopped' }), 'runtimePinStopped', 'force_stopped'],
+  ] as const)(
+    'Pin on a %s spec reads %s and writes %s through the full-spec PUT',
+    async (_, statusRow, labelKey, adminState) => {
+      const spec = single();
+      const { putSpecs } = renderActions([statusRow], spec);
+      await openStatusTab();
+      await waitForRowActions('4100', t[labelKey]);
+
+      fireEvent.click(inRowWith('4100').getByRole('button', { name: t[labelKey] }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].mappingId).toBe('map_1');
+      expect(putSpecs[0].body).toEqual(expectedBody(spec, adminState));
+    },
+  );
+
+  it('disables Start while its request is in flight, and enables it again after', async () => {
+    let finish: (v: { instance: number; state: 'running' }) => void = () => {};
+    const { fakeApi } = renderActions([instanceRow(0)], replicable(), {
+      startRuntime: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStart })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+    expect(fakeApi.startRuntime).toHaveBeenCalledTimes(1);
+    // Stop waits too: a stop of the instance the start is waiting on would
+    // fail that start, and its toast would then blame a lack of room. Pin
+    // stays usable.
+    const stop = inRowWith('4100').getByRole('button', { name: t.runtimeStop });
+    expect(stop).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.click(stop);
+    expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+    expect(
+      inRowWith('4100').getByRole('button', { name: t.runtimePinRunning }),
+    ).not.toHaveAttribute('aria-disabled');
+
+    await act(async () => finish({ instance: 1, state: 'running' }));
+    await waitForRowActions('4100', t.runtimeStart);
+    await waitForRowActions('4100', t.runtimeStop);
+  });
+
+  it('disables Stop while its request is in flight', async () => {
+    let finish: (v: { instance: number; state: 'stopping' }) => void = () => {};
+    const { fakeApi } = renderActions([instanceRow(0)], single(), {
+      stopRuntime: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStop);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStop }));
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeStop })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      ),
+    );
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStop }));
+    expect(fakeApi.stopRuntime).toHaveBeenCalledTimes(1);
+
+    await act(async () => finish({ instance: 0, state: 'stopping' }));
+    await waitForRowActions('4100', t.runtimeStop);
+  });
+
+  it.each([
+    [409, 'runtime.admin_stopped'],
+    [409, 'runtime.max_instances_reached'],
+    [409, 'runtime.instance_no_capacity'],
+    [409, 'runtime.instance_demand_unknown'],
+    [409, 'runtime_spec.server_benchmarking'],
+    [404, 'runtime.model_not_managed'],
+    [404, 'runtime_spec.not_found'],
+    [500, 'runtime.action_failed'],
+    [502, 'runtime.start_failed'],
+    [502, 'runtime.not_permitted'],
+    [502, 'runtime.upstream_gone'],
+    [502, 'runtime.agent_error'],
+    [503, 'runtime.agent_unavailable'],
+    [503, 'runtime.admission_blocked'],
+    [504, 'runtime.start_timeout'],
+    [504, 'runtime.agent_timeout'],
+  ] as const)('shows a start refused with %i %s as its translated label', async (status, code) => {
+    renderActions([instanceRow(0, { state: 'stopped' })], single(), {
+      startRuntime: async () => {
+        throw new PortalApiError(status, code, 'raw server text');
+      },
+    });
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStart);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+
+    const label = t[errorLabelByCode[code]!];
+    expect(await screen.findByText(`${code}: ${label}`)).toBeInTheDocument();
+    expect(screen.queryByText(/raw server text/)).not.toBeInTheDocument();
+    // The action is usable again.
+    await waitForRowActions('4100', t.runtimeStart);
+  });
+
+  it.each([
+    [400, 'runtime.instance_invalid'],
+    [409, 'runtime.instance_protected'],
+    [409, 'runtime.instance_not_highest'],
+    [409, 'runtime_spec.server_benchmarking'],
+    [404, 'runtime.model_not_managed'],
+    [502, 'runtime.upstream_gone'],
+    [502, 'runtime.agent_error'],
+    [503, 'runtime.agent_unavailable'],
+    [504, 'runtime.agent_timeout'],
+  ] as const)('shows a stop refused with %i %s as its translated label', async (status, code) => {
+    renderActions([instanceRow(0)], single(), {
+      stopRuntime: async () => {
+        throw new PortalApiError(status, code, 'raw server text');
+      },
+    });
+    await openStatusTab();
+    await waitForRowActions('4100', t.runtimeStop);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStop }));
+
+    const label = t[errorLabelByCode[code]!];
+    expect(await screen.findByText(`${code}: ${label}`)).toBeInTheDocument();
+    expect(screen.queryByText(/raw server text/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['start', 'runtime_ensure'],
+    ['start', 'runtime_instances'],
+    ['stop', 'runtime_stop'],
+  ] as const)('names the missing feature when a %s is refused for %s', async (action, feature) => {
+    const refuse = async (): Promise<never> => {
+      throw new PortalApiError(409, 'runtime.agent_feature_missing', 'raw', feature);
+    };
+    renderActions(
+      [instanceRow(0, { state: action === 'start' ? 'stopped' : 'running' })],
+      single(),
+      action === 'start' ? { startRuntime: refuse } : { stopRuntime: refuse },
+    );
+    await openStatusTab();
+    const name = action === 'start' ? t.runtimeStart : t.runtimeStop;
+    await waitForRowActions('4100', name);
+
+    fireEvent.click(inRowWith('4100').getByRole('button', { name }));
+
+    expect(
+      await screen.findByText(
+        `runtime.agent_feature_missing: ${t.errorRuntimeAgentFeatureMissingNamed(feature)}`,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('offers neither Start nor Stop nor Pin in file mode', async () => {
+    renderSection({
+      report: fileModeReport({ specs: [] }, {}, { agent_features: ['runtime_stop'] }),
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: single() },
+      statusRows: [instanceRow(0)],
+    }).stream.setStatus('open');
+    await openStatusTab();
+    await waitFor(() =>
+      expect(inRowWith('4100').getByRole('button', { name: t.runtimeLogs })).toBeInTheDocument(),
+    );
+    for (const name of [t.runtimeStart, t.runtimeStop, t.runtimePinRunning, t.runtimePinStopped]) {
+      expect(inRowWith('4100').queryByRole('button', { name })).not.toBeInTheDocument();
+    }
+  });
+
+  it('carries every new live-status action text in both locales, worded apart', () => {
+    const keys = [
+      'runtimeStart',
+      'runtimeStop',
+      'runtimePinRunning',
+      'runtimePinStopped',
+      'runtimeStartMore',
+      'runtimeStartForceStopped',
+      'runtimeStopProtected',
+      'runtimeStopFeatureMissing',
+      'runtimeStopHigherDraining',
+      'runtimeStartFeatureMissing',
+    ] as const;
+    for (const key of keys) {
+      expect(messages.de[key].length, key).toBeGreaterThan(0);
+      expect(messages.en[key].length, key).toBeGreaterThan(0);
+      expect(messages.de[key], key).not.toBe(messages.en[key]);
+    }
+    const fns = [
+      'runtimeStartMaxInstances',
+      'runtimeStartedRunning',
+      'runtimeStartedStarting',
+      'runtimeStopStopping',
+      'runtimeStopStopped',
+    ] as const;
+    for (const key of fns) {
+      expect(messages.de[key](3 as never), key).not.toBe(messages.en[key](3 as never));
+    }
+    expect(messages.de.runtimeStart).toBe('Starten');
+    expect(messages.en.runtimeStart).toBe('Start');
+    expect(messages.de.runtimeStop).toBe('Stoppen');
+    expect(messages.en.runtimeStop).toBe('Stop');
+    expect(messages.de.runtimePinRunning).toBe('Laufend anheften');
+    expect(messages.en.runtimePinRunning).toBe('Pin as running');
+    expect(messages.de.runtimePinStopped).toBe('Gestoppt anheften');
+    expect(messages.en.runtimePinStopped).toBe('Pin as stopped');
+    expect(messages.de.runtimeStartForceStopped).toBe(
+      'Gestoppt angeheftet – erst Übersteuerung aufheben',
+    );
+    // The 202's text says the instance starts and where its progress shows.
+    expect(messages.en.runtimeStartedStarting('X')).toMatch(/starting/);
+    expect(messages.en.runtimeStartedStarting('X')).toMatch(/status rows/);
   });
 });

@@ -87,6 +87,10 @@ func (s *Server) handlePortalMappingItem(w http.ResponseWriter, r *http.Request)
 		s.handlePortalMappingRuntimeSpec(w, r, token, parts[0])
 		return
 	}
+	if len(parts) == 3 && parts[1] == "runtime" && parts[0] != "" {
+		s.handlePortalMappingRuntimeAction(w, r, token, parts[0], parts[2])
+		return
+	}
 	id := pathID(r.URL.Path, "/api/portal/mappings/")
 	if id == "" {
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeMappingNotFound, msgMappingNotFound, ""))

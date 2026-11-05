@@ -34,6 +34,7 @@ type API interface {
 	AnthropicPromptCachingEnabled(context.Context) bool
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
+	AuthorizeRuntimeAction(context.Context, auth.Token, string) (RuntimeActionScope, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
 	BeginVendorAccountConnect(context.Context, auth.Token, string) (string, error)
 	BeginVendorAccountDeviceConnect(context.Context, auth.Token, string) (string, string, error)

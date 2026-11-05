@@ -1362,6 +1362,32 @@ const de = {
   runtimeForceStart: 'Start erzwingen',
   runtimeForceStop: 'Stopp erzwingen',
   runtimeClearOverride: 'Übersteuerung aufheben',
+  // Die Prozess-Aktionen einer Live-Status-Zeile. „Starten“ und „Stoppen“
+  // wirken einmal und schreiben nichts; „anheften“ setzt die dauerhafte
+  // Übersteuerung.
+  runtimeStart: 'Starten',
+  runtimeStop: 'Stoppen',
+  runtimePinRunning: 'Laufend anheften',
+  runtimePinStopped: 'Gestoppt anheften',
+  runtimeStartMore: 'Startet eine weitere Instanz dieses Modells',
+  runtimeStartForceStopped: 'Gestoppt angeheftet – erst Übersteuerung aufheben',
+  runtimeStartMaxInstances: (max: number) =>
+    max === 1
+      ? 'Die eine Instanz, die diese Startvorgabe erlaubt, ist bereits belegt (läuft, startet oder fährt noch herunter). Abwarten, bis eine heruntergefahren ist, oder die Höchstanzahl Instanzen anheben.'
+      : `Alle ${max} Instanzen, die diese Startvorgabe erlaubt, sind bereits belegt (laufen, starten oder fahren noch herunter). Abwarten, bis eine heruntergefahren ist, oder die Höchstanzahl Instanzen anheben.`,
+  runtimeStopProtected:
+    'Diese Instanz hält die Startvorgabe am Laufen; der Agent würde sie sofort wieder starten. Auswege: Übersteuerung aufheben, Mindestanzahl Instanzen senken, „Angeheftet“ abwählen oder die Admin-Übersteuerung der Startvorgabe auf „Stopp erzwingen“ setzen.',
+  runtimeStopFeatureMissing:
+    'Der Agent dieses Servers kann keine einzelne Instanz stoppen: Ihm fehlt die Funktion „runtime_stop“ (ab Agent 0.17.0). Den Agenten aktualisieren.',
+  runtimeStopHigherDraining:
+    'Eine höhere Instanz dieses Modells wird noch geleert. Instanzen werden von der höchsten an gestoppt; „Stoppen“ geht hier wieder, sobald sie gestoppt ist.',
+  runtimeStartFeatureMissing:
+    'Der Agent dieses Servers kann keine weitere Instanz starten: Ihm fehlt die Funktion „runtime_instances“ (ab Agent 0.16.0). Den Agenten aktualisieren.',
+  runtimeStartedRunning: (target: string) => `„${target}“ läuft.`,
+  runtimeStartedStarting: (target: string) =>
+    `„${target}“ startet. Die Statuszeilen zeigen den Fortschritt.`,
+  runtimeStopStopping: (target: string) => `„${target}“ wird gestoppt.`,
+  runtimeStopStopped: (target: string) => `„${target}“ ist bereits gestoppt.`,
   runtimeManagedLocally: 'Wird lokal vom Agenten verwaltet (Datei-Modus)',
   runtimeManagedOnlyBanner: 'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen.',
   runtimeManagedOnlyCreateBlocked:
@@ -1595,7 +1621,7 @@ const de = {
   // ausgegraute Aktion. Nach einem erfolgreichen Neustart ist genau dieser
   // Zustand der Ruhezustand der Zeile, also begegnet er jedem Betreiber.
   runtimeRestartUnavailable:
-    'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Start erzwingen“ verwenden.',
+    'Neu starten ist in diesem Zustand nicht möglich: Es läuft kein Prozess, der gestoppt werden könnte, und der Agent würde niemals „gestoppt“ melden — der Neustart würde in eine Zeitüberschreitung laufen und die Übersteuerung „Stopp erzwingen“ zurücklassen. Stattdessen „Starten“ verwenden.',
   // Neu starten ist auch gesperrt, wenn die Zeile selbst neu gestartet werden
   // könnte, eine andere Instanz desselben Modells aber in einem Zustand ruht,
   // aus dem der Agent sie nie „gestoppt“ melden würde.
@@ -1674,9 +1700,10 @@ const de = {
   runtimeLogs: 'Protokoll',
   runtimeLogsTitle: 'Prozessausgabe',
   // #340: every instance of a spec writes into its one log buffer; "Gesamt"
-  // shows it as it is, each instance's tab only that instance's lines.
+  // shows it with every line's instance prefixed, each instance's tab only
+  // that instance's lines.
   runtimeLogsAllInstances:
-    'Der Reiter „Gesamt“ zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Zeilen von Instanz k ≥ 1 beginnen mit [#k], die von Instanz 0 haben kein Präfix. Der Reiter einer Instanz zeigt nur deren Ausgabe, ohne Präfix. Fehlende Ausgabe wird in jedem Reiter gemeldet, weil sie keiner Instanz zugeordnet werden kann.',
+    'Der Reiter „Gesamt“ zeigt die Ausgabe aller Instanzen dieser Startvorgabe: Jede Zeile beginnt mit [#k], wobei k die Nummer ihrer Instanz ist. Der Reiter einer Instanz zeigt nur deren Ausgabe, ohne Präfix. Fehlende Ausgabe wird in jedem Reiter gemeldet, weil sie keiner Instanz zugeordnet werden kann.',
   runtimeLogsTabsLabel: 'Instanzen',
   runtimeLogsTabAll: 'Gesamt',
   runtimeLogsTabInstance: (k: number) => `Instanz ${k}`,
@@ -2189,13 +2216,49 @@ const de = {
   errorBenchmarkVramDeclaredGpuMissing:
     'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
   errorRuntimeSpecServerBenchmarking:
-    'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
+    'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – oder ein Starten oder Stoppen eines Modells würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   errorRuntimeSpecConfigFilesInvalid:
     'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
   errorRuntimeSpecInstancesInvalid:
     'Ungültige Instanzeinstellungen: Mindest- und Höchstanzahl müssen ganze Zahlen von 0 bis 64 sein, die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und die parallelen Anfragen pro Instanz müssen eine ganze Zahl von 1 bis 1024 sein.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
     'Mehrere Instanzen brauchen Listen-Port 0: Jede Instanz lauscht auf ihrem eigenen Port, den der Agent wählt.',
+  // Die Ablehnungen von „Starten“ und „Stoppen“ im Live-Status: die eigenen
+  // Codes des Gateways und die durchgereichten des Agenten.
+  errorRuntimeAdminStopped:
+    'Das Modell ist als gestoppt angeheftet (Übersteuerung „Stopp erzwingen“). Erst die Übersteuerung aufheben, dann starten.',
+  errorRuntimeMaxInstancesReached:
+    'Alle Instanzen, die diese Startvorgabe erlaubt, sind bereits belegt (laufen, starten oder fahren noch herunter). Abwarten, bis eine heruntergefahren ist, oder die Höchstanzahl Instanzen anheben.',
+  errorRuntimeAgentFeatureMissing:
+    'Der Agent dieses Servers kennt eine Funktion nicht, die diese Aktion braucht. Den Agenten aktualisieren.',
+  errorRuntimeAgentFeatureMissingNamed: (feature: string) =>
+    `Der Agent dieses Servers kennt die Funktion „${feature}“ nicht, die diese Aktion braucht. Den Agenten aktualisieren.`,
+  errorRuntimeAgentUnavailable:
+    'Der Agent dieses Servers ist nicht erreichbar oder hat sich seit dem Start des Gateways nicht gemeldet.',
+  errorRuntimeAgentTimeout: 'Der Agent hat nicht rechtzeitig geantwortet. Später erneut versuchen.',
+  errorRuntimeAgentError: 'Der Agent hat die Anfrage mit einem unerwarteten Fehler abgelehnt.',
+  errorRuntimeInstanceInvalid:
+    'Ungültige Instanz: Der Index muss eine ganze Zahl von 0 bis 63 sein.',
+  errorRuntimeActionFailed:
+    'Das Gateway konnte keine Instanz zum Starten auswählen (Lesefehler). Erneut versuchen.',
+  errorRuntimeInstanceNoCapacity:
+    'Auf dem Server ist kein Platz für eine weitere Instanz dieses Modells (VRAM, RAM oder Prozessgrenze).',
+  errorRuntimeInstanceDemandUnknown:
+    'Der Bedarf einer laufenden Instanz ist noch nicht gemessen. In ein paar Sekunden erneut versuchen.',
+  errorRuntimeInstanceProtected:
+    'Diese Instanz hält die Startvorgabe am Laufen (Mindestanzahl Instanzen, „Angeheftet“ oder „Start erzwingen“); der Agent würde sie sofort wieder starten.',
+  errorRuntimeInstanceNotHighest:
+    'Eine höhere Instanz dieses Modells läuft oder wird noch geleert. Instanzen werden von der höchsten an gestoppt.',
+  errorRuntimeModelNotManaged:
+    'Der Agent verwaltet dieses Modell oder diese Instanz nicht (mehr). Die Statuszeilen zeigen den aktuellen Stand.',
+  errorRuntimeAdmissionBlocked:
+    'Der Agent kann das Modell gerade nicht zulassen (z. B. eine Übersteuerung oder fehlender Platz).',
+  errorRuntimeStartTimeout:
+    'Das Modell ist innerhalb seiner Startzeitgrenze nicht betriebsbereit geworden.',
+  errorRuntimeStartFailed:
+    'Das Modell konnte nicht gestartet werden. Die Logs der Zeile zeigen, warum.',
+  errorRuntimeNotPermitted: 'Der Agent hat den Start dieses Modells nicht zugelassen.',
+  errorRuntimeUpstreamGone: 'Der Agent konnte die Anfrage nicht abschließen.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -4845,6 +4908,31 @@ const en: PortalMessages = {
   runtimeForceStart: 'Force start',
   runtimeForceStop: 'Force stop',
   runtimeClearOverride: 'Clear override',
+  // A live-status row's process actions. Start and Stop act once and write
+  // nothing; Pin sets the persistent override.
+  runtimeStart: 'Start',
+  runtimeStop: 'Stop',
+  runtimePinRunning: 'Pin as running',
+  runtimePinStopped: 'Pin as stopped',
+  runtimeStartMore: 'Starts one more instance of this model',
+  runtimeStartForceStopped: 'Pinned as stopped: clear the override first',
+  runtimeStartMaxInstances: (max: number) =>
+    max === 1
+      ? 'The one instance this launch spec allows is already in use (running, starting or still shutting down). Wait until it has shut down, or raise its maximum instances.'
+      : `All ${max} instances this launch spec allows are already in use (running, starting or still shutting down). Wait until one has shut down, or raise its maximum instances.`,
+  runtimeStopProtected:
+    'This instance keeps the launch spec up; the agent would start it again at once. Ways out: Clear override, lower the Minimum instances, untick "Pinned", or set the launch spec\'s Admin override to "Force stop".',
+  runtimeStopFeatureMissing:
+    'This server\'s agent cannot stop a single instance: it lacks the feature "runtime_stop" (agent 0.17.0 and later). Update the agent.',
+  runtimeStopHigherDraining:
+    'A higher instance of this model is still draining. Instances stop highest first; Stop works here again once it has stopped.',
+  runtimeStartFeatureMissing:
+    'This server\'s agent cannot start another instance: it lacks the feature "runtime_instances" (agent 0.16.0 and later). Update the agent.',
+  runtimeStartedRunning: (target: string) => `"${target}" is running.`,
+  runtimeStartedStarting: (target: string) =>
+    `"${target}" is starting. The status rows show its progress.`,
+  runtimeStopStopping: (target: string) => `"${target}" is stopping.`,
+  runtimeStopStopped: (target: string) => `"${target}" is already stopped.`,
   runtimeManagedLocally: 'Managed locally by the agent (file mode)',
   runtimeManagedOnlyBanner: 'This server only accepts agent-managed applications.',
   runtimeManagedOnlyCreateBlocked:
@@ -5059,7 +5147,7 @@ const en: PortalMessages = {
   // action. A successful restart leaves the row in exactly this state, so it
   // is the resting state every operator meets, not an edge case.
   runtimeRestartUnavailable:
-    'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "force start" instead.',
+    'Restart is not possible in this state: no process is running that could be stopped, and the agent would never report "stopped" — the restart would time out and leave the "force stop" override behind. Use "Start" instead.',
   // Restart is also unavailable when this row could restart, but another
   // instance of the same model rests in a state the agent would never report
   // "stopped" from.
@@ -5136,7 +5224,7 @@ const en: PortalMessages = {
   runtimeLogs: 'Logs',
   runtimeLogsTitle: 'Process output',
   runtimeLogsAllInstances:
-    'The "All" tab shows the output of every instance of this launch spec: lines of instance k ≥ 1 start with [#k], instance 0\'s carry no prefix. An instance\'s own tab shows only its output, without the prefix. Missing output is reported in every tab, because it cannot be attributed to one instance.',
+    'The "All" tab shows the output of every instance of this launch spec: every line starts with [#k], k being the number of its instance. An instance\'s own tab shows only its output, without the prefix. Missing output is reported in every tab, because it cannot be attributed to one instance.',
   runtimeLogsTabsLabel: 'Instances',
   runtimeLogsTabAll: 'All',
   runtimeLogsTabInstance: (k: number) => `Instance ${k}`,
@@ -5595,13 +5683,46 @@ const en: PortalMessages = {
   errorBenchmarkVramDeclaredGpuMissing:
     "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
   errorRuntimeSpecServerBenchmarking:
-    'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
+    'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — or starting or stopping a model would contaminate its measurement. Wait for the run to finish, or cancel it.',
   errorRuntimeSpecConfigFilesInvalid:
     'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
   errorRuntimeSpecInstancesInvalid:
     'Invalid instance settings: the minimum and maximum must be whole numbers from 0 to 64, the minimum must not exceed a set maximum, and the parallel requests per instance must be a whole number from 1 to 1024.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
     'Multiple instances need listen port 0: every instance listens on its own port, picked by the agent.',
+  // The live-status Start's and Stop's refusals: the gateway's own codes and
+  // the agent's, passed through.
+  errorRuntimeAdminStopped:
+    'The model is pinned as stopped (the "Force stop" override). Clear the override first, then start it.',
+  errorRuntimeMaxInstancesReached:
+    'Every instance this launch spec allows is already in use (running, starting or still shutting down). Wait until one has shut down, or raise its maximum instances.',
+  errorRuntimeAgentFeatureMissing:
+    "This server's agent lacks a feature this action needs. Update the agent.",
+  errorRuntimeAgentFeatureMissingNamed: (feature: string) =>
+    `This server's agent lacks the feature "${feature}" this action needs. Update the agent.`,
+  errorRuntimeAgentUnavailable:
+    "This server's agent cannot be reached, or has not reported since the gateway started.",
+  errorRuntimeAgentTimeout: 'The agent did not answer in time. Try again later.',
+  errorRuntimeAgentError: 'The agent refused the request with an unexpected error.',
+  errorRuntimeInstanceInvalid: 'Invalid instance: the index must be a whole number from 0 to 63.',
+  errorRuntimeActionFailed:
+    'The gateway could not pick an instance to start (a read failed). Try again.',
+  errorRuntimeInstanceNoCapacity:
+    'The server has no room for another instance of this model (VRAM, RAM or the process limit).',
+  errorRuntimeInstanceDemandUnknown:
+    "A running instance's demand is not measured yet. Try again in a few seconds.",
+  errorRuntimeInstanceProtected:
+    'This instance keeps the launch spec up (minimum instances, "Pinned" or "Force start"); the agent would start it again at once.',
+  errorRuntimeInstanceNotHighest:
+    'A higher instance of this model is running or still draining. Instances stop highest first.',
+  errorRuntimeModelNotManaged:
+    'The agent does not manage this model or instance (any more). The status rows show where it stands.',
+  errorRuntimeAdmissionBlocked:
+    'The agent cannot admit this model right now (an override, or no room).',
+  errorRuntimeStartTimeout: 'The model did not become ready within its startup timeout.',
+  errorRuntimeStartFailed: "The model failed to start. The row's logs show why.",
+  errorRuntimeNotPermitted: 'The agent did not permit this model to start.',
+  errorRuntimeUpstreamGone: 'The agent could not complete the request.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the

@@ -31,8 +31,9 @@ import { RUNTIME_AGENT_BIN, RUNTIME_ROUTER_PORT, RUNTIME_STUB_BIN } from "../pla
 //      then raises the budget to 2000 MB, changing NOTHING else, and the same
 //      two specs become co-resident. Neither scenario alone would isolate the
 //      arithmetic (see scenario 6's own comment); together they do.
-//   3. Force-stop from the portal, and that a further inference starts the
-//      model again.
+//   3. Stop from the portal stops the model once, and a further inference
+//      starts it again; Stop then "Pin as stopped" holds it down (requests are
+//      refused) until the override is cleared.
 //
 // The stub model server is BUILT here and never started here (see
 // playwright.runtime.config.ts's own note): starting it is the agent's job.
@@ -711,26 +712,56 @@ test("3 — cold start on demand: the inference itself starts the process, and t
 
 // --- Scenario 4 -------------------------------------------------------------
 
-test("4 — force stop from the portal really stops it, and a further inference starts it again", async () => {
+test("4 — stop from the portal stops it once, pin as stopped holds it down, and a further inference starts it again", async () => {
   await openRuntimeTab(t.runtimeLiveStatus);
+  const isStop = (r: { url(): string; request(): { method(): string } }) =>
+    /\/api\/portal\/mappings\/[^/]+\/runtime\/stop$/.test(new URL(r.url()).pathname) && r.request().method() === "POST";
+  const isSpecPut = (r: { url(): string; request(): { method(): string } }) =>
+    /\/api\/portal\/mappings\/[^/]+\/runtime-spec$/.test(new URL(r.url()).pathname) && r.request().method() === "PUT";
 
+  // Stop acts once: it persists nothing, so the next real request starts the
+  // model again on demand.
   const [stopped] = await Promise.all([
-    page.waitForResponse((r) => /\/api\/portal\/mappings\/[^/]+\/runtime-spec$/.test(new URL(r.url()).pathname) && r.request().method() === "PUT"),
-    row(MODEL_A).getByRole("button", { name: t.runtimeForceStop }).click()
+    page.waitForResponse(isStop),
+    row(MODEL_A).getByRole("button", { name: t.runtimeStop, exact: true }).click()
   ]);
-  expect(stopped.ok(), `force-stopping: ${stopped.status()} ${await stopped.text()}`).toBe(true);
+  expect(stopped.ok(), `stopping: ${stopped.status()} ${await stopped.text()}`).toBe(true);
+  await expect(stateBadge(MODEL_A, t.runtimeStateStopped)).toBeVisible({ timeout: 30000 });
+  await expect.poll(async () => await runningUpstreams(), { timeout: 30000, intervals: [250] }).toEqual([]);
+  await expect
+    .poll(async () => (await inference(MODEL_A, "after a stop")).content, { timeout: 60000, intervals: [500] })
+    .toBe(`[${TAG_A}] echo: after a stop`);
+  await expect(stateBadge(MODEL_A, t.runtimeStateRunning)).toBeVisible({ timeout: 15000 });
+  expect(await runningUpstreams()).toEqual([UPSTREAM_A]);
 
+  // Stop again, then pin the stopped state: force_stopped is a desired-state
+  // override, not a cosmetic badge, so the agent's router must refuse to start
+  // the model for a real request.
+  const [stoppedAgain] = await Promise.all([
+    page.waitForResponse(isStop),
+    row(MODEL_A).getByRole("button", { name: t.runtimeStop, exact: true }).click()
+  ]);
+  expect(stoppedAgain.ok(), `stopping again: ${stoppedAgain.status()} ${await stoppedAgain.text()}`).toBe(true);
   await expect(stateBadge(MODEL_A, t.runtimeStateStopped)).toBeVisible({ timeout: 30000 });
   await expect.poll(async () => await runningUpstreams(), { timeout: 30000, intervals: [250] }).toEqual([]);
 
-  // force_stopped is a desired-state override, not a cosmetic badge: the
-  // agent's router must refuse to start the model for a real request.
-  const refused = await inference(MODEL_A, "still stopped?");
-  expect(refused.status, `expected a refusal while force_stopped, got body: ${refused.content}`).not.toBe(200);
-  expect(await runningUpstreams()).toEqual([]);
+  const [pinned] = await Promise.all([
+    page.waitForResponse(isSpecPut),
+    row(MODEL_A).getByRole("button", { name: t.runtimePinStopped, exact: true }).click()
+  ]);
+  expect(pinned.ok(), `pinning as stopped: ${pinned.status()} ${await pinned.text()}`).toBe(true);
+  expect((JSON.parse(pinned.request().postData() ?? "{}") as { admin_state?: string }).admin_state).toBe("force_stopped");
+
+  // Polled because the pushed override has to reach the agent first.
+  await expect
+    .poll(async () => (await inference(MODEL_A, "still stopped?")).status, { timeout: 30000, intervals: [500] })
+    .not.toBe(200);
+  // A request that raced the push may have started the model; the override
+  // then drains it, so the end state is what is checked.
+  await expect.poll(async () => await runningUpstreams(), { timeout: 30000, intervals: [250] }).toEqual([]);
 
   const [cleared] = await Promise.all([
-    page.waitForResponse((r) => /\/api\/portal\/mappings\/[^/]+\/runtime-spec$/.test(new URL(r.url()).pathname) && r.request().method() === "PUT"),
+    page.waitForResponse(isSpecPut),
     row(MODEL_A).getByRole("button", { name: t.runtimeClearOverride }).click()
   ]);
   expect(cleared.ok(), `clearing the override: ${cleared.status()} ${await cleared.text()}`).toBe(true);
