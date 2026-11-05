@@ -1008,8 +1008,7 @@ func netbirdPolicyToRequest(p netbird.Policy) netbird.PolicyRequest {
 // permit traffic); when false it is re-ENABLED. Best-effort/void: it lists policies,
 // finds "Default", and re-PUTs it only when its enabled state actually needs to flip
 // (no-op when already in the target state or the policy is absent). The Default
-// policy's state, before and after the flip, is recorded for the cluster
-// derivation (recordDefaultPolicyState).
+// policy's final state is recorded for the cluster derivation.
 func (s *Service) applyDenyByDefault(ctx context.Context, ncfg netbird.Config, denyOn bool) {
 	s.netbird.policyMu.Lock()
 	defer s.netbird.policyMu.Unlock()
@@ -1018,7 +1017,6 @@ func (s *Service) applyDenyByDefault(ctx context.Context, ncfg netbird.Config, d
 		slog.Debug("deny-by-default apply: list", "error", err)
 		return
 	}
-	s.recordDefaultPolicyState(ctx, policies)
 	for i := range policies {
 		if policies[i].Name != NetbirdDefaultPolicyName {
 			continue
@@ -1029,12 +1027,16 @@ func (s *Service) applyDenyByDefault(ctx context.Context, ncfg netbird.Config, d
 			req.Enabled = want
 			if _, err := netbird.UpdatePolicy(ctx, ncfg, netbirdCallTimeout, policies[i].ID, req); err != nil {
 				slog.Debug("deny-by-default apply: update", "error", err)
+				// The flip failed: what the snapshot showed is still true.
+				s.recordDefaultPolicyState(ctx, policies)
 				return
 			}
 		}
+		// Only the final state is recorded, never the pre-flip one.
 		s.storeDefaultPolicyState(ctx, defaultPolicyState(want))
 		return
 	}
+	s.recordDefaultPolicyState(ctx, policies)
 }
 
 // enforceDenyByDefault disables NetBird's catch-all "Default" policy (best-effort).

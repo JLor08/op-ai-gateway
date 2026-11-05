@@ -78,7 +78,11 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) (
 					return nil, err
 				}
 				c := rpcCluster{head: spec, headServer: srv, members: members, servers: byID}
-				c.network, c.transport = s.resolveClusterNetwork(ctx, c)
+				all := []routing.AIServer{srv}
+				for _, m := range members {
+					all = append(all, byID[m.ServerID])
+				}
+				c.network, c.transport = s.resolveClusterNetwork(ctx, spec, all)
 				out = append(out, c)
 			}
 		}
@@ -86,16 +90,13 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) (
 	return out, nil
 }
 
-// resolveClusterNetwork is the network and transport deriveCluster resolves
-// for the head: the stored choice, else the defaults.
-func (s *Service) resolveClusterNetwork(ctx context.Context, c rpcCluster) (network, transport string) {
-	network, transport = c.head.ClusterNetwork, c.head.RPCTransport
+// resolveClusterNetwork is the network and transport of a head: the stored
+// choice, else the defaults over its head and member servers. Shared by the
+// derivation and the policy pass so they cannot disagree.
+func (s *Service) resolveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, servers []routing.AIServer) (network, transport string) {
+	network, transport = head.ClusterNetwork, head.RPCTransport
 	if network == "" {
-		all := []routing.AIServer{c.headServer}
-		for _, m := range c.members {
-			all = append(all, c.servers[m.ServerID])
-		}
-		network = defaultClusterNetwork(all)
+		network = defaultClusterNetwork(servers)
 	}
 	if transport == "" {
 		transport = s.defaultRPCTransport(ctx, network)
@@ -233,9 +234,23 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 		byID[srv.ID] = srv
 	}
 	existing := map[string]netbird.Policy{}
+	var extras []netbird.Policy
 	for _, p := range policies {
-		if strings.HasPrefix(p.Name, NetbirdRPCPolicyPrefix) {
-			existing[strings.TrimPrefix(p.Name, NetbirdRPCPolicyPrefix)] = p
+		if !strings.HasPrefix(p.Name, NetbirdRPCPolicyPrefix) {
+			continue
+		}
+		id := strings.TrimPrefix(p.Name, NetbirdRPCPolicyPrefix)
+		if _, dup := existing[id]; dup {
+			// A second policy of the same name would grant on its own whatever
+			// it holds; only the first is kept.
+			extras = append(extras, p)
+			continue
+		}
+		existing[id] = p
+	}
+	for _, p := range extras {
+		if err := netbird.DeletePolicy(ctx, ncfg, netbirdCallTimeout, p.ID); err != nil {
+			slog.Debug("rpc policy reconcile: delete duplicate", "policy_id", p.ID, "error", err)
 		}
 	}
 	ids := make([]string, 0, len(desired))

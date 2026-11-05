@@ -979,6 +979,10 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 				s.notifyRuntimeChanged(id)
 			}
 		}
+		// A benchmark writer (nil principal) only rewrites measurements and
+		// pinned settings of an existing spec: it cannot change the cluster
+		// flag, the network or the membership, so there is nothing for the
+		// policies to follow.
 		if principal != nil {
 			// The head's members may have changed: open the RPC ports the
 			// saved cluster needs before anything starts it.

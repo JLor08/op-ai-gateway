@@ -184,17 +184,11 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 	if reason, err := s.resolveMemberBinaries(ctx, head, headServer, members); err != nil || reason != "" {
 		return withheld(reason), err
 	}
-	network, transport := head.ClusterNetwork, head.RPCTransport
-	if network == "" {
-		servers := []routing.AIServer{headServer}
-		for _, m := range members {
-			servers = append(servers, m.server)
-		}
-		network = defaultClusterNetwork(servers)
+	servers := []routing.AIServer{headServer}
+	for _, m := range members {
+		servers = append(servers, m.server)
 	}
-	if transport == "" {
-		transport = s.defaultRPCTransport(ctx, network)
-	}
+	network, transport := s.resolveClusterNetwork(ctx, head, servers)
 	headIPs, headDomain, reason := clusterHeadIdentity(headServer, network)
 	if reason != "" {
 		return withheld(reason), nil

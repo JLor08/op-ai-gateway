@@ -568,3 +568,47 @@ func TestDefaultPolicyStateAbsentPolicyCountsAsDisabled(t *testing.T) {
 		t.Fatalf("state = %q, want disabled when no Default policy exists", got)
 	}
 }
+
+func TestRPCPolicyDuplicateNamedPoliciesAreCollapsed(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	seedRPCReadPolicy(e.fake, "pol-a1", "a", rpcRule{"g-head", "g-a", 47001})
+	seedRPCReadPolicy(e.fake, "pol-a2", "a", rpcRule{"g-evil", "g-a", 47001})
+	e.reconcile()
+	if !e.fake.wasPolicyDeleted("pol-a2") || e.fake.wasPolicyDeleted("pol-a1") {
+		t.Fatal("the duplicate was not the only policy removed")
+	}
+	if e.fake.policyUpdateCount() != 0 {
+		t.Fatal("the kept matching policy was rewritten")
+	}
+}
+
+// The deny-by-default flip records only the final state: one notification
+// burst for enabled -> disabled, never a transient write in between.
+func TestDenyByDefaultFlipRecordsOnlyFinalState(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	e.fake.seedDefaultPolicy("pol-default", true)
+
+	n0 := e.notifications()
+	e.svc.reconcileAllServerPolicies(e.ctx) // records enabled: one burst
+	burst := e.notifications() - n0
+	if got, _ := e.svc.NetbirdDefaultPolicyStateView(e.ctx); got != NetbirdDefaultPolicyEnabled || burst == 0 {
+		t.Fatalf("setup: state %q burst %d", got, burst)
+	}
+
+	n1 := e.notifications()
+	e.svc.applyDenyByDefault(e.ctx, netbird.Config{URL: e.fake.srv.URL, Token: "nbtok"}, true)
+	if got, _ := e.svc.NetbirdDefaultPolicyStateView(e.ctx); got != NetbirdDefaultPolicyDisabled {
+		t.Fatalf("state = %q, want disabled", got)
+	}
+	if got := e.notifications() - n1; got != burst {
+		t.Fatalf("flip notified %d times, want one burst of %d", got, burst)
+	}
+}

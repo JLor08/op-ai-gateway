@@ -7,9 +7,12 @@ package tracing
 // Regenerate with `go generate ./internal/tracing/...` after changing an interface.
 // gowrap is a dev-time tool (MIT); the generated code does not import it.
 //
-// gowrap does not preserve per-file license headers, so after regenerating run
-// `scripts/add-license-headers.sh` (idempotent) to re-apply the SPDX header to the
-// generated *_gen.go files; that keeps `go generate` output diff-clean.
+// gowrap does not preserve per-file license headers; zz_license_headers.go re-applies
+// them (it sorts after the generated routingstore_gen.go, whose own embedded
+// directive regenerates it), which keeps `go generate ./internal/tracing/...`
+// diff-clean. Running a generated file's embedded directive alone (for example
+// go generate ./internal/portal) skips that step; run
+// scripts/add-license-headers.sh <file> afterwards.
 
 //go:generate gowrap gen -p op-ai-gateway/internal/routing -i Store -t ./templates/tracing.gowrap.tmpl -o routingstore_gen.go -v Prefix=routing.Store -v DecoratorName=RoutingStoreWithTracing
 
