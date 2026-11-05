@@ -168,6 +168,10 @@ func (s *SQLiteStore) UnpricedUsageEvents(ctx context.Context, notBefore, notAft
 // [from, to]. Used by the energy reconciler to reconstruct how many concurrent
 // requests a server was serving during a target event's window.
 //
+// A cluster request is recorded on its head, so an event also matches when it
+// lists serverID in usage_event_hosts (the member side of the request); the
+// IN-subquery keeps each event to a single row either way.
+//
 // To stay dialect-neutral (sqlite and postgres differ on interval arithmetic),
 // the underlying fetch widens BOTH bounds by energyMaxRequestWindow — the lower
 // bound so a sibling that started before `from` but is still running is not
@@ -176,12 +180,16 @@ func (s *SQLiteStore) UnpricedUsageEvents(ctx context.Context, notBefore, notAft
 // not missed either — and the exact overlap test runs in Go over the fetched
 // rows.
 func (s *SQLiteStore) UsageEventsForServerWindow(ctx context.Context, serverID string, from, to time.Time) ([]usage.Event, error) {
+	lo, hi := from.Add(-energyMaxRequestWindow), to.Add(energyMaxRequestWindow)
 	rows, err := s.query(ctx, `
 		select `+usageEventColumns+`
 		from usage_events as e
-		where e.host = ? and e.created_at >= ? and e.created_at <= ?
+		where e.created_at >= ? and e.created_at <= ?
+			and (e.host = ? or e.id in (
+				select h.event_id from usage_event_hosts as h
+				where h.server_id = ? and h.created_at >= ? and h.created_at <= ?))
 		order by e.created_at asc, e.id asc`,
-		serverID, from.Add(-energyMaxRequestWindow), to.Add(energyMaxRequestWindow))
+		lo, hi, serverID, serverID, lo, hi)
 	if err != nil {
 		return nil, fmt.Errorf("usage events for server window: %w", err)
 	}
@@ -1081,6 +1089,100 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	}
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("iterate usage groups: %w", err)
+	}
+	return out, nil
+}
+
+// RecordEventHosts inserts hosts; a (event, server) pair already stored keeps
+// its row, so a retried record is harmless. A host naming an unknown event is
+// rejected by the foreign key.
+func (s *SQLiteStore) RecordEventHosts(ctx context.Context, hosts []usage.EventHost) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin record event hosts: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, h := range hosts {
+		if _, err := s.execOn(ctx, tx, `
+			insert into usage_event_hosts (event_id, server_id, role, created_at)
+			values (?, ?, ?, ?)
+			on conflict (event_id, server_id) do nothing`,
+			h.EventID, h.ServerID, h.Role, h.CreatedAt); err != nil {
+			return fmt.Errorf("insert usage event host: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// EventHosts lists an event's hosts, head first, then by server id.
+func (s *SQLiteStore) EventHosts(ctx context.Context, eventID string) ([]usage.EventHost, error) {
+	rows, err := s.query(ctx, `
+		select event_id, server_id, role, created_at
+		from usage_event_hosts where event_id = ?
+		order by case role when 'head' then 0 else 1 end, server_id`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("list usage event hosts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]usage.EventHost, 0)
+	for rows.Next() {
+		var h usage.EventHost
+		if err := rows.Scan(&h.EventID, &h.ServerID, &h.Role, &h.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan usage event host: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage event hosts: %w", err)
+	}
+	return out, nil
+}
+
+// SetEnergyParts atomically replaces an event's per-host energy parts.
+func (s *SQLiteStore) SetEnergyParts(ctx context.Context, eventID string, parts []usage.EnergyPart) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin set energy parts: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := s.execOn(ctx, tx, `delete from usage_event_energy_parts where event_id = ?`, eventID); err != nil {
+		return fmt.Errorf("clear usage event energy parts: %w", err)
+	}
+	for _, p := range parts {
+		if _, err := s.execOn(ctx, tx, `
+			insert into usage_event_energy_parts (event_id, server_id, role, wh, marginal_wh, source)
+			values (?, ?, ?, ?, ?, ?)`,
+			eventID, p.ServerID, p.Role, p.Wh, p.MarginalWh, p.Source); err != nil {
+			return fmt.Errorf("insert usage event energy part: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// EnergyParts lists an event's per-host energy parts, head first, then by
+// server id.
+func (s *SQLiteStore) EnergyParts(ctx context.Context, eventID string) ([]usage.EnergyPart, error) {
+	rows, err := s.query(ctx, `
+		select event_id, server_id, role, wh, marginal_wh, source
+		from usage_event_energy_parts where event_id = ?
+		order by case role when 'head' then 0 else 1 end, server_id`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("list usage event energy parts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]usage.EnergyPart, 0)
+	for rows.Next() {
+		var p usage.EnergyPart
+		if err := rows.Scan(&p.EventID, &p.ServerID, &p.Role, &p.Wh, &p.MarginalWh, &p.Source); err != nil {
+			return nil, fmt.Errorf("scan usage event energy part: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage event energy parts: %w", err)
 	}
 	return out, nil
 }

@@ -137,6 +137,7 @@ var migrations = []migration{
 	{version: 102, name: "route_affinity_instance", up: migration102Up},
 	{version: 103, name: "rpc_cluster_columns", up: migration103Up},
 	{version: 104, name: "rpc_cluster_tables", up: migration104Up},
+	{version: 105, name: "usage_event_hosts", up: migration105Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4690,6 +4691,46 @@ func migration104Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		)`,
 		`create index if not exists idx_rpc_sessions_head on rpc_sessions(head_spec_id, instance)`,
 		`create index if not exists idx_rpc_sessions_member on rpc_sessions(member_server_id, since)`,
+	} {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration105Up adds the per-host rows of a usage event.
+//
+// usage_event_hosts lists every server that served an event: a cluster
+// request names its head and each RPC member, so overlap queries on a member
+// server also find the cluster events it took part in. created_at copies the
+// event's created_at so the (server_id, created_at) index answers the window
+// scan without a join. usage_event_energy_parts splits an event's energy per
+// host (watt-hours, the marginal share and the derivation source) so each
+// host can be priced separately. Both cascade from usage_events and the
+// (event_id, server_id) key keeps a host listed once per event.
+//
+// Every statement is `if not exists`, so the step replays on both dialects.
+func migration105Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	for _, stmt := range []string{
+		`create table if not exists usage_event_hosts (
+			event_id text not null references usage_events(id) on delete cascade,
+			server_id text not null,
+			role text not null default 'head',
+			created_at ` + ts + ` not null,
+			primary key (event_id, server_id)
+		)`,
+		`create index if not exists idx_usage_event_hosts_server on usage_event_hosts(server_id, created_at)`,
+		`create table if not exists usage_event_energy_parts (
+			event_id text not null references usage_events(id) on delete cascade,
+			server_id text not null,
+			role text not null default 'head',
+			wh double precision not null default 0,
+			marginal_wh double precision not null default 0,
+			source text not null default '',
+			primary key (event_id, server_id)
+		)`,
 	} {
 		if err := execTx(ctx, tx, dl, stmt); err != nil {
 			return err

@@ -2288,3 +2288,19 @@ func TestServerDTOCarriesTLSProxyState(t *testing.T) {
 		t.Fatalf("tls_proxy_state = %q, want out_of_scope in manual mode", got.TLSProxyState)
 	}
 }
+
+func (f *fakeUsage) RecordEventHosts(ctx context.Context, hosts []usage.EventHost) error {
+	return f.recorder().RecordEventHosts(ctx, hosts)
+}
+
+func (f *fakeUsage) EventHosts(ctx context.Context, eventID string) ([]usage.EventHost, error) {
+	return f.recorder().EventHosts(ctx, eventID)
+}
+
+func (f *fakeUsage) SetEnergyParts(ctx context.Context, eventID string, parts []usage.EnergyPart) error {
+	return f.recorder().SetEnergyParts(ctx, eventID, parts)
+}
+
+func (f *fakeUsage) EnergyParts(ctx context.Context, eventID string) ([]usage.EnergyPart, error) {
+	return f.recorder().EnergyParts(ctx, eventID)
+}

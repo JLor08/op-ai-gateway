@@ -1173,3 +1173,73 @@ func containsID(ids []string, want string) bool {
 	}
 	return false
 }
+
+func TestRecorderUsageEventsForServerWindowIncludesMemberRows(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_cluster", Host: "srv_head", LatencyMS: 10000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_local", Host: "srv_member", LatencyMS: 10000, CreatedAt: at})
+	if err := rec.RecordEventHosts(ctx, []EventHost{
+		{EventID: "ev_cluster", ServerID: "srv_head", Role: "head", CreatedAt: at},
+		{EventID: "ev_cluster", ServerID: "srv_member", Role: "member", CreatedAt: at},
+		{EventID: "ev_local", ServerID: "srv_member", Role: "head", CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("record hosts: %v", err)
+	}
+	from := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 11, 5, 10, 0, 20, 0, time.UTC)
+	got, err := rec.UsageEventsForServerWindow(ctx, "srv_member", from, to)
+	if err != nil {
+		t.Fatalf("window: %v", err)
+	}
+	if ids := idsOf(got); len(ids) != 2 || !containsID(ids, "ev_cluster") || !containsID(ids, "ev_local") {
+		t.Fatalf("member ids = %v, want both once", ids)
+	}
+	got, _ = rec.UsageEventsForServerWindow(ctx, "srv_head", from, to)
+	if ids := idsOf(got); len(ids) != 1 || ids[0] != "ev_cluster" {
+		t.Fatalf("head ids = %v, want [ev_cluster] once", ids)
+	}
+	got, _ = rec.UsageEventsForServerWindow(ctx, "srv_other", from, to)
+	if len(got) != 0 {
+		t.Fatalf("unrelated ids = %v, want none", idsOf(got))
+	}
+}
+
+func TestRecorderEventHostsAndEnergyParts(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev1", Host: "srv_head", CreatedAt: at})
+	hosts := []EventHost{
+		{EventID: "ev1", ServerID: "srv_b", Role: "member", CreatedAt: at},
+		{EventID: "ev1", ServerID: "srv_head", Role: "head", CreatedAt: at},
+	}
+	if err := rec.RecordEventHosts(ctx, hosts); err != nil {
+		t.Fatalf("record hosts: %v", err)
+	}
+	if err := rec.RecordEventHosts(ctx, hosts[:1]); err != nil {
+		t.Fatalf("re-record hosts: %v", err)
+	}
+	got, err := rec.EventHosts(ctx, "ev1")
+	if err != nil || len(got) != 2 || got[0].ServerID != "srv_head" || got[1].ServerID != "srv_b" {
+		t.Fatalf("hosts = %+v err=%v, want head first, no duplicate", got, err)
+	}
+	parts := []EnergyPart{
+		{EventID: "ev1", ServerID: "srv_head", Role: "head", Wh: 0.1, MarginalWh: 0.01, Source: "measured"},
+		{EventID: "ev1", ServerID: "srv_b", Role: "member", Wh: 0.5, MarginalWh: 0.25, Source: "modeled"},
+	}
+	if err := rec.SetEnergyParts(ctx, "ev1", parts); err != nil {
+		t.Fatalf("set parts: %v", err)
+	}
+	gotParts, err := rec.EnergyParts(ctx, "ev1")
+	if err != nil || len(gotParts) != 2 || gotParts[0] != parts[0] || gotParts[1] != parts[1] {
+		t.Fatalf("parts = %+v err=%v, want %+v", gotParts, err, parts)
+	}
+	if err := rec.SetEnergyParts(ctx, "ev1", parts[:1]); err != nil {
+		t.Fatalf("replace parts: %v", err)
+	}
+	if gotParts, _ = rec.EnergyParts(ctx, "ev1"); len(gotParts) != 1 {
+		t.Fatalf("after replace = %+v, want 1", gotParts)
+	}
+}

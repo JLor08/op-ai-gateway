@@ -121,6 +121,29 @@ type Event struct {
 	CostEUR float64 `json:"cost_eur"`
 }
 
+// EventHost lists one server that took part in serving a usage event. A
+// cluster request names its head ("head") and every RPC member ("member") so
+// each host's energy can be priced on its own and overlap queries on a member
+// server also see the cluster events that used it. CreatedAt is a copy of the
+// event's created_at so the per-server window scan needs no join.
+type EventHost struct {
+	EventID   string
+	ServerID  string
+	Role      string
+	CreatedAt time.Time
+}
+
+// EnergyPart is one host's share of an event's energy: Wh attributed, the
+// marginal part of it, and how it was derived.
+type EnergyPart struct {
+	EventID    string
+	ServerID   string
+	Role       string
+	Wh         float64
+	MarginalWh float64
+	Source     string
+}
+
 type Store interface {
 	// Record persists event. The memory Recorder always returns nil (an
 	// in-memory append cannot fail); *store.SQLiteStore returns the real
@@ -158,7 +181,21 @@ type Store interface {
 	// whose own [CreatedAt-latency, CreatedAt] window overlaps [from, to]. Used by
 	// the energy reconciler to reconstruct how many concurrent requests a server
 	// was serving during a target event's window.
+	//
+	// An event also matches when it lists serverID in its event hosts (see
+	// RecordEventHosts), so a cluster member sees the cluster requests it
+	// served. An event is returned at most once.
 	UsageEventsForServerWindow(ctx context.Context, serverID string, from, to time.Time) ([]Event, error)
+	// RecordEventHosts stores the hosts of usage events. Recording a
+	// (event, server) pair that already exists keeps the stored row.
+	RecordEventHosts(ctx context.Context, hosts []EventHost) error
+	// EventHosts lists an event's hosts, head first, then by server id.
+	EventHosts(ctx context.Context, eventID string) ([]EventHost, error)
+	// SetEnergyParts replaces an event's per-host energy parts.
+	SetEnergyParts(ctx context.Context, eventID string, parts []EnergyPart) error
+	// EnergyParts lists an event's per-host energy parts, head first, then by
+	// server id.
+	EnergyParts(ctx context.Context, eventID string) ([]EnergyPart, error)
 	// EnergyByServer sums EnergyWh grouped by Host (server id) over the SAME
 	// filtered set Stats(q) would compute (same predicate as matchUsage/
 	// usageWhere) — used by the portal layer to weight the aggregate cost
@@ -175,6 +212,10 @@ type Store interface {
 type Recorder struct {
 	mu     sync.RWMutex
 	events []Event
+	// hosts and parts hold the per-event host and energy-part rows, keyed by
+	// event id, in insertion order.
+	hosts map[string][]EventHost
+	parts map[string][]EnergyPart
 
 	// ResolveUserName, when non-nil, maps a user_id to a human-readable owner
 	// name for ScopeAll queries. Default nil -> UserName stays empty.
@@ -249,7 +290,7 @@ func (r *Recorder) UsageEventsForServerWindow(_ context.Context, serverID string
 	defer r.mu.RUnlock()
 	out := make([]Event, 0)
 	for _, e := range r.events {
-		if e.Host != serverID {
+		if e.Host != serverID && !r.listsHostLocked(e.ID, serverID) {
 			continue
 		}
 		start := e.CreatedAt.Add(-time.Duration(e.LatencyMS) * time.Millisecond)
@@ -259,6 +300,77 @@ func (r *Recorder) UsageEventsForServerWindow(_ context.Context, serverID string
 		}
 		out = append(out, e)
 	}
+	return out, nil
+}
+
+// listsHostLocked reports whether eventID lists serverID among its hosts.
+// The caller holds r.mu.
+func (r *Recorder) listsHostLocked(eventID, serverID string) bool {
+	for _, h := range r.hosts[eventID] {
+		if h.ServerID == serverID {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordEventHosts stores hosts, keeping an existing row for a repeated
+// (event, server) pair.
+func (r *Recorder) RecordEventHosts(_ context.Context, hosts []EventHost) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.hosts == nil {
+		r.hosts = make(map[string][]EventHost)
+	}
+	for _, h := range hosts {
+		if r.listsHostLocked(h.EventID, h.ServerID) {
+			continue
+		}
+		r.hosts[h.EventID] = append(r.hosts[h.EventID], h)
+	}
+	return nil
+}
+
+// EventHosts returns eventID's hosts, head first, then by server id.
+func (r *Recorder) EventHosts(_ context.Context, eventID string) ([]EventHost, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := append([]EventHost{}, r.hosts[eventID]...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if hi, hj := out[i].Role == "head", out[j].Role == "head"; hi != hj {
+			return hi
+		}
+		return out[i].ServerID < out[j].ServerID
+	})
+	return out, nil
+}
+
+// SetEnergyParts replaces eventID's energy parts.
+func (r *Recorder) SetEnergyParts(_ context.Context, eventID string, parts []EnergyPart) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.parts == nil {
+		r.parts = make(map[string][]EnergyPart)
+	}
+	if len(parts) == 0 {
+		delete(r.parts, eventID)
+		return nil
+	}
+	r.parts[eventID] = append([]EnergyPart{}, parts...)
+	return nil
+}
+
+// EnergyParts returns eventID's energy parts, head first, then by server id.
+func (r *Recorder) EnergyParts(_ context.Context, eventID string) ([]EnergyPart, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := append([]EnergyPart{}, r.parts[eventID]...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if hi, hj := out[i].Role == "head", out[j].Role == "head"; hi != hj {
+			return hi
+		}
+		return out[i].ServerID < out[j].ServerID
+	})
 	return out, nil
 }
 
