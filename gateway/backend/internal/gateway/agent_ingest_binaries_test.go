@@ -183,3 +183,27 @@ func TestBinariesAPI(t *testing.T) {
 		t.Fatalf("unknown server = %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestIngestBinariesNULAndPathCap(t *testing.T) {
+	srv := NewTestServer()
+	long := "/" + strings.Repeat("a", maxBinaryPathBytes)    // 4097 bytes
+	exact := "/" + strings.Repeat("b", maxBinaryPathBytes-1) // 4096 bytes
+	ingestBinaries(t, srv, `[
+		{"path":"`+long+`","kind":"other"},
+		{"path":"`+exact+`","kind":"other"},
+		{"path":"/opt/nul\u0000x","kind":"other"},
+		{"path":"/opt/v","kind":"llama_server","version":"a\u0000b","build":"1\u00002","commit":"c\u0000d"}]`)
+	got := storedBinaries(t, srv)
+	if _, ok := got[long]; ok {
+		t.Fatal("path over the cap must be dropped")
+	}
+	if _, ok := got[exact]; !ok {
+		t.Fatal("path at the cap must be kept")
+	}
+	if _, ok := got["/opt/nul\x00x"]; ok {
+		t.Fatal("path with NUL must be dropped")
+	}
+	if v := got["/opt/v"]; v.Version != "ab" || v.Build != "12" || v.Commit != "cd" {
+		t.Fatalf("NUL not stripped: %+v", v)
+	}
+}

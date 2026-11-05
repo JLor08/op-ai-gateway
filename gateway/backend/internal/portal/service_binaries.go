@@ -282,16 +282,12 @@ func (s *Service) binaryDTOByPath(ctx context.Context, serverID, binaryPath stri
 	return serverBinaryDTO(row), nil
 }
 
-// binaryVersionFor returns the inventory row at path on serverID (the head
-// task needs the head binary's version); ok is false when the path is not in
-// the inventory.
-func (s *Service) binaryVersionFor(ctx context.Context, serverID, binaryPath string) (routing.ServerBinary, bool, error) {
-	return s.binaryRow(ctx, serverID, binaryPath)
-}
-
-// BinaryVersionFor is the exported form of binaryVersionFor.
+// BinaryVersionFor returns the inventory row at path on serverID, so a caller
+// can read the version of the binary a runtime spec names; ok is false when
+// the path is not in the inventory. It is a pure lookup: Source and Allowed
+// are exposed on the row, not filtered on.
 func (s *Service) BinaryVersionFor(ctx context.Context, serverID, binaryPath string) (routing.ServerBinary, bool, error) {
-	return s.binaryVersionFor(ctx, serverID, binaryPath)
+	return s.binaryRow(ctx, serverID, binaryPath)
 }
 
 var (
@@ -300,8 +296,14 @@ var (
 	versionBuildCommitRE = regexp.MustCompile(`(?i)build\s+(\d+)\s*,\s*commit\s+([0-9a-f]{7,40})`)
 	versionTagRE         = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])b(\d+)(?:$|[^0-9a-z])`)
 	versionHexRE         = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])([0-9a-f]{7,40})(?:$|[^0-9a-z])`)
+	hasHexLetterRE       = regexp.MustCompile(`(?i)[a-f]`)
 )
 
+// Override text is read in this order: "build N, commit H" (the llama-server
+// --version form) gives both; else a release tag "bN" gives the build and a
+// 7-40 character hex token containing at least one a-f letter gives the
+// commit (an all-digit token such as a date is not a commit).
+//
 // binaryIdentity is what matching compares: the commit and the build, taken
 // from the row's own fields or, when the operator overrode the version, read
 // out of the override text (the detected fields describe the wrong build
@@ -317,7 +319,7 @@ func binaryIdentity(b routing.ServerBinary) (commit, build string) {
 	if m := versionTagRE.FindStringSubmatch(v); m != nil {
 		build = normalizeBuild(m[1])
 	}
-	if m := versionHexRE.FindStringSubmatch(v); m != nil {
+	if m := versionHexRE.FindStringSubmatch(v); m != nil && hasHexLetterRE.MatchString(m[1]) {
 		commit = strings.ToLower(m[1])
 	}
 	return commit, build
@@ -358,12 +360,10 @@ func binariesSameVersion(a, b routing.ServerBinary) bool {
 
 // MatchingRPCBinary returns the rpc_server binary on serverID whose version
 // equals head's (commit, else build); with several matches the first by path.
-// ok is false when the server has none, or the versions are unknown.
+// Agent-reported rows the agent does not allow are skipped (they would fail
+// to start); manual rows carry no allowlist status and stay eligible. ok is
+// false when the server has none, or the versions are unknown.
 func (s *Service) MatchingRPCBinary(ctx context.Context, serverID string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
-	return s.matchingRPCBinary(ctx, serverID, head)
-}
-
-func (s *Service) matchingRPCBinary(ctx context.Context, serverID string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
 	rows, err := s.routes.ServerBinaries(ctx, serverID) // ordered by path
 	if err != nil {
 		return routing.ServerBinary{}, false, err
@@ -372,6 +372,9 @@ func (s *Service) matchingRPCBinary(ctx context.Context, serverID string, head r
 	found := false
 	for _, b := range rows {
 		if b.Kind != BinaryKindRPCServer || !binariesSameVersion(head, b) {
+			continue
+		}
+		if b.Source == routing.BinarySourceAgent && !b.Allowed {
 			continue
 		}
 		if !found || b.Path < best.Path {

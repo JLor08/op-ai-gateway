@@ -74,6 +74,7 @@ func sanitizeBinarySamples(in []agentBinarySample, serverID string, now time.Tim
 }
 
 func clampBinaryField(s string) string {
+	s = strings.ReplaceAll(s, "\x00", "")
 	if len(s) > maxBinaryFieldBytes {
 		return strings.ToValidUTF8(s[:maxBinaryFieldBytes], "")
 	}

@@ -45,12 +45,12 @@ func TestMatchingRPCBinaryByCommitThenBuild(t *testing.T) {
 	svc, store := newServerTestService(t, rpcMemberTestNow)
 	server := createTestServer(t, svc, "M", "m.example.test")
 	rows := []routing.ServerBinary{
-		{Path: "/z/rpc-server", Kind: "rpc_server", Commit: "2bc46baa9207d098d03741ac394e7faaf1a955b6", Build: "9"},
-		{Path: "/b/rpc-server", Kind: "rpc_server", Commit: "2BC46BA", Build: "1"},
-		{Path: "/a/rpc-server", Kind: "rpc_server", Commit: "ffffffff", Build: "1"},
-		{Path: "/c/llama-server", Kind: "llama_server", Commit: "2bc46ba"},
-		{Path: "/d/rpc-server", Kind: "rpc_server", Build: "b42"},
-		{Path: "/e/rpc-server", Kind: "rpc_server"},
+		{Path: "/z/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46baa9207d098d03741ac394e7faaf1a955b6", Build: "9"},
+		{Path: "/b/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2BC46BA", Build: "1"},
+		{Path: "/a/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "ffffffff", Build: "1"},
+		{Path: "/c/llama-server", Kind: "llama_server", Allowed: true, Commit: "2bc46ba"},
+		{Path: "/d/rpc-server", Kind: "rpc_server", Allowed: true, Build: "b42"},
+		{Path: "/e/rpc-server", Kind: "rpc_server", Allowed: true},
 	}
 	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, rows); err != nil {
 		t.Fatal(err)
@@ -91,10 +91,57 @@ func TestMatchingRPCBinaryByCommitThenBuild(t *testing.T) {
 		t.Fatalf("override match = %q %v", p, ok)
 	}
 	// binaryVersionFor looks one row up by path.
-	if b, ok, err := svc.binaryVersionFor(ctx, server.ID, "/d/rpc-server"); err != nil || !ok || b.Build != "b42" {
+	if b, ok, err := svc.BinaryVersionFor(ctx, server.ID, "/d/rpc-server"); err != nil || !ok || b.Build != "b42" {
 		t.Fatalf("binaryVersionFor = %+v %v %v", b, ok, err)
 	}
-	if _, ok, _ := svc.binaryVersionFor(ctx, server.ID, "/nope"); ok {
+	if _, ok, _ := svc.BinaryVersionFor(ctx, server.ID, "/nope"); ok {
 		t.Fatal("unknown path must not be found")
+	}
+}
+
+func TestMatchingRPCBinaryEligibility(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newServerTestService(t, rpcMemberTestNow)
+	server := createTestServer(t, svc, "M", "m.example.test")
+	head := routing.ServerBinary{Commit: "2bc46ba"}
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{
+		{Path: "/a/rpc-server", Kind: "rpc_server", Commit: "2bc46ba", Allowed: false},
+		{Path: "/b/rpc-server", Kind: "rpc_server", Commit: "2bc46ba", Allowed: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head)
+	if err != nil || !ok || b.Path != "/b/rpc-server" {
+		t.Fatalf("match = %+v %v %v, want the allowed /b/rpc-server", b, ok, err)
+	}
+	if err := store.UpsertManualServerBinary(ctx, routing.ServerBinary{ServerID: server.ID, Path: "/0/rpc-server", Kind: "rpc_server", Commit: "2bc46ba"}); err != nil {
+		t.Fatal(err)
+	}
+	if b, ok, _ = svc.MatchingRPCBinary(ctx, server.ID, head); !ok || b.Path != "/0/rpc-server" {
+		t.Fatalf("manual row must stay eligible, got %+v %v", b, ok)
+	}
+	// Only a disallowed agent row left: no match.
+	if err := store.DeleteManualServerBinary(ctx, server.ID, "/0/rpc-server"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{{Path: "/a/rpc-server", Kind: "rpc_server", Commit: "2bc46ba"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ = svc.MatchingRPCBinary(ctx, server.ID, head); ok {
+		t.Fatal("disallowed agent row must not match")
+	}
+}
+
+func TestBinaryIdentityOverrideParsing(t *testing.T) {
+	for override, want := range map[string][2]string{
+		"20240115":                        {"", ""},
+		"b99":                             {"", "99"},
+		"0.9.0 (build 5, commit 2bc46ba)": {"2bc46ba", "5"},
+		"b12 2BC46BA9":                    {"2bc46ba9", "12"},
+	} {
+		c, b := binaryIdentity(routing.ServerBinary{VersionOverride: override, Commit: "ignored", Build: "ignored"})
+		if c != want[0] || b != want[1] {
+			t.Errorf("override %q = (%q,%q), want %v", override, c, b, want)
+		}
 	}
 }
