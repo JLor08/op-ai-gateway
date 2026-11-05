@@ -79,6 +79,7 @@ import {
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
 import { CONFIG_FILES_MAX, configFileIssues, type ConfigFileIssue } from './shared/configFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
+import { formatArgsText, formatEnvText, parseArgsText, parseEnvText } from './shared/specText';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
@@ -95,6 +96,7 @@ import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
+import { RpcMemberSection } from './RpcMemberSection';
 import {
   INSTANCE_PARALLELISM_MAX,
   INSTANCES_MAX,
@@ -120,7 +122,7 @@ import { runtimeRowPlan, startInstanceLimit } from './shared/runtimeActions';
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
 // all, next to the model-mapping tab.
-type Tab = 'mapping' | 'specs' | 'coresidency' | 'limits' | 'status';
+type Tab = 'mapping' | 'specs' | 'coresidency' | 'rpc' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -789,29 +791,6 @@ function renderVisibilityChip(v: VisibilityValue, t: Translation) {
   );
 }
 
-// One argument per line. Splitting on spaces would corrupt any argument that
-// legitimately contains one (model server command lines routinely have
-// these), so a textarea line IS the argument. Lines are preserved verbatim
-// -- including an internally blank line and one carrying only whitespace --
-// because this form's whole job is faithfully representing a command line:
-// filtering "empty-looking" lines would make a load -> edit(no-op) -> save
-// round trip silently rewrite the spec's args. The ONE exception is a
-// single trailing blank line, which is a textarea artifact (the user's
-// cursor sitting on a fresh last line, or a copy-pasted trailing newline),
-// not a deliberate trailing empty argument.
-function parseArgsText(text: string): string[] {
-  if (text === '') return [];
-  const lines = text.split('\n').map((line) => line.replace(/\r$/, ''));
-  if (lines.length > 1 && lines[lines.length - 1] === '') {
-    lines.pop();
-  }
-  return lines;
-}
-
-function formatArgsText(args: string[]): string {
-  return args.join('\n');
-}
-
 /**
  * A whitespace-separated token shaped like a command-line FLAG: one or two
  * leading dashes followed by a LETTER.
@@ -1017,22 +996,6 @@ function collectArgsWarnings(args: string[], listenPort: number, t: Translation)
 const placeholderPattern = /\$\{[^}]*\}/g;
 const agentEnvPrefix = 'AGENT_ENV:';
 const agentOwnEnvPrefix = 'OP_AGENT_';
-
-// The agent's base-environment names (server-agent internal/runtime
-// policy_local.go `baseEnvNames`), which it copies from its OWN environment
-// into every child and therefore refuses as spec env keys. Mirrored here so
-// the form says no before the round trip rather than letting the spec save
-// and fail at process start as `not_permitted`.
-//
-// UPPER-CASE and compared upper-cased, exactly as the agent does: Windows
-// resolves environment names case-insensitively, so "Path" and "SystemRoot"
-// -- the only spellings a Windows operator would type -- are the same
-// variables. The four Windows names are not decoration: the agent copies
-// USERPROFILE/LOCALAPPDATA (per-user cache roots) and SYSTEMROOT/WINDIR
-// (system DLLs, and Winsock initialisation) so a Windows child can resolve a
-// home directory and open a socket at all.
-const reservedEnvKeys = ['PATH', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'SYSTEMROOT', 'WINDIR'];
-
 function findPlaceholderViolation(
   text: string,
 ): { kind: 'reserved' | 'malformed'; match: string } | null {
@@ -1199,47 +1162,6 @@ function stableGpuHandle(gpu: HardwareGPU): string {
   const body = uuid.replace(/^GPU-/i, '');
   return body.length > 8 ? `${body.slice(0, 8)}…` : body;
 }
-
-// KEY=value per line, one env var per line. Blank/whitespace-only lines are
-// skipped; a malformed (no "=") line is reported via the existing
-// runtime_spec.env_invalid label so it reads the same way a backend
-// rejection would. Only the KEY portion is trimmed (stray leading
-// indentation from a paste) -- the VALUE is preserved byte-for-byte after
-// the first "=" (a value may legitimately contain "=" itself, and trimming
-// the whole line before splitting would silently eat meaningful leading/
-// trailing whitespace IN the value). A key naming one of the agent's base
-// environment variables is refused outright, in any capitalisation -- see
-// reservedEnvKeys; the ${AGENT_ENV:OP_AGENT_*} / malformed-placeholder checks
-// run separately, over both args and env values together, via
-// validatePlaceholders.
-function parseEnvText(
-  text: string,
-  t: Translation,
-): { env: Record<string, string>; error?: string } {
-  const env: Record<string, string> = {};
-  for (const raw of text.split('\n')) {
-    const line = raw.replace(/\r$/, '');
-    if (line.trim() === '') continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) {
-      return { env: {}, error: t.errorRuntimeSpecEnvInvalid };
-    }
-    const key = line.slice(0, eq).trim();
-    const value = line.slice(eq + 1);
-    if (reservedEnvKeys.includes(key.toUpperCase())) {
-      return { env: {}, error: t.runtimeSpecEnvReserved };
-    }
-    env[key] = value;
-  }
-  return { env };
-}
-
-function formatEnvText(env: Record<string, string>): string {
-  return Object.entries(env)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('\n');
-}
-
 // The per-backend reference table: the Env var name each of these
 // three model servers reads for its own API key, the equivalent --api-key
 // argument, and the client header the token then answers to. Shown whenever
@@ -1317,6 +1239,12 @@ export function RuntimeAdminSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    // The RPC tab's manual member specs (the server settings and the live
+    // member list use updateServer and subscribeRuntimeStatus above).
+    | 'rpcMemberSpecs'
+    | 'createRPCMemberSpec'
+    | 'updateRPCMemberSpec'
+    | 'deleteRPCMemberSpec'
     // The live-status Start and Stop: transient, nothing is written.
     | 'startRuntime'
     | 'stopRuntime'
@@ -5760,6 +5688,8 @@ export function RuntimeAdminSection({
         <Tab label={t.runtimeMappingTab} value="mapping" />
         <Tab label={t.runtimeSpecs} value="specs" />
         <Tab label={t.runtimeCoresidency} value="coresidency" />
+        {/* File mode ignores gateway-side documents, so member specs written here would never apply. */}
+        {!fileMode && <Tab label={t.rpcTab} value="rpc" />}
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
@@ -5884,6 +5814,7 @@ export function RuntimeAdminSection({
           {renderCoresidencyBody()}
         </Panel>
       )}
+      {tab === 'rpc' && !fileMode && <RpcMemberSection t={t} api={api} server={server} />}
       {tab === 'limits' && (
         <Panel
           titleId="runtime-limits-heading"

@@ -314,6 +314,10 @@ function baseServerListApi(): ServerListApi {
     deleteApplication: vi.fn(async () => ({ ok: true })),
     deleteMapping: vi.fn(async () => ({ ok: true })),
     deleteRuntimeSpec: vi.fn(async () => ({ ok: true })),
+    rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+    createRPCMemberSpec: vi.fn(async () => ({}) as never),
+    updateRPCMemberSpec: vi.fn(async () => ({}) as never),
+    deleteRPCMemberSpec: vi.fn(async () => undefined),
     deleteServer: vi.fn(async () => ({ ok: true })),
     downloadAgentBinary: vi.fn(async () => new Blob()),
     generateAgentToken: vi.fn(async () => ({
@@ -3187,6 +3191,55 @@ describe('ServerList managed_runtime_only control', () => {
     fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
     await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
     expect(updateServer.mock.calls[0][1]).not.toHaveProperty('managed_runtime_only');
+  });
+
+  it('sends the LAN address and bind-only switch only when they were changed', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), lan_address: '192.168.1.5' };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    // Untouched: neither field is part of the PATCH.
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_address');
+    expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_bind_only');
+  });
+
+  it('PATCHes a changed LAN address, an explicit clear and the bind-only switch', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), lan_address: '192.168.1.5' };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    expect(screen.getByLabelText(t.serverLanAddressLabel)).toHaveValue('192.168.1.5');
+    fireEvent.change(screen.getByLabelText(t.serverLanAddressLabel), {
+      target: { value: '10.0.0.7' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.serverLanBindOnlyLabel }));
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1]).toMatchObject({
+      lan_address: '10.0.0.7',
+      lan_bind_only: true,
+    });
+  });
+
+  it('clears the LAN address with an explicit empty string', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), lan_address: '192.168.1.5' };
+    const updateServer = echoUpdate(server);
+    renderForm(managedApi({ updateServer }), [server]);
+    openEditForm();
+    fireEvent.change(screen.getByLabelText(t.serverLanAddressLabel), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+    await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+    expect(updateServer.mock.calls[0][1].lan_address).toBe('');
+  });
+
+  it('shows the NetBird mesh IP read-only when the server has one', async () => {
+    const server = { ...makeServer('srv-e', 'healthy'), netbird_ip: '100.64.0.5' };
+    renderForm(managedApi({ updateServer: echoUpdate(server) }), [server]);
+    openEditForm();
+    expect(screen.getByLabelText(t.serverNetbirdIpLabel)).toHaveValue('100.64.0.5');
+    expect(screen.getByLabelText(t.serverNetbirdIpLabel)).toHaveAttribute('readonly');
   });
 
   // Authorization, pinned both ways. UpdateServer runs authorizeServer (system

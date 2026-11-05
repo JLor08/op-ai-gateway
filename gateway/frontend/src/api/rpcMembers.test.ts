@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it, vi } from 'vitest';
-import { createPortalApi, PortalApiError, type PutRPCMemberSpecRequest } from '../api';
+import { createPortalApi, type PutRPCMemberSpecRequest } from '../api';
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -70,7 +70,6 @@ describe('rpcMembersApi', () => {
       status: 409,
       code: 'runtime.cluster_member_in_use',
     });
-    expect(PortalApiError).toBeDefined();
   });
 });
 

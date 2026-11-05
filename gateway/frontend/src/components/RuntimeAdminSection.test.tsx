@@ -648,6 +648,11 @@ function renderSection(
     benchmarkMapping: vi.fn(async () => idleBenchmark),
     mappingBenchmarks: opts.mappingBenchmarks ?? vi.fn(async () => []),
     subscribeBenchmark: vi.fn(() => () => {}),
+    // The RPC tab's manual member specs.
+    rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+    createRPCMemberSpec: vi.fn(async () => ({}) as never),
+    updateRPCMemberSpec: vi.fn(async () => ({}) as never),
+    deleteRPCMemberSpec: vi.fn(async () => undefined),
   };
 
   const view = render(
@@ -1553,6 +1558,10 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       benchmarkMapping: vi.fn(async () => idleBenchmark),
       mappingBenchmarks: vi.fn(async () => []),
       subscribeBenchmark: vi.fn(() => () => {}),
+      rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+      createRPCMemberSpec: vi.fn(async () => ({}) as never),
+      updateRPCMemberSpec: vi.fn(async () => ({}) as never),
+      deleteRPCMemberSpec: vi.fn(async () => undefined),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     };
@@ -4813,6 +4822,16 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(await screen.findByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
   });
 
+  it('offers an RPC tab that renders the member settings, and hides it in file mode', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('tab', { name: t.rpcTab }));
+    expect(await screen.findByLabelText(t.rpcMemberEnabledLabel)).toBeInTheDocument();
+    cleanup();
+    renderFileMode();
+    await screen.findByText(t.runtimeManagedLocally);
+    expect(screen.queryByRole('tab', { name: t.rpcTab })).not.toBeInTheDocument();
+  });
+
   it('turns every edit affordance off: no spec form, no co-residency editor, no budget form, no overrides', async () => {
     const { stream } = renderFileMode();
     await screen.findByText(t.runtimeManagedLocally);
@@ -7666,6 +7685,7 @@ describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
       t.runtimeMappingTab,
       t.runtimeSpecs,
       t.runtimeCoresidency,
+      t.rpcTab,
       t.runtimeLimits,
       t.runtimeLiveStatus,
     ]);
