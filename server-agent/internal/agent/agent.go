@@ -2437,7 +2437,12 @@ func (a *Agent) collectOnce(ctx context.Context) {
 				// StateStarting/backoff/crashed/etc. have no healthy
 				// endpoint yet, so they correctly stay at the zero value
 				// collectOnce would otherwise never touch.
-				if st.State == runtimectl.StateRunning && st.Port > 0 {
+				//
+				// An rpc_server member is the exception: its port speaks the
+				// ggml RPC protocol, not HTTP, so a probe could only provoke a
+				// protocol error in the member. Its readiness is a TCP connect
+				// the manager already made.
+				if st.State == runtimectl.StateRunning && st.Port > 0 && st.Kind != runtimectl.SpecKindRPCServer {
 					a.probeRuntimeChild(ctx, probeClient, st, &rs)
 				}
 				runtimes = append(runtimes, rs)

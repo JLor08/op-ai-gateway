@@ -426,6 +426,12 @@ func (p LocalPolicy) Permit(spec Spec) error {
 		return fmt.Errorf("runtime: binary %q is not in the allowed-binaries list", spec.Binary)
 	}
 
+	if spec.IsRPCServer() {
+		if err := permitMember(spec); err != nil {
+			return err
+		}
+	}
+
 	// R2: an EMPTY work_dir means "run beside the binary" (effectiveWorkDir),
 	// and is permitted UNCONDITIONALLY here -- before, and independent of, any
 	// AllowedDirs containment. The binary's own directory is trusted BY
@@ -1158,6 +1164,14 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, geten
 	// environment is byte-identical to the SetVisibleDevices-off one.
 	if name := injectedVisibleDevicesVar(spec, vendor); name != "" {
 		resultEnv = append(resultEnv, name+"="+gpuIDs)
+		resultSpans = append(resultSpans, nil)
+		fromSpec = append(fromSpec, false)
+	}
+	// A cluster head runs with the RPC backend's collective communication off:
+	// it is unsupported across rpc-server members. Agent-owned like the
+	// visibility variable, so it joins the base block.
+	if spec.IsClusterHead() {
+		resultEnv = append(resultEnv, "GGML_RPC_NO_COMM=1")
 		resultSpans = append(resultSpans, nil)
 		fromSpec = append(fromSpec, false)
 	}

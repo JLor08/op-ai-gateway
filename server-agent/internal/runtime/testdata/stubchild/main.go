@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -45,7 +47,24 @@ func main() {
 	requestLog := flag.String("request-log", "", "if set, append one line \"<METHOD> <PATH>\" per HTTP request this process receives, before answering it -- proves from the child's side which requests reached it, independent of the router's and the manager's own bookkeeping")
 	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
 	healthGate := flag.String("health-gate", "", "if set, /health answers 503 until this file exists (and -health-delay has passed) -- lets a test hold a child in starting for exactly as long as it needs, and end the load at a moment it chooses, instead of guessing a delay")
+	tcpListen := flag.Bool("tcp-listen", false, "stand in for an rpc-server: accept raw TCP connections on -H:-p (and answer no HTTP at all), so a test can prove readiness comes from a TCP connect alone")
+	// The flags the agent appends to an rpc_server member's command line
+	// (-H/-p/-d, -c when caching) plus the operator's -t. They are only parsed
+	// here so the stub accepts a real member argv; -H and -p are the listen
+	// address of -tcp-listen mode.
+	tcpHost := flag.String("H", "127.0.0.1", "-tcp-listen: host to bind")
+	tcpPort := flag.Int("p", 0, "-tcp-listen: port to bind")
+	flag.String("d", "", "accepted and ignored: the member's device list")
+	flag.Bool("c", false, "accepted and ignored: the member's cache switch")
+	flag.Int("t", 0, "accepted and ignored: the operator's thread count")
+	argvLog := flag.String("argv-log", "", "if set, write this process's argv (space-joined, without the program name) -- the only way to observe from the parent's test the exact command line the manager launched")
 	flag.Parse()
+
+	if *argvLog != "" {
+		if err := os.WriteFile(*argvLog, []byte(strings.Join(os.Args[1:], " ")), 0o644); err != nil {
+			log.Fatalf("stubchild: write argv log: %v", err)
+		}
+	}
 
 	// -ignore-sigterm exists so a test can observe manager state while a
 	// generation has been signalled but is NOT gone yet. A cooperative child
@@ -129,6 +148,11 @@ func main() {
 		}()
 	}
 
+	if *tcpListen {
+		serveTCPOnly(net.JoinHostPort(*tcpHost, strconv.Itoa(*tcpPort)))
+		return
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if time.Since(start) < *healthDelay || !healthGateOpen(*healthGate) {
@@ -208,6 +232,22 @@ func main() {
 	addr := "127.0.0.1:" + strconv.Itoa(*port)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("stubchild: listen %s: %v", addr, err)
+	}
+}
+
+// serveTCPOnly accepts connections on addr and closes each at once; it never
+// speaks HTTP, so only a plain TCP connect can tell it is up.
+func serveTCPOnly(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("stubchild: listen %s: %v", addr, err)
+	}
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			log.Fatalf("stubchild: accept: %v", err)
+		}
+		c.Close()
 	}
 }
 

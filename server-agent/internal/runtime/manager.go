@@ -1631,6 +1631,16 @@ func (o *owner) applyConfig(cfg Config) {
 	o.cfg = cfg
 	o.allowedPairs = cfg.AllowedPairs()
 
+	// A member's cache belongs to the head it serves: remember who served which
+	// head before this document, to drop the caches it orphans.
+	memberHeads := make(map[string]string)
+	for id, st := range o.specs {
+		if st.instance == 0 && st.spec.IsRPCServer() {
+			memberHeads[id] = st.spec.RPC.HeadSpecID
+		}
+	}
+	defer o.purgeDepartedMemberCaches(memberHeads, cfg.Specs)
+
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))
 	for _, spec := range cfg.Specs {
@@ -2026,7 +2036,9 @@ func sameLaunchShape(a, b Spec) bool {
 func (o *owner) rebuildUpstreamIndex() {
 	o.byUpstream = make(map[string]string, len(o.specs))
 	for id, st := range o.specs {
-		if st.instance != 0 {
+		if st.instance != 0 || st.spec.Kind == SpecKindRPCServer {
+			// An rpc_server member serves no model: indexed, it would sit under
+			// the empty upstream name and could shadow a real lookup.
 			continue
 		}
 		// M4 fix: this used to collapse silently, with map iteration order
@@ -3828,7 +3840,7 @@ func (o *owner) startProcess(st *specState) {
 	}
 
 	port := spec.ListenPort
-	if port == 0 {
+	if port == 0 && !spec.IsRPCServer() {
 		p, err := grabEphemeralPort()
 		if err != nil {
 			o.setState(st, StateStartFailed)
@@ -3865,6 +3877,16 @@ func (o *owner) startProcess(st *specState) {
 	}
 
 	args, env := ex.args, ex.env
+	if spec.IsRPCServer() {
+		// A member's command line is the operator's arguments plus the
+		// agent-owned -d/-H/-p/-c, and its port is the one it binds. Everything
+		// here is deterministic, so a failure is a verdict, not a start failure.
+		var err error
+		if args, env, port, err = o.prepareMember(spec, ex.args, ex.env); err != nil {
+			o.setNotPermitted(st, err.Error())
+			return
+		}
+	}
 	// The reportable form of this exact launch, built from the SAME expansion
 	// (never a second one that could disagree with it) and masked here, at the
 	// point of substitution, so no plaintext resolved command is ever retained
@@ -3972,6 +3994,11 @@ func (o *owner) pollHealth(specID string, proc *runningProc, spec Spec) {
 		startupTimeout = 30 * time.Second
 	}
 	deadline := proc.startedAt.Add(startupTimeout)
+
+	if spec.IsRPCServer() {
+		o.pollMemberReady(specID, proc, spec, deadline)
+		return
+	}
 
 	healthPath := spec.HealthPath
 	if healthPath == "" {
@@ -5135,13 +5162,17 @@ func (o *owner) scanIdle() {
 		if st.protected() {
 			continue
 		}
-		if st.spec.IdleTimeoutSeconds <= 0 || st.inFlight != 0 {
+		isMember := st.spec.Kind == SpecKindRPCServer
+		if (st.spec.IdleTimeoutSeconds <= 0 && !isMember) || st.inFlight != 0 {
 			continue
 		}
 		if o.higherSiblingRuns(st) {
 			continue
 		}
 		idle := time.Duration(st.spec.IdleTimeoutSeconds) * time.Second
+		if isMember {
+			idle = memberIdleTimeout(st.spec)
+		}
 		if now.Sub(st.lastUsed) >= idle {
 			o.beginDrain(id)
 		}
@@ -5171,6 +5202,7 @@ func (o *owner) snapshotStatus() []Status {
 			Type:             st.spec.Type,
 			MetricsPath:      st.spec.MetricsPath,
 			ContextProbePath: st.spec.ContextProbePath,
+			Kind:             st.spec.Kind,
 		}
 		if st.measuredVRAM != nil {
 			// M3 fix: hand out a COPY, not the same map the measurer
@@ -5197,7 +5229,7 @@ func (o *owner) snapshotStatus() []Status {
 func (o *owner) loadedModels() []string {
 	var out []string
 	for _, st := range o.specs {
-		if st.state == StateRunning {
+		if st.state == StateRunning && st.spec.Kind != SpecKindRPCServer {
 			out = append(out, InstanceAddress(st.spec.UpstreamModel, st.instance))
 		}
 	}
