@@ -184,6 +184,54 @@ func (_d *RoutingStoreWithTracing) ClearVendorAccountSharing(ctx context.Context
 	return _d.Store.ClearVendorAccountSharing(ctx, accountID)
 }
 
+func (_d *RoutingStoreWithTracing) CloseRPCSessions(ctx context.Context, headSpecID string, instance int, memberServerID string, until time.Time) (err error) {
+	ctx, span := Start(ctx, "routing.Store.CloseRPCSessions")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.CloseRPCSessions(ctx, headSpecID, instance, memberServerID, until)
+}
+
+func (_d *RoutingStoreWithTracing) ClusterMemberBySpec(ctx context.Context, memberSpecID string) (c2 _sourceRouting.ClusterMember, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.ClusterMemberBySpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ClusterMemberBySpec(ctx, memberSpecID)
+}
+
+func (_d *RoutingStoreWithTracing) ClusterMembers(ctx context.Context, headSpecID string) (ca1 []_sourceRouting.ClusterMember, ca2 []_sourceRouting.ClusterMemberGPU, err error) {
+	ctx, span := Start(ctx, "routing.Store.ClusterMembers")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ClusterMembers(ctx, headSpecID)
+}
+
+func (_d *RoutingStoreWithTracing) ClusterMembershipsByServer(ctx context.Context, serverID string) (ca1 []_sourceRouting.ClusterMember, err error) {
+	ctx, span := Start(ctx, "routing.Store.ClusterMembershipsByServer")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ClusterMembershipsByServer(ctx, serverID)
+}
+
 func (_d *RoutingStoreWithTracing) CoResidencyRulesByApplication(ctx context.Context, appID string) (ca1 []_sourceRouting.CoResidencyRule, err error) {
 	ctx, span := Start(ctx, "routing.Store.CoResidencyRulesByApplication")
 	defer span.End()
@@ -410,6 +458,18 @@ func (_d *RoutingStoreWithTracing) DeletePrincipalLimits(ctx context.Context, pr
 		}
 	}()
 	return _d.Store.DeletePrincipalLimits(ctx, principalType, principalID)
+}
+
+func (_d *RoutingStoreWithTracing) DeleteRPCMemberSpec(ctx context.Context, id string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteRPCMemberSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteRPCMemberSpec(ctx, id)
 }
 
 func (_d *RoutingStoreWithTracing) DeleteResourceGroup(ctx context.Context, id string) (err error) {
@@ -676,6 +736,18 @@ func (_d *RoutingStoreWithTracing) ModelSettings(ctx context.Context) (ma1 []_so
 	return _d.Store.ModelSettings(ctx)
 }
 
+func (_d *RoutingStoreWithTracing) OpenRPCSession(ctx context.Context, s _sourceRouting.RPCSession) (err error) {
+	ctx, span := Start(ctx, "routing.Store.OpenRPCSession")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.OpenRPCSession(ctx, s)
+}
+
 func (_d *RoutingStoreWithTracing) PrincipalLimits(ctx context.Context, principalType string, principalID string) (l1 _sourceRouting.LimitConfig, b1 bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.PrincipalLimits")
 	defer span.End()
@@ -734,6 +806,54 @@ func (_d *RoutingStoreWithTracing) PruneTelemetrySamples(ctx context.Context, be
 		}
 	}()
 	return _d.Store.PruneTelemetrySamples(ctx, before)
+}
+
+func (_d *RoutingStoreWithTracing) RPCMemberSpecByID(ctx context.Context, id string) (r1 _sourceRouting.RPCMemberSpec, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.RPCMemberSpecByID")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RPCMemberSpecByID(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) RPCMemberSpecGPUs(ctx context.Context, specID string) (ra1 []_sourceRouting.RPCMemberSpecGPU, err error) {
+	ctx, span := Start(ctx, "routing.Store.RPCMemberSpecGPUs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RPCMemberSpecGPUs(ctx, specID)
+}
+
+func (_d *RoutingStoreWithTracing) RPCMemberSpecsByServer(ctx context.Context, serverID string) (ra1 []_sourceRouting.RPCMemberSpec, err error) {
+	ctx, span := Start(ctx, "routing.Store.RPCMemberSpecsByServer")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RPCMemberSpecsByServer(ctx, serverID)
+}
+
+func (_d *RoutingStoreWithTracing) RPCSessionsAt(ctx context.Context, headSpecID string, instance int, at time.Time) (ra1 []_sourceRouting.RPCSession, err error) {
+	ctx, span := Start(ctx, "routing.Store.RPCSessionsAt")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.RPCSessionsAt(ctx, headSpecID, instance, at)
 }
 
 func (_d *RoutingStoreWithTracing) RemoveResourceGroupAdminGroup(ctx context.Context, rgID string, groupID string) (err error) {
@@ -1192,6 +1312,18 @@ func (_d *RoutingStoreWithTracing) ServicesByDelegate(ctx context.Context, userI
 	return _d.Store.ServicesByDelegate(ctx, userID)
 }
 
+func (_d *RoutingStoreWithTracing) SetClusterMembers(ctx context.Context, headSpecID string, members []_sourceRouting.ClusterMember, gpus []_sourceRouting.ClusterMemberGPU) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetClusterMembers")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetClusterMembers(ctx, headSpecID, members, gpus)
+}
+
 func (_d *RoutingStoreWithTracing) SetCoResidencyMode(ctx context.Context, appID string, mode _sourceRouting.CoResidencyMode) (err error) {
 	ctx, span := Start(ctx, "routing.Store.SetCoResidencyMode")
 	defer span.End()
@@ -1238,6 +1370,18 @@ func (_d *RoutingStoreWithTracing) SetPrincipalLimits(ctx context.Context, princ
 		}
 	}()
 	return _d.Store.SetPrincipalLimits(ctx, principalType, principalID, cfg)
+}
+
+func (_d *RoutingStoreWithTracing) SetRPCMemberSpecGPUs(ctx context.Context, specID string, gpus []_sourceRouting.RPCMemberSpecGPU) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetRPCMemberSpecGPUs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetRPCMemberSpecGPUs(ctx, specID, gpus)
 }
 
 func (_d *RoutingStoreWithTracing) SetResourceGroupAdminGroup(ctx context.Context, rgID string, groupID string) (err error) {
@@ -1502,6 +1646,18 @@ func (_d *RoutingStoreWithTracing) UpdateApplication(ctx context.Context, app _s
 		}
 	}()
 	return _d.Store.UpdateApplication(ctx, app)
+}
+
+func (_d *RoutingStoreWithTracing) UpdateClusterMemberUsage(ctx context.Context, m _sourceRouting.ClusterMember, gpus []_sourceRouting.ClusterMemberGPU) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateClusterMemberUsage")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateClusterMemberUsage(ctx, m, gpus)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateMapping(ctx context.Context, mapping _sourceRouting.ModelMapping) (err error) {
@@ -1970,6 +2126,18 @@ func (_d *RoutingStoreWithTracing) UpsertModelSetting(ctx context.Context, setti
 		}
 	}()
 	return _d.Store.UpsertModelSetting(ctx, setting)
+}
+
+func (_d *RoutingStoreWithTracing) UpsertRPCMemberSpec(ctx context.Context, s _sourceRouting.RPCMemberSpec) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertRPCMemberSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertRPCMemberSpec(ctx, s)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertRuntimeSpec(ctx context.Context, spec _sourceRouting.RuntimeSpec) (err error) {

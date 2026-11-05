@@ -141,6 +141,17 @@ type MemoryStore struct {
 	// serverBinaries mirrors server_binaries (migration 103): serverID -> path
 	// -> row. Deleted with the server, like the table's cascading FK.
 	serverBinaries map[string]map[string]ServerBinary
+	// rpcMemberSpecs mirrors rpc_member_specs (migration 104), rpcMemberSpecGPUs
+	// its GPU rows by spec id, clusterMembers rpc_cluster_members by head spec
+	// id (unordered; reads sort by position), clusterMemberGPUs
+	// rpc_cluster_member_gpus by head spec id and rpcSessions rpc_sessions.
+	// The cascades are by hand: a server delete drops its member specs and every
+	// membership row naming it, a head spec delete drops its membership.
+	rpcMemberSpecs    map[string]RPCMemberSpec
+	rpcMemberSpecGPUs map[string][]RPCMemberSpecGPU
+	clusterMembers    map[string][]ClusterMember
+	clusterMemberGPUs map[string][]ClusterMemberGPU
+	rpcSessions       []RPCSession
 	// runtimeReports mirrors server_runtime_reports (migration 67, Task 4):
 	// the latest file-mode runtime report per server. 1:1, upsert-overwrite —
 	// same shape as `hardware` above.
@@ -222,6 +233,10 @@ func NewMemoryStore() *MemoryStore {
 		coresidencyMode:          map[string]CoResidencyMode{},
 		gpuBudgets:               map[string][]ServerGPUBudget{},
 		serverBinaries:           map[string]map[string]ServerBinary{},
+		rpcMemberSpecs:           map[string]RPCMemberSpec{},
+		rpcMemberSpecGPUs:        map[string][]RPCMemberSpecGPU{},
+		clusterMembers:           map[string][]ClusterMember{},
+		clusterMemberGPUs:        map[string][]ClusterMemberGPU{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
 		mappingCache:             map[string]map[modelMappingCacheKey]ModelMappingCacheRow{},
@@ -456,6 +471,7 @@ func (m *MemoryStore) DeleteAIServer(_ context.Context, id string) error {
 	delete(m.availSamples, id)            // server_availability_samples
 	delete(m.gpuBudgets, id)              // ai_server_gpu_budgets
 	delete(m.serverBinaries, id)          // server_binaries
+	m.deleteRPCServerStateLocked(id)      // rpc_member_specs, rpc_cluster_members
 	delete(m.runtimeReports, id)          // server_runtime_reports
 	m.deleteAffinitiesForServerLocked(id) // route_affinity.server_id
 	// resourceGroupServers is keyed resourceGroupID -> serverID (the REVERSE
@@ -1037,6 +1053,7 @@ func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 		if spec.MappingID == mappingID {
 			delete(m.runtimeSpecs, specID)
 			delete(m.runtimeSpecGPUs, specID)
+			m.deleteClusterMembersLocked(specID)
 		}
 	}
 	for appID, rules := range m.coresidency {
@@ -2844,6 +2861,7 @@ func (m *MemoryStore) DeleteRuntimeSpec(_ context.Context, id string) error {
 	}
 	delete(m.runtimeSpecs, id)
 	delete(m.runtimeSpecGPUs, id)
+	m.deleteClusterMembersLocked(id)
 	return nil
 }
 
@@ -3599,4 +3617,343 @@ func (m *MemoryStore) VendorAccountUsageByID(_ context.Context, accountID string
 		return VendorAccountUsage{}, false, nil
 	}
 	return copyVendorAccountUsage(u), true, nil
+}
+
+// --- RPCClusterStore (migration 104) ------------------------------------------
+
+// deleteClusterMembersLocked drops headSpecID's membership and GPU rows
+// (agent_runtime_specs delete cascade). Callers hold m.mu for writing.
+func (m *MemoryStore) deleteClusterMembersLocked(headSpecID string) {
+	delete(m.clusterMembers, headSpecID)
+	delete(m.clusterMemberGPUs, headSpecID)
+}
+
+// deleteRPCServerStateLocked drops a deleted server's member specs (with their
+// GPU rows) and every membership row naming it as member, with that row's GPU
+// rows. Callers hold m.mu for writing.
+func (m *MemoryStore) deleteRPCServerStateLocked(serverID string) {
+	for id, sp := range m.rpcMemberSpecs {
+		if sp.ServerID == serverID {
+			delete(m.rpcMemberSpecs, id)
+			delete(m.rpcMemberSpecGPUs, id)
+		}
+	}
+	for head, members := range m.clusterMembers {
+		kept := make([]ClusterMember, 0, len(members))
+		for _, mem := range members {
+			if mem.ServerID != serverID {
+				kept = append(kept, mem)
+			}
+		}
+		m.clusterMembers[head] = kept
+		gpus := make([]ClusterMemberGPU, 0, len(m.clusterMemberGPUs[head]))
+		for _, g := range m.clusterMemberGPUs[head] {
+			if g.ServerID != serverID {
+				gpus = append(gpus, g)
+			}
+		}
+		m.clusterMemberGPUs[head] = gpus
+	}
+}
+
+// UpsertRPCMemberSpec inserts or updates the spec by ID, keeping CreatedAt on
+// update. An unknown ServerID is ErrNotFound.
+func (m *MemoryStore) UpsertRPCMemberSpec(_ context.Context, s RPCMemberSpec) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.servers[s.ServerID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	if prev, ok := m.rpcMemberSpecs[s.ID]; ok {
+		s.CreatedAt = prev.CreatedAt
+	}
+	m.rpcMemberSpecs[s.ID] = s
+	return nil
+}
+
+// RPCMemberSpecByID returns the spec; ok is false when it does not exist.
+func (m *MemoryStore) RPCMemberSpecByID(_ context.Context, id string) (RPCMemberSpec, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.rpcMemberSpecs[id]
+	return s, ok, nil
+}
+
+// RPCMemberSpecsByServer lists serverID's specs ordered by ID, always non-nil.
+func (m *MemoryStore) RPCMemberSpecsByServer(_ context.Context, serverID string) ([]RPCMemberSpec, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RPCMemberSpec, 0)
+	for _, s := range m.rpcMemberSpecs {
+		if s.ServerID == serverID {
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// DeleteRPCMemberSpec removes the spec and its GPU rows.
+func (m *MemoryStore) DeleteRPCMemberSpec(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.rpcMemberSpecs[id]; !ok {
+		return storeerr.ErrNotFound
+	}
+	delete(m.rpcMemberSpecs, id)
+	delete(m.rpcMemberSpecGPUs, id)
+	return nil
+}
+
+// SetRPCMemberSpecGPUs replaces specID's GPU rows (a duplicate GPUIndex is the
+// primary-key conflict the SQL side reports).
+func (m *MemoryStore) SetRPCMemberSpecGPUs(_ context.Context, specID string, gpus []RPCMemberSpecGPU) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.rpcMemberSpecs[specID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	seen := make(map[int]struct{}, len(gpus))
+	for _, g := range gpus {
+		if _, dup := seen[g.GPUIndex]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[g.GPUIndex] = struct{}{}
+	}
+	stored := make([]RPCMemberSpecGPU, len(gpus))
+	for i, g := range gpus {
+		g.SpecID = specID
+		stored[i] = g
+	}
+	m.rpcMemberSpecGPUs[specID] = stored
+	return nil
+}
+
+// RPCMemberSpecGPUs lists specID's GPU rows by position, then index.
+func (m *MemoryStore) RPCMemberSpecGPUs(_ context.Context, specID string) ([]RPCMemberSpecGPU, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RPCMemberSpecGPU, len(m.rpcMemberSpecGPUs[specID]))
+	copy(out, m.rpcMemberSpecGPUs[specID])
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Position != out[j].Position {
+			return out[i].Position < out[j].Position
+		}
+		return out[i].GPUIndex < out[j].GPUIndex
+	})
+	return out, nil
+}
+
+// SetClusterMembers replaces headSpecID's membership and GPU rows, enforcing
+// by hand what the tables enforce: the head and every member server exist
+// (ErrNotFound), (head, position), (head, server) and a non-empty
+// member_spec_id across all heads are unique (ErrConflict), and a GPU row
+// needs a membership row of its (head, server) in the same call (ErrNotFound).
+// Nothing is stored when any check fails.
+func (m *MemoryStore) SetClusterMembers(_ context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runtimeSpecs[headSpecID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	positions := make(map[int]struct{}, len(members))
+	servers := make(map[string]struct{}, len(members))
+	specs := make(map[string]struct{}, len(members))
+	for _, mem := range members {
+		if _, ok := m.servers[mem.ServerID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		if _, dup := positions[mem.Position]; dup {
+			return storeerr.ErrConflict
+		}
+		if _, dup := servers[mem.ServerID]; dup {
+			return storeerr.ErrConflict
+		}
+		positions[mem.Position], servers[mem.ServerID] = struct{}{}, struct{}{}
+		if mem.MemberSpecID == "" {
+			continue
+		}
+		if _, dup := specs[mem.MemberSpecID]; dup {
+			return storeerr.ErrConflict
+		}
+		specs[mem.MemberSpecID] = struct{}{}
+		for head, others := range m.clusterMembers {
+			if head == headSpecID {
+				continue
+			}
+			for _, o := range others {
+				if o.MemberSpecID == mem.MemberSpecID {
+					return storeerr.ErrConflict
+				}
+			}
+		}
+	}
+	gpuKeys := make(map[string]struct{}, len(gpus))
+	for _, g := range gpus {
+		if _, ok := servers[g.ServerID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		key := fmt.Sprintf("%s/%d", g.ServerID, g.GPUIndex)
+		if _, dup := gpuKeys[key]; dup {
+			return storeerr.ErrConflict
+		}
+		gpuKeys[key] = struct{}{}
+	}
+	storedM := make([]ClusterMember, len(members))
+	for i, mem := range members {
+		mem.HeadSpecID = headSpecID
+		storedM[i] = mem
+	}
+	storedG := make([]ClusterMemberGPU, len(gpus))
+	for i, g := range gpus {
+		g.HeadSpecID = headSpecID
+		storedG[i] = g
+	}
+	m.clusterMembers[headSpecID] = storedM
+	m.clusterMemberGPUs[headSpecID] = storedG
+	return nil
+}
+
+func sortClusterMembers(rows []ClusterMember) {
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Position < rows[j].Position })
+}
+
+// ClusterMembers returns headSpecID's membership by position and its GPU rows
+// by server, position, index; both are always non-nil.
+func (m *MemoryStore) ClusterMembers(_ context.Context, headSpecID string) ([]ClusterMember, []ClusterMemberGPU, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	members := make([]ClusterMember, len(m.clusterMembers[headSpecID]))
+	copy(members, m.clusterMembers[headSpecID])
+	sortClusterMembers(members)
+	gpus := make([]ClusterMemberGPU, len(m.clusterMemberGPUs[headSpecID]))
+	copy(gpus, m.clusterMemberGPUs[headSpecID])
+	sort.Slice(gpus, func(i, j int) bool {
+		a, b := gpus[i], gpus[j]
+		if a.ServerID != b.ServerID {
+			return a.ServerID < b.ServerID
+		}
+		if a.Position != b.Position {
+			return a.Position < b.Position
+		}
+		return a.GPUIndex < b.GPUIndex
+	})
+	return members, gpus, nil
+}
+
+// ClusterMembershipsByServer is the reverse index, ordered by head spec ID.
+func (m *MemoryStore) ClusterMembershipsByServer(_ context.Context, serverID string) ([]ClusterMember, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]ClusterMember, 0)
+	for _, members := range m.clusterMembers {
+		for _, mem := range members {
+			if mem.ServerID == serverID {
+				out = append(out, mem)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].HeadSpecID < out[j].HeadSpecID })
+	return out, nil
+}
+
+// ClusterMemberBySpec returns the membership row using the manual member spec.
+func (m *MemoryStore) ClusterMemberBySpec(_ context.Context, memberSpecID string) (ClusterMember, bool, error) {
+	if memberSpecID == "" {
+		return ClusterMember{}, false, nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, members := range m.clusterMembers {
+		for _, mem := range members {
+			if mem.MemberSpecID == memberSpecID {
+				return mem, true, nil
+			}
+		}
+	}
+	return ClusterMember{}, false, nil
+}
+
+// UpdateClusterMemberUsage writes only the measured / run-peak fields, like the
+// SQL update; a GPU row that does not exist is skipped.
+func (m *MemoryStore) UpdateClusterMemberUsage(_ context.Context, upd ClusterMember, gpus []ClusterMemberGPU) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	members := m.clusterMembers[upd.HeadSpecID]
+	idx := -1
+	for i, mem := range members {
+		if mem.ServerID == upd.ServerID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return storeerr.ErrNotFound
+	}
+	row := &members[idx]
+	row.RAMMeasuredMB, row.MeasuredAt, row.Stale = upd.RAMMeasuredMB, upd.MeasuredAt, upd.Stale
+	row.RunPeakRAMMB, row.RunHeadInstance, row.RunStartedAt = upd.RunPeakRAMMB, upd.RunHeadInstance, upd.RunStartedAt
+	stored := m.clusterMemberGPUs[upd.HeadSpecID]
+	for _, g := range gpus {
+		for i := range stored {
+			if stored[i].ServerID == upd.ServerID && stored[i].GPUIndex == g.GPUIndex {
+				stored[i].VRAMMeasuredMB, stored[i].RunPeakVRAMMB = g.VRAMMeasuredMB, g.RunPeakVRAMMB
+			}
+		}
+	}
+	return nil
+}
+
+// OpenRPCSession appends a session.
+func (m *MemoryStore) OpenRPCSession(_ context.Context, s RPCSession) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s.Until != nil {
+		u := *s.Until
+		s.Until = &u
+	}
+	m.rpcSessions = append(m.rpcSessions, s)
+	return nil
+}
+
+// CloseRPCSessions sets Until on the open sessions of (head, instance, member).
+func (m *MemoryStore) CloseRPCSessions(_ context.Context, headSpecID string, instance int, memberServerID string, until time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.rpcSessions {
+		s := &m.rpcSessions[i]
+		if s.HeadSpecID == headSpecID && s.Instance == instance && s.MemberServerID == memberServerID && s.Until == nil {
+			u := until
+			s.Until = &u
+		}
+	}
+	return nil
+}
+
+// RPCSessionsAt lists the sessions of (head, instance) in force at at, by
+// Since then member server ID.
+func (m *MemoryStore) RPCSessionsAt(_ context.Context, headSpecID string, instance int, at time.Time) ([]RPCSession, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RPCSession, 0)
+	for _, s := range m.rpcSessions {
+		if s.HeadSpecID != headSpecID || s.Instance != instance || s.Since.After(at) {
+			continue
+		}
+		if s.Until != nil && s.Until.Before(at) {
+			continue
+		}
+		if s.Until != nil {
+			u := *s.Until
+			s.Until = &u
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Since.Equal(out[j].Since) {
+			return out[i].Since.Before(out[j].Since)
+		}
+		return out[i].MemberServerID < out[j].MemberServerID
+	})
+	return out, nil
 }

@@ -3511,6 +3511,7 @@ type Store interface {
 	LimitsStore
 	CertificateStore
 	RuntimeStore
+	RPCClusterStore
 	VendorAccountStore
 }
 
@@ -3549,4 +3550,130 @@ func applicationServesEndpoint(app Application, fineFlavor string) bool {
 	default:
 		return applicationHasAPIFlavor(app, NormalizeAPIFlavor(fineFlavor))
 	}
+}
+
+// RPCMemberSpec is an operator-defined (manual) llama.cpp RPC member: one
+// member process on ServerID (rpc_member_specs, migration 104). Binary, Args
+// and Env are the operator's launch settings; AllowedHeadGroups is the member
+// side's consent, an opaque JSON array of user-group ids.
+type RPCMemberSpec struct {
+	ID                string
+	ServerID          string
+	Enabled           bool
+	Binary            string
+	Args              string
+	Env               string
+	CacheEnabled      bool
+	DeviceBackend     string
+	RAMEstimateMB     int
+	AllowedHeadGroups string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// RPCMemberSpecGPU is one GPU a manual member serves, keyed by (SpecID,
+// GPUIndex).
+type RPCMemberSpecGPU struct {
+	SpecID         string
+	GPUIndex       int
+	Position       int
+	VRAMEstimateMB int
+}
+
+// ClusterMember is one member of a cluster head's membership
+// (rpc_cluster_members), keyed by (HeadSpecID, ServerID) and ordered by
+// Position. MemberSpecID names the manual member spec; "" is an automatic
+// member, whose settings (Threads, CacheEnabled, DeviceBackend, RAMEstimateMB)
+// and Port live here instead. The measured and run-peak fields are usage the
+// agent reported for this head; the zero time means "not yet".
+type ClusterMember struct {
+	HeadSpecID      string
+	Position        int
+	ServerID        string
+	MemberSpecID    string
+	Threads         int
+	CacheEnabled    bool
+	DeviceBackend   string
+	RAMEstimateMB   int
+	Port            int
+	RAMMeasuredMB   int
+	MeasuredAt      time.Time
+	Stale           bool
+	RunPeakRAMMB    int
+	RunHeadInstance int
+	RunStartedAt    time.Time
+}
+
+// ClusterMemberGPU is one GPU of a membership row (rpc_cluster_member_gpus),
+// keyed by (HeadSpecID, ServerID, GPUIndex); it disappears with its membership
+// row.
+type ClusterMemberGPU struct {
+	HeadSpecID     string
+	ServerID       string
+	GPUIndex       int
+	Position       int
+	VRAMEstimateMB int
+	VRAMMeasuredMB int
+	RunPeakVRAMMB  int
+}
+
+// RPCSession records that head instance Instance of HeadSpecID used
+// MemberServerID from Since; Until is nil while the session is open.
+type RPCSession struct {
+	HeadSpecID     string
+	Instance       int
+	MemberServerID string
+	Since          time.Time
+	Until          *time.Time
+}
+
+// RPCClusterStore persists llama.cpp RPC cluster members, membership and
+// sessions (migration 104).
+type RPCClusterStore interface {
+	// UpsertRPCMemberSpec inserts or updates the manual member spec by ID,
+	// keeping CreatedAt on update. An unknown ServerID is ErrNotFound.
+	UpsertRPCMemberSpec(ctx context.Context, s RPCMemberSpec) error
+	// RPCMemberSpecByID returns the spec; ok is false when it does not exist.
+	RPCMemberSpecByID(ctx context.Context, id string) (RPCMemberSpec, bool, error)
+	// RPCMemberSpecsByServer lists serverID's member specs ordered by ID.
+	// Always non-nil.
+	RPCMemberSpecsByServer(ctx context.Context, serverID string) ([]RPCMemberSpec, error)
+	// DeleteRPCMemberSpec removes the spec and its GPU rows; ErrNotFound when
+	// it does not exist.
+	DeleteRPCMemberSpec(ctx context.Context, id string) error
+	// SetRPCMemberSpecGPUs atomically replaces specID's GPU rows. An unknown
+	// spec is ErrNotFound, a duplicate GPUIndex ErrConflict.
+	SetRPCMemberSpecGPUs(ctx context.Context, specID string, gpus []RPCMemberSpecGPU) error
+	// RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then
+	// index. Always non-nil.
+	RPCMemberSpecGPUs(ctx context.Context, specID string) ([]RPCMemberSpecGPU, error)
+	// SetClusterMembers atomically replaces every membership row (and its GPU
+	// rows) of headSpecID. Carrying measured fields over per (server,
+	// gpu_index) is the caller's job. An unknown head or member server is
+	// ErrNotFound; a duplicate position, a duplicate server, or a manual
+	// member spec already used by another membership row is ErrConflict.
+	SetClusterMembers(ctx context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error
+	// ClusterMembers returns headSpecID's membership ordered by position and
+	// its GPU rows ordered by server, position, index. Both always non-nil.
+	ClusterMembers(ctx context.Context, headSpecID string) ([]ClusterMember, []ClusterMemberGPU, error)
+	// ClusterMembershipsByServer is the reverse index: every membership row
+	// whose member is serverID, ordered by head spec ID. Always non-nil.
+	ClusterMembershipsByServer(ctx context.Context, serverID string) ([]ClusterMember, error)
+	// ClusterMemberBySpec returns the membership row that uses the manual
+	// member spec; ok is false when none does.
+	ClusterMemberBySpec(ctx context.Context, memberSpecID string) (ClusterMember, bool, error)
+	// UpdateClusterMemberUsage writes only the measured / run-peak fields of
+	// the existing membership row m (RAMMeasuredMB, MeasuredAt, Stale,
+	// RunPeakRAMMB, RunHeadInstance, RunStartedAt) and of each given GPU row
+	// (VRAMMeasuredMB, RunPeakVRAMMB). A missing row is ErrNotFound.
+	UpdateClusterMemberUsage(ctx context.Context, m ClusterMember, gpus []ClusterMemberGPU) error
+	// OpenRPCSession appends an open session.
+	OpenRPCSession(ctx context.Context, s RPCSession) error
+	// CloseRPCSessions sets Until on every open session of (headSpecID,
+	// instance, memberServerID); closing none is not an error.
+	CloseRPCSessions(ctx context.Context, headSpecID string, instance int, memberServerID string, until time.Time) error
+	// RPCSessionsAt lists the sessions of (headSpecID, instance) in force at
+	// at: Since <= at and (Until nil or Until >= at), ordered by Since, then
+	// member server ID. Always non-nil.
+	RPCSessionsAt(ctx context.Context, headSpecID string, instance int, at time.Time) ([]RPCSession, error)
 }

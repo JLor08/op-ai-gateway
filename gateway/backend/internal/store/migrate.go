@@ -136,6 +136,7 @@ var migrations = []migration{
 	{version: 101, name: "model_mapping_audio_metrics", up: migration101Up},
 	{version: 102, name: "route_affinity_instance", up: migration102Up},
 	{version: 103, name: "rpc_cluster_columns", up: migration103Up},
+	{version: 104, name: "rpc_cluster_tables", up: migration104Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4593,4 +4594,106 @@ func migration103Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		reported_at `+ts+` not null,
 		primary key (server_id, path)
 	)`)
+}
+
+// migration104Up adds the llama.cpp RPC cluster membership tables.
+//
+// rpc_member_specs holds an operator-defined (manual) member: one row per
+// member process on a server, with its binary, operator args, environment and
+// RAM estimate, plus allowed_head_groups (an opaque JSON array of user-group
+// ids, the member side's consent). rpc_member_spec_gpus lists the GPUs such a
+// member serves, keyed by (spec_id, gpu_index). Both cascade from the server
+// (and the GPU rows from the spec), so a deleted server leaves no member spec.
+//
+// rpc_cluster_members is the membership of a head spec: one row per member
+// server, ordered by position. Unique (head_spec_id, position) keeps the order
+// well defined and unique (head_spec_id, server_id) lets a server join a head
+// once; the latter is also the target of the composite FK the per-member GPU
+// rows use, so they vanish with their membership row. member_spec_id names the
+// manual member spec (empty = automatic member, which has no spec row); a partial
+// unique index on it where it is not empty makes a manual spec serve one head
+// only. A head spec or a server that is deleted takes its membership with it.
+// The measured / run-peak columns are usage the agent reports: ram_measured_mb
+// with measured_at (NULL until measured) and stale, run_peak_ram_mb with the
+// head instance and start time of the run that produced it.
+//
+// rpc_sessions records which member a head instance used and when: since, and
+// until while the session is open (NULL). The indexes serve the per-instance
+// lookup and the per-member time-range scan.
+//
+// Every statement is `if not exists`, so the step replays on both dialects.
+func migration104Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	for _, stmt := range []string{
+		`create table if not exists rpc_member_specs (
+			id text primary key,
+			server_id text not null references ai_servers(id) on delete cascade,
+			enabled integer not null default 1,
+			binary_path text not null default '',
+			args text not null default '',
+			env text not null default '',
+			cache_enabled integer not null default 0,
+			device_backend text not null default 'auto',
+			ram_estimate_mb integer not null default 0,
+			allowed_head_groups text not null default '[]',
+			created_at ` + ts + ` not null,
+			updated_at ` + ts + ` not null
+		)`,
+		`create index if not exists idx_rpc_member_specs_server on rpc_member_specs(server_id)`,
+		`create table if not exists rpc_member_spec_gpus (
+			spec_id text not null references rpc_member_specs(id) on delete cascade,
+			gpu_index integer not null,
+			position integer not null default 0,
+			vram_estimate_mb integer not null default 0,
+			primary key (spec_id, gpu_index)
+		)`,
+		`create table if not exists rpc_cluster_members (
+			head_spec_id text not null references agent_runtime_specs(id) on delete cascade,
+			position integer not null,
+			server_id text not null references ai_servers(id) on delete cascade,
+			member_spec_id text not null default '',
+			threads integer not null default 0,
+			cache_enabled integer not null default 0,
+			device_backend text not null default 'auto',
+			ram_estimate_mb integer not null default 0,
+			port integer not null default 0,
+			ram_measured_mb integer not null default 0,
+			measured_at ` + ts + `,
+			stale integer not null default 0,
+			run_peak_ram_mb integer not null default 0,
+			run_head_instance integer not null default 0,
+			run_started_at ` + ts + `,
+			primary key (head_spec_id, server_id),
+			unique (head_spec_id, position)
+		)`,
+		`create index if not exists idx_rpc_cluster_members_server on rpc_cluster_members(server_id)`,
+		`create unique index if not exists idx_rpc_cluster_members_member_spec
+			on rpc_cluster_members(member_spec_id) where member_spec_id <> ''`,
+		`create table if not exists rpc_cluster_member_gpus (
+			head_spec_id text not null,
+			server_id text not null,
+			gpu_index integer not null,
+			position integer not null default 0,
+			vram_estimate_mb integer not null default 0,
+			vram_measured_mb integer not null default 0,
+			run_peak_vram_mb integer not null default 0,
+			primary key (head_spec_id, server_id, gpu_index),
+			foreign key (head_spec_id, server_id)
+				references rpc_cluster_members(head_spec_id, server_id) on delete cascade
+		)`,
+		`create table if not exists rpc_sessions (
+			head_spec_id text not null,
+			instance integer not null default 0,
+			member_server_id text not null,
+			since ` + ts + ` not null,
+			until ` + ts + `
+		)`,
+		`create index if not exists idx_rpc_sessions_head on rpc_sessions(head_spec_id, instance)`,
+		`create index if not exists idx_rpc_sessions_member on rpc_sessions(member_server_id, since)`,
+	} {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
