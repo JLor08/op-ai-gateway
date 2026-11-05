@@ -1392,8 +1392,8 @@ type NetbirdStateStore interface {
 	UpdateServerNetbirdKey(ctx context.Context, id string, enabled bool, setupKeyID, groupID string) error
 	// UpdateServerNetbirdLink is the system-admin linkage editor: it sets the
 	// NetBird enabled flag + peer id and RESETS netbird_connected and netbird_ip
-	// (a targeted UPDATE), so a stale connection state or mesh address is not shown until the sync loop
-	// re-confirms from the new peer id.
+	// (a targeted UPDATE), so a stale connection state or mesh address is not
+	// shown until the sync loop re-confirms from the new peer id.
 	UpdateServerNetbirdLink(ctx context.Context, id string, enabled bool, peerID string) error
 	// UpdateServerNetbirdState writes the peer-synced server state — the domain
 	// (from the peer's DNS name), the peer id, the peer's mesh IP, and the

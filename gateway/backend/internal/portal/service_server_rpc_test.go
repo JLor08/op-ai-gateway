@@ -131,3 +131,61 @@ func TestUpdateServerNotifiesRuntimeOnRPCFields(t *testing.T) {
 		t.Fatalf("notified = %v, want [%s]", notified, srv.ID)
 	}
 }
+
+// TestUpdateServerNetbirdOffClearsMeshIP proves turning NetBird off through
+// UpdateServer drops the stored mesh IP (the peer sync no longer refreshes it).
+func TestUpdateServerNetbirdOffClearsMeshIP(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	ctx := context.Background()
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	if err := routeStore.UpdateServerNetbirdLink(ctx, srv.ID, true, "peer-1"); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if err := routeStore.UpdateServerNetbirdState(ctx, srv.ID, "s.example.test", "peer-1", "100.64.0.5", true); err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	off := false
+	got, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{NetbirdEnabled: &off})
+	if err != nil {
+		t.Fatalf("UpdateServer: %v", err)
+	}
+	if got.NetbirdIP != "" {
+		t.Fatalf("netbird_ip after disable = %q, want empty", got.NetbirdIP)
+	}
+	stored, _ := routeStore.AIServerByID(ctx, srv.ID)
+	if stored.NetbirdIP != "" {
+		t.Fatalf("stored netbird_ip = %q, want empty", stored.NetbirdIP)
+	}
+}
+
+// TestServerHeadGroupsPersistAndLegacyEmpty proves a non-empty head-group
+// list survives UpdateServer and a legacy "" stored value reads as [].
+func TestServerHeadGroupsPersistAndLegacyEmpty(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	ctx := context.Background()
+	srv := createTestServer(t, svc, "S", "s.example.test")
+
+	heads := []string{testAdminGroupID}
+	if _, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{RPCAllowedHeadGroups: &heads}); err != nil {
+		t.Fatalf("UpdateServer: %v", err)
+	}
+	stored, _ := routeStore.AIServerByID(ctx, srv.ID)
+	if stored.RPCAllowedHeadGroups != `["`+testAdminGroupID+`"]` {
+		t.Fatalf("stored = %q", stored.RPCAllowedHeadGroups)
+	}
+	got, err := svc.GetServer(ctx, systemAdminToken(), srv.ID)
+	if err != nil || !reflect.DeepEqual(got.RPCAllowedHeadGroups, heads) {
+		t.Fatalf("DTO heads = %v, %v", got.RPCAllowedHeadGroups, err)
+	}
+
+	stored.RPCAllowedHeadGroups = ""
+	if err := routeStore.UpdateAIServer(ctx, stored); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	got, err = svc.GetServer(ctx, systemAdminToken(), srv.ID)
+	if err != nil || got.RPCAllowedHeadGroups == nil || len(got.RPCAllowedHeadGroups) != 0 {
+		t.Fatalf("legacy DTO heads = %#v, %v; want empty non-nil", got.RPCAllowedHeadGroups, err)
+	}
+}

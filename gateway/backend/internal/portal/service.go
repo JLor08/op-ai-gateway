@@ -3951,6 +3951,11 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 		// configured; turning it OFF is always allowed. UpdateServer never
 		// generates a setup key (that is create/regenerate only).
 		server.NetbirdEnabled = *req.NetbirdEnabled && s.NetbirdModuleEnabled(ctx)
+		// The peer sync skips non-NetBird servers, so a stale mesh address
+		// would never be refreshed: drop it whenever the flag ends up off.
+		if !server.NetbirdEnabled {
+			server.NetbirdIP = ""
+		}
 	}
 	if req.AgentPresenceTimeoutSeconds != nil {
 		if *req.AgentPresenceTimeoutSeconds < 0 {
