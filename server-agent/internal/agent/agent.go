@@ -900,6 +900,9 @@ type Agent struct {
 	// to report holds to, which disables relay mode entirely. Its own locks
 	// make it safe from every goroutine that drives it.
 	relays *relayLink
+	// rpcObs watches the connections of direct-mode members and resolves
+	// head domains for both transports; nil whenever relays is.
+	rpcObs *rpcObserver
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -1054,6 +1057,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	if d.RuntimeDriver != nil && d.RPCMembers != nil {
 		a.relays = newRelayLink(d.RuntimeDriver.Status, d.RPCMembers)
 		d.RPCMembers.SetMemberRelayGate(a.relays.ready)
+		a.rpcObs = newMemberObserver(d.RuntimeDriver.Status, d.RPCMembers, a.relays)
 	}
 	return a
 }
@@ -1067,6 +1071,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	// The relays close with the run: every session ends and every hold the
 	// relay reported is released while the runtime is still there to hear it.
 	defer a.relays.close()
+	if a.rpcObs != nil {
+		obsCtx, stopObs := context.WithCancel(ctx)
+		defer stopObs()
+		go a.rpcObs.run(obsCtx)
+		go a.rpcObs.heads.run(obsCtx, a.rpcObs.headDomains)
+	}
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
