@@ -84,6 +84,7 @@ type API interface {
 	DeleteService(context.Context, auth.Token, string) error
 	DeleteServiceToken(context.Context, auth.Token, string, string) error
 	DeleteToken(context.Context, auth.Token, string) error
+	DeleteRPCMemberSpec(context.Context, auth.Token, string, string) error
 	DeleteVendorAccount(context.Context, auth.Token, string) (bool, error)
 	DemoteManager(context.Context, auth.Token, string, string) error
 	DetachProjectToken(context.Context, auth.Token, string, string) error
@@ -197,6 +198,8 @@ type API interface {
 	SaveChat(context.Context, auth.Token, string, UpdateChatRequest) (ChatDTO, error)
 	ServerAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
 	ServerAvailability(context.Context, auth.Token, string, time.Duration) ([]routing.ServerAvailabilitySample, error)
+	PutRPCMemberSpec(context.Context, auth.Token, string, string, PutRPCMemberSpecRequest) (RPCMemberSpecDTO, error)
+	RPCMemberSpecs(context.Context, auth.Token, string) ([]RPCMemberSpecDTO, error)
 	ServerHardware(context.Context, auth.Token, string) (routing.ServerHardware, bool, error)
 	ServerModels(context.Context, auth.Token, string) ([]ServerModelDTO, error)
 	ServerOwnerResourceGroups(context.Context, auth.Token, string) ([]ServerResourceGroupDTO, error)

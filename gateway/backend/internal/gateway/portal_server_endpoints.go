@@ -176,6 +176,14 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		s.handlePortalServerEnergy(w, r, token, parts[0])
 		return
 	}
+	if (len(parts) == 2 || len(parts) == 3) && parts[1] == "rpc-members" && parts[0] != "" {
+		specID := ""
+		if len(parts) == 3 {
+			specID = parts[2]
+		}
+		s.handlePortalServerRPCMembers(w, r, token, parts[0], specID)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "gpu-budgets" && parts[0] != "" {
 		s.handlePortalServerGPUBudgets(w, r, token, parts[0])
 		return
