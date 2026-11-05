@@ -124,3 +124,65 @@ func TestUsageEventHostsAndEnergyPartsRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// usagePartsContract pins the write semantics every usage.Store must share:
+// an unknown event is an error, a part list naming one server twice is an
+// error, a repeated host is kept once, and a failed call writes nothing.
+func usagePartsContract(t *testing.T, st usage.Store, record func(id string, at time.Time)) {
+	t.Helper()
+	ctx := context.Background()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	record("ev1", at)
+
+	if err := st.RecordEventHosts(ctx, []usage.EventHost{
+		{EventID: "ev1", ServerID: "srv_a", Role: "head", CreatedAt: at},
+		{EventID: "ev_unknown", ServerID: "srv_a", Role: "head", CreatedAt: at},
+	}); err == nil {
+		t.Fatal("RecordEventHosts accepted an unknown event")
+	}
+	if got, _ := st.EventHosts(ctx, "ev1"); len(got) != 0 {
+		t.Fatalf("failed RecordEventHosts partially wrote %+v", got)
+	}
+	if err := st.RecordEventHosts(ctx, []usage.EventHost{
+		{EventID: "ev1", ServerID: "srv_a", Role: "head", CreatedAt: at},
+		{EventID: "ev1", ServerID: "srv_a", Role: "member", CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("duplicate host in one batch: %v", err)
+	}
+	if got, _ := st.EventHosts(ctx, "ev1"); len(got) != 1 || got[0].Role != "head" {
+		t.Fatalf("hosts = %+v, want the first row kept once", got)
+	}
+
+	good := []usage.EnergyPart{{EventID: "ev1", ServerID: "srv_a", Role: "head", Wh: 1, Source: "modeled"}}
+	if err := st.SetEnergyParts(ctx, "ev1", good); err != nil {
+		t.Fatalf("set parts: %v", err)
+	}
+	if err := st.SetEnergyParts(ctx, "ev_unknown", good); err == nil {
+		t.Fatal("SetEnergyParts accepted an unknown event")
+	}
+	dup := []usage.EnergyPart{
+		{ServerID: "srv_b", Role: "member", Wh: 2},
+		{ServerID: "srv_b", Role: "member", Wh: 3},
+	}
+	if err := st.SetEnergyParts(ctx, "ev1", dup); err == nil {
+		t.Fatal("SetEnergyParts accepted two parts for one server")
+	}
+	if got, _ := st.EnergyParts(ctx, "ev1"); len(got) != 1 || got[0] != good[0] {
+		t.Fatalf("failed SetEnergyParts changed the parts: %+v", got)
+	}
+}
+
+func TestUsagePartsWriteContractMemory(t *testing.T) {
+	rec := usage.NewRecorder()
+	usagePartsContract(t, rec, func(id string, at time.Time) {
+		rec.Record(usage.Event{ID: id, UserID: "u1", Host: "srv_a", CreatedAt: at})
+	})
+}
+
+func TestUsagePartsWriteContractSQL(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		usagePartsContract(t, s, func(id string, at time.Time) {
+			seedUsageEventForParts(t, s, id, "srv_a", 100, at)
+		})
+	})
+}

@@ -280,8 +280,8 @@ func (r *Recorder) UnpricedUsageEvents(_ context.Context, notBefore, notAfter ti
 	return matched, nil
 }
 
-// UsageEventsForServerWindow returns the events on serverID (Host==serverID)
-// whose own [CreatedAt-latency, CreatedAt] window overlaps [from, to]
+// UsageEventsForServerWindow returns the events on serverID (Host==serverID,
+// or listing serverID among their event hosts) whose own [CreatedAt-latency, CreatedAt] window overlaps [from, to]
 // (inclusive on both ends, matching a closed-interval overlap test). Unlike the
 // SQL store, this scans the full in-memory set directly — no widen-then-filter
 // margin is needed since every event is already resident.
@@ -314,11 +314,28 @@ func (r *Recorder) listsHostLocked(eventID, serverID string) bool {
 	return false
 }
 
+// hasEventLocked reports whether an event with id was recorded. The caller
+// holds r.mu.
+func (r *Recorder) hasEventLocked(id string) bool {
+	for _, e := range r.events {
+		if e.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // RecordEventHosts stores hosts, keeping an existing row for a repeated
-// (event, server) pair.
+// (event, server) pair. Like the SQL stores' foreign key, an event id that was
+// never recorded is an error and the whole call writes nothing.
 func (r *Recorder) RecordEventHosts(_ context.Context, hosts []EventHost) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for _, h := range hosts {
+		if !r.hasEventLocked(h.EventID) {
+			return fmt.Errorf("usage event host: unknown event %q", h.EventID)
+		}
+	}
 	if r.hosts == nil {
 		r.hosts = make(map[string][]EventHost)
 	}
@@ -345,10 +362,22 @@ func (r *Recorder) EventHosts(_ context.Context, eventID string) ([]EventHost, e
 	return out, nil
 }
 
-// SetEnergyParts replaces eventID's energy parts.
+// SetEnergyParts replaces eventID's energy parts. Like the SQL stores, an
+// unknown event (with parts to store) and two parts for one server are errors,
+// and a failed call leaves the previous parts untouched.
 func (r *Recorder) SetEnergyParts(_ context.Context, eventID string, parts []EnergyPart) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(parts) > 0 && !r.hasEventLocked(eventID) {
+		return fmt.Errorf("usage event energy part: unknown event %q", eventID)
+	}
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		if seen[p.ServerID] {
+			return fmt.Errorf("usage event energy part: duplicate server %q", p.ServerID)
+		}
+		seen[p.ServerID] = true
+	}
 	if r.parts == nil {
 		r.parts = make(map[string][]EnergyPart)
 	}
@@ -356,7 +385,12 @@ func (r *Recorder) SetEnergyParts(_ context.Context, eventID string, parts []Ene
 		delete(r.parts, eventID)
 		return nil
 	}
-	r.parts[eventID] = append([]EnergyPart{}, parts...)
+	stored := make([]EnergyPart, len(parts))
+	for i, p := range parts {
+		p.EventID = eventID
+		stored[i] = p
+	}
+	r.parts[eventID] = stored
 	return nil
 }
 
