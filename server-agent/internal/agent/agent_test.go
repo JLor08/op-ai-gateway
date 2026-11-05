@@ -5370,3 +5370,43 @@ func TestRunPushesDeviceTotalsBeforeTheBootRuntimeSync(t *testing.T) {
 		t.Errorf("first HostInfo push = %+v, want the boot seed %+v (device totals from the hardware inventory, RAM unknown)", got, want)
 	}
 }
+
+// TestCollectSkipsRPCServerProbes proves a running rpc_server member is never
+// probed over HTTP: its port speaks the RPC protocol, and a stray HTTP request
+// would only log a protocol error in the member.
+func TestCollectSkipsRPCServerProbes(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rpcm_a",
+			State:            runtimectl.StateRunning,
+			PID:              5100,
+			Port:             portFromURL(t, srv.URL),
+			Kind:             runtimectl.SpecKindRPCServer,
+			Type:             "llama_cpp",
+			MetricsPath:      "/metrics",
+			ContextProbePath: "/props",
+		},
+	})
+
+	poster := &capturePoster{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+	for range 3 {
+		a.collectOnce(context.Background())
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("member port received %d HTTP probes over 3 collect cycles, want 0", n)
+	}
+	got := poster.last()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", got)
+	}
+}

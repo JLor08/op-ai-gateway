@@ -222,6 +222,17 @@ func VisibleDevicesVar(vendor GPUVendor) string {
 	}
 }
 
+// injectedVisibleDevicesVar is the single rule for whether the agent puts a
+// visibility variable into the child's environment, and which one: only for a
+// SetVisibleDevices spec in env mode on a vendor that has such a variable.
+// Empty means nothing is injected and the child sees the declared host indices.
+func injectedVisibleDevicesVar(spec Spec, vendor GPUVendor) string {
+	if !spec.SetVisibleDevices || spec.VisibleDevicesMode == VisibleDevicesModeArgs {
+		return ""
+	}
+	return VisibleDevicesVar(vendor)
+}
+
 // visibleDevicesOwnedVars is the set of environment variables the
 // SetVisibleDevices option OWNS: a spec may not hand-set any of them while the
 // option is on (ExpandPlaceholders refuses the pair outright -- trap 3).
@@ -413,6 +424,12 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	}
 	if !binaryAllowed {
 		return fmt.Errorf("runtime: binary %q is not in the allowed-binaries list", spec.Binary)
+	}
+
+	if spec.IsRPCServer() {
+		if err := permitMember(spec); err != nil {
+			return err
+		}
 	}
 
 	// R2: an EMPTY work_dir means "run beside the binary" (effectiveWorkDir),
@@ -805,8 +822,8 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // that performed the substitution. command.go turns that into the masked,
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
-func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
-	ex, err := expandSpec(spec, port, vendor, getenv, configFilesDir)
+func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, vendor, vendors, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -886,7 +903,10 @@ var deviceBackendByToken = map[string]string{
 // surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
 // secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
 // expandSpec resolves and masks them, expandConfigFileContent refuses them.
-func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string) (value string, handled bool, err error) {
+func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string, dev deviceContext) (value string, handled bool, err error) {
+	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
+		return v, true, derr
+	}
 	if inner == "PORT" {
 		return strconv.Itoa(port), true, nil
 	}
@@ -950,8 +970,12 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 // observable; it changes no classification and no error. A failing match
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
-func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
+// vendors is the host's detected vendor set, which only the generic device
+// tokens (${DEVICES}, ${FIRST_LOCAL_DEVICE}) consult to resolve an "auto"
+// device backend; nil falls back to the single vendor.
+func expandSpec(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
+	dev := newDeviceContext(spec, vendor, vendors)
 
 	expand := func(s string) (string, []secretSpan, error) {
 		matches := placeholderPattern.FindAllStringIndex(s, -1)
@@ -967,7 +991,7 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 			match := s[m[0]:m[1]]
 			inner := match[2 : len(match)-1] // strip "${" and "}"
 
-			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir); handled {
+			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir, dev); handled {
 				if resolveErr != nil {
 					return "", nil, resolveErr
 				}
@@ -1138,12 +1162,18 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 	// baseEnvNames reservation guarantees it for PATH. A "" name means Apple
 	// or an unrecognised stack: nothing is appended and the child's
 	// environment is byte-identical to the SetVisibleDevices-off one.
-	if spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs {
-		if name := VisibleDevicesVar(vendor); name != "" {
-			resultEnv = append(resultEnv, name+"="+gpuIDs)
-			resultSpans = append(resultSpans, nil)
-			fromSpec = append(fromSpec, false)
-		}
+	if name := injectedVisibleDevicesVar(spec, vendor); name != "" {
+		resultEnv = append(resultEnv, name+"="+gpuIDs)
+		resultSpans = append(resultSpans, nil)
+		fromSpec = append(fromSpec, false)
+	}
+	// A cluster head runs with the RPC backend's collective communication off:
+	// it is unsupported across rpc-server members. Agent-owned like the
+	// visibility variable, so it joins the base block.
+	if spec.IsClusterHead() {
+		resultEnv = append(resultEnv, "GGML_RPC_NO_COMM=1")
+		resultSpans = append(resultSpans, nil)
+		fromSpec = append(fromSpec, false)
 	}
 	for _, k := range envKeys {
 		v, spans, expandErr := expand(spec.Env[k])

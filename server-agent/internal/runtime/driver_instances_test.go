@@ -210,3 +210,49 @@ func TestApplySameETagWithAChangedOptInIsApplied(t *testing.T) {
 		t.Fatalf("instance 1 = %+v after an identical re-apply, want untouched (pid %d)", st, pid1)
 	}
 }
+
+func TestParseConfigDropsRPCKindWithoutGatewayFeature(t *testing.T) {
+	member := Spec{ID: "rpcm_1", Kind: SpecKindRPCServer, RPC: &RPCMember{Port: 47001}}
+	head := Spec{ID: "rspec_h", UpstreamModel: "big", Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a:1", DeviceCount: 1}}}}
+	plain := Spec{ID: "P", UpstreamModel: "p"}
+	src := &fakeSource{cfg: Config{ETag: "e1", Specs: []Spec{member, head, plain}, Coresident: [][2]string{{"rpcm_1", "P"}, {"P", "rspec_h"}}}}
+	mgr := &fakeManager{}
+	features, setFeatures := newSwitchableFeaturesServer(t, []string{runtimeManagerFeature, gatewayFeatureRuntimeInstances})
+	d := newDriver(mgr, src, features, nil, "")
+	ctx := context.Background()
+
+	d.Sync(ctx, nil)
+	got := mgr.lastApplied()
+	if len(got.Specs) != 1 || got.Specs[0].ID != "P" {
+		t.Fatalf("applied specs = %+v, want only the plain model without rpc_cluster", got.Specs)
+	}
+	if len(got.Coresident) != 0 {
+		t.Fatalf("applied coresident = %v, want pairs naming dropped specs removed", got.Coresident)
+	}
+	if len(src.cfg.Specs) != 3 {
+		t.Fatal("the source's cached document lost specs: the Driver must filter a copy")
+	}
+
+	d.Sync(ctx, nil)
+	if n := mgr.applyCount(); n != 1 {
+		t.Fatalf("Apply calls = %d after an unchanged Sync, want 1", n)
+	}
+
+	setFeatures([]string{runtimeManagerFeature, gatewayFeatureRuntimeInstances, gatewayFeatureRPCCluster})
+	d.Sync(ctx, nil)
+	if n := mgr.applyCount(); n != 2 {
+		t.Fatalf("Apply calls = %d once the gateway declares rpc_cluster, want 2: the declaration alone re-applies", n)
+	}
+	if got := mgr.lastApplied(); len(got.Specs) != 3 || len(got.Coresident) != 2 {
+		t.Fatalf("applied = %+v, want member, head and plain model with the declaration", got)
+	}
+
+	setFeatures([]string{runtimeManagerFeature, gatewayFeatureRuntimeInstances})
+	d.Sync(ctx, nil)
+	if n := mgr.applyCount(); n != 3 {
+		t.Fatalf("Apply calls = %d after the declaration is withdrawn, want 3", n)
+	}
+	if got := mgr.lastApplied(); len(got.Specs) != 1 {
+		t.Fatalf("applied specs = %+v, want the rpc specs dropped again", got.Specs)
+	}
+}

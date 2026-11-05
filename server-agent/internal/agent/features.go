@@ -361,6 +361,15 @@ var Features = []Feature{
 	// Since is 0.17.0: agent.Features gains an entry, so the rule is a MINOR bump
 	// (see agent.go's Version block).
 	{Name: FeatureRuntimeStop, Since: "0.17.0"},
+
+	// rpc_cluster: the agent runs llama.cpp RPC cluster members (rpc_server
+	// specs) and heads (specs with a cluster block), serves the /rpc/* member
+	// routes and the X-OP-Cluster-Start head start, and reports member and head
+	// state in telemetry (kind, rpc, cluster, admission_blocked_by, last_error
+	// code). The gateway sends cluster documents only to an agent declaring it.
+	//
+	// Since is 0.18.0: agent.Features gains an entry, so the rule is a MINOR bump.
+	{Name: FeatureRPCCluster, Since: "0.18.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
@@ -370,6 +379,10 @@ const FeatureRuntimeInstances = "runtime_instances"
 // FeatureRuntimeStop names the runtime_stop feature (see its registry entry
 // above): the router serves POST /stop/{model}, a transient stop of one instance.
 const FeatureRuntimeStop = "runtime_stop"
+
+// FeatureRPCCluster names the rpc_cluster feature (see its registry entry
+// above): RPC cluster members and heads.
+const FeatureRPCCluster = "rpc_cluster"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

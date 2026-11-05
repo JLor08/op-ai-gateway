@@ -392,7 +392,15 @@ import (
 // the operator's request without persisting anything -- a change to the wire
 // contract and to observable runtime behaviour. This is the ONE bump for the
 // whole branch; later commits on it do not bump again.
-const Version = "0.17.0"
+//
+// 0.17.0 -> 0.18.0 is the single bump for the llama.cpp RPC cluster mode branch.
+// MINOR, and the rule decides it: the agent accepts new spec-level wire fields
+// (kind, device_backend, cluster, rpc) and honours them only while the gateway
+// declares rpc_cluster, runs rpc-server members and cluster heads, reports new
+// status fields (kind, rpc, cluster, admission_blocked_by, last_error.code),
+// serves new router routes (/rpc/...) and gains an agent.Features entry. This is
+// the ONE bump for the whole branch; later commits on it do not bump again.
+const Version = "0.18.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -886,6 +894,19 @@ type Agent struct {
 	runtimeLogWake   <-chan json.RawMessage
 	runtimeLogPort   runtimeLogPort
 	runtimeLogPoster runtimeLogPoster
+
+	// relays runs the relays of this host's relay-mode RPC cluster members
+	// (see relayLink); nil when there is no runtime driver or no member sink
+	// to report holds to, which disables relay mode entirely. Its own locks
+	// make it safe from every goroutine that drives it.
+	relays *relayLink
+	// rpcObs watches the connections of direct-mode members and resolves
+	// head domains for both transports; nil whenever relays is.
+	rpcObs *rpcObserver
+	// cacheSizes measures the members' on-disk caches off the collect loop.
+	cacheSizes *cacheSizer
+	// binaries inventories the allowed runtime binaries off the collect loop.
+	binaries *binaryInventory
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -932,6 +953,11 @@ type Deps struct {
 	// only a proven-non-nil value (main.go's *runtimectl.FeaturesClient
 	// always is), never a possibly-nil concrete pointer.
 	GatewayFeatures gatewayFeatureSource
+	// RPCMembers receives the relay's member holds and installs its
+	// readiness gate (see rpcMemberSink); with RuntimeDriver set it enables
+	// the relays of relay-mode RPC members. Same typed-nil caveat: assign
+	// only a proven-non-nil value (main.go's *runtimectl.Manager always is).
+	RPCMembers rpcMemberSink
 }
 
 // New builds an Agent from the resolved config and its collectors/poster. The
@@ -995,6 +1021,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		hostInfo:        d.HostInfo,
 		gatewayFeatures: d.GatewayFeatures,
 		now:             time.Now,
+		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries),
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r
@@ -1032,7 +1059,31 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		a.runtimeLogPoster = logPoster
 		a.runtimeLogPort = logPort
 	}
+	if d.RuntimeDriver != nil && d.RPCMembers != nil {
+		a.relays = newRelayLink(d.RuntimeDriver.Status, d.RPCMembers)
+		d.RPCMembers.SetMemberRelayGate(a.relays.ready)
+		a.rpcObs = newMemberObserver(d.RuntimeDriver.Status, d.RPCMembers, a.relays)
+		a.cacheSizes = newCacheSizer(nil)
+	}
 	return a
+}
+
+// observerShutdownWait bounds how long Run waits for the RPC observer and head
+// resolver goroutines when it shuts down.
+const observerShutdownWait = 5 * time.Second
+
+// waitBounded waits for wg, giving up after d.
+func waitBounded(wg *sync.WaitGroup, d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		slog.Warn("agent: rpc observer goroutines still running at shutdown")
+	}
 }
 
 // Run collects the static hardware inventory once, sends it, then collects+pushes
@@ -1041,6 +1092,32 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 // Returns nil on graceful shutdown; a single failed collect/push/report never stops
 // the loop.
 func (a *Agent) Run(ctx context.Context) error {
+	// The relays close with the run: every session ends and every hold the
+	// relay reported is released while the runtime is still there to hear it.
+	defer a.relays.close()
+	if a.rpcObs != nil {
+		// The observer and the head resolver reach into the relays and the
+		// runtime, so Run waits (bounded: a wedged connection listing must not
+		// hold the shutdown) for them before it returns and closes the relays.
+		obsCtx, stopObs := context.WithCancel(ctx)
+		var obsWG sync.WaitGroup
+		obsWG.Add(2)
+		go func() {
+			defer obsWG.Done()
+			a.rpcObs.run(obsCtx)
+		}()
+		go func() {
+			defer obsWG.Done()
+			a.rpcObs.heads.run(obsCtx, a.rpcObs.headDomains)
+		}()
+		defer func() {
+			stopObs()
+			waitBounded(&obsWG, observerShutdownWait)
+		}()
+	}
+	if a.binaries != nil {
+		go a.binaries.run(ctx)
+	}
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
@@ -1124,6 +1201,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-logTickerC:
 			a.flushRuntimeLogs(ctx)
 		case <-a.runtimeTransitions:
+			// A member that started, stopped or began draining gains or
+			// loses its relay first: a drain must close the head's session
+			// before anything else.
+			a.relays.sync()
 			// Immediate coalesced sample on a spec state transition or a row
 			// leaving the runtime status (design spec §7): a portal click
 			// should feel like network latency, not the next 1s telemetry
@@ -1319,6 +1400,9 @@ func (a *Agent) runRuntimeSyncs(ctx context.Context, data json.RawMessage) {
 	s := &a.runtimeSync
 	for {
 		a.runtimeDriver.Sync(ctx, data)
+		// An applied document can change a member's relay settings in place
+		// (its allowlist) without any state transition.
+		a.relays.sync()
 		s.mu.Lock()
 		if !s.owed || ctx.Err() != nil {
 			s.running, s.owed, s.next = false, false, nil
@@ -2421,15 +2505,22 @@ func (a *Agent) collectOnce(ctx context.Context) {
 						ExitCode:   st.LastError.ExitCode,
 						Failures:   st.LastError.Failures,
 						StderrTail: st.LastError.StderrTail,
+						Code:       st.LastError.Code,
 					}
 				}
+				a.fillClusterTelemetry(&rs, st, a.cfg.ConfigFilesDir)
 				// Task 9: fill ContextSize/ActiveRequests/QueueDepth from
 				// this child's own /metrics and context endpoints. Only a
 				// running child with a live port has anything to probe --
 				// StateStarting/backoff/crashed/etc. have no healthy
 				// endpoint yet, so they correctly stay at the zero value
 				// collectOnce would otherwise never touch.
-				if st.State == runtimectl.StateRunning && st.Port > 0 {
+				//
+				// An rpc_server member is the exception: its port speaks the
+				// ggml RPC protocol, not HTTP, so a probe could only provoke a
+				// protocol error in the member. Its readiness is a TCP connect
+				// the manager already made.
+				if st.State == runtimectl.StateRunning && st.Port > 0 && st.Kind != runtimectl.SpecKindRPCServer {
 					a.probeRuntimeChild(ctx, probeClient, st, &rs)
 				}
 				runtimes = append(runtimes, rs)
@@ -2504,9 +2595,14 @@ func (a *Agent) collectOnce(ctx context.Context) {
 			"cert_mode", s.CertMode,
 			"cert_fingerprint_set", s.CertFingerprint != "")
 	}
+	binDelivered := func() {}
+	if a.binaries != nil {
+		s.Binaries, binDelivered = a.binaries.pending()
+	}
 	if err := a.poster.Post(ctx, &s); err != nil {
 		slog.Warn("telemetry push failed", "err", err)
 	} else {
+		binDelivered()
 		slog.Debug("telemetry pushed")
 	}
 }
