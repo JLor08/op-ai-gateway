@@ -12,9 +12,9 @@ Branch-local working file (removed before the PR).
 ## Tasks
 | Task | State |
 |---|---|
-| A1–A9 agent | pending |
+| A1–A10 agent | pending |
 | B1–B4 store | pending |
-| C1–C4 portal service | pending |
+| C1–C5 portal service | pending |
 | D1–D5 gateway runtime | pending |
-| E1–E4 portal UI | pending |
+| E1–E5 portal UI | pending |
 | F1–F3 e2e, docs, finish | pending |

@@ -101,7 +101,7 @@ Telemetry (`sample.RuntimeSample` additions; gateway `RuntimeStatusDTO` mirrors 
 
 ## Lanes
 
-The agent lane (Tasks A1–A9) and the gateway backend lane (B1–D5) build against the wire contract above and touch disjoint modules; the portal lane (E1–E4) starts after C2 has fixed the portal DTOs. Lanes run in sibling worktrees (`.worktrees/rpc-365-agent`, `.worktrees/rpc-365-fe`) and are merged into `claude/rpc-cluster-365-6070e9` with plain merges; only the controller edits `docs/implementation-status.md`. F1–F3 run on the integrated branch.
+The agent lane (Tasks A1–A10) and the gateway backend lane (B1–D5) build against the wire contract above and touch disjoint modules; the portal lane (E1–E5) starts after C2 has fixed the portal DTOs. Lanes run in sibling worktrees (`.worktrees/rpc-365-agent`, `.worktrees/rpc-365-fe`) and are merged into `claude/rpc-cluster-365-6070e9` with plain merges; only the controller edits `docs/implementation-status.md`. F1–F3 run on the integrated branch.
 
 ---
 
@@ -313,6 +313,24 @@ The agent lane (Tasks A1–A9) and the gateway backend lane (B1–D5) build agai
 - [ ] **Step 1:** `TestSampleCarriesRPCStatus` (kind, held_by, protocol, device_count, breaches, reserved_until, cache_mb, stalled), `TestSampleCarriesAdmissionBlockedBy`, `TestSampleCarriesLastErrorCode`, `TestFeaturesDeclareRPCCluster`.
 - [ ] **Step 2–4.** **Step 5:** commit `feat(agent): RPC telemetry and the rpc_cluster feature`.
 
+### Task A10: Binary inventory
+
+**Files:**
+- Create: `internal/agent/binaries.go`, `internal/agent/binaries_test.go`
+- Modify: `internal/sample/sample.go` (top-level `Binaries []BinaryInfo \`json:"binaries,omitempty"\``), `internal/agent/agent.go` (attach on first sample and on change)
+
+**Interfaces:**
+```go
+type BinaryInfo struct { Path, Kind, Version, Build, Commit, VersionSource string; Allowed bool } // Kind: llama_server | rpc_server | other; VersionSource: agent | path | ""
+func scanBinaries(allowed []string, stat func(string) (fs.FileInfo, error), runVersion func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo
+func parseLlamaVersion(out string) (version, build, commit string, ok bool) // "version: 0.9.0-dev (build 1, commit 2bc46ba)"
+func versionFromPath(path string) (build, commit string, ok bool)          // b<digits> tag or 7-40 hex segment
+```
+Rules: rescan every 5 min; `--version` only for kind `llama_server`, 10 s timeout, cached by (path, size, mtime); `rpc_server` inherits from a `llama_server` in the same directory, else `versionFromPath`; inventory hash decides whether the sample carries `binaries`.
+
+- [ ] Step 1: `TestParseLlamaVersionStage0Output`, `TestVersionFromPathTagAndCommit`, `TestRPCServerInheritsSiblingVersion`, `TestVersionRunCachedByStat`, `TestOnlyLlamaServerIsExecuted`, `TestSampleCarriesBinariesOnlyOnChange`.
+- [ ] Step 2–4: fail → implement → pass. Step 5: commit `feat(agent): report the binary inventory with versions`.
+
 ---
 
 ## Phase B — gateway store (`gateway/backend`, `go test ./internal/store/... ./internal/routing/...` with the Postgres DSN set)
@@ -323,7 +341,7 @@ The agent lane (Tasks A1–A9) and the gateway backend lane (B1–D5) build agai
 - Modify: `internal/store/migrate.go` (append `{version: 103, name: "rpc_cluster_columns"}`), `internal/routing/store.go` (`RuntimeSpec`, `AIServer`), `internal/store/sqlite_runtime.go` (`runtimeSpecCols`, prefixed list, `scanRuntimeSpec`, upsert set), `internal/store/sqlite_routes.go` (seven AIServer sites)
 - Test: parity tests, `internal/store/migration103_rpc_test.go`
 
-**Columns:** `agent_runtime_specs`: `cluster_enabled integer not null default 0`, `member_mode text not null default 'automatic'`, `cluster_network text not null default ''`, `rpc_transport text not null default ''`, `lan_exposure_ack integer not null default 0`, `device_backend text not null default 'auto'`. `ai_servers`: `netbird_ip text not null default ''`, `lan_address text not null default ''`, `lan_bind_only integer not null default 0`, `rpc_member_enabled integer not null default 0`, `rpc_binary text not null default ''`, `rpc_allowed_head_groups text not null default '[]'`.
+**Columns:** `agent_runtime_specs`: `cluster_enabled integer not null default 0`, `member_mode text not null default 'automatic'`, `cluster_network text not null default ''`, `rpc_transport text not null default ''`, `lan_exposure_ack integer not null default 0`, `device_backend text not null default 'auto'`. `ai_servers`: `netbird_ip text not null default ''`, `lan_address text not null default ''`, `lan_bind_only integer not null default 0`, `rpc_member_enabled integer not null default 0`, `rpc_allowed_head_groups text not null default '[]'`. New table `server_binaries(server_id → ai_servers cascade, path, kind, version, build, commit, version_source, source, allowed, reported_at, primary key (server_id, path))` with store methods `ServerBinaries(ctx, serverID) ([]ServerBinary, error)`, `ReplaceAgentServerBinaries(ctx, serverID string, rows []ServerBinary) error` (replaces `source='agent'` rows, keeps `manual` rows and manual version overrides), `UpsertManualServerBinary`, `DeleteManualServerBinary`.
 
 - [ ] Steps: failing parity/migration tests (fresh + upgraded-from-102 legs, replay idempotent) → implement → pass on all three stores → commit `feat(store): RPC cluster columns on specs and servers`.
 
@@ -385,7 +403,7 @@ Tables: `usage_event_hosts(event_id → usage_events cascade, server_id, role, c
 ### Task B4: Server fields end to end and mesh IP sync
 
 **Files:**
-- Modify: `cmd/gateway/netbird_sync.go` (~143-152 persist `peer.IP`; clear on disable/unlink), `internal/routing/store.go` (`UpdateServerNetbirdState` gains `ip string`), `internal/store/sqlite_routes.go` (~215), memory store, `internal/portal/service.go` (`ServerDTO` ~1527, `UpdateServerRequest` ~1683 pointer fields, validation ~3919: `lan_address` must parse as IPv4 or be empty → `server.lan_address_invalid`; `rpc_binary` absolute or empty → `server.rpc_binary_invalid`), `internal/gateway/portal_server_endpoints.go` (error rows ~438)
+- Modify: `cmd/gateway/netbird_sync.go` (~143-152 persist `peer.IP`; clear on disable/unlink), `internal/routing/store.go` (`UpdateServerNetbirdState` gains `ip string`), `internal/store/sqlite_routes.go` (~215), memory store, `internal/portal/service.go` (`ServerDTO` ~1527, `UpdateServerRequest` ~1683 pointer fields, validation ~3919: `lan_address` must parse as IPv4 or be empty → `server.lan_address_invalid`), `internal/gateway/portal_server_endpoints.go` (error rows ~438)
 - Test: `cmd/gateway/netbird_sync_test.go` (`TestSyncPersistsPeerIP`), `internal/portal/service_server_rpc_test.go`
 
 - [ ] Steps: failing tests (IP persisted/cleared; lan/rpc fields round-trip through Update; invalid values → codes; `UpdateServer` notifies runtime) → implement → pass → commit `feat(gateway): mesh IP, LAN address and RPC member settings on servers`.
@@ -430,7 +448,7 @@ func scanClusterArgs(args []string, env map[string]string) clusterArgScan // rpc
 func (s *Service) allocateRPCPort(ctx context.Context, serverID string) (int, error) // range 47000-47999, skips app Port, ProxyListenPort, router_listen, pinned listen_port, other RPC ports
 func (s *Service) ClusterCandidates(ctx context.Context, p auth.Token, headMappingID, mode string) ([]ClusterCandidateDTO, error)
 ```
-Save checks (appended last, in this order; all 400 unless noted): cluster on requires `type == llama_cpp` (`runtime_spec.cluster_type_invalid`); `${RPC_SERVERS}` present (`runtime_spec.cluster_rpc_placeholder_missing`) and exactly once across args/env (`runtime_spec.cluster_rpc_twice`); cluster off with `${RPC_SERVERS}`/`${RPC_DEVICES}` → `runtime_spec.cluster_rpc_placeholder_without_cluster`; device list lacks `${DEVICES}`/`${RPC_DEVICES}` → `runtime_spec.cluster_device_list_missing_rpc`; device in args before `--rpc` in args (and RPC not in env), or device in env while RPC in args → `runtime_spec.cluster_device_order`; ≥1 member; head not replicable (`runtime_spec.cluster_head_replicable`); explicit startup timeout > 0 (`runtime_spec.cluster_startup_timeout_required`, Q5); one entry per server (`runtime_spec.cluster_member_server_twice`); member server ≠ head server (`runtime_spec.cluster_member_on_head_server`); manual spec free (`runtime_spec.cluster_member_spec_taken`, 409); automatic server has `rpc_member_enabled` + binary (`runtime_spec.cluster_member_rpc_disabled`); consent (`allowed_head_groups` / `rpc_allowed_head_groups` ∩ head server's admin groups, or system scope) else 404-no-leak on that server; authorization on every member server; network `mesh` requires NetBird + tracking group + known `netbird_ip` on all (`runtime_spec.cluster_mesh_unavailable`); `lan` requires a LAN address per server, `lan_address` on NetBird-enabled ones (`runtime_spec.cluster_lan_address_required`); direct + `mesh` requires manage-policies + deny-by-default + enforce + Default last seen disabled (`runtime_spec.cluster_direct_unavailable`); direct + `lan` requires `lan_exposure_ack` (`runtime.cluster_lan_ack_required`); a member with Apple GPUs needs an explicit GPU budget on its server (`runtime_spec.cluster_member_budget_required`); a member with non-NVIDIA GPUs needs a VRAM estimate and the head needs `--tensor-split` (`runtime_spec.cluster_tensor_split_required`) — issue §7. Defaults when the request leaves them empty: network `mesh` if all NetBird-ready else `lan`; transport per Q3. Warnings (returned in `RuntimeSpecDTO.ClusterWarnings []string` codes, not errors): RPC devices not first, missing `-mmdev`, CPU member without `--tensor-split`, member on shared host without estimate, budget below device total without `--tensor-split`, overlapping GPU selection, relay+mesh with deny-by-default off (Q7).
+Save checks (appended last, in this order; all 400 unless noted): cluster on requires `type == llama_cpp` (`runtime_spec.cluster_type_invalid`); `${RPC_SERVERS}` present (`runtime_spec.cluster_rpc_placeholder_missing`) and exactly once across args/env (`runtime_spec.cluster_rpc_twice`); cluster off with `${RPC_SERVERS}`/`${RPC_DEVICES}` → `runtime_spec.cluster_rpc_placeholder_without_cluster`; device list lacks `${DEVICES}`/`${RPC_DEVICES}` → `runtime_spec.cluster_device_list_missing_rpc`; device in args before `--rpc` in args (and RPC not in env), or device in env while RPC in args → `runtime_spec.cluster_device_order`; ≥1 member; head not replicable (`runtime_spec.cluster_head_replicable`); explicit startup timeout > 0 (`runtime_spec.cluster_startup_timeout_required`, Q5); one entry per server (`runtime_spec.cluster_member_server_twice`); member server ≠ head server (`runtime_spec.cluster_member_on_head_server`); manual spec free (`runtime_spec.cluster_member_spec_taken`, 409); automatic server has `rpc_member_enabled` (`runtime_spec.cluster_member_rpc_disabled`) and an inventory `ggml-rpc-server` whose version matches the head binary's (`runtime_spec.cluster_member_no_matching_binary`); manual member with a known version different from the head's (`runtime_spec.cluster_version_mismatch`, unknown → warning); consent (`allowed_head_groups` / `rpc_allowed_head_groups` ∩ head server's admin groups, or system scope) else 404-no-leak on that server; authorization on every member server; network `mesh` requires NetBird + tracking group + known `netbird_ip` on all (`runtime_spec.cluster_mesh_unavailable`); `lan` requires a LAN address per server, `lan_address` on NetBird-enabled ones (`runtime_spec.cluster_lan_address_required`); direct + `mesh` requires manage-policies + deny-by-default + enforce + Default last seen disabled (`runtime_spec.cluster_direct_unavailable`); direct + `lan` requires `lan_exposure_ack` (`runtime.cluster_lan_ack_required`); a member with Apple GPUs needs an explicit GPU budget on its server (`runtime_spec.cluster_member_budget_required`); a member with non-NVIDIA GPUs needs a VRAM estimate and the head needs `--tensor-split` (`runtime_spec.cluster_tensor_split_required`) — issue §7. Defaults when the request leaves them empty: network `mesh` if all NetBird-ready else `lan`; transport per Q3. Warnings (returned in `RuntimeSpecDTO.ClusterWarnings []string` codes, not errors): RPC devices not first, missing `-mmdev`, CPU member without `--tensor-split`, member on shared host without estimate, budget below device total without `--tensor-split`, overlapping GPU selection, relay+mesh with deny-by-default off (Q7).
 Carry-over (D1): re-save keeping a (server, gpu_index) keeps measured values; changes to members/order/GPU rows/model/args/env mark the kept values `stale`; removed members drop. A write affecting a running cluster stops the head (C3 push + D1 orchestration flag `restartAfterApply`).
 
 - [ ] Steps: failing tests — one per save code (incl. all four env/argv device-order mixes from spec §2 and the additive double-`--rpc` case), `TestPutClusterDefaultsNetworkAndTransport`, `TestPutClusterReorderStopsHeadAndMarksStale`, `TestPutClusterCarriesMeasuredValues`, `TestAllocateRPCPortSkipsTakenPorts`, `TestClusterCandidatesFiltersByAuthAndConsent`, `TestClusterForeignMemberHiddenInDTO` → implement → pass → commit `feat(portal): cluster head configuration and save checks`.
@@ -469,6 +487,18 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 Only `mesh` clusters produce rules; Q6 every cluster. Synchronous hook on cluster/membership/member-spec writes and deletes (`reconcileRPCPolicies(ctx)` taking `policyMu`). Turning off manage-policies/deny/enforce while a direct `mesh` cluster exists → `settings.netbird_direct_cluster_exists` (409). Drift (`Default` enabled again, seen by the loop) → C3 withholds direct-mesh heads; D3 stops their members head first.
 
 - [ ] Steps: failing tests (create per member with exact port; update on port change; two members on one server → two rules; delete + sweep orphan; manage-off → untouched; relay rule uses relay port; lan cluster → no policy; switch-off refusal; Default state recorded) → implement → pass → commit `feat(portal): managed NetBird policies for RPC members`.
+
+### Task C5: Binary inventory ingest, API and version matching
+
+**Files:**
+- Create: `internal/portal/service_binaries.go`, `internal/gateway/portal_binary_endpoints.go` (`/api/portal/servers/{id}/binaries`, GET/POST/PUT/DELETE for manual rows and version overrides)
+- Modify: `internal/gateway/agent_ingest.go` (sample `binaries` → `ReplaceAgentServerBinaries`), `internal/portal/service_cluster.go` (`matchingRPCBinary(ctx, serverID, headVersion) (ServerBinary, bool)` used by C2 checks, C3 derivation and `ClusterCandidates`)
+- Test: `internal/portal/service_binaries_test.go`, `internal/gateway/agent_ingest_binaries_test.go`
+
+Rules: authorization via `authorizeServer` (404-no-leak); manual rows never overwritten by agent rows; a manual version override survives agent rescans; matching compares commit when both have one, else build; C3 sets the automatic member's `binary` from the match and withholds the head (`runtime.cluster_member_no_matching_binary`) when none exists at derivation time.
+
+- [ ] Step 1: `TestIngestReplacesAgentBinariesKeepsManual`, `TestManualVersionOverrideSurvivesRescan`, `TestMatchingRPCBinaryByCommitThenBuild`, `TestClusterCandidatesHideServersWithoutMatchingBinary`, `TestBinariesForeignServer404`.
+- [ ] Step 2–4. Step 5: commit `feat(gateway): server binary inventory and version matching`.
 
 ---
 
@@ -541,7 +571,7 @@ Rules: per issue §8 + Q8–Q11: head part as today; each member part = that hos
 
 ### Task E1: API types, error codes, i18n
 
-**Files:** `src/api/runtime.ts` (RuntimeSpec cluster fields, `ClusterMember`, echoes, `RuntimeStatus.kind/rpc/cluster/admission_blocked_by`, `clusterCandidates`, `startRuntime` unchanged path), `src/api/rpcMembers.ts` (new: list/put/delete manual member specs), `src/api/servers.ts` (`netbird_ip`, `lan_address`, `lan_bind_only`, `rpc_member_enabled`, `rpc_binary`, `rpc_allowed_head_groups`), `src/api.ts` barrel, `components/shared/format.ts` (`errorLabelByCode` for every new code in C1–D5 and A4/A6), `src/i18n.ts` (de+en).
+**Files:** `src/api/runtime.ts` (RuntimeSpec cluster fields, `ClusterMember`, echoes, `RuntimeStatus.kind/rpc/cluster/admission_blocked_by`, `clusterCandidates`, `startRuntime` unchanged path), `src/api/rpcMembers.ts` (new: list/put/delete manual member specs), `src/api/servers.ts` (`netbird_ip`, `lan_address`, `lan_bind_only`, `rpc_member_enabled`, `rpc_allowed_head_groups`), `src/api/binaries.ts` (new: inventory list, manual add/edit/delete), `src/api.ts` barrel, `components/shared/format.ts` (`errorLabelByCode` for every new code in C1–D5 and A4/A6), `src/i18n.ts` (de+en).
 - [ ] Steps: failing `runtime.test.ts`/`rpcMembers.test.ts`/`format.test.ts` cases (request shapes, every new code labelled in both locales) → implement → pass → commit `feat(portal): API types and messages for RPC clusters`.
 
 ### Task E2: Server settings and manual member view
@@ -559,6 +589,11 @@ Editor: cluster toggle; member mode switch (confirm replaces list); network (def
 
 **Files:** `RuntimeAdminSection.tsx` (`vram_total`/`ram` cells show cluster total marked "cluster", own value beneath, ≥ for incomplete, per-member breakdown popover; status tab shows cluster progress members starting → ready → head starting → formed, held-by, breaches, protocol mismatch flag; Start/Stop on a head call the same endpoints, which the gateway routes to the orchestrator), `components/shared/runtimeActions.ts` (head rows: Stop drains even when pinned).
 - [ ] Steps: failing tests (totals with an unknown member show ≥ and name it; CPU member adds RAM only; progress states from status frames; breach badge) → implement → pass → commit `feat(portal): cluster totals and status`.
+
+### Task E5: Binaries tab and binary pickers
+
+**Files:** create `src/components/BinariesSection.tsx` (+ test) as a new tab `'binaries'` in `RuntimeAdminSection.tsx` placed before `'limits'`; the spec form's binary field and the manual member editor (E2) become a picker over the server's inventory (path + version, "not allowed by the agent" marked), free text still accepted; the cluster editor (E3) shows each member's matched binary and version.
+- [ ] Steps: failing tests (tab order; agent rows read-only except the version override; manual add/edit/delete; picker fills `binary`; free text still saves; unknown version label) → implement → pass → commit `feat(portal): binaries tab and binary pickers`.
 
 ---
 

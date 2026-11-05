@@ -57,6 +57,7 @@ Anti-goals (a technically working result that is still a failure):
 | — | **Two member modes per head** (owner): `manual` — the operator creates an `rpc_server` runspec on a member server and the head selects only the server (it must have such a spec); `automatic` — the head selects server + GPUs (ordered) + member settings, and the gateway derives and manages one `rpc_server` instance per (head, server) itself (§1b). |
 | — | **Several members per server** in both modes: each member is its own `ggml-rpc-server` process with its own `-d` GPU set and port, serving one head. GPU availability is decided by the member host's admission at start (free, or freed by eviction; Q12 when a held member of another cluster blocks), never by a save-time exclusivity rule; overlapping GPU selections only warn. |
 | — | **LAN address per server** (owner, after the builder check): an optional IPv4 field plus a "listen only on this address" switch; used in `lan` clusters as the dial target and the head's identity, required there for NetBird-enabled servers (§4a). |
+| — | **Binary inventory per server** (owner): the agent reports its allowlisted binaries with kind and version; a new "Binaries" tab shows and edits them; runspecs pick binaries from it, and automatic members get the `ggml-rpc-server` whose version matches the head (§1c). |
 | — | Stage 1 lands as **one PR**. Host-dependent Stage 0 measurements (direct vs relay, mesh P2P, firewalls, observer cost on Windows, LAN reachability of a mesh bind, NVIDIA/Vulkan members) are coordinated with the owner and only feed docs and portal hints; Stage 1 does not wait for them. |
 
 ## 2. Verified upstream facts the decisions rest on (llama.cpp @ `2bc46ba`)
@@ -178,11 +179,12 @@ and a running cluster is stopped head first, like any membership edit).
 - The gateway derives one `rpc_server` spec per entry into the member server's runtime document, with a stable id
   derived from the head spec id and the member server id (e.g. `rpc-<head spec id>-<server id>`; the plan fixes the
   format). It has no row in `agent_runtime_specs`; its GPU rows, settings and the measured usage live on the
-  membership row. The binary comes from the member server's RPC settings (below).
+  membership row. The binary is the member server's `ggml-rpc-server` from its binary inventory whose version
+  matches the head's `llama-server` (§1c).
 - A second head selecting other GPUs of the same server gets a second derived instance with its own `-d` and port.
 - **Per-server RPC settings** (new, on the AI server's runtime settings, required before the server is offered in
-  automatic mode): `rpc_member_enabled`, the `ggml-rpc-server` binary path (subject to the agent allowlist like any
-  binary), `rpc_allowed_head_groups` (consent; default the server's own admin groups).
+  automatic mode): `rpc_member_enabled` and `rpc_allowed_head_groups` (consent; default the server's own admin groups).
+  No binary setting: the binary comes from the inventory (§1c).
 
 **Both modes:**
 - One entry per server per head (two members of the same head on one server are refused: combine the GPUs).
@@ -197,6 +199,29 @@ and a running cluster is stopped head first, like any membership edit).
 - Authorization: membership writes need management rights on the head's server and every member server (or system
   scope), plus the member side's consent (`allowed_head_groups` of the manual spec, or `rpc_allowed_head_groups` of
   the server in automatic mode).
+
+### 1c. Binary inventory per server (owner decision, 2026-11-05)
+
+Different llama.cpp versions can be installed side by side, and head and members must run compatible builds (same
+protocol major, member minor not newer, same `GRAPH_CACHE_MAX` — in practice the same build). Therefore:
+- **The agent reports its binary inventory**: every entry of its local `runtime_allowed_binaries` with path, kind
+  (from the file name: `llama-server`, `ggml-rpc-server` or the old `rpc-server`, else `other`) and version.
+  Version: for `llama-server`, the agent runs `<binary> --version` once and caches the result by path, size and
+  modification time (`version: 0.9.0-dev (build 1, commit 2bc46ba)` → build `1`, commit `2bc46ba`; only allowlisted
+  binaries, only this flag, bounded by a 10 s timeout); a `ggml-rpc-server` inherits the version of a `llama-server` in
+  the same directory (same build), else the path name is searched (`b<digits>` release tag or a 7–40 hex commit
+  segment), else the version stays unknown. The inventory rides on the telemetry sample (top-level `binaries`) on the
+  first sample after start and whenever it changed; otherwise it is omitted.
+- **New "Binaries" tab** in the server_agent application view, before "Runtime limits": path, kind, version, version
+  source and origin (agent or manual); a detected version can be overridden; manual entries can be added (e.g. for a
+  file-mode agent); entries the agent does not allow are marked, since they would fail with `not_permitted`.
+- **Runspecs pick their binary from the inventory** (picker with versions; free text stays possible for existing specs,
+  then without a known version). Manual member specs pick a `ggml-rpc-server` the same way.
+- **Version matching:** automatic mode selects on each member server the `ggml-rpc-server` whose version (commit,
+  else build) equals the head binary's; servers without one are not offered ("no rpc-server in version X"); several
+  matches → the first by path. Manual mode: both versions known and different → refused
+  (`runtime_spec.cluster_version_mismatch`); either unknown → warning. The runtime protocol check
+  (`runtime.cluster_version_mismatch`) stays the safety net.
 
 ### 1a. Member command line (changes to issue §1)
 
@@ -270,8 +295,8 @@ index and its re-push triggers — extended by `Domain`, the RPC bind address an
 - **§8 Energy:** as the issue with Q8 (host share), Q9 (member's own price), Q10, Q11, plus the Tier 2 PUE fix and
   the `usage.Event` doc location fix.
 - **§9 Operator workflow:** step 1 depends on the member mode — `manual`: create an `rpc_server` spec per member
-  server (no `-d`; the agent sets it); `automatic`: enable RPC membership and set the `ggml-rpc-server` binary once in
-  each member server's runtime settings; step 2 picks the members (servers, or servers + GPUs + settings), the
+  server (no `-d`; the agent sets it); `automatic`: enable RPC membership in each member server's runtime settings and make sure its
+  binary inventory (§1c) has a `ggml-rpc-server` of the head's version; step 2 picks the members (servers, or servers + GPUs + settings), the
   network (`mesh`/`lan`, LAN addresses where needed) and, for direct + `lan`, the acknowledgement; step 3 becomes: `--rpc ${RPC_SERVERS}` (or
   `LLAMA_ARG_RPC`), and for local GPUs either env mode or `--device ${DEVICES}` (`-mmdev ${FIRST_LOCAL_DEVICE}` for
   vision models), with `--ctx-size` and optional `--tensor-split` as the issue says (`--tensor-split` positions
@@ -283,7 +308,9 @@ index and its re-push triggers — extended by `Domain`, the RPC bind address an
   `cache_enabled`; heads `cluster_enabled`, `rpc_transport`) **plus** heads `member_mode` (`manual`|`automatic`),
   `cluster_network` (`mesh`|`lan`), `lan_exposure_ack`, and `device_backend` on every spec (default `auto`).
 - `ai_servers`: `netbird_ip` (mesh, as the issue) **plus** `lan_address` (optional IPv4 literal), `lan_bind_only`,
-  and the automatic-mode RPC settings `rpc_member_enabled`, `rpc_binary`, `rpc_allowed_head_groups`.
+  and the automatic-mode RPC settings `rpc_member_enabled`, `rpc_allowed_head_groups`.
+- `server_binaries` (§1c): `(server_id, path)` primary key, `kind`, `version`, `commit`, `version_source`
+  (`agent`/`path`/`manual`), `source` (`agent`/`manual`), `allowed` (agent-reported allowlist status), `reported_at`.
 - Membership rows (`runtime_spec_cluster_members`): position = operator order; `member_kind` = `spec` (manual,
   `member_id` = the `rpc_server` spec id) or `auto` (automatic, keyed by `member_server_id`, with the member settings
   `threads`, `cache_enabled`, `device_backend`, `vram_estimate_mb` per GPU, `ram_estimate_mb`, and the ordered GPU
