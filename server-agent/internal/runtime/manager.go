@@ -954,6 +954,9 @@ type cmdEnsure struct {
 	// member is given once it is running (armReservation); 0 arms none.
 	member  bool
 	reserve time.Duration
+	// clusterStart is set by EnsureClusterHead: the gateway's cluster start,
+	// the one ensure that may start a cold cluster head (headRefusesUnmarked).
+	clusterStart bool
 }
 
 func (cmdEnsure) isCommand() {}
@@ -1126,6 +1129,9 @@ type ensureWaiter struct {
 	queuedAt time.Time
 	// reserve is cmdEnsure.reserve, armed when this waiter is served.
 	reserve time.Duration
+	// clusterStart is cmdEnsure.clusterStart: this waiter wants a cold cluster
+	// head started (specState.wantsStart).
+	clusterStart bool
 }
 
 // runningProc is one live generation of a managed process. Its pointer
@@ -1592,7 +1598,7 @@ func (o *owner) handle(cmd command) {
 	case cmdLoadedModels:
 		c.reply <- o.loadedModels()
 	case cmdStop:
-		c.reply <- o.stopInstance(c.model)
+		c.reply <- o.handleStop(c)
 	case cmdStopMember:
 		c.reply <- o.stopMember(c.specID, c.force)
 	case cmdReleaseMember:
@@ -1603,6 +1609,8 @@ func (o *owner) handle(cmd command) {
 		o.handleReservationExpired(c)
 	case cmdPurgeMemberCache:
 		c.reply <- o.purgeMemberCache(c.specID)
+	case cmdClusterHeadInfo:
+		c.reply <- o.clusterHeadInfo(c.model)
 	case cmdResolve:
 		_, base, k, ok := o.resolveAddress(c.model)
 		c.reply <- resolvedAddress{base: base, k: k, ok: ok}
@@ -1805,7 +1813,9 @@ func (o *owner) applyConfig(cfg Config) {
 		}
 		// protected() is the pre-instance "pinned || force_running" for
 		// instance 0 of a spec that never replicates, and folds the
-		// min_instances floor in for a replicable one.
+		// min_instances floor in for a replicable one. A protected cluster
+		// head is asked too and stays down (wantsUp): only the gateway's
+		// cluster start brings one up.
 		if st.protected() && st.proc == nil && st.state != StateBackoff {
 			start = append(start, id)
 		}
@@ -2163,6 +2173,15 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 		return
 	}
+	// A cold cluster head starts only for the gateway's cluster start (see
+	// cluster_head.go); any other request is refused, so the gateway
+	// orchestrates the cluster first. Decided after the verdicts above, so a
+	// head that cannot run is reported as such rather than sending the gateway
+	// off to bring its members up for nothing.
+	if !c.clusterStart && headRefusesUnmarked(st) {
+		c.reply <- ensureOutcome{err: fmt.Errorf("%w: cluster head %s is not running; the gateway starts its cluster", ErrClusterNotReady, specID)}
+		return
+	}
 	// A burst instance is never queued behind anything but its own start: its
 	// admission is all-or-nothing and immediate, so that the gateway can place
 	// the request elsewhere at once. Starting: its admission already happened,
@@ -2176,7 +2195,7 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 
-	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now(), reserve: c.reserve}
+	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now(), reserve: c.reserve, clusterStart: c.clusterStart}
 	if st.spec.AdmissionWaitTimeoutSeconds > 0 {
 		d := time.Duration(st.spec.AdmissionWaitTimeoutSeconds) * time.Second
 		reply := c.reply
@@ -2654,13 +2673,14 @@ func (o *owner) vramBootstrapEligible(st *specState) bool {
 
 // wantsUp reports whether anything wants st running right now: a queued
 // request, or its being protected -- an operator pin / force_running on
-// instance 0, or an instance inside the min_instances floor (protected). It is
+// instance 0, or an instance inside the min_instances floor (protected) -- and
+// for a cluster head only a queued cluster start (specState.wantsStart). It is
 // admitAndStart's own admission precondition, factored out so the cold-start
 // bootstrap memory-pressure escalation (onProcExited, task 4.4) can ask the
 // identical question -- an eviction to free RAM for a retry is worth nothing if
 // no retry is coming.
 func (o *owner) wantsUp(st *specState) bool {
-	return len(st.pending) > 0 || st.protected()
+	return st.wantsStart()
 }
 
 // specForInstance returns the Spec instance k of base runs as (#340): base
@@ -2710,6 +2730,9 @@ func (st *specState) protected() bool {
 // a further instance of a pinned spec must not read as pinned merely because
 // its copy carries the field.
 //
+// A cluster head that is force_running reads pinned as well: for a head,
+// force_running means the gateway keeps it up (headKeptUp).
+//
 // An rpc_server member under a hold or a reservation (claimed) reads pinned
 // too: a head is using it, or is about to, and evicting it would abort that
 // head's cluster.
@@ -2721,7 +2744,7 @@ func (st *specState) pinnedForAdmission() bool {
 // pushed spec alone makes of the instance.
 func (st *specState) pinnedBySpec() bool {
 	if !st.spec.Replicable {
-		return st.spec.Pinned
+		return st.spec.Pinned || headKeptUp(st.spec)
 	}
 	return st.protected()
 }
@@ -2979,6 +3002,13 @@ func (o *owner) admitAndStart(specID string) {
 	// same member does not ring the transitions doorbell on every re-ask.
 	blockedBy := ""
 	defer func() { o.setAdmissionBlockedBy(st, blockedBy) }()
+	// A cold cluster head starts only for a cluster start. A request queued
+	// without the mark -- one that waited for a start or a drain that has since
+	// ended -- would otherwise start it here, so it is answered as handleEnsure
+	// answers it now.
+	if st.spec.IsClusterHead() && !st.clusterStartQueued() && len(st.pending) > 0 {
+		o.failPending(st, fmt.Errorf("%w: cluster head %s is not running; the gateway starts its cluster", ErrClusterNotReady, specID))
+	}
 	if !o.wantsUp(st) {
 		return
 	}
@@ -4794,12 +4824,17 @@ func (o *owner) hostRAMBudgetSnapshot() int {
 // instance, instanceForRequest; a plain request only retires it, handleEnsure)
 // or the next Apply; any waiter still queued on it would never be served, so it
 // is failed here.
+//
+// A CLUSTER HEAD never enters it either, for the same reason: only the
+// gateway's cluster start brings a head up (cluster_head.go), after bringing
+// its members up, so a timer here could never start it. It rests at the
+// failure until that start, which is the retry.
 func (o *owner) enterBackoff(st *specState) {
 	if o.closing {
 		o.setState(st, StateStopped)
 		return
 	}
-	if st.burst() {
+	if st.burst() || st.spec.IsClusterHead() {
 		o.failPending(st, ErrStartFailed)
 		return
 	}
@@ -5261,7 +5296,7 @@ func wantsWake(st *specState) bool {
 	if st.proc != nil || st.state == StateBackoff || terminalHeld(st) {
 		return false
 	}
-	return len(st.pending) > 0 || st.protected()
+	return st.wantsStart()
 }
 
 // lessByQueueAge is wakeAdmission's wake order: oldest queued

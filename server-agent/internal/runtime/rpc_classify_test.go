@@ -136,6 +136,17 @@ func headSpecPrinting(text string) Spec {
 	return spec
 }
 
+// clusterStartUnprobed is the gateway's cluster start of model without the
+// member probe, for heads whose endpoints are not meant to be reached: only
+// the head's own exit is under test. Its answer is not part of the test.
+func clusterStartUnprobed(m *Manager, model string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, release, err := m.startClusterHead(ctx, model); err == nil {
+		release()
+	}
+}
+
 func execCount(t *testing.T, path string) int {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -152,6 +163,7 @@ func TestHeadInvalidDeviceIsTerminal(t *testing.T) {
 
 	m := newTestManager(t, allowlistPolicy())
 	m.Apply(Config{Specs: []Spec{spec}})
+	clusterStartUnprobed(m, "m")
 	var got *Status
 	waitUntil(t, 5*time.Second, "head refused", func() bool {
 		got = statusFor(m, "rspec_h")
@@ -172,6 +184,7 @@ func TestTerminalHeadStaysPutWhenForceRunning(t *testing.T) {
 
 	m := newTestManager(t, allowlistPolicy())
 	m.Apply(Config{Specs: []Spec{spec}})
+	clusterStartUnprobed(m, "m")
 	waitUntil(t, 5*time.Second, "head refused", func() bool {
 		s := statusFor(m, "rspec_h")
 		return s != nil && s.State == StateNotPermitted
@@ -220,13 +233,18 @@ func TestTerminalOnDemandHeadRefusesEnsureUntilSpecChanges(t *testing.T) {
 	m.Apply(Config{Specs: []Spec{spec}})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, _, err := m.EnsureRunning(ctx, "m"); !errors.Is(err, ErrNotPermitted) {
+	if _, _, err := m.startClusterHead(ctx, "m"); !errors.Is(err, ErrNotPermitted) {
 		t.Fatalf("first ensure err = %v, want ErrNotPermitted", err)
 	}
 	time.Sleep(100 * time.Millisecond) // well past the rate-limit interval
 	for range 3 {
-		if _, _, err := m.EnsureRunning(ctx, "m"); !errors.Is(err, ErrNotPermitted) {
+		if _, _, err := m.startClusterHead(ctx, "m"); !errors.Is(err, ErrNotPermitted) {
 			t.Fatalf("later ensure err = %v, want ErrNotPermitted", err)
+		}
+		// A plain request learns the verdict too, rather than being sent to
+		// orchestrate a cluster whose head cannot run.
+		if _, _, err := m.EnsureRunning(ctx, "m"); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("later unmarked ensure err = %v, want ErrNotPermitted", err)
 		}
 	}
 	if n := execCount(t, invocations); n != 1 {
@@ -238,7 +256,7 @@ func TestTerminalOnDemandHeadRefusesEnsureUntilSpecChanges(t *testing.T) {
 	changed.Args = append(append([]string{}, spec.Args...), "-t", "4")
 	m.Apply(Config{Specs: []Spec{changed}})
 	time.Sleep(60 * time.Millisecond)
-	_, _, _ = m.EnsureRunning(ctx, "m")
+	_, _, _ = m.startClusterHead(ctx, "m")
 	if n := execCount(t, invocations); n != 2 {
 		t.Fatalf("head exec'd %d times after the spec changed, want 2", n)
 	}
@@ -275,7 +293,10 @@ func TestExitTailIsScopedToTheCurrentGeneration(t *testing.T) {
 	}
 }
 
-func TestHeadFailedToConnectBacksOffWithCode(t *testing.T) {
+// A head whose members refuse it rests at the failure with the code -- it never
+// enters the crash-loop wait, since only the gateway's cluster start brings a
+// head up.
+func TestHeadFailedToConnectRestsWithCode(t *testing.T) {
 	shrinkTimings(t)
 	spec := Spec{
 		ID: "rspec_h", Binary: stubchildPath, UpstreamModel: "m",
@@ -287,8 +308,9 @@ func TestHeadFailedToConnectBacksOffWithCode(t *testing.T) {
 
 	m := newTestManager(t, allowlistPolicy())
 	m.Apply(Config{Specs: []Spec{spec}})
-	waitUntil(t, 5*time.Second, "head in backoff", func() bool {
+	clusterStartUnprobed(m, "m")
+	waitUntil(t, 5*time.Second, "head failed with the code", func() bool {
 		s := statusFor(m, "rspec_h")
-		return s != nil && s.State != StateNotPermitted && s.LastError != nil && s.LastError.Code == "runtime.cluster_member_unreachable"
+		return s != nil && s.State == StateStartFailed && s.LastError != nil && s.LastError.Code == "runtime.cluster_member_unreachable"
 	})
 }

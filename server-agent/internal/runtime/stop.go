@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // The transient stop of one instance: Manager.Stop, behind the router's
@@ -51,10 +52,12 @@ const (
 	StopStopped StopState = "stopped"
 )
 
-// cmdStop asks the owner to stop one instance (Manager.Stop).
+// cmdStop asks the owner to stop one instance (Manager.Stop). ifEvictable
+// makes it the conditional stop (Manager.StopIfEvictable).
 type cmdStop struct {
-	model string
-	reply chan stopOutcome
+	model       string
+	ifEvictable bool
+	reply       chan stopOutcome
 }
 
 // isCommand marks cmdStop as an owner command; the marker has no body.
@@ -84,7 +87,9 @@ type stopOutcome struct {
 //     moot while the operator keeps the spec down; StopStopped for one with no
 //     process;
 //   - ErrInstanceProtected for an instance inside the protected floor
-//     (ProtectedCount), with or without a process;
+//     (ProtectedCount), with or without a process -- except a cluster head,
+//     whose pin or force_running only says the gateway keeps it up: the agent
+//     never starts one on its own, so it is drained like any other;
 //   - StopStopped for an instance with no process (none created for an
 //     allowed instance that does not exist): idempotent;
 //   - StopStopping for an instance already draining, whatever its siblings do:
@@ -112,9 +117,32 @@ type stopOutcome struct {
 // the stop does not suspend. A burst instance queues nothing while it drains
 // (handleEnsure refuses it at once), so it is always retired.
 func (m *Manager) Stop(ctx context.Context, model string) (StopState, error) {
+	return m.stop(ctx, cmdStop{model: model})
+}
+
+// StopIfEvictable is the conditional stop behind POST
+// /stop/{model}?if_evictable=1: Stop, but only for an instance the agent's own
+// eviction rule would pick right now (isEvictable) -- not pinned, not starting,
+// nothing in flight, outside the eviction grace -- and ErrInstanceBusy
+// otherwise. A force_running cluster head counts as pinned, since the gateway
+// keeps it up (headKeptUp). The rule and the drain are one owner turn, so no
+// request can be admitted between the check and the stop.
+//
+// It is how the gateway removes a cluster, head first, when a local start on a
+// member's host waits only for a member that head holds: the head goes only
+// when its own agent would have let it go anyway, and otherwise the start
+// waits. An instance with no process, or one already draining, is judged by
+// Stop's own answers.
+func (m *Manager) StopIfEvictable(ctx context.Context, model string) (StopState, error) {
+	return m.stop(ctx, cmdStop{model: model, ifEvictable: true})
+}
+
+// stop posts c with a fresh reply channel and waits for the answer.
+func (m *Manager) stop(ctx context.Context, c cmdStop) (StopState, error) {
 	reply := make(chan stopOutcome, 1)
+	c.reply = reply
 	select {
-	case m.cmds <- cmdStop{model: model, reply: reply}:
+	case m.cmds <- c:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	case <-m.done:
@@ -140,10 +168,16 @@ func (m *Manager) Stop(ctx context.Context, model string) (StopState, error) {
 // beginDrain is the one drain path every other stop uses too (an idle unload,
 // an eviction, a push), so a stopped instance leaves exactly as those do.
 func (o *owner) stopInstance(model string) stopOutcome {
+	return o.handleStop(cmdStop{model: model})
+}
+
+// handleStop is cmdStop on the owner: stopInstance, or the conditional stop
+// when c.ifEvictable is set (Manager.StopIfEvictable).
+func (o *owner) handleStop(c cmdStop) stopOutcome {
 	if o.closing {
 		return stopOutcome{err: ErrManagerClosed}
 	}
-	specID, _, k, ok := o.resolveAddress(model)
+	specID, _, k, ok := o.resolveAddress(c.model)
 	if !ok {
 		return stopOutcome{err: ErrModelNotManaged}
 	}
@@ -151,7 +185,27 @@ func (o *owner) stopInstance(model string) stopOutcome {
 	if base.removed {
 		return stopOutcome{err: ErrModelNotManaged}
 	}
+	if c.ifEvictable && !o.evictableNow(o.specs[InstanceKey(base.spec.ID, k)]) {
+		return stopOutcome{err: fmt.Errorf("%w: instance %s is in use, starting or kept up", ErrInstanceBusy, InstanceKey(base.spec.ID, k))}
+	}
 	return o.stopResolved(base, k)
+}
+
+// evictableNow is the conditional stop's rule (StopIfEvictable): an instance
+// with a process that is not already draining must be evictable by the
+// agent's own rule (isEvictable), judged with the Pinned flag admission uses
+// (pinnedForAdmission). One with no process, or a draining one, passes:
+// Stop's own answers apply to it.
+func (o *owner) evictableNow(st *specState) bool {
+	if st == nil || st.proc == nil || st.state == StateDraining {
+		return true
+	}
+	return isEvictable(RunningProc{
+		Pinned:   st.pinnedForAdmission(),
+		Starting: st.state == StateStarting,
+		InFlight: st.inFlight,
+		LastUsed: st.lastUsed,
+	}, time.Now(), o.evictionGrace)
 }
 
 // stopResolved is stopInstance once the address is resolved: instance k of the
@@ -167,7 +221,10 @@ func (o *owner) stopResolved(base *specState, k int) stopOutcome {
 		o.beginDrain(key) // a no-op when the push's own drain is under way
 		return stopOutcome{state: StopStopping}
 	}
-	if k < ProtectedCount(base.spec) {
+	// A cluster head is the exception to the protected floor: for a head, pinned
+	// and force_running mean the gateway keeps it up, and the agent never
+	// starts it on its own again, so a stop drains it like any other.
+	if k < ProtectedCount(base.spec) && !base.spec.IsClusterHead() {
 		return stopOutcome{err: ErrInstanceProtected}
 	}
 	if !hasProc {

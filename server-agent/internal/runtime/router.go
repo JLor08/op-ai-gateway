@@ -715,6 +715,14 @@ type ensureResponse struct {
 //     that leaves while the child is starting gets an error and so nothing to
 //     release; the start still comes up with nothing in flight, and the idle
 //     policy applies to it as after any request.
+//   - The header ClusterStartHeader with the value "1" makes the call the
+//     gateway's cluster start (Manager.EnsureClusterHead), the only call that
+//     starts a cold cluster head: it probes the head's member endpoints first
+//     and answers 503 runtime.cluster_member_unreachable when one stays
+//     unreachable for the head's startup bound, exec'ing nothing. Without the
+//     header a cold head is refused with 503 runtime.cluster_not_ready, as a
+//     proxied request for it is. For any other model the header changes
+//     nothing.
 //   - release() runs BEFORE the answer is written, since nothing is proxied:
 //     the start counts as one use (LastUsed is stamped) and leaves nothing in
 //     flight. The answer is written only while the client is still there.
@@ -730,7 +738,11 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(w, err)
 		return
 	}
-	_, release, err := rt.m.EnsureRunning(r.Context(), model)
+	ensure := rt.m.EnsureRunning
+	if heads, ok := rt.m.(clusterHeadPort); ok && r.Header.Get(ClusterStartHeader) == "1" {
+		ensure = heads.EnsureClusterHead
+	}
+	_, release, err := ensure(r.Context(), model)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
@@ -741,6 +753,19 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 	}
 	refreshWriteDeadline(w)
 	writeJSON(w, http.StatusOK, ensureResponse{Status: "running"})
+}
+
+// clusterHeadPort is the part of *Manager the cluster start needs, asserted
+// per request like stopPort; a manager without it serves a marked ensure as an
+// unmarked one.
+type clusterHeadPort interface {
+	EnsureClusterHead(ctx context.Context, model string) (endpoint string, release func(), err error)
+}
+
+// conditionalStopPort is the part of *Manager the conditional stop (POST
+// /stop/{model}?if_evictable=1) needs, asserted per request like stopPort.
+type conditionalStopPort interface {
+	StopIfEvictable(ctx context.Context, model string) (StopState, error)
 }
 
 // stopPort is the part of *Manager that POST /stop/{model} needs. It is kept
@@ -779,6 +804,12 @@ type stopResponse struct {
 // the protected floor, 409 runtime.instance_not_highest while a higher
 // instance of the spec has a process, or 502 runtime.upstream_gone for any
 // other failure, such as the manager shutting down.
+//
+// With ?if_evictable=1 it is the conditional stop (Manager.StopIfEvictable):
+// the same answers, plus 409 runtime.instance_busy when the agent's own
+// eviction rule would not let the instance go right now. A manager that cannot
+// stop conditionally refuses it the same way rather than stopping
+// unconditionally.
 func (rt *router) serveStop(w http.ResponseWriter, r *http.Request) {
 	model := strings.TrimPrefix(r.URL.Path, stopPathPrefix)
 	stopper, ok := rt.m.(stopPort)
@@ -791,12 +822,24 @@ func (rt *router) serveStop(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(w, err)
 		return
 	}
-	state, err := stopper.Stop(r.Context(), model)
+	stop := stopper.Stop
+	if v := r.URL.Query().Get("if_evictable"); v == "1" || v == "true" {
+		stop = refuseConditionalStop
+		if cond, ok := rt.m.(conditionalStopPort); ok {
+			stop = cond.StopIfEvictable
+		}
+	}
+	state, err := stop(r.Context(), model)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, stopResponse{State: state})
+}
+
+// refuseConditionalStop answers a conditional stop a manager cannot judge.
+func refuseConditionalStop(context.Context, string) (StopState, error) {
+	return "", fmt.Errorf("%w: this agent cannot stop conditionally", ErrInstanceBusy)
 }
 
 // rpcPathPrefix is the path prefix of the member routes, POST
@@ -2037,7 +2080,12 @@ const (
 // by changing the spec or stopping the higher instance first. A member's
 // (runtime.cluster_member_in_use) conflicts with the head holding it: the
 // cluster is stopped head first. runtime.cache_purge_failed (500) is the agent's
-// own filesystem refusing to remove a member cache.
+// own filesystem refusing to remove a member cache. The cluster refusals are
+// 503s, "not now, the gateway orchestrates and retries": a cold cluster head
+// asked for without the cluster start (runtime.cluster_not_ready), and a
+// cluster start whose member probe gave up (runtime.cluster_member_unreachable).
+// A conditional stop the eviction rule refuses is a 409
+// (runtime.instance_busy): the stop conflicts with the instance's use.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
@@ -2062,6 +2110,12 @@ func sentinelCode(err error) (code string, status int) {
 		return "runtime.cluster_member_in_use", http.StatusConflict
 	case errors.Is(err, ErrCachePurgeFailed):
 		return "runtime.cache_purge_failed", http.StatusInternalServerError
+	case errors.Is(err, ErrClusterNotReady):
+		return "runtime.cluster_not_ready", http.StatusServiceUnavailable
+	case errors.Is(err, ErrClusterMemberUnreachable):
+		return codeClusterMemberUnreach, http.StatusServiceUnavailable
+	case errors.Is(err, ErrInstanceBusy):
+		return "runtime.instance_busy", http.StatusConflict
 	default:
 		return codeUpstreamGone, http.StatusBadGateway
 	}
