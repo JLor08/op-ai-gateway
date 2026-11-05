@@ -1076,7 +1076,7 @@ const rpcClusterDocumentJSON = `{
      "rpc": {"head_spec_id": "rspec_h", "transport": "relay", "bind_ip": "100.64.0.5", "port": 47001,
              "head_ips": ["100.64.0.2"], "head_domain": "", "cache_enabled": true}},
     {"id": "rspec_h", "model": "big", "upstream_model": "big", "binary": "/bin/llama-server",
-     "cluster": {"transport": "direct", "network": "mesh", "endpoints": [
+     "cluster": {"transport": "direct", "network": "mesh", "generation": "g7", "endpoints": [
        {"address": "100.64.0.5:47001", "device_count": 2},
        {"address": "100.64.0.6:47001", "device_count": 1}]}}
   ],
@@ -1106,7 +1106,7 @@ func TestParseConfigRPCServerSpecRoundTrips(t *testing.T) {
 	if len(eps) != 2 || eps[0].Address != "100.64.0.5:47001" || eps[0].DeviceCount != 2 || eps[1].Address != "100.64.0.6:47001" {
 		t.Fatalf("endpoints = %+v, want the document order preserved", eps)
 	}
-	if head.Cluster.Transport != "direct" || head.Cluster.Network != "mesh" {
+	if head.Cluster.Transport != "direct" || head.Cluster.Network != "mesh" || head.Cluster.Generation != "g7" {
 		t.Fatalf("cluster = %+v", head.Cluster)
 	}
 	if len(cfg.Coresident) != 1 {
@@ -1182,5 +1182,10 @@ func TestSameLaunchShapeRPCAllowlistIsNotLaunchAffecting(t *testing.T) {
 	}
 	if !sameLaunchShape(head("a:1", "b:1"), head("a:1", "b:1")) {
 		t.Error("identical heads differ in launch shape")
+	}
+	regenerated := head("a:1", "b:1")
+	regenerated.Cluster.Generation = "g2"
+	if sameLaunchShape(head("a:1", "b:1"), regenerated) {
+		t.Error("a new cluster generation kept the launch shape, want a relaunch")
 	}
 }

@@ -544,7 +544,7 @@ func (m *Manager) Apply(cfg Config) {
 // how the gateway adds capacity; a request the router forwards is admitted with
 // EnsureServing instead, which never starts a burst instance.
 func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
-	return m.ensure(ctx, upstreamModel, false)
+	return m.ensure(ctx, cmdEnsure{model: upstreamModel})
 }
 
 // EnsureServing is EnsureRunning for a PLAIN request -- one the router forwards
@@ -574,15 +574,17 @@ func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endp
 // the address and reads the instance's state (handleEnsure), so no start can
 // slip in between the check and the request it lets through.
 func (m *Manager) EnsureServing(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
-	return m.ensure(ctx, upstreamModel, true)
+	return m.ensure(ctx, cmdEnsure{model: upstreamModel, serving: true})
 }
 
-// ensure is EnsureRunning and EnsureServing; serving marks a plain request
-// (cmdEnsure.serving).
-func (m *Manager) ensure(ctx context.Context, upstreamModel string, serving bool) (endpoint string, release func(), err error) {
+// ensure is EnsureRunning, EnsureServing and EnsureMember: it posts c, with a
+// fresh reply channel, and waits for the answer (cmdEnsure says what each
+// field asks for).
+func (m *Manager) ensure(ctx context.Context, c cmdEnsure) (endpoint string, release func(), err error) {
 	reply := make(chan ensureOutcome, 1)
+	c.reply = reply
 	select {
-	case m.cmds <- cmdEnsure{model: upstreamModel, reply: reply, serving: serving}:
+	case m.cmds <- c:
 	case <-ctx.Done():
 		return "", nil, ctx.Err()
 	case <-m.done:
@@ -947,6 +949,11 @@ type cmdEnsure struct {
 	// serving is set by EnsureServing: a plain request, which a burst instance
 	// serves only while it is running or starting (plainRequestRefused).
 	serving bool
+	// member is set by EnsureMember: model is then an rpc_server spec ID, and
+	// nothing else resolves (memberState). reserve is the reservation the
+	// member is given once it is running (armReservation); 0 arms none.
+	member  bool
+	reserve time.Duration
 }
 
 func (cmdEnsure) isCommand() {}
@@ -1117,6 +1124,8 @@ type ensureWaiter struct {
 	// request has been waiting longest gets the freed slot rather than
 	// whichever spec Go's randomized map iteration happened to visit first.
 	queuedAt time.Time
+	// reserve is cmdEnsure.reserve, armed when this waiter is served.
+	reserve time.Duration
 }
 
 // runningProc is one live generation of a managed process. Its pointer
@@ -1396,6 +1405,14 @@ type specState struct {
 	drainedFor []string
 
 	pending []*ensureWaiter
+
+	// claim is an rpc_server member's hold and reservation (rpc_hold.go): while
+	// either stands the member is never idle-unloaded nor an eviction victim.
+	claim memberClaim
+	// admissionBlockedBy names the claimed member a waiting admission of this
+	// spec could only proceed by evicting; empty otherwise. admitAndStart
+	// decides it on every ask, and it is dropped once nothing waits any more.
+	admissionBlockedBy string
 }
 
 // owner holds every piece of state the single serialized goroutine touches.
@@ -1576,6 +1593,16 @@ func (o *owner) handle(cmd command) {
 		c.reply <- o.loadedModels()
 	case cmdStop:
 		c.reply <- o.stopInstance(c.model)
+	case cmdStopMember:
+		c.reply <- o.stopMember(c.specID, c.force)
+	case cmdReleaseMember:
+		c.reply <- o.releaseMember(c.specID)
+	case cmdSetMemberHold:
+		o.setMemberHold(c)
+	case cmdReservationExpired:
+		o.handleReservationExpired(c)
+	case cmdPurgeMemberCache:
+		c.reply <- o.purgeMemberCache(c.specID)
 	case cmdResolve:
 		_, base, k, ok := o.resolveAddress(c.model)
 		c.reply <- resolvedAddress{base: base, k: k, ok: ok}
@@ -2111,42 +2138,16 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
 		return
 	}
-	specID, _, k, ok := o.resolveAddress(c.model)
-	if !ok {
-		c.reply <- ensureOutcome{err: ErrModelNotManaged}
+	st, err := o.ensureTarget(c)
+	if err != nil {
+		c.reply <- ensureOutcome{err: err}
 		return
 	}
-	st := o.specs[specID]
-	// force_stopped applies to every instance of the spec, and is read
-	// off instance 0 -- the pushed spec itself -- before a further instance
-	// could be created for nothing.
-	if st.spec.AdminState == "force_stopped" {
-		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
-		return
-	}
-	if k > 0 {
-		// Decided before instanceForRequest, which would create the instance, or
-		// retire a crashed or start_failed one and start a fresh one -- the start
-		// is exactly what a plain request must not cause for a burst instance
-		// (EnsureServing).
-		// The retirement it may cause: a burst instance resting at a failure
-		// stays only until it is named again, and deleting it creates and starts
-		// nothing. Left in place, a row the gateway keeps naming for a moment
-		// (its telemetry lags) would read crashed until the next Apply.
-		if c.serving && o.plainRequestRefused(st, k) {
-			key := InstanceKey(st.spec.ID, k)
-			if failed := o.specs[key]; failed != nil && failed.spentBurst() {
-				o.retire(key, failed)
-			}
-			c.reply <- ensureOutcome{err: ErrInstanceNoCapacity}
-			return
-		}
-		st = o.instanceForRequest(st, k)
-		specID = st.spec.ID
-	}
+	specID := st.spec.ID
 	if st.state == StateRunning && st.proc != nil {
 		st.inFlight++
 		st.lastUsed = time.Now()
+		o.armReservation(st, c.reserve)
 		c.reply <- ensureOutcome{endpoint: endpointFor(st.proc.port), specID: specID, proc: st.proc}
 		return
 	}
@@ -2175,7 +2176,7 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 
-	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now()}
+	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now(), reserve: c.reserve}
 	if st.spec.AdmissionWaitTimeoutSeconds > 0 {
 		d := time.Duration(st.spec.AdmissionWaitTimeoutSeconds) * time.Second
 		reply := c.reply
@@ -2185,6 +2186,53 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	}
 	st.pending = append(st.pending, w)
 	o.admitAndStart(specID)
+}
+
+// ensureTarget resolves what an ensure names to the state it is admitted as,
+// or answers it with a refusal. A member ensure names an rpc_server spec by ID
+// and reaches nothing else (memberState); every other ensure names an instance
+// address (resolveAddress), which never reaches a member: a member is not in
+// the upstream index. force_stopped applies to every instance of a spec and is
+// read off instance 0 -- the pushed spec itself -- before a further instance
+// could be created for nothing.
+func (o *owner) ensureTarget(c cmdEnsure) (*specState, error) {
+	if c.member {
+		st, ok := o.memberState(c.model)
+		if !ok {
+			return nil, ErrModelNotManaged
+		}
+		if st.spec.AdminState == "force_stopped" {
+			return nil, ErrAdmissionBlocked
+		}
+		return st, nil
+	}
+	specID, _, k, ok := o.resolveAddress(c.model)
+	if !ok {
+		return nil, ErrModelNotManaged
+	}
+	st := o.specs[specID]
+	if st.spec.AdminState == "force_stopped" {
+		return nil, ErrAdmissionBlocked
+	}
+	if k == 0 {
+		return st, nil
+	}
+	// Decided before instanceForRequest, which would create the instance, or
+	// retire a crashed or start_failed one and start a fresh one -- the start is
+	// exactly what a plain request must not cause for a burst instance
+	// (EnsureServing).
+	// The retirement it may cause: a burst instance resting at a failure stays
+	// only until it is named again, and deleting it creates and starts nothing.
+	// Left in place, a row the gateway keeps naming for a moment (its telemetry
+	// lags) would read crashed until the next Apply.
+	if c.serving && o.plainRequestRefused(st, k) {
+		key := InstanceKey(st.spec.ID, k)
+		if failed := o.specs[key]; failed != nil && failed.spentBurst() {
+			o.retire(key, failed)
+		}
+		return nil, ErrInstanceNoCapacity
+	}
+	return o.instanceForRequest(st, k), nil
 }
 
 // resolveAddress is Manager.ResolveAddress on the owner, and the rule
@@ -2293,6 +2341,7 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 			if w.reply == c.reply {
 				cancelTimer(o.m, &w.timer)
 				st.pending = append(st.pending[:i:i], st.pending[i+1:]...)
+				o.noteWaitEnded(st)
 				err := c.err
 				if err == nil {
 					err = context.Canceled
@@ -2379,6 +2428,7 @@ func (o *owner) handleWaiterTimeout(c cmdWaiterTimeout) {
 		if w.reply == c.reply {
 			w.timer = nil // this IS that timer's own callback; nothing left to Stop()
 			st.pending = append(st.pending[:i:i], st.pending[i+1:]...)
+			o.noteWaitEnded(st)
 			c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 			return
 		}
@@ -2407,6 +2457,7 @@ func (o *owner) failPending(st *specState, err error) {
 		w.reply <- ensureOutcome{err: err}
 	}
 	st.pending = nil
+	o.noteWaitEnded(st)
 }
 
 // succeedPending resolves and clears every waiter queued on st with st's
@@ -2417,6 +2468,7 @@ func (o *owner) succeedPending(st *specState, specID string) {
 	for _, w := range st.pending {
 		cancelTimer(o.m, &w.timer)
 		st.inFlight++
+		o.armReservation(st, w.reserve)
 		w.reply <- ensureOutcome{endpoint: ep, specID: specID, proc: st.proc}
 	}
 	st.pending = nil
@@ -2657,7 +2709,17 @@ func (st *specState) protected() bool {
 // promise is worth nothing if an admission may evict a protected instance, and
 // a further instance of a pinned spec must not read as pinned merely because
 // its copy carries the field.
+//
+// An rpc_server member under a hold or a reservation (claimed) reads pinned
+// too: a head is using it, or is about to, and evicting it would abort that
+// head's cluster.
 func (st *specState) pinnedForAdmission() bool {
+	return st.pinnedBySpec() || st.claimed()
+}
+
+// pinnedBySpec is pinnedForAdmission without a member's claim: what the
+// pushed spec alone makes of the instance.
+func (st *specState) pinnedBySpec() bool {
 	if !st.spec.Replicable {
 		return st.spec.Pinned
 	}
@@ -2912,6 +2974,11 @@ func (o *owner) admitAndStart(specID string) {
 	st.waitingOnGrace = false
 	st.waitingOnDemand = false
 	st.waitingOnSibling = false
+	// The claimed member blocking this admission is decided afresh on every ask
+	// and recorded once, on the way out, so a wait that stays blocked by the
+	// same member does not ring the transitions doorbell on every re-ask.
+	blockedBy := ""
+	defer func() { o.setAdmissionBlockedBy(st, blockedBy) }()
 	if !o.wantsUp(st) {
 		return
 	}
@@ -3016,6 +3083,7 @@ func (o *owner) admitAndStart(specID string) {
 		// that is the one Wait nothing need ever resolve. See
 		// noteAdmissionWait.
 		o.noteAdmissionWait(st, dec.Message)
+		blockedBy = o.claimedMemberBlocking(snap, demand)
 	case len(dec.Evict) > 0:
 		if dec.VRAMBootstrap {
 			// This Evict spent the candidate's one-shot VRAM bootstrap (rule 4
@@ -4290,6 +4358,11 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	cancelTimer(o.m, &proc.stableTimer)
 	st.proc = nil
 	st.rpcProtocol = ""
+	// A hold and a reservation are claims on a running member: with its process
+	// gone there is nothing left to hold, and the start a reservation covered has
+	// ended. The admission wake that follows every exit re-asks whoever waited
+	// for the room.
+	o.dropClaim(st)
 	// C3 fix: the generation's requests are dead by definition. Without
 	// this, a request in flight when the child crashed left InFlight stuck
 	// above zero forever, and Admit's isEvictable (which requires
@@ -5236,7 +5309,7 @@ func (o *owner) scanIdle() {
 		if st.proc == nil || st.state != StateRunning {
 			continue
 		}
-		if st.protected() {
+		if st.protected() || st.claimed() {
 			continue
 		}
 		isMember := st.spec.Kind == SpecKindRPCServer
@@ -5299,6 +5372,14 @@ func (o *owner) snapshotStatus() []Status {
 			s.PID = st.proc.pid
 			s.Port = st.proc.port
 		}
+		if st.spec.IsRPCServer() {
+			s.RPC = &RPCStatus{
+				HeldBy:        st.claim.heldBy,
+				HeldSince:     st.claim.heldSince,
+				ReservedUntil: st.claim.reservedUntil,
+			}
+		}
+		s.AdmissionBlockedBy = st.admissionBlockedBy
 		out = append(out, s)
 	}
 	return out
@@ -5333,6 +5414,9 @@ func (o *owner) handleClose() {
 			cancelTimer(o.m, &st.backoffTimer)
 			o.setState(st, StateStopped)
 		}
+		// Registered in m.wg like the backoff timer; nothing is idle-scanned or
+		// admitted again, so the reservation has nothing left to guard.
+		cancelTimer(o.m, &st.claim.reservationTimer)
 		o.failPending(st, ErrManagerClosed)
 		if st.proc != nil {
 			o.beginDrain(id)

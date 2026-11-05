@@ -355,7 +355,7 @@ func newRouter(m managerPort) *router {
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// M9: every control path answers one method -- GET, or POST for
-	// /ensure/{model} and /stop/{model}; a different method on one of these paths falls
+	// /ensure/{model}, /stop/{model}, /live/{model} and /rpc/...; a different method on one of these paths falls
 	// through to the model-routed proxy instead (the ordinary "everything
 	// else" case), rather than getting the control treatment regardless
 	// of method.
@@ -375,6 +375,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveStop(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, livePathPrefix):
 		rt.serveLive(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, rpcPathPrefix):
+		rt.serveRPC(w, r)
 	default:
 		rt.serveProxy(w, r)
 	}
@@ -795,6 +797,123 @@ func (rt *router) serveStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, stopResponse{State: state})
+}
+
+// rpcPathPrefix is the path prefix of the member routes, POST
+// /rpc/{action}/{specID}: everything after the action's "/" is the member's
+// spec ID.
+const rpcPathPrefix = "/rpc/"
+
+// memberPort is the part of *Manager the member routes need, asserted per
+// request like stopPort, so the managerPort fakes of the other routes need not
+// grow it; a manager without it manages no member.
+type memberPort interface {
+	EnsureMember(ctx context.Context, specID string, reserve time.Duration) error
+	ReleaseMember(specID string) error
+	StopMember(ctx context.Context, specID string, force bool) (StopState, error)
+	PurgeMemberCache(ctx context.Context, specID string) error
+}
+
+// memberResponse is the success body of every member route.
+type memberResponse struct {
+	State string `json:"state"`
+}
+
+// codeBadRequest answers a member route whose query cannot be used.
+const codeBadRequest = "runtime.bad_request"
+
+// serveRPC handles the member routes, which address an rpc_server member by
+// its spec ID -- a member has no upstream model, so the model routes never
+// reach it, and these never reach a model spec:
+//
+//   - POST /rpc/ensure/{specID}?reserve_seconds=N starts the member and
+//     answers 200 {"state":"running"} once it accepts TCP connections, with a
+//     reservation of N seconds armed (Manager.EnsureMember). One long call like
+//     POST /ensure/{model}, with the same refusals: 503 admission_blocked, 502
+//     not_permitted or start_failed, 504 start_timeout. N is a whole number
+//     from 0 (no reservation, the default) to a day; anything else is 400
+//     runtime.bad_request, refused before anything starts.
+//   - POST /rpc/release/{specID} ends the member's reservation and hold and
+//     answers 200 {"state":"released"} (Manager.ReleaseMember).
+//   - POST /rpc/stop/{specID}[?force=1] stops the member with the answers of
+//     POST /stop/{model}, and 409 runtime.cluster_member_in_use while it is
+//     held or reserved unless forced (Manager.StopMember).
+//   - POST /rpc/purge-cache/{specID} removes the member's tensor cache for its
+//     head and answers 200 {"state":"purged"}, or 409
+//     runtime.cluster_member_in_use while it is held or reserved
+//     (Manager.PurgeMemberCache).
+//
+// An unknown action, an empty or unknown spec ID, a spec that is not a member,
+// and a router without a manager all answer 404 runtime.model_not_managed. Any
+// body is read and discarded, as on the other control routes.
+func (rt *router) serveRPC(w http.ResponseWriter, r *http.Request) {
+	action, specID, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, rpcPathPrefix), "/")
+	members, ok := rt.m.(memberPort)
+	if !ok || specID == "" {
+		writeSentinelError(w, ErrModelNotManaged)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		writeBodyReadError(w, err)
+		return
+	}
+	switch action {
+	case "ensure":
+		rt.serveMemberEnsure(w, r, members, specID)
+	case "release":
+		rt.answerMember(w, members.ReleaseMember(specID), "released")
+	case "stop":
+		force := r.URL.Query().Get("force")
+		state, err := members.StopMember(r.Context(), specID, force == "1" || force == "true")
+		rt.answerMember(w, err, string(state))
+	case "purge-cache":
+		rt.answerMember(w, members.PurgeMemberCache(r.Context(), specID), "purged")
+	default:
+		writeSentinelError(w, ErrModelNotManaged)
+	}
+}
+
+// serveMemberEnsure is POST /rpc/ensure/{specID} (see serveRPC).
+func (rt *router) serveMemberEnsure(w http.ResponseWriter, r *http.Request, members memberPort, specID string) {
+	reserve, ok := parseReserveSeconds(r.URL.Query().Get("reserve_seconds"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, codeBadRequest,
+			"reserve_seconds must be a whole number of seconds from 0 to "+strconv.Itoa(int(maxMemberReservation/time.Second)))
+		return
+	}
+	if err := members.EnsureMember(r.Context(), specID, reserve); err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	if r.Context().Err() != nil {
+		return // the client left as the start succeeded; nobody reads an answer
+	}
+	refreshWriteDeadline(w)
+	writeJSON(w, http.StatusOK, memberResponse{State: "running"})
+}
+
+// parseReserveSeconds reads reserve_seconds: absent is no reservation, and a
+// value must be a whole number of seconds within maxMemberReservation.
+func parseReserveSeconds(v string) (time.Duration, bool) {
+	if v == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > int(maxMemberReservation/time.Second) {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
+}
+
+// answerMember writes a member route's answer: the refusal err maps to, or 200
+// with state.
+func (rt *router) answerMember(w http.ResponseWriter, err error, state string) {
+	if err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberResponse{State: state})
 }
 
 // serveLive handles POST /live/{model}: the full-duplex relay to a managed
@@ -1894,7 +2013,7 @@ const (
 )
 
 // sentinelCode maps a Manager error to the design doc §6.5 stable wire code
-// and HTTP status. Any error that is not one of the nine named sentinels
+// and HTTP status. Any error that is not one of the named sentinels
 // (including a raw upstream connection failure or non-2xx status, which
 // carry no Manager sentinel of their own) falls through to
 // runtime.upstream_gone/502 -- the same code the design doc assigns to "the
@@ -1910,11 +2029,13 @@ const (
 // or starting), and a request whose address moved while it was admitted
 // (errAddressMoved); runtime.instance_demand_unknown answers an ensure of a
 // burst instance whose demand is not known yet, which the gateway retries
-// shortly, by which time a sibling has usually been measured. The two stop
-// refusals (POST /stop/{model}) are 409s as well: the stop conflicts with the
+// shortly, by which time a sibling has usually been measured. The stop
+// refusals (POST /stop/{model}, POST /rpc/stop/{specID}) are 409s as well: the stop conflicts with the
 // spec's protected floor (runtime.instance_protected) or with the ordering of
 // its instances (runtime.instance_not_highest), and the operator resolves either
-// by changing the spec or stopping the higher instance first.
+// by changing the spec or stopping the higher instance first. A member's
+// (runtime.cluster_member_in_use) conflicts with the head holding it: the
+// cluster is stopped head first.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
@@ -1935,6 +2056,8 @@ func sentinelCode(err error) (code string, status int) {
 		return "runtime.instance_protected", http.StatusConflict
 	case errors.Is(err, ErrInstanceNotHighest):
 		return "runtime.instance_not_highest", http.StatusConflict
+	case errors.Is(err, ErrMemberInUse):
+		return "runtime.cluster_member_in_use", http.StatusConflict
 	default:
 		return codeUpstreamGone, http.StatusBadGateway
 	}

@@ -203,10 +203,17 @@ type ClusterEndpoint struct {
 // ClusterHead is a head spec's cluster description: the ordered endpoints, how
 // the members are reached (Transport "direct" | "relay") and over which network
 // ("mesh" | "lan"). It is carried verbatim; the vocabulary is the gateway's.
+// Generation is an opaque value the gateway derives from its members'
+// configuration (binaries, versions, device counts, transport, network). Being
+// part of the cluster description it is launch-affecting: a member-side fix
+// changes the head spec, which lifts a terminal verdict the head rests under
+// (a version mismatch, say) and relaunches it, although the endpoints read the
+// same.
 type ClusterHead struct {
-	Endpoints []ClusterEndpoint `json:"endpoints"`
-	Transport string            `json:"transport"`
-	Network   string            `json:"network"`
+	Endpoints  []ClusterEndpoint `json:"endpoints"`
+	Transport  string            `json:"transport"`
+	Network    string            `json:"network"`
+	Generation string            `json:"generation,omitempty"`
 }
 
 // RPCMember is an rpc_server spec's network settings. Port is the rpc-server's

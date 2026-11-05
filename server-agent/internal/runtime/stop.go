@@ -151,6 +151,12 @@ func (o *owner) stopInstance(model string) stopOutcome {
 	if base.removed {
 		return stopOutcome{err: ErrModelNotManaged}
 	}
+	return o.stopResolved(base, k)
+}
+
+// stopResolved is stopInstance once the address is resolved: instance k of the
+// spec whose instance 0 is base, which is still desired.
+func (o *owner) stopResolved(base *specState, k int) stopOutcome {
 	key := InstanceKey(base.spec.ID, k)
 	st := o.specs[key]
 	hasProc := st != nil && st.proc != nil
