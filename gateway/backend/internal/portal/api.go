@@ -78,13 +78,13 @@ type API interface {
 	DeleteMessageAudio(context.Context, auth.Token, string, string) error
 	DeleteModelGroup(context.Context, auth.Token, string) error
 	DeleteProject(context.Context, auth.Token, string) error
+	DeleteRPCMemberSpec(context.Context, auth.Token, string, string) error
 	DeleteResourceGroup(context.Context, auth.Token, string) error
 	DeleteRuntimeSpec(context.Context, auth.Token, string) error
 	DeleteServer(context.Context, auth.Token, string, bool) (bool, error)
 	DeleteService(context.Context, auth.Token, string) error
 	DeleteServiceToken(context.Context, auth.Token, string, string) error
 	DeleteToken(context.Context, auth.Token, string) error
-	DeleteRPCMemberSpec(context.Context, auth.Token, string, string) error
 	DeleteVendorAccount(context.Context, auth.Token, string) (bool, error)
 	DemoteManager(context.Context, auth.Token, string, string) error
 	DetachProjectToken(context.Context, auth.Token, string, string) error
@@ -162,7 +162,9 @@ type API interface {
 	PublicLanguage(context.Context) string
 	PublicTheme(context.Context) string
 	PublicThemeView(context.Context) ThemePublicView
+	PutRPCMemberSpec(context.Context, auth.Token, string, string, PutRPCMemberSpecRequest) (RPCMemberSpecDTO, error)
 	PutRuntimeSpec(context.Context, auth.Token, string, PutRuntimeSpecRequest) (RuntimeSpecDTO, error)
+	RPCMemberSpecs(context.Context, auth.Token, string) ([]RPCMemberSpecDTO, error)
 	ReassignGroupsOwnedBy(context.Context, auth.Token, string) error
 	ReconcileCertificates(context.Context)
 	ReconcileGatewayPeer(context.Context) (string, bool, error)
@@ -198,8 +200,6 @@ type API interface {
 	SaveChat(context.Context, auth.Token, string, UpdateChatRequest) (ChatDTO, error)
 	ServerAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
 	ServerAvailability(context.Context, auth.Token, string, time.Duration) ([]routing.ServerAvailabilitySample, error)
-	PutRPCMemberSpec(context.Context, auth.Token, string, string, PutRPCMemberSpecRequest) (RPCMemberSpecDTO, error)
-	RPCMemberSpecs(context.Context, auth.Token, string) ([]RPCMemberSpecDTO, error)
 	ServerHardware(context.Context, auth.Token, string) (routing.ServerHardware, bool, error)
 	ServerModels(context.Context, auth.Token, string) ([]ServerModelDTO, error)
 	ServerOwnerResourceGroups(context.Context, auth.Token, string) ([]ServerResourceGroupDTO, error)

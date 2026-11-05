@@ -5,12 +5,12 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"slices"
-	"strings"
 )
 
 // portalRPCMemberErrRows are the manual RPC member spec rows. The runtime
@@ -86,13 +86,13 @@ func (s *Server) putRPCMemberSpec(w http.ResponseWriter, r *http.Request, token 
 	writeJSON(w, okStatus, dto)
 }
 
-// rpcMemberInUseMessage appends the service's head detail (present only when
-// the caller may see the head's server) to the generic message.
+// rpcMemberInUseMessage appends the head's server name (present only when the
+// caller may see it) to the generic message.
 func rpcMemberInUseMessage(err error) string {
 	const generic = "member is used by a cluster head"
-	detail := strings.TrimPrefix(err.Error(), portal.ErrRPCMemberInUse.Error()+": ")
-	if detail == err.Error() || detail == "" {
-		return generic
+	var inUse *portal.RPCMemberInUseError
+	if errors.As(err, &inUse) {
+		return generic + " (server " + inUse.HeadServerName + ")"
 	}
-	return generic + " (" + detail + ")"
+	return generic
 }

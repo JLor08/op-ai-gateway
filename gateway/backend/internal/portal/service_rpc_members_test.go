@@ -193,6 +193,19 @@ func TestPutRPCMemberSpecVRAMEstimateOnNonNVIDIA(t *testing.T) {
 	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", withEstimate); err != nil {
 		t.Fatalf("amd with estimate: %v", err)
 	}
+	// Mixed host: GPU 1 is AMD, so a member GPU at index 1 still needs the
+	// estimate while one at index 0 (NVIDIA) does not.
+	set(`{"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:01:00.0"},{"index":1,"name":"AMD Radeon RX 7900"}]}`)
+	nvidiaOnly := validRPCMemberRequest()
+	nvidiaOnly.GPUs = []RuntimeSpecGPUDTO{{Index: 0}}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", nvidiaOnly); err != nil {
+		t.Fatalf("mixed host, nvidia index: %v", err)
+	}
+	amdOnly := validRPCMemberRequest()
+	amdOnly.GPUs = []RuntimeSpecGPUDTO{{Index: 1}}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", amdOnly); !errors.Is(err, ErrRPCMemberVRAMEstimateRequired) {
+		t.Fatalf("mixed host, amd index: %v", err)
+	}
 	set(`{"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:01:00.0"}]}`)
 	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", noEstimate); err != nil {
 		t.Fatalf("nvidia without estimate: %v", err)

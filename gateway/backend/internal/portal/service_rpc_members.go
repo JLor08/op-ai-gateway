@@ -284,9 +284,10 @@ func (s *Service) rpcMemberHeadGroups(ctx context.Context, serverID string, requ
 	}
 }
 
-// requireRPCMemberVRAMEstimates enforces the estimate on non-NVIDIA servers.
-// When the vendor cannot be determined (no hardware report yet, or an
-// unreadable one) the estimate stays optional.
+// requireRPCMemberVRAMEstimates enforces the estimate for every declared GPU
+// that has none and is known to be non-NVIDIA. A GPU whose vendor cannot be
+// determined (no hardware report, an unreadable one, or an index the report
+// does not list) keeps the estimate optional.
 func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID string, gpus []RuntimeSpecGPUDTO) error {
 	missing := false
 	for _, g := range gpus {
@@ -301,34 +302,39 @@ func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID st
 	if err != nil {
 		return err
 	}
-	if !ok || !hardwareReportIsNonNVIDIA(hw.ReportJSON) {
+	if !ok {
 		return nil
 	}
-	return ErrRPCMemberVRAMEstimateRequired
-}
-
-// hardwareReportIsNonNVIDIA reports whether the system report lists GPUs and
-// none of them is an NVIDIA device. The report carries no vendor field per
-// GPU; an NVIDIA card is recognised by its PCI bus id (collected only for
-// NVIDIA) or its name.
-func hardwareReportIsNonNVIDIA(reportJSON string) bool {
 	var report struct {
 		GPUs []struct {
+			Index    int    `json:"index"`
 			Name     string `json:"name"`
 			PCIBusID string `json:"pci_bus_id"`
 		} `json:"gpus"`
 	}
-	if err := json.Unmarshal([]byte(reportJSON), &report); err != nil || len(report.GPUs) == 0 {
-		return false
+	if err := json.Unmarshal([]byte(hw.ReportJSON), &report); err != nil {
+		return nil
 	}
-	for _, g := range report.GPUs {
-		name := strings.ToLower(g.Name)
-		if g.PCIBusID != "" || strings.Contains(name, "nvidia") || strings.Contains(name, "geforce") ||
-			strings.Contains(name, "quadro") || strings.Contains(name, "tesla") {
-			return false
+	for _, g := range gpus {
+		if g.VRAMEstimateMB != 0 {
+			continue
+		}
+		for _, rg := range report.GPUs {
+			if rg.Index == g.Index && !gpuLooksNVIDIA(rg.Name, rg.PCIBusID) {
+				return ErrRPCMemberVRAMEstimateRequired
+			}
 		}
 	}
-	return true
+	return nil
+}
+
+// gpuLooksNVIDIA recognises an NVIDIA card in a hardware report, which has no
+// vendor field: the collector fills the PCI bus id only for NVIDIA devices,
+// and the name is the fallback.
+func gpuLooksNVIDIA(name, pciBusID string) bool {
+	n := strings.ToLower(name)
+	return pciBusID != "" || strings.Contains(n, "nvidia") || strings.Contains(n, "geforce") ||
+		strings.Contains(n, "quadro") || strings.Contains(n, "tesla")
 }
 
 // rpcMemberInUseError returns ErrRPCMemberInUse when a head references the
@@ -342,10 +348,20 @@ func (s *Service) rpcMemberInUseError(ctx context.Context, p auth.Token, specID 
 		return nil
 	}
 	if name := s.visibleHeadServerName(ctx, p, head.HeadSpecID); name != "" {
-		return fmt.Errorf("%w: used by a cluster head on server %q", ErrRPCMemberInUse, name)
+		return &RPCMemberInUseError{HeadServerName: name}
 	}
 	return ErrRPCMemberInUse
 }
+
+// RPCMemberInUseError is ErrRPCMemberInUse carrying the name of the head's
+// server; it is only built for callers who may see that server.
+type RPCMemberInUseError struct{ HeadServerName string }
+
+func (e *RPCMemberInUseError) Error() string {
+	return fmt.Sprintf("%s: used by a cluster head on server %q", ErrRPCMemberInUse.Error(), e.HeadServerName)
+}
+
+func (e *RPCMemberInUseError) Unwrap() error { return ErrRPCMemberInUse }
 
 // headServerID resolves head spec -> mapping -> application -> server.
 func (s *Service) headServerID(ctx context.Context, headSpecID string) (string, bool) {
