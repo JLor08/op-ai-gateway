@@ -3307,6 +3307,7 @@ export function RuntimeAdminSection({
       type: specType,
       replicable,
       startupTimeoutSeconds,
+      binary,
       stored: editingSpecMappingId ? specsById[editingSpecMappingId] : undefined,
     });
     return key ? t[key] : undefined;
@@ -5540,9 +5541,12 @@ export function RuntimeAdminSection({
               </Box>
             </Box>
 
-            {/* Shown for llama.cpp, and for any spec that is still a head so
-                the operator can turn the cluster off after a type change. */}
-            {(specType === 'llama_cpp' || cluster.enabled) && (
+            {/* Shown for llama.cpp (explicit, or Auto resolved to it), and for
+                any spec that is still a head so the operator can turn the
+                cluster off after a type change. */}
+            {(specType === 'llama_cpp' ||
+              (specType === '' && currentSpec?.effective_type === 'llama_cpp') ||
+              cluster.enabled) && (
               <ClusterHeadEditor
                 t={t}
                 api={api}

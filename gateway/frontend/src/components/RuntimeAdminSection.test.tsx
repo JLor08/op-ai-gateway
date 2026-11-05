@@ -12216,6 +12216,42 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     expect(putSpecs).toHaveLength(0);
   });
 
+  it('refuses a head binary switch while a member is hidden, before the round trip', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama-b2/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorClusterHeadBinaryLocked)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('shows the cluster section for an Auto type that resolves to llama.cpp', async () => {
+    await openEditAndSave(
+      makeSpec({
+        configured: true,
+        mapping_id: 'map_1',
+        type: '',
+        effective_type: 'llama_cpp',
+        binary: '/usr/bin/llama-server',
+      }),
+    );
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeInTheDocument();
+  });
+
+  it('hides the cluster section for a spec that is no llama.cpp head', async () => {
+    await openEditAndSave(
+      makeSpec({
+        configured: true,
+        mapping_id: 'map_1',
+        type: '',
+        effective_type: 'vllm',
+        binary: '/usr/bin/vllm',
+      }),
+    );
+    expect(screen.queryByRole('checkbox', { name: t.clusterEnabledLabel })).not.toBeInTheDocument();
+  });
+
   it('accepts the device placeholders as plain placeholders', async () => {
     const { putSpecs } = await openEditAndSave(headSpec());
     fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {

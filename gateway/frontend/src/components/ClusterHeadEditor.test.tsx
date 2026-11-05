@@ -109,16 +109,17 @@ function setup(
     mappingId?: string;
     candidates?: ClusterCandidate[];
     hardwareByServer?: Record<string, HardwareResponse>;
+    hardwareFailing?: string[];
     headHasGpus?: boolean;
     server?: PortalServer;
   } = {},
 ) {
   const api = {
     clusterCandidates: vi.fn(async () => ({ data: opts.candidates ?? [] })),
-    serverHardware: vi.fn(
-      async (id: string) =>
-        opts.hardwareByServer?.[id] ?? ({ available: false } as HardwareResponse),
-    ),
+    serverHardware: vi.fn(async (id: string) => {
+      if (opts.hardwareFailing?.includes(id)) throw new Error('hardware read failed');
+      return opts.hardwareByServer?.[id] ?? ({ available: false } as HardwareResponse);
+    }),
   };
   const latest: { value: ClusterHeadState } = { value: opts.initial ?? state() };
   function Harness() {
@@ -200,6 +201,19 @@ describe('ClusterHeadEditor member mode', () => {
     expect(screen.queryByText(t.clusterModeSwitchBody)).not.toBeInTheDocument();
     expect(latest.value.memberMode).toBe('manual');
   });
+
+  it('closes an open member picker on a switch, since it lists the other mode', async () => {
+    const { api } = setup({
+      candidates: [{ server_id: 'srv_a', server_name: 'Alpha' }],
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberMode, t.clusterMemberModeManual);
+    expect(screen.queryByRole('combobox', { name: t.clusterMemberServer })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.clusterMemberAdd })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await waitFor(() => expect(api.clusterCandidates).toHaveBeenLastCalledWith('map_1', 'manual'));
+  });
 });
 
 describe('ClusterHeadEditor member order', () => {
@@ -274,6 +288,26 @@ describe('ClusterHeadEditor automatic members', () => {
     });
   });
 
+  it('tells a failed hardware read from a server without GPUs or a report', async () => {
+    setup({
+      initial: state({
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha' }),
+          member({ server_id: 'srv_b', server_name: 'Beta' }),
+          member({ server_id: 'srv_c', server_name: 'Gamma' }),
+        ]),
+      }),
+      hardwareFailing: ['srv_a'],
+      hardwareByServer: { srv_b: hardware([]) },
+    });
+    const rows = screen.getAllByTestId('cluster-member-row');
+    expect(await within(rows[0]).findByText(t.clusterMemberHardwareFailed)).toBeInTheDocument();
+    expect(await within(rows[1]).findByText(t.clusterMemberNoGpusReported)).toBeInTheDocument();
+    expect(
+      await within(rows[2]).findByText(t.clusterMemberHardwareUnavailable),
+    ).toBeInTheDocument();
+  });
+
   it('says what a server needs when none is offered', async () => {
     setup({ candidates: [] });
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
@@ -289,7 +323,16 @@ describe('ClusterHeadEditor manual members', () => {
         {
           server_id: 'srv_a',
           server_name: 'Alpha',
-          member_specs: [memberSpec('rpcm_1'), memberSpec('rpcm_2')],
+          member_specs: [
+            memberSpec('rpcm_1'),
+            memberSpec('rpcm_2', {
+              binary: '/opt/b2/ggml-rpc-server',
+              gpus: [
+                { index: 3, vram_estimate_mb: 0, vram_measured_mb: 0 },
+                { index: 1, vram_estimate_mb: 0, vram_measured_mb: 0 },
+              ],
+            }),
+          ],
         },
       ],
     });
@@ -299,7 +342,15 @@ describe('ClusterHeadEditor manual members', () => {
     pick(t.clusterMemberServer, 'Alpha');
     expect(screen.getByText(t.clusterMemberSpecPick)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: t.clusterMemberAddConfirm })).toBeDisabled();
-    pick(t.clusterMemberSpec, 'rpcm_2');
+    // Each offered spec names its devices and binary, not only its id.
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterMemberSpec }));
+    const options = within(screen.getByRole('listbox')).getAllByRole('option');
+    expect(options.map((o) => o.textContent)).toEqual([
+      '—',
+      `rpcm_1 · ${t.rpcMemberCpu} · /opt/llama/ggml-rpc-server`,
+      'rpcm_2 · GPU 3, GPU 1 · /opt/b2/ggml-rpc-server',
+    ]);
+    fireEvent.click(options[2]);
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
     expect(latest.value.members[0]).toMatchObject({ server_id: 'srv_a', member_spec_id: 'rpcm_2' });
   });
@@ -425,7 +476,26 @@ describe('clusterSaveError', () => {
     type: 'llama_cpp' as const,
     replicable: false,
     startupTimeoutSeconds: 600,
+    binary: '/opt/llama/llama-server',
   };
+
+  it('refuses a head binary switch while a member is hidden', () => {
+    const stored = {
+      configured: true,
+      binary: '/opt/llama/llama-server',
+    } as RuntimeSpec;
+    const s = state({ members: clusterRows([member(), hiddenMember(1)]) });
+    const args = ['--rpc', '${RPC_SERVERS}'];
+    expect(clusterSaveError(s, { ...base, args, env: {}, stored })).toBeNull();
+    expect(
+      clusterSaveError(s, { ...base, args, env: {}, stored, binary: '/opt/b2/llama-server' }),
+    ).toBe('errorClusterHeadBinaryLocked');
+    // Every member visible: the gateway runs the full member checks instead.
+    const visible = state({ members: clusterRows([member()]) });
+    expect(
+      clusterSaveError(visible, { ...base, args, env: {}, stored, binary: '/opt/b2/llama-server' }),
+    ).toBeNull();
+  });
 
   it('refuses the cluster placeholders without a cluster', () => {
     expect(

@@ -32,6 +32,7 @@ import type {
   HardwareGPU,
   PortalServer,
   PutRuntimeSpecRequest,
+  RPCMemberSpec,
   RpcTransport,
   RuntimeSpec,
 } from '../api';
@@ -154,6 +155,8 @@ export interface ClusterSaveFacts {
   type: RuntimeSpec['type'];
   replicable: boolean;
   startupTimeoutSeconds: number;
+  // The head binary as the form will send it.
+  binary: string;
   stored?: RuntimeSpec;
 }
 
@@ -176,7 +179,27 @@ export function clusterSaveError(s: ClusterHeadState, facts: ClusterSaveFacts): 
   const servers = s.members.filter((m) => m.visible).map((m) => m.server_id);
   if (new Set(servers).size !== servers.length) return 'errorClusterMemberServerTwice';
   if (needsLanAck(s, facts.stored) && !s.lanAck) return 'errorClusterLanAckRequired';
+  // The gateway lets a save through a member the caller cannot see only
+  // while the membership and the head binary stay as stored: the binary
+  // decides which member builds are compatible, so switching it runs every
+  // member check, and the hidden member's server then answers not found.
+  if (
+    s.members.some((m) => !m.visible) &&
+    facts.stored?.configured &&
+    facts.binary.trim() !== facts.stored.binary.trim()
+  ) {
+    return 'errorClusterHeadBinaryLocked';
+  }
   return null;
+}
+
+type HostGpus = HardwareGPU[] | 'unavailable' | 'failed';
+
+// A manual member spec as the picker offers it: id, devices and binary.
+function memberSpecLabel(s: RPCMemberSpec, t: Translation): string {
+  const devices =
+    s.gpus.length === 0 ? t.rpcMemberCpu : s.gpus.map((g) => `GPU ${g.index}`).join(', ');
+  return `${s.id} · ${devices} · ${s.binary}`;
 }
 
 function toCount(text: string): number {
@@ -234,11 +257,14 @@ export function ClusterHeadEditor({
     serverId: string;
     specId: string;
   } | null>(null);
-  const [hardwareByServer, setHardwareByServer] = useState<Record<string, HardwareGPU[]>>({});
+  // Per member server: its reported GPUs, 'unavailable' without a hardware
+  // report, 'failed' when the read failed.
+  const [hardwareByServer, setHardwareByServer] = useState<Record<string, HostGpus>>({});
 
   // A member on a server the caller cannot manage makes every membership
   // change a refusal (the gateway needs rights on every member server), so
-  // the membership, mode, network and transport are shown, not edited.
+  // the membership, mode, network and transport are shown, not edited (the
+  // head binary is held by clusterSaveError for the same reason).
   const locked = value.members.some((m) => !m.visible);
   const automaticServers =
     value.memberMode === 'automatic'
@@ -255,11 +281,11 @@ export function ClusterHeadEditor({
         .serverHardware(id)
         .then((hw) => {
           if (cancelled) return;
-          const gpus = hw.available && hw.report ? hw.report.gpus : [];
+          const gpus: HostGpus = hw.available && hw.report ? hw.report.gpus : 'unavailable';
           setHardwareByServer((cur) => ({ ...cur, [id]: gpus }));
         })
         .catch(() => {
-          if (!cancelled) setHardwareByServer((cur) => ({ ...cur, [id]: [] }));
+          if (!cancelled) setHardwareByServer((cur) => ({ ...cur, [id]: 'failed' }));
         });
     }
     return () => {
@@ -286,6 +312,8 @@ export function ClusterHeadEditor({
 
   function changeMode(mode: ClusterMemberMode) {
     if (mode === value.memberMode) return;
+    // The open picker lists the other mode's candidates.
+    setPicker(null);
     if (value.members.length > 0) setPendingMode(mode);
     else patch({ memberMode: mode, members: [] });
   }
@@ -631,7 +659,7 @@ export function ClusterHeadEditor({
                     </option>
                     {chosenSpecs.map((s) => (
                       <option key={s.id} value={s.id}>
-                        {s.id}
+                        {memberSpecLabel(s, t)}
                       </option>
                     ))}
                   </SelectField>
@@ -696,14 +724,14 @@ function MemberRow({
   locked: boolean;
   automatic: boolean;
   // undefined while the server's hardware report loads.
-  hostGpus?: HardwareGPU[];
+  hostGpus?: HostGpus;
   onMove: (delta: number) => void;
   onRemove: () => void;
   onPatch: (next: Partial<ClusterMember>) => void;
 }>) {
   const name = member.server_name || member.server_id;
   const selected = new Set(member.gpus.map((g) => g.index));
-  const addable = (hostGpus ?? []).filter((g) => !selected.has(g.index));
+  const addable = (Array.isArray(hostGpus) ? hostGpus : []).filter((g) => !selected.has(g.index));
 
   function setGpus(gpus: ClusterMemberGPU[]) {
     onPatch({ gpus });
@@ -831,9 +859,13 @@ function MemberRow({
               </IconButton>
             </Box>
           ))}
-          {hostGpus !== undefined && hostGpus.length === 0 && (
+          {hostGpus !== undefined && !(Array.isArray(hostGpus) && hostGpus.length > 0) && (
             <Typography variant="caption" color="text.secondary">
-              {t.clusterMemberNoGpusReported}
+              {hostGpus === 'failed'
+                ? t.clusterMemberHardwareFailed
+                : hostGpus === 'unavailable'
+                  ? t.clusterMemberHardwareUnavailable
+                  : t.clusterMemberNoGpusReported}
             </Typography>
           )}
           {addable.length > 0 && (

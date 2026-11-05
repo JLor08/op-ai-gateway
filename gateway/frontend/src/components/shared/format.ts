@@ -64,6 +64,8 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.admin_state_invalid': 'errorRuntimeSpecAdminStateInvalid',
   'runtime_spec.visible_devices_no_gpus': 'errorRuntimeSpecVisibleDevicesNoGpus',
   'runtime_spec.visible_devices_conflict': 'errorRuntimeSpecVisibleDevicesConflict',
+  'runtime_spec.visible_devices_args_no_placeholder':
+    'errorRuntimeSpecVisibleDevicesArgsNoPlaceholder',
   'runtime_spec.application_not_server_agent': 'errorRuntimeSpecApplicationNotServerAgent',
   // Issue #81 part 2 (design D10): the three refusals part 1 introduced. THREE
   // distinct labels on purpose -- the whole-map "reuses a label for two codes

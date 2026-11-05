@@ -1108,6 +1108,8 @@ const clusterWireCodes = [
   'runtime_spec.device_backend_invalid',
   'runtime_spec.member_flag_reserved',
   'runtime_spec.member_vram_estimate_required',
+  // The args-mode visibility rule, which ${DEVICES} now satisfies too.
+  'runtime_spec.visible_devices_args_no_placeholder',
   // Manual member specs, binary inventory, LAN address.
   'rpc_member_spec.not_found',
   'rpc_member_spec.request_failed',

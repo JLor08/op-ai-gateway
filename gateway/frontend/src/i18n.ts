@@ -2160,6 +2160,8 @@ const de = {
   errorRuntimeSpecAdminStateInvalid: 'Ungültiger Admin-Status',
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Für „GPU-Zuweisung erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
+  errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
+    'Im Argument-Modus von „GPU-Zuweisung erzwingen“ muss ein Geräte-Platzhalter in den Argumenten stehen: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} oder ${DEVICES}. Sonst setzt der Agent nichts und die Auswahl geht verloren.',
   errorRuntimeSpecVisibleDevicesConflict:
     'Diese Variable ist bereits von Hand gesetzt. „GPU-Zuweisung erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
   errorRuntimeSpecApplicationNotServerAgent:
@@ -2469,7 +2471,11 @@ const de = {
   clusterMembersEmpty: 'Noch keine Mitglieder.',
   clusterMemberHidden: 'Ein Mitglied auf einem Server, den Sie nicht sehen können',
   clusterMembersLocked:
-    'Ein Mitglied liegt auf einem Server, den Sie nicht verwalten: Cluster-Schalter, Mitglieder, Modus, Netz und Transport kann nur ändern, wer alle Mitglieds-Server verwalten darf. Die übrigen Felder des Heads bleiben bearbeitbar.',
+    'Ein Mitglied liegt auf einem Server, den Sie nicht verwalten: Cluster-Schalter, Mitglieder, Modus, Netz, Transport und das Binary des Heads kann nur ändern, wer alle Mitglieds-Server verwalten darf. Die übrigen Felder des Heads bleiben bearbeitbar.',
+  errorClusterHeadBinaryLocked:
+    'Das Binary des Heads lässt sich nicht ändern, solange ein Mitglied auf einem Server liegt, den Sie nicht verwalten: der Wechsel prüft die Versionen aller Mitglieder neu.',
+  clusterMemberHardwareFailed: 'Die Hardware-Angaben dieses Servers konnten nicht geladen werden.',
+  clusterMemberHardwareUnavailable: 'Für diesen Server liegt noch kein Hardware-Bericht vor.',
   clusterMemberAdd: 'Mitglied hinzufügen',
   clusterMemberServer: 'Server',
   clusterMemberSpec: 'Mitglieds-Spezifikation',
@@ -5873,6 +5879,8 @@ const en: PortalMessages = {
   errorRuntimeSpecAdminStateInvalid: 'Invalid admin state',
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Enforcing GPU assignment needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',
+  errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
+    'In arguments mode, enforcing GPU assignment needs a device placeholder in the args: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} or ${DEVICES}. Otherwise the agent sets nothing and the selection is lost.',
   errorRuntimeSpecVisibleDevicesConflict:
     'This variable is already set by hand. Enforcing GPU assignment and your own entry are two sources for one value — remove one of them.',
   errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',
@@ -6162,7 +6170,11 @@ const en: PortalMessages = {
   clusterMembersEmpty: 'No members yet.',
   clusterMemberHidden: 'A member on a server you cannot see',
   clusterMembersLocked:
-    "A member runs on a server you do not manage: the cluster switch, members, mode, network and transport can only be changed by someone who manages every member server. The head's other fields stay editable.",
+    "A member runs on a server you do not manage: the cluster switch, members, mode, network, transport and the head's binary can only be changed by someone who manages every member server. The head's other fields stay editable.",
+  errorClusterHeadBinaryLocked:
+    "The head's binary cannot change while a member runs on a server you do not manage: a switch checks every member's version again.",
+  clusterMemberHardwareFailed: "This server's hardware details could not be loaded.",
+  clusterMemberHardwareUnavailable: 'This server has no hardware report yet.',
   clusterMemberAdd: 'Add member',
   clusterMemberServer: 'Server',
   clusterMemberSpec: 'Member spec',
