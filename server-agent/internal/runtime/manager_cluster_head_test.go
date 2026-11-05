@@ -360,3 +360,22 @@ func TestConditionalStopHonoursEvictionGrace(t *testing.T) {
 		t.Fatalf("StopIfEvictable err = %v, want ErrInstanceBusy inside the eviction grace", err)
 	}
 }
+
+func TestStatusReportsHeadLaunchedEndpoints(t *testing.T) {
+	shrinkTimings(t)
+	inv := filepath.Join(t.TempDir(), "inv")
+	addr := fakeMember(t)
+	spec := clusterHead(inv, addr)
+	spec.AdminState = "force_running"
+
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{spec}})
+	if s := statusFor(m, "rspec_h"); s == nil || s.Cluster != nil {
+		t.Fatalf("a cold head reports no launch facts, got %+v", s)
+	}
+	startHead(t, m)
+	s := statusFor(m, "rspec_h")
+	if s == nil || s.Cluster == nil || len(s.Cluster.Launched) != 1 || s.Cluster.Launched[0] != addr {
+		t.Fatalf("status cluster = %+v, want launched [%s]", s, addr)
+	}
+}

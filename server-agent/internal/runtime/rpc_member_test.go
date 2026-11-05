@@ -503,3 +503,22 @@ func TestRelayMemberNotListeningAtDeadlineIsBindMismatch(t *testing.T) {
 		t.Fatalf("rpc status = %+v, want bind_mismatch set", s.RPC)
 	}
 }
+
+func TestRPCServerStatusReportsDeviceCount(t *testing.T) {
+	shrinkTimings(t)
+	spec := memberSpec("rpcm_a", "rspec_h", "-tcp-listen")
+	spec.RPC.BindIP = "127.0.0.1"
+	spec.RPC.Port = freeTCPPort(t)
+	spec.AdminState = "force_running"
+
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{spec}})
+	waitUntil(t, 5*time.Second, "member running", func() bool {
+		s := statusFor(m, "rpcm_a")
+		return s != nil && s.State == StateRunning
+	})
+	s := statusFor(m, "rpcm_a")
+	if s.RPC == nil || s.RPC.DeviceCount != 1 {
+		t.Fatalf("status rpc = %+v, want device_count 1 (a CPU member exposes one device)", s.RPC)
+	}
+}

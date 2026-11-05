@@ -214,7 +214,7 @@ func (o *rpcObserver) memberLocked(st runtimectl.Status) *observedMember {
 }
 
 // poll lists one member's connections and applies the result.
-func (o *rpcObserver) poll(_ context.Context, st runtimectl.Status) {
+func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 	rpc := st.RPCMember
 	conns, err := o.conns(int32(st.PID))
 
@@ -259,6 +259,11 @@ func (o *rpcObserver) poll(_ context.Context, st runtimectl.Status) {
 	}
 	o.mu.Unlock()
 
+	// A shutdown that overtook the listing: the runtime and the relays are on
+	// their way out, so nothing is reported to them any more.
+	if ctx.Err() != nil {
+		return
+	}
 	switch {
 	case release:
 		o.holds.SetMemberHold(st.SpecID, "", time.Time{})

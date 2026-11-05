@@ -255,7 +255,7 @@ placeholder-derived value by recorded provenance instead
 ([§14.7](#147-the-resolved-command-what-actually-ran)).
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly nine placeholders are resolved, in both `args` and `env` values — all but
+Exactly sixteen placeholders are resolved, in both `args` and `env` values — all but
 the two secret-bearing ones, `${AGENT_ENV:NAME}` and `${API_TOKEN}`, also in a
 spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)):
 
@@ -313,6 +313,36 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   with multi-device Metal support — the portal shows a hint when the placeholder
   is used against a non-macOS agent, since stock llama.cpp Metal builds expose
   one device.
+- `${RPC_SERVERS}` — an exact match, **cluster heads only**: the comma-joined
+  endpoint addresses of the head's `cluster.endpoints`, in the operator's member
+  order (`100.64.0.5:47001,100.64.0.6:47001`). The gateway resolves the
+  *configured* membership, never liveness, into the wire field and the agent
+  substitutes it, so a literal `${RPC_SERVERS}` can never reach a child. On a
+  spec that is not a head it is a hard error.
+- `${RPC_DEVICES}` — an exact match, heads only: `RPC0,RPC1,…,RPC(n−1)`, n
+  being the sum of the endpoints' `device_count`. A member exposing k devices
+  takes k consecutive names in `--rpc` order, which is why the count is part of
+  the wire and the agent verifies it against the member's startup banner
+  ([§3.6](#36-rpc-cluster-members-and-heads)). An error on a non-head, and when
+  the endpoints declare no devices.
+- `${DEVICES}` — an exact match, any spec: on a head the RPC devices first,
+  then the spec's local GPUs in declared order (`RPC0,RPC1,CUDA3,CUDA2`); on any
+  other spec the local GPUs only. The prefix is the spec's `device_backend`
+  (`auto` by default, resolved from the host's detected vendors, §3.6). A head
+  without GPUs renders only its RPC devices; a non-head without GPUs is a hard
+  error, on the same reasoning as `${CUDA_DEVICES}`. RPC devices come first
+  because llama.cpp puts the output layer on the **last** device and `--fit`
+  fills devices back to front, so "RPC first, local last" keeps the output layer
+  local.
+- `${FIRST_LOCAL_DEVICE}` — an exact match, any spec: the first local GPU in
+  declared order, for flags that take exactly one device (`-mmdev`, whose
+  default would otherwise be the first listed device, `RPC0`). On a head
+  without GPUs it falls back to the first RPC device; on a non-head without GPUs
+  it is a hard error.
+- `${CUDA_FIRST_DEVICE}` / `${VULKAN_FIRST_DEVICE}` / `${METAL_FIRST_DEVICE}` —
+  the first GPU in declared order, rendered like the matching `${…_DEVICES}`
+  sibling with an **explicit** prefix (`CUDA3` for GPUs `[3, 2]`). Without GPU
+  rows it is a hard error.
 - `${CONFIG_DIR}` — an exact match substitutes the **absolute per-instance
   directory the agent writes the spec's config files into**,
   `<config_files_dir>/<spec-id>` for instance 0 and
@@ -354,6 +384,25 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   reach. See the token modes and the full security posture below, and
   [ADR-035](../09-architecture-decisions.md#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)
   for the decision.
+
+**Renumbering, and which tokens never renumber.** Under `set_visible_devices` in
+`env` mode the child sees only its visible devices, numbered from 0. The
+generic `${DEVICES}` and `${FIRST_LOCAL_DEVICE}` therefore render the local part as
+`<prefix>0 … <prefix>(k−1)` (declared order) **when the agent actually injected
+a visibility variable that governs the resolved backend**
+(`CUDA_VISIBLE_DEVICES` for `CUDA`, `ROCR_VISIBLE_DEVICES` for `ROCm`). Otherwise
+they render the declared host indices, as `${CUDA_DEVICES}` does: in `args` mode,
+when no variable is injected (Apple), and always for `Vulkan`, `SYCL` and `MTL`,
+which enumerate independently of those variables. The **explicit** tokens
+(`${CUDA_DEVICES}`, `${CUDA_FIRST_DEVICE}` and their Vulkan and Metal siblings)
+**never renumber**, in any mode. The backend's own enumeration order versus the
+host index is a documented limitation of all of them (§3.6).
+
+The seven cluster and generic tokens are exact-match like their siblings, carry
+the same accepted cost (a typo reaches the child as literal text), and are
+understood by every agent that declares `rpc_cluster`; an older agent passes
+them through literally, which is why a head is only ever pushed to an agent that
+declares it (§3.6).
 
 Everything else passes through byte-for-byte so a model server's own templating
 syntax survives — *except* a near-miss, which is a hard error: if the
@@ -656,14 +705,16 @@ the option is on:
 | Mode | Behavior |
 |---|---|
 | `env` (default) | The agent injects the vendor variable from the table above, exactly as before this field existed. |
-| `args` | The agent injects **no** visibility variable at all. The operator instead places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) in the spec's own `args` — `["--device", "${CUDA_DEVICES}"]` for llama.cpp. |
+| `args` | The agent injects **no** visibility variable at all. The operator instead places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, or the generic `${DEVICES}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), in the spec's own `args` — `["--device", "${CUDA_DEVICES}"]` for llama.cpp. |
 
 `args` mode exists because a visibility variable hides every other card from
 the whole child process, while llama.cpp's own `--device` flag is
 finer-grained; it is a second lever beside the variable, not a replacement for
 it, which is why `env` stays the default and every pre-existing spec keeps its
 old behaviour untouched. An **`args`-mode spec must carry one of the three
-placeholders somewhere in `args`**: turning the option on, selecting `args`,
+placeholders, or `${DEVICES}`, somewhere in `args`** (the `${…_FIRST_DEVICE}` and
+`${FIRST_LOCAL_DEVICE}` tokens alone do not count: they name one device and
+restrict nothing). Turning the option on, selecting `args`,
 and never mentioning a placeholder would have the agent inject nothing *and*
 the args say nothing, silently leaving every card visible to the child — the
 exact failure trap 1 below exists to prevent, reached through the other door.
@@ -1376,12 +1427,303 @@ The agent gates nothing on it; the portal reads it to warn that a connected
 agent older than `0.10.0` would ignore the facet (§11.5). The file-mode upward
 report masks a config file's content like an `env` value (§8.3).
 
+### 3.6 RPC cluster members and heads
+
+A **cluster** runs one model across several AI servers. A *head* is an ordinary
+`llama_cpp` spec whose launch command carries `--rpc`: its `llama-server`
+offloads part of the model to **members**, `ggml-rpc-server` processes on other
+AI servers. The gateway configures, orders and secures the cluster; it is never
+on the RPC data path. This section is the agent's half of that design. It is
+active only while the gateway declares `rpc_cluster` ([§7](#7-feature-negotiation)):
+without it the agent drops every `rpc_server` spec and every spec carrying a
+`cluster` block (and their co-residency pairs) at parse, so an old gateway, or a
+file-mode document, can never start a member as a model and never run a head
+whose `${RPC_SERVERS}` would otherwise reach the child as literal text.
+
+**Heads.** A spec with a non-empty `cluster.endpoints` list is a head. The
+endpoints are the members' addresses in operator order (that order is the
+`RPC<n>` numbering), each with the device count the member exposes;
+`cluster.transport` (`direct` or `relay`) and `cluster.network` (`mesh` or
+`lan`) describe how they are reached, and `cluster.generation` is an opaque
+value the gateway derives from its members' configuration. All of `cluster` is
+launch-affecting, so a member-side fix that changes the generation (a matching
+binary after a version mismatch, say) lifts a sticky verdict the head rests
+under and relaunches it. The agent sets `GGML_RPC_NO_COMM=1` in a head's
+environment (the data path is the plain RPC connection; this closes the
+separate communicator listener on builds that would negotiate one).
+
+**The rpc_server member kind.** A spec with `kind: "rpc_server"` runs
+`ggml-rpc-server` instead of a model server. It has no upstream model, no
+listen port and no health, metrics or context probe paths, is never replicable,
+is addressed by its spec id on the `/rpc/*` routes below, and stays out of
+model routing, `/v1/models`, `loaded_models` and the instance scaler. The agent
+owns the bind and device flags:
+
+- `-H`, `-p`, `-d` and `-c` are **agent-owned**; an operator argument that sets
+  any of them (including the `--host`/`--port`/`--device`/`--cache` spellings
+  and the `flag=value` form) is refused (`runtime.not_permitted`). Operator
+  `args` carry `-t` and whatever upstream adds later.
+- `-d` is the spec's GPUs as device names with the member's `device_backend`
+  prefix, in the declared order and with the declared host indices (a member
+  never runs in visibility-variable mode: without `-d` a multi-backend build
+  exposes each card twice and shifts every `RPC<n>`), or `CPU` for a member
+  with no GPUs. A declared-GPU member whose backend cannot be resolved is a
+  hard error.
+- `-H`/`-p` follow the transport. `direct` binds `rpc.bind_ip` and `rpc.port`
+  exactly (a mesh address, `0.0.0.0` on a LAN, or the server's LAN address).
+  `relay` binds the child to `127.0.0.1` on an ephemeral port and listens on
+  `rpc.bind_ip:rpc.port` with the agent's own relay (below).
+- `GGML_RPC_NO_RDMA=1` is set: the transport is plain TCP, and an RDMA probe
+  stalls the start.
+- With `rpc.cache_enabled` the member starts with `-c` and
+  `LLAMA_CACHE=<config_files_dir>/rpc/<head spec id>`, a cache directory **per
+  head** (the cache holds whole model tensors, so a member that serves another
+  head must not reuse it). The head id becomes a path element and anything that
+  could leave the directory is refused. A cache-enabled member with no
+  `config_files_dir` is refused (`runtime.not_permitted`), and so is one whose
+  cache volume has less than 5120 MB free (a volume whose free space cannot be
+  measured does not block the start). The cache of a
+  head the member no longer serves is purged when the document changes it, and
+  `POST /rpc/purge-cache/{specID}` purges it on request.
+- **Readiness is a TCP connect** to the child's port (the port speaks the ggml
+  RPC protocol, not HTTP, so the agent never sends it a probe request and the
+  collect loop never HTTP-probes a member). For a relay member the member is
+  running only once its relay also listens, so `POST /rpc/ensure` answers 200
+  exactly when the head can connect. If the member printed its startup banner
+  (`Starting RPC server v<protocol>`, then a `Devices:` block) the agent reads
+  the protocol version and counts the devices; a count that differs from the one
+  the spec implies (the GPU rows, 1 for a CPU member) fails the start with
+  `runtime.rpc_device_count_mismatch`, because a silent mismatch would shift
+  every later `RPC<n>`. A build that prints no banner is not checked.
+- **Idle timeout** defaults to 60 s when the spec sets none: a member that no
+  head holds and no reservation covers is unloaded soon after, counted from the
+  moment the head let go.
+- **Co-residency:** a member is exempt from the pair matrix ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)),
+  on either side of a pair. VRAM and RAM admission still apply to it like any
+  other spec.
+- Nothing about a member may be reached over `/ensure/{model}`; a member id is
+  not a model.
+
+**Device backend and the device tokens.** `device_backend` (`""`/`auto`,
+`cuda`, `rocm`, `vulkan`, `metal`, `sycl`; case-insensitive) names the prefix
+the generic device tokens render: `CUDA`, `ROCm`, `Vulkan`, `MTL`, `SYCL`. An
+explicit value maps directly. `auto` is resolved **on the agent** from the
+host's detected GPU vendor set (`collector.DetectGPUCollectors`): exactly one
+vendor selects its native backend (NVIDIA `cuda`, AMD `rocm`, Apple `metal`),
+several vendors select `vulkan`, and none is a hard error for any token that
+needs a GPU prefix. This is an approximation by design: each collector numbers
+its devices from 0, so on a mixed host the agent cannot map a declared GPU
+index to a vendor, and "the vendor of the spec's GPUs" becomes "the vendors of
+the host". An unknown value is refused.
+
+**Known limitation, documented follow-up: backend enumeration order.** The
+number in a backend device name is the backend's own enumeration, not the host
+GPU index. CUDA matches `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID`,
+which the agent does not set (it would renumber existing specs); Vulkan, and
+above all mixed-vendor hosts, enumerate independently of the host indices. The
+operator verifies the mapping with the binary's `--list-devices` output. A later
+change may match that output to the host's GPUs; the placeholders already
+render exactly what the spec declares, so nothing here has to change for it.
+
+**Telemetry.** A cluster row reports, beside the ordinary fields
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `kind`,
+`admission_blocked_by` and `last_error.code`, plus a block for its role:
+
+- A **member's `rpc` block**: `held_by`/`held_since` (the head holding it),
+  `reserved_until`, `protocol` and `device_count` (from the startup banner and
+  the spec), `bind_mismatch`, `breaches`, `cache_mb` and `stalled`. The block is
+  merged from three sources: the runtime's own state, the relay's counters and
+  the connection observer. `bind_mismatch` is true when **either** the runtime
+  or the relay says so. `breaches` is the union of the relay's refused peers and
+  the observer's unexpected peers, deduplicated by peer address (the newest
+  sighting wins), the newest sixteen. `cache_mb` is the size of the member's
+  cache directory, measured **off the collect loop** and reused for 60 s: the
+  telemetry path never walks a large directory every sample, and a first read
+  reports 0 until the first measurement lands.
+- A **head's `cluster` block**: `launched` (the endpoint addresses the running
+  process was started against, present while the head has a process) and
+  `version` (the llama.cpp build the cluster agreed on, empty when nothing
+  recorded it; the agent never executes a binary to fill it on a status read).
+
+A model row carries none of these keys, so an agent without cluster specs is
+byte-neutral for the gateway's decoder.
+
+#### Holds, reservations and the member routes
+
+A member is **claimed** while a head uses it and while the gateway has reserved
+it for a head that is about to start. A claimed member is never idled out, and
+admission treats it as pinned: it is not evicted to make room for a local start.
+Two independent things claim a member:
+
+- A **hold** is the head's live connection. In relay mode the relay reports it
+  at the head's first byte; in direct mode the connection observer lists the
+  member process's established connections and holds on an allowed head address.
+  It ends when the relay session ends, or after two consecutive observer polls
+  without a head connection (one empty poll can be a listing racing a
+  reconnect). A hold for a member without a process is ignored, and a member's
+  exit drops its hold and reservation.
+- A **reservation** is armed by `POST /rpc/ensure/{specID}?reserve_seconds=N`
+  once the member is running, covers the gap between the member starting and
+  the head connecting, is never shortened by a later ensure, and expires on its
+  own. `reserve_seconds` must be an integer from 0 to 86400, anything else is
+  `400 runtime.bad_request`.
+
+When a local start waits only because a held member occupies the room, the
+waiting spec's row names that member in `admission_blocked_by`; the question is
+asked as a counterfactual (would the start proceed if the held members were not
+there), so a blocker that is not a held member is never named. The gateway reads
+the field to decide whether to remove the cluster, head first.
+
+| Route | Meaning | Answers |
+|---|---|---|
+| `POST /rpc/ensure/{specID}?reserve_seconds=N` | Start the member (through normal admission), arm the reservation | `200 {"state":"running"}` once it is TCP-ready and, for a relay member, its relay listens; `404 runtime.model_not_managed` for anything that is not an `rpc_server` spec; `503 runtime.admission_blocked`; `502 runtime.not_permitted` / `runtime.start_failed`; `504 runtime.start_timeout`; `400 runtime.bad_request` |
+| `POST /rpc/release/{specID}` | End the reservation and the hold (the head is not running) | `200 {"state":"released"}` |
+| `POST /rpc/stop/{specID}` | Stop the member | `200` `stopping` / `stopped`; `409 runtime.cluster_member_in_use` while it is claimed, unless `?force=1` (then the claim is dropped) |
+| `POST /rpc/purge-cache/{specID}` | Remove the member's per-head cache directory | `200 {"state":"purged"}`; `409 runtime.cluster_member_in_use` while claimed; `500 runtime.cache_purge_failed` |
+
+A member whose `bind_ip` is not an address of this host (and not `0.0.0.0`) is
+**not started**, in either transport: the agent records
+`last_error.code = runtime.bind_mismatch` and answers ensures on the rate-limited
+not-permitted path with no tight retry. It is not a terminal verdict, because
+the address may appear later (a mesh coming up), and the `bind_mismatch` flag
+stays in telemetry for as long as the member is listed.
+
+#### The head guard
+
+A cluster head starts **only** when the gateway asks for it, never on its own:
+
+- A plain `POST /ensure/{model}`, a proxied request, `/live` or any other
+  request that finds a cold head (no process, or draining) is refused with
+  `503 runtime.cluster_not_ready` instead of starting it. A head that is already
+  starting lets requests queue behind the start.
+- `POST /ensure/{model}` with the header `X-OP-Cluster-Start: 1` (exactly that
+  value) is the only way a cold head starts. The agent first **probes** every
+  endpoint: a bare TCP connect per address, closed at once and never written to,
+  retried every 500 ms until the head's startup timeout. If an endpoint never
+  answers, no process is started and the answer is
+  `503 runtime.cluster_member_unreachable`. The probe is skipped for a head that
+  a terminal verdict or `force_stopped` already refuses.
+- The ordinary start paths never start a head either: applying a document,
+  admission wake-ups and the pinned or `force_running` rules all skip it. A
+  pinned or `force_running` head counts as pinned for eviction, but the
+  protected-floor refusal of `POST /stop/{model}` does not apply to it.
+- A head **never enters the crash-loop backoff**: after a crash it rests at
+  `crashed` or `start_failed` and the gateway's next cluster start is the retry
+  (the gateway owns cooldown and re-orchestration). A launch-shape change drains
+  a running head and leaves it down for the same reason.
+- `POST /stop/{model}?if_evictable=1` (or `true`) is the **conditional stop**
+  the gateway uses to remove a cluster for a blocked local start. The agent
+  decides in the same owner turn as the drain: it stops the head only if its own
+  eviction rule would allow it (not pinned or `force_running`, not starting, no
+  request in flight, past the eviction grace), otherwise `409
+  runtime.instance_busy`. A router whose manager has no such check answers 409
+  as well, never an unconditional stop.
+
+#### Exit classification and sticky verdicts
+
+The agent reads the tail of a failed cluster process's output against a small,
+explicit table of llama.cpp messages, applied only to heads and `rpc_server`
+members (model specs are never classified), and attaches a stable code to
+`last_error.code`:
+
+| Message (source) | Code | Terminal |
+|---|---|---|
+| `invalid device: ` (head), `unknown device: ` / `No devices found` (member) | `runtime.device_backend_mismatch` | yes |
+| `RPC not supported in this build` | `runtime.rpc_unsupported_build` | yes |
+| `RPC handshake failed`, `protocol version mismatch` | `runtime.cluster_version_mismatch` | yes |
+| `Failed to connect` (head) | `runtime.cluster_member_unreachable` | no |
+
+A member's banner device-count mismatch is terminal too
+(`runtime.rpc_device_count_mismatch`). A **terminal** verdict is one no retry can
+change, so it is reported like `not_permitted`: no backoff, no failure count, the
+exit code and stderr tail kept. It applies to a start that never became healthy;
+a process that was healthy and later printed one of these messages keeps the
+ordinary crash handling and only gains the code. The verdict is **sticky**: it
+holds against `force_running`, admission wake-ups and repeated ensures (an
+ensure is answered `runtime.not_permitted` at once, without an exec) until the
+spec itself changes, which clears it; a successful start clears it as well. The
+specific code travels on `last_error.code`, not in the ensure's answer.
+
+#### The relay
+
+Where the member host cannot or should not expose the rpc-server itself, a
+member with `transport: "relay"` keeps the child on loopback and the agent runs
+a byte relay on `rpc.bind_ip:rpc.port` (`internal/rpcrelay`), forwarding to the
+child. It is the member's access control:
+
+- **Allowlist before any read.** The peer's source address is checked on accept,
+  before a byte is read: `rpc.head_ips` plus, when `rpc.head_domain` is set, the
+  IPv4 addresses that name resolves to (re-resolved every 60 s, every 10 s while
+  there is no good answer yet; a failed lookup keeps the last good set; no good
+  set refuses everyone). An empty or `0.0.0.0` allowlist refuses everyone. A
+  refused peer is closed and recorded as a breach. Only IPv4 is resolved, so an
+  IPv6-only head is never allowed.
+- **Dial on first byte.** The child is dialled only after the peer's first
+  byte, so a payload-less probe (the head's pre-exec probe, the readiness check)
+  never reaches the rpc-server and never takes a hold.
+- **One head per member.** A newer allowed connection that delivers its first
+  byte replaces the forwarding session; the hold survives the replacement.
+  At most four sockets (counting those that have not sent a byte), a 10 s
+  first-byte deadline, TCP keepalive (idle 30 s, 10 s interval, 3 probes: a
+  vanished head is noticed in about a minute).
+- **Stall signal.** When the head's last bytes go unanswered for 120 s,
+  measured from the last client byte, the relay reports `stalled`; it clears
+  when the session ends or another takes the hold.
+- **Allowlist edits are live.** A changed allowlist keeps the listener and
+  closes every session; only a changed bind or target replaces the relay. The
+  head resolver reports a changed answer, and also a spec that **loses** its
+  head domain while it had addresses, so sessions from the old head's addresses
+  end. The relay set is derived from the runtime status after every sync,
+  state change and readiness check.
+- **Bind retry.** A relay that cannot bind (the address is not local yet) sets
+  `bind_mismatch` and retries every 5 s; the member stays `starting` and its start fails
+  with `runtime.bind_mismatch` at the startup deadline.
+
+#### The direct-mode observer
+
+A direct-mode member has no relay, so its holds come from observing the
+member process's established connections on its bind port, polled every 2 s on
+a goroutine per member (listing connections can be slow, so it never runs on the
+collect loop and a poll still running is not overlapped). A connection from an
+allowed head address is the hold. A connection from this host's own addresses
+(the readiness probe, a local tool) is ignored. Any **other** remote address is
+a breach and never a holder, even when it is the only connection: llama.cpp
+blocks a second head in the handshake and lets it take over when the first
+disconnects, so a foreign peer must be reported, not mistaken for the head.
+Breaches are kept for 10 minutes after the last sighting, newest sixteen. The
+observer can report an intruder but cannot prevent it; the member's bind address
+and the network's policy are what narrow exposure. A failed listing keeps the
+last observation.
+
+#### Loopback-only, and its exceptions
+
+A managed process binds loopback and is reached only through the router (§4).
+Clusters add exactly two exceptions, both on a member host and both limited to
+the address the gateway configured: a **direct-mode member's rpc-server** binds
+`rpc.bind_ip` (a mesh address, or on a LAN `0.0.0.0` or the server's LAN
+address), and a **relay's listener** binds `rpc.bind_ip:rpc.port` while its
+child stays on `127.0.0.1`. A relay refuses a target that is not loopback and a
+bind that is not a literal IPv4 address. A head, like any model server, binds
+loopback and is reached through the router.
+
+#### Shutdown
+
+On shutdown `Agent.Run` stops the observer and the head resolver and waits for
+them (bounded, 5 s, so a wedged connection listing cannot hold the shutdown)
+before it closes the relays; both check for cancellation before they report a
+hold or a changed head address, so nothing touches the relays or the runtime
+after they are closed. Closing the relays ends every session and releases every
+hold while the runtime is still there to hear it, and a relay sync after the
+close is a no-op.
+
 ## 4. One router port per AI server
 
 The agent listens on a single HTTP port, reads the `model` field out of each
 request body, ensures the matching child process is running, and reverse-proxies
 to it. Child model servers bind loopback only and are reachable exclusively
-through the router.
+through the router. The one exception is a cluster member's rpc-server (or its
+relay), which listens on its configured address
+([§3.6](#loopback-only-and-its-exceptions)).
 
 This was chosen so that routing, the TLS proxy and the firewall/mesh surface all
 stay unchanged: the gateway sees exactly one `Application` row. The accepted
@@ -1392,7 +1734,7 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Seven fixed GET-only routes and three POST routes (the `/upstream` passthrough counts
+Seven fixed GET-only routes, three POST routes and the member routes `POST /rpc/{action}/{specID}` (since 0.18.0, [§3.6](#holds-reservations-and-the-member-routes)) (the `/upstream` passthrough counts
 once per allowlisted endpoint: `/props`, since 0.11.0 `/v1/audio/voices` and since 0.13.0
 `/v1/models`; the second POST route, `/live/{model}`, since 0.12.0, is the one that streams a
 request body rather than controlling anything; the third, `/stop/{model}`, since 0.17.0, drains
@@ -1406,8 +1748,9 @@ one instance); any other method on those paths falls through to model routing.
 | `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved by the manager's address rule (`ResolveAddress`, [§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) and then to the running row of the instance it names in `Status()` — a read-only lookup: a managed match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one, and an instance address whose reading moved between the two owner turns is refused with `409 runtime.instance_no_capacity`. For an instance address the forwarded query's `model=` value becomes the base name (`upstreamChildQuery`). Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved by `ResolveAddress` and that instance's running row in `Status()` (as for `/props`), **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `GET /upstream/{model}/v1/models` | The allowlist's third endpoint (issue #282, the `runtime_model_params` feature, `Since: "0.13.0"`): an audio.cpp child's model listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved by `ResolveAddress` and that instance's running row in `Status()` (as for `/props`), **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Unlike the voices read it **forwards the inbound query string** (`forwardQuery`), because audio.cpp adds each model's declared request `params` array only when asked with `?include_params=true`; the outbound path is exactly `/v1/models`. **Not** the router's own `GET /v1/models` control route above, which lists the managed specs and answers for the router itself. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
-| `POST /ensure/{model}` | Starts the managed child for `model` — for an instance address `m#k`, that instance, created on demand when its spec allows it ([§6.1](#61-one-lifecycle-per-instance)) — and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), `runtime.instance_no_capacity` / `runtime.instance_demand_unknown` (409) for a burst instance that does not fit into free room or whose demand is not measured yet ([§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. It is the only route that may start a **burst** instance, which is how the gateway's scaler adds capacity. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
-| `POST /stop/{model}` | Begins a graceful drain of **one** instance — `m` for instance 0, `m#k` for instance k, resolved by `ResolveAddress` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) — and persists nothing (the `runtime_stop` feature, `Since: "0.17.0"`): `200 {"state":"stopping"}` when the drain began or was already running, `200 {"state":"stopped"}` when the instance has no process (so a repeat is idempotent, and an allowed instance that does not exist is not created), `404 runtime.model_not_managed` for an address that is not managed (also an empty model, or a spec the last push removed), `409 runtime.instance_protected` for an instance inside the protected floor, `409 runtime.instance_not_highest` while a higher instance of the spec has a process (an instance already draining is answered `stopping` regardless), or `502 runtime.upstream_gone` for any other failure (the manager shutting down, the request's context ending). The checks run in that order, so a refusal wins over the idempotent answers: a protected instance is refused even with no process. An instance of a `force_stopped` spec is answered from its process alone (`stopping` while the push's drain runs, `stopped` after), with neither refusal. A stop that is not refused also answers every request queued on the instance at that moment, a starting instance's ensure included: `409 runtime.instance_no_capacity` for a burst instance, `503 runtime.admission_blocked` for instance 0. Bodiless like `/ensure`: any body is read and discarded, one over the 32 MiB bound gets `413 runtime.request_too_large`, and `model` is the decoded path after `/stop/` (the `#` percent-encoded). | Never: it answers as soon as the drain has begun; `Status()` and telemetry report the exit. |
+| `POST /ensure/{model}` | Starts the managed child for `model` — for an instance address `m#k`, that instance, created on demand when its spec allows it ([§6.1](#61-one-lifecycle-per-instance)) — and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), `runtime.instance_no_capacity` / `runtime.instance_demand_unknown` (409) for a burst instance that does not fit into free room or whose demand is not measured yet ([§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. It is the only route that may start a **burst** instance, which is how the gateway's scaler adds capacity. A **cold cluster head** is refused here with `503 runtime.cluster_not_ready` unless the request carries the header `X-OP-Cluster-Start: 1`, which probes the members and starts it (or answers `503 runtime.cluster_member_unreachable`, [§3.6](#the-head-guard)). Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
+| `POST /stop/{model}` | Begins a graceful drain of **one** instance — `m` for instance 0, `m#k` for instance k, resolved by `ResolveAddress` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) — and persists nothing (the `runtime_stop` feature, `Since: "0.17.0"`): `200 {"state":"stopping"}` when the drain began or was already running, `200 {"state":"stopped"}` when the instance has no process (so a repeat is idempotent, and an allowed instance that does not exist is not created), `404 runtime.model_not_managed` for an address that is not managed (also an empty model, or a spec the last push removed), `409 runtime.instance_protected` for an instance inside the protected floor, `409 runtime.instance_not_highest` while a higher instance of the spec has a process (an instance already draining is answered `stopping` regardless), or `502 runtime.upstream_gone` for any other failure (the manager shutting down, the request's context ending). The checks run in that order, so a refusal wins over the idempotent answers: a protected instance is refused even with no process. An instance of a `force_stopped` spec is answered from its process alone (`stopping` while the push's drain runs, `stopped` after), with neither refusal. A stop that is not refused also answers every request queued on the instance at that moment, a starting instance's ensure included: `409 runtime.instance_no_capacity` for a burst instance, `503 runtime.admission_blocked` for instance 0. `?if_evictable=1` makes it the gateway's conditional cluster-head stop: `409 runtime.instance_busy` when the agent's own eviction rule would not evict the head ([§3.6](#the-head-guard)). Bodiless like `/ensure`: any body is read and discarded, one over the 32 MiB bound gets `413 runtime.request_too_large`, and `model` is the decoded path after `/stop/` (the `#` percent-encoded). | Never: it answers as soon as the drain has begun; `Status()` and telemetry report the exit. |
+| `POST /rpc/{action}/{specID}` | The RPC cluster member routes (the `rpc_cluster` feature, `Since: "0.18.0"`); `action` is `ensure`, `release`, `stop` or `purge-cache`: start a member and arm a reservation, end it, stop a member, purge its cache. Addressed by **spec id** and never by model, answering `404 runtime.model_not_managed` for anything but an `rpc_server` spec. Answers and codes are in [§3.6](#holds-reservations-and-the-member-routes). | `ensure` for the start it asked for (held until the member is TCP-ready, and until the relay listens for a relay member); the others never. |
 | `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureServing`, so a burst instance that is not up answers `409 runtime.instance_no_capacity`, §4.8, and the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
@@ -1670,8 +2013,23 @@ request-id concept.
 | `runtime.instance_demand_unknown` | 409 | An ensure of a burst instance whose demand is still unknown — no declared estimate and no sibling measured since it became ready (§5.8). Normally resolves within seconds of the first instance being ready; the gateway's scaler waits 5 s before asking that host again. |
 | `runtime.instance_protected` | 409 | `POST /stop/{model}` named an instance inside its spec's protected floor (`min_instances` of a replicable spec, or the one instance a pinned or `force_running` spec keeps, §5.8). The agent would start it again at once; the way out is the spec's own settings (clear the override, lower `min_instances`, unpin), not a stop. |
 | `runtime.instance_not_highest` | 409 | `POST /stop/{model}` named an instance while a sibling with a higher index still has a process. The highest index leaves first (§6.1); stop that one first. |
+| `runtime.cluster_not_ready` | 503 | A request, or an `/ensure` without `X-OP-Cluster-Start: 1`, found a cold cluster head (§3.6). Only the gateway's cluster start brings a head up; it forms the cluster and retries. |
+| `runtime.cluster_member_unreachable` | 503 | The cluster start's pre-exec probe could not connect to a member endpoint within the head's startup timeout, so nothing was started (§3.6). Also the `last_error.code` of a head that printed `Failed to connect`. |
+| `runtime.cluster_member_in_use` | 409 | `POST /rpc/stop/{specID}` or `/rpc/purge-cache/{specID}` named a member a head holds or has reserved; `?force=1` stops it anyway (§3.6). |
+| `runtime.instance_busy` | 409 | `POST /stop/{model}?if_evictable=1` named a head the agent's eviction rule would not evict (pinned or `force_running`, starting, in flight, inside the eviction grace), or reached a router without that check (§3.6). |
+| `runtime.cache_purge_failed` | 500 | The member's cache directory could not be removed (§3.6). |
+| `runtime.bad_request` | 400 | `reserve_seconds` of `POST /rpc/ensure` is not an integer from 0 to 86400. |
 | `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props`, `/v1/audio/voices` or `/v1/models` — the passthrough allowlist (§4.1) is exactly those three endpoints. A router from 0.7.0 on that predates 0.13.0 answers this for `/v1/models` (and one that predates 0.11.0 for `/v1/audio/voices`). |
 | `runtime.upstream_gone` | 502 | The child died during the request — **and the fallthrough** for a raw connection failure, a non-2xx the router could not forward, or the manager-closed sentinel. |
+
+Five further codes never appear as an HTTP answer. They travel on
+`last_error.code` in telemetry ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
+because the ensure that hits a failed cluster process answers the ordinary
+`runtime.not_permitted` or `runtime.start_failed`:
+`runtime.device_backend_mismatch`, `runtime.rpc_device_count_mismatch`,
+`runtime.rpc_unsupported_build`, `runtime.cluster_version_mismatch` (all terminal,
+[§3.6](#exit-classification-and-sticky-verdicts)) and `runtime.bind_mismatch` (not
+terminal, §3.6).
 
 Collapsing or renaming any of these destroys the distinction between a
 misconfiguration, a slow load and a crash. The fallthrough to
@@ -3629,7 +3987,7 @@ agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`,
 `runtime_role_eviction`, `runtime_stop`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
-only and read by the agent (below); and one, `runtime_instances`, is on **both** lists
+only and read by the agent (below); and two, `runtime_instances` and `rpc_cluster`, are on **both** lists
 with a different fact behind each declaration, each side reading the other's (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
@@ -3668,14 +4026,15 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_role_eviction` ([§5.4](#54-eviction-queueing-and-drain)), `Since: "0.15.0"`, and
 `runtime_instances` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite),
 [§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`, and
-`runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`
+`runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`, and
+`rpc_cluster` ([§3.6](#36-rpc-cluster-members-and-heads)), `Since: "0.18.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
 `Since` because the agent's registry does not carry them. The gateway's own list is
 `runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp`,
-`capability_source_audiocpp` and `runtime_instances` (`gatewayAgentFeatures`,
-`internal/gateway/agent_features.go`).
+`capability_source_audiocpp`, `runtime_instances` and `rpc_cluster`
+(`gatewayAgentFeatures`, `internal/gateway/agent_features.go`).
 
 `runtime_instances` (#340, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
 is the one name **both sides declare, each stating a different fact, and each
@@ -3842,6 +4201,22 @@ gateway restarted, because the gateway holds the declared set in memory
 (`agentFeaturesRegistry`, below), and the refusal's label says so. A newer agent
 under an older gateway simply never receives the route. `server-agent`'s
 `Version` moved `0.7.4` → `0.8.0` for this entry, MINOR per the same rule.
+
+`rpc_cluster` (the RPC cluster mode, [§3.6](#36-rpc-cluster-members-and-heads)) is
+the second name both sides declare, and it is read fail-closed in both directions.
+**The agent's declaration** (`FeatureRPCCluster`, `Since: "0.18.0"`) says it runs
+`rpc_server` members and cluster heads, serves the `/rpc/*` routes and the
+`X-OP-Cluster-Start` head start, and reports `kind`, `rpc`, `cluster`,
+`admission_blocked_by` and `last_error.code` (§10); the gateway reads it before it
+pushes a head or a member to the agent. **The gateway's declaration** says it may
+send those documents at all, and the agent reads it before it honours `kind`,
+`cluster` and `rpc`: while it is absent (an older gateway, or a file-mode document)
+the agent drops every `rpc_server` spec and every head, with the pairs that name
+them, so a member can never start as a model and a literal `${RPC_SERVERS}` can
+never reach a child. A document change in either direction bypasses the
+ETag short-circuit, like `runtime_instances`. `server-agent`'s `Version` moved
+`0.17.0` → `0.18.0` for this entry, MINOR per the same rule
+(`FeatureRPCCluster`, pinned with the version by `TestFeaturesDeclareRPCCluster`).
 
 `runtime_stop` is the same shape as `runtime_ensure`: the gateway gates real
 behaviour on it, fail-closed. It says the router serves `POST /stop/{model}`
@@ -4359,6 +4734,14 @@ the newest feature's test, `TestFeaturesDeclareRuntimeStop`. Compatibility needs
 **no upgrade order**: an older gateway never calls the route, and the gateway
 sends it only to an agent that declares the name, so the portal's Stop action is
 unavailable against an older agent rather than misread.
+
+**`0.17.0` → `0.18.0` (RPC cluster mode) is MINOR, and one bump for the whole
+branch.** `agent.Features` gained `rpc_cluster` (§7), the spec gained `kind`,
+`device_backend`, `cluster` and `rpc`, `last_error` gained `code`, and the router
+gained the member routes, the head start header and the conditional stop (§3.6,
+§4.1). Compatibility needs **no upgrade order**: the gateway sends cluster
+documents only to an agent that declares the name, and the agent honours them only
+under a gateway that declares it.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -5007,6 +5390,16 @@ the runtime manager, overriding the generic model-status lister: only specs in
 state `running` count, and `starting` explicitly does not. Counting `starting` as
 loaded — to make the portal look responsive — sends real traffic to a model that
 cannot answer yet, turning a warm-up into user-visible timeouts.
+
+**Cluster rows add five optional keys** on the same sample row, all absent for a
+model that is none of these: `kind` (`"rpc_server"` for a member), `rpc` (a
+member's holder, reservation, protocol, device count, `bind_mismatch`, breaches,
+`cache_mb` and `stalled`), `cluster` (a head's launched endpoints and build
+version), `admission_blocked_by` (on any waiting spec, the held member that
+blocks it) and, inside `last_error`, `code`. Their sources, the merge rules and
+the cache-size measurement are in
+[§3.6](#36-rpc-cluster-members-and-heads); a member row is never HTTP-probed, so
+its `context_size`, `active_requests` and `queue_depth` stay at their zero values.
 
 **One status row per instance** (#340). `Status()` and the sample's `runtimes`
 carry a row per instance, identified by the pair (`spec_id`, `instance`), never by
@@ -8539,6 +8932,21 @@ operator meets first:
   the AI servers**, bounded solely by the agent-local binary allowlist (§3.1).
 - **WebSocket-serving model servers are not supported** through a `server_agent`
   application (§4.5). Their HTTP/JSON endpoints work.
+- **Device names follow the backend's enumeration, not the host index**
+  (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
+  the backend prefix, but the number the backend gives a card is its own:
+  CUDA matches `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID` (which the
+  agent does not set), and Vulkan and mixed-vendor hosts enumerate
+  independently. `device_backend: auto` on a mixed host is the host's vendor set,
+  not the vendor of the spec's GPUs. The operator verifies with `--list-devices`;
+  matching that output to the host's GPUs is an open follow-up.
+- **A direct-mode cluster member cannot defend itself.** The connection observer
+  reports an unexpected peer but cannot stop it, and a second head blocks and then
+  takes the member over when the first leaves; only the member's bind address,
+  the network's policy and the relay's allowlist narrow exposure (§3.6). A head
+  whose address is only a name is allowed by the IPv4 addresses that name
+  resolves to, so DNS is in the trust path and an IPv6-only head is never
+  allowed.
 - **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
   GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for

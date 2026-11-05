@@ -113,6 +113,42 @@ type RuntimeErrorSample struct {
 	ExitCode   int       `json:"exit_code"`
 	Failures   int       `json:"failures"`
 	StderrTail string    `json:"stderr_tail,omitempty"`
+	// Code is a stable machine-readable error code for lifecycle failures the
+	// gateway maps to a specific operator message (for example
+	// runtime.device_backend_mismatch); omitted for a plain failure.
+	Code string `json:"code,omitempty"`
+}
+
+// RuntimeRPCSample is an rpc_server member's live state: which head holds it
+// and since when, the end of an armed reservation, the protocol version and
+// device count it announced, whether it listens somewhere other than where the
+// head dials it, peers that connected without being allowed, the size of its
+// on-disk tensor cache, and whether it stopped making progress.
+type RuntimeRPCSample struct {
+	HeldBy        string                `json:"held_by,omitempty"`
+	HeldSince     time.Time             `json:"held_since,omitzero"`
+	ReservedUntil time.Time             `json:"reserved_until,omitzero"`
+	Protocol      string                `json:"protocol,omitempty"`
+	DeviceCount   int                   `json:"device_count"`
+	BindMismatch  bool                  `json:"bind_mismatch"`
+	Breaches      []RuntimeBreachSample `json:"breaches,omitempty"`
+	CacheMB       int                   `json:"cache_mb"`
+	Stalled       bool                  `json:"stalled"`
+}
+
+// RuntimeBreachSample is one peer that connected to a member without being on
+// its allowlist.
+type RuntimeBreachSample struct {
+	Peer string    `json:"peer"`
+	At   time.Time `json:"at"`
+}
+
+// RuntimeClusterSample is a head's launch facts: the endpoint addresses it was
+// started against and the llama.cpp build version the cluster agreed on (empty
+// when nothing recorded it).
+type RuntimeClusterSample struct {
+	Launched []string `json:"launched"`
+	Version  string   `json:"version"`
 }
 
 // RuntimeSample is one managed process's current visible-lifecycle state
@@ -206,6 +242,15 @@ type RuntimeSample struct {
 	// runtime_ram_measurement feature; Status.MeasuredRAMMB is its source.
 	RAMMeasuredMB int                 `json:"ram_measured_mb,omitempty"`
 	LastError     *RuntimeErrorSample `json:"last_error,omitempty"`
+	// Kind is the spec's kind: "rpc_server" for a cluster member, omitted for a
+	// model. RPC is a member's live state, Cluster a head's launch facts, and
+	// AdmissionBlockedBy names, on a waiting spec, the held member that blocks
+	// it. All are absent for a model that is none of those, so an agent without
+	// the cluster feature stays byte-neutral.
+	Kind               string                `json:"kind,omitempty"`
+	RPC                *RuntimeRPCSample     `json:"rpc,omitempty"`
+	Cluster            *RuntimeClusterSample `json:"cluster,omitempty"`
+	AdmissionBlockedBy string                `json:"admission_blocked_by,omitempty"`
 }
 
 // RuntimeImageOptions is one stable_diffusion_cpp child's image-generation

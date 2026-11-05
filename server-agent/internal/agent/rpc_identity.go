@@ -91,8 +91,13 @@ func (r *headResolver) refresh(ctx context.Context, domains map[string]string) {
 	var changed []string
 
 	r.mu.Lock()
-	for id := range r.ents {
+	for id, e := range r.ents {
 		if domains[id] == "" {
+			// A spec that lost its head domain loses its addresses too: report
+			// it so the relay closes the sessions of the old head.
+			if len(e.ips) > 0 {
+				changed = append(changed, id)
+			}
 			delete(r.ents, id)
 		}
 	}
@@ -125,7 +130,7 @@ func (r *headResolver) refresh(ctx context.Context, domains map[string]string) {
 			changed = append(changed, id)
 		}
 	}
-	if r.onChange != nil {
+	if r.onChange != nil && ctx.Err() == nil {
 		for _, id := range changed {
 			r.onChange(id)
 		}

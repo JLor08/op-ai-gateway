@@ -903,6 +903,8 @@ type Agent struct {
 	// rpcObs watches the connections of direct-mode members and resolves
 	// head domains for both transports; nil whenever relays is.
 	rpcObs *rpcObserver
+	// cacheSizes measures the members' on-disk caches off the collect loop.
+	cacheSizes *cacheSizer
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -1058,8 +1060,27 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		a.relays = newRelayLink(d.RuntimeDriver.Status, d.RPCMembers)
 		d.RPCMembers.SetMemberRelayGate(a.relays.ready)
 		a.rpcObs = newMemberObserver(d.RuntimeDriver.Status, d.RPCMembers, a.relays)
+		a.cacheSizes = newCacheSizer(nil)
 	}
 	return a
+}
+
+// observerShutdownWait bounds how long Run waits for the RPC observer and head
+// resolver goroutines when it shuts down.
+const observerShutdownWait = 5 * time.Second
+
+// waitBounded waits for wg, giving up after d.
+func waitBounded(wg *sync.WaitGroup, d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		slog.Warn("agent: rpc observer goroutines still running at shutdown")
+	}
 }
 
 // Run collects the static hardware inventory once, sends it, then collects+pushes
@@ -1072,10 +1093,24 @@ func (a *Agent) Run(ctx context.Context) error {
 	// relay reported is released while the runtime is still there to hear it.
 	defer a.relays.close()
 	if a.rpcObs != nil {
+		// The observer and the head resolver reach into the relays and the
+		// runtime, so Run waits (bounded: a wedged connection listing must not
+		// hold the shutdown) for them before it returns and closes the relays.
 		obsCtx, stopObs := context.WithCancel(ctx)
-		defer stopObs()
-		go a.rpcObs.run(obsCtx)
-		go a.rpcObs.heads.run(obsCtx, a.rpcObs.headDomains)
+		var obsWG sync.WaitGroup
+		obsWG.Add(2)
+		go func() {
+			defer obsWG.Done()
+			a.rpcObs.run(obsCtx)
+		}()
+		go func() {
+			defer obsWG.Done()
+			a.rpcObs.heads.run(obsCtx, a.rpcObs.headDomains)
+		}()
+		defer func() {
+			stopObs()
+			waitBounded(&obsWG, observerShutdownWait)
+		}()
 	}
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
@@ -2464,8 +2499,10 @@ func (a *Agent) collectOnce(ctx context.Context) {
 						ExitCode:   st.LastError.ExitCode,
 						Failures:   st.LastError.Failures,
 						StderrTail: st.LastError.StderrTail,
+						Code:       st.LastError.Code,
 					}
 				}
+				a.fillClusterTelemetry(&rs, st, a.cfg.ConfigFilesDir)
 				// Task 9: fill ContextSize/ActiveRequests/QueueDepth from
 				// this child's own /metrics and context endpoints. Only a
 				// running child with a live port has anything to probe --

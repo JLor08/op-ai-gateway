@@ -5466,12 +5466,37 @@ func (o *owner) snapshotStatus() []Status {
 				HeldSince:     st.claim.heldSince,
 				ReservedUntil: st.claim.reservedUntil,
 				BindMismatch:  st.bindMismatch,
+				// A start that verified the banner proved the device count equal
+				// to the expected one, so the expected count is what the member
+				// exposes; a member that is not running exposes none.
+				DeviceCount: st.memberDeviceCount(),
 			}
+		}
+		// A head's launch facts: its endpoints cannot change under a live
+		// process (a different set relaunches it), so while the process exists
+		// the spec's endpoints are the ones it was started against. The
+		// cluster's build version is not recorded here: the agent never
+		// executes the binary on a status read.
+		if st.spec.IsClusterHead() && st.proc != nil {
+			launched := make([]string, len(st.spec.Cluster.Endpoints))
+			for i, ep := range st.spec.Cluster.Endpoints {
+				launched[i] = ep.Address
+			}
+			s.Cluster = &ClusterStatus{Launched: launched}
 		}
 		s.AdmissionBlockedBy = st.admissionBlockedBy
 		out = append(out, s)
 	}
 	return out
+}
+
+// memberDeviceCount is the number of devices a running rpc_server member
+// exposes, 0 while it is not running.
+func (st *specState) memberDeviceCount() int {
+	if st.state != StateRunning || st.proc == nil {
+		return 0
+	}
+	return expectedMemberDevices(st.spec)
 }
 
 func (o *owner) loadedModels() []string {
