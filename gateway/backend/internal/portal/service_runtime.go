@@ -595,6 +595,33 @@ type RuntimeSpecDTO struct {
 	// PutRuntimeSpecRequest. It is NOT ModelDTO.Role, which folds every mapping of
 	// a model NAME into its best-ranked role; this is the role of one spec.
 	Role string `json:"role"`
+	// DeviceBackend is the GPU backend the generic device placeholders render
+	// for ("auto", "cuda", "rocm", "vulkan", "metal", "sycl"); never "" on the
+	// wire, a stored "" reads as "auto".
+	DeviceBackend string `json:"device_backend"`
+	// ClusterEnabled makes the spec a llama.cpp RPC cluster head; MemberMode,
+	// ClusterNetwork, RPCTransport, LANExposureAck and ClusterMembers are its
+	// cluster configuration (see PutRuntimeSpecRequest). MemberMode is never
+	// "" on the wire (a stored "" reads as "automatic").
+	ClusterEnabled bool               `json:"cluster_enabled"`
+	MemberMode     string             `json:"member_mode"`
+	ClusterNetwork string             `json:"cluster_network"`
+	RPCTransport   string             `json:"rpc_transport"`
+	LANExposureAck bool               `json:"lan_exposure_ack"`
+	ClusterMembers []ClusterMemberDTO `json:"cluster_members"`
+	// ClusterVRAMTotalMB / ClusterRAMTotalMB are the head's own effective
+	// demand plus every member's, each part max(measured, estimate);
+	// ClusterTotalsComplete is false when a part is unknown, so the totals
+	// are lower bounds. ClusterNetworkDefault / ClusterTransportDefault are
+	// what an empty cluster_network / rpc_transport resolves to for the stored
+	// membership, and ClusterWarnings lists the advisory cluster warning codes.
+	// All READ-ONLY, derived on every read, and only filled on a cluster head.
+	ClusterVRAMTotalMB      int      `json:"cluster_vram_total_mb"`
+	ClusterRAMTotalMB       int      `json:"cluster_ram_total_mb"`
+	ClusterTotalsComplete   bool     `json:"cluster_totals_complete"`
+	ClusterNetworkDefault   string   `json:"cluster_network_default"`
+	ClusterTransportDefault string   `json:"cluster_transport_default"`
+	ClusterWarnings         []string `json:"cluster_warnings"`
 }
 
 // ConfigFileDTO is one operator-supplied config file of a runtime spec: a
@@ -695,6 +722,24 @@ type PutRuntimeSpecRequest struct {
 	// means none: a PUT that omits them clears the stored set. Validated by
 	// validateRuntimeSpecConfigFiles.
 	ConfigFiles []ConfigFileDTO `json:"config_files,omitempty"`
+	// DeviceBackend: see RuntimeSpecDTO; "" stores "auto".
+	DeviceBackend string `json:"device_backend"`
+	// ClusterEnabled turns the spec into a llama.cpp RPC cluster head with the
+	// members in ClusterMembers, in that order (the --rpc order, and so the
+	// order of the head's RPC<n> devices). MemberMode is "automatic" (""
+	// stores it: each entry names a server, its ordered GPU selection and the
+	// member settings) or "manual" (each entry names a server and the
+	// rpc_server member spec on it). ClusterNetwork ("mesh" or "lan") and
+	// RPCTransport ("direct" or "relay") default from the membership when
+	// empty; LANExposureAck is the operator's acknowledgement a direct lan
+	// cluster requires. With ClusterEnabled false the membership is cleared.
+	// Checked by validateClusterHead.
+	ClusterEnabled bool               `json:"cluster_enabled"`
+	MemberMode     string             `json:"member_mode"`
+	ClusterNetwork string             `json:"cluster_network"`
+	RPCTransport   string             `json:"rpc_transport"`
+	LANExposureAck bool               `json:"lan_exposure_ack"`
+	ClusterMembers []ClusterMemberDTO `json:"cluster_members"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -704,7 +749,7 @@ type PutRuntimeSpecRequest struct {
 // mapping's runtime configuration without special-casing non-server_agent
 // applications.
 func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) (RuntimeSpecDTO, error) {
-	mapping, app, _, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -742,6 +787,10 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			ResolvedMetricsPath:      resolvedMetrics,
 			ResolvedContextProbePath: resolvedContext,
 			Role:                     role,
+			DeviceBackend:            deviceBackendAuto,
+			MemberMode:               memberModeAutomatic,
+			ClusterMembers:           []ClusterMemberDTO{},
+			ClusterWarnings:          []string{},
 		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
@@ -750,6 +799,9 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	}
 	dto, err := runtimeSpecDTO(spec, gpus, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	if dto, err = s.withClusterView(ctx, principal, server, dto); err != nil {
 		return RuntimeSpecDTO{}, err
 	}
 	return s.withRuntimeSpecRole(ctx, dto)
@@ -813,7 +865,7 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	dto, err := s.putRuntimeSpec(ctx, mapping, app, server, req, "")
+	dto, err := s.putRuntimeSpec(ctx, mapping, app, server, req, "", &principal)
 	if err != nil {
 		return dto, err
 	}
@@ -902,16 +954,33 @@ func (s *Service) serverIsBenchmarking(serverID string) bool {
 //
 // The notification fires exactly when writeRuntimeSpec reports stored: once
 // UpsertRuntimeSpec has succeeded, also when the GPU-row write or the
-// read-back after it fails. The returned document carries the derived Role
-// (withRuntimeSpecRole), which writeRuntimeSpec's batch callers have no use for
-// and so never pay a read for.
-func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string) (RuntimeSpecDTO, error) {
-	dto, stored, err := s.writeRuntimeSpec(ctx, mapping, app, req, expectSpecID)
-	if stored {
+// read-back after it fails. A cluster head's write also notifies every member
+// server it had or now has, since each one's document carries the member
+// processes derived from the head. The returned document carries the derived
+// Role (withRuntimeSpecRole), which writeRuntimeSpec's batch callers have no
+// use for and so never pay a read for, and, for an operator's write
+// (principal set), the cluster view a GET returns.
+//
+// principal is the operator for PutRuntimeSpec and nil for a benchmark
+// writer; see writeRuntimeSpecAs for what it changes.
+func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string, principal *auth.Token) (RuntimeSpecDTO, error) {
+	w, err := s.writeRuntimeSpecAs(ctx, mapping, app, req, expectSpecID, principal)
+	if w.stored {
 		s.notifyRuntimeChanged(server.ID)
+		for _, id := range w.memberServers {
+			if id != server.ID {
+				s.notifyRuntimeChanged(id)
+			}
+		}
 	}
+	dto := w.dto
 	if err != nil {
 		return dto, err
+	}
+	if principal != nil {
+		if dto, err = s.withClusterView(ctx, *principal, server, dto); err != nil {
+			return dto, err
+		}
 	}
 	// The write-back is the document the portal commits into the same per-mapping
 	// cache a GET fills, so it carries the derived role like a GET does. Read AFTER
@@ -933,34 +1002,76 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 // SetRuntimeSpecGPUs or a failed read-back after it reports stored alongside
 // its error. An error before the upsert stored nothing.
 func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, req PutRuntimeSpecRequest, expectSpecID string) (dto RuntimeSpecDTO, stored bool, err error) {
+	w, err := s.writeRuntimeSpecAs(ctx, mapping, app, req, expectSpecID, nil)
+	return w.dto, w.stored, err
+}
+
+// runtimeSpecWrite is what writeRuntimeSpecAs did: the stored document,
+// whether anything reached the store, and the member servers of a cluster
+// head (before and after the write) whose documents the write changed.
+type runtimeSpecWrite struct {
+	dto           RuntimeSpecDTO
+	stored        bool
+	memberServers []string
+}
+
+// writeRuntimeSpecAs is writeRuntimeSpec with the cluster configuration:
+// principal is the operator of PutRuntimeSpec, whose write is checked and
+// applied in full (validateClusterHead, then the membership rows after the
+// spec row). A benchmark writer passes nil and keeps the stored cluster
+// columns and membership verbatim: it carries no principal to authorize a
+// membership change with, it only ever means to change admin_state, pinned
+// or replicable, and a restore must not fail because a member server changed
+// since the run started.
+func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelMapping, app routing.Application, req PutRuntimeSpecRequest, expectSpecID string, principal *auth.Token) (runtimeSpecWrite, error) {
 	if app.Type != routing.ProviderServerAgent {
-		return RuntimeSpecDTO{}, false, ErrRuntimeSpecNotServerAgent
+		return runtimeSpecWrite{}, ErrRuntimeSpecNotServerAgent
 	}
 	// Validate everything that can fail BEFORE mutating/persisting anything.
 	fields, err := validateRuntimeSpecRequest(req)
 	if err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
+	}
+	if principal != nil {
+		// Port allocation and the one-head-per-manual-member rule are
+		// check-then-act across specs; serializing the operator writes keeps
+		// two saves from taking the same port or member.
+		s.clusterWriteMu.Lock()
+		defer s.clusterWriteMu.Unlock()
 	}
 	prior, err := s.priorRuntimeSpec(ctx, mapping.ID, expectSpecID)
 	if err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
+	}
+	plan := keepStoredCluster(prior, fields)
+	if principal != nil {
+		if plan, err = s.validateClusterHead(ctx, *principal, app, req, fields, prior); err != nil {
+			return runtimeSpecWrite{}, err
+		}
 	}
 	spec, err := s.runtimeSpecRow(mapping.ID, req, fields, prior)
 	if err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
 	}
+	plan.applyTo(&spec)
 	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
 	}
+	w := runtimeSpecWrite{stored: true, memberServers: plan.memberServers}
 	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
-		return RuntimeSpecDTO{}, true, err
+		return w, err
+	}
+	if plan.writeMembers {
+		if err := s.routes.SetClusterMembers(ctx, spec.ID, plan.members, plan.gpus); err != nil {
+			return w, clusterMembersStoreError(err)
+		}
 	}
 	storedGPUs, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
-		return RuntimeSpecDTO{}, true, err
+		return w, err
 	}
-	dto, err = runtimeSpecDTO(spec, storedGPUs, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
-	return dto, true, err
+	w.dto, err = runtimeSpecDTO(spec, storedGPUs, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
+	return w, err
 }
 
 // runtimeSpecFields is a PutRuntimeSpecRequest after
@@ -983,6 +1094,10 @@ type runtimeSpecFields struct {
 	healthPath         string
 	healthTimeout      int
 	startupTimeout     int
+	deviceBackend      string
+	memberMode         string
+	clusterNetwork     string
+	rpcTransport       string
 }
 
 // validateRuntimeSpecRequest runs every request validation of a runtime-spec
@@ -1123,6 +1238,13 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		return runtimeSpecFields{}, err
 	}
 	if err = validateRuntimeSpecInstances(req); err != nil {
+		return runtimeSpecFields{}, err
+	}
+	// The device backend and the three cluster enums run after the instance
+	// settings, for the same reason again: they are newer than every check
+	// above. The cluster checks that read the store follow in
+	// validateClusterHead, after this function.
+	if f.deviceBackend, f.memberMode, f.clusterNetwork, f.rpcTransport, err = validateClusterEnums(req); err != nil {
 		return runtimeSpecFields{}, err
 	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
@@ -1541,14 +1663,18 @@ var runtimeSpecVisibleDevicesVars = []string{
 	"HIP_VISIBLE_DEVICES",
 }
 
-// runtimeSpecDevicePlaceholders are the three llama.cpp --device placeholders
-// the agent expands (mirrors the agent's own token set in policy_local.go).
-// In args mode at least one must appear in the spec's args, else the
-// selection would silently vanish.
+// runtimeSpecDevicePlaceholders are the llama.cpp --device placeholders the
+// agent expands that name every local GPU of the spec (mirrors the agent's
+// own token set in policy_local.go): the three per-backend lists and the
+// generic ${DEVICES}. In args mode at least one must appear in the spec's
+// args, else the selection would silently vanish. The single-device tokens
+// (${FIRST_LOCAL_DEVICE}, ${CUDA_FIRST_DEVICE}, ...) do not count: they do
+// not restrict offloading to the selected GPUs.
 var runtimeSpecDevicePlaceholders = []string{
 	"${CUDA_DEVICES}",
 	"${VULKAN_DEVICES}",
 	"${METAL_DEVICES}",
+	placeholderDevices,
 }
 
 func argsHaveDevicePlaceholder(args []string) bool {
@@ -1974,6 +2100,14 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		EffectiveType:               string(effectiveType),
 		ResolvedMetricsPath:         resolvedMetrics,
 		ResolvedContextProbePath:    resolvedContext,
+		DeviceBackend:               normalizeDeviceBackend(spec.DeviceBackend),
+		ClusterEnabled:              spec.ClusterEnabled,
+		MemberMode:                  normalizeMemberMode(spec.MemberMode),
+		ClusterNetwork:              spec.ClusterNetwork,
+		RPCTransport:                spec.RPCTransport,
+		LANExposureAck:              spec.LANExposureAck,
+		ClusterMembers:              []ClusterMemberDTO{},
+		ClusterWarnings:             []string{},
 	}, nil
 }
 

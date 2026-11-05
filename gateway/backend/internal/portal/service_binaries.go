@@ -8,7 +8,7 @@ import (
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
-	"op-ai-gateway/internal/storeerr"
+	"op-ai-gateway/internal/store"
 	"path"
 	"regexp"
 	"strings"
@@ -164,7 +164,7 @@ func (s *Service) CreateManualServerBinary(ctx context.Context, p auth.Token, se
 		row.Commit = *req.Commit
 	}
 	if err := s.routes.UpsertManualServerBinary(ctx, row); err != nil {
-		if errors.Is(err, storeerr.ErrConflict) {
+		if errors.Is(err, store.ErrConflict) {
 			return ServerBinaryDTO{}, ErrBinaryAgentOwned
 		}
 		return ServerBinaryDTO{}, err
@@ -250,9 +250,9 @@ func (s *Service) DeleteManualServerBinary(ctx context.Context, p auth.Token, se
 
 func mapBinaryStoreErr(err error) error {
 	switch {
-	case errors.Is(err, storeerr.ErrNotFound):
+	case errors.Is(err, store.ErrNotFound):
 		return ErrBinaryNotFound
-	case errors.Is(err, storeerr.ErrConflict):
+	case errors.Is(err, store.ErrConflict):
 		return ErrBinaryAgentOwned
 	}
 	return err

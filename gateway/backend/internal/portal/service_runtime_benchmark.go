@@ -39,7 +39,10 @@ import (
 // settings spread the same way -- dropping them would turn a replicable spec
 // back into one process whenever a benchmark wrote next to it -- and the
 // read-only StartupMeasuredMS and EffectiveIdleTimeoutSeconds, like
-// RAMMeasuredMB, have no request counterpart.
+// RAMMeasuredMB, have no request counterpart. The cluster configuration
+// spreads too, although a benchmark writer's write keeps the stored one
+// regardless (writeRuntimeSpecAs); the cluster totals, defaults and warnings
+// are read-only echoes without a request counterpart.
 func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 	liveTimings := dto.ResponsesLiveTimingsEnabled
 	return PutRuntimeSpecRequest{
@@ -107,6 +110,13 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		Type:                        dto.Type,
 		MetricsPath:                 dto.MetricsPath,
 		ContextProbePath:            dto.ContextProbePath,
+		DeviceBackend:               dto.DeviceBackend,
+		ClusterEnabled:              dto.ClusterEnabled,
+		MemberMode:                  dto.MemberMode,
+		ClusterNetwork:              dto.ClusterNetwork,
+		RPCTransport:                dto.RPCTransport,
+		LANExposureAck:              dto.LANExposureAck,
+		ClusterMembers:              dto.ClusterMembers,
 	}
 }
 
@@ -169,7 +179,7 @@ func (s *Service) SetBenchmarkRuntimeSpecAdminState(ctx context.Context, specID,
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	return s.putRuntimeSpec(ctx, w.mapping, w.app, w.server, w.req, w.specID)
+	return s.putRuntimeSpec(ctx, w.mapping, w.app, w.server, w.req, w.specID, nil)
 }
 
 // BenchmarkSpecsOutcome is what a batched benchmark writer did, per spec id,

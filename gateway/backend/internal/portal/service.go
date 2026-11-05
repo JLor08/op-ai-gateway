@@ -936,6 +936,10 @@ type Service struct {
 	// silently losing conflict detection. The network ListModels call runs
 	// OUTSIDE this lock, so only the fast local read+write section serializes.
 	reconcileMu sync.Mutex
+	// clusterWriteMu serializes the operator's runtime-spec writes
+	// (writeRuntimeSpecAs): a cluster head's save allocates member ports and
+	// claims manual member specs, both check-then-act across specs.
+	clusterWriteMu sync.Mutex
 }
 
 // waitPolicySideEffects blocks until any in-flight settings-triggered NetBird
