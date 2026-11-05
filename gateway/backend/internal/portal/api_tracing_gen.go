@@ -489,6 +489,18 @@ func (_d *APIWithTracing) CreateGroup(ctx context.Context, t1 auth.Token, c2 Cre
 	return _d.API.CreateGroup(ctx, t1, c2)
 }
 
+func (_d *APIWithTracing) CreateManualServerBinary(ctx context.Context, t1 auth.Token, s1 string, p1 PutServerBinaryRequest) (s2 ServerBinaryDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CreateManualServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.CreateManualServerBinary(ctx, t1, s1, p1)
+}
+
 func (_d *APIWithTracing) CreateMapping(ctx context.Context, t1 auth.Token, s1 string, c2 CreateMappingRequest) (m1 ModelMappingDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CreateMapping")
 	defer span.End()
@@ -659,6 +671,18 @@ func (_d *APIWithTracing) DeleteGroup(ctx context.Context, t1 auth.Token, s1 str
 		}
 	}()
 	return _d.API.DeleteGroup(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) DeleteManualServerBinary(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteManualServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteManualServerBinary(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) DeleteMapping(ctx context.Context, t1 auth.Token, s1 string) (err error) {
@@ -2044,6 +2068,18 @@ func (_d *APIWithTracing) ServerAvailability(ctx context.Context, t1 auth.Token,
 	return _d.API.ServerAvailability(ctx, t1, s1, d1)
 }
 
+func (_d *APIWithTracing) ServerBinaries(ctx context.Context, t1 auth.Token, s1 string) (sa1 []ServerBinaryDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServerBinaries")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ServerBinaries(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) ServerHardware(ctx context.Context, t1 auth.Token, s1 string) (s2 routing.ServerHardware, b1 bool, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServerHardware")
 	defer span.End()
@@ -2580,6 +2616,18 @@ func (_d *APIWithTracing) UpdateServer(ctx context.Context, t1 auth.Token, s1 st
 		}
 	}()
 	return _d.API.UpdateServer(ctx, t1, s1, u1)
+}
+
+func (_d *APIWithTracing) UpdateServerBinary(ctx context.Context, t1 auth.Token, s1 string, p1 PutServerBinaryRequest) (s2 ServerBinaryDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.UpdateServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.UpdateServerBinary(ctx, t1, s1, p1)
 }
 
 func (_d *APIWithTracing) UpdateService(ctx context.Context, t1 auth.Token, s1 string, u1 UpdateServiceRequest) (s2 ServiceDTO, err error) {

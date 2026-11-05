@@ -79,6 +79,10 @@ type API interface {
 	DeleteModelGroup(context.Context, auth.Token, string) error
 	DeleteProject(context.Context, auth.Token, string) error
 	DeleteRPCMemberSpec(context.Context, auth.Token, string, string) error
+	ServerBinaries(context.Context, auth.Token, string) ([]ServerBinaryDTO, error)
+	CreateManualServerBinary(context.Context, auth.Token, string, PutServerBinaryRequest) (ServerBinaryDTO, error)
+	UpdateServerBinary(context.Context, auth.Token, string, PutServerBinaryRequest) (ServerBinaryDTO, error)
+	DeleteManualServerBinary(context.Context, auth.Token, string, string) error
 	DeleteResourceGroup(context.Context, auth.Token, string) error
 	DeleteRuntimeSpec(context.Context, auth.Token, string) error
 	DeleteServer(context.Context, auth.Token, string, bool) (bool, error)

@@ -118,6 +118,12 @@ type agentTelemetryRequest struct {
 	// see runtimeConfigAckFeature for why the NAME, not this field's presence,
 	// is what the gateway gates on.
 	RuntimeConfigAppliedETag string `json:"runtime_config_applied_etag"`
+	// Binaries is the agent's binary inventory (its allowlisted llama.cpp
+	// binaries with kind and version). A pointer tells the three states
+	// apart: absent means "unchanged" and leaves the stored inventory alone
+	// (the agent omits it unless it changed), an empty array means the agent
+	// allows no binaries and replaces the agent rows with nothing.
+	Binaries *[]agentBinarySample `json:"binaries,omitempty"`
 }
 
 // agentRuntimeGPUSample is one GPU's measured VRAM inside an
@@ -2264,6 +2270,9 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		// sample; a failure here is logged and dropped.
 		s.writeBackRuntimeCapabilities(ctx, serverID, req.Runtimes)
 	}
+	// Best-effort replacement of the agent-reported binary inventory. A
+	// no-op unless this sample carries the field. Never rejects the sample.
+	s.writeBackBinaries(ctx, serverID, req.Binaries, now)
 	s.maybeFireReactivation(ctx, server)
 	return nil
 }

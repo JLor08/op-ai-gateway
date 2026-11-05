@@ -184,6 +184,10 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		s.handlePortalServerRPCMembers(w, r, token, parts[0], specID)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "binaries" && parts[0] != "" {
+		s.handlePortalServerBinaries(w, r, token, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "gpu-budgets" && parts[0] != "" {
 		s.handlePortalServerGPUBudgets(w, r, token, parts[0])
 		return
