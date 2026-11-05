@@ -809,7 +809,7 @@ const rpcPathPrefix = "/rpc/"
 // grow it; a manager without it manages no member.
 type memberPort interface {
 	EnsureMember(ctx context.Context, specID string, reserve time.Duration) error
-	ReleaseMember(specID string) error
+	ReleaseMember(ctx context.Context, specID string) error
 	StopMember(ctx context.Context, specID string, force bool) (StopState, error)
 	PurgeMemberCache(ctx context.Context, specID string) error
 }
@@ -839,8 +839,9 @@ const codeBadRequest = "runtime.bad_request"
 //     POST /stop/{model}, and 409 runtime.cluster_member_in_use while it is
 //     held or reserved unless forced (Manager.StopMember).
 //   - POST /rpc/purge-cache/{specID} removes the member's tensor cache for its
-//     head and answers 200 {"state":"purged"}, or 409
-//     runtime.cluster_member_in_use while it is held or reserved
+//     head and answers 200 {"state":"purged"}, 409
+//     runtime.cluster_member_in_use while it is held or reserved, or 500
+//     runtime.cache_purge_failed when the filesystem refuses
 //     (Manager.PurgeMemberCache).
 //
 // An unknown action, an empty or unknown spec ID, a spec that is not a member,
@@ -862,7 +863,7 @@ func (rt *router) serveRPC(w http.ResponseWriter, r *http.Request) {
 	case "ensure":
 		rt.serveMemberEnsure(w, r, members, specID)
 	case "release":
-		rt.answerMember(w, members.ReleaseMember(specID), "released")
+		rt.answerMember(w, members.ReleaseMember(r.Context(), specID), "released")
 	case "stop":
 		force := r.URL.Query().Get("force")
 		state, err := members.StopMember(r.Context(), specID, force == "1" || force == "true")
@@ -2035,7 +2036,8 @@ const (
 // its instances (runtime.instance_not_highest), and the operator resolves either
 // by changing the spec or stopping the higher instance first. A member's
 // (runtime.cluster_member_in_use) conflicts with the head holding it: the
-// cluster is stopped head first.
+// cluster is stopped head first. runtime.cache_purge_failed (500) is the agent's
+// own filesystem refusing to remove a member cache.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
@@ -2058,6 +2060,8 @@ func sentinelCode(err error) (code string, status int) {
 		return "runtime.instance_not_highest", http.StatusConflict
 	case errors.Is(err, ErrMemberInUse):
 		return "runtime.cluster_member_in_use", http.StatusConflict
+	case errors.Is(err, ErrCachePurgeFailed):
+		return "runtime.cache_purge_failed", http.StatusInternalServerError
 	default:
 		return codeUpstreamGone, http.StatusBadGateway
 	}

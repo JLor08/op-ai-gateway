@@ -3073,6 +3073,16 @@ func (o *owner) admitAndStart(specID string) {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
 	case dec.Reason == StatePendingVRAMUnknown:
+		// The unknown-demand refusal reads a pinned occupant as one that never
+		// leaves, and a claimed member reads pinned. A claim does end, though:
+		// when it is the claim alone that refuses the start, the start waits
+		// instead -- queued, state untouched, the member named -- and the end of
+		// the claim asks it again (claimEnded), when the ordinary rules,
+		// the one-shot bootstrap among them, decide.
+		if member := o.claimedMemberBlocking(snap, demand); member != "" {
+			blockedBy = member
+			return
+		}
 		o.setPendingVRAMUnknown(st, dec.Message)
 	case dec.Wait:
 		// Leave st queued; a later release, exit or Apply re-triggers this
@@ -3715,6 +3725,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			Spec:     specBase(st.spec),
 			Instance: st.instance,
 			Surplus:  st.burst(),
+			Member:   st.spec.IsRPCServer(),
 			GPUs:     gpus,
 			RAMMB:    max(liveRAM, demand.RAMMB),
 			InFlight: st.inFlight,
@@ -5320,10 +5331,12 @@ func (o *owner) scanIdle() {
 			continue
 		}
 		idle := time.Duration(st.spec.IdleTimeoutSeconds) * time.Second
+		since := st.lastUsed
 		if isMember {
 			idle = memberIdleTimeout(st.spec)
+			since = st.claim.idleSince(st.lastUsed)
 		}
-		if now.Sub(st.lastUsed) >= idle {
+		if now.Sub(since) >= idle {
 			o.beginDrain(id)
 		}
 	}

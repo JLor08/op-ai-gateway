@@ -172,12 +172,7 @@ func TestRPCEnsureTerminalVerdictIsNotPermitted(t *testing.T) {
 func TestRPCStopRefusedWhileHeld(t *testing.T) {
 	shrinkTimings(t)
 	m := newTestManager(t, allowlistPolicy())
-	// The pair may co-reside: otherwise the second start would wait behind
-	// the first, held, member.
-	m.Apply(Config{
-		Specs:      []Spec{onDemandMember(t, "rpcm_h"), onDemandMember(t, "rpcm_r")},
-		Coresident: [][2]string{{"rpcm_h", "rpcm_r"}},
-	})
+	m.Apply(Config{Specs: []Spec{onDemandMember(t, "rpcm_h"), onDemandMember(t, "rpcm_r")}})
 	rt := newRouter(m)
 
 	wantRPCState(t, postRPC(rt, "/rpc/ensure/rpcm_h"), "running")
@@ -297,4 +292,27 @@ func TestPurgeCacheRemovesHeadCache(t *testing.T) {
 	}
 	wantRPCState(t, postRPC(rt, "/rpc/purge-cache/rpcm_a"), "purged")
 	wantRPCError(t, postRPC(rt, "/rpc/purge-cache/rpcm_nope"), http.StatusNotFound, codeModelNotManaged)
+}
+
+// TestPurgeCacheFailureIs500: a cache the filesystem refuses to move is
+// reported as 500 runtime.cache_purge_failed, not as an upstream failure.
+func TestPurgeCacheFailureIs500(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions this test relies on")
+	}
+	root := t.TempDir()
+	m, dir := cacheMember(t, root)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rpcDir := filepath.Dir(dir)
+	if err := os.Chmod(rpcDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(rpcDir, 0o700) })
+
+	wantRPCError(t, postRPC(newRouter(m), "/rpc/purge-cache/rpcm_a"), http.StatusInternalServerError, "runtime.cache_purge_failed")
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("cache dir gone although the purge failed: %v", err)
+	}
 }

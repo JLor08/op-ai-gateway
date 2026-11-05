@@ -28,7 +28,7 @@ func TestReservedMemberSurvivesIdleScan(t *testing.T) {
 	reserved, held := onDemandMember(t, "rpcm_r"), onDemandMember(t, "rpcm_h")
 	reserved.IdleTimeoutSeconds, held.IdleTimeoutSeconds = 1, 1
 	m := newTestManager(t, allowlistPolicy())
-	m.Apply(Config{Specs: []Spec{reserved, held}, Coresident: [][2]string{{"rpcm_r", "rpcm_h"}}})
+	m.Apply(Config{Specs: []Spec{reserved, held}})
 
 	ensureMember(t, m, "rpcm_r", 30*time.Second)
 	ensureMember(t, m, "rpcm_h", 0)
@@ -90,36 +90,154 @@ func TestReservationIsNeverShortened(t *testing.T) {
 	}
 }
 
+// gpuMember is an on-demand member lending GPU 0 with a known VRAM demand.
+func gpuMember(t *testing.T, id string, vramMB int) Spec {
+	t.Helper()
+	spec := onDemandMember(t, id)
+	spec.DeviceBackend = "cuda"
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: vramMB}}
+	return spec
+}
+
+// gpuModel is a model spec on GPU 0; vramMB 0 leaves its demand unknown.
+func gpuModel(id, upstream string, vramMB int) Spec {
+	spec := baseSpec(id, upstream)
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: vramMB}}
+	spec.AdmissionWaitTimeoutSeconds = 0 // wait as long as the caller does
+	return spec
+}
+
+// tenGiBOnGPU0 is a host whose GPU 0 holds one 6 GiB process, not two.
+var tenGiBOnGPU0 = []GPUBudget{{Index: 0, BudgetMB: 10000}, {Index: 1, BudgetMB: 10000}}
+
+// ensureModelAsync runs EnsureRunning(model) on its own goroutine, releasing
+// at once, and delivers its error.
+func ensureModelAsync(ctx context.Context, m *Manager, model string) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, release, err := m.EnsureRunning(ctx, model)
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+	return done
+}
+
 // TestHeldMemberNeverEvicted: a local start that could only proceed by
-// evicting a held member waits, names the member on its row, and proceeds once
-// the hold ends; the name then leaves its row.
+// evicting a held member (here: GPU 0 has room for one of them) waits, names the
+// member on its row, and -- without an eviction grace -- proceeds as soon as
+// the hold ends, evicting the member; the name then leaves its row. With an
+// eviction grace the member is named all the same: the grace its start stamped
+// does not hide that the claim is what blocks.
 func TestHeldMemberNeverEvicted(t *testing.T) {
+	for _, grace := range []time.Duration{0, 30 * time.Second} {
+		t.Run(grace.String(), func(t *testing.T) {
+			shrinkTimings(t)
+			m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }, EvictionGrace: grace})
+			t.Cleanup(m.Close)
+			m.Apply(Config{
+				Specs:      []Spec{gpuModel("spec-a", "model-a", 6000), gpuMember(t, "rpcm_a", 6000)},
+				GPUBudgets: tenGiBOnGPU0,
+			})
+
+			ensureMember(t, m, "rpcm_a", 0)
+			m.SetMemberHold("rpcm_a", "rspec_h", time.Now())
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			done := ensureModelAsync(ctx, m, "model-a")
+
+			waitUntil(t, 3*time.Second, "waiting spec names the held member", func() bool {
+				return statusFor(m, "spec-a").AdmissionBlockedBy == "rpcm_a"
+			})
+			time.Sleep(200 * time.Millisecond)
+			if s := statusFor(m, "rpcm_a"); s.State != StateRunning {
+				t.Fatalf("held member state = %s, want running: it is never an eviction victim", s.State)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("EnsureRunning returned %v while the member was held, want it to wait", err)
+			default:
+			}
+			if grace > 0 {
+				return
+			}
+
+			m.SetMemberHold("rpcm_a", "", time.Time{})
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("EnsureRunning after the hold ended: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the waiting start did not proceed after the hold ended")
+			}
+			if s := statusFor(m, "spec-a"); s.AdmissionBlockedBy != "" {
+				t.Fatalf("admission_blocked_by = %q, want it cleared once the wait ended", s.AdmissionBlockedBy)
+			}
+			if s := statusFor(m, "rpcm_a"); s.State == StateRunning {
+				t.Fatalf("released member still running beside the model that needed its room")
+			}
+		})
+	}
+}
+
+// TestAdmissionBlockedByNamesOnlyHeldMembers: a wait behind an ordinary pinned
+// model names no member, even with a held member on the host, as long as that
+// member is not what the start needs gone.
+func TestAdmissionBlockedByNamesOnlyHeldMembers(t *testing.T) {
 	shrinkTimings(t)
-	model := baseSpec("spec-a", "model-a")
-	model.AdmissionWaitTimeoutSeconds = 0 // wait as long as the caller does
+	pinned := gpuModel("spec-p", "model-p", 6000)
+	pinned.Pinned = true
+	member := gpuMember(t, "rpcm_b", 6000)
+	member.GPUs[0].Index = 1
 	m := newTestManager(t, allowlistPolicy())
-	m.Apply(Config{Specs: []Spec{model, onDemandMember(t, "rpcm_a")}})
+	m.Apply(Config{Specs: []Spec{pinned, gpuModel("spec-a", "model-a", 6000), member}, GPUBudgets: tenGiBOnGPU0})
+	waitUntil(t, 3*time.Second, "pinned spec running", func() bool {
+		return statusFor(m, "spec-p").State == StateRunning
+	})
+	ensureMember(t, m, "rpcm_b", 0)
+	m.SetMemberHold("rpcm_b", "rspec_h", time.Now())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ensureModelAsync(ctx, m, "model-a")
+	deadline := time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := statusFor(m, "spec-a").AdmissionBlockedBy; got != "" {
+			t.Fatalf("admission_blocked_by = %q, want empty behind a pinned model", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s := statusFor(m, "spec-a"); s.State != StateStopped {
+		t.Fatalf("spec-a state = %s, want stopped while it waits", s.State)
+	}
+}
+
+// TestUnknownDemandStartWaitsForHeldMember: a start of unknown VRAM demand on
+// a GPU a held member uses is not refused as pending_vram_unknown -- a claim
+// ends, unlike a pin -- but waits, naming the member, and starts once the
+// member has gone after its hold ended.
+func TestUnknownDemandStartWaitsForHeldMember(t *testing.T) {
+	shrinkTimings(t)
+	member := gpuMember(t, "rpcm_a", 6000)
+	member.IdleTimeoutSeconds = 1
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{gpuModel("spec-u", "model-u", 0), member}, GPUBudgets: tenGiBOnGPU0})
 
 	ensureMember(t, m, "rpcm_a", 0)
 	m.SetMemberHold("rpcm_a", "rspec_h", time.Now())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		_, release, err := m.EnsureRunning(ctx, "model-a")
-		if err == nil {
-			release()
-		}
-		done <- err
-	}()
-
-	waitUntil(t, 3*time.Second, "waiting spec names the held member", func() bool {
-		return statusFor(m, "spec-a").AdmissionBlockedBy == "rpcm_a"
+	done := ensureModelAsync(ctx, m, "model-u")
+	waitUntil(t, 3*time.Second, "unknown-demand start names the held member", func() bool {
+		return statusFor(m, "spec-u").AdmissionBlockedBy == "rpcm_a"
 	})
 	time.Sleep(200 * time.Millisecond)
-	if s := statusFor(m, "rpcm_a"); s.State != StateRunning {
-		t.Fatalf("held member state = %s, want running: it is never an eviction victim", s.State)
+	if s := statusFor(m, "spec-u"); s.State != StateStopped {
+		t.Fatalf("spec-u state = %s, want stopped (waiting), not a refusal", s.State)
 	}
 	select {
 	case err := <-done:
@@ -133,45 +251,43 @@ func TestHeldMemberNeverEvicted(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnsureRunning after the hold ended: %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the waiting start did not proceed after the hold ended")
+	case <-time.After(6 * time.Second):
+		t.Fatal("the unknown-demand start did not proceed after the hold ended")
 	}
-	if s := statusFor(m, "spec-a"); s.AdmissionBlockedBy != "" {
-		t.Fatalf("admission_blocked_by = %q, want it cleared once the wait ended", s.AdmissionBlockedBy)
-	}
-	waitUntil(t, 3*time.Second, "released member evicted", func() bool {
-		return statusFor(m, "rpcm_a").State == StateStopped
-	})
 }
 
-// TestAdmissionBlockedByNamesOnlyHeldMembers: a wait behind an ordinary pinned
-// model names no member.
-func TestAdmissionBlockedByNamesOnlyHeldMembers(t *testing.T) {
+// TestMemberCoresidesWithoutPair: the co-residency matrix does not apply to a
+// member, in either direction: a model with no pair starts beside a running
+// member, and a member starts beside a running model, neither evicting the
+// other.
+func TestMemberCoresidesWithoutPair(t *testing.T) {
 	shrinkTimings(t)
-	pinned := baseSpec("spec-p", "model-p")
-	pinned.Pinned = true
-	model := baseSpec("spec-a", "model-a")
-	model.AdmissionWaitTimeoutSeconds = 1
 	m := newTestManager(t, allowlistPolicy())
-	m.Apply(Config{Specs: []Spec{pinned, model}})
-	waitUntil(t, 3*time.Second, "pinned spec running", func() bool {
-		return statusFor(m, "spec-p").State == StateRunning
-	})
+	m.Apply(Config{Specs: []Spec{baseSpec("spec-a", "model-a"), onDemandMember(t, "rpcm_a"), baseSpec("spec-b", "model-b")}})
 
+	ensureMember(t, m, "rpcm_a", 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go func() {
-		_, release, err := m.EnsureRunning(ctx, "model-a")
-		if err == nil {
-			release()
+	if err := <-ensureModelAsync(ctx, m, "model-a"); err != nil {
+		t.Fatalf("EnsureRunning(model-a) beside a member: %v", err)
+	}
+	ensureMember(t, m, "rpcm_a", 0) // already up: answered at once
+	for _, id := range []string{"spec-a", "rpcm_a"} {
+		if s := statusFor(m, id); s.State != StateRunning {
+			t.Fatalf("%s state = %s, want running side by side", id, s.State)
 		}
-	}()
-	deadline := time.Now().Add(700 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if got := statusFor(m, "spec-a").AdmissionBlockedBy; got != "" {
-			t.Fatalf("admission_blocked_by = %q, want empty behind a pinned model", got)
-		}
-		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A second model still obeys the matrix towards the first: with no pair,
+	// the first (idle) one is evicted, and the member stays.
+	if err := <-ensureModelAsync(ctx, m, "model-b"); err != nil {
+		t.Fatalf("EnsureRunning(model-b): %v", err)
+	}
+	waitUntil(t, 3*time.Second, "spec-a evicted by the matrix", func() bool {
+		return statusFor(m, "spec-a").State == StateStopped
+	})
+	if s := statusFor(m, "rpcm_a"); s.State != StateRunning {
+		t.Fatalf("member state = %s, want running: the matrix does not apply to it", s.State)
 	}
 }
 
@@ -207,7 +323,7 @@ func TestEnsureMemberRefusesModelSpecs(t *testing.T) {
 	if _, err := m.StopMember(ctx, "spec-a", true); !errors.Is(err, ErrModelNotManaged) {
 		t.Fatalf("StopMember(model spec) = %v, want ErrModelNotManaged", err)
 	}
-	if err := m.ReleaseMember("spec-a"); !errors.Is(err, ErrModelNotManaged) {
+	if err := m.ReleaseMember(ctx, "spec-a"); !errors.Is(err, ErrModelNotManaged) {
 		t.Fatalf("ReleaseMember(model spec) = %v, want ErrModelNotManaged", err)
 	}
 }

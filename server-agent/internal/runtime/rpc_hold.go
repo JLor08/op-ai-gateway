@@ -6,9 +6,13 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"time"
 )
 
@@ -39,6 +43,11 @@ import (
 // reserved. Wire code runtime.cluster_member_in_use (409).
 var ErrMemberInUse = errors.New("runtime.cluster_member_in_use")
 
+// ErrCachePurgeFailed reports a member cache that could not be removed: the
+// purge was allowed, but the filesystem refused it. Wire code
+// runtime.cache_purge_failed (500).
+var ErrCachePurgeFailed = errors.New("runtime.cache_purge_failed")
+
 // maxMemberReservation bounds a reservation: it covers one cluster start, which
 // is minutes, and a larger value is a caller error rather than a longer start.
 const maxMemberReservation = 24 * time.Hour
@@ -53,6 +62,20 @@ type memberClaim struct {
 	// in m.wg, so it is cancelled whenever the reservation ends early.
 	reservedUntil    time.Time
 	reservationTimer *time.Timer
+	// endedAt is when the last claim on the running member ended. The idle
+	// timeout counts from it (scanIdle), so the member stays warm for a head
+	// that reconnects soon, while an admission that wants its room may still
+	// evict it at once: eviction reads lastUsed, which a claim never moves.
+	endedAt time.Time
+}
+
+// idleSince is when a member's idle timeout starts counting: its last use, or
+// the end of its last claim when that came later.
+func (c memberClaim) idleSince(lastUsed time.Time) time.Time {
+	if c.endedAt.After(lastUsed) {
+		return c.endedAt
+	}
+	return lastUsed
 }
 
 // claimed reports whether a hold or a reservation stands on st.
@@ -159,9 +182,9 @@ func (m *Manager) EnsureMember(ctx context.Context, specID string, reserve time.
 // its own timeout, counted from now, unless a waiting admission evicts it
 // first. Releasing a member with neither is a no-op; a spec ID that is not a
 // member is ErrModelNotManaged.
-func (m *Manager) ReleaseMember(specID string) error {
+func (m *Manager) ReleaseMember(ctx context.Context, specID string) error {
 	reply := make(chan error, 1)
-	out, err := askOwner(context.Background(), m, cmdReleaseMember{specID: specID, reply: reply}, reply)
+	out, err := askOwner(ctx, m, cmdReleaseMember{specID: specID, reply: reply}, reply)
 	if err != nil {
 		return err
 	}
@@ -193,9 +216,12 @@ func (m *Manager) SetMemberHold(specID, holder string, since time.Time) {
 
 // PurgeMemberCache removes the member's on-disk tensor cache for its head.
 // A held or reserved member keeps it (ErrMemberInUse); a member with no cache
-// directory, or none configured, has nothing to purge and succeeds. The
-// directory is removed on the caller's goroutine, never the owner's: a cache
-// can hold many gigabytes.
+// directory, or none configured, has nothing to purge and succeeds. The owner
+// moves the directory aside in the same turn it checks the claim, so a start
+// that follows creates a fresh directory rather than losing one being deleted;
+// the moved directory is then removed on the caller's goroutine, never the
+// owner's, since a cache can hold many gigabytes. A filesystem refusal is
+// ErrCachePurgeFailed.
 func (m *Manager) PurgeMemberCache(ctx context.Context, specID string) error {
 	reply := make(chan purgeOutcome, 1)
 	out, err := askOwner(ctx, m, cmdPurgeMemberCache{specID: specID, reply: reply}, reply)
@@ -205,7 +231,10 @@ func (m *Manager) PurgeMemberCache(ctx context.Context, specID string) error {
 	if out.err != nil || out.dir == "" {
 		return out.err
 	}
-	return os.RemoveAll(out.dir)
+	if err := os.RemoveAll(out.dir); err != nil {
+		return fmt.Errorf("%w: %v", ErrCachePurgeFailed, err)
+	}
+	return nil
 }
 
 // memberState returns the state of the rpc_server member specID: instance 0 of
@@ -297,18 +326,15 @@ func (o *owner) releaseMember(specID string) error {
 }
 
 // claimEnded follows a hold or a reservation ending while the process may run
-// on. Once nothing claims the member any more it counts as used just now -- its
-// idle timeout runs from the moment the head let go, as a model's runs from its
-// last request -- and every admission waiting for room is asked again, since
-// the member has just become a possible victim.
+// on. Once nothing claims the member any more its idle timeout runs from this
+// moment (memberClaim.endedAt), and every admission waiting for room is asked
+// again, since the member has just become a possible victim.
 func (o *owner) claimEnded(st *specState) {
 	o.signalTransition()
 	if st.claimed() {
 		return
 	}
-	if st.proc != nil {
-		st.lastUsed = time.Now()
-	}
+	st.claim.endedAt = time.Now()
 	o.wakeAdmissionCandidates()
 }
 
@@ -347,9 +373,11 @@ func (o *owner) stopMember(specID string, force bool) stopOutcome {
 }
 
 // purgeMemberCache is the owner's half of Manager.PurgeMemberCache: refuse a
-// claimed member, and name the directory otherwise. A member whose cache
+// claimed member, and otherwise move its cache directory aside to a tombstone
+// beside it, which the caller removes. A rename within one directory is a
+// single cheap call, so it may run on the owner. A member whose cache
 // directory cannot be formed (no config_files_dir, or a head ID that is not a
-// plain path element) has nothing the agent could have cached.
+// plain path element), or does not exist, has nothing to purge.
 func (o *owner) purgeMemberCache(specID string) purgeOutcome {
 	st, ok := o.memberState(specID)
 	if !ok {
@@ -362,44 +390,66 @@ func (o *owner) purgeMemberCache(specID string) purgeOutcome {
 	if err != nil {
 		return purgeOutcome{}
 	}
-	return purgeOutcome{dir: dir}
+	// The leading dot and the timestamp give the tombstone a name that is no
+	// head's cache directory (head IDs are the gateway's spec IDs).
+	tomb := filepath.Join(filepath.Dir(dir), ".purge-"+filepath.Base(dir)+"-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	if err := os.Rename(dir, tomb); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return purgeOutcome{}
+		}
+		return purgeOutcome{err: fmt.Errorf("%w: %v", ErrCachePurgeFailed, err)}
+	}
+	return purgeOutcome{dir: tomb}
 }
 
-// claimedMemberBlocking names the claimed member an admission that Admit
-// answered with Wait could proceed by evicting, or "" when no claim is what it
-// waits for. It asks Admit again with every claimed member read as its spec
-// alone makes it (pinnedBySpec): when that answer evicts a claimed member, the
-// claim is what holds the start back. The lowest such spec ID is named, so the
-// answer does not depend on map order.
+// claimedMemberBlocking names the claimed member an admission that cannot
+// proceed now (Admit answered Wait, or the unknown-demand refusal) waits for,
+// or "" when no claim is what holds it back. The question is whether the start
+// could proceed -- start, or evict what it may -- were the claimed members not
+// there: removing them, rather than reading them unpinned, leaves out every
+// reason the agent would have to keep them a moment longer once released (the
+// eviction grace above all, which a member's start stamps and a claim never
+// refreshes), since the gateway, told who blocks, decides that by stopping the
+// head. The member named is the lowest spec ID whose absence alone lets the
+// start proceed, or the lowest claimed one when only their absence together
+// does, so the answer does not depend on map order. A member pinned by its own
+// spec is no claim's doing and is left in place.
 func (o *owner) claimedMemberBlocking(snap PolicySnapshot, demand Spec) string {
-	running := slices.Clone(snap.Running)
-	unclaimed := false
-	for i := range running {
-		st := o.specs[running[i].SpecID]
-		if st == nil || !st.claimed() || st.pinnedBySpec() {
-			continue
+	var claimed []string
+	for _, r := range snap.Running {
+		if st := o.specs[r.SpecID]; st != nil && st.claimed() && !st.pinnedBySpec() {
+			claimed = append(claimed, r.SpecID)
 		}
-		running[i].Pinned = false
-		unclaimed = true
 	}
-	if !unclaimed {
+	if len(claimed) == 0 {
 		return ""
 	}
-	snap.Running = running
+	slices.Sort(claimed)
+	if !admitProceeds(withoutRunning(snap, claimed...), demand) {
+		return ""
+	}
+	for _, id := range claimed {
+		if admitProceeds(withoutRunning(snap, id), demand) {
+			return id
+		}
+	}
+	return claimed[0]
+}
+
+// withoutRunning returns snap with the processes ids taken out of Running, as
+// if they had exited; snap itself is left untouched.
+func withoutRunning(snap PolicySnapshot, ids ...string) PolicySnapshot {
+	snap.Running = slices.DeleteFunc(slices.Clone(snap.Running), func(r RunningProc) bool {
+		return slices.Contains(ids, r.SpecID)
+	})
+	return snap
+}
+
+// admitProceeds reports whether Admit lets demand start in snap, at once or by
+// evicting: neither a Wait nor a refusal.
+func admitProceeds(snap PolicySnapshot, demand Spec) bool {
 	dec := Admit(snap, demand)
-	if dec.Wait || dec.Reason != "" || dec.NoCapacity {
-		return ""
-	}
-	var blocking []string
-	for _, id := range dec.Evict {
-		if st := o.specs[id]; st != nil && st.claimed() {
-			blocking = append(blocking, id)
-		}
-	}
-	if len(blocking) == 0 {
-		return ""
-	}
-	return slices.Min(blocking)
+	return !dec.Wait && dec.Reason == "" && !dec.NoCapacity
 }
 
 // setAdmissionBlockedBy records the claimed member st's admission waits for
