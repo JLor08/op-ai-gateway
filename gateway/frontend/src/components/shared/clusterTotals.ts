@@ -95,3 +95,26 @@ export function clusterCellText(mb: number, complete: boolean): string {
   if (!(mb > 0)) return '—';
   return `${complete ? '' : '≥ '}${mb} MB`;
 }
+
+export type ClusterIncompleteCause = 'none' | 'members' | 'hidden' | 'head' | 'unknown';
+
+/**
+ * Why a total is a lower bound, for the cell's hint. A member the caller can
+ * see wins, then a hidden one; the head's own value is blamed only when it is
+ * missing and no member explains the gap (a CPU-only head legitimately has no
+ * own VRAM, so zero there is not "missing"). 'unknown' means nothing
+ * attributable explains it and the hint stays neutral.
+ */
+export function clusterIncompleteCause(
+  spec: Pick<RuntimeSpec, 'gpus'>,
+  view: ClusterTotalsView,
+  axis: 'vram' | 'ram',
+  ownMb: number,
+): ClusterIncompleteCause {
+  if (view.complete) return 'none';
+  if (view.incompleteNames.length > 0) return 'members';
+  if (view.hiddenIncomplete) return 'hidden';
+  const headHasPart = axis === 'ram' || (spec.gpus ?? []).length > 0;
+  if (headHasPart && !(ownMb > 0)) return 'head';
+  return 'unknown';
+}

@@ -6,7 +6,7 @@ import { Alert, Box, Button, Chip, Popover, Tooltip, Typography } from '@mui/mat
 import type { RuntimeSpec } from '../api';
 import type { Translation } from './shared/types';
 import { formatChatRunErrorCode } from './shared/format';
-import { clusterCellText, clusterTotalsView } from './shared/clusterTotals';
+import { clusterCellText, clusterIncompleteCause, clusterTotalsView } from './shared/clusterTotals';
 
 type Axis = 'vram' | 'ram';
 
@@ -29,15 +29,13 @@ export function ClusterTotalCell({
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const view = clusterTotalsView(spec);
   const total = axis === 'vram' ? view.vramMb : view.ramMb;
-  const incomplete = !view.complete;
+  const cause = clusterIncompleteCause(spec, view, axis, ownMb);
   let hint = '';
-  if (incomplete) {
-    hint = view.incompleteNames.length
-      ? `${t.clusterIncompleteTooltip}: ${view.incompleteNames.join(', ')}`
-      : view.hiddenIncomplete
-        ? t.clusterIncompleteHidden
-        : t.clusterIncompleteTooltip;
-  }
+  if (cause === 'members')
+    hint = `${t.clusterIncompleteTooltip}: ${view.incompleteNames.join(', ')}`;
+  else if (cause === 'hidden') hint = t.clusterIncompleteHidden;
+  else if (cause === 'head') hint = t.clusterIncompleteHead;
+  else if (cause === 'unknown') hint = t.clusterIncompleteNeutral;
   const text = (
     <Typography component="span" variant="body2" data-testid={`cluster-total-${axis}`}>
       {clusterCellText(total, view.complete)}
@@ -68,10 +66,10 @@ export function ClusterTotalCell({
       >
         <Box sx={{ p: 1.5, display: 'grid', gap: 0.5 }} data-testid={`cluster-breakdown-${axis}`}>
           <Typography variant="body2">{`${t.clusterBreakdownHead}: ${mbText(ownMb)}`}</Typography>
-          {view.members.map((m) => {
+          {view.members.map((m, i) => {
             const mb = axis === 'vram' ? m.vramMb : m.ramMb;
             return (
-              <Typography key={`${m.name}`} variant="body2">
+              <Typography key={i} variant="body2">
                 {`${m.name}${m.cpu ? ` (${t.clusterBreakdownCpu})` : ''}${m.stale ? ` (${t.clusterBreakdownStale})` : ''}: ${axis === 'vram' && m.cpu ? '—' : mbText(mb)}`}
               </Typography>
             );

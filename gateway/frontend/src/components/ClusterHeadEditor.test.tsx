@@ -111,6 +111,7 @@ function setup(
     hardwareByServer?: Record<string, HardwareResponse>;
     hardwareFailing?: string[];
     headHasGpus?: boolean;
+    headBinaryVersion?: string;
     server?: PortalServer;
   } = {},
 ) {
@@ -140,6 +141,7 @@ function setup(
         env={opts.env ?? {}}
         headHasGpus={opts.headHasGpus ?? false}
         startupTimeoutSeconds={600}
+        headBinaryVersion={opts.headBinaryVersion}
       />
     );
   }
@@ -213,6 +215,44 @@ describe('ClusterHeadEditor member mode', () => {
     expect(screen.getByRole('button', { name: t.clusterMemberAdd })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
     await waitFor(() => expect(api.clusterCandidates).toHaveBeenLastCalledWith('map_1', 'manual'));
+  });
+});
+
+describe('ClusterHeadEditor member binaries', () => {
+  it('notes that members use the matching rpc-server and names the head version', () => {
+    setup({
+      initial: state({ members: clusterRows([member({})]) }),
+      headBinaryVersion: 'b1234',
+    });
+    expect(screen.getByTestId('cluster-members-binary').textContent).toBe(
+      t.clusterMembersMatchingBinary('b1234'),
+    );
+  });
+
+  it('says the version is unknown when the inventory has none for the head binary', () => {
+    setup({ initial: state({ members: clusterRows([member({})]) }) });
+    expect(screen.getByTestId('cluster-members-binary').textContent).toBe(
+      t.clusterMembersMatchingBinary(t.binariesVersionUnknown),
+    );
+  });
+
+  it('shows the matched rpc binary and version of an automatic candidate', async () => {
+    setup({
+      candidates: [
+        {
+          server_id: 'srv_a',
+          server_name: 'Alpha',
+          rpc_binary: '/opt/llama/ggml-rpc-server',
+          rpc_binary_version: 'b1234',
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    expect(screen.getByTestId('cluster-candidate-binary').textContent).toBe(
+      '/opt/llama/ggml-rpc-server (b1234)',
+    );
   });
 });
 

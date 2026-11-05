@@ -30,6 +30,7 @@ import type {
   RuntimeReport,
   RuntimeReportContent,
   RuntimeSpec,
+  ServerBinary,
   RuntimeLogBatch,
   RuntimeLogState,
   RuntimeStatus,
@@ -374,6 +375,8 @@ function renderSection(
     gpuBudgetsFailing?: boolean;
     gpuBudgetsFailsOnCall?: number;
     hardware?: HardwareResponse;
+    // The server's binary inventory (the Binaries tab and the pickers).
+    binaries?: ServerBinary[];
     runtimeMaxProcesses?: number;
     // Task 22: the file-mode/feature-negotiation report, and the live SSE.
     report?: RuntimeReport;
@@ -653,6 +656,11 @@ function renderSection(
     createRPCMemberSpec: vi.fn(async () => ({}) as never),
     updateRPCMemberSpec: vi.fn(async () => ({}) as never),
     deleteRPCMemberSpec: vi.fn(async () => undefined),
+    // The Binaries tab and the binary pickers.
+    serverBinaries: vi.fn(async () => ({ data: opts.binaries ?? [] })),
+    createServerBinary: vi.fn(async () => ({}) as never),
+    updateServerBinary: vi.fn(async () => ({}) as never),
+    deleteServerBinary: vi.fn(async () => undefined),
     // The cluster head editor's member picker.
     clusterCandidates: vi.fn(async () => ({ data: [] })),
   };
@@ -1564,6 +1572,10 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       createRPCMemberSpec: vi.fn(async () => ({}) as never),
       updateRPCMemberSpec: vi.fn(async () => ({}) as never),
       deleteRPCMemberSpec: vi.fn(async () => undefined),
+      serverBinaries: vi.fn(async () => ({ data: [] })),
+      createServerBinary: vi.fn(async () => ({}) as never),
+      updateServerBinary: vi.fn(async () => ({}) as never),
+      deleteServerBinary: vi.fn(async () => undefined),
       clusterCandidates: vi.fn(async () => ({ data: [] })),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
@@ -4842,6 +4854,43 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(await screen.findByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
   });
 
+  it('offers a Binaries tab that also shows in file mode', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('tab', { name: t.binariesTab }));
+    expect(await screen.findByText(t.binariesEmpty)).toBeInTheDocument();
+    cleanup();
+    renderFileMode();
+    await screen.findByText(t.runtimeManagedLocally);
+    expect(screen.getByRole('tab', { name: t.binariesTab })).toBeInTheDocument();
+  });
+
+  it('fills the spec form binary from the server inventory and still takes free text', async () => {
+    renderSection({
+      binaries: [
+        {
+          path: '/opt/llama/llama-server',
+          kind: 'llama_server',
+          version: 'b1',
+          version_override: '',
+          effective_version: 'b1',
+          build: '',
+          commit: '',
+          version_source: 'agent',
+          source: 'agent',
+          allowed: true,
+          reported_at: '',
+        } satisfies ServerBinary,
+      ],
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const field = await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.mouseDown(field);
+    fireEvent.click(await screen.findByText('/opt/llama/llama-server'));
+    expect((field as HTMLInputElement).value).toBe('/opt/llama/llama-server');
+    fireEvent.change(field, { target: { value: '/somewhere/else' } });
+    expect((field as HTMLInputElement).value).toBe('/somewhere/else');
+  });
+
   it('offers an RPC tab that renders the member settings, and hides it in file mode', async () => {
     renderSection();
     fireEvent.click(await screen.findByRole('tab', { name: t.rpcTab }));
@@ -7706,6 +7755,7 @@ describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
       t.runtimeSpecs,
       t.runtimeCoresidency,
       t.rpcTab,
+      t.binariesTab,
       t.runtimeLimits,
       t.runtimeLiveStatus,
     ]);

@@ -8,7 +8,7 @@ import { RpcMemberSection } from './RpcMemberSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { PortalApiError } from '../api/transport';
 import { messages } from '../i18n';
-import type { PortalServer, RPCMemberSpec, RuntimeStatus } from '../api';
+import type { PortalServer, RPCMemberSpec, RuntimeStatus, ServerBinary } from '../api';
 
 const t = messages.de;
 
@@ -65,9 +65,11 @@ function setup(
     rows?: RuntimeStatus[];
     deleteError?: unknown;
     server?: PortalServer;
+    binaries?: ServerBinary[];
   } = {},
 ) {
   const api = {
+    serverBinaries: vi.fn().mockResolvedValue({ data: opts.binaries ?? [] }),
     rpcMemberSpecs: vi.fn().mockResolvedValue({ data: opts.specs ?? [] }),
     createRPCMemberSpec: vi.fn().mockResolvedValue(spec()),
     updateRPCMemberSpec: vi.fn().mockResolvedValue(spec()),
@@ -241,6 +243,44 @@ describe('RpcMemberSection manual member specs', () => {
     );
     await waitFor(() => expect(api.deleteRPCMemberSpec).toHaveBeenCalledWith('srv_1', 'rpcm_1'));
     expect(await screen.findByText(new RegExp(t.errorClusterMemberInUse))).toBeTruthy();
+  });
+});
+
+describe('RpcMemberSection binary picker', () => {
+  const rpcBinary = {
+    path: '/opt/llama/rpc-server',
+    kind: 'rpc_server',
+    version: 'b1',
+    version_override: '',
+    effective_version: 'b1',
+    build: '',
+    commit: '',
+    version_source: 'agent',
+    source: 'agent',
+    allowed: false,
+    reported_at: '',
+  } satisfies ServerBinary;
+
+  it('offers the inventory with the allow mark and fills the binary field', async () => {
+    const api = setup({ binaries: [rpcBinary] });
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
+    const field = await screen.findByLabelText(t.rpcMemberBinary);
+    fireEvent.mouseDown(field);
+    expect(await screen.findByText(t.binariesNotAllowed)).toBeTruthy();
+    fireEvent.click(screen.getByText('/opt/llama/rpc-server'));
+    expect((field as HTMLInputElement).value).toBe('/opt/llama/rpc-server');
+    expect(api.serverBinaries).toHaveBeenCalledWith('srv_1');
+  });
+
+  it('saves a typed path that is not in the inventory', async () => {
+    const api = setup({ binaries: [rpcBinary] });
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
+    fireEvent.change(await screen.findByLabelText(t.rpcMemberBinary), {
+      target: { value: '/unknown/rpc-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(api.createRPCMemberSpec).toHaveBeenCalled());
+    expect(api.createRPCMemberSpec.mock.calls[0][1].binary).toBe('/unknown/rpc-server');
   });
 });
 

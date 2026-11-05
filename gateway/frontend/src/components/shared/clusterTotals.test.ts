@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   clusterCellText,
+  clusterIncompleteCause,
   clusterTotalsView,
   clusterWithheldReason,
   isClusterHead,
@@ -135,5 +136,41 @@ describe('clusterWithheldReason', () => {
     ).toBe('runtime.cluster_port_unknown');
     expect(clusterWithheldReason(head())).toBe('');
     expect(clusterWithheldReason(undefined)).toBe('');
+  });
+});
+
+describe('clusterIncompleteCause', () => {
+  const incomplete = (members: ClusterMember[], over: Partial<RuntimeSpec> = {}) =>
+    head({ cluster_totals_complete: false, cluster_members: members, ...over });
+
+  it('is none for a complete total', () => {
+    const spec = head();
+    expect(clusterIncompleteCause(spec, clusterTotalsView(spec), 'ram', 0)).toBe('none');
+  });
+
+  it('blames a visible member first, then a hidden one', () => {
+    const named = incomplete([member({ ram_estimate_mb: 0 })]);
+    expect(clusterIncompleteCause(named, clusterTotalsView(named), 'ram', 0)).toBe('members');
+    const hidden = incomplete([member({ server_id: '', server_name: '', visible: false })]);
+    expect(clusterIncompleteCause(hidden, clusterTotalsView(hidden), 'ram', 4000)).toBe('hidden');
+  });
+
+  it('blames the head when its own value is the missing part and no member is', () => {
+    const spec = incomplete([member({ ram_estimate_mb: 1000 })]);
+    expect(clusterIncompleteCause(spec, clusterTotalsView(spec), 'ram', 0)).toBe('head');
+  });
+
+  it('does not call a CPU-only head own VRAM of zero missing', () => {
+    const spec = incomplete([member({ ram_estimate_mb: 1000 })], { gpus: [] });
+    expect(clusterIncompleteCause(spec, clusterTotalsView(spec), 'vram', 0)).toBe('unknown');
+    const gpuHead = incomplete([member({ ram_estimate_mb: 1000 })], {
+      gpus: [{ index: 0 }] as unknown as RuntimeSpec['gpus'],
+    });
+    expect(clusterIncompleteCause(gpuHead, clusterTotalsView(gpuHead), 'vram', 0)).toBe('head');
+  });
+
+  it('is unknown when nothing attributable explains the lower bound', () => {
+    const spec = incomplete([member({ ram_estimate_mb: 1000 })]);
+    expect(clusterIncompleteCause(spec, clusterTotalsView(spec), 'ram', 4000)).toBe('unknown');
   });
 });

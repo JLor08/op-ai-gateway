@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClusterTotalCell, ClusterWithheldNotice } from './ClusterTotalCell';
 import { messages } from '../i18n';
 import type { ClusterMember, RuntimeSpec } from '../api';
@@ -80,6 +80,35 @@ describe('ClusterTotalCell', () => {
     render(<ClusterTotalCell spec={spec} axis="ram" ownMb={0} t={t} />);
     expect(screen.getByTestId('cluster-total-ram').textContent).toBe('≥ 9000 MB');
     expect(screen.getByLabelText(`${t.clusterIncompleteTooltip}: CpuBox`)).toBeTruthy();
+  });
+});
+
+describe('ClusterTotalCell incomplete causes', () => {
+  it('says the head own value is missing when no member explains the lower bound', () => {
+    const spec = head([member({ ram_estimate_mb: 1000 })], false);
+    render(<ClusterTotalCell spec={spec} axis="ram" ownMb={0} t={t} />);
+    expect(screen.getByLabelText(t.clusterIncompleteHead)).toBeTruthy();
+  });
+
+  it('shows a neutral lower bound with no attributable cause', () => {
+    const spec = head([member({ ram_estimate_mb: 1000 })], false);
+    render(<ClusterTotalCell spec={spec} axis="ram" ownMb={4000} t={t} />);
+    expect(screen.getByLabelText(t.clusterIncompleteNeutral)).toBeTruthy();
+  });
+
+  it('keys breakdown rows by position so duplicate member names both show', () => {
+    const spec = head([
+      member({ server_name: 'Twin', ram_estimate_mb: 1000 }),
+      member({ position: 1, server_name: 'Twin', ram_estimate_mb: 2000 }),
+    ]);
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(<ClusterTotalCell spec={spec} axis="ram" ownMb={500} t={t} />);
+    fireEvent.click(screen.getByText(t.clusterBreakdown));
+    const panel = screen.getByTestId('cluster-breakdown-ram');
+    expect(panel.textContent).toContain(`Twin (${t.clusterBreakdownCpu}): 1000 MB`);
+    expect(panel.textContent).toContain(`Twin (${t.clusterBreakdownCpu}): 2000 MB`);
+    expect(spy.mock.calls.some((c) => String(c[0]).includes('same key'))).toBe(false);
+    spy.mockRestore();
   });
 });
 

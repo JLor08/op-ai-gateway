@@ -1165,6 +1165,8 @@ const clusterWireCodes = [
   'runtime.cluster_not_ready',
   'runtime.instance_busy',
   'runtime.cache_purge_failed',
+  // System settings.
+  'settings.netbird_direct_cluster_exists',
 ] as const;
 
 describe('RPC cluster codes', () => {

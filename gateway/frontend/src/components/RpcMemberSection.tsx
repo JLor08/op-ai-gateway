@@ -33,6 +33,7 @@ import { formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
+import { BinaryPicker, useServerBinaries } from './shared/BinaryPicker';
 import { SelectField } from './shared/SelectField';
 import { CheckboxGroup } from './shared/CheckboxGroup';
 import { ConfirmDialog } from './shared/ConfirmDialog';
@@ -207,6 +208,7 @@ export function RpcMemberSection({
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
+    | 'serverBinaries'
     | 'updateServer'
     | 'subscribeRuntimeStatus'
   >;
@@ -282,6 +284,7 @@ export function RpcMemberSection({
     t,
   );
   const specs = useMemo(() => specsData?.data ?? [], [specsData]);
+  const serverBinaries = useServerBinaries(api, server.id);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [errors, setErrors] = useState<Errors>({});
   const [saving, setSaving] = useState(false);
@@ -488,11 +491,14 @@ export function RpcMemberSection({
               }
               label={t.rpcMemberEnabled}
             />
-            <Field
+            <BinaryPicker
               id="rpc-member-binary"
               label={t.rpcMemberBinary}
+              t={t}
+              kind="rpc_server"
               value={editor.binary}
-              onChange={(e) => patchEditor({ binary: e.target.value })}
+              onChange={(binary) => patchEditor({ binary })}
+              binaries={serverBinaries}
               error={!!errors.binary}
               helperText={errors.binary}
             />

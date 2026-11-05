@@ -97,6 +97,8 @@ import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 import { RpcMemberSection } from './RpcMemberSection';
+import { BinariesSection } from './BinariesSection';
+import { BinaryPicker, binaryVersionFor, useServerBinaries } from './shared/BinaryPicker';
 import {
   ClusterHeadEditor,
   clusterBodyFields,
@@ -131,7 +133,7 @@ import { clusterWithheldReason, isClusterHead } from './shared/clusterTotals';
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
 // all, next to the model-mapping tab.
-type Tab = 'mapping' | 'specs' | 'coresidency' | 'rpc' | 'limits' | 'status';
+type Tab = 'mapping' | 'specs' | 'coresidency' | 'rpc' | 'binaries' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -1274,6 +1276,11 @@ export function RuntimeAdminSection({
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
+    // The Binaries tab and the binary pickers of the spec form and the RPC tab.
+    | 'serverBinaries'
+    | 'createServerBinary'
+    | 'updateServerBinary'
+    | 'deleteServerBinary'
     // The cluster head editor's member picker (it reads member GPUs through
     // serverHardware below).
     | 'clusterCandidates'
@@ -2592,6 +2599,7 @@ export function RuntimeAdminSection({
   const [appName, setAppName] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [binary, setBinary] = useState('');
+  const serverBinaries = useServerBinaries(api, server.id);
   const [argsText, setArgsText] = useState('');
   const [envText, setEnvText] = useState('');
   const [workDir, setWorkDir] = useState('');
@@ -4760,11 +4768,14 @@ export function RuntimeAdminSection({
               }
               label={t.runtimeSpecEnabled}
             />
-            <Field
+            <BinaryPicker
               id="runtime-spec-binary"
               label={t.runtimeSpecBinary}
+              t={t}
+              kind="llama_server"
               value={binary}
-              onChange={(e) => setBinary(e.target.value)}
+              onChange={setBinary}
+              binaries={serverBinaries}
               required
               placeholder="/usr/local/bin/llama-server"
             />
@@ -5598,6 +5609,7 @@ export function RuntimeAdminSection({
                 env={parseEnvText(envText, t).env}
                 headHasGpus={gpuRows.length > 0}
                 startupTimeoutSeconds={startupTimeoutSeconds}
+                headBinaryVersion={binaryVersionFor(serverBinaries, binary.trim())}
               />
             )}
 
@@ -5817,6 +5829,7 @@ export function RuntimeAdminSection({
         <Tab label={t.runtimeCoresidency} value="coresidency" />
         {/* File mode ignores gateway-side documents, so member specs written here would never apply. */}
         {!fileMode && <Tab label={t.rpcTab} value="rpc" />}
+        <Tab label={t.binariesTab} value="binaries" />
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
@@ -5949,6 +5962,7 @@ export function RuntimeAdminSection({
           onServerSaved={(saved) => setRpcSaved({ server: saved, propKey: rpcContentKey })}
         />
       )}
+      {tab === 'binaries' && <BinariesSection t={t} api={api} serverId={server.id} />}
       {tab === 'limits' && (
         <Panel
           titleId="runtime-limits-heading"

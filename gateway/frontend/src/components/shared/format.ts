@@ -191,6 +191,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'binary.not_found': 'errorBinaryNotFound',
   'binary.agent_owned': 'errorBinaryAgentOwned',
   'binary.request_failed': 'errorBinaryRequestFailed',
+  'settings.netbird_direct_cluster_exists': 'errorSettingsNetbirdDirectClusterExists',
   'server.lan_address_invalid': 'errorServerLanAddressInvalid',
   'runtime.cluster_lan_ack_required': 'errorClusterLanAckRequired',
   'runtime.cluster_member_in_use': 'errorClusterMemberInUse',

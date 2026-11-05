@@ -234,6 +234,7 @@ export function ClusterHeadEditor({
   env,
   headHasGpus,
   startupTimeoutSeconds,
+  headBinaryVersion = '',
 }: Readonly<{
   t: Translation;
   api: Pick<PortalApi, 'clusterCandidates' | 'serverHardware'>;
@@ -249,6 +250,10 @@ export function ClusterHeadEditor({
   env: Record<string, string>;
   headHasGpus: boolean;
   startupTimeoutSeconds: number;
+  // The version of the head's binary from the server's inventory ('' when
+  // unknown). Members carry no binary of their own: each runs the server's
+  // ggml-rpc-server matching this one.
+  headBinaryVersion?: string;
 }>) {
   const [pendingMode, setPendingMode] = useState<ClusterMemberMode | null>(null);
   const [pendingAck, setPendingAck] = useState<ClusterHeadState | null>(null);
@@ -600,6 +605,15 @@ export function ClusterHeadEditor({
               ),
             )}
           </Box>
+          {value.members.length > 0 && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              data-testid="cluster-members-binary"
+            >
+              {t.clusterMembersMatchingBinary(headBinaryVersion || t.binariesVersionUnknown)}
+            </Typography>
+          )}
           {stored?.cluster_enabled && stored.cluster_vram_total_mb !== undefined && (
             <Typography variant="body2">
               {`${t.clusterTotals}: VRAM ${stored.cluster_vram_total_mb} MB, RAM ${stored.cluster_ram_total_mb ?? 0} MB`}
@@ -645,6 +659,15 @@ export function ClusterHeadEditor({
                     </option>
                   ))}
                 </SelectField>
+              )}
+              {chosen?.rpc_binary && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  data-testid="cluster-candidate-binary"
+                >
+                  {`${chosen.rpc_binary} (${chosen.rpc_binary_version || t.binariesVersionUnknown})`}
+                </Typography>
               )}
               {value.memberMode === 'manual' && chosenSpecs.length > 1 && (
                 <>
