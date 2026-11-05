@@ -253,6 +253,10 @@ type ManagerOptions struct {
 	// GPUVendorNone, is the correct answer for a CPU-only host and makes
 	// that option a no-op rather than an error.
 	GPUVendor GPUVendor
+
+	// GPUVendors is the full detected vendor set (see GPUVendors). Optional;
+	// empty falls back to GPUVendor alone.
+	GPUVendors GPUVendors
 	// LogBufferBytes / LogBufferTotalBytes size the per-spec managed-process
 	// output retention and its fleet-wide ceiling (see LogStore). Both are
 	// OPERATOR settings from the agent's own local config -- memory on an AI
@@ -438,6 +442,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		policy:              opts.Policy,
 		getenv:              getenv,
 		gpuVendor:           opts.GPUVendor,
+		gpuVendors:          opts.GPUVendors,
 		specsFromLocalFile:  opts.SpecsFromLocalFile,
 		configFilesDir:      opts.ConfigFilesDir,
 		vramHeadroomMB:      max(0, opts.VRAMHeadroomMB),
@@ -1386,6 +1391,10 @@ type owner struct {
 	// not change under a running agent), so it is a plain field read by the
 	// owner goroutine and never written after construction.
 	gpuVendor GPUVendor
+	// gpuVendors is every vendor the host's GPU detection found, in precedence
+	// order. Only the generic device tokens' "auto" backend reads it; the
+	// single gpuVendor above keeps driving visibility and budgets.
+	gpuVendors GPUVendors
 	// specsFromLocalFile is ManagerOptions.SpecsFromLocalFile -- fixed for
 	// the process lifetime, so a plain field like gpuVendor above. Its only
 	// use is the masking rule for the reported launch command; see the option's
@@ -3802,7 +3811,7 @@ func (o *owner) startProcess(st *specState) {
 	// substitutes a decimal string for ${PORT}), so this dry run with a
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
-	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+	if _, _, err := ExpandPlaceholdersFor(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
@@ -3813,7 +3822,7 @@ func (o *owner) startProcess(st *specState) {
 	// rate-limited -- and before a port is acquired or anything is written. The
 	// checks are port-independent for the same reason the one above is. Only the
 	// filesystem writes, further down, are start failures.
-	if _, err := planSpecConfigFiles(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+	if _, err := planSpecConfigFilesFor(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
@@ -3831,7 +3840,7 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	ex, err := expandSpec(spec, port, o.gpuVendor, o.getenv, o.configFilesDir)
+	ex, err := expandSpecFor(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port
@@ -3847,7 +3856,7 @@ func (o *owner) startProcess(st *specState) {
 	// full disk, failed rename) -- a start failure that backs off and retries,
 	// the same shape as the ephemeral-port failure above, and NOT a
 	// not_permitted verdict, which would claim the config can never work.
-	if err := writeSpecConfigFiles(spec, port, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+	if err := writeSpecConfigFilesFor(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, err.Error(), 0, "")
 		o.failPending(st, ErrStartFailed)

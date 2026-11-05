@@ -22,6 +22,7 @@ import (
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
 	"op-ai-server-agent/internal/proxy"
+	"slices"
 
 	// runtimectl is internal/runtime. main.go itself imports no stdlib
 	// "runtime" package, so there is no LOCAL collision here -- the alias
@@ -166,9 +167,10 @@ func main() {
 	// rather than an error -- the same "hardware capability, not a
 	// negotiated feature" posture as the measurer below.
 	mgr := runtimectl.NewManager(runtimectl.ManagerOptions{
-		Policy:    localPolicy,
-		Getenv:    os.Getenv,
-		GPUVendor: runtimeGPUVendor(gpus),
+		Policy:     localPolicy,
+		Getenv:     os.Getenv,
+		GPUVendor:  runtimeGPUVendor(gpus),
+		GPUVendors: runtimeGPUVendors(gpus),
 		// Managed-process output retention (T3). Operator-owned, exactly
 		// like the allowlists above: how much of this host's memory goes to
 		// remembering what the models printed is the operator's call, and
@@ -425,6 +427,20 @@ func collectorNames(gpus []collector.GPUCollector) []string {
 		names = append(names, g.Name())
 	}
 	return names
+}
+
+// runtimeGPUVendors lists every distinct recognised vendor among the detected
+// collectors, in detection order. It feeds only the "auto" device backend
+// choice; the single vendor from runtimeGPUVendor still drives visibility.
+func runtimeGPUVendors(gpus []collector.GPUCollector) runtimectl.GPUVendors {
+	var out runtimectl.GPUVendors
+	for _, g := range gpus {
+		v := runtimectl.ParseGPUVendor(g.Name())
+		if v != runtimectl.GPUVendorNone && !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // runtimeGPUVendor picks the runtime manager's GPU vendor from the detected

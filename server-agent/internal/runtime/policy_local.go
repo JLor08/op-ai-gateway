@@ -806,7 +806,13 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
 func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
-	ex, err := expandSpec(spec, port, vendor, getenv, configFilesDir)
+	return ExpandPlaceholdersFor(spec, port, vendor, nil, getenv, configFilesDir)
+}
+
+// ExpandPlaceholdersFor is ExpandPlaceholders with the host's detected GPU
+// vendor set (see GPUVendors), used to resolve a spec's "auto" device backend.
+func ExpandPlaceholdersFor(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpecFor(spec, port, vendor, vendors, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -886,7 +892,10 @@ var deviceBackendByToken = map[string]string{
 // surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
 // secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
 // expandSpec resolves and masks them, expandConfigFileContent refuses them.
-func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string) (value string, handled bool, err error) {
+func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string, dev deviceContext) (value string, handled bool, err error) {
+	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
+		return v, true, derr
+	}
 	if inner == "PORT" {
 		return strconv.Itoa(port), true, nil
 	}
@@ -951,7 +960,15 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
 func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
+	return expandSpecFor(spec, port, vendor, nil, getenv, configFilesDir)
+}
+
+// expandSpecFor is expandSpec with the host's detected vendor set, which only
+// the generic device tokens (${DEVICES}, ${FIRST_LOCAL_DEVICE}) consult to
+// resolve an "auto" device backend. A nil set falls back to the single vendor.
+func expandSpecFor(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
+	dev := newDeviceContext(spec, vendor, vendors)
 
 	expand := func(s string) (string, []secretSpan, error) {
 		matches := placeholderPattern.FindAllStringIndex(s, -1)
@@ -967,7 +984,7 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 			match := s[m[0]:m[1]]
 			inner := match[2 : len(match)-1] // strip "${" and "}"
 
-			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir); handled {
+			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir, dev); handled {
 				if resolveErr != nil {
 					return "", nil, resolveErr
 				}
