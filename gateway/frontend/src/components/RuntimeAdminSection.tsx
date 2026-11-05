@@ -98,6 +98,13 @@ import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 import { RpcMemberSection } from './RpcMemberSection';
 import {
+  ClusterHeadEditor,
+  clusterBodyFields,
+  clusterSaveError,
+  clusterStateFromSpec,
+  emptyClusterState,
+} from './ClusterHeadEditor';
+import {
   INSTANCE_PARALLELISM_MAX,
   INSTANCES_MAX,
   instanceAddress,
@@ -290,6 +297,13 @@ function emptySpec(mappingId: string): RuntimeSpec {
     metrics_path: '',
     context_probe_path: '',
     config_files: [],
+    device_backend: 'auto',
+    cluster_enabled: false,
+    member_mode: 'automatic',
+    cluster_network: '',
+    rpc_transport: '',
+    lan_exposure_ack: false,
+    cluster_members: [],
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
@@ -632,6 +646,12 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // instances_min_exceeds_realtime (both derived on every read) have no
   // request counterpart and are dropped.
   //
+  // The cluster configuration (cluster_enabled, member_mode, cluster_network,
+  // rpc_transport, lan_exposure_ack, device_backend, cluster_members) rides
+  // `rest`: an absent cluster_enabled turns the cluster off and clears its
+  // membership. Its read view (the totals, the network and transport
+  // defaults and the warnings) is derived on every read and dropped.
+  //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
   // the stored value". Dropping it is therefore exactly what an override
@@ -655,6 +675,12 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     startup_measured_ms,
     effective_idle_timeout_seconds,
     instances_min_exceeds_realtime,
+    cluster_vram_total_mb,
+    cluster_ram_total_mb,
+    cluster_totals_complete,
+    cluster_network_default,
+    cluster_transport_default,
+    cluster_warnings,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -1245,6 +1271,9 @@ export function RuntimeAdminSection({
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
+    // The cluster head editor's member picker (it reads member GPUs through
+    // serverHardware below).
+    | 'clusterCandidates'
     // The live-status Start and Stop: transient, nothing is written.
     | 'startRuntime'
     | 'stopRuntime'
@@ -2662,6 +2691,10 @@ export function RuntimeAdminSection({
   // `config_files` clears the stored set, so this state is what keeps a save of
   // an unrelated field from deleting files that were set through the API.
   const [configFiles, setConfigFiles] = useState<ConfigFileRow[]>([]);
+  // The cluster head configuration and the spec's device backend, bound from
+  // the loaded spec and sent back by buildSpecBody for the same full-document
+  // reason: a save without them turns a cluster head into a plain spec.
+  const [cluster, setCluster] = useState(emptyClusterState);
   // undefined = "no opinion", and the request field is optional so this form
   // can say it. It genuinely has to: with Type on "Auto" the effective kind
   // is detected from the binary's basename, and that detection is Go-only --
@@ -2771,6 +2804,7 @@ export function RuntimeAdminSection({
     setMetricsPath('');
     setContextProbePath('');
     setConfigFiles([]);
+    setCluster(emptyClusterState());
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType(null);
   }
@@ -2841,6 +2875,7 @@ export function RuntimeAdminSection({
         content: f.content,
       })),
     );
+    setCluster(clusterStateFromSpec(spec));
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType({
       type: spec.type,
@@ -3260,7 +3295,21 @@ export function RuntimeAdminSection({
       // and this is the one place that decides what the full document says.
       // Plain {name, content} -- the row key is a render identity only.
       config_files: configFiles.map(({ name, content }) => ({ name, content })),
+      ...clusterBodyFields(cluster),
     };
+  }
+
+  // The cluster save checks the form can make itself (create and edit).
+  function clusterError(args: string[], env: Record<string, string>): string | undefined {
+    const key = clusterSaveError(cluster, {
+      args,
+      env,
+      type: specType,
+      replicable,
+      startupTimeoutSeconds,
+      stored: editingSpecMappingId ? specsById[editingSpecMappingId] : undefined,
+    });
+    return key ? t[key] : undefined;
   }
 
   // Refreshes what a committed spec write (create, edit, spec delete) can
@@ -3346,6 +3395,11 @@ export function RuntimeAdminSection({
     const instancesError = validateInstances(instanceForm(), listenPort, t);
     if (instancesError) {
       showError(instancesError);
+      return;
+    }
+    const clusterProblem = clusterError(args, parsedEnv.env);
+    if (clusterProblem) {
+      showError(clusterProblem);
       return;
     }
     setBusy(true);
@@ -3447,6 +3501,11 @@ export function RuntimeAdminSection({
     const instancesError = validateInstances(instanceForm(), listenPort, t);
     if (instancesError) {
       showError(instancesError);
+      return;
+    }
+    const clusterProblem = clusterError(args, parsedEnv.env);
+    if (clusterProblem) {
+      showError(clusterProblem);
       return;
     }
     setBusy(true);
@@ -5480,6 +5539,24 @@ export function RuntimeAdminSection({
                 </Button>
               </Box>
             </Box>
+
+            {/* Shown for llama.cpp, and for any spec that is still a head so
+                the operator can turn the cluster off after a type change. */}
+            {(specType === 'llama_cpp' || cluster.enabled) && (
+              <ClusterHeadEditor
+                t={t}
+                api={api}
+                mappingId={editingSpecMappingId}
+                headServer={server}
+                stored={currentSpec}
+                value={cluster}
+                onChange={setCluster}
+                args={parseArgsText(argsText)}
+                env={parseEnvText(envText, t).env}
+                headHasGpus={gpuRows.length > 0}
+                startupTimeoutSeconds={startupTimeoutSeconds}
+              />
+            )}
 
             <Box sx={{ display: 'flex', gap: 1.5 }}>
               <Button type="submit" variant="contained" disabled={busy}>

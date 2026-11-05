@@ -246,6 +246,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       createRPCMemberSpec: vi.fn(async () => ({}) as never),
       updateRPCMemberSpec: vi.fn(async () => ({}) as never),
       deleteRPCMemberSpec: vi.fn(async () => undefined),
+      clusterCandidates: vi.fn(async () => ({ data: [] })),
       runtimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
       putRuntimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
       runtimeWarnings: vi.fn(async () => ({ warnings: [] })),

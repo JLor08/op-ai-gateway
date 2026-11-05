@@ -213,6 +213,7 @@ export function ServerList({
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
+    | 'clusterCandidates'
     | 'runtimeCoresidency'
     | 'putRuntimeCoresidency'
     | 'runtimeWarnings'

@@ -318,6 +318,7 @@ function baseServerListApi(): ServerListApi {
     createRPCMemberSpec: vi.fn(async () => ({}) as never),
     updateRPCMemberSpec: vi.fn(async () => ({}) as never),
     deleteRPCMemberSpec: vi.fn(async () => undefined),
+    clusterCandidates: vi.fn(async () => ({ data: [] })),
     deleteServer: vi.fn(async () => ({ ok: true })),
     downloadAgentBinary: vi.fn(async () => new Blob()),
     generateAgentToken: vi.fn(async () => ({

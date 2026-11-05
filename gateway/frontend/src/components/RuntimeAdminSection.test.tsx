@@ -653,6 +653,8 @@ function renderSection(
     createRPCMemberSpec: vi.fn(async () => ({}) as never),
     updateRPCMemberSpec: vi.fn(async () => ({}) as never),
     deleteRPCMemberSpec: vi.fn(async () => undefined),
+    // The cluster head editor's member picker.
+    clusterCandidates: vi.fn(async () => ({ data: [] })),
   };
 
   const view = render(
@@ -1562,6 +1564,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       createRPCMemberSpec: vi.fn(async () => ({}) as never),
       updateRPCMemberSpec: vi.fn(async () => ({}) as never),
       deleteRPCMemberSpec: vi.fn(async () => undefined),
+      clusterCandidates: vi.fn(async () => ({ data: [] })),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     };
@@ -3296,6 +3299,23 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // spec stored through a FORM save carries `[]`, one from an older fixture
     // carries nothing, and the override must restate exactly what it read.
     ...(spec.config_files !== undefined ? { config_files: spec.config_files } : {}),
+    // The cluster configuration rides the same way: an absent cluster_enabled
+    // would clear a head's membership. Its read view never travels back.
+    ...Object.fromEntries(
+      (
+        [
+          'device_backend',
+          'cluster_enabled',
+          'member_mode',
+          'cluster_network',
+          'rpc_transport',
+          'lan_exposure_ack',
+          'cluster_members',
+        ] as const
+      )
+        .filter((key) => spec[key] !== undefined)
+        .map((key) => [key, spec[key]]),
+    ),
   };
 }
 
@@ -12034,5 +12054,177 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     // The 202's text says the instance starts and where its progress shows.
     expect(messages.en.runtimeStartedStarting('X')).toMatch(/starting/);
     expect(messages.en.runtimeStartedStarting('X')).toMatch(/status rows/);
+  });
+});
+
+// The spec PUT is a full document: a save without the cluster fields turns
+// the cluster off and clears its membership. Every save from the form must
+// therefore carry them, a member the caller cannot see included.
+describe('RuntimeAdminSection cluster head round trip', () => {
+  const visibleMember = {
+    position: 0,
+    server_id: 'srv_b',
+    server_name: 'Beta',
+    member_spec_id: '',
+    gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 7000 }],
+    threads: 8,
+    cache_enabled: true,
+    device_backend: 'cuda' as const,
+    ram_estimate_mb: 1024,
+    ram_measured_mb: 900,
+    stale: false,
+    port: 47001,
+    visible: true,
+  };
+  const hiddenMember = {
+    position: 1,
+    server_id: '',
+    server_name: '',
+    member_spec_id: '',
+    gpus: [],
+    threads: 0,
+    cache_enabled: false,
+    device_backend: '' as const,
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
+    stale: false,
+    port: 0,
+    visible: false,
+  };
+  function headSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+    return makeSpec({
+      configured: true,
+      id: 'spec_head',
+      mapping_id: 'map_1',
+      enabled: true,
+      type: 'llama_cpp',
+      binary: '/opt/llama/llama-server',
+      args: ['-m', '/m.gguf', '--rpc', '${RPC_SERVERS}', '--device', '${DEVICES}'],
+      startup_timeout_seconds: 900,
+      device_backend: 'cuda',
+      cluster_enabled: true,
+      member_mode: 'automatic',
+      cluster_network: 'lan',
+      rpc_transport: 'direct',
+      lan_exposure_ack: true,
+      cluster_members: [visibleMember, hiddenMember],
+      cluster_network_default: '',
+      cluster_transport_default: 'direct',
+      cluster_warnings: ['cluster_member_gpu_overlap'],
+      cluster_vram_total_mb: 16000,
+      cluster_ram_total_mb: 4096,
+      cluster_totals_complete: false,
+      ...overrides,
+    });
+  }
+
+  async function openEditAndSave(spec: RuntimeSpec) {
+    const view = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return view;
+  }
+
+  it('keeps every cluster field when an unrelated field changes', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    expect(screen.getByText(t.clusterMemberHidden)).toBeInTheDocument();
+    expect(screen.getByText(t.clusterWarnGpuOverlap)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+      target: { value: '/srv/models' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body.work_dir).toBe('/srv/models');
+    expect(body).toMatchObject({
+      cluster_enabled: true,
+      member_mode: 'automatic',
+      cluster_network: 'lan',
+      rpc_transport: 'direct',
+      lan_exposure_ack: true,
+      device_backend: 'cuda',
+      cluster_members: [visibleMember, hiddenMember],
+    });
+    // The read-only cluster view never travels back.
+    expect(body).not.toHaveProperty('cluster_warnings');
+    expect(body).not.toHaveProperty('cluster_network_default');
+    expect(body).not.toHaveProperty('cluster_vram_total_mb');
+  });
+
+  it('keeps the cluster on an override click', async () => {
+    const spec = headSpec();
+    const { putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_head' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimePinRunning }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body).toMatchObject({
+      admin_state: 'force_running',
+      cluster_enabled: true,
+      lan_exposure_ack: true,
+      cluster_members: spec.cluster_members,
+    });
+    expect(body).not.toHaveProperty('cluster_warnings');
+    expect(body).not.toHaveProperty('cluster_transport_default');
+    expect(body).not.toHaveProperty('cluster_totals_complete');
+  });
+
+  it('sends a spec that is no head as cluster off', async () => {
+    const { putSpecs } = await openEditAndSave(
+      makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/llama-server' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      cluster_enabled: false,
+      member_mode: 'automatic',
+      cluster_members: [],
+      device_backend: 'auto',
+    });
+  });
+
+  it('refuses a head save the gateway would refuse, before the round trip', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '-m\n/m.gguf' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorClusterRpcPlaceholderMissing)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('refuses the cluster placeholders on a spec that is no head', async () => {
+    const { putSpecs } = await openEditAndSave(
+      makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/llama-server' }),
+    );
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--rpc\n${RPC_SERVERS}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorClusterRpcPlaceholderWithoutCluster)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('accepts the device placeholders as plain placeholders', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: {
+        value:
+          '--rpc\n${RPC_SERVERS}\n--device\n${RPC_DEVICES},${DEVICES}\n-mmdev\n${FIRST_LOCAL_DEVICE}\n--alias\n${CUDA_FIRST_DEVICE}',
+      },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
   });
 });

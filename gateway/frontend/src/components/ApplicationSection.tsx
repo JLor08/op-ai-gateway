@@ -169,6 +169,7 @@ export function ApplicationSection({
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
+    | 'clusterCandidates'
     | 'runtimeSpec'
     | 'putRuntimeSpec'
     | 'deleteRuntimeSpec'

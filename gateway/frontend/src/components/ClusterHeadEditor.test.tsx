@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  ClusterHeadEditor,
+  clusterBodyFields,
+  clusterSaveError,
+  clusterStateFromSpec,
+  emptyClusterState,
+  type ClusterHeadState,
+} from './ClusterHeadEditor';
+import { messages } from '../i18n';
+import type {
+  ClusterCandidate,
+  ClusterMember,
+  HardwareResponse,
+  PortalServer,
+  RPCMemberSpec,
+  RuntimeSpec,
+} from '../api';
+
+const t = messages.de;
+
+afterEach(cleanup);
+
+const headServer = {
+  id: 'srv_head',
+  name: 'Head',
+  netbird_enabled: false,
+  lan_address: '',
+} as unknown as PortalServer;
+
+function member(over: Partial<ClusterMember> = {}): ClusterMember {
+  return {
+    position: 0,
+    server_id: 'srv_a',
+    server_name: 'Alpha',
+    member_spec_id: '',
+    gpus: [],
+    threads: 0,
+    cache_enabled: false,
+    device_backend: 'auto',
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
+    stale: false,
+    port: 0,
+    visible: true,
+    ...over,
+  };
+}
+
+// What the read view sends for a member on a server the caller may not
+// manage: its position and nothing else.
+function hiddenMember(position: number): ClusterMember {
+  return member({ position, server_id: '', server_name: '', gpus: [], visible: false });
+}
+
+function memberSpec(id: string, over: Partial<RPCMemberSpec> = {}): RPCMemberSpec {
+  return {
+    id,
+    server_id: 'srv_a',
+    enabled: true,
+    binary: '/opt/llama/ggml-rpc-server',
+    args: [],
+    env: {},
+    gpus: [],
+    cache_enabled: false,
+    device_backend: 'auto',
+    ram_estimate_mb: 0,
+    allowed_head_groups: [],
+    ...over,
+  };
+}
+
+function hardware(indices: number[]): HardwareResponse {
+  return {
+    available: true,
+    report: {
+      collected_at: '',
+      agent_version: '0.18.0',
+      os: 'linux',
+      arch: 'amd64',
+      cpu: {} as never,
+      memory: {} as never,
+      mainboard: {} as never,
+      bios: {} as never,
+      gpus: indices.map((index) => ({
+        index,
+        name: `RTX ${index}`,
+        memory_total_bytes: 24 * 1024 ** 3,
+      })),
+    },
+  };
+}
+
+function state(over: Partial<ClusterHeadState> = {}): ClusterHeadState {
+  return { ...emptyClusterState(), enabled: true, ...over };
+}
+
+function setup(
+  opts: {
+    initial?: ClusterHeadState;
+    stored?: Partial<RuntimeSpec>;
+    args?: string[];
+    env?: Record<string, string>;
+    mappingId?: string;
+    candidates?: ClusterCandidate[];
+    hardwareByServer?: Record<string, HardwareResponse>;
+    headHasGpus?: boolean;
+    server?: PortalServer;
+  } = {},
+) {
+  const api = {
+    clusterCandidates: vi.fn(async () => ({ data: opts.candidates ?? [] })),
+    serverHardware: vi.fn(
+      async (id: string) =>
+        opts.hardwareByServer?.[id] ?? ({ available: false } as HardwareResponse),
+    ),
+  };
+  const latest: { value: ClusterHeadState } = { value: opts.initial ?? state() };
+  function Harness() {
+    const [value, setValue] = useState<ClusterHeadState>(latest.value);
+    return (
+      <ClusterHeadEditor
+        t={t}
+        api={api}
+        mappingId={opts.mappingId ?? 'map_1'}
+        headServer={opts.server ?? headServer}
+        stored={opts.stored as RuntimeSpec | undefined}
+        value={value}
+        onChange={(next) => {
+          latest.value = next;
+          setValue(next);
+        }}
+        args={opts.args ?? ['--rpc', '${RPC_SERVERS}']}
+        env={opts.env ?? {}}
+        headHasGpus={opts.headHasGpus ?? false}
+        startupTimeoutSeconds={600}
+      />
+    );
+  }
+  render(<Harness />);
+  return { api, latest };
+}
+
+// MUI's select is not native: open it, then pick the option.
+function pick(label: string, option: string) {
+  fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+  fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: option }));
+}
+
+describe('ClusterHeadEditor cluster switch', () => {
+  it('asks for ${RPC_SERVERS} once the cluster is on and the args lack it', () => {
+    const { latest } = setup({ initial: emptyClusterState(), args: ['-m', '/m.gguf'] });
+    expect(screen.queryByText(t.clusterRpcHint)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.clusterEnabledLabel }));
+    expect(latest.value.enabled).toBe(true);
+    expect(screen.getByText(t.clusterRpcHint)).toBeInTheDocument();
+  });
+
+  it('does not ask once --rpc ${RPC_SERVERS} is there', () => {
+    setup({ args: ['--rpc', '${RPC_SERVERS}'] });
+    expect(screen.queryByText(t.clusterRpcHint)).not.toBeInTheDocument();
+  });
+
+  it('cannot turn a spec that is not saved yet into a head', () => {
+    setup({ initial: emptyClusterState(), mappingId: '' });
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+    expect(screen.getByText(t.clusterCreateFirst)).toBeInTheDocument();
+  });
+
+  it('shows the expected cold start against the head startup timeout', () => {
+    setup();
+    expect(screen.getByText(t.clusterColdStart(600))).toBeInTheDocument();
+  });
+});
+
+describe('ClusterHeadEditor member mode', () => {
+  it('confirms a switch that replaces the member list', async () => {
+    const { latest } = setup({ initial: state({ members: clusterRows([member()]) }) });
+    pick(t.clusterMemberMode, t.clusterMemberModeManual);
+    expect(screen.getByText(t.clusterModeSwitchBody)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(latest.value.memberMode).toBe('automatic');
+    expect(latest.value.members).toHaveLength(1);
+
+    pick(t.clusterMemberMode, t.clusterMemberModeManual);
+    fireEvent.click(screen.getByRole('button', { name: t.clusterModeSwitchConfirm }));
+    expect(latest.value.memberMode).toBe('manual');
+    expect(latest.value.members).toEqual([]);
+  });
+
+  it('switches without asking while there are no members', () => {
+    const { latest } = setup();
+    pick(t.clusterMemberMode, t.clusterMemberModeManual);
+    expect(screen.queryByText(t.clusterModeSwitchBody)).not.toBeInTheDocument();
+    expect(latest.value.memberMode).toBe('manual');
+  });
+});
+
+describe('ClusterHeadEditor member order', () => {
+  it('moves a member and sends the new order and positions', () => {
+    const { latest } = setup({
+      initial: state({
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', position: 0 }),
+          member({ server_id: 'srv_b', server_name: 'Beta', position: 1 }),
+        ]),
+      }),
+    });
+    fireEvent.click(screen.getByRole('button', { name: `${t.modelGroupMoveDown}: Alpha` }));
+    const body = clusterBodyFields(latest.value);
+    expect(body.cluster_members?.map((m) => [m.server_id, m.position])).toEqual([
+      ['srv_b', 0],
+      ['srv_a', 1],
+    ]);
+  });
+
+  it('removes a member', () => {
+    const { latest } = setup({
+      initial: state({ members: clusterRows([member({ server_name: 'Alpha' })]) }),
+    });
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberRemove}: Alpha` }));
+    expect(latest.value.members).toEqual([]);
+  });
+});
+
+describe('ClusterHeadEditor automatic members', () => {
+  it('adds a server from the automatic candidates and orders its GPUs', async () => {
+    const { api, latest } = setup({
+      candidates: [
+        { server_id: 'srv_a', server_name: 'Alpha', rpc_binary: '/b', rpc_binary_version: 'b1' },
+      ],
+      hardwareByServer: { srv_a: hardware([0, 1]) },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await waitFor(() => expect(api.clusterCandidates).toHaveBeenCalledWith('map_1', 'automatic'));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(latest.value.members.map((m) => m.server_id)).toEqual(['srv_a']);
+
+    await waitFor(() => expect(api.serverHardware).toHaveBeenCalledWith('srv_a'));
+    const gpuLabel = `${t.clusterMemberGpuAdd}: Alpha`;
+    await screen.findByRole('combobox', { name: gpuLabel });
+    pick(gpuLabel, 'GPU 1 · RTX 1');
+    pick(gpuLabel, 'GPU 0 · RTX 0');
+    expect(latest.value.members[0].gpus.map((g) => g.index)).toEqual([1, 0]);
+
+    fireEvent.click(screen.getByRole('button', { name: `${t.modelGroupMoveUp}: Alpha GPU 0` }));
+    const body = clusterBodyFields(latest.value);
+    expect(body.cluster_members?.[0].gpus.map((g) => g.index)).toEqual([0, 1]);
+  });
+
+  it('edits the member settings', () => {
+    const { latest } = setup({
+      initial: state({ members: clusterRows([member({ server_name: 'Alpha' })]) }),
+    });
+    fireEvent.change(screen.getByLabelText(`Alpha: ${t.clusterMemberThreads}`), {
+      target: { value: '8' },
+    });
+    fireEvent.change(screen.getByLabelText(`Alpha: ${t.clusterMemberRamEstimate}`), {
+      target: { value: '2048' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: `Alpha: ${t.rpcMemberCache}` }));
+    expect(latest.value.members[0]).toMatchObject({
+      threads: 8,
+      ram_estimate_mb: 2048,
+      cache_enabled: true,
+    });
+  });
+
+  it('says what a server needs when none is offered', async () => {
+    setup({ candidates: [] });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    expect(await screen.findByText(t.clusterCandidatesEmptyAutomatic)).toBeInTheDocument();
+  });
+});
+
+describe('ClusterHeadEditor manual members', () => {
+  it('asks for the spec when a server has several free ones', async () => {
+    const { api, latest } = setup({
+      initial: state({ memberMode: 'manual' }),
+      candidates: [
+        {
+          server_id: 'srv_a',
+          server_name: 'Alpha',
+          member_specs: [memberSpec('rpcm_1'), memberSpec('rpcm_2')],
+        },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await waitFor(() => expect(api.clusterCandidates).toHaveBeenCalledWith('map_1', 'manual'));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    expect(screen.getByText(t.clusterMemberSpecPick)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t.clusterMemberAddConfirm })).toBeDisabled();
+    pick(t.clusterMemberSpec, 'rpcm_2');
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(latest.value.members[0]).toMatchObject({ server_id: 'srv_a', member_spec_id: 'rpcm_2' });
+  });
+
+  it('resolves a server with one free spec to it', async () => {
+    const { latest } = setup({
+      initial: state({ memberMode: 'manual' }),
+      candidates: [
+        { server_id: 'srv_a', server_name: 'Alpha', member_specs: [memberSpec('rpcm_1')] },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    expect(screen.queryByText(t.clusterMemberSpecPick)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(latest.value.members[0].member_spec_id).toBe('rpcm_1');
+  });
+});
+
+describe('ClusterHeadEditor network and transport', () => {
+  it('shows the stored defaults with their reasons', () => {
+    setup({
+      stored: { cluster_network_default: 'mesh', cluster_transport_default: 'relay' },
+    });
+    expect(screen.getByRole('combobox', { name: t.clusterNetwork })).toHaveTextContent(
+      t.clusterDefaultOption(t.clusterNetworkMesh),
+    );
+    expect(screen.getByText(t.clusterNetworkReasonMesh)).toBeInTheDocument();
+    expect(screen.getByText(t.clusterTransportReasonMeshRelay)).toBeInTheDocument();
+  });
+
+  it('confirms the LAN exposure before direct + LAN takes effect', async () => {
+    const { latest } = setup({ initial: state({ network: 'lan', transport: 'relay' }) });
+    expect(screen.getByText(t.clusterLanAddressHint)).toBeInTheDocument();
+    pick(t.clusterTransport, t.clusterTransportDirect);
+    expect(screen.getByText(t.clusterLanAckBody)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(latest.value.transport).toBe('relay');
+    expect(latest.value.lanAck).toBe(false);
+
+    pick(t.clusterTransport, t.clusterTransportDirect);
+    fireEvent.click(screen.getByRole('button', { name: t.clusterLanAckConfirm }));
+    expect(latest.value).toMatchObject({ transport: 'direct', lanAck: true });
+    expect(screen.getByText(t.clusterLanAckGiven)).toBeInTheDocument();
+    expect(clusterBodyFields(latest.value).lan_exposure_ack).toBe(true);
+  });
+
+  it('flags a NetBird head without a LAN address in a LAN cluster', () => {
+    setup({
+      initial: state({ network: 'lan', transport: 'relay' }),
+      server: { ...headServer, netbird_enabled: true, lan_address: '' } as PortalServer,
+    });
+    expect(screen.getByText(t.clusterLanAddressHeadMissing)).toBeInTheDocument();
+  });
+});
+
+describe('ClusterHeadEditor hints and warnings', () => {
+  it('renders the stored cluster warnings with their labels', () => {
+    setup({
+      stored: {
+        cluster_enabled: true,
+        cluster_warnings: ['cluster_cpu_member_without_tensor_split', 'cluster_member_gpu_overlap'],
+      },
+    });
+    expect(screen.getByText(t.clusterWarnCpuMemberWithoutTensorSplit)).toBeInTheDocument();
+    expect(screen.getByText(t.clusterWarnGpuOverlap)).toBeInTheDocument();
+  });
+
+  it('recommends the RPC devices first', () => {
+    setup({
+      args: ['--rpc', '${RPC_SERVERS}', '--device', 'CUDA0,${RPC_DEVICES}'],
+      headHasGpus: true,
+    });
+    expect(screen.getByText(t.clusterDeviceOrderHint)).toBeInTheDocument();
+    expect(screen.queryByText(t.clusterMmdevHint)).not.toBeInTheDocument();
+  });
+
+  it('recommends -mmdev when the list starts with RPC devices', () => {
+    setup({ args: ['--rpc', '${RPC_SERVERS}', '--device', '${DEVICES}'], headHasGpus: true });
+    expect(screen.getByText(t.clusterMmdevHint)).toBeInTheDocument();
+    expect(screen.queryByText(t.clusterDeviceOrderHint)).not.toBeInTheDocument();
+  });
+});
+
+describe('ClusterHeadEditor hidden members', () => {
+  it('shows a hidden member in place, locks the membership and sends it back unchanged', () => {
+    const hidden = hiddenMember(1);
+    const spec = {
+      cluster_enabled: true,
+      member_mode: 'automatic',
+      cluster_network: 'lan',
+      rpc_transport: 'relay',
+      lan_exposure_ack: false,
+      device_backend: 'auto',
+      cluster_members: [
+        member({ server_id: 'srv_a', server_name: 'Alpha', position: 0 }),
+        hidden,
+        member({ server_id: 'srv_b', server_name: 'Beta', position: 2 }),
+      ],
+    } as RuntimeSpec;
+    const { latest } = setup({ initial: clusterStateFromSpec(spec), stored: spec });
+
+    const rows = screen.getAllByTestId('cluster-member-row');
+    expect(rows).toHaveLength(3);
+    expect(rows[1]).toHaveTextContent(t.clusterMemberHidden);
+    expect(screen.getByText(t.clusterMembersLocked)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+    expect(screen.getByRole('button', { name: t.clusterMemberAdd })).toBeDisabled();
+    expect(screen.getByRole('button', { name: `${t.modelGroupMoveDown}: Alpha` })).toBeDisabled();
+    expect(screen.getByRole('button', { name: `${t.clusterMemberRemove}: Beta` })).toBeDisabled();
+    expect(within(rows[1]).queryAllByRole('button')).toHaveLength(0);
+
+    const body = clusterBodyFields(latest.value);
+    expect(body.cluster_members?.[1]).toEqual(hidden);
+    expect(body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a', '', 'srv_b']);
+  });
+});
+
+describe('clusterSaveError', () => {
+  const base = {
+    type: 'llama_cpp' as const,
+    replicable: false,
+    startupTimeoutSeconds: 600,
+  };
+
+  it('refuses the cluster placeholders without a cluster', () => {
+    expect(
+      clusterSaveError(emptyClusterState(), {
+        ...base,
+        args: ['--rpc', '${RPC_SERVERS}'],
+        env: {},
+      }),
+    ).toBe('errorClusterRpcPlaceholderWithoutCluster');
+    expect(clusterSaveError(emptyClusterState(), { ...base, args: [], env: {} })).toBeNull();
+  });
+
+  it('runs the head document checks', () => {
+    const s = state({ members: clusterRows([member()]) });
+    expect(clusterSaveError(s, { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} })).toBeNull();
+    expect(clusterSaveError(s, { ...base, args: ['--rpc', 'x'], env: {} })).toBe(
+      'errorClusterRpcPlaceholderMissing',
+    );
+    expect(clusterSaveError(state(), { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} })).toBe(
+      'errorClusterMembersRequired',
+    );
+    expect(
+      clusterSaveError(s, {
+        ...base,
+        startupTimeoutSeconds: 0,
+        args: ['--rpc', '${RPC_SERVERS}'],
+        env: {},
+      }),
+    ).toBe('errorClusterStartupTimeoutRequired');
+  });
+
+  it('refuses one server twice', () => {
+    const s = state({
+      members: clusterRows([member({ server_id: 'srv_a' }), member({ server_id: 'srv_a' })]),
+    });
+    expect(clusterSaveError(s, { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} })).toBe(
+      'errorClusterMemberServerTwice',
+    );
+  });
+
+  it('refuses direct + LAN without the exposure confirmation', () => {
+    const s = state({
+      network: 'lan',
+      transport: 'direct',
+      members: clusterRows([member()]),
+    });
+    expect(clusterSaveError(s, { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} })).toBe(
+      'errorClusterLanAckRequired',
+    );
+    expect(
+      clusterSaveError(
+        { ...s, lanAck: true },
+        { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} },
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('clusterStateFromSpec / clusterBodyFields', () => {
+  it('round-trips every cluster field of a head', () => {
+    const spec = {
+      cluster_enabled: true,
+      member_mode: 'manual',
+      cluster_network: 'lan',
+      rpc_transport: 'direct',
+      lan_exposure_ack: true,
+      device_backend: 'vulkan',
+      cluster_members: [
+        member({
+          server_id: 'srv_a',
+          member_spec_id: 'rpcm_1',
+          gpus: [{ index: 2, vram_estimate_mb: 1000, vram_measured_mb: 900 }],
+          port: 47001,
+        }),
+      ],
+    } as RuntimeSpec;
+    expect(clusterBodyFields(clusterStateFromSpec(spec))).toEqual({
+      cluster_enabled: true,
+      member_mode: 'manual',
+      cluster_network: 'lan',
+      rpc_transport: 'direct',
+      lan_exposure_ack: true,
+      device_backend: 'vulkan',
+      cluster_members: spec.cluster_members,
+    });
+  });
+
+  it('reads a spec from before the cluster fields as no cluster', () => {
+    expect(clusterBodyFields(clusterStateFromSpec({} as RuntimeSpec))).toEqual({
+      cluster_enabled: false,
+      member_mode: 'automatic',
+      cluster_network: '',
+      rpc_transport: '',
+      lan_exposure_ack: false,
+      device_backend: 'auto',
+      cluster_members: [],
+    });
+  });
+});
+
+// Member rows as the editor holds them, built through the same reader the
+// form hydrates with.
+function clusterRows(members: ClusterMember[]) {
+  return clusterStateFromSpec({ cluster_members: members } as RuntimeSpec).members;
+}
