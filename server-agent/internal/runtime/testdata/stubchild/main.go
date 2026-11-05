@@ -57,8 +57,13 @@ func main() {
 	flag.String("d", "", "accepted and ignored: the member's device list")
 	flag.Bool("c", false, "accepted and ignored: the member's cache switch")
 	flag.Int("t", 0, "accepted and ignored: the operator's thread count")
+	printText := flag.String("print", "", "if set, write this text to stdout at startup, with \\n read as a newline -- stands in for the banner or error output of a real llama.cpp process")
 	argvLog := flag.String("argv-log", "", "if set, write this process's argv (space-joined, without the program name) -- the only way to observe from the parent's test the exact command line the manager launched")
 	flag.Parse()
+
+	if *printText != "" {
+		fmt.Print(strings.ReplaceAll(*printText, `\n`, "\n"))
+	}
 
 	if *argvLog != "" {
 		if err := os.WriteFile(*argvLog, []byte(strings.Join(os.Args[1:], " ")), 0o644); err != nil {

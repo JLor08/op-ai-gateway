@@ -820,6 +820,11 @@ type Status struct {
 	// gateway's cold-start figure for the instance.
 	StartupMS int `json:"startup_ms,omitempty"`
 
+	// RPCProtocol is the RPC protocol version a running rpc_server member
+	// announced in its startup banner; empty otherwise. It is not part of the
+	// status wire form itself: telemetry reports it under the member's rpc block.
+	RPCProtocol string `json:"-"`
+
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by
 	// snapshotStatus -- see the type doc above. Not lifecycle state, and

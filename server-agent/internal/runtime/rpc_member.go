@@ -212,7 +212,15 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 	defer ticker.Stop()
 	for {
 		if probeTCP(addr, 2*time.Second) {
-			o.m.postCmd(cmdStartResult{specID: specID, proc: proc, ok: true})
+			res := cmdStartResult{specID: specID, proc: proc, ok: true}
+			if banner, found := awaitMemberBanner(proc, deadline); found {
+				res.rpcProtocol = banner.Protocol
+				if want := expectedMemberDevices(spec); len(banner.Devices) != want {
+					res.deviceMismatch = fmt.Sprintf("runtime: the rpc-server listed %d device(s) (%s) but the spec selects %d",
+						len(banner.Devices), strings.Join(banner.Devices, ", "), want)
+				}
+			}
+			o.m.postCmd(res)
 			return
 		}
 		if time.Now().After(deadline) {

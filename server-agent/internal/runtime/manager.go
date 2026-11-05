@@ -984,6 +984,11 @@ type cmdStartResult struct {
 	proc   *runningProc
 	ok     bool
 	err    error
+	// rpcProtocol is the protocol version an rpc_server member announced in its
+	// startup banner; deviceMismatch, when set, is the verdict that the banner
+	// lists a different number of devices than the spec selects.
+	rpcProtocol    string
+	deviceMismatch string
 }
 
 func (cmdStartResult) isCommand() {}
@@ -1161,6 +1166,10 @@ type specState struct {
 	// copies of one unchanged base are DeepEqual, which is what keeps an
 	// unchanged push from restarting instances.
 	spec Spec
+
+	// rpcProtocol is the RPC protocol version the running rpc_server member
+	// announced in its startup banner; empty when none was seen.
+	rpcProtocol string
 
 	// instance is this state's instance index k: 0 for the spec's own process
 	// (and for every spec that never replicates), k >= 1 for a further
@@ -2445,9 +2454,15 @@ func (o *owner) deleteState(id string) {
 // event, leaving a request queued on it to its admission timeout. Every refusal
 // goes through here or through setPendingVRAMUnknown.
 func (o *owner) setNotPermitted(st *specState, message string) {
+	o.setNotPermittedCode(st, message, "")
+}
+
+// setNotPermittedCode is setNotPermitted for a verdict that carries a stable
+// error code.
+func (o *owner) setNotPermittedCode(st *specState, message, code string) {
 	o.setState(st, StateNotPermitted)
 	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
-	st.lastError = &LastError{Message: message, At: time.Now()}
+	st.lastError = &LastError{Message: message, At: time.Now(), Code: code}
 	o.failPending(st, ErrNotPermitted)
 	o.wakeSiblingsWaitingFor(st)
 }
@@ -4129,7 +4144,16 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		slog.Debug("runtime: discarding start result for a draining generation", "spec", c.specID, "ok", c.ok)
 		return
 	}
+	if c.ok && c.deviceMismatch != "" {
+		// The member is listening but exposes the wrong devices: serving
+		// requests with it would silently shrink the cluster. Refuse it before
+		// it is ever reported running; only a config change can fix it.
+		o.setNotPermittedCode(st, c.deviceMismatch, codeRPCDeviceCountMismatch)
+		o.terminateNow(st, c.proc)
+		return
+	}
 	if c.ok {
+		st.rpcProtocol = c.rpcProtocol
 		if st.hasRunBefore {
 			st.restarts++
 		}
@@ -4232,6 +4256,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	cancelTimer(o.m, &proc.drainTimer)
 	cancelTimer(o.m, &proc.stableTimer)
 	st.proc = nil
+	st.rpcProtocol = ""
 	// C3 fix: the generation's requests are dead by definition. Without
 	// this, a request in flight when the child crashed left InFlight stuck
 	// above zero forever, and Admit's isEvictable (which requires
@@ -4409,6 +4434,24 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		o.wakeAdmissionCandidates()
 		return
 	}
+
+	// A cluster head or rpc_server member that died with a known llama.cpp RPC
+	// message is classified. A terminal verdict on a START that never became
+	// healthy cannot be fixed by retrying, so it rests as not_permitted without
+	// backoff; every other classified exit keeps the ordinary handling below
+	// and only gains its error code.
+	class, classified := classifyExit(st.spec, tail)
+	if classified && class.Terminal && !wasHealthy {
+		o.setNotPermittedCode(st, exitClassMessage(st.spec, tail, exitCode), class.Code)
+		st.lastError.ExitCode, st.lastError.StderrTail = exitCode, tail
+		o.wakeAdmissionCandidates()
+		return
+	}
+	defer func() {
+		if classified && st.lastError != nil {
+			st.lastError.Code = class.Code
+		}
+	}()
 
 	if wasHealthy {
 		o.setState(st, StateCrashed)
@@ -5187,15 +5230,16 @@ func (o *owner) snapshotStatus() []Status {
 			// gateway sees exactly the rows it always did for a spec that never
 			// replicates and a newer one folds instance rows by spec; the
 			// instance address as the model; and the instance index.
-			SpecID:    specBase(st.spec),
-			Instance:  st.instance,
-			Model:     InstanceAddress(st.spec.UpstreamModel, st.instance),
-			StartupMS: st.startupMS,
-			State:     st.state,
-			Since:     st.since,
-			InFlight:  st.inFlight,
-			Restarts:  st.restarts,
-			LastError: st.lastError,
+			SpecID:      specBase(st.spec),
+			Instance:    st.instance,
+			Model:       InstanceAddress(st.spec.UpstreamModel, st.instance),
+			StartupMS:   st.startupMS,
+			RPCProtocol: st.rpcProtocol,
+			State:       st.state,
+			Since:       st.since,
+			InFlight:    st.inFlight,
+			Restarts:    st.restarts,
+			LastError:   st.lastError,
 			// Probe config (Task 9): pure struct copies of the spec's own
 			// resolved fields, no I/O -- this runs on the owner's single
 			// command goroutine, which must never block on a network probe.
