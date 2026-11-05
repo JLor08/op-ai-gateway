@@ -107,21 +107,31 @@ func localDeviceNames(spec Spec, prefix string, renumbered bool) []string {
 }
 
 // deviceContext carries what the cluster/generic device tokens need beyond the
-// spec: the detected vendors and whether the child will see renumbered devices.
+// spec: the detected vendors and the visibility variable the agent injects.
 type deviceContext struct {
-	vendors    GPUVendors
-	renumbered bool
+	vendors GPUVendors
+	visVar  string
 }
 
 func newDeviceContext(spec Spec, vendor GPUVendor, vendors GPUVendors) deviceContext {
 	if len(vendors) == 0 && vendor != GPUVendorNone {
 		vendors = GPUVendors{vendor}
 	}
-	return deviceContext{
-		vendors: vendors,
-		renumbered: spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs &&
-			VisibleDevicesVar(vendor) != "",
+	return deviceContext{vendors: vendors, visVar: injectedVisibleDevicesVar(spec, vendor)}
+}
+
+// renumbers reports whether the child sees its devices numbered from 0 under
+// prefix: only when an injected visibility variable governs that backend
+// (CUDA_VISIBLE_DEVICES for CUDA, ROCR_VISIBLE_DEVICES for ROCm). Vulkan, SYCL
+// and Metal enumerate independently of those variables.
+func (d deviceContext) renumbers(prefix string) bool {
+	switch d.visVar {
+	case "CUDA_VISIBLE_DEVICES":
+		return prefix == backendCUDA
+	case "ROCR_VISIBLE_DEVICES":
+		return prefix == backendROCm
 	}
+	return false
 }
 
 // resolveClusterDeviceToken resolves ${RPC_SERVERS}, ${RPC_DEVICES},
@@ -158,7 +168,9 @@ func resolveClusterDeviceToken(inner string, spec Spec, dev deviceContext) (valu
 			"VULKAN_FIRST_DEVICE": backendVulkan,
 			"METAL_FIRST_DEVICE":  backendMetal,
 		}[inner]
-		return localDeviceNames(spec, prefix, dev.renumbered)[0], true, nil
+		// Explicit-backend tokens render like their ${*_DEVICES} siblings: the
+		// declared host index, never renumbered.
+		return localDeviceNames(spec, prefix, false)[0], true, nil
 	}
 	return "", false, nil
 }
@@ -175,7 +187,7 @@ func resolveGenericDevices(inner string, spec Spec, dev deviceContext) (string, 
 		if err != nil {
 			return "", true, fmt.Errorf("${%s} cannot be resolved: %w", inner, err)
 		}
-		local = localDeviceNames(spec, prefix, dev.renumbered)
+		local = localDeviceNames(spec, prefix, dev.renumbers(prefix))
 	}
 	rpc := rpcDeviceNames(spec)
 	if inner == "FIRST_LOCAL_DEVICE" {

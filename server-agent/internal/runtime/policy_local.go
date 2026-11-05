@@ -222,6 +222,17 @@ func VisibleDevicesVar(vendor GPUVendor) string {
 	}
 }
 
+// injectedVisibleDevicesVar is the single rule for whether the agent puts a
+// visibility variable into the child's environment, and which one: only for a
+// SetVisibleDevices spec in env mode on a vendor that has such a variable.
+// Empty means nothing is injected and the child sees the declared host indices.
+func injectedVisibleDevicesVar(spec Spec, vendor GPUVendor) string {
+	if !spec.SetVisibleDevices || spec.VisibleDevicesMode == VisibleDevicesModeArgs {
+		return ""
+	}
+	return VisibleDevicesVar(vendor)
+}
+
 // visibleDevicesOwnedVars is the set of environment variables the
 // SetVisibleDevices option OWNS: a spec may not hand-set any of them while the
 // option is on (ExpandPlaceholders refuses the pair outright -- trap 3).
@@ -805,14 +816,8 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // that performed the substitution. command.go turns that into the masked,
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
-func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
-	return ExpandPlaceholdersFor(spec, port, vendor, nil, getenv, configFilesDir)
-}
-
-// ExpandPlaceholdersFor is ExpandPlaceholders with the host's detected GPU
-// vendor set (see GPUVendors), used to resolve a spec's "auto" device backend.
-func ExpandPlaceholdersFor(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
-	ex, err := expandSpecFor(spec, port, vendor, vendors, getenv, configFilesDir)
+func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, vendor, vendors, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -959,14 +964,10 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 // observable; it changes no classification and no error. A failing match
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
-func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
-	return expandSpecFor(spec, port, vendor, nil, getenv, configFilesDir)
-}
-
-// expandSpecFor is expandSpec with the host's detected vendor set, which only
-// the generic device tokens (${DEVICES}, ${FIRST_LOCAL_DEVICE}) consult to
-// resolve an "auto" device backend. A nil set falls back to the single vendor.
-func expandSpecFor(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
+// vendors is the host's detected vendor set, which only the generic device
+// tokens (${DEVICES}, ${FIRST_LOCAL_DEVICE}) consult to resolve an "auto"
+// device backend; nil falls back to the single vendor.
+func expandSpec(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
 	dev := newDeviceContext(spec, vendor, vendors)
 
@@ -1155,12 +1156,10 @@ func expandSpecFor(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, ge
 	// baseEnvNames reservation guarantees it for PATH. A "" name means Apple
 	// or an unrecognised stack: nothing is appended and the child's
 	// environment is byte-identical to the SetVisibleDevices-off one.
-	if spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs {
-		if name := VisibleDevicesVar(vendor); name != "" {
-			resultEnv = append(resultEnv, name+"="+gpuIDs)
-			resultSpans = append(resultSpans, nil)
-			fromSpec = append(fromSpec, false)
-		}
+	if name := injectedVisibleDevicesVar(spec, vendor); name != "" {
+		resultEnv = append(resultEnv, name+"="+gpuIDs)
+		resultSpans = append(resultSpans, nil)
+		fromSpec = append(fromSpec, false)
 	}
 	for _, k := range envKeys {
 		v, spans, expandErr := expand(spec.Env[k])

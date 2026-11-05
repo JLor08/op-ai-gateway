@@ -1,6 +1,9 @@
 package runtime
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func clusterHeadSpec(args ...string) Spec {
 	return Spec{
@@ -53,6 +56,15 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 			s.VisibleDevicesMode = VisibleDevicesModeEnv
 			return s
 		}(), "${DEVICES}", GPUVendorApple, GPUVendors{GPUVendorApple}, "RPC0,RPC1,RPC2,MTL3,MTL2", false},
+		{"env first local renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${FIRST_LOCAL_DEVICE}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "CUDA0", false},
+		{"env explicit CUDA first never renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${CUDA_FIRST_DEVICE}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "CUDA3", false},
+		{"env explicit Vulkan first never renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${VULKAN_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "Vulkan3", false},
+		{"env amd renumbers ROCm", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUVendorAMD, GPUVendors{GPUVendorAMD}, "ROCm0,ROCm1", false},
+		{"env mixed host auto Vulkan not renumbered", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}, "Vulkan3,Vulkan2", false},
+		{"env explicit vulkan not renumbered", Spec{GPUs: gpus, DeviceBackend: "vulkan", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUVendorNVIDIA, nil, "Vulkan3,Vulkan2", false},
+		{"env explicit sycl not renumbered", Spec{GPUs: gpus, DeviceBackend: "sycl", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${FIRST_LOCAL_DEVICE}", GPUVendorNVIDIA, nil, "SYCL3", false},
+		{"zero-count endpoint adds no rpc devices", Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 0}, {Address: "b", DeviceCount: 2}}}}, "${RPC_DEVICES}", GPUVendorNone, nil, "RPC0,RPC1", false},
+		{"all-zero endpoints rpc devices", Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 0}}}}, "${RPC_DEVICES}", GPUVendorNone, nil, "", true},
 		{"head without gpus devices", clusterHeadSpec(), "${DEVICES}", GPUVendorNone, nil, "RPC0,RPC1,RPC2", false},
 		{"head without gpus first local", clusterHeadSpec(), "${FIRST_LOCAL_DEVICE}", GPUVendorNone, nil, "RPC0", false},
 		{"head without gpus cuda first", clusterHeadSpec(), "${CUDA_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "", true},
@@ -69,7 +81,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.spec.Args = []string{"--device=" + tc.tok}
-			args, _, err := ExpandPlaceholdersFor(tc.spec, 8080, tc.vendor, tc.vendors, getenv, "")
+			args, _, err := ExpandPlaceholders(tc.spec, 8080, tc.vendor, tc.vendors, getenv, "")
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want error, got args %v", args)
@@ -88,7 +100,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	t.Run("env value expands", func(t *testing.T) {
 		s := clusterHeadSpec()
 		s.Env = map[string]string{"LLAMA_ARG_RPC": "${RPC_SERVERS}"}
-		_, env, err := ExpandPlaceholdersFor(s, 8080, GPUVendorNone, nil, getenv, "")
+		_, env, err := ExpandPlaceholders(s, 8080, GPUVendorNone, nil, getenv, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,7 +112,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	t.Run("config file content expands", func(t *testing.T) {
 		s := clusterHeadSpec()
 		s.GPUs = gpus
-		got, err := expandConfigFileContentFor("dev=${DEVICES}\nfirst=${FIRST_LOCAL_DEVICE}", s, 1, GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, getenv, "")
+		got, err := expandConfigFileContent("dev=${DEVICES}\nfirst=${FIRST_LOCAL_DEVICE}", s, 1, GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, getenv, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,7 +122,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	})
 
 	t.Run("single vendor fallback when no set is given", func(t *testing.T) {
-		args, _, err := ExpandPlaceholders(Spec{GPUs: gpus, Args: []string{"${DEVICES}"}}, 1, GPUVendorAMD, getenv, "")
+		args, _, err := ExpandPlaceholders(Spec{GPUs: gpus, Args: []string{"${DEVICES}"}}, 1, GPUVendorAMD, nil, getenv, "")
 		if err != nil || args[0] != "ROCm3,ROCm2" {
 			t.Errorf("args=%v err=%v", args, err)
 		}
@@ -154,7 +166,7 @@ func TestVisibleDevicesArgsModeAcceptsDevicesToken(t *testing.T) {
 		SetVisibleDevices:  true,
 		VisibleDevicesMode: VisibleDevicesModeArgs,
 	}
-	args, env, err := ExpandPlaceholdersFor(spec, 1, GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, func(string) string { return "" }, "")
+	args, env, err := ExpandPlaceholders(spec, 1, GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,5 +177,28 @@ func TestVisibleDevicesArgsModeAcceptsDevicesToken(t *testing.T) {
 		if e == "CUDA_VISIBLE_DEVICES=1" {
 			t.Errorf("args mode must not inject a visibility variable: %v", env)
 		}
+	}
+}
+
+func TestRPCDeviceNames(t *testing.T) {
+	if got := rpcDeviceNames(Spec{}); len(got) != 0 {
+		t.Errorf("non-head = %v, want none", got)
+	}
+	got := rpcDeviceNames(Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 2}, {Address: "b", DeviceCount: 0}, {Address: "c", DeviceCount: 1}}}})
+	if want := "RPC0,RPC1,RPC2"; strings.Join(got, ",") != want {
+		t.Errorf("got %v, want %s", got, want)
+	}
+}
+
+func TestLocalDeviceNames(t *testing.T) {
+	spec := Spec{GPUs: []SpecGPU{{Index: 3}, {Index: 2}, {Index: 3}}}
+	if got := strings.Join(localDeviceNames(spec, "CUDA", false), ","); got != "CUDA3,CUDA2" {
+		t.Errorf("declared = %s", got)
+	}
+	if got := strings.Join(localDeviceNames(spec, "CUDA", true), ","); got != "CUDA0,CUDA1" {
+		t.Errorf("renumbered = %s", got)
+	}
+	if got := localDeviceNames(Spec{}, "CUDA", false); len(got) != 0 {
+		t.Errorf("no gpus = %v", got)
 	}
 }
