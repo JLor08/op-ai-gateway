@@ -243,13 +243,14 @@ type clusterEntry struct {
 // specID is the manual member spec the entry uses, "" for an automatic one.
 func (e clusterEntry) specID() string { return e.spec.ID }
 
-// label names the entry's server in a refusal, or hides it from a caller
-// who may not see it.
-func (e clusterEntry) label() string {
-	if e.visible {
-		return fmt.Sprintf("server %q", e.server.Name)
+// refusal is sentinel with detail about the entry, for a caller who may see
+// its server; for any other caller it is the bare sentinel, so the refusal
+// says nothing about a server it hides.
+func (e clusterEntry) refusal(sentinel error, format string, args ...any) error {
+	if !e.visible {
+		return sentinel
 	}
-	return "a member server"
+	return fmt.Errorf("%w: "+format, append([]any{sentinel}, args...)...)
 }
 
 // validateClusterHead runs the cluster checks of an operator's write and
@@ -270,10 +271,13 @@ func (e clusterEntry) label() string {
 //     member on the head's own server. An entry without a server id keeps
 //     the stored member at its position (the read view hides members on
 //     servers the caller may not manage). When the membership, the member
-//     mode, the network and the transport are all as stored, steps 4 to 8
-//     are skipped: such a write changes no member server's document, so the
-//     head's own rights suffice and a member the caller cannot see does not
-//     lock it out of its head.
+//     mode, the network, the transport and the head binary are all as
+//     stored, steps 4 to 8 are skipped: such a write changes no member
+//     server's document, so the head's own rights suffice and a member the
+//     caller cannot see does not lock it out of its head. The binary belongs
+//     to that list because it decides which member builds are compatible
+//     (step 6 and 7); a switch, even to the same build at another path, runs
+//     every member check.
 //  4. rights: the caller manages every member server, former ones included,
 //     and every member consents to the head (its member spec's
 //     allowed_head_groups in manual mode, the server's rpc_allowed_head_groups
@@ -293,8 +297,10 @@ func (e clusterEntry) label() string {
 //     policy preconditions; direct lan: the exposure acknowledgement).
 //  9. member GPUs: an explicit budget for Apple GPUs, an estimate for known
 //     non-NVIDIA GPUs of an automatic member, and --tensor-split on the head
-//     for any member with known non-NVIDIA GPUs. A refusal names the server
-//     only when the caller may see it.
+//     for any member with known non-NVIDIA GPUs. These rules also hold for a
+//     member the caller cannot see (a head edit such as dropping
+//     --tensor-split would otherwise leave an invalid head stored); the
+//     refusal then carries no detail about that member.
 func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app routing.Application, req PutRuntimeSpecRequest, f runtimeSpecFields, prior runtimeSpecPrior) (clusterPlan, error) {
 	plan := clusterPlan{
 		enabled: req.ClusterEnabled, memberMode: f.memberMode, network: f.clusterNetwork, transport: f.rpcTransport,
@@ -335,6 +341,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	}
 	if prior.ok && prior.spec.ClusterEnabled && normalizeMemberMode(prior.spec.MemberMode) == f.memberMode &&
 		prior.spec.ClusterNetwork == f.clusterNetwork && prior.spec.RPCTransport == f.rpcTransport &&
+		prior.spec.Binary == f.binary &&
 		membershipUnchanged(entries, prevMembers, prevGPUs) {
 		if err := s.loadStoredClusterEntries(ctx, p, entries); err != nil {
 			return clusterPlan{}, err
@@ -869,7 +876,7 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 				continue
 			}
 			if !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool { return b.GPUIndex == idx && b.BudgetMB > 0 }) {
-				return fmt.Errorf("%w: GPU %d of %s needs a GPU budget", ErrClusterMemberBudgetRequired, idx, e.label())
+				return e.refusal(ErrClusterMemberBudgetRequired, "GPU %d of server %q needs a GPU budget", idx, e.server.Name)
 			}
 		}
 	}
@@ -886,7 +893,7 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 	}
 	for i, e := range entries {
 		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, func(idx int) bool { return nonNVIDIA(i, idx) }) {
-			return fmt.Errorf("%w: %s has non-NVIDIA GPUs", ErrClusterTensorSplitRequired, e.label())
+			return e.refusal(ErrClusterTensorSplitRequired, "server %q has non-NVIDIA GPUs", e.server.Name)
 		}
 	}
 	return nil

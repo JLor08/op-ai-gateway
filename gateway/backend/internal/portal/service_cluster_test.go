@@ -1225,3 +1225,71 @@ func TestPutClusterUnchangedMembershipKeepsTheAcknowledgement(t *testing.T) {
 		t.Fatalf("withdrawn acknowledgement = %v, want %v", err, ErrClusterLANAckRequired)
 	}
 }
+
+// TestPutClusterBinaryChangeRunsMemberChecks: the head binary decides which
+// member builds are compatible, so a save that switches it is no unchanged
+// membership, even with the same members, mode, network and transport.
+func TestPutClusterBinaryChangeRunsMemberChecks(t *testing.T) {
+	t.Run("visible manual member of the old version is refused", func(t *testing.T) {
+		f := newClusterFixture(t)
+		srv := f.member("M")
+		spec := f.manualSpec(srv.ID)
+		req := clusterHeadRequest(ClusterMemberDTO{ServerID: srv.ID, MemberSpecID: spec.ID})
+		req.MemberMode = "manual"
+		f.mustPut(req)
+		f.binary(f.head.ID, "/opt/new/llama-server", BinaryKindLlamaServer, "7777bbb")
+		req.Binary = "/opt/new/llama-server"
+		if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterVersionMismatch) {
+			t.Fatalf("binary switch = %v, want %v", err, ErrClusterVersionMismatch)
+		}
+	})
+	t.Run("a hidden member makes it a membership change", func(t *testing.T) {
+		f := newClusterFixture(t)
+		mine, foreign := f.member("Mine"), f.foreignServer("Foreign")
+		f.binary(f.head.ID, "/opt/other/llama-server", BinaryKindLlamaServer, clusterCommit)
+		if _, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID))); err != nil {
+			t.Fatalf("system save: %v", err)
+		}
+		got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := putRequestFromDTO(got)
+		if _, err := f.put(ownerToken(), req); err != nil {
+			t.Fatalf("unchanged binary keeps the shortcut: %v", err)
+		}
+		// Same build at another path: still a switch the owner may not make
+		// without rights on the hidden member's server.
+		req.Binary = "/opt/other/llama-server"
+		if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrServerNotFound) {
+			t.Fatalf("binary switch with a hidden member = %v, want %v", err, ErrServerNotFound)
+		}
+		if _, err := f.put(systemToken(), req); err != nil {
+			t.Fatalf("system binary switch: %v", err)
+		}
+	})
+}
+
+// TestPutClusterHiddenMemberGPURefusalNamesNothing: in an unchanged
+// membership the member GPU rules still hold for a hidden member, but the
+// refusal carries no detail about it.
+func TestPutClusterHiddenMemberGPURefusalNamesNothing(t *testing.T) {
+	f := newClusterFixture(t)
+	mine, foreign := f.member("Mine"), f.foreignServer("Foreign")
+	f.hardware(foreign.ID, `{"os":"linux","gpus":[{"index":3,"name":"AMD Radeon PRO W7900"}]}`)
+	req := clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID, 3))
+	req.Args = append(req.Args, "--tensor-split", "1,1")
+	if _, err := f.put(systemToken(), req); err != nil {
+		t.Fatalf("system save: %v", err)
+	}
+	got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resave := putRequestFromDTO(got)
+	resave.Args = []string{"-m", "/models/big.gguf", "--rpc", "${RPC_SERVERS}"}
+	_, err = f.put(ownerToken(), resave)
+	if !errors.Is(err, ErrClusterTensorSplitRequired) || err.Error() != ErrClusterTensorSplitRequired.Error() {
+		t.Fatalf("err = %v, want the bare %v", err, ErrClusterTensorSplitRequired)
+	}
+}
