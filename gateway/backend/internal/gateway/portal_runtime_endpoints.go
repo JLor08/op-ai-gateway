@@ -164,9 +164,10 @@ var portalRuntimeSpecErrRows = []errRow{
 }
 
 // portalClusterErrRows are the cluster head refusals of a runtime-spec write
-// and of the cluster-candidates listing. Every row is 400 except the two 409s
+// and of the cluster-candidates listing. Every row is 400 except the three 409s
 // (a member spec another head uses, a member server without a free RPC
-// port: both well-formed, both conflicts with other specs). Rows whose
+// port, a listen_port a member holds: well-formed, but in conflict with
+// other specs). Rows whose
 // refusal names the server or binary at fault surface the service's detail
 // through clusterErrDetail; the server-not-found answer for a member server
 // the caller may not use is the shared server row.
@@ -175,6 +176,7 @@ var portalClusterErrRows = []errRow{
 	{err: portal.ErrClusterNetworkInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_network_invalid", msg: "cluster_network must be \"mesh\" or \"lan\" (or empty for the default)"},
 	{err: portal.ErrClusterTransportInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_transport_invalid", msg: "rpc_transport must be \"direct\" or \"relay\" (or empty for the default)"},
 	{err: portal.ErrClusterTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_type_invalid", msg: "a cluster head must be a llama_cpp runtime spec"},
+	{err: portal.ErrClusterFlagEqualsForm, status: http.StatusBadRequest, code: "runtime_spec.cluster_flag_equals_form", msg: "llama-server refuses --flag=value: write --rpc, --device/-dev, --tensor-split/-ts and --mmproj-device/-mmdev with their value as the next argument"},
 	{err: portal.ErrClusterRPCPlaceholderMissing, status: http.StatusBadRequest, code: "runtime_spec.cluster_rpc_placeholder_missing", msg: "a cluster head needs ${RPC_SERVERS} as the value of --rpc in args or of LLAMA_ARG_RPC in env"},
 	{err: portal.ErrClusterRPCTwice, status: http.StatusBadRequest, code: "runtime_spec.cluster_rpc_twice", msg: "set the RPC servers exactly once: ${RPC_SERVERS} once, through either --rpc or LLAMA_ARG_RPC, never both"},
 	{err: portal.ErrClusterRPCPlaceholderWithoutCluster, status: http.StatusBadRequest, code: "runtime_spec.cluster_rpc_placeholder_without_cluster", msg: "${RPC_SERVERS} and ${RPC_DEVICES} need cluster mode"},
@@ -196,7 +198,8 @@ var portalClusterErrRows = []errRow{
 	{err: portal.ErrClusterLANAckRequired, status: http.StatusBadRequest, code: "runtime.cluster_lan_ack_required", msg: "direct transport in a lan cluster exposes each member's RPC port unauthenticated; acknowledge it with lan_exposure_ack"},
 	{err: portal.ErrClusterMemberBudgetRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_budget_required", msgFn: clusterErrDetail(portal.ErrClusterMemberBudgetRequired, "a member on an Apple GPU needs a GPU budget on its server")},
 	{err: portal.ErrClusterTensorSplitRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_tensor_split_required", msgFn: clusterErrDetail(portal.ErrClusterTensorSplitRequired, "a head with a non-NVIDIA member needs --tensor-split")},
-	{err: portal.ErrClusterPortExhausted, status: http.StatusConflict, code: "runtime_spec.cluster_port_exhausted", msg: "the member server has no free port left in the RPC range 47000-47999"},
+	{err: portal.ErrClusterPortExhausted, status: http.StatusConflict, code: "runtime_spec.cluster_port_exhausted", msg: "no free port in the RPC range 47000-47999 could be claimed on the member server"},
+	{err: portal.ErrRuntimeSpecPortConflictsRPCMember, status: http.StatusConflict, code: "runtime_spec.port_conflicts_rpc_member", msg: "listen_port is the RPC port of a cluster member on this server"},
 }
 
 // clusterErrDetail surfaces the detail a cluster refusal was wrapped with

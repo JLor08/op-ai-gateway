@@ -22,6 +22,7 @@ var (
 	ErrClusterNetworkInvalid               = errors.New("runtime_spec.cluster_network_invalid")
 	ErrClusterTransportInvalid             = errors.New("runtime_spec.cluster_transport_invalid")
 	ErrClusterTypeInvalid                  = errors.New("runtime_spec.cluster_type_invalid")
+	ErrClusterFlagEqualsForm               = errors.New("runtime_spec.cluster_flag_equals_form")
 	ErrClusterRPCPlaceholderMissing        = errors.New("runtime_spec.cluster_rpc_placeholder_missing")
 	ErrClusterRPCTwice                     = errors.New("runtime_spec.cluster_rpc_twice")
 	ErrClusterRPCPlaceholderWithoutCluster = errors.New("runtime_spec.cluster_rpc_placeholder_without_cluster")
@@ -48,6 +49,9 @@ var (
 	// ErrClusterPortExhausted is 409: the member server has no free port left
 	// in the RPC range.
 	ErrClusterPortExhausted = errors.New("runtime_spec.cluster_port_exhausted")
+	// ErrRuntimeSpecPortConflictsRPCMember refuses a fixed listen_port that a
+	// cluster member on the same server already uses as its RPC port.
+	ErrRuntimeSpecPortConflictsRPCMember = errors.New("runtime_spec.port_conflicts_rpc_member")
 )
 
 // Advisory cluster warning codes (RuntimeSpecDTO.ClusterWarnings). They never
@@ -153,6 +157,9 @@ type clusterPlan struct {
 	members       []routing.ClusterMember
 	gpus          []routing.ClusterMemberGPU
 	memberServers []string
+	// allocated lists the members whose port this write allocated (indices
+	// into members); the others keep the port their server's row had.
+	allocated []int
 }
 
 func (p clusterPlan) applyTo(spec *routing.RuntimeSpec) {
@@ -222,7 +229,10 @@ func validateClusterEnums(req PutRuntimeSpecRequest) (backend, mode, network, tr
 // server, the manual spec and its GPU rows (manual mode), and the ordered GPU
 // selection with its estimates.
 type clusterEntry struct {
-	manual   bool
+	manual bool
+	// visible: the caller manages the entry's server. Only an unchanged
+	// membership (validateClusterHead) can hold an entry that is not.
+	visible  bool
 	req      ClusterMemberDTO
 	server   routing.AIServer
 	spec     routing.RPCMemberSpec
@@ -233,6 +243,15 @@ type clusterEntry struct {
 // specID is the manual member spec the entry uses, "" for an automatic one.
 func (e clusterEntry) specID() string { return e.spec.ID }
 
+// label names the entry's server in a refusal, or hides it from a caller
+// who may not see it.
+func (e clusterEntry) label() string {
+	if e.visible {
+		return fmt.Sprintf("server %q", e.server.Name)
+	}
+	return "a member server"
+}
+
 // validateClusterHead runs the cluster checks of an operator's write and
 // plans the rows it stores. They run after validateRuntimeSpecRequest -- every
 // one is newer than the request validations -- and in this order, which is
@@ -241,18 +260,26 @@ func (e clusterEntry) specID() string { return e.spec.ID }
 //  1. cluster off: ${RPC_SERVERS}/${RPC_DEVICES} anywhere in args or env, then
 //     the caller's rights on every former member server (dropping the
 //     membership changes their documents); nothing else.
-//  2. cluster on, the head's own document: effective type llama_cpp,
+//  2. cluster on, the head's own document: effective type llama_cpp, no
+//     "=" form of the scanned options (llama-server refuses it),
 //     ${RPC_SERVERS} as the value of --rpc or LLAMA_ARG_RPC, exactly once
 //     and through one of the two, a device list that names the RPC devices,
 //     a device list llama-server parses after the RPC servers, at least one
 //     member, not replicable, an explicit startup timeout.
 //  3. the member list: each entry's settings, one entry per server, no
-//     member on the head's own server.
+//     member on the head's own server. An entry without a server id keeps
+//     the stored member at its position (the read view hides members on
+//     servers the caller may not manage). When the membership, the member
+//     mode, the network and the transport are all as stored, steps 4 to 8
+//     are skipped: such a write changes no member server's document, so the
+//     head's own rights suffice and a member the caller cannot see does not
+//     lock it out of its head.
 //  4. rights: the caller manages every member server, former ones included,
 //     and every member consents to the head (its member spec's
 //     allowed_head_groups in manual mode, the server's rpc_allowed_head_groups
-//     in automatic mode, intersected with the head server's admin groups;
-//     system scope needs no consent). Both answer server-not-found, so a
+//     in automatic mode, intersected with the head server's admin groups; an
+//     empty list means the member server's own admin groups; system scope
+//     needs no consent). Both answer server-not-found, so a
 //     caller learns nothing about a server it may not use. They run before
 //     the member checks below, which would otherwise tell such a caller
 //     about that server's settings.
@@ -266,7 +293,8 @@ func (e clusterEntry) specID() string { return e.spec.ID }
 //     policy preconditions; direct lan: the exposure acknowledgement).
 //  9. member GPUs: an explicit budget for Apple GPUs, an estimate for known
 //     non-NVIDIA GPUs of an automatic member, and --tensor-split on the head
-//     for any member with known non-NVIDIA GPUs.
+//     for any member with known non-NVIDIA GPUs. A refusal names the server
+//     only when the caller may see it.
 func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app routing.Application, req PutRuntimeSpecRequest, f runtimeSpecFields, prior runtimeSpecPrior) (clusterPlan, error) {
 	plan := clusterPlan{
 		enabled: req.ClusterEnabled, memberMode: f.memberMode, network: f.clusterNetwork, transport: f.rpcTransport,
@@ -297,7 +325,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	if err := validateClusterHeadDocument(req, f, scan); err != nil {
 		return clusterPlan{}, err
 	}
-	entries, err := clusterEntries(req.ClusterMembers, f.memberMode, app.ServerID)
+	entries, err := clusterEntries(req.ClusterMembers, f.memberMode, app.ServerID, prevMembers, prevGPUs)
 	if err != nil {
 		return clusterPlan{}, err
 	}
@@ -305,20 +333,18 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	if err != nil {
 		return clusterPlan{}, err
 	}
-	if err := s.authorizeClusterMembers(ctx, p, headServer.ID, entries, prevMembers); err != nil {
-		return clusterPlan{}, err
-	}
-	headSpecID := ""
-	if prior.ok {
-		headSpecID = prior.spec.ID
-	}
-	if err := s.checkClusterMemberSpecs(ctx, entries, headSpecID); err != nil {
-		return clusterPlan{}, err
-	}
-	if err := s.checkClusterMemberBinaries(ctx, headServer.ID, f.binary, entries); err != nil {
-		return clusterPlan{}, err
-	}
-	if plan.network, plan.transport, err = s.checkClusterNetwork(ctx, headServer, entries, plan.network, plan.transport, req.LANExposureAck); err != nil {
+	if prior.ok && prior.spec.ClusterEnabled && normalizeMemberMode(prior.spec.MemberMode) == f.memberMode &&
+		prior.spec.ClusterNetwork == f.clusterNetwork && prior.spec.RPCTransport == f.rpcTransport &&
+		membershipUnchanged(entries, prevMembers, prevGPUs) {
+		if err := s.loadStoredClusterEntries(ctx, p, entries); err != nil {
+			return clusterPlan{}, err
+		}
+		// The acknowledgement is the head's own setting: withdrawing it from a
+		// direct lan cluster is refused like a missing one.
+		if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !req.LANExposureAck {
+			return clusterPlan{}, ErrClusterLANAckRequired
+		}
+	} else if err := s.checkClusterMembership(ctx, p, headServer, f, req, prior, entries, prevMembers, &plan); err != nil {
 		return clusterPlan{}, err
 	}
 	if err := s.checkClusterMemberGPUs(ctx, entries, scan); err != nil {
@@ -335,6 +361,9 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 func validateClusterHeadDocument(req PutRuntimeSpecRequest, f runtimeSpecFields, scan clusterArgScan) error {
 	if routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: f.specType, Binary: f.binary}) != routing.RuntimeSpecTypeLlamaCpp {
 		return ErrClusterTypeInvalid
+	}
+	if scan.equalsForm {
+		return ErrClusterFlagEqualsForm
 	}
 	if scan.rpcPlaceholderCount == 0 || !scan.rpcValueHasPlaceholder {
 		return ErrClusterRPCPlaceholderMissing
@@ -372,12 +401,15 @@ func validateClusterHeadDocument(req PutRuntimeSpecRequest, f runtimeSpecFields,
 // one entry per server and none on the head's server. Settings the member
 // mode does not use are dropped (a manual member's settings live on its
 // spec; an automatic member has no spec).
-func clusterEntries(members []ClusterMemberDTO, mode, headServerID string) ([]clusterEntry, error) {
+func clusterEntries(members []ClusterMemberDTO, mode, headServerID string, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) ([]clusterEntry, error) {
 	entries := make([]clusterEntry, 0, len(members))
 	seen := map[string]bool{}
-	for _, m := range members {
+	for i, m := range members {
 		m.ServerID = strings.TrimSpace(m.ServerID)
 		m.MemberSpecID = strings.TrimSpace(m.MemberSpecID)
+		if m.ServerID == "" && i < len(prevMembers) {
+			m = storedMemberDTO(prevMembers[i], prevGPUs)
+		}
 		e := clusterEntry{manual: mode == memberModeManual, req: m, estimate: map[int]int{}}
 		if mode == memberModeAutomatic {
 			if m.Threads < 0 || m.RAMEstimateMB < 0 {
@@ -414,6 +446,113 @@ func clusterEntries(members []ClusterMemberDTO, mode, headServerID string) ([]cl
 	return entries, nil
 }
 
+// storedMemberDTO is the request entry that keeps a stored member as it is.
+func storedMemberDTO(row routing.ClusterMember, gpus []routing.ClusterMemberGPU) ClusterMemberDTO {
+	m := ClusterMemberDTO{
+		ServerID: row.ServerID, MemberSpecID: row.MemberSpecID, Threads: row.Threads, CacheEnabled: row.CacheEnabled,
+		DeviceBackend: row.DeviceBackend, RAMEstimateMB: row.RAMEstimateMB, GPUs: []ClusterMemberGPUDTO{},
+	}
+	for _, g := range gpus {
+		if g.ServerID == row.ServerID {
+			m.GPUs = append(m.GPUs, ClusterMemberGPUDTO{Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB})
+		}
+	}
+	return m
+}
+
+// membershipUnchanged reports whether entries are the stored membership:
+// the same servers in the same order with the same member spec, and for an
+// automatic member the same settings and GPU selection with the same
+// estimates.
+func membershipUnchanged(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) bool {
+	if len(entries) != len(prevMembers) {
+		return false
+	}
+	for i, e := range entries {
+		prev := prevMembers[i]
+		if e.req.ServerID != prev.ServerID || e.req.MemberSpecID != prev.MemberSpecID {
+			return false
+		}
+		if e.manual {
+			continue
+		}
+		stored := storedMemberDTO(prev, prevGPUs)
+		if e.req.Threads != prev.Threads || e.req.CacheEnabled != prev.CacheEnabled || e.req.RAMEstimateMB != prev.RAMEstimateMB ||
+			e.req.DeviceBackend != normalizeDeviceBackend(prev.DeviceBackend) || len(e.gpus) != len(stored.GPUs) {
+			return false
+		}
+		for j, g := range stored.GPUs {
+			if e.gpus[j] != g.Index || e.estimate[g.Index] != g.VRAMEstimateMB {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// loadStoredClusterEntries fills the entries of an unchanged membership
+// without authorizing them: each entry's server, its manual spec and whether
+// the caller may see the server.
+func (s *Service) loadStoredClusterEntries(ctx context.Context, p auth.Token, entries []clusterEntry) error {
+	for i := range entries {
+		e := &entries[i]
+		server, err := s.routes.AIServerByID(ctx, e.req.ServerID)
+		if err != nil {
+			return ErrServerNotFound
+		}
+		e.server, e.visible = server, s.callerManagesServer(ctx, p, server.ID)
+		if e.manual {
+			spec, ok, err := s.routes.RPCMemberSpecByID(ctx, e.req.MemberSpecID)
+			if err != nil {
+				return err
+			}
+			if ok {
+				if err := s.loadEntrySpec(ctx, e, spec); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// loadEntrySpec sets a manual entry's spec and takes its GPU selection from
+// the spec's GPU rows.
+func (s *Service) loadEntrySpec(ctx context.Context, e *clusterEntry, spec routing.RPCMemberSpec) error {
+	gpuRows, err := s.routes.RPCMemberSpecGPUs(ctx, spec.ID)
+	if err != nil {
+		return err
+	}
+	e.spec, e.gpus = spec, nil
+	for _, g := range gpuRows {
+		e.gpus = append(e.gpus, g.GPUIndex)
+		e.estimate[g.GPUIndex] = g.VRAMEstimateMB
+	}
+	return nil
+}
+
+// checkClusterMembership is steps 4 to 8 of validateClusterHead, for a write
+// that changes the membership, the member mode, the network or the
+// transport. It resolves plan's network and transport.
+func (s *Service) checkClusterMembership(ctx context.Context, p auth.Token, headServer routing.AIServer, f runtimeSpecFields, req PutRuntimeSpecRequest, prior runtimeSpecPrior, entries []clusterEntry, prevMembers []routing.ClusterMember, plan *clusterPlan) error {
+	if err := s.authorizeClusterMembers(ctx, p, headServer.ID, entries, prevMembers); err != nil {
+		return err
+	}
+	headSpecID := ""
+	if prior.ok {
+		headSpecID = prior.spec.ID
+	}
+	if err := s.checkClusterMemberSpecs(ctx, entries, headSpecID); err != nil {
+		return err
+	}
+	if err := s.checkClusterMemberBinaries(ctx, headServer.ID, f.binary, entries); err != nil {
+		return err
+	}
+	var err error
+	plan.network, plan.transport, err = s.checkClusterNetwork(ctx, headServer, entries, plan.network, plan.transport, req.LANExposureAck)
+	return err
+}
+
 // authorizeClusterMembers is step 4 of validateClusterHead. It fills each
 // entry's server and, in manual mode, its member spec.
 func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, headServerID string, entries []clusterEntry, prevMembers []routing.ClusterMember) error {
@@ -425,7 +564,7 @@ func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, hea
 		if err != nil {
 			return err
 		}
-		entries[i].server = server
+		entries[i].server, entries[i].visible = server, true
 	}
 	if err := s.authorizeFormerMembers(ctx, p, prevMembers, entries); err != nil {
 		return err
@@ -436,28 +575,43 @@ func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, hea
 	}
 	for i := range entries {
 		e := &entries[i]
-		consent := decodeRPCHeadGroups(e.server.RPCAllowedHeadGroups)
+		consentRaw := e.server.RPCAllowedHeadGroups
 		if e.manual {
 			spec, err := s.ownedRPCMemberSpec(ctx, e.server.ID, e.req.MemberSpecID)
 			if err != nil {
 				return err
 			}
-			gpuRows, err := s.routes.RPCMemberSpecGPUs(ctx, spec.ID)
-			if err != nil {
+			if err := s.loadEntrySpec(ctx, e, spec); err != nil {
 				return err
 			}
-			e.spec = spec
-			for _, g := range gpuRows {
-				e.gpus = append(e.gpus, g.GPUIndex)
-				e.estimate[g.GPUIndex] = g.VRAMEstimateMB
-			}
-			consent = decodeRPCHeadGroups(spec.AllowedHeadGroups)
+			consentRaw = spec.AllowedHeadGroups
 		}
-		if !consentAdmits(p, consent, headGroups) {
+		admits, err := s.memberConsentAdmits(ctx, p, consentRaw, e.server.ID, headGroups)
+		if err != nil {
+			return err
+		}
+		if !admits {
 			return ErrServerNotFound
 		}
 	}
 	return nil
+}
+
+// memberConsentAdmits reports whether a member's stored consent list admits
+// a head whose server is linked to headGroups. An empty list means the
+// member server's own admin groups (the default consent).
+func (s *Service) memberConsentAdmits(ctx context.Context, p auth.Token, consentRaw, memberServerID string, headGroups []string) (bool, error) {
+	if isSystem(p) {
+		return true, nil
+	}
+	consent := decodeRPCHeadGroups(consentRaw)
+	if len(consent) == 0 {
+		var err error
+		if consent, err = s.routes.ServerAdminGroups(ctx, memberServerID); err != nil {
+			return false, err
+		}
+	}
+	return consentAdmits(p, consent, headGroups), nil
 }
 
 // authorizeFormerMembers requires the caller's rights on every former member
@@ -715,7 +869,7 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 				continue
 			}
 			if !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool { return b.GPUIndex == idx && b.BudgetMB > 0 }) {
-				return fmt.Errorf("%w: GPU %d of server %q needs a GPU budget", ErrClusterMemberBudgetRequired, idx, e.server.Name)
+				return fmt.Errorf("%w: GPU %d of %s needs a GPU budget", ErrClusterMemberBudgetRequired, idx, e.label())
 			}
 		}
 	}
@@ -732,7 +886,7 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 	}
 	for i, e := range entries {
 		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, func(idx int) bool { return nonNVIDIA(i, idx) }) {
-			return fmt.Errorf("%w: server %q has non-NVIDIA GPUs", ErrClusterTensorSplitRequired, e.server.Name)
+			return fmt.Errorf("%w: %s has non-NVIDIA GPUs", ErrClusterTensorSplitRequired, e.label())
 		}
 	}
 	return nil
@@ -774,8 +928,11 @@ func (s *Service) planClusterRows(ctx context.Context, plan *clusterPlan, entrie
 		kept := hadRow && prev.MemberSpecID == e.specID()
 		if hadRow && prev.Port != 0 {
 			row.Port = prev.Port
-		} else if row.Port, err = s.allocateRPCPort(ctx, e.server.ID); err != nil {
-			return err
+		} else {
+			if row.Port, err = s.allocateRPCPort(ctx, e.server.ID); err != nil {
+				return err
+			}
+			plan.allocated = append(plan.allocated, i)
 		}
 		measured := false
 		if kept {
@@ -843,18 +1000,84 @@ func appendUnique(ids []string, id string) []string {
 	return append(ids, id)
 }
 
-// clusterMembersStoreError maps a membership write the store refused: a
-// manual member spec another head took in the meantime (the store's
-// one-head-per-spec rule), or a server deleted in the meantime.
+// writeClusterMembers stores plan's membership rows for headSpecID. The
+// store refuses with a conflict when, since the checks ran, another head
+// took one of the manual member specs (one head per spec) or another gateway
+// process allocated one of the new ports on the same server (one member per
+// port and server; the allocation lock is per process). The first is
+// ErrClusterMemberSpecTaken. For the second the new ports are allocated once
+// more from the store's current rows and the write is repeated; a second
+// conflict is ErrClusterPortExhausted.
+func (s *Service) writeClusterMembers(ctx context.Context, headSpecID string, plan *clusterPlan) error {
+	err := s.routes.SetClusterMembers(ctx, headSpecID, plan.members, plan.gpus)
+	if !errors.Is(err, store.ErrConflict) {
+		return clusterMembersStoreError(err)
+	}
+	for _, m := range plan.members {
+		if m.MemberSpecID == "" {
+			continue
+		}
+		used, ok, err := s.routes.ClusterMemberBySpec(ctx, m.MemberSpecID)
+		if err != nil {
+			return err
+		}
+		if ok && used.HeadSpecID != headSpecID {
+			return ErrClusterMemberSpecTaken
+		}
+	}
+	if len(plan.allocated) == 0 {
+		return ErrClusterPortExhausted
+	}
+	for _, i := range plan.allocated {
+		if plan.members[i].Port, err = s.allocateRPCPort(ctx, plan.members[i].ServerID); err != nil {
+			return err
+		}
+	}
+	err = s.routes.SetClusterMembers(ctx, headSpecID, plan.members, plan.gpus)
+	if errors.Is(err, store.ErrConflict) {
+		return ErrClusterPortExhausted
+	}
+	return clusterMembersStoreError(err)
+}
+
+// clusterMembersStoreError maps a membership write the store refused for a
+// reason other than a conflict: a server deleted in the meantime.
 func clusterMembersStoreError(err error) error {
-	switch {
-	case errors.Is(err, store.ErrConflict):
-		return ErrClusterMemberSpecTaken
-	case errors.Is(err, store.ErrNotFound):
+	if errors.Is(err, store.ErrNotFound) {
 		return ErrServerNotFound
-	default:
+	}
+	return err
+}
+
+// checkListenPortFree refuses a fixed listen_port that a cluster member on
+// serverID uses as its RPC port. Only a port the write sets or changes is
+// checked, so a re-save of an existing spec is never refused for a member
+// allocated later. The member allocator skips fixed listen ports already
+// stored, which covers the other direction.
+func (s *Service) checkListenPortFree(ctx context.Context, serverID string, port int, prior runtimeSpecPrior) error {
+	if port == 0 || (prior.ok && prior.spec.ListenPort == port) {
+		return nil
+	}
+	taken, err := s.rpcMemberPortTaken(ctx, serverID, port)
+	if err != nil {
 		return err
 	}
+	if taken {
+		return ErrRuntimeSpecPortConflictsRPCMember
+	}
+	return nil
+}
+
+// rpcMemberPortTaken reports whether a cluster member on serverID uses port.
+func (s *Service) rpcMemberPortTaken(ctx context.Context, serverID string, port int) (bool, error) {
+	if port == 0 {
+		return false, nil
+	}
+	memberships, err := s.routes.ClusterMembershipsByServer(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(memberships, func(m routing.ClusterMember) bool { return m.Port == port }), nil
 }
 
 // allocateRPCPort returns the lowest port in the RPC range that nothing on
@@ -940,6 +1163,8 @@ func (s *Service) netbirdDefaultPolicyDisabled(ctx context.Context) bool {
 
 // clusterMemberState is one stored member with what the read view needs.
 type clusterMemberState struct {
+	// visible: the reader may manage the member's server.
+	visible  bool
 	row      routing.ClusterMember
 	gpuRows  []routing.ClusterMemberGPU
 	server   routing.AIServer
@@ -1031,23 +1256,31 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 		return dto, nil
 	}
 	dto.ClusterMembers = make([]ClusterMemberDTO, 0, len(members))
-	for _, m := range members {
-		visible := m.found && (isSystem(p) || s.callerManagesServer(ctx, p, m.server.ID))
-		dto.ClusterMembers = append(dto.ClusterMembers, clusterMemberDTO(m, visible))
+	allVisible := true
+	for i, m := range members {
+		members[i].visible = m.found && (isSystem(p) || s.callerManagesServer(ctx, p, m.server.ID))
+		allVisible = allVisible && members[i].visible
+		dto.ClusterMembers = append(dto.ClusterMembers, clusterMemberDTO(m, members[i].visible))
 	}
 	dto.ClusterVRAMTotalMB, dto.ClusterRAMTotalMB, dto.ClusterTotalsComplete = clusterTotals(dto, members)
-	servers := []routing.AIServer{headServer}
-	for _, m := range members {
-		if m.found {
+	// The network default turns on every member server's NetBird readiness,
+	// so it would tell a caller something about a server it may not see:
+	// with a hidden member it stays empty (and the transport default with it
+	// unless the network is stored).
+	network := dto.ClusterNetwork
+	if allVisible {
+		servers := []routing.AIServer{headServer}
+		for _, m := range members {
 			servers = append(servers, m.server)
 		}
+		dto.ClusterNetworkDefault = defaultClusterNetwork(servers)
+		if network == "" {
+			network = dto.ClusterNetworkDefault
+		}
 	}
-	dto.ClusterNetworkDefault = defaultClusterNetwork(servers)
-	network := dto.ClusterNetwork
-	if network == "" {
-		network = dto.ClusterNetworkDefault
+	if network != "" {
+		dto.ClusterTransportDefault = s.defaultRPCTransport(ctx, network)
 	}
-	dto.ClusterTransportDefault = s.defaultRPCTransport(ctx, network)
 	if dto.ClusterEnabled {
 		transport := dto.RPCTransport
 		if transport == "" {
@@ -1113,7 +1346,8 @@ func clusterTotals(dto RuntimeSpecDTO, members []clusterMemberState) (vram, ram 
 }
 
 // clusterWarnings derives the advisory warnings of a cluster head, in a
-// fixed order, each code at most once.
+// fixed order, each code at most once. A member the reader may not see adds
+// none: each member warning tells something about the member's server.
 func (s *Service) clusterWarnings(ctx context.Context, headServerID string, dto RuntimeSpecDTO, members []clusterMemberState, network, transport string) ([]string, error) {
 	out := []string{}
 	add := func(code string) {
@@ -1126,7 +1360,7 @@ func (s *Service) clusterWarnings(ctx context.Context, headServerID string, dto 
 	// front, so the RPC devices belong first; the projector then defaults to
 	// RPC0 unless -mmdev names a local device.
 	if scan.hasDeviceList() {
-		if !scan.deviceListStartsWithRPC() {
+		if !scan.deviceListStartsWithRPC(len(dto.GPUs) > 0) {
 			add(ClusterWarnRPCDevicesNotFirst)
 		} else if !scan.mmdev {
 			add(ClusterWarnMMDevMissing)
@@ -1137,7 +1371,7 @@ func (s *Service) clusterWarnings(ctx context.Context, headServerID string, dto 
 		return nil, err
 	}
 	for _, m := range members {
-		if !m.found {
+		if !m.visible {
 			continue
 		}
 		if err := s.memberWarnings(ctx, dto.ID, m, scan, add); err != nil {
@@ -1287,7 +1521,8 @@ func (s *Service) otherGPUUses(ctx context.Context, headSpecID string, m cluster
 // ClusterCandidates lists the servers the head on headMappingID may add as
 // members in mode ("automatic" when empty): servers other than the head's
 // that the caller manages and whose consent admits the head (system scope
-// needs no consent). In automatic mode a server must offer RPC membership
+// needs no consent; an empty consent list means the member server's own
+// admin groups). In automatic mode a server must offer RPC membership
 // and have a ggml-rpc-server matching the head binary's version, which needs
 // the stored head spec's version known; in manual mode it must have enabled
 // member specs that serve no other head, which are listed. Sorted by server
@@ -1329,7 +1564,14 @@ func (s *Service) ClusterCandidates(ctx context.Context, p auth.Token, headMappi
 		}
 		c := ClusterCandidateDTO{ServerID: srv.ID, ServerName: srv.Name}
 		if mode == memberModeAutomatic {
-			if !srv.RPCMemberEnabled || !headKnown || !consentAdmits(p, decodeRPCHeadGroups(srv.RPCAllowedHeadGroups), headGroups) {
+			if !srv.RPCMemberEnabled || !headKnown {
+				continue
+			}
+			admits, err := s.memberConsentAdmits(ctx, p, srv.RPCAllowedHeadGroups, srv.ID, headGroups)
+			if err != nil {
+				return nil, err
+			}
+			if !admits {
 				continue
 			}
 			match, ok, err := s.MatchingRPCBinary(ctx, srv.ID, head)
@@ -1368,7 +1610,14 @@ func (s *Service) freeMemberSpecs(ctx context.Context, p auth.Token, serverID, h
 	}
 	out := []RPCMemberSpecDTO{}
 	for _, spec := range specs {
-		if !spec.Enabled || !consentAdmits(p, decodeRPCHeadGroups(spec.AllowedHeadGroups), headGroups) {
+		if !spec.Enabled {
+			continue
+		}
+		admits, err := s.memberConsentAdmits(ctx, p, spec.AllowedHeadGroups, serverID, headGroups)
+		if err != nil {
+			return nil, err
+		}
+		if !admits {
 			continue
 		}
 		used, ok, err := s.routes.ClusterMemberBySpec(ctx, spec.ID)

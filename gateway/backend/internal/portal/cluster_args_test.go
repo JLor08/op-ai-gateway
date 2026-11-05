@@ -26,6 +26,7 @@ func TestScanClusterArgs(t *testing.T) {
 			want: clusterArgScan{
 				rpcInArgs: true, rpcArgIndex: 2, rpcArgCount: 1, rpcValueHasPlaceholder: true, rpcPlaceholderCount: 1,
 				deviceInArgs: true, deviceArgIndex: 0, deviceList: "CUDA0", tensorSplit: true, mmdev: true, clusterPlaceholder: true,
+				equalsForm: true,
 			},
 		},
 		{
@@ -58,15 +59,56 @@ func TestScanClusterArgs(t *testing.T) {
 }
 
 func TestDeviceListStartsWithRPC(t *testing.T) {
-	for list, want := range map[string]bool{
-		"${DEVICES}":                true,
-		"${RPC_DEVICES},CUDA0":      true,
-		"RPC0,RPC1,CUDA0":           true,
-		"CUDA0,${RPC_DEVICES}":      false,
-		"${FIRST_LOCAL_DEVICE},RPC": false,
+	for _, tc := range []struct {
+		list        string
+		headHasGPUs bool
+		want        bool
+	}{
+		{"${DEVICES}", true, true},
+		{"${RPC_DEVICES},CUDA0", true, true},
+		{"RPC0,RPC1,CUDA0", true, true},
+		{"CUDA0,${RPC_DEVICES}", true, false},
+		{"${FIRST_LOCAL_DEVICE},${RPC_DEVICES}", true, false},
+		// Without GPU rows ${FIRST_LOCAL_DEVICE} falls back to RPC0.
+		{"${FIRST_LOCAL_DEVICE},${RPC_DEVICES}", false, true},
 	} {
-		if got := (clusterArgScan{deviceList: list}).deviceListStartsWithRPC(); got != want {
-			t.Errorf("deviceListStartsWithRPC(%q) = %v, want %v", list, got, want)
+		if got := (clusterArgScan{deviceList: tc.list}).deviceListStartsWithRPC(tc.headHasGPUs); got != tc.want {
+			t.Errorf("deviceListStartsWithRPC(%q, gpus=%v) = %v, want %v", tc.list, tc.headHasGPUs, got, tc.want)
+		}
+	}
+}
+
+func TestScanClusterArgsStepsOverValues(t *testing.T) {
+	// "-dev" is the value of --alias, "--rpc" the value of --api-key: neither
+	// is an option.
+	scan := scanClusterArgs([]string{"--alias", "-dev", "--api-key", "--rpc", "-m", "/m.gguf", "--rpc", "${RPC_SERVERS}"}, nil)
+	if scan.deviceInArgs || scan.rpcArgCount != 1 || scan.rpcArgIndex != 6 || !scan.rpcValueHasPlaceholder {
+		t.Fatalf("scan = %+v", scan)
+	}
+	// A boolean option takes no value: the next element is an option again.
+	scan = scanClusterArgs([]string{"--jinja", "-dev", "${DEVICES}"}, nil)
+	if !scan.deviceInArgs || scan.deviceList != "${DEVICES}" {
+		t.Fatalf("scan after a boolean option = %+v", scan)
+	}
+}
+
+func TestScanClusterArgsEqualsForm(t *testing.T) {
+	for _, args := range [][]string{
+		{"--rpc=${RPC_SERVERS}"}, {"--device=${DEVICES}"}, {"-dev=${DEVICES}"}, {"--tensor-split=1,1"}, {"-mmdev=CUDA0"},
+	} {
+		if !scanClusterArgs(args, nil).equalsForm {
+			t.Errorf("%v: equalsForm = false", args)
+		}
+	}
+	if scanClusterArgs([]string{"--alias=x", "--rpc", "${RPC_SERVERS}"}, nil).equalsForm {
+		t.Error("an unscanned option's = form is not the head's concern")
+	}
+}
+
+func TestLlamaServerValueFlags(t *testing.T) {
+	for flag, want := range map[string]int{"--rpc": 1, "--device": 1, "-dev": 1, "-ts": 1, "-mmdev": 1, "--alias": 1, "-m": 1, "--jinja": 0, "-h": 0} {
+		if got := llamaServerValueFlags[flag]; got != want {
+			t.Errorf("llamaServerValueFlags[%q] = %d, want %d", flag, got, want)
 		}
 	}
 }

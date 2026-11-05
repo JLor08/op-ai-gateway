@@ -3746,10 +3746,27 @@ func (m *MemoryStore) RPCMemberSpecGPUs(_ context.Context, specID string) ([]RPC
 	return out, nil
 }
 
+// clusterPortTakenLocked reports whether another head's member on serverID
+// uses port (the partial unique index on (server_id, port) of migration 106).
+func (m *MemoryStore) clusterPortTakenLocked(headSpecID, serverID string, port int) bool {
+	for head, others := range m.clusterMembers {
+		if head == headSpecID {
+			continue
+		}
+		for _, o := range others {
+			if o.ServerID == serverID && o.Port == port {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // SetClusterMembers replaces headSpecID's membership and GPU rows, enforcing
 // by hand what the tables enforce: the head and every member server exist
-// (ErrNotFound), (head, position), (head, server) and a non-empty
-// member_spec_id across all heads are unique (ErrConflict), and a GPU row
+// (ErrNotFound), (head, position), (head, server), a non-empty
+// member_spec_id across all heads and a non-zero (server, port) across all
+// heads are unique (ErrConflict), and a GPU row
 // needs a membership row of its (head, server) in the same call (ErrNotFound).
 // Nothing is stored when any check fails.
 func (m *MemoryStore) SetClusterMembers(_ context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error {
@@ -3772,6 +3789,9 @@ func (m *MemoryStore) SetClusterMembers(_ context.Context, headSpecID string, me
 			return storeerr.ErrConflict
 		}
 		positions[mem.Position], servers[mem.ServerID] = struct{}{}, struct{}{}
+		if mem.Port != 0 && m.clusterPortTakenLocked(headSpecID, mem.ServerID, mem.Port) {
+			return storeerr.ErrConflict
+		}
 		if mem.MemberSpecID == "" {
 			continue
 		}

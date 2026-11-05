@@ -405,3 +405,47 @@ func TestConformanceRPCSessions(t *testing.T) {
 		}
 	})
 }
+
+// TestConformanceRPCClusterMemberPortUnique pins the (server, port) rule on
+// every routing store: a non-zero port is unique on its server across heads,
+// a head rewriting its own rows keeps its ports, port 0 repeats freely, and
+// the same port on another server is fine.
+func TestConformanceRPCClusterMemberPortUnique(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		head := seedRPCHeadSpec(ctx, t, s, "p1", now)
+		head2 := seedRPCHeadSpec(ctx, t, s, "p2", now)
+		seedBinariesServer(ctx, t, s, "srv_pm1", now)
+		seedBinariesServer(ctx, t, s, "srv_pm2", now)
+		row := func(h, srv string, port int) []routing.ClusterMember {
+			return []routing.ClusterMember{{HeadSpecID: h, Position: 0, ServerID: srv, DeviceBackend: "auto", Port: port}}
+		}
+		if err := s.SetClusterMembers(ctx, head, row(head, "srv_pm1", 47000), nil); err != nil {
+			t.Fatalf("first head: %v", err)
+		}
+		if err := s.SetClusterMembers(ctx, head, row(head, "srv_pm1", 47000), nil); err != nil {
+			t.Fatalf("rewrite of the same head: %v", err)
+		}
+		if err := s.SetClusterMembers(ctx, head2, row(head2, "srv_pm1", 47000), nil); !errors.Is(err, ErrConflict) {
+			t.Fatalf("same port on the same server: err=%v, want ErrConflict", err)
+		}
+		if em, _, _ := s.ClusterMembers(ctx, head2); len(em) != 0 {
+			t.Fatalf("a refused write stored rows: %+v", em)
+		}
+		if err := s.SetClusterMembers(ctx, head2, row(head2, "srv_pm2", 47000), nil); err != nil {
+			t.Fatalf("same port on another server: %v", err)
+		}
+		if err := s.SetClusterMembers(ctx, head, row(head, "srv_pm2", 0), nil); err != nil {
+			t.Fatalf("port 0 next to a used port: %v", err)
+		}
+		head3 := seedRPCHeadSpec(ctx, t, s, "p3", now)
+		if err := s.SetClusterMembers(ctx, head3, row(head3, "srv_pm1", 0), nil); err != nil {
+			t.Fatalf("port 0 repeats: %v", err)
+		}
+		// Port 47000 on srv_pm1 is free again now that the first head moved.
+		if err := s.SetClusterMembers(ctx, head2, row(head2, "srv_pm1", 47000), nil); err != nil {
+			t.Fatalf("freed port: %v", err)
+		}
+	})
+}

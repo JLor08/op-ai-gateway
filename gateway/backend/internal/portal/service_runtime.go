@@ -96,8 +96,8 @@ var (
 	// that is not "env" or "args". HTTP 400.
 	ErrRuntimeSpecVisibleDevicesModeInvalid = errors.New("runtime_spec.visible_devices_mode_invalid")
 	// ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder rejects set_visible_devices
-	// in args mode when none of the three device placeholders
-	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}) appears in args: the
+	// in args mode when none of the device-list placeholders
+	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES}) appears in args: the
 	// agent would inject no visibility and the selection would be lost. HTTP 400.
 	ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder = errors.New("runtime_spec.visible_devices_args_no_placeholder")
 	// ErrRuntimeSpecAPITokenModeInvalid rejects an api_token_mode that is not
@@ -1043,15 +1043,21 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	if err != nil {
 		return runtimeSpecWrite{}, err
 	}
+	spec, err := s.runtimeSpecRow(mapping.ID, req, fields, prior)
+	if err != nil {
+		return runtimeSpecWrite{}, err
+	}
+	// The cluster checks and the listen-port check read the store and are
+	// the newest refusals, so they run after everything above, the row's own
+	// preparation (the token seal) included.
 	plan := keepStoredCluster(prior, fields)
 	if principal != nil {
 		if plan, err = s.validateClusterHead(ctx, *principal, app, req, fields, prior); err != nil {
 			return runtimeSpecWrite{}, err
 		}
-	}
-	spec, err := s.runtimeSpecRow(mapping.ID, req, fields, prior)
-	if err != nil {
-		return runtimeSpecWrite{}, err
+		if err := s.checkListenPortFree(ctx, app.ServerID, req.ListenPort, prior); err != nil {
+			return runtimeSpecWrite{}, err
+		}
 	}
 	plan.applyTo(&spec)
 	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
@@ -1062,8 +1068,8 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 		return w, err
 	}
 	if plan.writeMembers {
-		if err := s.routes.SetClusterMembers(ctx, spec.ID, plan.members, plan.gpus); err != nil {
-			return w, clusterMembersStoreError(err)
+		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
+			return w, err
 		}
 	}
 	storedGPUs, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
@@ -1634,10 +1640,21 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 	if !ok {
 		return ErrRuntimeSpecNotFound
 	}
+	// A cluster head's membership goes with it, and with it the member
+	// processes derived into each member server's document.
+	members, _, err := s.routes.ClusterMembers(ctx, spec.ID)
+	if err != nil {
+		return err
+	}
 	if err := s.routes.DeleteRuntimeSpec(ctx, spec.ID); err != nil {
 		return err
 	}
 	s.notifyRuntimeChanged(server.ID)
+	for _, m := range members {
+		if m.ServerID != server.ID {
+			s.notifyRuntimeChanged(m.ServerID)
+		}
+	}
 	return nil
 }
 

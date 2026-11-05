@@ -743,6 +743,13 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	if proxyPortTaken {
 		return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
 	}
+	if memberPort, err := s.rpcMemberPortTaken(ctx, server.ID, port); err != nil {
+		return ApplicationDTO{}, err
+	} else if memberPort {
+		// The store's unique (server_id, port) sees applications only; an
+		// llama.cpp RPC cluster member on the server holds this port.
+		return ApplicationDTO{}, ErrApplicationConflict
+	}
 	if appType == routing.ProviderServerAgent {
 		exists, err := s.serverAgentApplicationExistsOnServer(ctx, server.ID, "")
 		if err != nil {
@@ -1009,6 +1016,13 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		}
 		if proxyPortTaken {
 			return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
+		}
+	}
+	if req.Port != nil && port != app.Port {
+		if memberPort, err := s.rpcMemberPortTaken(ctx, server.ID, port); err != nil {
+			return ApplicationDTO{}, err
+		} else if memberPort {
+			return ApplicationDTO{}, ErrApplicationConflict
 		}
 	}
 	// The same "at most one server_agent application per server" invariant the
@@ -1759,7 +1773,8 @@ func (s *Service) proxyListenPortTakenOnServer(ctx context.Context, serverID str
 			return true, nil
 		}
 	}
-	return false, nil
+	// An llama.cpp RPC cluster member on the server listens there too.
+	return s.rpcMemberPortTaken(ctx, serverID, port)
 }
 
 // serverAgentApplicationExistsOnServer reports whether serverID already has a

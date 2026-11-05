@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"slices"
@@ -96,9 +97,12 @@ func (f *clusterFixture) member(name string) ServerDTO {
 // foreignServer creates a server owned by usr_other in an admin group
 // ownerToken does not manage; it consents to the head's admin group, offers
 // RPC membership and has a matching ggml-rpc-server.
-func (f *clusterFixture) foreignServer(name string) ServerDTO {
+const clusterForeignGroup = "ugrp_cluster_foreign"
+
+// foreignGroup returns an admin group ownerToken does not manage.
+func (f *clusterFixture) foreignGroup() string {
 	f.t.Helper()
-	const group = "ugrp_cluster_foreign"
+	const group = clusterForeignGroup
 	if _, err := f.dir.UserGroupByID(f.ctx, group); err != nil {
 		if err := f.dir.CreateUserGroup(f.ctx, store.UserGroup{
 			ID: group, Tier: store.GroupTierAdmin, Name: "Foreign", ParentGroupID: testSystemGroupID,
@@ -107,6 +111,12 @@ func (f *clusterFixture) foreignServer(name string) ServerDTO {
 			f.t.Fatalf("foreign group: %v", err)
 		}
 	}
+	return group
+}
+
+func (f *clusterFixture) foreignServer(name string) ServerDTO {
+	f.t.Helper()
+	group := f.foreignGroup()
 	srv, err := f.svc.CreateServer(f.ctx, systemToken(), CreateServerRequest{
 		Name: name, Domain: name + ".example.test", OwnerIDs: []string{"usr_other"}, AdminGroupIDs: []string{group},
 	})
@@ -285,6 +295,10 @@ func TestPutClusterSaveChecks(t *testing.T) {
 		{"device backend invalid", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.DeviceBackend = "musa" }), ErrRPCMemberDeviceBackendInvalid},
 		{"type not llama_cpp", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.Type = "vllm" }), ErrClusterTypeInvalid},
 		{"auto-detected llama-server is llama_cpp", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.Type = "" }), nil},
+		{"--rpc= form", with(args("--rpc=${RPC_SERVERS}")), ErrClusterFlagEqualsForm},
+		{"--device= form", with(args("--rpc", "${RPC_SERVERS}", "--device=${DEVICES}")), ErrClusterFlagEqualsForm},
+		{"-dev= form", with(args("--rpc", "${RPC_SERVERS}", "-dev=${DEVICES}")), ErrClusterFlagEqualsForm},
+		{"a flag-like value is no flag", with(args("--alias", "-dev", "--rpc", "${RPC_SERVERS}")), nil},
 		{"rpc placeholder missing", with(args()), ErrClusterRPCPlaceholderMissing},
 		{"rpc with a literal address", with(args("--rpc", "10.0.0.1:50052")), ErrClusterRPCPlaceholderMissing},
 		{"placeholder outside --rpc", with(args("--alias", "${RPC_SERVERS}")), ErrClusterRPCPlaceholderMissing},
@@ -340,22 +354,46 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			foreign := f.foreignServer("F")
 			r.ClusterMembers = []ClusterMemberDTO{autoMember(foreign.ID)}
 		}), ErrServerNotFound},
-		{"member server gives no consent", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		{"member server consents to another group only", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.updateServer(r.ClusterMembers[0].ServerID, func(s *routing.AIServer) {
+				s.RPCAllowedHeadGroups = encodeRPCHeadGroups([]string{f.foreignGroup()})
+			})
+		}), ErrServerNotFound},
+		// An empty consent list means the member server's own admin groups,
+		// which here include the head server's.
+		{"member server with an empty consent list", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			f.updateServer(r.ClusterMembers[0].ServerID, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = "[]" })
+		}), nil},
+		{"member server with an empty consent list in another group", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			srv := r.ClusterMembers[0].ServerID
+			f.updateServer(srv, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = "" })
+			// Still managed by ownerToken as its owner, but linked to a group
+			// the head's server is not in.
+			if _, err := f.svc.SetServerAdminGroups(f.ctx, systemToken(), srv, []string{f.foreignGroup()}); err != nil {
+				t.Fatal(err)
+			}
 		}), ErrServerNotFound},
 		{"manual spec missing", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.MemberMode = "manual" }), ErrRPCMemberSpecNotFound},
 		{"manual spec of another server", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			r.MemberMode = "manual"
 			r.ClusterMembers[0].MemberSpecID = f.manualSpec(f.member("B").ID).ID
 		}), ErrRPCMemberSpecNotFound},
-		{"manual spec without consent", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		{"manual spec consenting to another group", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.MemberMode = "manual"
+			spec, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), r.ClusterMembers[0].ServerID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary, AllowedHeadGroups: &[]string{f.foreignGroup()}})
+			if err != nil {
+				t.Fatalf("spec: %v", err)
+			}
+			r.ClusterMembers[0].MemberSpecID = spec.ID
+		}), ErrServerNotFound},
+		{"manual spec with an empty consent list", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			r.MemberMode = "manual"
 			spec, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), r.ClusterMembers[0].ServerID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary, AllowedHeadGroups: &[]string{}})
 			if err != nil {
 				t.Fatalf("spec: %v", err)
 			}
 			r.ClusterMembers[0].MemberSpecID = spec.ID
-		}), ErrServerNotFound},
+		}), nil},
 		{"manual spec taken by another head", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			r.MemberMode = "manual"
 			spec := f.manualSpec(r.ClusterMembers[0].ServerID)
@@ -619,12 +657,13 @@ func membersByServer(t *testing.T, f *clusterFixture, headID string) (map[string
 	return m, g
 }
 
-// TestPutClusterReorderStopsHeadAndMarksStale: a reorder of a running
-// cluster's members is pushed to the head server and every member server --
-// the head's pushed spec changes, which makes its agent drain the running
-// head -- keeps each member's port and measured values, and marks the kept
-// values stale, since the RPC<n> numbering and the split changed.
-func TestPutClusterReorderStopsHeadAndMarksStale(t *testing.T) {
+// TestPutClusterReorderNotifiesAndMarksStale: a reorder of a running
+// cluster's members stops nothing itself; it is pushed to the head server and
+// every member server (the head's pushed spec changes, and its agent drains
+// a running head on that change), keeps each member's port and measured
+// values, and marks the kept values stale, since the RPC<n> numbering and
+// the split changed.
+func TestPutClusterReorderNotifiesAndMarksStale(t *testing.T) {
 	f := newClusterFixture(t)
 	a, b := f.member("A"), f.member("B")
 	first := f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(b.ID, 0)))
@@ -794,7 +833,7 @@ func TestClusterCandidatesFiltersByAuthAndConsent(t *testing.T) {
 	f.mustPut(PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Args: []string{"-m", "/m.gguf"}})
 	good := f.member("Good")
 	noConsent := f.member("NoConsent")
-	f.updateServer(noConsent.ID, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = "[]" })
+	f.updateServer(noConsent.ID, func(s *routing.AIServer) { s.RPCAllowedHeadGroups = encodeRPCHeadGroups([]string{f.foreignGroup()}) })
 	disabled := f.member("Disabled")
 	f.updateServer(disabled.ID, func(s *routing.AIServer) { s.RPCMemberEnabled = false })
 	wrongVersion := f.member("WrongVersion")
@@ -837,7 +876,7 @@ func TestClusterCandidatesFiltersByAuthAndConsent(t *testing.T) {
 	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: good.ID, MemberSpecID: taken.ID, Port: 47100}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), disabled.ID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary, AllowedHeadGroups: &[]string{}}); err != nil {
+	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), disabled.ID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary, AllowedHeadGroups: &[]string{f.foreignGroup()}}); err != nil {
 		t.Fatal(err)
 	}
 	manual, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "manual")
@@ -859,6 +898,10 @@ func TestClusterForeignMemberHiddenInDTO(t *testing.T) {
 	f := newClusterFixture(t)
 	mine := f.member("Mine")
 	foreign := f.foreignServer("Foreign")
+	f.hardware(foreign.ID, `{"os":"linux","gpus":[{"index":0,"name":"NVIDIA RTX A6000","pci_bus_id":"0:1","memory_total_bytes":51539607552}]}`)
+	if err := f.routes.SetServerGPUBudgets(f.ctx, foreign.ID, []routing.ServerGPUBudget{{ServerID: foreign.ID, GPUIndex: 0, BudgetMB: 20000}}); err != nil {
+		t.Fatal(err)
+	}
 	req := clusterHeadRequest(autoMember(mine.ID, 0), autoMember(foreign.ID, 0))
 	req.ClusterMembers[1].RAMEstimateMB = 4000
 	req.RAMEstimateMB = 1000
@@ -889,12 +932,39 @@ func TestClusterForeignMemberHiddenInDTO(t *testing.T) {
 	if err != nil || !sys.ClusterMembers[1].Visible || sys.ClusterMembers[1].ServerID != foreign.ID {
 		t.Fatalf("system view = %+v err=%v", sys.ClusterMembers, err)
 	}
-	// The caller cannot save the head while it cannot manage every member
-	// server: the hidden entry names no server.
-	if _, err := f.put(ownerToken(), putRequestFromDTO(got)); !errors.Is(err, ErrServerNotFound) {
-		t.Fatalf("owner re-save = %v, want server not found", err)
+	// The hidden member's server says nothing through the warnings or the
+	// network default: the system view warns about its GPU budget, the
+	// owner's does not, and the owner gets no network default.
+	if !slices.Contains(sys.ClusterWarnings, ClusterWarnBudgetBelowDevice) || sys.ClusterNetworkDefault != "lan" {
+		t.Fatalf("system view warnings %v default %q", sys.ClusterWarnings, sys.ClusterNetworkDefault)
 	}
-	_ = head
+	if slices.Contains(got.ClusterWarnings, ClusterWarnBudgetBelowDevice) || got.ClusterNetworkDefault != "" {
+		t.Fatalf("owner view leaks the hidden member: warnings %v default %q", got.ClusterWarnings, got.ClusterNetworkDefault)
+	}
+	// A save that leaves the membership as stored needs the head's rights
+	// only, so the hidden member does not lock the owner out of the head.
+	resave := putRequestFromDTO(got)
+	resave.IdleTimeoutSeconds = 900
+	if _, err := f.put(ownerToken(), resave); err != nil {
+		t.Fatalf("owner re-save without membership change = %v", err)
+	}
+	if members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID); len(members) != 2 || members[1].ServerID != foreign.ID {
+		t.Fatalf("membership after the owner's re-save = %+v", members)
+	}
+	// A membership change still needs rights on every member server: drop
+	// the owner's own member, keep the hidden one.
+	change := putRequestFromDTO(got)
+	change.ClusterMembers = change.ClusterMembers[1:]
+	if _, err := f.put(ownerToken(), change); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("owner membership change = %v, want server not found", err)
+	}
+	// So does a transport change.
+	change = putRequestFromDTO(got)
+	change.RPCTransport = "direct"
+	change.LANExposureAck = true
+	if _, err := f.put(ownerToken(), change); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("owner transport change = %v, want server not found", err)
+	}
 }
 
 func TestPutClusterWarnings(t *testing.T) {
@@ -993,5 +1063,165 @@ func TestPutClusterManualMemberDTOUsesSpec(t *testing.T) {
 	f.mustPut(req)
 	if err := f.svc.DeleteRPCMemberSpec(f.ctx, ownerToken(), srv.ID, spec.ID); !errors.Is(err, ErrRPCMemberInUse) {
 		t.Fatalf("delete in-use spec = %v", err)
+	}
+}
+
+func TestDeleteClusterHeadNotifiesMemberServers(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID), autoMember(b.ID)))
+	f.mu.Lock()
+	f.notified = nil
+	f.mu.Unlock()
+	if err := f.svc.DeleteRuntimeSpec(f.ctx, ownerToken(), f.mappingID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got, want := f.notifiedServers(), sortedIDs(f.head.ID, a.ID, b.ID); !slices.Equal(got, want) {
+		t.Fatalf("notified = %v, want head and both members %v", got, want)
+	}
+	if members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID); len(members) != 0 {
+		t.Fatalf("membership survived the head: %+v", members)
+	}
+}
+
+// TestPortsOnAMemberServerAvoidRPCPorts: a port a cluster member holds on its
+// server is refused as a new fixed listen_port, application port or TLS
+// proxy port there; an unchanged listen_port is never refused.
+func TestPortsOnAMemberServerAvoidRPCPorts(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+	members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID)
+	rpcPort := members[0].Port
+
+	app := seedServerAgentApplication(t, f.routes, a.ID, clusterTestNow)
+	mapping, err := f.svc.CreateMapping(f.ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "local", AppModelName: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := PutRuntimeSpecRequest{Enabled: true, Binary: "/bin/x", ListenPort: rpcPort}
+	if _, err := f.svc.PutRuntimeSpec(f.ctx, ownerToken(), mapping.ID, spec); !errors.Is(err, ErrRuntimeSpecPortConflictsRPCMember) {
+		t.Fatalf("listen_port on an RPC port = %v, want %v", err, ErrRuntimeSpecPortConflictsRPCMember)
+	}
+	// A listen_port stored before the member took the port stays savable.
+	spec.ListenPort = rpcPort + 1
+	if _, err := f.svc.PutRuntimeSpec(f.ctx, ownerToken(), mapping.ID, spec); err != nil {
+		t.Fatalf("free listen_port: %v", err)
+	}
+	if err := f.routes.SetClusterMembers(f.ctx, head.ID, []routing.ClusterMember{{Position: 0, ServerID: a.ID, Port: rpcPort + 1, DeviceBackend: "auto"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	spec.IdleTimeoutSeconds = 60
+	if _, err := f.svc.PutRuntimeSpec(f.ctx, ownerToken(), mapping.ID, spec); err != nil {
+		t.Fatalf("unchanged listen_port refused: %v", err)
+	}
+
+	if _, err := f.svc.CreateApplication(f.ctx, ownerToken(), a.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: rpcPort + 1, Scheme: "http"}); !errors.Is(err, ErrApplicationConflict) {
+		t.Fatalf("application port on an RPC port = %v, want %v", err, ErrApplicationConflict)
+	}
+	created, err := f.svc.CreateApplication(f.ctx, ownerToken(), a.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "http"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clash := rpcPort + 1
+	if _, err := f.svc.UpdateApplication(f.ctx, ownerToken(), created.ID, UpdateApplicationRequest{Port: &clash}); !errors.Is(err, ErrApplicationConflict) {
+		t.Fatalf("application port update onto an RPC port = %v, want %v", err, ErrApplicationConflict)
+	}
+	if _, err := f.svc.UpdateApplication(f.ctx, ownerToken(), created.ID, UpdateApplicationRequest{ProxyListenPort: &clash}); !errors.Is(err, ErrApplicationProxyListenPortConflict) {
+		t.Fatalf("proxy port onto an RPC port = %v, want %v", err, ErrApplicationProxyListenPortConflict)
+	}
+}
+
+// racingPortStore makes the first membership write of a head lose a race:
+// another head takes the port the write allocated on the same server just
+// before it, as a second gateway process would.
+type racingPortStore struct {
+	*routing.MemoryStore
+	rival   string
+	races   int
+	written int
+}
+
+func (r *racingPortStore) SetClusterMembers(ctx context.Context, head string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
+	if head != r.rival && r.written < r.races && len(members) > 0 {
+		r.written++
+		if err := r.MemoryStore.SetClusterMembers(ctx, r.rival, []routing.ClusterMember{{Position: 0, ServerID: members[0].ServerID, Port: members[0].Port, DeviceBackend: "auto"}}, nil); err != nil {
+			return err
+		}
+	}
+	return r.MemoryStore.SetClusterMembers(ctx, head, members, gpus)
+}
+
+func TestPutClusterPortRace(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		races int
+		want  error
+	}{
+		{"one lost race allocates again", 1, nil},
+		{"a second lost race gives up", 2, ErrClusterPortExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClusterFixture(t)
+			a := f.member("A")
+			rival := seedOtherHead(t, f)
+			racing := &racingPortStore{MemoryStore: f.routes, rival: rival, races: tc.races}
+			f.svc.routes = racing
+			dto, err := f.put(ownerToken(), clusterHeadRequest(autoMember(a.ID)))
+			if !errors.Is(err, tc.want) && (tc.want != nil || err != nil) {
+				t.Fatalf("PutRuntimeSpec = %v, want %v", err, tc.want)
+			}
+			if tc.want != nil {
+				return
+			}
+			members, _, _ := f.routes.ClusterMembers(f.ctx, dto.ID)
+			rivals, _, _ := f.routes.ClusterMembers(f.ctx, rival)
+			if len(members) != 1 || members[0].Port == rivals[0].Port || members[0].Port == 0 {
+				t.Fatalf("ports: head %+v rival %+v", members, rivals)
+			}
+		})
+	}
+}
+
+// TestPutClusterChecksRunAfterTheRowIsBuilt: the cluster checks are the
+// newest refusals, so a body that also fails the row's own preparation (the
+// API token seal on a keyless store) reports that first.
+func TestPutClusterChecksRunAfterTheRowIsBuilt(t *testing.T) {
+	svc, routes := newServerTestServiceWithCipher(t, clusterTestNow, nil, false)
+	server := createTestServer(t, svc, "Head", "head.example.test")
+	app := seedServerAgentApplication(t, routes, server.ID, clusterTestNow)
+	mapping, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "big", AppModelName: "big"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := clusterHeadRequest() // no members: a cluster refusal
+	req.APITokenMode = "random"
+	req.Env = map[string]string{"LLAMA_API_KEY": "${API_TOKEN}"}
+	if _, err := svc.PutRuntimeSpec(context.Background(), ownerToken(), mapping.ID, req); !errors.Is(err, capture.ErrKeyRequired) {
+		t.Fatalf("err = %v, want the seal refusal before the cluster checks", err)
+	}
+}
+
+func TestPutClusterFirstLocalDeviceOnAHeadWithoutGPUs(t *testing.T) {
+	f := newClusterFixture(t)
+	req := clusterHeadRequest(autoMember(f.member("A").ID))
+	req.Args = []string{"-m", "/m.gguf", "--rpc", "${RPC_SERVERS}", "--device", "${FIRST_LOCAL_DEVICE},${RPC_DEVICES}", "-mmdev", "x"}
+	if dto := f.mustPut(req); slices.Contains(dto.ClusterWarnings, ClusterWarnRPCDevicesNotFirst) {
+		t.Fatalf("warnings = %v: ${FIRST_LOCAL_DEVICE} is RPC0 on a head without GPU rows", dto.ClusterWarnings)
+	}
+	req.GPUs = []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 1000}}
+	if dto := f.mustPut(req); !slices.Contains(dto.ClusterWarnings, ClusterWarnRPCDevicesNotFirst) {
+		t.Fatalf("warnings = %v, want %s with a local GPU first", dto.ClusterWarnings, ClusterWarnRPCDevicesNotFirst)
+	}
+}
+
+func TestPutClusterUnchangedMembershipKeepsTheAcknowledgement(t *testing.T) {
+	f := newClusterFixture(t)
+	req := clusterHeadRequest(autoMember(f.member("A").ID))
+	req.RPCTransport, req.LANExposureAck = "direct", true
+	f.mustPut(req)
+	req.LANExposureAck = false
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterLANAckRequired) {
+		t.Fatalf("withdrawn acknowledgement = %v, want %v", err, ErrClusterLANAckRequired)
 	}
 }

@@ -138,6 +138,7 @@ var migrations = []migration{
 	{version: 103, name: "rpc_cluster_columns", up: migration103Up},
 	{version: 104, name: "rpc_cluster_tables", up: migration104Up},
 	{version: 105, name: "usage_event_hosts", up: migration105Up},
+	{version: 106, name: "rpc_member_port_unique", up: migration106Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4737,4 +4738,17 @@ func migration105Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration106Up makes a member's RPC port unique on its server: a partial
+// unique index on rpc_cluster_members(server_id, port) for every allocated
+// port (0 = none yet). The portal allocates the lowest free port in the RPC
+// range under a process-local lock, so two gateway processes saving heads
+// at the same time could pick the same port on one server; the index turns
+// the second write into a conflict the portal retries. The membership table
+// is new in migration 104 and its rows come only from that allocator, so no
+// stored data can violate the index. `if not exists`, so the step replays.
+func migration106Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return execTx(ctx, tx, dl, `create unique index if not exists idx_rpc_cluster_members_server_port
+		on rpc_cluster_members(server_id, port) where port <> 0`)
 }

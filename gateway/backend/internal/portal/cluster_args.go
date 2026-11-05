@@ -14,6 +14,7 @@ const (
 	placeholderRPCServers = "${RPC_SERVERS}"
 	placeholderRPCDevices = "${RPC_DEVICES}"
 	placeholderDevices    = "${DEVICES}"
+	placeholderFirstLocal = "${FIRST_LOCAL_DEVICE}"
 
 	envLlamaArgRPC         = "LLAMA_ARG_RPC"
 	envLlamaArgDevice      = "LLAMA_ARG_DEVICE"
@@ -62,6 +63,9 @@ type clusterArgScan struct {
 	mmdev bool
 	// clusterPlaceholder: ${RPC_SERVERS} or ${RPC_DEVICES} appears anywhere.
 	clusterPlaceholder bool
+	// equalsForm: one of the options above is written as "--flag=value" or
+	// "-flag=value", which llama-server refuses as an invalid argument.
+	equalsForm bool
 }
 
 // hasDeviceList reports whether a device list is given at all.
@@ -69,24 +73,34 @@ func (c clusterArgScan) hasDeviceList() bool { return c.deviceInArgs || c.device
 
 // deviceListStartsWithRPC reports whether the device list's first entry is
 // an RPC device: ${DEVICES} renders the RPC devices first on a head, and
-// ${RPC_DEVICES} or a literal RPC<n> are RPC devices themselves.
-func (c clusterArgScan) deviceListStartsWithRPC() bool {
+// ${RPC_DEVICES} or a literal RPC<n> are RPC devices themselves. On a head
+// without GPU rows ${FIRST_LOCAL_DEVICE} falls back to the first RPC device,
+// so it counts too when headHasGPUs is false.
+func (c clusterArgScan) deviceListStartsWithRPC(headHasGPUs bool) bool {
 	first, _, _ := strings.Cut(c.deviceList, ",")
 	first = strings.TrimSpace(first)
+	if !headHasGPUs && strings.HasPrefix(first, placeholderFirstLocal) {
+		return true
+	}
 	return strings.HasPrefix(first, placeholderDevices) || strings.HasPrefix(first, placeholderRPCDevices) ||
 		strings.HasPrefix(first, "RPC")
 }
 
 // normalizeLlamaFlag returns the option name of one argv element and the
 // value attached with "=", if any. llama-server treats "_" and "-" alike in
-// long options, so --tensor_split is --tensor-split.
+// long options, so --tensor_split is --tensor-split. llama-server itself does
+// not split "=" (it refuses such an element as an invalid argument); the scan
+// splits it only to recognise the option and refuse the form.
 func normalizeLlamaFlag(arg string) (name, value string, attached bool) {
 	a := strings.TrimSpace(arg)
-	if !strings.HasPrefix(a, "--") {
+	if !strings.HasPrefix(a, "-") {
 		return a, "", false
 	}
 	name, value, attached = strings.Cut(a, "=")
-	return strings.ReplaceAll(name, "_", "-"), value, attached
+	if strings.HasPrefix(name, "--") {
+		name = strings.ReplaceAll(name, "_", "-")
+	}
+	return name, value, attached
 }
 
 // flagValue returns the value of the option at args[i]: the attached one,
@@ -126,8 +140,9 @@ func scanClusterArgs(args []string, env map[string]string) clusterArgScan {
 		}
 	}
 	argDeviceList := ""
-	for i, a := range args {
-		name, value, attached := normalizeLlamaFlag(a)
+	for i := 0; i < len(args); i++ {
+		name, value, attached := normalizeLlamaFlag(args[i])
+		scanned := true
 		switch {
 		case isOneOf(name, clusterRPCFlags):
 			scan.rpcInArgs = true
@@ -148,6 +163,16 @@ func scanClusterArgs(args []string, env map[string]string) clusterArgScan {
 			scan.tensorSplit = true
 		case isOneOf(name, clusterMMDevFlags):
 			scan.mmdev = true
+		default:
+			scanned = false
+		}
+		if scanned && attached {
+			scan.equalsForm = true
+		}
+		// Step over the option's value, so a value that looks like an option
+		// ("--alias -dev") is not read as one.
+		if !attached {
+			i += llamaServerValueFlags[name]
 		}
 	}
 	if v, ok := envValue(env, envLlamaArgRPC); ok {

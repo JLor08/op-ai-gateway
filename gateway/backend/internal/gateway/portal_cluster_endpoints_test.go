@@ -29,6 +29,7 @@ func TestPortalClusterErrorRows(t *testing.T) {
 		{portal.ErrClusterTransportInvalid, http.StatusBadRequest, "runtime_spec.cluster_transport_invalid"},
 		{portal.ErrRPCMemberDeviceBackendInvalid, http.StatusBadRequest, "runtime_spec.device_backend_invalid"},
 		{portal.ErrClusterTypeInvalid, http.StatusBadRequest, "runtime_spec.cluster_type_invalid"},
+		{portal.ErrClusterFlagEqualsForm, http.StatusBadRequest, "runtime_spec.cluster_flag_equals_form"},
 		{portal.ErrClusterRPCPlaceholderMissing, http.StatusBadRequest, "runtime_spec.cluster_rpc_placeholder_missing"},
 		{portal.ErrClusterRPCTwice, http.StatusBadRequest, "runtime_spec.cluster_rpc_twice"},
 		{portal.ErrClusterRPCPlaceholderWithoutCluster, http.StatusBadRequest, "runtime_spec.cluster_rpc_placeholder_without_cluster"},
@@ -54,6 +55,7 @@ func TestPortalClusterErrorRows(t *testing.T) {
 		{portal.ErrRPCMemberVRAMEstimateRequired, http.StatusBadRequest, "runtime_spec.member_vram_estimate_required"},
 		{portal.ErrClusterTensorSplitRequired, http.StatusBadRequest, "runtime_spec.cluster_tensor_split_required"},
 		{portal.ErrClusterPortExhausted, http.StatusConflict, "runtime_spec.cluster_port_exhausted"},
+		{portal.ErrRuntimeSpecPortConflictsRPCMember, http.StatusConflict, "runtime_spec.port_conflicts_rpc_member"},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
