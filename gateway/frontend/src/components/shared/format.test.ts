@@ -1052,6 +1052,20 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     // did not work"), which is why they share one.
     const documentedSharedLabels: Record<string, string[]> = {
       errorRequestFailed: ['request.failed', 'request.invalid_response'],
+      // A cluster head's withheld reason reads like the save refusal that
+      // names the same condition.
+      errorClusterDirectUnavailable: [
+        'runtime.cluster_direct_unavailable',
+        'runtime_spec.cluster_direct_unavailable',
+      ],
+      errorClusterMeshUnavailable: [
+        'runtime.cluster_mesh_unavailable',
+        'runtime_spec.cluster_mesh_unavailable',
+      ],
+      errorClusterMemberNoMatchingBinary: [
+        'runtime.cluster_member_no_matching_binary',
+        'runtime_spec.cluster_member_no_matching_binary',
+      ],
     };
     const codesByLabel = new Map<string, string[]>();
     for (const [code, key] of entries) {
@@ -1077,6 +1091,19 @@ describe('errorLabelByCode (whole-map invariants)', () => {
  * `last_error.code` or a start refusal.
  */
 const clusterWireCodes = [
+  // The reasons a cluster head is withheld from its agent
+  // (RuntimeSpec.cluster_withheld_reason).
+  'runtime.cluster_address_unknown',
+  'runtime.cluster_direct_unavailable',
+  'runtime.cluster_member_consent_withdrawn',
+  'runtime.cluster_member_disabled',
+  'runtime.cluster_member_missing',
+  'runtime.cluster_member_no_matching_binary',
+  'runtime.cluster_member_spec_invalid',
+  'runtime.cluster_member_unmanaged',
+  'runtime.cluster_mesh_unavailable',
+  'runtime.cluster_port_unknown',
+  'runtime_config.agent_features_pending',
   // Cluster head save refusals.
   'runtime_spec.cluster_member_mode_invalid',
   'runtime_spec.cluster_network_invalid',

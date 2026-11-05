@@ -29,7 +29,7 @@ export const RUNTIME_INSTANCES_FEATURE = 'runtime_instances';
 /** The spec fields the plan reads. */
 export type RowPlanSpec = Pick<
   RuntimeSpec,
-  'replicable' | 'min_instances' | 'max_instances' | 'pinned' | 'admin_state'
+  'replicable' | 'min_instances' | 'max_instances' | 'pinned' | 'admin_state' | 'cluster_enabled'
 >;
 
 /**
@@ -88,8 +88,12 @@ function higherSiblingDraining(rows: readonly RuntimeStatus[], specId: string, k
  * nothing up may stop its last instance.
  */
 export function manualStopProtectedCount(
-  spec: Pick<RuntimeSpec, 'replicable' | 'min_instances' | 'pinned' | 'admin_state'>,
+  spec: Pick<RuntimeSpec, 'replicable' | 'min_instances' | 'pinned' | 'admin_state'> &
+    Partial<Pick<RuntimeSpec, 'cluster_enabled'>>,
 ): number {
+  // A cluster head drains on stop: the gateway's cluster orchestrator takes
+  // the whole cluster down, so a pinned or force_running head still offers it.
+  if (spec.cluster_enabled) return 0;
   const floor = spec.replicable ? spec.min_instances : 0;
   const held = spec.pinned || spec.admin_state === 'force_running' ? 1 : 0;
   return Math.max(floor, held);

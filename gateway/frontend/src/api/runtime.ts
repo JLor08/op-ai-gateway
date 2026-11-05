@@ -286,6 +286,10 @@ export interface RuntimeSpec {
   cluster_network_default?: ClusterNetwork | '';
   cluster_transport_default?: RpcTransport | '';
   cluster_warnings?: string[];
+  // READ-ONLY: the stable error code (see errorLabelByCode) naming why the
+  // gateway does not send this head's cluster to its agent; empty when it
+  // does. Excluded from the PUT request.
+  cluster_withheld_reason?: string;
 }
 
 // A full-document upsert of a runtime spec: every field is applied verbatim
@@ -329,6 +333,7 @@ export type PutRuntimeSpecRequest = Omit<
   | 'cluster_network_default'
   | 'cluster_transport_default'
   | 'cluster_warnings'
+  | 'cluster_withheld_reason'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).

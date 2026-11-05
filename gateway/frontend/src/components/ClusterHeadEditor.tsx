@@ -38,6 +38,8 @@ import type {
 } from '../api';
 import type { MessageKey, PortalApi, Translation } from './shared/types';
 import { Field } from './shared/Field';
+import { ClusterWithheldNotice } from './ClusterTotalCell';
+import { clusterWithheldReason } from './shared/clusterTotals';
 import { SelectField } from './shared/SelectField';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { clusterWarningLabelByCode } from './shared/format';
@@ -379,6 +381,7 @@ export function ClusterHeadEditor({
       <Typography id="cluster-head-heading" variant="subtitle1" component="h3">
         {t.clusterTitle}
       </Typography>
+      <ClusterWithheldNotice reason={clusterWithheldReason(stored)} t={t} />
       <Typography variant="body2" color="text.secondary">
         {t.clusterIntro}
       </Typography>

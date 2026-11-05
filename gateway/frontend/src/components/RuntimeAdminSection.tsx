@@ -125,6 +125,8 @@ import {
 } from './shared/runtimeInstances';
 import { minRealtimeWarning } from './shared/audioMetrics';
 import { runtimeRowPlan, startInstanceLimit } from './shared/runtimeActions';
+import { ClusterTotalCell, ClusterWithheldNotice } from './ClusterTotalCell';
+import { clusterWithheldReason, isClusterHead } from './shared/clusterTotals';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
@@ -681,6 +683,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     cluster_network_default,
     cluster_transport_default,
     cluster_warnings,
+    cluster_withheld_reason,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -3816,10 +3819,18 @@ export function RuntimeAdminSection({
       id: 'vram_total',
       label: t.runtimeSpecVramTotal,
       value: (m) => {
-        const total = totalGpuVram(specsById[m.id]);
+        const spec = specsById[m.id];
+        const total = isClusterHead(spec) ? (spec?.cluster_vram_total_mb ?? 0) : totalGpuVram(spec);
         return total > 0 ? String(total) : '—';
       },
-      render: (m) => formatMb(totalGpuVram(specsById[m.id])),
+      render: (m) => {
+        const spec = specsById[m.id];
+        return spec && isClusterHead(spec) ? (
+          <ClusterTotalCell spec={spec} axis="vram" ownMb={totalGpuVram(spec)} t={t} />
+        ) : (
+          formatMb(totalGpuVram(spec))
+        );
+      },
       filter: 'text',
       searchable: false,
       numeric: true,
@@ -3828,10 +3839,21 @@ export function RuntimeAdminSection({
       id: 'ram',
       label: t.runtimeSpecRam,
       value: (m) => {
-        const ram = effectiveRam(specsById[m.id], statusForMapping(m));
+        const spec = specsById[m.id];
+        const ram = isClusterHead(spec)
+          ? (spec?.cluster_ram_total_mb ?? 0)
+          : effectiveRam(spec, statusForMapping(m));
         return ram > 0 ? String(ram) : '—';
       },
-      render: (m) => formatMb(effectiveRam(specsById[m.id], statusForMapping(m))),
+      render: (m) => {
+        const spec = specsById[m.id];
+        const own = effectiveRam(spec, statusForMapping(m));
+        return spec && isClusterHead(spec) ? (
+          <ClusterTotalCell spec={spec} axis="ram" ownMb={own} t={t} />
+        ) : (
+          formatMb(own)
+        );
+      },
       filter: 'text',
       searchable: false,
       numeric: true,
@@ -3873,12 +3895,29 @@ export function RuntimeAdminSection({
       searchable: false,
       render: (m) => {
         const live = statusForMapping(m);
+        const withheld = clusterWithheldReason(specsById[m.id]);
+        if (!live && withheld) {
+          return (
+            <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+              <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+              <ClusterWithheldNotice reason={withheld} t={t} compact />
+            </Box>
+          );
+        }
         if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
-        const chip = (
+        const baseChip = (
           <StatusChip
             status={runtimeStateBadge(live.state)}
             label={runtimeStateLabel(live.state, t)}
           />
+        );
+        const chip = withheld ? (
+          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+            {baseChip}
+            <ClusterWithheldNotice reason={withheld} t={t} compact />
+          </Box>
+        ) : (
+          baseChip
         );
         // A replicable spec's chip is the state of the row that speaks for it
         // (a running one first, see primaryStatusRows); how many instances run,

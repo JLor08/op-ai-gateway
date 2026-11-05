@@ -64,6 +64,22 @@ describe('highestLiveInstance', () => {
   });
 });
 
+describe('cluster head stop', () => {
+  it('offers Stop on a pinned cluster head, which drains on stop', () => {
+    const head = spec({ pinned: true, admin_state: 'force_running', cluster_enabled: true });
+    expect(manualStopProtectedCount(head)).toBe(0);
+    const plan = runtimeRowPlan(row('h', 0), head, [row('h', 0)], declared);
+    expect(plan.stop).toEqual({});
+  });
+
+  it('still protects a pinned model that is not a cluster head', () => {
+    const plain = spec({ pinned: true });
+    expect(runtimeRowPlan(row('h', 0), plain, [row('h', 0)], declared).stop).toEqual({
+      disabled: 'protected',
+    });
+  });
+});
+
 describe('manualStopProtectedCount', () => {
   it('is 0 for a spec that keeps nothing up', () => {
     expect(manualStopProtectedCount(spec())).toBe(0);
