@@ -1,0 +1,570 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package portal
+
+import (
+	"context"
+	"errors"
+	"op-ai-gateway/internal/netbird"
+	"op-ai-gateway/internal/routing"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+var rpcPolicyNow = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+
+// rpcPolicyEnv is a gateway with NetBird policy management on (deny-by-default
+// enforced) against a fake NetBird, and helpers to store RPC clusters directly.
+type rpcPolicyEnv struct {
+	t      *testing.T
+	ctx    context.Context
+	svc    *Service
+	routes *routing.MemoryStore
+	fake   *fakeNetbird
+
+	mu       sync.Mutex
+	notified int
+}
+
+func newRPCPolicyEnv(t *testing.T, managePolicies bool) *rpcPolicyEnv {
+	t.Helper()
+	svc, routes := newNetbirdServerTestService(t, rpcPolicyNow)
+	fake := newFakeNetbird(t)
+	if managePolicies {
+		enableNetbirdPolicies(t, svc, fake.srv.URL, "all", true, true)
+	} else {
+		enableNetbird(t, svc, fake.srv.URL, true)
+	}
+	e := &rpcPolicyEnv{t: t, ctx: context.Background(), svc: svc, routes: routes, fake: fake}
+	svc.SetRuntimeConfigChangedHook(func(string) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.notified++
+	})
+	return e
+}
+
+func (e *rpcPolicyEnv) notifications() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.notified
+}
+
+// group is the tracking group of a server seeded by server.
+func rpcGroup(serverID string) string { return "g-" + serverID }
+
+func (e *rpcPolicyEnv) server(id string) {
+	e.t.Helper()
+	seedManagedNetbirdServer(e.t, e.routes, id, id, rpcGroup(id), "", rpcPolicyNow)
+}
+
+type rpcMemberSeed struct {
+	server string
+	port   int
+}
+
+// cluster stores an enabled cluster head on headServer (with a server_agent
+// application, mapping and spec) and its membership, and returns the head
+// spec id and the mapping id.
+func (e *rpcPolicyEnv) cluster(headServer, network, transport string, members ...rpcMemberSeed) (specID, mappingID string) {
+	e.t.Helper()
+	app := seedServerAgentApplication(e.t, e.routes, headServer, rpcPolicyNow)
+	mapping, err := e.svc.CreateMapping(e.ctx, systemToken(), app.ID, CreateMappingRequest{GatewayModelName: "big-" + headServer, AppModelName: "big"})
+	if err != nil {
+		e.t.Fatalf("mapping: %v", err)
+	}
+	specID = "rspec_" + headServer
+	if err := e.routes.UpsertRuntimeSpec(e.ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: mapping.ID, Enabled: true, Binary: "/opt/llama/llama-server", Args: "[]", Env: "{}",
+		ClusterEnabled: true, ClusterNetwork: network, RPCTransport: transport,
+		CreatedAt: rpcPolicyNow, UpdatedAt: rpcPolicyNow,
+	}); err != nil {
+		e.t.Fatalf("spec: %v", err)
+	}
+	e.setMembers(specID, members...)
+	return specID, mapping.ID
+}
+
+func (e *rpcPolicyEnv) setMembers(specID string, members ...rpcMemberSeed) {
+	e.t.Helper()
+	rows := make([]routing.ClusterMember, len(members))
+	for i, m := range members {
+		rows[i] = routing.ClusterMember{HeadSpecID: specID, Position: i, ServerID: m.server, Port: m.port}
+	}
+	if err := e.routes.SetClusterMembers(e.ctx, specID, rows, nil); err != nil {
+		e.t.Fatalf("members: %v", err)
+	}
+}
+
+func (e *rpcPolicyEnv) reconcile() {
+	e.t.Helper()
+	e.svc.reconcileRPCPolicies(e.ctx)
+}
+
+// seedRPCReadPolicy adds a read-shape op-gw-rpc policy for the grants.
+func seedRPCReadPolicy(f *fakeNetbird, id, serverID string, rules ...rpcRule) {
+	desc := managedPolicyDescription(netbirdRPCPolicyPurpose)
+	out := make([]any, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, map[string]any{
+			"enabled": true, "description": desc, "action": "accept", "bidirectional": false, "protocol": "tcp",
+			"ports":        []any{strconv.Itoa(r.port)},
+			"sources":      []any{map[string]any{"id": r.sourceGroupID, "name": r.sourceGroupID}},
+			"destinations": []any{map[string]any{"id": r.destGroupID, "name": r.destGroupID}},
+		})
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.policies = append(f.policies, map[string]any{"id": id, "name": NetbirdRPCPolicyPrefix + serverID, "description": desc, "enabled": true, "rules": out})
+}
+
+// policyGrants decodes the rules of a recorded write-shape policy body into
+// "source>destination:port" strings, sorted.
+func policyGrants(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	rules, _ := body["rules"].([]any)
+	var out []string
+	for _, raw := range rules {
+		r, _ := raw.(map[string]any)
+		if r["action"] != "accept" || r["protocol"] != "tcp" || r["bidirectional"] != false || r["enabled"] != true {
+			t.Fatalf("rule shape = %v", r)
+		}
+		src, _ := r["sources"].([]any)
+		dst, _ := r["destinations"].([]any)
+		ports, _ := r["ports"].([]any)
+		if len(src) != 1 || len(dst) != 1 || len(ports) != 1 {
+			t.Fatalf("rule must be single source/destination/port: %v", r)
+		}
+		out = append(out, src[0].(string)+">"+dst[0].(string)+":"+ports[0].(string))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestRPCPolicyPrefixDoesNotCollideWithAccessPrefix(t *testing.T) {
+	if strings.HasPrefix(NetbirdRPCPolicyPrefix, NetbirdManagedPolicyPrefix) || strings.HasPrefix(NetbirdManagedPolicyPrefix, NetbirdRPCPolicyPrefix) {
+		t.Fatalf("%q starts with %q: the status counter would count RPC policies", NetbirdRPCPolicyPrefix, NetbirdManagedPolicyPrefix)
+	}
+}
+
+func TestRPCPolicyCreatedPerMemberServerWithExactPorts(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a", "b"} {
+		e.server(id)
+	}
+	// Direct: the member's RPC port. Relay: the member's relay port. Either
+	// way the row's Port is what the head dials.
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001}, rpcMemberSeed{"b", 47055})
+	e.reconcile()
+
+	a := e.fake.createdPolicyByName("op-gw-rpc-a")
+	if a == nil {
+		t.Fatal("no policy created for member a")
+	}
+	if got := policyGrants(t, a); !slices.Equal(got, []string{"g-head>g-a:47001"}) {
+		t.Fatalf("a grants = %v", got)
+	}
+	if got := policyGrants(t, e.fake.createdPolicyByName("op-gw-rpc-b")); !slices.Equal(got, []string{"g-head>g-b:47055"}) {
+		t.Fatalf("b grants = %v", got)
+	}
+	if a["enabled"] != true || a["description"] != managedPolicyDescription(netbirdRPCPolicyPurpose) {
+		t.Fatalf("policy header = %v", a)
+	}
+	if e.fake.policyCreateCountByName("op-gw-rpc-head") != 0 {
+		t.Fatal("the head server must not get a policy")
+	}
+}
+
+func TestRPCPolicyRelayClusterUsesRelayPort(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47301})
+	e.reconcile()
+	if got := policyGrants(t, e.fake.createdPolicyByName("op-gw-rpc-a")); !slices.Equal(got, []string{"g-head>g-a:47301"}) {
+		t.Fatalf("grants = %v", got)
+	}
+}
+
+func TestRPCPolicyUpdatedOnPortChangeAndLeftAloneWhenMatching(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	spec, _ := e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001})
+
+	e.reconcile()
+	if e.fake.policyUpdateCount() != 0 || e.fake.policyCreateCountByName("op-gw-rpc-a") != 0 {
+		t.Fatalf("a matching policy was touched: updates=%d", e.fake.policyUpdateCount())
+	}
+
+	e.setMembers(spec, rpcMemberSeed{"a", 47009})
+	e.reconcile()
+	upd := e.fake.updatedPolicyByName("op-gw-rpc-a")
+	if upd == nil {
+		t.Fatal("port change did not update the policy")
+	}
+	if got := policyGrants(t, upd); !slices.Equal(got, []string{"g-head>g-a:47009"}) {
+		t.Fatalf("updated grants = %v", got)
+	}
+}
+
+func TestRPCPolicyTwoMembersOnOneServerAreTwoRules(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"h1", "h2", "a"} {
+		e.server(id)
+	}
+	e.cluster("h1", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.cluster("h2", "mesh", "relay", rpcMemberSeed{"a", 47002})
+	e.reconcile()
+	if n := e.fake.policyCreateCountByName("op-gw-rpc-a"); n != 1 {
+		t.Fatalf("policy creates for a = %d, want 1", n)
+	}
+	want := []string{"g-h1>g-a:47001", "g-h2>g-a:47002"}
+	if got := policyGrants(t, e.fake.createdPolicyByName("op-gw-rpc-a")); !slices.Equal(got, want) {
+		t.Fatalf("grants = %v, want %v", got, want)
+	}
+}
+
+func TestRPCPolicyDriftIsUpdatedAndOrphansSwept(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	// A stale policy with an extra rule is rewritten to exactly the desired set.
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001}, rpcRule{"g-evil", "g-a", 47001})
+	// A policy of a server with no mesh member is an orphan.
+	seedRPCReadPolicy(e.fake, "pol-ghost", "ghost", rpcRule{"g-head", "g-ghost", 47002})
+	// A manual policy outside the prefix is never touched.
+	e.fake.seedPolicy("pol-access", "op-gw-access-a", true, []string{"9000"}, "g-gw", "g-a")
+
+	e.reconcile()
+
+	if got := policyGrants(t, e.fake.updatedPolicyByName("op-gw-rpc-a")); !slices.Equal(got, []string{"g-head>g-a:47001"}) {
+		t.Fatalf("drifted policy not restored: %v", got)
+	}
+	if !e.fake.wasPolicyDeleted("pol-ghost") {
+		t.Fatal("orphan op-gw-rpc policy was not swept")
+	}
+	if e.fake.wasPolicyDeleted("pol-access") || e.fake.wasPolicyDeleted("pol-a") {
+		t.Fatal("a live or foreign policy was deleted")
+	}
+}
+
+func TestRPCPolicyMatchesDriftTable(t *testing.T) {
+	desc := managedPolicyDescription(netbirdRPCPolicyPurpose)
+	rules := []rpcRule{{"gh", "ga", 47001}}
+	base := func() netbird.Policy {
+		return netbird.Policy{Name: "op-gw-rpc-a", Description: desc, Enabled: true, Rules: []netbird.PolicyRule{{
+			Enabled: true, Description: desc, Action: "accept", Protocol: "tcp", Ports: []string{"47001"},
+			Sources:      []netbird.GroupRef{{ID: "gh"}},
+			Destinations: []netbird.GroupRef{{ID: "ga"}},
+		}}}
+	}
+	if !rpcPolicyMatches(base(), rules) {
+		t.Fatal("the desired policy must match")
+	}
+	cases := map[string]func(*netbird.Policy){
+		"disabled policy": func(p *netbird.Policy) { p.Enabled = false },
+		"disabled rule":   func(p *netbird.Policy) { p.Rules[0].Enabled = false },
+		"bidirectional":   func(p *netbird.Policy) { p.Rules[0].Bidirectional = true },
+		"udp":             func(p *netbird.Policy) { p.Rules[0].Protocol = "udp" },
+		"drop action":     func(p *netbird.Policy) { p.Rules[0].Action = "drop" },
+		"other port":      func(p *netbird.Policy) { p.Rules[0].Ports = []string{"47002"} },
+		"extra port":      func(p *netbird.Policy) { p.Rules[0].Ports = []string{"47001", "47002"} },
+		"port range":      func(p *netbird.Policy) { p.Rules[0].PortRanges = []netbird.PortRange{{Start: 1, End: 65535}} },
+		"other source":    func(p *netbird.Policy) { p.Rules[0].Sources = []netbird.GroupRef{{ID: "gx"}} },
+		"extra destination": func(p *netbird.Policy) {
+			p.Rules[0].Destinations = append(p.Rules[0].Destinations, netbird.GroupRef{ID: "gx"})
+		},
+		"edited description": func(p *netbird.Policy) { p.Description = "mine" },
+		"edited rule desc":   func(p *netbird.Policy) { p.Rules[0].Description = "mine" },
+		"extra rule":         func(p *netbird.Policy) { p.Rules = append(p.Rules, p.Rules[0]) },
+		"no rules":           func(p *netbird.Policy) { p.Rules = nil },
+		"non-numeric port":   func(p *netbird.Policy) { p.Rules[0].Ports = []string{"http"} },
+		"swapped direction": func(p *netbird.Policy) {
+			p.Rules[0].Sources, p.Rules[0].Destinations = p.Rules[0].Destinations, p.Rules[0].Sources
+		},
+	}
+	for name, mutate := range cases {
+		p := base()
+		mutate(&p)
+		if rpcPolicyMatches(p, rules) {
+			t.Errorf("%s: drift accepted", name)
+		}
+	}
+}
+
+func TestRPCPolicyLanClusterGetsNoPolicy(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "lan", "direct", rpcMemberSeed{"a", 47001})
+	// A stale policy for that member goes away: the cluster is not on the mesh.
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001})
+	e.reconcile()
+	if e.fake.policyCreateCount() != 0 || e.fake.policyUpdateCount() != 0 {
+		t.Fatal("a lan cluster produced a policy write")
+	}
+	if !e.fake.wasPolicyDeleted("pol-a") {
+		t.Fatal("the policy of a member without a mesh cluster was not removed")
+	}
+}
+
+func TestRPCPolicyUntouchedWithoutManagePolicies(t *testing.T) {
+	e := newRPCPolicyEnv(t, false)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	seedRPCReadPolicy(e.fake, "pol-ghost", "ghost", rpcRule{"g-head", "g-ghost", 47002})
+
+	e.reconcile()
+	e.svc.reconcileAllServerPolicies(e.ctx)
+	e.svc.ReconcileAllServerNetbird(e.ctx)
+
+	if e.fake.policyListCount() != 0 || e.fake.policyCreateCount() != 0 || e.fake.deletedPolicyCount() != 0 {
+		t.Fatalf("policies touched with manage-policies off: lists=%d creates=%d deletes=%d",
+			e.fake.policyListCount(), e.fake.policyCreateCount(), e.fake.deletedPolicyCount())
+	}
+}
+
+func TestRPCPolicyFamilyRunsInBothFleetPasses(t *testing.T) {
+	// ReconcileAllServerNetbird lists once more for the deny-by-default
+	// enforcement that follows its policy section.
+	passes := map[string]struct {
+		run   func(*Service, context.Context)
+		lists int32
+	}{
+		"reconcileAllServerPolicies": {(*Service).reconcileAllServerPolicies, 1},
+		"ReconcileAllServerNetbird":  {(*Service).ReconcileAllServerNetbird, 2},
+	}
+	for name, pass := range passes {
+		t.Run(name, func(t *testing.T) {
+			e := newRPCPolicyEnv(t, true)
+			for _, id := range []string{"head", "a"} {
+				e.server(id)
+			}
+			e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+			seedRPCReadPolicy(e.fake, "pol-ghost", "ghost", rpcRule{"g-head", "g-ghost", 47002})
+			listsBefore := e.fake.policyListCount()
+
+			pass.run(e.svc, e.ctx)
+
+			if got := policyGrants(t, e.fake.createdPolicyByName("op-gw-rpc-a")); !slices.Equal(got, []string{"g-head>g-a:47001"}) {
+				t.Fatalf("grants = %v", got)
+			}
+			if !e.fake.wasPolicyDeleted("pol-ghost") {
+				t.Fatal("orphan not swept")
+			}
+			if lists := e.fake.policyListCount() - listsBefore; lists != pass.lists {
+				t.Fatalf("the pass listed policies %d times, want %d (one shared snapshot for the families)", lists, pass.lists)
+			}
+		})
+	}
+}
+
+func TestRPCPolicyHookRunsOnClusterWritesAndDeletes(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	_, mapping := e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001})
+
+	if err := e.svc.DeleteRuntimeSpec(e.ctx, systemToken(), mapping); err != nil {
+		t.Fatalf("DeleteRuntimeSpec: %v", err)
+	}
+	if !e.fake.wasPolicyDeleted("pol-a") {
+		t.Fatal("deleting the head did not remove its members' policy synchronously")
+	}
+}
+
+func TestRPCPolicyHookNeverFailsWhenNetbirdIsDown(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	_, mapping := e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	e.fake.failListPolicies = true
+	if err := e.svc.DeleteRuntimeSpec(e.ctx, systemToken(), mapping); err != nil {
+		t.Fatalf("DeleteRuntimeSpec must not fail on a NetBird error: %v", err)
+	}
+}
+
+func TestRPCPolicyMemberWithoutTrackingGroupGetsNoRule(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	e.server("head")
+	if err := e.routes.CreateAIServer(e.ctx, routing.AIServer{ID: "plain", Name: "plain", Status: routing.ServerStatusActive, CreatedAt: rpcPolicyNow, UpdatedAt: rpcPolicyNow}); err != nil {
+		t.Fatal(err)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"plain", 47001})
+	e.reconcile()
+	if e.fake.policyCreateCount() != 0 {
+		t.Fatal("a member without a tracking group got a policy")
+	}
+}
+
+func TestSettingsRefuseSwitchOffWhileDirectMeshClusterExists(t *testing.T) {
+	offs := map[string]UpdateSystemSettingsRequest{
+		"manage policies":     {NetbirdManagePolicies: boolPtr(false)},
+		"deny by default":     {NetbirdDenyByDefault: boolPtr(false)},
+		"deny enforcement":    {NetbirdDenyByDefaultEnforce: boolPtr(false)},
+		"manage with another": {NetbirdManagePolicies: boolPtr(false), Theme: strPtr("light")},
+	}
+	for name, req := range offs {
+		t.Run(name, func(t *testing.T) {
+			e := newRPCPolicyEnv(t, true)
+			for _, id := range []string{"head", "a"} {
+				e.server(id)
+			}
+			e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+			before := e.svc.systemSettingValues(e.ctx)
+
+			_, err := e.svc.UpdateSystemSettings(e.ctx, systemToken(), req)
+			e.svc.waitPolicySideEffects()
+			if !errors.Is(err, ErrNetbirdDirectClusterExists) {
+				t.Fatalf("err = %v, want ErrNetbirdDirectClusterExists", err)
+			}
+			after := e.svc.systemSettingValues(e.ctx)
+			for k, v := range before {
+				if after[k] != v {
+					t.Fatalf("setting %s changed from %q to %q on a refused save", k, v, after[k])
+				}
+			}
+		})
+	}
+}
+
+func TestSettingsAllowSwitchOffWithoutDirectMeshCluster(t *testing.T) {
+	setup := map[string]func(*rpcPolicyEnv){
+		"no cluster":    func(*rpcPolicyEnv) {},
+		"relay cluster": func(e *rpcPolicyEnv) { e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001}) },
+		"lan cluster":   func(e *rpcPolicyEnv) { e.cluster("head", "lan", "direct", rpcMemberSeed{"a", 47001}) },
+	}
+	for name, seed := range setup {
+		t.Run(name, func(t *testing.T) {
+			e := newRPCPolicyEnv(t, true)
+			for _, id := range []string{"head", "a"} {
+				e.server(id)
+			}
+			seed(e)
+			if _, err := e.svc.UpdateSystemSettings(e.ctx, systemToken(), UpdateSystemSettingsRequest{NetbirdManagePolicies: boolPtr(false)}); err != nil {
+				t.Fatalf("switch-off refused: %v", err)
+			}
+			e.svc.waitPolicySideEffects()
+			if NetbirdManagePolicies(e.svc.systemSettingValues(e.ctx)) {
+				t.Fatal("manage_policies still on")
+			}
+		})
+	}
+}
+
+func TestSettingsSwitchAlreadyOffIsNotRefused(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	// Saving the switch as it already is (or on) must pass even with the cluster.
+	if _, err := e.svc.UpdateSystemSettings(e.ctx, systemToken(), UpdateSystemSettingsRequest{NetbirdManagePolicies: boolPtr(true), NetbirdDenyByDefault: boolPtr(true)}); err != nil {
+		t.Fatalf("keeping the switches on was refused: %v", err)
+	}
+	e.svc.waitPolicySideEffects()
+}
+
+func TestDefaultPolicyStateRecordedAndClustersNotifiedOnChange(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	e.fake.seedDefaultPolicy("pol-default", false)
+
+	state := func() (string, time.Time) { return e.svc.NetbirdDefaultPolicyStateView(e.ctx) }
+	e.svc.ReconcileAllServerNetbird(e.ctx)
+	if got, at := state(); got != NetbirdDefaultPolicyDisabled || at.IsZero() {
+		t.Fatalf("state = %q at %v after a pass that saw Default disabled", got, at)
+	}
+
+	// Unchanged state: no notification, no rewrite.
+	before := e.notifications()
+	e.svc.ReconcileAllServerNetbird(e.ctx)
+	if e.notifications() != before {
+		t.Fatal("an unchanged Default state notified the clusters")
+	}
+
+	// Default turned back on out of band: the next pass records it and the
+	// head/member documents are re-derived.
+	e.fake.mu.Lock()
+	for _, p := range e.fake.policies {
+		if p["name"] == "Default" {
+			p["enabled"] = true
+		}
+	}
+	e.fake.mu.Unlock()
+	before = e.notifications()
+	e.svc.reconcileAllServerPolicies(e.ctx)
+	if got, _ := state(); got != NetbirdDefaultPolicyEnabled {
+		t.Fatalf("state = %q, want enabled", got)
+	}
+	if e.notifications() == before {
+		t.Fatal("a changed Default state did not notify the cluster servers")
+	}
+	if e.svc.directMeshAvailable(e.ctx) {
+		t.Fatal("direct mesh must be unavailable while Default is enabled")
+	}
+}
+
+func TestDefaultPolicyStateRecordedByEveryPass(t *testing.T) {
+	passes := map[string]func(*rpcPolicyEnv){
+		"single server": func(e *rpcPolicyEnv) { e.svc.reconcileServerPolicy(e.ctx, "head") },
+		"rpc hook":      func(e *rpcPolicyEnv) { e.reconcile() },
+		"fleet policy":  func(e *rpcPolicyEnv) { e.svc.reconcileAllServerPolicies(e.ctx) },
+	}
+	for name, pass := range passes {
+		t.Run(name, func(t *testing.T) {
+			e := newRPCPolicyEnv(t, true)
+			e.server("head")
+			e.fake.seedDefaultPolicy("pol-default", true)
+			pass(e)
+			if got, _ := e.svc.NetbirdDefaultPolicyStateView(e.ctx); got != NetbirdDefaultPolicyEnabled {
+				t.Fatalf("state = %q, want enabled", got)
+			}
+		})
+	}
+}
+
+// Enforcing deny-by-default flips Default off; the recorded state follows the
+// flip instead of keeping what the snapshot showed.
+func TestDefaultPolicyStateFollowsDenyByDefaultFlip(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	e.server("head")
+	e.fake.seedDefaultPolicy("pol-default", true)
+	e.svc.ReconcileAllServerNetbird(e.ctx)
+	if e.fake.policyUpdateCount() == 0 {
+		t.Fatal("deny-by-default enforcement did not disable Default")
+	}
+	if got, _ := e.svc.NetbirdDefaultPolicyStateView(e.ctx); got != NetbirdDefaultPolicyDisabled {
+		t.Fatalf("state = %q, want disabled after the flip", got)
+	}
+}
+
+func TestDefaultPolicyStateAbsentPolicyCountsAsDisabled(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	e.server("head")
+	e.reconcile()
+	if got, _ := e.svc.NetbirdDefaultPolicyStateView(e.ctx); got != NetbirdDefaultPolicyDisabled {
+		t.Fatalf("state = %q, want disabled when no Default policy exists", got)
+	}
+}

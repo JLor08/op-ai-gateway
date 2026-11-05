@@ -291,6 +291,7 @@ func (s *Service) ReconcileAllServerNetbird(ctx context.Context) {
 		if policies, lErr := netbird.ListPolicies(ctx, ncfg, netbirdCallTimeout); lErr != nil {
 			slog.Debug("reconcile all: list policies", "error", lErr)
 		} else {
+			s.recordDefaultPolicyState(ctx, policies)
 			for _, server := range servers {
 				if !server.NetbirdEnabled {
 					continue
@@ -306,6 +307,8 @@ func (s *Service) ReconcileAllServerNetbird(ctx context.Context) {
 			// Fleet-wide ICMP ping-allow policies (same snapshot, same lock).
 			s.reconcilePingGatewayPolicyWith(ctx, ncfg, set, servers, policies)
 			s.reconcilePingServersPolicyWith(ctx, ncfg, set, servers, policies)
+			// Per-member RPC cluster policies (same snapshot, same lock).
+			s.reconcileRPCPoliciesWith(ctx, ncfg, servers, policies)
 		}
 		s.netbird.policyMu.Unlock()
 	}

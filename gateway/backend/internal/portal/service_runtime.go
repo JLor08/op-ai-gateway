@@ -979,6 +979,11 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 				s.notifyRuntimeChanged(id)
 			}
 		}
+		if principal != nil {
+			// The head's members may have changed: open the RPC ports the
+			// saved cluster needs before anything starts it.
+			s.reconcileRPCPolicies(ctx)
+		}
 	}
 	dto := w.dto
 	if err != nil {
@@ -1662,6 +1667,7 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 			s.notifyRuntimeChanged(m.ServerID)
 		}
 	}
+	s.reconcileRPCPolicies(ctx)
 	return nil
 }
 

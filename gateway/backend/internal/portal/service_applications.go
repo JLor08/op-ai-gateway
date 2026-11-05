@@ -1370,6 +1370,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		for _, id := range clusterServers {
 			s.notifyRuntimeChanged(id)
 		}
+		s.reconcileRPCPolicies(ctx)
 	}
 	// Best-effort: a port/status change may alter the server's active port set, so
 	// its NetBird access policy (if managed) may need to be updated. Gates
@@ -1397,6 +1398,7 @@ func (s *Service) DeleteApplication(ctx context.Context, principal auth.Token, a
 				s.notifyRuntimeChanged(id)
 			}
 		}
+		s.reconcileRPCPolicies(ctx)
 	}
 	// Best-effort: deleting the server_agent application empties the server's
 	// runtime-config document (AgentRuntimeConfig's "no server_agent
@@ -2728,6 +2730,9 @@ func (s *Service) DeleteMapping(ctx context.Context, principal auth.Token, mappi
 		if id != server.ID {
 			s.notifyRuntimeChanged(id)
 		}
+	}
+	if len(clusterServers) > 0 {
+		s.reconcileRPCPolicies(ctx)
 	}
 	// Best-effort, after the successful store write: the store cascades the
 	// mapping's runtime spec, its GPU rows and its co-residency pairs, so

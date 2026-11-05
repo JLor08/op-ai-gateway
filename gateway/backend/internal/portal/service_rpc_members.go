@@ -432,6 +432,7 @@ func (s *Service) notifyRPCMemberChanged(ctx context.Context, serverID, specID s
 	if err != nil || !ok {
 		return
 	}
+	s.reconcileRPCPolicies(ctx)
 	for _, id := range s.clusterServers(ctx, head.HeadSpecID) {
 		if id != serverID {
 			s.notifyRuntimeChanged(id)

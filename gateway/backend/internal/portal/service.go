@@ -4321,6 +4321,9 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 			s.notifyRuntimeChanged(sid)
 		}
 	}
+	// The server's own policy as a member goes with its row; its heads' grants
+	// to other members go with the heads.
+	s.reconcileRPCPolicies(ctx)
 	return netbirdCleanupFailed, nil
 }
 

@@ -147,6 +147,7 @@ type API interface {
 	MyProjects(context.Context, auth.Token) ([]ProjectRefDTO, error)
 	NetbirdAgentDownloadOnly(context.Context) bool
 	NetbirdConfig(context.Context) (NetbirdConfig, bool, error)
+	NetbirdDefaultPolicyStateView(context.Context) (string, time.Time)
 	NetbirdGatewayPeerID(context.Context) string
 	NetbirdGroups(context.Context) ([]netbird.Group, error)
 	NetbirdKeyFileConfigured() bool

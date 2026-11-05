@@ -63,6 +63,11 @@ var (
 	ErrNetbirdKeyRequired              = errors.New("system.netbird_key_required")
 	ErrNetbirdIntervalOrder            = errors.New("system.netbird_interval_order")
 	ErrNetbirdTokenRotateBeforeInvalid = errors.New("system.netbird_token_rotate_before_invalid")
+	// ErrNetbirdDirectClusterExists refuses turning off a NetBird policy switch
+	// (manage policies, deny-by-default, enforcement) while a direct mesh RPC
+	// cluster exists: those switches are what keep its members' unauthenticated
+	// RPC ports off the rest of the mesh.
+	ErrNetbirdDirectClusterExists = errors.New("settings.netbird_direct_cluster_exists")
 	// ErrNetbirdNetworkRangeInvalid is returned by SetNetbirdNetwork when a
 	// non-empty network_range / network_range_v6 fails to parse as a CIDR of the
 	// expected IP family.
@@ -1821,6 +1826,9 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 	}
 	var writes []settingWrite
 
+	if err := s.checkDirectClusterSwitches(ctx, req); err != nil {
+		return SystemSettingsDTO{}, err
+	}
 	if req.Theme != nil {
 		if !s.isKnownTheme(ctx, *req.Theme) {
 			return SystemSettingsDTO{}, ErrThemeInvalid
@@ -2594,6 +2602,34 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 		}
 	}
 	return s.SystemSettingsView(ctx), nil
+}
+
+// checkDirectClusterSwitches refuses a request that turns manage-policies,
+// deny-by-default or deny-enforcement from on to off while a direct mesh
+// cluster exists (ErrNetbirdDirectClusterExists). Saving a switch that is
+// already off, or leaving it on, is never refused.
+func (s *Service) checkDirectClusterSwitches(ctx context.Context, req UpdateSystemSettingsRequest) error {
+	if req.NetbirdManagePolicies == nil && req.NetbirdDenyByDefault == nil && req.NetbirdDenyByDefaultEnforce == nil {
+		return nil
+	}
+	values := s.systemSettingValues(ctx)
+	turnsOff := func(req *bool, current bool) bool { return req != nil && !*req && current }
+	if !turnsOff(req.NetbirdManagePolicies, NetbirdManagePolicies(values)) &&
+		!turnsOff(req.NetbirdDenyByDefault, NetbirdDenyByDefault(values)) &&
+		!turnsOff(req.NetbirdDenyByDefaultEnforce, NetbirdDenyByDefaultEnforce(values)) {
+		return nil
+	}
+	if s.routes == nil {
+		return nil
+	}
+	exists, err := s.directMeshClusterExists(ctx)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return ErrNetbirdDirectClusterExists
+	}
+	return nil
 }
 
 // applyPolicySettingsSideEffects runs the best-effort NetBird side effects of a
