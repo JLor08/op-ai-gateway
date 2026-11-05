@@ -91,6 +91,11 @@ type Sample struct {
 	// neutral for every pre-existing agent's telemetry shape, exactly like
 	// ProxyRoutes above.
 	Runtimes []RuntimeSample `json:"runtimes,omitempty"`
+	// Binaries is the inventory of the agent's allowed runtime binaries with
+	// their versions. A pointer so that an empty inventory ("no allowed
+	// binaries") still travels as [] while nil means "unchanged since the
+	// last sample" and omits the field.
+	Binaries *[]BinaryInfo `json:"binaries,omitempty"`
 }
 
 // RuntimeGPUSample is one GPU's measured VRAM usage for a managed process,
@@ -569,4 +574,15 @@ func MergeUniqueStrings(groups ...[]string) []string {
 		}
 	}
 	return out
+}
+
+// BinaryInfo is one entry of the binary inventory.
+type BinaryInfo struct {
+	Path          string `json:"path"`
+	Kind          string `json:"kind"`
+	Version       string `json:"version"`
+	Build         string `json:"build"`
+	Commit        string `json:"commit"`
+	VersionSource string `json:"version_source"`
+	Allowed       bool   `json:"allowed"`
 }

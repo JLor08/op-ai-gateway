@@ -619,3 +619,27 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 		t.Fatalf("Version = %q, want 0.18.0 (the RPC cluster branch's single MINOR bump from 0.17.0; runtime_stop keeps Since 0.17.0)", Version)
 	}
 }
+
+func TestFeaturesDeclareRPCCluster(t *testing.T) {
+	if FeatureRPCCluster != "rpc_cluster" {
+		t.Fatalf("FeatureRPCCluster = %q, want the wire literal rpc_cluster", FeatureRPCCluster)
+	}
+	found := false
+	for _, f := range Features {
+		if f.Name == "rpc_cluster" {
+			found = true
+			if f.Since != "0.18.0" {
+				t.Fatalf("rpc_cluster Since = %q, want 0.18.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare rpc_cluster")
+	}
+	if !slices.Contains(FeatureNames(), "rpc_cluster") {
+		t.Fatal("FeatureNames() does not carry rpc_cluster")
+	}
+	if Version != "0.18.0" {
+		t.Fatalf("Version = %q, want 0.18.0", Version)
+	}
+}

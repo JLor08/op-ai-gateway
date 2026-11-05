@@ -905,6 +905,8 @@ type Agent struct {
 	rpcObs *rpcObserver
 	// cacheSizes measures the members' on-disk caches off the collect loop.
 	cacheSizes *cacheSizer
+	// binaries inventories the allowed runtime binaries off the collect loop.
+	binaries *binaryInventory
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -1019,6 +1021,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		hostInfo:        d.HostInfo,
 		gatewayFeatures: d.GatewayFeatures,
 		now:             time.Now,
+		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries),
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r
@@ -1112,6 +1115,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			waitBounded(&obsWG, observerShutdownWait)
 		}()
 	}
+	go a.binaries.run(ctx)
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
@@ -2589,9 +2593,14 @@ func (a *Agent) collectOnce(ctx context.Context) {
 			"cert_mode", s.CertMode,
 			"cert_fingerprint_set", s.CertFingerprint != "")
 	}
+	binDelivered := func() {}
+	if a.binaries != nil {
+		s.Binaries, binDelivered = a.binaries.pending()
+	}
 	if err := a.poster.Post(ctx, &s); err != nil {
 		slog.Warn("telemetry push failed", "err", err)
 	} else {
+		binDelivered()
 		slog.Debug("telemetry pushed")
 	}
 }

@@ -219,39 +219,6 @@ func TestCacheSizerIsCachedAndOffTheLoop(t *testing.T) {
 	waitFor(t, "refresh after ttl", func() bool { return walks.Load() == n+1 })
 }
 
-func TestFeaturesDeclareRPCCluster(t *testing.T) {
-	if FeatureRPCCluster != "rpc_cluster" {
-		t.Fatalf("FeatureRPCCluster = %q, want the wire literal rpc_cluster", FeatureRPCCluster)
-	}
-	found := false
-	for _, f := range Features {
-		if f.Name == "rpc_cluster" {
-			found = true
-			if f.Since != "0.18.0" {
-				t.Fatalf("rpc_cluster Since = %q, want 0.18.0", f.Since)
-			}
-		}
-	}
-	if !found {
-		t.Fatal("Features does not declare rpc_cluster")
-	}
-	if !contains(FeatureNames(), "rpc_cluster") {
-		t.Fatal("FeatureNames() does not carry rpc_cluster")
-	}
-	if Version != "0.18.0" {
-		t.Fatalf("Version = %q, want 0.18.0", Version)
-	}
-}
-
-func contains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
-
 func TestObserverPollAfterCancelTouchesNothing(t *testing.T) {
 	f := newObsFixture(t, directMember())
 	f.set(connFrom(obsHead, 5000))
