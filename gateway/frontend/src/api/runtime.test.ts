@@ -336,6 +336,19 @@ describe('runtimeApi manual start and stop', () => {
     expect(got).toEqual({ instance: 0, state: 'stopping' });
   });
 
+  it('sends stop_members only when the members are to be stopped too', async () => {
+    const fetcher = vi
+      .fn()
+      .mockImplementation(async () => jsonResponse({ instance: 0, state: 'stopping' }));
+    const api = createPortalApi(fetcher);
+
+    await api.stopRuntime('map_1', 0, true);
+    await api.stopRuntime('map_1', 0, false);
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ instance: 0, stop_members: true });
+    expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual({ instance: 0 });
+  });
+
   it('carries the missing feature of a runtime.agent_feature_missing refusal', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       jsonResponse(

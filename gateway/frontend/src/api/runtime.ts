@@ -63,6 +63,37 @@ export interface ClusterMember {
   visible: boolean;
 }
 
+export type ClusterState = 'cold' | 'forming' | 'formed' | 'cooling_down' | 'invalid';
+export type ClusterPhase = 'members_starting' | 'members_ready' | 'head_starting' | 'formed';
+export type ClusterMemberState = 'pending' | 'starting' | 'ready' | 'held' | 'failed';
+
+// One member's part of a start, by position (never by name: a member on a
+// server the caller may not see stays anonymous). `code` names a failure.
+export interface ClusterMemberStatus {
+  position: number;
+  state: ClusterMemberState;
+  code?: string;
+}
+
+// The last failed start: the cause's code, the member position that failed
+// (absent when it was the head or the cluster as a whole), whether it was the
+// head, and when.
+export interface ClusterFailure {
+  code: string;
+  position?: number;
+  head?: boolean;
+  at: string;
+}
+
+// The gateway's orchestration state of one cluster head (Go ClusterStatusDTO).
+export interface ClusterStatus {
+  state: ClusterState;
+  phase?: ClusterPhase;
+  members: ClusterMemberStatus[];
+  last_failure?: ClusterFailure;
+  cooldown_until?: string;
+}
+
 // A server a head may add as a member (Go ClusterCandidateDTO). Automatic
 // mode fills rpc_binary / rpc_binary_version (the server's ggml-rpc-server
 // matching the head's binary); manual mode fills member_specs (the server's
@@ -290,6 +321,10 @@ export interface RuntimeSpec {
   // gateway does not send this head's cluster to its agent; empty when it
   // does. Excluded from the PUT request.
   cluster_withheld_reason?: string;
+  // READ-ONLY, only on a cluster head and absent from an older gateway: the
+  // orchestration state and the progress of the running or last start.
+  // Excluded from the PUT request.
+  cluster_status?: ClusterStatus;
 }
 
 // A full-document upsert of a runtime spec: every field is applied verbatim
@@ -334,6 +369,7 @@ export type PutRuntimeSpecRequest = Omit<
   | 'cluster_transport_default'
   | 'cluster_warnings'
   | 'cluster_withheld_reason'
+  | 'cluster_status'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).
@@ -747,12 +783,13 @@ export function runtimeApi(fetcher: Fetcher) {
     // The live-status Stop: asks the agent to drain instance `instance` now,
     // transiently -- demand can start it again. The agent refuses an instance
     // the spec keeps up (runtime.instance_protected) and one with a higher
-    // sibling running (runtime.instance_not_highest).
-    stopRuntime: (mappingId: string, instance: number) =>
+    // sibling running (runtime.instance_not_highest). For a cluster head,
+    // `stopMembers` also stops the cluster's members once the head stopped.
+    stopRuntime: (mappingId: string, instance: number, stopMembers = false) =>
       request<RuntimeActionAnswer>(
         fetcher,
         `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/stop`,
-        { method: 'POST', body: { instance } },
+        { method: 'POST', body: stopMembers ? { instance, stop_members: true } : { instance } },
       ),
     // The servers the cluster head on this mapping may add as members.
     clusterCandidates: (mappingId: string, mode: ClusterMemberMode) =>

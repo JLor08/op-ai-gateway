@@ -1153,6 +1153,10 @@ const clusterWireCodes = [
   'runtime.cluster_start_failed',
   'runtime.cluster_unavailable',
   'runtime.cluster_member_unused',
+  'runtime.cluster_config_unacknowledged',
+  'runtime.cluster_head_disabled',
+  'runtime.cluster_start_cancelled',
+  'runtime.cluster_stopping',
   'runtime.cluster_agent_too_old',
   'runtime.cluster_head_unsupported',
   // Agent lifecycle codes (runtime status last_error.code).

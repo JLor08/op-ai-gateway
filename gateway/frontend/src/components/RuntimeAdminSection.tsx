@@ -127,7 +127,9 @@ import {
 } from './shared/runtimeInstances';
 import { minRealtimeWarning } from './shared/audioMetrics';
 import { runtimeRowPlan, startInstanceLimit } from './shared/runtimeActions';
+import { ClusterProgress } from './ClusterProgress';
 import { ClusterTotalCell, ClusterWithheldNotice } from './ClusterTotalCell';
+import { clusterStatusView } from './shared/clusterStatus';
 import { clusterWithheldReason, isClusterHead } from './shared/clusterTotals';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
@@ -654,7 +656,8 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // rpc_transport, lan_exposure_ack, device_backend, cluster_members) rides
   // `rest`: an absent cluster_enabled turns the cluster off and clears its
   // membership. Its read view (the totals, the network and transport
-  // defaults and the warnings) is derived on every read and dropped.
+  // defaults, the warnings and the orchestration status) is derived on every
+  // read and dropped.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -686,6 +689,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     cluster_transport_default,
     cluster_warnings,
     cluster_withheld_reason,
+    cluster_status,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -1334,6 +1338,11 @@ export function RuntimeAdminSection({
   const [specMode, setSpecMode] = useState<SpecMode>('list');
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
+  // The cluster head whose Stop awaits its confirmation, and the checkbox in it.
+  const [clusterStop, setClusterStop] = useState<{ row: RuntimeStatus; spec: RuntimeSpec } | null>(
+    null,
+  );
+  const [stopMembersToo, setStopMembersToo] = useState(false);
   const [loadingEditFor, setLoadingEditFor] = useState('');
   // Bumped by every launch-spec form open (openEdit, openCreate): an Edit GET
   // fills the form only while it is still the latest one.
@@ -2386,11 +2395,25 @@ export function RuntimeAdminSection({
     );
   }
 
-  function stopRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec) {
+  // A cluster head's Stop asks first whether its members stop too; any other
+  // spec stops at once.
+  function requestStop(row: RuntimeStatus, spec: RuntimeSpec) {
+    if (spec.cluster_enabled) {
+      setStopMembersToo(false);
+      setClusterStop({ row, spec });
+      return;
+    }
+    stopRuntimeInstance(row, spec);
+  }
+
+  function stopRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec, stopMembers = false) {
     const k = instanceIndex(row);
     void runRuntimeAction(
       runtimeActionKey('stop', row),
-      () => api.stopRuntime(spec.mapping_id, k),
+      () =>
+        stopMembers
+          ? api.stopRuntime(spec.mapping_id, k, true)
+          : api.stopRuntime(spec.mapping_id, k),
       (answer) => {
         const target = instanceTargetName(row, spec, answer.instance);
         return answer.state === 'stopped'
@@ -3766,6 +3789,58 @@ export function RuntimeAdminSection({
     return live ? runtimeStateLabel(live.state, t) : t.runtimeStatusUnknown;
   }
 
+  function liveStatusChip(m: PortalModelMapping) {
+    const live = statusForMapping(m);
+    const withheld = clusterWithheldReason(specsById[m.id]);
+    if (!live && withheld) {
+      return (
+        <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+          <ClusterWithheldNotice reason={withheld} t={t} compact />
+        </Box>
+      );
+    }
+    if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
+    const baseChip = (
+      <StatusChip status={runtimeStateBadge(live.state)} label={runtimeStateLabel(live.state, t)} />
+    );
+    const chip = withheld ? (
+      <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+        {baseChip}
+        <ClusterWithheldNotice reason={withheld} t={t} compact />
+      </Box>
+    ) : (
+      baseChip
+    );
+    // A replicable spec's chip is the state of the row that speaks for it
+    // (a running one first, see primaryStatusRows); how many instances run,
+    // against the bounds, is the line under it. Only once the agent
+    // reports the spec at all -- with no row, "0 running" would be a
+    // claim nobody made.
+    const spec = specsById[m.id];
+    if (!spec?.replicable || spec.id === undefined) return chip;
+    return (
+      <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+        {chip}
+        <Typography variant="caption" color="text.secondary">
+          {instancesSummary(spec.id, spec, runningInstancesBySpecId, t)}
+        </Typography>
+      </Box>
+    );
+  }
+
+  // The live-status chip with the cluster progress of a head beneath it.
+  function liveStatusCell(m: PortalModelMapping) {
+    const chip = liveStatusChip(m);
+    if (!clusterStatusView(specsById[m.id])) return chip;
+    return (
+      <Box sx={{ display: 'grid', gap: 0.5, justifyItems: 'start' }}>
+        {chip}
+        <ClusterProgress spec={specsById[m.id]} t={t} compact />
+      </Box>
+    );
+  }
+
   const columns: ListColumn<PortalModelMapping>[] = [
     {
       id: 'gateway',
@@ -3901,48 +3976,7 @@ export function RuntimeAdminSection({
       filter: 'enum',
       sortable: false,
       searchable: false,
-      render: (m) => {
-        const live = statusForMapping(m);
-        const withheld = clusterWithheldReason(specsById[m.id]);
-        if (!live && withheld) {
-          return (
-            <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
-              <StatusChip status="standby" label={t.runtimeStatusUnknown} />
-              <ClusterWithheldNotice reason={withheld} t={t} compact />
-            </Box>
-          );
-        }
-        if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
-        const baseChip = (
-          <StatusChip
-            status={runtimeStateBadge(live.state)}
-            label={runtimeStateLabel(live.state, t)}
-          />
-        );
-        const chip = withheld ? (
-          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
-            {baseChip}
-            <ClusterWithheldNotice reason={withheld} t={t} compact />
-          </Box>
-        ) : (
-          baseChip
-        );
-        // A replicable spec's chip is the state of the row that speaks for it
-        // (a running one first, see primaryStatusRows); how many instances run,
-        // against the bounds, is the line under it. Only once the agent
-        // reports the spec at all -- with no row, "0 running" would be a
-        // claim nobody made.
-        const spec = specsById[m.id];
-        if (!spec?.replicable || spec.id === undefined) return chip;
-        return (
-          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
-            {chip}
-            <Typography variant="caption" color="text.secondary">
-              {instancesSummary(spec.id, spec, runningInstancesBySpecId, t)}
-            </Typography>
-          </Box>
-        );
-      },
+      render: (m) => liveStatusCell(m),
     },
     {
       // Task 6: whether the agent's last per-model /metrics and context
@@ -4387,7 +4421,7 @@ export function RuntimeAdminSection({
           runtimeActionsBusy.has(stopKey) ||
           runtimeActionsBusy.has(runtimeActionKey('start', row)),
         title: stopTitle,
-        onClick: () => stopRuntimeInstance(row, spec),
+        onClick: () => requestStop(row, spec),
       });
     }
     const pin = plan.pin;
@@ -6178,6 +6212,40 @@ export function RuntimeAdminSection({
         </Panel>
       )}
 
+      <ConfirmDialog
+        open={clusterStop !== null}
+        title={
+          clusterStop
+            ? t.runtimeStopClusterTitle(
+                instanceTargetName(
+                  clusterStop.row,
+                  clusterStop.spec,
+                  instanceIndex(clusterStop.row),
+                ),
+              )
+            : ''
+        }
+        body={t.runtimeStopClusterBody}
+        extra={
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={stopMembersToo}
+                onChange={(e) => setStopMembersToo(e.target.checked)}
+              />
+            }
+            label={t.runtimeStopMembersToo}
+          />
+        }
+        confirmLabel={t.runtimeStop}
+        cancelLabel={t.cancel}
+        onConfirm={() => {
+          const pending = clusterStop;
+          setClusterStop(null);
+          if (pending) stopRuntimeInstance(pending.row, pending.spec, stopMembersToo);
+        }}
+        onCancel={() => setClusterStop(null)}
+      />
       <ConfirmDialog
         open={confirmingDeleteId !== ''}
         title={confirmIsSpecDelete ? t.runtimeSpecDeleteConfirm : t.mappingDeleteConfirm}

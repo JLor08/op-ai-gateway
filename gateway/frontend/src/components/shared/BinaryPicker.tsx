@@ -119,10 +119,6 @@ export function BinaryPicker({
           placeholder={placeholder}
           error={error}
           helperText={helperText ?? (options.length > 0 ? t.binaryPickerHint : undefined)}
-          slotProps={{
-            ...params.slotProps,
-            inputLabel: { ...params.slotProps?.inputLabel, required: false },
-          }}
         />
       )}
     />

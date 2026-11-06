@@ -38,6 +38,7 @@ import type {
 } from '../api';
 import type { MessageKey, PortalApi, Translation } from './shared/types';
 import { Field } from './shared/Field';
+import { ClusterProgress } from './ClusterProgress';
 import { ClusterWithheldNotice } from './ClusterTotalCell';
 import { clusterWithheldReason } from './shared/clusterTotals';
 import { SelectField } from './shared/SelectField';
@@ -387,6 +388,7 @@ export function ClusterHeadEditor({
         {t.clusterTitle}
       </Typography>
       <ClusterWithheldNotice reason={clusterWithheldReason(stored)} t={t} />
+      <ClusterProgress spec={stored} t={t} />
       <Typography variant="body2" color="text.secondary">
         {t.clusterIntro}
       </Typography>
