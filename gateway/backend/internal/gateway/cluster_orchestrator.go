@@ -61,7 +61,18 @@ const (
 	// codeClusterConfigUnacknowledged: an agent of the cluster did not
 	// acknowledge a document carrying its part within the bound.
 	codeClusterConfigUnacknowledged = "runtime.cluster_config_unacknowledged"
+	// codeClusterStartCancelled: a stop of the head or the gateway's shutdown
+	// ended the start before it completed. Nothing failed, so nothing cools
+	// down.
+	codeClusterStartCancelled = "runtime.cluster_start_cancelled"
+	// codeClusterStopping: a stop of the head is under way; a start waits
+	// for it to finish.
+	codeClusterStopping = "runtime.cluster_stopping"
 )
+
+// maxPlanRereads bounds how often one start re-reads a plan the runtime
+// documents moved past during step one.
+const maxPlanRereads = 3
 
 // The agent's codes the orchestration reads: the router's start refusals and
 // the lifecycle causes that travel on telemetry (last_error.code), never on
@@ -282,7 +293,10 @@ type clusterHeadState struct {
 	// parked: an operator stopped the head; the reconciler leaves it down
 	// until a manual start.
 	parked bool
-	start  *clusterStart
+	// stopping counts the stops of the head under way; every start is
+	// refused meanwhile, so none can race the drain.
+	stopping int
+	start    *clusterStart
 }
 
 // clusterStart is one running start that every Ensure of its head joins.
@@ -391,6 +405,10 @@ func (o *clusterOrchestrator) ensure(ctx context.Context, head string, manual bo
 	}
 	o.mu.Lock()
 	st := o.headState(head)
+	if st.stopping > 0 {
+		o.mu.Unlock()
+		return &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStopping, Position: -1, Message: "the cluster is being stopped; start it again once the stop finished"}
+	}
 	if manual {
 		st.parked = false
 	}
@@ -407,7 +425,7 @@ func (o *clusterOrchestrator) ensure(ctx context.Context, head string, manual bo
 	base := o.deps.base()
 	if base.Err() != nil {
 		o.mu.Unlock()
-		return fmt.Errorf("cluster start: the gateway is shutting down: %w", base.Err())
+		return &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStartCancelled, Position: -1, Message: "the gateway is shutting down"}
 	}
 	runCtx, cancel := context.WithCancel(base)
 	s := &clusterStart{done: make(chan struct{}), cancel: cancel}
@@ -447,8 +465,9 @@ func (o *clusterOrchestrator) joiners(head string) int {
 	return 0
 }
 
-// wait returns once every start and reconciler-spawned ensure has ended. Only
-// tests join them: the shutdown ends each through the server's lifetime.
+// wait returns once every start and reconciler-spawned ensure has ended. The
+// shutdown cancels the server's lifetime first, which ends each of them, and
+// then joins them here before the store closes; tests join them as well.
 func (o *clusterOrchestrator) wait() {
 	if o != nil {
 		o.wg.Wait()
@@ -465,17 +484,15 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) error {
 	if agents == nil {
 		return &clusterError{Code: codeClusterUnavailable, Position: -1, Message: "this gateway's provider cannot start a cluster through the agents"}
 	}
-	fp := o.fingerprint(ctx, plan)
 	if o.formedNow(plan) {
 		o.markFormed(head, plan)
 		return nil
 	}
 	o.beginStart(head, plan)
 
-	if plan.Network == clusterNetworkMesh {
-		o.deps.portal.ReconcileRPCPolicies(ctx)
-	}
-	if ce := o.awaitConfig(ctx, plan); ce != nil {
+	plan, ce := o.applyConfig(ctx, head, plan)
+	fp := o.fingerprint(ctx, plan)
+	if ce != nil {
 		return o.fail(ctx, head, ce, fp)
 	}
 
@@ -515,7 +532,9 @@ func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.Clu
 		return plan, &clusterError{Code: codeClusterUnavailable, Cause: portal.ErrRuntimeSpecNotFound.Error(), Position: -1}
 	}
 	if err != nil {
-		return plan, &clusterError{Code: codeClusterUnavailable, Cause: codeRuntimeActionFailed, Position: -1, Message: err.Error()}
+		// The store's error stays in the log: it is no answer for a client.
+		slog.Warn("cluster start: reading the head's plan failed", "head_spec_id", head, "err", err)
+		return plan, &clusterError{Code: codeClusterUnavailable, Cause: codeRuntimeActionFailed, Position: -1}
 	}
 	o.mu.Lock()
 	o.headState(head).withheld = plan.WithheldReason
@@ -589,7 +608,7 @@ func (o *clusterOrchestrator) fail(ctx context.Context, head string, ce *cluster
 		st := o.headState(head)
 		st.formed, st.phase = false, ""
 		o.mu.Unlock()
-		return fmt.Errorf("cluster start ended before it completed: %w", ctx.Err())
+		return &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStartCancelled, Position: -1, Message: "a stop of the head or the gateway's shutdown ended the start"}
 	}
 	now := o.deps.now()
 	failure := &portal.ClusterFailureDTO{Code: ce.Cause, Head: ce.Head, At: now}
@@ -643,10 +662,75 @@ func (o *clusterOrchestrator) row(serverID, spec string) (RuntimeStatusDTO, bool
 	return RuntimeStatusDTO{}, false
 }
 
-// headRunning reports whether the head's agent reports it running.
-func (o *clusterOrchestrator) headRunning(plan portal.ClusterPlan) bool {
+// headOccupied reports whether the head's agent reports a process for it:
+// starting, running or draining. While it has one the head may still hold its
+// members, so a member's hold is not yet a dead connection.
+func (o *clusterOrchestrator) headOccupied(plan portal.ClusterPlan) bool {
 	r, ok := o.row(plan.Head.Server.ID, plan.Head.Spec.ID)
-	return ok && r.State == agentSpecStateRunning
+	return ok && stateOccupied(r.State)
+}
+
+// stateOccupied reports whether an agent state has a process behind it.
+func stateOccupied(state string) bool {
+	return state == agentSpecStateRunning || state == agentSpecStateStarting || state == agentSpecStateDraining
+}
+
+// agentSpecStateDraining is the state of an instance on its way out.
+const agentSpecStateDraining = "draining"
+
+// applyConfig is step one under a single bound of configWait. A mesh
+// cluster's RPC policies are reconciled first, inside that bound: the policy
+// pass serializes on the portal's policy lock and does not watch ctx while it
+// waits for it, so it runs aside and the start stops waiting for it when the
+// bound ends -- the acknowledgement wait then has what is left, and the next
+// policy pass (every policy write and the NetBird sync run one) completes the
+// rules. When the runtime documents moved past plan meanwhile (the head's
+// document no longer carries plan's generation), the plan is read again --
+// at most maxPlanRereads times -- rather than waiting out the bound for an
+// acknowledgement that can never come.
+func (o *clusterOrchestrator) applyConfig(ctx context.Context, head string, plan portal.ClusterPlan) (portal.ClusterPlan, *clusterError) {
+	cctx, cancel := context.WithTimeout(ctx, o.t.configWait)
+	defer cancel()
+	if plan.Network == clusterNetworkMesh {
+		o.reconcilePolicies(cctx, head)
+	}
+	for reread := 0; ; reread++ {
+		ce, stale := o.awaitConfig(ctx, cctx, plan)
+		if !stale {
+			return plan, ce
+		}
+		if reread >= maxPlanRereads {
+			return plan, &clusterError{
+				Code: codeClusterStartFailed, Cause: codeClusterConfigUnacknowledged, Position: -1, Head: true,
+				Message: "the cluster's configuration kept changing while it started",
+			}
+		}
+		next, err := o.plan(ctx, head)
+		if err != nil {
+			var ce *clusterError
+			errors.As(err, &ce)
+			return plan, ce
+		}
+		plan = next
+		o.beginStart(head, plan)
+	}
+}
+
+// reconcilePolicies runs the portal's RPC policy pass and waits for it until
+// ctx ends (see applyConfig).
+func (o *clusterOrchestrator) reconcilePolicies(ctx context.Context, head string) {
+	done := make(chan struct{})
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		defer close(done)
+		o.deps.portal.ReconcileRPCPolicies(ctx)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		slog.Info("cluster start: the RPC policy pass did not finish within the configuration bound; going on", "head_spec_id", head)
+	}
 }
 
 // formedNow reports whether the agents' telemetry already shows the cluster
@@ -667,28 +751,32 @@ func (o *clusterOrchestrator) formedNow(plan portal.ClusterPlan) bool {
 	return true
 }
 
-// awaitConfig is step one: it returns once every agent of the cluster
-// acknowledged a document that carries its part -- the head's spec with this
+// awaitConfig waits, until cctx ends, for every agent of the cluster to
+// acknowledge a document that carries its part -- the head's spec with this
 // cluster's generation on the head's server, the member's spec on each
-// member's server -- or fails naming the first agent that did not within the
-// bound. Like the VRAM isolation gate it accepts only an ETag the gateway
-// derived itself and found to carry that part, so no agent-supplied string
-// can pass it; a reported ETag is derived at most once.
-func (o *clusterOrchestrator) awaitConfig(ctx context.Context, plan portal.ClusterPlan) *clusterError {
+// member's server -- or fails naming the first agent that did not. Like the
+// VRAM isolation gate it accepts only an ETag the gateway derived itself and
+// found to carry that part, so no agent-supplied string can pass it; a
+// reported ETag is derived at most once. stale reports that the head's
+// current document does not carry plan's cluster: the plan is out of date.
+// ctx is the start's: its end is a cancellation, cctx's alone the bound.
+func (o *clusterOrchestrator) awaitConfig(ctx, cctx context.Context, plan portal.ClusterPlan) (ce *clusterError, stale bool) {
 	type gate struct {
 		serverID  string
 		position  int // -1: the head's server
 		accepted  map[string]bool
 		evaluated string
 	}
-	gates := []*gate{{serverID: plan.Head.Server.ID, position: -1, accepted: map[string]bool{}}}
+	headServer := plan.Head.Server.ID
+	if doc, err := o.deps.portal.AgentRuntimeConfig(cctx, headServer); err == nil && doc.ETag != "" && !documentCarriesCluster(doc, plan, headServer) {
+		return nil, true
+	}
+	gates := []*gate{{serverID: headServer, position: -1, accepted: map[string]bool{}}}
 	for _, m := range plan.Members {
-		if m.Server.ID != plan.Head.Server.ID && !slices.ContainsFunc(gates, func(g *gate) bool { return g.serverID == m.Server.ID }) {
+		if m.Server.ID != headServer && !slices.ContainsFunc(gates, func(g *gate) bool { return g.serverID == m.Server.ID }) {
 			gates = append(gates, &gate{serverID: m.Server.ID, position: m.Position, accepted: map[string]bool{}})
 		}
 	}
-	deadline := time.NewTimer(o.t.configWait)
-	defer deadline.Stop()
 	tick := time.NewTicker(o.t.poll)
 	defer tick.Stop()
 	for {
@@ -696,31 +784,34 @@ func (o *clusterOrchestrator) awaitConfig(ctx context.Context, plan portal.Clust
 		for _, g := range gates {
 			reported := o.deps.statuses.AppliedConfigETag(g.serverID)
 			if reported != "" && !g.accepted[reported] && reported != g.evaluated {
-				if doc, err := o.deps.portal.AgentRuntimeConfig(ctx, g.serverID); err == nil && doc.ETag != "" {
-					if documentCarriesCluster(doc, plan, g.serverID) {
+				if doc, err := o.deps.portal.AgentRuntimeConfig(cctx, g.serverID); err == nil && doc.ETag != "" {
+					carries := documentCarriesCluster(doc, plan, g.serverID)
+					if !carries && g.serverID == headServer {
+						return nil, true
+					}
+					if carries {
 						g.accepted[doc.ETag] = true
 					}
 					g.evaluated = reported
 				}
 			}
-			if reported == "" || !g.accepted[reported] {
-				if pending == nil {
-					pending = g
-				}
+			if pending == nil && (reported == "" || !g.accepted[reported]) {
+				pending = g
 			}
 		}
 		if pending == nil {
-			return nil
+			return nil, false
 		}
 		select {
-		case <-ctx.Done():
-			return &clusterError{Code: codeClusterStartFailed, Cause: codeClusterConfigUnacknowledged, Position: -1}
-		case <-deadline.C:
+		case <-cctx.Done():
+			if ctx.Err() != nil {
+				return &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStartCancelled, Position: -1}, false
+			}
 			return &clusterError{
 				Code: codeClusterStartFailed, Cause: codeClusterConfigUnacknowledged,
 				Position: pending.position, Head: pending.position < 0,
 				Message: "the agent did not acknowledge a runtime document carrying its part of the cluster",
-			}
+			}, false
 		case <-tick.C:
 		}
 	}
@@ -748,7 +839,7 @@ func documentCarriesCluster(doc portal.AgentRuntimeConfigDTO, plan portal.Cluste
 func (o *clusterOrchestrator) startMembers(ctx context.Context, head string, plan portal.ClusterPlan, agents clusterAgentClient, reserve time.Duration) *clusterError {
 	mctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	headDown := !o.headRunning(plan)
+	headDown := !o.headOccupied(plan)
 	results := make(chan *clusterError, len(plan.Members))
 	for _, m := range plan.Members {
 		go func() { results <- o.startMember(ctx, mctx, head, plan, m, agents, reserve, headDown) }()
@@ -998,8 +1089,15 @@ func (o *clusterOrchestrator) Stop(ctx context.Context, head string, stopMembers
 		return &clusterError{Code: codeClusterUnavailable, Position: -1, Message: "this gateway runs no cluster orchestration"}
 	}
 	o.mu.Lock()
-	s := o.headState(head).start
+	st := o.headState(head)
+	st.stopping++
+	s := st.start
 	o.mu.Unlock()
+	defer func() {
+		o.mu.Lock()
+		o.headState(head).stopping--
+		o.mu.Unlock()
+	}()
 	if s != nil {
 		s.cancel()
 		if err := joinClusterStart(ctx, s); ctx.Err() != nil {
@@ -1018,7 +1116,6 @@ func (o *clusterOrchestrator) Stop(ctx context.Context, head string, stopMembers
 		return err
 	}
 	o.mu.Lock()
-	st := o.headState(head)
 	st.formed, st.phase = false, ""
 	for i := range st.members {
 		st.members[i].State, st.members[i].Code = clusterMemberPending, ""
@@ -1085,7 +1182,7 @@ func headGone(rows []RuntimeStatusDTO, head string) bool {
 	for i := range rows {
 		r := &rows[i]
 		if r.SpecID == head && r.Instance == 0 {
-			return r.State != agentSpecStateRunning && r.State != agentSpecStateStarting && r.State != "draining"
+			return !stateOccupied(r.State)
 		}
 	}
 	return true
@@ -1128,9 +1225,10 @@ func (o *clusterOrchestrator) TriggerChannel() <-chan struct{} {
 }
 
 // observeStatus reads one telemetry frame of serverID against the previous
-// one: a cluster head whose launch facts were there and are gone (its process
-// exited) is no longer formed, and the reconciler is woken, since a kept-up
-// head must be started again members first.
+// one: a cluster head that had a process with its launch facts and has none
+// now (it exited) is no longer formed, and the reconciler is woken, since a
+// kept-up head must be started again members first. A head that is only
+// draining has not exited yet.
 func (o *clusterOrchestrator) observeStatus(serverID string, prev, next []RuntimeStatusDTO) {
 	if o == nil {
 		return
@@ -1138,11 +1236,13 @@ func (o *clusterOrchestrator) observeStatus(serverID string, prev, next []Runtim
 	var exited []string
 	for i := range prev {
 		p := &prev[i]
-		if p.Cluster == nil || p.Instance != 0 || p.State != agentSpecStateRunning {
+		if p.Cluster == nil || p.Instance != 0 || !stateOccupied(p.State) {
 			continue
 		}
+		// A draining head still has its process and holds its members; it
+		// has exited once no process is left.
 		j := slices.IndexFunc(next, func(r RuntimeStatusDTO) bool { return r.SpecID == p.SpecID && r.Instance == 0 })
-		if j < 0 || next[j].Cluster == nil || next[j].State != agentSpecStateRunning {
+		if j < 0 || !stateOccupied(next[j].State) {
 			exited = append(exited, p.SpecID)
 		}
 	}
@@ -1185,7 +1285,7 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 	for _, head := range heads {
 		o.mu.Lock()
 		st := o.heads[head]
-		state, parked := o.stateLocked(st), st != nil && st.parked
+		state, parked := o.stateLocked(st), st != nil && (st.parked || st.stopping > 0)
 		o.mu.Unlock()
 		if parked || (state != clusterCold && (state != clusterInvalid || st.terminal)) {
 			continue

@@ -713,6 +713,29 @@ Conventions worth stating, because each is a judgement call a client depends on:
     runtime.instance_protected` (below the spec's protected floor: the agent
     would restart it at once), `409 runtime.instance_not_highest` (a higher
     instance of the spec runs) and `404 runtime.model_not_managed`.
+  - **A llama.cpp RPC cluster head** (`cluster_enabled`) starts and stops
+    through the gateway's cluster orchestration instead, always as instance 0.
+    **Start** runs the members-first start in the background (configuration
+    acknowledged, members, the head with the cluster-start marker, formation)
+    and answers like a model's start: `200 running` once the cluster formed
+    within the early-answer window, the start's error within it, else `202
+    starting`. It overrides the head's cooldown and a terminal block. **Stop**
+    drains the head first, waits (bounded) for its stopped state on the status
+    stream, then — only with the optional body field `stop_members: true` —
+    releases and stops each member; without it the members idle out on their
+    short timeout once the head's holds end. It runs under the gateway's
+    lifetime, not the request's, and answers `200 stopped` when it finished
+    within the early-answer window, its error within it, else `202 stopping`
+    (a drain can outlast the server's write timeout). A pinned or
+    `force_running` head is drained, not refused with
+    `runtime.instance_protected`: for a head those mean that the gateway keeps
+    it up. A head an operator stopped is **parked** — the gateway's reconciler
+    does not start it again — until a manual start or a gateway restart;
+    request demand may still start it. Any `instance` other than 0 is `404
+    runtime.model_not_managed`. A start that a stop or the shutdown ended, or
+    one asked for while a stop of the head runs, is `503
+    runtime.cluster_unavailable` with `error.cause`
+    `runtime.cluster_start_cancelled` or `runtime.cluster_stopping`.
   - **An agent refusal keeps the agent's code** at the router's status
     (`runtime.instance_no_capacity`, `runtime.instance_demand_unknown`,
     `runtime.admission_blocked`, `runtime.start_timeout`, `runtime.start_failed`,
@@ -787,7 +810,19 @@ Conventions worth stating, because each is a judgement call a client depends on:
   concurrency the mapping's audio ramp measured as a ceiling — only an
   `audio_concurrency_limit` of `performance` is one, a measured `0` included — so
   the minimum would keep more instances warm than one host keeps above real time
-  (`minInstancesExceedRealtime`, `internal/portal/service_runtime.go`). The PUT refuses, in
+  (`minInstancesExceedRealtime`, `internal/portal/service_runtime.go`). On an
+  enabled cluster head the GET also carries the read-only **`cluster_status`**,
+  the gateway's in-memory orchestration state of the head (no PUT counterpart;
+  absent on any other spec): `state` (`cold`, `forming`, `formed`,
+  `cooling_down`, `invalid` — invalid while the runtime documents withhold the
+  head or a terminal cause blocks automatic starts), `phase`
+  (`members_starting`, `members_ready`, `head_starting`, `formed`), `members`
+  (`position`, `state` — `pending`, `starting`, `ready`, `held`, `failed` — and
+  a failed member's `code`; positions only, never server names, so a member on
+  a server the caller may not see stays anonymous), `last_failure` (`code`, the
+  failing member's `position` or `head: true`, `at`) and `cooldown_until`. A
+  restarted gateway starts from `cold` and learns a running cluster again from
+  the agents' telemetry. The PUT refuses, in
   this order: a negative `min_instances`, `max_instances` or
   `instance_parallelism` `400 runtime_spec.tuning_invalid`; a `min_instances` or
   `max_instances` above 64 (`MaxInstanceIndex` + 1), an `instance_parallelism`
@@ -975,7 +1010,7 @@ spec PUT's authorization and benchmark refusals above, and these codes of their 
 | the agent's `runtime.cluster_not_ready`, `.cluster_member_unreachable` / `.cluster_member_in_use` | 503 / 409 — passed through |
 | `runtime.cluster_start_failed` | 502 — a cluster head's members-first start failed; `error.cause` is the cause's code (the agent's code, the specific one its telemetry reported, or `runtime.cluster_config_unacknowledged` when an agent did not acknowledge a document carrying its part in time) and `error.position` the failing member's position, or `error.head: true`. The head then cools down; a cause of `runtime.rpc_unsupported_build`, `.cluster_version_mismatch`, `.device_backend_mismatch` or `.rpc_device_count_mismatch` blocks automatic starts until the head's runtime document changes. A manual start overrides both |
 | `runtime.cluster_member_unused` | 502 — the head started but the member at `error.position` never reported its hold within the head's startup timeout plus 30 s; the head was stopped |
-| `runtime.cluster_unavailable` | 409 — the cluster cannot start: `error.cause` is the reason the runtime documents withhold it (`runtime.cluster_*`, `runtime.cluster_head_disabled`) or `runtime_spec.not_found` |
+| `runtime.cluster_unavailable` | 409 — the cluster cannot start: `error.cause` is the reason the runtime documents withhold it (`runtime.cluster_*`, `runtime.cluster_head_disabled`), `runtime_spec.not_found`, or `runtime.action_failed` (a store read failed; the details are logged, never answered). **503** when `error.cause` is `runtime.cluster_start_cancelled` (a stop or the shutdown ended the start; nothing cools down) or `runtime.cluster_stopping` (a stop of the head is under way) |
 
 The application endpoints' unmapped fallback is **500 `application.request_failed`**
 (`writePortalApplicationError`), not the `runtime_spec.request_failed` in the row

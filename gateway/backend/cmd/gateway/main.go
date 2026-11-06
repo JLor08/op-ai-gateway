@@ -500,6 +500,10 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 		stopScheduler()
 		cancelEnergy()
 		cancelClusters()
+		// The server's lifetime is cancelled before this cleanup runs (main
+		// defers cancelBase after cleanup, so it runs first), which ends every
+		// cluster start; join them before the store closes.
+		srv.WaitClusterStarts()
 		_ = tracer.Shutdown(context.Background())
 		if prevCleanup != nil {
 			return prevCleanup()

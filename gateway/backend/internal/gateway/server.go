@@ -1287,6 +1287,12 @@ func (s *Server) ClusterReconcileTrigger() <-chan struct{} { return s.clusters.T
 // cluster heads members first. cmd/gateway runs it through startCancellable.
 func (s *Server) ReconcileClusters(ctx context.Context) { s.clusters.Reconcile(ctx) }
 
+// WaitClusterStarts returns once every cluster start and reconciler-spawned
+// start has ended. cmd/gateway calls it in its cleanup, after the server's
+// lifetime was cancelled (which ends each start) and before the store
+// closes, so no start reads a closed store.
+func (s *Server) WaitClusterStarts() { s.clusters.wait() }
+
 // chatAudioCaps is the pair of caps the run executors bound a speech turn's audio by: the
 // most decoded PCM bytes the whole turn may keep (maxChatAudioBytes) and the per-blob
 // ceiling (maxChatBlobBytes) each part must fit, which sizes the parts (speechPartBytes).

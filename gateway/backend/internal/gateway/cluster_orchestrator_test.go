@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -56,6 +57,13 @@ type orchPortal struct {
 	version    int
 	reconciles int
 	kept       []string
+	// planReads counts ClusterPlan calls; afterPlan, when set, runs once
+	// after a read was answered (a write that lands right after it).
+	planReads int
+	afterPlan func(p *orchPortal)
+	// reconcileGate, when set, holds the policy pass until it closes (a pass
+	// stuck behind another on the policy lock; it ignores ctx).
+	reconcileGate chan struct{}
 }
 
 func (p *orchPortal) ClusterPlan(_ context.Context, headSpecID string) (portal.ClusterPlan, error) {
@@ -64,8 +72,13 @@ func (p *orchPortal) ClusterPlan(_ context.Context, headSpecID string) (portal.C
 	if headSpecID != p.plan.Head.Spec.ID {
 		return portal.ClusterPlan{}, portal.ErrRuntimeSpecNotFound
 	}
+	p.planReads++
 	plan := p.plan
 	plan.Members = slices.Clone(p.plan.Members)
+	if hook := p.afterPlan; hook != nil {
+		p.afterPlan = nil
+		hook(p)
+	}
 	return plan, nil
 }
 
@@ -93,8 +106,12 @@ func (p *orchPortal) AgentRuntimeConfig(_ context.Context, serverID string) (por
 
 func (p *orchPortal) ReconcileRPCPolicies(context.Context) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.reconciles++
+	gate := p.reconcileGate
+	p.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 }
 
 func (p *orchPortal) KeptUpClusterHeads(context.Context) ([]string, error) {
@@ -821,5 +838,234 @@ func TestReconcileRefreshesWithheldHead(t *testing.T) {
 	f.o.Reconcile(context.Background())
 	if st := f.o.State(orchHead); st != clusterCold {
 		t.Fatalf("state after the documents carry the head = %v, want cold", st)
+	}
+}
+
+// TestManualStopClusterAnswers pins the manual stop of a cluster head: it runs
+// in the background under the server's lifetime and answers 200 stopped when
+// the drain finished within the early-answer window, else 202 stopping while
+// it completes.
+func TestManualStopClusterAnswers(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		slow      bool
+		wantCode  int
+		wantState string
+	}{
+		{name: "inside the window", wantCode: http.StatusOK, wantState: provider.RuntimeStopStopped},
+		{name: "past the window", slow: true, wantCode: http.StatusAccepted, wantState: provider.RuntimeStopStopping},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newActionAgent()
+			srv := newActionServer(t, agent, 50*time.Millisecond, func(spec *routing.RuntimeSpec) {
+				spec.ClusterEnabled, spec.Replicable, spec.MaxInstances = true, false, 0
+			})
+			f := newOrchFixture(t, 1, "relay", "lan")
+			f.portal.plan.Head.Spec.ID = actionSpec
+			srv.clusters = f.o
+			f.statuses.publish(orchHeadServer, []RuntimeStatusDTO{{SpecID: actionSpec, State: agentSpecStateRunning}})
+			release := make(chan struct{})
+			if tc.slow {
+				f.agent.stopState = provider.RuntimeStopStopping
+				f.agent.onHeadStop = func() {
+					go func() {
+						<-release
+						f.statuses.publish(orchHeadServer, []RuntimeStatusDTO{{SpecID: actionSpec, State: agentSpecStateStopped}})
+					}()
+				}
+			}
+
+			rec := postAction(srv, "stop", `{"instance":0,"stop_members":true}`)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("stop = %d %s, want %d", rec.Code, rec.Body.String(), tc.wantCode)
+			}
+			if got := decodeAnswer(t, rec); got.Instance != 0 || got.State != tc.wantState {
+				t.Fatalf("answer = %+v, want instance 0 %s", got, tc.wantState)
+			}
+			close(release)
+			srv.waitRuntimeStarts()
+			calls := f.agent.recorded()
+			if len(calls) != 3 || calls[0] != "head:stop:"+orchHeadModel || calls[2] != "member:stop:"+orchMemberSpec(0) {
+				t.Fatalf("calls = %q, want the head stopped, then the member released and stopped", calls)
+			}
+			if len(agent.stopped()) != 0 {
+				t.Fatalf("plain stops = %q, want none for a cluster head", agent.stopped())
+			}
+		})
+	}
+}
+
+// TestEnsureClusterPolicyPassBounded pins step one's single bound: a mesh
+// cluster's policy pass that is stuck (behind another on the policy lock)
+// is waited for no longer than the configuration bound, and the start goes on
+// with the acknowledgement wait.
+func TestEnsureClusterPolicyPassBounded(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "mesh")
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	gate := make(chan struct{})
+	f.portal.reconcileGate = gate
+	t.Cleanup(func() { close(gate) })
+
+	began := time.Now()
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if elapsed := time.Since(began); elapsed > 2*time.Second {
+		t.Fatalf("the start took %v behind a stuck policy pass, want about the configuration bound", elapsed)
+	}
+}
+
+// TestEnsureClusterRereadsStalePlan pins that a plan the runtime documents
+// moved past during step one (a write that changed the generation right after
+// the plan was read) is read again, not waited out until the bound.
+func TestEnsureClusterRereadsStalePlan(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.holdOnHeadEnsure(0)
+	f.portal.afterPlan = func(p *orchPortal) {
+		p.plan.Generation = "gen2"
+		p.version++
+	}
+	// The agents acknowledge the documents as they are after the write.
+	f.portal.mu.Lock()
+	f.portal.version++
+	f.portal.mu.Unlock()
+	f.ackAll()
+	f.portal.mu.Lock()
+	f.portal.version--
+	f.portal.mu.Unlock()
+
+	began := time.Now()
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if elapsed := time.Since(began); elapsed >= 300*time.Millisecond {
+		t.Fatalf("the start took %v, want it to re-read the plan instead of waiting out the bound", elapsed)
+	}
+	f.portal.mu.Lock()
+	reads := f.portal.planReads
+	f.portal.mu.Unlock()
+	if reads < 2 {
+		t.Fatalf("plan reads = %d, want the stale plan read again", reads)
+	}
+}
+
+// TestEnsureClusterJoinerLeavingKeepsTheStart pins that the start belongs to
+// no caller: a joiner whose context ends gets its context's error, and the
+// start goes on for the others.
+func TestEnsureClusterJoinerLeavingKeepsTheStart(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	gate := make(chan struct{})
+	f.agent.memberGate[orchMemberSpec(0)] = gate
+	f.portal.plan.Members[0].StartupTimeoutSeconds = 500
+
+	leaving, leave := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() { first <- f.o.Ensure(leaving, orchHead) }()
+	<-f.agent.arrived
+	second := make(chan error, 1)
+	go func() { second <- f.o.Ensure(context.Background(), orchHead) }()
+	for f.o.joiners(orchHead) < 1 {
+		time.Sleep(time.Millisecond)
+	}
+	leave()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leaving caller = %v, want its context's error", err)
+	}
+	close(gate)
+	if err := <-second; err != nil {
+		t.Fatalf("remaining caller = %v, want the start formed", err)
+	}
+	if f.o.State(orchHead) != clusterFormed {
+		t.Fatalf("state = %v, want formed", f.o.State(orchHead))
+	}
+}
+
+// TestStopClusterCancelsRunningStart pins a stop during a start: the start is
+// cancelled (its callers get a 503-class cancellation, not a failure that
+// cools the head down), the head is drained, and a start asked for while the
+// stop runs is refused.
+func TestStopClusterCancelsRunningStart(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.ackAll()
+	f.agent.memberGate[orchMemberSpec(0)] = make(chan struct{}) // never answers
+	f.portal.plan.Members[0].StartupTimeoutSeconds = 500
+	f.statuses.publish(orchHeadServer, []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateRunning}})
+	release := make(chan struct{})
+	f.agent.stopState = provider.RuntimeStopStopping
+	f.agent.onHeadStop = func() {
+		go func() {
+			<-release
+			f.statuses.publish(orchHeadServer, []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateStopped}})
+		}()
+	}
+
+	started := make(chan error, 1)
+	go func() { started <- f.o.Ensure(context.Background(), orchHead) }()
+	<-f.agent.arrived
+	stopped := make(chan error, 1)
+	go func() { stopped <- f.o.Stop(context.Background(), orchHead, false) }()
+
+	ce := clusterErrOf(t, <-started)
+	if ce.Code != codeClusterUnavailable || ce.Cause != codeClusterStartCancelled {
+		t.Fatalf("start = %+v, want cluster_unavailable with start_cancelled", ce)
+	}
+	for call := range f.agent.arrived {
+		if call == "head:stop:"+orchHeadModel {
+			break
+		}
+	}
+	ce = clusterErrOf(t, f.o.Ensure(context.Background(), orchHead))
+	if ce.Cause != codeClusterStopping {
+		t.Fatalf("start during the stop = %+v, want cluster_stopping", ce)
+	}
+	close(release)
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if st := f.o.State(orchHead); st != clusterCold {
+		t.Fatalf("state = %v, want cold (a cancelled start cools nothing down)", st)
+	}
+	rec := httptest.NewRecorder()
+	writeRuntimeAgentError(rec, &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStartCancelled, Position: -1})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cancelled start answers %d, want 503", rec.Code)
+	}
+}
+
+// TestDrainingHeadStillOccupiesItsMembers pins that a draining head still has
+// its process: its frame wakes no reconciler and keeps the cluster formed,
+// and a direct member it still holds is not force-stopped meanwhile.
+func TestDrainingHeadStillOccupiesItsMembers(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	running := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateRunning, Cluster: &RuntimeClusterStatusDTO{Launched: []string{"a:1"}}}}
+	draining := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateDraining, Cluster: &RuntimeClusterStatusDTO{Launched: []string{"a:1"}}}}
+	f.o.observeStatus(orchHeadServer, running, draining)
+	select {
+	case <-f.o.TriggerChannel():
+		t.Fatal("a draining head woke the reconciler")
+	default:
+	}
+	if st := f.o.State(orchHead); st != clusterFormed {
+		t.Fatalf("state = %v, want still formed while the head drains", st)
+	}
+
+	g := newOrchFixture(t, 1, "direct", "lan")
+	g.ackAll()
+	g.holdOnHeadEnsure(0)
+	g.statuses.publish(orchHeadServer, []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateDraining}})
+	g.statuses.publish(orchMemberServer(0), []RuntimeStatusDTO{orchMemberRow(orchMemberSpec(0), orchHead)})
+	if err := g.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if n := g.agent.count("member:stop:"); n != 0 {
+		t.Fatalf("calls = %q, want no force-stop of a member a draining head holds", g.agent.recorded())
 	}
 }
