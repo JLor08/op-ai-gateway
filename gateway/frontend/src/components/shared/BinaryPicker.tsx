@@ -119,6 +119,12 @@ export function BinaryPicker({
           placeholder={placeholder}
           error={error}
           helperText={helperText ?? (options.length > 0 ? t.binaryPickerHint : undefined)}
+          // Keep `required` on the native input but hide the label asterisk, as
+          // Field does for every other required field.
+          slotProps={{
+            ...params.slotProps,
+            inputLabel: { ...params.slotProps?.inputLabel, required: false },
+          }}
         />
       )}
     />

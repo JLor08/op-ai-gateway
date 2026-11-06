@@ -42,11 +42,6 @@ import type {
 
 const t = messages.de;
 
-// A required field's label carries MUI's asterisk, so it is matched by text
-// plus the marker rather than by the bare label.
-const requiredLabel = (label: string) =>
-  new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\*$`);
-
 const server: PortalServer = {
   id: 'srv_1',
   name: 'S1',
@@ -240,7 +235,7 @@ async function openApiTokenSpecEdit(
   });
   await screen.findByText('gw-model');
   fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-  await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+  await screen.findByLabelText(t.runtimeSpecBinary);
   return rendered;
 }
 
@@ -1289,7 +1284,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     // Only the app model name is entered on create; the gateway name is derived
     // from it (see the "derives the gateway name" test for the ownership rule).
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
@@ -1361,7 +1356,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -1386,7 +1381,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(images).not.toBeChecked();
     fireEvent.click(images);
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd-server/sd-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -1409,7 +1404,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(screen.getByRole('checkbox', { name: 'openai' })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeChecked();
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -1435,7 +1430,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'anthropic' })).not.toBeChecked();
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd-server/sd-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -1448,7 +1443,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -1460,7 +1455,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
@@ -1485,7 +1480,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       const { created, putSpecs } = renderSection();
       fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
       fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-      fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
         target: { value: '/usr/bin/llama-server' },
       });
       fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
@@ -1508,7 +1503,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
@@ -1594,7 +1589,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -1622,7 +1617,7 @@ describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => 
   };
   const fillCreate = () => {
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
   };
@@ -1695,7 +1690,7 @@ describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => 
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     untickAll();
     const submit = screen.getByRole('button', { name: t.save });
     const group = screen.getByRole('group', { name: t.applicationFlavors });
@@ -1729,7 +1724,7 @@ describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => 
 
     fireEvent.click(await screen.findByRole('button', { name: en.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(en.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(en.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(en.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     untickAll();
@@ -1741,7 +1736,7 @@ describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => 
 
     fireEvent.click(screen.getByRole('button', { name: en.cancel }));
     fireEvent.click(await screen.findByRole('button', { name: en.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(en.runtimeSpecBinary));
+    await screen.findByLabelText(en.runtimeSpecBinary);
     untickAll();
     fireEvent.click(screen.getByRole('button', { name: en.save }));
     const editGroup = screen.getByRole('group', { name: en.applicationFlavors });
@@ -1768,7 +1763,7 @@ describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => 
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
     expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
 
@@ -1816,14 +1811,14 @@ describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => 
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
 
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     expect(screen.getByText(t.runtimeSpecFlavorsRequired)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: t.cancel }));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
     expect(putSpecs).toHaveLength(0);
   });
@@ -1845,7 +1840,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     return handles;
   }
 
@@ -1862,7 +1857,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
     );
     expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -1879,7 +1874,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
     expect(
       screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }),
     ).not.toBeChecked();
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -1890,7 +1885,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
   it('keeps openai_images for an images-only parent, as Create does', async () => {
     const { putSpecs } = await openEditOfSpecless({ api_flavors: ['openai_images'] });
     expect(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages })).toBeChecked();
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -1903,7 +1898,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
   it('opens with Enabled ticked, as Create does, and an untouched save sends it', async () => {
     const { putSpecs } = await openEditOfSpecless({});
     expect(screen.getByRole('checkbox', { name: t.runtimeSpecEnabled })).toBeChecked();
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -1925,7 +1920,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect(screen.getByRole('checkbox', { name: t.runtimeSpecEnabled })).not.toBeChecked();
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
@@ -1949,7 +1944,7 @@ describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.api_flavors).toEqual(['anthropic']);
@@ -2030,14 +2025,10 @@ describe('RuntimeAdminSection overlapping form opens', () => {
     fireEvent.click(inRowWith('gw-a').getByRole('button', { name: t.runtimeSpecEditAction }));
     fireEvent.click(inRowWith('gw-b').getByRole('button', { name: t.runtimeSpecEditAction }));
     await land('map_b');
-    expect(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary))).toHaveValue(
-      '/opt/b/llama-server',
-    );
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toHaveValue('/opt/b/llama-server');
 
     await land('map_a');
-    expect(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary))).toHaveValue(
-      '/opt/b/llama-server',
-    );
+    expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveValue('/opt/b/llama-server');
     expect(screen.getByLabelText(t.mappingGatewayName)).toHaveValue('gw-b');
     expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('app-b');
 
@@ -2062,12 +2053,10 @@ describe('RuntimeAdminSection overlapping form opens', () => {
     expect(
       inRowWith('gw-b').getByRole('button', { name: t.runtimeSpecEditAction }),
     ).toHaveAttribute('aria-disabled', 'true');
-    expect(screen.queryByLabelText(requiredLabel(t.runtimeSpecBinary))).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecBinary)).not.toBeInTheDocument();
 
     await land('map_b');
-    expect(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary))).toHaveValue(
-      '/opt/b/llama-server',
-    );
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toHaveValue('/opt/b/llama-server');
   });
 
   it('does not let an Edit GET landing after a Create take the form over', async () => {
@@ -2081,7 +2070,7 @@ describe('RuntimeAdminSection overlapping form opens', () => {
 
     await land('map_a');
     expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('app-new');
-    expect(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary))).toHaveValue('');
+    expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveValue('');
     expect(screen.getByRole('button', { name: t.runtimeSpecCreate })).toBeInTheDocument();
     expect(created).toHaveLength(0);
 
@@ -2113,7 +2102,7 @@ describe('RuntimeAdminSection edit + delete', () => {
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
 
-    const binaryField = await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    const binaryField = await screen.findByLabelText(t.runtimeSpecBinary);
     expect((binaryField as HTMLInputElement).value).toBe('/usr/bin/llama-server');
     fireEvent.change(binaryField, { target: { value: '/usr/bin/llama-server-v2' } });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -2179,7 +2168,7 @@ describe('RuntimeAdminSection edit + delete', () => {
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
 
-    expect(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary))).toBeInTheDocument();
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
     expect(screen.getByRole('combobox', { name: t.applicationMessagesMode })).toHaveTextContent(
@@ -2257,7 +2246,7 @@ describe('RuntimeAdminSection reloads the mappings after a spec write', { timeou
     }));
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }));
     fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -2277,7 +2266,7 @@ describe('RuntimeAdminSection reloads the mappings after a spec write', { timeou
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     const writesSeen = recordWritesSeenByMappingReads(fakeApi, putSpecs);
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -2293,7 +2282,7 @@ describe('RuntimeAdminSection reloads the mappings after a spec write', { timeou
     const { fakeApi, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -2361,7 +2350,7 @@ describe('RuntimeAdminSection placeholder validation (mirrors the agent policy)'
   async function openCreateAndFillBase() {
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
   }
@@ -2519,7 +2508,7 @@ describe('RuntimeAdminSection arguments field contract (hint + warnings)', () =>
     const { created, putSpecs } = renderSection();
     await openCreateForm();
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     setArgs('--port 50395 --mmproj C:\\models\\mmproj-BF16.gguf');
@@ -2677,7 +2666,7 @@ describe('RuntimeAdminSection arguments field contract (hint + warnings)', () =>
     const { putSpecs } = renderSection();
     await openCreateForm();
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     // A reverse-prompt whose trailing space is the whole point of the value.
@@ -2727,7 +2716,7 @@ describe('RuntimeAdminSection edit-without-changes round trip', () => {
 
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     // No edits at all -- just re-save exactly what was loaded.
     fireEvent.click(screen.getByRole('button', { name: t.save }));
 
@@ -4324,7 +4313,7 @@ describe('RuntimeAdminSection restart sequence', () => {
       return createdAgain;
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    fireEvent.change(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/local/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -4440,7 +4429,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
 
       fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
       fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-      fireEvent.change(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+      fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
         target: { value: '/opt/llama/bin/llama-server' },
       });
       fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -4480,7 +4469,7 @@ describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 1
 
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    fireEvent.change(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/llama/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -4894,7 +4883,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       ],
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    const field = await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    const field = await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.mouseDown(field);
     fireEvent.click(await screen.findByText('/opt/llama/llama-server'));
     expect((field as HTMLInputElement).value).toBe('/opt/llama/llama-server');
@@ -5258,7 +5247,7 @@ describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block 
       report: makeReport({ agent_version: '0.4.0', agent_features: ['gpu_selection'] }),
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary)); // form is open
+    await screen.findByLabelText(t.runtimeSpecBinary); // form is open
     expect(screen.queryByText(t.runtimeSpecMetalNonMacos)).not.toBeInTheDocument();
   });
 });
@@ -6200,7 +6189,7 @@ describe('RuntimeAdminSection duplicate GPU index (task 22b, C5)', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
@@ -6267,7 +6256,7 @@ describe('RuntimeAdminSection trailing empty argument (task 22b, C4)', () => {
 
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.click(screen.getByRole('button', { name: t.save }));
 
     await waitFor(() => expect(putSpecs).toHaveLength(1));
@@ -6472,7 +6461,7 @@ describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', ()
     });
     // Still on the list: `specMode` only flips once the GET resolves, so
     // nothing on this screen is locked.
-    expect(screen.queryByLabelText(requiredLabel(t.runtimeSpecBinary))).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecBinary)).not.toBeInTheDocument();
 
     // The operator switches to the live-status tab and forces the model down.
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
@@ -6497,7 +6486,7 @@ describe('RuntimeAdminSection openEdit GET takes a ticket (fix round 1, C2)', ()
 
     // The form opened and hydrated from that snapshot -- which is right, it is
     // the document this form will PUT back. Back out of it.
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.click(screen.getByRole('button', { name: t.cancel }));
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
 
@@ -6575,7 +6564,7 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
     // form would PUT back, which C2's own comment insists on. Back out of it;
     // nothing re-fetches on the way (`loadedIdsRef` blocks the lazy loader), so
     // whatever the cache holds now is what it holds for the rest of the mount.
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.click(screen.getByRole('button', { name: t.cancel }));
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
 
@@ -6643,7 +6632,7 @@ describe('RuntimeAdminSection spec reads snapshot the COMMIT order (fix round 2,
       landGet(fullSpec({ admin_state: 'force_running' }));
       await Promise.resolve();
     });
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.click(screen.getByRole('button', { name: t.cancel }));
 
     // It has to be kept. Discarded, it is discarded for good -- `loadedIdsRef`
@@ -6677,7 +6666,7 @@ describe('RuntimeAdminSection specsSettled survives a create (fix round 1, C3)',
     fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -6764,7 +6753,7 @@ describe('RuntimeAdminSection mapping delete takes a ticket (fix round 1, M5)', 
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     // The mapping POST resolves; the spec PUT hangs.
@@ -7195,7 +7184,7 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     // The mapping POST succeeds, the spec PUT does not: a partial failure, so
@@ -7500,7 +7489,7 @@ describe('RuntimeAdminSection spec GPU picker', () => {
     fireEvent.change(screen.getByLabelText(t.runtimeSpecVram), { target: { value: '18000' } });
 
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -7566,7 +7555,7 @@ describe('RuntimeAdminSection set_visible_devices', () => {
   async function openCreateWithVisibleDevices() {
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByLabelText(t.runtimeSpecSetVisibleDevices));
@@ -7646,7 +7635,7 @@ describe('RuntimeAdminSection set_visible_devices', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
@@ -7716,7 +7705,7 @@ describe('RuntimeAdminSection visibility mode', () => {
       },
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     // Control is present because the checkbox is on, and shows the stored 'env'.
     const combo = screen.getByRole('combobox', { name: t.runtimeSpecVisibleDevicesMode });
     expect(combo).toHaveTextContent(t.runtimeSpecVisibleDevicesModeEnv);
@@ -8121,7 +8110,7 @@ describe('RuntimeAdminSection spec form ownership', () => {
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
     // Await something that proves the form rendered before asserting a NEGATIVE.
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
 
     expect(document.querySelector('#runtime-spec-gateway-name')).toHaveAttribute('readonly');
     expect(screen.getByText(t.runtimeSpecGatewayNameReadOnly)).toBeInTheDocument();
@@ -8142,8 +8131,8 @@ describe('RuntimeAdminSection spec form ownership', () => {
       },
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/new' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -8163,8 +8152,8 @@ describe('RuntimeAdminSection spec form ownership', () => {
       },
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/new' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -8201,7 +8190,7 @@ describe('RuntimeAdminSection spec form ownership', () => {
     expect(document.querySelector('#runtime-spec-status')).toBeNull();
 
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -8270,7 +8259,7 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
     const rendered = renderSection(opts);
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     return rendered;
   }
 
@@ -8424,7 +8413,7 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
       ]) as unknown as PortalApi['mappingBenchmarks'],
     });
 
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     // An inconclusive run is NOT a measurement of 0: there is no number, so
     // there is no affordance and no field showing one.
     expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
@@ -8442,7 +8431,7 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
       ]) as unknown as PortalApi['mappingBenchmarks'],
     });
 
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
   });
 
@@ -8457,7 +8446,7 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
       }) as unknown as PortalApi['mappingBenchmarks'],
     });
 
-    expect(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary))).toBeInTheDocument();
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: t.runtimeSpecVramApply })).not.toBeInTheDocument();
   });
 
@@ -8608,7 +8597,7 @@ describe('RuntimeAdminSection RuntimeSpec Type + probe-path overrides', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
 
     expect((screen.getByLabelText(t.runtimeSpecEffectiveType) as HTMLInputElement).value).toBe(
       'llama_cpp',
@@ -8625,7 +8614,7 @@ describe('RuntimeAdminSection RuntimeSpec Type + probe-path overrides', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
 
@@ -8658,7 +8647,7 @@ describe('RuntimeAdminSection stable_diffusion_cpp health path + args example', 
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/sd-server' },
     });
 
@@ -8740,7 +8729,7 @@ describe('RuntimeAdminSection stable_diffusion_cpp health path + args example', 
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
       '/v1/models',
     );
@@ -8850,7 +8839,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     // Type stays at Auto; the health path field is never touched.
@@ -8868,7 +8857,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
@@ -8891,7 +8880,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    fireEvent.change(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
@@ -8911,7 +8900,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    fireEvent.change(await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
@@ -8937,7 +8926,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
       '/health',
     );
@@ -8960,7 +8949,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
 
@@ -8990,7 +8979,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
@@ -9019,7 +9008,7 @@ describe('RuntimeAdminSection API-token mode', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -9198,7 +9187,7 @@ describe('RuntimeAdminSection API-token header source', () => {
   it('falls back to the parent application’s own header on CREATE (no spec yet)', async () => {
     renderSection({ application: { ...application, api_token_header: 'X-From-App' } });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
 
     expect(
       (screen.getByLabelText(t.runtimeSpecApiTokenHeaderInheritedLabel) as HTMLInputElement).value,
@@ -9388,7 +9377,7 @@ describe('RuntimeAdminSection responses live timings', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
     cleanup();
 
@@ -9403,7 +9392,7 @@ describe('RuntimeAdminSection responses live timings', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
     fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
@@ -9415,7 +9404,7 @@ describe('RuntimeAdminSection responses live timings body', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
@@ -9430,7 +9419,7 @@ describe('RuntimeAdminSection responses live timings body', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings }));
@@ -9443,7 +9432,7 @@ describe('RuntimeAdminSection responses live timings body', () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
@@ -9476,7 +9465,7 @@ describe('RuntimeAdminSection responses live timings body', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
 
     fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
@@ -9506,7 +9495,7 @@ async function openFlavorSpecEdit(spec: Partial<RuntimeSpec>, parent?: PortalApp
   });
   await screen.findByText('gw-model');
   fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-  await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+  await screen.findByLabelText(t.runtimeSpecBinary);
   return rendered;
 }
 
@@ -9594,14 +9583,14 @@ describe('RuntimeAdminSection launch-spec flavor hints', () => {
 
     // The resolved type is stale once the binary changes: the detection is
     // Go-only, so the form stops claiming the spec is sd.
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/other-server' },
     });
     expect(
       screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
     ).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
@@ -9638,7 +9627,7 @@ describe('RuntimeAdminSection launch-spec flavor hints', () => {
     expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: t.cancel }));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     expect(
@@ -9661,7 +9650,7 @@ describe('RuntimeAdminSection launch-spec flavor hints', () => {
   it('does not warn under Auto on Create, whatever the binary', async () => {
     renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     expect(
@@ -9688,7 +9677,7 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
@@ -9715,7 +9704,7 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     // The same flavor set in another order, and a mode off the template: the
@@ -9807,7 +9796,7 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
     });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
@@ -9852,7 +9841,7 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
     fireEvent.click(screen.getByRole('button', { name: t.cancel }));
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     await pickFlavorFormType(t.runtimeSpecTypeVllm);
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
@@ -9891,7 +9880,7 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
 
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/sd/sd-server' },
     });
     // Both mode dropdowns are gated on their own flavor's checkbox
@@ -9940,7 +9929,7 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, 
     const rendered = renderSection({ application: { ...application, ...parent } });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: binary },
     });
     return rendered;
@@ -10204,14 +10193,14 @@ describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, (
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     return rendered;
   }
 
   async function openCreateAndFillBase() {
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
   }
@@ -10391,7 +10380,7 @@ describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, (
       const again = await screen.findAllByRole('button', { name: t.runtimeSpecEditAction });
       fireEvent.click(again[1]);
       await waitFor(() =>
-        expect(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary))).toHaveValue('/usr/bin/b'),
+        expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveValue('/usr/bin/b'),
       );
       expect(nameFields()).toHaveLength(0);
       fireEvent.click(screen.getByRole('button', { name: t.save }));
@@ -10418,7 +10407,7 @@ describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, (
       fireEvent.click(screen.getByRole('button', { name: t.cancel }));
 
       fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
-      await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+      await screen.findByLabelText(t.runtimeSpecBinary);
       expect(nameFields()).toHaveLength(0);
     });
 
@@ -10694,7 +10683,7 @@ describe('RuntimeAdminSection spec-level RAM estimate', () => {
     expect(ramField().value).toBe('0');
 
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/llama-server' },
     });
     fireEvent.change(ramField(), { target: { value: '12288' } });
@@ -10713,7 +10702,7 @@ describe('RuntimeAdminSection instance settings', () => {
     const handles = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/bin/audio-server' },
     });
     return handles;
@@ -10885,7 +10874,7 @@ describe('RuntimeAdminSection instance settings', () => {
   }
 
   function submitSpecForm() {
-    fireEvent.submit(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)).closest('form')!);
+    fireEvent.submit(screen.getByLabelText(t.runtimeSpecBinary).closest('form')!);
   }
 
   it.each(invalidTicked)('refuses %s on Create before ever calling the API', async (_, values) => {
@@ -11006,7 +10995,7 @@ describe('RuntimeAdminSection instance settings', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     return rendered;
   }
 
@@ -12226,7 +12215,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
-    await screen.findByLabelText(requiredLabel(t.runtimeSpecBinary));
+    await screen.findByLabelText(t.runtimeSpecBinary);
     return view;
   }
 
@@ -12361,7 +12350,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
 
   it('refuses a head binary switch while a member is hidden, before the round trip', async () => {
     const { putSpecs } = await openEditAndSave(headSpec());
-    fireEvent.change(screen.getByLabelText(requiredLabel(t.runtimeSpecBinary)), {
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/llama-b2/llama-server' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
