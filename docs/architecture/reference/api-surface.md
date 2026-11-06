@@ -972,6 +972,10 @@ spec PUT's authorization and benchmark refusals above, and these codes of their 
 | the agent's `runtime.instance_no_capacity`, `.instance_demand_unknown`, `.instance_protected`, `.instance_not_highest` | 409 — passed through |
 | the agent's `runtime.model_not_managed` | 404 — passed through |
 | the agent's `runtime.admission_blocked` / `.start_timeout` / `.start_failed`, `.not_permitted`, `.upstream_gone` | 503 / 504 / 502 — passed through |
+| the agent's `runtime.cluster_not_ready`, `.cluster_member_unreachable` / `.cluster_member_in_use` | 503 / 409 — passed through |
+| `runtime.cluster_start_failed` | 502 — a cluster head's members-first start failed; `error.cause` is the cause's code (the agent's code, the specific one its telemetry reported, or `runtime.cluster_config_unacknowledged` when an agent did not acknowledge a document carrying its part in time) and `error.position` the failing member's position, or `error.head: true`. The head then cools down; a cause of `runtime.rpc_unsupported_build`, `.cluster_version_mismatch`, `.device_backend_mismatch` or `.rpc_device_count_mismatch` blocks automatic starts until the head's runtime document changes. A manual start overrides both |
+| `runtime.cluster_member_unused` | 502 — the head started but the member at `error.position` never reported its hold within the head's startup timeout plus 30 s; the head was stopped |
+| `runtime.cluster_unavailable` | 409 — the cluster cannot start: `error.cause` is the reason the runtime documents withhold it (`runtime.cluster_*`, `runtime.cluster_head_disabled`) or `runtime_spec.not_found` |
 
 The application endpoints' unmapped fallback is **500 `application.request_failed`**
 (`writePortalApplicationError`), not the `runtime_spec.request_failed` in the row

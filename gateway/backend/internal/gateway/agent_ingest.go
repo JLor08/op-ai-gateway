@@ -152,6 +152,7 @@ type agentRuntimeError struct {
 	ExitCode   int       `json:"exit_code"`
 	Failures   int       `json:"failures"`
 	StderrTail string    `json:"stderr_tail,omitempty"`
+	Code       string    `json:"code,omitempty"`
 }
 
 // agentRuntimeCapabilityVerdict is one capability's answer inside an
@@ -455,6 +456,12 @@ type agentRuntimeSample struct {
 	RAMMeasuredMB int                     `json:"ram_measured_mb,omitempty"`
 	GPUs          []agentRuntimeGPUSample `json:"gpus,omitempty"`
 	LastError     *agentRuntimeError      `json:"last_error,omitempty"`
+	// Kind, RPC, Cluster and AdmissionBlockedBy are the cluster telemetry; see
+	// RuntimeStatusDTO's fields of the same names, whose types decode them.
+	Kind               string                   `json:"kind,omitempty"`
+	RPC                *RuntimeRPCStatusDTO     `json:"rpc,omitempty"`
+	Cluster            *RuntimeClusterStatusDTO `json:"cluster,omitempty"`
+	AdmissionBlockedBy string                   `json:"admission_blocked_by,omitempty"`
 }
 
 // agentRuntimeImageOptions mirrors the agent's sample.RuntimeImageOptions (the
@@ -616,6 +623,10 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			ContextProbe:        rt.ContextProbe,
 			LiveProgressSupport: rt.LiveProgressSupport,
 			ImageOptions:        rt.ImageOptions.toProvider(),
+			Kind:                rt.Kind,
+			RPC:                 rt.RPC.clone(),
+			Cluster:             rt.Cluster.clone(),
+			AdmissionBlockedBy:  rt.AdmissionBlockedBy,
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.
@@ -648,6 +659,7 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 				ExitCode:   rt.LastError.ExitCode,
 				Failures:   rt.LastError.Failures,
 				StderrTail: clampRuntimeStderrTail(rt.LastError.StderrTail),
+				Code:       rt.LastError.Code,
 			}
 		}
 		out = append(out, dto)
@@ -2234,7 +2246,11 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// The registry keeps every row as the agent sent it, one per instance of a
 	// replicable spec; only the store write-backs below fold them per spec.
 	statuses := runtimeStatusDTOsFromSamples(req.Runtimes, now)
+	prevStatuses := s.RuntimeStatus.statusRows(serverID)
 	s.RuntimeStatus.publish(serverID, statuses)
+	// A cluster head whose process exited is no longer formed, and a kept-up
+	// one is started again members first (clusterOrchestrator.observeStatus).
+	s.clusters.observeStatus(serverID, prevStatuses, statuses)
 	// One fold of the sample's rows per spec (foldInstanceRows), which every
 	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.
 	folded := foldInstanceRows(statuses[:min(len(statuses), maxRuntimeSamplesPerSample)])

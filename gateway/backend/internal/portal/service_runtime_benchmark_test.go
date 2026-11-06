@@ -128,7 +128,9 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// The cluster totals, the network/transport defaults and the warnings
 		// are derived on every read from the membership, the servers and the
 		// settings, never stored: read-only echoes. So is the reason a head is
-		// withheld from its runtime document.
+		// withheld from its runtime document, and the gateway's in-memory
+		// orchestration state of the head.
+		"cluster_status":            true,
 		"cluster_vram_total_mb":     true,
 		"cluster_ram_total_mb":      true,
 		"cluster_totals_complete":   true,

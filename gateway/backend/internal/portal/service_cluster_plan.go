@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package portal
+
+import (
+	"context"
+	"op-ai-gateway/internal/routing"
+	"slices"
+	"time"
+)
+
+// ClusterWithheldHeadDisabled is a ClusterPlan's reason for a head spec that
+// is disabled: no document carries it, so nothing can start it.
+const ClusterWithheldHeadDisabled = "runtime.cluster_head_disabled"
+
+// ClusterPlan is what the gateway's cluster orchestration needs to start one
+// cluster head: the head's scope (its spec, mapping, application and server,
+// from which the head's agent target is built) and, when the cluster is
+// derivable, each member in member order with the agent spec id the runtime
+// documents push for it. WithheldReason is the derivation's reason when the
+// cluster is not pushed (a ClusterWithheld* code); Members is then empty.
+// Network, Transport and Generation are the head's cluster block's.
+type ClusterPlan struct {
+	Head           RuntimeActionScope
+	WithheldReason string
+	Network        string
+	Transport      string
+	Generation     string
+	Members        []ClusterPlanMember
+}
+
+// ClusterPlanMember is one member of a ClusterPlan: its position in the
+// member order, its server and that server's server_agent application (the
+// agent router the member routes are sent to), the agent spec id of its
+// rpc_server spec and that spec's startup timeout.
+type ClusterPlanMember struct {
+	Position              int
+	Server                routing.AIServer
+	Application           routing.Application
+	SpecID                string
+	StartupTimeoutSeconds int
+}
+
+// ClusterPlan returns headSpecID's plan, built from the same derivation the
+// runtime documents use (deriveCluster), so the orchestration starts exactly
+// the members the documents carry. ErrRuntimeSpecNotFound when the spec does
+// not exist, is no cluster head, or its mapping, application or server is
+// gone. A derivable cluster whose member server lost its server_agent
+// application between the derivation and this read reads as withheld
+// (ClusterWithheldMemberUnmanaged), as the derivation itself would.
+func (s *Service) ClusterPlan(ctx context.Context, headSpecID string) (ClusterPlan, error) {
+	head, ok, err := s.routes.RuntimeSpecByID(ctx, headSpecID)
+	if err != nil {
+		return ClusterPlan{}, err
+	}
+	if !ok || !head.ClusterEnabled {
+		return ClusterPlan{}, ErrRuntimeSpecNotFound
+	}
+	scope, ok, err := s.headScope(ctx, head)
+	if err != nil {
+		return ClusterPlan{}, err
+	}
+	if !ok {
+		return ClusterPlan{}, ErrRuntimeSpecNotFound
+	}
+	plan := ClusterPlan{Head: scope, Members: []ClusterPlanMember{}}
+	if !head.Enabled {
+		plan.WithheldReason = ClusterWithheldHeadDisabled
+		return plan, nil
+	}
+	d, err := s.deriveCluster(ctx, head, scope.Server, scope.Server.ID)
+	if err != nil {
+		return ClusterPlan{}, err
+	}
+	if d.reason != "" {
+		plan.WithheldReason = d.reason
+		return plan, nil
+	}
+	plan.Network, plan.Transport, plan.Generation = d.head.Network, d.head.Transport, d.head.Generation
+	rows, _, err := s.routes.ClusterMembers(ctx, head.ID)
+	if err != nil {
+		return ClusterPlan{}, err
+	}
+	for _, row := range rows {
+		spec, ok := d.members[row.ServerID]
+		if !ok {
+			return withheldPlan(plan, ClusterWithheldMemberMissing), nil
+		}
+		srv, err := s.routes.AIServerByID(ctx, row.ServerID)
+		if err != nil {
+			if ignoreNotFound(err) == nil {
+				return withheldPlan(plan, ClusterWithheldMemberMissing), nil
+			}
+			return ClusterPlan{}, err
+		}
+		app, ok, err := s.serverAgentApplication(ctx, row.ServerID)
+		if err != nil {
+			return ClusterPlan{}, err
+		}
+		if !ok {
+			return withheldPlan(plan, ClusterWithheldMemberUnmanaged), nil
+		}
+		plan.Members = append(plan.Members, ClusterPlanMember{
+			Position: row.Position, Server: srv, Application: app,
+			SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds,
+		})
+	}
+	return plan, nil
+}
+
+func withheldPlan(plan ClusterPlan, reason string) ClusterPlan {
+	plan.WithheldReason = reason
+	plan.Network, plan.Transport, plan.Generation = "", "", ""
+	plan.Members = []ClusterPlanMember{}
+	return plan
+}
+
+// headScope resolves head -> mapping -> application -> server; ok is false
+// when a link is gone or the application is no server_agent one.
+func (s *Service) headScope(ctx context.Context, head routing.RuntimeSpec) (RuntimeActionScope, bool, error) {
+	mapping, err := s.routes.MappingByID(ctx, head.MappingID)
+	if err != nil {
+		return RuntimeActionScope{}, false, ignoreNotFound(err)
+	}
+	app, err := s.routes.ApplicationByID(ctx, mapping.ApplicationID)
+	if err != nil {
+		return RuntimeActionScope{}, false, ignoreNotFound(err)
+	}
+	if app.Type != routing.ProviderServerAgent {
+		return RuntimeActionScope{}, false, nil
+	}
+	server, err := s.routes.AIServerByID(ctx, app.ServerID)
+	if err != nil {
+		return RuntimeActionScope{}, false, ignoreNotFound(err)
+	}
+	return RuntimeActionScope{Server: server, Application: app, Mapping: mapping, Spec: head}, true, nil
+}
+
+// serverAgentApplication returns serverID's server_agent application, the
+// one agent router the server runs.
+func (s *Service) serverAgentApplication(ctx context.Context, serverID string) (routing.Application, bool, error) {
+	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
+	if err != nil {
+		return routing.Application{}, false, err
+	}
+	i := slices.IndexFunc(apps, func(a routing.Application) bool { return a.Type == routing.ProviderServerAgent })
+	if i < 0 {
+		return routing.Application{}, false, nil
+	}
+	return apps[i], true, nil
+}
+
+// KeptUpClusterHeads lists the enabled cluster heads the gateway keeps up on
+// its own: pinned or force_running. For a head these mean that the gateway,
+// not the agent, starts it -- an agent never starts a cold head by itself, so
+// the gateway's reconciler runs the members-first start for them. In no
+// particular order; a server or application whose specs cannot be read fails
+// the whole list.
+func (s *Service) KeptUpClusterHeads(ctx context.Context) ([]string, error) {
+	servers, err := s.routes.AIServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var heads []string
+	for _, srv := range servers {
+		apps, err := s.routes.ApplicationsByServer(ctx, srv.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, app := range apps {
+			if app.Type != routing.ProviderServerAgent {
+				continue
+			}
+			specs, err := s.routes.RuntimeSpecsByApplication(ctx, app.ID)
+			if err != nil {
+				return nil, err
+			}
+			for _, spec := range specs {
+				if spec.ClusterEnabled && spec.Enabled && (spec.Pinned || spec.AdminState == adminStateForceRunning) {
+					heads = append(heads, spec.ID)
+				}
+			}
+		}
+	}
+	return heads, nil
+}
+
+// adminStateForceRunning is the admin_state that keeps a spec up.
+const adminStateForceRunning = "force_running"
+
+// ReconcileRPCPolicies runs the NetBird policy pass for the RPC cluster
+// members synchronously: the cluster orchestration calls it before it starts
+// a mesh cluster, so the policy that lets the head reach its members exists
+// before the head dials them. A no-op while NetBird or policy management is
+// off; failures are logged by the pass, never returned.
+func (s *Service) ReconcileRPCPolicies(ctx context.Context) {
+	s.reconcileRPCPolicies(ctx)
+}
+
+// The states of a cluster head's orchestration (ClusterStatusDTO.State).
+const (
+	ClusterStateCold        = "cold"
+	ClusterStateForming     = "forming"
+	ClusterStateFormed      = "formed"
+	ClusterStateCoolingDown = "cooling_down"
+	ClusterStateInvalid     = "invalid"
+)
+
+// The phases of a forming cluster (ClusterStatusDTO.Phase).
+const (
+	ClusterPhaseMembersStarting = "members_starting"
+	ClusterPhaseMembersReady    = "members_ready"
+	ClusterPhaseHeadStarting    = "head_starting"
+	ClusterPhaseFormed          = "formed"
+)
+
+// ClusterStatusDTO is the gateway's orchestration state of one cluster head,
+// read-only on the head's runtime spec: State (cold, forming, formed,
+// cooling_down, invalid), the Phase of the last or running start, each
+// member's state by position (never by name, so a member on a server the
+// caller may not see stays anonymous), the last failure and the end of a
+// cooldown.
+type ClusterStatusDTO struct {
+	State         string                   `json:"state"`
+	Phase         string                   `json:"phase,omitempty"`
+	Members       []ClusterMemberStatusDTO `json:"members"`
+	LastFailure   *ClusterFailureDTO       `json:"last_failure,omitempty"`
+	CooldownUntil *time.Time               `json:"cooldown_until,omitempty"`
+}
+
+// ClusterMemberStatusDTO is one member's part of a start: its position, its
+// state (pending, starting, ready, held, failed) and, for a failed one, the
+// cause's code.
+type ClusterMemberStatusDTO struct {
+	Position int    `json:"position"`
+	State    string `json:"state"`
+	Code     string `json:"code,omitempty"`
+}
+
+// ClusterFailureDTO is the last failed start: the cause's code, the member
+// position that failed (nil when it was the head or the cluster as a whole),
+// whether it was the head, and when.
+type ClusterFailureDTO struct {
+	Code     string    `json:"code"`
+	Position *int      `json:"position,omitempty"`
+	Head     bool      `json:"head,omitempty"`
+	At       time.Time `json:"at"`
+}
+
+// ClusterStatusReader is the gateway's cluster orchestration as the portal
+// reads it: the state of one head, cold for a head it knows nothing about.
+// The gateway injects it (SetClusterStatusReader), so the portal does not
+// depend on the gateway package.
+type ClusterStatusReader interface {
+	ClusterStatus(headSpecID string) ClusterStatusDTO
+}
+
+// SetClusterStatusReader sets (or replaces) the reader of the gateway's
+// cluster orchestration state; nil leaves a head's cluster_status cold. A
+// setter for the same reason as SetRuntimeConfigChangedHook: the gateway
+// Server that owns the orchestration is built after this Service.
+func (s *Service) SetClusterStatusReader(r ClusterStatusReader) {
+	s.clusterStatus = r
+}
+
+// headClusterStatus is an enabled head's cluster_status: the orchestration's
+// state, and invalid while the derivation withholds the head (withheld != "")
+// whatever the orchestration last saw.
+func (s *Service) headClusterStatus(headSpecID, withheld string) *ClusterStatusDTO {
+	st := ClusterStatusDTO{State: ClusterStateCold, Members: []ClusterMemberStatusDTO{}}
+	if s.clusterStatus != nil {
+		st = s.clusterStatus.ClusterStatus(headSpecID)
+		if st.Members == nil {
+			st.Members = []ClusterMemberStatusDTO{}
+		}
+	}
+	if withheld != "" {
+		st.State = ClusterStateInvalid
+	}
+	return &st
+}

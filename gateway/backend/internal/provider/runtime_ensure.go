@@ -22,6 +22,28 @@ const runtimeEnsurePath = "/ensure/{model}"
 // runtimeEnsureRunning is the status the ensure route answers on success.
 const runtimeEnsureRunning = "running"
 
+// clusterStartHeader marks an ensure as the gateway's start of a cold cluster
+// head. The agent router starts a cold head only on an ensure that carries it
+// with the value "1"; a plain ensure or a request is refused with
+// runtime.cluster_not_ready. The agent module names the same string.
+const clusterStartHeader = "X-OP-Cluster-Start"
+
+// clusterStartKey is the context key of WithClusterStart.
+type clusterStartKey struct{}
+
+// WithClusterStart marks ctx so that EnsureRuntimeModel sends the cluster-start
+// header. Only the gateway's cluster orchestration uses it, after it started
+// the head's members: the header is what lets the agent start a cold head.
+func WithClusterStart(ctx context.Context) context.Context {
+	return context.WithValue(ctx, clusterStartKey{}, true)
+}
+
+// IsClusterStart reports whether ctx carries WithClusterStart's mark.
+func IsClusterStart(ctx context.Context) bool {
+	on, _ := ctx.Value(clusterStartKey{}).(bool)
+	return on
+}
+
 // runtimeEnsureBodyLimit bounds how much of an ensure answer is read. The
 // success body and the router's error envelope are both short.
 const runtimeEnsureBodyLimit = 64 << 10
@@ -82,6 +104,9 @@ func (e *RouterError) Unwrap() error {
 // for target.ProviderModel through this client's transport and credential.
 // See RuntimeEnsurer.
 //
+// Under WithClusterStart the request carries the cluster-start header, the one
+// way a cold cluster head starts.
+//
 // The request stays bodiless: an agent router without the route hands the
 // POST to its proxy, which answers a body that names no model with 404
 // runtime.model_not_managed before it starts anything.
@@ -96,6 +121,9 @@ func (c *OpenAICompatibleClient) EnsureRuntimeModel(ctx context.Context, target 
 		return fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
 	applyUpstreamAuth(ctx, req)
+	if IsClusterStart(ctx) {
+		req.Header.Set(clusterStartHeader, "1")
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		if timeout := ensureDeadlineError(ctx); timeout != nil {

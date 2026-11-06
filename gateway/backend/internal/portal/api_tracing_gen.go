@@ -405,6 +405,18 @@ func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, 
 	return _d.API.ClusterCandidates(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) ClusterPlan(ctx context.Context, s1 string) (c2 ClusterPlan, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ClusterPlan")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ClusterPlan(ctx, s1)
+}
+
 func (_d *APIWithTracing) CommitAssistant(ctx context.Context, t1 auth.Token, s1 string, a1 AssistantTurn, s2 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CommitAssistant")
 	defer span.End()
@@ -1121,6 +1133,18 @@ func (_d *APIWithTracing) HealthCheckIntervalSeconds(ctx context.Context) (i1 in
 	return _d.API.HealthCheckIntervalSeconds(ctx)
 }
 
+func (_d *APIWithTracing) KeptUpClusterHeads(ctx context.Context) (sa1 []string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.KeptUpClusterHeads")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.KeptUpClusterHeads(ctx)
+}
+
 func (_d *APIWithTracing) ListApplications(ctx context.Context, t1 auth.Token, s1 string) (a1 ApplicationListResponse, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ListApplications")
 	defer span.End()
@@ -1707,6 +1731,13 @@ func (_d *APIWithTracing) ReconcileGatewayPeer(ctx context.Context) (s1 string, 
 		}
 	}()
 	return _d.API.ReconcileGatewayPeer(ctx)
+}
+
+func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ReconcileRPCPolicies")
+	defer span.End()
+	_d.API.ReconcileRPCPolicies(ctx)
+	return
 }
 
 func (_d *APIWithTracing) RefreshVendorAccountModels(ctx context.Context, t1 auth.Token, s1 string) (v1 VendorAccountDTO, r1 RefreshResult, err error) {

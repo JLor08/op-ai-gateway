@@ -309,6 +309,13 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetClusterStatusReader is the same wiring conduit for the cluster
+	// orchestration's state: it is portal.Service.SetClusterStatusReader
+	// itself, called ONCE by cmd/gateway's buildGatewayServer with the
+	// just-built Server's ClusterStatusReader, so a cluster head's runtime
+	// spec shows where its start stands. Server never stores or reads this
+	// field. nil is correct for any Server built without cmd/gateway.
+	SetClusterStatusReader func(portal.ClusterStatusReader)
 	// SetAudioBenchmarkTrigger is the same wiring conduit for the app-health loop's
 	// one-time automatic audio benchmark: cmd/gateway's buildGatewayServer calls it ONCE
 	// with the just-built Server's TriggerAudioBenchmark, and until then the loop's
@@ -494,6 +501,12 @@ type Server struct {
 	// one instance index at the same time. Built in New; a bare &Server{} leaves
 	// it nil, which holds nothing.
 	instanceClaims *instanceClaims
+	// clusters is the llama.cpp RPC cluster orchestration
+	// (cluster_orchestrator.go): the members-first start of a cluster head,
+	// its stop, and the reconciler that keeps pinned and force_running heads
+	// up. New builds it whenever a portal is wired; nil otherwise, which every
+	// method treats as no orchestration.
+	clusters *clusterOrchestrator
 	// runtimeStarts counts the portal's manual starts whose ensure runs in the
 	// background (runtime_actions.go); cancelling the server's lifetime
 	// (baseCtx) ends each one's ensure. Only tests join them
@@ -1230,9 +1243,49 @@ func New(deps ServerDeps) *Server {
 		}, deps.InstanceScaleCooldown)
 		resolver.SetDemandSink(s.instanceScaler)
 	}
+	if s.Portal != nil {
+		s.clusters = newClusterOrchestrator(clusterOrchestratorDeps{
+			portal: s.Portal,
+			agents: func() clusterAgentClient {
+				agents, _ := s.Provider.(clusterAgentClient)
+				return agents
+			},
+			statuses: runtimeStatus,
+			authCtx:  s.upstreamAuthCtx,
+			base:     s.lifetime,
+			now:      time.Now,
+		}, defaultClusterTimings())
+	}
 	s.routes()
 	return s
 }
+
+// ClusterStatusReader is the cluster orchestration's state as the portal
+// reads it (portal.ClusterStatusReader), nil on a server without one.
+func (s *Server) ClusterStatusReader() portal.ClusterStatusReader {
+	if s.clusters == nil {
+		return nil
+	}
+	return s.clusters
+}
+
+// clusterReconcileInterval is how often the cluster reconciler runs a pass
+// without a trigger: it picks up a kept-up head whose cooldown ended.
+const clusterReconcileInterval = 30 * time.Second
+
+// ClusterReconcileInterval is the cluster reconciler's tick period.
+func (s *Server) ClusterReconcileInterval() time.Duration { return clusterReconcileInterval }
+
+// ClusterReconcileTrigger is the channel that wakes the cluster reconciler
+// beside its tick: a pushed runtime document, an exited head. nil (never
+// fires) on a server without an orchestration.
+func (s *Server) ClusterReconcileTrigger() <-chan struct{} { return s.clusters.TriggerChannel() }
+
+// ReconcileClusters is one cluster reconciler pass
+// (clusterOrchestrator.Reconcile): at boot, on every pushed runtime document,
+// when a head exits and on the tick, it starts the pinned and force_running
+// cluster heads members first. cmd/gateway runs it through startCancellable.
+func (s *Server) ReconcileClusters(ctx context.Context) { s.clusters.Reconcile(ctx) }
 
 // chatAudioCaps is the pair of caps the run executors bound a speech turn's audio by: the
 // most decoded PCM bytes the whole turn may keep (maxChatAudioBytes) and the per-blob

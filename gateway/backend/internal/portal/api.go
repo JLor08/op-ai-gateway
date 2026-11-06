@@ -31,6 +31,8 @@ type API interface {
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
 	NotifyClustersOfServer(context.Context, string)
+	KeptUpClusterHeads(context.Context) ([]string, error)
+	ReconcileRPCPolicies(context.Context)
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AnthropicPromptCachingEnabled(context.Context) bool
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
@@ -52,6 +54,7 @@ type API interface {
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
 	ClusterCandidates(context.Context, auth.Token, string, string) ([]ClusterCandidateDTO, error)
+	ClusterPlan(context.Context, string) (ClusterPlan, error)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
 	CommitVoiceTurn(context.Context, auth.Token, string, string, AssistantTurn, string) error
 	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)

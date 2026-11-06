@@ -1297,6 +1297,7 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 		if dto.ClusterWithheldReason, err = s.clusterWithheldReason(ctx, dto.ID, headServer); err != nil {
 			return dto, err
 		}
+		dto.ClusterStatus = s.headClusterStatus(dto.ID, dto.ClusterWithheldReason)
 		transport := dto.RPCTransport
 		if transport == "" {
 			transport = dto.ClusterTransportDefault

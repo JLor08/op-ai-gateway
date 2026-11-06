@@ -433,6 +433,11 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	if deps.SetVendorTokenRefresher != nil {
 		deps.SetVendorTokenRefresher(srv.RefreshVendorSubscriptionTokens)
 	}
+	// And for the cluster orchestration's state, which a cluster head's
+	// runtime spec shows read-only: the orchestration belongs to srv.
+	if deps.SetClusterStatusReader != nil {
+		deps.SetClusterStatusReader(srv.ClusterStatusReader())
+	}
 	// Settle what a benchmark run left behind when the process died: the
 	// force_stopped overrides and lifted pins it recorded in the override
 	// lease. Synchronous, and before the scheduler and the listeners start, so
@@ -479,10 +484,22 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	cancelEnergy := startCancellable(func(ctx context.Context) {
 		srv.StartEnergyReconciler(ctx, time.Duration(cfg.EnergyReconcileIntervalSeconds)*time.Second)
 	})
+	// Start the cluster reconciler: the members-first start of every pinned or
+	// force_running llama.cpp RPC cluster head, at boot (the immediate pass),
+	// on every pushed runtime document and exited head (the trigger), and on
+	// its tick, which picks up a head whose cooldown ended. Each start it
+	// spawns is bounded by its own bounds and the server's lifetime.
+	cancelClusters := startLoop(loopOpts{
+		Immediate: true,
+		Interval:  srv.ClusterReconcileInterval,
+		Trigger:   srv.ClusterReconcileTrigger(),
+		Pass:      srv.ReconcileClusters,
+	})
 	prevCleanup := cleanup
 	cleanup = func() error {
 		stopScheduler()
 		cancelEnergy()
+		cancelClusters()
 		_ = tracer.Shutdown(context.Background())
 		if prevCleanup != nil {
 			return prevCleanup()
@@ -1111,6 +1128,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
 		SetBenchmarkReservationHook:     portalService.SetBenchmarkReservationHook,
 		SetVendorTokenRefresher:         portalService.SetVendorTokenRefresher,
+		SetClusterStatusReader:          portalService.SetClusterStatusReader,
 		SetSpeechRateTrigger:            speechRate.set,
 		SetAudioBenchmarkTrigger:        audioBenchmark.set,
 		Account:                         b.Account,

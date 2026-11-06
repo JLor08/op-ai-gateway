@@ -629,6 +629,11 @@ type RuntimeSpecDTO struct {
 	// matching member binary); "" when it is pushed. READ-ONLY, derived on
 	// every read.
 	ClusterWithheldReason string `json:"cluster_withheld_reason,omitempty"`
+	// ClusterStatus is the gateway's orchestration state of an enabled
+	// cluster head (ClusterStatusDTO): where a start stands, which member
+	// position failed and why, and the cooldown. READ-ONLY, read on every
+	// read from the gateway's memory; nil on a spec that is no enabled head.
+	ClusterStatus *ClusterStatusDTO `json:"cluster_status,omitempty"`
 }
 
 // ConfigFileDTO is one operator-supplied config file of a runtime spec: a

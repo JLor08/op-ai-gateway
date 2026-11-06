@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/tracing"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/codes"
 )
@@ -576,4 +577,71 @@ func (m *Multiplexer) dispatchProbeServerMemory(ctx context.Context, target rout
 		return p.ProbeServerMemory(ctx, target, probePath, format)
 	}
 	return ServerMemory{}, nil
+}
+
+var _ RPCMemberController = (*Multiplexer)(nil)
+
+// rpcMemberController returns the member-route capability of target's
+// provider client, falling back to the fallback client like the ensure call;
+// nil when neither has it.
+func (m *Multiplexer) rpcMemberController(target routing.Target) RPCMemberController {
+	if m == nil {
+		return nil
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if c, ok := client.(RPCMemberController); ok {
+			return c
+		}
+	}
+	if c, ok := m.fallback.(RPCMemberController); ok {
+		return c
+	}
+	return nil
+}
+
+// EnsureRPCMember routes the member start to the provider's client. A provider
+// whose client does not implement RPCMemberController yields ErrUnavailable:
+// a nil error would read as a member that is running.
+func (m *Multiplexer) EnsureRPCMember(ctx context.Context, target routing.Target, specID string, reserve time.Duration) error {
+	ctx, span := tracing.Start(ctx, "provider.EnsureRPCMember")
+	defer span.End()
+	err := fmt.Errorf("%w: rpc members not supported for provider %q", ErrUnavailable, target.Provider)
+	if c := m.rpcMemberController(target); c != nil {
+		err = c.EnsureRPCMember(ctx, target, specID, reserve)
+	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
+}
+
+// ReleaseRPCMember routes the member release like EnsureRPCMember.
+func (m *Multiplexer) ReleaseRPCMember(ctx context.Context, target routing.Target, specID string) error {
+	ctx, span := tracing.Start(ctx, "provider.ReleaseRPCMember")
+	defer span.End()
+	err := fmt.Errorf("%w: rpc members not supported for provider %q", ErrUnavailable, target.Provider)
+	if c := m.rpcMemberController(target); c != nil {
+		err = c.ReleaseRPCMember(ctx, target, specID)
+	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
+}
+
+// StopRPCMember routes the member stop like EnsureRPCMember.
+func (m *Multiplexer) StopRPCMember(ctx context.Context, target routing.Target, specID string, force bool) (string, error) {
+	ctx, span := tracing.Start(ctx, "provider.StopRPCMember")
+	defer span.End()
+	state, err := "", fmt.Errorf("%w: rpc members not supported for provider %q", ErrUnavailable, target.Provider)
+	if c := m.rpcMemberController(target); c != nil {
+		state, err = c.StopRPCMember(ctx, target, specID, force)
+	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return state, err
 }

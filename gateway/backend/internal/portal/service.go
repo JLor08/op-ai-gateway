@@ -846,11 +846,14 @@ type Service struct {
 	agentCertReports AgentCertReportReader
 	agentTransport   AgentTransportReader
 	agentFeatures    AgentFeatureReader
-	proxyStatus      ProxyRouteStatusReader
-	groups           GroupStore
-	groupCache       GroupCache
-	projects         ProjectStore
-	cipher           *capture.Cipher
+	// clusterStatus reads the gateway's cluster orchestration state for a
+	// head's read view (SetClusterStatusReader); nil before it is wired.
+	clusterStatus ClusterStatusReader
+	proxyStatus   ProxyRouteStatusReader
+	groups        GroupStore
+	groupCache    GroupCache
+	projects      ProjectStore
+	cipher        *capture.Cipher
 	// cert groups the certificate/edge-cert subsystem's fields (see certState
 	// above): the certificate-only cipher, edge-delivery config/state, the ACME
 	// challenge store, the certMu/edgeMu/certGWDNSMu mutexes (and the state

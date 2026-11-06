@@ -3589,3 +3589,57 @@ func TestRuntimeStatusDTOImageOptionsStayOffTheSSEFrame(t *testing.T) {
 		t.Fatalf("status frame JSON carries the image options: %s", b)
 	}
 }
+
+// TestRuntimeStatusCarriesClusterTelemetry pins the cluster telemetry's way
+// from the wire onto the status stream: kind, a member's rpc state, a head's
+// launch facts, admission_blocked_by and the last error's code arrive on the
+// RuntimeStatusDTO key for key, as the agent sends them.
+func TestRuntimeStatusCarriesClusterTelemetry(t *testing.T) {
+	raw := `[
+	  {"spec_id":"rpca_h_s","model":"","state":"running","kind":"rpc_server",
+	   "rpc":{"held_by":"h","held_since":"2026-11-05T10:00:00Z","reserved_until":"2026-11-05T10:02:00Z",
+	          "protocol":"3.0.0","device_count":2,"bind_mismatch":true,
+	          "breaches":[{"peer":"100.64.0.9","at":"2026-11-05T10:01:00Z"}],"cache_mb":12,"stalled":true}},
+	  {"spec_id":"h","model":"m","state":"running","cluster":{"launched":["100.64.0.5:47001"],"version":"b1"}},
+	  {"spec_id":"w","model":"w","state":"waiting","admission_blocked_by":"rpcm_x",
+	   "last_error":{"message":"boom","at":"2026-11-05T09:00:00Z","exit_code":1,"failures":1,"code":"runtime.device_backend_mismatch"}}
+	]`
+	var samples []agentRuntimeSample
+	if err := json.Unmarshal([]byte(raw), &samples); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	rows := runtimeStatusDTOsFromSamples(samples, time.Now())
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	member := rows[0]
+	if member.Kind != "rpc_server" || member.RPC == nil {
+		t.Fatalf("member kind/rpc = %q/%v, want rpc_server with rpc state", member.Kind, member.RPC)
+	}
+	rpc := member.RPC
+	if rpc.HeldBy != "h" || rpc.HeldSince.IsZero() || rpc.ReservedUntil.IsZero() || rpc.Protocol != "3.0.0" ||
+		rpc.DeviceCount != 2 || !rpc.BindMismatch || len(rpc.Breaches) != 1 || rpc.Breaches[0].Peer != "100.64.0.9" ||
+		rpc.CacheMB != 12 || !rpc.Stalled {
+		t.Fatalf("member rpc = %+v, want every field carried", *rpc)
+	}
+	head := rows[1]
+	if head.Cluster == nil || len(head.Cluster.Launched) != 1 || head.Cluster.Launched[0] != "100.64.0.5:47001" || head.Cluster.Version != "b1" {
+		t.Fatalf("head cluster = %+v, want the launch facts", head.Cluster)
+	}
+	waiting := rows[2]
+	if waiting.AdmissionBlockedBy != "rpcm_x" {
+		t.Fatalf("admission_blocked_by = %q, want rpcm_x", waiting.AdmissionBlockedBy)
+	}
+	if waiting.LastError == nil || waiting.LastError.Code != "runtime.device_backend_mismatch" {
+		t.Fatalf("last_error = %+v, want its code carried", waiting.LastError)
+	}
+	out, err := json.Marshal(rows[0])
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	for _, key := range []string{`"kind":"rpc_server"`, `"held_by":"h"`, `"device_count":2`, `"stalled":true`} {
+		if !strings.Contains(string(out), key) {
+			t.Errorf("status frame %s lacks %s", out, key)
+		}
+	}
+}
