@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/portal"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -266,12 +267,16 @@ func TestWatchdogIgnoresStaleInGrace(t *testing.T) {
 		t.Fatalf("state = %v, want formed", st)
 	}
 
-	// The member reports every second again, so its interval reads 1 s; then
-	// it is silent for 10 s: more than three intervals, less than the 15 s
+	// Both servers report every second again, so the member's interval
+	// reads 1 s and the head's server runs on without a gap; then the member
+	// is silent for 10 s: more than three intervals, less than the 15 s
 	// floor.
 	for range watchGapSamples + 1 {
 		f.advance(time.Second)
 		f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+		f.settle()
+		f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+		f.settle()
 	}
 	f.advance(10 * time.Second)
 	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
@@ -1009,5 +1014,100 @@ func TestSilentHeadIsNotJudgedWithoutItsInterval(t *testing.T) {
 	}
 	if calls := g.agent.recorded()[before:]; len(calls) != 0 {
 		t.Fatalf("calls before the head's interval was measured = %q, want none", calls)
+	}
+}
+
+// TestSharedGapWithUnequalIntervalsJudgesNothing pins a shared gap between
+// servers whose intervals differ: the member reports every 10 s (its own
+// stale threshold 30 s), the head's server every 2 s (threshold 15 s). A
+// 20 s gap on both, closed by the member's frame first, must not count the
+// member as having reported through the head's silence: any gap past the
+// stale floor starts a new run of the member's frames.
+func TestSharedGapWithUnequalIntervalsJudgesNothing(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	f.formed()
+	f.pastBootGrace()
+	for range 9 {
+		for range 5 {
+			f.advance(2 * time.Second)
+			f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+			f.settle()
+		}
+		f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+		f.settle()
+	}
+	before := len(f.agent.recorded())
+	f.silentHeadStep(20*time.Second, false)
+	f.silentHeadStep(100*time.Millisecond, true)
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want none after a gap both hosts shared", calls)
+	}
+	if st := f.o.State(orchHead); st != clusterFormed {
+		t.Fatalf("state = %v, want still formed", st)
+	}
+}
+
+// TestSharedGapHeadFirstIsNoStaleMember pins the mirror case of a shared
+// gap: the head's frame closes it first, and the member's last frame then
+// looks stale. The member's silence counts only from the start of the head
+// server's current run of frames, so the member's frame that follows in
+// time keeps the cluster formed.
+func TestSharedGapHeadFirstIsNoStaleMember(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	before := f.formed()
+	f.pastBootGrace()
+	f.advance(30 * time.Second)
+	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	f.settle()
+	f.advance(100 * time.Millisecond)
+	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	f.settle()
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want none after a gap both hosts shared", calls)
+	}
+	if st := f.o.State(orchHead); st != clusterFormed {
+		t.Fatalf("state = %v, want still formed", st)
+	}
+
+	// A member that stays away past its threshold after the head resumed is
+	// still lost (the shared gap made its threshold 3 x 30 s).
+	for range 20 {
+		f.advance(5 * time.Second)
+		f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+		f.settle()
+	}
+	if st := f.o.State(orchHead); st != clusterCoolingDown {
+		t.Fatalf("state = %v, want cooling down once the member stayed silent", st)
+	}
+}
+
+// TestWatchdogForgetsDeletedServers pins the watchdog's per-server memory: a
+// server the runtime status registry dropped (deleted; the app-health cycle
+// retains only live servers) loses its arrivals and its member bookkeeping
+// on the next reconciler pass.
+func TestWatchdogForgetsDeletedServers(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	f.formed()
+	f.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
+	f.settle()
+	member := orchMemberServer(0)
+	if f.o.watch.lastArrival(member).IsZero() || len(f.o.watch.released) == 0 {
+		t.Fatal("setup: the member server has no arrivals or released members")
+	}
+
+	f.statuses.Retain(map[string]struct{}{orchHeadServer: {}})
+	f.o.Reconcile(context.Background())
+	f.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
+	f.settle()
+	if !f.o.watch.lastArrival(member).IsZero() {
+		t.Fatal("the deleted server's arrivals are still kept")
+	}
+	for key := range f.o.watch.released {
+		if strings.HasPrefix(key, member+"\x00") {
+			t.Fatalf("released still holds %q", key)
+		}
+	}
+	if f.o.watch.lastArrival(orchHeadServer).IsZero() {
+		t.Fatal("a live server's arrivals were dropped")
 	}
 }
