@@ -233,7 +233,9 @@ func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (ar
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, nil, 0, fmt.Errorf("runtime: create rpc cache %s: %w", dir, err)
 		}
-		markMemberCache(dir)
+		if err := markMemberCache(dir); err != nil {
+			slog.Warn("runtime: cannot mark the rpc cache for the sweep; the sweep will never remove it", "path", dir, "err", err)
+		}
 		if free, err := freeDiskMB(dir); err != nil {
 			slog.Warn("runtime: cannot measure free space for the rpc cache", "path", dir, "err", err)
 		} else if free < memberCacheMinFreeMB {
@@ -348,15 +350,16 @@ func (o *owner) purgeChangedHeadCaches(before map[string]string, after []Spec) {
 	}
 }
 
-// markMemberCache puts the sweep's marker into a member cache directory; a
-// failure only means the sweep will never remove that directory.
-func markMemberCache(dir string) {
+// markMemberCache puts the sweep's marker into a member cache directory
+// (keeping one that is there). Failing only means the sweep never removes
+// that directory, and never keeps it young; the caller decides how loudly to
+// say so.
+func markMemberCache(dir string) error {
 	f, err := os.OpenFile(filepath.Join(dir, memberCacheMarker), os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		slog.Warn("runtime: cannot mark the rpc cache for the sweep", "path", dir, "err", err)
-		return
+		return err
 	}
-	f.Close()
+	return f.Close()
 }
 
 // maybeSweepMemberCaches starts a sweep of the cache root against specs, the
@@ -403,15 +406,17 @@ func (o *owner) sweepTick() {
 // logged once per streak rather than every hour. Sweeps may overlap (one
 // outliving the interval), so the record is guarded.
 type memberCacheSweeper struct {
-	// chtimes is os.Chtimes; a field so tests can make a touch fail.
+	// mark is markMemberCache and chtimes os.Chtimes; fields so tests can
+	// make either leg of a touch fail.
+	mark    func(dir string) error
 	chtimes func(name string, atime, mtime time.Time) error
 
 	mu          sync.Mutex
-	touchFailed map[string]bool
+	touchFailed map[string]bool // listed heads in a streak of failed touches
 }
 
 func newMemberCacheSweeper() *memberCacheSweeper {
-	return &memberCacheSweeper{chtimes: os.Chtimes, touchFailed: map[string]bool{}}
+	return &memberCacheSweeper{mark: markMemberCache, chtimes: os.Chtimes, touchFailed: map[string]bool{}}
 }
 
 // sweep sweeps the cache root. The cache of every head in keep is touched: its
@@ -428,6 +433,15 @@ func newMemberCacheSweeper() *memberCacheSweeper {
 // recorded in its name, lies more than memberCacheSweepEvery back. Anything
 // else -- a file, a directory without the marker -- is left alone.
 func (sw *memberCacheSweeper) sweep(root string, keep map[string]bool, now time.Time) {
+	// A head that is no longer listed ends its streak: should it come back
+	// still failing, that is worth a Warn again.
+	sw.mu.Lock()
+	for head := range sw.touchFailed {
+		if !keep[head] {
+			delete(sw.touchFailed, head)
+		}
+	}
+	sw.mu.Unlock()
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -463,11 +477,14 @@ func (sw *memberCacheSweeper) sweep(root string, keep map[string]bool, now time.
 }
 
 // touch marks the cache dir of head and sets its marker's times to now. A
-// failure is logged at Warn on the first failing sweep for that head only;
-// the next successful touch ends the streak.
+// failure of either step is logged at Warn on the first failing sweep for
+// that head only; the next successful touch, or the head leaving the listed
+// set, ends the streak.
 func (sw *memberCacheSweeper) touch(head, dir string, now time.Time) {
-	markMemberCache(dir)
-	err := sw.chtimes(filepath.Join(dir, memberCacheMarker), now, now)
+	err := sw.mark(dir)
+	if err == nil {
+		err = sw.chtimes(filepath.Join(dir, memberCacheMarker), now, now)
+	}
 	sw.mu.Lock()
 	first := err != nil && !sw.touchFailed[head]
 	if err != nil {
@@ -477,7 +494,7 @@ func (sw *memberCacheSweeper) touch(head, dir string, now time.Time) {
 	}
 	sw.mu.Unlock()
 	if first {
-		slog.Warn("runtime: cannot touch the rpc cache marker; the cache's age keeps running and the sweep may remove it 7 days after its last successful touch",
+		slog.Warn("runtime: cannot mark or touch the rpc cache marker; the cache is kept while its head is listed, and may be removed once its head is no longer listed and nothing in it changed for 7 days",
 			"path", dir, "err", err)
 	}
 }
