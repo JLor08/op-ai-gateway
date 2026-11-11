@@ -419,6 +419,21 @@ func TestRPCSessionsOpenAndClose(t *testing.T) {
 	}
 }
 
+// TestClusterUsageClockIsUTC pins that the session clock the server gives the
+// member usage reads UTC without a monotonic reading: session bounds are
+// compared with usage event times, which are UTC, and a SQL engine that
+// keeps times as text compares them as written.
+func TestClusterUsageClockIsUTC(t *testing.T) {
+	srv := NewTestServer()
+	got := srv.clusterUsage.now()
+	if got.Location() != time.UTC {
+		t.Fatalf("session clock zone = %v, want UTC", got.Location())
+	}
+	if got != got.Round(0) {
+		t.Fatal("session clock carries a monotonic reading")
+	}
+}
+
 // TestResetMemberUsage pins POST .../runtime/cluster-members/{serverID}/reset-usage:
 // the member's stored usage and run peaks are cleared, the member server's
 // document is pushed, and the answer is the head's runtime spec. A server

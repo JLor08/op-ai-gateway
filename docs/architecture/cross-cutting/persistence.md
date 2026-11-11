@@ -692,7 +692,12 @@ portal save that reset the run can never overwrite it. `rpc_sessions` has no
 foreign keys at all: a session records what happened and outlives the head or
 membership it names (an open one of a membership deleted meanwhile is closed on
 the member server's next sample), and its closed rows are pruned with the
-telemetry retention. `MemoryStore.DeleteAIServer` drops the server's binaries,
+telemetry retention. The SQL store binds every cluster time it writes or
+compares in UTC (session bounds, `measured_at`, `run_started_at`, the
+`usage_event_hosts` time), whatever zone the caller's value carries: SQLite
+stores and compares times as text, so a value in another zone would compare by
+its wall clock, not its instant, and a request would get the wrong member hosts.
+`MemoryStore.DeleteAIServer` drops the server's binaries,
 member specs and memberships by hand, like the other per-server maps.
 
 One nuance to the general note that FK violations are invisible in the memory

@@ -1228,7 +1228,7 @@ func (s *SQLiteStore) RecordEventHosts(ctx context.Context, hosts []usage.EventH
 			insert into usage_event_hosts (event_id, server_id, role, created_at)
 			values (?, ?, ?, ?)
 			on conflict (event_id, server_id) do nothing`,
-			h.EventID, h.ServerID, h.Role, h.CreatedAt); err != nil {
+			h.EventID, h.ServerID, h.Role, h.CreatedAt.UTC()); err != nil {
 			return fmt.Errorf("insert usage event host: %w", err)
 		}
 	}
