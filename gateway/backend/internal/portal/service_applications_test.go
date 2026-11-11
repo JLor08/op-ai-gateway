@@ -4537,3 +4537,31 @@ func TestMappingAudioMetricsEditable(t *testing.T) {
 		t.Fatalf("after an unlocked benchmark write: rate = %v, want 1.75", got.rate)
 	}
 }
+
+func TestNormalizeFlavorsAcceptsDecisionsAndNeverDefaultsIt(t *testing.T) {
+	got, err := normalizeApplicationFlavors([]string{routing.APIFlavorDecisions})
+	if err != nil || !reflect.DeepEqual(got, []string{routing.APIFlavorDecisions}) {
+		t.Fatalf("[decisions] = %v, %v, want it kept", got, err)
+	}
+	got, err = normalizeApplicationFlavors([]string{})
+	if err != nil || !reflect.DeepEqual(got, []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}) {
+		t.Fatalf("[] = %v, %v, want the [openai anthropic] default", got, err)
+	}
+	if _, err := normalizeApplicationFlavors([]string{"bogus"}); !errors.Is(err, ErrApplicationFlavorInvalid) {
+		t.Fatalf("[bogus] error = %v, want ErrApplicationFlavorInvalid", err)
+	}
+}
+
+// (decision, no) is reserved on the same terms as (speech, no): the
+// systemone_probe is the writer entitled to establish it.
+func TestReservedManualVerdictRefusesDecisionNo(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilityDecision, routing.CapabilityNo) {
+		t.Error("(decision, no) must be reserved")
+	}
+	if reservedManualVerdict(routing.CapabilityDecision, routing.CapabilityYes) {
+		t.Error("(decision, yes) must stay writable")
+	}
+	if reservedManualVerdict(routing.CapabilityDecision, "") {
+		t.Error("the reset must never be refused")
+	}
+}

@@ -382,6 +382,13 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// hide a clone model the listing has not classified, or a non-audio.cpp speech
 	// model they know needs a reference voice.
 	routing.CapabilitySpeechClone: {routing.CapabilityNo: true},
+	// routing.CapabilityDecision + CapabilityNo is reserved on the same terms as
+	// (speech, no): an absent row already refuses a decision request, so "is not
+	// a decision model" costs the operator nothing to leave unsaid, while a manual
+	// no is rank 3 and would outrank forever the writer entitled to establish the
+	// fact -- the gateway's systemone_probe (routing.CapabilitySourceSystemOneProbe).
+	// (decision, yes) stays writable as the operator's override of that probe.
+	routing.CapabilityDecision: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 
@@ -1919,7 +1926,7 @@ func normalizeFlavors(raw []string, errInvalid error) ([]string, error) {
 	for _, candidate := range raw {
 		flavor := strings.TrimSpace(candidate)
 		switch flavor {
-		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages, routing.APIFlavorOpenAIAudio:
+		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages, routing.APIFlavorOpenAIAudio, routing.APIFlavorDecisions:
 		default:
 			return nil, errInvalid
 		}

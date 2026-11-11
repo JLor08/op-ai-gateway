@@ -1656,3 +1656,11 @@ func TestResolverKeepsImagesAndTextFlavorsApartAtCandidacy(t *testing.T) {
 		t.Fatalf("images request for the text application: error = %v, want ErrNoModelRoute", err)
 	}
 }
+
+func TestNormalizeAPIFlavorKeepsDecisions(t *testing.T) {
+	for _, in := range []string{"decisions", " Decisions "} {
+		if got := NormalizeAPIFlavor(in); got != APIFlavorDecisions {
+			t.Errorf("NormalizeAPIFlavor(%q) = %q, want %q", in, got, APIFlavorDecisions)
+		}
+	}
+}

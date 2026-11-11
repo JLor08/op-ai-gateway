@@ -3647,3 +3647,22 @@ func TestRuntimeStatusCarriesClusterTelemetry(t *testing.T) {
 		}
 	}
 }
+
+// An agent probe may not claim decision: the verdict is the gateway's own
+// systemone_probe's to write.
+func TestAgentIngestDropsADecisionCapabilityRow(t *testing.T) {
+	if !reservedAgentCapabilityNames[routing.CapabilityDecision] {
+		t.Fatal("decision must be a reserved agent capability name")
+	}
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_decision")
+	req, raw := ingestReq(t, capabilitiesBody("rspec_decision",
+		`{"verdicts":[{"name":"decision","verdict":"yes"},{"name":"vision","verdict":"yes"}],"source":"`+routing.CapabilitySourceLlamaCppProps+`"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if row, ok := capabilityRow(t, srv, "map_rspec_decision", routing.CapabilityDecision); ok {
+		t.Fatalf("a decision row exists (%+v), want none", row)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_decision", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+}

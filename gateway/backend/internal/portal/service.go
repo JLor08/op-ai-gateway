@@ -1457,6 +1457,10 @@ type ModelDTO struct {
 	// model SYNTHESISES audio from text, and another capability's yes verdict
 	// never makes a model a speech candidate.
 	Speech bool `json:"speech"`
+	// Decision is true only when every offering mapping (or, for a group, every
+	// offerable member) has a (decision, yes) verdict and declares the decisions
+	// flavor: decisionFlagsByName, the speech fold's twin.
+	Decision bool `json:"decision,omitempty"`
 	// Transcription is true only when the transcription endpoint would serve the
 	// model -- EVERY offering mapping (or, for a group, every offerable member) has
 	// a (transcription, yes) verdict and passes both flavor stages of a
@@ -2935,6 +2939,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// capability batch and the same runtime-spec index as the image folds,
 			// so the flag costs no further store read.
 			speechOn := speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
+			decisionOn := decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
 			// transcription is transcriptionFlagsByName, speech's twin and the one
 			// transcription fold the redirect asks too: the (transcription, yes)
 			// verdict and the same openai_audio flavor half, from the same
@@ -3118,6 +3123,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				groupImage := groupCapabilityFlags(entries, imageOn)
 				groupImageEdit := groupCapabilityFlags(entries, imageEditOn)
 				groupSpeech := groupCapabilityFlags(entries, speechOn)
+				groupDecision := groupCapabilityFlags(entries, decisionOn)
 				groupTranscription := groupCapabilityFlags(entries, transcriptionOn)
 				groupSpeechClone := groupCapabilityFlagsOr(entries, speechCloneOn)
 				// speech_clone_voices is the AND again (it OFFERS, so one member
@@ -3166,6 +3172,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					imageOn[e.Name] = groupImage[e.Name]
 					imageEditOn[e.Name] = groupImageEdit[e.Name]
 					speechOn[e.Name] = groupSpeech[e.Name]
+					decisionOn[e.Name] = groupDecision[e.Name]
 					transcriptionOn[e.Name] = groupTranscription[e.Name]
 					speechCloneOn[e.Name] = groupSpeechClone[e.Name]
 					speechCloneVoicesOn[e.Name] = groupSpeechCloneVoices[e.Name]
@@ -3244,6 +3251,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					if v, ok := speechOn[target]; ok {
 						speechOn[name] = v
+					}
+					if v, ok := decisionOn[target]; ok {
+						decisionOn[name] = v
 					}
 					if v, ok := transcriptionOn[target]; ok {
 						transcriptionOn[name] = v
@@ -3328,6 +3338,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.Image = imageOn[id]
 				dto.ImageEdit = imageEditOn[id]
 				dto.Speech = speechOn[id]
+				dto.Decision = decisionOn[id]
 				dto.Transcription = transcriptionOn[id]
 				dto.SpeechClone = speechCloneOn[id]
 				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
@@ -3433,6 +3444,16 @@ func imageEditFlagsByName(views []mappingView, capsByMapping map[string][]routin
 func speechFlagsByName(views []mappingView, speechRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	return foldMappingFlags(views, func(view mappingView) bool {
 		return speechRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesAudio(view, idx)
+	})
+}
+
+// decisionFlagsByName is speechFlagsByName's decision twin: a name carries the
+// decision capability only when EVERY one of its mappings has a (decision, yes)
+// verdict (decisionRows, keyed by mapping id) AND passes the decisions flavor
+// half. Fail-closed, independent of every other capability.
+func decisionFlagsByName(views []mappingView, decisionRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
 	})
 }
 
@@ -5183,7 +5204,7 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 // listing.
 //
 // The seed fallback does not read this set; see seedAPIFlavors.
-var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}
+var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorDecisions, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}
 
 // seedAPIFlavors is the sorted set of flavors the seed models (the
 // unconfigured-routing-store fallback) expose. The seeds are TEXT models, and

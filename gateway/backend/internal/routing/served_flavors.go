@@ -93,6 +93,25 @@ func FlavorsAreAudioOnly(flavors []string) bool {
 	return audio
 }
 
+// FlavorsAreDecisionsOnly is FlavorsAreAudioOnly's decision twin: it reports
+// whether a flavor list names decisions and neither text flavor (openai,
+// anthropic). An empty list is never decisions-only. It keeps a decisions-only
+// server from being offered a chat prompt: the effective half of the openai row
+// of MappingHasAPIFlavor and MappingServesAPIFlavor, and the test the background
+// jobs that send a mapping a chat prompt apply to its effective flavors.
+func FlavorsAreDecisionsOnly(flavors []string) bool {
+	decisions := false
+	for _, f := range flavors {
+		switch f {
+		case APIFlavorOpenAI, APIFlavorAnthropic:
+			return false
+		case APIFlavorDecisions:
+			decisions = true
+		}
+	}
+	return decisions
+}
+
 // MappingHasAPIFlavor is the FLAVOR HALF of the rule the model listings apply
 // to one mapping: whether a request of the coarse flavor gets past both flavor
 // checks on its way to the mapping, before any endpoint mode is read. app is
@@ -140,7 +159,7 @@ func MappingServesAPIFlavor(app Application, eff EffectiveSpecFields, flavor str
 // MappingServesAPIFlavor asks applicationServesEndpoint about: chat
 // completions for openai (never openai_responses, whose mode no listing
 // reflects), the Messages endpoint for anthropic, and openai_images and
-// openai_audio themselves. known is false for any other value.
+// openai_audio and decisions themselves. known is false for any other value.
 func listedEndpoint(flavor string) (endpoint string, known bool) {
 	switch flavor {
 	case APIFlavorOpenAI:
@@ -151,18 +170,20 @@ func listedEndpoint(flavor string) (endpoint string, known bool) {
 		return APIFlavorOpenAIImages, true
 	case APIFlavorOpenAIAudio:
 		return APIFlavorOpenAIAudio, true
+	case APIFlavorDecisions:
+		return APIFlavorDecisions, true
 	default:
 		return "", false
 	}
 }
 
 // effectiveHasAPIFlavor is the half of both mapping rules that eff answers:
-// for openai that its flavors are neither images-only nor audio-only (a server
-// that can only generate images or audio answers no chat prompt), for any
+// for openai that its flavors are neither images-only, audio-only nor decisions-only (a server
+// that can only generate images, audio or decisions answers no chat prompt), for any
 // other flavor that they list it.
 func effectiveHasAPIFlavor(eff EffectiveSpecFields, flavor string) bool {
 	if flavor == APIFlavorOpenAI {
-		return !FlavorsAreImagesOnly(eff.APIFlavors) && !FlavorsAreAudioOnly(eff.APIFlavors)
+		return !FlavorsAreImagesOnly(eff.APIFlavors) && !FlavorsAreAudioOnly(eff.APIFlavors) && !FlavorsAreDecisionsOnly(eff.APIFlavors)
 	}
 	return slices.Contains(eff.APIFlavors, flavor)
 }

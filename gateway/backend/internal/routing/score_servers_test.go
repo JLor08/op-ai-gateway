@@ -289,3 +289,31 @@ func TestScoreModelServersAppliesTheAudioTermToAMappingAlsoOfferedAsText(t *test
 		t.Fatalf("scores = %+v, want map_dual and map_audio scored alike (both with the audio term)", scores)
 	}
 }
+
+// A decisions-only mapping is a candidate like any other: ScoreModelServers
+// must walk the decisions flavor too, or the UI's live order omits it.
+func TestScoreModelServersRanksADecisionsOnlyMapping(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	store := seededScoreServersStore(t, now)
+	ctx := context.Background()
+	if err := store.CreateApplication(ctx, Application{ID: "app_d", ServerID: "srv_a", Type: ProviderMock, Port: 8001, Scheme: "http", APIFlavors: []string{APIFlavorDecisions}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication app_d: %v", err)
+	}
+	if err := store.CreateMapping(ctx, ModelMapping{ID: "map_d", ApplicationID: "app_d", GatewayModelName: "m1", AppModelName: "m1-upstream", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping map_d: %v", err)
+	}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+	scores, err := resolver.ScoreModelServers(ctx, "m1", now)
+	if err != nil {
+		t.Fatalf("ScoreModelServers: %v", err)
+	}
+	found := false
+	for _, cs := range scores {
+		if cs.MappingID == "map_d" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("decisions-only map_d missing from scores %+v", scores)
+	}
+}

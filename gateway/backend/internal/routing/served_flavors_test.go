@@ -519,3 +519,54 @@ func TestMappingServedImpliesFlavorHalf(t *testing.T) {
 		}
 	}
 }
+
+func TestFlavorsAreDecisionsOnly(t *testing.T) {
+	cases := []struct {
+		flavors []string
+		want    bool
+	}{
+		{nil, false},
+		{[]string{}, false},
+		{[]string{APIFlavorDecisions}, true},
+		{[]string{APIFlavorDecisions, APIFlavorOpenAI}, false},
+		{[]string{APIFlavorDecisions, APIFlavorAnthropic}, false},
+		{[]string{APIFlavorOpenAIAudio, APIFlavorDecisions}, true},
+		{[]string{APIFlavorOpenAI}, false},
+		{[]string{APIFlavorOpenAIAudio}, false},
+	}
+	for _, tc := range cases {
+		if got := FlavorsAreDecisionsOnly(tc.flavors); got != tc.want {
+			t.Errorf("FlavorsAreDecisionsOnly(%q) = %v, want %v", tc.flavors, got, tc.want)
+		}
+	}
+}
+
+// A decisions-only mapping answers no chat prompt, so it serves neither openai
+// nor anthropic; a mapping that also lists openai serves all three.
+func TestMappingServesAPIFlavorDecisionsOnlyIsNotOpenAI(t *testing.T) {
+	for _, tc := range []struct {
+		flavors []string
+		want    map[string]bool
+	}{
+		{[]string{APIFlavorDecisions}, map[string]bool{APIFlavorOpenAI: false, APIFlavorAnthropic: false, APIFlavorDecisions: true}},
+		{[]string{APIFlavorOpenAI, APIFlavorDecisions}, map[string]bool{APIFlavorOpenAI: true, APIFlavorAnthropic: false, APIFlavorDecisions: true}},
+	} {
+		app := Application{Type: ProviderLlamaCPP, APIFlavors: tc.flavors, MessagesMode: EndpointModePassthrough}
+		eff := EffectiveFields(app, RuntimeSpec{}, false)
+		for flavor, want := range tc.want {
+			if got := MappingServesAPIFlavor(app, eff, flavor); got != want {
+				t.Errorf("flavors %q: MappingServesAPIFlavor(%q) = %v, want %v", tc.flavors, flavor, got, want)
+			}
+			if got := MappingHasAPIFlavor(app, eff, flavor); got != want {
+				t.Errorf("flavors %q: MappingHasAPIFlavor(%q) = %v, want %v", tc.flavors, flavor, got, want)
+			}
+		}
+	}
+	both := Application{Type: ProviderLlamaCPP, APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorDecisions}, MessagesMode: EndpointModePassthrough}
+	eff := EffectiveFields(both, RuntimeSpec{}, false)
+	for _, flavor := range []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorDecisions} {
+		if !MappingServesAPIFlavor(both, eff, flavor) {
+			t.Errorf("[openai anthropic decisions] must serve %q", flavor)
+		}
+	}
+}

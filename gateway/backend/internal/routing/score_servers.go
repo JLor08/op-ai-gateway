@@ -33,7 +33,7 @@ type CandidateScore struct {
 // intentionally NOT applied: this is the GENERAL live order shown in the UI, not a
 // specific request's pinned choice. Read-only — mutates no resolver state.
 func (r *Resolver) ScoreModelServers(ctx context.Context, model string, now time.Time) ([]CandidateScore, error) {
-	flavors := []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, APIFlavorOpenAIAudio}
+	flavors := []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, APIFlavorOpenAIAudio, APIFlavorDecisions}
 	pools := make([][]MappingCandidate, len(flavors))
 	audio := make(map[string]bool)
 	for i, flavor := range flavors {

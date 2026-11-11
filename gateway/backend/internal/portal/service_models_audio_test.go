@@ -289,3 +289,39 @@ func TestSeedModelsAreNeverSpeechCandidates(t *testing.T) {
 		t.Fatalf("ModelOfferingFor(openai_audio) with no store = %#v, want every set empty", off)
 	}
 }
+
+func TestKnownAPIFlavorsListDecisions(t *testing.T) {
+	if !slices.Contains(knownAPIFlavors, routing.APIFlavorDecisions) {
+		t.Fatalf("knownAPIFlavors = %v, want it to contain %q", knownAPIFlavors, routing.APIFlavorDecisions)
+	}
+	if !slices.IsSorted(knownAPIFlavors) {
+		t.Fatalf("knownAPIFlavors = %v, want the documented sorted order", knownAPIFlavors)
+	}
+	if isSeedAPIFlavor(routing.APIFlavorDecisions) {
+		t.Fatalf("seedAPIFlavors = %v, want no decisions: it is opt-in everywhere", seedAPIFlavors)
+	}
+}
+
+// TestCapabilityFoldCarriesDecision: a (decision, yes) row on a mapping whose
+// application declares decisions folds to ModelDTO.Decision, and neither a
+// missing row nor the verdict without the flavor does.
+func TestCapabilityFoldCarriesDecision(t *testing.T) {
+	rs := routing.NewMemoryStore()
+	row := routing.CapabilityRow{Capability: routing.CapabilityDecision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceSystemOneProbe, CheckedAt: offeringTime}
+	offerSpeechModel(t, rs, routing.ProviderLlamaCPP, []string{routing.APIFlavorDecisions}, nil, "dec-yes", row)
+	offerSpeechModel(t, rs, routing.ProviderLlamaCPP, []string{routing.APIFlavorDecisions}, nil, "dec-unprobed")
+	offerSpeechModel(t, rs, routing.ProviderLlamaCPP, []string{routing.APIFlavorOpenAI}, nil, "dec-no-flavor", row)
+	byID := modelsByID(offerSvc(rs, nil).Models(context.Background(), auth.Token{UserID: "usr_1"}))
+	for name, want := range map[string]bool{"dec-yes": true, "dec-unprobed": false, "dec-no-flavor": false} {
+		got, ok := byID[name]
+		if !ok {
+			t.Fatalf("%s missing from Models(): %#v", name, byID)
+		}
+		if got.Decision != want {
+			t.Errorf("%s decision = %v, want %v", name, got.Decision, want)
+		}
+	}
+	if !hasCapabilityFold(routing.CapabilityDecision) {
+		t.Error("hasCapabilityFold(decision) = false")
+	}
+}
