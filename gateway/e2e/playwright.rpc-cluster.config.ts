@@ -48,10 +48,11 @@ export default defineConfig({
   workers: 1,
   reporter: "list",
   // A scenario performs real process starts (members, then a llama-server
-  // that loads a model over RPC), a member idle-out of about a minute and
-  // several telemetry round trips.
+  // that loads a model over RPC), several telemetry round trips, and one wait
+  // of about a minute: a member's idle-out, or a head's cooldown after it lost
+  // its member.
   timeout: 300000,
-  // The whole run normally takes about five minutes. A hang fails here, with
+  // The whole run normally takes about three minutes. A hang fails here, with
   // Playwright's report and the agents' logs, well before CI's 30 minute job
   // timeout would kill the run without either.
   globalTimeout: 20 * 60 * 1000,

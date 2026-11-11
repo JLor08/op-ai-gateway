@@ -19,20 +19,18 @@ import { HEAD_ROUTER_PORT, MEMBER_ROUTER_PORT, RPC_AGENT_BIN } from "../playwrig
 //       member stops with the head.
 //   (b) direct transport, the head names them in argv
 //       (--rpc ${RPC_SERVERS} --device ${DEVICES}); stopped without
-//       stop_members, so the member idles out on its own once its start
-//       reservation has run out.
-//   (c) the member process of a formed cluster is killed: the head's next
-//       request fails, and the head's agent does not start the head again on
-//       its own.
+//       stop_members, so the gateway only releases the member, which then
+//       idles out on its own short timeout.
+//   (c) the member process of a formed cluster is killed: the gateway's
+//       watchdog stops the head without any request, the head cools down, a
+//       request meanwhile is refused with the cluster's own code, and once the
+//       cooldown ended a request forms the cluster again, members first.
 //
-// Each scenario: manual start -> the gateway reports the cluster formed and
-// the member reports the head's hold -> a completion through the gateway
-// returns text -> stop.
-//
-// Steps that depend on gateway parts not built yet are test.fixme with a note
-// saying what enables them: a request that starts a cold cluster (the routing
-// gate), member usage stored on the head, the watchdog, and the cluster code
-// on a failed request.
+// Each of (a) and (b): a request for the cold head parks while the gateway
+// starts the cluster, and is answered once it formed -> a manual start finds
+// it formed, and the member reports the head's hold -> a completion through
+// the gateway returns text -> the member's measured usage is stored on the
+// head -> stop.
 //
 // Network: both servers are `lan` servers with lan_address 127.0.0.1 and
 // lan_bind_only, so every member and relay binds loopback (binding all
@@ -71,8 +69,11 @@ const MODEL = process.env.OP_E2E_RPC_MODEL ?? "";
 const LLAMA_SERVER = BIN_DIR === "" ? "" : path.join(path.resolve(BIN_DIR), "llama-server");
 const RPC_SERVER = BIN_DIR === "" ? "" : path.join(path.resolve(BIN_DIR), "ggml-rpc-server");
 
-// The gateway's idle timeout for a cluster member process.
+// The agent's idle timeout for a cluster member process nothing claims.
 const MEMBER_IDLE_TIMEOUT_MS = 60000;
+
+// How long the gateway lets a head rest after it lost a member.
+const CLUSTER_COOLDOWN_MS = 60000;
 
 const GOCACHE = process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache";
 
@@ -174,14 +175,15 @@ type ClusterStatus = {
   state: string;
   phase?: string;
   members: { position: number; state: string; code?: string }[];
-  last_failure?: { code: string };
+  last_failure?: { code: string; position?: number; head?: boolean };
+  cooldown_until?: string;
 };
 
 type RuntimeSpec = {
   id: string;
   cluster_withheld_reason?: string;
   cluster_status?: ClusterStatus;
-  cluster_members: { server_id: string; port: number; ram_measured_mb: number }[];
+  cluster_members: { server_id: string; port: number; ram_measured_mb: number; measured_at?: string; stale: boolean }[];
 };
 
 // --- Suite state ---------------------------------------------------------------
@@ -322,7 +324,8 @@ function memberRowOf(headSpecId: string): (r: RuntimeRow) => boolean {
   return (r) => r.kind === "rpc_server" && r.spec_id.includes(headSpecId);
 }
 
-type Completion = { status: number; text: string; content: string };
+/** A completion's answer: the text of a 200, the error code of a refusal. */
+type Completion = { status: number; text: string; content: string; code: string };
 
 /** One chat completion through the gateway with the dev bearer token. */
 async function complete(model: string): Promise<Completion> {
@@ -339,11 +342,18 @@ async function complete(model: string): Promise<Completion> {
   });
   const text = await resp.text();
   let content = "";
+  let code = "";
   if (resp.ok) {
     const body = JSON.parse(text) as { choices?: { message?: { content?: string } }[] };
     content = body.choices?.[0]?.message?.content ?? "";
+  } else {
+    try {
+      code = (JSON.parse(text) as { error?: { code?: string } }).error?.code ?? "";
+    } catch {
+      // Not JSON; the caller reads text.
+    }
   }
-  return { status: resp.status, text, content };
+  return { status: resp.status, text, content, code };
 }
 
 /** POST .../runtime/start, answered 200 running or 202 starting. */
@@ -515,22 +525,23 @@ for (const sc of [RELAY, DIRECT]) {
       expect((await runtimeSpec(mapping.id)).cluster_status?.state).toBe("cold");
     });
 
-    // The routing gate parks a request for a cold cluster head and starts the
-    // cluster for it (members first); the request is then served by the
-    // formed cluster. Enable once the gate is in the gateway: until then a
-    // request for a cold head is refused by the head's agent with
-    // runtime.cluster_not_ready. It must run first in its scenario: a manual
-    // stop parks the head until a manual start, so after one a request never
-    // starts the cluster.
-    test.fixme("a request for the cold head parks, the cluster forms, and the request is answered", async () => {
-      const { mappingId } = mappings.get(sc.label)!;
+    // The routing gate never dispatches to a head whose cluster has not
+    // formed: the request parks (bounded by the head's startup timeout plus
+    // its member's), its demand starts the cluster members first, and the
+    // request is served by the formed cluster. Nothing else starts this head:
+    // it is neither pinned nor kept up, and its agent refuses any start
+    // without the gateway's cluster-start mark.
+    test("a request for the cold head parks, the cluster forms, and the request is answered", async () => {
+      const { mappingId, headSpecId } = mappings.get(sc.label)!;
+      expect(await headState(headSpecId), "the head before the request").toMatch(/^(stopped|absent)$/);
       const c = await complete(sc.gatewayModel);
       expect(c.status, c.text).toBe(200);
-      expect(c.content.trim()).not.toBe("");
-      await awaitFormed(mappingId);
+      expect(c.content.trim(), "the parked request's completion text").not.toBe("");
+      // The request was answered only once the cluster formed.
+      expect((await runtimeSpec(mappingId)).cluster_status?.state).toBe("formed");
     });
 
-    test("a manual start forms the cluster: member first, then the head, and the member reports the head's hold", async () => {
+    test("a manual start of the formed cluster keeps it, and the member reports the head's hold", async () => {
       const { mappingId, headSpecId } = mappings.get(sc.label)!;
       await startCluster(mappingId);
       const formed = await awaitFormed(mappingId);
@@ -563,34 +574,48 @@ for (const sc of [RELAY, DIRECT]) {
       expect(c.content.trim(), "the cluster's completion text").not.toBe("");
     });
 
-    // The gateway measures each member's usage per run and stores it on the
-    // head's membership row. Enable once member-usage ingest is in the
-    // gateway: until then nothing writes ram_measured_mb.
-    test.fixme("the member's measured usage is stored on the head", async () => {
+    // The member's own agent measures its resident RAM, and the gateway
+    // stores it on the head's membership row: only samples inside the head's
+    // run that show the member held by this head count, so a positive value
+    // here was measured while the cluster served.
+    test("the member's measured usage is stored on the head", async () => {
       const { mappingId } = mappings.get(sc.label)!;
       await expect
         .poll(async () => (await runtimeSpec(mappingId)).cluster_members[0].ram_measured_mb, { timeout: 30000, intervals: [1000] })
         .toBeGreaterThan(0);
+      const member = (await runtimeSpec(mappingId)).cluster_members[0];
+      expect(member.measured_at, "when the member's usage was measured").toBeTruthy();
+      expect(member.stale, "a value measured on the current distribution").toBe(false);
     });
 
-    test(`stop ${sc.stopMembers ? "with stop_members stops the member with the head" : "without stop_members lets the member idle out"}`, async () => {
+    test(`stop ${sc.stopMembers ? "with stop_members stops the member with the head" : "without stop_members releases the member, which idles out"}`, async () => {
       const { mappingId, headSpecId } = mappings.get(sc.label)!;
       await stopCluster(mappingId, sc.stopMembers);
       await expect
         .poll(async () => (await row(headServerId, (r) => r.spec_id === headSpecId))?.state ?? "absent", { timeout: 60000, intervals: [1000] })
         .toMatch(/^(stopped|absent)$/);
       await expect.poll(async () => (await runtimeSpec(mappingId)).cluster_status?.state, { timeout: 30000, intervals: [1000] }).toBe("cold");
-      // stop_members releases and stops the member right after the head.
-      // Without it the gateway leaves the member alone: its hold ends with the
-      // head's connection, but the reservation the members-first start armed
-      // (the head's startup bound plus the orchestration's margins) still
-      // runs, and only once that ends does the member idle timeout (60 s)
-      // start. The bound is read from the member's own reservation.
+      // The run formed, so its end replaces the stored usage by the run's
+      // peak: still a measured value, not reset by the stop.
+      expect((await runtimeSpec(mappingId)).cluster_members[0].ram_measured_mb, "the member's usage after the stop").toBeGreaterThan(0);
+      // Every stop of the head releases its member: the hold and the start
+      // reservation end together. stop_members then stops the member right
+      // away. Without it the member runs on unclaimed, and its idle timeout
+      // counts from the release, not from the end of the reservation the
+      // members-first start armed (the head's startup bound plus the
+      // orchestration's margins, two minutes here).
       let timeout = 60000;
       if (!sc.stopMembers) {
-        const member = await row(memberServerId, memberRowOf(headSpecId));
-        const reservedUntil = Date.parse(member?.rpc?.reserved_until ?? "") || Date.now();
-        timeout = Math.max(reservedUntil - Date.now(), 0) + MEMBER_IDLE_TIMEOUT_MS + 30000;
+        await expect
+          .poll(
+            async () => {
+              const m = await row(memberServerId, memberRowOf(headSpecId));
+              return m === undefined || ((m.rpc?.held_by ?? "") === "" && (m.rpc?.reserved_until ?? "") === "");
+            },
+            { timeout: 30000, intervals: [1000] }
+          )
+          .toBe(true);
+        timeout = MEMBER_IDLE_TIMEOUT_MS + 30000;
       }
       await expect
         .poll(async () => (await row(memberServerId, memberRowOf(headSpecId)))?.state ?? "absent", { timeout, intervals: [2000] })
@@ -600,68 +625,86 @@ for (const sc of [RELAY, DIRECT]) {
 }
 
 test.describe("(c) member process killed", () => {
+  // The member process the test kills, so the recovery can tell a new one.
+  let killedPid = 0;
+
   test("a formed cluster loses its member process", async () => {
-    // The direct cluster of (b) again; a manual start ends the park its stop set.
+    // The direct cluster of (b) again; its head is cold since (b)'s stop.
     const { mappingId, headSpecId } = mappings.get(DIRECT.label)!;
     await startCluster(mappingId);
     await awaitFormed(mappingId);
     // The status stream lags the formed state by a telemetry frame, and until
     // it catches up it may still show (b)'s stopped member with its old pid.
-    // Only a running member holding this head names the process to kill.
-    let pid = 0;
+    // Only a running member holding this head names the process to kill, and
+    // the watchdog needs that frame too: a loss is evidence only against a
+    // frame that showed the member held.
     await expect
       .poll(
         async () => {
           const m = await row(memberServerId, memberRowOf(headSpecId));
-          pid = m?.state === "running" && m.rpc?.held_by === headSpecId ? (m.pid ?? 0) : 0;
-          return pid;
+          killedPid = m?.state === "running" && m.rpc?.held_by === headSpecId ? (m.pid ?? 0) : 0;
+          return killedPid;
         },
         { timeout: 30000, intervals: [1000] }
       )
       .toBeGreaterThan(0);
-    process.kill(pid, "SIGKILL");
+    await expect.poll(async () => headState(headSpecId), { timeout: 30000, intervals: [1000] }).toBe("running");
+    process.kill(killedPid, "SIGKILL");
   });
 
-  // The gateway's watchdog stops the head once a member it relies on exits,
-  // before any request reaches the head. Enable once the watchdog is in the
-  // gateway: until then the head only ends when it next talks to the lost
-  // member (the test below).
-  test.fixme("the watchdog stops the head without a request", async () => {
-    const { headSpecId } = mappings.get(DIRECT.label)!;
+  // The head itself notices a lost member only when it next talks to it. The
+  // gateway's watchdog does not wait for that: the member's exit is a
+  // suspicion, which the next frame of the head's server -- the head still
+  // running with the same process -- confirms. The head is stopped, the
+  // member recorded as the cause, and the head cools down.
+  test("the watchdog stops the head without a request, and the member is recorded as the cause", async () => {
+    const { mappingId, headSpecId } = mappings.get(DIRECT.label)!;
     await expect
       .poll(async () => headState(headSpecId), { timeout: 60000, intervals: [1000] })
-      .not.toMatch(/^(running|starting)$/);
+      .not.toMatch(/^(running|starting|draining)$/);
+    const st = (await runtimeSpec(mappingId)).cluster_status!;
+    expect(st.state, JSON.stringify(st)).toBe("cooling_down");
+    expect(st.last_failure, JSON.stringify(st)).toMatchObject({ code: "runtime.cluster_member_lost", position: 0 });
+    expect(st.members, JSON.stringify(st)).toEqual([{ position: 0, state: "failed", code: "runtime.cluster_member_lost" }]);
+    expect(Date.parse(st.cooldown_until ?? ""), "the end of the cooldown").toBeGreaterThan(Date.now());
   });
 
-  test("the head's next request fails, and the head's agent does not start it again on its own", async () => {
+  // While the head cools down the routing gate excludes it, so the request
+  // never reaches the head's agent, and nothing starts the head for it: the
+  // gateway answers at once, 503, with the cluster's code.
+  test("a request during the cooldown is refused with the cluster's code, and the head stays down", async () => {
     const { headSpecId } = mappings.get(DIRECT.label)!;
-    // A head that loses a member aborts as soon as it talks to it
-    // ("Remote RPC server crashed"), so the request fails rather than being
-    // answered by a head without its member.
-    await expect
-      .poll(async () => (await complete(DIRECT.gatewayModel)).status, { timeout: 60000, intervals: [2000] })
-      .toBeGreaterThanOrEqual(500);
-    await expect
-      .poll(async () => headState(headSpecId), { timeout: 30000, intervals: [1000] })
-      .not.toMatch(/^(running|starting)$/);
-    // Only the gateway's members-first start may start a cold head: a request
-    // reaching the head's agent directly is refused (runtime.cluster_not_ready)
-    // and the head stays down.
-    const again = await complete(DIRECT.gatewayModel);
-    expect(again.status, again.text).toBeGreaterThanOrEqual(500);
-    expect(await headState(headSpecId)).not.toMatch(/^(running|starting)$/);
+    const c = await complete(DIRECT.gatewayModel);
+    expect(c.status, c.text).toBe(503);
+    expect(c.code, c.text).toBe("runtime.cluster_start_failed");
+    expect(await headState(headSpecId)).not.toMatch(/^(running|starting|draining)$/);
   });
 
-  // The client sees the cluster's own code (runtime.cluster_*) rather than a
-  // generic provider.unavailable. Enable once the routing gate maps cluster
-  // refusals to their codes: until then the agent's runtime.cluster_not_ready
-  // appears only in the gateway's log. When enabling it together with the
-  // gate, check the expectation still holds: the gate may start the cluster
-  // again for this request, members first.
-  test.fixme("the failed request carries a cluster code", async () => {
+  // The cooldown ends the refusals, not the cluster: the head is cold again,
+  // and the next request parks while the gateway starts the cluster members
+  // first -- a new member process, then the head.
+  test("once the cooldown ended, a request forms the cluster again with a new member process", async () => {
+    const { mappingId, headSpecId } = mappings.get(DIRECT.label)!;
+    await expect
+      .poll(async () => (await runtimeSpec(mappingId)).cluster_status?.state, { timeout: CLUSTER_COOLDOWN_MS + 30000, intervals: [2000] })
+      .toBe("cold");
     const c = await complete(DIRECT.gatewayModel);
-    expect(c.status, c.text).toBeGreaterThanOrEqual(400);
-    expect(c.text).toMatch(/"runtime\.cluster_[a-z_]+"/);
+    expect(c.status, c.text).toBe(200);
+    expect(c.content.trim(), "the completion text after the recovery").not.toBe("");
+    const st = (await runtimeSpec(mappingId)).cluster_status!;
+    expect(st.state, JSON.stringify(st)).toBe("formed");
+    expect(st.members, JSON.stringify(st)).toEqual([{ position: 0, state: "held" }]);
+    await expect
+      .poll(
+        async () => {
+          const m = await row(memberServerId, memberRowOf(headSpecId));
+          return m?.state === "running" && m.rpc?.held_by === headSpecId ? (m.pid ?? 0) : 0;
+        },
+        { timeout: 30000, intervals: [1000] }
+      )
+      .not.toBe(0);
+    const member = (await row(memberServerId, memberRowOf(headSpecId)))!;
+    expect(member.pid, "the member process after the recovery").not.toBe(killedPid);
   });
 
   test("cleanup: the head is stopped with its members", async () => {
