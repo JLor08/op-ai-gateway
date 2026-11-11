@@ -209,18 +209,22 @@ test.beforeAll(() => {
 });
 
 test.afterAll(async () => {
-  for (const a of agents) a.kill("SIGTERM");
+  const alive = (a: ChildProcess) => a.exitCode === null && a.signalCode === null;
+  for (const a of agents) if (alive(a)) a.kill("SIGTERM");
   // The agents drain-stop their children on SIGTERM; give them the moment.
   await Promise.all(
     agents.map(
       (a) =>
         new Promise<void>((resolve) => {
-          if (a.exitCode !== null) return resolve();
+          if (!alive(a)) return resolve();
           a.once("exit", () => resolve());
           setTimeout(resolve, 10000);
         })
     )
   );
+  // An agent that did not exit in time must not outlive the suite (it would
+  // hold its router port for the next run).
+  for (const a of agents) if (alive(a)) a.kill("SIGKILL");
   if (workRoot !== "") {
     for (const name of ["head", "member"]) {
       const log = path.join(workRoot, name, "agent.log");
@@ -263,6 +267,10 @@ function spawnAgent(name: string, token: string, routerPort: number): void {
     },
     stdio: ["ignore", log, log]
   });
+  // A spawn failure (a missing or non-executable binary) is reported as an
+  // event; unhandled it would crash the test runner instead of failing the
+  // setup, whose next waits then time out with the log line below.
+  child.on("error", (err) => fs.writeSync(log, `# e2e: spawning agent ${name} failed: ${String(err)}\n`));
   agents.push(child);
   // The router port is the application's; kept here so the log names it.
   fs.writeSync(log, `# e2e: agent ${name}, router port ${routerPort}\n`);
@@ -597,9 +605,21 @@ test.describe("(c) member process killed", () => {
     const { mappingId, headSpecId } = mappings.get(DIRECT.label)!;
     await startCluster(mappingId);
     await awaitFormed(mappingId);
-    const member = (await row(memberServerId, memberRowOf(headSpecId)))!;
-    expect(member.pid, "the member's pid").toBeGreaterThan(0);
-    process.kill(member.pid!, "SIGKILL");
+    // The status stream lags the formed state by a telemetry frame, and until
+    // it catches up it may still show (b)'s stopped member with its old pid.
+    // Only a running member holding this head names the process to kill.
+    let pid = 0;
+    await expect
+      .poll(
+        async () => {
+          const m = await row(memberServerId, memberRowOf(headSpecId));
+          pid = m?.state === "running" && m.rpc?.held_by === headSpecId ? (m.pid ?? 0) : 0;
+          return pid;
+        },
+        { timeout: 30000, intervals: [1000] }
+      )
+      .toBeGreaterThan(0);
+    process.kill(pid, "SIGKILL");
   });
 
   // The gateway's watchdog stops the head once a member it relies on exits,

@@ -51,6 +51,10 @@ export default defineConfig({
   // that loads a model over RPC), a member idle-out of about a minute and
   // several telemetry round trips.
   timeout: 300000,
+  // The whole run normally takes about five minutes. A hang fails here, with
+  // Playwright's report and the agents' logs, well before CI's 30 minute job
+  // timeout would kill the run without either.
+  globalTimeout: 20 * 60 * 1000,
   webServer: [
     {
       command: `rm -f ${GATEWAY_BIN}; go build -o ${GATEWAY_BIN} ./cmd/gateway && ${GATEWAY_BIN}`,

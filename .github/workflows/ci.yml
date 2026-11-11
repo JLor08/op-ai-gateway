@@ -223,10 +223,10 @@ jobs:
       LLAMA_CPP_COMMIT: 2bc46baa9207d098d03741ac394e7faaf1a955b6
       # Static libraries, so the two binaries run from wherever they are
       # copied; no OpenSSL (the suite never downloads a model through
-      # llama-server). Change LLAMA_CPP_BUILD_TAG with these flags: it is part
-      # of the cache key.
+      # llama-server). A digest of these flags is part of the cache key, so a
+      # change of flags rebuilds.
       LLAMA_CPP_CMAKE_FLAGS: -DGGML_RPC=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
-      LLAMA_CPP_BUILD_TAG: cpu-rpc-static-v1
+      LLAMA_CPP_TARGETS: llama-server ggml-rpc-server
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -238,12 +238,17 @@ jobs:
       # As in e2e-runtime: the configs fall back to $GOCACHE when it is set.
       - name: Point GOCACHE at a writable path
         run: echo "GOCACHE=$RUNNER_TEMP/op-e2e-go-build" >> "$GITHUB_ENV"
+      # The key names the commit and a digest of the flags and targets: the
+      # build is a function of exactly those.
+      - name: Compute the llama.cpp cache key
+        id: llama-key
+        run: echo "flags=$(printf '%s|%s' "$LLAMA_CPP_CMAKE_FLAGS" "$LLAMA_CPP_TARGETS" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Restore the llama.cpp build
         id: llama-cache
         uses: actions/cache@v4
         with:
           path: ~/llama-cpp-rpc/bin
-          key: llama-cpp-${{ runner.os }}-${{ env.LLAMA_CPP_COMMIT }}-${{ env.LLAMA_CPP_BUILD_TAG }}
+          key: llama-cpp-${{ runner.os }}-${{ env.LLAMA_CPP_COMMIT }}-${{ steps.llama-key.outputs.flags }}
       # A shallow fetch of exactly the pinned commit. The build number
       # llama-server reports is then 1; the agent and the gateway match head
       # and member builds on the commit, which is exact.
@@ -257,7 +262,8 @@ jobs:
           git -C "$src" checkout -q --detach FETCH_HEAD
           # shellcheck disable=SC2086 # the flags are a word list on purpose
           cmake -S "$src" -B "$src/build" $LLAMA_CPP_CMAKE_FLAGS
-          cmake --build "$src/build" --config Release -j "$(nproc)" --target llama-server ggml-rpc-server
+          # shellcheck disable=SC2086 # likewise the targets
+          cmake --build "$src/build" --config Release -j "$(nproc)" --target $LLAMA_CPP_TARGETS
           mkdir -p ~/llama-cpp-rpc/bin
           cp "$src/build/bin/llama-server" "$src/build/bin/ggml-rpc-server" ~/llama-cpp-rpc/bin/
       # The agent versions an ggml-rpc-server by the llama-server beside it,
