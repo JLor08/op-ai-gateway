@@ -511,7 +511,7 @@ describe('ClusterHeadEditor hidden members', () => {
     expect(rows).toHaveLength(3);
     expect(rows[1]).toHaveTextContent(t.clusterMemberHidden);
     expect(screen.getByText(t.clusterMembersLocked)).toBeInTheDocument();
-    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeEnabled();
     expect(screen.getByRole('button', { name: t.clusterMemberAdd })).toBeDisabled();
     expect(screen.getByRole('button', { name: `${t.modelGroupMoveDown}: Alpha` })).toBeDisabled();
     expect(screen.getByRole('button', { name: `${t.clusterMemberRemove}: Beta` })).toBeDisabled();
@@ -520,6 +520,60 @@ describe('ClusterHeadEditor hidden members', () => {
     const body = clusterBodyFields(latest.value);
     expect(body.cluster_members?.[1]).toEqual(hidden);
     expect(body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a', '', 'srv_b']);
+  });
+});
+
+describe('ClusterHeadEditor cluster switch with a hidden member', () => {
+  const hiddenHead = {
+    cluster_enabled: true,
+    member_mode: 'automatic',
+    cluster_network: 'lan',
+    rpc_transport: 'relay',
+    lan_exposure_ack: false,
+    device_backend: 'auto',
+    cluster_members: [
+      member({ server_id: 'srv_a', server_name: 'Alpha', position: 0 }),
+      hiddenMember(1),
+    ],
+  } as RuntimeSpec;
+
+  it('turns the cluster off with the head rights alone', () => {
+    const { latest } = setup({ initial: clusterStateFromSpec(hiddenHead), stored: hiddenHead });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.clusterEnabledLabel }));
+    expect(latest.value.enabled).toBe(false);
+    expect(clusterBodyFields(latest.value)).toMatchObject({
+      cluster_enabled: false,
+      cluster_members: [],
+    });
+    expect(screen.getByText(t.clusterMembersLocked)).toBeInTheDocument();
+  });
+
+  it('can undo the switch-off back to the stored head', () => {
+    const { latest } = setup({ initial: clusterStateFromSpec(hiddenHead), stored: hiddenHead });
+    const toggle = screen.getByRole('checkbox', { name: t.clusterEnabledLabel });
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    expect(latest.value.enabled).toBe(true);
+    expect(clusterBodyFields(latest.value).cluster_members?.map((m) => m.server_id)).toEqual([
+      'srv_a',
+      '',
+    ]);
+  });
+
+  it('cannot turn a cluster on that the stored spec does not run', () => {
+    setup({
+      initial: { ...clusterStateFromSpec(hiddenHead), enabled: false },
+      stored: { ...hiddenHead, cluster_enabled: false },
+    });
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+  });
+
+  it('says that only turning the cluster off is open', () => {
+    for (const m of [messages.de, messages.en]) {
+      expect(m.clusterMembersLocked).not.toMatch(/Cluster-Schalter|cluster switch/);
+    }
+    expect(messages.de.clusterMembersLocked).toContain('ausschalten');
+    expect(messages.en.clusterMembersLocked).toContain('turn the cluster off');
   });
 });
 
