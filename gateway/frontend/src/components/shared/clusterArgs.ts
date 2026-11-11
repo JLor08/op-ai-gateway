@@ -26,10 +26,10 @@ const envMtmdBackendDevice = 'MTMD_BACKEND_DEVICE';
 
 // llama-server's own spellings: --rpc only has a long form, --device also
 // answers to -dev, --tensor-split to -ts and --mmproj-device to -mmdev.
-const rpcFlags = ['--rpc'];
-const deviceFlags = ['--device', '-dev'];
-const tensorSplitFlags = ['--tensor-split', '-ts'];
-const mmdevFlags = ['--mmproj-device', '-mmdev'];
+const rpcFlags = new Set(['--rpc']);
+const deviceFlags = new Set(['--device', '-dev']);
+const tensorSplitFlags = new Set(['--tensor-split', '-ts']);
+const mmdevFlags = new Set(['--mmproj-device', '-mmdev']);
 
 // Every llama-server option that takes one value at the pinned llama.cpp build
 // (2bc46baa9207d098d03741ac394e7faaf1a955b6), copied from the gateway's
@@ -145,8 +145,8 @@ function countOf(text: string, token: string): number {
   return text.split(token).length - 1;
 }
 
-export function scanClusterArgs(args: string[], env: Record<string, string>): ClusterArgScan {
-  const scan: ClusterArgScan = {
+function emptyScan(): ClusterArgScan {
+  return {
     rpcInArgs: false,
     rpcInEnv: false,
     rpcArgIndex: -1,
@@ -163,37 +163,68 @@ export function scanClusterArgs(args: string[], env: Record<string, string>): Cl
     clusterPlaceholder: false,
     equalsForm: false,
   };
-  for (const v of [...args, ...Object.values(env)]) {
+}
+
+// Counts ${RPC_SERVERS} and notes any cluster placeholder in every arg and
+// env value.
+function scanPlaceholders(scan: ClusterArgScan, values: string[]) {
+  for (const v of values) {
     scan.rpcPlaceholderCount += countOf(v, placeholderRPCServers);
     if (v.includes(placeholderRPCServers) || v.includes(placeholderRPCDevices)) {
       scan.clusterPlaceholder = true;
     }
   }
+}
+
+// Records one cluster option of args at index i; false when name is none of
+// them. A device option answers its value as the device list so far.
+function scanArgFlag(
+  scan: ClusterArgScan,
+  name: string,
+  flagValue: string,
+  i: number,
+): { scanned: boolean; deviceList?: string } {
+  if (rpcFlags.has(name)) {
+    scan.rpcInArgs = true;
+    scan.rpcArgCount++;
+    if (scan.rpcArgIndex < 0) scan.rpcArgIndex = i;
+    if (flagValue.includes(placeholderRPCServers)) scan.rpcValueHasPlaceholder = true;
+    return { scanned: true };
+  }
+  if (deviceFlags.has(name)) {
+    if (!scan.deviceInArgs) scan.deviceArgIndex = i;
+    scan.deviceInArgs = true;
+    return { scanned: true, deviceList: flagValue };
+  }
+  if (tensorSplitFlags.has(name)) {
+    scan.tensorSplit = true;
+    return { scanned: true };
+  }
+  if (mmdevFlags.has(name)) {
+    scan.mmdev = true;
+    return { scanned: true };
+  }
+  return { scanned: false };
+}
+
+// Walks args left to right, stepping over each option's value, and answers
+// the device list the last device option in args set ('' without one).
+function scanArgs(scan: ClusterArgScan, args: string[]): string {
   let argDeviceList = '';
   for (let i = 0; i < args.length; i++) {
     const { name, value, attached } = normalizeFlag(args[i]);
     const flagValue = attached ? value : (args[i + 1] ?? '');
-    let scanned = true;
-    if (rpcFlags.includes(name)) {
-      scan.rpcInArgs = true;
-      scan.rpcArgCount++;
-      if (scan.rpcArgIndex < 0) scan.rpcArgIndex = i;
-      if (flagValue.includes(placeholderRPCServers)) scan.rpcValueHasPlaceholder = true;
-    } else if (deviceFlags.includes(name)) {
-      if (!scan.deviceInArgs) scan.deviceArgIndex = i;
-      scan.deviceInArgs = true;
-      argDeviceList = flagValue;
-    } else if (tensorSplitFlags.includes(name)) {
-      scan.tensorSplit = true;
-    } else if (mmdevFlags.includes(name)) {
-      scan.mmdev = true;
-    } else {
-      scanned = false;
-    }
+    const { scanned, deviceList } = scanArgFlag(scan, name, flagValue, i);
+    if (deviceList !== undefined) argDeviceList = deviceList;
     if (scanned && attached) scan.equalsForm = true;
     if (!attached) i += llamaServerValueCount(name);
   }
-  // llama-server reads its variables by their exact upper-case names.
+  return argDeviceList;
+}
+
+// The env side. llama-server reads its variables by their exact upper-case
+// names.
+function scanEnv(scan: ClusterArgScan, env: Record<string, string>) {
   if (envLlamaArgRPC in env) {
     scan.rpcInEnv = true;
     if (env[envLlamaArgRPC].includes(placeholderRPCServers)) scan.rpcValueHasPlaceholder = true;
@@ -201,6 +232,13 @@ export function scanClusterArgs(args: string[], env: Record<string, string>): Cl
   scan.deviceInEnv = envLlamaArgDevice in env;
   if (envLlamaArgTensorSplit in env) scan.tensorSplit = true;
   if (envMtmdBackendDevice in env) scan.mmdev = true;
+}
+
+export function scanClusterArgs(args: string[], env: Record<string, string>): ClusterArgScan {
+  const scan = emptyScan();
+  scanPlaceholders(scan, [...args, ...Object.values(env)]);
+  const argDeviceList = scanArgs(scan, args);
+  scanEnv(scan, env);
   if (scan.deviceInArgs) scan.deviceList = argDeviceList;
   else if (scan.deviceInEnv) scan.deviceList = env[envLlamaArgDevice];
   scan.deviceHasRPC =

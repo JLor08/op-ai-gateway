@@ -19,7 +19,7 @@ import type { Translation } from './types';
 export function parseArgsText(text: string): string[] {
   if (text === '') return [];
   const lines = text.split('\n').map((line) => line.replace(/\r$/, ''));
-  if (lines.length > 1 && lines[lines.length - 1] === '') {
+  if (lines.length > 1 && lines.at(-1) === '') {
     lines.pop();
   }
   return lines;
@@ -42,7 +42,14 @@ export function formatArgsText(args: string[]): string {
 // USERPROFILE/LOCALAPPDATA (per-user cache roots) and SYSTEMROOT/WINDIR
 // (system DLLs, and Winsock initialisation) so a Windows child can resolve a
 // home directory and open a socket at all.
-const reservedEnvKeys = ['PATH', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'SYSTEMROOT', 'WINDIR'];
+const reservedEnvKeys = new Set([
+  'PATH',
+  'HOME',
+  'USERPROFILE',
+  'LOCALAPPDATA',
+  'SYSTEMROOT',
+  'WINDIR',
+]);
 
 // KEY=value per line, one env var per line. Blank/whitespace-only lines are
 // skipped; a malformed (no "=") line is reported via the existing
@@ -70,7 +77,7 @@ export function parseEnvText(
     }
     const key = line.slice(0, eq).trim();
     const value = line.slice(eq + 1);
-    if (reservedEnvKeys.includes(key.toUpperCase())) {
+    if (reservedEnvKeys.has(key.toUpperCase())) {
       return { env: {}, error: t.runtimeSpecEnvReserved };
     }
     env[key] = value;

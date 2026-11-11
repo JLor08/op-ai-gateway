@@ -10,6 +10,8 @@ import type { ClusterMember, RuntimeSpec } from '../../api';
 
 /** One visible member's share of the totals. */
 export interface ClusterMemberShare {
+  /** The member's place in the --rpc order, unique within the head. */
+  position: number;
   name: string;
   vramMb: number;
   ramMb: number;
@@ -63,6 +65,7 @@ function memberShare(m: ClusterMember): {
   const ramMb = Math.max(m.ram_measured_mb ?? 0, m.ram_estimate_mb ?? 0);
   return {
     share: {
+      position: m.position,
       name: m.server_name,
       vramMb,
       ramMb,
@@ -119,7 +122,7 @@ export function clusterTotalsView(spec: RuntimeSpec): ClusterTotalsView {
 
 /** A total for a table cell: "≥ " before a lower bound, an em-dash when unknown. */
 export function clusterCellText(mb: number, complete: boolean): string {
-  if (!(mb > 0)) return '—';
+  if (mb <= 0 || Number.isNaN(mb)) return '—';
   return `${complete ? '' : '≥ '}${mb} MB`;
 }
 
@@ -143,6 +146,6 @@ export function clusterIncompleteCause(
   if (total.incompleteNames.length > 0) return 'members';
   if (total.hiddenIncomplete) return 'hidden';
   const headHasPart = axis === 'ram' || (spec.gpus ?? []).length > 0;
-  if (headHasPart && !(ownMb > 0)) return 'head';
+  if (headHasPart && (ownMb <= 0 || Number.isNaN(ownMb))) return 'head';
   return 'unknown';
 }

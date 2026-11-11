@@ -104,7 +104,9 @@ describe('clusterTotalsView', () => {
         ],
       }),
     );
-    expect(v.members).toEqual([{ name: 'Cpu', vramMb: 0, ramMb: 5000, cpu: true, stale: false }]);
+    expect(v.members).toEqual([
+      { position: 0, name: 'Cpu', vramMb: 0, ramMb: 5000, cpu: true, stale: false },
+    ]);
   });
 
   it('takes max(measured, estimate) per GPU and sums the card rows', () => {

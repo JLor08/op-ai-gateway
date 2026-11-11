@@ -11,10 +11,21 @@ import {
   clusterIncompleteCause,
   clusterTotalsView,
   type ClusterAxis,
+  type ClusterMemberShare,
 } from './shared/clusterTotals';
 
 function mbText(mb: number): string {
   return mb > 0 ? `${mb} MB` : '—';
+}
+
+// One member's line in the breakdown: its name, a CPU and a stale mark, and
+// its share on this axis (a CPU member has no VRAM share).
+function breakdownLine(m: ClusterMemberShare, axis: ClusterAxis, t: Translation): string {
+  const cpu = m.cpu ? ` (${t.clusterBreakdownCpu})` : '';
+  const stale = m.stale ? ` (${t.clusterBreakdownStale})` : '';
+  const mb = axis === 'vram' ? m.vramMb : m.ramMb;
+  const value = axis === 'vram' && m.cpu ? '—' : mbText(mb);
+  return `${m.name}${cpu}${stale}: ${value}`;
 }
 
 /**
@@ -91,14 +102,11 @@ export function ClusterTotalCell({
       >
         <Box sx={{ p: 1.5, display: 'grid', gap: 0.5 }} data-testid={`cluster-breakdown-${axis}`}>
           <Typography variant="body2">{`${t.clusterBreakdownHead}: ${mbText(ownMb)}`}</Typography>
-          {view.members.map((m, i) => {
-            const mb = axis === 'vram' ? m.vramMb : m.ramMb;
-            return (
-              <Typography key={i} variant="body2">
-                {`${m.name}${m.cpu ? ` (${t.clusterBreakdownCpu})` : ''}${m.stale ? ` (${t.clusterBreakdownStale})` : ''}: ${axis === 'vram' && m.cpu ? '—' : mbText(mb)}`}
-              </Typography>
-            );
-          })}
+          {view.members.map((m) => (
+            <Typography key={m.position} variant="body2">
+              {breakdownLine(m, axis, t)}
+            </Typography>
+          ))}
           {view.hiddenCount > 0 && (
             <Typography variant="caption" color="text.secondary">
               {t.clusterBreakdownHiddenCount(view.hiddenCount)}

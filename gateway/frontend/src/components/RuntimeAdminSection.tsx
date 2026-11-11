@@ -1878,7 +1878,7 @@ export function RuntimeAdminSection({
   // The server as the RPC tab last saved it: the tab remounts on every tab
   // switch and the `server` prop is only as fresh as the parent's last fetch.
   const [rpcSaved, setRpcSaved] = useState<{ server: PortalServer; propKey: string } | null>(null);
-  const rpcContentKey = `${server.id}|${server.rpc_member_enabled ?? false}|${[...(server.rpc_allowed_head_groups ?? [])].sort().join(',')}`;
+  const rpcContentKey = `${server.id}|${server.rpc_member_enabled ?? false}|${[...(server.rpc_allowed_head_groups ?? [])].sort((a, b) => a.localeCompare(b)).join(',')}`;
   // The override lasts only while the prop still shows what it showed at save
   // time; once the prop's RPC content moves, the prop is fresher.
   const rpcSavedServer = rpcSaved?.propKey === rpcContentKey ? rpcSaved.server : null;

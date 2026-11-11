@@ -49,14 +49,14 @@ const deviceBackends: DeviceBackend[] = ['auto', 'cuda', 'rocm', 'vulkan', 'meta
 // validateRPCMemberArgs: a long flag is refused in its plain and "=" forms, a
 // short flag also when its value is attached ("-p8080"), so the form says no
 // before the round trip.
-const reservedLongFlags = ['--host', '--port', '--device', '--cache'];
+const reservedLongFlags = new Set(['--host', '--port', '--device', '--cache']);
 const reservedShortFlags = ['-H', '-p', '-d', '-c'];
 
 export function hasReservedMemberFlag(args: string[]): boolean {
   return args.some((raw) => {
     const a = raw.trim();
     if (a.startsWith('--')) {
-      return reservedLongFlags.includes(a.split('=')[0]);
+      return reservedLongFlags.has(a.split('=')[0]);
     }
     return reservedShortFlags.some((f) => a.startsWith(f));
   });
@@ -121,7 +121,7 @@ function editorFor(spec: RPCMemberSpec): EditorState {
 }
 
 function groupsKey(groups: string[]): string {
-  return [...groups].sort().join(',');
+  return [...groups].sort((a, b) => a.localeCompare(b)).join(',');
 }
 
 function toggle(list: string[], value: string): string[] {
@@ -192,6 +192,23 @@ function effectiveVramMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): n
   }
   for (const [idx, mb] of live) if (!specIdx.has(idx)) sum += mb;
   return sum;
+}
+
+// A measurement for the status line: MB, or an em-dash when unknown.
+function mbOrDash(mb: number): string {
+  return mb > 0 ? `${mb} MB` : '—';
+}
+
+// Who holds a member: its head when the spec names one the caller may see,
+// another head otherwise, or nobody.
+function heldText(
+  heldBy: string | undefined,
+  spec: RPCMemberSpec | undefined,
+  t: Translation,
+): string {
+  if (!heldBy) return t.rpcStatusNotHeld;
+  if (!spec?.used_by_head_spec_id) return t.rpcStatusHeldElsewhere;
+  return `${t.rpcStatusHeldBy}: ${t.rpcStatusHeldByHead} ${spec.used_by_head_spec_id}`;
 }
 
 function effectiveRamMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): number {
@@ -712,17 +729,13 @@ export function RpcMemberSection({
                     label={runtimeStateLabel(row.state, t)}
                   />
                   <Typography component="span" variant="body2">
-                    {heldBy
-                      ? spec?.used_by_head_spec_id
-                        ? `${t.rpcStatusHeldBy}: ${t.rpcStatusHeldByHead} ${spec.used_by_head_spec_id}`
-                        : t.rpcStatusHeldElsewhere
-                      : t.rpcStatusNotHeld}
+                    {heldText(heldBy, spec, t)}
                   </Typography>
                   <Typography component="span" variant="body2">
-                    {`${t.rpcStatusVram}: ${vram > 0 ? `${vram} MB` : '—'}`}
+                    {`${t.rpcStatusVram}: ${mbOrDash(vram)}`}
                   </Typography>
                   <Typography component="span" variant="body2">
-                    {`${t.rpcStatusRam}: ${ram > 0 ? `${ram} MB` : '—'}`}
+                    {`${t.rpcStatusRam}: ${mbOrDash(ram)}`}
                   </Typography>
                   {row.rpc?.protocol && (
                     <Typography component="span" variant="body2">
