@@ -346,6 +346,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'benchmark.vram_no_gpu_samples',
     'benchmark.vram_isolation_blocked',
     'benchmark.vram_declared_gpu_missing',
+    'benchmark.vram_cluster_member_held',
     'runtime_spec.server_benchmarking',
   ] as const;
 
@@ -1159,6 +1160,13 @@ const clusterWireCodes = [
   'runtime.cluster_stopping',
   'runtime.cluster_agent_too_old',
   'runtime.cluster_head_unsupported',
+  // The watchdog's cause when it stopped a formed head over a lost member
+  // (cluster_status member code and last failure).
+  'runtime.cluster_member_lost',
+  // A VRAM benchmark refused while a cluster holds a member on the server.
+  'benchmark.vram_cluster_member_held',
+  // The member usage reset of a server that is no member of the head.
+  'runtime_spec.cluster_member_not_found',
   // Agent lifecycle codes (runtime status last_error.code).
   'runtime.device_backend_mismatch',
   'runtime.rpc_device_count_mismatch',

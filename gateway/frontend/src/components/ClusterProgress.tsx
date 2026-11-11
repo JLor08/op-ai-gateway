@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { Box, Chip, Step, StepLabel, Stepper, Typography } from '@mui/material';
+import { Alert, Box, Chip, Step, StepLabel, Stepper, Typography } from '@mui/material';
 import type { ClusterMemberState, ClusterPhase, ClusterState, RuntimeSpec } from '../api';
 import type { Translation } from './shared/types';
 import { formatChatRunErrorCode, formatDate } from './shared/format';
 import {
   clusterStatusView,
+  type ClusterBreachView,
   type ClusterFailureView,
   type ClusterMemberView,
+  type ClusterPeakView,
 } from './shared/clusterStatus';
 
 const stateLabel = (s: ClusterState, t: Translation): string =>
@@ -56,6 +58,27 @@ const memberName = (m: { position: number; name?: string }, t: Translation): str
 function failureWhere(f: ClusterFailureView, t: Translation): string {
   if (f.position === undefined) return t.clusterStatusHead;
   return f.memberName ?? t.clusterStatusMemberHidden(f.position + 1);
+}
+
+// A hidden member's breach or peak carries only its position, so its line
+// says that something was reported and nothing more.
+function breachText(b: ClusterBreachView, t: Translation): string {
+  const who = memberName(b, t);
+  const at = b.at ? formatDate(b.at, b.at) : '';
+  if (!b.kind) return t.clusterBreachHidden(who);
+  if (b.kind === 'peer') return t.clusterBreachPeer(who, b.peer ?? '—', at);
+  if (b.kind === 'foreign_hold') return t.clusterBreachForeignHold(who, at);
+  return t.clusterBreachOther(who, b.kind);
+}
+
+function peakText(p: ClusterPeakView, t: Translation): string {
+  const who = memberName(p, t);
+  const known = p.storedMb !== undefined && p.ceilingMb !== undefined;
+  if (known && p.resource === 'vram' && p.gpuIndex !== undefined) {
+    return t.clusterPeakVram(who, p.gpuIndex, p.storedMb!, p.ceilingMb!);
+  }
+  if (known && p.resource === 'ram') return t.clusterPeakRam(who, p.storedMb!, p.ceilingMb!);
+  return t.clusterPeakHidden(who);
 }
 
 function MemberChip({ m, t }: Readonly<{ m: ClusterMemberView; t: Translation }>) {
@@ -120,6 +143,24 @@ export function ClusterProgress({
             {failureText}
           </Typography>
         )}
+        {view.breaches.length > 0 && (
+          <Chip
+            size="small"
+            variant="outlined"
+            color="warning"
+            label={t.clusterBreachesCount(view.breaches.length)}
+            title={view.breaches.map((b) => breachText(b, t)).join('\n')}
+          />
+        )}
+        {view.peaks.length > 0 && (
+          <Chip
+            size="small"
+            variant="outlined"
+            color="warning"
+            label={t.clusterPeaksCount(view.peaks.length)}
+            title={view.peaks.map((p) => peakText(p, t)).join('\n')}
+          />
+        )}
       </Box>
     );
   }
@@ -159,6 +200,31 @@ export function ClusterProgress({
         <Typography variant="body2" color="text.secondary">
           {failureText}
         </Typography>
+      )}
+      {view.breaches.length > 0 && (
+        <Alert severity="warning" data-testid="cluster-breaches">
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            {t.clusterBreachesTitle}
+          </Typography>
+          {view.breaches.map((b, i) => (
+            <Typography key={i} variant="body2" data-testid="cluster-breach">
+              {breachText(b, t)}
+            </Typography>
+          ))}
+        </Alert>
+      )}
+      {view.peaks.length > 0 && (
+        <Alert severity="warning" data-testid="cluster-peaks">
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            {t.clusterPeaksTitle}
+          </Typography>
+          <Typography variant="body2">{t.clusterPeaksHint}</Typography>
+          {view.peaks.map((p, i) => (
+            <Typography key={i} variant="body2" data-testid="cluster-peak">
+              {peakText(p, t)}
+            </Typography>
+          ))}
+        </Alert>
       )}
     </Box>
   );

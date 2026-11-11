@@ -2984,7 +2984,10 @@ power, split over every request that host served in the window.
   that moves its samples out of the window drop that part to Tier 2; there is
   no skew correction, so the server DTO shows each agent's clock offset
   (`clock_offset_ms`: the agent's time stamp on its latest sample minus the
-  gateway's receive time, signed, positive when the agent runs ahead).
+  gateway's receive time, signed, positive when the agent runs ahead). The
+  portal shows it as a diagnostic in the System group of a server's hardware
+  view, beside the agent version, and flags an offset above 2 s, the gap
+  tolerance a part's coverage already allows.
 - **Combining.** The parts are stored in `usage_event_energy_parts` before the
   event is stamped (a stamped event is never priced again). `energy_wh` and
   `energy_marginal_wh` are the parts' sums and `energy_source` the weakest

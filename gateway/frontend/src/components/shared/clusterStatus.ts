@@ -40,6 +40,27 @@ export interface ClusterFailureView {
   memberName?: string;
 }
 
+export interface ClusterBreachView {
+  position: number;
+  /** The visible member's server name; undefined for a hidden or unknown one. */
+  name?: string;
+  /** Absent for a member the caller may not see. */
+  kind?: string;
+  peer?: string;
+  at?: string;
+}
+
+export interface ClusterPeakView {
+  position: number;
+  /** The visible member's server name; undefined for a hidden or unknown one. */
+  name?: string;
+  /** Absent for a member the caller may not see, like the figures. */
+  resource?: 'vram' | 'ram';
+  gpuIndex?: number;
+  storedMb?: number;
+  ceilingMb?: number;
+}
+
 export interface ClusterStatusView {
   state: ClusterState;
   phase?: ClusterPhase;
@@ -48,6 +69,10 @@ export interface ClusterStatusView {
   members: ClusterMemberView[];
   cooldownUntil?: string;
   failure?: ClusterFailureView;
+  /** The policy breaches the members' agents report now, in the gateway's order. */
+  breaches: ClusterBreachView[];
+  /** Stored member peaks above their host's budget; each refuses the member's next start. */
+  peaks: ClusterPeakView[];
   /** The head is cold and nothing about it is worth a line. */
   idle: boolean;
 }
@@ -98,6 +123,23 @@ export function clusterStatusView(spec: RuntimeSpec | undefined): ClusterStatusV
           : { position: f.position, memberName: nameAt(f.position) }),
       }
     : undefined;
+  // Only the fields the gateway sent are copied: for a hidden member that is
+  // the position alone, and the view must not add more.
+  const breaches: ClusterBreachView[] = (status.breaches ?? []).map((b) => ({
+    position: b.position,
+    name: nameAt(b.position),
+    ...(b.kind ? { kind: b.kind } : {}),
+    ...(b.peer ? { peer: b.peer } : {}),
+    ...(b.at ? { at: b.at } : {}),
+  }));
+  const peaks: ClusterPeakView[] = (status.peaks_above_budget ?? []).map((p) => ({
+    position: p.position,
+    name: nameAt(p.position),
+    ...(p.resource ? { resource: p.resource } : {}),
+    ...(p.gpu_index === undefined ? {} : { gpuIndex: p.gpu_index }),
+    ...(p.stored_mb ? { storedMb: p.stored_mb } : {}),
+    ...(p.ceiling_mb ? { ceilingMb: p.ceiling_mb } : {}),
+  }));
   return {
     state: status.state,
     phase: status.phase,
@@ -105,6 +147,14 @@ export function clusterStatusView(spec: RuntimeSpec | undefined): ClusterStatusV
     members,
     cooldownUntil: status.state === 'cooling_down' ? status.cooldown_until : undefined,
     failure: status.state === 'cooling_down' || status.state === 'invalid' ? failure : undefined,
-    idle: status.state === 'cold' && members.length === 0,
+    breaches,
+    peaks,
+    // A stored peak refuses the next start of a cold head, and a breach can
+    // outlive the cluster, so either is worth a line.
+    idle:
+      status.state === 'cold' &&
+      members.length === 0 &&
+      breaches.length === 0 &&
+      peaks.length === 0,
   };
 }

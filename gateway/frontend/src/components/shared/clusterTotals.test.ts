@@ -53,10 +53,11 @@ describe('isClusterHead', () => {
 describe('clusterTotalsView', () => {
   it('takes the totals from the document and marks a complete one without a lower bound', () => {
     const v = clusterTotalsView(head());
-    expect(v.vramMb).toBe(30000);
-    expect(v.ramMb).toBe(20000);
-    expect(v.complete).toBe(true);
-    expect(clusterCellText(v.vramMb, v.complete)).toBe('30000 MB');
+    expect(v.vram.mb).toBe(30000);
+    expect(v.ram.mb).toBe(20000);
+    expect(v.vram.complete).toBe(true);
+    expect(v.ram.complete).toBe(true);
+    expect(clusterCellText(v.vram.mb, v.vram.complete)).toBe('30000 MB');
   });
 
   it('prefixes a lower bound and names the visible incomplete member', () => {
@@ -76,9 +77,9 @@ describe('clusterTotalsView', () => {
         ],
       }),
     );
-    expect(clusterCellText(v.vramMb, v.complete)).toBe('≥ 30000 MB');
-    expect(v.incompleteNames).toEqual(['Beta']);
-    expect(v.hiddenIncomplete).toBe(false);
+    expect(clusterCellText(v.vram.mb, v.vram.complete)).toBe('≥ 30000 MB');
+    expect(v.vram.incompleteNames).toEqual(['Beta']);
+    expect(v.vram.hiddenIncomplete).toBe(false);
   });
 
   it('never names a hidden member and flags it only as hidden', () => {
@@ -88,8 +89,9 @@ describe('clusterTotalsView', () => {
         cluster_members: [member({ server_id: '', server_name: '', visible: false })],
       }),
     );
-    expect(v.incompleteNames).toEqual([]);
-    expect(v.hiddenIncomplete).toBe(true);
+    expect(v.vram.incompleteNames).toEqual([]);
+    expect(v.vram.hiddenIncomplete).toBe(true);
+    expect(v.ram.hiddenIncomplete).toBe(true);
     expect(v.members).toEqual([]);
     expect(v.hiddenCount).toBe(1);
   });
@@ -121,6 +123,67 @@ describe('clusterTotalsView', () => {
       }),
     );
     expect(v.members[0]).toMatchObject({ vramMb: 17000, ramMb: 1000, cpu: false, stale: true });
+  });
+
+  it('marks only the incomplete axis: a CPU member with unknown RAM leaves VRAM exact', () => {
+    const v = clusterTotalsView(
+      head({
+        cluster_totals_complete: false,
+        cluster_vram_total_complete: true,
+        cluster_ram_total_complete: false,
+        cluster_members: [member({ server_name: 'Cpu', ram_estimate_mb: 0 })],
+      }),
+    );
+    expect(v.vram.complete).toBe(true);
+    expect(v.ram.complete).toBe(false);
+    expect(clusterCellText(v.vram.mb, v.vram.complete)).toBe('30000 MB');
+    expect(clusterCellText(v.ram.mb, v.ram.complete)).toBe('≥ 20000 MB');
+    expect(v.vram.incompleteNames).toEqual([]);
+    expect(v.ram.incompleteNames).toEqual(['Cpu']);
+  });
+
+  it('names a member only on the axis its unknown part belongs to', () => {
+    const v = clusterTotalsView(
+      head({
+        cluster_totals_complete: false,
+        cluster_vram_total_complete: false,
+        cluster_ram_total_complete: true,
+        cluster_members: [
+          member({
+            server_name: 'Gpu',
+            ram_estimate_mb: 1000,
+            gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+          }),
+        ],
+      }),
+    );
+    expect(v.vram.incompleteNames).toEqual(['Gpu']);
+    expect(v.ram.incompleteNames).toEqual([]);
+    expect(v.ram.complete).toBe(true);
+  });
+
+  it('flags a hidden member only on the incomplete axis', () => {
+    const v = clusterTotalsView(
+      head({
+        cluster_totals_complete: false,
+        cluster_vram_total_complete: true,
+        cluster_ram_total_complete: false,
+        cluster_members: [member({ server_id: '', server_name: '', visible: false })],
+      }),
+    );
+    expect(v.vram.hiddenIncomplete).toBe(false);
+    expect(v.ram.hiddenIncomplete).toBe(true);
+  });
+
+  it('falls back to the combined flag for a gateway without the per-axis ones', () => {
+    const v = clusterTotalsView(
+      head({
+        cluster_totals_complete: false,
+        cluster_members: [member({ server_name: 'Cpu', ram_estimate_mb: 0 })],
+      }),
+    );
+    expect(v.vram.complete).toBe(false);
+    expect(v.ram.complete).toBe(false);
   });
 
   it('shows an em-dash for an unknown total', () => {

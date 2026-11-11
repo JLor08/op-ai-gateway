@@ -83,6 +83,23 @@ describe('ClusterTotalCell', () => {
   });
 });
 
+describe('ClusterTotalCell per-axis lower bound', () => {
+  it('keeps the VRAM total exact when only RAM is a lower bound', () => {
+    const spec = {
+      ...head([member({ server_name: 'CpuBox', ram_estimate_mb: 0 })], false),
+      cluster_vram_total_complete: true,
+      cluster_ram_total_complete: false,
+    } as RuntimeSpec;
+    render(<ClusterTotalCell spec={spec} axis="vram" ownMb={8000} t={t} />);
+    expect(screen.getByTestId('cluster-total-vram').textContent).toBe('24000 MB');
+    expect(screen.queryByLabelText(/CpuBox/)).toBeNull();
+    cleanup();
+    render(<ClusterTotalCell spec={spec} axis="ram" ownMb={500} t={t} />);
+    expect(screen.getByTestId('cluster-total-ram').textContent).toBe('≥ 9000 MB');
+    expect(screen.getByLabelText(`${t.clusterIncompleteTooltip}: CpuBox`)).toBeTruthy();
+  });
+});
+
 describe('ClusterTotalCell incomplete causes', () => {
   it('says the head own value is missing when no member explains the lower bound', () => {
     const spec = head([member({ ram_estimate_mb: 1000 })], false);

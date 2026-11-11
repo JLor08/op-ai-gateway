@@ -8,7 +8,7 @@
 // and a save without the cluster fields would turn the cluster off and clear
 // its membership.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -22,6 +22,7 @@ import AddIcon from '@mui/icons-material/Add';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import CloseIcon from '@mui/icons-material/Close';
+import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import type {
   ClusterCandidate,
   ClusterMember,
@@ -40,10 +41,10 @@ import type { MessageKey, PortalApi, Translation } from './shared/types';
 import { Field } from './shared/Field';
 import { ClusterProgress } from './ClusterProgress';
 import { ClusterWithheldNotice } from './ClusterTotalCell';
-import { clusterWithheldReason } from './shared/clusterTotals';
+import { clusterCellText, clusterTotalsView, clusterWithheldReason } from './shared/clusterTotals';
 import { SelectField } from './shared/SelectField';
 import { ConfirmDialog } from './shared/ConfirmDialog';
-import { clusterWarningLabelByCode } from './shared/format';
+import { clusterWarningLabelByCode, formatPortalError } from './shared/format';
 import {
   clusterHeadDocumentError,
   deviceListStartsWithRPC,
@@ -126,6 +127,44 @@ export function clusterBodyFields(
       m.visible ? { ...m, position: i } : m,
     ),
   };
+}
+
+// The stored usage of the member on serverId as the head reads after a
+// reset, put into the form: only the read-only measurements change (each
+// GPU's measured VRAM by host index, the measured RAM, when and whether it is
+// stale), so the operator's unsaved edits to the member stay.
+export function mergeMemberUsage(
+  s: ClusterHeadState,
+  spec: RuntimeSpec,
+  serverId: string,
+): ClusterHeadState {
+  const fresh = (spec.cluster_members ?? []).find((m) => m.visible && m.server_id === serverId);
+  if (!fresh) return s;
+  const vramByIndex = new Map((fresh.gpus ?? []).map((g) => [g.index, g.vram_measured_mb]));
+  return {
+    ...s,
+    members: s.members.map((row) =>
+      row.visible && row.server_id === serverId
+        ? {
+            ...row,
+            ram_measured_mb: fresh.ram_measured_mb,
+            measured_at: fresh.measured_at,
+            stale: fresh.stale,
+            gpus: row.gpus.map((g) => ({ ...g, vram_measured_mb: vramByIndex.get(g.index) ?? 0 })),
+          }
+        : row,
+    ),
+  };
+}
+
+// Whether a stored member carries usage a reset would clear.
+function hasStoredUsage(m: ClusterMember | undefined): boolean {
+  if (!m) return false;
+  return (
+    Boolean(m.measured_at) ||
+    m.ram_measured_mb > 0 ||
+    (m.gpus ?? []).some((g) => g.vram_measured_mb > 0)
+  );
 }
 
 // What an empty network resolves to, as far as the loaded spec tells.
@@ -236,6 +275,7 @@ export function ClusterHeadEditor({
   headHasGpus,
   startupTimeoutSeconds,
   headBinaryVersion = '',
+  resetMemberUsage,
 }: Readonly<{
   t: Translation;
   api: Pick<PortalApi, 'clusterCandidates' | 'serverHardware'>;
@@ -255,6 +295,10 @@ export function ClusterHeadEditor({
   // unknown). Members carry no binary of their own: each runs the server's
   // ggml-rpc-server matching this one.
   headBinaryVersion?: string;
+  // Clears the stored usage of the member on a server and answers the head's
+  // spec as it reads afterwards (the caller keeps that as the loaded spec).
+  // Without it, as for a spec not saved yet, no member offers a reset.
+  resetMemberUsage?: (serverId: string) => Promise<RuntimeSpec>;
 }>) {
   const [pendingMode, setPendingMode] = useState<ClusterMemberMode | null>(null);
   const [pendingAck, setPendingAck] = useState<ClusterHeadState | null>(null);
@@ -265,6 +309,22 @@ export function ClusterHeadEditor({
     serverId: string;
     specId: string;
   } | null>(null);
+  const [pendingReset, setPendingReset] = useState<{ serverId: string; name: string } | null>(null);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState('');
+  // A reset answers after the operator may have edited on: the merge reads
+  // the form as it is then, not as it was at the click.
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   // Per member server: its reported GPUs, 'unavailable' without a hardware
   // report, 'failed' when the read failed.
   const [hardwareByServer, setHardwareByServer] = useState<Record<string, HostGpus>>({});
@@ -373,6 +433,37 @@ export function ClusterHeadEditor({
     patch({ members: [...value.members, row] });
     setPicker(null);
   }
+
+  async function confirmReset() {
+    const target = pendingReset;
+    setPendingReset(null);
+    if (!target || !resetMemberUsage) return;
+    setResetBusy(true);
+    setResetError('');
+    try {
+      const spec = await resetMemberUsage(target.serverId);
+      if (mountedRef.current) {
+        onChangeRef.current(mergeMemberUsage(valueRef.current, spec, target.serverId));
+      }
+    } catch (e) {
+      if (mountedRef.current) setResetError(formatPortalError(e, t));
+    } finally {
+      if (mountedRef.current) setResetBusy(false);
+    }
+  }
+
+  // A reset clears a stored row, so it is offered only on a member as it is
+  // stored, and only where there is usage to clear.
+  const storedMembers = stored?.cluster_enabled ? (stored.cluster_members ?? []) : [];
+  const resettable = (serverId: string) =>
+    resetMemberUsage !== undefined &&
+    mappingId !== '' &&
+    hasStoredUsage(storedMembers.find((m) => m.visible && m.server_id === serverId));
+
+  const totals =
+    stored?.cluster_enabled && stored.cluster_vram_total_mb !== undefined
+      ? clusterTotalsView(stored)
+      : undefined;
 
   const warnings = stored?.cluster_enabled ? (stored.cluster_warnings ?? []) : [];
   const deviceListGiven = hasDeviceList(scan);
@@ -589,6 +680,16 @@ export function ClusterHeadEditor({
                     patch({ members: value.members.filter((x) => x.rowKey !== m.rowKey) })
                   }
                   onPatch={(next) => patchMember(m.rowKey, next)}
+                  onResetUsage={
+                    resettable(m.server_id)
+                      ? () =>
+                          setPendingReset({
+                            serverId: m.server_id,
+                            name: m.server_name || m.server_id,
+                          })
+                      : undefined
+                  }
+                  resetBusy={resetBusy}
                 />
               ) : (
                 <Box
@@ -616,10 +717,15 @@ export function ClusterHeadEditor({
               {t.clusterMembersMatchingBinary(headBinaryVersion || t.binariesVersionUnknown)}
             </Typography>
           )}
-          {stored?.cluster_enabled && stored.cluster_vram_total_mb !== undefined && (
-            <Typography variant="body2">
-              {`${t.clusterTotals}: VRAM ${stored.cluster_vram_total_mb} MB, RAM ${stored.cluster_ram_total_mb ?? 0} MB`}
-              {stored.cluster_totals_complete === false && ` (${t.clusterTotalsLowerBound})`}
+          {resetError && (
+            <Alert severity="error" data-testid="cluster-reset-error">
+              {resetError}
+            </Alert>
+          )}
+          {totals && (
+            <Typography variant="body2" data-testid="cluster-totals">
+              {`${t.clusterTotals}: VRAM ${clusterCellText(totals.vram.mb, totals.vram.complete)}, RAM ${clusterCellText(totals.ram.mb, totals.ram.complete)}`}
+              {(!totals.vram.complete || !totals.ram.complete) && ` (${t.clusterTotalsLowerBound})`}
             </Typography>
           )}
 
@@ -729,6 +835,15 @@ export function ClusterHeadEditor({
         }}
         onCancel={() => setPendingAck(null)}
       />
+      <ConfirmDialog
+        open={pendingReset !== null}
+        title={t.clusterMemberResetUsageTitle(pendingReset?.name ?? '')}
+        body={t.clusterMemberResetUsageBody}
+        confirmLabel={t.clusterMemberResetUsageConfirm}
+        cancelLabel={t.cancel}
+        onConfirm={() => void confirmReset()}
+        onCancel={() => setPendingReset(null)}
+      />
     </Box>
   );
 }
@@ -744,6 +859,8 @@ function MemberRow({
   onMove,
   onRemove,
   onPatch,
+  onResetUsage,
+  resetBusy = false,
 }: Readonly<{
   t: Translation;
   member: ClusterMemberRow;
@@ -756,6 +873,9 @@ function MemberRow({
   onMove: (delta: number) => void;
   onRemove: () => void;
   onPatch: (next: Partial<ClusterMember>) => void;
+  // Undefined when the member has no stored usage to reset.
+  onResetUsage?: () => void;
+  resetBusy?: boolean;
 }>) {
   const name = member.server_name || member.server_id;
   const selected = new Set(member.gpus.map((g) => g.index));
@@ -796,6 +916,17 @@ function MemberRow({
           </Typography>
         )}
         <Box sx={{ ml: 'auto' }}>
+          {onResetUsage && (
+            <IconButton
+              size="small"
+              aria-label={`${t.clusterMemberResetUsage}: ${name}`}
+              title={t.clusterMemberResetUsage}
+              disabled={resetBusy}
+              onClick={onResetUsage}
+            >
+              <RestartAltIcon fontSize="small" />
+            </IconButton>
+          )}
           <IconButton
             size="small"
             aria-label={`${t.modelGroupMoveUp}: ${name}`}

@@ -124,6 +124,12 @@ export type PortalServer = {
   // "out_of_scope": an older backend or a DTO that lost the field must SHOW
   // the control, never hide it.
   tls_proxy_state?: 'out_of_scope' | 'unknown' | 'agent_off' | 'proxy';
+  // The agent's clock offset in ms: the time stamp on its latest telemetry
+  // sample minus the gateway's receive time of it (so it includes the
+  // transit), signed, positive when the agent's clock runs ahead. Derived and
+  // diagnostic only; null until the agent reports after a gateway start, and
+  // optional so existing fixtures compile (absent reads as unknown too).
+  clock_offset_ms?: number | null;
   // RPC cluster settings. netbird_ip is the peer's mesh address as last
   // synced (read-only, "" until known). lan_address is the optional IPv4 the
   // server uses for LAN cluster traffic; lan_bind_only makes an RPC member
@@ -407,7 +413,9 @@ export type BenchmarkResult = {
   // only) or "audio_only" (they serve speech only). A skipped result carries no
   // measurement, and its numeric fields are 0 because the backend does not
   // omit them.
-  skipped?: 'images_only' | 'audio_only' | 'not_speech' | 'speech_clone';
+  // "cluster_head" marks a llama.cpp RPC cluster head, which no benchmark
+  // measures yet: it starts only together with its members.
+  skipped?: 'images_only' | 'audio_only' | 'not_speech' | 'speech_clone' | 'cluster_head';
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;

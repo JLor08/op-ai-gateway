@@ -57,7 +57,7 @@ import type {
   VRAMReportDTO,
 } from '../api';
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
-import { formatPortalError, formatMetric, formatDate } from './shared/format';
+import { errorLabelByCode, formatPortalError, formatMetric, formatDate } from './shared/format';
 import { useResource } from './shared/useResource';
 import { ResourceFallback, resourceState, type ResourceState } from './shared/ResourceFallback';
 import { useLatestFetch } from './shared/useLatestFetch';
@@ -1288,6 +1288,7 @@ export function RuntimeAdminSection({
     // The cluster head editor's member picker (it reads member GPUs through
     // serverHardware below).
     | 'clusterCandidates'
+    | 'resetClusterMemberUsage'
     // The live-status Start and Stop: transient, nothing is written.
     | 'startRuntime'
     | 'stopRuntime'
@@ -3347,6 +3348,16 @@ export function RuntimeAdminSection({
     return key ? t[key] : undefined;
   }
 
+  // A member usage reset is a write to the head's spec: the answer is the
+  // head as it reads afterwards, and it takes a ticket like every other write
+  // so a slower, earlier write cannot land over it (see beginSpecWrite).
+  async function resetClusterMemberUsage(mappingId: string, serverId: string) {
+    const ticket = beginSpecWrite(mappingId);
+    const spec = await api.resetClusterMemberUsage(mappingId, serverId);
+    commitSpecCache(mappingId, ticket, spec);
+    return spec;
+  }
+
   // Refreshes what a committed spec write (create, edit, spec delete) can
   // change: the warnings, and each mapping row's `images_only` marker, which
   // the backend computes from the spec's API flavors when the mapping has a
@@ -4078,13 +4089,17 @@ export function RuntimeAdminSection({
   // spec can still carry "last attempt failed yesterday 14:32, exit code 1".
   // That makes "last load failed" a fact no state chip can ever convey, hence
   // its own column, always visible (the message inline, the details in the
-  // tooltip), on every state including stopped.
+  // tooltip), on every state including stopped. A failure with a stable code
+  // this build knows reads as the code's label (the agent's message is
+  // English); the code and the raw message then move into the tooltip.
   function renderLastError(err: RuntimeError | undefined) {
     if (!err) return '–';
+    const labelKey = err.code ? errorLabelByCode[err.code] : undefined;
     return (
       <Tooltip
         title={
           <Box sx={{ display: 'grid', gap: 0.25 }}>
+            {labelKey && <Typography variant="caption">{`${err.code}: ${err.message}`}</Typography>}
             <Typography variant="caption">
               {t.runtimeLastErrorAt}: {formatDate(err.at, '—')}
             </Typography>
@@ -4110,7 +4125,7 @@ export function RuntimeAdminSection({
       >
         <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
           <WarningAmberIcon fontSize="small" color="warning" />
-          <Typography variant="body2">{err.message}</Typography>
+          <Typography variant="body2">{labelKey ? t[labelKey] : err.message}</Typography>
         </Box>
       </Tooltip>
     );
@@ -5644,6 +5659,11 @@ export function RuntimeAdminSection({
                 headHasGpus={gpuRows.length > 0}
                 startupTimeoutSeconds={startupTimeoutSeconds}
                 headBinaryVersion={binaryVersionFor(serverBinaries, binary.trim())}
+                resetMemberUsage={
+                  editingSpecMappingId && currentSpec?.configured
+                    ? (serverId) => resetClusterMemberUsage(editingSpecMappingId, serverId)
+                    : undefined
+                }
               />
             )}
 

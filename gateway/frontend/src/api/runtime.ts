@@ -85,6 +85,32 @@ export interface ClusterFailure {
   at: string;
 }
 
+// A policy breach a member's agent reports (Go ClusterBreachDTO): a peer the
+// member does not allow connected to it ("peer", with the peer's address), or
+// the member reports a hold by another head ("foreign_hold"). A member on a
+// server the caller may not manage carries only its position. `kind` stays a
+// plain string: a kind a newer gateway adds is shown as its wire value.
+export interface ClusterBreach {
+  position: number;
+  kind?: string;
+  peer?: string;
+  at?: string;
+}
+
+// A stored member peak above what the member's host admits (Go
+// ClusterPeakAboveBudgetDTO): one GPU's VRAM above its budget (or the card),
+// or the member's RAM above the host's memory. The member's next start is
+// refused until the budget is raised, the split changed or the stored usage
+// reset. A member on a server the caller may not manage carries only its
+// position.
+export interface ClusterPeakAboveBudget {
+  position: number;
+  resource?: 'vram' | 'ram';
+  gpu_index?: number;
+  stored_mb?: number;
+  ceiling_mb?: number;
+}
+
 // The gateway's orchestration state of one cluster head (Go ClusterStatusDTO).
 export interface ClusterStatus {
   state: ClusterState;
@@ -92,6 +118,9 @@ export interface ClusterStatus {
   members: ClusterMemberStatus[];
   last_failure?: ClusterFailure;
   cooldown_until?: string;
+  // Absent when there is none (and from an older gateway).
+  breaches?: ClusterBreach[];
+  peaks_above_budget?: ClusterPeakAboveBudget[];
 }
 
 // A server a head may add as a member (Go ClusterCandidateDTO). Automatic
@@ -313,7 +342,12 @@ export interface RuntimeSpec {
   // codes (see clusterWarningLabelByCode). Excluded from the PUT request.
   cluster_vram_total_mb?: number;
   cluster_ram_total_mb?: number;
+  // Per axis: false when a part of that total is unknown, so it is a lower
+  // bound (a CPU member has no VRAM part and never makes VRAM one).
+  // cluster_totals_complete is both together; an older gateway sends only it.
   cluster_totals_complete?: boolean;
+  cluster_vram_total_complete?: boolean;
+  cluster_ram_total_complete?: boolean;
   cluster_network_default?: ClusterNetwork | '';
   cluster_transport_default?: RpcTransport | '';
   cluster_warnings?: string[];
@@ -365,6 +399,8 @@ export type PutRuntimeSpecRequest = Omit<
   | 'cluster_vram_total_mb'
   | 'cluster_ram_total_mb'
   | 'cluster_totals_complete'
+  | 'cluster_vram_total_complete'
+  | 'cluster_ram_total_complete'
   | 'cluster_network_default'
   | 'cluster_transport_default'
   | 'cluster_warnings'
@@ -796,6 +832,16 @@ export function runtimeApi(fetcher: Fetcher) {
       request<{ data: ClusterCandidate[] }>(
         fetcher,
         `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-candidates${buildQueryString({ mode })}`,
+      ),
+    // Clears the stored usage of the member on serverId of the cluster head on
+    // this mapping -- the way out of a stored peak above the member's budget,
+    // which its next start would be refused for -- and answers the head's
+    // spec as it reads afterwards.
+    resetClusterMemberUsage: (mappingId: string, serverId: string) =>
+      request<RuntimeSpec>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-members/${encodeURIComponent(serverId)}/reset-usage`,
+        { method: 'POST' },
       ),
     runtimeCoresidency: (appId: string) =>
       request<CoResidency>(

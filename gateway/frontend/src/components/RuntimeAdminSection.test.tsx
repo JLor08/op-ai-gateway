@@ -332,6 +332,8 @@ function renderSection(
     benchmarkStatus?: PortalApi['benchmarkStatus'];
     probeMappingContext?: PortalApi['probeMappingContext'];
     probeMappingVram?: PortalApi['probeMappingVram'];
+    // The cluster head editor's per-member usage reset.
+    resetClusterMemberUsage?: PortalApi['resetClusterMemberUsage'];
     // The launch-spec form reads a mapping's benchmark history to find the
     // newest applicable VRAM measurement for its per-GPU apply affordance.
     mappingBenchmarks?: PortalApi['mappingBenchmarks'];
@@ -663,6 +665,9 @@ function renderSection(
     deleteServerBinary: vi.fn(async () => undefined),
     // The cluster head editor's member picker.
     clusterCandidates: vi.fn(async () => ({ data: [] })),
+    resetClusterMemberUsage:
+      opts.resetClusterMemberUsage ??
+      vi.fn(async (mappingId: string) => storedSpecs[mappingId] as RuntimeSpec),
   };
 
   const view = render(
@@ -1577,6 +1582,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       updateServerBinary: vi.fn(async () => ({}) as never),
       deleteServerBinary: vi.fn(async () => undefined),
       clusterCandidates: vi.fn(async () => ({ data: [] })),
+      resetClusterMemberUsage: vi.fn(async () => ({}) as never),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     };
@@ -3489,6 +3495,52 @@ describe('RuntimeAdminSection live status list', () => {
     );
     // Visible in the row itself, not hidden behind a hover-only tooltip.
     expect(screen.getByText('CUDA error: out of memory')).toBeInTheDocument();
+  });
+
+  // A lifecycle failure with a stable code reads as the code's label, so a
+  // cluster failure the agent reports in English still reaches the operator
+  // in the portal's language; the raw message stays in the tooltip.
+  it('labels a last error that carries a stable code', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          state: 'start_failed',
+          last_error: {
+            message: 'rpc member 10.0.0.2:50052 unreachable',
+            at: '2026-07-15T14:32:00Z',
+            exit_code: 1,
+            failures: 1,
+            code: 'runtime.cluster_member_unreachable',
+          },
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText(t.errorRuntimeClusterMemberUnreachable)).toBeInTheDocument();
+    expect(screen.queryByText('rpc member 10.0.0.2:50052 unreachable')).not.toBeInTheDocument();
+  });
+
+  it('shows the raw message of a last error whose code this build does not know', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          state: 'start_failed',
+          last_error: {
+            message: 'something new went wrong',
+            at: '2026-07-15T14:32:00Z',
+            exit_code: 1,
+            failures: 1,
+            code: 'runtime.some_future_code',
+          },
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('something new went wrong')).toBeInTheDocument();
   });
 
   it('replaces the row set on every frame instead of appending', async () => {
@@ -12263,6 +12315,40 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body).not.toHaveProperty('cluster_status');
+  });
+
+  it('resets a member usage and shows the head the gateway answers', async () => {
+    const answer = headSpec({
+      cluster_vram_total_mb: 9000,
+      cluster_members: [
+        {
+          ...visibleMember,
+          ram_measured_mb: 0,
+          gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+        },
+        hiddenMember,
+      ],
+    });
+    const reset = vi.fn(async () => answer);
+    const view = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec() },
+      resetClusterMemberUsage: reset,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByTestId('cluster-totals')).toHaveTextContent('VRAM ≥ 16000 MB');
+
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Beta` }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('map_1', 'srv_b'));
+    await waitFor(() =>
+      expect(screen.getByTestId('cluster-totals')).toHaveTextContent('VRAM ≥ 9000 MB'),
+    );
+    expect(screen.queryByText(`${t.clusterMemberMeasured} 900 MB`)).not.toBeInTheDocument();
+    expect(view.putSpecs).toHaveLength(0);
   });
 
   it('shows the compact cluster status in the live-status cell', async () => {

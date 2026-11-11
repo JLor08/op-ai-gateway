@@ -6,9 +6,12 @@ import { Alert, Box, Button, Chip, Popover, Tooltip, Typography } from '@mui/mat
 import type { RuntimeSpec } from '../api';
 import type { Translation } from './shared/types';
 import { formatChatRunErrorCode } from './shared/format';
-import { clusterCellText, clusterIncompleteCause, clusterTotalsView } from './shared/clusterTotals';
-
-type Axis = 'vram' | 'ram';
+import {
+  clusterCellText,
+  clusterIncompleteCause,
+  clusterTotalsView,
+  type ClusterAxis,
+} from './shared/clusterTotals';
 
 function mbText(mb: number): string {
   return mb > 0 ? `${mb} MB` : '—';
@@ -16,8 +19,8 @@ function mbText(mb: number): string {
 
 /**
  * A resource-table cell of a cluster head: the cluster total marked "Cluster"
- * (a lower bound carries "≥" and, where visible, names the incomplete
- * members), the head's own value beneath, and a popover with the per-member
+ * (a lower bound on this axis carries "≥" and, where visible, names the
+ * members incomplete on it), the head's own value beneath, and a popover with the per-member
  * breakdown. Hidden members only count inside the totals.
  */
 export function ClusterTotalCell({
@@ -25,20 +28,20 @@ export function ClusterTotalCell({
   axis,
   ownMb,
   t,
-}: Readonly<{ spec: RuntimeSpec; axis: Axis; ownMb: number; t: Translation }>) {
+}: Readonly<{ spec: RuntimeSpec; axis: ClusterAxis; ownMb: number; t: Translation }>) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const view = clusterTotalsView(spec);
-  const total = axis === 'vram' ? view.vramMb : view.ramMb;
+  const total = view[axis];
   const cause = clusterIncompleteCause(spec, view, axis, ownMb);
   let hint = '';
   if (cause === 'members')
-    hint = `${t.clusterIncompleteTooltip}: ${view.incompleteNames.join(', ')}`;
+    hint = `${t.clusterIncompleteTooltip}: ${total.incompleteNames.join(', ')}`;
   else if (cause === 'hidden') hint = t.clusterIncompleteHidden;
   else if (cause === 'head') hint = t.clusterIncompleteHead;
   else if (cause === 'unknown') hint = t.clusterIncompleteNeutral;
   const text = (
     <Typography component="span" variant="body2" data-testid={`cluster-total-${axis}`}>
-      {clusterCellText(total, view.complete)}
+      {clusterCellText(total.mb, total.complete)}
     </Typography>
   );
   return (
