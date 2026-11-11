@@ -1090,18 +1090,37 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 		}
 	}
 	plan.applyTo(&spec)
-	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
-		return runtimeSpecWrite{}, err
-	}
 	w := runtimeSpecWrite{
-		stored: true, memberServers: plan.memberServers,
+		memberServers:  plan.memberServers,
 		touchesCluster: plan.enabled || len(plan.memberServers) > 0 || (prior.ok && prior.spec.ClusterEnabled),
 	}
+	// The membership write is the step that can still be refused by state
+	// the checks could not hold (a member spec or port another gateway
+	// process took, a member server deleted since). It goes first wherever
+	// the head row exists already, so such a refusal stores nothing, rather
+	// than a head whose cluster columns no longer match its membership.
+	if plan.writeMembers && prior.ok {
+		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
+			return w, err
+		}
+		w.stored = true
+	}
+	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
+		return w, err
+	}
+	w.stored = true
 	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
 		return w, err
 	}
-	if plan.writeMembers {
+	// A new head's membership needs its row; a refused membership takes the
+	// new row away again, so the refusal stores nothing here either.
+	if plan.writeMembers && !prior.ok {
 		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
+			if delErr := s.routes.DeleteRuntimeSpec(ctx, spec.ID); delErr == nil {
+				w.stored = false
+			} else {
+				slog.Warn("runtime spec: could not remove a new cluster head whose membership was refused", "spec_id", spec.ID, "err", delErr)
+			}
 			return w, err
 		}
 	}

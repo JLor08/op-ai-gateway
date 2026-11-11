@@ -954,8 +954,9 @@ type Service struct {
 	// OUTSIDE this lock, so only the fast local read+write section serializes.
 	reconcileMu sync.Mutex
 	// clusterWriteMu serializes the operator's runtime-spec writes
-	// (writeRuntimeSpecAs): a cluster head's save allocates member ports and
-	// claims manual member specs, both check-then-act across specs.
+	// (writeRuntimeSpecAs) with the manual member spec writes and deletes: a
+	// cluster head's save allocates member ports and claims manual member
+	// specs, both check-then-act across specs, and reads the specs it claims.
 	clusterWriteMu sync.Mutex
 }
 

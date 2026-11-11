@@ -51,7 +51,13 @@ func scanRPCMemberSpec(row rowScanner) (routing.RPCMemberSpec, error) {
 // UpsertRPCMemberSpec inserts or updates a manual member spec by id; an update
 // keeps created_at. An unknown server is ErrNotFound.
 func (s *SQLiteStore) UpsertRPCMemberSpec(ctx context.Context, sp routing.RPCMemberSpec) error {
-	_, err := s.exec(ctx, `
+	return s.upsertRPCMemberSpecOn(ctx, s.db, sp)
+}
+
+// upsertRPCMemberSpecOn is UpsertRPCMemberSpec against ex: the pool, or the
+// transaction of a write that stores more along with the spec.
+func (s *SQLiteStore) upsertRPCMemberSpecOn(ctx context.Context, ex execer, sp routing.RPCMemberSpec) error {
+	_, err := s.execOn(ctx, ex, `
 		insert into rpc_member_specs (`+rpcMemberSpecColumns+`)
 		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(id) do update set
@@ -125,6 +131,14 @@ func (s *SQLiteStore) SetRPCMemberSpecGPUs(ctx context.Context, specID string, g
 	if exists == 0 {
 		return ErrNotFound
 	}
+	if err := s.setRPCMemberSpecGPUsOn(ctx, tx, specID, gpus); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// setRPCMemberSpecGPUsOn replaces specID's GPU rows inside tx.
+func (s *SQLiteStore) setRPCMemberSpecGPUsOn(ctx context.Context, tx *sql.Tx, specID string, gpus []routing.RPCMemberSpecGPU) error {
 	if _, err := s.execOn(ctx, tx, `delete from rpc_member_spec_gpus where spec_id = ?`, specID); err != nil {
 		return fmt.Errorf("clear rpc member spec gpus: %w", err)
 	}
@@ -135,7 +149,7 @@ func (s *SQLiteStore) SetRPCMemberSpecGPUs(ctx context.Context, specID string, g
 			return s.classifyRPCWrite(err, "insert rpc member spec gpu")
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then index.
@@ -178,6 +192,15 @@ func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, 
 	if exists == 0 {
 		return ErrNotFound
 	}
+	if err := s.setClusterMembersOn(ctx, tx, headSpecID, members, gpus); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// setClusterMembersOn replaces headSpecID's membership and GPU rows inside
+// tx; the caller has checked that the head exists.
+func (s *SQLiteStore) setClusterMembersOn(ctx context.Context, tx *sql.Tx, headSpecID string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
 	// The GPU rows cascade from their membership row.
 	if _, err := s.execOn(ctx, tx, `delete from rpc_cluster_members where head_spec_id = ?`, headSpecID); err != nil {
 		return fmt.Errorf("clear cluster members: %w", err)
@@ -203,7 +226,7 @@ func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, 
 			return s.classifyRPCWrite(err, "insert cluster member gpu")
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 const clusterMemberColumns = `head_spec_id, position, server_id, member_spec_id, threads, cache_enabled, device_backend,

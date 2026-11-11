@@ -1145,14 +1145,14 @@ type racingPortStore struct {
 	written int
 }
 
-func (r *racingPortStore) SetClusterMembers(ctx context.Context, head string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
+func (r *racingPortStore) SetClusterMembersIf(ctx context.Context, head string, expect []routing.ClusterMember, expectGPUs []routing.ClusterMemberGPU, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) (bool, error) {
 	if head != r.rival && r.written < r.races && len(members) > 0 {
 		r.written++
 		if err := r.MemoryStore.SetClusterMembers(ctx, r.rival, []routing.ClusterMember{{Position: 0, ServerID: members[0].ServerID, Port: members[0].Port, DeviceBackend: "auto"}}, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return r.MemoryStore.SetClusterMembers(ctx, head, members, gpus)
+	return r.MemoryStore.SetClusterMembersIf(ctx, head, expect, expectGPUs, members, gpus)
 }
 
 func TestPutClusterPortRace(t *testing.T) {
@@ -1175,6 +1175,10 @@ func TestPutClusterPortRace(t *testing.T) {
 				t.Fatalf("PutRuntimeSpec = %v, want %v", err, tc.want)
 			}
 			if tc.want != nil {
+				// A refused membership stores no head.
+				if _, ok, _ := f.routes.RuntimeSpecByMapping(f.ctx, f.mappingID); ok {
+					t.Fatal("a new head was kept although its membership was refused")
+				}
 				return
 			}
 			members, _, _ := f.routes.ClusterMembers(f.ctx, dto.ID)
@@ -1393,4 +1397,145 @@ func TestPutClusterRemovingMembersNeedsHeadRightsOnly(t *testing.T) {
 			t.Fatalf("owner adds a foreign member = %v, want server not found", err)
 		}
 	})
+}
+
+// TestPutClusterUnchangedMembershipWithMissingSpec: a manual member whose
+// spec is gone (the reference has no foreign key) is never rewritten as an
+// automatic member by a head save that leaves the membership as stored; the
+// save runs the full member checks and refuses it.
+func TestPutClusterUnchangedMembershipWithMissingSpec(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	spec := f.manualSpec(a.ID, RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 5000})
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID})
+	req.MemberMode = "manual"
+	head := f.mustPut(req)
+	if err := f.routes.DeleteRPCMemberSpec(f.ctx, spec.ID); err != nil {
+		t.Fatal(err)
+	}
+	req.IdleTimeoutSeconds = 900
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrRPCMemberSpecNotFound) {
+		t.Fatalf("re-save with a missing member spec = %v, want %v", err, ErrRPCMemberSpecNotFound)
+	}
+	members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID)
+	if len(members) != 1 || members[0].MemberSpecID != spec.ID {
+		t.Fatalf("membership = %+v, want the manual reference kept", members)
+	}
+}
+
+// TestDeleteRPCMemberSpecSerializedWithHeadWrites: the in-use check and the
+// delete of a member spec run under the cluster write lock, so a head save
+// cannot claim the spec in between and leave a dangling reference.
+func TestDeleteRPCMemberSpecSerializedWithHeadWrites(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	spec := f.manualSpec(a.ID)
+	f.svc.clusterWriteMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- f.svc.DeleteRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID) }()
+	select {
+	case err := <-done:
+		f.svc.clusterWriteMu.Unlock()
+		t.Fatalf("DeleteRPCMemberSpec ran while a head write held the lock (err %v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	f.svc.clusterWriteMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPutRPCMemberSpecSerializedWithHeadWrites: a member spec write runs
+// under the cluster write lock as a whole (spec row, GPU rows and the
+// head's membership), so a head save never reads it half written.
+func TestPutRPCMemberSpecSerializedWithHeadWrites(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	spec := f.manualSpec(a.ID)
+	f.svc.clusterWriteMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID, PutRPCMemberSpecRequest{Binary: clusterRPCBinary, Args: []string{"-t", "4"}})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	stored, _, err := f.routes.RPCMemberSpecByID(f.ctx, spec.ID)
+	f.svc.clusterWriteMu.Unlock()
+	if err != nil || strings.Contains(stored.Args, "-t") {
+		t.Fatalf("member spec written while a head write held the lock: %+v err=%v", stored, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPutClusterRefusedMembershipKeepsTheStoredSpec: converting a stored
+// model spec into a head whose membership the store then refuses leaves the
+// spec as it was, not a head without members that its document withholds.
+func TestPutClusterRefusedMembershipKeepsTheStoredSpec(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	plain := PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Type: "llama_cpp", Args: []string{"-m", "/models/big.gguf"}}
+	stored := f.mustPut(plain)
+	rival := seedOtherHead(t, f)
+	f.svc.routes = &racingPortStore{MemoryStore: f.routes, rival: rival, races: 2}
+	if _, err := f.put(ownerToken(), clusterHeadRequest(autoMember(a.ID))); !errors.Is(err, ErrClusterPortExhausted) {
+		t.Fatalf("PutRuntimeSpec = %v, want %v", err, ErrClusterPortExhausted)
+	}
+	spec, ok, err := f.routes.RuntimeSpecByID(f.ctx, stored.ID)
+	if err != nil || !ok || spec.ClusterEnabled || strings.Contains(spec.Args, "RPC_SERVERS") {
+		t.Fatalf("stored spec after the refused conversion = %+v ok=%v err=%v", spec, ok, err)
+	}
+	if got := f.notifiedServers(); len(got) != 0 {
+		t.Fatalf("notified = %v for a write that stored nothing", got)
+	}
+}
+
+// usageRaceStore lets the gateway write a member's measured usage between a
+// head save's read of the membership and its write, once.
+type usageRaceStore struct {
+	*routing.MemoryStore
+	raised bool
+	ramMB  int
+}
+
+func (u *usageRaceStore) SetClusterMembersIf(ctx context.Context, head string, expect []routing.ClusterMember, expectGPUs []routing.ClusterMemberGPU, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) (bool, error) {
+	if !u.raised && len(expect) > 0 {
+		u.raised = true
+		current, _, err := u.MemoryStore.ClusterMembers(ctx, head)
+		if err != nil {
+			return false, err
+		}
+		m := current[0]
+		m.RAMMeasuredMB, m.RunPeakRAMMB = u.ramMB, u.ramMB
+		if _, err := u.MemoryStore.UpdateClusterMemberUsage(ctx, m, nil); err != nil {
+			return false, err
+		}
+	}
+	return u.MemoryStore.SetClusterMembersIf(ctx, head, expect, expectGPUs, members, gpus)
+}
+
+// TestPutClusterKeepsAUsageRiseDuringTheSave: a head save that keeps the
+// split carries the measured values over, and a rise the gateway wrote
+// between the save's read and its write survives the save.
+func TestPutClusterKeepsAUsageRiseDuringTheSave(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+	f.usage(head.ID, a.ID, 3000, nil)
+	race := &usageRaceStore{MemoryStore: f.routes, ramMB: 5000}
+	f.svc.routes = race
+	req := clusterHeadRequest(autoMember(a.ID))
+	req.IdleTimeoutSeconds = 900
+	req.ClusterMembers[0].Threads = 4
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatal(err)
+	}
+	if !race.raised {
+		t.Fatal("the usage write never ran")
+	}
+	members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID)
+	if len(members) != 1 || members[0].RAMMeasuredMB != 5000 || members[0].Threads != 4 {
+		t.Fatalf("membership after the save = %+v, want the raised value and the new threads", members)
+	}
 }

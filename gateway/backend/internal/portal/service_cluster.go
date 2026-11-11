@@ -160,6 +160,16 @@ type clusterPlan struct {
 	// allocated lists the members whose port this write allocated (indices
 	// into members); the others keep the port their server's row had.
 	allocated []int
+	// readMembers and readGPUs are the stored rows the plan was built from:
+	// the membership is replaced only while it still holds them, so measured
+	// values the gateway wrote since are never overwritten with an older
+	// read (see writeClusterMembers).
+	readMembers []routing.ClusterMember
+	readGPUs    []routing.ClusterMemberGPU
+	// replan plans the rows again from a fresh read of the stored rows; its
+	// members, gpus and allocated replace this plan's. nil when the plan
+	// stores no members.
+	replan func(ctx context.Context, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) (clusterPlan, error)
 }
 
 func (p clusterPlan) applyTo(spec *routing.RuntimeSpec) {
@@ -319,6 +329,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	for _, m := range prevMembers {
 		plan.memberServers = appendUnique(plan.memberServers, m.ServerID)
 	}
+	plan.readMembers, plan.readGPUs = prevMembers, prevGPUs
 	scan := scanClusterArgs(req.Args, req.Env)
 	if !req.ClusterEnabled {
 		if scan.clusterPlaceholder {
@@ -338,13 +349,19 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	if err != nil {
 		return clusterPlan{}, err
 	}
-	if prior.ok && prior.spec.ClusterEnabled && normalizeMemberMode(prior.spec.MemberMode) == f.memberMode &&
+	unchanged := prior.ok && prior.spec.ClusterEnabled && normalizeMemberMode(prior.spec.MemberMode) == f.memberMode &&
 		prior.spec.ClusterNetwork == f.clusterNetwork && prior.spec.RPCTransport == f.rpcTransport &&
 		prior.spec.Binary == f.binary &&
-		membershipUnchanged(entries, prevMembers, prevGPUs) {
-		if err := s.loadStoredClusterEntries(ctx, p, entries); err != nil {
+		membershipUnchanged(entries, prevMembers, prevGPUs)
+	if unchanged {
+		// A manual member whose spec is gone runs the full checks instead,
+		// which refuse it: kept as stored it would turn into an automatic
+		// member.
+		if unchanged, err = s.loadStoredClusterEntries(ctx, p, entries); err != nil {
 			return clusterPlan{}, err
 		}
+	}
+	if unchanged {
 		// The acknowledgement is the head's own setting: withdrawing it from a
 		// direct lan cluster is refused like a missing one.
 		if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !req.LANExposureAck {
@@ -358,6 +375,11 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	}
 	if err := s.planClusterRows(ctx, &plan, entries, prior, f, req, prevMembers, prevGPUs); err != nil {
 		return clusterPlan{}, err
+	}
+	plan.replan = func(ctx context.Context, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) (clusterPlan, error) {
+		var fresh clusterPlan
+		err := s.planClusterRows(ctx, &fresh, entries, prior, f, req, prevMembers, prevGPUs)
+		return fresh, err
 	}
 	return plan, nil
 }
@@ -498,28 +520,32 @@ func membershipUnchanged(entries []clusterEntry, prevMembers []routing.ClusterMe
 
 // loadStoredClusterEntries fills the entries of an unchanged membership
 // without authorizing them: each entry's server, its manual spec and whether
-// the caller may see the server.
-func (s *Service) loadStoredClusterEntries(ctx context.Context, p auth.Token, entries []clusterEntry) error {
+// the caller may see the server. complete is false when a manual member's
+// spec is gone (the reference has no foreign key); the entries are then not
+// usable as stored.
+func (s *Service) loadStoredClusterEntries(ctx context.Context, p auth.Token, entries []clusterEntry) (complete bool, err error) {
 	for i := range entries {
 		e := &entries[i]
 		server, err := s.routes.AIServerByID(ctx, e.req.ServerID)
 		if err != nil {
-			return ErrServerNotFound
+			return false, ErrServerNotFound
 		}
 		e.server, e.visible = server, s.callerManagesServer(ctx, p, server.ID)
-		if e.manual {
-			spec, ok, err := s.routes.RPCMemberSpecByID(ctx, e.req.MemberSpecID)
-			if err != nil {
-				return err
-			}
-			if ok {
-				if err := s.loadEntrySpec(ctx, e, spec); err != nil {
-					return err
-				}
-			}
+		if !e.manual {
+			continue
+		}
+		spec, ok, err := s.routes.RPCMemberSpecByID(ctx, e.req.MemberSpecID)
+		if err != nil {
+			return false, err
+		}
+		if !ok || spec.ServerID != server.ID {
+			return false, nil
+		}
+		if err := s.loadEntrySpec(ctx, e, spec); err != nil {
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // loadEntrySpec sets a manual entry's spec and takes its GPU selection from
@@ -1013,20 +1039,75 @@ func appendUnique(ids []string, id string) []string {
 	return append(ids, id)
 }
 
-// writeClusterMembers stores plan's membership rows for headSpecID. The
-// store refuses with a conflict when, since the checks ran, another head
-// took one of the manual member specs (one head per spec) or another gateway
-// process allocated one of the new ports on the same server (one member per
-// port and server; the allocation lock is per process). The first is
-// ErrClusterMemberSpecTaken. For the second the new ports are allocated once
-// more from the store's current rows and the write is repeated; a second
-// conflict is ErrClusterPortExhausted.
+// clusterRewriteAttempts bounds how often a membership rewrite starts over
+// because the gateway wrote measured values between its read and its write.
+const clusterRewriteAttempts = 5
+
+// errClusterMembersChanged ends a membership rewrite whose stored rows kept
+// changing under it; nothing of the rewrite is stored.
+var errClusterMembersChanged = errors.New("cluster membership changed during the write")
+
+// writeClusterMembers stores plan's membership rows for headSpecID, but only
+// over the rows the plan was built from (SetClusterMembersIf): the plan
+// carries measured values over, and the gateway may have raised them since.
+// Then the stored rows are read again, the plan is rebuilt from them, and the
+// write starts over. The store refuses with a conflict when, since the
+// checks ran, another head took one of the manual member specs (one head per
+// spec) or another gateway process allocated one of the new ports on the
+// same server (one member per port and server; the allocation lock is per
+// process). The first is ErrClusterMemberSpecTaken. For the second the new
+// ports are allocated once more from the store's current rows and the write
+// is repeated; a second conflict is ErrClusterPortExhausted.
 func (s *Service) writeClusterMembers(ctx context.Context, headSpecID string, plan *clusterPlan) error {
-	err := s.routes.SetClusterMembers(ctx, headSpecID, plan.members, plan.gpus)
-	if !errors.Is(err, store.ErrConflict) {
-		return clusterMembersStoreError(err)
+	portsRetried := false
+	for attempt := 0; attempt < clusterRewriteAttempts; {
+		applied, err := s.routes.SetClusterMembersIf(ctx, headSpecID, plan.readMembers, plan.readGPUs, plan.members, plan.gpus)
+		switch {
+		case errors.Is(err, store.ErrConflict):
+			if err := s.checkClusterMemberSpecsFree(ctx, headSpecID, plan.members); err != nil {
+				return err
+			}
+			if portsRetried || len(plan.allocated) == 0 {
+				return ErrClusterPortExhausted
+			}
+			portsRetried = true
+			for _, i := range plan.allocated {
+				if plan.members[i].Port, err = s.allocateRPCPort(ctx, plan.members[i].ServerID); err != nil {
+					return err
+				}
+			}
+			continue
+		case errors.Is(err, store.ErrNotFound):
+			// The head row went away under the write (a concurrent delete)
+			// unless a member server did.
+			if _, ok, rerr := s.routes.RuntimeSpecByID(ctx, headSpecID); rerr == nil && !ok {
+				return ErrRuntimeSpecNotFound
+			}
+			return ErrServerNotFound
+		case err != nil:
+			return err
+		case applied:
+			return nil
+		}
+		attempt++
+		if plan.readMembers, plan.readGPUs, err = s.routes.ClusterMembers(ctx, headSpecID); err != nil {
+			return err
+		}
+		if plan.replan != nil {
+			fresh, err := plan.replan(ctx, plan.readMembers, plan.readGPUs)
+			if err != nil {
+				return err
+			}
+			plan.members, plan.gpus, plan.allocated = fresh.members, fresh.gpus, fresh.allocated
+		}
 	}
-	for _, m := range plan.members {
+	return errClusterMembersChanged
+}
+
+// checkClusterMemberSpecsFree is ErrClusterMemberSpecTaken when another head
+// uses one of members' manual member specs.
+func (s *Service) checkClusterMemberSpecsFree(ctx context.Context, headSpecID string, members []routing.ClusterMember) error {
+	for _, m := range members {
 		if m.MemberSpecID == "" {
 			continue
 		}
@@ -1038,28 +1119,7 @@ func (s *Service) writeClusterMembers(ctx context.Context, headSpecID string, pl
 			return ErrClusterMemberSpecTaken
 		}
 	}
-	if len(plan.allocated) == 0 {
-		return ErrClusterPortExhausted
-	}
-	for _, i := range plan.allocated {
-		if plan.members[i].Port, err = s.allocateRPCPort(ctx, plan.members[i].ServerID); err != nil {
-			return err
-		}
-	}
-	err = s.routes.SetClusterMembers(ctx, headSpecID, plan.members, plan.gpus)
-	if errors.Is(err, store.ErrConflict) {
-		return ErrClusterPortExhausted
-	}
-	return clusterMembersStoreError(err)
-}
-
-// clusterMembersStoreError maps a membership write the store refused for a
-// reason other than a conflict: a server deleted in the meantime.
-func clusterMembersStoreError(err error) error {
-	if errors.Is(err, store.ErrNotFound) {
-		return ErrServerNotFound
-	}
-	return err
+	return nil
 }
 
 // checkListenPortFree refuses a fixed listen_port that a cluster member on

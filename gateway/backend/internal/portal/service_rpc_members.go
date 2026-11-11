@@ -105,59 +105,84 @@ func (s *Service) RPCMemberSpecs(ctx context.Context, p auth.Token, serverID str
 
 // PutRPCMemberSpec creates (specID "") or replaces a manual member spec on
 // serverID. The request is validated in full before anything is written.
+// The write runs under the cluster write lock as a whole -- the in-use check
+// of a disable, the spec with its GPU rows (one store transaction) and the
+// membership of the head that uses it -- so a head save never claims a spec
+// half written or one that is being disabled. The notification follows the
+// lock.
 func (s *Service) PutRPCMemberSpec(ctx context.Context, p auth.Token, serverID, specID string, req PutRPCMemberSpecRequest) (RPCMemberSpecDTO, error) {
 	server, err := s.authorizeServer(ctx, p, serverID)
 	if err != nil {
 		return RPCMemberSpecDTO{}, err
 	}
+	s.clusterWriteMu.Lock()
+	id, stored, err := s.writeRPCMemberSpec(ctx, p, server, specID, req)
+	s.clusterWriteMu.Unlock()
+	if stored {
+		s.notifyRPCMemberChanged(ctx, server.ID, id)
+	}
+	if err != nil {
+		return RPCMemberSpecDTO{}, err
+	}
+	row, _, err := s.routes.RPCMemberSpecByID(ctx, id)
+	if err != nil {
+		return RPCMemberSpecDTO{}, err
+	}
+	return s.rpcMemberSpecDTO(ctx, p, row)
+}
+
+// writeRPCMemberSpec is PutRPCMemberSpec's write under the cluster write
+// lock. It returns the spec's id and whether anything was stored.
+func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server routing.AIServer, specID string, req PutRPCMemberSpecRequest) (string, bool, error) {
 	var prior routing.RPCMemberSpec
+	var err error
 	if specID != "" {
 		prior, err = s.ownedRPCMemberSpec(ctx, server.ID, specID)
 		if err != nil {
-			return RPCMemberSpecDTO{}, err
+			return "", false, err
 		}
 	}
 	binary := strings.TrimSpace(req.Binary)
 	if !runtimeSpecBinaryIsAbsolute(binary) {
-		return RPCMemberSpecDTO{}, ErrRuntimeSpecBinaryRequired
+		return "", false, ErrRuntimeSpecBinaryRequired
 	}
 	if req.RAMEstimateMB < 0 {
-		return RPCMemberSpecDTO{}, ErrRuntimeSpecTuningInvalid
+		return "", false, ErrRuntimeSpecTuningInvalid
 	}
 	if err := validateRuntimeSpecGPUs(req.GPUs); err != nil {
-		return RPCMemberSpecDTO{}, err
+		return "", false, err
 	}
 	for k := range req.Env {
 		if !runtimeSpecEnvKeyPattern.MatchString(k) {
-			return RPCMemberSpecDTO{}, ErrRuntimeSpecEnvInvalid
+			return "", false, ErrRuntimeSpecEnvInvalid
 		}
 		// Members always select devices with -d, so a visibility variable
 		// would filter a second time and hide the cards from the member.
 		if slices.Contains(runtimeSpecVisibleDevicesVars, strings.ToUpper(strings.TrimSpace(k))) {
-			return RPCMemberSpecDTO{}, ErrRuntimeSpecVisibleDevicesConflict
+			return "", false, ErrRuntimeSpecVisibleDevicesConflict
 		}
 	}
 	if err := validateRPCMemberArgs(req.Args); err != nil {
-		return RPCMemberSpecDTO{}, err
+		return "", false, err
 	}
 	backend := strings.TrimSpace(req.DeviceBackend)
 	if backend == "" {
 		backend = "auto"
 	}
 	if !slices.Contains(rpcMemberDeviceBackends, backend) {
-		return RPCMemberSpecDTO{}, ErrRPCMemberDeviceBackendInvalid
+		return "", false, ErrRPCMemberDeviceBackendInvalid
 	}
 	groups, err := s.rpcMemberHeadGroups(ctx, server.ID, req.AllowedHeadGroups, prior)
 	if err != nil {
-		return RPCMemberSpecDTO{}, err
+		return "", false, err
 	}
 	if err := s.requireRPCMemberVRAMEstimates(ctx, server.ID, req.GPUs); err != nil {
-		return RPCMemberSpecDTO{}, err
+		return "", false, err
 	}
 	enabled := req.Enabled == nil || *req.Enabled
 	if specID != "" && prior.Enabled && !enabled {
 		if err := s.rpcMemberInUseError(ctx, p, specID); err != nil {
-			return RPCMemberSpecDTO{}, err
+			return "", false, err
 		}
 	}
 	args := req.Args
@@ -170,11 +195,11 @@ func (s *Service) PutRPCMemberSpec(ctx context.Context, p auth.Token, serverID, 
 	}
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
-		return RPCMemberSpecDTO{}, ErrRuntimeSpecArgsInvalid
+		return "", false, ErrRuntimeSpecArgsInvalid
 	}
 	envJSON, err := json.Marshal(env)
 	if err != nil {
-		return RPCMemberSpecDTO{}, ErrRuntimeSpecEnvInvalid
+		return "", false, ErrRuntimeSpecEnvInvalid
 	}
 	now := s.clock().UTC()
 	row := routing.RPCMemberSpec{
@@ -196,42 +221,42 @@ func (s *Service) PutRPCMemberSpec(ctx context.Context, p auth.Token, serverID, 
 	} else {
 		row.CreatedAt = prior.CreatedAt
 	}
-	if err := s.routes.UpsertRPCMemberSpec(ctx, row); err != nil {
-		return RPCMemberSpecDTO{}, err
-	}
 	gpuRows := make([]routing.RPCMemberSpecGPU, len(req.GPUs))
 	for i, g := range req.GPUs {
 		gpuRows[i] = routing.RPCMemberSpecGPU{SpecID: row.ID, GPUIndex: g.Index, Position: i, VRAMEstimateMB: g.VRAMEstimateMB}
 	}
-	if err := s.routes.SetRPCMemberSpecGPUs(ctx, row.ID, gpuRows); err != nil {
-		s.notifyRPCMemberChanged(ctx, server.ID, row.ID)
-		return RPCMemberSpecDTO{}, err
+	if err := s.routes.ReplaceRPCMemberSpec(ctx, row, gpuRows); err != nil {
+		return "", false, err
 	}
 	// The membership of the head using the spec holds the measured usage per
-	// GPU, so it follows the spec's GPU rows. Serialized with the head writes,
-	// which replace the same membership.
-	s.clusterWriteMu.Lock()
+	// GPU, so it follows the spec's GPU rows.
 	_, err = s.resyncManualMemberGPUs(ctx, row.ID, gpuRows)
-	s.clusterWriteMu.Unlock()
-	s.notifyRPCMemberChanged(ctx, server.ID, row.ID)
-	if err != nil {
-		return RPCMemberSpecDTO{}, err
-	}
-	stored, _, err := s.routes.RPCMemberSpecByID(ctx, row.ID)
-	if err != nil {
-		return RPCMemberSpecDTO{}, err
-	}
-	return s.rpcMemberSpecDTO(ctx, p, stored)
+	return row.ID, true, err
 }
 
 // DeleteRPCMemberSpec removes a manual member spec. A spec a head still
-// references is ErrRPCMemberInUse.
+// references is ErrRPCMemberInUse. The in-use check and the delete run under
+// the cluster write lock, so a head save cannot claim the spec in between
+// and keep a reference to a spec that is gone.
 func (s *Service) DeleteRPCMemberSpec(ctx context.Context, p auth.Token, serverID, specID string) error {
 	server, err := s.authorizeServer(ctx, p, serverID)
 	if err != nil {
 		return err
 	}
-	if _, err := s.ownedRPCMemberSpec(ctx, server.ID, specID); err != nil {
+	s.clusterWriteMu.Lock()
+	err = s.deleteRPCMemberSpec(ctx, p, server.ID, specID)
+	s.clusterWriteMu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.notifyRuntimeChanged(server.ID)
+	return nil
+}
+
+// deleteRPCMemberSpec is DeleteRPCMemberSpec's check and delete under the
+// cluster write lock.
+func (s *Service) deleteRPCMemberSpec(ctx context.Context, p auth.Token, serverID, specID string) error {
+	if _, err := s.ownedRPCMemberSpec(ctx, serverID, specID); err != nil {
 		return err
 	}
 	if err := s.rpcMemberInUseError(ctx, p, specID); err != nil {
@@ -243,7 +268,6 @@ func (s *Service) DeleteRPCMemberSpec(ctx context.Context, p auth.Token, serverI
 		}
 		return err
 	}
-	s.notifyRuntimeChanged(server.ID)
 	return nil
 }
 

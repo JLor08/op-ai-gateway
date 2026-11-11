@@ -765,15 +765,33 @@ func (s *Service) clusterWithheldReason(ctx context.Context, headSpecID string, 
 // A changed device order or set changes the distribution, so kept values
 // become a stale floor and every member's run of that head ends, as on a
 // head edit (planClusterRows).
+//
+// The rewrite applies only over the rows it read (SetClusterMembersIf), so a
+// measured value the gateway wrote in between is read again, never
+// overwritten.
 func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, rows []routing.RPCMemberSpecGPU) (headSpecID string, err error) {
 	used, ok, err := s.routes.ClusterMemberBySpec(ctx, specID)
 	if err != nil || !ok {
 		return "", err
 	}
-	members, gpus, err := s.routes.ClusterMembers(ctx, used.HeadSpecID)
-	if err != nil {
-		return "", err
+	for range clusterRewriteAttempts {
+		read, readGPUs, err := s.routes.ClusterMembers(ctx, used.HeadSpecID)
+		if err != nil {
+			return "", err
+		}
+		members, gpus := resyncedManualMember(used, rows, read, readGPUs)
+		applied, err := s.routes.SetClusterMembersIf(ctx, used.HeadSpecID, read, readGPUs, members, gpus)
+		if err != nil || applied {
+			return used.HeadSpecID, err
+		}
 	}
+	return used.HeadSpecID, errClusterMembersChanged
+}
+
+// resyncedManualMember is resyncManualMemberGPUs' rewrite of the membership
+// rows read: used's GPU rows follow the spec's rows.
+func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSpecGPU, read []routing.ClusterMember, gpus []routing.ClusterMemberGPU) ([]routing.ClusterMember, []routing.ClusterMemberGPU) {
+	members := slices.Clone(read)
 	prev := map[int]routing.ClusterMemberGPU{}
 	var prevOrder, nextOrder []int
 	next := make([]routing.ClusterMemberGPU, 0, len(gpus)+len(rows))
@@ -814,7 +832,7 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 			members[i].Stale = true
 		}
 	}
-	return used.HeadSpecID, s.routes.SetClusterMembers(ctx, used.HeadSpecID, members, next)
+	return members, next
 }
 
 // clusterServers is headSpecID's head server and every member server, each
