@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CLUSTER_SPEC_REFRESH_MS,
+  CLUSTER_START_NOTICE_MS,
   CLUSTER_START_REFRESH_MS,
   OVERRIDE_WRITE_TIMEOUT_MS,
   RESTART_STOP_TIMEOUT_MS,
@@ -11870,6 +11871,88 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
           t.clusterPhaseMembersStarting,
         ),
       ).toBeInTheDocument();
+    });
+
+    it('keeps the notice and the fast re-read while an accepted start does not show yet', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { fakeApi, storedSpecs } = renderActions(
+          [instanceRow(0, { state: 'stopped' })],
+          clusterHead({ cluster_status: { state: 'cold', members: [] } }),
+          { startRuntime: async () => ({ instance: 0, state: 'starting' as const }) },
+        );
+        await openStatusTab();
+        await waitForRowActions('4100', t.runtimeStart);
+        fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+        // The start is accepted, but the reads after it still say cold.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS + 100);
+        });
+        expect(screen.getByTestId('cluster-start-requested')).toBeInTheDocument();
+        const reads = fakeApi.runtimeSpec.mock.calls.length;
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
+        });
+        expect(fakeApi.runtimeSpec.mock.calls.length).toBe(reads + 1);
+
+        storedSpecs.map_1 = clusterHead({
+          cluster_status: { state: 'forming', phase: 'members_starting', members: [] },
+        });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
+        });
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('gives up the notice of an accepted start that never shows', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderActions(
+          [instanceRow(0, { state: 'stopped' })],
+          clusterHead({ cluster_status: { state: 'cold', members: [] } }),
+          { startRuntime: async () => ({ instance: 0, state: 'starting' as const }) },
+        );
+        await openStatusTab();
+        await waitForRowActions('4100', t.runtimeStart);
+        fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+        expect(await screen.findByTestId('cluster-start-requested')).toBeInTheDocument();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_NOTICE_MS + 100);
+        });
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not take a head still formed from before as the new start', async () => {
+      let answer: (a: { instance: number; state: 'starting' }) => void = () => {};
+      const { storedSpecs } = renderActions(
+        [instanceRow(0, { state: 'stopped' })],
+        clusterHead({ cluster_status: { state: 'formed', phase: 'formed', members: [] } }),
+        { startRuntime: () => new Promise((resolve) => (answer = resolve)) },
+      );
+      await openStatusTab();
+      await waitForRowActions('4100', t.runtimeStart);
+      fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+      const notice = await screen.findByTestId('cluster-start-requested');
+      // Announced politely by screen readers.
+      expect(notice.closest('[role="status"]')).toHaveAttribute('aria-live', 'polite');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByTestId('cluster-start-requested')).toBeInTheDocument();
+
+      storedSpecs.map_1 = clusterHead({
+        cluster_status: { state: 'forming', phase: 'members_starting', members: [] },
+      });
+      await act(async () => answer({ instance: 0, state: 'starting' }));
+      await waitFor(() =>
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument(),
+      );
     });
 
     it('drops the start notice when the start is refused', async () => {

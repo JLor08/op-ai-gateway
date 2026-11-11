@@ -185,7 +185,11 @@ export const RESTART_VANISH_GRACE_MS = 8_000;
  */
 export const OVERRIDE_WRITE_TIMEOUT_MS = 30_000;
 
-export { CLUSTER_SPEC_REFRESH_MS, CLUSTER_START_REFRESH_MS } from './shared/useClusterHeadRefresh';
+export {
+  CLUSTER_SPEC_REFRESH_MS,
+  CLUSTER_START_NOTICE_MS,
+  CLUSTER_START_REFRESH_MS,
+} from './shared/useClusterHeadRefresh';
 
 /**
  * A render-only identity for one row of the two editable row lists (a spec's
@@ -4196,15 +4200,19 @@ export function RuntimeAdminSection({
     if (!mapping || !spec?.cluster_enabled || instanceIndex(row) !== 0) return null;
     return (
       <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start', flexBasis: '100%' }}>
-        {clusterRefresh.startPending(mapping.id) && (
-          <Chip
-            size="small"
-            variant="outlined"
-            color="info"
-            label={t.clusterStartRequested}
-            data-testid="cluster-start-requested"
-          />
-        )}
+        {/* A live region that is always there, so a screen reader announces
+            the notice when it appears. */}
+        <Box role="status" aria-live="polite">
+          {clusterRefresh.startPending(mapping.id) && (
+            <Chip
+              size="small"
+              variant="outlined"
+              color="info"
+              label={t.clusterStartRequested}
+              data-testid="cluster-start-requested"
+            />
+          )}
+        </Box>
         <ClusterProgress spec={spec} t={t} compact />
       </Box>
     );

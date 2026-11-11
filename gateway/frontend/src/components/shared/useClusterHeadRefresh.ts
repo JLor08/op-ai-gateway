@@ -37,10 +37,26 @@ export interface ClusterHeadRefresh {
   startPending: (mappingId: string) => boolean;
 }
 
-// The states in which a start has shown up in the head's cluster status.
-function startVisible(spec: RuntimeSpec | undefined): boolean {
-  const state = spec?.cluster_status?.state;
-  return state === 'forming' || state === 'formed';
+/**
+ * How long the notice of an accepted start waits for the start to show in
+ * the head's status before it gives up. The gateway begins the start before
+ * it answers, so the first read after the answer normally shows it; this
+ * bounds the fast cadence should it not.
+ */
+export const CLUSTER_START_NOTICE_MS = 10_000;
+
+// What a head's cluster status said when Start was pressed: a start shows
+// once it says something else, or once the cluster forms. A formed cluster
+// stopped and started again still says `formed` until the new start begins,
+// so `formed` alone is no sign of it.
+function statusMark(spec: RuntimeSpec | undefined): string {
+  const s = spec?.cluster_status;
+  if (!s) return '';
+  return [s.state, s.phase ?? '', s.cooldown_until ?? '', s.last_failure?.at ?? ''].join('|');
+}
+
+function startVisible(spec: RuntimeSpec | undefined, markAtPress: string): boolean {
+  return forming(spec) || statusMark(spec) !== markAtPress;
 }
 
 function forming(spec: RuntimeSpec | undefined): boolean {
@@ -89,7 +105,9 @@ export function useClusterHeadRefresh({
   commitRead: (mappingId: string, seen: number, spec: RuntimeSpec) => boolean;
   mountedRef: { current: boolean };
 }): ClusterHeadRefresh {
-  const [requested, setRequested] = useState<ReadonlySet<string>>(new Set());
+  // The heads whose Start was pressed, with their status mark at the press.
+  const [requested, setRequested] = useState<ReadonlyMap<string, string>>(new Map());
+  const noticeTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const inFlightRef = useRef(new Map<string, Promise<void>>());
   // The read pair changes identity on every render of the caller; the reads
   // always use the latest.
@@ -169,42 +187,59 @@ export function useClusterHeadRefresh({
     headKey.split(SEP).forEach(refreshOne);
   }, [refreshing, headKey, signature, view, refreshOne]);
 
-  // A start that shows up in the head's status needs no notice any more.
-  useEffect(() => {
-    if (requested.size === 0) return;
-    const shown = [...requested].filter((id) => startVisible(specsById[id]));
-    if (shown.length === 0) return;
-    setRequested((cur) => {
-      const next = new Set(cur);
-      shown.forEach((id) => next.delete(id));
-      return next;
-    });
-  }, [requested, specsById]);
-
   const drop = useCallback(
-    (id: string) => {
-      if (!mountedRef.current) return;
+    (ids: readonly string[]) => {
+      if (!mountedRef.current || ids.length === 0) return;
+      for (const id of ids) {
+        clearTimeout(noticeTimersRef.current.get(id));
+        noticeTimersRef.current.delete(id);
+      }
       setRequested((cur) => {
-        if (!cur.has(id)) return cur;
-        const next = new Set(cur);
-        next.delete(id);
+        if (!ids.some((id) => cur.has(id))) return cur;
+        const next = new Map(cur);
+        ids.forEach((id) => next.delete(id));
         return next;
       });
     },
     [mountedRef],
   );
 
+  // A start that shows in the head's status needs no notice any more, and a
+  // head that is gone (deleted, or no head any more) none at all.
+  useEffect(() => {
+    const done = [...requested].filter(
+      ([id, mark]) => !headIds.includes(id) || startVisible(specsById[id], mark),
+    );
+    drop(done.map(([id]) => id));
+    // headIds is derived from specsById and mappings.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requested, specsById, mappings, drop]);
+
+  useEffect(() => {
+    const timers = noticeTimersRef.current;
+    return () => timers.forEach((timer) => clearTimeout(timer));
+  }, []);
+
   return {
-    requestStart: (id) => setRequested((cur) => new Set(cur).add(id)),
-    // An accepted start has begun on the gateway: the next read shows it, so
-    // the notice lasts until that read lands.
+    requestStart: (id) => setRequested((cur) => new Map(cur).set(id, statusMark(specsById[id]))),
+    // An accepted start has begun on the gateway: the notice, and with it the
+    // fast cadence, lasts until the start shows in the head's status, or at
+    // most CLUSTER_START_NOTICE_MS.
     settleStart: (id, accepted) => {
       if (!accepted) {
-        drop(id);
+        drop([id]);
         return;
       }
-      void refreshOne(id).then(() => drop(id));
+      void refreshOne(id);
+      clearTimeout(noticeTimersRef.current.get(id));
+      noticeTimersRef.current.set(
+        id,
+        setTimeout(() => drop([id]), CLUSTER_START_NOTICE_MS),
+      );
     },
-    startPending: (id) => requested.has(id) && !startVisible(specsById[id]),
+    startPending: (id) => {
+      const mark = requested.get(id);
+      return mark !== undefined && !startVisible(specsById[id], mark);
+    },
   };
 }
