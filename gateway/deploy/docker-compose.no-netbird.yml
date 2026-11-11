@@ -26,7 +26,7 @@ services:
       # The gateway's OWN edge certificate, delivered by the backend into this shared
       # volume (OP_AI_GATEWAY_CERT_EDGE_OUTPUT_DIR). The gateway is the only writer of
       # the REAL pair; nginx only reads it (its master runs as root in
-      # nginx:1.27-alpine, so it can read the 0600 key).
+      # nginx:1.30-alpine, so it can read the 0600 key).
       #
       # NOT :ro, deliberately. `ssl_certificate` pointing at a missing file is an nginx
       # LOAD error, and this nginx is the entrance to the portal, the whole API and the

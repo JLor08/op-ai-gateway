@@ -9,8 +9,8 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM nginx:1.27-alpine
-# openssl is NOT in nginx:1.27-alpine. The entrypoint needs it for two things: the
+FROM nginx:1.30-alpine
+# openssl is NOT in nginx:1.30-alpine. The entrypoint needs it for two things: the
 # throwaway bootstrap certificate (so nginx can always start) and reading the
 # delivered chain's fingerprint (so a renewal reloads nginx).
 RUN apk add --no-cache openssl
