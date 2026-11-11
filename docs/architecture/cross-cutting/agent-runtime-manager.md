@@ -1483,11 +1483,17 @@ owns the bind and device flags:
 - **A launch change while claimed waits.** A launch-shape change of a member
   that a head holds or has reserved does not drain it: a member has no request
   in flight, so the drain would kill it at once and abort the head mid-request.
-  The relaunch is deferred until the claim ends (the hold ends and nothing
-  reserves it, or the gateway releases it when the head stops); the member then
-  drains and comes back with its current launch. The gateway relaunches the
-  head for any change of a member's launch inputs, which is what ends the claim
-  ([§3.7](#37-the-gateways-half-of-a-cluster)).
+  The relaunch is deferred, and happens at whichever comes first: the claim
+  ends (the hold ends and nothing reserves it, or the gateway releases it when
+  the head stops), or a `POST /rpc/ensure` arrives while no head holds the
+  member (only a reservation stands), in which case the ensure drains it and
+  answers with the relaunched process. Either way the member comes back with
+  its current launch. The gateway relaunches the head for any change of a
+  member's launch inputs ([§3.7](#37-the-gateways-half-of-a-cluster)), and that
+  head stop and the start after it normally carry the change through. If the
+  member's document reaches its agent only after the new head has connected,
+  the member keeps its old launch until that head next stops; it is never
+  killed under a head.
 - `GGML_RPC_NO_RDMA=1` is set: the transport is plain TCP, and an RDMA probe
   stalls the start.
 - With `rpc.cache_enabled` the member starts with `-c` and
