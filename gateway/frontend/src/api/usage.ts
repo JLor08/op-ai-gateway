@@ -75,7 +75,22 @@ export type UsageEvent = {
   // default). Never a DB column; a store-returned event never carries it until the
   // portal layer sets it, so it is optional here too (0/undefined = unknown/unpriced).
   cost_eur?: number;
+  // The energy of each host that served a llama.cpp RPC cluster request, head
+  // first, resolved at read time; absent for every other row. A member server
+  // the viewer may not see has no server_name and no cost, only its number.
+  energy_parts?: UsageEnergyPart[];
   created_at: string;
+};
+
+// One host's energy part of a cluster request (UsageEvent.energy_parts).
+export type UsageEnergyPart = {
+  role: 'head' | 'member';
+  server_name?: string;
+  // 1-based number of a member within its request; absent for the head.
+  member?: number;
+  energy_wh: number;
+  energy_source: string;
+  cost?: number;
 };
 
 export type ActivityQuery = {

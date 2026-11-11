@@ -3449,6 +3449,9 @@ const de = {
   activityColBillingQuantity: 'Abrechnungsmenge',
   activityColNonTokenRequests: 'Nicht-Token-Anfragen',
   activityNotTokenMetered: 'Nicht in Token abgerechnet',
+  activityEnergyPartsTitle: 'Energie je Host',
+  activityEnergyPartHead: 'Head',
+  activityEnergyPartMember: (n: number) => `Mitglied ${n}`,
   activityMixedUnitsHint: (n: number) => `Summe ohne ${n} nicht in Token abgerechnete Anfrage(n).`,
   energySourceHelpMeasured:
     'Gemessen: echte Leistungstelemetrie des Servers deckt das Zeitfenster dieser Anfrage lückenlos ab.',
@@ -7253,6 +7256,9 @@ const en: PortalMessages = {
   activityColBillingQuantity: 'Billing quantity',
   activityColNonTokenRequests: 'Non-token requests',
   activityNotTokenMetered: 'Not token-metered',
+  activityEnergyPartsTitle: 'Energy per host',
+  activityEnergyPartHead: 'Head',
+  activityEnergyPartMember: (n: number) => `Member ${n}`,
   activityMixedUnitsHint: (n: number) => `Sum excludes ${n} request(s) that are not token-metered.`,
   energySourceHelpMeasured:
     'Measured: real power telemetry from the server covers this request’s window without gaps.',

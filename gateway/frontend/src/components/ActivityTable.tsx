@@ -31,6 +31,7 @@ import { ServerLabelText } from './shared/ServerLabelText';
 import { StatusChip } from './shared/StatusChip';
 import { usageChipStatus } from './shared/status';
 import { ColumnFilter } from './shared/ColumnFilter';
+import { EnergyPartsCell } from './EnergyPartsCell';
 import { useColumnDrag, columnDragSx, type DragPlace } from './shared/columnDrag';
 import type { ColumnDef, ColumnId } from './activityColumns';
 import {
@@ -309,6 +310,10 @@ export function ActivityTable({
         return tokenCell(row);
       case 'cost_eur':
         return formatCost(row.cost_eur, costUnit, currencyFactor);
+      case 'energy_wh':
+        return (
+          <EnergyPartsCell row={row} t={t} costUnit={costUnit} currencyFactor={currencyFactor} />
+        );
       default:
         return renderCell(row, col.id, t);
     }

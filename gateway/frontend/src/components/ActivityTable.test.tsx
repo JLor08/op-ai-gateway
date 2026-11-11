@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActivityTable } from './ActivityTable';
 import { ACTIVITY_COLUMNS, type ColumnId } from './activityColumns';
@@ -421,6 +421,64 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(
           screen.getByRole('button', { name: `${t.listFilter}: ${t.activityColService}` }),
         ).toBeInTheDocument();
+      });
+    });
+
+    describe('energy_wh cell of a cluster request', () => {
+      const energyColumns = ACTIVITY_COLUMNS.filter(
+        (c) => c.defaultVisible || c.id === 'energy_wh',
+      );
+
+      it('lists every host in a keyboard-reachable tooltip, hidden members by number', async () => {
+        renderTable({
+          columns: energyColumns,
+          costUnit: 'eur_cent',
+          currencyFactor: 1,
+          rows: [
+            makeRow({
+              energy_wh: 7.913,
+              energy_parts: [
+                {
+                  role: 'head',
+                  server_name: 'GPU 1',
+                  energy_wh: 3.1,
+                  energy_source: 'measured',
+                  cost: 0.0008,
+                },
+                { role: 'member', member: 1, energy_wh: 2.4, energy_source: 'estimated' },
+                {
+                  role: 'member',
+                  member: 2,
+                  server_name: 'Box B',
+                  energy_wh: 2.413,
+                  energy_source: 'measured',
+                  cost: 0.0003,
+                },
+              ],
+            }),
+          ],
+        });
+        const total = screen.getByTestId('energy-parts-req_1');
+        expect(total).toHaveTextContent('7.913');
+        expect(total.getAttribute('tabindex')).toBe('0');
+        fireEvent.keyDown(document.body, { key: 'Tab' });
+        act(() => total.focus());
+        const tip = await screen.findByRole('tooltip');
+        expect(tip).toHaveTextContent(t.activityEnergyPartsTitle);
+        expect(tip).toHaveTextContent('GPU 1: 3.100 Wh');
+        expect(tip).toHaveTextContent('0.0800 ct');
+        expect(tip).toHaveTextContent(`${t.activityEnergyPartMember(1)}: 2.400 Wh`);
+        expect(tip).not.toHaveTextContent(`${t.activityEnergyPartMember(1)}: 2.400 Wh ·`);
+        expect(tip).toHaveTextContent('Box B: 2.413 Wh');
+        expect(tip).toHaveTextContent('0.0300 ct');
+        expect(within(tip).getByText('estimated')).toBeInTheDocument();
+        expect(total).toHaveAccessibleDescription(expect.stringContaining('Box B'));
+      });
+
+      it('keeps a single-host row a plain number', () => {
+        renderTable({ columns: energyColumns, rows: [makeRow({ energy_wh: 2.5 })] });
+        expect(screen.queryByTestId('energy-parts-req_1')).toBeNull();
+        expect(screen.getByRole('cell', { name: '2.500' })).toBeInTheDocument();
       });
     });
 
