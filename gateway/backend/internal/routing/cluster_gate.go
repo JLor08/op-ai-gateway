@@ -63,12 +63,13 @@ type ClusterGateVerdict struct {
 	Code      string
 }
 
-// ClusterGate answers the gate state of a mapping. It is asked only for a
-// server_agent candidate's instance 0 (a head is never replicable), once per
-// candidate per selection turn, so an answer for a mapping that is no head
-// must be cheap. Satisfied by the gateway's cluster orchestration.
+// ClusterGate answers the gate state of mapping mappingID on server serverID.
+// It is asked only for a server_agent candidate's instance 0 (a head is never
+// replicable), once per candidate per selection turn, so an answer for a
+// mapping that is no head must be cheap. Satisfied by the gateway's cluster
+// orchestration.
 type ClusterGate interface {
-	ClusterGateState(ctx context.Context, mappingID string) ClusterGateVerdict
+	ClusterGateState(ctx context.Context, serverID, mappingID string) ClusterGateVerdict
 }
 
 // SetClusterGate installs the cluster gate. Leaving it unset (nil) means no
@@ -78,10 +79,13 @@ func (r *Resolver) SetClusterGate(g ClusterGate) { r.clusterGate = g }
 // ClusterUnavailableError is the request's answer when the only candidates
 // left were cluster heads that cannot serve: Code is the cluster's stable code
 // (runtime.cluster_start_failed while it cools down after a failed start,
-// runtime.cluster_unavailable otherwise), Head the head's spec id.
+// runtime.cluster_unavailable otherwise), Head the head's spec id. The gateway
+// answers a request whose head's cluster failed to form on the dispatch path
+// with it too, Cause then naming what failed (the start's cause code).
 type ClusterUnavailableError struct {
-	Code string
-	Head string
+	Code  string
+	Cause string
+	Head  string
 }
 
 func (e *ClusterUnavailableError) Error() string { return e.Code }
@@ -112,7 +116,7 @@ func (r *Resolver) clusterVerdict(ctx context.Context, c MappingCandidate) Clust
 	if r.clusterGate == nil || c.Application.Type != ProviderServerAgent || c.Instance != 0 {
 		return ClusterGateVerdict{}
 	}
-	return r.clusterGate.ClusterGateState(ctx, c.Mapping.ID)
+	return r.clusterGate.ClusterGateState(ctx, c.Server.ID, c.Mapping.ID)
 }
 
 // gate sorts c by its verdict: it returns true when c may be dispatched,

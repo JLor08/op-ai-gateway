@@ -2542,7 +2542,14 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   by the **cluster's own bound** — the head's startup timeout plus its slowest member's — clipped
   by the head application's `timeout_ms`, not by `admission_queue_timeout_seconds`; a turn that
   parks on other candidates at their cap as well waits for the later of the two, and a request
-  keeps the cluster's bound for its later turns once it parked for one. A request that must not
+  keeps the cluster's bound for its later turns once it parked for one (a plain model and a group
+  alike). Cluster parks wait in the same global admission queue as every other park, so they count
+  toward `admission_queue_max_depth`: a burst of requests for a cold head can fill the queue and be
+  refused `routing.admission_queue_full`, and so can the other requests arriving meanwhile. The
+  bound (Q4) can also be shorter than a worst-case start, which adds the configuration
+  acknowledgement wait (up to 30 s), the member and head margins and the formation wait to the
+  startup timeouts: a parked request can time out with `routing.admission_queue_timeout` while
+  the cluster still forms, and its client's retry then finds it formed. A request that must not
   park (`NoPark`, `CheckOnly`), or a resolver without a queue, is served by a parkable head only
   when no running candidate is left; the voice-chat gate then starts the cluster itself through
   the orchestration.
@@ -2551,12 +2558,20 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   else serves the model the request fails with the cluster's code (§8), never
   `routing.no_healthy_host`. In a model group such a member is unavailable and the walk goes on.
 
-A sticky pin to a head that has not formed is passed over and kept, so the fresh selection parks
-the request. A request that reached a head in the race between its selection and a stop of the
+Only an agent known to declare `rpc_cluster` is asked about at all (no other agent runs a head),
+so a mapping on any other agent costs the gate no spec read; an agent whose features are not
+known yet (it has not reported since the gateway started) is not gated, and a request reaching a
+head there is handled on the dispatch path below. A sticky pin to a head that has not formed is
+passed over and kept, so the fresh selection parks the request. A request that reached a head in the race between its selection and a stop of the
 head (the agent's `runtime.cluster_not_ready`, buffered or streamed, before any byte was
 relayed) has the cluster started again — bounded by the request and its application's
-`timeout_ms` — and is sent to the same head **once** more; a second refusal is its answer. A
-server override is not gated and relies on that retry. The model warmer skips heads, and Loads,
+`timeout_ms` — and is sent to the same head **once** more; a second refusal is its answer, and a
+start that fails is answered with the cluster's own code (`runtime.cluster_start_failed`,
+`.cluster_member_unused` or `.cluster_unavailable`, the cause in the message). Every refusal of
+a head that reaches a client — `runtime.cluster_not_ready` or `.cluster_member_unreachable`,
+through a relay that does not retry or a server override, which is not gated — is a **503** with
+the agent's code, never `502 provider.unavailable`; the native relays forward the agent's error
+envelope at its status. The model warmer skips heads, and Loads,
 VRAM runs, the speed, capacity and both benchmark modes and the audio benchmark refuse a head
 with `runtime.cluster_head_unsupported` (an application or server scope skips it as
 `cluster_head`).

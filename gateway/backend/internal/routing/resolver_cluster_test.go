@@ -33,7 +33,7 @@ type fakeClusterGate struct {
 	asked    []string
 }
 
-func (g *fakeClusterGate) ClusterGateState(_ context.Context, mappingID string) ClusterGateVerdict {
+func (g *fakeClusterGate) ClusterGateState(_ context.Context, _, mappingID string) ClusterGateVerdict {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.asked = append(g.asked, mappingID)
@@ -314,6 +314,13 @@ func TestGroupExcludedClusterMemberFailsWithClusterCode(t *testing.T) {
 // rather than timing out at once on the short queue timeout it had outlived
 // while the cluster formed.
 func TestResolveKeepsTheClusterBoundOnceFormed(t *testing.T) {
+	for _, model := range []string{clusterTestModel, "big-group"} {
+		t.Run(model, func(t *testing.T) { keepsTheClusterBound(t, model) })
+	}
+}
+
+func keepsTheClusterBound(t *testing.T, model string) {
+	t.Helper()
 	now := instanceCapacityNow
 	store := clusterHeadStore(t, now, 5, 600000)
 	m, err := store.MappingByID(context.Background(), clusterTestMapping)
@@ -327,6 +334,9 @@ func TestResolveKeepsTheClusterBoundOnceFormed(t *testing.T) {
 	gate := &fakeClusterGate{verdicts: map[string]ClusterGateVerdict{clusterTestMapping: parkable(2 * time.Minute)}}
 	r, _ := clusterResolver(store, now, gate)
 	r.SetServerActivityChecker(&fakeActivity{inFlight: map[string]int{clusterTestServer: 1}}, 0)
+	r.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{
+		"big-group": {policy: GroupPolicy{FailoverMode: "sticky"}, members: []GroupMember{{ID: "gm_h", GroupID: "grp1", MemberGatewayName: clusterTestModel, Priority: 0}}},
+	}})
 	var timeouts []time.Duration
 	adm := &fakeAdmission{}
 	adm.onWait = func(call int) error {
@@ -339,10 +349,55 @@ func TestResolveKeepsTheClusterBoundOnceFormed(t *testing.T) {
 	}
 	r.SetAdmissionController(adm)
 
-	if _, err := r.Resolve(context.Background(), auth.Token{}, chatRequest(clusterTestModel)); !errors.Is(err, ErrAdmissionQueueTimeout) {
+	if _, err := r.Resolve(context.Background(), auth.Token{}, chatRequest(model)); !errors.Is(err, ErrAdmissionQueueTimeout) {
 		t.Fatalf("Resolve err = %v, want the second wait's ErrAdmissionQueueTimeout", err)
 	}
 	if len(timeouts) != 2 || timeouts[0] != 2*time.Minute || timeouts[1] != 2*time.Minute {
 		t.Fatalf("wait bounds = %v, want the cluster's 2m on both turns", timeouts)
+	}
+}
+
+// A request that first parked for a slot on a formed head and finds the
+// cluster cold on a later turn (the head exited meanwhile) waits for the
+// cluster's bound from then on, in a group as on a plain model: the deadline
+// is not the one its first turn fixed.
+func TestResolveTakesTheClusterBoundOnALaterTurn(t *testing.T) {
+	for _, model := range []string{clusterTestModel, "big-group"} {
+		t.Run(model, func(t *testing.T) {
+			now := instanceCapacityNow
+			store := clusterHeadStore(t, now, 5, 600000)
+			m, err := store.MappingByID(context.Background(), clusterTestMapping)
+			if err != nil {
+				t.Fatalf("MappingByID: %v", err)
+			}
+			m.MaxConcurrency = 1
+			if err := store.UpdateMapping(context.Background(), m); err != nil {
+				t.Fatalf("UpdateMapping: %v", err)
+			}
+			gate := &fakeClusterGate{verdicts: map[string]ClusterGateVerdict{clusterTestMapping: {State: ClusterGateFormed, Head: clusterTestHead}}}
+			r, _ := clusterResolver(store, now, gate)
+			r.SetServerActivityChecker(&fakeActivity{inFlight: map[string]int{clusterTestServer: 1}}, 0)
+			r.SetGroupResolver(&fakeGroups{groups: map[string]fakeGroup{
+				"big-group": {policy: GroupPolicy{FailoverMode: "sticky"}, members: []GroupMember{{ID: "gm_h", GroupID: "grp1", MemberGatewayName: clusterTestModel, Priority: 0}}},
+			}})
+			var timeouts []time.Duration
+			adm := &fakeAdmission{}
+			adm.onWait = func(call int) error {
+				timeouts = append(timeouts, adm.gotTimeout)
+				if call == 1 {
+					gate.set(clusterTestMapping, parkable(2*time.Minute))
+					return nil
+				}
+				return ErrAdmissionQueueTimeout
+			}
+			r.SetAdmissionController(adm)
+
+			if _, err := r.Resolve(context.Background(), auth.Token{}, chatRequest(model)); !errors.Is(err, ErrAdmissionQueueTimeout) {
+				t.Fatalf("Resolve err = %v, want the second wait's ErrAdmissionQueueTimeout", err)
+			}
+			if len(timeouts) != 2 || timeouts[0] != 5*time.Second || timeouts[1] != 2*time.Minute {
+				t.Fatalf("wait bounds = %v, want the queue's 5s, then the cluster's 2m", timeouts)
+			}
+		})
 	}
 }

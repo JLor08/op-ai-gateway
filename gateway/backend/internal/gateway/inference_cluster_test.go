@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"strings"
@@ -27,7 +28,7 @@ import (
 // fakeClusterHeads answers which mappings are cluster heads.
 type fakeClusterHeads map[string]string
 
-func (f fakeClusterHeads) clusterHead(_ context.Context, mappingID string) (string, bool) {
+func (f fakeClusterHeads) clusterHead(_ context.Context, _, mappingID string) (string, bool) {
 	head, ok := f[mappingID]
 	return head, ok
 }
@@ -58,7 +59,7 @@ func newTestClusterGate(f *orchFixture, busy routing.ServerBusyChecker) *cluster
 func TestClusterGateVerdicts(t *testing.T) {
 	t.Run("no head", func(t *testing.T) {
 		f := newOrchFixture(t, 1, "relay", "lan")
-		if v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_other"); v.State != routing.ClusterGateNone {
+		if v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), orchHeadServer, "map_other"); v.State != routing.ClusterGateNone {
 			t.Fatalf("verdict = %+v, want none for a mapping that is no head", v)
 		}
 	})
@@ -67,7 +68,7 @@ func TestClusterGateVerdicts(t *testing.T) {
 		f.portal.plan.Members[1].StartupTimeoutSeconds = 8
 		f.activeMembers()
 		g := newTestClusterGate(f, nil)
-		v := g.ClusterGateState(context.Background(), "map_head")
+		v := g.ClusterGateState(context.Background(), orchHeadServer, "map_head")
 		// 10 units for the head plus 8 for the slowest member, 10 ms each.
 		if v.State != routing.ClusterGateParkable || v.Head != orchHead || v.ParkBound != 180*time.Millisecond {
 			t.Fatalf("cold verdict = %+v, want parkable for %s with a 180ms bound", v, orchHead)
@@ -77,7 +78,7 @@ func TestClusterGateVerdicts(t *testing.T) {
 		if err := f.o.Ensure(context.Background(), orchHead); err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
-		if v := g.ClusterGateState(context.Background(), "map_head"); v.State != routing.ClusterGateFormed {
+		if v := g.ClusterGateState(context.Background(), orchHeadServer, "map_head"); v.State != routing.ClusterGateFormed {
 			t.Fatalf("formed verdict = %+v, want formed", v)
 		}
 	})
@@ -89,7 +90,7 @@ func TestClusterGateVerdicts(t *testing.T) {
 		if err := f.o.Ensure(context.Background(), orchHead); err == nil {
 			t.Fatal("Ensure succeeded, want the member's refusal")
 		}
-		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_head")
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), orchHeadServer, "map_head")
 		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterStartFailed {
 			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterStartFailed)
 		}
@@ -97,7 +98,7 @@ func TestClusterGateVerdicts(t *testing.T) {
 	t.Run("withheld", func(t *testing.T) {
 		f := newOrchFixture(t, 1, "relay", "lan")
 		f.portal.plan.WithheldReason = "runtime_config.agent_features_pending"
-		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_head")
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), orchHeadServer, "map_head")
 		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable {
 			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterUnavailable)
 		}
@@ -105,7 +106,7 @@ func TestClusterGateVerdicts(t *testing.T) {
 	t.Run("member server held by a benchmark", func(t *testing.T) {
 		f := newOrchFixture(t, 1, "relay", "lan")
 		f.activeMembers()
-		v := newTestClusterGate(f, fakeServerBusy{orchMemberServer(0): true}).ClusterGateState(context.Background(), "map_head")
+		v := newTestClusterGate(f, fakeServerBusy{orchMemberServer(0): true}).ClusterGateState(context.Background(), orchHeadServer, "map_head")
 		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable {
 			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterUnavailable)
 		}
@@ -114,7 +115,7 @@ func TestClusterGateVerdicts(t *testing.T) {
 		f := newOrchFixture(t, 1, "relay", "lan")
 		f.activeMembers()
 		f.portal.plan.Members[0].Server.HealthStatus = routing.HealthUnhealthy
-		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_head")
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), orchHeadServer, "map_head")
 		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable {
 			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterUnavailable)
 		}
@@ -259,6 +260,7 @@ func coldClusterHeadServer(t *testing.T, prov provider.Client) (*Server, *orchFi
 	must("CreateMapping", srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: "map_head", ApplicationID: "app_head", GatewayModelName: orchHeadModel, AppModelName: orchHeadModel, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 	must("UpsertRuntimeSpec", srv.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: orchHead, MappingID: "map_head", Enabled: true, ClusterEnabled: true, StartupTimeoutSeconds: 10, Binary: "/opt/bin/llama-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, CreatedAt: now, UpdatedAt: now}))
 
+	srv.AgentFeatures.Set(orchHeadServer, []string{rpcClusterFeature})
 	f := newOrchFixture(t, 1, "relay", "lan")
 	f.activeMembers()
 	f.ackAll()
@@ -342,16 +344,76 @@ func TestCompletionRetriesOnceOnClusterNotReady(t *testing.T) {
 			srv, _ := clusterHeadServer(t, prov)
 
 			rec := postChat(srv, tc.body)
-			if rec.Code == http.StatusOK && !tc.stream {
-				t.Fatalf("answer = %d %s, want the refusal", rec.Code, rec.Body.String())
-			}
-			if strings.Contains(rec.Body.String(), "served by the head") {
-				t.Fatalf("answer = %s, want no served content", rec.Body.String())
-			}
+			assertClusterAnswer(t, rec, tc.stream, codeClusterNotReady)
 			if prov.callCount() != 2 {
 				t.Fatalf("provider calls = %d, want exactly one retry", prov.callCount())
 			}
 		})
+		t.Run(tc.name+": the cluster fails to form again", func(t *testing.T) {
+			prov := &clusterNotReadyProvider{refusals: 1}
+			srv, f := clusterHeadServer(t, prov)
+			f.agent.mu.Lock()
+			f.agent.memberErr[orchMemberSpec(0)] = orchRefusal(http.StatusServiceUnavailable, "runtime.admission_blocked")
+			f.agent.mu.Unlock()
+
+			rec := postChat(srv, tc.body)
+			assertClusterAnswer(t, rec, tc.stream, codeClusterStartFailed)
+			if prov.callCount() != 1 {
+				t.Fatalf("provider calls = %d, want no retry after the failed start", prov.callCount())
+			}
+		})
+	}
+}
+
+// assertClusterAnswer checks a request answered with code: a buffered request
+// as a 503 with that code, a streamed one in its error frame. Nothing was
+// served.
+func assertClusterAnswer(t *testing.T, rec *httptest.ResponseRecorder, stream bool, code string) {
+	t.Helper()
+	if strings.Contains(rec.Body.String(), "served by the head") {
+		t.Fatalf("answer = %s, want no served content", rec.Body.String())
+	}
+	if stream {
+		if !strings.Contains(rec.Body.String(), `"code":"`+code+`"`) {
+			t.Fatalf("stream = %s, want an error frame with %s", rec.Body.String(), code)
+		}
+		return
+	}
+	var body apierror.Body
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", rec.Body.String(), err)
+	}
+	if rec.Code != http.StatusServiceUnavailable || body.Error.Code != code {
+		t.Fatalf("answer = %d %s, want 503 %s", rec.Code, rec.Body.String(), code)
+	}
+}
+
+// The agent's refusals of a cluster head a request reached without a retry --
+// a relay that does not retry, a server override the gate does not judge, the
+// second refusal after the one retry -- are 503 with the agent's code, not 502
+// provider.unavailable. A relay forwards the agent's envelope at its status;
+// the images relay keeps that envelope rather than renaming its code.
+func TestClusterRefusalsAnswer503WithTheirCode(t *testing.T) {
+	for _, code := range []string{codeClusterNotReady, codeClusterMemberUnreachable} {
+		err := orchRefusal(http.StatusServiceUnavailable, code)
+		if got := completionHTTPStatus(err); got != http.StatusServiceUnavailable {
+			t.Fatalf("%s: status = %d, want 503", code, got)
+		}
+		if got := completionErrorCode(err); got != code {
+			t.Fatalf("%s: code = %q, want the agent's", code, got)
+		}
+		if body := completionErrorResponse(err); body.Error.Code != code || body.Error.Message == "provider unavailable" {
+			t.Fatalf("%s: body = %+v, want the code with its own message", code, body)
+		}
+		envelope := []byte(`{"error":{"code":"` + code + `","message":"` + code + `"}}`)
+		if body, ok := normalizeImagesUpstreamError(http.StatusServiceUnavailable, envelope); !ok || body.Error.Code != code {
+			t.Fatalf("%s: images relay body = %+v, %v; want the agent's envelope kept", code, body, ok)
+		}
+	}
+	failed := &routing.ClusterUnavailableError{Code: codeClusterStartFailed, Cause: codeClusterMemberUnreachable, Head: orchHead}
+	if completionHTTPStatus(failed) != http.StatusServiceUnavailable || completionErrorCode(failed) != codeClusterStartFailed ||
+		!strings.Contains(completionErrorResponse(failed).Error.Message, codeClusterMemberUnreachable) {
+		t.Fatalf("start failure answer = %d %q %q, want 503 %s naming the cause", completionHTTPStatus(failed), completionErrorCode(failed), completionErrorResponse(failed).Error.Message, codeClusterStartFailed)
 	}
 }
 
@@ -438,5 +500,89 @@ func TestVoiceGateUsesOrchestratorForHeads(t *testing.T) {
 	var ce *clusterError
 	if !errors.As(err, &ce) || ce.Code != codeClusterStartFailed {
 		t.Fatalf("ensureVoiceTarget err = %v, want the cluster's start failure", err)
+	}
+}
+
+// singleSpecReader answers one spec for every mapping and counts the reads.
+type singleSpecReader struct {
+	mu    sync.Mutex
+	spec  routing.RuntimeSpec
+	reads int
+}
+
+func (c *singleSpecReader) RuntimeSpecByMapping(context.Context, string) (routing.RuntimeSpec, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads++
+	return c.spec, true, nil
+}
+
+// The cluster gate asks for a mapping's spec only on an agent that declares
+// rpc_cluster: no other agent runs a head, and a mapping there costs no read.
+func TestClusterHeadLookupNeedsRPCCluster(t *testing.T) {
+	ctx := context.Background()
+	store := &singleSpecReader{spec: routing.RuntimeSpec{ID: orchHead, ClusterEnabled: true}}
+	features := newAgentFeaturesRegistry()
+	src := newInstanceSource(store, features, newRuntimeStatusRegistry())
+
+	if _, ok := src.clusterHead(ctx, orchHeadServer, "map_head"); ok || store.reads != 0 {
+		t.Fatalf("head %v after %d reads, want no head and no read on an agent without rpc_cluster", ok, store.reads)
+	}
+	features.Set(orchHeadServer, []string{rpcClusterFeature})
+	if head, ok := src.clusterHead(ctx, orchHeadServer, "map_head"); !ok || head != orchHead || store.reads != 1 {
+		t.Fatalf("head %q, %v after %d reads, want %s from one read", head, ok, store.reads, orchHead)
+	}
+}
+
+// blockingPlanPortal holds every ClusterPlan read until release closes, and
+// counts them.
+type blockingPlanPortal struct {
+	*orchPortal
+	release chan struct{}
+	mu      sync.Mutex
+	reads   int
+}
+
+func (p *blockingPlanPortal) ClusterPlan(ctx context.Context, head string) (portal.ClusterPlan, error) {
+	p.mu.Lock()
+	p.reads++
+	p.mu.Unlock()
+	<-p.release
+	return p.orchPortal.ClusterPlan(ctx, head)
+}
+
+func (p *blockingPlanPortal) readCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reads
+}
+
+// The first gate view of a head is read once however many requests ask while
+// that read is in flight: they wait for it rather than read the plan too.
+func TestClusterGateViewFirstReadIsSingleFlight(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	blocking := &blockingPlanPortal{orchPortal: f.portal, release: make(chan struct{})}
+	f.o.deps.portal = blocking
+	waiting := make(chan string, 8)
+	f.o.viewWaitHook = func(head string) { waiting <- head }
+
+	const askers = 5
+	views := make(chan clusterGateView, askers)
+	go func() { views <- f.o.gateView(context.Background(), orchHead) }()
+	waitFor(t, func() bool { return blocking.readCount() == 1 })
+	for range askers - 1 {
+		go func() { views <- f.o.gateView(context.Background(), orchHead) }()
+	}
+	for range askers - 1 {
+		<-waiting
+	}
+	close(blocking.release)
+	for range askers {
+		if v := <-views; v.bound != 150*time.Millisecond {
+			t.Fatalf("view bound = %v, want the plan's 150ms", v.bound)
+		}
+	}
+	if n := blocking.readCount(); n != 1 {
+		t.Fatalf("plan reads = %d, want one", n)
 	}
 }

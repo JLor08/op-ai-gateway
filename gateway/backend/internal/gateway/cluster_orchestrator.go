@@ -276,9 +276,12 @@ type clusterOrchestrator struct {
 	mu    sync.Mutex
 	heads map[string]*clusterHeadState
 	// views is the cluster gate's view of each head (gateView), viewReads the
-	// heads a view read is in flight for.
-	views     map[string]clusterGateView
-	viewReads map[string]bool
+	// heads a view read is in flight for, each closed when its read landed.
+	// viewWaitHook is a TEST-ONLY seam: when set, gateView calls it with the
+	// head each time a request starts waiting on a read in flight.
+	views        map[string]clusterGateView
+	viewReads    map[string]chan struct{}
+	viewWaitHook func(head string)
 
 	wg sync.WaitGroup // one per running start and per reconciler-spawned ensure
 }
@@ -322,7 +325,7 @@ type clusterStart struct {
 func newClusterOrchestrator(deps clusterOrchestratorDeps, t clusterTimings) *clusterOrchestrator {
 	return &clusterOrchestrator{
 		deps: deps, t: t, bootAt: deps.now(), trigger: make(chan struct{}, 1),
-		heads: map[string]*clusterHeadState{}, views: map[string]clusterGateView{}, viewReads: map[string]bool{},
+		heads: map[string]*clusterHeadState{}, views: map[string]clusterGateView{}, viewReads: map[string]chan struct{}{},
 	}
 }
 

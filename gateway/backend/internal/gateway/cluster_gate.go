@@ -54,19 +54,44 @@ func (o *clusterOrchestrator) viewOf(plan portal.ClusterPlan) clusterGateView {
 }
 
 // gateView is head's gate view, from the cache while it answers. A stale or
-// missing view is read again (one read per head at a time; a request that
-// finds a read in flight answers with the view it has), bounded by
-// clusterGateViewReadTimeout. A read that fails keeps the last view, or --
-// without one -- assumes the agent's default startup timeout for the head and
-// one member, and judges no member server.
+// missing view is read again, one read per head at a time, bounded by
+// clusterGateViewReadTimeout: a request that finds a read in flight answers
+// with the stale view it has, or -- without one -- waits for that read (or its
+// own end). A read that fails keeps the last view, or -- without one --
+// assumes the agent's default startup timeout for the head and one member, and
+// judges no member server; a request that ended before any view existed is
+// judged the same way.
 func (o *clusterOrchestrator) gateView(ctx context.Context, head string) clusterGateView {
+	fallback := clusterGateView{bound: 2 * o.startupBound(0)}
 	o.mu.Lock()
 	v, ok := o.views[head]
-	if ok && (o.deps.now().Before(v.until) || o.viewReads[head]) {
+	if ok && o.deps.now().Before(v.until) {
 		o.mu.Unlock()
 		return v
 	}
-	o.viewReads[head] = true
+	if done, reading := o.viewReads[head]; reading {
+		hook := o.viewWaitHook
+		o.mu.Unlock()
+		if ok {
+			return v
+		}
+		if hook != nil {
+			hook(head)
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+		o.mu.Lock()
+		v, ok = o.views[head]
+		o.mu.Unlock()
+		if !ok {
+			return fallback
+		}
+		return v
+	}
+	done := make(chan struct{})
+	o.viewReads[head] = done
 	o.mu.Unlock()
 
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterGateViewReadTimeout)
@@ -76,13 +101,14 @@ func (o *clusterOrchestrator) gateView(ctx context.Context, head string) cluster
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	delete(o.viewReads, head)
+	defer close(done)
 	switch {
 	case errors.Is(err, portal.ErrRuntimeSpecNotFound):
 		v = clusterGateView{withheld: portal.ErrRuntimeSpecNotFound.Error(), until: o.deps.now().Add(clusterGateViewTTL)}
 	case err != nil:
 		slog.Warn("cluster gate: reading the head's plan failed; judging it by the last view", "head_spec_id", head, "err", err)
 		if !ok {
-			v = clusterGateView{bound: 2 * o.startupBound(0)}
+			v = fallback
 		}
 		v.until = o.deps.now().Add(clusterGateViewTTL)
 	default:
@@ -95,7 +121,7 @@ func (o *clusterOrchestrator) gateView(ctx context.Context, head string) cluster
 // clusterHeadSource answers whether a mapping's spec is a cluster head, and
 // its spec id. Satisfied by the instance source's spec cache.
 type clusterHeadSource interface {
-	clusterHead(ctx context.Context, mappingID string) (string, bool)
+	clusterHead(ctx context.Context, serverID, mappingID string) (string, bool)
 }
 
 // clusterRoutingGate is the gateway's routing.ClusterGate: a mapping whose
@@ -120,8 +146,8 @@ type clusterRoutingGate struct {
 //     configuration change fixes, a member server not selectable or held by a
 //     benchmark, or no orchestration at all: excluded with
 //     runtime.cluster_unavailable.
-func (g *clusterRoutingGate) ClusterGateState(ctx context.Context, mappingID string) routing.ClusterGateVerdict {
-	head, ok := g.heads.clusterHead(ctx, mappingID)
+func (g *clusterRoutingGate) ClusterGateState(ctx context.Context, serverID, mappingID string) routing.ClusterGateVerdict {
+	head, ok := g.heads.clusterHead(ctx, serverID, mappingID)
 	if !ok {
 		return routing.ClusterGateVerdict{}
 	}
@@ -180,17 +206,23 @@ func isClusterNotReady(err error) bool {
 // err is the agent's runtime.cluster_not_ready and target is a cluster head
 // (instance 0, as every head is), the head's cluster is started again -- the
 // orchestration's Ensure, joined if a start already runs -- bounded by ctx and
-// the target's own timeout, and true says the request is to be sent to the same
-// head once more. The caller sends it once; a second refusal is the request's
-// answer, so the retry never loops. False for any other error, a head whose
-// start failed, and a gateway without an orchestration.
-func (s *Server) readyClusterHead(ctx context.Context, target routing.Target, err error) bool {
+// the target's own timeout, and retry true says the request is to be sent to
+// the same head once more. The caller sends it once; a second refusal is the
+// request's answer, so the retry never loops.
+//
+// Without a retry, answer is the error the request is answered with: the
+// cluster's own failure (a *routing.ClusterUnavailableError carrying the
+// start's code and cause, answered 503 like the gate's exclusion) when the
+// start failed, and err itself otherwise -- any other error, a mapping that is
+// no head, a gateway without an orchestration, or a request that ended while
+// the cluster formed.
+func (s *Server) readyClusterHead(ctx context.Context, target routing.Target, err error) (retry bool, answer error) {
 	if !isClusterNotReady(err) || s.clusters == nil || s.Routes == nil {
-		return false
+		return false, err
 	}
 	spec, ok, serr := s.Routes.RuntimeSpecByMapping(ctx, target.RouteID)
 	if serr != nil || !ok || !spec.ClusterEnabled {
-		return false
+		return false, err
 	}
 	if target.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -198,9 +230,13 @@ func (s *Server) readyClusterHead(ctx context.Context, target routing.Target, er
 		defer cancel()
 	}
 	if eerr := s.clusters.Ensure(ctx, spec.ID); eerr != nil {
-		slog.Info("inference: the cluster head was not ready and its cluster did not form; answering the refusal", "head_spec_id", spec.ID, "err", eerr)
-		return false
+		slog.Info("inference: the cluster head was not ready and its cluster did not form; answering the cluster's failure", "head_spec_id", spec.ID, "err", eerr)
+		var ce *clusterError
+		if errors.As(eerr, &ce) {
+			return false, &routing.ClusterUnavailableError{Code: ce.Code, Cause: ce.Cause, Head: spec.ID}
+		}
+		return false, err
 	}
 	slog.Info("inference: the cluster head was not ready; its cluster formed, retrying once", "head_spec_id", spec.ID, "server", target.ServerID)
-	return true
+	return true, nil
 }

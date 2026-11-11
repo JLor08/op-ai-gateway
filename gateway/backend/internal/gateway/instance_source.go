@@ -168,13 +168,17 @@ func (s *instanceSource) InstanceView(ctx context.Context, serverID string, m ro
 	return view, true
 }
 
-// clusterHead reports whether mapping mappingID's spec is a llama.cpp RPC
-// cluster head, and its spec id. It answers from the spec cache instance
-// expansion reads (spec), so the cluster gate costs a mapping that is no head
-// nothing beyond that cached read; unlike InstanceView it does not ask the
-// agent's features first, since a head is never replicable.
-func (s *instanceSource) clusterHead(ctx context.Context, mappingID string) (string, bool) {
-	if s == nil {
+// clusterHead reports whether mapping mappingID on serverID is a llama.cpp RPC
+// cluster head, and its spec id. Only an agent KNOWN to declare rpc_cluster
+// runs a head -- the runtime documents withhold every cluster from the others
+// -- so, like InstanceView, it asks the agent's features first and an agent
+// without the feature costs no spec read; one that has it is answered from the
+// spec cache instance expansion reads (spec). An agent whose features are not
+// known yet (it has not reported since the gateway started) is not gated: a
+// request that reaches a head there is refused as not ready and answered, or
+// retried, on the dispatch path (readyClusterHead).
+func (s *instanceSource) clusterHead(ctx context.Context, serverID, mappingID string) (string, bool) {
+	if s == nil || !s.features.Has(serverID, rpcClusterFeature) {
 		return "", false
 	}
 	e := s.spec(ctx, mappingID)

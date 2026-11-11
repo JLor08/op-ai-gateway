@@ -73,11 +73,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	// Attach the resolved application's per-app upstream credential (fail-open).
 	provCtx = s.upstreamAuthCtx(provCtx, target)
 	resp, err := s.Provider.Complete(provCtx, target, providerReq)
-	if err != nil && s.readyClusterHead(r.Context(), target, err) {
-		// The head refused as not ready -- it stopped between the selection and the
-		// dispatch -- and its cluster formed again: the same head is asked once more
-		// (cluster_gate.go). A second refusal is the answer.
-		resp, err = s.Provider.Complete(provCtx, target, providerReq)
+	if err != nil {
+		// A head refused as not ready -- it stopped between the selection and the
+		// dispatch -- whose cluster formed again is asked once more; a second refusal
+		// is the answer, and so is the cluster's failure when it did not form
+		// (cluster_gate.go).
+		var retry bool
+		if retry, err = s.readyClusterHead(r.Context(), target, err); retry {
+			resp, err = s.Provider.Complete(provCtx, target, providerReq)
+		}
 	}
 	if err != nil && reselectsLostInstance(target, req, err) {
 		// The instance is gone (see instance_reselect.go): nothing has been written
@@ -1025,6 +1029,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if ce, ok := clusterUnavailable(err); ok {
 		message = clusterUnavailableMessage(ce)
 	}
+	if code, ok := clusterRouterRefusal(err); ok {
+		message = clusterRefusalMessages[code]
+	}
 	if errors.Is(err, errImageEditUnavailable) {
 		message = "image edit is not available on this model's server: its agent has not declared the " + multipartProxyFeature + " feature. The agent is older than 0.9.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported"
 	}
@@ -1120,6 +1127,9 @@ func completionHTTPStatus(err error) int {
 	if _, ok := clusterUnavailable(err); ok {
 		return http.StatusServiceUnavailable
 	}
+	if _, ok := clusterRouterRefusal(err); ok {
+		return http.StatusServiceUnavailable
+	}
 	return http.StatusBadGateway
 }
 
@@ -1132,15 +1142,48 @@ func clusterUnavailable(err error) (*routing.ClusterUnavailableError, bool) {
 
 // clusterUnavailableMessage words a routing.ClusterUnavailableError.
 func clusterUnavailableMessage(ce *routing.ClusterUnavailableError) string {
-	if ce.Code == codeClusterStartFailed {
-		return "the model's llama.cpp RPC cluster failed to start and is cooling down; retry shortly"
+	msg := "the model's llama.cpp RPC cluster cannot be started right now"
+	switch ce.Code {
+	case codeClusterStartFailed:
+		msg = "the model's llama.cpp RPC cluster failed to start and is cooling down; retry shortly"
+	case codeClusterMemberUnused:
+		msg = "the model's llama.cpp RPC cluster started, but a member never joined it; retry shortly"
 	}
-	return "the model's llama.cpp RPC cluster cannot be started right now"
+	if ce.Cause != "" && ce.Cause != ce.Code {
+		msg += " (cause: " + ce.Cause + ")"
+	}
+	return msg
+}
+
+// clusterRefusalMessages words the agent's refusals of a cluster head that a
+// request reached (clusterRouterRefusal).
+var clusterRefusalMessages = map[string]string{
+	codeClusterNotReady:          "the model's llama.cpp RPC cluster is not formed yet; retry shortly",
+	codeClusterMemberUnreachable: "a member of the model's llama.cpp RPC cluster is unreachable; retry shortly",
+}
+
+// clusterRouterRefusal reports whether err is the agent's refusal of a cluster
+// head a request reached -- runtime.cluster_not_ready (the head has not formed:
+// the request reached it in a race with a stop, through a relay that does not
+// retry, or through a server override, which the cluster gate does not judge)
+// or runtime.cluster_member_unreachable -- and its code. Such a refusal is
+// answered 503 with the agent's code, as the gate's own exclusion is, rather
+// than as an upstream failure: a retry once the cluster formed cures it.
+func clusterRouterRefusal(err error) (string, bool) {
+	var re *provider.RouterError
+	if !errors.As(err, &re) {
+		return "", false
+	}
+	_, ok := clusterRefusalMessages[re.Code]
+	return re.Code, ok
 }
 
 func completionErrorCode(err error) string {
 	if ce, ok := clusterUnavailable(err); ok {
 		return ce.Code
+	}
+	if code, ok := clusterRouterRefusal(err); ok {
+		return code
 	}
 	switch {
 	case errors.Is(err, routing.ErrModelNotCapable):

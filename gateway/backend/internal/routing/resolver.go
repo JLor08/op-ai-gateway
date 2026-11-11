@@ -3533,7 +3533,8 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// established on the first queue so the queue's internal liveness re-check cannot re-arm
 	// the full budget every iteration (mirrors the main Resolve deadline semantics), counted
 	// from the request's admission start (admissionStart) when the caller set one.
-	var deadline time.Time
+	var deadline, start time.Time
+	var clusterBound time.Duration
 	for {
 		name, sel, park, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.walk())
 		if err != nil {
@@ -3565,21 +3566,23 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		}
 		if len(park.servers) > 0 && r.admission != nil {
 			queueTimeout := time.Duration(park.queueSecs) * time.Second
-			if deadline.IsZero() {
-				start := admissionStart(g.req, g.now)
-				var queueDeadline time.Time
-				if queueTimeout > 0 {
-					queueDeadline = start.Add(queueTimeout)
-				}
-				// A park on cold cluster heads waits for the cluster's own bound
-				// (parkDeadline).
-				deadline = parkDeadline(start, queueDeadline, park.clusterBound, !park.capped)
+			if start.IsZero() {
+				start = admissionStart(g.req, g.now)
+			}
+			if queueTimeout > 0 && deadline.IsZero() {
+				deadline = start.Add(queueTimeout)
 			}
 			// Once a finite deadline is established it is enforced on EVERY subsequent
 			// wake (parkTurn) — even if the current at-capacity union is now all-unbounded
 			// (e.g. the sole bounded-timeout member went down mid-queue). A finite wait must
 			// never be silently promoted back to unbounded.
-			if werr := r.parkTurn(ctx, deadline, distinctStrings(park.servers), park.demand...); werr != nil {
+			//
+			// A turn that parks on cold cluster heads waits for the cluster's own bound
+			// instead (parkDeadline), and the longest cluster bound any turn parked under
+			// stays the request's, as on the plain path.
+			clusterBound = max(clusterBound, park.clusterBound)
+			turnDeadline := parkDeadline(start, deadline, clusterBound, !park.capped)
+			if werr := r.parkTurn(ctx, turnDeadline, distinctStrings(park.servers), park.demand...); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
 			g.now = r.clock()
