@@ -2472,6 +2472,7 @@ const de = {
   clusterMemberStateFailed: 'fehlgeschlagen',
   clusterStatusMemberHidden: (n: number) => `Mitglied ${n} (nicht sichtbar)`,
   clusterStatusHead: 'Head',
+  clusterStartRequested: 'Start angefordert…',
   clusterCooldownUntil: (time: string) => `Neuer Start frühestens ab ${time}`,
   clusterLastFailure: (code: string, where: string) => `Letzter Fehler (${where}): ${code}`,
   clusterBreachesTitle: 'Richtlinienverstöße der Mitglieder',
@@ -2552,8 +2553,6 @@ const de = {
   clusterIntro:
     'Als Cluster-Head lädt diese llama.cpp-Spezifikation einen Teil des Modells auf ggml-rpc-server-Mitglieder auf anderen Servern aus.',
   clusterEnabledLabel: 'Als Cluster-Head betreiben',
-  clusterCreateFirst:
-    'Die Spezifikation zuerst speichern; danach lässt sie sich als Cluster-Head einrichten.',
   clusterRpcHint:
     'Ein Cluster-Head braucht ${RPC_SERVERS} genau einmal: als zwei Zeilen „--rpc“ und „${RPC_SERVERS}“ in den Argumenten oder als LLAMA_ARG_RPC=${RPC_SERVERS} in der Umgebung.',
   clusterDeviceBackend: 'Geräte-Backend',
@@ -2615,12 +2614,20 @@ const de = {
   clusterMemberServer: 'Server',
   clusterMemberSpec: 'Mitglieds-Spezifikation',
   clusterMemberSpecPick: 'Dieser Server hat mehrere freie Mitglieds-Spezifikationen; eine wählen.',
-  clusterMemberAddConfirm: 'Übernehmen',
+  clusterMemberAddConfirm: 'Hinzufügen',
   clusterCandidatesEmptyAutomatic:
-    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries; der Head muss mit einem Binary bekannter Version gespeichert sein.',
+    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries, dessen Version bekannt sein muss.',
   clusterCandidatesEmptyManual:
     'Kein Server steht zur Wahl. Er braucht eine freie, aktivierte Mitglieds-Spezifikation (Reiter „RPC“), die diesen Head zulässt.',
   clusterCandidatesFailed: 'Die möglichen Mitglieds-Server konnten nicht geladen werden.',
+  clusterMemberNoMatchingRpcBinary:
+    'Dieser Server hat keinen ggml-rpc-server in der Version des Head-Binaries; so lässt sich der Head nicht speichern.',
+  clusterMemberNotOffered:
+    'Dieser Server bietet diesem Head keine RPC-Mitgliedschaft an (Reiter „RPC“ des Servers); so lässt sich der Head nicht speichern.',
+  clusterMemberVersionMismatch:
+    'Das Binary dieser Mitglieds-Spezifikation hat eine andere Version als das Head-Binary; so lässt sich der Head nicht speichern.',
+  clusterMemberSpecNotOffered:
+    'Diese Mitglieds-Spezifikation steht dem Head nicht mehr zur Verfügung (deaktiviert, Zustimmung entzogen oder von einem anderen Head belegt); so lässt sich der Head nicht speichern.',
   clusterMemberRemove: 'Mitglied entfernen',
   clusterMemberGpus: 'GPUs (Reihenfolge = Geräte-Reihenfolge im Mitglied)',
   clusterMemberGpuAdd: 'GPU hinzufügen',
@@ -3443,6 +3450,13 @@ const de = {
   activityColBillingQuantity: 'Abrechnungsmenge',
   activityColNonTokenRequests: 'Nicht-Token-Anfragen',
   activityNotTokenMetered: 'Nicht in Token abgerechnet',
+  activityEnergyPartsTitle: 'Energie je Host',
+  activityEnergyPartHead: 'Head',
+  activityEnergyPartMember: (n: number) => `Mitglied ${n}`,
+  activityEnergyPartsLabel: (wh: string) => `Energie ${wh} Wh, je Host aufgeschlüsselt`,
+  activityEnergyMarginalPartsTitle: 'Energie marginal je Host',
+  activityEnergyMarginalPartsLabel: (wh: string) =>
+    `Energie marginal ${wh} Wh, je Host aufgeschlüsselt`,
   activityMixedUnitsHint: (n: number) => `Summe ohne ${n} nicht in Token abgerechnete Anfrage(n).`,
   energySourceHelpMeasured:
     'Gemessen: echte Leistungstelemetrie des Servers deckt das Zeitfenster dieser Anfrage lückenlos ab.',
@@ -6314,6 +6328,7 @@ const en: PortalMessages = {
   clusterMemberStateFailed: 'failed',
   clusterStatusMemberHidden: (n: number) => `Member ${n} (not visible)`,
   clusterStatusHead: 'Head',
+  clusterStartRequested: 'Start requested…',
   clusterCooldownUntil: (time: string) => `Next start possible from ${time}`,
   clusterLastFailure: (code: string, where: string) => `Last failure (${where}): ${code}`,
   clusterBreachesTitle: 'Member policy breaches',
@@ -6390,7 +6405,6 @@ const en: PortalMessages = {
   clusterIntro:
     'As a cluster head this llama.cpp spec offloads part of the model to ggml-rpc-server members on other servers.',
   clusterEnabledLabel: 'Run as a cluster head',
-  clusterCreateFirst: 'Save the spec first; it can then be set up as a cluster head.',
   clusterRpcHint:
     'A cluster head needs ${RPC_SERVERS} exactly once: as the two lines "--rpc" and "${RPC_SERVERS}" in args, or as LLAMA_ARG_RPC=${RPC_SERVERS} in env.',
   clusterDeviceBackend: 'Device backend',
@@ -6454,10 +6468,18 @@ const en: PortalMessages = {
   clusterMemberSpecPick: 'This server has several free member specs; pick one.',
   clusterMemberAddConfirm: 'Add',
   clusterCandidatesEmptyAutomatic:
-    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s version; the head must be saved with a binary of known version.',
+    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s version, which must be known.',
   clusterCandidatesEmptyManual:
     'No server is available. It needs a free, enabled member spec ("RPC" tab) that admits this head.',
   clusterCandidatesFailed: 'The possible member servers could not be loaded.',
+  clusterMemberNoMatchingRpcBinary:
+    "This server has no ggml-rpc-server of the head binary's version; the head cannot be saved like this.",
+  clusterMemberNotOffered:
+    'This server does not offer RPC membership to this head (the server\'s "RPC" tab); the head cannot be saved like this.',
+  clusterMemberVersionMismatch:
+    "This member spec's binary is a different version than the head binary; the head cannot be saved like this.",
+  clusterMemberSpecNotOffered:
+    'This member spec is no longer available to the head (disabled, its consent withdrawn, or taken by another head); the head cannot be saved like this.',
   clusterMemberRemove: 'Remove member',
   clusterMemberGpus: 'GPUs (order = device order in the member)',
   clusterMemberGpuAdd: 'Add GPU',
@@ -7241,6 +7263,13 @@ const en: PortalMessages = {
   activityColBillingQuantity: 'Billing quantity',
   activityColNonTokenRequests: 'Non-token requests',
   activityNotTokenMetered: 'Not token-metered',
+  activityEnergyPartsTitle: 'Energy per host',
+  activityEnergyPartHead: 'Head',
+  activityEnergyPartMember: (n: number) => `Member ${n}`,
+  activityEnergyPartsLabel: (wh: string) => `Energy ${wh} Wh, broken down per host`,
+  activityEnergyMarginalPartsTitle: 'Marginal energy per host',
+  activityEnergyMarginalPartsLabel: (wh: string) =>
+    `Marginal energy ${wh} Wh, broken down per host`,
   activityMixedUnitsHint: (n: number) => `Sum excludes ${n} request(s) that are not token-metered.`,
   energySourceHelpMeasured:
     'Measured: real power telemetry from the server covers this request’s window without gaps.',

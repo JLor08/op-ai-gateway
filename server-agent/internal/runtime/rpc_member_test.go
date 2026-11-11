@@ -832,3 +832,46 @@ func TestMemberCacheTouchStreakEndsWhenHeadLeaves(t *testing.T) {
 		t.Fatalf("Warns = %d, want 2: one per streak, the head's departure ending the first", n)
 	}
 }
+
+// TestMemberStartedMarkerReportsTheExecutedCommand: a member's started marker
+// carries the command the rpc-server really received -- the operator's
+// arguments with their secrets still masked, then the agent-owned -d, -H, -p
+// and (cache on) -c, and the agent-added environment (GGML_RPC_NO_RDMA,
+// LLAMA_CACHE). Bind addresses, ports and cache paths are no secrets and are
+// shown as they are.
+func TestMemberStartedMarkerReportsTheExecutedCommand(t *testing.T) {
+	shrinkTimings(t)
+	root := t.TempDir()
+	origFree := freeDiskMB
+	freeDiskMB = func(string) (int, error) { return 1 << 20, nil }
+	t.Cleanup(func() { freeDiskMB = origFree })
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), ConfigFilesDir: root, Getenv: func(k string) string {
+		if k == "MEMBER_SECRET" {
+			return "hunter2"
+		}
+		return ""
+	}})
+	t.Cleanup(m.Close)
+	spec := cachingMember(t, "rpcm_a", "rspec_h")
+	spec.Args = append(spec.Args, "-env-name", "${AGENT_ENV:MEMBER_SECRET}")
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "1"})
+
+	marker := waitForCommand(t, m, "rpcm_a", "a started marker carrying a command", func(e LogEntry) bool {
+		return e.Command != nil && e.Event == logEventStarted && e.PID > 0
+	})
+	cmd := marker.Command
+	joined := strings.Join(cmd.Args, " ")
+	want := "-tcp-listen -env-name ${AGENT_ENV:MEMBER_SECRET} -d CPU -H 127.0.0.1 -p " + strconv.Itoa(spec.RPC.Port) + " -c"
+	if joined != want {
+		t.Fatalf("reported args = %q, want %q", joined, want)
+	}
+	if strings.Contains(joined, "hunter2") || !cmd.Masked {
+		t.Fatalf("command = %+v, want the operator's secret masked", cmd)
+	}
+	if v, ok := envValue(cmd.Env, "GGML_RPC_NO_RDMA"); !ok || v != "1" {
+		t.Errorf("env GGML_RPC_NO_RDMA = %q (present=%v), want 1", v, ok)
+	}
+	if v, ok := envValue(cmd.Env, "LLAMA_CACHE"); !ok || v != filepath.Join(root, "rpc", "rspec_h") {
+		t.Errorf("env LLAMA_CACHE = %q (present=%v), want the head's cache directory", v, ok)
+	}
+}

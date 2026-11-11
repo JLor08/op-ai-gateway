@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -209,35 +210,53 @@ func memberIdleTimeout(spec Spec) time.Duration {
 }
 
 // prepareMember resolves everything a member launch needs beyond the shared
-// expansion: the child's port, its final argv and environment, and (with the
-// cache on) the cache directory with its free-space check. A returned error is
-// a verdict the spec can never launch as written (not_permitted); the cache
-// directory is created here, before anything is exec'd.
-func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (args, env []string, port int, err error) {
+// expansion ex: the child's port, its final argv and environment, and (with
+// the cache on) the cache directory with its free-space check. The result is
+// ex extended by the agent-owned arguments (-d, -H, -p, -c, after the
+// operator's) and environment (memberEnv), so the command the start reports
+// is exactly the one it executes. The operator's entries keep their secret
+// spans; the agent's carry none, since a device list, a bind address, a port
+// and a cache path are no secrets. A returned error is a verdict the spec can
+// never launch as written (not_permitted); the cache directory is created
+// here, before anything is exec'd.
+func (o *owner) prepareMember(spec Spec, ex expandedSpec) (out expandedSpec, port int, err error) {
 	prefix, err := o.memberDevicePrefix(spec)
 	if err != nil {
-		return nil, nil, 0, err
+		return expandedSpec{}, 0, err
 	}
 	if spec.RPC.Transport == "relay" {
 		if port, err = grabEphemeralPort(); err != nil {
-			return nil, nil, 0, fmt.Errorf("runtime: grab ephemeral port: %w", err)
+			return expandedSpec{}, 0, fmt.Errorf("runtime: grab ephemeral port: %w", err)
 		}
 	}
 	withArgs := spec
-	withArgs.Args = expandedArgs
-	if args, err = memberArgs(withArgs, port, prefix); err != nil {
-		return nil, nil, 0, err
+	withArgs.Args = ex.args
+	args, err := memberArgs(withArgs, port, prefix)
+	if err != nil {
+		return expandedSpec{}, 0, err
 	}
 	if spec.RPC.Transport != "relay" {
 		port = spec.RPC.Port
 	}
 	if spec.RPC.CacheEnabled {
 		if err := o.prepareMemberCache(spec); err != nil {
-			return nil, nil, 0, err
+			return expandedSpec{}, 0, err
 		}
 	}
-	env = append(append([]string{}, expandedEnv...), memberEnv(spec, o.configFilesDir)...)
-	return args, env, port, nil
+	return withAgentEntries(ex, args[len(ex.args):], memberEnv(spec, o.configFilesDir)), port, nil
+}
+
+// withAgentEntries returns ex with args and env appended: entries the agent
+// adds after the expansion, which carry no secret span and did not come from
+// the spec's env. ex itself is left unchanged.
+func withAgentEntries(ex expandedSpec, args, env []string) expandedSpec {
+	out := ex
+	out.args = append(slices.Clone(ex.args), args...)
+	out.argSpans = append(slices.Clone(ex.argSpans), make([][]secretSpan, len(args))...)
+	out.env = append(slices.Clone(ex.env), env...)
+	out.envSpans = append(slices.Clone(ex.envSpans), make([][]secretSpan, len(env))...)
+	out.envFromSpec = append(slices.Clone(ex.envFromSpec), make([]bool, len(env))...)
+	return out
 }
 
 // memberDevicePrefix is the backend prefix of the member's -d device names,

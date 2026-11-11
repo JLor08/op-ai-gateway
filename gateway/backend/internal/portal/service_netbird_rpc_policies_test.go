@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"op-ai-gateway/internal/netbird"
 	"op-ai-gateway/internal/routing"
 	"slices"
@@ -855,5 +856,176 @@ func TestRPCPolicyWithheldClusterGetsNoGrant(t *testing.T) {
 	}
 	if e.fake.policyCreateCountByName("op-gw-rpc-a") != 0 {
 		t.Fatal("a withheld cluster's member got a policy")
+	}
+}
+
+// rpcPolicyClock makes the env's service clock settable; it starts at
+// rpcPolicyNow.
+func (e *rpcPolicyEnv) rpcPolicyClock() (advance func(time.Duration)) {
+	var mu sync.Mutex
+	now := rpcPolicyNow
+	e.svc.clock = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	return func(d time.Duration) {
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+	}
+}
+
+// recentWrites reads the recorded RPC policy writes still settling, as
+// ReconcileRPCPolicies reports them, without running a pass.
+func (e *rpcPolicyEnv) recentWrites() []RPCPolicyWrite {
+	e.svc.netbird.policyMu.Lock()
+	defer e.svc.netbird.policyMu.Unlock()
+	return e.svc.recentRPCPolicyWritesLocked()
+}
+
+// TestRPCPolicyWritesAreKeptForTheSettleWindow pins what ReconcileRPCPolicies
+// tells the cluster orchestration: every member server whose policy any pass
+// wrote within RPCPolicySettle, with the write time. A write by a save's own
+// pass (the hook) is reported to a start that runs moments later, until the
+// window has passed; a server that is gone is forgotten.
+func TestRPCPolicyWritesAreKeptForTheSettleWindow(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	advance := e.rpcPolicyClock()
+	for _, id := range []string{"head", "a", "b"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"b", 47001}, rpcMemberSeed{"a", 47002})
+
+	e.reconcile() // the save's pass
+	want := []RPCPolicyWrite{{ServerID: "a", WrittenAt: rpcPolicyNow}, {ServerID: "b", WrittenAt: rpcPolicyNow}}
+	if got := e.recentWrites(); !slices.Equal(got, want) {
+		t.Fatalf("writes after the save's pass = %v, want %v", got, want)
+	}
+	advance(5 * time.Second)
+	if got := e.recentWrites(); !slices.Equal(got, want) {
+		t.Fatalf("writes 5s later = %v, want the save's writes still settling", got)
+	}
+	advance(RPCPolicySettle - 5*time.Second)
+	if got := e.recentWrites(); len(got) != 0 {
+		t.Fatalf("writes after the window = %v, want none", got)
+	}
+
+	// A written server that is deleted is forgotten at the next pass.
+	g := newRPCPolicyEnv(t, true)
+	g.rpcPolicyClock()
+	for _, id := range []string{"head", "a"} {
+		g.server(id)
+	}
+	g.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	g.reconcile()
+	if err := g.routes.DeleteAIServer(g.ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile()
+	if got := g.recentWrites(); len(got) != 0 {
+		t.Fatalf("writes after a's server was deleted = %v, want none", got)
+	}
+}
+
+// TestRPCPolicyPassReportsRecentWrites pins ReconcileRPCPolicies' own answer:
+// the writes still settling after its pass, including one an earlier pass
+// made, also when its own pass can write nothing (the policy list failing).
+func TestRPCPolicyPassReportsRecentWrites(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	advance := e.rpcPolicyClock()
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.reconcile()
+	advance(3 * time.Second)
+	e.fake.failListPolicies = true
+	want := []RPCPolicyWrite{{ServerID: "a", WrittenAt: rpcPolicyNow}}
+	if got := e.svc.ReconcileRPCPolicies(e.ctx); !slices.Equal(got, want) {
+		t.Fatalf("start's pass reported %v, want the earlier write %v", got, want)
+	}
+}
+
+// TestRPCPolicyMatchingPassKeepsAnEarlierWrite pins the owner's scenario: the
+// save's pass writes a member's policy; seconds later the start's pass runs
+// successfully, finds the policy matching, writes nothing and prunes -- and
+// still reports the save's write, so the start waits for the rest of its
+// window.
+func TestRPCPolicyMatchingPassKeepsAnEarlierWrite(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	advance := e.rpcPolicyClock()
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.reconcile() // the save's pass creates the policy
+	// NetBird now holds the policy as written.
+	e.fake.mu.Lock()
+	e.fake.policies = nil
+	e.fake.mu.Unlock()
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001})
+	creates, updates := e.fake.policyCreateCountByName("op-gw-rpc-a"), e.fake.policyUpdateCount()
+
+	advance(3 * time.Second)
+	want := []RPCPolicyWrite{{ServerID: "a", WrittenAt: rpcPolicyNow}}
+	if got := e.svc.ReconcileRPCPolicies(e.ctx); !slices.Equal(got, want) {
+		t.Fatalf("the start's matching pass reported %v, want the save's write %v", got, want)
+	}
+	if e.fake.policyCreateCountByName("op-gw-rpc-a") != creates || e.fake.policyUpdateCount() != updates {
+		t.Fatal("the start's pass wrote the matching policy again")
+	}
+}
+
+// TestRPCPolicyWriteFromTheFutureAgesOut pins a backward step of the wall
+// clock: a write recorded "in the future" is taken as written now, so it ages
+// out RPCPolicySettle after the step rather than after the clock caught up.
+func TestRPCPolicyWriteFromTheFutureAgesOut(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	advance := e.rpcPolicyClock()
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.reconcile()
+	advance(-time.Hour) // the clock steps back
+	stepped := rpcPolicyNow.Add(-time.Hour)
+	if got := e.recentWrites(); !slices.Equal(got, []RPCPolicyWrite{{ServerID: "a", WrittenAt: stepped}}) {
+		t.Fatalf("writes after the step = %v, want a's write taken as written now (%v)", got, stepped)
+	}
+	e.fake.failListPolicies = true // the next pass only prunes
+	e.reconcile()
+	advance(RPCPolicySettle)
+	if got := e.recentWrites(); len(got) != 0 {
+		t.Fatalf("writes %v after the step = %v, want none", RPCPolicySettle, got)
+	}
+}
+
+// TestRPCPolicyRefusedWriteIsNoWrite pins which failed writes count: a create
+// NetBird definitively refuses (a 4xx) changed nothing and is not recorded; a
+// create whose outcome is unknown (a 5xx) may have landed and is.
+func TestRPCPolicyRefusedWriteIsNoWrite(t *testing.T) {
+	for name, c := range map[string]struct {
+		refuse int
+		fail   bool
+		want   int
+	}{
+		"refused 400": {refuse: http.StatusBadRequest, want: 0},
+		"refused 422": {refuse: http.StatusUnprocessableEntity, want: 0},
+		"failed 500":  {fail: true, want: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newRPCPolicyEnv(t, true)
+			e.rpcPolicyClock()
+			for _, id := range []string{"head", "a"} {
+				e.server(id)
+			}
+			e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+			e.fake.refuseCreatePolicy, e.fake.failCreatePolicy = c.refuse, c.fail
+			e.reconcile()
+			if got := e.recentWrites(); len(got) != c.want {
+				t.Fatalf("recorded writes = %v, want %d", got, c.want)
+			}
+		})
 	}
 }

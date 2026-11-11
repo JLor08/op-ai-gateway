@@ -5,6 +5,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CLUSTER_SPEC_REFRESH_MS,
+  CLUSTER_START_NOTICE_MS,
+  CLUSTER_START_REFRESH_MS,
   OVERRIDE_WRITE_TIMEOUT_MS,
   RESTART_STOP_TIMEOUT_MS,
   RESTART_VANISH_GRACE_MS,
@@ -667,6 +669,7 @@ function renderSection(
     deleteServerBinary: vi.fn(async () => undefined),
     // The cluster head editor's member picker.
     clusterCandidates: vi.fn(async () => ({ data: [] })),
+    applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
     resetClusterMemberUsage:
       opts.resetClusterMemberUsage ??
       vi.fn(async (mappingId: string) => storedSpecs[mappingId] as RuntimeSpec),
@@ -1284,6 +1287,120 @@ describe('RuntimeAdminSection launch specs list', () => {
 });
 
 describe('RuntimeAdminSection create (mapping + spec)', () => {
+  async function openCreate() {
+    const view = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    return view;
+  }
+
+  it('offers the RPC cluster block for a new spec with the llama.cpp type', async () => {
+    const { putSpecs } = await openCreate();
+    expect(screen.queryByRole('checkbox', { name: t.clusterEnabledLabel })).not.toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama/server' },
+    });
+
+    // The device backend is set on the new spec already.
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeEnabled();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterDeviceBackend }));
+    fireEvent.click(await screen.findByRole('option', { name: 'vulkan' }));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      type: 'llama_cpp',
+      device_backend: 'vulkan',
+      cluster_enabled: false,
+      cluster_members: [],
+    });
+  });
+
+  it('offers the RPC cluster block for a new Auto spec whose binary resolves to llama.cpp', async () => {
+    await openCreate();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/vllm' },
+    });
+    expect(screen.queryByRole('checkbox', { name: t.clusterEnabledLabel })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama.cpp/bin/llama-server' },
+    });
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeEnabled();
+    expect(screen.getByRole('combobox', { name: t.clusterDeviceBackend })).toBeInTheDocument();
+  });
+
+  // Fills a new llama.cpp head with one automatic member from the
+  // application-scoped listing.
+  async function fillNewHead(fakeApi: { applicationClusterCandidates: ReturnType<typeof vi.fn> }) {
+    fakeApi.applicationClusterCandidates.mockResolvedValue({
+      data: [{ server_id: 'srv_a', server_name: 'Alpha', compatible: true, rpc_binary: '/b' }],
+      head_binary_known: true,
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama/llama-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '-m\n/m.gguf\n--rpc\n${RPC_SERVERS}' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecStartupTimeout), {
+      target: { value: '600' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.clusterEnabledLabel }));
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterTransport }));
+    fireEvent.click(await screen.findByRole('option', { name: t.clusterTransportRelay }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.clusterMemberServer }));
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: 'Alpha' }));
+    const confirm = screen.getByRole('button', { name: t.clusterMemberAddConfirm });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    fireEvent.click(confirm);
+    expect(await screen.findByTestId('cluster-member-row')).toHaveTextContent('Alpha');
+  }
+
+  it('creates a cluster head with its members in the first write', async () => {
+    const { fakeApi, putSpecs } = await openCreate();
+    await fillNewHead(fakeApi);
+    expect(fakeApi.applicationClusterCandidates).toHaveBeenCalledWith(
+      'app_1',
+      'automatic',
+      '/opt/llama/llama-server',
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      cluster_enabled: true,
+      rpc_transport: 'relay',
+      startup_timeout_seconds: 600,
+    });
+    expect(putSpecs[0].body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a']);
+  });
+
+  it('keeps the form, members included, as the Edit of the new mapping when the first write is refused', async () => {
+    const { fakeApi, putSpecs, created } = await openCreate();
+    await fillNewHead(fakeApi);
+    fakeApi.putRuntimeSpec.mockRejectedValueOnce(
+      new PortalApiError(400, 'runtime_spec.cluster_member_no_matching_binary', 'server "Alpha"'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    expect(
+      await screen.findByText(new RegExp(t.errorClusterMemberNoMatchingBinary)),
+    ).toBeInTheDocument();
+    // Still the form, now the Edit of the mapping the create made, with
+    // every entry kept.
+    expect(screen.getByTestId('cluster-member-row')).toHaveTextContent('Alpha');
+    expect((screen.getByLabelText(t.runtimeSpecArgs) as HTMLTextAreaElement).value).toContain(
+      '${RPC_SERVERS}',
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].mappingId).toBe('map_created');
+    expect(putSpecs[0].body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a']);
+    // The re-save is an edit of that mapping, never a second create.
+    expect(created).toHaveLength(1);
+  });
+
   it('creates a mapping+spec through the form', async () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -1585,6 +1702,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       updateServerBinary: vi.fn(async () => ({}) as never),
       deleteServerBinary: vi.fn(async () => undefined),
       clusterCandidates: vi.fn(async () => ({ data: [] })),
+      applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
       resetClusterMemberUsage: vi.fn(async () => ({}) as never),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
@@ -7261,6 +7379,9 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    // The refused create stays open as the new mapping's Edit; leaving it
+    // brings the list back.
+    fireEvent.click(await screen.findByRole('button', { name: t.cancel }));
 
     const del = await screen.findByRole('button', { name: t.mappingDelete });
     expect(del).toBeEnabled();
@@ -10862,15 +10983,23 @@ describe('RuntimeAdminSection instance settings', () => {
     });
   });
 
+  // The timeout is raised for a cost this test cannot shed: it fills the
+  // create form, the largest DOM on the portal, and each of its eight
+  // label/role queries walks all of it (60-100 ms apiece on a developer
+  // machine, about 1.2 s in all; the same on main). A shared CI runner under
+  // the full suite's parallel load has taken more than the default 5 s for
+  // it. The test awaits nothing but the PUT, and the checkbox is looked up
+  // once.
   it('sends the neutral 0/0/0 once unticked, and never refuses what the hidden fields hold', async () => {
     const { created, putSpecs } = await openFilledCreate();
-    tickReplicable();
+    const replicableBox = screen.getByLabelText(t.runtimeSpecReplicable);
+    fireEvent.click(replicableBox);
     fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '3' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '2' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
       target: { value: '4' },
     });
-    tickReplicable();
+    fireEvent.click(replicableBox);
 
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
 
@@ -10883,7 +11012,7 @@ describe('RuntimeAdminSection instance settings', () => {
       max_instances: 0,
       instance_parallelism: 0,
     });
-  });
+  }, 15_000);
 
   it('saves a stored replicable spec unticked as the neutral 0/0/0', async () => {
     const { putSpecs } = await openApiTokenSpecEdit({
@@ -11689,7 +11818,8 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
   });
 
   describe('on a cluster head', () => {
-    const clusterHead = () => fullSpec({ pinned: false, cluster_enabled: true });
+    const clusterHead = (overrides: Partial<RuntimeSpec> = {}) =>
+      fullSpec({ pinned: false, cluster_enabled: true, ...overrides });
 
     async function clickStop() {
       const view = renderActions([instanceRow(0)], clusterHead());
@@ -11716,6 +11846,137 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
       fireEvent.click(within(dialog).getByRole('checkbox', { name: t.runtimeStopMembersToo }));
       fireEvent.click(within(dialog).getByRole('button', { name: t.runtimeStop }));
       await waitFor(() => expect(fakeApi.stopRuntime).toHaveBeenCalledWith('map_1', 0, true));
+    });
+
+    it('says a start was asked for until the start shows, then shows its progress', async () => {
+      let answer: (a: { instance: number; state: 'starting' }) => void = () => {};
+      const { fakeApi, storedSpecs } = renderActions(
+        [instanceRow(0, { state: 'stopped' })],
+        clusterHead({ cluster_status: { state: 'cold', members: [] } }),
+        { startRuntime: () => new Promise((resolve) => (answer = resolve)) },
+      );
+      await openStatusTab();
+      await waitForRowActions('4100', t.runtimeStart);
+      fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+      expect(await screen.findByTestId('cluster-start-requested')).toHaveTextContent(
+        t.clusterStartRequested,
+      );
+      expect(fakeApi.startRuntime).toHaveBeenCalledWith('map_1');
+
+      storedSpecs.map_1 = clusterHead({
+        cluster_status: {
+          state: 'forming',
+          phase: 'members_starting',
+          members: [{ position: 0, state: 'starting' }],
+        },
+      });
+      await act(async () => answer({ instance: 0, state: 'starting' }));
+      await waitFor(() =>
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument(),
+      );
+      expect(
+        within(screen.getByTestId('cluster-progress-compact')).getByText(
+          t.clusterPhaseMembersStarting,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('keeps the notice and the fast re-read while an accepted start does not show yet', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { fakeApi, storedSpecs } = renderActions(
+          [instanceRow(0, { state: 'stopped' })],
+          clusterHead({ cluster_status: { state: 'cold', members: [] } }),
+          { startRuntime: async () => ({ instance: 0, state: 'starting' as const }) },
+        );
+        await openStatusTab();
+        await waitForRowActions('4100', t.runtimeStart);
+        fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+        // The start is accepted, but the reads after it still say cold.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS + 100);
+        });
+        expect(screen.getByTestId('cluster-start-requested')).toBeInTheDocument();
+        const reads = fakeApi.runtimeSpec.mock.calls.length;
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
+        });
+        expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(reads + 1);
+
+        storedSpecs.map_1 = clusterHead({
+          cluster_status: { state: 'forming', phase: 'members_starting', members: [] },
+        });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
+        });
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('gives up the notice of an accepted start that never shows', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderActions(
+          [instanceRow(0, { state: 'stopped' })],
+          clusterHead({ cluster_status: { state: 'cold', members: [] } }),
+          { startRuntime: async () => ({ instance: 0, state: 'starting' as const }) },
+        );
+        await openStatusTab();
+        await waitForRowActions('4100', t.runtimeStart);
+        fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+        expect(await screen.findByTestId('cluster-start-requested')).toBeInTheDocument();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(CLUSTER_START_NOTICE_MS + 100);
+        });
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not take a head still formed from before as the new start', async () => {
+      let answer: (a: { instance: number; state: 'starting' }) => void = () => {};
+      const { storedSpecs } = renderActions(
+        [instanceRow(0, { state: 'stopped' })],
+        clusterHead({ cluster_status: { state: 'formed', phase: 'formed', members: [] } }),
+        { startRuntime: () => new Promise((resolve) => (answer = resolve)) },
+      );
+      await openStatusTab();
+      await waitForRowActions('4100', t.runtimeStart);
+      fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+      const notice = await screen.findByTestId('cluster-start-requested');
+      // Announced politely by screen readers.
+      expect(notice.closest('[role="status"]')).toHaveAttribute('aria-live', 'polite');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByTestId('cluster-start-requested')).toBeInTheDocument();
+
+      storedSpecs.map_1 = clusterHead({
+        cluster_status: { state: 'forming', phase: 'members_starting', members: [] },
+      });
+      await act(async () => answer({ instance: 0, state: 'starting' }));
+      await waitFor(() =>
+        expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument(),
+      );
+    });
+
+    it('drops the start notice when the start is refused', async () => {
+      renderActions(
+        [instanceRow(0, { state: 'stopped' })],
+        clusterHead({ cluster_status: { state: 'cold', members: [] } }),
+        {
+          startRuntime: () =>
+            Promise.reject(new PortalApiError(503, 'runtime.cluster_unavailable', 'no')),
+        },
+      );
+      await openStatusTab();
+      await waitForRowActions('4100', t.runtimeStart);
+      fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStart }));
+      expect(await screen.findByText(/runtime\.cluster_unavailable/)).toBeInTheDocument();
+      expect(screen.queryByTestId('cluster-start-requested')).not.toBeInTheDocument();
     });
 
     it('stops nothing when the dialog is cancelled', async () => {
@@ -12215,7 +12476,11 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
 // The spec PUT is a full document: a save without the cluster fields turns
 // the cluster off and clears its membership. Every save from the form must
 // therefore carry them, a member the caller cannot see included.
-describe('RuntimeAdminSection cluster head round trip', () => {
+// The edit-form round trips here render the whole spec form with the cluster
+// block and its members several times (up to ~1.6 s locally); a shared CI runner
+// under the full suite's parallel load has pushed that past the 5 s default, as
+// for the other form-heavy describes in this file.
+describe('RuntimeAdminSection cluster head round trip', { timeout: 15_000 }, () => {
   const visibleMember = {
     position: 0,
     server_id: 'srv_b',
@@ -12283,6 +12548,48 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     await screen.findByLabelText(t.runtimeSpecBinary);
     return view;
   }
+
+  it('keeps the edit form, members included, when the spec save is refused, and saves again', async () => {
+    const { fakeApi, putSpecs, updatedMappings } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'renamed' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+      target: { value: '/srv/models' },
+    });
+    fakeApi.putRuntimeSpec.mockRejectedValueOnce(
+      new PortalApiError(400, 'runtime_spec.cluster_member_no_matching_binary', 'server "Beta"'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(new RegExp(t.errorClusterMemberNoMatchingBinary)),
+    ).toBeInTheDocument();
+
+    // Still the form, with every entry: the typed fields and the members.
+    expect((screen.getByLabelText(t.runtimeSpecWorkDir) as HTMLInputElement).value).toBe(
+      '/srv/models',
+    );
+    expect((screen.getByLabelText(t.mappingAppName) as HTMLInputElement).value).toBe('renamed');
+    expect(screen.getByText(t.clusterMemberHidden)).toBeInTheDocument();
+    expect(screen.getAllByTestId('cluster-member-row')).toHaveLength(2);
+    // The mapping PATCH landed before the refusal.
+    expect(updatedMappings).toEqual([{ id: 'map_1', body: { app_model_name: 'renamed' } }]);
+
+    // The second save goes through: the same name again, then the spec.
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(updatedMappings).toEqual([
+      { id: 'map_1', body: { app_model_name: 'renamed' } },
+      { id: 'map_1', body: { app_model_name: 'renamed' } },
+    ]);
+    expect(putSpecs[0].mappingId).toBe('map_1');
+    expect(putSpecs[0].body).toMatchObject({
+      work_dir: '/srv/models',
+      cluster_enabled: true,
+      cluster_members: [visibleMember, hiddenMember],
+    });
+    await waitFor(() =>
+      expect(screen.queryByLabelText(t.runtimeSpecWorkDir)).not.toBeInTheDocument(),
+    );
+  });
 
   it('keeps every cluster field when an unrelated field changes', async () => {
     const { putSpecs } = await openEditAndSave(headSpec());
@@ -12438,9 +12745,14 @@ describe('RuntimeAdminSection cluster head round trip', () => {
   it('re-reads the head specs on an interval while the list is shown', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
+      // Not forming: the normal cadence (a forming head is re-read faster).
+      const coolingDown = {
+        state: 'cooling_down' as const,
+        members: [{ position: 0, state: 'failed' as const }],
+      };
       const { fakeApi, storedSpecs } = renderSection({
         mappings: [makeMapping({ id: 'map_1' })],
-        specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+        specsByMappingId: { map_1: headSpec({ cluster_status: coolingDown }) },
         statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
       });
       await screen.findByTestId('cluster-progress-compact');
@@ -12457,6 +12769,89 @@ describe('RuntimeAdminSection cluster head round trip', () => {
           within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterPhaseFormed),
         ).toBeInTheDocument(),
       );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the cluster progress on the head row of the Live-Status tab', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting', pid: 4200 })],
+    });
+    await openStatusTab();
+    const progress = await within(screen.getByRole('table')).findByTestId(
+      'cluster-progress-compact',
+    );
+    expect(within(progress).getByText(t.clusterPhaseMembersReady)).toBeInTheDocument();
+    expect(within(progress).getByText(`Beta: ${t.clusterMemberStateReady}`)).toBeInTheDocument();
+    // A member the caller may not see is named by its position only.
+    expect(
+      within(progress).getByText(
+        `${t.clusterStatusMemberHidden(2)}: ${t.clusterMemberStateStarting}`,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('re-reads a forming head fast on the Live-Status tab, and slows down once formed', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { fakeApi, storedSpecs } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+        statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+      });
+      await openStatusTab();
+      await screen.findByTestId('cluster-progress-compact');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      const reads = () => fakeApi.runtimeSpec.mock.calls.length;
+      const before = reads();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
+      });
+      expect(reads()).toBe(before + 1);
+
+      storedSpecs.map_1 = headSpec({
+        cluster_status: { state: 'formed', phase: 'formed', members: [] },
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
+      });
+      expect(
+        within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterStateFormed),
+      ).toBeInTheDocument();
+      const formedAt = reads();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS * 3);
+      });
+      expect(reads()).toBe(formedAt);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps one read per head in flight however fast the head is re-read', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { fakeApi } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+        statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+      });
+      await openStatusTab();
+      await screen.findByTestId('cluster-progress-compact');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      fakeApi.runtimeSpec.mockImplementation(() => new Promise<RuntimeSpec>(() => {}));
+      const before = fakeApi.runtimeSpec.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS * 4);
+      });
+      expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(before + 1);
     } finally {
       vi.useRealTimers();
     }

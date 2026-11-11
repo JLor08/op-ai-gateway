@@ -50,16 +50,23 @@ func (o *clusterOrchestrator) viewOf(plan portal.ClusterPlan) clusterGateView {
 		v.members = append(v.members, m.Server)
 		slowest = max(slowest, o.startupBound(m.StartupTimeoutSeconds))
 	}
-	v.bound = o.parkBound(o.startupBound(plan.Head.Spec.StartupTimeoutSeconds), slowest)
+	v.bound = o.parkBound(o.startupBound(plan.Head.Spec.StartupTimeoutSeconds), slowest, plan.Network == clusterNetworkMesh)
 	return v
 }
 
 // parkBound is the longest a start takes whose head starts within head and
 // whose slowest member within slowest: step one's configuration wait, the
-// members' bound and the head's bound, which also covers the formation (the
-// bounds at the top of cluster_orchestrator.go).
-func (o *clusterOrchestrator) parkBound(head, slowest time.Duration) time.Duration {
-	return o.t.configWait + slowest + o.t.memberMargin + head + o.t.headMargin
+// members' bound, for a mesh cluster (mesh) the policy settle a head may wait
+// for after a member's NetBird policy was written (counted whether or not a
+// write is pending: the bound is an upper bound), and the head's bound, which
+// also covers the formation (the bounds at the top of
+// cluster_orchestrator.go).
+func (o *clusterOrchestrator) parkBound(head, slowest time.Duration, mesh bool) time.Duration {
+	bound := o.t.configWait + slowest + o.t.memberMargin + head + o.t.headMargin
+	if mesh {
+		bound += o.t.policySettle
+	}
+	return bound
 }
 
 // gateView is head's gate view, from the cache while it answers. A stale or
@@ -71,7 +78,7 @@ func (o *clusterOrchestrator) parkBound(head, slowest time.Duration) time.Durati
 // judges no member server; a request that ended before any view existed is
 // judged the same way.
 func (o *clusterOrchestrator) gateView(ctx context.Context, head string) clusterGateView {
-	fallback := clusterGateView{bound: o.parkBound(o.startupBound(0), o.startupBound(0))}
+	fallback := clusterGateView{bound: o.parkBound(o.startupBound(0), o.startupBound(0), true)}
 	o.mu.Lock()
 	v, ok := o.views[head]
 	if ok && o.deps.now().Before(v.until) {

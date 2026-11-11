@@ -150,6 +150,24 @@ type ClusterCandidateDTO struct {
 	RPCBinary        string             `json:"rpc_binary,omitempty"`
 	RPCBinaryVersion string             `json:"rpc_binary_version,omitempty"`
 	MemberSpecs      []RPCMemberSpecDTO `json:"member_specs,omitempty"`
+	// Compatible: in automatic mode, the server has a ggml-rpc-server of the
+	// head binary's version (RPCBinary names it); false when it offers
+	// membership but has none, or the head binary's version is unknown. In
+	// manual mode, at least one listed member spec is not in
+	// IncompatibleMemberSpecs.
+	Compatible bool `json:"compatible"`
+	// IncompatibleMemberSpecs lists, in manual mode, the member specs whose
+	// binary's known version differs from the head binary's: the save
+	// refuses them with runtime_spec.cluster_version_mismatch.
+	IncompatibleMemberSpecs []string `json:"incompatible_member_specs,omitempty"`
+}
+
+// ClusterCandidateList is ClusterCandidates' answer: the candidates and
+// whether the head binary's version is known (automatic members are matched
+// on it).
+type ClusterCandidateList struct {
+	Candidates      []ClusterCandidateDTO
+	HeadBinaryKnown bool
 }
 
 // clusterPlan is the cluster part of one runtime-spec write: the columns of
@@ -847,15 +865,56 @@ func (s *Service) checkAutomaticMemberBinary(ctx context.Context, e clusterEntry
 // checkManualMemberBinary refuses a manual entry's binary whose known
 // version differs from the head binary's; an unknown one only warns.
 func (s *Service) checkManualMemberBinary(ctx context.Context, e clusterEntry, head routing.ServerBinary) error {
-	member, ok, err := s.BinaryVersionFor(ctx, e.server.ID, e.spec.Binary)
+	member, mismatch, err := s.memberBinaryMismatch(ctx, e.server.ID, e.spec.Binary, head)
 	if err != nil {
 		return err
 	}
-	if ok && binaryVersionKnown(member) && binaryVersionsComparable(head, member) && !binariesSameVersion(head, member) {
+	if mismatch {
 		return fmt.Errorf("%w: member binary %s on server %q is version %s, the head's is %s",
 			ErrClusterVersionMismatch, e.spec.Binary, e.server.Name, member.EffectiveVersion(), head.EffectiveVersion())
 	}
 	return nil
+}
+
+// mismatchedMemberSpecs lists the ids of specs on serverID whose binary's
+// known version differs from head's, reading the server's inventory once.
+func (s *Service) mismatchedMemberSpecs(ctx context.Context, serverID string, specs []RPCMemberSpecDTO, head routing.ServerBinary) ([]string, error) {
+	rows, err := s.routes.ServerBinaries(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	byPath := make(map[string]routing.ServerBinary, len(rows))
+	for _, b := range rows {
+		if _, seen := byPath[b.Path]; !seen {
+			byPath[b.Path] = b
+		}
+	}
+	var out []string
+	for _, spec := range specs {
+		member, listed := byPath[spec.Binary]
+		if memberVersionDiffers(member, listed, head) {
+			out = append(out, spec.ID)
+		}
+	}
+	return out, nil
+}
+
+// memberBinaryMismatch reads a manual member's binary on serverID and reports
+// whether its known version differs from head's (memberVersionDiffers).
+func (s *Service) memberBinaryMismatch(ctx context.Context, serverID, memberBinary string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
+	member, listed, err := s.BinaryVersionFor(ctx, serverID, memberBinary)
+	if err != nil {
+		return member, false, err
+	}
+	return member, memberVersionDiffers(member, listed, head), nil
+}
+
+// memberVersionDiffers is the manual member rule the save check and the
+// candidates listing share: a listed member binary whose known version
+// differs from head's. An unlisted binary or an unknown version is no
+// mismatch (it only warns).
+func memberVersionDiffers(member routing.ServerBinary, listed bool, head routing.ServerBinary) bool {
+	return listed && binaryVersionKnown(member) && binaryVersionsComparable(head, member) && !binariesSameVersion(head, member)
 }
 
 // netbirdMeshReady reports whether a server can take part in a mesh
@@ -2006,31 +2065,83 @@ func (s *Service) addOtherMemberSpecGPUUses(ctx context.Context, m clusterMember
 // members in mode ("automatic" when empty): servers other than the head's
 // that the caller manages and whose consent admits the head (for every
 // caller, system scope included; an empty consent list means the member
-// server's own admin groups). In automatic mode a server must offer RPC membership
-// and have a ggml-rpc-server matching the head binary's version, which needs
-// the stored head spec's version known; in manual mode it must have enabled
-// member specs that serve no other head, which are listed. Sorted by server
-// name.
-func (s *Service) ClusterCandidates(ctx context.Context, p auth.Token, headMappingID, mode string) ([]ClusterCandidateDTO, error) {
+// server's own admin groups). In automatic mode a server must offer RPC
+// membership; it is Compatible when it has a ggml-rpc-server matching the
+// head binary's version. In manual mode it must have enabled member specs
+// that serve no other head, which are listed with the ones whose binary's
+// version differs from the head binary's. headBinary is the head binary to
+// match against, as the operator's form has it; empty means the stored
+// spec's. Its version is read from the head server's inventory exactly as the
+// save checks read it, so the list and the save agree. Sorted by server name.
+func (s *Service) ClusterCandidates(ctx context.Context, p auth.Token, headMappingID, mode, headBinary string) (ClusterCandidateList, error) {
 	mapping, _, headServer, err := s.authorizeMapping(ctx, p, headMappingID)
 	if err != nil {
-		return nil, err
+		return ClusterCandidateList{}, err
 	}
+	if mode, err = candidateMode(mode); err != nil {
+		return ClusterCandidateList{}, err
+	}
+	headSpec, configured, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)
+	if err != nil {
+		return ClusterCandidateList{}, err
+	}
+	binary := strings.TrimSpace(headBinary)
+	if binary == "" && configured {
+		binary = headSpec.Binary
+	}
+	return s.listClusterCandidates(ctx, p, headServer.ID, headSpec.ID, mode, binary)
+}
+
+// ApplicationClusterCandidates is ClusterCandidates for a head that is not
+// stored yet: a new runtime spec on appID, whose first write stores the spec
+// and its members together. It needs the application's rights, as creating
+// the spec does; the head binary is headBinary alone (no stored spec), and
+// no member spec is this head's own.
+func (s *Service) ApplicationClusterCandidates(ctx context.Context, p auth.Token, appID, mode, headBinary string) (ClusterCandidateList, error) {
+	_, headServer, err := s.authorizeApplication(ctx, p, appID)
+	if err != nil {
+		return ClusterCandidateList{}, err
+	}
+	if mode, err = candidateMode(mode); err != nil {
+		return ClusterCandidateList{}, err
+	}
+	return s.listClusterCandidates(ctx, p, headServer.ID, "", mode, strings.TrimSpace(headBinary))
+}
+
+// candidateMode normalizes a listing's member mode; "" is automatic.
+func candidateMode(mode string) (string, error) {
 	mode = normalizeMemberMode(strings.TrimSpace(mode))
 	if mode != memberModeAutomatic && mode != memberModeManual {
-		return nil, ErrClusterMemberModeInvalid
+		return "", ErrClusterMemberModeInvalid
 	}
-	head, err := s.candidateHeadOf(ctx, mapping.ID, headServer.ID)
+	return mode, nil
+}
+
+// listClusterCandidates is both listings' shared body: the head on
+// headServerID with the stored spec headSpecID ("" for a new one) and the
+// head binary binary ("" when there is none to match on).
+func (s *Service) listClusterCandidates(ctx context.Context, p auth.Token, headServerID, headSpecID, mode, binary string) (ClusterCandidateList, error) {
+	head, err := s.candidateHeadFor(ctx, headServerID, headSpecID, binary)
 	if err != nil {
-		return nil, err
+		return ClusterCandidateList{}, err
 	}
+	out, err := s.clusterCandidatesFor(ctx, p, headServerID, mode, head)
+	if err != nil {
+		return ClusterCandidateList{}, err
+	}
+	return ClusterCandidateList{Candidates: out, HeadBinaryKnown: head.known}, nil
+}
+
+// clusterCandidatesFor builds the candidate entries of every server other
+// than the head's that the caller manages, sorted by server name.
+func (s *Service) clusterCandidatesFor(ctx context.Context, p auth.Token, headServerID, mode string, head candidateHead) ([]ClusterCandidateDTO, error) {
 	servers, err := s.routes.AIServers(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := []ClusterCandidateDTO{}
 	for _, srv := range servers {
-		if srv.ID == headServer.ID || !s.callerManagesServer(ctx, p, srv.ID) {
+		if srv.ID == headServerID || !s.callerManagesServer(ctx, p, srv.ID) {
 			continue
 		}
 		c, ok, err := s.clusterCandidate(ctx, p, srv, mode, head)
@@ -2060,22 +2171,20 @@ type candidateHead struct {
 	groups []string
 }
 
-// candidateHeadOf reads the head on mappingID; a mapping without a stored
-// spec has no known binary version.
-func (s *Service) candidateHeadOf(ctx context.Context, mappingID, headServerID string) (candidateHead, error) {
-	var h candidateHead
-	headSpec, configured, err := s.routes.RuntimeSpecByMapping(ctx, mappingID)
-	if err != nil {
-		return h, err
-	}
-	h.specID = headSpec.ID
-	if configured {
+// candidateHeadFor reads what the listing needs of the head: its binary's
+// inventory row on headServerID (none when binary is "") and its server's
+// admin groups.
+func (s *Service) candidateHeadFor(ctx context.Context, headServerID, headSpecID, binary string) (candidateHead, error) {
+	h := candidateHead{specID: headSpecID}
+	if binary != "" {
 		var listed bool
-		if h.binary, listed, err = s.BinaryVersionFor(ctx, headServerID, headSpec.Binary); err != nil {
+		var err error
+		if h.binary, listed, err = s.BinaryVersionFor(ctx, headServerID, binary); err != nil {
 			return h, err
 		}
 		h.known = listed && binaryVersionKnown(h.binary)
 	}
+	var err error
 	h.groups, err = s.routes.ServerAdminGroups(ctx, headServerID)
 	return h, err
 }
@@ -2085,26 +2194,43 @@ func (s *Service) candidateHeadOf(ctx context.Context, mappingID, headServerID s
 func (s *Service) clusterCandidate(ctx context.Context, p auth.Token, srv routing.AIServer, mode string, head candidateHead) (ClusterCandidateDTO, bool, error) {
 	c := ClusterCandidateDTO{ServerID: srv.ID, ServerName: srv.Name}
 	if mode != memberModeAutomatic {
-		specs, err := s.freeMemberSpecs(ctx, p, srv.ID, head.specID, head.groups)
-		if err != nil {
-			return c, false, err
-		}
-		c.MemberSpecs = specs
-		return c, len(specs) > 0, nil
+		return s.manualCandidate(ctx, p, c, head)
 	}
-	if !srv.RPCMemberEnabled || !head.known {
+	if !srv.RPCMemberEnabled {
 		return c, false, nil
 	}
 	admits, err := s.memberConsentAdmits(ctx, srv.RPCAllowedHeadGroups, srv.ID, head.groups)
 	if err != nil || !admits {
 		return c, false, err
 	}
+	if !head.known {
+		return c, true, nil
+	}
 	match, ok, err := s.MatchingRPCBinary(ctx, srv.ID, head.binary)
-	if err != nil || !ok {
+	if err != nil {
 		return c, false, err
 	}
-	c.RPCBinary, c.RPCBinaryVersion = match.Path, match.EffectiveVersion()
+	if ok {
+		c.RPCBinary, c.RPCBinaryVersion, c.Compatible = match.Path, match.EffectiveVersion(), true
+	}
 	return c, true, nil
+}
+
+// manualCandidate fills c's free member specs and marks the ones whose
+// binary the save would refuse for its version; ok is false without any.
+func (s *Service) manualCandidate(ctx context.Context, p auth.Token, c ClusterCandidateDTO, head candidateHead) (ClusterCandidateDTO, bool, error) {
+	specs, err := s.freeMemberSpecs(ctx, p, c.ServerID, head.specID, head.groups)
+	if err != nil {
+		return c, false, err
+	}
+	c.MemberSpecs = specs
+	if head.known {
+		if c.IncompatibleMemberSpecs, err = s.mismatchedMemberSpecs(ctx, c.ServerID, specs, head.binary); err != nil {
+			return c, false, err
+		}
+	}
+	c.Compatible = len(specs) > len(c.IncompatibleMemberSpecs)
+	return c, len(specs) > 0, nil
 }
 
 // freeMemberSpecs lists serverID's enabled member specs that admit the head

@@ -440,8 +440,26 @@ cluster (a spec saved or deleted that was or becomes a head or has members, a
 member spec a head uses, an application edit or delete or a server delete on a
 server that takes part in a cluster) also runs the pass synchronously, and a cluster start runs it first, so a head that was just saved
 can reach its members before it starts; a write that touches no cluster never
-waits on NetBird for it. A store error skips the whole pass rather than deleting policies of
-clusters it failed to read.
+waits on NetBird for it. A written policy is not in force at once: NetBird
+distributes a new or changed policy to the peers asynchronously. Every pass --
+a save's, a fleet pass, a cluster start's -- therefore records, per member
+server, when it last wrote that server's policy, and keeps the record for a
+**15 s settle window**. A write NetBird answered with an ambiguous error
+(a timeout, a transport failure, a 5xx, an unreadable answer) counts, since it
+may have landed; a definite refusal (a 4xx such as a stale group id) changed
+nothing and does not. The pass run before a mesh cluster start returns the
+writes still inside the window, its own and earlier passes', and when one
+grants a member of that cluster the orchestration starts the head only once
+15 s have passed since the latest such write, letting the members start
+meanwhile ([Runtime View §6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)).
+So a start right after the save that switched a cluster to `mesh` waits for
+the rest of the window although its own pass finds the policy already in
+place, and a start after the window does not wait. Without the wait the
+head's first connect to a member's mesh IP ran into a grant that had not
+arrived yet and hung until the TCP connect timed out. Records of servers
+that no longer exist, and those past the window, are dropped. A store error
+skips the whole pass rather than deleting policies of clusters it failed to
+read.
 
 **NetBird policies only allow; the `Default` policy decides what they are worth.**
 While NetBird's built-in `Default` (all-to-all) policy is enabled, a member's

@@ -400,7 +400,15 @@ import (
 // status fields (kind, rpc, cluster, admission_blocked_by, last_error.code),
 // serves new router routes (/rpc/...) and gains an agent.Features entry. This is
 // the ONE bump for the whole branch; later commits on it do not bump again.
-const Version = "0.18.0"
+//
+// 0.18.0 -> 0.18.1 is the single bump for the RPC cluster follow-up branch.
+// PATCH: no agent.Features entry changes (rpc_cluster keeps Since 0.18.0), but
+// what an operator and the gateway observe does -- an unreachable member's
+// exit is classified before the device error it causes
+// (runtime.cluster_member_unreachable, non-terminal, instead of a terminal
+// device_backend_mismatch), and a member's reported command carries the
+// arguments and environment the agent adds.
+const Version = "0.18.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

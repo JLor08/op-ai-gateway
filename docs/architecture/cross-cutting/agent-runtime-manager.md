@@ -1689,14 +1689,23 @@ A cluster head starts **only** when the gateway asks for it, never on its own:
 The agent reads the tail of a failed cluster process's output against a small,
 explicit table of llama.cpp messages, applied only to heads and `rpc_server`
 members (model specs are never classified), and attaches a stable code to
-`last_error.code`:
+`last_error.code`. The rows are in precedence order: when the tail holds
+several of the messages, the first row that matches decides, wherever in the
+tail its message stands. Causes come before the errors they lead to.
+llama.cpp registers an RPC device only for a member it connected to and shook
+hands with, so an unreachable member, a failed handshake or a protocol
+mismatch is followed by `invalid device: RPC<n>` when the head's `--device`
+list names that member's device. That tail is an unreachable member
+(non-terminal), or a version mismatch, never a backend mismatch. A failed
+handshake or protocol mismatch also wins over a `Failed to connect` printed
+with it, since the member was reached.
 
 | Message (source) | Code | Terminal |
 |---|---|---|
-| `invalid device: ` (head), `unknown device: ` / `No devices found` (member) | `runtime.device_backend_mismatch` | yes |
 | `RPC not supported in this build` | `runtime.rpc_unsupported_build` | yes |
 | `RPC handshake failed`, `protocol version mismatch` | `runtime.cluster_version_mismatch` | yes |
 | `Failed to connect` (head) | `runtime.cluster_member_unreachable` | no |
+| `invalid device: ` (head), `unknown device: ` / `No devices found` (member) | `runtime.device_backend_mismatch` | yes |
 
 A member's banner device-count mismatch is terminal too
 (`runtime.rpc_device_count_mismatch`). A **terminal** verdict is one no retry
@@ -5082,6 +5091,12 @@ gained the member routes, the head start header and the conditional stop (§3.6,
 §4.1). Compatibility needs **no upgrade order**: the gateway sends cluster
 documents only to an agent that declares the name, and the agent honours them only
 under a gateway that declares it.
+
+**`0.18.0` → `0.18.1` (RPC cluster follow-ups) is PATCH.** No feature flag
+changes (`rpc_cluster` keeps `Since: "0.18.0"`), but what an operator and the
+gateway observe does: the exit classification takes an unreachable member
+before the device error it causes (§3.6), and a member's reported command
+carries the arguments and environment the agent adds (§14.7).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -9776,7 +9791,13 @@ assume. The gap between what was typed and what ran is where the bug tends to
 be. Binary, argv, working directory and the **complete** effective environment
 are reported; nothing was retained before this existed, because
 `ExpandPlaceholders` built the resolved form, `exec.Command` consumed it, and it
-was dropped.
+was dropped. For an `rpc_server` member the report includes what the agent
+adds after the expansion (§3.6): the `-d`, `-H`, `-p` and `-c` arguments after
+the operator's, and `GGML_RPC_NO_RDMA` and `LLAMA_CACHE` in the environment.
+These are exactly the values `exec.Command` receives, and they carry no secret
+span. A head's `--rpc` and `--device` values come from the
+`${RPC_SERVERS}`/`${RPC_DEVICES}` placeholders, which the expansion resolves,
+so the report shows them expanded.
 
 **On the marker, and that is the design.** `${PORT}` is resolved afresh on every
 start, so across a crash loop the command *differs* between attempts. Because it

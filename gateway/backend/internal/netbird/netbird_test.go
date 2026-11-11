@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1293,4 +1294,43 @@ func TestDeleteToken(t *testing.T) {
 		return DeleteToken(ctx, cfg, timeout, "u1", tokenID)
 	}
 	runDeleteContract(t, del, "/api/users/u1/tokens/")
+}
+
+// TestIsRefusalTellsDefiniteRefusalsFromAmbiguousFailures: a 4xx (and the
+// 401/403 ErrAuth) is NetBird refusing the request, which therefore changed
+// nothing; a 5xx, a transport failure or an unreadable 2xx answer leaves it
+// open whether the request took effect. The status error keeps its text.
+func TestIsRefusalTellsDefiniteRefusalsFromAmbiguousFailures(t *testing.T) {
+	answer := func(status int, body string) error {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		_, err := CreatePolicy(context.Background(), Config{URL: srv.URL, Token: "t"}, time.Second, PolicyRequest{Name: "p"})
+		return err
+	}
+	for name, c := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"400":            {answer(http.StatusBadRequest, `{"message":"group not found"}`), true},
+		"422":            {answer(http.StatusUnprocessableEntity, `{"message":"invalid"}`), true},
+		"403":            {answer(http.StatusForbidden, ``), true},
+		"500":            {answer(http.StatusInternalServerError, `{"message":"boom"}`), false},
+		"unreadable 2xx": {answer(http.StatusOK, `not json`), false},
+		"transport":      {fmt.Errorf("wrapped: %w", errors.New("dial tcp: connection refused")), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if c.err == nil {
+				t.Fatal("no error")
+			}
+			if got := IsRefusal(c.err); got != c.want {
+				t.Fatalf("IsRefusal(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+	if err := answer(http.StatusBadRequest, `{"message":"group not found"}`); !strings.Contains(err.Error(), "status 400: group not found") {
+		t.Fatalf("error text = %q, want the status and message", err)
+	}
 }

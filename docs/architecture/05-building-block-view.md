@@ -258,10 +258,23 @@ Additions worth knowing when looking for code on this side:
   owns its state and sends it with every save, because the spec PUT is a full
   document. `shared/clusterArgs.ts` mirrors the gateway's head save checks in the
   gateway's order, so the form refuses before the round trip while the gateway
-  stays the authority. `ClusterProgress.tsx` (over `shared/clusterStatus.ts`)
+  stays the authority. `shared/clusterCandidates.ts` reads the member
+  candidates for the head binary the form has (per mapping, or per application
+  for a spec not saved yet) and turns the gateway's verdicts into the picker's
+  offer and each member's problem, and `shared/runtimeSpecTypeFlavors.ts`
+  mirrors the llama.cpp branch of the gateway's Auto type detection
+  (`routing.DetectRuntimeSpecType`) to decide when the cluster block shows.
+  `ClusterProgress.tsx` (over `shared/clusterStatus.ts`)
   renders the head's `cluster_status` as a step progress, and
   `ClusterTotalCell.tsx` (over `shared/clusterTotals.ts`) the cluster totals with
   the head's own value beneath; both know a hidden member by its position only.
+  The compact progress shows in the spec list's live-status column and on the
+  head's row of the Live-Status tab, off the same head spec, which
+  `shared/useClusterHeadRefresh.ts` re-reads every 10 s, at once on a status
+  change, and every 1.5 s while the cluster forms or a Start just pressed there
+  has not shown yet (one read in flight per head): the members run on other
+  servers, whose status streams the page does not follow, so the orchestration's
+  `cluster_status` is where their phases show.
   Two server tabs belong to it: **RPC** (`RpcMemberSection.tsx`: the server's RPC
   membership and consent, its manual member specs and the live member rows;
   hidden for a file-mode agent) and **Binaries** (`BinariesSection.tsx`: the

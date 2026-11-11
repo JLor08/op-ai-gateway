@@ -90,6 +90,41 @@ export function formSpecIsStableDiffusion(
 }
 
 /**
+ * Whether Auto (an empty Type) resolves binary to llama_cpp: the llama.cpp
+ * branch of routing.DetectRuntimeSpecType, which reads the lower-cased base
+ * name and checks vllm before it. Only this branch is mirrored, for the RPC
+ * cluster block a new llama.cpp spec offers before the gateway resolved it.
+ */
+export function autoDetectsLlamaCpp(binary: string): boolean {
+  // Like Go's filepath.Base: trailing slashes do not count.
+  let path = binary.trim();
+  while (path.endsWith('/')) path = path.slice(0, -1);
+  const name = (path.split('/').at(-1) ?? '').toLowerCase();
+  if (name.includes('vllm')) return false;
+  return ['llama-server', 'llama_cpp', 'llama.cpp'].some((marker) => name.includes(marker));
+}
+
+/**
+ * Whether the form describes a llama_cpp spec: the Type select says so, or
+ * Type is Auto and the binary resolves to it -- by the mirrored detection, or
+ * as the loaded Auto spec resolved while its binary is unchanged.
+ */
+export function formSpecIsLlamaCpp(
+  type: RuntimeSpec['type'],
+  binary: string,
+  loaded: LoadedSpecType | null,
+): boolean {
+  if (type === 'llama_cpp') return true;
+  if (type !== '') return false;
+  if (autoDetectsLlamaCpp(binary)) return true;
+  return (
+    loaded?.type === '' &&
+    loaded.effective_type === 'llama_cpp' &&
+    binary.trim() === loaded.binary.trim()
+  );
+}
+
+/**
  * Whether a stable_diffusion_cpp spec has a text flavor ticked, or none at
  * all. sd-server has no chat endpoint, and a list that is not images-only is
  * listed as a text model. Mirrors the api_flavors_text_on_stable_diffusion

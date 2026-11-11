@@ -42,22 +42,24 @@ type rpcExitRule struct {
 // rpcExitRules is a deliberately small, explicit table: free-text matching is
 // confined to the llama.cpp RPC messages the cluster mode depends on and to
 // cluster heads and rpc_server members, so model specs are never classified.
+//
+// ORDER IS PRECEDENCE: matchExitRule takes the first rule whose message
+// appears anywhere in the tail, so the table lists causes before the errors
+// they lead to. llama.cpp registers an RPC device only for a member it
+// connected to and shook hands with, so an unreachable member, a failed
+// handshake or a protocol mismatch is followed by "invalid device: RPC<n>"
+// when the head's --device list names that member's device. Read first, the
+// device rule would turn an unreachable member, which a later start may find
+// up, into a terminal backend mismatch. Hence:
+//
+//  1. an RPC-less build: nothing RPC can work, whatever else is printed;
+//  2. a failed handshake or a protocol mismatch: the member was reached, so a
+//     "Failed to connect" printed with it is its consequence, not a second
+//     cause, and the more specific, terminal verdict wins;
+//  3. an unreachable member (non-terminal);
+//  4. the device rules, which stand on their own only when none of the above
+//     was printed.
 var rpcExitRules = []rpcExitRule{
-	{
-		"invalid device: ", true, false,
-		exitClass{codeDeviceBackendMismatch, true},
-		"the cluster head names a device its llama.cpp build does not provide",
-	},
-	{
-		"unknown device: ", false, true,
-		exitClass{codeDeviceBackendMismatch, true},
-		"the rpc-server member names a device its llama.cpp build does not provide",
-	},
-	{
-		"No devices found", false, true,
-		exitClass{codeDeviceBackendMismatch, true},
-		"the rpc-server member found no usable device",
-	},
 	{
 		"RPC not supported in this build", true, true,
 		exitClass{codeRPCUnsupportedBuild, true},
@@ -78,10 +80,25 @@ var rpcExitRules = []rpcExitRule{
 		exitClass{codeClusterMemberUnreach, false},
 		"the cluster head could not connect to an rpc-server member",
 	},
+	{
+		"invalid device: ", true, false,
+		exitClass{codeDeviceBackendMismatch, true},
+		"the cluster head names a device its llama.cpp build does not provide",
+	},
+	{
+		"unknown device: ", false, true,
+		exitClass{codeDeviceBackendMismatch, true},
+		"the rpc-server member names a device its llama.cpp build does not provide",
+	},
+	{
+		"No devices found", false, true,
+		exitClass{codeDeviceBackendMismatch, true},
+		"the rpc-server member found no usable device",
+	},
 }
 
-// matchExitRule returns the first rule that applies to spec and whose message
-// appears in tail. It reports false for anything that is not a cluster head or
+// matchExitRule returns the first rule, in rpcExitRules' precedence order,
+// that applies to spec and whose message appears in tail. It reports false for anything that is not a cluster head or
 // rpc_server member, and for output that matches no rule.
 func matchExitRule(spec Spec, tail string) (rpcExitRule, bool) {
 	head, member := spec.IsClusterHead(), spec.IsRPCServer()

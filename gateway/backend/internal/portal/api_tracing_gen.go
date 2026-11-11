@@ -209,6 +209,18 @@ func (_d *APIWithTracing) AnthropicPromptCachingEnabled(ctx context.Context) (b1
 	return _d.API.AnthropicPromptCachingEnabled(ctx)
 }
 
+func (_d *APIWithTracing) ApplicationClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string) (c2 ClusterCandidateList, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ApplicationClusterCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ApplicationClusterCandidates(ctx, t1, s1, s2, s3)
+}
+
 func (_d *APIWithTracing) AuthorizeBenchmarkScope(ctx context.Context, t1 auth.Token, s1 string, s2 string) (a1 routing.AIServer, ba1 []BenchmarkTargetView, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeBenchmarkScope")
 	defer span.End()
@@ -405,7 +417,7 @@ func (_d *APIWithTracing) ClaudeAliasTarget(ctx context.Context, t1 auth.Token, 
 	return _d.API.ClaudeAliasTarget(ctx, t1, s1)
 }
 
-func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string) (ca1 []ClusterCandidateDTO, err error) {
+func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string) (c2 ClusterCandidateList, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ClusterCandidates")
 	defer span.End()
 	defer func() {
@@ -414,7 +426,7 @@ func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, 
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.ClusterCandidates(ctx, t1, s1, s2)
+	return _d.API.ClusterCandidates(ctx, t1, s1, s2, s3)
 }
 
 func (_d *APIWithTracing) ClusterPlan(ctx context.Context, s1 string) (c2 ClusterPlan, err error) {
@@ -1745,11 +1757,10 @@ func (_d *APIWithTracing) ReconcileGatewayPeer(ctx context.Context) (s1 string, 
 	return _d.API.ReconcileGatewayPeer(ctx)
 }
 
-func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) {
+func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) (ra1 []RPCPolicyWrite) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ReconcileRPCPolicies")
 	defer span.End()
-	_d.API.ReconcileRPCPolicies(ctx)
-	return
+	return _d.API.ReconcileRPCPolicies(ctx)
 }
 
 func (_d *APIWithTracing) RefreshVendorAccountModels(ctx context.Context, t1 auth.Token, s1 string) (v1 VendorAccountDTO, r1 RefreshResult, err error) {

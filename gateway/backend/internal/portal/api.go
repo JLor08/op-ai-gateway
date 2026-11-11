@@ -32,9 +32,10 @@ type API interface {
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
 	NotifyClustersOfServer(context.Context, string)
 	KeptUpClusterHeads(context.Context) ([]string, error)
-	ReconcileRPCPolicies(context.Context)
+	ReconcileRPCPolicies(context.Context) []RPCPolicyWrite
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AnthropicPromptCachingEnabled(context.Context) bool
+	ApplicationClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeRuntimeAction(context.Context, auth.Token, string) (RuntimeActionScope, error)
@@ -54,7 +55,7 @@ type API interface {
 	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
-	ClusterCandidates(context.Context, auth.Token, string, string) ([]ClusterCandidateDTO, error)
+	ClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	ClusterPlan(context.Context, string) (ClusterPlan, error)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
 	CommitVoiceTurn(context.Context, auth.Token, string, string, AssistantTurn, string) error

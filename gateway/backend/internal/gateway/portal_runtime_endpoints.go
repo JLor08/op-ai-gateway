@@ -65,20 +65,23 @@ func (s *Server) handlePortalMappingRuntimeSpec(w http.ResponseWriter, r *http.R
 }
 
 // handlePortalClusterCandidates serves GET
-// /api/portal/mappings/{mappingID}/runtime/cluster-candidates?mode=automatic|manual:
+// /api/portal/mappings/{mappingID}/runtime/cluster-candidates?mode=automatic|manual&binary=<path>:
 // the servers the cluster head on that mapping may add as members, as
-// {"data": [...]}. Authorization (the head's mapping, each candidate server,
-// member consent) happens inside portal.Service.ClusterCandidates.
+// {"data": [...], "head_binary_known": bool}. binary is the head binary the
+// operator's form has (empty: the stored spec's). Authorization (the head's
+// mapping, each candidate server, member consent) happens inside
+// portal.Service.ClusterCandidates.
 func (s *Server) handlePortalClusterCandidates(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID string) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	list, err := s.Portal.ClusterCandidates(r.Context(), token, mappingID, r.URL.Query().Get("mode"))
+	q := r.URL.Query()
+	list, err := s.Portal.ClusterCandidates(r.Context(), token, mappingID, q.Get("mode"), q.Get("binary"))
 	if err != nil {
 		writePortalRuntimeSpecError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": list})
+	writeJSON(w, http.StatusOK, map[string]any{"data": list.Candidates, "head_binary_known": list.HeadBinaryKnown})
 }
 
 // handlePortalClusterMemberResetUsage serves POST

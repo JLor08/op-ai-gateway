@@ -893,23 +893,29 @@ func TestClusterCandidatesFiltersByAuthAndConsent(t *testing.T) {
 		}
 		return out
 	}
-	auto, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic")
+	autoList, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names(auto); !slices.Equal(got, []string{"Good"}) {
-		t.Fatalf("automatic candidates = %v, want [Good]", got)
+	auto := autoList.Candidates
+	// A server that offers membership but has no ggml-rpc-server of the head
+	// binary's version is listed as incompatible.
+	if got := names(auto); !slices.Equal(got, []string{"Good", "WrongVersion"}) || !autoList.HeadBinaryKnown {
+		t.Fatalf("automatic candidates = %v (head known %v), want [Good WrongVersion]", got, autoList.HeadBinaryKnown)
 	}
-	if auto[0].ServerID != good.ID || auto[0].RPCBinary != clusterRPCBinary {
+	if auto[0].ServerID != good.ID || auto[0].RPCBinary != clusterRPCBinary || !auto[0].Compatible {
 		t.Fatalf("candidate = %+v", auto[0])
+	}
+	if auto[1].Compatible || auto[1].RPCBinary != "" {
+		t.Fatalf("wrong-version candidate = %+v, want incompatible", auto[1])
 	}
 	// System scope manages every server, but consent binds it like anyone:
 	// the server that does not consent to the head is not offered.
-	sys, err := f.svc.ClusterCandidates(f.ctx, systemToken(), f.mappingID, "automatic")
+	sys, err := f.svc.ClusterCandidates(f.ctx, systemToken(), f.mappingID, "automatic", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names(sys); !slices.Equal(got, []string{"Foreign", "Good"}) {
+	if got := names(sys.Candidates); !slices.Equal(got, []string{"Foreign", "Good", "WrongVersion"}) {
 		t.Fatalf("system candidates = %v", got)
 	}
 
@@ -923,18 +929,168 @@ func TestClusterCandidatesFiltersByAuthAndConsent(t *testing.T) {
 	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), disabled.ID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary, AllowedHeadGroups: &[]string{f.foreignGroup()}}); err != nil {
 		t.Fatal(err)
 	}
-	manual, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "manual")
+	manualList, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "manual", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manual) != 1 || manual[0].ServerID != good.ID || len(manual[0].MemberSpecs) != 1 || manual[0].MemberSpecs[0].ID != free.ID {
+	manual := manualList.Candidates
+	if len(manual) != 1 || !manual[0].Compatible || manual[0].ServerID != good.ID || len(manual[0].MemberSpecs) != 1 || manual[0].MemberSpecs[0].ID != free.ID {
 		t.Fatalf("manual candidates = %+v", manual)
 	}
-	if _, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "sideways"); !errors.Is(err, ErrClusterMemberModeInvalid) {
+	if _, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "sideways", ""); !errors.Is(err, ErrClusterMemberModeInvalid) {
 		t.Fatalf("bad mode err = %v", err)
 	}
-	if _, err := f.svc.ClusterCandidates(f.ctx, otherToken(), f.mappingID, "automatic"); !errors.Is(err, ErrMappingNotFound) {
+	if _, err := f.svc.ClusterCandidates(f.ctx, otherToken(), f.mappingID, "automatic", ""); !errors.Is(err, ErrMappingNotFound) {
 		t.Fatalf("foreign head err = %v, want mapping not found", err)
+	}
+}
+
+// The form's head binary, not the stored one, decides which members match:
+// the listing reads its version from the head server's inventory exactly as
+// the save check does.
+func TestClusterCandidatesMatchTheFormsHeadBinary(t *testing.T) {
+	f := newClusterFixture(t)
+	f.mustPut(PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Args: []string{"-m", "/m.gguf"}})
+	const newHead = "/opt/llama-b2/llama-server"
+	f.binary(f.head.ID, newHead, BinaryKindLlamaServer, "9999fff")
+	old := f.member("Old")
+	upgraded := f.member("Upgraded")
+	if err := f.routes.DeleteManualServerBinary(f.ctx, upgraded.ID, clusterRPCBinary); err != nil {
+		t.Fatal(err)
+	}
+	f.binary(upgraded.ID, clusterRPCBinary, BinaryKindRPCServer, "9999fff")
+
+	compatible := func(list ClusterCandidateList) map[string]bool {
+		out := map[string]bool{}
+		for _, c := range list.Candidates {
+			out[c.ServerID] = c.Compatible
+		}
+		return out
+	}
+	stored, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := compatible(stored); !got[old.ID] || got[upgraded.ID] {
+		t.Fatalf("stored binary: compatible = %v", got)
+	}
+	switched, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", newHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := compatible(switched); got[old.ID] || !got[upgraded.ID] || !switched.HeadBinaryKnown {
+		t.Fatalf("form binary: compatible = %v, head known %v", got, switched.HeadBinaryKnown)
+	}
+
+	// The save agrees: Old is refused against the new binary, Upgraded is not.
+	req := clusterHeadRequest(autoMember(old.ID))
+	req.Binary = newHead
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterMemberNoMatchingBinary) {
+		t.Fatalf("save with Old = %v, want %v", err, ErrClusterMemberNoMatchingBinary)
+	}
+	req.ClusterMembers = []ClusterMemberDTO{autoMember(upgraded.ID)}
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatalf("save with Upgraded = %v", err)
+	}
+
+	// A binary the inventory does not list has no known version: every
+	// automatic candidate is listed, none compatible.
+	unknown, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", "/somewhere/llama-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.HeadBinaryKnown || len(unknown.Candidates) != 2 || unknown.Candidates[0].Compatible || unknown.Candidates[1].Compatible {
+		t.Fatalf("unknown binary = %+v", unknown)
+	}
+	// The save agrees: an automatic member cannot be matched on it.
+	req.Binary = "/somewhere/llama-server"
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterHeadBinaryVersionUnknown) {
+		t.Fatalf("save with an unknown head version = %v, want %v", err, ErrClusterHeadBinaryVersionUnknown)
+	}
+}
+
+func TestClusterCandidatesFlagManualSpecsOfAnotherVersion(t *testing.T) {
+	f := newClusterFixture(t)
+	f.mustPut(PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Args: []string{"-m", "/m.gguf"}})
+	srv := f.member("Manual")
+	match := f.manualSpec(srv.ID)
+	const otherBuild = "/opt/llama-old/ggml-rpc-server"
+	f.binary(srv.ID, otherBuild, BinaryKindRPCServer, "9999fff")
+	mismatch, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), srv.ID, "", PutRPCMemberSpecRequest{Binary: otherBuild})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "manual", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Candidates) != 1 || len(list.Candidates[0].MemberSpecs) != 2 || !list.Candidates[0].Compatible {
+		t.Fatalf("manual candidates = %+v", list.Candidates)
+	}
+	if got := list.Candidates[0].IncompatibleMemberSpecs; !slices.Equal(got, []string{mismatch.ID}) {
+		t.Fatalf("incompatible specs = %v, want [%s] (not %s)", got, mismatch.ID, match.ID)
+	}
+	// The save refuses that spec for the same reason.
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: srv.ID, MemberSpecID: mismatch.ID})
+	req.MemberMode = "manual"
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterVersionMismatch) {
+		t.Fatalf("save with the mismatched spec = %v, want %v", err, ErrClusterVersionMismatch)
+	}
+	// And accepts the spec the listing does not flag.
+	req.ClusterMembers = []ClusterMemberDTO{{ServerID: srv.ID, MemberSpecID: match.ID}}
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatalf("save with the matching spec = %v", err)
+	}
+}
+
+// A new runtime spec has no mapping-scoped listing yet: the application's
+// listing reads the head server from the application and the head binary
+// from the form, and no member spec is the new head's own. The first write
+// then stores the head with its members.
+func TestApplicationClusterCandidatesForANewHead(t *testing.T) {
+	f := newClusterFixture(t)
+	good := f.member("Good")
+	free := f.manualSpec(good.ID)
+	taken := f.manualSpec(good.ID)
+	other := seedOtherHead(t, f)
+	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: good.ID, MemberSpecID: taken.ID, Port: 26100}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	auto, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "automatic", clusterHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !auto.HeadBinaryKnown || len(auto.Candidates) != 1 || auto.Candidates[0].ServerID != good.ID || !auto.Candidates[0].Compatible {
+		t.Fatalf("automatic = %+v", auto)
+	}
+	// Without a form binary there is nothing to match on.
+	none, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.HeadBinaryKnown || len(none.Candidates) != 1 || none.Candidates[0].Compatible {
+		t.Fatalf("no binary = %+v", none)
+	}
+	manual, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "manual", clusterHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manual.Candidates) != 1 || len(manual.Candidates[0].MemberSpecs) != 1 || manual.Candidates[0].MemberSpecs[0].ID != free.ID {
+		t.Fatalf("manual = %+v, want only the free spec", manual.Candidates)
+	}
+	if _, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "sideways", ""); !errors.Is(err, ErrClusterMemberModeInvalid) {
+		t.Fatalf("bad mode err = %v", err)
+	}
+	if _, err := f.svc.ApplicationClusterCandidates(f.ctx, otherToken(), f.app.ID, "automatic", ""); !errors.Is(err, ErrApplicationNotFound) {
+		t.Fatalf("foreign application err = %v, want application not found", err)
+	}
+
+	// The spec's first write stores the head and the member the listing
+	// offered.
+	dto := f.mustPut(clusterHeadRequest(autoMember(good.ID)))
+	if !dto.ClusterEnabled || len(dto.ClusterMembers) != 1 || dto.ClusterMembers[0].ServerID != good.ID {
+		t.Fatalf("first write = %+v", dto)
 	}
 }
 

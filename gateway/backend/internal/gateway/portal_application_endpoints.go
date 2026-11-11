@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/store"
@@ -85,58 +86,10 @@ func (s *Server) handlePortalApplicationItem(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// GET/PUT /api/portal/applications/{id}/runtime/coresidency and
-	// GET /api/portal/applications/{id}/runtime/warnings (Task 6): both are
-	// gated the same way as every other application sub-resource above
-	// (authorizeApplication inside the Portal method -- 404-no-leak), so
-	// they share writePortalApplicationError.
+	// The application's runtime sub-resources (handlePortalApplicationRuntime).
 	if len(parts) == 3 && parts[1] == "runtime" {
-		switch parts[2] {
-		case "coresidency":
-			switch r.Method {
-			case http.MethodGet:
-				dto, err := s.Portal.GetCoResidency(r.Context(), token, appID)
-				if err != nil {
-					writePortalApplicationError(w, err)
-					return
-				}
-				writeJSON(w, http.StatusOK, dto)
-			case http.MethodPut:
-				raw, ok := readRawJSON(w, r)
-				if !ok {
-					return
-				}
-				var req portal.SetCoResidencyRequest
-				if err := json.Unmarshal(raw, &req); err != nil {
-					writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
-					return
-				}
-				dto, err := s.Portal.SetCoResidency(r.Context(), token, appID, req)
-				if err != nil {
-					writePortalApplicationError(w, err)
-					return
-				}
-				writeJSON(w, http.StatusOK, dto)
-			default:
-				w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
-				writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
-			}
-			return
-		case "warnings":
-			if !requireMethod(w, r, http.MethodGet) {
-				return
-			}
-			warnings, err := s.Portal.RuntimeWarnings(r.Context(), token, appID)
-			if err != nil {
-				writePortalApplicationError(w, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"warnings": warnings})
-			return
-		default:
-			writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeApplicationNotFound, msgApplicationNotFound, ""))
-			return
-		}
+		s.handlePortalApplicationRuntime(w, r, token, appID, parts[2])
+		return
 	}
 
 	if len(parts) != 1 {
@@ -270,4 +223,78 @@ var portalApplicationErrRows = []errRow{
 
 func writePortalApplicationError(w http.ResponseWriter, err error) {
 	writeMappedError(w, err, portalApplicationErrRows, http.StatusInternalServerError, "application.request_failed", "application request failed")
+}
+
+// handlePortalApplicationRuntime serves the application's runtime
+// sub-resources:
+//   - GET/PUT /api/portal/applications/{id}/runtime/coresidency and
+//     GET /api/portal/applications/{id}/runtime/warnings (Task 6): both are
+//     gated the same way as every other application sub-resource
+//     (authorizeApplication inside the Portal method -- 404-no-leak), so they
+//     share writePortalApplicationError.
+//   - GET /api/portal/applications/{id}/runtime/cluster-candidates?mode=&binary=:
+//     the member candidates of a cluster head that is not stored yet (a new
+//     runtime spec on the application), answered like the mapping-scoped
+//     listing and refused with the runtime-spec error table.
+func (s *Server) handlePortalApplicationRuntime(w http.ResponseWriter, r *http.Request, token auth.Token, appID, sub string) {
+	switch sub {
+	case "coresidency":
+		s.handlePortalApplicationCoResidency(w, r, token, appID)
+	case "warnings":
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		warnings, err := s.Portal.RuntimeWarnings(r.Context(), token, appID)
+		if err != nil {
+			writePortalApplicationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"warnings": warnings})
+	case "cluster-candidates":
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		q := r.URL.Query()
+		list, err := s.Portal.ApplicationClusterCandidates(r.Context(), token, appID, q.Get("mode"), q.Get("binary"))
+		if err != nil {
+			writePortalRuntimeSpecError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": list.Candidates, "head_binary_known": list.HeadBinaryKnown})
+	default:
+		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeApplicationNotFound, msgApplicationNotFound, ""))
+	}
+}
+
+// handlePortalApplicationCoResidency serves GET/PUT
+// /api/portal/applications/{id}/runtime/coresidency.
+func (s *Server) handlePortalApplicationCoResidency(w http.ResponseWriter, r *http.Request, token auth.Token, appID string) {
+	switch r.Method {
+	case http.MethodGet:
+		dto, err := s.Portal.GetCoResidency(r.Context(), token, appID)
+		if err != nil {
+			writePortalApplicationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, dto)
+	case http.MethodPut:
+		raw, ok := readRawJSON(w, r)
+		if !ok {
+			return
+		}
+		var req portal.SetCoResidencyRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+			return
+		}
+		dto, err := s.Portal.SetCoResidency(r.Context(), token, appID, req)
+		if err != nil {
+			writePortalApplicationError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, dto)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+		writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
+	}
 }
