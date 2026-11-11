@@ -1376,7 +1376,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
   });
 
   it('keeps the form, members included, as the Edit of the new mapping when the first write is refused', async () => {
-    const { fakeApi, putSpecs } = await openCreate();
+    const { fakeApi, putSpecs, created } = await openCreate();
     await fillNewHead(fakeApi);
     fakeApi.putRuntimeSpec.mockRejectedValueOnce(
       new PortalApiError(400, 'runtime_spec.cluster_member_no_matching_binary', 'server "Alpha"'),
@@ -1395,6 +1395,8 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].mappingId).toBe('map_created');
     expect(putSpecs[0].body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a']);
+    // The re-save is an edit of that mapping, never a second create.
+    expect(created).toHaveLength(1);
   });
 
   it('creates a mapping+spec through the form', async () => {
