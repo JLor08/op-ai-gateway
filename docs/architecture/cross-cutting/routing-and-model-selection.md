@@ -2553,21 +2553,24 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   park (`NoPark`, `CheckOnly`), or a resolver without a queue, is served by a parkable head only
   when no running candidate is left; the voice-chat gate then starts the cluster itself through
   the orchestration.
-- **Excluded** (cooling down after a failed start or after the watchdog stopped it for a lost
-  member, withheld by the runtime documents, blocked by a terminal cause, a member server not
-  selectable or held by a benchmark): dropped. When nothing else serves the model the request
-  fails with the cluster's code (§8), never `routing.no_healthy_host`. The code stays the stable
-  one (`runtime.cluster_start_failed` during a cooldown, `runtime.cluster_unavailable`
-  otherwise); a head excluded for a failure the cluster recorded — the cooldown, a terminal
-  block — carries that failure in its verdict, and the message names its cause and where it
-  happened (`(cause: runtime.cluster_member_lost at member 0)`, `… at the head`). In a model
-  group such a member is unavailable and the walk goes on.
+- **Excluded** (cooling down after a failed start, after the watchdog stopped it for a lost
+  member or after the head crashed, withheld by the runtime documents, blocked by a terminal
+  cause, a member server not selectable or held by a benchmark): dropped. A crash records the
+  agent's own code as the cause, or `runtime.cluster_head_crashed` when the exit carried none.
+  When nothing else serves the model the request fails with the cluster's code (§8), never
+  `routing.no_healthy_host`. The code stays the stable one (`runtime.cluster_start_failed`
+  during a cooldown, `runtime.cluster_unavailable` otherwise); a head excluded for a failure the
+  cluster recorded — the cooldown, a terminal block — carries that failure in its verdict, and
+  the message names its cause and where it happened
+  (`(cause: runtime.cluster_member_lost at member 0)`, `… at the head`). In a model group such a
+  member is unavailable and the walk goes on.
 
   **Naming the cause in an inference refusal is deliberate.** The message may carry the
   recorded cause code and the member's **position**, never a server name: positions are the
   anonymous member identity the portal already shows a caller who may not see a member's
   server, and the cause codes are stable public error codes. With them an API client can tell
-  a transient member loss (`runtime.cluster_member_lost`, `.cluster_member_unreachable`: retry
+  a transient failure (a member loss, `runtime.cluster_member_lost`,
+  `.cluster_member_unreachable`, or a crash of the head, `runtime.cluster_head_crashed`: retry
   after the cooldown) from a block that needs the operator (`.cluster_version_mismatch`,
   `.device_backend_mismatch`, `.rpc_device_count_mismatch`, `.rpc_unsupported_build`: no
   retry helps until the head's configuration changes). The cost is that an application client

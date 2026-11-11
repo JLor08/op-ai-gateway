@@ -315,7 +315,7 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   one device.
 - `${RPC_SERVERS}` — an exact match, **cluster heads only**: the comma-joined
   endpoint addresses of the head's `cluster.endpoints`, in the operator's member
-  order (`100.64.0.5:47001,100.64.0.6:47001`). The gateway resolves the
+  order (`100.64.0.5:26001,100.64.0.6:26001`). The gateway resolves the
   *configured* membership, never liveness, into the wire field and the agent
   substitutes it, so a literal `${RPC_SERVERS}` can never reach a child. On a
   spec that is not a head it is a hard error.
@@ -1435,11 +1435,12 @@ offloads part of the model to **members**, `ggml-rpc-server` processes on other
 AI servers. The gateway configures, orders and secures the cluster; it is never
 on the RPC data path. This section is the agent's half of that design; the
 gateway's half is [§3.7](#37-the-gateways-half-of-a-cluster). It is
-active only while the gateway declares `rpc_cluster` ([§7](#7-feature-negotiation)):
-without it the agent drops every `rpc_server` spec and every spec carrying a
-`cluster` block (and their co-residency pairs) at parse, so an old gateway, or a
-file-mode document, can never start a member as a model and never run a head
-whose `${RPC_SERVERS}` would otherwise reach the child as literal text.
+active only while the gateway declares `rpc_cluster`
+([§7](#7-feature-negotiation)): without it the agent drops every `rpc_server`
+spec and every spec carrying a `cluster` block (and their co-residency pairs) at
+parse, so an old gateway, or a file-mode document, can never start a member as a
+model and never run a head whose `${RPC_SERVERS}` would otherwise reach the
+child as literal text.
 
 **Heads.** A spec with a non-empty `cluster.endpoints` list is a head. The
 endpoints are the members' addresses in operator order (that order is the
@@ -1530,9 +1531,9 @@ owns the bind and device flags:
 - **Idle timeout** defaults to 60 s when the spec sets none: a member that no
   head holds and no reservation covers is unloaded soon after, counted from the
   moment the head let go.
-- **Co-residency:** a member is exempt from the pair matrix ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)),
-  on either side of a pair. VRAM and RAM admission still apply to it like any
-  other spec.
+- **Co-residency:** a member is exempt from the pair matrix
+  ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)), on either side
+  of a pair. VRAM and RAM admission still apply to it like any other spec.
 - Nothing about a member may be reached over `/ensure/{model}`; a member id is
   not a model.
 
@@ -1627,10 +1628,10 @@ the field to decide whether to remove the cluster, head first.
 
 A member whose `bind_ip` is not an address of this host (and not `0.0.0.0`) is
 **not started**, in either transport: the agent records
-`last_error.code = runtime.bind_mismatch` and answers ensures on the rate-limited
-not-permitted path with no tight retry. It is not a terminal verdict, because
-the address may appear later (a mesh coming up), and the `bind_mismatch` flag
-stays in telemetry for as long as the member is listed.
+`last_error.code = runtime.bind_mismatch` and answers ensures on the
+rate-limited not-permitted path with no tight retry. It is not a terminal
+verdict, because the address may appear later (a mesh coming up), and the
+`bind_mismatch` flag stays in telemetry for as long as the member is listed.
 
 #### The head guard
 
@@ -1690,15 +1691,16 @@ members (model specs are never classified), and attaches a stable code to
 | `Failed to connect` (head) | `runtime.cluster_member_unreachable` | no |
 
 A member's banner device-count mismatch is terminal too
-(`runtime.rpc_device_count_mismatch`). A **terminal** verdict is one no retry can
-change, so it is reported like `not_permitted`: no backoff, no failure count, the
-exit code and stderr tail kept. It applies to a start that never became healthy;
-a process that was healthy and later printed one of these messages keeps the
-ordinary crash handling and only gains the code. The verdict is **sticky**: it
-holds against `force_running`, admission wake-ups and repeated ensures (an
-ensure is answered `runtime.not_permitted` at once, without an exec) until the
-spec itself changes, which clears it; a successful start clears it as well. The
-specific code travels on `last_error.code`, not in the ensure's answer.
+(`runtime.rpc_device_count_mismatch`). A **terminal** verdict is one no retry
+can change, so it is reported like `not_permitted`: no backoff, no failure
+count, the exit code and stderr tail kept. It applies to a start that never
+became healthy; a process that was healthy and later printed one of these
+messages keeps the ordinary crash handling and only gains the code. The verdict
+is **sticky**: it holds against `force_running`, admission wake-ups and repeated
+ensures (an ensure is answered `runtime.not_permitted` at once, without an exec)
+until the spec itself changes, which clears it; a successful start clears it as
+well. The specific code travels on `last_error.code`, not in the ensure's
+answer.
 
 #### The relay
 
@@ -1731,14 +1733,13 @@ child. It is the member's access control:
   closes only the sessions whose peer it no longer allows: a head domain that
   resolves to one more address (several A records, a second interface) must
   not cut the running cluster. Only a changed bind or target replaces the
-  relay. The
-  head resolver reports a changed answer, and also a spec that **loses** its
-  head domain while it had addresses, so sessions from the old head's addresses
-  end. The relay set is derived from the runtime status after every sync,
-  state change and readiness check.
+  relay. The head resolver reports a changed answer, and also a spec that
+  **loses** its head domain while it had addresses, so sessions from the old
+  head's addresses end. The relay set is derived from the runtime status after
+  every sync, state change and readiness check.
 - **Bind retry.** A relay that cannot bind (the address is not local yet) sets
-  `bind_mismatch` and retries every 5 s; the member stays `starting` and its start fails
-  with `runtime.bind_mismatch` at the startup deadline.
+  `bind_mismatch` and retries every 5 s; the member stays `starting` and its
+  start fails with `runtime.bind_mismatch` at the startup deadline.
 
 #### The direct-mode observer
 
@@ -1791,16 +1792,16 @@ backoff, 30 s after the first failure and doubling up to an hour: a missing
 version withholds every automatic cluster that needs the binary, so a
 transient failure must not stick until the file changes. The inventory is
 rescanned every 5 minutes on its own goroutine, off the collect loop, and
-earlier when a retry is due; each sample carries the last computed result. Entries that are not
-regular files are skipped: with `runtime_allow_binary_dirs` an allowed entry may
-name a directory, which is not expanded. The list is sent on the first sample
-after the first completed scan and then only when its hash changes, and again,
-unchanged, whenever the connection to the gateway is re-established and on the
-system-report cadence: a delivery is only the transport accepting the sample,
-and a frame lost with its connection, or a gateway store write that failed,
-would otherwise leave the gateway without it until a binary changes. An empty
-list means the agent allows no binaries, and an unchanged inventory omits the
-field.
+earlier when a retry is due; each sample carries the last computed result.
+Entries that are not regular files are skipped: with `runtime_allow_binary_dirs`
+an allowed entry may name a directory, which is not expanded. The list is sent
+on the first sample after the first completed scan and then only when its hash
+changes, and again, unchanged, whenever the connection to the gateway is
+re-established and on the system-report cadence: a delivery is only the
+transport accepting the sample, and a frame lost with its connection, or a
+gateway store write that failed, would otherwise leave the gateway without it
+until a binary changes. An empty list means the agent allows no binaries, and an
+unchanged inventory omits the field.
 
 #### Shutdown
 
@@ -1854,8 +1855,8 @@ member server the write keeps or adds; removing members, turning the cluster
 off included, needs the head's rights only, as deleting the head does: removal
 only frees the member host, consent protects additions. Off a head,
 `${RPC_SERVERS}` and `${RPC_DEVICES}` are refused in args, env and config file
-content alike. The scan of the head's args steps over option values with a table of
-llama-server's value-taking options at the pinned build
+content alike. The scan of the head's args steps over option values with a table
+of llama-server's value-taking options at the pinned build
 (`internal/portal/llama_flags.go`), so `--alias -dev` is one option and its
 value. When the membership, member mode, network, transport and head binary are
 all as stored, the rights-to-network steps are skipped, so a member the caller
@@ -1880,9 +1881,9 @@ server: the lowest one no application port, TLS proxy port, fixed `listen_port`
 or other member there uses. The range lies below every default ephemeral range
 (Linux 32768–60999, Windows and macOS 49152–65535), so a model child, whose port
 the kernel picks, never holds a member's port. A member that stays on its server
-keeps its port. The allocator's lock is per process, so a partial unique index on
-`(server_id, port)` (migration 106) turns a race between two gateway processes
-into a conflict; the write allocates once more and then answers
+keeps its port. The allocator's lock is per process, so a partial unique index
+on `(server_id, port)` (migration 106) turns a race between two gateway
+processes into a conflict; the write allocates once more and then answers
 `runtime_spec.cluster_port_exhausted`. The other direction is checked where
 ports are typed: a new fixed `listen_port`, application port or TLS proxy port
 equal to a member's port is refused.
@@ -1908,15 +1909,17 @@ or 1 for a CPU member, which exposes its CPU device), the transport, the
 network, and `generation`, a digest of every member launch input the
 endpoints do not show (binaries and versions, args, env, the cache switch,
 device backends, GPU selections, bind addresses and ports): whatever relaunches
-a member relaunches the head, which would otherwise lose the member mid-request. For a member server it carries one `rpc_server` spec per membership: the
-manual spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
+a member relaunches the head, which would otherwise lose the member mid-request.
+For a member server it carries one `rpc_server` spec per membership: the manual
+spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
 member's `ggml-rpc-server` matching the head binary's version, read on every
 derivation, so an inventory change moves it); `-t <threads>` for an automatic
 member, the manual spec's own args and env otherwise; the GPUs with their demand
 and the RAM demand, each `max(stored usage, estimate)`; a 60 s startup and a
 60 s idle timeout; the generic type and the role `other`, so nothing
-type-specific probes it; and the `rpc` block (head spec id, transport, bind address and port,
-the head's addresses or the domain the member agent resolves, cache switch). The
+type-specific probes it; and the `rpc` block (head spec id, transport, bind
+address and port, the head's addresses or the domain the member agent resolves,
+cache switch). The
 addresses follow the network: a mesh member is dialled and bound at its mesh
 IPv4; a LAN member is dialled at `lan_address`, else `Domain` (never the
 `Domain` of a NetBird-enabled server), and binds `0.0.0.0`, or `lan_address`

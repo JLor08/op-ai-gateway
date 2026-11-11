@@ -2602,7 +2602,7 @@ const de = {
   clusterMembersEmpty: 'Noch keine Mitglieder.',
   clusterMemberHidden: 'Ein Mitglied auf einem Server, den Sie nicht sehen können',
   clusterMembersLocked:
-    'Ein Mitglied liegt auf einem Server, den Sie nicht verwalten: Cluster-Schalter, Mitglieder, Modus, Netz, Transport und das Binary des Heads kann nur ändern, wer alle Mitglieds-Server verwalten darf. Die übrigen Felder des Heads bleiben bearbeitbar.',
+    'Ein Mitglied liegt auf einem Server, den Sie nicht verwalten: Mitglieder, Modus, Netz, Transport und das Binary des Heads kann nur ändern, wer alle Mitglieds-Server verwalten darf. Den Cluster ausschalten können Sie mit den Rechten am Head allein; die übrigen Felder des Heads bleiben ebenfalls bearbeitbar.',
   errorClusterHeadBinaryLocked:
     'Das Binary des Heads lässt sich nicht ändern, solange ein Mitglied auf einem Server liegt, den Sie nicht verwalten: der Wechsel prüft die Versionen aller Mitglieder neu.',
   clusterMemberHardwareFailed: 'Die Hardware-Angaben dieses Servers konnten nicht geladen werden.',
@@ -6435,7 +6435,7 @@ const en: PortalMessages = {
   clusterMembersEmpty: 'No members yet.',
   clusterMemberHidden: 'A member on a server you cannot see',
   clusterMembersLocked:
-    "A member runs on a server you do not manage: the cluster switch, members, mode, network, transport and the head's binary can only be changed by someone who manages every member server. The head's other fields stay editable.",
+    "A member runs on a server you do not manage: the members, mode, network, transport and the head's binary can only be changed by someone who manages every member server. Your rights on the head are enough to turn the cluster off, and the head's other fields stay editable too.",
   errorClusterHeadBinaryLocked:
     "The head's binary cannot change while a member runs on a server you do not manage: a switch checks every member's version again.",
   clusterMemberHardwareFailed: "This server's hardware details could not be loaded.",

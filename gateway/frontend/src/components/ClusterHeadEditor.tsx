@@ -123,9 +123,11 @@ export function clusterBodyFields(
     rpc_transport: s.transport,
     lan_exposure_ack: s.lanAck,
     device_backend: s.deviceBackend,
-    cluster_members: s.members.map(({ rowKey: _rowKey, ...m }, i) =>
-      m.visible ? { ...m, position: i } : m,
-    ),
+    // A cluster that is off has no members; the form keeps them only so the
+    // switch can be undone before the save.
+    cluster_members: s.enabled
+      ? s.members.map(({ rowKey: _rowKey, ...m }, i) => (m.visible ? { ...m, position: i } : m))
+      : [],
   };
 }
 
@@ -330,10 +332,14 @@ export function ClusterHeadEditor({
   const [hardwareByServer, setHardwareByServer] = useState<Record<string, HostGpus>>({});
 
   // A member on a server the caller cannot manage makes every membership
-  // change a refusal (the gateway needs rights on every member server), so
-  // the membership, mode, network and transport are shown, not edited (the
-  // head binary is held by clusterSaveError for the same reason).
+  // change a refusal (the gateway needs rights on every member server it
+  // keeps), so the membership, mode, network and transport are shown, not
+  // edited (the head binary is held by clusterSaveError for the same reason).
+  // Turning the cluster off drops every member and needs the head's rights
+  // only, so the switch stays open in that direction; turning it on again is
+  // open only as the undo back to the stored head.
   const locked = value.members.some((m) => !m.visible);
+  const switchLocked = locked && !value.enabled && !stored?.cluster_enabled;
   const automaticServers =
     value.memberMode === 'automatic'
       ? value.members.filter((m) => m.visible).map((m) => m.server_id)
@@ -501,7 +507,7 @@ export function ClusterHeadEditor({
         control={
           <Checkbox
             checked={value.enabled}
-            disabled={locked || (mappingId === '' && !value.enabled)}
+            disabled={switchLocked || (mappingId === '' && !value.enabled)}
             onChange={(e) => patch({ enabled: e.target.checked })}
           />
         }
