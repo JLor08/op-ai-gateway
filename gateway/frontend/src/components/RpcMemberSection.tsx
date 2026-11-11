@@ -39,6 +39,7 @@ import { BinaryPicker, useServerBinaries } from './shared/BinaryPicker';
 import { SelectField } from './shared/SelectField';
 import { CheckboxGroup } from './shared/CheckboxGroup';
 import { ConfirmDialog } from './shared/ConfirmDialog';
+import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { StatusChip } from './shared/StatusChip';
 import { runtimeStateBadge, runtimeStateLabel } from './shared/runtimeState';
 import { useToast } from './shared/ToastProvider';
@@ -195,21 +196,15 @@ function effectiveVramMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): n
   return sum;
 }
 
-// A measurement for the status line: MB, or an em-dash when unknown.
+// A measurement for a table cell: MB, or an em-dash when unknown.
 function mbOrDash(mb: number): string {
   return mb > 0 ? `${mb} MB` : '—';
 }
 
-// Who holds a member: its head when the spec names one the caller may see,
-// another head otherwise, or nobody.
-function heldText(
-  heldBy: string | undefined,
-  spec: RPCMemberSpec | undefined,
-  t: Translation,
-): string {
-  if (!heldBy) return t.rpcStatusNotHeld;
-  if (!spec?.used_by_head_spec_id) return t.rpcStatusHeldElsewhere;
-  return `${t.rpcStatusHeldBy}: ${t.rpcStatusHeldByHead} ${spec.used_by_head_spec_id}`;
+// Whether a head holds a member. Which head it serves is in the member's
+// name, resolved for what the caller may see.
+function heldText(row: RuntimeStatus, t: Translation): string {
+  return row.rpc?.held_by ? t.rpcStatusHeldElsewhere : t.rpcStatusNotHeld;
 }
 
 function effectiveRamMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): number {
@@ -239,6 +234,100 @@ function groupOptionsFor(
     options.push({ value: id, label: t.rpcAllowedHeadGroupUnlisted(id) });
   }
   return options;
+}
+
+// A member's name as the table shows it: the gateway's display name, or its
+// spec id from an older gateway that sends none.
+function memberName(row: RuntimeStatus): string {
+  return row.display_name || row.spec_id;
+}
+
+function memberRowKey(row: RuntimeStatus): string {
+  return `${row.spec_id}#${row.instance}`;
+}
+
+// A measurement as a sortable cell value: blank when unknown, so the table
+// keeps it at the bottom.
+function mbValue(mb: number): string {
+  return mb > 0 ? String(mb) : '';
+}
+
+// The columns of the running members' table. Bind mismatch and breaches show
+// as chips beside the state; the spec id and the RPC protocol are columns
+// hidden by default.
+function memberStatusColumns(
+  specById: ReadonlyMap<string, RPCMemberSpec>,
+  t: Translation,
+): ListColumn<RuntimeStatus>[] {
+  return [
+    {
+      id: 'name',
+      label: t.tableName,
+      value: memberName,
+      render: (row) => <RpcMemberName row={row} variant="body2" />,
+      filter: 'text',
+    },
+    {
+      id: 'status',
+      label: t.tableStatus,
+      value: (row) => runtimeStateLabel(row.state, t),
+      render: (row) => <MemberStatusCell row={row} t={t} />,
+      filter: 'enum',
+    },
+    {
+      id: 'occupancy',
+      label: t.rpcStatusOccupancy,
+      value: (row) => heldText(row, t),
+      filter: 'enum',
+    },
+    {
+      id: 'vram',
+      label: t.rpcStatusVram,
+      value: (row) => mbValue(effectiveVramMb(row, specById.get(row.spec_id))),
+      render: (row) => mbOrDash(effectiveVramMb(row, specById.get(row.spec_id))),
+      numeric: true,
+      searchable: false,
+    },
+    {
+      id: 'ram',
+      label: t.rpcStatusRam,
+      value: (row) => mbValue(effectiveRamMb(row, specById.get(row.spec_id))),
+      render: (row) => mbOrDash(effectiveRamMb(row, specById.get(row.spec_id))),
+      numeric: true,
+      searchable: false,
+    },
+    {
+      id: 'id',
+      label: t.rpcStatusId,
+      value: (row) => row.spec_id,
+      render: (row) => (
+        <Typography component="span" variant="body2" sx={{ fontFamily: 'monospace' }}>
+          {row.spec_id}
+        </Typography>
+      ),
+      defaultHidden: true,
+    },
+    {
+      id: 'protocol',
+      label: t.rpcStatusProtocol,
+      value: (row) => row.rpc?.protocol ?? '',
+      defaultHidden: true,
+    },
+  ];
+}
+
+// A member's state, with chips for a bind mismatch and for breaches.
+function MemberStatusCell({ row, t }: Readonly<{ row: RuntimeStatus; t: Translation }>) {
+  const breaches = row.rpc?.breaches ?? [];
+  return (
+    <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
+      <StatusChip status={runtimeStateBadge(row.state)} label={runtimeStateLabel(row.state, t)} />
+      {row.rpc?.bind_mismatch && <StatusChip status="watch" label={t.rpcStatusBindMismatch} />}
+      {breaches.length > 0 && (
+        <StatusChip status="watch" label={`${t.rpcStatusBreaches}: ${breaches.length}`} />
+      )}
+    </Box>
+  );
 }
 
 /**
@@ -455,8 +544,23 @@ export function RpcMemberSection({
   }, [specsData, editor]);
 
   // ---- 3. Member status ---------------------------------------------------
-  const memberRows = statusRows.filter((r) => r.kind === 'rpc_server');
+  // The status stream sends its rows in no fixed order, so they are put in a
+  // stable one (name, then id and instance) before the table sorts them: the
+  // rows stay put between frames whatever column is sorted, or none.
+  const memberRows = useMemo(
+    () =>
+      statusRows
+        .filter((r) => r.kind === 'rpc_server')
+        .sort(
+          (a, b) =>
+            memberName(a).localeCompare(memberName(b)) ||
+            a.spec_id.localeCompare(b.spec_id) ||
+            a.instance - b.instance,
+        ),
+    [statusRows],
+  );
   const specById = useMemo(() => new Map(specs.map((s) => [s.id, s])), [specs]);
+  const memberColumns = useMemo(() => memberStatusColumns(specById, t), [specById, t]);
 
   return (
     <Box sx={{ display: 'grid', gap: 3 }}>
@@ -735,55 +839,14 @@ export function RpcMemberSection({
       </Panel>
 
       <Panel titleId="rpc-status-heading" title={t.rpcStatusTitle}>
-        {memberRows.length === 0 ? (
-          <Typography color="text.secondary">{t.rpcStatusEmpty}</Typography>
-        ) : (
-          <Box sx={{ display: 'grid', gap: 1.5 }}>
-            {memberRows.map((row) => {
-              const spec = specById.get(row.spec_id);
-              const heldBy = row.rpc?.held_by;
-              const vram = effectiveVramMb(row, spec);
-              const ram = effectiveRamMb(row, spec);
-              const breaches = row.rpc?.breaches ?? [];
-              return (
-                <Box
-                  key={`${row.spec_id}#${row.instance}`}
-                  data-testid={`rpc-status-${row.spec_id}`}
-                  sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
-                >
-                  <RpcMemberName row={row} />
-                  <StatusChip
-                    status={runtimeStateBadge(row.state)}
-                    label={runtimeStateLabel(row.state, t)}
-                  />
-                  <Typography component="span" variant="body2">
-                    {heldText(heldBy, spec, t)}
-                  </Typography>
-                  <Typography component="span" variant="body2">
-                    {`${t.rpcStatusVram}: ${mbOrDash(vram)}`}
-                  </Typography>
-                  <Typography component="span" variant="body2">
-                    {`${t.rpcStatusRam}: ${mbOrDash(ram)}`}
-                  </Typography>
-                  {row.rpc?.protocol && (
-                    <Typography component="span" variant="body2">
-                      {`${t.rpcStatusProtocol}: ${row.rpc.protocol}`}
-                    </Typography>
-                  )}
-                  {row.rpc?.bind_mismatch && (
-                    <StatusChip status="watch" label={t.rpcStatusBindMismatch} />
-                  )}
-                  {breaches.length > 0 && (
-                    <StatusChip
-                      status="watch"
-                      label={`${t.rpcStatusBreaches}: ${breaches.length}`}
-                    />
-                  )}
-                </Box>
-              );
-            })}
-          </Box>
-        )}
+        <ListTable
+          rows={memberRows}
+          columns={memberColumns}
+          rowKey={memberRowKey}
+          storageKey="op.rpc-members"
+          defaultSort={{ id: 'name', order: 'asc' }}
+          labels={listTableLabels(t, { empty: t.rpcStatusEmpty })}
+        />
       </Panel>
 
       <ConfirmDialog

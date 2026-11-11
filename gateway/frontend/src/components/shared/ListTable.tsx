@@ -119,6 +119,7 @@ export function ListTable<Row>({
   minWidth = 680,
   maxInlineActions = 4,
   loading = false,
+  defaultSort,
 }: Readonly<{
   rows: Row[];
   columns: ListColumn<Row>[];
@@ -133,6 +134,9 @@ export function ListTable<Row>({
   /** When true and there are no rows, show `labels.loading` instead of
       `labels.empty` — distinguishes an in-flight fetch from a truly empty set. */
   loading?: boolean;
+  /** The sort before the user picks one (a stored choice wins); unsorted by
+      default. */
+  defaultSort?: { id: string; order: 'asc' | 'desc' };
 }>) {
   const baseKey = `table.${storageKey ?? 'list'}`;
   const catalogue = useMemo(() => columns.map((c) => c.id), [columns]);
@@ -152,16 +156,19 @@ export function ListTable<Row>({
     reorder,
     reset: resetColumns,
   } = useColumnSettings<string>(baseKey, catalogue, defaultHidden);
-  const [storedSort, setSort] = usePreference<SortState>(`${baseKey}.sort`, {
-    id: null,
-    order: 'asc',
-  });
+  const defaultSortId = defaultSort?.id ?? null;
+  const defaultSortOrder = defaultSort?.order ?? 'asc';
+  const initialSort = useMemo<SortState>(
+    () => ({ id: defaultSortId, order: defaultSortOrder }),
+    [defaultSortId, defaultSortOrder],
+  );
+  const [storedSort, setSort] = usePreference<SortState>(`${baseKey}.sort`, initialSort);
   const sort: SortState = useMemo(
     () =>
       storedSort && typeof storedSort === 'object' && 'id' in storedSort && 'order' in storedSort
         ? storedSort
-        : { id: null, order: 'asc' },
-    [storedSort],
+        : initialSort,
+    [storedSort, initialSort],
   );
   const [storedRpp, setRowsPerPage] = usePreference<number>(`${baseKey}.rpp`, 10);
   const rowsPerPage = typeof storedRpp === 'number' && storedRpp > 0 ? storedRpp : 10;

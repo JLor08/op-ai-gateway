@@ -1854,6 +1854,17 @@ PUT is a full document: a write that omits `cluster_enabled` turns the cluster
 off and clears the membership, like any omitted field, so every portal path that
 PUTs a spec carries the cluster fields along.
 
+The RPC tab lists the live member rows in the portal's standard list table:
+name (`display_name`, else the spec id), state, occupancy (free or held; which
+head a member serves is in its name, resolved for the reader), effective VRAM
+and RAM, and the spec id and the RPC protocol as columns hidden by default. It
+sorts by name until the user picks another sort. The
+status stream sends its rows in no fixed order, so the tab orders them by name,
+spec id and instance first: rows that tie on the sorted column stay put between
+frames. A row's name falls back to its spec id until the stream's first name
+lookup lands and after its names expire, so a row can move once at those
+points.
+
 **Save checks.** A head write runs the cluster checks after the request
 validations, in a fixed order that is part of the API (the codes and the order
 are in [HTTP API

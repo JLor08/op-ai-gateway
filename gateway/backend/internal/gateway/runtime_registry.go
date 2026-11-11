@@ -208,7 +208,7 @@ type RuntimeStatusDTO struct {
 	AdmissionBlockedBy string                   `json:"admission_blocked_by,omitempty"`
 
 	// DisplayName is an RPC member's readable name for the reader of the
-	// status stream ("RPC (<head model>)(<member server>)",
+	// status stream ("RPC (<head model>)(<head server>)",
 	// portal.Service.RPCMemberDisplayNames). The registry never sets it: the
 	// name depends on what the reader may see, so the status stream adds it
 	// per subscriber (rpcMemberNamer). SpecID stays the member's identity.
