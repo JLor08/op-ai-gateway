@@ -3094,8 +3094,11 @@ this: `EnergyByServer` and `UsageAggregateSince` left-join
 parts by its own host), `UsageGroups` counts the request once in its own
 host's bucket with the head part's energy and adds every other part's energy
 to that part host's bucket in the same group, and the per-row cost reads the
-page's parts in one call (`EnergyPartsByEvents`). The in-memory
-`usage.Recorder` mirrors the SQL stores.
+page's parts in one call (`EnergyPartsByEvents`). While
+`usage_event_energy_parts` is empty, as on a gateway that never priced a
+cluster request, these three SQL aggregates skip the parts join and price
+every request on its own host, the same result without the join's cost. The
+in-memory `usage.Recorder` mirrors the SQL stores.
 
 **A member's share shows under the member server, aggregated only.** The
 rule for every per-server aggregate is that a part counts under the server

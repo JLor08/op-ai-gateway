@@ -859,6 +859,33 @@ const (
 	partWhExpr     = "coalesce(p.wh, e.energy_wh)"
 )
 
+// partsSQL is how an aggregate prices its events: the join it adds and the
+// host and watt-hour expressions each joined row is priced at.
+type partsSQL struct{ join, host, wh string }
+
+var (
+	// pricedByParts prices a cluster request per energy part (usagePartsJoin).
+	pricedByParts = partsSQL{usagePartsJoin, partHostExpr, partWhExpr}
+	// pricedByHost prices every request on its own host: the same result as
+	// pricedByParts while no event has parts, without the join.
+	pricedByHost = partsSQL{"", "e.host", "e.energy_wh"}
+)
+
+// energyPartsPricing picks pricedByHost while usage_event_energy_parts is
+// empty, which it stays on a gateway that never priced a cluster request, so
+// those gateways do not pay for the parts join on every aggregate. A part
+// written between this check and the aggregate is seen by the next call.
+func (s *SQLStore) energyPartsPricing(ctx context.Context) (partsSQL, error) {
+	var n int
+	if err := s.queryRow(ctx, `select count(*) from (select 1 from usage_event_energy_parts limit 1) as any_part`).Scan(&n); err != nil {
+		return partsSQL{}, fmt.Errorf("check energy parts: %w", err)
+	}
+	if n == 0 {
+		return pricedByHost, nil
+	}
+	return pricedByParts, nil
+}
+
 // EnergyByServer sums energy_wh grouped by host over the SAME filtered set
 // usageWhere(q) applies to Stats, for the portal layer to derive a
 // per-server-price-weighted total cost (see portal.Service.UsageStats). An
@@ -866,7 +893,11 @@ const (
 // no matching rows is simply absent from the returned map.
 func (s *SQLiteStore) EnergyByServer(ctx context.Context, q usage.Query) (map[string]float64, error) {
 	where, args := usageWhere(s.dl, q, "")
-	rows, err := s.query(ctx, "select "+partHostExpr+", sum("+partWhExpr+") from usage_events as e"+usagePartsJoin+where+" group by "+partHostExpr, args...)
+	pricing, err := s.energyPartsPricing(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("energy by server: %w", err)
+	}
+	rows, err := s.query(ctx, "select "+pricing.host+", sum("+pricing.wh+") from usage_events as e"+pricing.join+where+" group by "+pricing.host, args...)
 	if err != nil {
 		return nil, fmt.Errorf("energy by server: %w", err)
 	}
@@ -952,9 +983,13 @@ func (s *SQLStore) UsageAggregateSince(ctx context.Context, principalType, princ
 
 	// Priced per energy part, like EnergyByServer: a cluster request's member
 	// parts at each member's own price.
+	pricing, err := s.energyPartsPricing(ctx)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("usage aggregate energy: %w", err)
+	}
 	rows, err := s.query(ctx,
-		"select "+partHostExpr+", coalesce(sum("+partWhExpr+"), 0) from usage_events as e"+usagePartsJoin+
-			" where e."+col+" = ? and e.created_at >= ? group by "+partHostExpr,
+		"select "+pricing.host+", coalesce(sum("+pricing.wh+"), 0) from usage_events as e"+pricing.join+
+			" where e."+col+" = ? and e.created_at >= ? group by "+pricing.host,
 		principalID, since)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("usage aggregate energy: %w", err)
@@ -1087,16 +1122,24 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 		return nil, fmt.Errorf("usage groups: invalid group_by %q", groupBy)
 	}
 	where, args := usageWhere(s.dl, q, "")
+	pricing, err := s.energyPartsPricing(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("usage groups: %w", err)
+	}
+	byParts := pricing == pricedByParts
+	energyExpr, partsJoin := "e.energy_wh", ""
+	if byParts {
+		energyExpr = "case when exists (select 1 from usage_event_energy_parts as ap where ap.event_id = e.id)" +
+			" then coalesce(hp.wh, 0) else e.energy_wh end"
+		partsJoin = " left join usage_event_energy_parts as hp on hp.event_id = e.id and hp.server_id = e.host"
+	}
 	sqlText := "select e." + col + " as gkey, e.host," +
 		" count(*)," +
 		" sum(case when e.status = 'error' or e.http_status >= 400 then 1 else 0 end)," +
 		" sum(case when e.billing_unit <> '' then 1 else 0 end)," +
 		" sum(e.input_tokens), sum(e.output_tokens), sum(e.cached_tokens), sum(e.cache_write_tokens)," +
-		" sum(case when exists (select 1 from usage_event_energy_parts as ap where ap.event_id = e.id)" +
-		" then coalesce(hp.wh, 0) else e.energy_wh end), min(e.created_at), max(e.created_at)" +
-		usageEventsFromClause +
-		" left join usage_event_energy_parts as hp on hp.event_id = e.id and hp.server_id = e.host" +
-		where +
+		" sum(" + energyExpr + "), min(e.created_at), max(e.created_at)" +
+		usageEventsFromClause + partsJoin + where +
 		" group by e." + col + ", e.host"
 	rows, err := s.query(ctx, sqlText, args...)
 	if err != nil {
@@ -1126,6 +1169,9 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	}
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("iterate usage groups: %w", err)
+	}
+	if !byParts {
+		return out, nil
 	}
 	members, err := s.memberPartBuckets(ctx, col, where, args, nil)
 	if err != nil {
