@@ -2543,8 +2543,10 @@ func (a *Agent) collectOnce(ctx context.Context) {
 				// answer yet) -- only StateRunning counts, matching the
 				// design spec's own §7 "flat loaded_models list carries
 				// only truly loaded models" rule and Manager.LoadedModels'
-				// identical StateRunning-only filter.
-				if st.State == runtimectl.StateRunning {
+				// identical StateRunning-only filter. An rpc_server member
+				// serves no model (its row's model is empty), so it is never
+				// one, the same rule Manager.LoadedModels applies.
+				if st.State == runtimectl.StateRunning && st.Kind != runtimectl.SpecKindRPCServer {
 					loaded = append(loaded, st.Model)
 				}
 			}

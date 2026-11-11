@@ -1120,11 +1120,15 @@ func TestParseConfigDemotesInvalidRPCServer(t *testing.T) {
 	}
 	for name, spec := range map[string]string{
 		"no rpc settings":    member(`"binary": "/b"`),
-		"zero port":          member(`"rpc": {"port": 0}`),
-		"negative port":      member(`"rpc": {"port": -1}`),
-		"port out of range":  member(`"rpc": {"port": 70000}`),
-		"listen port set":    member(`"listen_port": 9001, "rpc": {"port": 47001}`),
-		"upstream model set": member(`"upstream_model": "m", "rpc": {"port": 47001}`),
+		"zero port":          member(`"rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 0}`),
+		"negative port":      member(`"rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": -1}`),
+		"port out of range":  member(`"rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 70000}`),
+		"listen port set":    member(`"listen_port": 9001, "rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 47001}`),
+		"upstream model set": member(`"upstream_model": "m", "rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 47001}`),
+		"no transport":       member(`"rpc": {"bind_ip": "100.64.0.5", "port": 47001}`),
+		"unknown transport":  member(`"rpc": {"transport": "tunnel", "bind_ip": "100.64.0.5", "port": 47001}`),
+		"no bind ip":         member(`"rpc": {"transport": "direct", "port": 47001}`),
+		"bind ip not an ip":  member(`"rpc": {"transport": "relay", "bind_ip": "member.lan", "port": 47001}`),
 		"unknown kind":       `{"id": "bad", "kind": "future_kind"}`,
 	} {
 		t.Run(name, func(t *testing.T) {

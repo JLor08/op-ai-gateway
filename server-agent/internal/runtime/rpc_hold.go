@@ -67,6 +67,10 @@ type memberClaim struct {
 	// that reconnects soon, while an admission that wants its room may still
 	// evict it at once: eviction reads lastUsed, which a claim never moves.
 	endedAt time.Time
+	// releasedAt is when the gateway last released the member
+	// (Status.RPCReleasedAt). Unlike the claim it survives the release and
+	// the member's process.
+	releasedAt time.Time
 }
 
 // idleSince is when a member's idle timeout starts counting: its last use, or
@@ -310,31 +314,41 @@ func (o *owner) setMemberHold(c cmdSetMemberHold) {
 	o.signalTransition()
 }
 
-// releaseMember ends a member's claim (Manager.ReleaseMember).
+// releaseMember ends a member's claim (Manager.ReleaseMember) and records the
+// release, even of a member nothing claims: a hold the observer reported just
+// before may still be on its way, and the stamp lets it withdraw that.
 func (o *owner) releaseMember(specID string) error {
 	st, ok := o.memberState(specID)
 	if !ok {
 		return ErrModelNotManaged
 	}
+	releasedAt := time.Now()
 	if !st.claimed() {
+		st.claim.releasedAt = releasedAt
 		return nil
 	}
 	cancelTimer(o.m, &st.claim.reservationTimer)
-	st.claim = memberClaim{}
+	st.claim = memberClaim{releasedAt: releasedAt}
 	o.claimEnded(st)
 	return nil
 }
 
 // claimEnded follows a hold or a reservation ending while the process may run
 // on. Once nothing claims the member any more its idle timeout runs from this
-// moment (memberClaim.endedAt), and every admission waiting for room is asked
-// again, since the member has just become a possible victim.
+// moment (memberClaim.endedAt), a relaunch deferred while it was claimed
+// starts (the member drains and comes back with its current launch), and every
+// admission waiting for room is asked again, since the member has just become
+// a possible victim.
 func (o *owner) claimEnded(st *specState) {
 	o.signalTransition()
 	if st.claimed() {
 		return
 	}
 	st.claim.endedAt = time.Now()
+	if st.relaunchDeferred && st.proc != nil {
+		st.relaunchDeferred = false
+		o.beginDrain(st.spec.ID)
+	}
 	o.wakeAdmissionCandidates()
 }
 
@@ -346,7 +360,7 @@ func (o *owner) dropClaim(st *specState) {
 		return
 	}
 	cancelTimer(o.m, &st.claim.reservationTimer)
-	st.claim = memberClaim{}
+	st.claim = memberClaim{releasedAt: st.claim.releasedAt}
 	o.signalTransition()
 }
 

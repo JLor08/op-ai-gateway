@@ -35,9 +35,8 @@ type relayTelemetry struct {
 	// this host. It stays set after the member's start gave up on it, for as
 	// long as the member is listed, so the failure keeps its explanation.
 	BindMismatch bool
-	// Refusals counts every connection refused for being off the allowlist;
-	// Breaches keeps the last maxRelayBreaches of them.
-	Refusals int
+	// Breaches are the peers refused for being off the allowlist, kept like
+	// the observer's (breachLog).
 	Breaches []runtimectl.RPCBreach
 	// Stalled: the head's last bytes went unanswered for the stall threshold.
 	// Cleared when the session ends or a new one takes the hold.
@@ -66,15 +65,19 @@ type relayLink struct {
 	// cache.
 	headDomainIPs func(specID string) []net.IP
 
+	// now is the breach log's clock.
+	now func() time.Time
+
 	syncMu  sync.Mutex
 	lastErr string // the last Apply error logged, so a repeated one is not
 
-	telMu sync.Mutex
-	tel   map[string]*relayTelemetry
+	telMu    sync.Mutex
+	tel      map[string]*relayTelemetry
+	breaches map[string]*breachLog
 }
 
 func newRelayLink(status func() []runtimectl.Status, holds rpcMemberSink) *relayLink {
-	l := &relayLink{status: status, holds: holds, tel: map[string]*relayTelemetry{}}
+	l := &relayLink{status: status, holds: holds, now: time.Now, tel: map[string]*relayTelemetry{}, breaches: map[string]*breachLog{}}
 	l.relay = rpcrelay.NewManager(l, l.running)
 	return l
 }
@@ -162,6 +165,7 @@ func (l *relayLink) noteListeners(statuses []runtimectl.Status, cfgs []rpcrelay.
 	for id := range l.tel {
 		if !slices.ContainsFunc(statuses, func(s runtimectl.Status) bool { return s.SpecID == id }) {
 			delete(l.tel, id)
+			delete(l.breaches, id)
 		}
 	}
 }
@@ -185,7 +189,9 @@ func (l *relayLink) telemetry(specID string) (relayTelemetry, bool) {
 		return relayTelemetry{}, false
 	}
 	out := *t
-	out.Breaches = slices.Clone(t.Breaches)
+	if b := l.breaches[specID]; b != nil {
+		out.Breaches = b.snapshot(l.now())
+	}
 	return out, true
 }
 
@@ -245,12 +251,13 @@ func (l *relayLink) Released(specID string) {
 func (l *relayLink) Refused(specID string, peer net.IP) {
 	l.telMu.Lock()
 	defer l.telMu.Unlock()
-	t := l.telFor(specID)
-	t.Refusals++
-	t.Breaches = append(t.Breaches, runtimectl.RPCBreach{Peer: peer.String(), At: time.Now()})
-	if n := len(t.Breaches); n > maxRelayBreaches {
-		t.Breaches = slices.Clone(t.Breaches[n-maxRelayBreaches:])
+	l.telFor(specID)
+	b := l.breaches[specID]
+	if b == nil {
+		b = &breachLog{}
+		l.breaches[specID] = b
 	}
+	b.note(l.now(), peer.String())
 }
 
 // Stalled implements rpcrelay.Events.

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strings"
 	"time"
@@ -574,7 +575,10 @@ func withoutReservedSpecIDs(specs []Spec) []Spec {
 // fails the document (one bad spec costs that spec, like a reserved ID), and a
 // dropped spec's coresident pairs go with it (the caller removes its ID from
 // the known set). An rpc_server member is invalid without member settings, with
-// a port outside 1..65535, or with fields that only make sense on a model
+// a port outside 1..65535, without a transport the agent knows (direct or
+// relay: the relay and the connection observer each act on exactly one, so a
+// member with any other value would run and never be held), with a bind_ip
+// that is not an IP address, or with fields that only make sense on a model
 // (listen_port, upstream_model): starting it as the model it half-describes
 // would exec the rpc-server binary behind a proxy route. An unknown kind is
 // dropped too, since a newer gateway's kind may need handling this agent lacks
@@ -608,6 +612,10 @@ func invalidKindReason(spec Spec) string {
 			return "rpc_server spec has no rpc settings"
 		case spec.RPC.Port <= 0 || spec.RPC.Port > 65535:
 			return "rpc_server spec has an invalid rpc port"
+		case spec.RPC.Transport != "direct" && spec.RPC.Transport != "relay":
+			return "rpc_server spec has no known rpc transport (want direct or relay)"
+		case net.ParseIP(spec.RPC.BindIP) == nil:
+			return "rpc_server spec's rpc bind_ip is not an IP address"
 		case spec.ListenPort != 0 || spec.UpstreamModel != "":
 			return "rpc_server spec sets listen_port or upstream_model, which only a model has"
 		}
@@ -835,6 +843,11 @@ type Status struct {
 	// allowlist included as last applied: the agent builds the member's relay
 	// from it. Not part of the status wire form.
 	RPCMember *RPCMember `json:"-"`
+	// RPCReleasedAt is when the gateway last released this rpc_server member
+	// (Manager.ReleaseMember), zero when it never did. The direct-mode
+	// observer reads it to tell the head connections a release ended from a
+	// head's new one. Not part of the status wire form.
+	RPCReleasedAt time.Time `json:"-"`
 
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by
@@ -878,10 +891,9 @@ type RPCBreach struct {
 }
 
 // ClusterStatus is what a head's last launch used: the endpoint addresses it
-// was started against and the llama.cpp build version the cluster agreed on.
+// was started against.
 type ClusterStatus struct {
 	Launched []string `json:"launched"`
-	Version  string   `json:"version"`
 }
 
 // statusAlias is Status under a different name, used only to marshal

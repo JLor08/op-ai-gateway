@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
 package runtime
 
 import (
@@ -89,7 +92,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("ExpandPlaceholdersFor: %v", err)
+				t.Fatalf("ExpandPlaceholders: %v", err)
 			}
 			if got := args[0]; got != "--device="+tc.want {
 				t.Errorf("got %q, want %q", got, "--device="+tc.want)

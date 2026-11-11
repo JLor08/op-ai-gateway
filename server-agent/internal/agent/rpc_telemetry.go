@@ -93,10 +93,7 @@ func (a *Agent) fillClusterTelemetry(rs *sample.RuntimeSample, st runtimectl.Sta
 	rs.Kind = st.Kind
 	rs.AdmissionBlockedBy = st.AdmissionBlockedBy
 	if st.Cluster != nil {
-		rs.Cluster = &sample.RuntimeClusterSample{
-			Launched: slices.Clone(st.Cluster.Launched),
-			Version:  st.Cluster.Version,
-		}
+		rs.Cluster = &sample.RuntimeClusterSample{Launched: slices.Clone(st.Cluster.Launched)}
 	}
 	if st.Kind != runtimectl.SpecKindRPCServer {
 		return

@@ -94,7 +94,7 @@ func memberFlagReserved(args []string) bool {
 // at childPort so only the relay is reachable from outside.
 func memberBind(spec Spec, childPort int) (host string, port int, err error) {
 	switch spec.RPC.Transport {
-	case "", "direct":
+	case "direct":
 		return spec.RPC.BindIP, spec.RPC.Port, nil
 	case "relay":
 		return "127.0.0.1", childPort, nil

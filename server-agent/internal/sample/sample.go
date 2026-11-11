@@ -149,11 +149,9 @@ type RuntimeBreachSample struct {
 }
 
 // RuntimeClusterSample is a head's launch facts: the endpoint addresses it was
-// started against and the llama.cpp build version the cluster agreed on (empty
-// when nothing recorded it).
+// started against.
 type RuntimeClusterSample struct {
 	Launched []string `json:"launched"`
-	Version  string   `json:"version"`
 }
 
 // RuntimeSample is one managed process's current visible-lifecycle state
