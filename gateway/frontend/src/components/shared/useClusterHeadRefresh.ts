@@ -119,7 +119,8 @@ export function useClusterHeadRefresh({
   const headSpecIds = new Set(
     headIds.map((id) => specsById[id]?.id).filter((id): id is string => Boolean(id)),
   );
-  const signature = liveSignature(statusRows, headSpecIds);
+  // Without a head there is nothing to follow, and no frame needs reading.
+  const signature = headSpecIds.size > 0 ? liveSignature(statusRows, headSpecIds) : '';
   const fastKey = headIds.filter((id) => forming(specsById[id]) || requested.has(id)).join(SEP);
   const refreshing = active && headKey !== '';
 

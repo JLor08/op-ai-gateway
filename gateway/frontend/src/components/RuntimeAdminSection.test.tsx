@@ -10983,15 +10983,23 @@ describe('RuntimeAdminSection instance settings', () => {
     });
   });
 
+  // The timeout is raised for a cost this test cannot shed: it fills the
+  // create form, the largest DOM on the portal, and each of its eight
+  // label/role queries walks all of it (60-100 ms apiece on a developer
+  // machine, about 1.2 s in all; the same on main). A shared CI runner under
+  // the full suite's parallel load has taken more than the default 5 s for
+  // it. The test awaits nothing but the PUT, and the checkbox is looked up
+  // once.
   it('sends the neutral 0/0/0 once unticked, and never refuses what the hidden fields hold', async () => {
     const { created, putSpecs } = await openFilledCreate();
-    tickReplicable();
+    const replicableBox = screen.getByLabelText(t.runtimeSpecReplicable);
+    fireEvent.click(replicableBox);
     fireEvent.change(screen.getByLabelText(t.runtimeSpecMinInstances), { target: { value: '3' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecMaxInstances), { target: { value: '2' } });
     fireEvent.change(screen.getByLabelText(t.runtimeSpecInstanceParallelism), {
       target: { value: '4' },
     });
-    tickReplicable();
+    fireEvent.click(replicableBox);
 
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
 
@@ -11004,7 +11012,7 @@ describe('RuntimeAdminSection instance settings', () => {
       max_instances: 0,
       instance_parallelism: 0,
     });
-  });
+  }, 15_000);
 
   it('saves a stored replicable spec unticked as the neutral 0/0/0', async () => {
     const { putSpecs } = await openApiTokenSpecEdit({
