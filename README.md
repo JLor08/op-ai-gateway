@@ -78,10 +78,11 @@ servers, models, launch specifications, users, and policies in a bilingual
 
 **Identity, access & limits**
 
-- Local users with **invite-based provisioning** (no self-registration),
-  server-side sessions + CSRF for browsers, scoped **API tokens** for
-  programs, three roles (`user < admin < system_admin`) with a step-up
-  system-admin mode, optional **TOTP 2FA**.
+- Local users with **invite-based provisioning** (no self-registration;
+  invite links go out by email when SMTP is configured), server-side
+  sessions + CSRF for browsers, scoped **API tokens** for programs, three
+  roles (`user < admin < system_admin`) with a step-up system-admin mode,
+  optional **TOTP 2FA**.
 - Groups, projects, services (service accounts), and resource groups for
   fleet-scale organization; per-model visibility (hidden/locked models).
 - Optional per-user/per-service **rate limits, request/token quotas, and cost
@@ -281,7 +282,7 @@ Create an API token in the portal (**API Tokens**), then:
 | Client | Base URL / endpoint |
 |---|---|
 | OpenAI SDKs & tools | `http://<gateway>/openai/v1` (Chat Completions, Responses, Images, Speech, Transcriptions, Models) |
-| Anthropic SDKs | `http://<gateway>/anthropic/v1` (Messages, Models) |
+| Anthropic SDKs | `http://<gateway>/anthropic` (the SDK adds `/v1/messages` and `/v1/models`) |
 | Codex | Responses API at `/v1/responses` |
 | Claude Code | Messages API at `/v1/messages` |
 | opencode | `scripts/gen-opencode-config.sh --url http://<gateway> --token <api-token>` writes an `opencode.json` with each model's context window |
