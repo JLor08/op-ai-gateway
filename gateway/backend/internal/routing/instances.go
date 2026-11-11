@@ -106,7 +106,9 @@ func (r *Resolver) SetInstanceActivityChecker(c InstanceActivityChecker) { r.ins
 // (inference.Request.NoPark) or a pinned one (which waits only when it needs a
 // free live slot and cannot be served without one), has just been served on a
 // busy candidate -- because every candidate it could use was at capacity, at
-// least one of them an instance.
+// least one of them an instance. A signal with ClusterHead set says instead
+// that a request parked for a cold or forming llama.cpp RPC cluster head
+// (cluster_gate.go): that cluster is to be started, members first.
 type DemandSignal struct {
 	// Model is the gateway model whose instances were all busy -- a group
 	// member's own name, never the group's.
@@ -125,6 +127,10 @@ type DemandSignal struct {
 	// capability and reachability filters -- once each, in candidate order. An
 	// instance started for any other mapping of Model would not serve it.
 	MappingIDs []string
+	// ClusterHead is the spec id of the llama.cpp RPC cluster head the
+	// request parked for (ClusterGateParkable): the demand is for that
+	// cluster to form, not for another instance. "" for an instance demand.
+	ClusterHead string
 }
 
 // DemandSink receives demand signals. Signal is called on the request path,

@@ -88,6 +88,16 @@ const (
 	// set, and a Load must not override desired state (ADR-026).
 	codeBenchmarkSpecForceStopped = "benchmark.spec_force_stopped"
 	msgBenchmarkSpecForceStopped  = "this model's runtime spec is force-stopped; clear the admin override before loading it"
+
+	// codeClusterHeadUnsupported: the mapping's spec is a llama.cpp RPC
+	// cluster head. A head starts only members first, through the cluster
+	// orchestration, never by a Load's own ensure or chat prompt, and a VRAM
+	// run would measure the head's own share of the model alone. The Load,
+	// the VRAM run, the speed, capacity and both modes and the audio
+	// benchmark refuse it (an application- or server-scope run skips it,
+	// benchmarkSkippedClusterHead).
+	codeClusterHeadUnsupported = "runtime.cluster_head_unsupported"
+	msgClusterHeadUnsupported  = "this model is a llama.cpp RPC cluster head, which loads and benchmarks do not support yet; it starts with its members when a request needs it"
 )
 
 // The refusal sentinels, one per code above. writeBenchmarkError maps each to
@@ -100,16 +110,18 @@ var (
 	errBenchmarkScopeUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (images and audio)")
 	errBenchmarkAgentEnsureUnsupported = errors.New(codeBenchmarkAgentEnsureUnsupported)
 	errBenchmarkSpecForceStopped       = errors.New(codeBenchmarkSpecForceStopped)
+	errBenchmarkClusterHeadUnsupported = errors.New(codeClusterHeadUnsupported)
 )
 
-// The reasons loadRefusal gives, a closed set. Each is the suffix of the
-// error code the Load starter answers for it (benchmark.<reason>, through
-// loadRefusalErrs).
+// The reasons loadRefusal gives, a closed set. Each is the last part of the
+// error code the Load starter answers for it (benchmark.<reason>, and
+// runtime.<reason> for the cluster head's, through loadRefusalErrs).
 const (
 	loadRefusalImagesOnly             = "images_only"
 	loadRefusalAudioOnly              = "audio_only"
 	loadRefusalAgentEnsureUnsupported = "agent_ensure_unsupported"
 	loadRefusalSpecForceStopped       = "spec_force_stopped"
+	loadRefusalClusterHead            = "cluster_head_unsupported"
 )
 
 // loadRefusalErrs maps each loadRefusal reason to the sentinel the Load
@@ -119,6 +131,7 @@ var loadRefusalErrs = map[string]error{
 	loadRefusalAudioOnly:              errBenchmarkAudioOnly,
 	loadRefusalAgentEnsureUnsupported: errBenchmarkAgentEnsureUnsupported,
 	loadRefusalSpecForceStopped:       errBenchmarkSpecForceStopped,
+	loadRefusalClusterHead:            errBenchmarkClusterHeadUnsupported,
 }
 
 // benchmarkSkippedImagesOnly is BenchmarkResult.Skipped for a mapping an
@@ -132,6 +145,11 @@ const benchmarkSkippedImagesOnly = "images_only"
 // measure as audio either -- no speech or transcription verdict, or no audio
 // request routed to it (benchmarkViewTarget).
 const benchmarkSkippedAudioOnly = "audio_only"
+
+// benchmarkSkippedClusterHead is BenchmarkResult.Skipped for a mapping whose spec
+// is a llama.cpp RPC cluster head, which no benchmark measures yet
+// (codeClusterHeadUnsupported).
+const benchmarkSkippedClusterHead = "cluster_head"
 
 // The two values of BenchmarkResult.Skipped a speech run (?mode=speech) records,
 // for a mapping an application- or server-scope run did not measure
@@ -213,8 +231,15 @@ func AudioTargetFlavors(app routing.Application, spec routing.RuntimeSpec, hasSp
 // text, images-only and audio-only alike. The images-only and audio-only
 // reasons come first because clearing the override would not make such a Load
 // possible.
+//
+// A llama.cpp RPC cluster head is refused before all of them: it starts only
+// members first, through the cluster orchestration, which a Load does not run,
+// and no other setting of the spec changes that.
 func loadRefusal(app routing.Application, spec routing.RuntimeSpec, hasSpec bool, ensureSupported bool) string {
 	agent := app.Type == routing.ProviderServerAgent
+	if agent && hasSpec && spec.ClusterEnabled {
+		return loadRefusalClusterHead
+	}
 	imagesOnly := mappingSpecIsImagesOnly(app, spec, hasSpec)
 	if imagesOnly || mappingSpecIsAudioOnly(app, spec, hasSpec) {
 		if !agent {
@@ -291,8 +316,9 @@ type benchmarkViewPartition struct {
 	// audio, and audioUnmeasurable the audio-only views the speed, capacity and
 	// both modes skip because they cannot measure their audio either (no speech
 	// or transcription verdict, or a clone model without a preset voice).
-	// refuseNothingRunnable names the kind.
-	imagesOnly, audioOnly, audioUnmeasurable int
+	// refuseNothingRunnable names the kind. clusterHeads counts the views skipped
+	// because they are cluster heads.
+	imagesOnly, audioOnly, audioUnmeasurable, clusterHeads int
 }
 
 // partitionBenchmarkViews sorts each view (benchmarkViewTarget) into runnable,
@@ -322,6 +348,9 @@ func (s *Server) partitionBenchmarkViews(ctx context.Context, views []portal.Ben
 			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Error: err.Error()})
 		case skipped == benchmarkSkippedImagesOnly:
 			p.imagesOnly++
+			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: skipped})
+		case skipped == benchmarkSkippedClusterHead:
+			p.clusterHeads++
 			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: skipped})
 		case skipped != "":
 			if measureAudio {
@@ -366,6 +395,9 @@ func (e *benchmarkViewUnreadable) Unwrap() error { return e.err }
 // BenchmarkResult.Skipped values), or a *benchmarkViewUnreadable when a read it decides on
 // failed -- what the view is is then unknown, and is not guessed at. The runtime spec is read
 // once (mappingRuntimeSpec) and the target is built from it.
+//   - A view whose spec is a llama.cpp RPC cluster head is skipped
+//     (benchmarkSkippedClusterHead): it starts only through the cluster
+//     orchestration, which a run does not drive.
 //   - A view that serves only images is skipped (benchmarkSkippedImagesOnly).
 //   - A view that serves a text flavor (it is not audio-only, mappingSpecIsAudioOnly) is a
 //     chat model and a text target, exactly as before audio was measured: one with a speech
@@ -384,6 +416,9 @@ func (s *Server) benchmarkViewTarget(ctx context.Context, v portal.BenchmarkTarg
 	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, v.App, v.Mapping.ID)
 	if err != nil {
 		return benchmarkTarget{}, "", &benchmarkViewUnreadable{what: benchmarkViewSpec, err: err}
+	}
+	if v.App.Type == routing.ProviderServerAgent && hasSpec && spec.ClusterEnabled {
+		return benchmarkTarget{}, benchmarkSkippedClusterHead, nil
 	}
 	if mappingSpecIsImagesOnly(v.App, spec, hasSpec) {
 		return benchmarkTarget{}, benchmarkSkippedImagesOnly, nil
@@ -471,6 +506,8 @@ func (p benchmarkViewPartition) refuseNothingRunnable(w http.ResponseWriter) boo
 		return false
 	case p.unreadable > 0:
 		writeBenchmarkRequestFailed(w)
+	case p.clusterHeads > 0 && p.imagesOnly+p.audioOnly+p.audioUnmeasurable == 0:
+		writeBenchmarkError(w, errBenchmarkClusterHeadUnsupported)
 	case p.audioUnmeasurable > 0 && p.imagesOnly > 0:
 		writeBenchmarkError(w, errBenchmarkScopeUnmeasurable)
 	case p.imagesOnly > 0:

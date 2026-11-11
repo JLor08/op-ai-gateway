@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/provider"
+	"op-ai-gateway/internal/routing"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// The gateway side of the cluster gate: the verdict routing reads, the demand
+// that starts a cold cluster and wakes the requests parked for it, the retry
+// of a request the agent refused because its head was not ready, and the
+// voice-chat gate's start of a head.
+
+// fakeClusterHeads answers which mappings are cluster heads.
+type fakeClusterHeads map[string]string
+
+func (f fakeClusterHeads) clusterHead(_ context.Context, mappingID string) (string, bool) {
+	head, ok := f[mappingID]
+	return head, ok
+}
+
+// activeMembers marks every member server of f's plan active and healthy, as
+// the store reports a member routing may use.
+func (f *orchFixture) activeMembers() {
+	f.portal.mu.Lock()
+	defer f.portal.mu.Unlock()
+	for i := range f.portal.plan.Members {
+		f.portal.plan.Members[i].Server.Status = routing.ServerStatusActive
+		f.portal.plan.Members[i].Server.HealthStatus = routing.HealthHealthy
+	}
+}
+
+func newTestClusterGate(f *orchFixture, busy routing.ServerBusyChecker) *clusterRoutingGate {
+	return &clusterRoutingGate{
+		heads:    fakeClusterHeads{"map_head": orchHead},
+		clusters: func() *clusterOrchestrator { return f.o },
+		busy:     busy,
+	}
+}
+
+// The verdict per state: no head, cold (parkable with the cluster's bound:
+// the head's startup timeout plus its slowest member's), formed, cooling down
+// after a failed start, withheld by the runtime documents, and a member
+// server routing may not use.
+func TestClusterGateVerdicts(t *testing.T) {
+	t.Run("no head", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		if v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_other"); v.State != routing.ClusterGateNone {
+			t.Fatalf("verdict = %+v, want none for a mapping that is no head", v)
+		}
+	})
+	t.Run("cold, then formed", func(t *testing.T) {
+		f := newOrchFixture(t, 2, "relay", "lan")
+		f.portal.plan.Members[1].StartupTimeoutSeconds = 8
+		f.activeMembers()
+		g := newTestClusterGate(f, nil)
+		v := g.ClusterGateState(context.Background(), "map_head")
+		// 10 units for the head plus 8 for the slowest member, 10 ms each.
+		if v.State != routing.ClusterGateParkable || v.Head != orchHead || v.ParkBound != 180*time.Millisecond {
+			t.Fatalf("cold verdict = %+v, want parkable for %s with a 180ms bound", v, orchHead)
+		}
+		f.ackAll()
+		f.holdOnHeadEnsure(0, 1)
+		if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		if v := g.ClusterGateState(context.Background(), "map_head"); v.State != routing.ClusterGateFormed {
+			t.Fatalf("formed verdict = %+v, want formed", v)
+		}
+	})
+	t.Run("cooling down", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		f.activeMembers()
+		f.ackAll()
+		f.agent.memberErr[orchMemberSpec(0)] = orchRefusal(http.StatusServiceUnavailable, "runtime.admission_blocked")
+		if err := f.o.Ensure(context.Background(), orchHead); err == nil {
+			t.Fatal("Ensure succeeded, want the member's refusal")
+		}
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_head")
+		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterStartFailed {
+			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterStartFailed)
+		}
+	})
+	t.Run("withheld", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		f.portal.plan.WithheldReason = "runtime_config.agent_features_pending"
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_head")
+		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable {
+			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterUnavailable)
+		}
+	})
+	t.Run("member server held by a benchmark", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		f.activeMembers()
+		v := newTestClusterGate(f, fakeServerBusy{orchMemberServer(0): true}).ClusterGateState(context.Background(), "map_head")
+		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable {
+			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterUnavailable)
+		}
+	})
+	t.Run("member server not selectable", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		f.activeMembers()
+		f.portal.plan.Members[0].Server.HealthStatus = routing.HealthUnhealthy
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), "map_head")
+		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable {
+			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterUnavailable)
+		}
+	})
+}
+
+type fakeServerBusy map[string]bool
+
+func (f fakeServerBusy) ServerBusy(serverID string) bool { return f[serverID] }
+
+// A demand naming a head starts its cluster in the background -- one start
+// however often it is signalled -- and once the start ended the requests
+// parked on the head's server are woken. A head cooling down is not started.
+func TestClusterDemandStartsTheClusterAndWakesParkedRequests(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.ackAll()
+	gate := make(chan struct{})
+	f.agent.memberGate[orchMemberSpec(0)] = gate
+	f.portal.plan.Members[0].StartupTimeoutSeconds = 500
+	f.holdOnHeadEnsure(0)
+	woke := make(chan string, 4)
+	f.o.deps.wake = func(serverID string) { woke <- serverID }
+
+	f.o.Signal(routing.DemandSignal{Model: orchHeadModel, ClusterHead: orchHead})
+	f.o.Signal(routing.DemandSignal{Model: orchHeadModel, ClusterHead: orchHead})
+	if f.o.State(orchHead) != clusterForming {
+		t.Fatalf("state = %v, want forming right after the signal", f.o.State(orchHead))
+	}
+	close(gate)
+	select {
+	case id := <-woke:
+		if id != orchHeadServer {
+			t.Fatalf("woke %q, want the head's server", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked requests were never woken")
+	}
+	f.o.wait()
+	if f.o.State(orchHead) != clusterFormed || f.agent.count("head:ensure:") != 1 {
+		t.Fatalf("state %v, head ensures %d; want formed by one start", f.o.State(orchHead), f.agent.count("head:ensure:"))
+	}
+
+	// A failed start cools the head down; a signal then starts nothing.
+	g := newOrchFixture(t, 1, "relay", "lan")
+	g.ackAll()
+	g.agent.memberErr[orchMemberSpec(0)] = orchRefusal(http.StatusServiceUnavailable, "runtime.admission_blocked")
+	if err := g.o.Ensure(context.Background(), orchHead); err == nil {
+		t.Fatal("Ensure succeeded, want the member's refusal")
+	}
+	before := g.agent.count("member:ensure:")
+	g.o.Signal(routing.DemandSignal{Model: orchHeadModel, ClusterHead: orchHead})
+	g.o.wait()
+	if got := g.agent.count("member:ensure:"); got != before {
+		t.Fatalf("member ensures %d -> %d after a signal during the cooldown, want none", before, got)
+	}
+}
+
+// The resolver's one demand sink sends a cluster demand to the orchestration
+// and every other demand to the instance scaler.
+func TestDemandSinkFansOutByClusterHead(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	scaler := &recordingDemandSink{}
+	sink := demandFanout{scaler: scaler, clusters: func() *clusterOrchestrator { return f.o }}
+
+	sink.Signal(routing.DemandSignal{Model: "small", MappingIDs: []string{"map_small"}})
+	sink.Signal(routing.DemandSignal{Model: orchHeadModel, ClusterHead: orchHead})
+	if got := scaler.signals(); len(got) != 1 || got[0].Model != "small" {
+		t.Fatalf("scaler got %+v, want the instance demand only", got)
+	}
+	if f.o.State(orchHead) != clusterForming {
+		t.Fatalf("state = %v, want the cluster demand to start the head", f.o.State(orchHead))
+	}
+	_ = f.o.Stop(context.Background(), orchHead, false) // the start only needs to end
+}
+
+// clusterNotReadyProvider answers its first refusals calls -- buffered or
+// streamed -- with the agent's 503 runtime.cluster_not_ready, as a head that
+// stopped between the selection and the dispatch does, and serves after that.
+type clusterNotReadyProvider struct {
+	mu       sync.Mutex
+	refusals int
+	calls    int
+}
+
+func (p *clusterNotReadyProvider) refuse() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return p.calls <= p.refusals
+}
+
+func (p *clusterNotReadyProvider) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+func (p *clusterNotReadyProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	if p.refuse() {
+		return provider.Response{}, orchRefusal(http.StatusServiceUnavailable, codeClusterNotReady)
+	}
+	return provider.Response{Text: "served by the head", Usage: inference.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}}, nil
+}
+
+func (p *clusterNotReadyProvider) CompleteStream(_ context.Context, _ routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+	if p.refuse() {
+		return orchRefusal(http.StatusServiceUnavailable, codeClusterNotReady)
+	}
+	if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: "served by the head"}); err != nil {
+		return err
+	}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted})
+}
+
+// clusterHeadServer is the stream test server with a cluster head seeded --
+// map_head on srv_head, its spec a head -- and the orchestration replaced by
+// f's, whose cluster has formed.
+func clusterHeadServer(t *testing.T, prov provider.Client) (*Server, *orchFixture) {
+	t.Helper()
+	srv, f := coldClusterHeadServer(t, prov)
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	return srv, f
+}
+
+// coldClusterHeadServer is clusterHeadServer with the cluster still cold.
+func coldClusterHeadServer(t *testing.T, prov provider.Client) (*Server, *orchFixture) {
+	t.Helper()
+	srv := newStreamTestServerWithProvider(prov)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	must := func(what string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	must("CreateAIServer", srv.Routes.CreateAIServer(ctx, routing.AIServer{ID: orchHeadServer, Name: "Head", Domain: "head.example.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}))
+	must("UpsertTelemetry", srv.Routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: orchHeadServer, ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}))
+	must("CreateApplication", srv.Routes.CreateApplication(ctx, routing.Application{ID: "app_head", ServerID: orchHeadServer, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	must("CreateMapping", srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: "map_head", ApplicationID: "app_head", GatewayModelName: orchHeadModel, AppModelName: orchHeadModel, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	must("UpsertRuntimeSpec", srv.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: orchHead, MappingID: "map_head", Enabled: true, ClusterEnabled: true, StartupTimeoutSeconds: 10, Binary: "/opt/bin/llama-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, CreatedAt: now, UpdatedAt: now}))
+
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.activeMembers()
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	srv.clusters = f.o
+	return srv, f
+}
+
+// A request for a cold cluster head parks, its demand forms the cluster
+// members first, and it is served by the head once the cluster formed -- the
+// head is never sent a request before.
+func TestColdClusterRequestParksUntilFormed(t *testing.T) {
+	prov := &clusterNotReadyProvider{}
+	srv, f := coldClusterHeadServer(t, prov)
+	gate := make(chan struct{})
+	f.agent.memberGate[orchMemberSpec(0)] = gate
+	f.portal.plan.Members[0].StartupTimeoutSeconds = 500
+	f.portal.plan.Head.Spec.StartupTimeoutSeconds = 500
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postChat(srv, `{"model":"`+orchHeadModel+`","messages":[{"role":"user","content":"hi"}]}`)
+	}()
+	waitFor(t, func() bool { return f.o.State(orchHead) == clusterForming })
+	if prov.callCount() != 0 {
+		t.Fatalf("provider calls = %d while the cluster forms, want none", prov.callCount())
+	}
+	close(gate)
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "served by the head") {
+			t.Fatalf("answer = %d %s, want 200 from the head", rec.Code, rec.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the parked request was never served")
+	}
+	if prov.callCount() != 1 || f.agent.count("head:ensure:"+orchHeadModel+":cluster") != 1 {
+		t.Fatalf("provider calls %d, cluster starts %d; want one each", prov.callCount(), f.agent.count("head:ensure:"))
+	}
+}
+
+func postChat(srv *Server, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("Content-Type", jsonContentType)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// A request the agent refuses with runtime.cluster_not_ready -- the head
+// stopped between the selection and the dispatch -- has the cluster started
+// again and is retried on the same head once: never more, buffered and
+// streamed alike.
+func TestCompletionRetriesOnceOnClusterNotReady(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   string
+		stream bool
+	}{
+		{"buffered", `{"model":"` + orchHeadModel + `","messages":[{"role":"user","content":"hi"}]}`, false},
+		{"streamed", `{"model":"` + orchHeadModel + `","stream":true,"messages":[{"role":"user","content":"hi"}]}`, true},
+	} {
+		t.Run(tc.name+": retried once the cluster formed again", func(t *testing.T) {
+			prov := &clusterNotReadyProvider{refusals: 1}
+			srv, f := clusterHeadServer(t, prov)
+
+			rec := postChat(srv, tc.body)
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "served by the head") {
+				t.Fatalf("answer = %d %s, want 200 from the head", rec.Code, rec.Body.String())
+			}
+			if prov.callCount() != 2 {
+				t.Fatalf("provider calls = %d, want the refused one and its one retry", prov.callCount())
+			}
+			if got := f.agent.count("head:ensure:" + orchHeadModel + ":cluster"); got != 2 {
+				t.Fatalf("cluster-start ensures = %d, want the first formation and the one the retry ran", got)
+			}
+		})
+		t.Run(tc.name+": never more than once", func(t *testing.T) {
+			prov := &clusterNotReadyProvider{refusals: 10}
+			srv, _ := clusterHeadServer(t, prov)
+
+			rec := postChat(srv, tc.body)
+			if rec.Code == http.StatusOK && !tc.stream {
+				t.Fatalf("answer = %d %s, want the refusal", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "served by the head") {
+				t.Fatalf("answer = %s, want no served content", rec.Body.String())
+			}
+			if prov.callCount() != 2 {
+				t.Fatalf("provider calls = %d, want exactly one retry", prov.callCount())
+			}
+		})
+	}
+}
+
+// A request for a model whose only server is a cluster head cooling down
+// after a failed start is answered with the cluster's own code, a 503, not
+// no_healthy_host.
+func TestCompletionAnswersTheClusterCode(t *testing.T) {
+	prov := &clusterNotReadyProvider{}
+	srv, f := clusterHeadServer(t, prov)
+	f.agent.memberErr[orchMemberSpec(0)] = orchRefusal(http.StatusServiceUnavailable, "runtime.admission_blocked")
+	_ = f.o.Stop(context.Background(), orchHead, false) // leaves the head cold
+	if err := f.o.Ensure(context.Background(), orchHead); err == nil {
+		t.Fatal("Ensure succeeded, want the member's refusal")
+	}
+
+	rec := postChat(srv, `{"model":"`+orchHeadModel+`","messages":[{"role":"user","content":"hi"}]}`)
+	var body apierror.Body
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", rec.Body.String(), err)
+	}
+	if rec.Code != http.StatusServiceUnavailable || body.Error.Code != codeClusterStartFailed {
+		t.Fatalf("answer = %d %s, want 503 %s", rec.Code, rec.Body.String(), codeClusterStartFailed)
+	}
+	if prov.callCount() != 0 {
+		t.Fatalf("provider calls = %d, want none", prov.callCount())
+	}
+}
+
+// recordingEnsurer is a plain ensure route that records what it was asked.
+type recordingEnsurer struct {
+	mu      sync.Mutex
+	ensured []string
+}
+
+func (e *recordingEnsurer) EnsureRuntimeModel(_ context.Context, target routing.Target) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensured = append(e.ensured, target.ProviderModel)
+	return nil
+}
+
+// The voice-chat gate starts a cluster head through the orchestration --
+// members first, the head with the cluster-start mark -- never with the plain
+// ensure, which the agent refuses for a head.
+func TestVoiceGateUsesOrchestratorForHeads(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	mem := routing.NewMemoryStore()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: orchHeadServer, Name: "Head", Domain: "head.example.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := mem.CreateApplication(ctx, routing.Application{ID: "app_head", ServerID: orchHeadServer, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map_head", ApplicationID: "app_head", GatewayModelName: orchHeadModel, AppModelName: orchHeadModel, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: orchHead, MappingID: "map_head", Enabled: true, ClusterEnabled: true, StartupTimeoutSeconds: 10, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	srv := &Server{Routes: mem, clusters: f.o}
+	plain := &recordingEnsurer{}
+	target := routing.Target{RouteID: "map_head", ServerID: orchHeadServer, Provider: routing.ProviderServerAgent, ProviderModel: orchHeadModel, Timeout: time.Second}
+
+	if err := srv.ensureVoiceTarget(context.Background(), plain, target); err != nil {
+		t.Fatalf("ensureVoiceTarget: %v", err)
+	}
+	if len(plain.ensured) != 0 {
+		t.Fatalf("plain ensures = %q, want none for a head", plain.ensured)
+	}
+	if f.agent.count("head:ensure:"+orchHeadModel+":cluster") != 1 || f.o.State(orchHead) != clusterFormed {
+		t.Fatalf("calls %q, state %v; want one members-first start that formed", f.agent.recorded(), f.o.State(orchHead))
+	}
+
+	// A head whose start fails answers the cluster's error.
+	g := newOrchFixture(t, 1, "relay", "lan")
+	g.ackAll()
+	g.agent.memberErr[orchMemberSpec(0)] = orchRefusal(http.StatusServiceUnavailable, "runtime.admission_blocked")
+	srv.clusters = g.o
+	err := srv.ensureVoiceTarget(context.Background(), plain, target)
+	var ce *clusterError
+	if !errors.As(err, &ce) || ce.Code != codeClusterStartFailed {
+		t.Fatalf("ensureVoiceTarget err = %v, want the cluster's start failure", err)
+	}
+}

@@ -208,8 +208,8 @@ type clusterAgentClient interface {
 	provider.RPCMemberController
 }
 
-// clusterOrchestratorDeps is what an orchestrator works with. Every field is
-// required.
+// clusterOrchestratorDeps is what an orchestrator works with. Every field but
+// wake is required.
 type clusterOrchestratorDeps struct {
 	portal clusterPortal
 	// agents returns the provider's agent calls, nil when it has none; asked
@@ -221,6 +221,11 @@ type clusterOrchestratorDeps struct {
 	// base is the server's lifetime: its end ends every start.
 	base func() context.Context
 	now  func() time.Time
+	// wake, when set, wakes the requests parked in the admission queue for a
+	// server: called with the head's server once a start ended, formed or
+	// failed, so a request parked for the cluster is served -- or answered
+	// the cluster's failure -- at once.
+	wake func(serverID string)
 }
 
 // clusterTimings are the orchestration's bounds.
@@ -270,6 +275,10 @@ type clusterOrchestrator struct {
 
 	mu    sync.Mutex
 	heads map[string]*clusterHeadState
+	// views is the cluster gate's view of each head (gateView), viewReads the
+	// heads a view read is in flight for.
+	views     map[string]clusterGateView
+	viewReads map[string]bool
 
 	wg sync.WaitGroup // one per running start and per reconciler-spawned ensure
 }
@@ -297,6 +306,9 @@ type clusterHeadState struct {
 	// refused meanwhile, so none can race the drain.
 	stopping int
 	start    *clusterStart
+	// server is the head's server, from the last plan read: the server whose
+	// parked requests a start's end wakes.
+	server string
 }
 
 // clusterStart is one running start that every Ensure of its head joins.
@@ -310,7 +322,7 @@ type clusterStart struct {
 func newClusterOrchestrator(deps clusterOrchestratorDeps, t clusterTimings) *clusterOrchestrator {
 	return &clusterOrchestrator{
 		deps: deps, t: t, bootAt: deps.now(), trigger: make(chan struct{}, 1),
-		heads: map[string]*clusterHeadState{},
+		heads: map[string]*clusterHeadState{}, views: map[string]clusterGateView{}, viewReads: map[string]bool{},
 	}
 }
 
@@ -427,22 +439,62 @@ func (o *clusterOrchestrator) ensure(ctx context.Context, head string, manual bo
 		o.mu.Unlock()
 		return &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStartCancelled, Position: -1, Message: "the gateway is shutting down"}
 	}
+	s := o.startLocked(base, head, st)
+	o.mu.Unlock()
+	return joinClusterStart(ctx, s)
+}
+
+// startLocked begins a start of head under base and records it on st; the
+// caller holds o.mu and has checked that none runs. Once the start ended, the
+// requests parked on the head's server are woken (deps.wake).
+func (o *clusterOrchestrator) startLocked(base context.Context, head string, st *clusterHeadState) *clusterStart {
 	runCtx, cancel := context.WithCancel(base)
 	s := &clusterStart{done: make(chan struct{}), cancel: cancel}
 	st.start = s
 	o.wg.Add(1)
-	o.mu.Unlock()
 	go func() {
 		defer o.wg.Done()
 		defer cancel()
 		err := o.run(runCtx, head)
 		o.mu.Lock()
-		o.headState(head).start = nil
+		hs := o.headState(head)
+		hs.start = nil
 		s.err = err
 		close(s.done)
+		server := hs.server
 		o.mu.Unlock()
+		if o.deps.wake != nil && server != "" {
+			o.deps.wake(server)
+		}
 	}()
-	return joinClusterStart(ctx, s)
+	return s
+}
+
+// Signal is the cluster orchestration's demand sink (routing.DemandSink, through
+// the gateway's fan-out): a request parked for d.ClusterHead, a cold or forming
+// head, asks for its cluster. It starts one in the background under the
+// server's lifetime unless one runs already, a stop of the head is under way,
+// or the head cools down or is blocked -- the automatic start's rules
+// (Ensure). It never blocks: every parked request signals on every park turn,
+// and the signals of one head coalesce into its one start.
+func (o *clusterOrchestrator) Signal(d routing.DemandSignal) {
+	if o == nil || d.ClusterHead == "" {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	st := o.headState(d.ClusterHead)
+	if st.start != nil || st.stopping > 0 || st.formed {
+		return
+	}
+	if st.failErr != nil && (st.terminal || o.deps.now().Before(st.cooldownUntil)) {
+		return
+	}
+	base := o.deps.base()
+	if base.Err() != nil {
+		return
+	}
+	o.startLocked(base, d.ClusterHead, st)
 }
 
 func joinClusterStart(ctx context.Context, s *clusterStart) error {
@@ -537,7 +589,9 @@ func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.Clu
 		return plan, &clusterError{Code: codeClusterUnavailable, Cause: codeRuntimeActionFailed, Position: -1}
 	}
 	o.mu.Lock()
-	o.headState(head).withheld = plan.WithheldReason
+	st := o.headState(head)
+	st.withheld, st.server = plan.WithheldReason, plan.Head.Server.ID
+	o.views[head] = o.viewOf(plan)
 	o.mu.Unlock()
 	if plan.WithheldReason != "" {
 		return plan, &clusterError{Code: codeClusterUnavailable, Cause: plan.WithheldReason, Position: -1}
@@ -1285,9 +1339,9 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 	for _, head := range heads {
 		o.mu.Lock()
 		st := o.heads[head]
-		state, parked := o.stateLocked(st), st != nil && (st.parked || st.stopping > 0)
+		state, parked, terminal := o.stateLocked(st), st != nil && (st.parked || st.stopping > 0), st != nil && st.terminal
 		o.mu.Unlock()
-		if parked || (state != clusterCold && (state != clusterInvalid || st.terminal)) {
+		if parked || (state != clusterCold && (state != clusterInvalid || terminal)) {
 			continue
 		}
 		plan, err := o.plan(ctx, head)

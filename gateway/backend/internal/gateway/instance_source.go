@@ -61,8 +61,11 @@ type instanceSpecEntry struct {
 	replicable   bool
 	maxInstances int
 	parallelism  int
-	startedAt    time.Time
-	until        time.Time
+	// clusterHead marks a llama.cpp RPC cluster head (RuntimeSpec.ClusterEnabled),
+	// which the cluster gate reads through the same cache (clusterHead).
+	clusterHead bool
+	startedAt   time.Time
+	until       time.Time
 }
 
 // fresh reports whether the entry still answers at now.
@@ -163,6 +166,22 @@ func (s *instanceSource) InstanceView(ctx context.Context, serverID string, m ro
 	slices.Sort(view.Present)
 	view.Present = slices.Compact(view.Present)
 	return view, true
+}
+
+// clusterHead reports whether mapping mappingID's spec is a llama.cpp RPC
+// cluster head, and its spec id. It answers from the spec cache instance
+// expansion reads (spec), so the cluster gate costs a mapping that is no head
+// nothing beyond that cached read; unlike InstanceView it does not ask the
+// agent's features first, since a head is never replicable.
+func (s *instanceSource) clusterHead(ctx context.Context, mappingID string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	e := s.spec(ctx, mappingID)
+	if !e.found || !e.clusterHead {
+		return "", false
+	}
+	return e.specID, true
 }
 
 // spec returns mapping mappingID's spec, from the cache while its entry is
@@ -276,6 +295,7 @@ func (s *instanceSource) remember(mappingID string, startedAt, readAt time.Time,
 			replicable:   spec.Replicable,
 			maxInstances: spec.MaxInstances,
 			parallelism:  spec.InstanceParallelism,
+			clusterHead:  spec.ClusterEnabled,
 			until:        readAt.Add(instanceSpecCacheTTL),
 		}
 	}

@@ -231,10 +231,31 @@ func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error
 		return handler(ev)
 	}
 	err := ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
+	if err != nil && !delivered && ss.readyClusterHead(err) {
+		err = ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
+	}
 	if err != nil && !delivered && ss.reselect(err) {
 		err = ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
 	}
 	return err
+}
+
+// readyClusterHead reports whether the session's head, refused with err as not
+// ready, is to be asked once more because its cluster formed again
+// (Server.readyClusterHead). The idle watchdog is held while the cluster starts
+// and armed afresh after it, as a re-selection holds it: the start is not the
+// stream going idle. A watchdog that has already fired has ended the stream.
+func (ss *streamSession) readyClusterHead(err error) bool {
+	if !isClusterNotReady(err) {
+		return false
+	}
+	if ss.watchdog != nil {
+		if !ss.watchdog.Stop() {
+			return false
+		}
+		defer ss.watchdog.Reset(ss.idle)
+	}
+	return ss.s.readyClusterHead(ss.r.Context(), ss.target, err)
 }
 
 // reselect moves the session onto a re-selected target when err says its instance

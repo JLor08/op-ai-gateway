@@ -160,6 +160,10 @@ func (w *modelWarmer) warmOnce(name string) {
 // candidate whose spec cannot be read is dropped too: the warm is a best-effort load-ahead,
 // and a chat prompt to a child that may serve only images or only audio is the one thing it must
 // not send. The spec is read once per candidate and both tests are asked of that one read.
+//
+// A llama.cpp RPC cluster head is dropped as well: it starts only members first, through
+// the cluster orchestration, and its agent refuses a plain request while it has not formed,
+// so a warm could only fail; a request for the model parks and forms the cluster instead.
 func (w *modelWarmer) textCandidates(ctx context.Context, cands []routing.MappingCandidate) []routing.MappingCandidate {
 	out := cands[:0:0]
 	for _, c := range cands {
@@ -168,7 +172,7 @@ func (w *modelWarmer) textCandidates(ctx context.Context, cands []routing.Mappin
 			slog.Debug("model warm: runtime spec read failed", "mapping_id", c.Mapping.ID, "err", err)
 			continue
 		}
-		if mappingSpecIsImagesOnly(c.Application, spec, hasSpec) || mappingSpecIsAudioOnly(c.Application, spec, hasSpec) {
+		if mappingSpecIsImagesOnly(c.Application, spec, hasSpec) || mappingSpecIsAudioOnly(c.Application, spec, hasSpec) || (hasSpec && spec.ClusterEnabled) {
 			continue
 		}
 		out = append(out, c)

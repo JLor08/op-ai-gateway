@@ -765,10 +765,21 @@ func audioLevelOf(k int, rates []float64) audioLevel {
 // its next poll. That refusal is retried every coldLoadPollGap for as long as the stop path
 // waits for a document to reach an agent (benchmarkStopWaitBound); any other answer, and
 // that one once the bound is spent, is the ensure's.
+//
+// A llama.cpp RPC cluster head is refused (errBenchmarkClusterHeadUnsupported): the
+// agent starts a head only members first, through the cluster orchestration, which the
+// audio benchmark does not drive. The classification skips heads before a ramp is
+// planned (benchmarkViewTarget); this keeps a target built any other way from sending
+// the head a plain ensure the agent would refuse.
 func (s *Server) ensureAudioInstance(ctx context.Context, target routing.Target, restored bool) error {
 	ensurer, ok := s.Provider.(provider.RuntimeEnsurer)
 	if !ok {
 		return errBenchmarkNoRuntimeEnsure
+	}
+	if s.Routes != nil {
+		if spec, found, err := s.Routes.RuntimeSpecByMapping(ctx, target.RouteID); err == nil && found && spec.ClusterEnabled {
+			return errBenchmarkClusterHeadUnsupported
+		}
 	}
 	deadline := time.Now().Add(benchmarkStopWaitBound)
 	for {

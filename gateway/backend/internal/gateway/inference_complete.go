@@ -73,6 +73,12 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	// Attach the resolved application's per-app upstream credential (fail-open).
 	provCtx = s.upstreamAuthCtx(provCtx, target)
 	resp, err := s.Provider.Complete(provCtx, target, providerReq)
+	if err != nil && s.readyClusterHead(r.Context(), target, err) {
+		// The head refused as not ready -- it stopped between the selection and the
+		// dispatch -- and its cluster formed again: the same head is asked once more
+		// (cluster_gate.go). A second refusal is the answer.
+		resp, err = s.Provider.Complete(provCtx, target, providerReq)
+	}
 	if err != nil && reselectsLostInstance(target, req, err) {
 		// The instance is gone (see instance_reselect.go): nothing has been written
 		// to the client and nothing recorded. The attempt leaves the instance first --
@@ -1016,6 +1022,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrModelNotCapable) {
 		message = "the requested model is not capable of this endpoint"
 	}
+	if ce, ok := clusterUnavailable(err); ok {
+		message = clusterUnavailableMessage(ce)
+	}
 	if errors.Is(err, errImageEditUnavailable) {
 		message = "image edit is not available on this model's server: its agent has not declared the " + multipartProxyFeature + " feature. The agent is older than 0.9.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported"
 	}
@@ -1104,10 +1113,35 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, routing.ErrNoHealthyHost) || errors.Is(err, routing.ErrVoiceUnavailable) {
 		return http.StatusServiceUnavailable
 	}
+	// The model's only servers are cluster heads that cannot serve now
+	// (routing.ClusterUnavailableError): a 503 like no_healthy_host, whose more
+	// specific twin it is -- a cooldown ending, or the cluster's configuration
+	// being fixed, is what cures it.
+	if _, ok := clusterUnavailable(err); ok {
+		return http.StatusServiceUnavailable
+	}
 	return http.StatusBadGateway
 }
 
+// clusterUnavailable returns the routing.ClusterUnavailableError err carries.
+func clusterUnavailable(err error) (*routing.ClusterUnavailableError, bool) {
+	var ce *routing.ClusterUnavailableError
+	ok := errors.As(err, &ce)
+	return ce, ok
+}
+
+// clusterUnavailableMessage words a routing.ClusterUnavailableError.
+func clusterUnavailableMessage(ce *routing.ClusterUnavailableError) string {
+	if ce.Code == codeClusterStartFailed {
+		return "the model's llama.cpp RPC cluster failed to start and is cooling down; retry shortly"
+	}
+	return "the model's llama.cpp RPC cluster cannot be started right now"
+}
+
 func completionErrorCode(err error) string {
+	if ce, ok := clusterUnavailable(err); ok {
+		return ce.Code
+	}
 	switch {
 	case errors.Is(err, routing.ErrModelNotCapable):
 		return routing.ErrModelNotCapable.Error()

@@ -1219,8 +1219,8 @@ func New(deps ServerDeps) *Server {
 		// the audio benchmark judges a ramp level by, so "real time" means one thing.
 		resolver.SetAudioRealtimeMinFactor(s.audioRealtimeMinFactor)
 	}
-	// The instance scaler is the resolver's demand sink: a request about to park
-	// because every instance of its model is busy asks it for another. It needs
+	// The instance scaler takes the resolver's instance demand: a request about to
+	// park because every instance of its model is busy asks it for another. It needs
 	// the built Server for the provider (read at each signal, so a provider without
 	// the ensure route starts nothing), the upstream credential and the shutdown
 	// context, and it counts instances through the resolver's own instance source.
@@ -1241,7 +1241,15 @@ func New(deps ServerDeps) *Server {
 			now:     time.Now,
 			claims:  s.instanceClaims,
 		}, deps.InstanceScaleCooldown)
-		resolver.SetDemandSink(s.instanceScaler)
+		// The resolver's one demand sink fans out: a request parked for a cold
+		// llama.cpp RPC cluster head asks the cluster orchestration to form it,
+		// every other demand goes to the instance scaler. The cluster gate reads
+		// a mapping's spec through the instance source's cache, so a mapping that
+		// is no head costs nothing beyond the read instance expansion makes. Both
+		// read s.clusters at each call: it is built below.
+		clusters := func() *clusterOrchestrator { return s.clusters }
+		resolver.SetDemandSink(demandFanout{scaler: s.instanceScaler, clusters: clusters})
+		resolver.SetClusterGate(&clusterRoutingGate{heads: instances, clusters: clusters, busy: benchmarks})
 	}
 	if s.Portal != nil {
 		s.clusters = newClusterOrchestrator(clusterOrchestratorDeps{
@@ -1254,6 +1262,8 @@ func New(deps ServerDeps) *Server {
 			authCtx:  s.upstreamAuthCtx,
 			base:     s.lifetime,
 			now:      time.Now,
+			// A start's end wakes every request parked for the head's server.
+			wake: admission.releaseAll,
 		}, defaultClusterTimings())
 	}
 	s.routes()
