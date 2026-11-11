@@ -1957,9 +1957,13 @@ stage that finds a reason stops it:
    version, and also when the **head** binary's own version is unknown (no
    inventory row, or one with neither commit nor build), since then nothing can
    match. A manual member takes its spec's binary and never fails here. An agent
-   re-report of a binary without a version (a `--version` probe that failed or
-   timed out) keeps the version its inventory row already had, so one failed
-   probe does not withhold the host's clusters.
+   re-report of a binary without a probed version (a `--version` probe that
+   failed or timed out, reported with no version or only what the path says)
+   keeps the probed version, build and commit its inventory row already had, so
+   one failed probe neither withholds the host's clusters nor moves a head's
+   generation; since the inventory carries no file identity, a binary replaced
+   at the same path whose probe fails keeps the old identity until a probe
+   succeeds.
 5. **The head's own address** in the resolved network (the stored choice, else
    the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
    NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;

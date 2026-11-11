@@ -1252,16 +1252,10 @@ func parseNetbirdDefaultPolicyState(raw string) netbirdDefaultPolicyState {
 	return netbirdDefaultPolicyState{State: NetbirdDefaultPolicyUnknown}
 }
 
-// netbirdDefaultPolicyDisabled reports whether the last NetBird policy pass
-// saw the Default policy disabled. Unknown -- never observed, unreadable, or
-// no settings store -- is not disabled, so a direct mesh cluster is refused
-// until a pass has seen it.
-func (s *Service) netbirdDefaultPolicyDisabled(ctx context.Context) bool {
-	return defaultPolicyDisabledIn(s.systemSettingValues(ctx))
-}
-
-// defaultPolicyDisabledIn is netbirdDefaultPolicyDisabled over settings
-// already read.
+// defaultPolicyDisabledIn reports whether the settings values record that the
+// last NetBird policy pass saw the Default policy disabled. Unknown -- never
+// observed, or no settings -- is not disabled, so a direct mesh cluster is
+// refused until a pass has seen it.
 func defaultPolicyDisabledIn(values map[string]string) bool {
 	return parseNetbirdDefaultPolicyState(values[netbirdDefaultPolicyStateKey]).State == NetbirdDefaultPolicyDisabled
 }

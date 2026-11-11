@@ -5,12 +5,16 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 const binariesTestServer = "mock-host-qwen"
@@ -229,5 +233,93 @@ func TestIngestBinariesKeepLastKnownVersion(t *testing.T) {
 	ingestBinaries(t, srv, `[{"path":"/opt/a/llama-server","kind":"llama_server","version":"0.9.1 (build 2, commit 3cd57cb)","build":"2","commit":"3cd57cb","version_source":"agent","allowed":true}]`)
 	if a := storedBinaries(t, srv)["/opt/a/llama-server"]; a.Commit != "3cd57cb" || a.Build != "2" {
 		t.Fatalf("row after a versioned report = %+v", a)
+	}
+}
+
+// notifyCountingPortal counts the cluster notifications a binary write-back
+// sends; nothing else of the portal is called on that path.
+type notifyCountingPortal struct {
+	portal.API
+	mu sync.Mutex
+	n  int
+}
+
+func (p *notifyCountingPortal) NotifyClustersOfServer(context.Context, string) {
+	p.mu.Lock()
+	p.n++
+	p.mu.Unlock()
+}
+
+func (p *notifyCountingPortal) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.n
+}
+
+// TestIngestBinariesNotifyClustersOnlyOnChange: the agent resends its
+// inventory unchanged on every reconnect and on the system-report cadence,
+// so only a report that changes the stored rows re-derives the clusters of
+// the server; a resend, a probe failure whose version is kept, and a path a
+// manual row owns change nothing.
+func TestIngestBinariesNotifyClustersOnlyOnChange(t *testing.T) {
+	srv := NewTestServer()
+	p := &notifyCountingPortal{}
+	srv.Portal = p
+	ctx := context.Background()
+	write := func(raw string) {
+		t.Helper()
+		var samples []agentBinarySample
+		if err := json.Unmarshal([]byte(raw), &samples); err != nil {
+			t.Fatal(err)
+		}
+		srv.writeBackBinaries(ctx, binariesTestServer, &samples, time.Now())
+	}
+	probed := `{"path":"/opt/a/llama-server","kind":"llama_server","version":"0.9.0 (build 1, commit 2bc46ba)","build":"1","commit":"2bc46ba","version_source":"agent","allowed":true}`
+
+	write(`[` + probed + `]`)
+	if n := p.count(); n != 1 {
+		t.Fatalf("notifications after the first report = %d, want 1", n)
+	}
+	write(`[` + probed + `]`)
+	write(`[{"path":"/opt/a/llama-server","kind":"llama_server","allowed":true}]`)
+	if err := srv.Routes.UpsertManualServerBinary(ctx, routing.ServerBinary{ServerID: binariesTestServer, Path: "/opt/m/rpc-server", Kind: "rpc_server", Version: "b1"}); err != nil {
+		t.Fatal(err)
+	}
+	write(`[` + probed + `,{"path":"/opt/m/rpc-server","kind":"rpc_server","allowed":true}]`)
+	if n := p.count(); n != 1 {
+		t.Fatalf("notifications after unchanged resends = %d, want still 1", n)
+	}
+	write(`[{"path":"/opt/a/llama-server","kind":"llama_server","version":"0.9.1 (build 2, commit 3cd57cb)","build":"2","commit":"3cd57cb","version_source":"agent","allowed":true}]`)
+	if n := p.count(); n != 2 {
+		t.Fatalf("notifications after a new version = %d, want 2", n)
+	}
+	write(`[]`)
+	if n := p.count(); n != 3 {
+		t.Fatalf("notifications after the binary left = %d, want 3", n)
+	}
+}
+
+// TestIngestBinariesKeepProbedIdentityOverPathFallback: a binary whose path
+// carries a build tag still reports that build when its --version probe
+// fails, from the path. That fallback must not replace the identity the
+// probe found before -- the version would go empty and the build or commit
+// could differ, moving the head's generation until the next probe succeeds.
+// A row the agent probed again replaces it.
+func TestIngestBinariesKeepProbedIdentityOverPathFallback(t *testing.T) {
+	srv := NewTestServer()
+	ingestBinaries(t, srv, `[
+		{"path":"/opt/llama-b5000/llama-server","kind":"llama_server","version":"5000 (5000-a1b2c3d)","build":"5000","commit":"a1b2c3d","version_source":"agent","allowed":true},
+		{"path":"/opt/llama-b5000/rpc-server","kind":"rpc_server","version":"5000 (5000-a1b2c3d)","build":"5000","commit":"a1b2c3d","version_source":"agent","allowed":true}]`)
+	ingestBinaries(t, srv, `[
+		{"path":"/opt/llama-b5000/llama-server","kind":"llama_server","build":"5000","version_source":"path","allowed":true},
+		{"path":"/opt/llama-b5000/rpc-server","kind":"rpc_server","build":"5000","version_source":"path","allowed":true}]`)
+	for path, b := range storedBinaries(t, srv) {
+		if b.Version != "5000 (5000-a1b2c3d)" || b.Build != "5000" || b.Commit != "a1b2c3d" || b.VersionSource != "agent" {
+			t.Fatalf("%s after a failed probe = %+v, want the probed identity kept", path, b)
+		}
+	}
+	ingestBinaries(t, srv, `[{"path":"/opt/llama-b5000/llama-server","kind":"llama_server","version":"5001 (5001-0f0f0f0)","build":"5001","commit":"0f0f0f0","version_source":"agent","allowed":true}]`)
+	if b := storedBinaries(t, srv)["/opt/llama-b5000/llama-server"]; b.Build != "5001" || b.Commit != "0f0f0f0" {
+		t.Fatalf("row after a new probe = %+v, want the new identity", b)
 	}
 }

@@ -1077,13 +1077,16 @@ func TestNetbirdDefaultPolicyDisabled(t *testing.T) {
 		if err := f.settings.SetSystemSetting(f.ctx, netbirdDefaultPolicyStateKey, raw, clusterTestNow); err != nil {
 			t.Fatal(err)
 		}
-		if got := f.svc.netbirdDefaultPolicyDisabled(f.ctx); got != want {
+		values, err := f.svc.readSystemSettings(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := defaultPolicyDisabledIn(values); got != want {
 			t.Errorf("state %q: disabled = %v, want %v", raw, got, want)
 		}
 	}
-	f.svc.settings = nil
-	if f.svc.netbirdDefaultPolicyDisabled(f.ctx) {
-		t.Error("no settings store must read as not disabled")
+	if defaultPolicyDisabledIn(nil) {
+		t.Error("no settings must read as not disabled")
 	}
 }
 
