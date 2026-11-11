@@ -133,8 +133,8 @@ function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
     case 'billing_unit':
       return chipWithHelp(row.billing_unit ?? '', BILLING_UNIT_HELP_KEYS, t);
     case 'billing_quantity':
-      // Guarded on the UNIT, not on the value -- unlike the energy cells above,
-      // and deliberately so. This column IS the measure for a non-token row, so
+      // Guarded on the UNIT, not on the value -- unlike the energy cells
+      // (EnergyPartsCell.tsx), and deliberately so. This column IS the measure for a non-token row, so
       // a quantity of 0 is a measurement (every FAILED image request has one)
       // and must read as `0`; only a token-metered row, where the quantity does
       // not apply at all, gets the em dash. Same rule as tokenCountCell, applied

@@ -3103,7 +3103,10 @@ known idle draw contributing its whole draw. A member server the caller
 may not see (the server list's rule) keeps its identity hidden ("Member N", no
 name, no id) but shows its Wh, source and cost like the others: the row's own
 cost contains its price, which is not secret from a requester whose request
-it served. While
+it served. Its idle draw over the request is inferable too, as its Wh minus
+its marginal Wh; that is accepted on the same reasoning as its price -- it is
+a property of the host that served the request, shown to the requester it
+served -- while its identity stays hidden. While
 `usage_event_energy_parts` is empty, as on a gateway that never priced a
 cluster request, these three SQL aggregates skip the parts join and price
 every request on its own host, the same result without the join's cost. The
