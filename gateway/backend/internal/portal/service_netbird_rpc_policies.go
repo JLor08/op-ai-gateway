@@ -61,47 +61,46 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer, d
 		byID[srv.ID] = srv
 	}
 	var out []rpcCluster
-	for _, srv := range servers {
-		apps, err := s.routes.ApplicationsByServer(ctx, srv.ID)
+	err := s.forEachAgentSpec(ctx, servers, func(srv routing.AIServer, spec routing.RuntimeSpec) error {
+		if !spec.ClusterEnabled || !spec.Enabled {
+			return nil
+		}
+		c, err := s.rpcClusterOf(ctx, spec, srv, byID, derive)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		for _, app := range apps {
-			if app.Type != routing.ProviderServerAgent {
-				continue
-			}
-			specs, err := s.routes.RuntimeSpecsByApplication(ctx, app.ID)
-			if err != nil {
-				return nil, err
-			}
-			for _, spec := range specs {
-				if !spec.ClusterEnabled || !spec.Enabled {
-					continue
-				}
-				members, _, err := s.routes.ClusterMembers(ctx, spec.ID)
-				if err != nil {
-					return nil, err
-				}
-				c := rpcCluster{head: spec, headServer: srv, members: members, servers: byID}
-				all := []routing.AIServer{srv}
-				for _, m := range members {
-					all = append(all, byID[m.ServerID])
-				}
-				if c.network, c.transport, err = s.resolveClusterNetwork(ctx, spec, all); err != nil {
-					return nil, err
-				}
-				if derive {
-					d, err := s.deriveCluster(ctx, spec, srv, "")
-					if err != nil {
-						return nil, err
-					}
-					c.derived = d.reason == ""
-				}
-				out = append(out, c)
-			}
-		}
+		out = append(out, c)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+// rpcClusterOf reads one enabled head's membership and resolves its network
+// and transport; with derive it also derives the cluster.
+func (s *Service) rpcClusterOf(ctx context.Context, spec routing.RuntimeSpec, srv routing.AIServer, byID map[string]routing.AIServer, derive bool) (rpcCluster, error) {
+	members, _, err := s.routes.ClusterMembers(ctx, spec.ID)
+	if err != nil {
+		return rpcCluster{}, err
+	}
+	c := rpcCluster{head: spec, headServer: srv, members: members, servers: byID}
+	all := []routing.AIServer{srv}
+	for _, m := range members {
+		all = append(all, byID[m.ServerID])
+	}
+	if c.network, c.transport, err = s.resolveClusterNetwork(ctx, spec, all); err != nil {
+		return rpcCluster{}, err
+	}
+	if derive {
+		d, err := s.deriveCluster(ctx, spec, srv, "")
+		if err != nil {
+			return rpcCluster{}, err
+		}
+		c.derived = d.reason == ""
+	}
+	return c, nil
 }
 
 // resolveClusterNetwork is the network and transport of a head: the stored
@@ -254,21 +253,7 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 	for _, srv := range servers {
 		byID[srv.ID] = srv
 	}
-	existing := map[string]netbird.Policy{}
-	var extras []netbird.Policy
-	for _, p := range policies {
-		if !strings.HasPrefix(p.Name, NetbirdRPCPolicyPrefix) {
-			continue
-		}
-		id := strings.TrimPrefix(p.Name, NetbirdRPCPolicyPrefix)
-		if _, dup := existing[id]; dup {
-			// A second policy of the same name would grant on its own whatever
-			// it holds; only the first is kept.
-			extras = append(extras, p)
-			continue
-		}
-		existing[id] = p
-	}
+	existing, extras := existingRPCPolicies(policies)
 	for _, p := range extras {
 		if err := netbird.DeletePolicy(ctx, ncfg, netbirdCallTimeout, p.ID); err != nil {
 			slog.Debug("rpc policy reconcile: delete duplicate", "policy_id", p.ID, "error", err)
@@ -280,18 +265,8 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		req := desiredRPCPolicyRequest(byID[id], desired[id])
 		cur, ok := existing[id]
-		switch {
-		case !ok:
-			if _, err := netbird.CreatePolicy(ctx, ncfg, netbirdCallTimeout, req); err != nil {
-				slog.Debug("rpc policy reconcile: create", "server_id", id, "error", err)
-			}
-		case !rpcPolicyMatches(cur, desired[id]):
-			if _, err := netbird.UpdatePolicy(ctx, ncfg, netbirdCallTimeout, cur.ID, req); err != nil {
-				slog.Debug("rpc policy reconcile: update", "server_id", id, "error", err)
-			}
-		}
+		applyRPCPolicy(ctx, ncfg, byID[id], desired[id], cur, ok)
 	}
 	for id, p := range existing {
 		if _, ok := desired[id]; ok {
@@ -299,6 +274,41 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 		}
 		if err := netbird.DeletePolicy(ctx, ncfg, netbirdCallTimeout, p.ID); err != nil {
 			slog.Debug("rpc policy reconcile: delete", "server_id", id, "error", err)
+		}
+	}
+}
+
+// existingRPCPolicies indexes the op-gw-rpc policies by member server id.
+// A second policy of the same name would grant on its own whatever it
+// holds: only the first is kept, the others are returned as extras.
+func existingRPCPolicies(policies []netbird.Policy) (existing map[string]netbird.Policy, extras []netbird.Policy) {
+	existing = map[string]netbird.Policy{}
+	for _, p := range policies {
+		if !strings.HasPrefix(p.Name, NetbirdRPCPolicyPrefix) {
+			continue
+		}
+		id := strings.TrimPrefix(p.Name, NetbirdRPCPolicyPrefix)
+		if _, dup := existing[id]; dup {
+			extras = append(extras, p)
+			continue
+		}
+		existing[id] = p
+	}
+	return existing, extras
+}
+
+// applyRPCPolicy creates memberServer's policy when there is none (exists
+// false) and rewrites cur when it does not grant exactly rules. Best-effort.
+func applyRPCPolicy(ctx context.Context, ncfg netbird.Config, memberServer routing.AIServer, rules []rpcRule, cur netbird.Policy, exists bool) {
+	req := desiredRPCPolicyRequest(memberServer, rules)
+	switch {
+	case !exists:
+		if _, err := netbird.CreatePolicy(ctx, ncfg, netbirdCallTimeout, req); err != nil {
+			slog.Debug("rpc policy reconcile: create", "server_id", memberServer.ID, "error", err)
+		}
+	case !rpcPolicyMatches(cur, rules):
+		if _, err := netbird.UpdatePolicy(ctx, ncfg, netbirdCallTimeout, cur.ID, req); err != nil {
+			slog.Debug("rpc policy reconcile: update", "server_id", memberServer.ID, "error", err)
 		}
 	}
 }

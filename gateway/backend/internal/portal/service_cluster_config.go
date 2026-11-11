@@ -179,54 +179,99 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 		d.hold = hold
 		return d, nil
 	}
-	headGroups, err := s.routes.ServerAdminGroups(ctx, headServer.ID)
+	members, reason, err := s.checkDerivedMembers(ctx, headServer.ID, states)
+	if err != nil || reason != "" {
+		return withheld(reason), err
+	}
+	if reason, err := s.resolveMemberBinaries(ctx, head, headServer, members); err != nil || reason != "" {
+		return withheld(reason), err
+	}
+	cn, reason, err := s.deriveClusterNetwork(ctx, head, headServer, members)
 	if err != nil {
 		return clusterDerivation{}, err
+	}
+	if reason != "" {
+		return withheld(reason), nil
+	}
+	return s.buildCluster(ctx, head, members, cn.network, cn.transport, cn.headIPs, cn.headDomain)
+}
+
+// checkDerivedMembers is the membership stage of deriveCluster: each member
+// in member order, the first reason found withholding the cluster.
+func (s *Service) checkDerivedMembers(ctx context.Context, headServerID string, states []clusterMemberState) ([]derivedMember, string, error) {
+	headGroups, err := s.routes.ServerAdminGroups(ctx, headServerID)
+	if err != nil {
+		return nil, "", err
 	}
 	members := make([]derivedMember, len(states))
 	for i, st := range states {
 		members[i].clusterMemberState = st
 		reason, err := s.checkDerivedMember(ctx, i, st, headGroups)
 		if err != nil || reason != "" {
-			return withheld(reason), err
+			return nil, reason, err
 		}
 	}
-	if reason, err := s.resolveMemberBinaries(ctx, head, headServer, members); err != nil || reason != "" {
-		return withheld(reason), err
-	}
+	return members, "", nil
+}
+
+// derivedNetwork is a derivable cluster's network, transport and the head's
+// identity as its members see it.
+type derivedNetwork struct {
+	network, transport string
+	headIPs            []string
+	headDomain         string
+}
+
+// deriveClusterNetwork is the address and transport stages of deriveCluster:
+// the resolved network and transport, the head's identity, each member's
+// address and bind address (set on members), then the transport's
+// preconditions. A reason withholds the cluster.
+func (s *Service) deriveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer, members []derivedMember) (derivedNetwork, string, error) {
 	servers := []routing.AIServer{headServer}
 	for _, m := range members {
 		servers = append(servers, m.server)
 	}
-	network, transport, err := s.resolveClusterNetwork(ctx, head, servers)
-	if err != nil {
-		return clusterDerivation{}, err
+	var cn derivedNetwork
+	var err error
+	if cn.network, cn.transport, err = s.resolveClusterNetwork(ctx, head, servers); err != nil {
+		return cn, "", err
 	}
-	headIPs, headDomain, reason := clusterHeadIdentity(headServer, network)
-	if reason != "" {
-		return withheld(reason), nil
+	var reason string
+	if cn.headIPs, cn.headDomain, reason = clusterHeadIdentity(headServer, cn.network); reason != "" {
+		return cn, reason, nil
 	}
 	for i := range members {
-		if members[i].address, reason = clusterAddress(members[i].server, network); reason != "" {
-			return withheld(reason), nil
+		if members[i].address, reason = clusterAddress(members[i].server, cn.network); reason != "" {
+			return cn, reason, nil
 		}
-		if members[i].bindIP, reason = memberBindIP(members[i].server, network); reason != "" {
-			return withheld(reason), nil
+		if members[i].bindIP, reason = memberBindIP(members[i].server, cn.network); reason != "" {
+			return cn, reason, nil
 		}
 	}
-	if transport == rpcTransportDirect && network == clusterNetworkMesh {
+	reason, err = s.derivedTransportReason(ctx, head, cn.network, cn.transport)
+	return cn, reason, err
+}
+
+// derivedTransportReason is the transport stage of deriveCluster: direct
+// mesh needs the NetBird policy preconditions, direct lan the head's
+// exposure acknowledgement.
+func (s *Service) derivedTransportReason(ctx context.Context, head routing.RuntimeSpec, network, transport string) (string, error) {
+	if transport != rpcTransportDirect {
+		return "", nil
+	}
+	if network == clusterNetworkMesh {
 		direct, err := s.directMeshAvailable(ctx)
 		if err != nil {
-			return clusterDerivation{}, err
+			return "", err
 		}
 		if !direct {
-			return withheld(ClusterWithheldDirectUnavailable), nil
+			return ClusterWithheldDirectUnavailable, nil
 		}
 	}
-	if transport == rpcTransportDirect && network == clusterNetworkLAN && !head.LANExposureAck {
-		return withheld(ClusterWithheldLANAckRequired), nil
+	if network == clusterNetworkLAN && !head.LANExposureAck {
+		return ClusterWithheldLANAckRequired, nil
 	}
-	return s.buildCluster(ctx, head, members, network, transport, headIPs, headDomain)
+	return "", nil
 }
 
 // clusterFeatureReason is the feature part of deriveCluster over every
@@ -256,16 +301,9 @@ func (s *Service) clusterFeatureReason(ctx context.Context, viewerID string, ser
 	}
 	pending, old := false, false
 	for _, id := range serverIDs {
-		r := ""
-		switch {
-		case s.agentFeatures.Known(id):
-			if !s.agentFeatures.Has(id, AgentFeatureRPCCluster) {
-				r = ClusterWithheldAgentTooOld
-			}
-		default:
-			if r, err = s.peerFeatureReason(ctx, id); err != nil {
-				return "", false, err
-			}
+		r, err := s.serverFeatureReason(ctx, id)
+		if err != nil {
+			return "", false, err
 		}
 		pending = pending || r == ClusterWithheldFeaturesPending
 		old = old || r == ClusterWithheldAgentTooOld
@@ -277,6 +315,18 @@ func (s *Service) clusterFeatureReason(ctx context.Context, viewerID string, ser
 		return ClusterWithheldAgentTooOld, false, nil
 	}
 	return "", false, nil
+}
+
+// serverFeatureReason is one server's feature reason: by its live
+// declaration when known, else by its last reported version.
+func (s *Service) serverFeatureReason(ctx context.Context, serverID string) (string, error) {
+	if !s.agentFeatures.Known(serverID) {
+		return s.peerFeatureReason(ctx, serverID)
+	}
+	if !s.agentFeatures.Has(serverID, AgentFeatureRPCCluster) {
+		return ClusterWithheldAgentTooOld, nil
+	}
+	return "", nil
 }
 
 // peerFeatureReason judges a server whose live declaration is unknown by the
@@ -389,40 +439,75 @@ func (s *Service) serverRunsAgentApplication(ctx context.Context, serverID strin
 // (MatchingRPCBinary, read now, so an inventory change moves it), a manual
 // member its spec's binary with whatever version the inventory knows.
 func (s *Service) resolveMemberBinaries(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer, members []derivedMember) (string, error) {
-	var headRow routing.ServerBinary
-	headKnown, headRead := false, false
+	headBin := lazyHeadBinary{serverID: headServer.ID, path: head.Binary}
 	for i := range members {
 		m := &members[i]
 		if m.row.MemberSpecID != "" {
-			b, ok, err := s.BinaryVersionFor(ctx, m.server.ID, m.spec.Binary)
-			if err != nil {
+			if err := s.resolveManualMemberBinary(ctx, m); err != nil {
 				return "", err
 			}
-			if !ok {
-				b = routing.ServerBinary{ServerID: m.server.ID, Path: m.spec.Binary}
-			}
-			m.binary = b
 			continue
 		}
-		if !headRead {
-			row, listed, err := s.BinaryVersionFor(ctx, headServer.ID, head.Binary)
-			if err != nil {
-				return "", err
-			}
-			headRow, headKnown, headRead = row, listed && binaryVersionKnown(row), true
+		if reason, err := s.resolveAutomaticMemberBinary(ctx, m, &headBin); err != nil || reason != "" {
+			return reason, err
 		}
-		if !headKnown {
-			return ClusterWithheldNoMatchingBinary, nil
-		}
-		b, ok, err := s.MatchingRPCBinary(ctx, m.server.ID, headRow)
-		if err != nil {
-			return "", err
-		}
-		if !ok {
-			return ClusterWithheldNoMatchingBinary, nil
-		}
-		m.binary = b
 	}
+	return "", nil
+}
+
+// lazyHeadBinary is the head binary's inventory row, read on first use: only
+// an automatic member needs it.
+type lazyHeadBinary struct {
+	serverID, path string
+	row            routing.ServerBinary
+	known, read    bool
+}
+
+func (s *Service) headBinaryRow(ctx context.Context, h *lazyHeadBinary) (routing.ServerBinary, bool, error) {
+	if !h.read {
+		row, listed, err := s.BinaryVersionFor(ctx, h.serverID, h.path)
+		if err != nil {
+			return routing.ServerBinary{}, false, err
+		}
+		h.row, h.known, h.read = row, listed && binaryVersionKnown(row), true
+	}
+	return h.row, h.known, nil
+}
+
+// resolveManualMemberBinary sets a manual member's binary: its spec's, with
+// whatever version the inventory knows.
+func (s *Service) resolveManualMemberBinary(ctx context.Context, m *derivedMember) error {
+	b, ok, err := s.BinaryVersionFor(ctx, m.server.ID, m.spec.Binary)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		b = routing.ServerBinary{ServerID: m.server.ID, Path: m.spec.Binary}
+	}
+	m.binary = b
+	return nil
+}
+
+// resolveAutomaticMemberBinary sets an automatic member's binary: its
+// server's ggml-rpc-server of the head binary's version.
+// ClusterWithheldNoMatchingBinary when the head's version is unknown or no
+// such binary is listed.
+func (s *Service) resolveAutomaticMemberBinary(ctx context.Context, m *derivedMember, headBin *lazyHeadBinary) (string, error) {
+	headRow, headKnown, err := s.headBinaryRow(ctx, headBin)
+	if err != nil {
+		return "", err
+	}
+	if !headKnown {
+		return ClusterWithheldNoMatchingBinary, nil
+	}
+	b, ok, err := s.MatchingRPCBinary(ctx, m.server.ID, headRow)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return ClusterWithheldNoMatchingBinary, nil
+	}
+	m.binary = b
 	return "", nil
 }
 
@@ -692,23 +777,12 @@ func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (sp
 	}
 	specs = []AgentRuntimeSpecDTO{}
 	for _, row := range memberships {
-		head, ok, err := s.routes.RuntimeSpecByID(ctx, row.HeadSpecID)
-		if err != nil {
-			return nil, false, err
-		}
-		if !ok || !head.Enabled || !head.ClusterEnabled {
-			continue
-		}
-		headServer, ok, err := s.specServer(ctx, head)
+		d, ok, err := s.deriveHeadOf(ctx, row.HeadSpecID, serverID)
 		if err != nil {
 			return nil, false, err
 		}
 		if !ok {
 			continue
-		}
-		d, err := s.deriveCluster(ctx, head, headServer, serverID)
-		if err != nil {
-			return nil, false, err
 		}
 		hold = hold || d.hold
 		if spec, ok := d.members[serverID]; ok && d.reason == "" {
@@ -716,6 +790,22 @@ func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (sp
 		}
 	}
 	return specs, hold, nil
+}
+
+// deriveHeadOf derives the cluster of the head headSpecID for viewerID's
+// document; ok is false for a head that is gone, disabled, no longer a
+// cluster head, or whose server cannot be resolved.
+func (s *Service) deriveHeadOf(ctx context.Context, headSpecID, viewerID string) (clusterDerivation, bool, error) {
+	head, ok, err := s.routes.RuntimeSpecByID(ctx, headSpecID)
+	if err != nil || !ok || !head.Enabled || !head.ClusterEnabled {
+		return clusterDerivation{}, false, err
+	}
+	headServer, ok, err := s.specServer(ctx, head)
+	if err != nil || !ok {
+		return clusterDerivation{}, false, err
+	}
+	d, err := s.deriveCluster(ctx, head, headServer, viewerID)
+	return d, err == nil, err
 }
 
 // specServer resolves spec -> mapping -> application -> server; ok is false
@@ -793,7 +883,7 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSpecGPU, read []routing.ClusterMember, gpus []routing.ClusterMemberGPU) ([]routing.ClusterMember, []routing.ClusterMemberGPU) {
 	members := slices.Clone(read)
 	prev := map[int]routing.ClusterMemberGPU{}
-	var prevOrder, nextOrder []int
+	var prevOrder []int
 	next := make([]routing.ClusterMemberGPU, 0, len(gpus)+len(rows))
 	for _, g := range gpus {
 		if g.ServerID == used.ServerID {
@@ -803,36 +893,36 @@ func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSp
 		}
 		next = append(next, g)
 	}
+	nextOrder := make([]int, 0, len(rows))
 	measured := false
-	for _, r := range rows {
-		if p, ok := prev[r.GPUIndex]; ok {
-			measured = measured || p.VRAMMeasuredMB > 0
-		}
-		nextOrder = append(nextOrder, r.GPUIndex)
-	}
-	changed := !slices.Equal(prevOrder, nextOrder)
 	for pos, r := range rows {
 		g := routing.ClusterMemberGPU{HeadSpecID: used.HeadSpecID, ServerID: used.ServerID, GPUIndex: r.GPUIndex, Position: pos}
 		if p, ok := prev[r.GPUIndex]; ok {
 			g.VRAMMeasuredMB, g.RunPeakVRAMMB = p.VRAMMeasuredMB, p.RunPeakVRAMMB
+			measured = measured || p.VRAMMeasuredMB > 0
 		}
+		nextOrder = append(nextOrder, r.GPUIndex)
 		next = append(next, g)
 	}
-	if changed {
-		for i := range next {
-			next[i].RunPeakVRAMMB = 0
-		}
+	if !slices.Equal(prevOrder, nextOrder) {
+		endClusterRuns(members, next, used.ServerID, measured)
+	}
+	return members, next
+}
+
+// endClusterRuns is a change of the distribution on a head's membership:
+// every member's run ends with its peaks, and the kept values of the member
+// on serverID (measured: a kept GPU value is known) become a stale floor.
+func endClusterRuns(members []routing.ClusterMember, gpus []routing.ClusterMemberGPU, serverID string, measured bool) {
+	for i := range gpus {
+		gpus[i].RunPeakVRAMMB = 0
 	}
 	for i := range members {
-		if !changed {
-			continue
-		}
 		members[i].RunPeakRAMMB, members[i].RunHeadInstance, members[i].RunStartedAt = 0, 0, time.Time{}
-		if members[i].ServerID == used.ServerID && (measured || members[i].RAMMeasuredMB > 0) {
+		if members[i].ServerID == serverID && (measured || members[i].RAMMeasuredMB > 0) {
 			members[i].Stale = true
 		}
 	}
-	return members, next
 }
 
 // clusterServers is headSpecID's head server and every member server, each
