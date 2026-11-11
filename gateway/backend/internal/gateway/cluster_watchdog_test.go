@@ -888,37 +888,126 @@ func TestBlockedAdmissionForceStopsADeadDirectHold(t *testing.T) {
 	}
 }
 
+// silentHeadStep advances the clock by step and feeds a frame of member 0
+// held by the head, and with head a frame of the head's server showing the
+// head running; it settles after each frame, so frames never coalesce.
+func (f *orchFixture) silentHeadStep(step time.Duration, head bool) {
+	f.t.Helper()
+	f.advance(step)
+	if head {
+		f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+		f.settle()
+	}
+	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	f.settle()
+}
+
+// pastBootGrace feeds both servers' frames every 5 s until the gateway's
+// boot grace ended, so the head's server has a measured interval.
+func (f *orchFixture) pastBootGrace() {
+	f.t.Helper()
+	for f.o.inBootGrace() {
+		f.silentHeadStep(5*time.Second, true)
+	}
+}
+
 // TestDeadHoldOfASilentHeadServerIsForceStopped pins a head host that lost
 // power: its last frame still shows the head running, and no later frame
 // comes, so the head's row never says it stopped. A head server silent past
-// the stale threshold counts as not running the head, and a direct member
-// that still reports its hold is stopped, forced. While the head's server
+// the stale threshold while the member's server kept reporting counts as not
+// running the head: a direct member that still reports its hold is stopped,
+// forced, and recorded as a suspected loss, so when the head's server reports
+// again with the head running the head is stopped and its members released
+// rather than left formed with a dead member. While the head's server
 // reports, the same member frame changes nothing.
 func TestDeadHoldOfASilentHeadServerIsForceStopped(t *testing.T) {
 	f := newOrchFixture(t, 1, "direct", "lan")
 	before := f.formed()
-
-	f.advance(5 * time.Second)
-	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
-	f.settle()
+	f.pastBootGrace()
 	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
 		t.Fatalf("calls = %q, want none while the head's server reports", calls)
 	}
 
-	f.advance(orchTimings().staleFloor)
-	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
-	f.settle()
+	for range 3 {
+		f.silentHeadStep(5*time.Second, false)
+	}
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want none within the stale threshold", calls)
+	}
+	f.silentHeadStep(5*time.Second, false)
 	if calls := f.agent.recorded()[before:]; !slices.Equal(calls, []string{"member:stop:" + orchMemberSpec(0) + ":force"}) {
 		t.Fatalf("calls = %q, want the dead hold ended by a forced stop", calls)
+	}
+
+	// The link comes back with the head still running its process: the
+	// member it lost is confirmed, and the head is stopped.
+	before = len(f.agent.recorded())
+	f.advance(time.Second)
+	f.confirm()
+	calls := f.agent.recorded()[before:]
+	if len(calls) == 0 || calls[0] != "head:stop:"+orchHeadModel || !slices.Equal(releases(calls[1:]), allReleases(1)) {
+		t.Fatalf("calls = %q, want the head stopped and its member released", calls)
+	}
+	if st := f.o.State(orchHead); st != clusterCoolingDown {
+		t.Fatalf("state = %v, want cooling down after the lost member", st)
 	}
 
 	// Over a relay the session ends with the head: nothing to stop.
 	g := newOrchFixture(t, 1, "relay", "lan")
 	before = g.formed()
-	g.advance(20 * time.Second)
-	g.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
-	g.settle()
+	g.pastBootGrace()
+	for range 4 {
+		g.silentHeadStep(5*time.Second, false)
+	}
 	if calls := g.agent.recorded()[before:]; len(calls) != 0 {
 		t.Fatalf("relay calls = %q, want none", calls)
+	}
+}
+
+// TestSilentHeadNeedsAMemberThatKeptReporting pins telemetry that resumes
+// after a gap on every host at once (a WAN blip, a stalled ingest): the
+// member's frame can be handled before the head's, but the member did not
+// report through the head's silence either, so nothing is judged dead.
+func TestSilentHeadNeedsAMemberThatKeptReporting(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	before := f.formed()
+	f.pastBootGrace()
+
+	f.silentHeadStep(30*time.Second, false) // the member's frame comes first
+	f.silentHeadStep(time.Second, true)
+	f.silentHeadStep(time.Second, false)
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want none after a gap every host shared", calls)
+	}
+	if st := f.o.State(orchHead); st != clusterFormed {
+		t.Fatalf("state = %v, want still formed", st)
+	}
+}
+
+// TestSilentHeadIsNotJudgedWithoutItsInterval pins the two cases where the
+// gateway cannot tell a silent head server from a slow one: inside the boot
+// grace, and before the head's server sent a second frame (its interval is
+// not measured yet, and an agent may report less often than the floor).
+func TestSilentHeadIsNotJudgedWithoutItsInterval(t *testing.T) {
+	// Inside the boot grace, with the interval measured.
+	f := newOrchFixture(t, 1, "direct", "lan")
+	before := f.formed()
+	f.silentHeadStep(time.Second, true)
+	for range 6 {
+		f.silentHeadStep(5*time.Second, false)
+	}
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls in the boot grace = %q, want none", calls)
+	}
+
+	// After the boot grace, but the head's server sent one frame only.
+	g := newOrchFixture(t, 1, "direct", "lan")
+	g.advance(orchTimings().bootGrace)
+	before = g.formed()
+	for range 6 {
+		g.silentHeadStep(5*time.Second, false)
+	}
+	if calls := g.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls before the head's interval was measured = %q, want none", calls)
 	}
 }

@@ -993,8 +993,13 @@ start, so a kept-up head is not started again at once. A head whose spec is gone
 (deleted, or no cluster head any more) is forgotten. A direct member that still
 reports the hold of a head that is not running holds a half-open connection its
 agent keeps listing, so the watchdog stops it with `POST /rpc/stop/{specID}?force=1`
-instead of releasing it; a head server silent past the stale threshold counts as
-not running the head, since a host that lost power never reports it stopped. A local start on a member host that waits only for a
+instead of releasing it; a head server silent past its stale threshold while the
+member's server kept reporting through that silence counts as not running the
+head, since a host that lost power never reports it stopped (never inside the
+boot grace, and only once the head server's interval is measured). That forced
+stop is also a suspected loss: if the head's server reports again with the head
+still running, the head is stopped and cools down rather than staying formed
+with a dead member. A local start on a member host that waits only for a
 held member (`admission_blocked_by`) makes the gateway ask the head's agent for
 a conditional stop (`POST /stop/{model}?if_evictable=1`); the agent stops the
 head only when its own eviction rule allows it, and once the head is gone a

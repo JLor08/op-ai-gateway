@@ -47,8 +47,11 @@ import (
 //     is forgotten. A member that still reports the hold of a direct head
 //     that is not running holds a dead connection -- a half-open one, which
 //     its agent keeps listing -- so it is stopped, forced. A head server
-//     silent past the stale threshold counts as not running the head here:
-//     a host that lost power never reports the head stopped.
+//     silent past its stale threshold while the member's server kept
+//     reporting counts as not running the head here (a host that lost power
+//     never reports the head stopped), outside the boot grace and once the
+//     head server's interval is measured; that stop is a suspected loss the
+//     head's next frame confirms.
 //   - A local start on a member's server that waits only for a held member
 //     (admission_blocked_by) makes the gateway ask the head's agent for a
 //     conditional stop: the head goes only when that agent's own eviction
@@ -103,6 +106,7 @@ const (
 	evidenceSessionClosed = "session_closed"
 	evidenceStalled       = "relay_stalled"
 	evidenceStale         = "telemetry_stale"
+	evidenceDeadHold      = "dead_hold_of_silent_head"
 )
 
 // clusterWatchdog is the orchestration's telemetry follower. See the top of
@@ -141,12 +145,32 @@ type watchSuspicion struct {
 	headPID  int
 }
 
-// watchArrivals is when a server's frames arrived: the last one and the
-// recent gaps between them.
+// watchArrivals is when a server's frames arrived: the last one, the recent
+// gaps between them, and streak, the arrival that began the current run of
+// frames without a gap past the server's stale threshold.
 type watchArrivals struct {
-	last time.Time
-	gaps [watchGapSamples]time.Duration
-	n    int
+	last   time.Time
+	gaps   [watchGapSamples]time.Duration
+	n      int
+	streak time.Time
+}
+
+// interval is the server's telemetry interval as the watchdog estimates it:
+// the largest recent gap between its frames, at least floor. A frame that
+// arrived early (an agent reports a transition at once) shortens no gap that
+// counts, and a late one makes the estimate more patient.
+func (a *watchArrivals) interval(floor time.Duration) time.Duration {
+	d := floor
+	for _, g := range a.gaps[:min(a.n, watchGapSamples)] {
+		d = max(d, g)
+	}
+	return d
+}
+
+// staleLimit is the server's stale threshold: three of its intervals, and at
+// least staleFloor.
+func (w *clusterWatchdog) staleLimit(a *watchArrivals) time.Duration {
+	return max(clusterStaleIntervals*a.interval(w.o.t.minAgentInterval), w.o.t.staleFloor)
 }
 
 func newClusterWatchdog(o *clusterOrchestrator) *clusterWatchdog {
@@ -164,10 +188,14 @@ func (w *clusterWatchdog) enqueue(serverID string, prev, next []RuntimeStatusDTO
 	w.mu.Lock()
 	a := w.arrivals[serverID]
 	if a == nil {
-		a = &watchArrivals{}
+		a = &watchArrivals{streak: now}
 		w.arrivals[serverID] = a
 	} else {
-		a.gaps[a.n%watchGapSamples] = now.Sub(a.last)
+		gap := now.Sub(a.last)
+		if gap > w.staleLimit(a) {
+			a.streak = now
+		}
+		a.gaps[a.n%watchGapSamples] = gap
 		a.n++
 	}
 	a.last = now
@@ -229,12 +257,43 @@ func (w *clusterWatchdog) lastArrival(serverID string) time.Time {
 // the arrival of its last frame; a server with no frame since the gateway
 // started is not judged.
 func (w *clusterWatchdog) silentSince(serverID string) (time.Time, bool) {
-	last := w.lastArrival(serverID)
-	if last.IsZero() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	a := w.arrivals[serverID]
+	if a == nil {
 		return time.Time{}, false
 	}
-	limit := max(clusterStaleIntervals*w.interval(serverID), w.o.t.staleFloor)
-	return last, w.o.deps.now().Sub(last) > limit
+	return a.last, w.o.deps.now().Sub(a.last) > w.staleLimit(a)
+}
+
+// headSilentFor reports whether the head's server, headServer, has been
+// silent past its stale threshold while memberServer kept reporting: the time
+// since the later of the head's last frame and the start of the member's
+// current run of frames exceeds the head's threshold. Telemetry that resumes
+// on every host after a shared gap starts a new run for the member, so its
+// frame -- handled before the head's -- judges no head silent. Not judged
+// inside the boot grace, nor before the head's server sent a second frame:
+// its interval is not measured yet, and an agent may report less often than
+// the floor.
+func (w *clusterWatchdog) headSilentFor(headServer, memberServer string) bool {
+	if w.o.inBootGrace() {
+		return false
+	}
+	now := w.o.deps.now()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	h, m := w.arrivals[headServer], w.arrivals[memberServer]
+	if h == nil || h.n == 0 || m == nil {
+		return false
+	}
+	return now.Sub(later(h.last, m.streak)) > w.staleLimit(h)
+}
+
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // heard reports whether serverID sent a frame since the gateway started.
@@ -242,20 +301,15 @@ func (w *clusterWatchdog) heard(serverID string) bool {
 	return !w.lastArrival(serverID).IsZero()
 }
 
-// interval is serverID's telemetry interval as the watchdog estimates it: the
-// largest recent gap between its frames, at least minAgentInterval. A frame
-// that arrived early (an agent reports a transition at once) shortens no gap
-// that counts, and a late one makes the estimate more patient.
+// interval is serverID's telemetry interval as the watchdog estimates it
+// (watchArrivals.interval), minAgentInterval for a server not heard from.
 func (w *clusterWatchdog) interval(serverID string) time.Duration {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	d := w.o.t.minAgentInterval
 	if a := w.arrivals[serverID]; a != nil {
-		for _, g := range a.gaps[:min(a.n, watchGapSamples)] {
-			d = max(d, g)
-		}
+		return a.interval(w.o.t.minAgentInterval)
 	}
-	return d
+	return w.o.t.minAgentInterval
 }
 
 // watchView is what the worker reads of one head the orchestration knows a
@@ -549,10 +603,12 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 		return
 	}
 	hr, present, reported := o.headRow(v.plan)
-	// A head server silent past the stale threshold (its host lost power,
-	// say) keeps its last rows, which may still show the head running; its
-	// head is judged gone, so a direct member's hold of it is a dead one.
-	if _, silent := w.silentSince(v.plan.Head.Server.ID); silent {
+	// A head server silent past the stale threshold while this member's
+	// server kept reporting (the head's host lost power, say) keeps its last
+	// rows, which may still show the head running; its head is judged gone,
+	// so a direct member's hold of it is a dead one.
+	headSilent := w.headSilentFor(v.plan.Head.Server.ID, serverID)
+	if headSilent {
 		present = false
 	}
 	if v.formed && present && hr.State == agentSpecStateRunning {
@@ -579,8 +635,15 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 		}
 		w.released[key] = now
 		slog.Info("cluster watchdog: stopping a member that holds a dead connection to its stopped head",
-			"head_spec_id", v.head, "position", m.Position)
+			"head_spec_id", v.head, "position", m.Position, "head_server_silent", headSilent)
 		o.goAction(func(ctx context.Context) { o.stopDeadHolds(ctx, v.head, []portal.ClusterPlanMember{m}) })
+		// A silent head may still run: only its server's link may be down.
+		// The forced stop then aborts it, so the stop is a suspected loss
+		// that the head's next frame confirms -- the head is stopped and its
+		// members released instead of staying formed with a dead member.
+		if _, pending := w.suspects[v.head]; headSilent && v.formed && !pending {
+			w.suspects[v.head] = watchSuspicion{position: m.Position, evidence: evidenceDeadHold, seq: seq, headPID: hr.PID}
+		}
 	}
 }
 
