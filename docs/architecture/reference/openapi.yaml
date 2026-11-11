@@ -2526,6 +2526,41 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage:
+    description: >
+      Clears the stored usage of one member of the llama.cpp RPC cluster head on
+      the mapping: its stored VRAM per GPU and RAM, their stale mark and the
+      current run's peaks. The member's demand pushed to its host is
+      max(stored usage, estimate), so this is the way out of a stored peak above
+      the member's GPU budget or host memory (cluster_status.peaks_above_budget),
+      which its next start would be refused for. The member server's runtime
+      document is pushed. Authorized on the head (through its mapping) and on
+      the member's server.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: serverID, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Reset a cluster member's stored usage
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404':
+          description: >
+            The Error envelope with `mapping.not_found` (the head's authorization
+            no-leak collapse), `runtime_spec.not_found` (the mapping has no
+            spec), `server.not_found` (a member server the caller may not
+            manage, or none) or `runtime_spec.cluster_member_not_found` (the
+            server is no member of the head).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '500':
+          description: The Error envelope with `runtime_spec.request_failed` (a store read or write failed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/applications/{id}/runtime/coresidency:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }

@@ -24,6 +24,7 @@ func TestPortalClusterErrorRows(t *testing.T) {
 		status int
 		code   string
 	}{
+		{portal.ErrClusterMemberNotFound, http.StatusNotFound, "runtime_spec.cluster_member_not_found"},
 		{portal.ErrClusterMemberModeInvalid, http.StatusBadRequest, "runtime_spec.cluster_member_mode_invalid"},
 		{portal.ErrClusterNetworkInvalid, http.StatusBadRequest, "runtime_spec.cluster_network_invalid"},
 		{portal.ErrClusterTransportInvalid, http.StatusBadRequest, "runtime_spec.cluster_transport_invalid"},

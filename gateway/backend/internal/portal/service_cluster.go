@@ -1278,7 +1278,8 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 		}
 		dto.ClusterMembers = append(dto.ClusterMembers, clusterMemberDTO(m, members[i].visible))
 	}
-	dto.ClusterVRAMTotalMB, dto.ClusterRAMTotalMB, dto.ClusterTotalsComplete = clusterTotals(dto, members)
+	dto.ClusterVRAMTotalMB, dto.ClusterRAMTotalMB, dto.ClusterVRAMTotalComplete, dto.ClusterRAMTotalComplete = clusterTotals(dto, members)
+	dto.ClusterTotalsComplete = dto.ClusterVRAMTotalComplete && dto.ClusterRAMTotalComplete
 	// The network default turns on every member server's NetBird readiness,
 	// so it would tell a caller something about a server it may not see:
 	// with a hidden member it stays empty (and the transport default with it
@@ -1302,6 +1303,9 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 			return dto, err
 		}
 		dto.ClusterStatus = s.headClusterStatus(dto.ID, dto.ClusterWithheldReason, hidden)
+		if dto.ClusterStatus.PeaksAboveBudget, err = s.peaksAboveBudget(ctx, members); err != nil {
+			return dto, err
+		}
 		transport := dto.RPCTransport
 		if transport == "" {
 			transport = dto.ClusterTransportDefault
@@ -1341,28 +1345,74 @@ func clusterMemberDTO(m clusterMemberState, visible bool) ClusterMemberDTO {
 
 // clusterTotals sums the head's own effective VRAM and RAM and every
 // member's, each part max(measured, estimate). A part that is 0 is unknown:
-// it adds nothing and makes the totals lower bounds (complete false). A CPU
-// member has no VRAM part.
-func clusterTotals(dto RuntimeSpecDTO, members []clusterMemberState) (vram, ram int, complete bool) {
-	complete = true
-	add := func(total *int, measured, estimate int) {
+// it adds nothing and makes its total a lower bound (complete false for that
+// axis). A CPU member has no VRAM part, so it never touches the VRAM total.
+func clusterTotals(dto RuntimeSpecDTO, members []clusterMemberState) (vram, ram int, vramComplete, ramComplete bool) {
+	vramComplete, ramComplete = true, true
+	add := func(total *int, complete *bool, measured, estimate int) {
 		v := max(measured, estimate)
 		if v == 0 {
-			complete = false
+			*complete = false
 		}
 		*total += v
 	}
 	for _, g := range dto.GPUs {
-		add(&vram, g.VRAMMeasuredMB, g.VRAMEstimateMB)
+		add(&vram, &vramComplete, g.VRAMMeasuredMB, g.VRAMEstimateMB)
 	}
-	add(&ram, dto.RAMMeasuredMB, dto.RAMEstimateMB)
+	add(&ram, &ramComplete, dto.RAMMeasuredMB, dto.RAMEstimateMB)
 	for _, m := range members {
 		for _, g := range m.gpuParts() {
-			add(&vram, g.VRAMMeasuredMB, g.VRAMEstimateMB)
+			add(&vram, &vramComplete, g.VRAMMeasuredMB, g.VRAMEstimateMB)
 		}
-		add(&ram, m.row.RAMMeasuredMB, m.ramEstimate())
+		add(&ram, &ramComplete, m.row.RAMMeasuredMB, m.ramEstimate())
 	}
-	return vram, ram, complete
+	return vram, ram, vramComplete, ramComplete
+}
+
+// peaksAboveBudget names every stored member peak above what its host admits:
+// a GPU's stored VRAM above the GPU's ceiling (the operator's budget, else the
+// card), a member's stored RAM above the host's memory. Such a peak is the
+// member's demand, so its next start is refused as not permitted until the
+// budget is raised, the split changed, or the stored usage reset. A stale
+// value is not named: as demand it is held at that same ceiling. A member the
+// reader may not see keeps only its position (visible false), since the
+// figures describe its server. Members in member order, then RAM before the
+// GPUs in device order.
+func (s *Service) peaksAboveBudget(ctx context.Context, members []clusterMemberState) ([]ClusterPeakAboveBudgetDTO, error) {
+	var out []ClusterPeakAboveBudgetDTO
+	for _, m := range members {
+		if !m.found || m.row.Stale {
+			continue
+		}
+		parts := m.gpuParts()
+		measured := m.row.RAMMeasuredMB > 0 || slices.ContainsFunc(parts, func(g ClusterMemberGPUDTO) bool { return g.VRAMMeasuredMB > 0 })
+		if !measured {
+			continue
+		}
+		gpuCeilings, ramCeiling, err := s.serverMemoryCeilings(ctx, m.server.ID)
+		if err != nil {
+			return nil, err
+		}
+		var found []ClusterPeakAboveBudgetDTO
+		if ramCeiling > 0 && m.row.RAMMeasuredMB > ramCeiling {
+			found = append(found, ClusterPeakAboveBudgetDTO{
+				Position: m.row.Position, Resource: ClusterPeakResourceRAM, StoredMB: m.row.RAMMeasuredMB, CeilingMB: ramCeiling,
+			})
+		}
+		for _, g := range parts {
+			if c := gpuCeilings[g.Index]; c > 0 && g.VRAMMeasuredMB > c {
+				index := g.Index
+				found = append(found, ClusterPeakAboveBudgetDTO{
+					Position: m.row.Position, Resource: ClusterPeakResourceVRAM, GPUIndex: &index, StoredMB: g.VRAMMeasuredMB, CeilingMB: c,
+				})
+			}
+		}
+		if len(found) > 0 && !m.visible {
+			found = []ClusterPeakAboveBudgetDTO{{Position: m.row.Position}}
+		}
+		out = append(out, found...)
+	}
+	return out, nil
 }
 
 // clusterWarnings derives the advisory warnings of a cluster head, in a

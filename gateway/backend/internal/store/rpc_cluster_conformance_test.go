@@ -406,6 +406,42 @@ func TestConformanceRPCSessions(t *testing.T) {
 	})
 }
 
+// TestConformanceRPCSessionsPrune pins the retention prune: a closed session
+// whose until is before the cutoff goes, one closed at or after it stays, and
+// an open session stays however old it is.
+func TestConformanceRPCSessionsPrune(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		for _, m := range []string{"srv_old", "srv_edge", "srv_open"} {
+			if err := s.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: "rspec_h", MemberServerID: m, Since: t0}); err != nil {
+				t.Fatalf("open %s: %v", m, err)
+			}
+		}
+		cutoff := t0.Add(time.Hour)
+		if err := s.CloseRPCSessions(ctx, "rspec_h", 0, "srv_old", cutoff.Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CloseRPCSessions(ctx, "rspec_h", 0, "srv_edge", cutoff); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PruneRPCSessions(ctx, cutoff); err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		rows, err := s.RPCSessionsAt(ctx, "rspec_h", 0, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := []string{}
+		for _, r := range rows {
+			got = append(got, r.MemberServerID)
+		}
+		if len(got) != 2 || got[0] != "srv_edge" || got[1] != "srv_open" {
+			t.Fatalf("after prune = %v, want the session closed at the cutoff and the open one", got)
+		}
+	})
+}
+
 // TestConformanceRPCClusterMemberPortUnique pins the (server, port) rule on
 // every routing store: a non-zero port is unique on its server across heads,
 // a head rewriting its own rows keeps its ports, port 0 repeats freely, and

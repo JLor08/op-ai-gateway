@@ -69,12 +69,15 @@ func pruneCapturesOnce(ctx context.Context, pruner capturePruner, now time.Time)
 const telemetryPruneInterval = time.Hour
 
 // telemetryPruner is the store surface the telemetry retention loop needs.
-// *store.SQLStore satisfies it via PruneTelemetrySamples + PruneBenchmarkRuns
-// (both share the telemetry retention window) and PruneServerAvailabilitySamples
-// (its own, longer availability retention window).
+// *store.SQLStore satisfies it via PruneTelemetrySamples, PruneBenchmarkRuns and
+// PruneRPCSessions (all three share the telemetry retention window: the closed
+// RPC cluster sessions are telemetry-derived records the energy accounting reads
+// for the same window) and PruneServerAvailabilitySamples (its own, longer
+// availability retention window).
 type telemetryPruner interface {
 	PruneTelemetrySamples(ctx context.Context, before time.Time) error
 	PruneBenchmarkRuns(ctx context.Context, before time.Time) error
+	PruneRPCSessions(ctx context.Context, before time.Time) error
 	PruneServerAvailabilitySamples(ctx context.Context, before time.Time) error
 }
 
@@ -101,8 +104,8 @@ var startTelemetryPruneLoop = func(pruner telemetryPruner, retention, availabili
 	})
 }
 
-// pruneTelemetryOnce deletes telemetry/benchmark samples older than the telemetry
-// retention window and availability samples older than their own (typically longer)
+// pruneTelemetryOnce deletes telemetry/benchmark samples and closed RPC cluster
+// sessions older than the telemetry retention window and availability samples older than their own (typically longer)
 // retention window. Each block is independently guarded: a non-positive retention
 // disables just that block, so the two windows are decoupled. Errors are logged and
 // swallowed so the loop keeps running.
@@ -114,6 +117,9 @@ func pruneTelemetryOnce(ctx context.Context, pruner telemetryPruner, retention, 
 		}
 		if err := pruner.PruneBenchmarkRuns(ctx, cutoff); err != nil {
 			log.Printf("benchmark prune: %v", err)
+		}
+		if err := pruner.PruneRPCSessions(ctx, cutoff); err != nil {
+			log.Printf("rpc session prune: %v", err)
 		}
 	}
 	if availabilityRetention > 0 {

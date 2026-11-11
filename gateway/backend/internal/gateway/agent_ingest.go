@@ -2253,9 +2253,16 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// member, a breach, a local start a held member blocks. It only enqueues
 	// the frame; the watchdog works on its own goroutines.
 	s.clusters.observeStatus(serverID, prevStatuses, statuses)
+	capped := statuses[:min(len(statuses), maxRuntimeSamplesPerSample)]
+	// Best-effort write-back of the cluster members' measured usage onto
+	// their membership rows by the peak rule, and of the members' session
+	// records -- see clusterUsage.observe. A member spec has no runtime spec
+	// row, so the per-spec write-backs below never see its measurement. Never
+	// rejects the sample.
+	s.clusterUsage.observe(ctx, serverID, capped)
 	// One fold of the sample's rows per spec (foldInstanceRows), which every
 	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.
-	folded := foldInstanceRows(statuses[:min(len(statuses), maxRuntimeSamplesPerSample)])
+	folded := foldInstanceRows(capped)
 	// Best-effort write-back of each spec's measured VRAM onto its launch
 	// spec -- see writeBackRuntimeVRAM. Never rejects the sample; a failure
 	// here is logged and dropped.

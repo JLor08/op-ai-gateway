@@ -231,6 +231,33 @@ type ClusterStatusDTO struct {
 	// member position: a peer that connected without being allowed, or a
 	// hold by another head. Ordered by position, kind and peer.
 	Breaches []ClusterBreachDTO `json:"breaches,omitempty"`
+	// PeaksAboveBudget names every stored member peak above what the member's
+	// host admits (a GPU budget, the host's memory): the member's next start
+	// is refused until the budget is raised, the split changed, or the stored
+	// usage reset. Derived by the portal from the stored usage on every read.
+	PeaksAboveBudget []ClusterPeakAboveBudgetDTO `json:"peaks_above_budget,omitempty"`
+}
+
+// The resources of a ClusterPeakAboveBudgetDTO.
+const (
+	// ClusterPeakResourceVRAM: one GPU's stored VRAM is above the GPU's
+	// operator budget, or above the card when it has none.
+	ClusterPeakResourceVRAM = "vram"
+	// ClusterPeakResourceRAM: the member's stored RAM is above the host's
+	// memory.
+	ClusterPeakResourceRAM = "ram"
+)
+
+// ClusterPeakAboveBudgetDTO is one stored member peak above its ceiling: the
+// member's position, the resource, the GPU's host index for VRAM, the stored
+// value and the ceiling it exceeds. A member on a server the reader may not
+// manage shows only its position: the figures are facts about that server.
+type ClusterPeakAboveBudgetDTO struct {
+	Position  int    `json:"position"`
+	Resource  string `json:"resource,omitempty"`
+	GPUIndex  *int   `json:"gpu_index,omitempty"`
+	StoredMB  int    `json:"stored_mb,omitempty"`
+	CeilingMB int    `json:"ceiling_mb,omitempty"`
 }
 
 // The kinds of a cluster breach (ClusterBreachDTO.Kind).

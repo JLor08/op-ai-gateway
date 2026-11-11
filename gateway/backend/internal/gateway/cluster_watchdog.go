@@ -311,10 +311,17 @@ func findInstanceRow(rows []RuntimeStatusDTO, spec string) (RuntimeStatusDTO, bo
 // headExited follows a head whose process is gone: no longer formed, its
 // members released unless a start or a stop of it runs (which handles them),
 // then the reconciler woken, since a kept-up head starts again members first.
+// The head's run ends here unless a start runs: that start began a new run,
+// and an exit seen meanwhile is the old process's or a failed start's, whose
+// run ends as unformed when the next one begins.
 func (w *clusterWatchdog) headExited(serverID, head string) {
 	o := w.o
 	o.mu.Lock()
 	st := o.heads[head]
+	var ended, formed bool
+	if st != nil && st.start == nil {
+		ended, formed = endRunLocked(st)
+	}
 	var members []portal.ClusterPlanMember
 	if st != nil {
 		if st.formed {
@@ -329,6 +336,9 @@ func (w *clusterWatchdog) headExited(serverID, head string) {
 	}
 	o.mu.Unlock()
 	slog.Info("cluster head exited", "server_id", serverID, "head_spec_id", head)
+	if ended {
+		o.runEnded(head, formed)
+	}
 	if len(members) == 0 {
 		o.Trigger()
 		return

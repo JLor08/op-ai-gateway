@@ -486,7 +486,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 		})
 	}
 	spec := AgentRuntimeSpecDTO{
-		ID:                    "rpca_" + headSpecID + "_" + m.server.ID,
+		ID:                    automaticMemberAgentSpecID(headSpecID, m.server.ID),
 		Kind:                  AgentSpecKindRPCServer,
 		Binary:                m.binary.Path,
 		Args:                  []string{},

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"op-ai-gateway/internal/storeerr"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -3949,6 +3950,16 @@ func (m *MemoryStore) CloseRPCSessions(_ context.Context, headSpecID string, ins
 			s.Until = &u
 		}
 	}
+	return nil
+}
+
+// PruneRPCSessions deletes the closed sessions whose Until is before before.
+func (m *MemoryStore) PruneRPCSessions(_ context.Context, before time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rpcSessions = slices.DeleteFunc(m.rpcSessions, func(s RPCSession) bool {
+		return s.Until != nil && s.Until.Before(before)
+	})
 	return nil
 }
 

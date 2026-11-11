@@ -611,17 +611,21 @@ type RuntimeSpecDTO struct {
 	ClusterMembers []ClusterMemberDTO `json:"cluster_members"`
 	// ClusterVRAMTotalMB / ClusterRAMTotalMB are the head's own effective
 	// demand plus every member's, each part max(measured, estimate);
-	// ClusterTotalsComplete is false when a part is unknown, so the totals
-	// are lower bounds. ClusterNetworkDefault / ClusterTransportDefault are
+	// ClusterVRAMTotalComplete / ClusterRAMTotalComplete are false when a part
+	// of that total is unknown, so it is a lower bound (a CPU member has no
+	// VRAM part, so it never makes the VRAM total one), and
+	// ClusterTotalsComplete is both together. ClusterNetworkDefault / ClusterTransportDefault are
 	// what an empty cluster_network / rpc_transport resolves to for the stored
 	// membership, and ClusterWarnings lists the advisory cluster warning codes.
 	// All READ-ONLY, derived on every read, and only filled on a cluster head.
-	ClusterVRAMTotalMB      int      `json:"cluster_vram_total_mb"`
-	ClusterRAMTotalMB       int      `json:"cluster_ram_total_mb"`
-	ClusterTotalsComplete   bool     `json:"cluster_totals_complete"`
-	ClusterNetworkDefault   string   `json:"cluster_network_default"`
-	ClusterTransportDefault string   `json:"cluster_transport_default"`
-	ClusterWarnings         []string `json:"cluster_warnings"`
+	ClusterVRAMTotalMB       int      `json:"cluster_vram_total_mb"`
+	ClusterRAMTotalMB        int      `json:"cluster_ram_total_mb"`
+	ClusterTotalsComplete    bool     `json:"cluster_totals_complete"`
+	ClusterVRAMTotalComplete bool     `json:"cluster_vram_total_complete"`
+	ClusterRAMTotalComplete  bool     `json:"cluster_ram_total_complete"`
+	ClusterNetworkDefault    string   `json:"cluster_network_default"`
+	ClusterTransportDefault  string   `json:"cluster_transport_default"`
+	ClusterWarnings          []string `json:"cluster_warnings"`
 	// ClusterWithheldReason is why an enabled cluster head is not in its
 	// server's runtime document (a ClusterWithheld* code: an agent too old
 	// or not heard from, a member missing, disabled or no longer
@@ -2783,6 +2787,16 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // such a spec, since the derived timeout is the one field either moves.
 // Any other writer of load_time_ms, an audio benchmark included, pushes the
 // same way.
+//
+// The cluster members' measured usage (rpc_cluster_members and its GPU rows)
+// is a document input of the member server's rpc_server spec (its demand is
+// max(stored usage, estimate)), written outside this service by the gateway's
+// telemetry ingest (gateway.clusterUsage). It follows the agent's-own-writeback
+// exemption above for the rises during a run: the agent charges max(live,
+// demand) itself, so a push would only echo it its own measurement. It pushes
+// the member server's document when a formed run's end replaces the stored
+// value (after the head disconnects, the agent no longer holds the value) and
+// when an operator resets a member's stored usage.
 //
 // One input of the document is not a row: whether the server's agent declares
 // the runtime_instances feature (AgentFeatureReader, Service.specAsPushed),

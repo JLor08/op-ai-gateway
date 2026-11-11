@@ -507,6 +507,11 @@ type Server struct {
 	// up. New builds it whenever a portal is wired; nil otherwise, which every
 	// method treats as no orchestration.
 	clusters *clusterOrchestrator
+	// clusterUsage keeps the cluster members' measured usage and session
+	// records (cluster_usage.go), fed by the telemetry ingest and told of
+	// every run by the orchestration. New builds it whenever a route store is
+	// wired; nil otherwise, which every method treats as nothing to keep.
+	clusterUsage *clusterUsage
 	// runtimeStarts counts the portal's manual starts whose ensure runs in the
 	// background (runtime_actions.go); cancelling the server's lifetime
 	// (baseCtx) ends each one's ensure. Only tests join them
@@ -1251,7 +1256,14 @@ func New(deps ServerDeps) *Server {
 		resolver.SetDemandSink(demandFanout{scaler: s.instanceScaler, clusters: clusters})
 		resolver.SetClusterGate(&clusterRoutingGate{heads: instances, clusters: clusters, busy: benchmarks})
 	}
+	if deps.Routes != nil {
+		s.clusterUsage = newClusterUsage(deps.Routes, s.PushRuntimeConfig, time.Now)
+	}
 	if s.Portal != nil {
+		var runs clusterRunObserver
+		if s.clusterUsage != nil {
+			runs = s.clusterUsage
+		}
 		s.clusters = newClusterOrchestrator(clusterOrchestratorDeps{
 			portal: s.Portal,
 			agents: func() clusterAgentClient {
@@ -1264,6 +1276,7 @@ func New(deps ServerDeps) *Server {
 			now:      time.Now,
 			// A start's end wakes every request parked for the head's server.
 			wake: admission.releaseAll,
+			runs: runs,
 		}, defaultClusterTimings())
 	}
 	s.routes()

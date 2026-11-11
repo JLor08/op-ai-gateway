@@ -232,6 +232,9 @@ type clusterOrchestratorDeps struct {
 	// failed, so a request parked for the cluster is served -- or answered
 	// the cluster's failure -- at once.
 	wake func(serverID string)
+	// runs, when set, is told where each run of a head begins and ends (the
+	// member usage's peak rule).
+	runs clusterRunObserver
 }
 
 // clusterTimings are the orchestration's bounds.
@@ -352,6 +355,11 @@ type clusterHeadState struct {
 	// lands on a reservation the start armed.
 	releasing    int
 	releasesDone chan struct{}
+	// runOpen: a run of the head began (a start) or was found formed, and its
+	// end -- the head's stop -- has not been passed on yet; runFormed: that
+	// run formed.
+	runOpen   bool
+	runFormed bool
 }
 
 // clusterStart is one running start that every Ensure of its head joins.
@@ -593,6 +601,9 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) (release *po
 		return nil, nil
 	}
 	o.beginStart(head, plan)
+	if o.deps.runs != nil {
+		o.deps.runs.runBegan(ctx, head)
+	}
 
 	plan, ce := o.applyConfig(ctx, head, plan)
 	fp := o.fingerprint(ctx, plan)
@@ -703,6 +714,7 @@ func (o *clusterOrchestrator) beginStart(head string, plan portal.ClusterPlan) {
 	st := o.headState(head)
 	st.formed = false
 	st.phase = ""
+	st.runOpen, st.runFormed = true, false
 	st.members = make([]portal.ClusterMemberStatusDTO, len(plan.Members))
 	for i, m := range plan.Members {
 		st.members[i] = portal.ClusterMemberStatusDTO{Position: m.Position, State: clusterMemberPending}
@@ -733,6 +745,7 @@ func (o *clusterOrchestrator) markFormed(head string, plan portal.ClusterPlan) {
 	defer o.mu.Unlock()
 	st := o.headState(head)
 	st.formed, st.phase, st.formedAt = true, portal.ClusterPhaseFormed, o.deps.now()
+	st.runOpen, st.runFormed = true, true
 	st.members = make([]portal.ClusterMemberStatusDTO, len(plan.Members))
 	for i, m := range plan.Members {
 		st.members[i] = portal.ClusterMemberStatusDTO{Position: m.Position, State: clusterMemberHeld}
@@ -1279,10 +1292,9 @@ func (o *clusterOrchestrator) Stop(ctx context.Context, head string, stopMembers
 
 // markStopped records head no longer formed: every member pending, except a
 // member the watchdog recorded as the cause of the stop, which keeps its
-// failed state until the next start.
+// failed state until the next start. The head's run ends here.
 func (o *clusterOrchestrator) markStopped(head string) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	st := o.headState(head)
 	st.formed, st.phase = false, ""
 	for i := range st.members {
@@ -1290,6 +1302,34 @@ func (o *clusterOrchestrator) markStopped(head string) {
 			st.members[i].State, st.members[i].Code = clusterMemberPending, ""
 		}
 	}
+	ended, formed := endRunLocked(st)
+	o.mu.Unlock()
+	if ended {
+		o.runEnded(head, formed)
+	}
+}
+
+// endRunLocked takes st's open run, if any: ended reports whether one was
+// open (each run ends once, whichever of a stop and the head's exit on
+// telemetry passes it on first), formed whether it formed. The caller holds
+// o.mu.
+func endRunLocked(st *clusterHeadState) (ended, formed bool) {
+	if st == nil || !st.runOpen {
+		return false, false
+	}
+	formed = st.runFormed
+	st.runOpen, st.runFormed = false, false
+	return true, formed
+}
+
+// runEnded passes the end of head's run to the run observer, on an action
+// goroutine under the server's lifetime: a run whose end is lost to the
+// shutdown ends as unformed when the next one begins.
+func (o *clusterOrchestrator) runEnded(head string, formed bool) {
+	if o.deps.runs == nil {
+		return
+	}
+	o.goAction(func(ctx context.Context) { o.deps.runs.runEnded(ctx, head, formed) })
 }
 
 // StopManual is the operator's stop of head: Stop, and the head stays down

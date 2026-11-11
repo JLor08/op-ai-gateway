@@ -784,6 +784,18 @@ func (_d *RoutingStoreWithTracing) PruneBenchmarkRuns(ctx context.Context, befor
 	return _d.Store.PruneBenchmarkRuns(ctx, before)
 }
 
+func (_d *RoutingStoreWithTracing) PruneRPCSessions(ctx context.Context, before time.Time) (err error) {
+	ctx, span := Start(ctx, "routing.Store.PruneRPCSessions")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.PruneRPCSessions(ctx, before)
+}
+
 func (_d *RoutingStoreWithTracing) PruneServerAvailabilitySamples(ctx context.Context, before time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.PruneServerAvailabilitySamples")
 	defer span.End()

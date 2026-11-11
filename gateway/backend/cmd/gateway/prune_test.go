@@ -112,6 +112,22 @@ type fakeTelemetryPruner struct {
 	benchmarkBefore   time.Time
 	availabilityCalls int
 	availabilityBefr  time.Time
+	sessionCalls      int
+	sessionBefore     time.Time
+}
+
+func (f *fakeTelemetryPruner) PruneRPCSessions(_ context.Context, before time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessionCalls++
+	f.sessionBefore = before
+	return nil
+}
+
+func (f *fakeTelemetryPruner) Sessions() (int, time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionCalls, f.sessionBefore
 }
 
 func (f *fakeTelemetryPruner) PruneTelemetrySamples(_ context.Context, before time.Time) error {
@@ -195,6 +211,10 @@ func TestPruneTelemetryOnce(t *testing.T) {
 	if want := now.Add(-1 * time.Hour); !fake.BenchmarkBefore().Equal(want) {
 		t.Fatalf("benchmark prune cutoff = %v, want %v (now-1h)", fake.BenchmarkBefore(), want)
 	}
+	// The closed RPC cluster sessions are kept like telemetry: the same cutoff.
+	if calls, before := fake.Sessions(); calls != 1 || !before.Equal(now.Add(-1*time.Hour)) {
+		t.Fatalf("PruneRPCSessions calls = %d cutoff %v, want 1 at now-1h", calls, before)
+	}
 	// Availability prunes on its OWN, longer cutoff.
 	if fake.AvailabilityCalls() != 1 {
 		t.Fatalf("PruneServerAvailabilitySamples calls = %d, want 1", fake.AvailabilityCalls())
@@ -212,6 +232,9 @@ func TestPruneTelemetryOnce(t *testing.T) {
 	}
 	if telemOff.BenchmarkCalls() != 0 {
 		t.Fatalf("PruneBenchmarkRuns calls with retention=0 = %d, want 0", telemOff.BenchmarkCalls())
+	}
+	if calls, _ := telemOff.Sessions(); calls != 0 {
+		t.Fatalf("PruneRPCSessions calls with retention=0 = %d, want 0", calls)
 	}
 	if telemOff.AvailabilityCalls() != 1 {
 		t.Fatalf("PruneServerAvailabilitySamples calls with availabilityRetention=24h = %d, want 1", telemOff.AvailabilityCalls())

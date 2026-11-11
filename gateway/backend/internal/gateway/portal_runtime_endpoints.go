@@ -5,12 +5,14 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/store"
 	"slices"
 	"strings"
 	"time"
@@ -77,6 +79,40 @@ func (s *Server) handlePortalClusterCandidates(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": list})
+}
+
+// handlePortalClusterMemberResetUsage serves POST
+// /api/portal/mappings/{mappingID}/runtime/cluster-members/{serverID}/reset-usage:
+// it clears the stored usage of the member on serverID of the cluster head on
+// that mapping (the way out of a stored peak above the member's budget, which
+// its next start would be refused for) and answers the head's runtime spec.
+// Authorization -- the head's mapping and the member's server -- happens
+// inside portal.Service.AuthorizeClusterMemberUsageReset; the reset itself
+// runs beside the telemetry ingest that writes the same row (clusterUsage),
+// which also pushes the member server's document.
+func (s *Server) handlePortalClusterMemberResetUsage(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID, serverID string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	m, err := s.Portal.AuthorizeClusterMemberUsageReset(r.Context(), token, mappingID, serverID)
+	if err != nil {
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	if err := s.clusterUsage.reset(r.Context(), m.HeadSpecID, m.ServerID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// The member left between the authorization and the reset.
+			err = portal.ErrClusterMemberNotFound
+		}
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	dto, err := s.Portal.GetRuntimeSpec(r.Context(), token, mappingID)
+	if err != nil {
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 // portalRuntimeSpecErrRows are writePortalRuntimeSpecError's mapper-specific
@@ -172,6 +208,7 @@ var portalRuntimeSpecErrRows = []errRow{
 // through clusterErrDetail; the server-not-found answer for a member server
 // the caller may not use is the shared server row.
 var portalClusterErrRows = []errRow{
+	{err: portal.ErrClusterMemberNotFound, status: http.StatusNotFound, code: "runtime_spec.cluster_member_not_found", msg: "the server is no member of this cluster head"},
 	{err: portal.ErrClusterMemberModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_mode_invalid", msg: "member_mode must be \"automatic\" or \"manual\""},
 	{err: portal.ErrClusterNetworkInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_network_invalid", msg: "cluster_network must be \"mesh\" or \"lan\" (or empty for the default)"},
 	{err: portal.ErrClusterTransportInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_transport_invalid", msg: "rpc_transport must be \"direct\" or \"relay\" (or empty for the default)"},

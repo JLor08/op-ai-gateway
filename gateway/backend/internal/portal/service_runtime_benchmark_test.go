@@ -130,14 +130,16 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// settings, never stored: read-only echoes. So is the reason a head is
 		// withheld from its runtime document, and the gateway's in-memory
 		// orchestration state of the head.
-		"cluster_status":            true,
-		"cluster_vram_total_mb":     true,
-		"cluster_ram_total_mb":      true,
-		"cluster_totals_complete":   true,
-		"cluster_network_default":   true,
-		"cluster_transport_default": true,
-		"cluster_warnings":          true,
-		"cluster_withheld_reason":   true,
+		"cluster_status":              true,
+		"cluster_vram_total_mb":       true,
+		"cluster_ram_total_mb":        true,
+		"cluster_totals_complete":     true,
+		"cluster_vram_total_complete": true,
+		"cluster_ram_total_complete":  true,
+		"cluster_network_default":     true,
+		"cluster_transport_default":   true,
+		"cluster_warnings":            true,
+		"cluster_withheld_reason":     true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only
@@ -229,6 +231,8 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		ClusterVRAMTotalMB:          24000,                             // read-only; must NOT appear in want below
 		ClusterRAMTotalMB:           8000,                              // read-only; must NOT appear in want below
 		ClusterTotalsComplete:       true,                              // read-only; must NOT appear in want below
+		ClusterVRAMTotalComplete:    true,                              // read-only; must NOT appear in want below
+		ClusterRAMTotalComplete:     true,                              // read-only; must NOT appear in want below
 		ClusterNetworkDefault:       "lan",                             // read-only; must NOT appear in want below
 		ClusterTransportDefault:     "direct",                          // read-only; must NOT appear in want below
 		ClusterWarnings:             []string{"cluster_mmdev_missing"}, // read-only; must NOT appear in want below

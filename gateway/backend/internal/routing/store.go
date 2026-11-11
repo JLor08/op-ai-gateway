@@ -3676,4 +3676,8 @@ type RPCClusterStore interface {
 	// at: Since <= at and (Until nil or Until >= at), ordered by Since, then
 	// member server ID. Always non-nil.
 	RPCSessionsAt(ctx context.Context, headSpecID string, instance int, at time.Time) ([]RPCSession, error)
+	// PruneRPCSessions deletes every closed session whose Until is before
+	// before; an open session is never pruned. Sessions are kept like
+	// telemetry: the telemetry retention loop calls it with its cutoff.
+	PruneRPCSessions(ctx context.Context, before time.Time) error
 }

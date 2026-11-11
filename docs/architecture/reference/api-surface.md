@@ -662,6 +662,7 @@ semantics.
 | `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
 | `/api/portal/mappings/{id}/runtime/start` | POST | mapping | **Transient manual start** (the live-status Play): starts one more instance of the mapping's managed model and writes nothing, so it then follows the normal idle, eviction and burst rules. No body. Refused while a benchmark run holds the server (`409 runtime_spec.server_benchmarking`, as the spec PUT). `200 {"instance":k,"state":"running"}` when the agent reports it running within 5 s, the agent's refusal when it answers within 5 s, otherwise `202 {"instance":k,"state":"starting"}` while the start completes in the background. See the start and stop conventions below |
 | `/api/portal/mappings/{id}/runtime/stop` | POST | mapping | **Transient manual stop** (the live-status Stop): `{"instance":k}` (required, 0–63) drains that one instance now and writes nothing, so demand can start it again. Needs the agent feature `runtime_stop` (agent 0.17.0). `200 {"instance":k,"state":"stopping"\|"stopped"}`, the agent's answer passed through. Refused while a benchmark run holds the server, like the start |
+| `/api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage` | POST | mapping + member server | **Reset a cluster member's stored usage**: clears the stored VRAM per GPU and RAM of the member on `{serverID}` of the llama.cpp RPC cluster head on the mapping, their stale mark and the current run's peaks, and pushes the member server's runtime document (its demand is `max(stored usage, estimate)`). The way out of a stored peak above the member's budget (`cluster_status.peaks_above_budget`). No body. `200` the head's runtime spec; `404 server.not_found` for a member server the caller may not manage, `404 runtime_spec.cluster_member_not_found` for a server that is no member of the head |
 | `/api/portal/mappings/{id}/probe-vram` | POST | mapping (`AuthorizeBenchmarkScope`, **not** the mapping write rule above) | The **VRAM benchmark**: force-stop every managed spec on the server (*the target included*), load this one model, and report its VRAM. `202` + the initial `BenchmarkStatus`; the result arrives on the benchmark status poll / SSE as `results[].vram`. Reserves the server like any benchmark (`409 benchmark.already_running`, checked before the refusals below, and `409 benchmark.server_in_use`). See the six refusals below and [§11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs) |
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's co-residency document, `{"mode":"opt_out"\|"opt_in","pairs":[{"a","b","verdict":"allow"\|"forbid"}]}`: its per-server **mode** (what a pair with no entry means, default `opt_out`) and the complete set of its **explicit** pair verdicts, each canonical (`a < b`). `pairs` is always a non-nil array; the effective allowed-pair list the agent receives is derived from both and is not part of this document ([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)). The PUT is a full replace of the explicit pairs; an empty or absent `mode` leaves the stored mode unchanged, an empty `verdict` is an `allow`, and `400` `runtime_coresidency.mode_invalid` / `runtime_coresidency.pair_invalid` reject an unknown mode / a bad pair or verdict |
 | `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout`, `binary_path_os_mismatch`, `api_flavors_not_on_application` and `api_flavors_text_on_stable_diffusion` ([Agent-Managed Model Runtime §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows)) |
@@ -821,9 +822,24 @@ Conventions worth stating, because each is a judgement call a client depends on:
   (`position`, `state` — `pending`, `starting`, `ready`, `held`, `failed` — and
   a failed member's `code`; positions only, never server names, so a member on
   a server the caller may not see stays anonymous), `last_failure` (`code`, the
-  failing member's `position` or `head: true`, `at`) and `cooldown_until`. A
+  failing member's `position` or `head: true`, `at`), `cooldown_until`,
+  `breaches` (`position`, `kind` — `peer` or `foreign_hold` — and for a peer its
+  address and `at`) and `peaks_above_budget` (`position`, `resource` — `vram`
+  with the GPU's `gpu_index`, or `ram` — `stored_mb` and `ceiling_mb`: a stored,
+  not stale, member peak above its GPU's budget (the card without one) or above
+  the host's memory, which the member's next start is refused for until the
+  budget is raised, the split changed or the member's usage reset). A breach or
+  peak of a member the caller may not see keeps only its `position`. A
   restarted gateway starts from `cold` and learns a running cluster again from
-  the agents' telemetry. The PUT refuses, in
+  the agents' telemetry. Beside it the head carries the read-only cluster
+  totals `cluster_vram_total_mb` / `cluster_ram_total_mb` (the head's own
+  effective demand plus every member's, each part `max(measured, estimate)`),
+  `cluster_vram_total_complete` / `cluster_ram_total_complete` (false when a
+  part of that total is unknown, so it is a lower bound; a CPU member has no
+  VRAM part) and `cluster_totals_complete` (both). A member's measured usage is
+  kept per run: during a run of the head the stored value only rises, a formed
+  run's peak replaces it when the head stops, and a run that never formed
+  replaces nothing. The PUT refuses, in
   this order: a negative `min_instances`, `max_instances` or
   `instance_parallelism` `400 runtime_spec.tuning_invalid`; a `min_instances` or
   `max_instances` above 64 (`MaxInstanceIndex` + 1), an `instance_parallelism`

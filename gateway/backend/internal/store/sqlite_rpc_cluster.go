@@ -350,6 +350,14 @@ func (s *SQLiteStore) CloseRPCSessions(ctx context.Context, headSpecID string, i
 	return nil
 }
 
+// PruneRPCSessions deletes the closed sessions whose until is before before.
+func (s *SQLiteStore) PruneRPCSessions(ctx context.Context, before time.Time) error {
+	if _, err := s.exec(ctx, `delete from rpc_sessions where until is not null and until < ?`, before); err != nil {
+		return fmt.Errorf("prune rpc sessions: %w", err)
+	}
+	return nil
+}
+
 // RPCSessionsAt lists the sessions of (head, instance) in force at at.
 func (s *SQLiteStore) RPCSessionsAt(ctx context.Context, headSpecID string, instance int, at time.Time) ([]routing.RPCSession, error) {
 	rows, err := s.query(ctx, `
