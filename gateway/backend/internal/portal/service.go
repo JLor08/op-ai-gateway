@@ -2556,9 +2556,12 @@ func (s *Service) attachUsageCost(ctx context.Context, principal auth.Token, row
 }
 
 // rowEnergyParts is row's cost -- the sum of its parts, each at its own
-// host's price -- and the parts as the Activity list shows them: the head
-// named as the row names it, a member named only when names lets the viewer
-// see its server, else an anonymous numbered member without a cost.
+// host's price -- and the parts as the Activity list shows them, each with
+// its cost: the head named as the row names it, a member named only when
+// names lets the viewer see its server, else an anonymous numbered member.
+// Only the server's identity is hidden: its price is not secret from a
+// requester whose request it served, since the row's cost already contains
+// it.
 func rowEnergyParts(row usage.Row, parts []usage.EnergyPart, prices *usagePricer, names *usagePartNamer) (float64, []usage.RowEnergyPart) {
 	var total float64
 	out := make([]usage.RowEnergyPart, 0, len(parts))
@@ -2573,8 +2576,9 @@ func rowEnergyParts(row usage.Row, parts []usage.EnergyPart, prices *usagePricer
 			dto.Member = member
 			name, visible = names.of(p.ServerID)
 		}
+		dto.Cost = &cost
 		if visible {
-			dto.ServerName, dto.Cost = name, &cost
+			dto.ServerName = name
 		}
 		out = append(out, dto)
 	}

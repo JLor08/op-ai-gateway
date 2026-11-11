@@ -194,8 +194,10 @@ type Row struct {
 // RowEnergyPart is one host's energy part of a cluster request as the
 // Activity list shows it. ServerName is set only for a server the viewer may
 // see (the head is named as the row names it); a member the viewer may not
-// see is identified by Member alone, and carries no cost, since its cost would
-// reveal its server's price. Member numbers the members of the request from 1,
+// see is identified by Member alone. Only its identity is hidden: its Wh,
+// source and cost are shown like every other part's, since the row's own
+// energy and cost contain them and its price is not secret from a requester
+// whose request it served. Member numbers the members of the request from 1,
 // in the order of their parts; 0 for the head.
 type RowEnergyPart struct {
 	Role         string   `json:"role"`

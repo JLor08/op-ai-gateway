@@ -1406,9 +1406,10 @@ paths:
       description: >-
         A row of a llama.cpp RPC cluster request carries `energy_parts` (absent on every
         other row): one object per host, head first, with `role` (`head` or `member`),
-        `server_name` (only for a server the caller may see), `member` (1-based member
-        number), `energy_wh`, `energy_source` and `cost` (only for a server the caller
-        may see).
+        `server_name` (only for a server the caller may see; a hidden member keeps its
+        identity hidden), `member` (1-based member number), `energy_wh`, `energy_source`
+        and `cost` (on every part: the row's own cost contains it, so it is not secret
+        from the requester).
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
