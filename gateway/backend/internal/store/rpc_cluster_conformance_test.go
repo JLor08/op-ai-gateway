@@ -548,9 +548,9 @@ func TestConformanceRPCClusterMemberRuns(t *testing.T) {
 	})
 }
 
-// TestConformanceOpenRPCSessionsByMember pins the per-member listing of open
-// sessions: every head's open session on the member, none closed, none of
-// another member.
+// TestConformanceOpenRPCSessionsByMember pins the listings of open sessions:
+// per member every head's open session on it, none closed, none of another
+// member; and every open session, by member server.
 func TestConformanceOpenRPCSessionsByMember(t *testing.T) {
 	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
@@ -574,6 +574,11 @@ func TestConformanceOpenRPCSessionsByMember(t *testing.T) {
 		}
 		if none, err := s.OpenRPCSessionsByMember(ctx, "srv_none"); err != nil || none == nil || len(none) != 0 {
 			t.Fatalf("no sessions = %v err=%v, want an empty list", none, err)
+		}
+		all, err := s.OpenRPCSessions(ctx)
+		if err != nil || len(all) != 3 || all[0].MemberServerID != "srv_a" || all[0].HeadSpecID != "rspec_a" ||
+			all[1].HeadSpecID != "rspec_b" || all[2].MemberServerID != "srv_b" {
+			t.Fatalf("all open sessions = %+v err=%v, want srv_a's two then srv_b's", all, err)
 		}
 	})
 }

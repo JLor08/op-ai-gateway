@@ -451,11 +451,17 @@ func (s *SQLiteStore) CloseRPCSessions(ctx context.Context, headSpecID string, i
 
 // OpenRPCSessionsByMember lists the open sessions on memberServerID.
 func (s *SQLiteStore) OpenRPCSessionsByMember(ctx context.Context, memberServerID string) ([]routing.RPCSession, error) {
-	rows, err := s.query(ctx, `
-		select head_spec_id, instance, member_server_id, since
-		from rpc_sessions
-		where member_server_id = ? and until is null
-		order by head_spec_id, instance, since`, memberServerID)
+	return s.openRPCSessions(ctx, `where member_server_id = ? and until is null order by head_spec_id, instance, since`, memberServerID)
+}
+
+// OpenRPCSessions lists every open session.
+func (s *SQLiteStore) OpenRPCSessions(ctx context.Context) ([]routing.RPCSession, error) {
+	return s.openRPCSessions(ctx, `where until is null order by member_server_id, head_spec_id, instance, since`)
+}
+
+// openRPCSessions lists the open sessions the where-and-order clause selects.
+func (s *SQLiteStore) openRPCSessions(ctx context.Context, clause string, args ...any) ([]routing.RPCSession, error) {
+	rows, err := s.query(ctx, `select head_spec_id, instance, member_server_id, since from rpc_sessions `+clause, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list open rpc sessions: %w", err)
 	}

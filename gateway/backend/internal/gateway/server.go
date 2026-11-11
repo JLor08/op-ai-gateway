@@ -1258,6 +1258,14 @@ func New(deps ServerDeps) *Server {
 	}
 	if deps.Routes != nil {
 		s.clusterUsage = newClusterUsage(deps.Routes, s.PushRuntimeConfig, time.Now)
+		routes := deps.Routes
+		s.clusterUsage.lastSeen = func(ctx context.Context, serverID string) (time.Time, bool) {
+			srv, err := routes.AIServerByID(ctx, serverID)
+			if err != nil || srv.LastSeenAt == nil {
+				return time.Time{}, false
+			}
+			return *srv.LastSeenAt, true
+		}
 	}
 	if s.Portal != nil {
 		var runs clusterRunObserver

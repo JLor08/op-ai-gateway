@@ -271,6 +271,9 @@ type clusterTimings struct {
 	// it releases again a member that still reports a dead hold.
 	blockedRetry time.Duration
 	releaseRetry time.Duration
+	// sessionWait bounds a reconciler pass's session closes, apart from the
+	// pass's own reads.
+	sessionWait time.Duration
 }
 
 func defaultClusterTimings() clusterTimings {
@@ -279,6 +282,7 @@ func defaultClusterTimings() clusterTimings {
 		cooldown: 60 * time.Second, codeWait: 2 * time.Second, stopWait: 60 * time.Second,
 		memberMargin: 10 * time.Second, headMargin: 30 * time.Second, reserveMargin: 60 * time.Second,
 		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
+		sessionWait: 10 * time.Second,
 	}
 }
 
@@ -310,6 +314,11 @@ type clusterOrchestrator struct {
 	// wg counts every running start, reconciler-spawned ensure, watchdog
 	// worker and watchdog action.
 	wg sync.WaitGroup
+
+	// unheardSwept: the sessions the store held open on member servers not
+	// heard from since the gateway started were closed (once, after the boot
+	// grace). Guarded by mu.
+	unheardSwept bool
 }
 
 // clusterHeadState is what the orchestration knows of one head.
@@ -1305,20 +1314,28 @@ func (o *clusterOrchestrator) markStopped(head string) {
 }
 
 // openRun records the run of a start of head: a new one while the head's
-// server reports no process for the head, else -- the head still runs, or
-// its server has not reported since the gateway started -- the stored run
-// continues, so a start that finds the head up (a restarted gateway before
-// every member reported) never discards the measurement of the process that
-// runs.
+// server reports no process for the head. A head seen still running
+// continues the stored run, so a start that finds the head up (a restarted
+// gateway before every member reported) never discards the measurement of
+// the process that runs. A head whose server has not reported since the
+// gateway started continues the stored run when there is one -- the head may
+// be running -- and otherwise begins one: the last run ended, so whatever
+// runs now is new, and without a run it would measure nothing.
 func (o *clusterOrchestrator) openRun(ctx context.Context, head string, plan portal.ClusterPlan) {
 	if o.deps.runs == nil {
 		return
 	}
 	var run time.Time
-	if row, present, reported := o.headRow(plan); reported && (!present || !stateOccupied(row.State)) {
+	row, present, reported := o.headRow(plan)
+	switch {
+	case reported && (!present || !stateOccupied(row.State)):
 		run = o.deps.runs.runBegan(ctx, head)
-	} else {
+	case reported:
 		run = o.deps.runs.currentRun(ctx, head)
+	default:
+		if run = o.deps.runs.currentRun(ctx, head); run.IsZero() {
+			run = o.deps.runs.runBegan(ctx, head)
+		}
 	}
 	o.mu.Lock()
 	st := o.headState(head)
@@ -1500,12 +1517,10 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 	if o == nil {
 		return
 	}
+	o.closeSessions(ctx)
 	ctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
 	defer cancel()
 	o.liftChangedBlocks(ctx)
-	if o.deps.runs != nil {
-		o.deps.runs.closeSilentSessions(ctx, o.watch.silentSince)
-	}
 	heads, err := o.deps.portal.KeptUpClusterHeads(ctx)
 	if err != nil {
 		slog.Warn("cluster reconcile: listing the kept-up heads failed", "err", err)
@@ -1541,6 +1556,36 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 				slog.Debug("cluster reconcile: start of a kept-up head did not form", "head_spec_id", head, "err", err)
 			}
 		}()
+	}
+}
+
+// closeSessions is a reconciler pass's part of the member sessions, under its
+// own bound (sessionWait), so a slow store there leaves the pass's reads
+// their full budget: the sessions of member servers silent past the stale
+// threshold are closed, and once after the boot grace those the store holds
+// open on member servers not heard from since the gateway started (a member
+// that never reported again after a restart). Before the boot grace a
+// member may simply not have reported yet.
+func (o *clusterOrchestrator) closeSessions(parent context.Context) {
+	if o.deps.runs == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, o.t.sessionWait)
+	defer cancel()
+	o.deps.runs.closeSilentSessions(ctx, o.watch.silentSince)
+	if o.inBootGrace() {
+		return
+	}
+	o.mu.Lock()
+	swept := o.unheardSwept
+	o.mu.Unlock()
+	if swept {
+		return
+	}
+	if o.deps.runs.closeUnheardSessions(ctx, o.bootAt, o.watch.heard) {
+		o.mu.Lock()
+		o.unheardSwept = true
+		o.mu.Unlock()
 	}
 }
 

@@ -3696,6 +3696,9 @@ type RPCClusterStore interface {
 	// memberServerID, of every head and instance, ordered by head spec ID,
 	// then instance, then Since. Always non-nil.
 	OpenRPCSessionsByMember(ctx context.Context, memberServerID string) ([]RPCSession, error)
+	// OpenRPCSessions lists every open session (Until nil), ordered by member
+	// server ID, then head spec ID, instance and Since. Always non-nil.
+	OpenRPCSessions(ctx context.Context) ([]RPCSession, error)
 	// PruneRPCSessions deletes every closed session whose Until is before
 	// before; an open session is never pruned. Sessions are kept like
 	// telemetry: the telemetry retention loop calls it with its cutoff.

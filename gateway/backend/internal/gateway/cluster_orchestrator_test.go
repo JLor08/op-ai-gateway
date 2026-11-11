@@ -42,6 +42,7 @@ func orchTimings() clusterTimings {
 		cooldown: 60 * time.Second, codeWait: 200 * time.Millisecond, stopWait: 300 * time.Millisecond,
 		memberMargin: 20 * time.Millisecond, headMargin: 50 * time.Millisecond, reserveMargin: 60 * time.Millisecond,
 		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
+		sessionWait: 50 * time.Millisecond,
 	}
 }
 
@@ -67,6 +68,8 @@ type orchPortal struct {
 	// withheld, when set, is the derivation's reason: the plan is read as
 	// withheld (no members, no network or transport), as the portal answers.
 	withheld string
+	// keptCtxErr is the context error the last kept-up listing saw.
+	keptCtxErr error
 }
 
 func (p *orchPortal) ClusterPlan(_ context.Context, headSpecID string) (portal.ClusterPlan, error) {
@@ -121,9 +124,10 @@ func (p *orchPortal) ReconcileRPCPolicies(context.Context) {
 	}
 }
 
-func (p *orchPortal) KeptUpClusterHeads(context.Context) ([]string, error) {
+func (p *orchPortal) KeptUpClusterHeads(ctx context.Context) ([]string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.keptCtxErr = ctx.Err()
 	return slices.Clone(p.kept), nil
 }
 

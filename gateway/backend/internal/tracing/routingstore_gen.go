@@ -772,6 +772,18 @@ func (_d *RoutingStoreWithTracing) OpenRPCSession(ctx context.Context, s _source
 	return _d.Store.OpenRPCSession(ctx, s)
 }
 
+func (_d *RoutingStoreWithTracing) OpenRPCSessions(ctx context.Context) (ra1 []_sourceRouting.RPCSession, err error) {
+	ctx, span := Start(ctx, "routing.Store.OpenRPCSessions")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.OpenRPCSessions(ctx)
+}
+
 func (_d *RoutingStoreWithTracing) OpenRPCSessionsByMember(ctx context.Context, memberServerID string) (ra1 []_sourceRouting.RPCSession, err error) {
 	ctx, span := Start(ctx, "routing.Store.OpenRPCSessionsByMember")
 	defer span.End()

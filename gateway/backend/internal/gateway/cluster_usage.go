@@ -97,6 +97,10 @@ type clusterRunObserver interface {
 	// closeSilentSessions closes the open sessions of every member server
 	// lastFrame reports silent, at that server's last frame.
 	closeSilentSessions(ctx context.Context, lastFrame func(serverID string) (time.Time, bool))
+	// closeUnheardSessions closes the sessions the store holds open on member
+	// servers heard reports unheard since the gateway started at bootAt, and
+	// reports whether it could.
+	closeUnheardSessions(ctx context.Context, bootAt time.Time, heard func(serverID string) bool) bool
 }
 
 // clusterUsage keeps the member usage and the session records. See the top of
@@ -106,6 +110,9 @@ type clusterUsage struct {
 	// push pushes a server's runtime document.
 	push func(serverID string)
 	now  func() time.Time
+	// lastSeen, when set, is a server's last telemetry as stored (from
+	// before a gateway restart too); ok false when unknown.
+	lastSeen func(ctx context.Context, serverID string) (time.Time, bool)
 
 	// locks serialize, per member server, the handling of its samples and,
 	// per head, every read-modify-write of the head's membership rows.
@@ -604,17 +611,23 @@ func (u *clusterUsage) closeSilentSessions(ctx context.Context, lastFrame func(s
 	}
 	u.mu.Unlock()
 	for _, member := range members {
-		last, silent := lastFrame(member)
-		if !silent {
-			continue
+		if _, silent := lastFrame(member); silent {
+			u.closeSilent(ctx, member, lastFrame)
 		}
-		u.closeSilent(ctx, member, last)
 	}
 }
 
-func (u *clusterUsage) closeSilent(ctx context.Context, member string, last time.Time) {
+// closeSilent closes member's open sessions at its last frame, judging the
+// silence again under the server's lock: a frame handled since the first
+// verdict makes the server heard, and its sessions stay as that frame left
+// them.
+func (u *clusterUsage) closeSilent(ctx context.Context, member string, lastFrame func(serverID string) (time.Time, bool)) {
 	unlock := u.locks.lock(serverLockKey(member))
 	defer unlock()
+	last, silent := lastFrame(member)
+	if !silent {
+		return
+	}
 	u.mu.Lock()
 	var keys []rpcSessionKey
 	for k := range u.open {
@@ -633,4 +646,71 @@ func (u *clusterUsage) closeSilent(ctx context.Context, member string, last time
 		delete(u.seen, member)
 		u.mu.Unlock()
 	}
+}
+
+// closeUnheardSessions closes the sessions the store holds open on member
+// servers that have not reported since the gateway started (heard false):
+// sessions a gateway left open before a restart, on a member that never
+// reported again, which no frame will sync. A server that sends its first
+// frame meanwhile is left to that frame's sync. Each session closes at the
+// server's last telemetry before the restart when it is known and not before
+// the session began, else at the gateway's start (bootAt) -- the latest
+// instant the gateway cannot rule the hold out for. One store listing.
+func (u *clusterUsage) closeUnheardSessions(ctx context.Context, bootAt time.Time, heard func(serverID string) bool) bool {
+	if u == nil || u.store == nil {
+		return true
+	}
+	sessions, err := u.store.OpenRPCSessions(ctx)
+	if err != nil {
+		slog.Debug("cluster member usage: listing the open sessions failed", "err", err)
+		return false
+	}
+	ok := true
+	for member, mine := range groupByMember(sessions) {
+		if heard(member) {
+			continue
+		}
+		ok = u.closeUnheard(ctx, member, mine, bootAt, heard) && ok
+	}
+	return ok
+}
+
+func groupByMember(sessions []routing.RPCSession) map[string][]routing.RPCSession {
+	out := map[string][]routing.RPCSession{}
+	for _, s := range sessions {
+		out[s.MemberServerID] = append(out[s.MemberServerID], s)
+	}
+	return out
+}
+
+// closeUnheard closes the given open sessions of member, under the server's
+// lock, unless its first frame arrived meanwhile.
+func (u *clusterUsage) closeUnheard(ctx context.Context, member string, sessions []routing.RPCSession, bootAt time.Time, heard func(serverID string) bool) bool {
+	unlock := u.locks.lock(serverLockKey(member))
+	defer unlock()
+	u.mu.Lock()
+	synced := u.seen[member]
+	u.mu.Unlock()
+	if synced || heard(member) {
+		return true
+	}
+	last, known := time.Time{}, false
+	if u.lastSeen != nil {
+		last, known = u.lastSeen(ctx, member)
+	}
+	ok := true
+	for _, s := range sessions {
+		until := bootAt
+		if known && !last.Before(s.Since) && last.Before(bootAt) {
+			until = last
+		}
+		if err := u.store.CloseRPCSessions(ctx, s.HeadSpecID, s.Instance, member, until); err != nil {
+			slog.Debug("cluster member usage: closing an unheard member's session failed", "head_spec_id", s.HeadSpecID, "server_id", member, "err", err)
+			ok = false
+		}
+	}
+	if ok && len(sessions) > 0 {
+		slog.Info("cluster member usage: closed the sessions of a member server not heard from since the gateway started", "server_id", member)
+	}
+	return ok
 }

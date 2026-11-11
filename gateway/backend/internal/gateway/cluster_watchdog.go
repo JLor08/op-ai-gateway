@@ -217,6 +217,11 @@ func (w *clusterWatchdog) silentSince(serverID string) (time.Time, bool) {
 	return last, w.o.deps.now().Sub(last) > limit
 }
 
+// heard reports whether serverID sent a frame since the gateway started.
+func (w *clusterWatchdog) heard(serverID string) bool {
+	return !w.lastArrival(serverID).IsZero()
+}
+
 // interval is serverID's telemetry interval as the watchdog estimates it: the
 // largest recent gap between its frames, at least minAgentInterval. A frame
 // that arrived early (an agent reports a transition at once) shortens no gap

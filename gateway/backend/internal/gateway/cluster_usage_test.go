@@ -486,6 +486,17 @@ func TestResetMemberUsage(t *testing.T) {
 type runRecorder struct {
 	mu     sync.Mutex
 	events []string
+	// noStored: the store holds no run (currentRun answers zero).
+	noStored bool
+	// silentCtx, when set, receives the context closeSilentSessions got and
+	// when, and the call waits for that context to end.
+	silentCtx chan silentCall
+	unheard   int
+}
+
+type silentCall struct {
+	ctx context.Context
+	at  time.Time
 }
 
 // The recorder's runs: a begun run is "begun", the stored run it reports is
@@ -516,6 +527,9 @@ func (r *runRecorder) currentRun(_ context.Context, head string) time.Time {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, "continued:"+head)
+	if r.noStored {
+		return time.Time{}
+	}
 	return recordedStored
 }
 
@@ -529,7 +543,32 @@ func (r *runRecorder) runEnded(_ context.Context, head string, run time.Time, fo
 	r.events = append(r.events, "ended:unformed:"+runName(run)+":"+head)
 }
 
-func (r *runRecorder) closeSilentSessions(context.Context, func(string) (time.Time, bool)) {}
+func (r *runRecorder) closeSilentSessions(ctx context.Context, _ func(string) (time.Time, bool)) {
+	r.mu.Lock()
+	ch := r.silentCtx
+	r.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	ch <- silentCall{ctx: ctx, at: time.Now()}
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+	}
+}
+
+func (r *runRecorder) closeUnheardSessions(context.Context, time.Time, func(string) bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unheard++
+	return true
+}
+
+func (r *runRecorder) unheardCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.unheard
+}
 
 func (r *runRecorder) take() []string {
 	r.mu.Lock()
@@ -904,5 +943,147 @@ func TestKeyedLocksShrink(t *testing.T) {
 	k.lock("b")()
 	if n := k.size(); n != 0 {
 		t.Fatalf("locks held in the map = %d, want 0", n)
+	}
+}
+
+// TestRestartWithoutAStoredRunBegins: a restarted gateway asked to start a
+// cluster before the head's server reported continues the stored run -- but
+// when the store holds none (the last run ended normally), it begins one, or
+// the whole new run would measure nothing.
+func TestRestartWithoutAStoredRunBegins(t *testing.T) {
+	f := newOrchFixture(t, 2, "relay", "lan")
+	runs := &runRecorder{noStored: true}
+	f.o.deps.runs = runs
+	f.ackAll()
+	f.holdOnHeadEnsure(0, 1)
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := runs.take(); !slices.Equal(got, []string{"continued:" + orchHead, "began:" + orchHead}) {
+		t.Fatalf("runs = %v, want the empty stored run found, then a run begun", got)
+	}
+
+	// A head seen still running continues even an empty stored run: its
+	// process's peaks are unknown, and a begun run would replace by a part.
+	g := newOrchFixture(t, 2, "relay", "lan")
+	gruns := &runRecorder{noStored: true}
+	g.o.deps.runs = gruns
+	g.ackAll()
+	g.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	g.hold(0)
+	g.holdOnHeadEnsure(0, 1)
+	if err := g.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := gruns.take(); !slices.Equal(got, []string{"continued:" + orchHead}) {
+		t.Fatalf("runs with the head running = %v, want only continued", got)
+	}
+}
+
+// TestSilentCloseRechecksUnderTheLock: a frame of the member server handled
+// between the reconciler's verdict and the close makes the server heard
+// again; the close must see that and leave its sessions open and synced.
+func TestSilentCloseRechecksUnderTheLock(t *testing.T) {
+	f := newUsageFixture(t)
+	last := f.clock()
+	f.observeGPU(usageHead, 0, nil)
+	calls := 0
+	f.u.closeSilentSessions(f.ctx, func(string) (time.Time, bool) {
+		calls++
+		// The first verdict says silent; by the time the close holds the
+		// server's lock, a frame arrived.
+		return last, calls == 1
+	})
+	if calls < 2 {
+		t.Fatalf("silence judged %d times, want it judged again under the server's lock", calls)
+	}
+	if got := f.openSessions(); !slices.Equal(got, []string{usageGPUServer}) {
+		t.Fatalf("open sessions = %v, want the session kept", got)
+	}
+	f.u.mu.Lock()
+	synced := f.u.seen[usageGPUServer]
+	f.u.mu.Unlock()
+	if !synced {
+		t.Fatal("the server was marked unsynced")
+	}
+}
+
+// TestUnheardMemberSessionsClose: sessions the store holds open on a member
+// server that has not reported since the gateway started are closed -- at the
+// server's last telemetry before the start when it is known, else at the
+// gateway's start. A server heard since the start, whose own frames sync its
+// sessions, is left alone.
+func TestUnheardMemberSessionsClose(t *testing.T) {
+	f := newUsageFixture(t)
+	since := f.clock()
+	for _, member := range []string{usageGPUServer, usageCPUServer, usageHeadServer} {
+		if err := f.store.OpenRPCSession(f.ctx, routing.RPCSession{HeadSpecID: usageHead, MemberServerID: member, Since: since}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lastSeen := since.Add(30 * time.Second)
+	bootAt := since.Add(time.Minute)
+	f.u.lastSeen = func(_ context.Context, id string) (time.Time, bool) {
+		return lastSeen, id == usageGPUServer
+	}
+	if !f.u.closeUnheardSessions(f.ctx, bootAt, func(id string) bool { return id == usageHeadServer }) {
+		t.Fatal("the sweep reported a failure")
+	}
+	until := map[string]*time.Time{}
+	rows, err := f.store.RPCSessionsAt(f.ctx, usageHead, 0, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		until[r.MemberServerID] = r.Until
+	}
+	if u := until[usageGPUServer]; u == nil || !u.Equal(lastSeen) {
+		t.Fatalf("GPU member closed at %v, want its last telemetry %v", u, lastSeen)
+	}
+	if u := until[usageCPUServer]; u == nil || !u.Equal(bootAt) {
+		t.Fatalf("CPU member closed at %v, want the gateway's start %v", u, bootAt)
+	}
+	if u := until[usageHeadServer]; u != nil {
+		t.Fatalf("a heard server's session closed at %v", u)
+	}
+}
+
+// TestReconcileSweepsUnheardSessionsOnceAfterBootGrace: the unheard-server
+// sweep runs after the boot grace only -- a member may simply not have
+// reported yet before -- and once.
+func TestReconcileSweepsUnheardSessionsOnceAfterBootGrace(t *testing.T) {
+	f, runs := newRunFixture(t)
+	f.o.Reconcile(context.Background())
+	if n := runs.unheardCalls(); n != 0 {
+		t.Fatalf("sweeps in the boot grace = %d", n)
+	}
+	f.advance(61 * time.Second)
+	f.o.Reconcile(context.Background())
+	f.o.Reconcile(context.Background())
+	if n := runs.unheardCalls(); n != 1 {
+		t.Fatalf("sweeps after the boot grace = %d, want 1", n)
+	}
+}
+
+// TestSessionCloseHasItsOwnBudget: the session closes of a reconciler pass
+// run under their own bound, so a slow store there cannot use up the pass's
+// budget for the kept-up heads.
+func TestSessionCloseHasItsOwnBudget(t *testing.T) {
+	f, runs := newRunFixture(t)
+	calls := make(chan silentCall, 1)
+	runs.mu.Lock()
+	runs.silentCtx = calls
+	runs.mu.Unlock()
+	f.o.Reconcile(context.Background())
+	call := <-calls
+	deadline, ok := call.ctx.Deadline()
+	if !ok || deadline.Sub(call.at) > f.o.t.sessionWait+50*time.Millisecond {
+		t.Fatalf("session close deadline in %v, want its own bound of %v", deadline.Sub(call.at), f.o.t.sessionWait)
+	}
+	f.portal.mu.Lock()
+	keptErr := f.portal.keptCtxErr
+	f.portal.mu.Unlock()
+	if keptErr != nil {
+		t.Fatalf("the kept-up heads were listed on an ended context: %v", keptErr)
 	}
 }

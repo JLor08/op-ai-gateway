@@ -4021,6 +4021,32 @@ func (m *MemoryStore) CloseRPCSessions(_ context.Context, headSpecID string, ins
 	return nil
 }
 
+// OpenRPCSessions lists every open session by member server, then head,
+// instance and Since.
+func (m *MemoryStore) OpenRPCSessions(_ context.Context) ([]RPCSession, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RPCSession, 0)
+	for _, s := range m.rpcSessions {
+		if s.Until == nil {
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		switch {
+		case a.MemberServerID != b.MemberServerID:
+			return a.MemberServerID < b.MemberServerID
+		case a.HeadSpecID != b.HeadSpecID:
+			return a.HeadSpecID < b.HeadSpecID
+		case a.Instance != b.Instance:
+			return a.Instance < b.Instance
+		}
+		return a.Since.Before(b.Since)
+	})
+	return out, nil
+}
+
 // PruneRPCSessions deletes the closed sessions whose Until is before before.
 func (m *MemoryStore) PruneRPCSessions(_ context.Context, before time.Time) error {
 	m.mu.Lock()
