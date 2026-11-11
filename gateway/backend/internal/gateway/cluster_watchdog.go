@@ -547,9 +547,29 @@ func (w *clusterWatchdog) headExited(serverID string, exit headExit) {
 		o.Trigger()
 		return
 	}
-	run, formed := time.Time{}, false
+	out := o.endExitedHeadLocked(st, exit)
+	o.mu.Unlock()
+	w.followHeadExit(serverID, exit, out)
+}
+
+// headExitOutcome is what ending an exited head's state left to do once o.mu
+// is released: the run to pass on (zero: none) and whether it formed, the
+// members to release, and whether the exit was recorded as a crash.
+type headExitOutcome struct {
+	run     time.Time
+	formed  bool
+	members []portal.ClusterPlanMember
+	crashed bool
+}
+
+// endExitedHeadLocked ends st's state for the exit of its head (headExited):
+// the run ends unless a start runs, a formed head is no longer formed, and
+// unless a start or a stop runs the last plan's members are to be released
+// and a crash is recorded. The caller holds o.mu.
+func (o *clusterOrchestrator) endExitedHeadLocked(st *clusterHeadState, exit headExit) headExitOutcome {
+	var out headExitOutcome
 	if st.start == nil {
-		run, formed = endRunLocked(st)
+		out.run, out.formed = endRunLocked(st)
 	}
 	if st.formed {
 		st.formed, st.phase = false, ""
@@ -558,16 +578,24 @@ func (w *clusterWatchdog) headExited(serverID string, exit headExit) {
 		}
 	}
 	idle := st.start == nil && st.stopping == 0
-	var members []portal.ClusterPlanMember
 	if st.lastPlan != nil && idle {
-		members = slices.Clone(st.lastPlan.Members)
+		out.members = slices.Clone(st.lastPlan.Members)
 	}
-	crashed := exit.crash != nil && idle
-	if crashed {
+	out.crashed = exit.crash != nil && idle
+	if out.crashed {
 		o.recordCrashLocked(st, exit)
 	}
-	o.mu.Unlock()
-	if crashed {
+	return out
+}
+
+// followHeadExit does what an exited head's state change left to do, without
+// o.mu (headExited): it logs the exit, passes the run's end on, marks the
+// members released and releases them on an action goroutine, then forgets a
+// head whose spec is gone and wakes the reconciler.
+func (w *clusterWatchdog) followHeadExit(serverID string, exit headExit, out headExitOutcome) {
+	o := w.o
+	head := exit.head
+	if out.crashed {
 		slog.Warn("cluster head crashed; it cools down", "server_id", serverID, "head_spec_id", head,
 			"code", exit.crash.Code, "message", exit.crash.Message, "restart_after_cooldown", exit.inUse)
 		if exit.inUse {
@@ -576,8 +604,9 @@ func (w *clusterWatchdog) headExited(serverID string, exit headExit) {
 	} else {
 		slog.Info("cluster head exited", "server_id", serverID, "head_spec_id", head)
 	}
-	o.runEnded(head, run, formed)
+	o.runEnded(head, out.run, out.formed)
 	now := o.deps.now()
+	members := out.members
 	for _, m := range members {
 		w.released[memberKey(m.Server.ID, m.SpecID)] = now
 	}
@@ -674,12 +703,7 @@ func (o *clusterOrchestrator) headRow(plan portal.ClusterPlan) (row RuntimeStatu
 // head frame confirms it), and the release of a dead direct hold.
 func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next []RuntimeStatusDTO, seq uint64) {
 	o := w.o
-	var here []portal.ClusterPlanMember
-	for _, m := range v.plan.Members {
-		if m.Server.ID == serverID {
-			here = append(here, m)
-		}
-	}
+	here := membersOn(v.plan.Members, serverID)
 	if len(here) == 0 {
 		return
 	}
@@ -698,20 +722,49 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 		present = false
 	}
 	if v.formed && present && hr.State == agentSpecStateRunning {
-		if _, pending := w.suspects[v.head]; pending {
-			return
-		}
-		for _, m := range here {
-			if ev := memberEvidence(prev, next, m.SpecID, v.head); ev != "" {
-				w.suspects[v.head] = watchSuspicion{position: m.Position, evidence: ev, seq: seq, headPID: hr.PID}
-				return
-			}
-		}
+		w.suspectLoss(v.head, here, prev, next, seq, hr.PID)
 		return
 	}
 	if v.plan.Transport != clusterTransportDirect || !reported || (present && stateOccupied(hr.State)) {
 		return
 	}
+	w.endDeadHolds(v, serverID, here, next, seq, hr.PID, headSilent)
+}
+
+// membersOn is the members among members on serverID.
+func membersOn(members []portal.ClusterPlanMember, serverID string) []portal.ClusterPlanMember {
+	var here []portal.ClusterPlanMember
+	for _, m := range members {
+		if m.Server.ID == serverID {
+			here = append(here, m)
+		}
+	}
+	return here
+}
+
+// suspectLoss records, unless one is pending, a suspicion for head from the
+// first of its members here whose frames prev and next show evidence of a
+// loss, with the head process headPID that a later head frame must still show
+// to confirm it.
+func (w *clusterWatchdog) suspectLoss(head string, here []portal.ClusterPlanMember, prev, next []RuntimeStatusDTO, seq uint64, headPID int) {
+	if _, pending := w.suspects[head]; pending {
+		return
+	}
+	for _, m := range here {
+		if ev := memberEvidence(prev, next, m.SpecID, head); ev != "" {
+			w.suspects[head] = watchSuspicion{position: m.Position, evidence: ev, seq: seq, headPID: headPID}
+			return
+		}
+	}
+}
+
+// endDeadHolds stops, forced, each direct member here (on serverID) whose row
+// in next still shows the hold of v's head, which is not running, at most
+// once per releaseRetry. When the head is only silent (headSilent) and was
+// formed, the first such stop is also a suspected loss (headPID being the
+// process its last row showed): the head's next frame confirms it.
+func (w *clusterWatchdog) endDeadHolds(v watchView, serverID string, here []portal.ClusterPlanMember, next []RuntimeStatusDTO, seq uint64, headPID int, headSilent bool) {
+	o := w.o
 	now := o.deps.now()
 	for _, m := range here {
 		r, ok := findInstanceRow(next, m.SpecID)
@@ -728,7 +781,7 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 		// that the head's next frame confirms -- the head is stopped and its
 		// members released instead of staying formed with a dead member.
 		if _, pending := w.suspects[v.head]; headSilent && v.formed && !pending {
-			w.suspects[v.head] = watchSuspicion{position: m.Position, evidence: evidenceDeadHold, seq: seq, headPID: hr.PID}
+			w.suspects[v.head] = watchSuspicion{position: m.Position, evidence: evidenceDeadHold, seq: seq, headPID: headPID}
 		}
 	}
 }
@@ -762,8 +815,30 @@ func memberEvidence(prev, next []RuntimeStatusDTO, spec, head string) string {
 func (o *clusterOrchestrator) noteBreaches(head, serverID string, members, here []portal.ClusterPlanMember,
 	next []RuntimeStatusDTO,
 ) {
-	var found []portal.ClusterBreachDTO
-	positions := make([]int, 0, len(here))
+	found, positions := breachesIn(head, here, next)
+	o.mu.Lock()
+	st := o.heads[head]
+	if st == nil {
+		o.mu.Unlock()
+		return
+	}
+	old := st.breaches
+	st.breaches = mergeBreaches(old, members, positions, found)
+	o.mu.Unlock()
+	for _, b := range found {
+		if !slices.ContainsFunc(old, func(x portal.ClusterBreachDTO) bool {
+			return x.Position == b.Position && x.Kind == b.Kind && x.Peer == b.Peer
+		}) {
+			slog.Warn("cluster member breach", "head_spec_id", head, "server_id", serverID, "position", b.Position, "kind", b.Kind, "peer", b.Peer)
+		}
+	}
+}
+
+// breachesIn is the breaches next reports for the members here of head --
+// each peer a member does not allow, and a hold by another head -- and the
+// positions of those members.
+func breachesIn(head string, here []portal.ClusterPlanMember, next []RuntimeStatusDTO) (found []portal.ClusterBreachDTO, positions []int) {
+	positions = make([]int, 0, len(here))
 	for _, m := range here {
 		positions = append(positions, m.Position)
 		r, ok := findInstanceRow(next, m.SpecID)
@@ -777,33 +852,25 @@ func (o *clusterOrchestrator) noteBreaches(head, serverID string, members, here 
 			found = append(found, portal.ClusterBreachDTO{Position: m.Position, Kind: portal.ClusterBreachForeignHold, At: r.RPC.HeldSince})
 		}
 	}
-	o.mu.Lock()
-	st := o.heads[head]
-	if st == nil {
-		o.mu.Unlock()
-		return
-	}
-	old := st.breaches
+	return found, positions
+}
+
+// mergeBreaches is old with the breaches of positions replaced by found and
+// those of positions no longer among members dropped, sorted by position,
+// kind and peer; nil when none is left. old itself is not changed.
+func mergeBreaches(old []portal.ClusterBreachDTO, members []portal.ClusterPlanMember, positions []int, found []portal.ClusterBreachDTO) []portal.ClusterBreachDTO {
 	breaches := slices.DeleteFunc(slices.Clone(old), func(b portal.ClusterBreachDTO) bool {
 		inPlan := slices.ContainsFunc(members, func(m portal.ClusterPlanMember) bool { return m.Position == b.Position })
 		return !inPlan || slices.Contains(positions, b.Position)
 	})
 	breaches = append(breaches, found...)
-	st.breaches = breaches
-	slices.SortFunc(st.breaches, func(a, b portal.ClusterBreachDTO) int {
+	slices.SortFunc(breaches, func(a, b portal.ClusterBreachDTO) int {
 		return cmp.Or(cmp.Compare(a.Position, b.Position), cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Peer, b.Peer))
 	})
-	if len(st.breaches) == 0 {
-		st.breaches = nil
+	if len(breaches) == 0 {
+		return nil
 	}
-	o.mu.Unlock()
-	for _, b := range found {
-		if !slices.ContainsFunc(old, func(x portal.ClusterBreachDTO) bool {
-			return x.Position == b.Position && x.Kind == b.Kind && x.Peer == b.Peer
-		}) {
-			slog.Warn("cluster member breach", "head_spec_id", head, "server_id", serverID, "position", b.Position, "kind", b.Kind, "peer", b.Peer)
-		}
-	}
+	return breaches
 }
 
 // memberLost stops head after the member at position was lost (evidence
@@ -819,6 +886,26 @@ func (o *clusterOrchestrator) memberLost(head string, position int, evidence str
 		o.mu.Unlock()
 		return
 	}
+	o.recordMemberLossLocked(st, position, evidence, inUse)
+	// The stop marker keeps every start out until the head is down; Stop
+	// takes its own.
+	st.stopping++
+	o.mu.Unlock()
+	slog.Warn("cluster watchdog: a member was lost; stopping the head", "head_spec_id", head,
+		"position", position, "evidence", evidence, "restart_after_cooldown", inUse)
+	if !o.goAction(func(ctx context.Context) {
+		defer o.unmarkStopping(head)
+		o.stopAfterMemberLoss(ctx, head, inUse)
+	}) {
+		o.unmarkStopping(head)
+	}
+}
+
+// recordMemberLossLocked records on st that the member at position was lost
+// (evidence names how): no longer formed, the failure and the cooldown, the
+// member failed and every other pending, and, with inUse, the head to start
+// again. The caller holds o.mu.
+func (o *clusterOrchestrator) recordMemberLossLocked(st *clusterHeadState, position int, evidence string, inUse bool) {
 	now := o.deps.now()
 	p := position
 	st.formed, st.phase = false, ""
@@ -836,30 +923,24 @@ func (o *clusterOrchestrator) memberLost(head string, position int, evidence str
 			st.members[i].State, st.members[i].Code = clusterMemberPending, ""
 		}
 	}
-	// The stop marker keeps every start out until the head is down; Stop
-	// takes its own.
-	st.stopping++
-	o.mu.Unlock()
-	slog.Warn("cluster watchdog: a member was lost; stopping the head", "head_spec_id", head,
-		"position", position, "evidence", evidence, "restart_after_cooldown", inUse)
-	if !o.goAction(func(ctx context.Context) {
-		defer o.unmarkStopping(head)
-		// One retry: the head aborts once a member is gone, so a stop that
-		// failed (an agent restarting, a store read timing out) is worth one
-		// more try; after it the head idles out, and its exit releases the
-		// members.
-		for attempt := range 2 {
-			err := o.Stop(ctx, head, false)
-			if err == nil || ctx.Err() != nil {
-				break
-			}
-			slog.Warn("cluster watchdog: stopping the head failed", "head_spec_id", head, "attempt", attempt+1, "err", err)
+}
+
+// stopAfterMemberLoss stops head after a lost member, on an action goroutine
+// that holds the head's stop marker. One retry: the head aborts once a member
+// is gone, so a stop that failed (an agent restarting, a store read timing
+// out) is worth one more try; after it the head idles out, and its exit
+// releases the members. With inUse the reconciler is woken once the cooldown
+// ended.
+func (o *clusterOrchestrator) stopAfterMemberLoss(ctx context.Context, head string, inUse bool) {
+	for attempt := range 2 {
+		err := o.Stop(ctx, head, false)
+		if err == nil || ctx.Err() != nil {
+			break
 		}
-		if inUse {
-			time.AfterFunc(o.t.cooldown, o.Trigger)
-		}
-	}) {
-		o.unmarkStopping(head)
+		slog.Warn("cluster watchdog: stopping the head failed", "head_spec_id", head, "attempt", attempt+1, "err", err)
+	}
+	if inUse {
+		time.AfterFunc(o.t.cooldown, o.Trigger)
 	}
 }
 
