@@ -268,6 +268,13 @@ Additions worth knowing when looking for code on this side:
   renders the head's `cluster_status` as a step progress, and
   `ClusterTotalCell.tsx` (over `shared/clusterTotals.ts`) the cluster totals with
   the head's own value beneath; both know a hidden member by its position only.
+  The compact progress shows in the spec list's live-status column and on the
+  head's row of the Live-Status tab, off the same head spec, which
+  `shared/useClusterHeadRefresh.ts` re-reads every 10 s, at once on a status
+  change, and every 1.5 s while the cluster forms or a Start just pressed there
+  has not shown yet (one read in flight per head): the members run on other
+  servers, whose status streams the page does not follow, so the orchestration's
+  `cluster_status` is where their phases show.
   Two server tabs belong to it: **RPC** (`RpcMemberSection.tsx`: the server's RPC
   membership and consent, its manual member specs and the live member rows;
   hidden for a file-mode agent) and **Binaries** (`BinariesSection.tsx`: the
