@@ -954,8 +954,9 @@ type Service struct {
 	// OUTSIDE this lock, so only the fast local read+write section serializes.
 	reconcileMu sync.Mutex
 	// clusterWriteMu serializes the operator's runtime-spec writes
-	// (writeRuntimeSpecAs): a cluster head's save allocates member ports and
-	// claims manual member specs, both check-then-act across specs.
+	// (writeRuntimeSpecAs) with the manual member spec writes and deletes: a
+	// cluster head's save allocates member ports and claims manual member
+	// specs, both check-then-act across specs, and reads the specs it claims.
 	clusterWriteMu sync.Mutex
 }
 
@@ -4437,8 +4438,11 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 		}
 	}
 	// The server's own policy as a member goes with its row; its heads' grants
-	// to other members go with the heads.
-	s.reconcileRPCPolicies(ctx)
+	// to other members go with the heads. A server in no cluster has no grant
+	// to remove, and its delete never waits on that pass.
+	if len(clusterServers) > 0 {
+		s.reconcileRPCPolicies(ctx)
+	}
 	return netbirdCleanupFailed, nil
 }
 

@@ -434,7 +434,15 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			f.binary(srv.ID, clusterRPCBinary, BinaryKindRPCServer, "9999fff")
 			r.ClusterMembers = []ClusterMemberDTO{autoMember(srv.ID)}
 		}), ErrClusterMemberNoMatchingBinary},
-		{"head binary version unknown", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.Binary = "/usr/local/bin/llama-server" }), ErrClusterMemberNoMatchingBinary},
+		{"head binary version unknown", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.Binary = "/usr/local/bin/llama-server" }), ErrClusterHeadBinaryVersionUnknown},
+		{"head binary version unknown, manual members only", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.Binary, r.MemberMode = "/usr/local/bin/llama-server", "manual"
+			spec, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), r.ClusterMembers[0].ServerID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary})
+			if err != nil {
+				t.Fatalf("spec: %v", err)
+			}
+			r.ClusterMembers[0].MemberSpecID = spec.ID
+		}), nil},
 		{"manual member of another version", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			r.MemberMode = "manual"
 			srv := r.ClusterMembers[0].ServerID
@@ -577,8 +585,34 @@ func TestPutClusterHeadVersionUnknownMessage(t *testing.T) {
 	req := clusterHeadRequest(autoMember(f.member("A").ID))
 	req.Binary = "/usr/local/bin/llama-server"
 	_, err := f.put(ownerToken(), req)
-	if !errors.Is(err, ErrClusterMemberNoMatchingBinary) || !strings.Contains(err.Error(), "Binaries tab") {
+	if !errors.Is(err, ErrClusterHeadBinaryVersionUnknown) || !strings.Contains(err.Error(), "Binaries tab") {
 		t.Fatalf("err = %v, want the head-version-unknown refusal naming the Binaries tab", err)
+	}
+}
+
+// TestPutClusterHeadVersionUnknownIsTheLastRefusal: the newest save code
+// runs after every other check, so a body that also fails an older one
+// keeps that answer.
+func TestPutClusterHeadVersionUnknownIsTheLastRefusal(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	other := seedOtherHead(t, f)
+	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: f.head.ID, Port: 26500}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*PutRuntimeSpecRequest)
+		want   error
+	}{
+		"direct lan without acknowledgement": {func(r *PutRuntimeSpecRequest) { r.RPCTransport = "direct" }, ErrClusterLANAckRequired},
+		"listen port of a member":            {func(r *PutRuntimeSpecRequest) { r.ListenPort = 26500 }, ErrRuntimeSpecPortConflictsRPCMember},
+	} {
+		req := clusterHeadRequest(autoMember(a.ID))
+		req.Binary = "/usr/local/bin/llama-server"
+		tc.mutate(&req)
+		if _, err := f.put(ownerToken(), req); !errors.Is(err, tc.want) {
+			t.Errorf("%s with an unknown head version = %v, want %v", name, err, tc.want)
+		}
 	}
 }
 
@@ -790,17 +824,17 @@ func TestBenchmarkWriteKeepsClusterConfiguration(t *testing.T) {
 func TestAllocateRPCPortSkipsTakenPorts(t *testing.T) {
 	f := newClusterFixture(t)
 	srv := f.member("A")
-	seedApp(t, f.routes, "app_plain", srv.ID, 47000, routing.ServerStatusActive, clusterTestNow)
+	seedApp(t, f.routes, "app_plain", srv.ID, 26000, routing.ServerStatusActive, clusterTestNow)
 	plain, err := f.routes.ApplicationByID(f.ctx, "app_plain")
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain.ProxyListenPort = 47001
+	plain.ProxyListenPort = 26001
 	if err := f.routes.UpdateApplication(f.ctx, plain); err != nil {
 		t.Fatalf("proxy port: %v", err)
 	}
 	agentApp := routing.Application{
-		ID: "app_agent", ServerID: srv.ID, Type: routing.ProviderServerAgent, Port: 47002, Scheme: "http",
+		ID: "app_agent", ServerID: srv.ID, Type: routing.ProviderServerAgent, Port: 26002, Scheme: "http",
 		Status: routing.ServerStatusActive, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow,
 	}
 	if err := f.routes.CreateApplication(f.ctx, agentApp); err != nil {
@@ -811,18 +845,18 @@ func TestAllocateRPCPortSkipsTakenPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.routes.UpsertRuntimeSpec(f.ctx, routing.RuntimeSpec{
-		ID: "rspec_pinned", MappingID: mapping.ID, Binary: "/bin/x", Args: "[]", Env: "{}", ListenPort: 47003,
+		ID: "rspec_pinned", MappingID: mapping.ID, Binary: "/bin/x", Args: "[]", Env: "{}", ListenPort: 26003,
 		CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	other := seedOtherHead(t, f)
-	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: srv.ID, Port: 47004}}, nil); err != nil {
+	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: srv.ID, Port: 26004}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	port, err := f.svc.allocateRPCPort(f.ctx, srv.ID)
-	if err != nil || port != 47005 {
-		t.Fatalf("allocateRPCPort = %d, %v; want 47005", port, err)
+	if err != nil || port != 26005 {
+		t.Fatalf("allocateRPCPort = %d, %v; want 26005", port, err)
 	}
 	// Another server's ports do not count.
 	if port, err := f.svc.allocateRPCPort(f.ctx, f.head.ID); err != nil || port != rpcPortFirst {
@@ -961,10 +995,10 @@ func TestClusterForeignMemberHiddenInDTO(t *testing.T) {
 	if members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID); len(members) != 2 || members[1].ServerID != foreign.ID {
 		t.Fatalf("membership after the owner's re-save = %+v", members)
 	}
-	// A membership change still needs rights on every member server: drop
-	// the owner's own member, keep the hidden one.
+	// A membership change still needs rights on every member server it
+	// keeps: change the owner's own member, keep the hidden one.
 	change := putRequestFromDTO(got)
-	change.ClusterMembers = change.ClusterMembers[1:]
+	change.ClusterMembers[0].Threads = 4
 	if _, err := f.put(ownerToken(), change); !errors.Is(err, ErrServerNotFound) {
 		t.Fatalf("owner membership change = %v, want server not found", err)
 	}
@@ -1152,14 +1186,14 @@ type racingPortStore struct {
 	written int
 }
 
-func (r *racingPortStore) SetClusterMembers(ctx context.Context, head string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
+func (r *racingPortStore) SetClusterMembersIf(ctx context.Context, head string, expect []routing.ClusterMember, expectGPUs []routing.ClusterMemberGPU, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) (bool, error) {
 	if head != r.rival && r.written < r.races && len(members) > 0 {
 		r.written++
 		if err := r.MemoryStore.SetClusterMembers(ctx, r.rival, []routing.ClusterMember{{Position: 0, ServerID: members[0].ServerID, Port: members[0].Port, DeviceBackend: "auto"}}, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return r.MemoryStore.SetClusterMembers(ctx, head, members, gpus)
+	return r.MemoryStore.SetClusterMembersIf(ctx, head, expect, expectGPUs, members, gpus)
 }
 
 func TestPutClusterPortRace(t *testing.T) {
@@ -1182,6 +1216,10 @@ func TestPutClusterPortRace(t *testing.T) {
 				t.Fatalf("PutRuntimeSpec = %v, want %v", err, tc.want)
 			}
 			if tc.want != nil {
+				// A refused membership stores no head.
+				if _, ok, _ := f.routes.RuntimeSpecByMapping(f.ctx, f.mappingID); ok {
+					t.Fatal("a new head was kept although its membership was refused")
+				}
 				return
 			}
 			members, _, _ := f.routes.ClusterMembers(f.ctx, dto.ID)
@@ -1340,5 +1378,253 @@ func TestClusterBreachPeerHiddenForHiddenMember(t *testing.T) {
 	}
 	if sys.ClusterStatus == nil || len(sys.ClusterStatus.Breaches) != 2 || sys.ClusterStatus.Breaches[1].Peer != "100.64.0.9" {
 		t.Fatalf("system breaches = %+v, want both peers", sys.ClusterStatus)
+	}
+}
+
+// TestPutClusterRemovingMembersNeedsHeadRightsOnly: removing a member only
+// frees its host, so a head owner who cannot manage a member server may
+// still drop that member or turn the cluster off -- as deleting the head
+// already allowed. Adding a member still needs rights and consent.
+func TestPutClusterRemovingMembersNeedsHeadRightsOnly(t *testing.T) {
+	setup := func(t *testing.T) (*clusterFixture, ServerDTO, RuntimeSpecDTO) {
+		f := newClusterFixture(t)
+		mine := f.member("Mine")
+		foreign := f.foreignServer("Foreign")
+		if _, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID))); err != nil {
+			t.Fatalf("system save: %v", err)
+		}
+		got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f, foreign, got
+	}
+	t.Run("drop the hidden member", func(t *testing.T) {
+		f, foreign, got := setup(t)
+		drop := putRequestFromDTO(got)
+		drop.ClusterMembers = drop.ClusterMembers[:1]
+		if _, err := f.put(ownerToken(), drop); err != nil {
+			t.Fatalf("owner drops the hidden member = %v", err)
+		}
+		members, _, _ := f.routes.ClusterMembers(f.ctx, got.ID)
+		if len(members) != 1 || members[0].ServerID == foreign.ID {
+			t.Fatalf("membership = %+v", members)
+		}
+		if !slices.Contains(f.notifiedServers(), foreign.ID) {
+			t.Fatalf("notified = %v, want the dropped member's server", f.notifiedServers())
+		}
+	})
+	t.Run("cluster off", func(t *testing.T) {
+		f, foreign, got := setup(t)
+		off := putRequestFromDTO(got)
+		off.ClusterEnabled, off.ClusterMembers = false, nil
+		off.Args = []string{"-m", "/models/big.gguf"}
+		if _, err := f.put(ownerToken(), off); err != nil {
+			t.Fatalf("owner turns the cluster off = %v", err)
+		}
+		if members, _, _ := f.routes.ClusterMembers(f.ctx, got.ID); len(members) != 0 {
+			t.Fatalf("membership after cluster off = %+v", members)
+		}
+		if !slices.Contains(f.notifiedServers(), foreign.ID) {
+			t.Fatalf("notified = %v, want the former member's server", f.notifiedServers())
+		}
+	})
+	t.Run("adding still needs rights", func(t *testing.T) {
+		f, _, got := setup(t)
+		other := f.foreignServer("Other")
+		add := putRequestFromDTO(got)
+		add.ClusterMembers = []ClusterMemberDTO{add.ClusterMembers[0], autoMember(other.ID)}
+		if _, err := f.put(ownerToken(), add); !errors.Is(err, ErrServerNotFound) {
+			t.Fatalf("owner adds a foreign member = %v, want server not found", err)
+		}
+	})
+}
+
+// TestPutClusterUnchangedMembershipWithMissingSpec: a manual member whose
+// spec is gone (the reference has no foreign key) is never rewritten as an
+// automatic member by a head save that leaves the membership as stored; the
+// save runs the full member checks and refuses it.
+func TestPutClusterUnchangedMembershipWithMissingSpec(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	spec := f.manualSpec(a.ID, RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 5000})
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID})
+	req.MemberMode = "manual"
+	head := f.mustPut(req)
+	if err := f.routes.DeleteRPCMemberSpec(f.ctx, spec.ID); err != nil {
+		t.Fatal(err)
+	}
+	req.IdleTimeoutSeconds = 900
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrRPCMemberSpecNotFound) {
+		t.Fatalf("re-save with a missing member spec = %v, want %v", err, ErrRPCMemberSpecNotFound)
+	}
+	members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID)
+	if len(members) != 1 || members[0].MemberSpecID != spec.ID {
+		t.Fatalf("membership = %+v, want the manual reference kept", members)
+	}
+}
+
+// TestDeleteRPCMemberSpecSerializedWithHeadWrites: the in-use check and the
+// delete of a member spec run under the cluster write lock, so a head save
+// cannot claim the spec in between and leave a dangling reference.
+func TestDeleteRPCMemberSpecSerializedWithHeadWrites(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	spec := f.manualSpec(a.ID)
+	f.svc.clusterWriteMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- f.svc.DeleteRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID) }()
+	select {
+	case err := <-done:
+		f.svc.clusterWriteMu.Unlock()
+		t.Fatalf("DeleteRPCMemberSpec ran while a head write held the lock (err %v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	f.svc.clusterWriteMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPutRPCMemberSpecSerializedWithHeadWrites: a member spec write runs
+// under the cluster write lock as a whole (spec row, GPU rows and the
+// head's membership), so a head save never reads it half written.
+func TestPutRPCMemberSpecSerializedWithHeadWrites(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	spec := f.manualSpec(a.ID)
+	f.svc.clusterWriteMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID, PutRPCMemberSpecRequest{Binary: clusterRPCBinary, Args: []string{"-t", "4"}})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	stored, _, err := f.routes.RPCMemberSpecByID(f.ctx, spec.ID)
+	f.svc.clusterWriteMu.Unlock()
+	if err != nil || strings.Contains(stored.Args, "-t") {
+		t.Fatalf("member spec written while a head write held the lock: %+v err=%v", stored, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPutClusterRefusedMembershipKeepsTheStoredSpec: converting a stored
+// model spec into a head whose membership the store then refuses leaves the
+// spec as it was, not a head without members that its document withholds.
+func TestPutClusterRefusedMembershipKeepsTheStoredSpec(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	plain := PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Type: "llama_cpp", Args: []string{"-m", "/models/big.gguf"}}
+	stored := f.mustPut(plain)
+	rival := seedOtherHead(t, f)
+	f.svc.routes = &racingPortStore{MemoryStore: f.routes, rival: rival, races: 2}
+	if _, err := f.put(ownerToken(), clusterHeadRequest(autoMember(a.ID))); !errors.Is(err, ErrClusterPortExhausted) {
+		t.Fatalf("PutRuntimeSpec = %v, want %v", err, ErrClusterPortExhausted)
+	}
+	spec, ok, err := f.routes.RuntimeSpecByID(f.ctx, stored.ID)
+	if err != nil || !ok || spec.ClusterEnabled || strings.Contains(spec.Args, "RPC_SERVERS") {
+		t.Fatalf("stored spec after the refused conversion = %+v ok=%v err=%v", spec, ok, err)
+	}
+	if got := f.notifiedServers(); len(got) != 0 {
+		t.Fatalf("notified = %v for a write that stored nothing", got)
+	}
+}
+
+// usageRaceStore lets the gateway write a member's measured usage between a
+// head save's read of the membership and its write, once.
+type usageRaceStore struct {
+	*routing.MemoryStore
+	raised bool
+	ramMB  int
+}
+
+func (u *usageRaceStore) SetClusterMembersIf(ctx context.Context, head string, expect []routing.ClusterMember, expectGPUs []routing.ClusterMemberGPU, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) (bool, error) {
+	if !u.raised && len(expect) > 0 {
+		u.raised = true
+		current, _, err := u.MemoryStore.ClusterMembers(ctx, head)
+		if err != nil {
+			return false, err
+		}
+		m := current[0]
+		m.RAMMeasuredMB, m.RunPeakRAMMB = u.ramMB, u.ramMB
+		if _, err := u.MemoryStore.UpdateClusterMemberUsage(ctx, m, nil); err != nil {
+			return false, err
+		}
+	}
+	return u.MemoryStore.SetClusterMembersIf(ctx, head, expect, expectGPUs, members, gpus)
+}
+
+// TestPutClusterKeepsAUsageRiseDuringTheSave: a head save that keeps the
+// split carries the measured values over, and a rise the gateway wrote
+// between the save's read and its write survives the save.
+func TestPutClusterKeepsAUsageRiseDuringTheSave(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+	f.usage(head.ID, a.ID, 3000, nil)
+	race := &usageRaceStore{MemoryStore: f.routes, ramMB: 5000}
+	f.svc.routes = race
+	req := clusterHeadRequest(autoMember(a.ID))
+	req.IdleTimeoutSeconds = 900
+	req.ClusterMembers[0].Threads = 4
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatal(err)
+	}
+	if !race.raised {
+		t.Fatal("the usage write never ran")
+	}
+	members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID)
+	if len(members) != 1 || members[0].RAMMeasuredMB != 5000 || members[0].Threads != 4 {
+		t.Fatalf("membership after the save = %+v, want the raised value and the new threads", members)
+	}
+}
+
+// TestRPCPortRangeOutsideEphemeralRanges: a member binds its port while the
+// agent's model children take theirs from the kernel, so the range lies
+// below every default ephemeral range (Linux 32768-60999, Windows and macOS
+// 49152-65535) and a child can never hold a member's port.
+func TestRPCPortRangeOutsideEphemeralRanges(t *testing.T) {
+	if rpcPortFirst != 26000 || rpcPortLast != 26999 || rpcPortLast >= 32768 {
+		t.Fatalf("RPC port range %d-%d, want 26000-26999", rpcPortFirst, rpcPortLast)
+	}
+}
+
+// TestPutClusterPlaceholderInConfigFileNeedsCluster: the agent resolves
+// ${RPC_SERVERS} and ${RPC_DEVICES} in config files too and refuses them
+// outside a head, so the save refuses them there as it does in args and env.
+func TestPutClusterPlaceholderInConfigFileNeedsCluster(t *testing.T) {
+	for _, placeholder := range []string{"${RPC_SERVERS}", "${RPC_DEVICES}"} {
+		f := newClusterFixture(t)
+		req := PutRuntimeSpecRequest{
+			Enabled: true, Binary: clusterHeadBinary, Type: "llama_cpp", Args: []string{"--models-preset", "${CONFIG_DIR}/presets.ini"},
+			ConfigFiles: []ConfigFileDTO{{Name: "presets.ini", Content: "[big]\nrpc = " + placeholder + "\n"}},
+		}
+		if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterRPCPlaceholderWithoutCluster) {
+			t.Fatalf("%s in a config file of a non-head = %v, want %v", placeholder, err, ErrClusterRPCPlaceholderWithoutCluster)
+		}
+	}
+}
+
+// TestSetServerNetbirdRefusalNotifiesNobody: a NetBird link refused because
+// its peer is linked to another server changes nothing, so no cluster
+// server is pushed.
+func TestSetServerNetbirdRefusalNotifiesNobody(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+	other := f.member("Other")
+	if err := f.routes.UpdateServerNetbirdLink(f.ctx, other.ID, true, "peer-taken"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.notified = nil
+	f.mu.Unlock()
+	if _, err := f.svc.SetServerNetbird(f.ctx, systemToken(), f.head.ID, true, "peer-taken", nil, false, "", false, false); !errors.Is(err, ErrNetbirdPeerInUse) {
+		t.Fatalf("SetServerNetbird = %v, want %v", err, ErrNetbirdPeerInUse)
+	}
+	if got := f.notifiedServers(); len(got) != 0 {
+		t.Fatalf("notified = %v for a refused link", got)
 	}
 }

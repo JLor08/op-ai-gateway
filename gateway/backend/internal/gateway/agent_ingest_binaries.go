@@ -90,6 +90,12 @@ func (s *Server) writeBackBinaries(ctx context.Context, serverID string, reporte
 		return
 	}
 	rows := sanitizeBinarySamples(*reported, serverID, now)
+	stored, err := s.Routes.ServerBinaries(ctx, serverID)
+	if err != nil {
+		slog.Warn("agent binary inventory read failed", "server_id", serverID, "err", err)
+		return
+	}
+	keepKnownBinaryVersions(rows, stored)
 	if err := s.Routes.ReplaceAgentServerBinaries(ctx, serverID, rows); err != nil {
 		slog.Warn("agent binary inventory write failed", "server_id", serverID, "err", err)
 		return
@@ -99,5 +105,29 @@ func (s *Server) writeBackBinaries(ctx context.Context, serverID string, reporte
 	// it changed, so every server sharing a cluster with this one is pushed.
 	if s.Portal != nil {
 		s.Portal.NotifyClustersOfServer(ctx, serverID)
+	}
+}
+
+// keepKnownBinaryVersions gives a reported row without any version the
+// version its agent row already carries at the same path. The agent sends no
+// version when its --version probe failed or timed out (a busy host at agent
+// start), and taking that as "unknown" would withhold every automatic cluster
+// whose binary it is until the file changed; a report that carries a version
+// replaces the kept one.
+func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
+	known := make(map[string]routing.ServerBinary, len(stored))
+	for _, b := range stored {
+		if b.Source == routing.BinarySourceAgent && (b.Version != "" || b.Build != "" || b.Commit != "") {
+			known[b.Path] = b
+		}
+	}
+	for i := range rows {
+		r := &rows[i]
+		if r.Version != "" || r.Build != "" || r.Commit != "" {
+			continue
+		}
+		if b, ok := known[r.Path]; ok {
+			r.Version, r.Build, r.Commit, r.VersionSource = b.Version, b.Build, b.Commit, b.VersionSource
+		}
 	}
 }

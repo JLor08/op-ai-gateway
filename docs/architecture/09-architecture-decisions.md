@@ -11694,7 +11694,8 @@ unauthenticated port to the network, lets one head take another's member, or poi
   (`runtime.cluster_lan_ack_required`), while `relay` + `mesh` with deny-by-default off only warns: the allowlist is
   the gate there. A server gains `lan_address` (an IPv4 literal) and `lan_bind_only`; a NetBird-enabled server in a
   `lan` cluster needs `lan_address`, because the peer sync rewrites its `Domain` to the NetBird name. The managed
-  policy family covers every `mesh` cluster in either transport, with no per-server include or exclude, and a policy
+  policy family covers every `mesh` cluster the runtime documents carry, in either transport, with no per-server
+  include or exclude (a withheld cluster gets no grant), and a policy
   switch that a direct mesh cluster relies on cannot be turned off while one exists
   ([Networking & Mesh §12](cross-cutting/networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)).
 - **(c) Two member modes per head.** `automatic` (the default, since it needs no member-side spec work): the head
@@ -11759,8 +11760,9 @@ unauthenticated port to the network, lets one head take another's member, or poi
   and starts the cluster again after the cooldown if the head was serving requests.
 - **(i) Rights on every server, the member side's consent, and positions instead of names.** A write that changes the
   membership, member mode, network, transport or the head binary needs management rights on the head's server and on
-  every member server, former ones included; one that changes none of them needs rights on the head's server only, so a
-  member the caller cannot see never locks them out of their own head. The member side consents per head-server admin
+  every member server it keeps or adds; one that changes none of them needs rights on the head's server only, so a
+  member the caller cannot see never locks them out of their own head. Removing members, turning the cluster off
+  included, needs the head's rights only, like deleting the head: removal only frees the member host. The member side consents per head-server admin
   group (`rpc_allowed_head_groups` on the server for automatic members, `allowed_head_groups` on a manual spec; an empty
   list means the member server's own admin groups), and consent binds **every** caller, system scope included: the
   derivation re-checks it on every document, so a save past it would store a head that is never pushed. Every refusal
@@ -11772,8 +11774,10 @@ unauthenticated port to the network, lets one head take another's member, or poi
   member spec derived from it, so no agent ever receives a partial endpoint list (which would shift `RPC<n>`). Both
   sides declare `rpc_cluster` and read the other's declaration fail-closed: the gateway pushes a head or member only to
   an agent that declares it, and an agent honours `kind`, `cluster` and `rpc` only while the gateway declares it, so a
-  file-mode document or an older gateway can never start a member as a model. A member host whose features are unknown
-  withholds only its heads, never the head server's whole document. Deleting a server that is a member is refused
+  file-mode document or an older gateway can never start a member as a model. A host whose live declaration is not
+  known yet (after a gateway start) counts by the agent version of its last telemetry (0.18.0 or newer declares
+  `rpc_cluster`), so the host that reports first does not drain a running cluster; one with no version withholds
+  only its heads, never the head server's whole document. Deleting a server that is a member is refused
   (`409 runtime.cluster_member_in_use`): the membership row would cascade away silently and shorten the endpoint list.
 - **(k) Member usage per run, stored with the head.** A member's agent measures its process while the head holds it;
   the gateway stores the VRAM per member GPU and the member's RAM on the membership row by a per-run peak rule (rises

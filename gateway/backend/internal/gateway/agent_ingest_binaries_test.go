@@ -207,3 +207,27 @@ func TestIngestBinariesNULAndPathCap(t *testing.T) {
 		t.Fatalf("NUL not stripped: %+v", v)
 	}
 }
+
+// TestIngestBinariesKeepLastKnownVersion: a re-report of the same path
+// without a version (a --version probe that failed or timed out) keeps the
+// version the inventory already knows, so one failed probe does not withhold
+// the automatic clusters on the host until the file changes.
+func TestIngestBinariesKeepLastKnownVersion(t *testing.T) {
+	srv := NewTestServer()
+	ingestBinaries(t, srv, `[{"path":"/opt/a/llama-server","kind":"llama_server","version":"0.9.0 (build 1, commit 2bc46ba)","build":"1","commit":"2bc46ba","version_source":"agent","allowed":true}]`)
+	ingestBinaries(t, srv, `[{"path":"/opt/a/llama-server","kind":"llama_server","allowed":true},
+		{"path":"/opt/a/rpc-server","kind":"rpc_server","allowed":true}]`)
+	got := storedBinaries(t, srv)
+	a := got["/opt/a/llama-server"]
+	if a.Version != "0.9.0 (build 1, commit 2bc46ba)" || a.Build != "1" || a.Commit != "2bc46ba" || a.VersionSource != "agent" {
+		t.Fatalf("re-reported row = %+v, want the last known version kept", a)
+	}
+	if b := got["/opt/a/rpc-server"]; b.Version != "" || b.Commit != "" {
+		t.Fatalf("new row without a version = %+v, want it unversioned", b)
+	}
+	// A report that carries a version replaces the kept one.
+	ingestBinaries(t, srv, `[{"path":"/opt/a/llama-server","kind":"llama_server","version":"0.9.1 (build 2, commit 3cd57cb)","build":"2","commit":"3cd57cb","version_source":"agent","allowed":true}]`)
+	if a := storedBinaries(t, srv)["/opt/a/llama-server"]; a.Commit != "3cd57cb" || a.Build != "2" {
+		t.Fatalf("row after a versioned report = %+v", a)
+	}
+}

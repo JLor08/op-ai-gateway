@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"op-ai-gateway/internal/netbird"
 	"op-ai-gateway/internal/routing"
 	"slices"
@@ -42,6 +43,7 @@ func newRPCPolicyEnv(t *testing.T, managePolicies bool) *rpcPolicyEnv {
 		enableNetbird(t, svc, fake.srv.URL, true)
 	}
 	e := &rpcPolicyEnv{t: t, ctx: context.Background(), svc: svc, routes: routes, fake: fake}
+	svc.agentFeatures = fakeAgentFeatures{}
 	svc.SetRuntimeConfigChangedHook(func(string) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
@@ -59,9 +61,54 @@ func (e *rpcPolicyEnv) notifications() int {
 // group is the tracking group of a server seeded by server.
 func rpcGroup(serverID string) string { return "g-" + serverID }
 
+// rpcPolicyAdminGroup links every server of the env, so each member's
+// default consent admits every head.
+const rpcPolicyAdminGroup = "ugrp_rpc_policy"
+
+// server seeds a NetBird-managed server whose cluster derives: a mesh IP, an
+// agent that declares rpc_cluster, RPC membership on with the env's consent,
+// and a head and a member binary of one build.
 func (e *rpcPolicyEnv) server(id string) {
 	e.t.Helper()
 	seedManagedNetbirdServer(e.t, e.routes, id, id, rpcGroup(id), "", rpcPolicyNow)
+	srv, err := e.routes.AIServerByID(e.ctx, id)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	srv.RPCMemberEnabled = true
+	if err := e.routes.UpdateAIServer(e.ctx, srv); err != nil {
+		e.t.Fatal(err)
+	}
+	ip := fmt.Sprintf("100.64.0.%d", len(e.svc.agentFeatures.(fakeAgentFeatures))+1)
+	if err := e.routes.UpdateServerNetbirdState(e.ctx, id, srv.Domain, srv.NetbirdPeerID, ip, true); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := e.routes.SetServerAdminGroup(e.ctx, id, rpcPolicyAdminGroup); err != nil {
+		e.t.Fatal(err)
+	}
+	for path, kind := range map[string]string{"/opt/llama/llama-server": BinaryKindLlamaServer, "/opt/llama/ggml-rpc-server": BinaryKindRPCServer} {
+		if err := e.routes.UpsertManualServerBinary(e.ctx, routing.ServerBinary{
+			ServerID: id, Path: path, Kind: kind, Version: "version: 1 (build 1, commit abc1234)", Build: "1", Commit: "abc1234",
+		}); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+	e.svc.agentFeatures.(fakeAgentFeatures)[id] = []string{AgentFeatureRPCCluster}
+}
+
+// agentApp returns serverID's server_agent application, seeding one first.
+func (e *rpcPolicyEnv) agentApp(serverID string) routing.Application {
+	e.t.Helper()
+	apps, err := e.routes.ApplicationsByServer(e.ctx, serverID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	for _, a := range apps {
+		if a.Type == routing.ProviderServerAgent {
+			return a
+		}
+	}
+	return seedServerAgentApplication(e.t, e.routes, serverID, rpcPolicyNow)
 }
 
 type rpcMemberSeed struct {
@@ -74,7 +121,7 @@ type rpcMemberSeed struct {
 // spec id and the mapping id.
 func (e *rpcPolicyEnv) cluster(headServer, network, transport string, members ...rpcMemberSeed) (specID, mappingID string) {
 	e.t.Helper()
-	app := seedServerAgentApplication(e.t, e.routes, headServer, rpcPolicyNow)
+	app := e.agentApp(headServer)
 	mapping, err := e.svc.CreateMapping(e.ctx, systemToken(), app.ID, CreateMappingRequest{GatewayModelName: "big-" + headServer, AppModelName: "big"})
 	if err != nil {
 		e.t.Fatalf("mapping: %v", err)
@@ -95,6 +142,7 @@ func (e *rpcPolicyEnv) setMembers(specID string, members ...rpcMemberSeed) {
 	e.t.Helper()
 	rows := make([]routing.ClusterMember, len(members))
 	for i, m := range members {
+		e.agentApp(m.server)
 		rows[i] = routing.ClusterMember{HeadSpecID: specID, Position: i, ServerID: m.server, Port: m.port}
 	}
 	if err := e.routes.SetClusterMembers(e.ctx, specID, rows, nil); err != nil {
@@ -521,7 +569,7 @@ func TestDefaultPolicyStateRecordedAndClustersNotifiedOnChange(t *testing.T) {
 	if e.notifications() == before {
 		t.Fatal("a changed Default state did not notify the cluster servers")
 	}
-	if e.svc.directMeshAvailable(e.ctx) {
+	if direct, err := e.svc.directMeshAvailable(e.ctx); err != nil || direct {
 		t.Fatal("direct mesh must be unavailable while Default is enabled")
 	}
 }
@@ -702,5 +750,93 @@ func TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying(t *testing.T) {
 	if e.notifications() <= atHandler {
 		t.Fatalf("notifications = %d after the drift, want more than the %d seen when the clusters were stopped",
 			e.notifications(), atHandler)
+	}
+}
+
+// TestRPCPolicyPassOnlyForClusterWrites: a write that touches no cluster makes
+// no RPC policy pass, so a deployment without clusters never waits on NetBird
+// for a model save. The writes that also reconcile the server's own access
+// policy list once for that, never a second time.
+func TestRPCPolicyPassOnlyForClusterWrites(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	e.server("plain")
+	app := e.agentApp("plain")
+	mapping, err := e.svc.CreateMapping(e.ctx, systemToken(), app.ID, CreateMappingRequest{GatewayModelName: "small", AppModelName: "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lists := func(what string, want int32, op func() error) {
+		t.Helper()
+		before := e.fake.policyListCount()
+		if err := op(); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if got := e.fake.policyListCount() - before; got != want {
+			t.Fatalf("%s listed policies %d times, want %d", what, got, want)
+		}
+	}
+	lists("PutRuntimeSpec", 0, func() error {
+		_, err := e.svc.PutRuntimeSpec(e.ctx, systemToken(), mapping.ID, PutRuntimeSpecRequest{Enabled: true, Binary: "/opt/llama/llama-server"})
+		return err
+	})
+	lists("DeleteRuntimeSpec", 0, func() error { return e.svc.DeleteRuntimeSpec(e.ctx, systemToken(), mapping.ID) })
+	lists("UpdateApplication", 1, func() error {
+		port := 9001
+		_, err := e.svc.UpdateApplication(e.ctx, systemToken(), app.ID, UpdateApplicationRequest{Port: &port})
+		return err
+	})
+	lists("DeleteApplication", 1, func() error { return e.svc.DeleteApplication(e.ctx, systemToken(), app.ID) })
+	lists("DeleteServer", 1, func() error {
+		_, err := e.svc.DeleteServer(e.ctx, systemToken(), "plain", false)
+		return err
+	})
+}
+
+// TestRPCPolicyPassForClusterApplicationWrites: an application write on a
+// server that takes part in a cluster still reconciles the RPC policies.
+func TestRPCPolicyPassForClusterApplicationWrites(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	apps, err := e.routes.ApplicationsByServer(e.ctx, "head")
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("apps = %+v err=%v", apps, err)
+	}
+	before := e.fake.policyListCount()
+	port := 9001
+	if _, err := e.svc.UpdateApplication(e.ctx, systemToken(), apps[0].ID, UpdateApplicationRequest{Port: &port}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.fake.policyListCount() - before; got != 2 {
+		t.Fatalf("UpdateApplication on a head server listed policies %d times, want 2 (access policy + RPC family)", got)
+	}
+}
+
+// TestRPCPolicyWithheldClusterGetsNoGrant: a cluster the runtime documents
+// withhold runs nowhere, so its member's port is not opened -- here after
+// the member turned RPC membership off.
+func TestRPCPolicyWithheldClusterGetsNoGrant(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 26001})
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 26001})
+	srv, err := e.routes.AIServerByID(e.ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.RPCMemberEnabled = false
+	if err := e.routes.UpdateAIServer(e.ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	e.reconcile()
+	if !e.fake.wasPolicyDeleted("pol-a") {
+		t.Fatal("the grant of a withheld cluster's member was kept")
+	}
+	if e.fake.policyCreateCountByName("op-gw-rpc-a") != 0 {
+		t.Fatal("a withheld cluster's member got a policy")
 	}
 }

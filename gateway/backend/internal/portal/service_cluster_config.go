@@ -26,6 +26,10 @@ import (
 // as a model.
 const AgentFeatureRPCCluster = "rpc_cluster"
 
+// agentRPCClusterSince is the first agent version that declares
+// AgentFeatureRPCCluster.
+var agentRPCClusterSince = [3]int{0, 18, 0}
+
 // AgentSpecKindRPCServer is the runtime-document kind of a cluster member
 // spec; a model spec has no kind.
 const AgentSpecKindRPCServer = "rpc_server"
@@ -34,8 +38,9 @@ const AgentSpecKindRPCServer = "rpc_server"
 // (RuntimeSpecDTO.ClusterWithheldReason). The head and every member spec
 // derived from it are withheld together, so an agent never receives a
 // partial endpoint list. ClusterWithheldFeaturesPending withholds the
-// cluster while the declaration of an agent of it is unknown; a server whose
-// OWN agent's declaration is unknown has its whole document held instead
+// cluster while the declaration of an agent of it is unknown and its last
+// reported version does not tell either; a server whose OWN agent's
+// declaration is unknown has its whole document held instead
 // (AgentRuntimeConfigDTO.AwaitsAgentFeatures), while the other servers'
 // documents go out without that cluster's head or member.
 const (
@@ -74,10 +79,10 @@ type AgentClusterEndpointDTO struct {
 
 // AgentClusterHeadDTO makes a model spec a cluster head: its members in
 // member order (the order fixes the RPC<n> numbering), the transport and the
-// network. Generation is a digest of the member configuration that the
-// endpoints do not show (binaries and their versions, args, device backends,
-// GPU selections, bind addresses), so a member-side change relaunches the
-// head.
+// network. Generation is a digest of every member launch input the
+// endpoints do not show (binaries and their versions, args, env, the cache
+// switch, device backends, GPU selections, bind addresses), so whatever
+// relaunches a member relaunches the head.
 type AgentClusterHeadDTO struct {
 	Endpoints  []AgentClusterEndpointDTO `json:"endpoints"`
 	Transport  string                    `json:"transport"`
@@ -165,7 +170,11 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 	for _, m := range states {
 		serverIDs = append(serverIDs, m.row.ServerID)
 	}
-	if reason, hold := s.clusterFeatureReason(viewerID, serverIDs); reason != "" {
+	reason, hold, err := s.clusterFeatureReason(ctx, viewerID, serverIDs)
+	if err != nil {
+		return clusterDerivation{}, err
+	}
+	if reason != "" {
 		d := withheld(reason)
 		d.hold = hold
 		return d, nil
@@ -189,7 +198,10 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 	for _, m := range members {
 		servers = append(servers, m.server)
 	}
-	network, transport := s.resolveClusterNetwork(ctx, head, servers)
+	network, transport, err := s.resolveClusterNetwork(ctx, head, servers)
+	if err != nil {
+		return clusterDerivation{}, err
+	}
 	headIPs, headDomain, reason := clusterHeadIdentity(headServer, network)
 	if reason != "" {
 		return withheld(reason), nil
@@ -202,8 +214,14 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 			return withheld(reason), nil
 		}
 	}
-	if transport == rpcTransportDirect && network == clusterNetworkMesh && !s.directMeshAvailable(ctx) {
-		return withheld(ClusterWithheldDirectUnavailable), nil
+	if transport == rpcTransportDirect && network == clusterNetworkMesh {
+		direct, err := s.directMeshAvailable(ctx)
+		if err != nil {
+			return clusterDerivation{}, err
+		}
+		if !direct {
+			return withheld(ClusterWithheldDirectUnavailable), nil
+		}
 	}
 	if transport == rpcTransportDirect && network == clusterNetworkLAN && !head.LANExposureAck {
 		return withheld(ClusterWithheldLANAckRequired), nil
@@ -221,30 +239,98 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 // document has declared, the gateway cannot tell what it runs. A REMOTE
 // unknown agent only withholds the cluster from the viewer's document --
 // holding the whole document for it would freeze every other model on the
-// viewer for as long as that other host stays away.
-func (s *Service) clusterFeatureReason(viewerID string, serverIDs []string) (reason string, hold bool) {
+// viewer for as long as that other host stays away. viewerID "" is no
+// document's: every server is a peer.
+//
+// A peer's live declaration is unknown after every gateway start until that
+// host reports, and one host always reports first. So a peer counts by the
+// agent version it last reported (peerFeatureReason): withholding the
+// cluster until every host has reported would make the first host's agent
+// drain a running head or member on every gateway restart.
+func (s *Service) clusterFeatureReason(ctx context.Context, viewerID string, serverIDs []string) (reason string, hold bool, err error) {
 	if s.agentFeatures == nil {
-		return ClusterWithheldAgentTooOld, false
+		return ClusterWithheldAgentTooOld, false, nil
 	}
-	if !s.agentFeatures.Known(viewerID) {
-		return ClusterWithheldFeaturesPending, true
+	if viewerID != "" && !s.agentFeatures.Known(viewerID) {
+		return ClusterWithheldFeaturesPending, true, nil
 	}
 	pending, old := false, false
 	for _, id := range serverIDs {
+		r := ""
 		switch {
-		case !s.agentFeatures.Known(id):
-			pending = true
-		case !s.agentFeatures.Has(id, AgentFeatureRPCCluster):
-			old = true
+		case s.agentFeatures.Known(id):
+			if !s.agentFeatures.Has(id, AgentFeatureRPCCluster) {
+				r = ClusterWithheldAgentTooOld
+			}
+		default:
+			if r, err = s.peerFeatureReason(ctx, id); err != nil {
+				return "", false, err
+			}
 		}
+		pending = pending || r == ClusterWithheldFeaturesPending
+		old = old || r == ClusterWithheldAgentTooOld
 	}
 	if pending {
-		return ClusterWithheldFeaturesPending, false
+		return ClusterWithheldFeaturesPending, false, nil
 	}
 	if old {
-		return ClusterWithheldAgentTooOld, false
+		return ClusterWithheldAgentTooOld, false, nil
 	}
-	return "", false
+	return "", false, nil
+}
+
+// peerFeatureReason judges a server whose live declaration is unknown by the
+// agent version of its last telemetry: one that declares rpc_cluster counts
+// as declaring it, an older one is too old, and none (or one that does not
+// parse) leaves the declaration pending. The host's next report replaces the
+// guess with its declaration.
+func (s *Service) peerFeatureReason(ctx context.Context, serverID string) (string, error) {
+	telemetry, ok, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return ClusterWithheldFeaturesPending, nil
+	}
+	version, parsed := parseAgentVersion(telemetry.AgentVersion)
+	switch {
+	case !parsed:
+		return ClusterWithheldFeaturesPending, nil
+	case compareAgentVersions(version, agentRPCClusterSince) < 0:
+		return ClusterWithheldAgentTooOld, nil
+	}
+	return "", nil
+}
+
+// parseAgentVersion reads "MAJOR.MINOR.PATCH" with an optional "v" prefix
+// and an optional pre-release or build suffix, which it ignores.
+func parseAgentVersion(raw string) ([3]int, bool) {
+	var out [3]int
+	v := strings.TrimPrefix(strings.TrimSpace(raw), "v")
+	if i := strings.IndexAny(v, "-+"); i >= 0 {
+		v = v[:i]
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func compareAgentVersions(a, b [3]int) int {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] - b[i]
+		}
+	}
+	return 0
 }
 
 // checkDerivedMember is the membership part of deriveCluster for the member
@@ -396,24 +482,28 @@ func clusterHeadIdentity(headServer routing.AIServer, network string) (ips []str
 }
 
 // memberGenerationPart is one member's share of the head's generation:
-// everything of the member's launch that decides what devices the head sees
-// and whether its build talks to the head's.
+// every input of the member's launch. Whatever relaunches a member must
+// relaunch its head as well, since a head whose member restarts under it
+// aborts mid-request; beyond that it records what decides which devices the
+// head sees and whether the member's build talks to the head's.
 type memberGenerationPart struct {
-	Kind          string   `json:"kind"`
-	ID            string   `json:"id"`
-	Server        string   `json:"server"`
-	Binary        string   `json:"binary"`
-	Args          []string `json:"args"`
-	DeviceBackend string   `json:"device_backend"`
-	Version       string   `json:"version"`
-	Commit        string   `json:"commit"`
-	Build         string   `json:"build"`
-	DeviceCount   int      `json:"device_count"`
-	GPUs          []int    `json:"gpus"`
-	Transport     string   `json:"transport"`
-	Network       string   `json:"network"`
-	Bind          string   `json:"bind"`
-	Port          int      `json:"port"`
+	Kind          string            `json:"kind"`
+	ID            string            `json:"id"`
+	Server        string            `json:"server"`
+	Binary        string            `json:"binary"`
+	Args          []string          `json:"args"`
+	Env           map[string]string `json:"env"`
+	CacheEnabled  bool              `json:"cache_enabled"`
+	DeviceBackend string            `json:"device_backend"`
+	Version       string            `json:"version"`
+	Commit        string            `json:"commit"`
+	Build         string            `json:"build"`
+	DeviceCount   int               `json:"device_count"`
+	GPUs          []int             `json:"gpus"`
+	Transport     string            `json:"transport"`
+	Network       string            `json:"network"`
+	Bind          string            `json:"bind"`
+	Port          int               `json:"port"`
 }
 
 // buildCluster assembles a derivable cluster: the head's block and each
@@ -449,7 +539,8 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			kind = memberModeManual
 		}
 		parts = append(parts, memberGenerationPart{
-			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Args: spec.Args, DeviceBackend: spec.DeviceBackend,
+			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Args: spec.Args, Env: spec.Env,
+			CacheEnabled: spec.RPC.CacheEnabled, DeviceBackend: spec.DeviceBackend,
 			Version: m.binary.EffectiveVersion(),
 			Commit:  commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: transport, Network: network,
 			Bind: m.bindIP, Port: m.row.Port,
@@ -674,15 +765,33 @@ func (s *Service) clusterWithheldReason(ctx context.Context, headSpecID string, 
 // A changed device order or set changes the distribution, so kept values
 // become a stale floor and every member's run of that head ends, as on a
 // head edit (planClusterRows).
+//
+// The rewrite applies only over the rows it read (SetClusterMembersIf), so a
+// measured value the gateway wrote in between is read again, never
+// overwritten.
 func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, rows []routing.RPCMemberSpecGPU) (headSpecID string, err error) {
 	used, ok, err := s.routes.ClusterMemberBySpec(ctx, specID)
 	if err != nil || !ok {
 		return "", err
 	}
-	members, gpus, err := s.routes.ClusterMembers(ctx, used.HeadSpecID)
-	if err != nil {
-		return "", err
+	for range clusterRewriteAttempts {
+		read, readGPUs, err := s.routes.ClusterMembers(ctx, used.HeadSpecID)
+		if err != nil {
+			return "", err
+		}
+		members, gpus := resyncedManualMember(used, rows, read, readGPUs)
+		applied, err := s.routes.SetClusterMembersIf(ctx, used.HeadSpecID, read, readGPUs, members, gpus)
+		if err != nil || applied {
+			return used.HeadSpecID, err
+		}
 	}
+	return used.HeadSpecID, errClusterMembersChanged
+}
+
+// resyncedManualMember is resyncManualMemberGPUs' rewrite of the membership
+// rows read: used's GPU rows follow the spec's rows.
+func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSpecGPU, read []routing.ClusterMember, gpus []routing.ClusterMemberGPU) ([]routing.ClusterMember, []routing.ClusterMemberGPU) {
+	members := slices.Clone(read)
 	prev := map[int]routing.ClusterMemberGPU{}
 	var prevOrder, nextOrder []int
 	next := make([]routing.ClusterMemberGPU, 0, len(gpus)+len(rows))
@@ -723,7 +832,7 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 			members[i].Stale = true
 		}
 	}
-	return used.HeadSpecID, s.routes.SetClusterMembers(ctx, used.HeadSpecID, members, next)
+	return members, next
 }
 
 // clusterServers is headSpecID's head server and every member server, each
@@ -807,7 +916,8 @@ func (s *Service) NotifyClustersOfServer(ctx context.Context, serverID string) {
 
 // notifyAllClusterServers notifies every server of every cluster: the
 // NetBird policy settings decide whether any direct mesh cluster may be
-// pushed. Best-effort.
+// pushed. Each head's servers are read once, and a fleet without a cluster
+// notifies nobody. Best-effort.
 func (s *Service) notifyAllClusterServers(ctx context.Context) {
 	if s.runtimeChanged == nil || s.routes == nil {
 		return
@@ -817,9 +927,15 @@ func (s *Service) notifyAllClusterServers(ctx context.Context) {
 		slog.Debug("cluster notification: server list failed", "err", err)
 		return
 	}
-	var ids []string
+	var heads []string
 	for _, srv := range servers {
-		for _, id := range s.clusterServersOfServer(ctx, srv.ID) {
+		for _, head := range s.clusterHeadsOfServer(ctx, srv.ID) {
+			heads = appendUnique(heads, head)
+		}
+	}
+	var ids []string
+	for _, head := range heads {
+		for _, id := range s.clusterServers(ctx, head) {
 			ids = appendUnique(ids, id)
 		}
 	}

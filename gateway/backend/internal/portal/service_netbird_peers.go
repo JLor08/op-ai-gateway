@@ -503,10 +503,6 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 	if !enabled && strings.TrimSpace(server.Domain) == "" {
 		return ServerDTO{}, ErrServerDomainRequired
 	}
-	// NetBird enablement, the tracking group, the mesh IP and the Domain shape
-	// every cluster of the server (NotifyClustersOfServer); each write below
-	// can move one, also when a later step fails.
-	defer s.NotifyClustersOfServer(ctx, id)
 	// Uniqueness: a peer id must not be linked to another server.
 	if peerID != "" {
 		servers, err := s.routes.AIServers(ctx)
@@ -519,6 +515,10 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 			}
 		}
 	}
+	// NetBird enablement, the tracking group, the mesh IP and the Domain shape
+	// every cluster of the server (NotifyClustersOfServer); each write below
+	// can move one, also when a later step fails. Nothing above wrote.
+	defer s.NotifyClustersOfServer(ctx, id)
 	// Disable: delete the per-server tracking group (best-effort, only when one was
 	// stored + the module is configured) and ALWAYS clear the local linkage (group
 	// id + policy-group mirror) alongside the disable link write (which also resets

@@ -36,7 +36,9 @@ type rpcRule struct {
 }
 
 // rpcCluster is a stored cluster head with the members it dials and the
-// network and transport it resolves to.
+// network and transport it resolves to. derived is set when the runtime
+// documents carry the cluster (deriveCluster withholds it for no reason);
+// only rpcClusters with derive set fills it.
 type rpcCluster struct {
 	head       routing.RuntimeSpec
 	headServer routing.AIServer
@@ -44,13 +46,16 @@ type rpcCluster struct {
 	servers    map[string]routing.AIServer
 	network    string
 	transport  string
+	derived    bool
 }
 
 // rpcClusters lists every enabled cluster head with its membership, resolving
-// the network and transport the way the derivation does. A store error is
-// returned whole: a caller that acts on a partial list would delete policies
-// of clusters it failed to read.
-func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) ([]rpcCluster, error) {
+// the network and transport the way the derivation does; with derive it also
+// derives each cluster, as no particular server's document, to tell whether
+// the runtime documents carry it. A store error is returned whole: a caller
+// that acts on a partial list would delete policies of clusters it failed to
+// read.
+func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer, derive bool) ([]rpcCluster, error) {
 	byID := make(map[string]routing.AIServer, len(servers))
 	for _, srv := range servers {
 		byID[srv.ID] = srv
@@ -82,7 +87,16 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) (
 				for _, m := range members {
 					all = append(all, byID[m.ServerID])
 				}
-				c.network, c.transport = s.resolveClusterNetwork(ctx, spec, all)
+				if c.network, c.transport, err = s.resolveClusterNetwork(ctx, spec, all); err != nil {
+					return nil, err
+				}
+				if derive {
+					d, err := s.deriveCluster(ctx, spec, srv, "")
+					if err != nil {
+						return nil, err
+					}
+					c.derived = d.reason == ""
+				}
 				out = append(out, c)
 			}
 		}
@@ -93,27 +107,31 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) (
 // resolveClusterNetwork is the network and transport of a head: the stored
 // choice, else the defaults over its head and member servers. Shared by the
 // derivation and the policy pass so they cannot disagree.
-func (s *Service) resolveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, servers []routing.AIServer) (network, transport string) {
+func (s *Service) resolveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, servers []routing.AIServer) (network, transport string, err error) {
 	network, transport = head.ClusterNetwork, head.RPCTransport
 	if network == "" {
 		network = defaultClusterNetwork(servers)
 	}
 	if transport == "" {
-		transport = s.defaultRPCTransport(ctx, network)
+		if transport, err = s.defaultRPCTransport(ctx, network); err != nil {
+			return "", "", err
+		}
 	}
-	return network, transport
+	return network, transport, nil
 }
 
 // directMeshClusterExists reports whether a cluster relies on NetBird's policy
 // enforcement: a direct cluster on the mesh exposes every member's
 // unauthenticated RPC port to the whole mesh unless the catch-all policy is
-// off and the managed policies are the only grants.
+// off and the managed policies are the only grants. Every enabled head
+// counts, also one withheld right now: it is pushed again as soon as its
+// reason goes away.
 func (s *Service) directMeshClusterExists(ctx context.Context) (bool, error) {
 	servers, err := s.routes.AIServers(ctx)
 	if err != nil {
 		return false, err
 	}
-	clusters, err := s.rpcClusters(ctx, servers)
+	clusters, err := s.rpcClusters(ctx, servers, false)
 	if err != nil {
 		return false, err
 	}
@@ -123,13 +141,16 @@ func (s *Service) directMeshClusterExists(ctx context.Context) (bool, error) {
 }
 
 // desiredRPCRules groups the grants every mesh cluster needs by member server.
-// A member needs a tracking group on both ends and an allocated port; the
-// grants are deduplicated (several heads of one server may dial one port) and
-// sorted so the desired policy is stable.
+// Only a cluster the runtime documents carry gets grants: one withheld --
+// a member that withdrew its consent or turned RPC membership off, a missing
+// binary -- runs nowhere, and its member's port stays closed. A member needs
+// a tracking group on both ends and an allocated port; the grants are
+// deduplicated (several heads of one server may dial one port) and sorted so
+// the desired policy is stable.
 func desiredRPCRules(clusters []rpcCluster) map[string][]rpcRule {
 	out := map[string][]rpcRule{}
 	for _, c := range clusters {
-		if c.network != clusterNetworkMesh || !serverHasGroup(c.headServer) {
+		if !c.derived || c.network != clusterNetworkMesh || !serverHasGroup(c.headServer) {
 			continue
 		}
 		for _, m := range c.members {
@@ -223,7 +244,7 @@ func rpcPolicyMatches(p netbird.Policy, rules []rpcRule) bool {
 // store error skips the whole pass: nothing is created or deleted from a
 // cluster list that could not be read. Best-effort, errors are Debug-logged.
 func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Config, servers []routing.AIServer, policies []netbird.Policy) {
-	clusters, err := s.rpcClusters(ctx, servers)
+	clusters, err := s.rpcClusters(ctx, servers, true)
 	if err != nil {
 		slog.Debug("rpc policy reconcile: read clusters", "error", err)
 		return

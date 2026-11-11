@@ -3663,12 +3663,28 @@ type RPCClusterStore interface {
 	// RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then
 	// index. Always non-nil.
 	RPCMemberSpecGPUs(ctx context.Context, specID string) ([]RPCMemberSpecGPU, error)
+	// ReplaceRPCMemberSpec is UpsertRPCMemberSpec and SetRPCMemberSpecGPUs
+	// in one transaction: the spec and exactly gpus as its GPU rows are
+	// stored together, or nothing is. An unknown ServerID is ErrNotFound, a
+	// duplicate GPUIndex ErrConflict.
+	ReplaceRPCMemberSpec(ctx context.Context, s RPCMemberSpec, gpus []RPCMemberSpecGPU) error
 	// SetClusterMembers atomically replaces every membership row (and its GPU
 	// rows) of headSpecID. Carrying measured fields over per (server,
 	// gpu_index) is the caller's job. An unknown head or member server is
 	// ErrNotFound; a duplicate position, a duplicate server, or a manual
 	// member spec already used by another membership row is ErrConflict.
 	SetClusterMembers(ctx context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error
+	// SetClusterMembersIf is SetClusterMembers, but only while the stored
+	// rows still carry what the caller read them as: exactly the membership
+	// rows of expect (by server) with the same RAMMeasuredMB, Stale,
+	// RunPeakRAMMB, RunHeadInstance and RunStartedAt, and exactly the GPU
+	// rows of expectGPUs (by server and index) with the same VRAMMeasuredMB
+	// and RunPeakVRAMMB. A usage write, a run begun or ended, or any other
+	// rewrite since then makes it store nothing and report applied false, so
+	// a caller that carries measured values over never writes back an older
+	// read of them. MeasuredAt is not compared: it only moves with the
+	// values. Errors are SetClusterMembers'.
+	SetClusterMembersIf(ctx context.Context, headSpecID string, expect []ClusterMember, expectGPUs []ClusterMemberGPU, members []ClusterMember, gpus []ClusterMemberGPU) (applied bool, err error)
 	// ClusterMembers returns headSpecID's membership ordered by position and
 	// its GPU rows ordered by server, position, index. Both always non-nil.
 	ClusterMembers(ctx context.Context, headSpecID string) ([]ClusterMember, []ClusterMemberGPU, error)

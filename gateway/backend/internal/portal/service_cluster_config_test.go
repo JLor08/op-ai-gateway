@@ -4,6 +4,7 @@
 package portal
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -790,5 +791,135 @@ func TestAgentRuntimeConfigWithholdsOnCorruptMemberSpec(t *testing.T) {
 	}
 	if got := f.withheldReason(); got != ClusterWithheldMemberSpecInvalid {
 		t.Fatalf("reason = %q", got)
+	}
+}
+
+// failingSettings is a system settings store whose reads fail while fail is
+// set.
+type failingSettings struct {
+	SystemSettingsStore
+	fail bool
+}
+
+func (s *failingSettings) SystemSettings(ctx context.Context) (map[string]string, error) {
+	if s.fail {
+		return nil, errors.New("settings read failed")
+	}
+	return s.SystemSettingsStore.SystemSettings(ctx)
+}
+
+// TestAgentRuntimeConfigPropagatesSettingsReadError: a failed settings read
+// is an error of the document, never every NetBird switch read as off, which
+// would withhold a running direct mesh cluster and drain it.
+func TestAgentRuntimeConfigPropagatesSettingsReadError(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.clusterAgents(a.ID)
+	f.netbirdReady(f.head.ID, "100.64.0.1")
+	f.netbirdReady(a.ID, "100.64.0.2")
+	f.directMeshPolicies()
+	req := clusterHeadRequest(autoMember(a.ID))
+	req.ClusterNetwork, req.RPCTransport = "mesh", "direct"
+	head := f.mustPut(req)
+	if hs, ok := specByID(f.config(f.head.ID), head.ID); !ok || hs.Cluster == nil {
+		t.Fatalf("head withheld before the failure: %q", f.withheldReason())
+	}
+	settings := &failingSettings{SystemSettingsStore: f.settings, fail: true}
+	f.svc.settings = settings
+	for _, id := range []string{f.head.ID, a.ID} {
+		if _, err := f.svc.AgentRuntimeConfig(f.ctx, id); err == nil {
+			t.Fatalf("AgentRuntimeConfig(%s) served a document over a failed settings read", id)
+		}
+	}
+}
+
+// TestAgentRuntimeConfigGenerationCoversEveryMemberLaunchInput: a member's
+// env and its cache switch relaunch the member, so they move the head's
+// generation too and the head relaunches with it instead of losing the
+// member under a running model.
+func TestAgentRuntimeConfigGenerationCoversEveryMemberLaunchInput(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	f.clusterAgents(a.ID, b.ID)
+	spec := f.manualSpec(a.ID, RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 5000})
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID})
+	req.MemberMode = "manual"
+	head := f.mustPut(req)
+	generation := func(headID string) string {
+		t.Helper()
+		hs, ok := specByID(f.config(f.head.ID), headID)
+		if !ok || hs.Cluster == nil {
+			t.Fatalf("head %s withheld", headID)
+		}
+		return hs.Cluster.Generation
+	}
+	putSpec := func(r PutRPCMemberSpecRequest) {
+		t.Helper()
+		r.Binary, r.GPUs = clusterRPCBinary, []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 5000}}
+		if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := generation(head.ID)
+	putSpec(PutRPCMemberSpecRequest{Env: map[string]string{"GGML_SCHED_MAX_COPIES": "1"}})
+	afterEnv := generation(head.ID)
+	if afterEnv == before {
+		t.Fatal("generation unchanged by the manual member's env")
+	}
+	putSpec(PutRPCMemberSpecRequest{Env: map[string]string{"GGML_SCHED_MAX_COPIES": "1"}, CacheEnabled: true})
+	if generation(head.ID) == afterEnv {
+		t.Fatal("generation unchanged by the manual member's cache switch")
+	}
+
+	second, err := f.svc.CreateMapping(f.ctx, ownerToken(), f.app.ID, CreateMappingRequest{GatewayModelName: "big2", AppModelName: "big2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto := f.putFor(second.ID, clusterHeadRequest(autoMember(b.ID, 0)))
+	before = generation(auto.ID)
+	cached := clusterHeadRequest(autoMember(b.ID, 0))
+	cached.ClusterMembers[0].CacheEnabled = true
+	f.putFor(second.ID, cached)
+	if generation(auto.ID) == before {
+		t.Fatal("generation unchanged by the automatic member's cache switch")
+	}
+}
+
+// TestAgentRuntimeConfigPeerFeaturesFromPersistedVersion: after a gateway
+// restart a peer whose live declaration is not known yet counts as declaring
+// rpc_cluster when its last reported agent version has it, so the host that
+// reports first does not cut a running cluster.
+func TestAgentRuntimeConfigPeerFeaturesFromPersistedVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name, version, reason string
+	}{
+		{"current agent", "0.18.0", ""},
+		{"newer agent", "v0.19.2-rc1", ""},
+		{"older agent", "0.17.4", ClusterWithheldAgentTooOld},
+		{"no version reported", "", ClusterWithheldFeaturesPending},
+		{"unreadable version", "dev", ClusterWithheldFeaturesPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClusterFixture(t)
+			a := f.member("A")
+			f.clusterAgents(a.ID)
+			head := f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+			if tc.version != "" {
+				if err := f.routes.UpsertTelemetry(f.ctx, routing.ServerTelemetry{
+					ServerID: a.ID, ReportedAt: clusterTestNow, AgentVersion: tc.version, UpdatedAt: clusterTestNow,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			delete(f.svc.agentFeatures.(fakeAgentFeatures), a.ID)
+			_, pushed := specByID(f.config(f.head.ID), head.ID)
+			if got := f.withheldReason(); got != tc.reason || pushed != (tc.reason == "") {
+				t.Fatalf("reason = %q pushed = %v, want reason %q", got, pushed, tc.reason)
+			}
+			// The viewer's own unknown declaration still holds its document.
+			if !f.config(a.ID).AwaitsAgentFeatures {
+				t.Fatal("member document served while its own agent's features are unknown")
+			}
+		})
 	}
 }

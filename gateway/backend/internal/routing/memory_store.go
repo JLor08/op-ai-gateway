@@ -3699,6 +3699,11 @@ func (m *MemoryStore) deleteRPCServerStateLocked(serverID string) {
 func (m *MemoryStore) UpsertRPCMemberSpec(_ context.Context, s RPCMemberSpec) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.upsertRPCMemberSpecLocked(s)
+}
+
+// upsertRPCMemberSpecLocked is UpsertRPCMemberSpec; the caller holds m.mu.
+func (m *MemoryStore) upsertRPCMemberSpecLocked(s RPCMemberSpec) error {
 	if _, ok := m.servers[s.ServerID]; !ok {
 		return storeerr.ErrNotFound
 	}
@@ -3751,19 +3756,48 @@ func (m *MemoryStore) SetRPCMemberSpecGPUs(_ context.Context, specID string, gpu
 	if _, ok := m.rpcMemberSpecs[specID]; !ok {
 		return storeerr.ErrNotFound
 	}
+	if !uniqueRPCMemberSpecGPUs(gpus) {
+		return storeerr.ErrConflict
+	}
+	m.setRPCMemberSpecGPUsLocked(specID, gpus)
+	return nil
+}
+
+// uniqueRPCMemberSpecGPUs reports whether every GPU index occurs once.
+func uniqueRPCMemberSpecGPUs(gpus []RPCMemberSpecGPU) bool {
 	seen := make(map[int]struct{}, len(gpus))
 	for _, g := range gpus {
 		if _, dup := seen[g.GPUIndex]; dup {
-			return storeerr.ErrConflict
+			return false
 		}
 		seen[g.GPUIndex] = struct{}{}
 	}
+	return true
+}
+
+// setRPCMemberSpecGPUsLocked stores gpus as specID's GPU rows; the caller
+// holds m.mu and has checked them.
+func (m *MemoryStore) setRPCMemberSpecGPUsLocked(specID string, gpus []RPCMemberSpecGPU) {
 	stored := make([]RPCMemberSpecGPU, len(gpus))
 	for i, g := range gpus {
 		g.SpecID = specID
 		stored[i] = g
 	}
 	m.rpcMemberSpecGPUs[specID] = stored
+}
+
+// ReplaceRPCMemberSpec stores the spec and its GPU rows under one lock;
+// every check runs before either is written.
+func (m *MemoryStore) ReplaceRPCMemberSpec(_ context.Context, s RPCMemberSpec, gpus []RPCMemberSpecGPU) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !uniqueRPCMemberSpecGPUs(gpus) {
+		return storeerr.ErrConflict
+	}
+	if err := m.upsertRPCMemberSpecLocked(s); err != nil {
+		return err
+	}
+	m.setRPCMemberSpecGPUsLocked(s.ID, gpus)
 	return nil
 }
 
@@ -3808,6 +3842,53 @@ func (m *MemoryStore) clusterPortTakenLocked(headSpecID, serverID string, port i
 func (m *MemoryStore) SetClusterMembers(_ context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.setClusterMembersLocked(headSpecID, members, gpus)
+}
+
+// SetClusterMembersIf compares the stored rows with what the caller read and
+// replaces them under the same lock.
+func (m *MemoryStore) SetClusterMembersIf(_ context.Context, headSpecID string, expect []ClusterMember, expectGPUs []ClusterMemberGPU, members []ClusterMember, gpus []ClusterMemberGPU) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !clusterMembersAsRead(m.clusterMembers[headSpecID], m.clusterMemberGPUs[headSpecID], expect, expectGPUs) {
+		if _, ok := m.runtimeSpecs[headSpecID]; !ok {
+			return false, storeerr.ErrNotFound
+		}
+		return false, nil
+	}
+	if err := m.setClusterMembersLocked(headSpecID, members, gpus); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// clusterMembersAsRead reports whether the stored rows carry the measured
+// and run fields of the rows a caller read (see SetClusterMembersIf).
+func clusterMembersAsRead(stored []ClusterMember, storedGPUs []ClusterMemberGPU, expect []ClusterMember, expectGPUs []ClusterMemberGPU) bool {
+	if len(stored) != len(expect) || len(storedGPUs) != len(expectGPUs) {
+		return false
+	}
+	for _, e := range expect {
+		if !slices.ContainsFunc(stored, func(s ClusterMember) bool {
+			return s.ServerID == e.ServerID && s.RAMMeasuredMB == e.RAMMeasuredMB && s.Stale == e.Stale &&
+				s.RunPeakRAMMB == e.RunPeakRAMMB && s.RunHeadInstance == e.RunHeadInstance && s.RunStartedAt.Equal(e.RunStartedAt)
+		}) {
+			return false
+		}
+	}
+	for _, e := range expectGPUs {
+		if !slices.ContainsFunc(storedGPUs, func(s ClusterMemberGPU) bool {
+			return s.ServerID == e.ServerID && s.GPUIndex == e.GPUIndex && s.VRAMMeasuredMB == e.VRAMMeasuredMB &&
+				s.RunPeakVRAMMB == e.RunPeakVRAMMB
+		}) {
+			return false
+		}
+	}
+	return true
+}
+
+// setClusterMembersLocked is SetClusterMembers; the caller holds m.mu.
+func (m *MemoryStore) setClusterMembersLocked(headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error {
 	if _, ok := m.runtimeSpecs[headSpecID]; !ok {
 		return storeerr.ErrNotFound
 	}

@@ -206,3 +206,16 @@ func envValue(env map[string]string, key string) (string, bool) {
 	v, ok := env[key]
 	return v, ok
 }
+
+// configFilesHaveClusterPlaceholder reports whether a config file's content
+// carries ${RPC_SERVERS} or ${RPC_DEVICES}: the agent resolves them in files
+// as in args and env, and refuses them outside a cluster head. A head's own
+// rules (--rpc exactly once, the device list) read args and env only.
+func configFilesHaveClusterPlaceholder(files []ConfigFileDTO) bool {
+	for _, f := range files {
+		if strings.Contains(f.Content, placeholderRPCServers) || strings.Contains(f.Content, placeholderRPCDevices) {
+			return true
+		}
+	}
+	return false
+}

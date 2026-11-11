@@ -991,8 +991,10 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		// A benchmark writer (nil principal) only rewrites measurements and
 		// pinned settings of an existing spec: it cannot change the cluster
 		// flag, the network or the membership, so there is nothing for the
-		// policies to follow.
-		if principal != nil {
+		// policies to follow. Neither is there for a write that is no cluster
+		// head before or after and has no membership: the pass waits on
+		// NetBird, which a plain model save must never do.
+		if principal != nil && w.touchesCluster {
 			// The head's members may have changed: open the RPC ports the
 			// saved cluster needs before anything starts it.
 			s.reconcileRPCPolicies(ctx)
@@ -1032,12 +1034,15 @@ func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMap
 }
 
 // runtimeSpecWrite is what writeRuntimeSpecAs did: the stored document,
-// whether anything reached the store, and the member servers of a cluster
-// head (before and after the write) whose documents the write changed.
+// whether anything reached the store, the member servers of a cluster head
+// (before and after the write) whose documents the write changed, and
+// whether the write touched a cluster at all (the spec was or is a head, or
+// had or has members).
 type runtimeSpecWrite struct {
-	dto           RuntimeSpecDTO
-	stored        bool
-	memberServers []string
+	dto            RuntimeSpecDTO
+	stored         bool
+	memberServers  []string
+	touchesCluster bool
 }
 
 // writeRuntimeSpecAs is writeRuntimeSpec with the cluster configuration:
@@ -1083,17 +1088,45 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 		if err := s.checkListenPortFree(ctx, app.ServerID, req.ListenPort, prior); err != nil {
 			return runtimeSpecWrite{}, err
 		}
+		// The newest save code: appended after every refusal above, so a body
+		// that is also invalid for an older reason keeps that answer.
+		if plan.headVersionUnknown {
+			return runtimeSpecWrite{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
+				ErrClusterHeadBinaryVersionUnknown, fields.binary)
+		}
 	}
 	plan.applyTo(&spec)
-	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
-		return runtimeSpecWrite{}, err
+	w := runtimeSpecWrite{
+		memberServers:  plan.memberServers,
+		touchesCluster: plan.enabled || len(plan.memberServers) > 0 || (prior.ok && prior.spec.ClusterEnabled),
 	}
-	w := runtimeSpecWrite{stored: true, memberServers: plan.memberServers}
+	// The membership write is the step that can still be refused by state
+	// the checks could not hold (a member spec or port another gateway
+	// process took, a member server deleted since). It goes first wherever
+	// the head row exists already, so such a refusal stores nothing, rather
+	// than a head whose cluster columns no longer match its membership.
+	if plan.writeMembers && prior.ok {
+		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
+			return w, err
+		}
+		w.stored = true
+	}
+	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
+		return w, err
+	}
+	w.stored = true
 	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
 		return w, err
 	}
-	if plan.writeMembers {
+	// A new head's membership needs its row; a refused membership takes the
+	// new row away again, so the refusal stores nothing here either.
+	if plan.writeMembers && !prior.ok {
 		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
+			if delErr := s.routes.DeleteRuntimeSpec(ctx, spec.ID); delErr == nil {
+				w.stored = false
+			} else {
+				slog.Warn("runtime spec: could not remove a new cluster head whose membership was refused", "spec_id", spec.ID, "err", delErr)
+			}
 			return w, err
 		}
 	}
@@ -1680,7 +1713,9 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 			s.notifyRuntimeChanged(m.ServerID)
 		}
 	}
-	s.reconcileRPCPolicies(ctx)
+	if spec.ClusterEnabled || len(members) > 0 {
+		s.reconcileRPCPolicies(ctx)
+	}
 	return nil
 }
 
@@ -3063,9 +3098,12 @@ type AgentRuntimeConfigDTO struct {
 	// serving it without the cluster would make the agent stop a running
 	// head or member after a gateway restart, until its declaration arrived.
 	// An unknown declaration of ANOTHER server of the cluster does not hold
-	// the document; it only withholds that cluster's head or member from it
+	// the document. That server counts by the agent version it last
+	// reported, and only when that does not tell either is the cluster's
+	// head or member withheld from the document
 	// (ClusterWithheldFeaturesPending), so a member host that stays away
-	// cannot freeze every other model on the head's server.
+	// cannot freeze every other model on the head's server, and the host
+	// that reports first after a gateway restart keeps its cluster.
 	//
 	// The specs of a held document are derived as stored, as for an agent that
 	// runs instances (Service.specAsPushed). The flag itself is never on the

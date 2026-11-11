@@ -918,7 +918,9 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// The server's clusters, read before a retype away from server_agent
 	// hides its own heads from clusterServersOfServer: a server_agent
 	// application decides whether the server's member processes and heads can
-	// be pushed, so a retype either way notifies every server of them.
+	// be pushed, so a retype either way notifies every server of them. A
+	// retype TO server_agent is read after the write instead, once the
+	// application's heads are visible; one read covers every case.
 	var clusterServers []string
 	if previousType == routing.ProviderServerAgent {
 		clusterServers = s.clusterServersOfServer(ctx, server.ID)
@@ -1363,13 +1365,16 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// see notifyRuntimeChangedForApplication for why over-notifying is the
 	// deliberate choice here.
 	s.notifyRuntimeChangedForApplication(server.ID, previousType, app.Type)
-	if previousType == routing.ProviderServerAgent || app.Type == routing.ProviderServerAgent {
-		for _, id := range s.clusterServersOfServer(ctx, server.ID) {
-			clusterServers = appendUnique(clusterServers, id)
-		}
-		for _, id := range clusterServers {
-			s.notifyRuntimeChanged(id)
-		}
+	if previousType != routing.ProviderServerAgent && app.Type == routing.ProviderServerAgent {
+		clusterServers = s.clusterServersOfServer(ctx, server.ID)
+	}
+	for _, id := range clusterServers {
+		s.notifyRuntimeChanged(id)
+	}
+	// Only a server that takes part in a cluster has RPC grants for this
+	// write to move; the pass waits on NetBird, which no other application
+	// edit should.
+	if len(clusterServers) > 0 {
 		s.reconcileRPCPolicies(ctx)
 	}
 	// Best-effort: a port/status change may alter the server's active port set, so
@@ -1398,7 +1403,9 @@ func (s *Service) DeleteApplication(ctx context.Context, principal auth.Token, a
 				s.notifyRuntimeChanged(id)
 			}
 		}
-		s.reconcileRPCPolicies(ctx)
+		if len(clusterServers) > 0 {
+			s.reconcileRPCPolicies(ctx)
+		}
 	}
 	// Best-effort: deleting the server_agent application empties the server's
 	// runtime-config document (AgentRuntimeConfig's "no server_agent

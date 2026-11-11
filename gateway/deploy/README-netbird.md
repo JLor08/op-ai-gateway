@@ -137,7 +137,7 @@ mesh (allow `op-gw-portal` → the AI-server groups on the app ports).
 ### 6.1 llama.cpp RPC clusters on the mesh
 
 A cluster head reaches each RPC member on a port the gateway allocates on the member server
-(47000–47999; the portal shows it per member). With `netbird_manage_policies` **on**, the gateway
+(26000–26999, below every default ephemeral range; the portal shows it per member). With `netbird_manage_policies` **on**, the gateway
 maintains one policy per member server, `op-gw-rpc-<member server id>`: the head server's tracking
 group → the member server's tracking group, TCP, on that member's port only. Do not edit it; a manual
 edit is restored on the next reconcile.

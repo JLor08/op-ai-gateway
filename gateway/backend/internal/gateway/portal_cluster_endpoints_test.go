@@ -57,6 +57,7 @@ func TestPortalClusterErrorRows(t *testing.T) {
 		{portal.ErrClusterTensorSplitRequired, http.StatusBadRequest, "runtime_spec.cluster_tensor_split_required"},
 		{portal.ErrClusterPortExhausted, http.StatusConflict, "runtime_spec.cluster_port_exhausted"},
 		{portal.ErrRuntimeSpecPortConflictsRPCMember, http.StatusConflict, "runtime_spec.port_conflicts_rpc_member"},
+		{portal.ErrClusterHeadBinaryVersionUnknown, http.StatusBadRequest, "runtime_spec.cluster_head_binary_version_unknown"},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()

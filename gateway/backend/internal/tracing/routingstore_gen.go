@@ -1024,6 +1024,18 @@ func (_d *RoutingStoreWithTracing) ReplaceAgentServerBinaries(ctx context.Contex
 	return _d.Store.ReplaceAgentServerBinaries(ctx, serverID, rows)
 }
 
+func (_d *RoutingStoreWithTracing) ReplaceRPCMemberSpec(ctx context.Context, s1 _sourceRouting.RPCMemberSpec, gpus []_sourceRouting.RPCMemberSpecGPU) (err error) {
+	ctx, span := Start(ctx, "routing.Store.ReplaceRPCMemberSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ReplaceRPCMemberSpec(ctx, s1, gpus)
+}
+
 func (_d *RoutingStoreWithTracing) ResourceGroupAdminGroups(ctx context.Context, rgID string) (sa1 []string, err error) {
 	ctx, span := Start(ctx, "routing.Store.ResourceGroupAdminGroups")
 	defer span.End()
@@ -1394,6 +1406,18 @@ func (_d *RoutingStoreWithTracing) SetClusterMembers(ctx context.Context, headSp
 		}
 	}()
 	return _d.Store.SetClusterMembers(ctx, headSpecID, members, gpus)
+}
+
+func (_d *RoutingStoreWithTracing) SetClusterMembersIf(ctx context.Context, headSpecID string, expect []_sourceRouting.ClusterMember, expectGPUs []_sourceRouting.ClusterMemberGPU, members []_sourceRouting.ClusterMember, gpus []_sourceRouting.ClusterMemberGPU) (applied bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.SetClusterMembersIf")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetClusterMembersIf(ctx, headSpecID, expect, expectGPUs, members, gpus)
 }
 
 func (_d *RoutingStoreWithTracing) SetCoResidencyMode(ctx context.Context, appID string, mode _sourceRouting.CoResidencyMode) (err error) {
