@@ -35,7 +35,12 @@ const mmdevFlags = ['--mmproj-device', '-mmdev'];
 // (2bc46baa9207d098d03741ac394e7faaf1a955b6), copied from the gateway's
 // llamaServerValueFlags; --control-vector-layer-range takes two. The scan steps
 // over an option's value, so "--alias -dev" is one option with its value, not a
-// device flag. Regenerate both tables together when the pinned build moves.
+// device flag.
+//
+// This is a second copy of gateway/backend/internal/portal/llama_flags.go.
+// When the pinned llama.cpp build moves, regenerate that table from the new
+// build's common/arg.cpp and then copy it here; a copy left behind makes the
+// portal's pre-check read args differently from the gateway's save check.
 const oneValueFlags = new Set(
   `
   --adaptive-decay --adaptive-target --alias --api-key --api-key-file --api-prefix --batch-size
