@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 
-FROM node:24-slim AS build
+FROM node:26-slim AS build
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci

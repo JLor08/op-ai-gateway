@@ -14,7 +14,7 @@ demand). Everything below is runnable headlessly by a coding agent.
 | Tool | Version | Used for |
 |---|---|---|
 | Go | 1.27+ | `gateway/backend` (`op-ai-gateway`, declares go 1.25.0) and `server-agent` (`op-ai-server-agent`, declares go 1.26) |
-| Node.js / npm | Node 22 | `gateway/frontend` (React/TS/Vite) and `gateway/e2e` (Playwright) |
+| Node.js / npm | Node 26 (LTS) | `gateway/frontend` (React/TS/Vite) and `gateway/e2e` (Playwright) |
 | golangci-lint | v2 (pinned in CI, currently v2.15.0) | Go formatting (`fmt`, gofumpt-based) + linting, both modules; CI pins Go 1.27 |
 | Docker | any recent | Deploy images, the Postgres test env, the local SonarQube server |
 
