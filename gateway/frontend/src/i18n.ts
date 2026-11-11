@@ -15,7 +15,10 @@ type PortalMessageValue =
   | ((a: number, b: string) => string)
   | ((a: AudioConcurrencyLimit | '') => string)
   | ((a: number, b: AudioConcurrencyLimit | '') => string)
-  | ((a: number, b: number, c: number | null) => string);
+  | ((a: number, b: number, c: number | null) => string)
+  | ((a: string, b: string, c: string) => string)
+  | ((a: string, b: number, c: number) => string)
+  | ((a: string, b: number, c: number, d: number) => string);
 
 // A measured startup in ms as the launch-spec form names it (#340), shared by
 // runtimeSpecMeasuredStartup and the start of runtimeSpecAutoIdleTimeout. 0 is
@@ -1900,6 +1903,8 @@ const de = {
   benchmarkResultSkippedNotSpeech: 'übersprungen – kein Sprachsynthese-Modell, nichts gesendet',
   benchmarkResultSkippedSpeechClone:
     'übersprungen – ein Stimmklon-Modell braucht eine Referenzstimme, nichts gesendet',
+  benchmarkResultSkippedClusterHead:
+    'übersprungen – ein RPC-Cluster-Head startet nur mit seinen Mitgliedern, nichts gesendet',
   benchmarkResultLoadTimeNotMeasured: 'Ladezeit nicht gemessen',
   benchmarkNotMeasured: 'Nicht gemessen',
   // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
@@ -2374,6 +2379,12 @@ const de = {
   rpcStatusRam: 'RAM (effektiv)',
   rpcStatusBindMismatch: 'Bind-Abweichung',
   rpcStatusBreaches: 'Verstöße',
+  agentClockOffset: (offset: string) => `Uhrabweichung des Agents: ${offset}`,
+  agentClockOffsetUnknown: 'unbekannt',
+  agentClockOffsetHelp:
+    'Diagnosewert: Zeitstempel der letzten Telemetrie des Agents minus Empfangszeit am Gateway, inklusive Übertragungszeit; positiv heißt, die Uhr des Agents geht vor. Die Energiezuordnung liest die Messwerte jedes Hosts nach seinen eigenen Zeitstempeln, eine große Abweichung verschiebt also das Fenster, über das sein Anteil gerechnet wird. Unbekannt, bis der Agent nach einem Gateway-Start gemeldet hat.',
+  agentClockOffsetWarn:
+    'Mehr als 2 s: die Uhr dieses Hosts synchronisieren (NTP), sonst kann sein Energieanteil auf die Schätzung zurückfallen.',
   serverNetbirdIpLabel: 'NetBird-IP (Mesh)',
   serverLanAddressLabel: 'LAN-Adresse',
   serverLanAddressHelp: 'Optionale IPv4-Adresse dieses Servers im LAN; Grundlage für LAN-Cluster.',
@@ -2459,6 +2470,24 @@ const de = {
   clusterStatusHead: 'Head',
   clusterCooldownUntil: (time: string) => `Neuer Start frühestens ab ${time}`,
   clusterLastFailure: (code: string, where: string) => `Letzter Fehler (${where}): ${code}`,
+  clusterBreachesTitle: 'Richtlinienverstöße der Mitglieder',
+  clusterBreachPeer: (member: string, peer: string, at: string) =>
+    `${member}: ein nicht erlaubter Peer hat sich verbunden (${peer}${at ? `, ${at}` : ''})`,
+  clusterBreachForeignHold: (member: string, at: string) =>
+    `${member}: wird von einem anderen Head gehalten${at ? ` (seit ${at})` : ''}`,
+  clusterBreachHidden: (member: string) => `${member}: ein Verstoß wurde gemeldet`,
+  clusterBreachOther: (member: string, kind: string) => `${member}: Verstoß (${kind})`,
+  clusterBreachesCount: (n: number) => `Verstöße: ${n}`,
+  clusterPeaksTitle: 'Gespeicherte Spitzenwerte über dem Budget',
+  clusterPeaksHint:
+    'Der nächste Start dieser Mitglieder wird abgelehnt, bis das Budget erhöht, die Aufteilung geändert oder die gespeicherte Nutzung zurückgesetzt wird.',
+  clusterPeakVram: (member: string, gpu: number, storedMb: number, ceilingMb: number) =>
+    `${member}, GPU ${gpu}: ${storedMb} MB VRAM gespeichert, Budget ${ceilingMb} MB`,
+  clusterPeakRam: (member: string, storedMb: number, ceilingMb: number) =>
+    `${member}: ${storedMb} MB RAM gespeichert, Speicher des Hosts ${ceilingMb} MB`,
+  clusterPeakHidden: (member: string) =>
+    `${member}: ein gespeicherter Spitzenwert liegt über dem Budget`,
+  clusterPeaksCount: (n: number) => `Über Budget: ${n}`,
   runtimeStopClusterTitle: (name: string) => `${name} stoppen?`,
   runtimeStopClusterBody: 'Der Head wird gestoppt. Die Mitglieder laufen sonst noch kurz weiter.',
   runtimeStopMembersToo: 'Mitglieder ebenfalls stoppen',
@@ -2471,7 +2500,12 @@ const de = {
   clusterBreakdownHiddenCount: (n: number) =>
     `${n} nicht sichtbare(s) Mitglied(er) nur in der Summe`,
   errorClusterHeadUnsupported:
-    'Dieser Head kann nicht als Cluster laufen (Agent oder Binary unterstützt das nicht).',
+    'Dieses Modell ist ein llama.cpp-RPC-Cluster-Head: Laden und Benchmarks unterstützen das noch nicht. Es startet mit seinen Mitgliedern, sobald eine Anfrage es braucht.',
+  errorClusterMemberLost:
+    'Der Cluster hat ein Mitglied verloren und wurde gestoppt; nach der Pause startet er wieder.',
+  errorClusterMemberNotFound: 'Dieser Server ist kein Mitglied dieses Cluster-Heads.',
+  errorBenchmarkVramClusterMemberHeld:
+    'Ein llama.cpp-RPC-Cluster nutzt ein Mitglied auf diesem Server. Den Cluster stoppen (zuerst den Head) und die Messung erneut starten.',
   errorRuntimeDeviceBackendMismatch:
     'Das gewählte Geräte-Backend passt nicht zu den GPUs dieses Servers.',
   errorRuntimeRpcDeviceCountMismatch:
@@ -2584,6 +2618,11 @@ const de = {
   clusterWarnings: 'Hinweise zum Cluster',
   clusterTotals: 'Cluster gesamt',
   clusterTotalsLowerBound: 'mindestens, nicht alle Teile sind bekannt',
+  clusterMemberResetUsage: 'Gespeicherte Nutzung zurücksetzen',
+  clusterMemberResetUsageTitle: (name: string) => `Gespeicherte Nutzung von ${name} zurücksetzen?`,
+  clusterMemberResetUsageBody:
+    'Die gemessenen VRAM- und RAM-Werte dieses Mitglieds werden verworfen; bis zur nächsten Messung gelten seine Schätzungen. Ein gespeicherter Spitzenwert über dem Budget sperrt seinen nächsten Start dann nicht mehr.',
+  clusterMemberResetUsageConfirm: 'Zurücksetzen',
   clusterColdStart: (seconds: number) =>
     `Ein kalter Start startet erst alle Mitglieder, dann den Head; er kann so lange dauern wie das Start-Timeout des Heads (${seconds} s) plus das des langsamsten Mitglieds. Das Start-Timeout des Heads muss gesetzt sein.`,
   clusterDeviceOrderHint:
@@ -3399,6 +3438,8 @@ const de = {
     'Keine Grundlage: diese Anfrage wird nicht in Token abgerechnet, und der Server hat weder Telemetrie noch eine konfigurierte Wattzahl. Setze estimated_watts für diesen Server, um sie zu bepreisen.',
   energySourceHelpPending:
     'Noch nicht bepreist: der Energie-Reconciler hat diese Zeile noch nicht verarbeitet.',
+  energySourceHelpMemberUnpriced:
+    'Unvollständig: der Energieanteil eines Cluster-Mitglieds ließ sich nicht bepreisen (weder Telemetrie noch eine konfigurierte Wattzahl); die Summe ist ein Mindestwert.',
   billingUnitHelpImage: 'Diese Anfrage wird pro Bild abgerechnet, nicht in Token.',
   billingUnitHelpAudioSecond: 'Diese Anfrage wird pro Audiosekunde abgerechnet, nicht in Token.',
   activityCostUnit: 'Kosten-Einheit',
@@ -5741,6 +5782,8 @@ const en: PortalMessages = {
   benchmarkResultSkippedNotSpeech: 'skipped — not a speech synthesis model, nothing sent',
   benchmarkResultSkippedSpeechClone:
     'skipped — a voice-clone model needs a reference voice, nothing sent',
+  benchmarkResultSkippedClusterHead:
+    'skipped — an RPC cluster head starts only with its members, nothing sent',
   benchmarkResultLoadTimeNotMeasured: 'load time not measured',
   benchmarkNotMeasured: 'Not measured',
   // See the German block for the two rules these texts carry: 0 always means
@@ -6162,6 +6205,12 @@ const en: PortalMessages = {
   rpcStatusRam: 'RAM (effective)',
   rpcStatusBindMismatch: 'Bind mismatch',
   rpcStatusBreaches: 'Breaches',
+  agentClockOffset: (offset: string) => `Agent clock offset: ${offset}`,
+  agentClockOffsetUnknown: 'unknown',
+  agentClockOffsetHelp:
+    "A diagnostic: the time stamp on the agent's latest telemetry minus the gateway's receive time, transit included; positive means the agent's clock runs ahead. Energy attribution reads each host's samples by its own time stamps, so a large offset shifts the window its share is computed over. Unknown until the agent reports after a gateway start.",
+  agentClockOffsetWarn:
+    "Above 2 s: synchronize this host's clock (NTP), or its energy share can fall back to the estimate.",
   serverNetbirdIpLabel: 'NetBird IP (mesh)',
   serverLanAddressLabel: 'LAN address',
   serverLanAddressHelp:
@@ -6248,6 +6297,23 @@ const en: PortalMessages = {
   clusterStatusHead: 'Head',
   clusterCooldownUntil: (time: string) => `Next start possible from ${time}`,
   clusterLastFailure: (code: string, where: string) => `Last failure (${where}): ${code}`,
+  clusterBreachesTitle: 'Member policy breaches',
+  clusterBreachPeer: (member: string, peer: string, at: string) =>
+    `${member}: a peer it does not allow connected (${peer}${at ? `, ${at}` : ''})`,
+  clusterBreachForeignHold: (member: string, at: string) =>
+    `${member}: held by another head${at ? ` (since ${at})` : ''}`,
+  clusterBreachHidden: (member: string) => `${member}: a breach was reported`,
+  clusterBreachOther: (member: string, kind: string) => `${member}: breach (${kind})`,
+  clusterBreachesCount: (n: number) => `Breaches: ${n}`,
+  clusterPeaksTitle: 'Stored peaks above budget',
+  clusterPeaksHint:
+    "These members' next start is refused until the budget is raised, the split changed or the stored usage reset.",
+  clusterPeakVram: (member: string, gpu: number, storedMb: number, ceilingMb: number) =>
+    `${member}, GPU ${gpu}: ${storedMb} MB VRAM stored, budget ${ceilingMb} MB`,
+  clusterPeakRam: (member: string, storedMb: number, ceilingMb: number) =>
+    `${member}: ${storedMb} MB RAM stored, host memory ${ceilingMb} MB`,
+  clusterPeakHidden: (member: string) => `${member}: a stored peak is above its budget`,
+  clusterPeaksCount: (n: number) => `Above budget: ${n}`,
   runtimeStopClusterTitle: (name: string) => `Stop ${name}?`,
   runtimeStopClusterBody:
     'The head is stopped. The members otherwise keep running for a short while.',
@@ -6261,7 +6327,12 @@ const en: PortalMessages = {
   clusterBreakdownHiddenCount: (n: number) =>
     `${n} member(s) you cannot see are in the totals only`,
   errorClusterHeadUnsupported:
-    'This head cannot run as a cluster (the agent or binary does not support it).',
+    'This model is a llama.cpp RPC cluster head, which loads and benchmarks do not support yet. It starts with its members when a request needs it.',
+  errorClusterMemberLost:
+    'The cluster lost a member and was stopped; it starts again after the cooldown.',
+  errorClusterMemberNotFound: 'This server is no member of this cluster head.',
+  errorBenchmarkVramClusterMemberHeld:
+    'A llama.cpp RPC cluster uses a member on this server. Stop that cluster (head first) and run the measurement again.',
   errorRuntimeDeviceBackendMismatch: "The chosen device backend does not match this server's GPUs.",
   errorRuntimeRpcDeviceCountMismatch:
     'The RPC server reports a different number of devices than configured.',
@@ -6370,6 +6441,11 @@ const en: PortalMessages = {
   clusterWarnings: 'Cluster notes',
   clusterTotals: 'Cluster total',
   clusterTotalsLowerBound: 'at least, not every part is known',
+  clusterMemberResetUsage: 'Reset stored usage',
+  clusterMemberResetUsageTitle: (name: string) => `Reset the stored usage of ${name}?`,
+  clusterMemberResetUsageBody:
+    "This member's measured VRAM and RAM are discarded; its estimates apply until the next measurement. A stored peak above its budget then no longer refuses its next start.",
+  clusterMemberResetUsageConfirm: 'Reset',
   clusterColdStart: (seconds: number) =>
     `A cold start starts every member first, then the head; it can take as long as the head's startup timeout (${seconds} s) plus the slowest member's. The head's startup timeout must be set.`,
   clusterDeviceOrderHint:
@@ -7145,6 +7221,8 @@ const en: PortalMessages = {
   energySourceHelpUnpriceable:
     'No basis: this request is not token-metered, and the server has neither telemetry nor a configured wattage. Set estimated_watts on this server to price it.',
   energySourceHelpPending: 'Not yet priced: the energy reconciler has not processed this row.',
+  energySourceHelpMemberUnpriced:
+    "Incomplete: a cluster member's energy share could not be priced (neither telemetry nor a configured wattage); the total is a lower bound.",
   billingUnitHelpImage: 'This request is billed per image, not in tokens.',
   billingUnitHelpAudioSecond: 'This request is billed per second of audio, not in tokens.',
   activityCostUnit: 'Cost unit',

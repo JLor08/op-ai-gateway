@@ -417,3 +417,52 @@ describe('RpcMemberSection settings state', () => {
     expect(api.updateRPCMemberSpec.mock.calls[0][2].gpus[0].vram_measured_mb).toBe(0);
   });
 });
+
+describe('RpcMemberSection agent clock offset', () => {
+  const withOffset = (clock_offset_ms: number | null | undefined) =>
+    ({ ...server, clock_offset_ms }) as unknown as PortalServer;
+
+  it.each([
+    [120, '+120 ms'],
+    [-80, '-80 ms'],
+    [0, '0 ms'],
+    [-2500, '-2500 ms'],
+  ])('shows an offset of %d ms signed as %s', async (ms, text) => {
+    setup({ server: withOffset(ms) });
+    expect(await screen.findByTestId('agent-clock-offset')).toHaveTextContent(
+      t.agentClockOffset(text),
+    );
+  });
+
+  it('flags an offset above 2 s in either direction and leaves a small one plain', async () => {
+    setup({ server: withOffset(2500) });
+    expect(await screen.findByTestId('agent-clock-offset')).toHaveAttribute('data-warning', 'true');
+    cleanup();
+    setup({ server: withOffset(-2001) });
+    expect(await screen.findByTestId('agent-clock-offset')).toHaveAttribute('data-warning', 'true');
+    cleanup();
+    setup({ server: withOffset(2000) });
+    expect(await screen.findByTestId('agent-clock-offset')).toHaveAttribute(
+      'data-warning',
+      'false',
+    );
+  });
+
+  it('says the offset is unknown until the agent reported after a gateway start', async () => {
+    setup({ server: withOffset(null) });
+    expect(await screen.findByTestId('agent-clock-offset')).toHaveTextContent(
+      t.agentClockOffset(t.agentClockOffsetUnknown),
+    );
+    cleanup();
+    setup({ server: withOffset(undefined) });
+    expect(await screen.findByTestId('agent-clock-offset')).toHaveTextContent(
+      t.agentClockOffset(t.agentClockOffsetUnknown),
+    );
+  });
+
+  it('explains in a tooltip that the offset is a diagnostic', async () => {
+    setup({ server: withOffset(120) });
+    fireEvent.mouseOver(await screen.findByTestId('agent-clock-offset'));
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.agentClockOffsetHelp);
+  });
+});

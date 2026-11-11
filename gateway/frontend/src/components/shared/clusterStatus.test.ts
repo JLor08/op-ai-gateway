@@ -128,4 +128,79 @@ describe('clusterStatusView', () => {
     expect(v.cooldownUntil).toBeUndefined();
     expect(v.failure).toBeUndefined();
   });
+
+  it('joins breaches to visible names and keeps a hidden one at its position', () => {
+    const v = clusterStatusView(
+      head(
+        {
+          state: 'formed',
+          phase: 'formed',
+          members: [],
+          breaches: [
+            { position: 0, kind: 'peer', peer: '10.0.0.9:4711', at: '2026-01-01T09:00:00Z' },
+            { position: 0, kind: 'foreign_hold', at: '2026-01-01T09:01:00Z' },
+            { position: 1 },
+          ],
+        },
+        two,
+      ),
+    )!;
+    expect(v.breaches).toEqual([
+      {
+        position: 0,
+        name: 'gpu-a',
+        kind: 'peer',
+        peer: '10.0.0.9:4711',
+        at: '2026-01-01T09:00:00Z',
+      },
+      { position: 0, name: 'gpu-a', kind: 'foreign_hold', at: '2026-01-01T09:01:00Z' },
+      { position: 1, name: undefined },
+    ]);
+  });
+
+  it('joins stored peaks above budget to visible names', () => {
+    const v = clusterStatusView(
+      head(
+        {
+          state: 'cold',
+          members: [],
+          peaks_above_budget: [
+            { position: 0, resource: 'vram', gpu_index: 1, stored_mb: 9000, ceiling_mb: 8000 },
+            { position: 0, resource: 'ram', stored_mb: 70000, ceiling_mb: 65536 },
+            { position: 1 },
+          ],
+        },
+        two,
+      ),
+    )!;
+    expect(v.peaks).toEqual([
+      {
+        position: 0,
+        name: 'gpu-a',
+        resource: 'vram',
+        gpuIndex: 1,
+        storedMb: 9000,
+        ceilingMb: 8000,
+      },
+      { position: 0, name: 'gpu-a', resource: 'ram', storedMb: 70000, ceilingMb: 65536 },
+      { position: 1, name: undefined },
+    ]);
+  });
+
+  it('a cold head with a breach or a stored peak is not idle', () => {
+    const breach = clusterStatusView(
+      head({ state: 'cold', members: [], breaches: [{ position: 1 }] }, two),
+    )!;
+    expect(breach.idle).toBe(false);
+    const peak = clusterStatusView(
+      head({ state: 'cold', members: [], peaks_above_budget: [{ position: 1 }] }, two),
+    )!;
+    expect(peak.idle).toBe(false);
+  });
+
+  it('has no breaches or peaks for a gateway that reports none', () => {
+    const v = clusterStatusView(head({ state: 'cold', members: [] }, two))!;
+    expect(v.breaches).toEqual([]);
+    expect(v.peaks).toEqual([]);
+  });
 });

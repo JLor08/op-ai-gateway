@@ -13,6 +13,7 @@ import {
   type ClusterHeadState,
 } from './ClusterHeadEditor';
 import { messages } from '../i18n';
+import { PortalApiError } from '../api';
 import type {
   ClusterCandidate,
   ClusterMember,
@@ -113,6 +114,7 @@ function setup(
     headHasGpus?: boolean;
     headBinaryVersion?: string;
     server?: PortalServer;
+    resetMemberUsage?: (serverId: string) => Promise<RuntimeSpec>;
   } = {},
 ) {
   const api = {
@@ -142,6 +144,7 @@ function setup(
         headHasGpus={opts.headHasGpus ?? false}
         startupTimeoutSeconds={600}
         headBinaryVersion={opts.headBinaryVersion}
+        resetMemberUsage={opts.resetMemberUsage}
       />
     );
   }
@@ -508,6 +511,151 @@ describe('ClusterHeadEditor hidden members', () => {
     const body = clusterBodyFields(latest.value);
     expect(body.cluster_members?.[1]).toEqual(hidden);
     expect(body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a', '', 'srv_b']);
+  });
+});
+
+describe('ClusterHeadEditor cluster totals', () => {
+  it('marks only the incomplete axis as a lower bound', () => {
+    setup({
+      stored: {
+        cluster_enabled: true,
+        cluster_vram_total_mb: 30000,
+        cluster_ram_total_mb: 20000,
+        cluster_totals_complete: false,
+        cluster_vram_total_complete: true,
+        cluster_ram_total_complete: false,
+        cluster_members: [],
+      },
+    });
+    expect(screen.getByTestId('cluster-totals')).toHaveTextContent(
+      `${t.clusterTotals}: VRAM 30000 MB, RAM ≥ 20000 MB (${t.clusterTotalsLowerBound})`,
+    );
+  });
+
+  it('shows complete totals without a lower-bound note', () => {
+    setup({
+      stored: {
+        cluster_enabled: true,
+        cluster_vram_total_mb: 30000,
+        cluster_ram_total_mb: 20000,
+        cluster_totals_complete: true,
+        cluster_vram_total_complete: true,
+        cluster_ram_total_complete: true,
+        cluster_members: [],
+      },
+    });
+    expect(screen.getByTestId('cluster-totals').textContent).toBe(
+      `${t.clusterTotals}: VRAM 30000 MB, RAM 20000 MB`,
+    );
+  });
+});
+
+describe('ClusterHeadEditor member usage reset', () => {
+  const measured = member({
+    server_name: 'Alpha',
+    ram_estimate_mb: 1000,
+    ram_measured_mb: 70000,
+    measured_at: '2026-01-01T09:00:00Z',
+    gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+  });
+  const unmeasured = member({ position: 1, server_id: 'srv_b', server_name: 'Beta' });
+  const storedHead = {
+    cluster_enabled: true,
+    cluster_members: [measured, unmeasured],
+  } as Partial<RuntimeSpec>;
+
+  it('offers the reset only on a stored member with stored usage', () => {
+    setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: vi.fn(),
+    });
+    expect(
+      screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: `${t.clusterMemberResetUsage}: Beta` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('offers no reset without the action (a spec not saved yet)', () => {
+    setup({ initial: clusterStateFromSpec(storedHead as RuntimeSpec), stored: storedHead });
+    expect(
+      screen.queryByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('resets after a confirmation and shows the answer, keeping unsaved edits', async () => {
+    const answer = {
+      ...storedHead,
+      cluster_members: [
+        {
+          ...measured,
+          ram_measured_mb: 0,
+          measured_at: undefined,
+          gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+        },
+        unmeasured,
+      ],
+    } as RuntimeSpec;
+    const reset = vi.fn(async () => answer);
+    const { latest } = setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: reset,
+    });
+    // An unsaved edit made before the reset must survive it.
+    fireEvent.change(screen.getByLabelText(`Alpha: ${t.clusterMemberThreads}`), {
+      target: { value: '12' },
+    });
+    expect(screen.getByText(`${t.clusterMemberMeasured} 70000 MB`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` }));
+    expect(screen.getByText(t.clusterMemberResetUsageBody)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('srv_a'));
+    await waitFor(() =>
+      expect(screen.queryByText(`${t.clusterMemberMeasured} 70000 MB`)).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText(`${t.clusterMemberMeasured} 9000 MB`)).not.toBeInTheDocument();
+    const alpha = latest.value.members.find((m) => m.server_id === 'srv_a')!;
+    expect(alpha.threads).toBe(12);
+    expect(alpha.ram_measured_mb).toBe(0);
+    expect(alpha.gpus[0]).toEqual({ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 });
+  });
+
+  it('does nothing when the confirmation is cancelled', async () => {
+    const reset = vi.fn();
+    setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: reset,
+    });
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` }));
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(reset).not.toHaveBeenCalled();
+  });
+
+  it('shows a refused reset by its label', async () => {
+    const reset = vi.fn(async () => {
+      throw new PortalApiError(
+        404,
+        'runtime_spec.cluster_member_not_found',
+        'the server is no member of this cluster head',
+      );
+    });
+    setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: reset,
+    });
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+    expect(await screen.findByTestId('cluster-reset-error')).toHaveTextContent(
+      t.errorClusterMemberNotFound,
+    );
   });
 });
 

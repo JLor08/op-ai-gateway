@@ -174,6 +174,7 @@ export function ApplicationSection({
     | 'updateServerBinary'
     | 'deleteServerBinary'
     | 'clusterCandidates'
+    | 'resetClusterMemberUsage'
     | 'runtimeSpec'
     | 'putRuntimeSpec'
     | 'deleteRuntimeSpec'

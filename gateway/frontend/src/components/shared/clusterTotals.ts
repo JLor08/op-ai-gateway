@@ -5,8 +5,8 @@ import type { ClusterMember, RuntimeSpec } from '../../api';
 
 // Pure formatting logic for the cluster totals the runtime table shows on a
 // cluster head. The gateway derives the totals (cluster_vram_total_mb and
-// friends) on every read; this module only decides how they are marked and
-// which members the breakdown may name.
+// friends, with a completeness flag per axis) on every read; this module only
+// decides how they are marked and which members the breakdown may name.
 
 /** One visible member's share of the totals. */
 export interface ClusterMemberShare {
@@ -19,17 +19,24 @@ export interface ClusterMemberShare {
   stale: boolean;
 }
 
-export interface ClusterTotalsView {
-  vramMb: number;
-  ramMb: number;
-  /** False when a part was unknown, so the totals are lower bounds. */
+export type ClusterAxis = 'vram' | 'ram';
+
+/** One axis of the totals (VRAM or RAM). */
+export interface ClusterAxisTotal {
+  mb: number;
+  /** False when a part of this total was unknown, so it is a lower bound. */
   complete: boolean;
+  /** Visible members with an unknown part on this axis (named only while incomplete). */
+  incompleteNames: string[];
+  /** This total is incomplete and a hidden member may be the reason. */
+  hiddenIncomplete: boolean;
+}
+
+export interface ClusterTotalsView {
+  vram: ClusterAxisTotal;
+  ram: ClusterAxisTotal;
   /** Visible members only, in --rpc order. */
   members: ClusterMemberShare[];
-  /** Visible members with an unknown part (named only while incomplete). */
-  incompleteNames: string[];
-  /** The totals are incomplete and a hidden member may be the reason. */
-  hiddenIncomplete: boolean;
   /** Members the caller may not see: counted in the totals, never named. */
   hiddenCount: number;
 }
@@ -46,13 +53,14 @@ export function clusterWithheldReason(
 }
 
 // The larger of measurement and estimate, the rule admission charges by; 0 is
-// unknown.
-function memberShare(m: ClusterMember): { share: ClusterMemberShare; unknown: boolean } {
+// unknown. A CPU member has no VRAM part, so it is never unknown on VRAM.
+function memberShare(m: ClusterMember): {
+  share: ClusterMemberShare;
+  unknown: Record<ClusterAxis, boolean>;
+} {
   const gpus = m.gpus ?? [];
   const vramMb = gpus.reduce((sum, g) => sum + Math.max(g.vram_measured_mb, g.vram_estimate_mb), 0);
   const ramMb = Math.max(m.ram_measured_mb ?? 0, m.ram_estimate_mb ?? 0);
-  const unknown =
-    ramMb === 0 || gpus.some((g) => Math.max(g.vram_measured_mb, g.vram_estimate_mb) === 0);
   return {
     share: {
       name: m.server_name,
@@ -61,14 +69,36 @@ function memberShare(m: ClusterMember): { share: ClusterMemberShare; unknown: bo
       cpu: gpus.length === 0,
       stale: m.stale === true,
     },
-    unknown,
+    unknown: {
+      vram: gpus.some((g) => Math.max(g.vram_measured_mb, g.vram_estimate_mb) === 0),
+      ram: ramMb === 0,
+    },
   };
 }
 
+// Whether one axis is complete. An older gateway sends only the combined
+// flag, which then stands for both axes.
+function axisComplete(spec: RuntimeSpec, axis: ClusterAxis): boolean {
+  const own = axis === 'vram' ? spec.cluster_vram_total_complete : spec.cluster_ram_total_complete;
+  return (own ?? spec.cluster_totals_complete) !== false;
+}
+
 export function clusterTotalsView(spec: RuntimeSpec): ClusterTotalsView {
-  const complete = spec.cluster_totals_complete !== false;
+  const axes: Record<ClusterAxis, ClusterAxisTotal> = {
+    vram: {
+      mb: spec.cluster_vram_total_mb ?? 0,
+      complete: axisComplete(spec, 'vram'),
+      incompleteNames: [],
+      hiddenIncomplete: false,
+    },
+    ram: {
+      mb: spec.cluster_ram_total_mb ?? 0,
+      complete: axisComplete(spec, 'ram'),
+      incompleteNames: [],
+      hiddenIncomplete: false,
+    },
+  };
   const members: ClusterMemberShare[] = [];
-  const incompleteNames: string[] = [];
   let hiddenCount = 0;
   for (const m of spec.cluster_members ?? []) {
     if (!m.visible) {
@@ -77,17 +107,14 @@ export function clusterTotalsView(spec: RuntimeSpec): ClusterTotalsView {
     }
     const { share, unknown } = memberShare(m);
     members.push(share);
-    if (unknown && !complete) incompleteNames.push(share.name);
+    for (const axis of ['vram', 'ram'] as const) {
+      if (unknown[axis] && !axes[axis].complete) axes[axis].incompleteNames.push(share.name);
+    }
   }
-  return {
-    vramMb: spec.cluster_vram_total_mb ?? 0,
-    ramMb: spec.cluster_ram_total_mb ?? 0,
-    complete,
-    members,
-    incompleteNames,
-    hiddenIncomplete: !complete && hiddenCount > 0,
-    hiddenCount,
-  };
+  for (const axis of ['vram', 'ram'] as const) {
+    axes[axis].hiddenIncomplete = !axes[axis].complete && hiddenCount > 0;
+  }
+  return { ...axes, members, hiddenCount };
 }
 
 /** A total for a table cell: "≥ " before a lower bound, an em-dash when unknown. */
@@ -108,12 +135,13 @@ export type ClusterIncompleteCause = 'none' | 'members' | 'hidden' | 'head' | 'u
 export function clusterIncompleteCause(
   spec: Pick<RuntimeSpec, 'gpus'>,
   view: ClusterTotalsView,
-  axis: 'vram' | 'ram',
+  axis: ClusterAxis,
   ownMb: number,
 ): ClusterIncompleteCause {
-  if (view.complete) return 'none';
-  if (view.incompleteNames.length > 0) return 'members';
-  if (view.hiddenIncomplete) return 'hidden';
+  const total = view[axis];
+  if (total.complete) return 'none';
+  if (total.incompleteNames.length > 0) return 'members';
+  if (total.hiddenIncomplete) return 'hidden';
   const headHasPart = axis === 'ram' || (spec.gpus ?? []).length > 0;
   if (headHasPart && !(ownMb > 0)) return 'head';
   return 'unknown';

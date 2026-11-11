@@ -162,4 +162,89 @@ describe('ClusterProgress', () => {
     expect(within(cell).getByText(t.clusterPhaseHeadStarting)).toBeInTheDocument();
     expect(within(cell).getByTestId('cluster-progress-member')).toHaveTextContent('Alpha');
   });
+
+  it('lists each breach by kind and a hidden member by position only', () => {
+    const at = '2026-01-01T09:00:00Z';
+    render(
+      <ClusterProgress
+        spec={head({
+          state: 'formed',
+          phase: 'formed',
+          members: [],
+          breaches: [
+            { position: 0, kind: 'peer', peer: '10.0.0.9:4711', at },
+            { position: 0, kind: 'foreign_hold', at },
+            { position: 1 },
+          ],
+        })}
+        t={t}
+      />,
+    );
+    const box = screen.getByTestId('cluster-breaches');
+    expect(within(box).getByText(t.clusterBreachesTitle)).toBeInTheDocument();
+    const items = within(box).getAllByTestId('cluster-breach');
+    expect(items[0]).toHaveTextContent(
+      t.clusterBreachPeer('Alpha', '10.0.0.9:4711', formatDate(at, '')),
+    );
+    expect(items[1]).toHaveTextContent(t.clusterBreachForeignHold('Alpha', formatDate(at, '')));
+    expect(items[2]).toHaveTextContent(t.clusterBreachHidden(t.clusterStatusMemberHidden(2)));
+  });
+
+  it('names a breach of an unknown kind without inventing a meaning', () => {
+    render(
+      <ClusterProgress
+        spec={head({
+          state: 'formed',
+          phase: 'formed',
+          members: [],
+          breaches: [{ position: 0, kind: 'something_new' }],
+        })}
+        t={t}
+      />,
+    );
+    expect(screen.getByTestId('cluster-breach')).toHaveTextContent(
+      t.clusterBreachOther('Alpha', 'something_new'),
+    );
+  });
+
+  it('warns about each stored peak above its budget', () => {
+    render(
+      <ClusterProgress
+        spec={head({
+          state: 'cold',
+          members: [],
+          peaks_above_budget: [
+            { position: 0, resource: 'vram', gpu_index: 1, stored_mb: 9000, ceiling_mb: 8000 },
+            { position: 0, resource: 'ram', stored_mb: 70000, ceiling_mb: 65536 },
+            { position: 1 },
+          ],
+        })}
+        t={t}
+      />,
+    );
+    const box = screen.getByTestId('cluster-peaks');
+    expect(within(box).getByText(t.clusterPeaksTitle)).toBeInTheDocument();
+    const items = within(box).getAllByTestId('cluster-peak');
+    expect(items[0]).toHaveTextContent(t.clusterPeakVram('Alpha', 1, 9000, 8000));
+    expect(items[1]).toHaveTextContent(t.clusterPeakRam('Alpha', 70000, 65536));
+    expect(items[2]).toHaveTextContent(t.clusterPeakHidden(t.clusterStatusMemberHidden(2)));
+  });
+
+  it('the compact cell flags breaches and stored peaks even on a cold head', () => {
+    render(
+      <ClusterProgress
+        spec={head({
+          state: 'cold',
+          members: [],
+          breaches: [{ position: 1 }],
+          peaks_above_budget: [{ position: 1 }, { position: 0, resource: 'ram' }],
+        })}
+        t={t}
+        compact
+      />,
+    );
+    const cell = screen.getByTestId('cluster-progress-compact');
+    expect(within(cell).getByText(t.clusterBreachesCount(1))).toBeInTheDocument();
+    expect(within(cell).getByText(t.clusterPeaksCount(2))).toBeInTheDocument();
+  });
 });

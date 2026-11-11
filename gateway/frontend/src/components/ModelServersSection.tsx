@@ -377,13 +377,15 @@ function loadFailureMessage(e: unknown, t: Translation): string {
 
 /**
  * The tooltip of a Load action the gateway would refuse. `load_refusal` names
- * the `benchmark.<reason>` 409 the Load starter answers, so the tooltip is that
- * 409's own label and a hover says what a refused click's toast would. A
- * reason this build has no label for still means a Load cannot succeed, so it
- * still disables the action, named by its wire code.
+ * the `benchmark.<reason>` 409 the Load starter answers (a cluster head's is
+ * `runtime.cluster_head_unsupported`), so the tooltip is that 409's own label
+ * and a hover says what a refused click's toast would. A reason this build has
+ * no label for still means a Load cannot succeed, so it still disables the
+ * action, named by its wire code.
  */
 function loadRefusalReason(refusal: string, t: Translation): string {
-  const code = `benchmark.${refusal}`;
+  const code =
+    refusal === 'cluster_head_unsupported' ? `runtime.${refusal}` : `benchmark.${refusal}`;
   const labelKey = errorLabelByCode[code];
   return labelKey ? t[labelKey] : code;
 }

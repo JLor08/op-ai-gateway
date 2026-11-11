@@ -13,6 +13,7 @@ import {
   Checkbox,
   FormControlLabel,
   IconButton,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
@@ -193,6 +194,47 @@ function effectiveVramMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): n
 
 function effectiveRamMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): number {
   return Math.max(row.ram_measured_mb ?? 0, spec?.ram_estimate_mb ?? 0);
+}
+
+// Energy attribution covers a host's request window from that host's own
+// samples and accepts telemetry gaps up to 2 s; an agent clock off by more
+// than that moves its samples out of the window, and the host's energy share
+// drops to the estimate. A smaller offset shifts the window by no more than
+// the gap attribution already tolerates, so only a larger one is flagged.
+const clockOffsetWarnMs = 2000;
+
+function formatClockOffset(ms: number): string {
+  return `${ms > 0 ? '+' : ''}${ms} ms`;
+}
+
+/** The agent's clock offset, a diagnostic for energy attribution. */
+function AgentClockOffset({
+  offsetMs,
+  t,
+}: Readonly<{ offsetMs: number | null | undefined; t: Translation }>) {
+  const known = typeof offsetMs === 'number';
+  const warning = known && Math.abs(offsetMs) > clockOffsetWarnMs;
+  const text = t.agentClockOffset(known ? formatClockOffset(offsetMs) : t.agentClockOffsetUnknown);
+  return (
+    <Tooltip
+      title={
+        <Box sx={{ display: 'grid', gap: 0.5 }}>
+          <span>{t.agentClockOffsetHelp}</span>
+          {warning && <span>{t.agentClockOffsetWarn}</span>}
+        </Box>
+      }
+    >
+      <Typography
+        variant="body2"
+        color={warning ? 'warning.main' : 'text.secondary'}
+        data-testid="agent-clock-offset"
+        data-warning={String(warning)}
+        sx={{ justifySelf: 'start', fontWeight: warning ? 600 : undefined }}
+      >
+        {text}
+      </Typography>
+    </Tooltip>
+  );
 }
 
 export function RpcMemberSection({
@@ -645,6 +687,9 @@ export function RpcMemberSection({
       </Panel>
 
       <Panel titleId="rpc-status-heading" title={t.rpcStatusTitle}>
+        <Box sx={{ display: 'grid', mb: 1.5 }}>
+          <AgentClockOffset offsetMs={server.clock_offset_ms} t={t} />
+        </Box>
         {memberRows.length === 0 ? (
           <Typography color="text.secondary">{t.rpcStatusEmpty}</Typography>
         ) : (

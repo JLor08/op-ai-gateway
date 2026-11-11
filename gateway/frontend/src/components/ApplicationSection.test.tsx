@@ -251,6 +251,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       updateServerBinary: vi.fn(async () => ({}) as never),
       deleteServerBinary: vi.fn(async () => undefined),
       clusterCandidates: vi.fn(async () => ({ data: [] })),
+      resetClusterMemberUsage: vi.fn(async () => ({}) as never),
       runtimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
       putRuntimeCoresidency: vi.fn(async () => ({ mode: 'opt_out' as const, pairs: [] })),
       runtimeWarnings: vi.fn(async () => ({ warnings: [] })),

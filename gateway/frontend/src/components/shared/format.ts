@@ -114,6 +114,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'benchmark.vram_no_gpu_samples': 'errorBenchmarkVramNoGpuSamples',
   'benchmark.vram_isolation_blocked': 'errorBenchmarkVramIsolationBlocked',
   'benchmark.vram_declared_gpu_missing': 'errorBenchmarkVramDeclaredGpuMissing',
+  // A llama.cpp RPC cluster holds or has reserved a member on the server: the
+  // drain cannot stop a member (only its head can), so the run would measure
+  // beside it.
+  'benchmark.vram_cluster_member_held': 'errorBenchmarkVramClusterMemberHeld',
   // A launch-spec write refused because a benchmark run is holding that
   // server: one override click mid-run is what contaminates its measurement.
   'runtime_spec.server_benchmarking': 'errorRuntimeSpecServerBenchmarking',
@@ -214,7 +218,14 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime.cluster_mesh_unavailable': 'errorClusterMeshUnavailable',
   'runtime.cluster_port_unknown': 'errorClusterPortUnknown',
   'runtime_config.agent_features_pending': 'errorRuntimeConfigAgentFeaturesPending',
+  // A Load or benchmark of a cluster head (the model list's load_refusal
+  // cluster_head_unsupported answers under this code too).
   'runtime.cluster_head_unsupported': 'errorClusterHeadUnsupported',
+  // The watchdog stopped a formed head because it lost a member (the cluster
+  // status names the member's position).
+  'runtime.cluster_member_lost': 'errorClusterMemberLost',
+  // The member usage reset of a server that is no member of the head (404).
+  'runtime_spec.cluster_member_not_found': 'errorClusterMemberNotFound',
   'runtime.device_backend_mismatch': 'errorRuntimeDeviceBackendMismatch',
   'runtime.rpc_device_count_mismatch': 'errorRuntimeRpcDeviceCountMismatch',
   'runtime.rpc_unsupported_build': 'errorRuntimeRpcUnsupportedBuild',
