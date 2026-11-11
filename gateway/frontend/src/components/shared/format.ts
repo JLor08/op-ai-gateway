@@ -225,6 +225,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // The watchdog stopped a formed head because it lost a member (the cluster
   // status names the member's position).
   'runtime.cluster_member_lost': 'errorClusterMemberLost',
+  'runtime.cluster_head_crashed': 'errorClusterHeadCrashed',
   // The member usage reset of a server that is no member of the head (404).
   'runtime_spec.cluster_member_not_found': 'errorClusterMemberNotFound',
   'runtime.device_backend_mismatch': 'errorRuntimeDeviceBackendMismatch',

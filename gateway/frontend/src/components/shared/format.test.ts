@@ -1164,6 +1164,9 @@ const clusterWireCodes = [
   // The watchdog's cause when it stopped a formed head over a lost member
   // (cluster_status member code and last failure).
   'runtime.cluster_member_lost',
+  // The cooldown cause when a formed head ended unexpectedly without a code of
+  // the agent's own.
+  'runtime.cluster_head_crashed',
   // A VRAM benchmark refused while a cluster holds a member on the server.
   'benchmark.vram_cluster_member_held',
   // The member usage reset of a server that is no member of the head.

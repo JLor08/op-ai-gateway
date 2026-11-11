@@ -505,7 +505,6 @@ export interface RuntimeRpcStatus {
 // What a running cluster head launched with.
 export interface RuntimeClusterStatus {
   launched?: string[];
-  version?: string;
 }
 
 // One GPU's measured VRAM as carried on THIS status frame (mirrors the Go

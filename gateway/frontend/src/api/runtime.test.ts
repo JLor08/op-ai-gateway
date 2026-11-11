@@ -454,7 +454,7 @@ describe('runtimeApi RPC cluster', () => {
         cache_mb: 0,
         stalled: false,
       },
-      cluster: { launched: ['100.64.0.5:26001'], version: 'b1234' },
+      cluster: { launched: ['100.64.0.5:26001'] },
       admission_blocked_by: 'rpcm_x',
       last_error: {
         code: 'runtime.bind_mismatch',

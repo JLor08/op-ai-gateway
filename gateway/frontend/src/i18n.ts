@@ -2510,6 +2510,8 @@ const de = {
     'Dieses Modell ist ein llama.cpp-RPC-Cluster-Head: Laden und Benchmarks unterstützen das noch nicht. Es startet mit seinen Mitgliedern, sobald eine Anfrage es braucht.',
   errorClusterMemberLost:
     'Der Cluster hat ein Mitglied verloren und wurde gestoppt; nach der Pause startet er wieder.',
+  errorClusterHeadCrashed:
+    'Der Cluster-Head ist unerwartet beendet worden; nach der Pause startet er wieder.',
   errorClusterMemberNotFound: 'Dieser Server ist kein Mitglied dieses Cluster-Heads.',
   errorBenchmarkVramClusterMemberHeld:
     'Ein llama.cpp-RPC-Cluster nutzt ein Mitglied auf diesem Server. Den Cluster stoppen (zuerst den Head) und die Messung erneut starten.',
@@ -6345,6 +6347,8 @@ const en: PortalMessages = {
     'This model is a llama.cpp RPC cluster head, which loads and benchmarks do not support yet. It starts with its members when a request needs it.',
   errorClusterMemberLost:
     'The cluster lost a member and was stopped; it starts again after the cooldown.',
+  errorClusterHeadCrashed:
+    'The cluster head ended unexpectedly; it starts again after the cooldown.',
   errorClusterMemberNotFound: 'This server is no member of this cluster head.',
   errorBenchmarkVramClusterMemberHeld:
     'A llama.cpp RPC cluster uses a member on this server. Stop that cluster (head first) and run the measurement again.',
