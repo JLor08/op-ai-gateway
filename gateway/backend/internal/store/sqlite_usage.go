@@ -1065,8 +1065,9 @@ func usageGroupColumn(groupBy string) (string, bool) {
 // from user input; an unknown value is an error.
 //
 // An event with energy parts counts in its own host's bucket with the energy
-// of its part on that host (hp), and each part on another host adds its
-// energy, and nothing else, to that host's bucket in the same group.
+// of its part on that host (hp); each part on another host adds its energy,
+// and nothing else, to a separate MemberParts bucket of that host in the same
+// group.
 func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy string) ([]usage.GroupBucket, error) {
 	col, ok := usageGroupColumn(groupBy)
 	if !ok {
@@ -1113,42 +1114,78 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("iterate usage groups: %w", err)
 	}
-	return s.addMemberPartBuckets(ctx, out, col, where, args)
+	members, err := s.memberPartBuckets(ctx, col, where, args, nil)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, members...), nil
 }
 
-// addMemberPartBuckets adds to buckets the energy of every energy part on a
-// host other than its event's own, under (the event's group value, the part's
-// host): into that bucket when buckets has it, else as a bucket of its own
-// that counts no requests.
-func (s *SQLiteStore) addMemberPartBuckets(ctx context.Context, buckets []usage.GroupBucket, col, where string, args []any) ([]usage.GroupBucket, error) {
-	rows, err := s.query(ctx, "select e."+col+", p.server_id, sum(p.wh)"+usageEventsFromClause+
+// MemberPartEnergy sums, over the events matching q, the energy parts drawn
+// on one of hosts for events whose own host is none of them, as MemberParts
+// buckets per (groupBy value, part host); groupBy "" leaves Key empty. No
+// hosts reads nothing.
+func (s *SQLiteStore) MemberPartEnergy(ctx context.Context, q usage.Query, hosts []string, groupBy string) ([]usage.GroupBucket, error) {
+	col := ""
+	if groupBy != "" {
+		var ok bool
+		if col, ok = usageGroupColumn(groupBy); !ok {
+			return nil, fmt.Errorf("member part energy: invalid group_by %q", groupBy)
+		}
+	}
+	if len(hosts) == 0 {
+		return []usage.GroupBucket{}, nil
+	}
+	where, args := usageWhere(s.dl, q, "")
+	return s.memberPartBuckets(ctx, col, where, args, hosts)
+}
+
+// memberPartBuckets sums, per (event column col, part host), the energy of
+// every part on a host other than its event's own, over the events where
+// selects (usageWhere's clause and args). col "" groups by the part host only
+// and leaves Key empty. Non-empty hosts keeps only parts on one of hosts of
+// events whose own host is none of them. Every bucket is a MemberParts bucket.
+func (s *SQLiteStore) memberPartBuckets(ctx context.Context, col, where string, args []any, hosts []string) ([]usage.GroupBucket, error) {
+	keyExpr, groupExpr := "''", "p.server_id"
+	if col != "" {
+		keyExpr, groupExpr = "e."+col, "e."+col+", p.server_id"
+	}
+	if len(hosts) > 0 {
+		in := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
+		cond := "p.server_id in (" + in + ") and e.host not in (" + in + ")"
+		if where == "" {
+			where = " where " + cond
+		} else {
+			where += " and " + cond
+		}
+		extended := make([]any, 0, len(args)+2*len(hosts))
+		extended = append(extended, args...)
+		for range 2 {
+			for _, h := range hosts {
+				extended = append(extended, h)
+			}
+		}
+		args = extended
+	}
+	rows, err := s.query(ctx, "select "+keyExpr+", p.server_id, sum(p.wh)"+usageEventsFromClause+
 		" join usage_event_energy_parts as p on p.event_id = e.id and p.server_id <> e.host"+where+
-		" group by e."+col+", p.server_id", args...)
+		" group by "+groupExpr, args...)
 	if err != nil {
-		return nil, fmt.Errorf("usage groups parts: %w", err)
+		return nil, fmt.Errorf("usage member parts: %w", err)
 	}
 	defer rows.Close()
-	index := make(map[[2]string]int, len(buckets))
-	for i, b := range buckets {
-		index[[2]string{b.Key, b.Host}] = i
-	}
+	out := make([]usage.GroupBucket, 0)
 	for rows.Next() {
-		var key, host string
-		var wh float64
-		if err := rows.Scan(&key, &host, &wh); err != nil {
-			return nil, fmt.Errorf("scan usage group part: %w", err)
+		b := usage.GroupBucket{MemberParts: true}
+		if err := rows.Scan(&b.Key, &b.Host, &b.EnergyWh); err != nil {
+			return nil, fmt.Errorf("scan usage member part: %w", err)
 		}
-		if i, ok := index[[2]string{key, host}]; ok {
-			buckets[i].EnergyWh += wh
-			continue
-		}
-		index[[2]string{key, host}] = len(buckets)
-		buckets = append(buckets, usage.GroupBucket{Key: key, Host: host, EnergyWh: wh})
+		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate usage group parts: %w", err)
+		return nil, fmt.Errorf("iterate usage member parts: %w", err)
 	}
-	return buckets, nil
+	return out, nil
 }
 
 // RecordEventHosts inserts hosts; a (event, server) pair already stored keeps

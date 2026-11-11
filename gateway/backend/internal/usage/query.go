@@ -159,6 +159,13 @@ type GroupBucket struct {
 	EnergyWh         float64
 	FirstAt          time.Time
 	LastAt           time.Time
+	// MemberParts marks an energy-only bucket: the energy parts drawn on Host
+	// for llama.cpp RPC cluster requests another host served, under those
+	// requests' group value. It counts no request and no token (they belong to
+	// the serving host's bucket) and has no FirstAt/LastAt. A store never
+	// merges it into Host's own request bucket, so a group by server can show
+	// it under Host's own name.
+	MemberParts bool
 }
 
 // Row is a read DTO: the full Event plus the resolved owner name, which is

@@ -2963,8 +2963,9 @@ No per-process power exists, so a member's share is a share of its host's
 power, split over every request that host served in the window.
 
 - **Member set, fixed at completion.** `recordUsage` (`recordClusterHosts`)
-  asks whether the target mapping is a cluster head (through the instance
-  source's spec cache) and, if so, writes `usage_event_hosts` rows for the
+  asks whether the target mapping is a cluster head (the instance source's
+  cached spec entry, whatever its age, since routing read it when it chose the
+  target; the store is read only for a mapping with no entry) and, if so, writes `usage_event_hosts` rows for the
   head's server (`role = head`) and every member server whose session record
   (`rpc_sessions`, head instance 0) is in force at the event's `created_at`
   (`role = member`). Sessions and `created_at` are both the gateway's own
@@ -2992,17 +2993,22 @@ power, split over every request that host served in the window.
   falls to Tier 3 (or `unpriceable`), the request is priced by that result
   alone and gets no parts: the per-token coefficient is calibrated from
   whole-cluster energy, so adding member parts would count them twice. A
-  single-host request never gets parts.
+  single-host request never gets parts. Whenever a request listing other
+  hosts is stamped without parts, parts an earlier, unstamped attempt wrote
+  are removed first; a failed lookup or parts write leaves the request
+  unpriced, and the retry replaces its parts.
 - **Calibration** fires only when the combined source is `measured`, i.e.
   every part was measured, and then learns the whole cluster's marginal energy
-  per output token.
+  per output token. A request on a cluster head's mapping without parts (its
+  member list could not be recorded, or no member was in session) measured
+  the head's share only and never calibrates.
 - **Formation energy.** A request that waited while its cluster formed has a
   window that covers the formation, so each host's formation draw falls into
   the parts of the requests that waited, as a single-host cold start does.
 - **Visibility.** Parts feed only aggregates and costs: the request rows and
   their owner stay as they are (`host` is the head's server), and a member
-  server's share appears only as Wh inside sums, never as another principal's
-  request detail.
+  server's share appears only as aggregated Wh and cost under that member
+  server, never as another principal's request detail (§8.4.5).
 
 **Tier 3 is a TOKEN-ONLY surface, and a non-token row is stamped
 `unpriceable`.** `Wh = coeff × OutputTokens` is denominated in watt-hours per
@@ -3075,7 +3081,34 @@ parts by its own host), `UsageGroups` counts the request once in its own
 host's bucket with the head part's energy and adds every other part's energy
 to that part host's bucket in the same group, and the per-row cost reads the
 page's parts in one call (`EnergyPartsByEvents`). The in-memory
-`usage.Recorder` mirrors the SQL stores. Each AI server also carries a
+`usage.Recorder` mirrors the SQL stores.
+
+**A member's share shows under the member server, aggregated only.** The
+rule for every per-server aggregate is that a part counts under the server
+that drew it:
+
+- *Group by server.* `UsageGroups` returns a part on another host as a
+  separate, energy-only `MemberParts` bucket (no request, token or time span),
+  never merged into that host's own request bucket. Grouped by server, the
+  portal re-keys such a bucket to the member server's current name, so the
+  head's row carries the requests and the head part at the head's price, and
+  each member's row the member part at the member's price, with a request
+  count of 0 unless the member also served requests of its own.
+- *Filter by server.* A stats or groups query filtered by server (`server`
+  substring or exact `server_exact`) selects the requests that server served,
+  as before, and then adds the energy the matching servers drew as members of
+  other servers' cluster requests: the portal resolves the filter to server
+  ids by the servers' current names and asks `MemberPartEnergy` for the parts
+  on those ids of requests served by any other host, under the caller's scope
+  and every other filter. That adds Wh and cost only, never a request, count
+  or token. A request served by a matching server already counts in full, its
+  member parts included. The request list (`Usage`) and the time series are
+  unchanged: they show requests, and a member server served none of these.
+- *Scope.* The supplement follows the caller's usage scope like every other
+  usage read: a non-admin sees the member shares of their own requests only.
+  There is no server-manager scope over other principals' usage, so a member
+  server's manager sees foreign cluster shares only if they may already see
+  those principals' usage. Each AI server also carries a
 display-only `PriceUnit` (migration 37) so the operator's configured currency/unit
 label round-trips even though the underlying figure is always computed in the same
 base unit.

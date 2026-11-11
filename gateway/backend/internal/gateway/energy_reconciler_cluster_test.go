@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"testing"
@@ -235,6 +236,9 @@ func TestReconcileClusterEnergyOrderIndependent(t *testing.T) {
 			t.Fatalf("%s: member side first = %+v, cluster first = %+v", id, a, b)
 		}
 	}
+	if len(memberFirstParts) != 2 || len(clusterFirstParts) != len(memberFirstParts) {
+		t.Fatalf("parts: member side first = %+v, cluster first = %+v, want two each", memberFirstParts, clusterFirstParts)
+	}
 	for id, a := range memberFirstParts {
 		if b := clusterFirstParts[id]; !almostEqual(a.Wh, b.Wh, whTol) || a.Source != b.Source {
 			t.Fatalf("part %s: member side first = %+v, cluster first = %+v", id, a, b)
@@ -292,4 +296,205 @@ func TestCalibrationSkipsPartiallyMeasured(t *testing.T) {
 		// (1 Wh head + 2 Wh member) / 1000 tokens; idle 0, so marginal == total.
 		requireCloseWh(t, "EnergyWhPerToken", m.EnergyWhPerToken, 0.003)
 	})
+}
+
+// failingUsage fails SetEnergyParts while failSets > 0.
+type failingUsage struct {
+	*usage.Recorder
+	failSets int
+}
+
+func (f *failingUsage) SetEnergyParts(ctx context.Context, eventID string, parts []usage.EnergyPart) error {
+	if f.failSets > 0 {
+		f.failSets--
+		return errors.New("store down")
+	}
+	return f.Recorder.SetEnergyParts(ctx, eventID, parts)
+}
+
+// failingRoutes fails AIServerByID for failServer while fails > 0.
+type failingRoutes struct {
+	*routing.MemoryStore
+	failServer string
+	fails      int
+}
+
+func (f *failingRoutes) AIServerByID(ctx context.Context, id string) (routing.AIServer, error) {
+	if id == f.failServer && f.fails > 0 {
+		f.fails--
+		return routing.AIServer{}, errors.New("store down")
+	}
+	return f.MemoryStore.AIServerByID(ctx, id)
+}
+
+// TestReconcileDeletedMemberIsUnpriced pins that a member server deleted
+// since the request completed can never report again: its part is 0 Wh
+// member_unpriced at once, not retried.
+func TestReconcileDeletedMemberIsUnpriced(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	f := newEnergyFixture(t, 0, 0)
+	f.createServer("srv-head", routing.AIServer{})
+	f.constPower("srv-head", clusterEnergyBase, 36, 100)
+	f.recordClusterEvent(usage.Event{ID: "ev_cluster", CreatedAt: end, LatencyMS: 36000}, "srv-head", "srv-deleted")
+
+	f.reconcile("ev_cluster")
+
+	ev := f.event("ev_cluster")
+	if ev.EnergySource != energySourceMemberUnpriced {
+		t.Fatalf("energy_source = %q, want %s", ev.EnergySource, energySourceMemberUnpriced)
+	}
+	requireCloseWh(t, "energy_wh", ev.EnergyWh, 1.0)
+	if p := f.parts("ev_cluster")["srv-deleted"]; p.Source != energySourceMemberUnpriced || p.Wh != 0 {
+		t.Fatalf("deleted member part = %+v", p)
+	}
+}
+
+// TestReconcileRetryReplacesParts pins that a failed member lookup or a
+// failed parts write leaves the event unpriced (its old parts untouched), and
+// that the next pass prices it and replaces the parts.
+func TestReconcileRetryReplacesParts(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	for _, tc := range []struct {
+		name string
+		fail func(f *energyFixture)
+	}{
+		{"member lookup fails", func(f *energyFixture) {
+			f.srv.Routes = &failingRoutes{MemoryStore: f.routes, failServer: "srv-mem", fails: 1}
+		}},
+		{"parts write fails", func(f *energyFixture) {
+			f.srv.Usage = &failingUsage{Recorder: f.usage, failSets: 1}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEnergyFixture(t, 0, 0)
+			f.createServer("srv-head", routing.AIServer{})
+			f.createServer("srv-mem", routing.AIServer{})
+			f.constPower("srv-head", clusterEnergyBase, 36, 100)
+			f.constPower("srv-mem", clusterEnergyBase, 36, 200)
+			f.recordClusterEvent(usage.Event{ID: "ev_cluster", CreatedAt: end, LatencyMS: 36000}, "srv-head", "srv-mem")
+			stale := []usage.EnergyPart{{ServerID: "srv-old", Role: usage.EventHostRoleMember, Wh: 9, Source: "estimated"}}
+			if err := f.usage.SetEnergyParts(context.Background(), "ev_cluster", stale); err != nil {
+				t.Fatal(err)
+			}
+			tc.fail(f)
+
+			f.reconcile("ev_cluster")
+			if ev := f.event("ev_cluster"); ev.EnergySource != "" {
+				t.Fatalf("energy_source = %q after a failed pass, want the event left unpriced", ev.EnergySource)
+			}
+			if parts := f.parts("ev_cluster"); len(parts) != 1 || parts["srv-old"].Wh != 9 {
+				t.Fatalf("parts after a failed pass = %+v, want the old ones untouched", parts)
+			}
+
+			f.reconcile("ev_cluster")
+			ev := f.event("ev_cluster")
+			if ev.EnergySource != "measured" {
+				t.Fatalf("energy_source = %q after the retry, want measured", ev.EnergySource)
+			}
+			requireCloseWh(t, "energy_wh", ev.EnergyWh, 3.0)
+			parts := f.parts("ev_cluster")
+			if len(parts) != 2 || parts["srv-head"].Wh == 0 || parts["srv-mem"].Wh == 0 {
+				t.Fatalf("parts after the retry = %+v, want the head's and the member's only", parts)
+			}
+		})
+	}
+}
+
+// TestReconcileClearsStalePartsWithoutParts pins that an event listing more
+// hosts than its own that ends up priced without parts -- its head priced
+// per token, or its head server deleted -- carries no parts from an earlier
+// attempt, which every per-host sum would otherwise read.
+func TestReconcileClearsStalePartsWithoutParts(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	for _, tc := range []struct {
+		name   string
+		source string
+		setup  func(f *energyFixture)
+	}{
+		{"head priced per token", "modeled", func(f *energyFixture) {
+			f.createServer("srv-head", routing.AIServer{})
+		}},
+		{"head server deleted", "modeled", func(*energyFixture) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEnergyFixture(t, 0, 0.01)
+			tc.setup(f)
+			f.createServer("srv-mem", routing.AIServer{})
+			f.constPower("srv-mem", clusterEnergyBase, 36, 200)
+			f.recordClusterEvent(usage.Event{ID: "ev_cluster", CreatedAt: end, LatencyMS: 36000, OutputTokens: 100}, "srv-head", "srv-mem")
+			stale := []usage.EnergyPart{
+				{ServerID: "srv-head", Role: usage.EventHostRoleHead, Wh: 5, Source: "measured"},
+				{ServerID: "srv-mem", Role: usage.EventHostRoleMember, Wh: 7, Source: "measured"},
+			}
+			if err := f.usage.SetEnergyParts(context.Background(), "ev_cluster", stale); err != nil {
+				t.Fatal(err)
+			}
+
+			f.reconcile("ev_cluster")
+
+			if ev := f.event("ev_cluster"); ev.EnergySource != tc.source {
+				t.Fatalf("energy_source = %q, want %s", ev.EnergySource, tc.source)
+			}
+			if parts := f.parts("ev_cluster"); len(parts) != 0 {
+				t.Fatalf("parts = %+v, want the stale ones gone", parts)
+			}
+		})
+	}
+}
+
+// TestCalibrationSkipsClusterHeadWithoutParts pins that a request on a
+// cluster head's mapping that lists no members (its member list could not be
+// recorded, or no session was in force) never calibrates the mapping: its
+// measured figure is the head's share only, while the coefficient prices a
+// whole cluster request.
+func TestCalibrationSkipsClusterHeadWithoutParts(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	f := newEnergyFixture(t, 0, 0)
+	f.createServer("srv-head", routing.AIServer{})
+	f.constPower("srv-head", clusterEnergyBase, 36, 100)
+	f.createMapping("map1", "app1", "srv-head", 8080, routing.ModelMapping{GatewayModelName: "gw", AppModelName: "upstream"})
+	if err := f.routes.UpsertRuntimeSpec(context.Background(), routing.RuntimeSpec{ID: "rspec_head", MappingID: "map1", ClusterEnabled: true}); err != nil {
+		t.Fatalf("upsert head spec: %v", err)
+	}
+	if err := f.usage.Record(usage.Event{ID: "ev_head", Host: "srv-head", RouteID: "map1", CreatedAt: end, LatencyMS: 36000, OutputTokens: 1000}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.reconcile("ev_head")
+
+	if ev := f.event("ev_head"); ev.EnergySource != "measured" {
+		t.Fatalf("energy_source = %q, want measured", ev.EnergySource)
+	}
+	if m := f.mapping("map1"); m.EnergyWhPerToken != 0 || m.MetricsSource == "energy" {
+		t.Fatalf("mapping = %+v, want no calibration from a head's share alone", m)
+	}
+}
+
+// TestReconcileMemberOfTwoClustersSplitsThreeWays pins that a host serving as
+// a member of two clusters at once, while also serving a request of its own,
+// splits its power three ways: each cluster request's member part and its own
+// request get a third.
+func TestReconcileMemberOfTwoClustersSplitsThreeWays(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	f := newEnergyFixture(t, 0, 0)
+	for _, id := range []string{"srv-head-a", "srv-head-b", "srv-mem"} {
+		f.createServer(id, routing.AIServer{})
+	}
+	f.constPower("srv-head-a", clusterEnergyBase, 36, 100)
+	f.constPower("srv-head-b", clusterEnergyBase, 36, 100)
+	f.constPower("srv-mem", clusterEnergyBase, 36, 300)
+	f.recordClusterEvent(usage.Event{ID: "ev_a", CreatedAt: end, LatencyMS: 36000}, "srv-head-a", "srv-mem")
+	f.recordClusterEvent(usage.Event{ID: "ev_b", CreatedAt: end, LatencyMS: 36000}, "srv-head-b", "srv-mem")
+	if err := f.usage.Record(usage.Event{ID: "ev_local", Host: "srv-mem", CreatedAt: end, LatencyMS: 36000}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"ev_a", "ev_b", "ev_local"} {
+		f.reconcile(id)
+	}
+
+	third := 100.0 * 36 / 3600 // 300 W / 3 over 36 s
+	requireCloseWh(t, "member part of a", f.parts("ev_a")["srv-mem"].Wh, third)
+	requireCloseWh(t, "member part of b", f.parts("ev_b")["srv-mem"].Wh, third)
+	requireCloseWh(t, "local request", f.event("ev_local").EnergyWh, third)
+	requireCloseWh(t, "cluster a", f.event("ev_a").EnergyWh, 1.0+third)
 }

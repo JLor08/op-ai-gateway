@@ -699,3 +699,55 @@ func TestRunningInstanceIsRoutedEndToEnd(t *testing.T) {
 		t.Fatalf("agent without runtime_instances: target %q, err %v; want instance 0, inst-model", target.ProviderModel, err)
 	}
 }
+
+// TestKnownClusterHeadReadsOnlyWithoutAnEntry pins the completion-time head
+// lookup (recordClusterHosts): it answers from the cached entry whatever its
+// age -- the request was routed through it -- and reads the store only for a
+// mapping it has no entry for, so a long request on a mapping that is no head
+// pays no store read when it completes.
+func TestKnownClusterHeadReadsOnlyWithoutAnEntry(t *testing.T) {
+	reader := &countingSpecReader{specs: map[string]routing.RuntimeSpec{
+		"map_head":  {ID: "rspec_head", MappingID: "map_head", ClusterEnabled: true},
+		"map_plain": {ID: "rspec_plain", MappingID: "map_plain"},
+	}}
+	features := newAgentFeaturesRegistry()
+	features.Set("srv1", []string{"runtime_manager", rpcClusterFeature})
+	src := newInstanceSource(reader, features, newRuntimeStatusRegistry())
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	src.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	// Routing warms the cache.
+	if _, ok := src.clusterHead(ctx, "srv1", "map_plain"); ok {
+		t.Fatal("map_plain is no head")
+	}
+	if head, ok := src.clusterHead(ctx, "srv1", "map_head"); !ok || head != "rspec_head" {
+		t.Fatalf("map_head = %q %v", head, ok)
+	}
+	reads := len(reader.reads)
+
+	// The requests complete long after the entries expired.
+	now = now.Add(10 * time.Minute)
+	if _, ok := src.knownClusterHead(ctx, "srv1", "map_plain"); ok {
+		t.Fatal("map_plain is no head")
+	}
+	if head, ok := src.knownClusterHead(ctx, "srv1", "map_head"); !ok || head != "rspec_head" {
+		t.Fatalf("map_head = %q %v", head, ok)
+	}
+	if len(reader.reads) != reads {
+		t.Fatalf("store reads at completion = %v, want none", reader.reads[reads:])
+	}
+
+	// A mapping without an entry is read once.
+	reader.specs["map_new"] = routing.RuntimeSpec{ID: "rspec_new", MappingID: "map_new", ClusterEnabled: true}
+	if head, ok := src.knownClusterHead(ctx, "srv1", "map_new"); !ok || head != "rspec_new" {
+		t.Fatalf("map_new = %q %v", head, ok)
+	}
+	if len(reader.reads) != reads+1 {
+		t.Fatalf("store reads = %v, want one for the mapping without an entry", reader.reads[reads:])
+	}
+	// An agent without rpc_cluster runs no head: no read at all.
+	if _, ok := src.knownClusterHead(ctx, "srv_old", "map_other"); ok || len(reader.reads) != reads+1 {
+		t.Fatalf("an agent without rpc_cluster: ok=%v reads=%v", ok, reader.reads[reads:])
+	}
+}

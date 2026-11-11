@@ -138,6 +138,10 @@ func (s *Server) reconcileEnergyEvent(ctx context.Context, ev usage.Event, now t
 			// telemetry -- finalize now via Tier 3 (modeled), which always
 			// succeeds (even at coeff==0 -> Wh==0), rather than retrying this
 			// event forever against a server that will never come back.
+			// Parts from an earlier attempt go first: this figure has none.
+			if !s.clearEnergyParts(ctx, ev) {
+				return
+			}
 			s.finalizeEnergyEvent(ctx, ev, modeledEnergy(ev, mappingCoeff, sysDefaultWhPerToken))
 			return
 		}
@@ -163,9 +167,12 @@ func (s *Server) reconcileEnergyEvent(ctx context.Context, ev usage.Event, now t
 	if !ok {
 		return
 	}
-	if len(parts) > 0 {
-		// The parts are written before the stamp: a stamped event is never
-		// priced again, so a stamp without its parts would stay without them.
+	// The parts are written before the stamp: a stamped event is never priced
+	// again, so a stamp without its parts would stay without them. An event
+	// listing other hosts that ends up without parts (its head priced per
+	// token) has any parts an earlier, unstamped attempt wrote removed, since
+	// every per-host sum reads parts in place of energy_wh.
+	if len(hosts) > 1 || len(parts) > 0 {
 		if err := s.Usage.SetEnergyParts(ctx, ev.ID, parts); err != nil {
 			slog.Debug("energy reconcile: energy parts write failed", "event_id", ev.ID, "err", err)
 			return
@@ -190,12 +197,48 @@ func (s *Server) reconcileEnergyEvent(ctx context.Context, ev usage.Event, now t
 	// UpdateMappingEnergyEWMA is itself metrics_locked-guarded at the store
 	// layer (a locked mapping's write is a benign no-op), so no separate lock
 	// check is needed here.
-	if res.Source == "measured" && ev.BillingUnit == usage.BillingUnitTokens && ev.OutputTokens > 0 && mappingID != "" {
+	//
+	// A request on a cluster head's mapping without parts measured the head's
+	// share only (its member list could not be recorded, or no member was in
+	// session), so it never calibrates the whole-cluster coefficient.
+	if res.Source == "measured" && ev.BillingUnit == usage.BillingUnitTokens && ev.OutputTokens > 0 && mappingID != "" &&
+		(len(parts) > 0 || !s.mappingIsClusterHead(ctx, mappingID)) {
 		sample := res.WhMarginal / float64(ev.OutputTokens)
 		if err := s.Routes.UpdateMappingEnergyEWMA(ctx, mappingID, sample, energyCalibrationAlpha, now); err != nil {
 			slog.Debug("energy reconcile: calibration write failed", "mapping_id", mappingID, "err", err)
 		}
 	}
+}
+
+// clearEnergyParts removes the energy parts of ev when it lists hosts other
+// than its own (only such an event can have parts). false means a lookup or
+// the write failed: the event stays unpriced for a retry.
+func (s *Server) clearEnergyParts(ctx context.Context, ev usage.Event) bool {
+	hosts, err := s.Usage.EventHosts(ctx, ev.ID)
+	if err != nil {
+		slog.Debug("energy reconcile: event hosts lookup failed", "event_id", ev.ID, "err", err)
+		return false
+	}
+	if len(hosts) <= 1 {
+		return true
+	}
+	if err := s.Usage.SetEnergyParts(ctx, ev.ID, nil); err != nil {
+		slog.Debug("energy reconcile: energy parts clear failed", "event_id", ev.ID, "err", err)
+		return false
+	}
+	return true
+}
+
+// mappingIsClusterHead reports whether mappingID's runtime spec is a
+// llama.cpp RPC cluster head. A failed read counts as a head: calibration is
+// then skipped, which only delays it.
+func (s *Server) mappingIsClusterHead(ctx context.Context, mappingID string) bool {
+	spec, found, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
+	if err != nil {
+		slog.Debug("energy reconcile: runtime spec lookup failed; calibration skipped", "mapping_id", mappingID, "err", err)
+		return true
+	}
+	return found && spec.ClusterEnabled
 }
 
 // hostEnergyInput is what pricing one host's share of an event needs: the

@@ -2305,6 +2305,10 @@ func (f *fakeUsage) EnergyParts(ctx context.Context, eventID string) ([]usage.En
 	return f.recorder().EnergyParts(ctx, eventID)
 }
 
+func (f *fakeUsage) MemberPartEnergy(ctx context.Context, q usage.Query, hosts []string, groupBy string) ([]usage.GroupBucket, error) {
+	return f.recorder().MemberPartEnergy(ctx, q, hosts, groupBy)
+}
+
 func (f *fakeUsage) EnergyPartsByEvents(ctx context.Context, eventIDs []string) (map[string][]usage.EnergyPart, error) {
 	return f.recorder().EnergyPartsByEvents(ctx, eventIDs)
 }

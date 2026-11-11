@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// knownClusterHead answers the completion-time lookup from the same table.
+func (f fakeClusterHeads) knownClusterHead(ctx context.Context, serverID, mappingID string) (string, bool) {
+	return f.clusterHead(ctx, serverID, mappingID)
+}
+
 // TestRecordUsageListsClusterMembers pins that a request served by a cluster
 // head lists, when it completes, the head and every member the head held at
 // that moment (from the session records), so each host's energy part can be

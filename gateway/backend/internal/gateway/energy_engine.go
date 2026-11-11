@@ -471,10 +471,10 @@ func concurrencyAt(cc []interval, a, b time.Time) int {
 
 // estimatedEnergy implements Tier 2: the same concurrency-shared integration
 // as Tier 1, but over a flat `watts` (already PUE-scaled by the caller) for
-// the whole window instead of a per-sample power curve. A degenerate window (end<=start) yields dt=0 for
-// every interval (concurrencyBreakpoints returns nil), so WhTotal/WhMarginal
-// are both 0 — Source is still "estimated" (Tier 2 ran; it just integrated
-// over nothing).
+// the whole window instead of a per-sample power curve. A degenerate window
+// (end<=start) yields dt=0 for every interval (concurrencyBreakpoints returns
+// nil), so WhTotal/WhMarginal are both 0 — Source is still "estimated" (Tier
+// 2 ran; it just integrated over nothing).
 func estimatedEnergy(start, end time.Time, siblings []usage.Event, watts, idleW float64) EnergyResult {
 	cc := concurrencyBreakpoints(start, end, siblings)
 	var total, marginal float64

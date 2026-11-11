@@ -272,3 +272,84 @@ func TestUsageCostPricesPartsByPartHost(t *testing.T) {
 
 // closeTo tolerates postgres' float4 energy columns.
 func closeTo(a, b float64) bool { return a-b < 1e-3 && b-a < 1e-3 }
+
+// TestUsageMemberPartBuckets pins the member-part buckets: UsageGroups emits
+// another host's part as an energy-only bucket flagged MemberParts, never
+// merged into that host's own request bucket (so the portal can re-key it),
+// and MemberPartEnergy sums the parts drawn on the given hosts for requests
+// served by any other host -- energy only, under the request's group value.
+func TestUsageMemberPartBuckets(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		for _, e := range []usage.Event{
+			{ID: "ev_cluster", UserID: "u1", Model: "big", Host: "srv_head", ServerName: "Head", InputTokens: 7, EnergyWh: 3000, Status: "ok", HTTPStatus: 200, CreatedAt: now},
+			{ID: "ev_local", UserID: "u1", Model: "big", Host: "srv_mem", ServerName: "Member", InputTokens: 3, EnergyWh: 500, Status: "ok", HTTPStatus: 200, CreatedAt: now},
+		} {
+			s.Record(e)
+			if err := s.LastUsageError(); err != nil {
+				t.Fatalf("record %s: %v", e.ID, err)
+			}
+		}
+		if err := s.SetEnergyParts(ctx, "ev_cluster", []usage.EnergyPart{
+			{ServerID: "srv_head", Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
+			{ServerID: "srv_mem", Role: usage.EventHostRoleMember, Wh: 2000, Source: "measured"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		q := usage.Query{UserID: "u1"}
+		assertMemberPartBuckets(t, s, q)
+	})
+}
+
+// assertMemberPartBuckets runs the member-part bucket expectations on st,
+// seeded as TestUsageMemberPartBuckets seeds it.
+func assertMemberPartBuckets(t *testing.T, st usage.Store, q usage.Query) {
+	t.Helper()
+	ctx := context.Background()
+	buckets, err := st.UsageGroups(ctx, q, "model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own, member *usage.GroupBucket
+	for i := range buckets {
+		b := &buckets[i]
+		if b.Host != "srv_mem" {
+			continue
+		}
+		if b.MemberParts {
+			member = b
+		} else {
+			own = b
+		}
+	}
+	if own == nil || own.Count != 1 || !closeTo(own.EnergyWh, 500) || own.InputTokens != 3 {
+		t.Fatalf("member host's own bucket = %+v, want 1 request, 500 Wh", own)
+	}
+	if member == nil || member.Count != 0 || member.InputTokens != 0 || member.Key != "big" || !closeTo(member.EnergyWh, 2000) {
+		t.Fatalf("member part bucket = %+v, want energy only (2000 Wh) under the request's group", member)
+	}
+
+	got, err := st.MemberPartEnergy(ctx, q, []string{"srv_mem"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Host != "srv_mem" || got[0].Key != "" || !got[0].MemberParts || got[0].Count != 0 || !closeTo(got[0].EnergyWh, 2000) {
+		t.Fatalf("member part energy = %+v, want srv_mem 2000 Wh, energy only", got)
+	}
+	got, err = st.MemberPartEnergy(ctx, q, []string{"srv_mem"}, "server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Key != "Head" || !closeTo(got[0].EnergyWh, 2000) {
+		t.Fatalf("member part energy by server = %+v, want under the request's group value", got)
+	}
+	// A request whose own host is selected already counts in full.
+	got, err = st.MemberPartEnergy(ctx, q, []string{"srv_mem", "srv_head"}, "")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("member part energy with the head selected = %+v err=%v, want none", got, err)
+	}
+	if got, err := st.MemberPartEnergy(ctx, q, nil, ""); err != nil || len(got) != 0 {
+		t.Fatalf("member part energy of no hosts = %+v err=%v", got, err)
+	}
+}

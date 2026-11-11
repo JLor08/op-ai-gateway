@@ -908,6 +908,14 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	}
 }
 
+// completedClusterHeadSource answers, for a request that completed, whether
+// its mapping is a cluster head (and the head's spec id) without reading the
+// store for a mapping routing already looked up; satisfied by the instance
+// source.
+type completedClusterHeadSource interface {
+	knownClusterHead(ctx context.Context, serverID, mappingID string) (string, bool)
+}
+
 // clusterHostsTimeout bounds recordClusterHosts' store work; it runs on the
 // completed request's goroutine.
 const clusterHostsTimeout = 5 * time.Second
@@ -927,7 +935,7 @@ func (s *Server) recordClusterHosts(ev usage.Event, target routing.Target) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), clusterHostsTimeout)
 	defer cancel()
-	head, ok := s.clusterHeads.clusterHead(ctx, target.ServerID, target.RouteID)
+	head, ok := s.clusterHeads.knownClusterHead(ctx, target.ServerID, target.RouteID)
 	if !ok {
 		return
 	}

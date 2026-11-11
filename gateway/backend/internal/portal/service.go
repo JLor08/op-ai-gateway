@@ -2406,15 +2406,71 @@ func (s *Service) UsageStats(principal auth.Token, q usage.Query) (usage.Stats, 
 		return stats, fmt.Errorf("usage stats: %w", err)
 	}
 	ctx := context.Background()
+	sysDefault := s.systemDefaultPricePerKwh(ctx)
 	if byServer, err := s.usage.EnergyByServer(ctx, q); err == nil {
-		sysDefault := s.systemDefaultPricePerKwh(ctx)
 		var totalCost float64
 		for host, wh := range byServer {
 			totalCost += wh / 1000 * s.resolveUsagePrice(ctx, host, sysDefault)
 		}
 		stats.Totals.TotalCostEUR = totalCost
 	}
+	for _, b := range s.filteredServerMemberParts(ctx, q, "") {
+		stats.Totals.TotalEnergyWh += b.EnergyWh
+		stats.Totals.TotalCostEUR += b.EnergyWh / 1000 * s.resolveUsagePrice(ctx, b.Host, sysDefault)
+	}
 	return stats, nil
+}
+
+// filteredServerMemberParts returns, for a usage query filtered by server
+// (Server or ServerExact), the energy the selected servers drew as llama.cpp
+// RPC cluster members for requests other servers served, within the caller's
+// scope and every other filter: energy-only MemberParts buckets per
+// (groupBy value, member server). They add Wh and cost to an aggregate, never
+// a request, count or token -- those stay with the serving server, and the
+// request list (Usage) is not touched. A query without a server filter, no
+// matching server, or a failed read yields nothing (cost and energy are
+// best-effort display values here).
+func (s *Service) filteredServerMemberParts(ctx context.Context, q usage.Query, groupBy string) []usage.GroupBucket {
+	hosts := s.serverFilterHosts(ctx, q)
+	if len(hosts) == 0 {
+		return nil
+	}
+	unfiltered := q
+	unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
+	buckets, err := s.usage.MemberPartEnergy(ctx, unfiltered, hosts, groupBy)
+	if err != nil {
+		log.Printf("portal: member part energy lookup failed: %v", err)
+		return nil
+	}
+	return buckets
+}
+
+// serverFilterHosts resolves q's server filter to server ids by the servers'
+// current names, as the stores match a request's server: Server is a
+// case-insensitive substring of the name or the id, ServerExact the exact
+// name (case-insensitive). nil when q has no server filter.
+func (s *Service) serverFilterHosts(ctx context.Context, q usage.Query) []string {
+	exact := q.HasServerExact || q.ServerExact != ""
+	if (q.Server == "" && !exact) || s.routes == nil {
+		return nil
+	}
+	servers, err := s.routes.AIServers(ctx)
+	if err != nil {
+		log.Printf("portal: server list for a usage server filter failed: %v", err)
+		return nil
+	}
+	needle := strings.ToLower(q.Server)
+	var hosts []string
+	for _, srv := range servers {
+		if q.Server != "" && !strings.Contains(strings.ToLower(srv.Name), needle) && !strings.Contains(strings.ToLower(srv.ID), needle) {
+			continue
+		}
+		if exact && !strings.EqualFold(srv.Name, q.ServerExact) {
+			continue
+		}
+		hosts = append(hosts, srv.ID)
+	}
+	return hosts
 }
 
 // UsageTimeSeries returns the bucketed activity time-series under the same scope

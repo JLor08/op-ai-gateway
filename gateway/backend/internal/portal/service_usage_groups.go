@@ -73,6 +73,19 @@ func (s *Service) UsageGroups(principal auth.Token, q usage.Query, groupBy strin
 	if err != nil {
 		return nil, err
 	}
+	// Filtered by a server, the server's share of other servers' cluster
+	// requests counts too, as energy only.
+	buckets = append(buckets, s.filteredServerMemberParts(ctx, q, groupBy)...)
+	if groupBy == "server" {
+		// A member part is energy its own server drew: grouped by server it
+		// shows under that server's (current) name, not the serving server's.
+		names := make(map[string]string)
+		for i := range buckets {
+			if buckets[i].MemberParts {
+				buckets[i].Key = s.usageServerName(ctx, buckets[i].Host, names)
+			}
+		}
+	}
 	sysDefault := s.systemDefaultPricePerKwh(ctx)
 	// Resolve each host's price ONCE (mirrors attachUsageCost): a group-by over
 	// many groups sharing few servers must not issue an AIServerByID lookup per
@@ -140,6 +153,22 @@ func (s *Service) UsageGroups(principal auth.Token, q usage.Query, groupBy strin
 		out = out[:usageGroupsLimit]
 	}
 	return out, nil
+}
+
+// usageServerName returns server id's current name, else the id itself,
+// memoized in names for one call.
+func (s *Service) usageServerName(ctx context.Context, id string, names map[string]string) string {
+	if name, ok := names[id]; ok {
+		return name
+	}
+	name := id
+	if s.routes != nil {
+		if srv, err := s.routes.AIServerByID(ctx, id); err == nil && srv.Name != "" {
+			name = srv.Name
+		}
+	}
+	names[id] = name
+	return name
 }
 
 // usageGroupLabel resolves a display label for a group key. The default is the

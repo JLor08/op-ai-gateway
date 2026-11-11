@@ -219,10 +219,19 @@ type Store interface {
 	// UsageGroups aggregates the filtered set GROUP BY (dimension, host). groupBy is
 	// one of session|server|user|token|model (validated by the caller). Returns one
 	// bucket per (group value, host). An event with energy parts counts in the
-	// bucket of its own Host, with the head part's energy, and adds each other
-	// part's energy to the bucket of that part's host (in the same group), so
-	// the requests are counted once and every part can be priced at its host.
+	// bucket of its own Host, with the head part's energy; each other part's
+	// energy goes to a separate MemberParts bucket of that part's host in the
+	// same group, so the requests are counted once and every part can be
+	// priced at, and shown under, its host.
 	UsageGroups(ctx context.Context, q Query, groupBy string) ([]GroupBucket, error)
+	// MemberPartEnergy sums, over the events matching q, the energy parts
+	// drawn on one of hosts for events whose own Host is none of them (an
+	// event served by a selected host already counts in full), as MemberParts
+	// buckets per (groupBy value, part host). groupBy "" groups by host only
+	// (Key ""). The portal uses it to show a server's share of other servers'
+	// cluster requests in an aggregate filtered by that server; q then carries
+	// no server filter. No hosts reads nothing.
+	MemberPartEnergy(ctx context.Context, q Query, hosts []string, groupBy string) ([]GroupBucket, error)
 }
 
 type Recorder struct {
@@ -664,31 +673,71 @@ func (r *Recorder) UsageGroups(_ context.Context, q Query, groupBy string) ([]Gr
 			b.LastAt = e.CreatedAt
 		}
 	}
-	// The other hosts' parts add energy only, under their own host in the
-	// event's group: the request is already counted above.
+	out := make([]GroupBucket, 0, len(acc))
+	for _, b := range acc {
+		out = append(out, *b)
+	}
+	// The other hosts' parts add energy only, in buckets of their own: the
+	// request is already counted above.
+	return append(out, r.memberPartBucketsLocked(q, groupBy, nil)...), nil
+}
+
+// MemberPartEnergy sums the parts drawn on hosts for events served by any
+// other host, mirroring the SQL stores.
+func (r *Recorder) MemberPartEnergy(_ context.Context, q Query, hosts []string, groupBy string) ([]GroupBucket, error) {
+	if groupBy != "" {
+		if _, ok := usageGroupKey(groupBy, Event{}); !ok {
+			return nil, fmt.Errorf("member part energy: invalid group_by %q", groupBy)
+		}
+	}
+	if len(hosts) == 0 {
+		return []GroupBucket{}, nil
+	}
+	selected := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		selected[h] = true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.memberPartBucketsLocked(q, groupBy, selected), nil
+}
+
+// memberPartBucketsLocked sums, per (groupBy value, part host), the energy of
+// every part on a host other than its event's own, over the events matching
+// q. A non-nil selected keeps only parts on a selected host of events whose
+// own host is not selected. groupBy "" leaves Key empty. The caller holds
+// r.mu.
+func (r *Recorder) memberPartBucketsLocked(q Query, groupBy string, selected map[string]bool) []GroupBucket {
+	type gk struct{ key, host string }
+	acc := make(map[gk]*GroupBucket)
+	order := make([]gk, 0)
 	for _, e := range r.events {
-		if !matchUsage(q, e, nil) {
+		if !matchUsage(q, e, nil) || (selected != nil && selected[e.Host]) {
 			continue
 		}
-		key, _ := usageGroupKey(groupBy, e)
+		key := ""
+		if groupBy != "" {
+			key, _ = usageGroupKey(groupBy, e)
+		}
 		for _, p := range r.parts[e.ID] {
-			if p.ServerID == e.Host {
+			if p.ServerID == e.Host || (selected != nil && !selected[p.ServerID]) {
 				continue
 			}
 			id := gk{key, p.ServerID}
 			b := acc[id]
 			if b == nil {
-				b = &GroupBucket{Key: key, Host: p.ServerID}
+				b = &GroupBucket{Key: key, Host: p.ServerID, MemberParts: true}
 				acc[id] = b
+				order = append(order, id)
 			}
 			b.EnergyWh += p.Wh
 		}
 	}
-	out := make([]GroupBucket, 0, len(acc))
-	for _, b := range acc {
-		out = append(out, *b)
+	out := make([]GroupBucket, 0, len(order))
+	for _, id := range order {
+		out = append(out, *acc[id])
 	}
-	return out, nil
+	return out
 }
 
 // TimeSeries buckets the events matching q (From/To window + UserID/ScopeAll

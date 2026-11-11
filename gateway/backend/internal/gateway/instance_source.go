@@ -188,6 +188,28 @@ func (s *instanceSource) clusterHead(ctx context.Context, serverID, mappingID st
 	return e.specID, true
 }
 
+// knownClusterHead is clusterHead for a request that already completed
+// (recordClusterHosts): routing read the mapping's spec when it chose the
+// target, so the cached entry answers whatever its age, and the store is read
+// only when there is no entry at all (dropped after instanceSpecRetention, or
+// a target chosen without the instance source). A request on any mapping
+// therefore pays no store read on completion while its entry is kept.
+func (s *instanceSource) knownClusterHead(ctx context.Context, serverID, mappingID string) (string, bool) {
+	if s == nil || !s.features.Has(serverID, rpcClusterFeature) {
+		return "", false
+	}
+	s.mu.Lock()
+	e, hit := s.specs[mappingID]
+	s.mu.Unlock()
+	if !hit {
+		e = s.spec(ctx, mappingID)
+	}
+	if !e.found || !e.clusterHead {
+		return "", false
+	}
+	return e.specID, true
+}
+
 // spec returns mapping mappingID's spec, from the cache while its entry is
 // fresh. A miss reads the store, once per mapping at a time: the first request
 // to miss reads (read), and every request that misses while that read is in

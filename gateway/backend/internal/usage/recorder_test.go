@@ -1278,3 +1278,41 @@ func TestRecorderPricesPartsByPartHost(t *testing.T) {
 		t.Fatalf("parts by events = %+v, want ev_cluster's parts, head first", parts)
 	}
 }
+
+// TestRecorderMemberPartBuckets mirrors the SQL stores' member-part buckets:
+// flagged, never merged into the host's own request bucket, and
+// MemberPartEnergy over the selected hosts.
+func TestRecorderMemberPartBuckets(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_cluster", UserID: "u1", Model: "big", Host: "srv_head", ServerName: "Head", InputTokens: 7, EnergyWh: 3000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_local", UserID: "u1", Model: "big", Host: "srv_mem", ServerName: "Member", InputTokens: 3, EnergyWh: 500, CreatedAt: at})
+	if err := rec.SetEnergyParts(ctx, "ev_cluster", []EnergyPart{
+		{ServerID: "srv_head", Role: EventHostRoleHead, Wh: 1000},
+		{ServerID: "srv_mem", Role: EventHostRoleMember, Wh: 2000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := Query{UserID: "u1"}
+	buckets, _ := rec.UsageGroups(ctx, q, "model")
+	var own, member int
+	for _, b := range buckets {
+		switch {
+		case b.Host == "srv_mem" && b.MemberParts && b.Count == 0 && b.EnergyWh == 2000 && b.Key == "big":
+			member++
+		case b.Host == "srv_mem" && !b.MemberParts && b.Count == 1 && b.EnergyWh == 500:
+			own++
+		}
+	}
+	if own != 1 || member != 1 {
+		t.Fatalf("buckets = %+v, want srv_mem's own bucket and a separate member-part bucket", buckets)
+	}
+	got, _ := rec.MemberPartEnergy(ctx, q, []string{"srv_mem"}, "server")
+	if len(got) != 1 || got[0].Key != "Head" || got[0].Host != "srv_mem" || !got[0].MemberParts || got[0].EnergyWh != 2000 {
+		t.Fatalf("member part energy = %+v", got)
+	}
+	if got, _ := rec.MemberPartEnergy(ctx, q, []string{"srv_mem", "srv_head"}, ""); len(got) != 0 {
+		t.Fatalf("member part energy with the head selected = %+v, want none", got)
+	}
+}

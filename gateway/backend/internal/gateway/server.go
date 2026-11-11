@@ -513,10 +513,10 @@ type Server struct {
 	// wired; nil otherwise, which every method treats as nothing to keep.
 	clusterUsage *clusterUsage
 	// clusterHeads tells recordUsage which mappings are llama.cpp RPC cluster
-	// heads, through the instance source's spec cache, so a completed cluster
-	// request lists its member hosts for energy attribution. New sets it
+	// heads, from the instance source's spec cache (knownClusterHead), so a
+	// completed cluster request lists its member hosts for energy attribution. New sets it
 	// with the resolver's instance source; nil lists nothing.
-	clusterHeads clusterHeadSource
+	clusterHeads completedClusterHeadSource
 	// runtimeStarts counts the portal's manual starts whose ensure runs in the
 	// background (runtime_actions.go); cancelling the server's lifetime
 	// (baseCtx) ends each one's ensure. Only tests join them
