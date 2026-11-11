@@ -1465,6 +1465,8 @@ type owner struct {
 	// lastCacheSweep is when the last sweep of the rpc cache root started
 	// (maybeSweepMemberCaches); zero before the first document.
 	lastCacheSweep time.Time
+	// cacheSweeper runs those sweeps; created by the first.
+	cacheSweeper *memberCacheSweeper
 	// vramHeadroomMB is ManagerOptions.VRAMHeadroomMB, never negative. Fixed
 	// for the process lifetime, so a plain field like gpuVendor above; read
 	// only by buildSnapshot's auto-detected budgets.

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -316,7 +317,7 @@ const purgeTombstonePrefix = ".purge-"
 // purgeChangedHeadCaches removes the cache directory of every member spec in
 // before that is still in after but now serves another head, unless another
 // member in after still serves the old head. A member that left the document
-// keeps its cache: the sweep (sweepMemberCaches) removes it once it has been
+// keeps its cache: the sweep (memberCacheSweeper) removes it once it has been
 // unused long enough. The directories are removed off the owner goroutine: a
 // cache can hold many gigabytes.
 func (o *owner) purgeChangedHeadCaches(before map[string]string, after []Spec) {
@@ -380,7 +381,11 @@ func (o *owner) maybeSweepMemberCaches(specs []Spec) {
 		}
 	}
 	root := filepath.Join(o.configFilesDir, "rpc")
-	o.m.wg.Go(func() { sweepMemberCaches(root, keep, now) })
+	if o.cacheSweeper == nil {
+		o.cacheSweeper = newMemberCacheSweeper()
+	}
+	sw := o.cacheSweeper
+	o.m.wg.Go(func() { sw.sweep(root, keep, now) })
 }
 
 // sweepTick is the housekeeping beat's sweep: the document in force, but only
@@ -393,17 +398,36 @@ func (o *owner) sweepTick() {
 	o.maybeSweepMemberCaches(o.cfg.Specs)
 }
 
-// sweepMemberCaches sweeps the cache root. The cache of every head in keep is
-// touched (its modification time set to now, and marked if it is not), so the
+// memberCacheSweeper sweeps the cache root (sweep). It remembers, across
+// sweeps, the heads whose marker it last failed to touch, so that failure is
+// logged once per streak rather than every hour. Sweeps may overlap (one
+// outliving the interval), so the record is guarded.
+type memberCacheSweeper struct {
+	// chtimes is os.Chtimes; a field so tests can make a touch fail.
+	chtimes func(name string, atime, mtime time.Time) error
+
+	mu          sync.Mutex
+	touchFailed map[string]bool
+}
+
+func newMemberCacheSweeper() *memberCacheSweeper {
+	return &memberCacheSweeper{chtimes: os.Chtimes, touchFailed: map[string]bool{}}
+}
+
+// sweep sweeps the cache root. The cache of every head in keep is touched: its
+// marker is created if missing and its modification time set to now, so the
 // age the sweep judges is the time since a member last served that head, not
-// since its tensors were written: they are written once and then only read.
-// Every other directory that carries memberCacheMarker and whose newest
-// modification, its own or of anything inside it, lies more than
+// since its tensors were written (they are written once and then only read).
+// The marker is touched rather than the directory because Windows refuses to
+// change a directory's times while another process (Explorer, the indexer, a
+// virus scanner) holds it open. Every other directory that carries
+// memberCacheMarker and whose newest modification -- the marker's above all,
+// or anything else inside it, the directory included -- lies more than
 // memberCacheOrphanAge before now is removed; this covers caches orphaned
 // while the agent was down. A purge tombstone is removed once its purge,
 // recorded in its name, lies more than memberCacheSweepEvery back. Anything
 // else -- a file, a directory without the marker -- is left alone.
-func sweepMemberCaches(root string, keep map[string]bool, now time.Time) {
+func (sw *memberCacheSweeper) sweep(root string, keep map[string]bool, now time.Time) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -418,10 +442,7 @@ func sweepMemberCaches(root string, keep map[string]bool, now time.Time) {
 		}
 		dir := filepath.Join(root, name)
 		if keep[name] {
-			markMemberCache(dir)
-			if err := os.Chtimes(dir, now, now); err != nil {
-				slog.Warn("runtime: touch rpc cache", "path", dir, "err", err)
-			}
+			sw.touch(name, dir, now)
 			continue
 		}
 		if at, ok := tombstonePurgedAt(name); ok {
@@ -438,6 +459,26 @@ func sweepMemberCaches(root string, keep map[string]bool, now time.Time) {
 			continue
 		}
 		slog.Info("runtime: removed an unused rpc cache", "path", dir)
+	}
+}
+
+// touch marks the cache dir of head and sets its marker's times to now. A
+// failure is logged at Warn on the first failing sweep for that head only;
+// the next successful touch ends the streak.
+func (sw *memberCacheSweeper) touch(head, dir string, now time.Time) {
+	markMemberCache(dir)
+	err := sw.chtimes(filepath.Join(dir, memberCacheMarker), now, now)
+	sw.mu.Lock()
+	first := err != nil && !sw.touchFailed[head]
+	if err != nil {
+		sw.touchFailed[head] = true
+	} else {
+		delete(sw.touchFailed, head)
+	}
+	sw.mu.Unlock()
+	if first {
+		slog.Warn("runtime: cannot touch the rpc cache marker; the cache's age keeps running and the sweep may remove it 7 days after its last successful touch",
+			"path", dir, "err", err)
 	}
 }
 
