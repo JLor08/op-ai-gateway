@@ -980,7 +980,10 @@ head frame that arrived after the member's and still shows the head running the
 same process confirms it, because a head that stopped on its own ends its
 members' sessions too. A member server silent for max(3 × its telemetry
 interval, 15 s) counts as lost on a fresh head frame, never in the boot grace or
-before formation. A confirmed loss drains the head, releases the members, records
+before formation; the silence counts only from the start of the head server's
+current run of frames (a run ends at any gap over 15 s), so after a gap both
+hosts shared the head's frame arriving first is no lost member, and a head
+server reporting less often than every 15 s never counts a member stale. A confirmed loss drains the head, releases the members, records
 `runtime.cluster_member_lost` at that position and cools down; a head that was
 serving requests starts again once the cooldown ended. A head that exits on its
 own -- its own server's frame shows no process with its launch facts, either no
@@ -994,9 +997,11 @@ start, so a kept-up head is not started again at once. A head whose spec is gone
 reports the hold of a head that is not running holds a half-open connection its
 agent keeps listing, so the watchdog stops it with `POST /rpc/stop/{specID}?force=1`
 instead of releasing it; a head server silent past its stale threshold while the
-member's server kept reporting through that silence counts as not running the
-head, since a host that lost power never reports it stopped (never inside the
-boot grace, and only once the head server's interval is measured). That forced
+member's server kept reporting through that silence -- no gap over 15 s of its
+own -- counts as not running the head, since a host that lost power never
+reports it stopped (never inside the boot grace, only once the head server's
+interval is measured, and never for a member whose agent reports less often
+than every 15 s, which waits for the head server's own report). That forced
 stop is also a suspected loss: if the head's server reports again with the head
 still running, the head is stopped and cools down rather than staying formed
 with a dead member. A local start on a member host that waits only for a

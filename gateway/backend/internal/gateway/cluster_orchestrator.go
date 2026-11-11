@@ -1572,6 +1572,7 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 		return
 	}
 	o.closeSessions(ctx)
+	o.retainServers()
 	ctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
 	defer cancel()
 	o.liftChangedBlocks(ctx)
@@ -1615,6 +1616,18 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 			}
 		}()
 	}
+}
+
+// retainServers bounds the watchdog's per-server memory to the servers the
+// runtime status registry still holds: the app-health cycle prunes a deleted
+// server there (runtimeStatusRegistry.Retain), and every frame the watchdog
+// sees was published there first.
+func (o *clusterOrchestrator) retainServers() {
+	live := map[string]struct{}{}
+	for _, id := range o.deps.statuses.serverIDs() {
+		live[id] = struct{}{}
+	}
+	o.watch.retain(live)
 }
 
 // keptUpHeads lists the kept-up heads: the list read before while no runtime
