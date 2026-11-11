@@ -446,15 +446,6 @@ var usageSortColumns = map[string]string{
 	"token_name":        "e.token_name",
 }
 
-// usageWhere builds the parameterized WHERE shared by Query and Stats. dl is
-// the caller's dialect (for the ilike() operator, since sqlite LIKE and
-// postgres ILIKE are the case-insensitive spellings on their respective
-// dialects — dl.ilike() lets these filters match case-insensitively on both).
-// ownerNameExpr, when non-empty, is the SQL expression yielding the resolved
-// owner name (available only when the caller has joined users — the ScopeAll
-// list); the Owner filter then LIKE-matches it in addition to e.user_id.
-// Numeric filters iterate NumericColumns in a sorted key order so the
-// positional args are deterministic.
 // usageServerConds returns usageWhere's server predicates (Server, ServerExact)
 // on e, in usageWhere's order, so MemberPartEnergy can leave out exactly the
 // requests a server filter selects.
@@ -481,6 +472,15 @@ func usageServerConds(dl dialect, q usage.Query) ([]string, []any) {
 	return conds, args
 }
 
+// usageWhere builds the parameterized WHERE shared by Query and Stats. dl is
+// the caller's dialect (for the ilike() operator, since sqlite LIKE and
+// postgres ILIKE are the case-insensitive spellings on their respective
+// dialects — dl.ilike() lets these filters match case-insensitively on both).
+// ownerNameExpr, when non-empty, is the SQL expression yielding the resolved
+// owner name (available only when the caller has joined users — the ScopeAll
+// list); the Owner filter then LIKE-matches it in addition to e.user_id.
+// Numeric filters iterate NumericColumns in a sorted key order so the
+// positional args are deterministic.
 func usageWhere(dl dialect, q usage.Query, ownerNameExpr string) (string, []any) {
 	il := dl.ilike()
 	conds := make([]string, 0)
