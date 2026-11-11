@@ -2379,7 +2379,7 @@ const de = {
   rpcStatusRam: 'RAM (effektiv)',
   rpcStatusBindMismatch: 'Bind-Abweichung',
   rpcStatusBreaches: 'Verstöße',
-  agentClockOffset: (offset: string) => `Uhrabweichung des Agents: ${offset}`,
+  agentClockOffset: 'Uhrabweichung des Agents',
   agentClockOffsetUnknown: 'unbekannt',
   agentClockOffsetHelp:
     'Diagnosewert: Zeitstempel der letzten Telemetrie des Agents minus Empfangszeit am Gateway, inklusive Übertragungszeit; positiv heißt, die Uhr des Agents geht vor. Die Energiezuordnung liest die Messwerte jedes Hosts nach seinen eigenen Zeitstempeln, eine große Abweichung verschiebt also das Fenster, über das sein Anteil gerechnet wird. Unbekannt, bis der Agent nach einem Gateway-Start gemeldet hat.',
@@ -6205,7 +6205,7 @@ const en: PortalMessages = {
   rpcStatusRam: 'RAM (effective)',
   rpcStatusBindMismatch: 'Bind mismatch',
   rpcStatusBreaches: 'Breaches',
-  agentClockOffset: (offset: string) => `Agent clock offset: ${offset}`,
+  agentClockOffset: 'Agent clock offset',
   agentClockOffsetUnknown: 'unknown',
   agentClockOffsetHelp:
     "A diagnostic: the time stamp on the agent's latest telemetry minus the gateway's receive time, transit included; positive means the agent's clock runs ahead. Energy attribution reads each host's samples by its own time stamps, so a large offset shifts the window its share is computed over. Unknown until the agent reports after a gateway start.",
