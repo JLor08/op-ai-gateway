@@ -134,6 +134,25 @@ func TestHandlePortalClusterCandidates(t *testing.T) {
 		t.Fatalf("unknown mapping = %d %s", rec.Code, rec.Body.String())
 	}
 
+	// The application-scoped listing serves a head that is not stored yet.
+	appBase := "/api/portal/applications/app_head/runtime/cluster-candidates"
+	rec = rpcMemberDo(t, srv, http.MethodGet, appBase+"?mode=automatic&binary=%2Fopt%2Fllama%2Fllama-server", "")
+	list.Data, list.HeadBinaryKnown = nil, nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); rec.Code != http.StatusOK || err != nil || list.Data == nil || list.HeadBinaryKnown == nil || !*list.HeadBinaryKnown {
+		t.Fatalf("application list = %d %s err=%v", rec.Code, rec.Body.String(), err)
+	}
+	rec = rpcMemberDo(t, srv, http.MethodGet, appBase+"?mode=sideways", "")
+	if rec.Code != http.StatusBadRequest || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_mode_invalid" {
+		t.Fatalf("application bad mode = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec = rpcMemberDo(t, srv, http.MethodPost, appBase, ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("application post = %d", rec.Code)
+	}
+	rec = rpcMemberDo(t, srv, http.MethodGet, "/api/portal/applications/app_nope/runtime/cluster-candidates", "")
+	if rec.Code != http.StatusNotFound || rpcMemberErrCode(t, rec) != "application.not_found" {
+		t.Fatalf("unknown application = %d %s", rec.Code, rec.Body.String())
+	}
+
 	// A cluster head write refused through the HTTP surface answers its code.
 	rec = rpcMemberDo(t, srv, http.MethodPut, "/api/portal/mappings/map_head/runtime-spec",
 		`{"enabled":true,"binary":"/opt/llama/llama-server","type":"llama_cpp","args":["--rpc","${RPC_SERVERS}"],"startup_timeout_seconds":600,"cluster_enabled":true}`)

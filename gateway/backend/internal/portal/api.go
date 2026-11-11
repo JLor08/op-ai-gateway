@@ -35,6 +35,7 @@ type API interface {
 	ReconcileRPCPolicies(context.Context)
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AnthropicPromptCachingEnabled(context.Context) bool
+	ApplicationClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeRuntimeAction(context.Context, auth.Token, string) (RuntimeActionScope, error)

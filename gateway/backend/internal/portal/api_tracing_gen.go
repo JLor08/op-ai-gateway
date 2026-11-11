@@ -209,6 +209,18 @@ func (_d *APIWithTracing) AnthropicPromptCachingEnabled(ctx context.Context) (b1
 	return _d.API.AnthropicPromptCachingEnabled(ctx)
 }
 
+func (_d *APIWithTracing) ApplicationClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string) (c2 ClusterCandidateList, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ApplicationClusterCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ApplicationClusterCandidates(ctx, t1, s1, s2, s3)
+}
+
 func (_d *APIWithTracing) AuthorizeBenchmarkScope(ctx context.Context, t1 auth.Token, s1 string, s2 string) (a1 routing.AIServer, ba1 []BenchmarkTargetView, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeBenchmarkScope")
 	defer span.End()

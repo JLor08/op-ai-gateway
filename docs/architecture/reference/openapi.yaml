@@ -2592,6 +2592,25 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/applications/{id}/runtime/cluster-candidates:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: mode, in: query, required: false, schema: { type: string, enum: [automatic, manual] } }
+      - { name: binary, in: query, required: false, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Member candidates for a cluster head not stored yet ({"data":[...],"head_binary_known":bool})
+      description: >
+        The mapping-scoped cluster-candidates listing for a new runtime spec on
+        the application: the head server is the application's, the head binary
+        is the binary parameter alone, and a member spec any head uses is not
+        offered. Same answer and refusals; an application the caller may not
+        manage is 404 application.not_found.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/portal/applications/{id}/runtime/coresidency:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }

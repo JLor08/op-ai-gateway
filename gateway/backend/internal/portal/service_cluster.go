@@ -877,15 +877,22 @@ func (s *Service) checkManualMemberBinary(ctx context.Context, e clusterEntry, h
 }
 
 // mismatchedMemberSpecs lists the ids of specs on serverID whose binary's
-// known version differs from head's.
+// known version differs from head's, reading the server's inventory once.
 func (s *Service) mismatchedMemberSpecs(ctx context.Context, serverID string, specs []RPCMemberSpecDTO, head routing.ServerBinary) ([]string, error) {
+	rows, err := s.routes.ServerBinaries(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	byPath := make(map[string]routing.ServerBinary, len(rows))
+	for _, b := range rows {
+		if _, seen := byPath[b.Path]; !seen {
+			byPath[b.Path] = b
+		}
+	}
 	var out []string
 	for _, spec := range specs {
-		_, mismatch, err := s.memberBinaryMismatch(ctx, serverID, spec.Binary, head)
-		if err != nil {
-			return nil, err
-		}
-		if mismatch {
+		member, listed := byPath[spec.Binary]
+		if memberVersionDiffers(member, listed, head) {
 			out = append(out, spec.ID)
 		}
 	}
@@ -893,16 +900,21 @@ func (s *Service) mismatchedMemberSpecs(ctx context.Context, serverID string, sp
 }
 
 // memberBinaryMismatch reads a manual member's binary on serverID and reports
-// whether its known version differs from head's; an unlisted binary or an
-// unknown version is no mismatch (it only warns). The save check and the
-// candidates listing both decide with it.
+// whether its known version differs from head's (memberVersionDiffers).
 func (s *Service) memberBinaryMismatch(ctx context.Context, serverID, memberBinary string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
-	member, ok, err := s.BinaryVersionFor(ctx, serverID, memberBinary)
+	member, listed, err := s.BinaryVersionFor(ctx, serverID, memberBinary)
 	if err != nil {
 		return member, false, err
 	}
-	mismatch := ok && binaryVersionKnown(member) && binaryVersionsComparable(head, member) && !binariesSameVersion(head, member)
-	return member, mismatch, nil
+	return member, memberVersionDiffers(member, listed, head), nil
+}
+
+// memberVersionDiffers is the manual member rule the save check and the
+// candidates listing share: a listed member binary whose known version
+// differs from head's. An unlisted binary or an unknown version is no
+// mismatch (it only warns).
+func memberVersionDiffers(member routing.ServerBinary, listed bool, head routing.ServerBinary) bool {
+	return listed && binaryVersionKnown(member) && binaryVersionsComparable(head, member) && !binariesSameVersion(head, member)
 }
 
 // netbirdMeshReady reports whether a server can take part in a mesh
@@ -2066,15 +2078,54 @@ func (s *Service) ClusterCandidates(ctx context.Context, p auth.Token, headMappi
 	if err != nil {
 		return ClusterCandidateList{}, err
 	}
-	mode = normalizeMemberMode(strings.TrimSpace(mode))
-	if mode != memberModeAutomatic && mode != memberModeManual {
-		return ClusterCandidateList{}, ErrClusterMemberModeInvalid
+	if mode, err = candidateMode(mode); err != nil {
+		return ClusterCandidateList{}, err
 	}
-	head, err := s.candidateHeadOf(ctx, mapping.ID, headServer.ID, headBinary)
+	headSpec, configured, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)
 	if err != nil {
 		return ClusterCandidateList{}, err
 	}
-	out, err := s.clusterCandidatesFor(ctx, p, headServer.ID, mode, head)
+	binary := strings.TrimSpace(headBinary)
+	if binary == "" && configured {
+		binary = headSpec.Binary
+	}
+	return s.listClusterCandidates(ctx, p, headServer.ID, headSpec.ID, mode, binary)
+}
+
+// ApplicationClusterCandidates is ClusterCandidates for a head that is not
+// stored yet: a new runtime spec on appID, whose first write stores the spec
+// and its members together. It needs the application's rights, as creating
+// the spec does; the head binary is headBinary alone (no stored spec), and
+// no member spec is this head's own.
+func (s *Service) ApplicationClusterCandidates(ctx context.Context, p auth.Token, appID, mode, headBinary string) (ClusterCandidateList, error) {
+	_, headServer, err := s.authorizeApplication(ctx, p, appID)
+	if err != nil {
+		return ClusterCandidateList{}, err
+	}
+	if mode, err = candidateMode(mode); err != nil {
+		return ClusterCandidateList{}, err
+	}
+	return s.listClusterCandidates(ctx, p, headServer.ID, "", mode, strings.TrimSpace(headBinary))
+}
+
+// candidateMode normalizes a listing's member mode; "" is automatic.
+func candidateMode(mode string) (string, error) {
+	mode = normalizeMemberMode(strings.TrimSpace(mode))
+	if mode != memberModeAutomatic && mode != memberModeManual {
+		return "", ErrClusterMemberModeInvalid
+	}
+	return mode, nil
+}
+
+// listClusterCandidates is both listings' shared body: the head on
+// headServerID with the stored spec headSpecID ("" for a new one) and the
+// head binary binary ("" when there is none to match on).
+func (s *Service) listClusterCandidates(ctx context.Context, p auth.Token, headServerID, headSpecID, mode, binary string) (ClusterCandidateList, error) {
+	head, err := s.candidateHeadFor(ctx, headServerID, headSpecID, binary)
+	if err != nil {
+		return ClusterCandidateList{}, err
+	}
+	out, err := s.clusterCandidatesFor(ctx, p, headServerID, mode, head)
 	if err != nil {
 		return ClusterCandidateList{}, err
 	}
@@ -2120,27 +2171,20 @@ type candidateHead struct {
 	groups []string
 }
 
-// candidateHeadOf reads the head on mappingID. Its binary is headBinary when
-// given, else the stored spec's; a mapping without a stored spec and no
-// headBinary has no known binary version.
-func (s *Service) candidateHeadOf(ctx context.Context, mappingID, headServerID, headBinary string) (candidateHead, error) {
-	var h candidateHead
-	headSpec, configured, err := s.routes.RuntimeSpecByMapping(ctx, mappingID)
-	if err != nil {
-		return h, err
-	}
-	h.specID = headSpec.ID
-	binary := strings.TrimSpace(headBinary)
-	if binary == "" && configured {
-		binary = headSpec.Binary
-	}
+// candidateHeadFor reads what the listing needs of the head: its binary's
+// inventory row on headServerID (none when binary is "") and its server's
+// admin groups.
+func (s *Service) candidateHeadFor(ctx context.Context, headServerID, headSpecID, binary string) (candidateHead, error) {
+	h := candidateHead{specID: headSpecID}
 	if binary != "" {
 		var listed bool
+		var err error
 		if h.binary, listed, err = s.BinaryVersionFor(ctx, headServerID, binary); err != nil {
 			return h, err
 		}
 		h.known = listed && binaryVersionKnown(h.binary)
 	}
+	var err error
 	h.groups, err = s.routes.ServerAdminGroups(ctx, headServerID)
 	return h, err
 }

@@ -1002,6 +1002,11 @@ func TestClusterCandidatesMatchTheFormsHeadBinary(t *testing.T) {
 	if unknown.HeadBinaryKnown || len(unknown.Candidates) != 2 || unknown.Candidates[0].Compatible || unknown.Candidates[1].Compatible {
 		t.Fatalf("unknown binary = %+v", unknown)
 	}
+	// The save agrees: an automatic member cannot be matched on it.
+	req.Binary = "/somewhere/llama-server"
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterHeadBinaryVersionUnknown) {
+		t.Fatalf("save with an unknown head version = %v, want %v", err, ErrClusterHeadBinaryVersionUnknown)
+	}
 }
 
 func TestClusterCandidatesFlagManualSpecsOfAnotherVersion(t *testing.T) {
@@ -1030,6 +1035,62 @@ func TestClusterCandidatesFlagManualSpecsOfAnotherVersion(t *testing.T) {
 	req.MemberMode = "manual"
 	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterVersionMismatch) {
 		t.Fatalf("save with the mismatched spec = %v, want %v", err, ErrClusterVersionMismatch)
+	}
+	// And accepts the spec the listing does not flag.
+	req.ClusterMembers = []ClusterMemberDTO{{ServerID: srv.ID, MemberSpecID: match.ID}}
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatalf("save with the matching spec = %v", err)
+	}
+}
+
+// A new runtime spec has no mapping-scoped listing yet: the application's
+// listing reads the head server from the application and the head binary
+// from the form, and no member spec is the new head's own. The first write
+// then stores the head with its members.
+func TestApplicationClusterCandidatesForANewHead(t *testing.T) {
+	f := newClusterFixture(t)
+	good := f.member("Good")
+	free := f.manualSpec(good.ID)
+	taken := f.manualSpec(good.ID)
+	other := seedOtherHead(t, f)
+	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: good.ID, MemberSpecID: taken.ID, Port: 26100}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	auto, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "automatic", clusterHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !auto.HeadBinaryKnown || len(auto.Candidates) != 1 || auto.Candidates[0].ServerID != good.ID || !auto.Candidates[0].Compatible {
+		t.Fatalf("automatic = %+v", auto)
+	}
+	// Without a form binary there is nothing to match on.
+	none, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.HeadBinaryKnown || len(none.Candidates) != 1 || none.Candidates[0].Compatible {
+		t.Fatalf("no binary = %+v", none)
+	}
+	manual, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "manual", clusterHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manual.Candidates) != 1 || len(manual.Candidates[0].MemberSpecs) != 1 || manual.Candidates[0].MemberSpecs[0].ID != free.ID {
+		t.Fatalf("manual = %+v, want only the free spec", manual.Candidates)
+	}
+	if _, err := f.svc.ApplicationClusterCandidates(f.ctx, ownerToken(), f.app.ID, "sideways", ""); !errors.Is(err, ErrClusterMemberModeInvalid) {
+		t.Fatalf("bad mode err = %v", err)
+	}
+	if _, err := f.svc.ApplicationClusterCandidates(f.ctx, otherToken(), f.app.ID, "automatic", ""); !errors.Is(err, ErrApplicationNotFound) {
+		t.Fatalf("foreign application err = %v, want application not found", err)
+	}
+
+	// The spec's first write stores the head and the member the listing
+	// offered.
+	dto := f.mustPut(clusterHeadRequest(autoMember(good.ID)))
+	if !dto.ClusterEnabled || len(dto.ClusterMembers) != 1 || dto.ClusterMembers[0].ServerID != good.ID {
+		t.Fatalf("first write = %+v", dto)
 	}
 }
 
