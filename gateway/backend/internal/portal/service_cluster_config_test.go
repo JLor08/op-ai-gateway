@@ -533,7 +533,7 @@ func TestAgentRuntimeConfigStaleDemandCappedAtBudget(t *testing.T) {
 	members, _ := membersByServer(t, f, head.ID)
 	m := members[a.ID]
 	m.Stale = true
-	if err := f.routes.UpdateClusterMemberUsage(f.ctx, m, nil); err != nil {
+	if _, err := f.routes.UpdateClusterMemberUsage(f.ctx, m, nil); err != nil {
 		t.Fatal(err)
 	}
 	stale, _ := specByID(f.config(a.ID), automaticMemberSpecID(head.ID, a.ID))

@@ -112,6 +112,18 @@ func (_d *RoutingStoreWithTracing) ApplicationsByServer(ctx context.Context, ser
 	return _d.Store.ApplicationsByServer(ctx, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) BeginClusterMemberRun(ctx context.Context, headSpecID string, startedAt time.Time, headInstance int) (err error) {
+	ctx, span := Start(ctx, "routing.Store.BeginClusterMemberRun")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.BeginClusterMemberRun(ctx, headSpecID, startedAt, headInstance)
+}
+
 func (_d *RoutingStoreWithTracing) BenchmarkRunsByMapping(ctx context.Context, mappingID string, limit int) (ba1 []_sourceRouting.BenchmarkRun, err error) {
 	ctx, span := Start(ctx, "routing.Store.BenchmarkRunsByMapping")
 	defer span.End()
@@ -532,6 +544,18 @@ func (_d *RoutingStoreWithTracing) DeleteVendorAccount(ctx context.Context, id s
 	return _d.Store.DeleteVendorAccount(ctx, id)
 }
 
+func (_d *RoutingStoreWithTracing) EndClusterMemberRun(ctx context.Context, headSpecID string, serverID string, startedAt time.Time) (ended bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.EndClusterMemberRun")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.EndClusterMemberRun(ctx, headSpecID, serverID, startedAt)
+}
+
 func (_d *RoutingStoreWithTracing) GetCoResidencyMode(ctx context.Context, appID string) (c2 _sourceRouting.CoResidencyMode, err error) {
 	ctx, span := Start(ctx, "routing.Store.GetCoResidencyMode")
 	defer span.End()
@@ -746,6 +770,18 @@ func (_d *RoutingStoreWithTracing) OpenRPCSession(ctx context.Context, s _source
 		}
 	}()
 	return _d.Store.OpenRPCSession(ctx, s)
+}
+
+func (_d *RoutingStoreWithTracing) OpenRPCSessionsByMember(ctx context.Context, memberServerID string) (ra1 []_sourceRouting.RPCSession, err error) {
+	ctx, span := Start(ctx, "routing.Store.OpenRPCSessionsByMember")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.OpenRPCSessionsByMember(ctx, memberServerID)
 }
 
 func (_d *RoutingStoreWithTracing) PrincipalLimits(ctx context.Context, principalType string, principalID string) (l1 _sourceRouting.LimitConfig, b1 bool, err error) {
@@ -1660,7 +1696,7 @@ func (_d *RoutingStoreWithTracing) UpdateApplication(ctx context.Context, app _s
 	return _d.Store.UpdateApplication(ctx, app)
 }
 
-func (_d *RoutingStoreWithTracing) UpdateClusterMemberUsage(ctx context.Context, m _sourceRouting.ClusterMember, gpus []_sourceRouting.ClusterMemberGPU) (err error) {
+func (_d *RoutingStoreWithTracing) UpdateClusterMemberUsage(ctx context.Context, m _sourceRouting.ClusterMember, gpus []_sourceRouting.ClusterMemberGPU) (applied bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateClusterMemberUsage")
 	defer span.End()
 	defer func() {

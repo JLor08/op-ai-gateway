@@ -190,7 +190,7 @@ func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, 
 			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			headSpecID, m.Position, m.ServerID, m.MemberSpecID, m.Threads, m.CacheEnabled, m.DeviceBackend,
 			m.RAMEstimateMB, m.Port, m.RAMMeasuredMB, nullableTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB,
-			m.RunHeadInstance, nullableTime(m.RunStartedAt)); err != nil {
+			m.RunHeadInstance, runTime(m.RunStartedAt)); err != nil {
 			return s.classifyRPCWrite(err, "insert cluster member")
 		}
 	}
@@ -291,37 +291,136 @@ func (s *SQLiteStore) ClusterMemberBySpec(ctx context.Context, memberSpecID stri
 	return m, true, nil
 }
 
-// UpdateClusterMemberUsage writes only the measured / run-peak fields of the
-// membership row m and of each given GPU row, in one transaction. A missing
-// membership row is ErrNotFound; a GPU row that does not exist is skipped (the
-// usage of a card that left the membership is of no interest).
-func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
+// runTime is a run's start as a query argument: NULL for the zero time,
+// else the instant in UTC, so an equality test against the stored value
+// compares the same representation on every engine.
+func runTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UTC()
+}
+
+// inRun is the where-clause fragment and its arguments that hold while the
+// membership row of (head, server) is in the run that started at startedAt
+// (no run for the zero time).
+func inRun(headSpecID, serverID string, startedAt time.Time) (string, []any) {
+	if startedAt.IsZero() {
+		return `head_spec_id = ? and server_id = ? and run_started_at is null`, []any{headSpecID, serverID}
+	}
+	return `head_spec_id = ? and server_id = ? and run_started_at = ?`, []any{headSpecID, serverID, runTime(startedAt)}
+}
+
+// clusterMemberExists reports whether (head, server) has a membership row.
+func (s *SQLiteStore) clusterMemberExists(ctx context.Context, q *sql.Tx, headSpecID, serverID string) (bool, error) {
+	var n int
+	if err := q.QueryRowContext(ctx, s.dl.rebind(`select count(*) from rpc_cluster_members where head_spec_id = ? and server_id = ?`),
+		headSpecID, serverID).Scan(&n); err != nil {
+		return false, fmt.Errorf("check cluster member: %w", err)
+	}
+	return n > 0, nil
+}
+
+// UpdateClusterMemberUsage writes the measured fields of the membership row m
+// and of each given GPU row, in one transaction, while the row is in the run
+// m names (see the interface). A missing membership row is ErrNotFound; a GPU
+// row that does not exist is skipped (the usage of a card that left the
+// membership is of no interest).
+func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.ClusterMember, gpus []routing.ClusterMemberGPU) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin update cluster member usage: %w", err)
+		return false, fmt.Errorf("begin update cluster member usage: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	where, args := inRun(m.HeadSpecID, m.ServerID, m.RunStartedAt)
 	res, err := s.execOn(ctx, tx, `
-		update rpc_cluster_members set ram_measured_mb = ?, measured_at = ?, stale = ?, run_peak_ram_mb = ?,
-			run_head_instance = ?, run_started_at = ?
-		where head_spec_id = ? and server_id = ?`,
-		m.RAMMeasuredMB, nullableTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB, m.RunHeadInstance,
-		nullableTime(m.RunStartedAt), m.HeadSpecID, m.ServerID)
+		update rpc_cluster_members set ram_measured_mb = ?, measured_at = ?, stale = ?, run_peak_ram_mb = ?
+		where `+where,
+		append([]any{m.RAMMeasuredMB, nullableTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB}, args...)...)
 	if err != nil {
-		return fmt.Errorf("update cluster member usage: %w", err)
+		return false, fmt.Errorf("update cluster member usage: %w", err)
 	}
-	if err := requireAffected(res); err != nil {
-		return err
+	if n, err := res.RowsAffected(); err != nil {
+		return false, fmt.Errorf("update cluster member usage: %w", err)
+	} else if n == 0 {
+		exists, err := s.clusterMemberExists(ctx, tx, m.HeadSpecID, m.ServerID)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, ErrNotFound
+		}
+		return false, nil
 	}
 	for _, g := range gpus {
 		if _, err := s.execOn(ctx, tx, `
 			update rpc_cluster_member_gpus set vram_measured_mb = ?, run_peak_vram_mb = ?
 			where head_spec_id = ? and server_id = ? and gpu_index = ?`,
 			g.VRAMMeasuredMB, g.RunPeakVRAMMB, m.HeadSpecID, m.ServerID, g.GPUIndex); err != nil {
-			return fmt.Errorf("update cluster member gpu usage: %w", err)
+			return false, fmt.Errorf("update cluster member gpu usage: %w", err)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit cluster member usage: %w", err)
+	}
+	return true, nil
+}
+
+// BeginClusterMemberRun stamps every membership row of headSpecID with the
+// run and clears the run peaks, in one transaction.
+func (s *SQLiteStore) BeginClusterMemberRun(ctx context.Context, headSpecID string, startedAt time.Time, headInstance int) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin cluster member run: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := s.execOn(ctx, tx, `
+		update rpc_cluster_members set run_started_at = ?, run_head_instance = ?, run_peak_ram_mb = 0
+		where head_spec_id = ?`, runTime(startedAt), headInstance, headSpecID); err != nil {
+		return fmt.Errorf("begin cluster member run: %w", err)
+	}
+	if _, err := s.execOn(ctx, tx, `update rpc_cluster_member_gpus set run_peak_vram_mb = 0 where head_spec_id = ?`, headSpecID); err != nil {
+		return fmt.Errorf("begin cluster member gpu run: %w", err)
+	}
 	return tx.Commit()
+}
+
+// EndClusterMemberRun clears the run of (head, server) when it is the run
+// that started at startedAt, in one transaction.
+func (s *SQLiteStore) EndClusterMemberRun(ctx context.Context, headSpecID, serverID string, startedAt time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin end cluster member run: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	where, args := inRun(headSpecID, serverID, startedAt)
+	res, err := s.execOn(ctx, tx, `
+		update rpc_cluster_members set run_started_at = null, run_head_instance = 0, run_peak_ram_mb = 0
+		where `+where, args...)
+	if err != nil {
+		return false, fmt.Errorf("end cluster member run: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return false, fmt.Errorf("end cluster member run: %w", err)
+	} else if n == 0 {
+		exists, err := s.clusterMemberExists(ctx, tx, headSpecID, serverID)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			return false, ErrNotFound
+		}
+		return false, nil
+	}
+	if _, err := s.execOn(ctx, tx, `
+		update rpc_cluster_member_gpus set run_peak_vram_mb = 0 where head_spec_id = ? and server_id = ?`,
+		headSpecID, serverID); err != nil {
+		return false, fmt.Errorf("end cluster member gpu run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit end cluster member run: %w", err)
+	}
+	return true, nil
 }
 
 // OpenRPCSession appends an open session.
@@ -348,6 +447,31 @@ func (s *SQLiteStore) CloseRPCSessions(ctx context.Context, headSpecID string, i
 		return fmt.Errorf("close rpc sessions: %w", err)
 	}
 	return nil
+}
+
+// OpenRPCSessionsByMember lists the open sessions on memberServerID.
+func (s *SQLiteStore) OpenRPCSessionsByMember(ctx context.Context, memberServerID string) ([]routing.RPCSession, error) {
+	rows, err := s.query(ctx, `
+		select head_spec_id, instance, member_server_id, since
+		from rpc_sessions
+		where member_server_id = ? and until is null
+		order by head_spec_id, instance, since`, memberServerID)
+	if err != nil {
+		return nil, fmt.Errorf("list open rpc sessions: %w", err)
+	}
+	defer rows.Close()
+	out := make([]routing.RPCSession, 0)
+	for rows.Next() {
+		var sess routing.RPCSession
+		if err := rows.Scan(&sess.HeadSpecID, &sess.Instance, &sess.MemberServerID, &sess.Since); err != nil {
+			return nil, fmt.Errorf("scan open rpc session: %w", err)
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate open rpc sessions: %w", err)
+	}
+	return out, nil
 }
 
 // PruneRPCSessions deletes the closed sessions whose until is before before.

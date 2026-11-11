@@ -3897,25 +3897,32 @@ func (m *MemoryStore) ClusterMemberBySpec(_ context.Context, memberSpecID string
 	return ClusterMember{}, false, nil
 }
 
-// UpdateClusterMemberUsage writes only the measured / run-peak fields, like the
-// SQL update; a GPU row that does not exist is skipped.
-func (m *MemoryStore) UpdateClusterMemberUsage(_ context.Context, upd ClusterMember, gpus []ClusterMemberGPU) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	members := m.clusterMembers[upd.HeadSpecID]
-	idx := -1
-	for i, mem := range members {
-		if mem.ServerID == upd.ServerID {
-			idx = i
-			break
+// clusterMemberIndexLocked returns the index of serverID's row among
+// headSpecID's members, -1 when there is none. The caller holds m.mu.
+func (m *MemoryStore) clusterMemberIndexLocked(headSpecID, serverID string) int {
+	for i, mem := range m.clusterMembers[headSpecID] {
+		if mem.ServerID == serverID {
+			return i
 		}
 	}
+	return -1
+}
+
+// UpdateClusterMemberUsage writes the measured fields while the row is in
+// the run upd names, like the SQL update; a GPU row that does not exist is
+// skipped.
+func (m *MemoryStore) UpdateClusterMemberUsage(_ context.Context, upd ClusterMember, gpus []ClusterMemberGPU) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idx := m.clusterMemberIndexLocked(upd.HeadSpecID, upd.ServerID)
 	if idx < 0 {
-		return storeerr.ErrNotFound
+		return false, storeerr.ErrNotFound
 	}
-	row := &members[idx]
-	row.RAMMeasuredMB, row.MeasuredAt, row.Stale = upd.RAMMeasuredMB, upd.MeasuredAt, upd.Stale
-	row.RunPeakRAMMB, row.RunHeadInstance, row.RunStartedAt = upd.RunPeakRAMMB, upd.RunHeadInstance, upd.RunStartedAt
+	row := &m.clusterMembers[upd.HeadSpecID][idx]
+	if !row.RunStartedAt.Equal(upd.RunStartedAt) {
+		return false, nil
+	}
+	row.RAMMeasuredMB, row.MeasuredAt, row.Stale, row.RunPeakRAMMB = upd.RAMMeasuredMB, upd.MeasuredAt, upd.Stale, upd.RunPeakRAMMB
 	stored := m.clusterMemberGPUs[upd.HeadSpecID]
 	for _, g := range gpus {
 		for i := range stored {
@@ -3924,7 +3931,68 @@ func (m *MemoryStore) UpdateClusterMemberUsage(_ context.Context, upd ClusterMem
 			}
 		}
 	}
+	return true, nil
+}
+
+// setClusterMemberRunLocked sets the run of the row at idx of headSpecID and
+// clears its run peaks and its GPU rows'. The caller holds m.mu.
+func (m *MemoryStore) setClusterMemberRunLocked(headSpecID string, idx int, startedAt time.Time, headInstance int) {
+	row := &m.clusterMembers[headSpecID][idx]
+	row.RunStartedAt, row.RunHeadInstance, row.RunPeakRAMMB = startedAt, headInstance, 0
+	stored := m.clusterMemberGPUs[headSpecID]
+	for i := range stored {
+		if stored[i].ServerID == row.ServerID {
+			stored[i].RunPeakVRAMMB = 0
+		}
+	}
+}
+
+// BeginClusterMemberRun stamps every row of headSpecID with the run.
+func (m *MemoryStore) BeginClusterMemberRun(_ context.Context, headSpecID string, startedAt time.Time, headInstance int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.clusterMembers[headSpecID] {
+		m.setClusterMemberRunLocked(headSpecID, i, startedAt, headInstance)
+	}
 	return nil
+}
+
+// EndClusterMemberRun clears the row's run when it is the run named.
+func (m *MemoryStore) EndClusterMemberRun(_ context.Context, headSpecID, serverID string, startedAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idx := m.clusterMemberIndexLocked(headSpecID, serverID)
+	if idx < 0 {
+		return false, storeerr.ErrNotFound
+	}
+	if !m.clusterMembers[headSpecID][idx].RunStartedAt.Equal(startedAt) {
+		return false, nil
+	}
+	m.setClusterMemberRunLocked(headSpecID, idx, time.Time{}, 0)
+	return true, nil
+}
+
+// OpenRPCSessionsByMember lists memberServerID's open sessions by head, then
+// instance, then Since.
+func (m *MemoryStore) OpenRPCSessionsByMember(_ context.Context, memberServerID string) ([]RPCSession, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RPCSession, 0)
+	for _, s := range m.rpcSessions {
+		if s.MemberServerID == memberServerID && s.Until == nil {
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].HeadSpecID != out[j].HeadSpecID {
+			return out[i].HeadSpecID < out[j].HeadSpecID
+		}
+		if out[i].Instance != out[j].Instance {
+			return out[i].Instance < out[j].Instance
+		}
+		return out[i].Since.Before(out[j].Since)
+	})
+	return out, nil
 }
 
 // OpenRPCSession appends a session.

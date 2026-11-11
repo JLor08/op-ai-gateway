@@ -3662,11 +3662,27 @@ type RPCClusterStore interface {
 	// ClusterMemberBySpec returns the membership row that uses the manual
 	// member spec; ok is false when none does.
 	ClusterMemberBySpec(ctx context.Context, memberSpecID string) (ClusterMember, bool, error)
-	// UpdateClusterMemberUsage writes only the measured / run-peak fields of
-	// the existing membership row m (RAMMeasuredMB, MeasuredAt, Stale,
-	// RunPeakRAMMB, RunHeadInstance, RunStartedAt) and of each given GPU row
-	// (VRAMMeasuredMB, RunPeakVRAMMB). A missing row is ErrNotFound.
-	UpdateClusterMemberUsage(ctx context.Context, m ClusterMember, gpus []ClusterMemberGPU) error
+	// UpdateClusterMemberUsage writes the measured fields (RAMMeasuredMB,
+	// MeasuredAt, Stale, RunPeakRAMMB) of the existing membership row m and
+	// the measured fields (VRAMMeasuredMB, RunPeakVRAMMB) of each given GPU
+	// row, but only while the stored row is still in the run the caller read:
+	// its run_started_at equals m.RunStartedAt (the zero time matches no run).
+	// It never writes the run identity (RunStartedAt, RunHeadInstance). A
+	// membership rewrite in between that reset the run -- a change of the
+	// distribution, which also marks the values stale -- makes it write
+	// nothing and report applied false, so a value read before that rewrite
+	// is never written back over it. A missing row is ErrNotFound; a GPU row
+	// that does not exist is skipped.
+	UpdateClusterMemberUsage(ctx context.Context, m ClusterMember, gpus []ClusterMemberGPU) (applied bool, err error)
+	// BeginClusterMemberRun stamps every membership row of headSpecID with a
+	// new run (RunStartedAt = startedAt, RunHeadInstance = headInstance) and
+	// clears the run peaks of the rows and their GPU rows.
+	BeginClusterMemberRun(ctx context.Context, headSpecID string, startedAt time.Time, headInstance int) error
+	// EndClusterMemberRun clears the run of serverID's membership row of
+	// headSpecID (RunStartedAt, RunHeadInstance and the run peaks of the row
+	// and its GPU rows) when the row is in the run that started at
+	// startedAt; ended reports whether it was. A missing row is ErrNotFound.
+	EndClusterMemberRun(ctx context.Context, headSpecID, serverID string, startedAt time.Time) (ended bool, err error)
 	// OpenRPCSession appends an open session.
 	OpenRPCSession(ctx context.Context, s RPCSession) error
 	// CloseRPCSessions sets Until on every open session of (headSpecID,
@@ -3676,6 +3692,10 @@ type RPCClusterStore interface {
 	// at: Since <= at and (Until nil or Until >= at), ordered by Since, then
 	// member server ID. Always non-nil.
 	RPCSessionsAt(ctx context.Context, headSpecID string, instance int, at time.Time) ([]RPCSession, error)
+	// OpenRPCSessionsByMember lists the open sessions (Until nil) on
+	// memberServerID, of every head and instance, ordered by head spec ID,
+	// then instance, then Since. Always non-nil.
+	OpenRPCSessionsByMember(ctx context.Context, memberServerID string) ([]RPCSession, error)
 	// PruneRPCSessions deletes every closed session whose Until is before
 	// before; an open session is never pruned. Sessions are kept like
 	// telemetry: the telemetry retention loop calls it with its cutoff.

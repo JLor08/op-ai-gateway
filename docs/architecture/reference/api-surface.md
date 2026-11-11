@@ -839,7 +839,9 @@ Conventions worth stating, because each is a judgement call a client depends on:
   VRAM part) and `cluster_totals_complete` (both). A member's measured usage is
   kept per run: during a run of the head the stored value only rises, a formed
   run's peak replaces it when the head stops, and a run that never formed
-  replaces nothing. The PUT refuses, in
+  replaces nothing. A save that changes the split (members added, removed or
+  reordered, a member's GPUs, the head's launch) keeps the values as a stale
+  floor and ends the current run, so that run's peak never replaces them. The PUT refuses, in
   this order: a negative `min_instances`, `max_instances` or
   `instance_parallelism` `400 runtime_spec.tuning_invalid`; a `min_instances` or
   `max_instances` above 64 (`MaxInstanceIndex` + 1), an `instance_parallelism`

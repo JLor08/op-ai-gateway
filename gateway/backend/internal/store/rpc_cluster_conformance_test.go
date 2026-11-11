@@ -261,20 +261,21 @@ func TestConformanceRPCClusterMembership(t *testing.T) {
 			t.Fatalf("a failed replace must keep the old membership and gpus: %+v %+v", em, eg)
 		}
 
-		// Usage update touches only the measured fields.
+		// Usage update touches only the measured fields, and only while the
+		// row is in the run the caller read (none here).
 		measured := now.Add(time.Minute)
 		upd := members[0] // the srv_m2 member
 		upd.RAMMeasuredMB, upd.MeasuredAt, upd.Stale = 700, measured, true
-		upd.RunPeakRAMMB, upd.RunHeadInstance, upd.RunStartedAt = 900, 2, measured
+		upd.RunPeakRAMMB, upd.RunHeadInstance = 900, 2
 		upd.Threads, upd.Port, upd.RAMEstimateMB = 99, 99, 99 // must be ignored
 		ug := []routing.ClusterMemberGPU{{HeadSpecID: head, ServerID: "srv_m2", GPUIndex: 0, VRAMMeasuredMB: 5500, RunPeakVRAMMB: 5800, VRAMEstimateMB: 1}}
-		if err := s.UpdateClusterMemberUsage(ctx, upd, ug); err != nil {
-			t.Fatalf("usage update: %v", err)
+		if applied, err := s.UpdateClusterMemberUsage(ctx, upd, ug); err != nil || !applied {
+			t.Fatalf("usage update: applied=%v err=%v", applied, err)
 		}
 		gotM, gotG, _ = s.ClusterMembers(ctx, head)
 		m := gotM[1]
-		if m.RAMMeasuredMB != 700 || !m.MeasuredAt.Equal(measured) || !m.Stale || m.RunPeakRAMMB != 900 || m.RunHeadInstance != 2 || !m.RunStartedAt.Equal(measured) {
-			t.Fatalf("usage fields not written: %+v", m)
+		if m.RAMMeasuredMB != 700 || !m.MeasuredAt.Equal(measured) || !m.Stale || m.RunPeakRAMMB != 900 || m.RunHeadInstance != 0 || !m.RunStartedAt.IsZero() {
+			t.Fatalf("usage fields not written, or the run identity touched: %+v", m)
 		}
 		if m.Threads != 4 || m.Port != 47002 || m.RAMEstimateMB != 512 || m.DeviceBackend != "vulkan" {
 			t.Fatalf("usage update must not touch settings: %+v", m)
@@ -284,7 +285,7 @@ func TestConformanceRPCClusterMembership(t *testing.T) {
 		}
 		ghost := upd
 		ghost.ServerID = "srv_ghost"
-		if err := s.UpdateClusterMemberUsage(ctx, ghost, nil); !errors.Is(err, ErrNotFound) {
+		if _, err := s.UpdateClusterMemberUsage(ctx, ghost, nil); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("usage on a missing row: err=%v, want ErrNotFound", err)
 		}
 
@@ -438,6 +439,141 @@ func TestConformanceRPCSessionsPrune(t *testing.T) {
 		}
 		if len(got) != 2 || got[0] != "srv_edge" || got[1] != "srv_open" {
 			t.Fatalf("after prune = %v, want the session closed at the cutoff and the open one", got)
+		}
+	})
+}
+
+// TestConformanceRPCClusterMemberRuns pins the run identity of a head's
+// membership rows: a begin stamps every row with the run's start and clears
+// the run peaks, a usage write applies only while the row is still in the run
+// the caller read (a membership rewrite that reset the run refuses it), and
+// an end clears the run only for the run it names.
+func TestConformanceRPCClusterMemberRuns(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		head := seedRPCHeadSpec(ctx, t, s, "runs", now)
+		seedBinariesServer(ctx, t, s, "srv_r1", now)
+		seedBinariesServer(ctx, t, s, "srv_r2", now)
+		members := []routing.ClusterMember{
+			{HeadSpecID: head, Position: 0, ServerID: "srv_r1", Port: 47001, RunPeakRAMMB: 50},
+			{HeadSpecID: head, Position: 1, ServerID: "srv_r2", Port: 47001},
+		}
+		gpus := []routing.ClusterMemberGPU{{HeadSpecID: head, ServerID: "srv_r1", GPUIndex: 0, RunPeakVRAMMB: 70}}
+		if err := s.SetClusterMembers(ctx, head, members, gpus); err != nil {
+			t.Fatal(err)
+		}
+		read := func() (map[string]routing.ClusterMember, routing.ClusterMemberGPU) {
+			t.Helper()
+			m, g, err := s.ClusterMembers(ctx, head)
+			if err != nil || len(g) != 1 {
+				t.Fatalf("read: %v %v", g, err)
+			}
+			out := map[string]routing.ClusterMember{}
+			for _, row := range m {
+				out[row.ServerID] = row
+			}
+			return out, g[0]
+		}
+
+		run := now.Add(time.Minute).Truncate(time.Millisecond)
+		if err := s.BeginClusterMemberRun(ctx, head, run, 0); err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		got, g := read()
+		for _, id := range []string{"srv_r1", "srv_r2"} {
+			if !got[id].RunStartedAt.Equal(run) || got[id].RunPeakRAMMB != 0 {
+				t.Fatalf("%s after begin = %+v, want the run stamped and its peak cleared", id, got[id])
+			}
+		}
+		if g.RunPeakVRAMMB != 0 {
+			t.Fatalf("gpu after begin = %+v, want its peak cleared", g)
+		}
+
+		// A write for the run the caller read applies; one for another run
+		// does not, and writes nothing.
+		upd := got["srv_r1"]
+		upd.RAMMeasuredMB, upd.RunPeakRAMMB = 4000, 4000
+		if applied, err := s.UpdateClusterMemberUsage(ctx, upd, []routing.ClusterMemberGPU{{GPUIndex: 0, VRAMMeasuredMB: 9000, RunPeakVRAMMB: 9000}}); err != nil || !applied {
+			t.Fatalf("write in the run: applied=%v err=%v", applied, err)
+		}
+		other := upd
+		other.RunStartedAt, other.RAMMeasuredMB, other.Stale = run.Add(time.Second), 1, true
+		if applied, err := s.UpdateClusterMemberUsage(ctx, other, []routing.ClusterMemberGPU{{GPUIndex: 0, VRAMMeasuredMB: 1}}); err != nil || applied {
+			t.Fatalf("write for another run: applied=%v err=%v, want refused", applied, err)
+		}
+		got, g = read()
+		if r := got["srv_r1"]; r.RAMMeasuredMB != 4000 || r.Stale || g.VRAMMeasuredMB != 9000 || g.RunPeakVRAMMB != 9000 {
+			t.Fatalf("after the refused write = %+v %+v, want the run's write only", r, g)
+		}
+
+		// A membership rewrite that resets the run (a distribution change)
+		// refuses a write read before it.
+		rewritten, _, _ := s.ClusterMembers(ctx, head)
+		for i := range rewritten {
+			rewritten[i].RunStartedAt, rewritten[i].RunPeakRAMMB, rewritten[i].Stale = time.Time{}, 0, true
+		}
+		if err := s.SetClusterMembers(ctx, head, rewritten, []routing.ClusterMemberGPU{{HeadSpecID: head, ServerID: "srv_r1", GPUIndex: 0, VRAMMeasuredMB: 9000}}); err != nil {
+			t.Fatal(err)
+		}
+		upd.Stale = false
+		if applied, err := s.UpdateClusterMemberUsage(ctx, upd, nil); err != nil || applied {
+			t.Fatalf("write across a rewrite: applied=%v err=%v, want refused", applied, err)
+		}
+		if ended, err := s.EndClusterMemberRun(ctx, head, "srv_r1", run); err != nil || ended {
+			t.Fatalf("end of a reset run: ended=%v err=%v, want nothing ended", ended, err)
+		}
+		if got, _ = read(); !got["srv_r1"].Stale {
+			t.Fatalf("the rewrite's stale mark was overwritten: %+v", got["srv_r1"])
+		}
+
+		// An end names its run: another run's end leaves it alone.
+		run2 := run.Add(time.Hour)
+		if err := s.BeginClusterMemberRun(ctx, head, run2, 0); err != nil {
+			t.Fatal(err)
+		}
+		if ended, err := s.EndClusterMemberRun(ctx, head, "srv_r2", run); err != nil || ended {
+			t.Fatalf("end of the old run: ended=%v err=%v", ended, err)
+		}
+		if ended, err := s.EndClusterMemberRun(ctx, head, "srv_r2", run2); err != nil || !ended {
+			t.Fatalf("end of the current run: ended=%v err=%v", ended, err)
+		}
+		got, _ = read()
+		if !got["srv_r2"].RunStartedAt.IsZero() || !got["srv_r1"].RunStartedAt.Equal(run2) {
+			t.Fatalf("after the end = %+v", got)
+		}
+		if _, err := s.EndClusterMemberRun(ctx, head, "srv_ghost", run2); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("end on a missing row: err=%v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestConformanceOpenRPCSessionsByMember pins the per-member listing of open
+// sessions: every head's open session on the member, none closed, none of
+// another member.
+func TestConformanceOpenRPCSessionsByMember(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		for _, sess := range []routing.RPCSession{
+			{HeadSpecID: "rspec_b", MemberServerID: "srv_a", Since: t0.Add(time.Minute)},
+			{HeadSpecID: "rspec_a", MemberServerID: "srv_a", Since: t0},
+			{HeadSpecID: "rspec_c", MemberServerID: "srv_a", Since: t0},
+			{HeadSpecID: "rspec_a", MemberServerID: "srv_b", Since: t0},
+		} {
+			if err := s.OpenRPCSession(ctx, sess); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.CloseRPCSessions(ctx, "rspec_c", 0, "srv_a", t0.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.OpenRPCSessionsByMember(ctx, "srv_a")
+		if err != nil || len(got) != 2 || got[0].HeadSpecID != "rspec_a" || got[1].HeadSpecID != "rspec_b" || got[0].Until != nil {
+			t.Fatalf("open sessions of srv_a = %+v err=%v, want rspec_a then rspec_b", got, err)
+		}
+		if none, err := s.OpenRPCSessionsByMember(ctx, "srv_none"); err != nil || none == nil || len(none) != 0 {
+			t.Fatalf("no sessions = %v err=%v, want an empty list", none, err)
 		}
 	})
 }

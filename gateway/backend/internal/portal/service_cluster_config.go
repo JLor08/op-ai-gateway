@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // AgentFeatureRPCCluster is the feature an agent declares when it runs
@@ -671,7 +672,8 @@ func (s *Service) clusterWithheldReason(ctx context.Context, headSpecID string, 
 // measured usage per GPU, so they list exactly the spec's GPUs in the spec's
 // order, a kept GPU keeps its measured values and a removed one drops them.
 // A changed device order or set changes the distribution, so kept values
-// become a stale floor, as on a head edit.
+// become a stale floor and every member's run of that head ends, as on a
+// head edit (planClusterRows).
 func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, rows []routing.RPCMemberSpecGPU) (headSpecID string, err error) {
 	used, ok, err := s.routes.ClusterMemberBySpec(ctx, specID)
 	if err != nil || !ok {
@@ -693,17 +695,31 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 		next = append(next, g)
 	}
 	measured := false
+	for _, r := range rows {
+		if p, ok := prev[r.GPUIndex]; ok {
+			measured = measured || p.VRAMMeasuredMB > 0
+		}
+		nextOrder = append(nextOrder, r.GPUIndex)
+	}
+	changed := !slices.Equal(prevOrder, nextOrder)
 	for pos, r := range rows {
 		g := routing.ClusterMemberGPU{HeadSpecID: used.HeadSpecID, ServerID: used.ServerID, GPUIndex: r.GPUIndex, Position: pos}
 		if p, ok := prev[r.GPUIndex]; ok {
 			g.VRAMMeasuredMB, g.RunPeakVRAMMB = p.VRAMMeasuredMB, p.RunPeakVRAMMB
-			measured = measured || p.VRAMMeasuredMB > 0
 		}
-		nextOrder = append(nextOrder, r.GPUIndex)
 		next = append(next, g)
 	}
+	if changed {
+		for i := range next {
+			next[i].RunPeakVRAMMB = 0
+		}
+	}
 	for i := range members {
-		if members[i].ServerID == used.ServerID && !slices.Equal(prevOrder, nextOrder) && (measured || members[i].RAMMeasuredMB > 0) {
+		if !changed {
+			continue
+		}
+		members[i].RunPeakRAMMB, members[i].RunHeadInstance, members[i].RunStartedAt = 0, 0, time.Time{}
+		if members[i].ServerID == used.ServerID && (measured || members[i].RAMMeasuredMB > 0) {
 			members[i].Stale = true
 		}
 	}

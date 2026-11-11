@@ -24,49 +24,79 @@ import (
 // rule instead, per run -- one head process from its cluster start until it
 // stops:
 //
-//   - A sample counts only from the server that owns the member (the
-//     membership row's server for an automatic member, whose agent spec id
-//     names that server; the manual member spec's own server for a manual
-//     one) and only while the member reports the hold of that membership's
-//     head. The hold gates the sample; it never selects the head.
+//   - A run has an identity: the instant it began, stamped on every
+//     membership row of the head (run_started_at). Every write of the
+//     member usage names the run it read and applies only while the row is
+//     still in that run, and a run's end acts only on the rows of that run.
+//     So an end that arrives after the next run began changes nothing, and a
+//     change of the distribution -- which the portal answers by marking the
+//     kept values stale and resetting the run -- can never be overwritten by
+//     a value read before it, nor replaced by the old split's peak.
+//   - A sample counts only inside a run, only from the server that owns the
+//     member (the membership row's server for an automatic member, whose
+//     agent spec id names that server; the manual member spec's own server
+//     for a manual one), and only while the member reports the hold of that
+//     membership's head. The hold gates the sample; it never selects the
+//     head.
 //   - During a run the stored value only rises, and the run's own peak is
-//     kept beside it (run_peak_*, with the run's start), so a gateway restart
-//     in the middle of a run keeps both.
-//   - When a run that formed ends, its peak replaces the stored value -- also
-//     a lower one, and one kept stale from before a change of the
-//     distribution -- and the member server's document is pushed when that
-//     changed what it is pushed: after the head disconnects, its agent no
-//     longer holds the value. A rise pushes nothing: during the run the agent
-//     charges max(live, demand) itself, so a push would only echo the agent
-//     its own measurement.
+//     kept beside it (run_peak_*), so a gateway restart in the middle of a
+//     run keeps both.
+//   - When a run that formed ends, its peak replaces the stored value part by
+//     part -- also a lower one -- and the member server's document is pushed
+//     when that changed what it is pushed: after the head disconnects, its
+//     agent no longer holds the value. The stale mark clears only when the
+//     run measured every part that holds a stored value. A rise pushes
+//     nothing: during the run the agent charges max(live, demand) itself, so
+//     a push would only echo the agent its own measurement.
 //   - A run that never formed replaces nothing; what it raised stays.
 //
-// The orchestration (clusterOrchestrator) marks the runs: it begins one where
-// a cluster start begins, knows whether it formed, and ends it where it
-// learns the head stopped -- its explicit stop, or the head's exit on
-// telemetry. A run nobody ended (the gateway was down when the head stopped)
-// ends as unformed when the next one begins.
+// The orchestration (clusterOrchestrator) marks the runs: a cluster start
+// begins one while the head has no process, and otherwise -- and when the
+// telemetry shows the cluster formed already, a restarted gateway's case --
+// continues the stored one; it knows whether the run formed, and ends it
+// where it learns the head stopped -- its explicit stop, or the head's exit
+// on telemetry. A run nobody ended (the gateway was down when the head
+// stopped) is replaced by the next one, which replaces nothing of it.
 //
 // The same samples keep the session records (rpc_sessions): the hold of a
 // member by its head opens one, the end of the hold closes it. A restarted
 // gateway knows nothing of the sessions it left open, so the first sample of
-// each member server it receives closes those of members that no longer
-// report the hold and adopts those that still do.
+// each member server it receives syncs them with the store: a session still
+// held is adopted, any other open session of the server is closed -- also
+// one of a head or membership deleted meanwhile. A member server whose
+// telemetry stays away past the watchdog's stale threshold has its sessions
+// closed at its last frame, and syncs again when it comes back.
 
 // clusterHeadInstance is the instance index of a cluster head: a head is
 // never replicable, so its one process is instance 0.
 const clusterHeadInstance = 0
 
+// clusterUsageWriteAttempts bounds how often a reset re-reads a row whose run
+// changed under it.
+const clusterUsageWriteAttempts = 3
+
 // errClusterUsageUnavailable: the gateway has no store to keep member usage
 // in.
 var errClusterUsageUnavailable = errors.New("cluster member usage is not kept by this gateway")
 
-// clusterRunObserver is told where a cluster head's run begins and ends:
-// runBegan at the start of a cluster start, runEnded once the head stopped,
-// with whether the run formed. Satisfied by *clusterUsage.
+// errClusterUsageContended: a reset kept losing its write to concurrent
+// rewrites of the membership.
+var errClusterUsageContended = errors.New("cluster member usage changed concurrently; try again")
+
+// clusterRunObserver is told where a cluster head's run begins and ends, and
+// keeps the member sessions. Satisfied by *clusterUsage.
 type clusterRunObserver interface {
-	runBegan(ctx context.Context, head string)
-	runEnded(ctx context.Context, head string, formed bool)
+	// runBegan begins a run of head and returns its identity (zero when it
+	// could not be recorded: that run then measures nothing).
+	runBegan(ctx context.Context, head string) time.Time
+	// currentRun is the identity of head's stored run, zero when none is.
+	currentRun(ctx context.Context, head string) time.Time
+	// runEnded ends the run of head identified by run, with whether it
+	// formed.
+	runEnded(ctx context.Context, head string, run time.Time, formed bool)
+	// closeSilentSessions closes the open sessions of every member server
+	// lastFrame reports silent, at that server's last frame.
+	closeSilentSessions(ctx context.Context, lastFrame func(serverID string) (time.Time, bool))
 }
 
 // clusterUsage keeps the member usage and the session records. See the top of
@@ -84,8 +114,10 @@ type clusterUsage struct {
 	mu sync.Mutex
 	// open is the sessions this gateway opened or adopted and has not closed.
 	open map[rpcSessionKey]bool
-	// seen is the member servers whose first sample since the gateway started
-	// was handled.
+	// seen is the member servers whose sessions were synced with the store
+	// since the gateway started (or since they last went silent): one entry
+	// per server that reports, so a frame without member rows costs no store
+	// read.
 	seen map[string]bool
 }
 
@@ -95,37 +127,63 @@ func newClusterUsage(st routing.RPCClusterStore, push func(serverID string), now
 	return &clusterUsage{store: st, push: push, now: now, open: map[rpcSessionKey]bool{}, seen: map[string]bool{}}
 }
 
-// keyedLocks is one mutex per key, created on first use.
+// keyedLocks is one mutex per key, held in the map only while someone holds
+// or waits for it.
 type keyedLocks struct {
 	mu sync.Mutex
-	m  map[string]*sync.Mutex
+	m  map[string]*refLock
 }
 
-// lock locks key's mutex and returns its unlock.
+type refLock struct {
+	sync.Mutex
+	refs int
+}
+
+// lock locks key's mutex and returns its unlock, which drops the mutex from
+// the map once nobody holds or waits for it.
 func (k *keyedLocks) lock(key string) func() {
 	k.mu.Lock()
 	if k.m == nil {
-		k.m = map[string]*sync.Mutex{}
+		k.m = map[string]*refLock{}
 	}
 	l := k.m[key]
 	if l == nil {
-		l = &sync.Mutex{}
+		l = &refLock{}
 		k.m[key] = l
 	}
+	l.refs++
 	k.mu.Unlock()
 	l.Lock()
-	return l.Unlock
+	return func() {
+		l.Unlock()
+		k.mu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
+}
+
+// size is how many keys the map holds.
+func (k *keyedLocks) size() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.m)
 }
 
 func headLockKey(head string) string     { return "head\x00" + head }
 func serverLockKey(server string) string { return "server\x00" + server }
 
+// runIdentity is a run's identity for the instant t: UTC, to the millisecond,
+// so it compares equal after a round trip through every store.
+func runIdentity(t time.Time) time.Time { return t.UTC().Truncate(time.Millisecond) }
+
 // observe handles one telemetry frame of serverID: the usage of every member
 // on serverID its head holds, and the session records of every membership
-// on serverID. A frame without member rows costs nothing, unless it is the
-// server's first since the gateway started or the server has an open
-// session. Best-effort like every write-back of the ingest: a failure is
-// logged, never returned.
+// on serverID. A frame without member rows costs nothing, unless the
+// server's sessions are not synced yet or it has a session open.
+// Best-effort like every write-back of the ingest: a failure is logged,
+// never returned.
 func (u *clusterUsage) observe(ctx context.Context, serverID string, rows []RuntimeStatusDTO) {
 	if u == nil || u.store == nil || !u.relevant(serverID, rows) {
 		return
@@ -137,32 +195,26 @@ func (u *clusterUsage) observe(ctx context.Context, serverID string, rows []Runt
 		slog.Debug("cluster member usage: reading the server's memberships failed", "server_id", serverID, "err", err)
 		return
 	}
-	u.mu.Lock()
-	first := !u.seen[serverID]
-	u.seen[serverID] = true
-	u.mu.Unlock()
-	now := u.now()
 	byID := make(map[string]RuntimeStatusDTO, len(rows))
 	for _, r := range rows {
 		if r.Kind == portal.AgentSpecKindRPCServer && r.Instance == 0 {
 			byID[r.SpecID] = r
 		}
 	}
-	heads := make([]string, 0, len(memberships))
+	held := make(map[string]bool, len(memberships))
 	for _, m := range memberships {
-		heads = append(heads, m.HeadSpecID)
-		row, held := u.heldRow(ctx, serverID, m, byID)
-		u.trackSession(ctx, m.HeadSpecID, serverID, held, first, now)
-		if held {
-			u.raise(ctx, m, row, now)
+		row, ok := u.heldRow(ctx, serverID, m, byID)
+		held[m.HeadSpecID] = ok
+		if ok {
+			u.raise(ctx, m, row)
 		}
 	}
-	u.closeLeftSessions(ctx, serverID, heads, now)
+	u.syncSessions(ctx, serverID, held, u.now())
 }
 
 // relevant reports whether a frame of serverID can concern member usage or
-// sessions: it carries a member row, it is the server's first since the
-// gateway started, or the server has a session open.
+// sessions: it carries a member row, the server's sessions are not synced,
+// or the server has a session open.
 func (u *clusterUsage) relevant(serverID string, rows []RuntimeStatusDTO) bool {
 	if slices.ContainsFunc(rows, func(r RuntimeStatusDTO) bool { return r.Kind == portal.AgentSpecKindRPCServer }) {
 		return true
@@ -234,13 +286,13 @@ func gpusOf(gpus []routing.ClusterMemberGPU, serverID string) []routing.ClusterM
 	return out
 }
 
-// raise applies one counted sample of m: the run's peak and the stored value
-// rise to what it measured, each only upwards; a measurement of 0 is unknown
-// and changes nothing. A GPU the membership does not list is ignored. An
-// unchanged row is not written, so a stable member costs one read per sample.
-// The first counted sample of a run nobody began (one that was running before
-// the gateway kept runs) records the run's start.
-func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO, now time.Time) {
+// raise applies one counted sample of m inside the member's run: the run's
+// peak and the stored value rise to what it measured, each only upwards; a
+// measurement of 0 is unknown and changes nothing. A GPU the membership does
+// not list is ignored. Outside a run nothing counts. An unchanged row is not
+// written, so a stable member costs one read per sample; the write applies
+// only while the row is still in the run it read.
+func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO) {
 	vram := make(map[int]int, len(row.GPUs))
 	for _, g := range row.GPUs[:min(len(row.GPUs), maxRuntimeGPUsPerSample)] {
 		if g.VRAMMeasuredMB > 0 {
@@ -253,10 +305,11 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 	unlock := u.locks.lock(headLockKey(m.HeadSpecID))
 	defer unlock()
 	cur, gpus, ok, err := u.member(ctx, m.HeadSpecID, m.ServerID)
-	if err != nil || !ok {
-		if err != nil {
-			slog.Debug("cluster member usage: reading the membership failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
-		}
+	if err != nil {
+		slog.Debug("cluster member usage: reading the membership failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+		return
+	}
+	if !ok || cur.RunStartedAt.IsZero() {
 		return
 	}
 	peak, stored := false, false
@@ -280,51 +333,58 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 	if !peak && !stored {
 		return
 	}
-	if cur.RunStartedAt.IsZero() {
-		cur.RunStartedAt, cur.RunHeadInstance = now, clusterHeadInstance
-	}
 	if stored {
-		cur.MeasuredAt = now
+		cur.MeasuredAt = u.now()
 	}
-	if err := u.store.UpdateClusterMemberUsage(ctx, cur, gpus); err != nil {
+	if _, err := u.store.UpdateClusterMemberUsage(ctx, cur, gpus); err != nil {
 		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
 	}
 }
 
-// runBegan begins a run of head: every member's run peak starts from nothing
-// at now. A run still open from before -- one whose end the gateway missed --
-// thereby ends as unformed: its rises stay, its peak replaces nothing.
-func (u *clusterUsage) runBegan(ctx context.Context, head string) {
+// runBegan begins a run of head: every member row is stamped with the run's
+// identity (now) and its run peaks start from nothing. A run still open from
+// before -- one whose end the gateway missed -- is thereby replaced: its
+// rises stay, its peak replaces nothing.
+func (u *clusterUsage) runBegan(ctx context.Context, head string) time.Time {
 	if u == nil || u.store == nil {
-		return
+		return time.Time{}
 	}
 	unlock := u.locks.lock(headLockKey(head))
 	defer unlock()
-	members, gpus, err := u.store.ClusterMembers(ctx, head)
-	if err != nil {
-		slog.Warn("cluster member usage: reading the membership at a run's start failed", "head_spec_id", head, "err", err)
-		return
+	run := runIdentity(u.now())
+	if err := u.store.BeginClusterMemberRun(ctx, head, run, clusterHeadInstance); err != nil {
+		slog.Warn("cluster member usage: recording a run's start failed", "head_spec_id", head, "err", err)
+		return time.Time{}
 	}
-	now := u.now()
-	for _, m := range members {
-		mg := gpusOf(gpus, m.ServerID)
-		m.RunStartedAt, m.RunHeadInstance, m.RunPeakRAMMB = now, clusterHeadInstance, 0
-		for i := range mg {
-			mg[i].RunPeakVRAMMB = 0
-		}
-		if err := u.store.UpdateClusterMemberUsage(ctx, m, mg); err != nil {
-			slog.Warn("cluster member usage: recording a run's start failed", "head_spec_id", head, "server_id", m.ServerID, "err", err)
-		}
-	}
+	return run
 }
 
-// runEnded ends head's run. When it formed, each member's run peak replaces
-// its stored value, GPU by GPU (a part the run did not measure keeps its
-// stored value), and a member the run measured is no longer stale; a member
-// server whose pushed demand that changed is pushed once. Either way the
-// run's fields are cleared.
-func (u *clusterUsage) runEnded(ctx context.Context, head string, formed bool) {
+// currentRun is the identity of head's stored run: the run its member rows
+// are stamped with (a begin stamps them all alike), zero when none is.
+func (u *clusterUsage) currentRun(ctx context.Context, head string) time.Time {
 	if u == nil || u.store == nil {
+		return time.Time{}
+	}
+	members, _, err := u.store.ClusterMembers(ctx, head)
+	if err != nil {
+		slog.Warn("cluster member usage: reading the stored run failed", "head_spec_id", head, "err", err)
+		return time.Time{}
+	}
+	for _, m := range members {
+		if !m.RunStartedAt.IsZero() {
+			return m.RunStartedAt
+		}
+	}
+	return time.Time{}
+}
+
+// runEnded ends head's run identified by run, on the member rows still in it
+// (a row a later run or a change of the distribution took over is left
+// alone). When it formed, each part's run peak replaces its stored value
+// (replaceByRunPeak); a member server whose pushed demand that changed is
+// pushed once. Either way the run is cleared from the row.
+func (u *clusterUsage) runEnded(ctx context.Context, head string, run time.Time, formed bool) {
+	if u == nil || u.store == nil || run.IsZero() {
 		return
 	}
 	unlock := u.locks.lock(headLockKey(head))
@@ -337,25 +397,10 @@ func (u *clusterUsage) runEnded(ctx context.Context, head string, formed bool) {
 	now := u.now()
 	var pushes []string
 	for _, m := range members {
-		mg := gpusOf(gpus, m.ServerID)
-		open := !m.RunStartedAt.IsZero() || m.RunPeakRAMMB > 0 ||
-			slices.ContainsFunc(mg, func(g routing.ClusterMemberGPU) bool { return g.RunPeakVRAMMB > 0 })
-		if !open {
+		if !m.RunStartedAt.Equal(run) {
 			continue
 		}
-		changed := false
-		if formed {
-			changed = replaceByRunPeak(&m, mg, now)
-		}
-		m.RunStartedAt, m.RunHeadInstance, m.RunPeakRAMMB = time.Time{}, 0, 0
-		for i := range mg {
-			mg[i].RunPeakVRAMMB = 0
-		}
-		if err := u.store.UpdateClusterMemberUsage(ctx, m, mg); err != nil {
-			slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", head, "server_id", m.ServerID, "err", err)
-			continue
-		}
-		if changed && !slices.Contains(pushes, m.ServerID) {
+		if u.endMemberRun(ctx, m, gpusOf(gpus, m.ServerID), formed, now) && !slices.Contains(pushes, m.ServerID) {
 			pushes = append(pushes, m.ServerID)
 		}
 	}
@@ -368,16 +413,42 @@ func (u *clusterUsage) runEnded(ctx context.Context, head string, formed bool) {
 	}
 }
 
-// replaceByRunPeak lets a formed run's peaks replace m's stored values and
+// endMemberRun ends m's run (m read in it): a formed run's peaks replace the
+// stored values first, then the run is cleared. It reports whether the
+// member's pushed demand changed. The caller holds the head's lock.
+func (u *clusterUsage) endMemberRun(ctx context.Context, m routing.ClusterMember, gpus []routing.ClusterMemberGPU, formed bool, now time.Time) bool {
+	changed := false
+	if formed {
+		changed = replaceByRunPeak(&m, gpus, now)
+		applied, err := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
+		if err != nil || !applied {
+			if err != nil {
+				slog.Warn("cluster member usage: replacing by the run's peak failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+			}
+			return false
+		}
+	}
+	if _, err := u.store.EndClusterMemberRun(ctx, m.HeadSpecID, m.ServerID, m.RunStartedAt); err != nil {
+		slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+	}
+	return changed
+}
+
+// replaceByRunPeak lets a formed run's peaks replace m's stored values, part
+// by part (a part the run did not measure keeps its stored value), and
 // reports whether the member's pushed demand changed (a stored value, or the
-// stale mark that caps it).
+// stale mark that caps it). The stale mark clears only when the run measured
+// every part that holds a stored value: one measured GPU says nothing about
+// another GPU's stale value.
 func replaceByRunPeak(m *routing.ClusterMember, gpus []routing.ClusterMemberGPU, now time.Time) bool {
-	measured, changed := false, false
+	measured, complete, changed := false, true, false
 	if p := m.RunPeakRAMMB; p > 0 {
 		measured = true
 		if m.RAMMeasuredMB != p {
 			m.RAMMeasuredMB, changed = p, true
 		}
+	} else if m.RAMMeasuredMB > 0 {
+		complete = false
 	}
 	for i := range gpus {
 		if p := gpus[i].RunPeakVRAMMB; p > 0 {
@@ -385,15 +456,17 @@ func replaceByRunPeak(m *routing.ClusterMember, gpus []routing.ClusterMemberGPU,
 			if gpus[i].VRAMMeasuredMB != p {
 				gpus[i].VRAMMeasuredMB, changed = p, true
 			}
+		} else if gpus[i].VRAMMeasuredMB > 0 {
+			complete = false
 		}
 	}
 	if !measured {
 		return false
 	}
-	if m.Stale {
+	m.MeasuredAt = now
+	if m.Stale && complete {
 		m.Stale, changed = false, true
 	}
-	m.MeasuredAt = now
 	return changed
 }
 
@@ -406,16 +479,25 @@ func (u *clusterUsage) reset(ctx context.Context, head, serverID string) error {
 		return errClusterUsageUnavailable
 	}
 	unlock := u.locks.lock(headLockKey(head))
-	m, gpus, ok, err := u.member(ctx, head, serverID)
-	if err == nil && !ok {
-		err = store.ErrNotFound
-	}
-	if err == nil {
+	err := errClusterUsageContended
+	for range clusterUsageWriteAttempts {
+		m, gpus, ok, rerr := u.member(ctx, head, serverID)
+		if rerr == nil && !ok {
+			rerr = store.ErrNotFound
+		}
+		if rerr != nil {
+			err = rerr
+			break
+		}
 		m.RAMMeasuredMB, m.MeasuredAt, m.Stale, m.RunPeakRAMMB = 0, time.Time{}, false, 0
 		for i := range gpus {
 			gpus[i].VRAMMeasuredMB, gpus[i].RunPeakVRAMMB = 0, 0
 		}
-		err = u.store.UpdateClusterMemberUsage(ctx, m, gpus)
+		applied, werr := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
+		if werr != nil || applied {
+			err = werr
+			break
+		}
 	}
 	unlock()
 	if err != nil {
@@ -427,41 +509,61 @@ func (u *clusterUsage) reset(ctx context.Context, head, serverID string) error {
 	return nil
 }
 
-// trackSession keeps the session record of member's hold by head: a hold
-// this gateway has no open session for opens one -- unless, on the server's
-// first frame since the gateway started, the store still has it open, which
-// is adopted -- and the end of a hold closes it. On the first frame a member
-// without the hold closes whatever the store has open for it.
-func (u *clusterUsage) trackSession(ctx context.Context, head, member string, held, first bool, now time.Time) {
-	key := rpcSessionKey{head: head, member: member}
+// syncSessions keeps the session records of serverID's memberships after a
+// frame; held tells, per head serverID is a member of, whether the frame
+// shows that head's hold. A hold without an open session opens one, an open
+// session without the hold -- or of a head serverID is no longer a member of
+// -- is closed. Until the server's sessions were synced with the store, the
+// open sessions are the store's (a session a restarted gateway left open is
+// adopted while still held, closed otherwise); a sync that failed in part is
+// tried again on the next frame, so it never opens a session twice.
+func (u *clusterUsage) syncSessions(ctx context.Context, serverID string, held map[string]bool, now time.Time) {
 	u.mu.Lock()
-	open := u.open[key]
+	synced := u.seen[serverID]
+	open := map[string]bool{}
+	for k := range u.open {
+		if k.member == serverID {
+			open[k.head] = true
+		}
+	}
 	u.mu.Unlock()
-	switch {
-	case held && !open:
-		if first && u.sessionOpenInStore(ctx, head, member, now) {
+	if !synced {
+		stored, err := u.store.OpenRPCSessionsByMember(ctx, serverID)
+		if err != nil {
+			slog.Debug("cluster member usage: reading the open sessions failed", "server_id", serverID, "err", err)
+			return
+		}
+		for _, s := range stored {
+			open[s.HeadSpecID] = true
+		}
+	}
+	ok := true
+	for head, h := range held {
+		key := rpcSessionKey{head: head, member: serverID}
+		switch {
+		case h && open[head]:
 			u.setOpen(key, true)
-			return
+		case h:
+			if err := u.store.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: head, Instance: clusterHeadInstance, MemberServerID: serverID, Since: now}); err != nil {
+				slog.Debug("cluster member usage: opening a session failed", "head_spec_id", head, "server_id", serverID, "err", err)
+				ok = false
+				continue
+			}
+			u.setOpen(key, true)
+		case open[head]:
+			ok = u.closeSession(ctx, key, now) && ok
 		}
-		if err := u.store.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: head, Instance: clusterHeadInstance, MemberServerID: member, Since: now}); err != nil {
-			slog.Debug("cluster member usage: opening a session failed", "head_spec_id", head, "server_id", member, "err", err)
-			return
+	}
+	for head := range open {
+		if _, member := held[head]; !member {
+			ok = u.closeSession(ctx, rpcSessionKey{head: head, member: serverID}, now) && ok
 		}
-		u.setOpen(key, true)
-	case !held && (open || first):
-		u.closeSession(ctx, key, now)
 	}
-}
-
-// sessionOpenInStore reports whether the store has a session of head on
-// member open at now.
-func (u *clusterUsage) sessionOpenInStore(ctx context.Context, head, member string, now time.Time) bool {
-	sessions, err := u.store.RPCSessionsAt(ctx, head, clusterHeadInstance, now)
-	if err != nil {
-		slog.Debug("cluster member usage: reading the open sessions failed", "head_spec_id", head, "err", err)
-		return false
+	if ok {
+		u.mu.Lock()
+		u.seen[serverID] = true
+		u.mu.Unlock()
 	}
-	return slices.ContainsFunc(sessions, func(s routing.RPCSession) bool { return s.MemberServerID == member && s.Until == nil })
 }
 
 func (u *clusterUsage) setOpen(key rpcSessionKey, open bool) {
@@ -474,27 +576,61 @@ func (u *clusterUsage) setOpen(key rpcSessionKey, open bool) {
 	}
 }
 
-func (u *clusterUsage) closeSession(ctx context.Context, key rpcSessionKey, now time.Time) {
-	if err := u.store.CloseRPCSessions(ctx, key.head, clusterHeadInstance, key.member, now); err != nil {
+// closeSession closes key's open sessions at until and reports whether it
+// could.
+func (u *clusterUsage) closeSession(ctx context.Context, key rpcSessionKey, until time.Time) bool {
+	if err := u.store.CloseRPCSessions(ctx, key.head, clusterHeadInstance, key.member, until); err != nil {
 		slog.Debug("cluster member usage: closing a session failed", "head_spec_id", key.head, "server_id", key.member, "err", err)
-		return
+		return false
 	}
 	u.setOpen(key, false)
+	return true
 }
 
-// closeLeftSessions closes the open sessions on serverID of heads it is no
-// longer a member of (heads lists those it is): a membership removed while
-// its member was held.
-func (u *clusterUsage) closeLeftSessions(ctx context.Context, serverID string, heads []string, now time.Time) {
+// closeSilentSessions closes the open sessions of every member server whose
+// telemetry lastFrame reports silent, at that server's last frame: the
+// member is gone or cut off, and its head cannot hold it unseen. The server
+// is synced with the store again once it reports.
+func (u *clusterUsage) closeSilentSessions(ctx context.Context, lastFrame func(serverID string) (time.Time, bool)) {
+	if u == nil || u.store == nil {
+		return
+	}
 	u.mu.Lock()
-	var left []rpcSessionKey
+	var members []string
 	for k := range u.open {
-		if k.member == serverID && !slices.Contains(heads, k.head) {
-			left = append(left, k)
+		if !slices.Contains(members, k.member) {
+			members = append(members, k.member)
 		}
 	}
 	u.mu.Unlock()
-	for _, k := range left {
-		u.closeSession(ctx, k, now)
+	for _, member := range members {
+		last, silent := lastFrame(member)
+		if !silent {
+			continue
+		}
+		u.closeSilent(ctx, member, last)
+	}
+}
+
+func (u *clusterUsage) closeSilent(ctx context.Context, member string, last time.Time) {
+	unlock := u.locks.lock(serverLockKey(member))
+	defer unlock()
+	u.mu.Lock()
+	var keys []rpcSessionKey
+	for k := range u.open {
+		if k.member == member {
+			keys = append(keys, k)
+		}
+	}
+	u.mu.Unlock()
+	ok := true
+	for _, k := range keys {
+		ok = u.closeSession(ctx, k, last) && ok
+	}
+	if ok {
+		slog.Info("cluster member usage: closed the sessions of a member server that went silent", "server_id", member, "last_frame", last)
+		u.mu.Lock()
+		delete(u.seen, member)
+		u.mu.Unlock()
 	}
 }

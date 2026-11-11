@@ -8,6 +8,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"slices"
 	"testing"
+	"time"
 )
 
 // headDTO reads the head's runtime spec as the owner sees it.
@@ -132,7 +133,7 @@ func TestClusterStatusFlagsPeakAboveBudget(t *testing.T) {
 	members, _ := membersByServer(t, f, head.ID)
 	stale := members[c.ID]
 	stale.Stale = true
-	if err := f.routes.UpdateClusterMemberUsage(f.ctx, stale, nil); err != nil {
+	if _, err := f.routes.UpdateClusterMemberUsage(f.ctx, stale, nil); err != nil {
 		t.Fatal(err)
 	}
 	f.usage(head.ID, foreign.ID, 900, nil)
@@ -178,5 +179,74 @@ func TestAuthorizeClusterMemberUsageReset(t *testing.T) {
 	}
 	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, otherToken(), f.mappingID, mine.ID); !errors.Is(err, ErrMappingNotFound) {
 		t.Fatalf("foreign head err = %v, want mapping not found", err)
+	}
+}
+
+// TestDistributionChangeEndsTheRun pins the portal's half of the member usage
+// peak rule: a run that began before a change of the distribution must never
+// replace the stored values or clear the stale mark, so the change that marks
+// the kept values stale also resets every member's run (its start and peaks).
+// A save that keeps the distribution keeps the run.
+func TestDistributionChangeEndsTheRun(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	req := clusterHeadRequest(autoMember(a.ID, 0), autoMember(b.ID))
+	head := f.mustPut(req)
+	run := clusterTestNow.Add(time.Minute)
+	if err := f.routes.BeginClusterMemberRun(f.ctx, head.ID, run, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.usage(head.ID, a.ID, 1000, map[int]int{0: 7000})
+
+	f.mustPut(req)
+	rows, gpus := membersByServer(t, f, head.ID)
+	if !rows[a.ID].RunStartedAt.Equal(run) || rows[a.ID].RunPeakRAMMB != 1000 || gpus[a.ID][0].RunPeakVRAMMB != 7000 || rows[a.ID].Stale {
+		t.Fatalf("an unchanged save = %+v %+v, want the run kept", rows[a.ID], gpus[a.ID])
+	}
+
+	req.ClusterMembers = []ClusterMemberDTO{autoMember(b.ID), autoMember(a.ID, 0)}
+	f.mustPut(req)
+	rows, gpus = membersByServer(t, f, head.ID)
+	for _, id := range []string{a.ID, b.ID} {
+		if !rows[id].RunStartedAt.IsZero() || rows[id].RunPeakRAMMB != 0 {
+			t.Fatalf("member %s after a reorder = %+v, want its run reset", id, rows[id])
+		}
+	}
+	if gpus[a.ID][0].RunPeakVRAMMB != 0 || gpus[a.ID][0].VRAMMeasuredMB != 7000 || rows[a.ID].RAMMeasuredMB != 1000 || !rows[a.ID].Stale {
+		t.Fatalf("member A after a reorder = %+v %+v, want its values kept, stale, and its run peaks gone", rows[a.ID], gpus[a.ID])
+	}
+}
+
+// TestManualMemberGPUChangeEndsTheRun: re-ordering a manual member spec's
+// GPUs changes the split of the head that uses it, so every member's run of
+// that head is reset with the stale mark.
+func TestManualMemberGPUChangeEndsTheRun(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	spec := f.manualSpec(a.ID, RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 8000}, RuntimeSpecGPUDTO{Index: 1, VRAMEstimateMB: 8000})
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID}, autoMember(b.ID))
+	req.MemberMode = "manual"
+	req.ClusterMembers[1] = ClusterMemberDTO{ServerID: b.ID, MemberSpecID: f.manualSpec(b.ID).ID}
+	head := f.mustPut(req)
+	run := clusterTestNow.Add(time.Minute)
+	if err := f.routes.BeginClusterMemberRun(f.ctx, head.ID, run, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.usage(head.ID, a.ID, 1000, map[int]int{0: 7000, 1: 6000})
+	f.usage(head.ID, b.ID, 2000, nil)
+
+	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID, PutRPCMemberSpecRequest{
+		Binary: clusterRPCBinary, GPUs: []RuntimeSpecGPUDTO{{Index: 1, VRAMEstimateMB: 8000}, {Index: 0, VRAMEstimateMB: 8000}},
+	}); err != nil {
+		t.Fatalf("reorder the member spec's GPUs: %v", err)
+	}
+	rows, gpus := membersByServer(t, f, head.ID)
+	for _, id := range []string{a.ID, b.ID} {
+		if !rows[id].RunStartedAt.IsZero() || rows[id].RunPeakRAMMB != 0 {
+			t.Fatalf("member %s = %+v, want its run reset", id, rows[id])
+		}
+	}
+	if !rows[a.ID].Stale || gpus[a.ID][0].RunPeakVRAMMB != 0 || gpus[a.ID][0].VRAMMeasuredMB != 7000 {
+		t.Fatalf("member A = %+v %+v, want stale with its values kept and no run peak", rows[a.ID], gpus[a.ID])
 	}
 }

@@ -630,8 +630,10 @@ func (f *clusterFixture) usage(headID, serverID string, ramMB int, vram map[int]
 	for idx, mb := range vram {
 		gpus = append(gpus, routing.ClusterMemberGPU{GPUIndex: idx, VRAMMeasuredMB: mb, RunPeakVRAMMB: mb})
 	}
-	if err := f.routes.UpdateClusterMemberUsage(f.ctx, routing.ClusterMember{
+	members, _ := membersByServer(f.t, f, headID)
+	if _, err := f.routes.UpdateClusterMemberUsage(f.ctx, routing.ClusterMember{
 		HeadSpecID: headID, ServerID: serverID, RAMMeasuredMB: ramMB, MeasuredAt: clusterTestNow, RunPeakRAMMB: ramMB,
+		RunStartedAt: members[serverID].RunStartedAt,
 	}, gpus); err != nil {
 		f.t.Fatalf("usage: %v", err)
 	}
@@ -727,7 +729,7 @@ func TestPutClusterCarriesMeasuredValues(t *testing.T) {
 	// A head args change marks kept values stale too; a re-added member
 	// starts unmeasured.
 	f.usage(head.ID, a.ID, 1000, map[int]int{0: 7000})
-	if err := f.routes.UpdateClusterMemberUsage(f.ctx, routing.ClusterMember{HeadSpecID: head.ID, ServerID: a.ID, RAMMeasuredMB: 1000, MeasuredAt: clusterTestNow}, nil); err != nil {
+	if _, err := f.routes.UpdateClusterMemberUsage(f.ctx, routing.ClusterMember{HeadSpecID: head.ID, ServerID: a.ID, RAMMeasuredMB: 1000, MeasuredAt: clusterTestNow}, nil); err != nil {
 		t.Fatal(err)
 	}
 	req.ClusterMembers = []ClusterMemberDTO{autoMember(a.ID, 0), autoMember(b.ID, 0)}

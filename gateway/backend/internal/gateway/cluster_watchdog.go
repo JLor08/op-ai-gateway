@@ -204,6 +204,19 @@ func (w *clusterWatchdog) lastArrival(serverID string) time.Time {
 	return time.Time{}
 }
 
+// silentSince reports whether serverID's telemetry has stayed away past the
+// stale threshold -- three of its intervals, and at least staleFloor -- with
+// the arrival of its last frame; a server with no frame since the gateway
+// started is not judged.
+func (w *clusterWatchdog) silentSince(serverID string) (time.Time, bool) {
+	last := w.lastArrival(serverID)
+	if last.IsZero() {
+		return time.Time{}, false
+	}
+	limit := max(clusterStaleIntervals*w.interval(serverID), w.o.t.staleFloor)
+	return last, w.o.deps.now().Sub(last) > limit
+}
+
 // interval is serverID's telemetry interval as the watchdog estimates it: the
 // largest recent gap between its frames, at least minAgentInterval. A frame
 // that arrived early (an agent reports a transition at once) shortens no gap
@@ -318,9 +331,10 @@ func (w *clusterWatchdog) headExited(serverID, head string) {
 	o := w.o
 	o.mu.Lock()
 	st := o.heads[head]
-	var ended, formed bool
+	var run time.Time
+	var formed bool
 	if st != nil && st.start == nil {
-		ended, formed = endRunLocked(st)
+		run, formed = endRunLocked(st)
 	}
 	var members []portal.ClusterPlanMember
 	if st != nil {
@@ -336,9 +350,7 @@ func (w *clusterWatchdog) headExited(serverID, head string) {
 	}
 	o.mu.Unlock()
 	slog.Info("cluster head exited", "server_id", serverID, "head_spec_id", head)
-	if ended {
-		o.runEnded(head, formed)
-	}
+	o.runEnded(head, run, formed)
 	if len(members) == 0 {
 		o.Trigger()
 		return

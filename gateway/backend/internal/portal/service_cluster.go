@@ -939,10 +939,18 @@ func (s *Service) planClusterRows(ctx context.Context, plan *clusterPlan, entrie
 			}
 			plan.allocated = append(plan.allocated, i)
 		}
+		// A change of the distribution keeps the measured values as a stale
+		// floor and ends the member's current run: a run that began on the
+		// old split must never replace them (its peak describes that split)
+		// nor clear the stale mark. The gateway's usage writes are bound to
+		// the run they read, so the reset also refuses any write of a value
+		// read before this save.
 		measured := false
 		if kept {
 			row.RAMMeasuredMB, row.MeasuredAt, row.Stale = prev.RAMMeasuredMB, prev.MeasuredAt, prev.Stale
-			row.RunPeakRAMMB, row.RunHeadInstance, row.RunStartedAt = prev.RunPeakRAMMB, prev.RunHeadInstance, prev.RunStartedAt
+			if !changed {
+				row.RunPeakRAMMB, row.RunHeadInstance, row.RunStartedAt = prev.RunPeakRAMMB, prev.RunHeadInstance, prev.RunStartedAt
+			}
 			measured = prev.RAMMeasuredMB > 0
 		}
 		for pos, idx := range e.gpus {
@@ -952,7 +960,10 @@ func (s *Service) planClusterRows(ctx context.Context, plan *clusterPlan, entrie
 				g.VRAMEstimateMB = e.estimate[idx]
 			}
 			if prevGPU, ok := prevGPUByKey[e.server.ID][idx]; kept && ok {
-				g.VRAMMeasuredMB, g.RunPeakVRAMMB = prevGPU.VRAMMeasuredMB, prevGPU.RunPeakVRAMMB
+				g.VRAMMeasuredMB = prevGPU.VRAMMeasuredMB
+				if !changed {
+					g.RunPeakVRAMMB = prevGPU.RunPeakVRAMMB
+				}
 				measured = measured || prevGPU.VRAMMeasuredMB > 0
 			}
 			plan.gpus = append(plan.gpus, g)

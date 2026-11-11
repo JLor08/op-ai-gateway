@@ -233,7 +233,7 @@ type clusterOrchestratorDeps struct {
 	// the cluster's failure -- at once.
 	wake func(serverID string)
 	// runs, when set, is told where each run of a head begins and ends (the
-	// member usage's peak rule).
+	// member usage's peak rule) and keeps the member sessions.
 	runs clusterRunObserver
 }
 
@@ -355,10 +355,9 @@ type clusterHeadState struct {
 	// lands on a reservation the start armed.
 	releasing    int
 	releasesDone chan struct{}
-	// runOpen: a run of the head began (a start) or was found formed, and its
-	// end -- the head's stop -- has not been passed on yet; runFormed: that
-	// run formed.
-	runOpen   bool
+	// run is the identity of the head's run whose end -- the head's stop --
+	// has not been passed on yet (zero: none); runFormed: that run formed.
+	run       time.Time
 	runFormed bool
 }
 
@@ -597,13 +596,12 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) (release *po
 		return nil, &clusterError{Code: codeClusterUnavailable, Position: -1, Message: "this gateway's provider cannot start a cluster through the agents"}
 	}
 	if o.formedNow(plan) {
+		o.continueRun(ctx, head)
 		o.markFormed(head, plan)
 		return nil, nil
 	}
 	o.beginStart(head, plan)
-	if o.deps.runs != nil {
-		o.deps.runs.runBegan(ctx, head)
-	}
+	o.openRun(ctx, head, plan)
 
 	plan, ce := o.applyConfig(ctx, head, plan)
 	fp := o.fingerprint(ctx, plan)
@@ -714,7 +712,6 @@ func (o *clusterOrchestrator) beginStart(head string, plan portal.ClusterPlan) {
 	st := o.headState(head)
 	st.formed = false
 	st.phase = ""
-	st.runOpen, st.runFormed = true, false
 	st.members = make([]portal.ClusterMemberStatusDTO, len(plan.Members))
 	for i, m := range plan.Members {
 		st.members[i] = portal.ClusterMemberStatusDTO{Position: m.Position, State: clusterMemberPending}
@@ -745,7 +742,7 @@ func (o *clusterOrchestrator) markFormed(head string, plan portal.ClusterPlan) {
 	defer o.mu.Unlock()
 	st := o.headState(head)
 	st.formed, st.phase, st.formedAt = true, portal.ClusterPhaseFormed, o.deps.now()
-	st.runOpen, st.runFormed = true, true
+	st.runFormed = true
 	st.members = make([]portal.ClusterMemberStatusDTO, len(plan.Members))
 	for i, m := range plan.Members {
 		st.members[i] = portal.ClusterMemberStatusDTO{Position: m.Position, State: clusterMemberHeld}
@@ -1302,34 +1299,74 @@ func (o *clusterOrchestrator) markStopped(head string) {
 			st.members[i].State, st.members[i].Code = clusterMemberPending, ""
 		}
 	}
-	ended, formed := endRunLocked(st)
+	run, formed := endRunLocked(st)
 	o.mu.Unlock()
-	if ended {
-		o.runEnded(head, formed)
-	}
+	o.runEnded(head, run, formed)
 }
 
-// endRunLocked takes st's open run, if any: ended reports whether one was
-// open (each run ends once, whichever of a stop and the head's exit on
-// telemetry passes it on first), formed whether it formed. The caller holds
-// o.mu.
-func endRunLocked(st *clusterHeadState) (ended, formed bool) {
-	if st == nil || !st.runOpen {
-		return false, false
-	}
-	formed = st.runFormed
-	st.runOpen, st.runFormed = false, false
-	return true, formed
-}
-
-// runEnded passes the end of head's run to the run observer, on an action
-// goroutine under the server's lifetime: a run whose end is lost to the
-// shutdown ends as unformed when the next one begins.
-func (o *clusterOrchestrator) runEnded(head string, formed bool) {
+// openRun records the run of a start of head: a new one while the head's
+// server reports no process for the head, else -- the head still runs, or
+// its server has not reported since the gateway started -- the stored run
+// continues, so a start that finds the head up (a restarted gateway before
+// every member reported) never discards the measurement of the process that
+// runs.
+func (o *clusterOrchestrator) openRun(ctx context.Context, head string, plan portal.ClusterPlan) {
 	if o.deps.runs == nil {
 		return
 	}
-	o.goAction(func(ctx context.Context) { o.deps.runs.runEnded(ctx, head, formed) })
+	var run time.Time
+	if row, present, reported := o.headRow(plan); reported && (!present || !stateOccupied(row.State)) {
+		run = o.deps.runs.runBegan(ctx, head)
+	} else {
+		run = o.deps.runs.currentRun(ctx, head)
+	}
+	o.mu.Lock()
+	st := o.headState(head)
+	st.run, st.runFormed = run, false
+	o.mu.Unlock()
+}
+
+// continueRun records the stored run of head as the one the orchestration
+// follows, unless it follows one already: the case of a cluster the
+// telemetry shows formed, which a restarted gateway finds running.
+func (o *clusterOrchestrator) continueRun(ctx context.Context, head string) {
+	if o.deps.runs == nil {
+		return
+	}
+	o.mu.Lock()
+	known := !o.headState(head).run.IsZero()
+	o.mu.Unlock()
+	if known {
+		return
+	}
+	run := o.deps.runs.currentRun(ctx, head)
+	o.mu.Lock()
+	o.headState(head).run = run
+	o.mu.Unlock()
+}
+
+// endRunLocked takes st's run, if any: its identity (zero when none is
+// followed -- each run ends once, whichever of a stop and the head's exit on
+// telemetry passes it on first) and whether it formed. The caller holds
+// o.mu.
+func endRunLocked(st *clusterHeadState) (run time.Time, formed bool) {
+	if st == nil || st.run.IsZero() {
+		return time.Time{}, false
+	}
+	run, formed = st.run, st.runFormed
+	st.run, st.runFormed = time.Time{}, false
+	return run, formed
+}
+
+// runEnded passes the end of head's run to the run observer, on an action
+// goroutine under the server's lifetime. The end names its run, so it acts
+// on that run alone whenever it lands -- also after the next run began. A
+// zero run is none.
+func (o *clusterOrchestrator) runEnded(head string, run time.Time, formed bool) {
+	if o.deps.runs == nil || run.IsZero() {
+		return
+	}
+	o.goAction(func(ctx context.Context) { o.deps.runs.runEnded(ctx, head, run, formed) })
 }
 
 // StopManual is the operator's stop of head: Stop, and the head stays down
@@ -1466,6 +1503,9 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
 	defer cancel()
 	o.liftChangedBlocks(ctx)
+	if o.deps.runs != nil {
+		o.deps.runs.closeSilentSessions(ctx, o.watch.silentSince)
+	}
 	heads, err := o.deps.portal.KeptUpClusterHeads(ctx)
 	if err != nil {
 		slog.Warn("cluster reconcile: listing the kept-up heads failed", "err", err)

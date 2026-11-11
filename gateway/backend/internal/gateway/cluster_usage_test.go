@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
@@ -170,9 +171,21 @@ func (f *usageFixture) storeUsage(serverID string, ramMB int, vram map[int]int, 
 	for idx, v := range vram {
 		gpus = append(gpus, routing.ClusterMemberGPU{GPUIndex: idx, VRAMMeasuredMB: v})
 	}
-	if err := f.store.UpdateClusterMemberUsage(f.ctx, m, gpus); err != nil {
-		f.t.Fatal(err)
+	if applied, err := f.store.UpdateClusterMemberUsage(f.ctx, m, gpus); err != nil || !applied {
+		f.t.Fatalf("store usage: applied=%v err=%v", applied, err)
 	}
+}
+
+// begin begins a run of the head and moves the clock on, so the next run
+// gets another identity.
+func (f *usageFixture) begin() time.Time {
+	f.t.Helper()
+	run := f.u.runBegan(f.ctx, usageHead)
+	if run.IsZero() {
+		f.t.Fatal("runBegan recorded no run")
+	}
+	f.advance(time.Second)
+	return run
 }
 
 func (f *usageFixture) wantStored(serverID string, ramMB int, vram map[int]int) {
@@ -194,6 +207,7 @@ func (f *usageFixture) wantStored(serverID string, ramMB int, vram map[int]int) 
 // manual spec itself belongs to another server.
 func TestMemberUsageOnlyFromOwningServer(t *testing.T) {
 	f := newUsageFixture(t)
+	f.begin()
 	forged := usageRow(usageMemberSpec(usageGPUServer), usageHead, 9000, map[int]int{0: 20000})
 	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{forged})
 	f.u.observe(f.ctx, usageHeadServer, []RuntimeStatusDTO{forged})
@@ -212,6 +226,7 @@ func TestMemberUsageOnlyFromOwningServer(t *testing.T) {
 	if err := f.store.SetClusterMembers(f.ctx, usageHead, members, nil); err != nil {
 		t.Fatal(err)
 	}
+	f.begin()
 	manual := usageRow("rpcm_moved", usageHead, 7000, nil)
 	f.u.observe(f.ctx, usageGPUServer, []RuntimeStatusDTO{manual})
 	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{manual})
@@ -226,6 +241,10 @@ func TestMemberUsageOnlyFromOwningServer(t *testing.T) {
 // sample: one without a hold, or with another head's, writes nothing.
 func TestMemberUsageOnlyWhileHeldByThatHead(t *testing.T) {
 	f := newUsageFixture(t)
+	// Outside a run, even the head's hold counts for nothing.
+	f.observeGPU(usageHead, 5000, map[int]int{0: 10000})
+	f.wantStored(usageGPUServer, 0, map[int]int{0: 0})
+	f.begin()
 	f.observeGPU("", 5000, map[int]int{0: 10000})
 	f.observeGPU("rspec_other", 6000, map[int]int{0: 11000})
 	f.wantStored(usageGPUServer, 0, map[int]int{0: 0})
@@ -238,7 +257,7 @@ func TestMemberUsageOnlyWhileHeldByThatHead(t *testing.T) {
 func TestMemberUsageRisesDuringRun(t *testing.T) {
 	f := newUsageFixture(t)
 	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000, 1: 3000}, false)
-	f.u.runBegan(f.ctx, usageHead)
+	f.begin()
 	f.observeGPU(usageHead, 4000, map[int]int{0: 10000, 1: 4000})
 	f.observeGPU(usageHead, 6000, map[int]int{0: 9000, 1: 5000})
 	f.observeGPU(usageHead, 5000, map[int]int{0: 8000, 1: 4500})
@@ -261,12 +280,11 @@ func TestMemberUsageRisesDuringRun(t *testing.T) {
 func TestMemberUsageRunPeakReplacesAtFormedEnd(t *testing.T) {
 	f := newUsageFixture(t)
 	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000, 1: 6000}, true)
-	f.u.runBegan(f.ctx, usageHead)
-	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
+	run := f.begin()
+	f.observeGPU(usageHead, 5000, map[int]int{0: 9000, 1: 4000})
 	f.advance(time.Minute)
-	f.u.runEnded(f.ctx, usageHead, true)
-	// GPU 1 measured nothing in this run, so its stored value stays.
-	f.wantStored(usageGPUServer, 5000, map[int]int{0: 9000, 1: 6000})
+	f.u.runEnded(f.ctx, usageHead, run, true)
+	f.wantStored(usageGPUServer, 5000, map[int]int{0: 9000, 1: 4000})
 	m, gpus := f.member(usageGPUServer)
 	if m.Stale || !m.MeasuredAt.Equal(f.clock()) {
 		t.Fatalf("after the formed end: stale %v measured_at %v, want fresh at %v", m.Stale, m.MeasuredAt, f.clock())
@@ -283,9 +301,9 @@ func TestMemberUsageRunPeakReplacesAtFormedEnd(t *testing.T) {
 func TestMemberUsageUnformedRunKeepsRises(t *testing.T) {
 	f := newUsageFixture(t)
 	f.storeUsage(usageGPUServer, 3000, map[int]int{0: 20000}, false)
-	f.u.runBegan(f.ctx, usageHead)
+	run := f.begin()
 	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
-	f.u.runEnded(f.ctx, usageHead, false)
+	f.u.runEnded(f.ctx, usageHead, run, false)
 	f.wantStored(usageGPUServer, 5000, map[int]int{0: 20000})
 	m, _ := f.member(usageGPUServer)
 	if !m.RunStartedAt.IsZero() || m.RunPeakRAMMB != 0 {
@@ -294,11 +312,12 @@ func TestMemberUsageUnformedRunKeepsRises(t *testing.T) {
 	if pushed := f.takePushes(); len(pushed) != 0 {
 		t.Fatalf("an unformed end pushed %v, want nothing", pushed)
 	}
-	// A new run begun over a run nobody ended counts that one as unformed.
-	f.u.runBegan(f.ctx, usageHead)
+	// A new run begun over a run nobody ended replaces it: the old run's
+	// peak replaces nothing.
+	f.begin()
 	f.observeGPU(usageHead, 2000, nil)
-	f.u.runBegan(f.ctx, usageHead)
-	f.u.runEnded(f.ctx, usageHead, true)
+	next := f.begin()
+	f.u.runEnded(f.ctx, usageHead, next, true)
 	f.wantStored(usageGPUServer, 5000, map[int]int{0: 20000})
 }
 
@@ -308,21 +327,21 @@ func TestMemberUsageUnformedRunKeepsRises(t *testing.T) {
 func TestMemberUsagePushesMemberServerAtRunEnd(t *testing.T) {
 	f := newUsageFixture(t)
 	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, false)
-	f.u.runBegan(f.ctx, usageHead)
+	run := f.begin()
 	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
 	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 3000, nil)})
 	if pushed := f.takePushes(); len(pushed) != 0 {
 		t.Fatalf("rises pushed %v", pushed)
 	}
-	f.u.runEnded(f.ctx, usageHead, true)
+	f.u.runEnded(f.ctx, usageHead, run, true)
 	if got := slices.Sorted(slices.Values(f.takePushes())); !slices.Equal(got, []string{usageGPUServer}) {
 		t.Fatalf("pushed %v, want the GPU member's server only (the CPU member's stored value equals its peak)", got)
 	}
 
 	// The same peak again changes nothing and pushes nothing.
-	f.u.runBegan(f.ctx, usageHead)
+	run = f.begin()
 	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
-	f.u.runEnded(f.ctx, usageHead, true)
+	f.u.runEnded(f.ctx, usageHead, run, true)
 	if pushed := f.takePushes(); len(pushed) != 0 {
 		t.Fatalf("an unchanged formed end pushed %v", pushed)
 	}
@@ -415,10 +434,13 @@ func TestResetMemberUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := srv.Routes.BeginClusterMemberRun(ctx, usageHead, now, 0); err != nil {
+		t.Fatal(err)
+	}
 	m := members[0]
 	m.RAMMeasuredMB, m.RunPeakRAMMB, m.Stale, m.MeasuredAt, m.RunStartedAt = 7000, 6000, true, now, now
-	if err := srv.Routes.UpdateClusterMemberUsage(ctx, m, []routing.ClusterMemberGPU{{GPUIndex: 0, VRAMMeasuredMB: 30000, RunPeakVRAMMB: 25000}}); err != nil {
-		t.Fatal(err)
+	if applied, err := srv.Routes.UpdateClusterMemberUsage(ctx, m, []routing.ClusterMemberGPU{{GPUIndex: 0, VRAMMeasuredMB: 30000, RunPeakVRAMMB: 25000}}); err != nil || !applied {
+		t.Fatalf("seed usage: applied=%v err=%v", applied, err)
 	}
 
 	base := "/api/portal/mappings/map_usage_head/runtime/cluster-members/"
@@ -435,8 +457,8 @@ func TestResetMemberUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := members[0]
-	if got.RAMMeasuredMB != 0 || got.RunPeakRAMMB != 0 || got.Stale || !got.MeasuredAt.IsZero() {
-		t.Fatalf("member after reset = %+v, want its usage cleared", got)
+	if got.RAMMeasuredMB != 0 || got.RunPeakRAMMB != 0 || got.Stale || !got.MeasuredAt.IsZero() || !got.RunStartedAt.Equal(now) {
+		t.Fatalf("member after reset = %+v, want its usage cleared and its run kept", got)
 	}
 	for _, g := range gpus {
 		if g.ServerID == usageGPUServer && (g.VRAMMeasuredMB != 0 || g.RunPeakVRAMMB != 0) {
@@ -466,21 +488,48 @@ type runRecorder struct {
 	events []string
 }
 
-func (r *runRecorder) runBegan(_ context.Context, head string) {
+// The recorder's runs: a begun run is "begun", the stored run it reports is
+// "stored"; events name the run an end was for.
+var (
+	recordedBegun  = time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC)
+	recordedStored = time.Date(2026, 11, 6, 11, 0, 0, 0, time.UTC)
+)
+
+func runName(run time.Time) string {
+	switch {
+	case run.Equal(recordedBegun):
+		return "begun"
+	case run.Equal(recordedStored):
+		return "stored"
+	}
+	return run.String()
+}
+
+func (r *runRecorder) runBegan(_ context.Context, head string) time.Time {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, "began:"+head)
+	return recordedBegun
 }
 
-func (r *runRecorder) runEnded(_ context.Context, head string, formed bool) {
+func (r *runRecorder) currentRun(_ context.Context, head string) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, "continued:"+head)
+	return recordedStored
+}
+
+func (r *runRecorder) runEnded(_ context.Context, head string, run time.Time, formed bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if formed {
-		r.events = append(r.events, "ended:formed:"+head)
+		r.events = append(r.events, "ended:formed:"+runName(run)+":"+head)
 		return
 	}
-	r.events = append(r.events, "ended:unformed:"+head)
+	r.events = append(r.events, "ended:unformed:"+runName(run)+":"+head)
 }
+
+func (r *runRecorder) closeSilentSessions(context.Context, func(string) (time.Time, bool)) {}
 
 func (r *runRecorder) take() []string {
 	r.mu.Lock()
@@ -495,15 +544,18 @@ func newRunFixture(t *testing.T) (*orchFixture, *runRecorder) {
 	f := newOrchFixture(t, 2, "relay", "lan")
 	runs := &runRecorder{}
 	f.o.deps.runs = runs
+	// The head's server has reported, without a process for the head.
+	f.statuses.publish(orchHeadServer, []RuntimeStatusDTO{})
 	return f, runs
 }
 
 // TestClusterRunsFollowTheOrchestration pins where the orchestration begins
-// and ends a head's run for the member usage: a start begins one; the head's
-// stop ends it once -- formed when the cluster formed, whether the explicit
-// stop or the head's exit on telemetry passes it on first; a start that
-// never formed ends its run unformed; a head found formed after a gateway
-// restart continues the stored run instead of beginning one.
+// and ends a head's run for the member usage: a start of a head without a
+// process begins one; the head's stop ends it once, naming it -- formed when
+// the cluster formed, whether the explicit stop or the head's exit on
+// telemetry passes it on first; a start that never formed ends its run
+// unformed; a head found formed, or still running, continues the stored run
+// instead of beginning one.
 func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	f, runs := newRunFixture(t)
 	f.formed()
@@ -515,8 +567,8 @@ func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	}
 	f.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
 	f.settle()
-	if got := runs.take(); !slices.Equal(got, []string{"ended:formed:" + orchHead}) {
-		t.Fatalf("runs after the stop = %v, want one formed end", got)
+	if got := runs.take(); !slices.Equal(got, []string{"ended:formed:begun:" + orchHead}) {
+		t.Fatalf("runs after the stop = %v, want one formed end of the begun run", got)
 	}
 
 	// The head's own exit (an idle-out) ends a formed run as well.
@@ -525,7 +577,7 @@ func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	gruns.take()
 	g.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
 	g.settle()
-	if got := gruns.take(); !slices.Equal(got, []string{"ended:formed:" + orchHead}) {
+	if got := gruns.take(); !slices.Equal(got, []string{"ended:formed:begun:" + orchHead}) {
 		t.Fatalf("runs after the head exited = %v, want one formed end", got)
 	}
 
@@ -540,12 +592,12 @@ func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	clusterErrOf(t, h.o.Ensure(context.Background(), orchHead))
 	h.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
 	h.settle()
-	if got := hruns.take(); !slices.Equal(got, []string{"began:" + orchHead, "ended:unformed:" + orchHead}) {
+	if got := hruns.take(); !slices.Equal(got, []string{"began:" + orchHead, "ended:unformed:begun:" + orchHead}) {
 		t.Fatalf("runs of an unformed start = %v, want begun, then ended unformed", got)
 	}
 
 	// A cluster the telemetry already shows formed (a restarted gateway)
-	// begins no run; its end is still passed on, formed.
+	// begins no run: it continues the stored one, and its end names it.
 	k, kruns := newRunFixture(t)
 	k.ackAll()
 	k.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
@@ -555,7 +607,302 @@ func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	}
 	k.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
 	k.settle()
-	if got := kruns.take(); !slices.Equal(got, []string{"ended:formed:" + orchHead}) {
-		t.Fatalf("runs of a cluster found formed = %v, want only its formed end", got)
+	if got := kruns.take(); !slices.Equal(got, []string{"continued:" + orchHead, "ended:formed:stored:" + orchHead}) {
+		t.Fatalf("runs of a cluster found formed = %v, want the stored run continued and ended formed", got)
+	}
+}
+
+// TestRestartWithPartialTelemetryContinuesTheRun: after a gateway restart a
+// request can start a cluster whose head still runs while a member has not
+// reported yet, so formation is not seen. The start must continue the stored
+// run of the running process, never begin one (which would discard its
+// peaks); a head whose server has not reported at all is treated the same.
+func TestRestartWithPartialTelemetryContinuesTheRun(t *testing.T) {
+	f, runs := newRunFixture(t)
+	f.ackAll()
+	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	f.hold(0) // member 1 has not reported since the restart
+	f.holdOnHeadEnsure(0, 1)
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := runs.take(); !slices.Equal(got, []string{"continued:" + orchHead}) {
+		t.Fatalf("runs = %v, want the stored run continued, none begun", got)
+	}
+
+	g := newOrchFixture(t, 2, "relay", "lan")
+	gruns := &runRecorder{}
+	g.o.deps.runs = gruns
+	g.ackAll()
+	g.holdOnHeadEnsure(0, 1)
+	if err := g.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := gruns.take(); !slices.Equal(got, []string{"continued:" + orchHead}) {
+		t.Fatalf("runs with the head server unheard = %v, want the stored run continued", got)
+	}
+}
+
+// TestMemberUsageRunContinuesAcrossARestart: the run lives in the store, so
+// a restarted gateway continues it -- the peaks before the restart count at
+// the formed end.
+func TestMemberUsageRunContinuesAcrossARestart(t *testing.T) {
+	f := newUsageFixture(t)
+	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, false)
+	run := f.begin()
+	f.observeGPU(usageHead, 6000, map[int]int{0: 10000})
+	f.u = f.newUsage()
+	if got := f.u.currentRun(f.ctx, usageHead); !got.Equal(run) {
+		t.Fatalf("stored run after the restart = %v, want %v", got, run)
+	}
+	f.observeGPU(usageHead, 4000, map[int]int{0: 9000})
+	f.u.runEnded(f.ctx, usageHead, run, true)
+	f.wantStored(usageGPUServer, 6000, map[int]int{0: 10000})
+}
+
+// TestMemberUsageLateEndLeavesTheNextRunAlone: a run's end can land after the
+// next run began (the end runs aside, the next start does not wait for it).
+// It names its run, so it neither ends the new run nor replaces the stored
+// value with the new run's partial peak.
+func TestMemberUsageLateEndLeavesTheNextRunAlone(t *testing.T) {
+	f := newUsageFixture(t)
+	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, false)
+	old := f.begin()
+	f.observeGPU(usageHead, 7000, map[int]int{0: 11000})
+	next := f.begin()
+	f.observeGPU(usageHead, 2000, map[int]int{0: 3000})
+	f.u.runEnded(f.ctx, usageHead, old, true)
+	f.wantStored(usageGPUServer, 8000, map[int]int{0: 12000})
+	m, gpus := f.member(usageGPUServer)
+	if !m.RunStartedAt.Equal(next) || m.RunPeakRAMMB != 2000 || gpus[0].RunPeakVRAMMB != 3000 {
+		t.Fatalf("the new run after the late end = %+v %+v, want it intact", m, gpus[0])
+	}
+	if pushed := f.takePushes(); len(pushed) != 0 {
+		t.Fatalf("the late end pushed %v", pushed)
+	}
+	f.u.runEnded(f.ctx, usageHead, next, true)
+	f.wantStored(usageGPUServer, 2000, map[int]int{0: 3000})
+}
+
+// portalRewrite does to a membership what the portal's save does on a change
+// of the distribution: the values kept as a stale floor, the run reset.
+func (f *usageFixture) portalRewrite() {
+	f.t.Helper()
+	members, gpus, err := f.store.ClusterMembers(f.ctx, usageHead)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	for i := range members {
+		members[i].RunStartedAt, members[i].RunHeadInstance, members[i].RunPeakRAMMB = time.Time{}, 0, 0
+		members[i].Stale = members[i].RAMMeasuredMB > 0
+	}
+	for i := range gpus {
+		gpus[i].RunPeakVRAMMB = 0
+	}
+	if err := f.store.SetClusterMembers(f.ctx, usageHead, members, gpus); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// TestRunEndKeepsAnEditsStaleMark: a cluster edited while it runs (its
+// distribution changed) keeps its member values as a stale floor; the old
+// run's formed end must neither replace them with the old split's peak nor
+// clear the stale mark, and pushes nothing.
+func TestRunEndKeepsAnEditsStaleMark(t *testing.T) {
+	f := newUsageFixture(t)
+	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, false)
+	run := f.begin()
+	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
+	f.portalRewrite()
+	// The old process still reports the hold while it drains: outside a run
+	// it counts for nothing.
+	f.observeGPU(usageHead, 9000, map[int]int{0: 13000})
+	f.u.runEnded(f.ctx, usageHead, run, true)
+	f.wantStored(usageGPUServer, 8000, map[int]int{0: 12000})
+	if m, _ := f.member(usageGPUServer); !m.Stale {
+		t.Fatalf("member after the old run's end = %+v, want it still stale", m)
+	}
+	if pushed := f.takePushes(); len(pushed) != 0 {
+		t.Fatalf("pushed %v, want nothing", pushed)
+	}
+}
+
+// rewritingStore is a memory store that runs a membership rewrite right after
+// the next ClusterMembers read: a portal save landing between the gateway's
+// read and its write.
+type rewritingStore struct {
+	*routing.MemoryStore
+	mu    sync.Mutex
+	after func()
+}
+
+func (s *rewritingStore) ClusterMembers(ctx context.Context, head string) ([]routing.ClusterMember, []routing.ClusterMemberGPU, error) {
+	m, g, err := s.MemoryStore.ClusterMembers(ctx, head)
+	s.mu.Lock()
+	hook := s.after
+	s.after = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return m, g, err
+}
+
+// TestUsageWriteNeverUndoesAConcurrentEdit: a portal save that marks the
+// values stale and resets the run between the gateway's read of a row and
+// its write wins -- neither a rise nor a formed end writes back the stale
+// mark or the values it read.
+func TestUsageWriteNeverUndoesAConcurrentEdit(t *testing.T) {
+	f := newUsageFixture(t)
+	rs := &rewritingStore{MemoryStore: f.store}
+	f.u = newClusterUsage(rs, func(string) {}, f.clock)
+	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, false)
+	f.begin()
+	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
+
+	rs.mu.Lock()
+	rs.after = f.portalRewrite
+	rs.mu.Unlock()
+	f.observeGPU(usageHead, 9500, map[int]int{0: 14000})
+	f.wantStored(usageGPUServer, 8000, map[int]int{0: 12000})
+	if m, _ := f.member(usageGPUServer); !m.Stale {
+		t.Fatalf("after a rise raced the edit: %+v, want it stale", m)
+	}
+
+	// The same race at a formed end: the end read the run before the edit.
+	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, true)
+	run := f.begin()
+	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
+	rs.mu.Lock()
+	rs.after = f.portalRewrite
+	rs.mu.Unlock()
+	f.u.runEnded(f.ctx, usageHead, run, true)
+	f.wantStored(usageGPUServer, 8000, map[int]int{0: 12000})
+	if m, _ := f.member(usageGPUServer); !m.Stale {
+		t.Fatalf("after a formed end raced the edit: %+v, want it stale", m)
+	}
+}
+
+// TestMemberUsageStaleClearsOnlyWhenEveryPartWasMeasured: a formed run that
+// measured one GPU of a stale member replaces that GPU's value, but the
+// member stays stale while another stored part was not measured in the run.
+func TestMemberUsageStaleClearsOnlyWhenEveryPartWasMeasured(t *testing.T) {
+	f := newUsageFixture(t)
+	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000, 1: 6000}, true)
+	run := f.begin()
+	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
+	f.u.runEnded(f.ctx, usageHead, run, true)
+	f.wantStored(usageGPUServer, 5000, map[int]int{0: 9000, 1: 6000})
+	if m, _ := f.member(usageGPUServer); !m.Stale {
+		t.Fatalf("member = %+v, want it still stale: GPU 1 was not measured", m)
+	}
+}
+
+// failingSessionsStore fails the open-session listing the given number of
+// times.
+type failingSessionsStore struct {
+	*routing.MemoryStore
+	fails int
+}
+
+func (s *failingSessionsStore) OpenRPCSessionsByMember(ctx context.Context, member string) ([]routing.RPCSession, error) {
+	if s.fails > 0 {
+		s.fails--
+		return nil, errors.New("store unavailable")
+	}
+	return s.MemoryStore.OpenRPCSessionsByMember(ctx, member)
+}
+
+// TestSessionSyncFailureOpensNoDuplicate: a restarted gateway that cannot
+// read the sessions the store has open must not open another one (the energy
+// accounting would count the member twice); it syncs on the next frame.
+func TestSessionSyncFailureOpensNoDuplicate(t *testing.T) {
+	f := newUsageFixture(t)
+	f.observeGPU(usageHead, 0, nil)
+	fs := &failingSessionsStore{MemoryStore: f.store, fails: 1}
+	f.u = newClusterUsage(fs, func(string) {}, f.clock)
+	f.advance(time.Second)
+	f.observeGPU(usageHead, 0, nil)
+	f.advance(time.Second)
+	f.observeGPU(usageHead, 0, nil)
+	if got := f.openSessions(); !slices.Equal(got, []string{usageGPUServer}) {
+		t.Fatalf("open sessions = %v, want the one session adopted, none opened twice", got)
+	}
+}
+
+// TestSessionsOfAGoneMembershipCloseAtTheFirstFrame: a session the store has
+// open for a head the member server no longer serves (deleted while the
+// gateway was down) is closed by the server's first frame.
+func TestSessionsOfAGoneMembershipCloseAtTheFirstFrame(t *testing.T) {
+	f := newUsageFixture(t)
+	if err := f.store.OpenRPCSession(f.ctx, routing.RPCSession{HeadSpecID: "rspec_deleted", MemberServerID: usageGPUServer, Since: f.clock()}); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(time.Second)
+	f.u.observe(f.ctx, usageGPUServer, nil)
+	open, err := f.store.OpenRPCSessionsByMember(f.ctx, usageGPUServer)
+	if err != nil || len(open) != 0 {
+		t.Fatalf("open sessions = %+v err=%v, want the gone head's closed", open, err)
+	}
+}
+
+// TestSilentMemberSessionsClose: a member server whose telemetry stays away
+// past the stale threshold has its sessions closed at its last frame, and
+// syncs again when it reports.
+func TestSilentMemberSessionsClose(t *testing.T) {
+	f := newUsageFixture(t)
+	last := f.clock()
+	f.observeGPU(usageHead, 0, nil)
+	f.advance(time.Minute)
+	f.u.closeSilentSessions(f.ctx, func(string) (time.Time, bool) { return last, false })
+	if got := f.openSessions(); !slices.Equal(got, []string{usageGPUServer}) {
+		t.Fatalf("open while reporting = %v", got)
+	}
+	f.u.closeSilentSessions(f.ctx, func(id string) (time.Time, bool) { return last, id == usageGPUServer })
+	at, err := f.store.RPCSessionsAt(f.ctx, usageHead, 0, last)
+	if err != nil || len(at) != 1 || at[0].Until == nil || !at[0].Until.Equal(last) {
+		t.Fatalf("session = %+v err=%v, want it closed at the last frame", at, err)
+	}
+	f.advance(time.Second)
+	f.observeGPU(usageHead, 0, nil)
+	if got := f.openSessions(); !slices.Equal(got, []string{usageGPUServer}) {
+		t.Fatalf("open after the server came back = %v, want a new session", got)
+	}
+}
+
+// TestWatchdogSilentSince pins the silence threshold the session close uses:
+// the watchdog's stale threshold, max(3 intervals, staleFloor).
+func TestWatchdogSilentSince(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	if _, silent := f.o.watch.silentSince(orchMemberServer(0)); silent {
+		t.Fatal("a server never heard from is judged silent")
+	}
+	f.frame(orchMemberServer(0))
+	f.settle()
+	arrived := f.clock()
+	f.advance(15 * time.Second)
+	if _, silent := f.o.watch.silentSince(orchMemberServer(0)); silent {
+		t.Fatal("silent at the threshold, want only past it")
+	}
+	f.advance(time.Second)
+	if last, silent := f.o.watch.silentSince(orchMemberServer(0)); !silent || !last.Equal(arrived) {
+		t.Fatalf("silentSince = %v %v, want silent since %v", last, silent, arrived)
+	}
+}
+
+// TestKeyedLocksShrink: a lock nobody holds or waits for leaves the map.
+func TestKeyedLocksShrink(t *testing.T) {
+	var k keyedLocks
+	unlock := k.lock("a")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		k.lock("a")()
+	}()
+	unlock()
+	<-done
+	k.lock("b")()
+	if n := k.size(); n != 0 {
+		t.Fatalf("locks held in the map = %d, want 0", n)
 	}
 }
