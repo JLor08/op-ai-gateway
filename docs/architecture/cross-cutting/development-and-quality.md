@@ -13,10 +13,27 @@ demand). Everything below is runnable headlessly by a coding agent.
 
 | Tool | Version | Used for |
 |---|---|---|
-| Go | 1.27+ | `gateway/backend` (`op-ai-gateway`, declares go 1.25.0) and `server-agent` (`op-ai-server-agent`, declares go 1.26) |
+| Go | 1.26+ | `gateway/backend` (`op-ai-gateway`, declares go 1.25.0) and `server-agent` (`op-ai-server-agent`, declares go 1.26) |
 | Node.js / npm | Node 26 (LTS) | `gateway/frontend` (React/TS/Vite) and `gateway/e2e` (Playwright) |
-| golangci-lint | v2 (pinned in CI, currently v2.15.0) | Go formatting (`fmt`, gofumpt-based) + linting, both modules; CI pins Go 1.27 |
+| golangci-lint | v2 (pinned in CI, currently v2.15.0) | Go formatting (`fmt`, gofumpt-based) + linting, both modules; CI pins Go 1.26 |
 | Docker | any recent | Deploy images, the Postgres test env, the local SonarQube server |
+
+**Go stays on 1.26 for now (CI `go-version: "1.26"`, both Go builder images pinned to
+`golang:1.26.5`).** Go 1.27 (checked up to go1.27.4) carries a net/http server regression,
+golang/go commit `f5c3217500dc` (CL 794640, "net/http: don't rely on server request body not
+changing"): to decide whether to close the connection after the reply, `chunkWriter.writeHeader`
+now calls `bodyRemains()`, which takes the request body's mutex, where Go 1.26 read a lock-free
+flag. `body.Read` holds that mutex for the whole blocking network read. So for a request that sent
+`Expect: 100-continue`, a full-duplex handler (`EnableFullDuplex`) cannot write its response
+headers while another goroutine is blocked reading the request body: the header write waits until
+the client sends more body bytes. The live-transcription relay hits exactly that. The loopback
+dials `/v1/audio/transcriptions/live` with `Expect: 100-continue` (load-bearing, see ADR-073 (d)),
+`liveBodyCopyLoop` reads the body during the upstream dial (#331), and a client that waits for the
+SSE `200` before sending more audio deadlocks. On Go 1.27 every live-transcription and voice chat
+WebSocket test times out. There is no GODEBUG for it, and dropping the `Expect` header instead
+breaks the early-refusal paths. Move to Go 1.27+ once a Go release takes the body lock out of
+that header-write path; the `TestVoice*` and `TestLiveTranscriptionLoopback*` tests in
+`internal/gateway` show when it is safe.
 
 ## 2. Branching & pull requests
 

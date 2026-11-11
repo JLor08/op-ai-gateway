@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 
-FROM golang:1.27.4 AS builder
+# Pinned to an exact Go patch release. Not to 1.27 yet: its net/http regression deadlocks
+# the live-transcription relay (docs/architecture/cross-cutting/development-and-quality.md,
+# section 1).
+FROM golang:1.26.5 AS builder
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \

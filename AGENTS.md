@@ -261,7 +261,7 @@ pushing.
 
 ## Build And Verification Commands
 
-Toolchain baseline: Go 1.27+ (backend declares 1.25.0, server-agent 1.26),
+Toolchain baseline: Go 1.26+ (backend declares 1.25.0, server-agent 1.26),
 Node.js 26 (LTS) + npm. The full tooling and
 quality-gate reference (make targets, lint/format, CI, e2e suite catalog,
 SonarQube gate) is
