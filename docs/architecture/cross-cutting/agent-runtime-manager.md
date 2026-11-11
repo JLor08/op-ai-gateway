@@ -1637,7 +1637,8 @@ A cluster head starts **only** when the gateway asks for it, never on its own:
   not "no start asked for": while the gateway's marked start still waits for
   admission (queued, nothing executed yet), an unmarked request is refused all
   the same, with `503 runtime.cluster_not_ready` and the message
-  `cluster head <spec id> is not running; the gateway starts its cluster`
+  `runtime.cluster_not_ready: cluster head <spec id> is not running; the
+  gateway starts its cluster`
   (`handleEnsure`'s check, `headRefusesUnmarked`); it queues only once the start
   has a process. The gateway's request path parks such a request rather than
   dispatching it, so in practice this reaches a client only through a server
