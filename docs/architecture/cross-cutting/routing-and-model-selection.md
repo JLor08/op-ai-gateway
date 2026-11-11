@@ -2539,17 +2539,17 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   orchestration instead of the instance scaler, which starts the cluster in the background, one
   start per head however many requests signal. When the start ends, formed or failed, every
   request parked for the head's server is woken (`admissionQueue.releaseAll`). The park is bound
-  by the **cluster's own bound** — the head's startup timeout plus its slowest member's — clipped
-  by the head application's `timeout_ms`, not by `admission_queue_timeout_seconds`; a turn that
+  by the **cluster's own bound** — the longest a start may take: the configuration acknowledgement
+  wait (30 s), the slowest member's startup timeout plus 10 s and the head's plus 30 s, which also
+  covers the formation — clipped by the head application's `timeout_ms`, not by
+  `admission_queue_timeout_seconds`; a turn that
   parks on other candidates at their cap as well waits for the later of the two, and a request
   keeps the cluster's bound for its later turns once it parked for one (a plain model and a group
   alike). Cluster parks wait in the same global admission queue as every other park, so they count
   toward `admission_queue_max_depth`: a burst of requests for a cold head can fill the queue and be
-  refused `routing.admission_queue_full`, and so can the other requests arriving meanwhile. The
-  bound (Q4) can also be shorter than a worst-case start, which adds the configuration
-  acknowledgement wait (up to 30 s), the member and head margins and the formation wait to the
-  startup timeouts: a parked request can time out with `routing.admission_queue_timeout` while
-  the cluster still forms, and its client's retry then finds it formed. A request that must not
+  refused `routing.admission_queue_full`, and so can the other requests arriving meanwhile. Only a
+  `timeout_ms` shorter than that bound can end a park while the cluster still forms
+  (`routing.admission_queue_timeout`); the client's retry then finds it formed. A request that must not
   park (`NoPark`, `CheckOnly`), or a resolver without a queue, is served by a parkable head only
   when no running candidate is left; the voice-chat gate then starts the cluster itself through
   the orchestration.

@@ -414,9 +414,9 @@ func TestBlockedAdmissionWaitsWhenHeadBusy(t *testing.T) {
 }
 
 // TestHeadStopReleasesDirectMembers pins the hold release: a head that is no
-// longer running holds nothing, so its members are released -- when its exit
-// is seen, and again for a direct member that still reports the dead
-// connection later on.
+// longer running holds nothing, so its members are released when its exit is
+// seen; a direct member that still reports the hold later on holds a dead
+// connection, which only a forced stop ends.
 func TestHeadStopReleasesDirectMembers(t *testing.T) {
 	f := newOrchFixture(t, 2, "direct", "lan")
 	before := f.formed()
@@ -440,8 +440,8 @@ func TestHeadStopReleasesDirectMembers(t *testing.T) {
 	before = len(f.agent.recorded())
 	f.frame(orchMemberServer(1), watchMemberRow(1, orchHead, 11))
 	f.settle()
-	if calls := f.agent.recorded()[before:]; !slices.Equal(calls, []string{"member:release:" + orchMemberSpec(1)}) {
-		t.Fatalf("calls = %q, want the dead hold of member 1 released", calls)
+	if calls := f.agent.recorded()[before:]; !slices.Equal(calls, []string{"member:stop:" + orchMemberSpec(1) + ":force"}) {
+		t.Fatalf("calls = %q, want member 1's dead hold ended by a forced stop", calls)
 	}
 }
 
@@ -737,6 +737,7 @@ func TestWatchdogCodesAreStableWireStrings(t *testing.T) {
 	for _, tc := range []struct{ got, want string }{
 		{codeClusterMemberLost, "runtime.cluster_member_lost"},
 		{codeRuntimeInstanceBusy, "runtime.instance_busy"},
+		{codeClusterHeadCrashed, "runtime.cluster_head_crashed"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("stable error code drift: got %q, want %q", tc.got, tc.want)
@@ -753,5 +754,136 @@ func TestWatchdogRetriesAFailedStop(t *testing.T) {
 	f.confirm()
 	if n := f.agent.count("head:stop:"); n != 2 {
 		t.Fatalf("calls = %q, want the stop tried twice", f.agent.recorded()[before:])
+	}
+}
+
+// TestWatchdogIgnoresAHeadExitFromAnotherServer pins whose frames can end a
+// head's run: only its own server's. Another server that reports the head's
+// spec running and then drops it neither ends the run nor releases a member.
+func TestWatchdogIgnoresAHeadExitFromAnotherServer(t *testing.T) {
+	f := newOrchFixture(t, 2, "relay", "lan")
+	before := f.formed()
+
+	f.frame("srv_other", watchHeadRow(agentSpecStateRunning))
+	f.settle()
+	f.frame("srv_other")
+	f.settle()
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want none for another server's frames", calls)
+	}
+	if st := f.o.State(orchHead); st != clusterFormed {
+		t.Fatalf("state = %v, want still formed", st)
+	}
+	select {
+	case <-f.o.TriggerChannel():
+		t.Fatal("another server's frame woke the reconciler")
+	default:
+	}
+}
+
+// TestWatchdogCoolsDownAHeadThatCrashed pins a formed head that ends on its
+// own with a new last error: a crash, not an idle stop. The members are
+// released and the head cools down with the agent's code, or
+// runtime.cluster_head_crashed when the agent named none, so a kept-up head
+// is not started again at once.
+func TestWatchdogCoolsDownAHeadThatCrashed(t *testing.T) {
+	for _, tc := range []struct{ name, state, agentCode, want string }{
+		{"unclassified crash", "crashed", "", codeClusterHeadCrashed},
+		{"classified crash", "crashed", codeClusterMemberUnreachable, codeClusterMemberUnreachable},
+		{"already in backoff", "backoff", "", codeClusterHeadCrashed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOrchFixture(t, 2, "relay", "lan")
+			before := f.formed()
+
+			f.frame(orchHeadServer, RuntimeStatusDTO{
+				SpecID: orchHead, Model: orchHeadModel, State: tc.state,
+				LastError: &RuntimeErrorDTO{Message: "runtime: process exited unexpectedly (exit code 1)", At: f.clock(), ExitCode: 1, Failures: 1, Code: tc.agentCode},
+			})
+			f.settle()
+			if got := releases(f.agent.recorded()[before:]); !slices.Equal(got, allReleases(2)) {
+				t.Fatalf("calls = %q, want every member released", f.agent.recorded()[before:])
+			}
+			if st := f.o.State(orchHead); st != clusterCoolingDown {
+				t.Fatalf("state = %v, want cooling down after a crash", st)
+			}
+			status := f.o.ClusterStatus(orchHead)
+			if status.LastFailure == nil || status.LastFailure.Code != tc.want || !status.LastFailure.Head || status.CooldownUntil == nil {
+				t.Fatalf("status = %+v, want a failure %s at the head and a cooldown", status, tc.want)
+			}
+			ce := clusterErrOf(t, f.o.Ensure(context.Background(), orchHead))
+			if ce.Code != codeClusterStartFailed || ce.Cause != tc.want || !ce.Head {
+				t.Fatalf("Ensure in the cooldown = %+v, want the crash", ce)
+			}
+		})
+	}
+}
+
+// TestWatchdogEndsAHeadThatLostItsLaunchFacts pins a head switched to a
+// plain spec while it ran: its server still reports a process for the spec,
+// but without the launch facts it is no cluster head any more. The run ends,
+// the members are released, and a head the plan no longer knows is
+// forgotten, so a later member frame is no lost member of it.
+func TestWatchdogEndsAHeadThatLostItsLaunchFacts(t *testing.T) {
+	f := newOrchFixture(t, 2, "relay", "lan")
+	before := f.formed()
+	f.portal.mu.Lock()
+	f.portal.gone = true
+	f.portal.mu.Unlock()
+
+	plain := watchHeadRow(agentSpecStateStarting)
+	plain.Cluster, plain.PID = nil, 101
+	f.frame(orchHeadServer, plain)
+	f.settle()
+	if got := releases(f.agent.recorded()[before:]); !slices.Equal(got, allReleases(2)) {
+		t.Fatalf("calls = %q, want every member released", f.agent.recorded()[before:])
+	}
+	f.o.mu.Lock()
+	_, known := f.o.heads[orchHead]
+	f.o.mu.Unlock()
+	if known {
+		t.Fatal("the orchestration still follows a head the plan no longer knows")
+	}
+
+	n := len(f.agent.recorded())
+	plain.State = agentSpecStateRunning
+	f.frame(orchMemberServer(0), watchMemberRow(0, "", 10))
+	f.frame(orchHeadServer, plain)
+	f.settle()
+	if calls := f.agent.recorded()[n:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want nothing for a head that is gone", calls)
+	}
+}
+
+// TestBlockedAdmissionForceStopsADeadDirectHold pins the direct transport's
+// half-open connection: a member that still reports the hold of a head that
+// is gone holds a dead connection, which a release does not end (the agent
+// lists the connection again), so a local start waiting for the member has it
+// force-stopped once the head is down.
+func TestBlockedAdmissionForceStopsADeadDirectHold(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	f.formed()
+	f.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
+	f.settle()
+
+	before := len(f.agent.recorded())
+	f.frame(orchMemberServer(0), blockedFrame(0)...)
+	f.settle()
+	calls := f.agent.recorded()[before:]
+	want := []string{"head:stop:" + orchHeadModel + ":if_evictable", "member:stop:" + orchMemberSpec(0) + ":force"}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+
+	// Over a relay the session ends with the head, so a release is enough.
+	g := newOrchFixture(t, 1, "relay", "lan")
+	g.formed()
+	g.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
+	g.settle()
+	before = len(g.agent.recorded())
+	g.frame(orchMemberServer(0), blockedFrame(0)...)
+	g.settle()
+	if calls := g.agent.recorded()[before:]; g.agent.count("member:stop:") != 0 || len(releases(calls)) != 1 {
+		t.Fatalf("calls = %q, want the relay member released, not stopped", calls)
 	}
 }

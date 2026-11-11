@@ -965,10 +965,13 @@ A failed start names its cause (the agent's code, the specific one read from
 its telemetry when the router answered only `start_failed`, `start_timeout` or
 `not_permitted`) and the member position or the head, releases the members it
 reserved, and cools the head down for 60 s; a cause no retry can fix blocks
-automatic starts until the head's document changes. Every request parked for
-the head's server is woken when the start ends, formed or failed. A start that
-finds the telemetry already showing the cluster formed (a restarted gateway
-under a running cluster) does nothing.
+automatic starts until the head's document changes. A start that could not even
+read the head's plan (a store error) records no failure and no cooldown, but a
+parked request's demand starts nothing for 5 s after it, so a store outage does
+not turn into a loop of failing starts. Every request parked for the head's
+server is woken when the start ends, formed or failed. A start that finds the
+telemetry already showing the cluster formed (a restarted gateway under a
+running cluster) does nothing.
 
 **After formation, the watchdog** (`cluster_watchdog.go`) follows the agents'
 frames on its own worker, off the ingest path. A member that exited, changed its
@@ -980,12 +983,23 @@ interval, 15 s) counts as lost on a fresh head frame, never in the boot grace or
 before formation. A confirmed loss drains the head, releases the members, records
 `runtime.cluster_member_lost` at that position and cools down; a head that was
 serving requests starts again once the cooldown ended. A head that exits on its
-own releases its members and wakes the reconciler. A local start on a member host
-that waits only for a held member (`admission_blocked_by`) makes the gateway ask
-the head's agent for a conditional stop (`POST /stop/{model}?if_evictable=1`);
-the agent stops the head only when its own eviction rule allows it. A peer a
-member does not allow, or a hold by another head, is a breach: logged and listed
-in the head's `cluster_status` by member position.
+own -- its own server's frame shows no process with its launch facts, either no
+process or one that is no cluster head any more -- releases its members and
+wakes the reconciler; a frame of any other server that names the head is
+ignored. A head that ended with a new last error (a crash, for example an
+out-of-memory abort under load) also records that failure at the head (the
+agent's code, else `runtime.cluster_head_crashed`) and cools down like a failed
+start, so a kept-up head is not started again at once. A head whose spec is gone
+(deleted, or no cluster head any more) is forgotten. A direct member that still
+reports the hold of a head that is not running holds a half-open connection its
+agent keeps listing, so the watchdog stops it with `POST /rpc/stop/{specID}?force=1`
+instead of releasing it. A local start on a member host that waits only for a
+held member (`admission_blocked_by`) makes the gateway ask the head's agent for
+a conditional stop (`POST /stop/{model}?if_evictable=1`); the agent stops the
+head only when its own eviction rule allows it, and once the head is gone a
+direct member still showing its hold is force-stopped, every other member
+released. A peer a member does not allow, or a hold by another head, is a
+breach: logged and listed in the head's `cluster_status` by member position.
 
 **A stop** (manual, watchdog, conditional, NetBird drift) always goes head first:
 drain the head, wait (bounded, 60 s) for its stopped state on the status stream,

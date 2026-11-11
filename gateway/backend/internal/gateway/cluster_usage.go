@@ -171,13 +171,6 @@ func (k *keyedLocks) lock(key string) func() {
 	}
 }
 
-// size is how many keys the map holds.
-func (k *keyedLocks) size() int {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return len(k.m)
-}
-
 func headLockKey(head string) string     { return "head\x00" + head }
 func serverLockKey(server string) string { return "server\x00" + server }
 

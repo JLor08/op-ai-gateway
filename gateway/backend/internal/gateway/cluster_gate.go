@@ -39,8 +39,9 @@ type clusterGateView struct {
 	until    time.Time
 }
 
-// viewOf is plan's gate view: the park bound is the head's startup timeout
-// plus its slowest member's -- the time a cold cluster takes to form, which a
+// viewOf is plan's gate view: the park bound is the longest a start of the
+// cold cluster may take -- the configuration wait, the slowest member's
+// startup timeout and the head's, each with the start's margin -- which a
 // request parked for it waits at most.
 func (o *clusterOrchestrator) viewOf(plan portal.ClusterPlan) clusterGateView {
 	v := clusterGateView{withheld: plan.WithheldReason, until: o.deps.now().Add(clusterGateViewTTL)}
@@ -49,8 +50,16 @@ func (o *clusterOrchestrator) viewOf(plan portal.ClusterPlan) clusterGateView {
 		v.members = append(v.members, m.Server)
 		slowest = max(slowest, o.startupBound(m.StartupTimeoutSeconds))
 	}
-	v.bound = o.startupBound(plan.Head.Spec.StartupTimeoutSeconds) + slowest
+	v.bound = o.parkBound(o.startupBound(plan.Head.Spec.StartupTimeoutSeconds), slowest)
 	return v
+}
+
+// parkBound is the longest a start takes whose head starts within head and
+// whose slowest member within slowest: step one's configuration wait, the
+// members' bound and the head's bound, which also covers the formation (the
+// bounds at the top of cluster_orchestrator.go).
+func (o *clusterOrchestrator) parkBound(head, slowest time.Duration) time.Duration {
+	return o.t.configWait + slowest + o.t.memberMargin + head + o.t.headMargin
 }
 
 // gateView is head's gate view, from the cache while it answers. A stale or
@@ -62,7 +71,7 @@ func (o *clusterOrchestrator) viewOf(plan portal.ClusterPlan) clusterGateView {
 // judges no member server; a request that ended before any view existed is
 // judged the same way.
 func (o *clusterOrchestrator) gateView(ctx context.Context, head string) clusterGateView {
-	fallback := clusterGateView{bound: 2 * o.startupBound(0)}
+	fallback := clusterGateView{bound: o.parkBound(o.startupBound(0), o.startupBound(0))}
 	o.mu.Lock()
 	v, ok := o.views[head]
 	if ok && o.deps.now().Before(v.until) {
@@ -138,8 +147,8 @@ type clusterRoutingGate struct {
 
 // ClusterGateState is the head's verdict (routing.ClusterGate):
 //   - formed: the cluster serves;
-//   - cold or forming: parkable, with the head's startup timeout plus its
-//     slowest member's as the bound;
+//   - cold or forming: parkable, with the longest a start may take as the
+//     bound (viewOf);
 //   - cooling down after a failed start or a lost member: excluded with
 //     runtime.cluster_start_failed;
 //   - withheld by the runtime documents, blocked by a cause only a

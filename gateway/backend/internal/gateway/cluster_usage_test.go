@@ -1111,3 +1111,10 @@ func TestUnheardSessionCloseNeverPrecedesItsStart(t *testing.T) {
 		t.Fatalf("sessions = %+v, want one closed at its start %v", rows, since)
 	}
 }
+
+// size is how many keys the map holds.
+func (k *keyedLocks) size() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.m)
+}

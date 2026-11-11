@@ -206,7 +206,7 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 	s.runtimePush.notify(serverID, s.pushRuntimeConfigSpacing, s.pushRuntimeConfigPass)
 	// A changed document may change a cluster: a kept-up head to start, or a
 	// head blocked by a terminal cause whose configuration was fixed.
-	s.clusters.Trigger()
+	s.clusters.DocumentsChanged()
 }
 
 // pushRuntimeConfigPass is one pass of serverID's push worker: it derives the

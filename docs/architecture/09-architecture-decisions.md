@@ -11733,16 +11733,18 @@ unauthenticated port to the network, lets one head take another's member, or poi
   rather than an overloaded `/ensure/{model}`, because a member has no upstream model to address), starts the head
   with the `X-OP-Cluster-Start: 1` marker and waits until every member reports the head's hold. An agent refuses any
   other start of a cold head (`runtime.cluster_not_ready`) and never puts a head into its crash-loop backoff: the
-  gateway owns retries, the 60 s cooldown after a failed start and re-orchestration. A cause no retry can fix (an
-  unsupported build, a version or device mismatch) blocks automatic starts until the head's runtime document changes;
-  an operator's manual start overrides both.
+  gateway owns retries, the 60 s cooldown after a failed start or a crash of a formed head, and re-orchestration. A
+  cause no retry can fix (an unsupported build, a version or device mismatch) blocks automatic starts until the head's
+  runtime document changes; an operator's manual start overrides both.
 - **(g) Members are claimed while their head needs them, and released at every head stop.** A reservation armed by the
   member ensure covers the gap until the head connects; the head's live connection is the hold. Members are released
   at every stop of the head (manual, watchdog, conditional, the head's exit, a NetBird drift) and after every failed
   start, but **not** at formation: the agent's release ends the hold along with the reservation, so a release at
-  formation would leave a member evictable while its head runs. A local start on a member host that waits only for a
-  held member makes the gateway ask the head's agent for a conditional stop, which happens only when that agent's own
-  eviction rule lets the head go; otherwise the local start waits.
+  formation would leave a member evictable while its head runs. A direct member that still reports the hold of a head
+  that is down holds a half-open connection (the rpc-server sets no keepalive), which a release does not end, so the
+  gateway stops it, forced, instead. A local start on a member host that waits only for a held member makes the
+  gateway ask the head's agent for a conditional stop, which happens only when that agent's own eviction rule lets the
+  head go; otherwise the local start waits.
 - **(h) A watchdog follows a formed cluster on telemetry, and acts only on the head.** Losing a member aborts the head
   anyway, and a member is removed only through its head. Evidence of a lost member (exit, a new PID, a vanished hold,
   a relay stall) is a suspicion until a head frame that arrived **after** the member's confirms the head still runs
@@ -11750,7 +11752,9 @@ unauthenticated port to the network, lets one head take another's member, or poi
   first. A member server that falls silent counts as lost after **max(3 × its telemetry interval, 15 s)** (3 s at the
   default 1 s cadence would stop healthy clusters on a reporting hiccup), never in the gateway's boot grace and never
   before formation. A confirmed loss stops the head, records `runtime.cluster_member_lost` at that member's position
-  and starts the cluster again after the cooldown if the head was serving requests.
+  and starts the cluster again after the cooldown if the head was serving requests. Only a frame of the head's own
+  server ends a head: any agent can send any row, and acting on another server's would let one agent stop another
+  tenant's cluster.
 - **(i) Rights on every server, the member side's consent, and positions instead of names.** A write that changes the
   membership, member mode, network, transport or the head binary needs management rights on the head's server and on
   every member server, former ones included; one that changes none of them needs rights on the head's server only, so a
