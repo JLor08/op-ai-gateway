@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 
-FROM node:24-slim AS build
+FROM node:26-slim AS build
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM nginx:1.27-alpine
-# openssl is NOT in nginx:1.27-alpine. The entrypoint needs it for two things: the
+FROM nginx:1.30-alpine
+# openssl is NOT in nginx:1.30-alpine. The entrypoint needs it for two things: the
 # throwaway bootstrap certificate (so nginx can always start) and reading the
 # delivered chain's fingerprint (so a renewal reloads nginx).
 RUN apk add --no-cache openssl

@@ -42,12 +42,12 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
       - name: Format check + lint + test (backend)
         working-directory: gateway/backend
         # Only the backend reads this: the server-agent has no store. The suite
@@ -89,7 +89,7 @@ jobs:
     name: Docs (links, index, openapi)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The checker resolves link targets from `git ls-files`, so it needs the
       # repository, not a shallow export -- checkout@v4 gives it that. No Go,
       # no Node, no dependency install: bash + git + awk.
@@ -106,7 +106,7 @@ jobs:
     name: Sonar tooling (offline tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # branch-findings.test.sh SKIPs, exit 0, without jq; a job that went
       # green while testing nothing would read as a pass.
       - name: Require jq
@@ -123,7 +123,7 @@ jobs:
     name: opencode config generator (offline test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The test SKIPs, exit 0, without jq; a job that went green while testing
       # nothing would read as a pass.
       - name: Require jq
@@ -138,10 +138,10 @@ jobs:
       run:
         working-directory: gateway/frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "26"
       - name: Install dependencies
         run: npm ci
       - name: Format check
@@ -166,13 +166,13 @@ jobs:
     # noticed (issue #24). This job runs `e2e:runtime` ONLY; the other 23
     # Playwright suites stay local-only (development-and-quality.md §6).
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "26"
       # Every e2e config's webServer builds a Go binary and sets GOCACHE. The
       # in-repo default is the macOS-only /private/tmp path; the configs fall
       # back to $GOCACHE when it is set (playwright.*.config.ts), so point it at
