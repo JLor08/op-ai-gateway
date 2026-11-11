@@ -1623,11 +1623,12 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 // server there (runtimeStatusRegistry.Retain), and every frame the watchdog
 // sees was published there first.
 func (o *clusterOrchestrator) retainServers() {
+	at := o.deps.now()
 	live := map[string]struct{}{}
 	for _, id := range o.deps.statuses.serverIDs() {
 		live[id] = struct{}{}
 	}
-	o.watch.retain(live)
+	o.watch.retain(live, at)
 }
 
 // keptUpHeads lists the kept-up heads: the list read before while no runtime

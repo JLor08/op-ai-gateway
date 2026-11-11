@@ -933,11 +933,13 @@ func TestDeadHoldOfASilentHeadServerIsForceStopped(t *testing.T) {
 		t.Fatalf("calls = %q, want none while the head's server reports", calls)
 	}
 
-	for range 3 {
+	// The head's server reports every 5 s: threshold 15 s, plus one
+	// interval, so 20 s of silence is not yet enough and 25 s is.
+	for range 4 {
 		f.silentHeadStep(5*time.Second, false)
 	}
 	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
-		t.Fatalf("calls = %q, want none within the stale threshold", calls)
+		t.Fatalf("calls = %q, want none within the threshold and its margin", calls)
 	}
 	f.silentHeadStep(5*time.Second, false)
 	if calls := f.agent.recorded()[before:]; !slices.Equal(calls, []string{"member:stop:" + orchMemberSpec(0) + ":force"}) {
@@ -1070,8 +1072,8 @@ func TestSharedGapHeadFirstIsNoStaleMember(t *testing.T) {
 	}
 
 	// A member that stays away past its threshold after the head resumed is
-	// still lost (the shared gap made its threshold 3 x 30 s).
-	for range 20 {
+	// still lost (the shared gap made its threshold 3 x 30 s, plus 30 s).
+	for range 30 {
 		f.advance(5 * time.Second)
 		f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
 		f.settle()
@@ -1109,5 +1111,137 @@ func TestWatchdogForgetsDeletedServers(t *testing.T) {
 	}
 	if f.o.watch.lastArrival(orchHeadServer).IsZero() {
 		t.Fatal("a live server's arrivals were dropped")
+	}
+}
+
+// atDefaultCadence forms a direct cluster and brings both servers to the
+// agent's default 1 s cadence, past the boot grace. With headFirst each
+// second's head frame arrives 0.9 s before the member's, else 0.9 s after.
+func atDefaultCadence(t *testing.T, headFirst bool) *orchFixture {
+	t.Helper()
+	f := newOrchFixture(t, 1, "direct", "lan")
+	f.formed()
+	f.pastBootGrace()
+	first, second := orchHeadServer, orchMemberServer(0)
+	if !headFirst {
+		first, second = second, first
+	}
+	feed := func(id string) {
+		if id == orchHeadServer {
+			f.frame(id, watchHeadRow(agentSpecStateRunning))
+		} else {
+			f.frame(id, watchMemberRow(0, orchHead, 10))
+		}
+		f.settle()
+	}
+	for range 12 {
+		f.advance(100 * time.Millisecond)
+		feed(first)
+		f.advance(900 * time.Millisecond)
+		feed(second)
+	}
+	return f
+}
+
+// TestSharedGapJustUnderTheFloorJudgesNothing pins a gap every host shares
+// that is just under the 15 s floor at the default cadence: the judged
+// server reported up to one interval before the others went quiet, so its
+// silence reads 15.4 s. Each rule allows the judged server one interval more
+// than its threshold, so neither the member's frame first (silent-head rule)
+// nor the head's frame first (stale-member rule) stops the cluster.
+func TestSharedGapJustUnderTheFloorJudgesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		headFirst bool
+	}{
+		{"member frame first after the gap", true},
+		{"head frame first after the gap", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The server whose frame comes second each second stopped 0.9 s
+			// after the other, and its frame closes the gap first.
+			f := atDefaultCadence(t, tc.headFirst)
+			before := len(f.agent.recorded())
+			closer, other := orchMemberServer(0), orchHeadServer
+			if !tc.headFirst {
+				closer, other = other, closer
+			}
+			f.advance(14500 * time.Millisecond)
+			for _, id := range []string{closer, other} {
+				if id == orchHeadServer {
+					f.frame(id, watchHeadRow(agentSpecStateRunning))
+				} else {
+					f.frame(id, watchMemberRow(0, orchHead, 10))
+				}
+				f.settle()
+				f.advance(100 * time.Millisecond)
+			}
+			if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+				t.Fatalf("calls = %q, want none after a 14.5 s gap every host shared", calls)
+			}
+			if st := f.o.State(orchHead); st != clusterFormed {
+				t.Fatalf("state = %v, want still formed", st)
+			}
+		})
+	}
+}
+
+// TestDefaultCadenceStillDetectsLosses pins the cost of that margin: one
+// interval of delay. At the default 1 s cadence a head server that stays
+// silent while the member reports, and a member that stays silent while the
+// head's server reports, are each acted on within 17 s.
+func TestDefaultCadenceStillDetectsLosses(t *testing.T) {
+	t.Run("silent head", func(t *testing.T) {
+		f := atDefaultCadence(t, true)
+		before := len(f.agent.recorded())
+		for i := range 17 {
+			f.advance(time.Second)
+			f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+			f.settle()
+			calls := f.agent.recorded()[before:]
+			if len(calls) == 0 {
+				continue
+			}
+			if i+1 < 16 || calls[0] != "member:stop:"+orchMemberSpec(0)+":force" {
+				t.Fatalf("after %d s: calls = %q, want the dead hold stopped no earlier than 16 s", i+1, calls)
+			}
+			return
+		}
+		t.Fatal("a silent head server was never judged within 17 s")
+	})
+	t.Run("stale member", func(t *testing.T) {
+		f := atDefaultCadence(t, false)
+		for i := range 17 {
+			f.advance(time.Second)
+			f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+			f.settle()
+			if st := f.o.State(orchHead); st == clusterCoolingDown {
+				if i+1 < 16 {
+					t.Fatalf("member judged stale after %d s, want no earlier than 16 s", i+1)
+				}
+				return
+			}
+		}
+		t.Fatal("a stale member was never judged within 17 s")
+	})
+}
+
+// TestRetainKeepsAServerThatReportedAfterTheSnapshot pins the race between a
+// reconciler pass and a first frame: the pass reads the registry's servers,
+// then a new server's frame is published and arrives before the pass prunes.
+// That server's arrivals are newer than the snapshot, so they are kept.
+func TestRetainKeepsAServerThatReportedAfterTheSnapshot(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	at := f.clock()
+	f.advance(time.Second)
+	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	f.settle()
+	f.o.watch.retain(map[string]struct{}{}, at)
+	if !f.o.watch.heard(orchHeadServer) {
+		t.Fatal("a server that reported after the snapshot lost its arrivals")
+	}
+	f.o.watch.retain(map[string]struct{}{}, f.clock())
+	if f.o.watch.heard(orchHeadServer) {
+		t.Fatal("a server missing from a later snapshot kept its arrivals")
 	}
 }

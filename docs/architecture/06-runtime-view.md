@@ -979,38 +979,40 @@ PID, lost the head's hold or whose relay reports a stall is a suspicion; only a
 head frame that arrived after the member's and still shows the head running the
 same process confirms it, because a head that stopped on its own ends its
 members' sessions too. A member server silent for max(3 × its telemetry
-interval, 15 s) counts as lost on a fresh head frame, never in the boot grace or
-before formation; the silence counts only from the start of the head server's
-current run of frames (a run ends at any gap over 15 s), so after a gap both
-hosts shared the head's frame arriving first is no lost member, and a head
-server reporting less often than every 15 s never counts a member stale. A confirmed loss drains the head, releases the members, records
-`runtime.cluster_member_lost` at that position and cools down; a head that was
-serving requests starts again once the cooldown ended. A head that exits on its
-own -- its own server's frame shows no process with its launch facts, either no
-process or one that is no cluster head any more -- releases its members and
-wakes the reconciler; a frame of any other server that names the head is
-ignored. A head that ended with a new last error (a crash, for example an
-out-of-memory abort under load) also records that failure at the head (the
-agent's code, else `runtime.cluster_head_crashed`) and cools down like a failed
-start, so a kept-up head is not started again at once. A head whose spec is gone
-(deleted, or no cluster head any more) is forgotten. A direct member that still
-reports the hold of a head that is not running holds a half-open connection its
-agent keeps listing, so the watchdog stops it with `POST /rpc/stop/{specID}?force=1`
-instead of releasing it; a head server silent past its stale threshold while the
-member's server kept reporting through that silence -- no gap over 15 s of its
-own -- counts as not running the head, since a host that lost power never
-reports it stopped (never inside the boot grace, only once the head server's
-interval is measured, and never for a member whose agent reports less often
-than every 15 s, which waits for the head server's own report). That forced
-stop is also a suspected loss: if the head's server reports again with the head
-still running, the head is stopped and cools down rather than staying formed
-with a dead member. A local start on a member host that waits only for a
-held member (`admission_blocked_by`) makes the gateway ask the head's agent for
-a conditional stop (`POST /stop/{model}?if_evictable=1`); the agent stops the
-head only when its own eviction rule allows it, and once the head is gone a
-direct member still showing its hold is force-stopped, every other member
-released. A peer a member does not allow, or a hold by another head, is a
-breach: logged and listed in the head's `cluster_status` by member position.
+interval, 15 s) plus one interval (16 s at the default 1 s cadence) counts as
+lost on a fresh head frame, never in the boot grace or before formation; the
+silence counts only from the start of the head server's current run of frames (a
+run ends at any gap over 15 s), so after a gap both hosts shared the head's
+frame arriving first is no lost member, and a head server reporting less often
+than every 15 s never counts a member stale. A confirmed loss drains the head,
+releases the members, records `runtime.cluster_member_lost` at that position and
+cools down; a head that was serving requests starts again once the cooldown
+ended. A head that exits on its own -- its own server's frame shows no process
+with its launch facts, either no process or one that is no cluster head any more
+-- releases its members and wakes the reconciler; a frame of any other server
+that names the head is ignored. A head that ended with a new last error (a
+crash, for example an out-of-memory abort under load) also records that failure
+at the head (the agent's code, else `runtime.cluster_head_crashed`) and cools
+down like a failed start, so a kept-up head is not started again at once. A head
+whose spec is gone (deleted, or no cluster head any more) is forgotten. A direct
+member that still reports the hold of a head that is not running holds a
+half-open connection its agent keeps listing, so the watchdog stops it with
+`POST /rpc/stop/{specID}?force=1` instead of releasing it; a head server silent
+past its stale threshold plus one of its intervals while the member's server
+kept reporting through that silence -- no gap over 15 s of its own -- counts as
+not running the head, since a host that lost power never reports it stopped
+(never inside the boot grace, only once the head server's interval is measured,
+and never for a member whose agent reports less often than every 15 s, which
+waits for the head server's own report). That forced stop is also a suspected
+loss: if the head's server reports again with the head still running, the head
+is stopped and cools down rather than staying formed with a dead member. A local
+start on a member host that waits only for a held member
+(`admission_blocked_by`) makes the gateway ask the head's agent for a
+conditional stop (`POST /stop/{model}?if_evictable=1`); the agent stops the head
+only when its own eviction rule allows it, and once the head is gone a direct
+member still showing its hold is force-stopped, every other member released. A
+peer a member does not allow, or a hold by another head, is a breach: logged and
+listed in the head's `cluster_status` by member position.
 
 **A stop** (manual, watchdog, conditional, NetBird drift) always goes head first:
 drain the head, wait (bounded, 60 s) for its stopped state on the status stream,

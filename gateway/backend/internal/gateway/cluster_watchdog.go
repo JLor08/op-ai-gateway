@@ -181,6 +181,16 @@ func (w *clusterWatchdog) staleLimit(a *watchArrivals) time.Duration {
 	return max(clusterStaleIntervals*a.interval(w.o.t.minAgentInterval), w.o.t.staleFloor)
 }
 
+// judgedLimit is how long a server must stay silent before a cluster rule
+// judges it gone: its stale threshold plus one of its intervals. A gap every
+// host shares can begin up to one interval after the judged server's last
+// frame, so a shared gap just under staleFloor reads as that much longer for
+// it; the margin keeps such a gap from aborting a healthy cluster, at the
+// cost of one interval of detection delay (16 s at the default 1 s cadence).
+func judgedLimit(staleLimit, interval time.Duration) time.Duration {
+	return staleLimit + interval
+}
+
 func newClusterWatchdog(o *clusterOrchestrator) *clusterWatchdog {
 	return &clusterWatchdog{
 		o: o, pending: map[string]*watchFrame{}, arrivals: map[string]*watchArrivals{},
@@ -278,7 +288,8 @@ func (w *clusterWatchdog) silentSince(serverID string) (time.Time, bool) {
 // headSilentFor reports whether the head's server, headServer, has been
 // silent past its stale threshold while memberServer kept reporting: the time
 // since the later of the head's last frame and the start of the member's
-// current run of frames exceeds the head's threshold. Telemetry that resumes
+// current run of frames exceeds the head's threshold plus one of its
+// intervals (judgedLimit). Telemetry that resumes
 // on every host after a shared gap starts a new run for the member, so its
 // frame -- handled before the head's -- judges no head silent. A member whose
 // agent reports less often than every staleFloor starts a new run with every
@@ -298,7 +309,7 @@ func (w *clusterWatchdog) headSilentFor(headServer, memberServer string) bool {
 	if h == nil || h.n == 0 || m == nil {
 		return false
 	}
-	return now.Sub(later(h.last, m.streak)) > w.staleLimit(h)
+	return now.Sub(later(h.last, m.streak)) > judgedLimit(w.staleLimit(h), h.interval(w.o.t.minAgentInterval))
 }
 
 func later(a, b time.Time) time.Time {
@@ -320,16 +331,27 @@ func (w *clusterWatchdog) streakStart(serverID string) time.Time {
 }
 
 // retain forgets the servers not in live -- deleted ones: their arrivals at
-// once, and the member bookkeeping the worker owns on its next turn.
-func (w *clusterWatchdog) retain(live map[string]struct{}) {
+// once, and the member bookkeeping the worker owns on its next turn. live is
+// a snapshot taken at at; a server whose frame arrived after it was published
+// after the snapshot, so it is kept.
+func (w *clusterWatchdog) retain(live map[string]struct{}, at time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for id := range w.arrivals {
-		if _, ok := live[id]; !ok {
-			delete(w.arrivals, id)
-		}
+	kept := make(map[string]struct{}, len(live))
+	for id := range live {
+		kept[id] = struct{}{}
 	}
-	w.live = live
+	for id, a := range w.arrivals {
+		if _, ok := live[id]; ok {
+			continue
+		}
+		if a.last.After(at) {
+			kept[id] = struct{}{}
+			continue
+		}
+		delete(w.arrivals, id)
+	}
+	w.live = kept
 }
 
 // pruneMembers drops the released and asked entries of servers retain
@@ -620,7 +642,8 @@ func (w *clusterWatchdog) checkStale(v watchView, next []RuntimeStatusDTO) {
 	headRun := w.streakStart(v.plan.Head.Server.ID)
 	for _, m := range v.plan.Members {
 		since := later(later(w.lastArrival(m.Server.ID), v.formedAt), headRun)
-		limit := max(clusterStaleIntervals*w.interval(m.Server.ID), o.t.staleFloor)
+		interval := w.interval(m.Server.ID)
+		limit := judgedLimit(max(clusterStaleIntervals*interval, o.t.staleFloor), interval)
 		if now.Sub(since) > limit {
 			o.memberLost(v.head, m.Position, evidenceStale, headInUse(headRow))
 			return

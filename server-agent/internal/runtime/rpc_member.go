@@ -234,7 +234,7 @@ func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (ar
 			return nil, nil, 0, fmt.Errorf("runtime: create rpc cache %s: %w", dir, err)
 		}
 		if err := markMemberCache(dir); err != nil {
-			slog.Warn("runtime: cannot mark the rpc cache for the sweep; the sweep will never remove it", "path", dir, "err", err)
+			slog.Warn("runtime: cannot mark the rpc cache for the sweep; without a marker it is never swept, and with an existing marker it may be removed once its head is no longer listed and nothing in it changed for 7 days", "path", dir, "err", err)
 		}
 		if free, err := freeDiskMB(dir); err != nil {
 			slog.Warn("runtime: cannot measure free space for the rpc cache", "path", dir, "err", err)
