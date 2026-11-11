@@ -1714,6 +1714,18 @@ func (_d *APIWithTracing) PutRuntimeSpec(ctx context.Context, t1 auth.Token, s1 
 	return _d.API.PutRuntimeSpec(ctx, t1, s1, p1)
 }
 
+func (_d *APIWithTracing) RPCMemberDisplayNames(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (m1 map[string]string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RPCMemberDisplayNames")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RPCMemberDisplayNames(ctx, t1, s1, sa1)
+}
+
 func (_d *APIWithTracing) RPCMemberSpecs(ctx context.Context, t1 auth.Token, s1 string) (ra1 []RPCMemberSpecDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RPCMemberSpecs")
 	defer span.End()
