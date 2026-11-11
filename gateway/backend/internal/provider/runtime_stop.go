@@ -27,6 +27,26 @@ const (
 	RuntimeStopStopped = "stopped"
 )
 
+// ifEvictableKey is the context key of WithIfEvictable.
+type ifEvictableKey struct{}
+
+// WithIfEvictable marks ctx so that StopRuntimeModel asks for the conditional
+// stop (POST /stop/{model}?if_evictable=1): the agent stops the instance only
+// when its own eviction rule would let it go right now -- not pinned or kept
+// up, not starting, nothing in flight, outside the eviction grace -- and
+// answers 409 runtime.instance_busy otherwise. The gateway's cluster
+// orchestration uses it to remove a cluster head that a local start on a
+// member's server waits for.
+func WithIfEvictable(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ifEvictableKey{}, true)
+}
+
+// IsIfEvictable reports whether ctx carries WithIfEvictable's mark.
+func IsIfEvictable(ctx context.Context) bool {
+	on, _ := ctx.Value(ifEvictableKey{}).(bool)
+	return on
+}
+
 // RuntimeStopper is an optional provider capability: it asks an agent router
 // to stop one instance of a managed spec (target.ProviderModel is its address,
 // m or m#k) and returns the state the router answered, RuntimeStopStopping or
@@ -37,8 +57,9 @@ const (
 // Errors classify as EnsureRuntimeModel's do: a non-2xx answer is the provider
 // error its status maps to, and a router error envelope adds its code as a
 // *RouterError (runtime.instance_protected, runtime.instance_not_highest,
-// runtime.model_not_managed); an expired deadline is ErrTimeout; a 2xx that
-// names neither state is ErrInvalidResponse. It arms no timeout of its own.
+// runtime.model_not_managed, and for a conditional stop (WithIfEvictable)
+// runtime.instance_busy); an expired deadline is ErrTimeout; a 2xx that names
+// neither state is ErrInvalidResponse. It arms no timeout of its own.
 type RuntimeStopper interface {
 	StopRuntimeModel(ctx context.Context, target routing.Target) (string, error)
 }
@@ -52,6 +73,9 @@ var _ RuntimeStopper = (*OpenAICompatibleClient)(nil)
 // names no model with 404 runtime.model_not_managed and stops nothing.
 func (c *OpenAICompatibleClient) StopRuntimeModel(ctx context.Context, target routing.Target) (string, error) {
 	reqURL := endpointURL(target.Endpoint, ExpandModelPath(runtimeStopPath, target.ProviderModel))
+	if IsIfEvictable(ctx) {
+		reqURL += "?if_evictable=1"
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, http.NoBody)
 	if err != nil {
 		return "", fmt.Errorf("%w: create request: %v", ErrUnavailable, err)

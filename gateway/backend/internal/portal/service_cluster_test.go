@@ -1294,3 +1294,42 @@ func TestPutClusterHiddenMemberGPURefusalNamesNothing(t *testing.T) {
 		t.Fatalf("err = %v, want the bare %v", err, ErrClusterTensorSplitRequired)
 	}
 }
+
+// TestClusterBreachPeerHiddenForHiddenMember pins the breaches on a head's
+// cluster_status: a member on a server the reader may not manage shows its
+// position and kind only, never the peer address its agent reported.
+func TestClusterBreachPeerHiddenForHiddenMember(t *testing.T) {
+	f := newClusterFixture(t)
+	mine := f.member("Mine")
+	foreign := f.foreignServer("Foreign")
+	head, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID)))
+	if err != nil {
+		t.Fatalf("system save: %v", err)
+	}
+	at := clusterTestNow.Add(time.Minute)
+	f.svc.SetClusterStatusReader(fakeClusterStatus{head.ID: {
+		State: ClusterStateFormed, Members: []ClusterMemberStatusDTO{{Position: 0, State: "held"}, {Position: 1, State: "held"}},
+		Breaches: []ClusterBreachDTO{
+			{Position: 0, Kind: ClusterBreachPeer, Peer: "100.64.0.8", At: at},
+			{Position: 1, Kind: ClusterBreachPeer, Peer: "100.64.0.9", At: at},
+		},
+	}})
+	got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClusterBreachDTO{
+		{Position: 0, Kind: ClusterBreachPeer, Peer: "100.64.0.8", At: at},
+		{Position: 1, Kind: ClusterBreachPeer},
+	}
+	if got.ClusterStatus == nil || !slices.Equal(got.ClusterStatus.Breaches, want) {
+		t.Fatalf("owner breaches = %+v, want the hidden member's peer left out", got.ClusterStatus)
+	}
+	sys, err := f.svc.GetRuntimeSpec(f.ctx, systemToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sys.ClusterStatus == nil || len(sys.ClusterStatus.Breaches) != 2 || sys.ClusterStatus.Breaches[1].Peer != "100.64.0.9" {
+		t.Fatalf("system breaches = %+v, want both peers", sys.ClusterStatus)
+	}
+}

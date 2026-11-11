@@ -41,7 +41,7 @@ func orchTimings() clusterTimings {
 		unit: 10 * time.Millisecond, configWait: 300 * time.Millisecond, poll: 5 * time.Millisecond,
 		cooldown: 60 * time.Second, codeWait: 200 * time.Millisecond, stopWait: 300 * time.Millisecond,
 		memberMargin: 20 * time.Millisecond, headMargin: 50 * time.Millisecond, reserveMargin: 60 * time.Millisecond,
-		bootGrace: 60 * time.Second,
+		bootGrace: 60 * time.Second, minAgentInterval: time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
 	}
 }
 
@@ -64,6 +64,9 @@ type orchPortal struct {
 	// reconcileGate, when set, holds the policy pass until it closes (a pass
 	// stuck behind another on the policy lock; it ignores ctx).
 	reconcileGate chan struct{}
+	// withheld, when set, is the derivation's reason: the plan is read as
+	// withheld (no members, no network or transport), as the portal answers.
+	withheld string
 }
 
 func (p *orchPortal) ClusterPlan(_ context.Context, headSpecID string) (portal.ClusterPlan, error) {
@@ -75,6 +78,10 @@ func (p *orchPortal) ClusterPlan(_ context.Context, headSpecID string) (portal.C
 	p.planReads++
 	plan := p.plan
 	plan.Members = slices.Clone(p.plan.Members)
+	if p.withheld != "" {
+		plan.WithheldReason, plan.Network, plan.Transport, plan.Generation = p.withheld, "", "", ""
+		plan.Members = []portal.ClusterPlanMember{}
+	}
 	if hook := p.afterPlan; hook != nil {
 		p.afterPlan = nil
 		hook(p)
@@ -139,8 +146,9 @@ func (p *orchPortal) servers() []string {
 }
 
 // orchAgent is the scripted agent fleet. calls records, in order:
-// "member:ensure:<spec>", "head:ensure:<model>:<mark>", "head:stop:<model>",
-// "member:release:<spec>", "member:stop:<spec>[:force]".
+// "member:ensure:<spec>", "head:ensure:<model>:<mark>",
+// "head:stop:<model>[:if_evictable]", "member:release:<spec>",
+// "member:stop:<spec>[:force]".
 type orchAgent struct {
 	mu           sync.Mutex
 	calls        []string
@@ -148,6 +156,8 @@ type orchAgent struct {
 	memberErr    map[string]error
 	memberGate   map[string]chan struct{}
 	headErr      error
+	headStopErr  error
+	releaseGate  chan struct{}
 	stopState    string
 	arrived      chan string
 	onHeadEnsure func()
@@ -199,11 +209,18 @@ func (a *orchAgent) EnsureRuntimeModel(ctx context.Context, target routing.Targe
 	return err
 }
 
-func (a *orchAgent) StopRuntimeModel(_ context.Context, target routing.Target) (string, error) {
-	a.record("head:stop:" + target.ProviderModel)
+func (a *orchAgent) StopRuntimeModel(ctx context.Context, target routing.Target) (string, error) {
+	call := "head:stop:" + target.ProviderModel
+	if provider.IsIfEvictable(ctx) {
+		call += ":if_evictable"
+	}
+	a.record(call)
 	a.mu.Lock()
-	hook, state := a.onHeadStop, a.stopState
+	hook, state, err := a.onHeadStop, a.stopState, a.headStopErr
 	a.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
 	if hook != nil {
 		hook()
 	}
@@ -226,8 +243,18 @@ func (a *orchAgent) EnsureRPCMember(ctx context.Context, _ routing.Target, specI
 	return err
 }
 
-func (a *orchAgent) ReleaseRPCMember(_ context.Context, _ routing.Target, specID string) error {
+func (a *orchAgent) ReleaseRPCMember(ctx context.Context, _ routing.Target, specID string) error {
 	a.record("member:release:" + specID)
+	a.mu.Lock()
+	gate := a.releaseGate
+	a.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return nil
 }
 
@@ -478,6 +505,7 @@ func TestEnsureClusterMemberRefusedCoolsDown(t *testing.T) {
 		t.Fatalf("status = %+v, want the cooldown naming member 1", status)
 	}
 
+	f.o.wait() // the failed start's member releases
 	before := len(f.agent.recorded())
 	ce = clusterErrOf(t, f.o.Ensure(context.Background(), orchHead))
 	if ce.Code != codeClusterStartFailed || len(f.agent.recorded()) != before {
@@ -529,9 +557,11 @@ func TestEnsureClusterFormationTimeoutStopsHead(t *testing.T) {
 	if ce.Code != codeClusterMemberUnused || ce.Position != 1 {
 		t.Fatalf("error = %+v, want cluster_member_unused naming member 1", ce)
 	}
+	f.o.wait()
 	calls := f.agent.recorded()
-	if calls[len(calls)-1] != "head:stop:"+orchHeadModel {
-		t.Fatalf("calls = %q, want the head stopped last", calls)
+	stop := slices.Index(calls, "head:stop:"+orchHeadModel)
+	if stop < 0 || slices.ContainsFunc(calls[stop+1:], func(c string) bool { return !strings.HasPrefix(c, "member:release:") }) {
+		t.Fatalf("calls = %q, want the head stopped, followed by the member releases only", calls)
 	}
 	if st := f.o.State(orchHead); st != clusterCoolingDown {
 		t.Fatalf("state = %v, want cooling down", st)
@@ -561,6 +591,7 @@ func TestEnsureClusterTerminalCodeStopsRetries(t *testing.T) {
 		t.Fatalf("state = %v, want invalid", st)
 	}
 
+	f.o.wait() // the failed start's member releases
 	f.advance(10 * time.Minute)
 	before := len(f.agent.recorded())
 	ce = clusterErrOf(t, f.o.Ensure(context.Background(), orchHead))
@@ -741,6 +772,7 @@ func TestClusterHeadExitMarksColdAndTriggers(t *testing.T) {
 	running := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateRunning, Cluster: &RuntimeClusterStatusDTO{Launched: []string{"a:1"}}}}
 	exited := []RuntimeStatusDTO{{SpecID: orchHead, State: "crashed"}}
 	f.o.observeStatus(orchHeadServer, running, exited)
+	f.o.wait()
 	if st := f.o.State(orchHead); st != clusterCold {
 		t.Fatalf("state = %v, want cold after the head exited", st)
 	}
@@ -1048,6 +1080,7 @@ func TestDrainingHeadStillOccupiesItsMembers(t *testing.T) {
 	running := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateRunning, Cluster: &RuntimeClusterStatusDTO{Launched: []string{"a:1"}}}}
 	draining := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateDraining, Cluster: &RuntimeClusterStatusDTO{Launched: []string{"a:1"}}}}
 	f.o.observeStatus(orchHeadServer, running, draining)
+	f.o.wait()
 	select {
 	case <-f.o.TriggerChannel():
 		t.Fatal("a draining head woke the reconciler")

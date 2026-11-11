@@ -39,11 +39,17 @@ import (
 //     after the head's start began, within the same bound; otherwise the head
 //     is stopped and the start fails with runtime.cluster_member_unused.
 //
-// A failed start leaves the started members with nothing but their
-// reservation, so they idle out on their own. The head then cools down; a
-// cause that only a configuration change can fix (an unsupported build, a
-// version or device mismatch) blocks automatic starts until the head's
-// document changes. The orchestration's state lives in memory: a restarted
+// A failed start releases the members it started once its head is not
+// running: their reservations served that start only, and a released member
+// idles out on its short timeout. The head then cools down; a cause that only
+// a configuration change can fix (an unsupported build, a version or device
+// mismatch) blocks automatic starts until the head's document changes. A
+// formed cluster releases nothing: the agent's release ends the hold along
+// with the reservation, and a relay reports a hold only once per session, so
+// a released member would be unclaimed while its head uses it. Every stop of
+// the head -- an explicit one, the watchdog's, the head's own exit -- releases
+// the members after it (cluster_watchdog.go has the rules that follow a
+// running cluster). The orchestration's state lives in memory: a restarted
 // gateway learns it again from the agents' telemetry.
 
 // The cluster orchestration's own error codes. A start's error names its cause
@@ -249,8 +255,17 @@ type clusterTimings struct {
 	headMargin    time.Duration
 	reserveMargin time.Duration
 	// bootGrace is how long after the gateway started the reconciler leaves a
-	// cluster alone whose servers have not reported yet.
+	// cluster alone whose servers have not reported yet, and the watchdog
+	// does not count stale telemetry.
 	bootGrace time.Duration
+	// minAgentInterval is the least telemetry interval the watchdog assumes
+	// for a server, whatever shorter gaps it saw.
+	minAgentInterval time.Duration
+	// blockedRetry is how long the watchdog waits before it asks again to
+	// remove a cluster a local start waits for; releaseRetry how long before
+	// it releases again a member that still reports a dead hold.
+	blockedRetry time.Duration
+	releaseRetry time.Duration
 }
 
 func defaultClusterTimings() clusterTimings {
@@ -258,7 +273,7 @@ func defaultClusterTimings() clusterTimings {
 		unit: time.Second, configWait: 30 * time.Second, poll: 250 * time.Millisecond,
 		cooldown: 60 * time.Second, codeWait: 2 * time.Second, stopWait: 60 * time.Second,
 		memberMargin: 10 * time.Second, headMargin: 30 * time.Second, reserveMargin: 60 * time.Second,
-		bootGrace: 60 * time.Second,
+		bootGrace: 60 * time.Second, minAgentInterval: time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
 	}
 }
 
@@ -283,7 +298,13 @@ type clusterOrchestrator struct {
 	viewReads    map[string]chan struct{}
 	viewWaitHook func(head string)
 
-	wg sync.WaitGroup // one per running start and per reconciler-spawned ensure
+	// watch is the watchdog the ingest hands every telemetry frame to
+	// (observeStatus).
+	watch *clusterWatchdog
+
+	// wg counts every running start, reconciler-spawned ensure, watchdog
+	// worker and watchdog action.
+	wg sync.WaitGroup
 }
 
 // clusterHeadState is what the orchestration knows of one head.
@@ -312,6 +333,23 @@ type clusterHeadState struct {
 	// server is the head's server, from the last plan read: the server whose
 	// parked requests a start's end wakes.
 	server string
+	// lastPlan is the last plan read that was not withheld: the members a
+	// stop releases, and the members the watchdog follows, after the
+	// derivation withheld the head.
+	lastPlan *portal.ClusterPlan
+	// formedAt is when the head last formed; stale telemetry counts from it.
+	formedAt time.Time
+	// resume: the watchdog stopped the head while it served requests, so it
+	// is started again once the cooldown ended, kept up or not.
+	resume bool
+	// breaches are the breaches the members report now (ClusterStatusDTO).
+	breaches []portal.ClusterBreachDTO
+	// releasing counts the member releases of the head under way outside a
+	// start or a stop; releasesDone, when set, is closed once none is left. A
+	// start waits for them before it ensures the members, so no release
+	// lands on a reservation the start armed.
+	releasing    int
+	releasesDone chan struct{}
 }
 
 // clusterStart is one running start that every Ensure of its head joins.
@@ -323,10 +361,12 @@ type clusterStart struct {
 }
 
 func newClusterOrchestrator(deps clusterOrchestratorDeps, t clusterTimings) *clusterOrchestrator {
-	return &clusterOrchestrator{
+	o := &clusterOrchestrator{
 		deps: deps, t: t, bootAt: deps.now(), trigger: make(chan struct{}, 1),
 		heads: map[string]*clusterHeadState{}, views: map[string]clusterGateView{}, viewReads: map[string]chan struct{}{},
 	}
+	o.watch = newClusterWatchdog(o)
+	return o
 }
 
 // headState returns head's state, created cold. The caller holds o.mu.
@@ -394,6 +434,7 @@ func (o *clusterOrchestrator) ClusterStatus(head string) portal.ClusterStatusDTO
 		until := st.cooldownUntil
 		out.CooldownUntil = &until
 	}
+	out.Breaches = slices.Clone(st.breaches)
 	return out
 }
 
@@ -453,12 +494,12 @@ func (o *clusterOrchestrator) ensure(ctx context.Context, head string, manual bo
 func (o *clusterOrchestrator) startLocked(base context.Context, head string, st *clusterHeadState) *clusterStart {
 	runCtx, cancel := context.WithCancel(base)
 	s := &clusterStart{done: make(chan struct{}), cancel: cancel}
-	st.start = s
+	st.start, st.resume = s, false
 	o.wg.Add(1)
 	go func() {
 		defer o.wg.Done()
 		defer cancel()
-		err := o.run(runCtx, head)
+		release, err := o.run(runCtx, head)
 		o.mu.Lock()
 		hs := o.headState(head)
 		hs.start = nil
@@ -466,6 +507,9 @@ func (o *clusterOrchestrator) startLocked(base context.Context, head string, st 
 		close(s.done)
 		server := hs.server
 		o.mu.Unlock()
+		if release != nil {
+			o.goAction(func(ctx context.Context) { o.releaseAfterFailedStart(ctx, head, *release) })
+		}
 		if o.deps.wake != nil && server != "" {
 			o.deps.wake(server)
 		}
@@ -529,32 +573,45 @@ func (o *clusterOrchestrator) wait() {
 	}
 }
 
-// run is one start of head (the four steps at the top of this file).
-func (o *clusterOrchestrator) run(ctx context.Context, head string) error {
+// run is one start of head (the four steps at the top of this file). release
+// is the plan whose members a failed start leaves reserved -- nil when it
+// started none, or when a stop or the shutdown ended the start, since the
+// stop releases them itself.
+func (o *clusterOrchestrator) run(ctx context.Context, head string) (release *portal.ClusterPlan, err error) {
 	plan, err := o.plan(ctx, head)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	agents := o.deps.agents()
 	if agents == nil {
-		return &clusterError{Code: codeClusterUnavailable, Position: -1, Message: "this gateway's provider cannot start a cluster through the agents"}
+		return nil, &clusterError{Code: codeClusterUnavailable, Position: -1, Message: "this gateway's provider cannot start a cluster through the agents"}
 	}
 	if o.formedNow(plan) {
 		o.markFormed(head, plan)
-		return nil
+		return nil, nil
 	}
 	o.beginStart(head, plan)
 
 	plan, ce := o.applyConfig(ctx, head, plan)
 	fp := o.fingerprint(ctx, plan)
 	if ce != nil {
-		return o.fail(ctx, head, ce, fp)
+		return nil, o.fail(ctx, head, ce, fp)
+	}
+	failed := func(ce *clusterError) (*portal.ClusterPlan, error) {
+		err := o.fail(ctx, head, ce, fp)
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return &plan, err
 	}
 
 	headBound := o.startupBound(plan.Head.Spec.StartupTimeoutSeconds) + o.t.headMargin
 	o.setPhase(head, portal.ClusterPhaseMembersStarting)
+	if err := o.awaitReleases(ctx, head); err != nil {
+		return nil, o.fail(ctx, head, &clusterError{Code: codeClusterStartFailed, Position: -1, Message: err.Error()}, fp)
+	}
 	if ce := o.startMembers(ctx, head, plan, agents, headBound+o.t.reserveMargin); ce != nil {
-		return o.fail(ctx, head, ce, fp)
+		return failed(ce)
 	}
 	o.setPhase(head, portal.ClusterPhaseMembersReady)
 
@@ -567,17 +624,17 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) error {
 	before := o.lastError(plan.Head.Server.ID, head)
 	if err := agents.EnsureRuntimeModel(provider.WithClusterStart(o.deps.authCtx(hctx, target)), target); err != nil {
 		cause := o.cause(ctx, err, plan.Head.Server.ID, head, before)
-		return o.fail(ctx, head, &clusterError{Code: codeClusterStartFailed, Cause: cause, Position: -1, Head: true}, fp)
+		return failed(&clusterError{Code: codeClusterStartFailed, Cause: cause, Position: -1, Head: true})
 	}
 	if pos, formed := watch.await(hctx, head, plan); !formed {
 		o.stopHead(ctx, plan, agents)
-		return o.fail(ctx, head, &clusterError{
+		return failed(&clusterError{
 			Code: codeClusterMemberUnused, Cause: codeClusterMemberUnused, Position: pos,
 			Message: "the member never reported the head's hold; check the split (a member given no layers) and whether the model fits without it",
-		}, fp)
+		})
 	}
 	o.markFormed(head, plan)
-	return nil
+	return nil, nil
 }
 
 // plan loads head's plan; a withheld cluster marks the head invalid.
@@ -594,12 +651,38 @@ func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.Clu
 	o.mu.Lock()
 	st := o.headState(head)
 	st.withheld, st.server = plan.WithheldReason, plan.Head.Server.ID
+	o.rememberPlanLocked(st, plan)
 	o.views[head] = o.viewOf(plan)
 	o.mu.Unlock()
 	if plan.WithheldReason != "" {
 		return plan, &clusterError{Code: codeClusterUnavailable, Cause: plan.WithheldReason, Position: -1}
 	}
 	return plan, nil
+}
+
+// rememberPlanLocked keeps plan as st's last plan when it is not withheld; the
+// caller holds o.mu.
+func (o *clusterOrchestrator) rememberPlanLocked(st *clusterHeadState, plan portal.ClusterPlan) {
+	if plan.WithheldReason != "" {
+		return
+	}
+	p := plan
+	p.Members = slices.Clone(plan.Members)
+	st.lastPlan = &p
+}
+
+// membersOf returns plan's members, or, when the derivation withholds the head
+// (a withheld plan lists none), the members of head's last plan.
+func (o *clusterOrchestrator) membersOf(head string, plan portal.ClusterPlan) []portal.ClusterPlanMember {
+	if plan.WithheldReason == "" {
+		return plan.Members
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if st := o.heads[head]; st != nil && st.lastPlan != nil {
+		return slices.Clone(st.lastPlan.Members)
+	}
+	return nil
 }
 
 // startupBound is a startup timeout of secs seconds in the orchestration's
@@ -647,7 +730,7 @@ func (o *clusterOrchestrator) markFormed(head string, plan portal.ClusterPlan) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	st := o.headState(head)
-	st.formed, st.phase = true, portal.ClusterPhaseFormed
+	st.formed, st.phase, st.formedAt = true, portal.ClusterPhaseFormed, o.deps.now()
 	st.members = make([]portal.ClusterMemberStatusDTO, len(plan.Members))
 	for i, m := range plan.Members {
 		st.members[i] = portal.ClusterMemberStatusDTO{Position: m.Position, State: clusterMemberHeld}
@@ -1137,10 +1220,10 @@ func (o *clusterOrchestrator) stopHead(ctx context.Context, plan portal.ClusterP
 
 // Stop ends head's cluster head first: a running start of it is cancelled,
 // the head is drained and the stop waits, bounded, for the head's stopped
-// state on its server's status stream; then, with stopMembers, each member's
-// reservation and hold are released and the member stopped. Without
-// stopMembers the members idle out on their short timeout once the head's
-// holds end.
+// state on its server's status stream; then each member's reservation and
+// hold are released and, with stopMembers, the member stopped. Without
+// stopMembers the released members idle out on their short timeout. While
+// the derivation withholds the head, the members are those of its last plan.
 func (o *clusterOrchestrator) Stop(ctx context.Context, head string, stopMembers bool) error {
 	if o == nil {
 		return &clusterError{Code: codeClusterUnavailable, Position: -1, Message: "this gateway runs no cluster orchestration"}
@@ -1165,29 +1248,44 @@ func (o *clusterOrchestrator) Stop(ctx context.Context, head string, stopMembers
 	if err != nil {
 		return err
 	}
+	o.mu.Lock()
+	o.rememberPlanLocked(st, plan)
+	o.mu.Unlock()
 	agents := o.deps.agents()
 	if agents == nil {
 		return fmt.Errorf("%w: this gateway's provider cannot stop a cluster through the agents", provider.ErrUnavailable)
 	}
-	if err := o.drainHead(ctx, plan, agents); err != nil {
+	if err := o.drainHead(ctx, plan, agents, false); err != nil {
 		return err
 	}
-	o.mu.Lock()
-	st.formed, st.phase = false, ""
-	for i := range st.members {
-		st.members[i].State, st.members[i].Code = clusterMemberPending, ""
-	}
-	o.mu.Unlock()
+	o.markStopped(head)
+	members := o.membersOf(head, plan)
 	if !stopMembers {
+		o.releaseMembers(ctx, head, members, agents)
 		return nil
 	}
 	var first error
-	for _, m := range plan.Members {
+	for _, m := range members {
 		if err := o.stopMember(ctx, m, agents); err != nil && first == nil {
 			first = err
 		}
 	}
 	return first
+}
+
+// markStopped records head no longer formed: every member pending, except a
+// member the watchdog recorded as the cause of the stop, which keeps its
+// failed state until the next start.
+func (o *clusterOrchestrator) markStopped(head string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	st := o.headState(head)
+	st.formed, st.phase = false, ""
+	for i := range st.members {
+		if st.members[i].State != clusterMemberFailed {
+			st.members[i].State, st.members[i].Code = clusterMemberPending, ""
+		}
+	}
 }
 
 // StopManual is the operator's stop of head: Stop, and the head stays down
@@ -1202,19 +1300,38 @@ func (o *clusterOrchestrator) StopManual(ctx context.Context, head string, stopM
 	return o.Stop(ctx, head, stopMembers)
 }
 
-// drainHead asks the head's agent to stop the head and waits, bounded by
-// stopWait, until its status shows no process. It subscribes before it asks,
-// so the frame that reports the stop is not missed.
-func (o *clusterOrchestrator) drainHead(ctx context.Context, plan portal.ClusterPlan, agents clusterAgentClient) error {
+// drainHead asks the head's agent to stop the head -- with conditional, only
+// if the agent's own eviction rule lets it go (provider.WithIfEvictable) --
+// and waits, bounded by stopWait, until its status shows no process. It
+// subscribes before it asks, so the frame that reports the stop is not
+// missed.
+func (o *clusterOrchestrator) drainHead(ctx context.Context, plan portal.ClusterPlan, agents clusterAgentClient, conditional bool) error {
 	rows, updates, unsubscribe := o.deps.statuses.subscribe(plan.Head.Server.ID)
 	defer unsubscribe()
 	sctx, cancel := context.WithTimeout(ctx, runtimeStopTimeout)
 	target := runtimeInstanceTarget(plan.Head, 0)
-	state, err := agents.StopRuntimeModel(o.deps.authCtx(sctx, target), target)
+	sctx = o.deps.authCtx(sctx, target)
+	if conditional {
+		sctx = provider.WithIfEvictable(sctx)
+	}
+	state, err := agents.StopRuntimeModel(sctx, target)
 	cancel()
 	if err != nil || state == provider.RuntimeStopStopped {
 		return err
 	}
+	if !o.awaitHeadGone(ctx, plan, rows, updates) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: the cluster head did not stop within %s", provider.ErrTimeout, o.t.stopWait)
+	}
+	return nil
+}
+
+// awaitHeadGone follows the head server's status from rows on, bounded by
+// stopWait and ctx, until the head shows no process; it reports whether it
+// did.
+func (o *clusterOrchestrator) awaitHeadGone(ctx context.Context, plan portal.ClusterPlan, rows []RuntimeStatusDTO, updates <-chan []RuntimeStatusDTO) bool {
 	timer := time.NewTimer(o.t.stopWait)
 	defer timer.Stop()
 	for !headGone(rows, plan.Head.Spec.ID) {
@@ -1226,12 +1343,12 @@ func (o *clusterOrchestrator) drainHead(ctx context.Context, plan portal.Cluster
 			}
 			rows = next
 		case <-timer.C:
-			return fmt.Errorf("%w: the cluster head did not stop within %s", provider.ErrTimeout, o.t.stopWait)
+			return false
 		case <-ctx.Done():
-			return ctx.Err()
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 // headGone reports whether rows show head's instance 0 without a process.
@@ -1281,48 +1398,19 @@ func (o *clusterOrchestrator) TriggerChannel() <-chan struct{} {
 	return o.trigger
 }
 
-// observeStatus reads one telemetry frame of serverID against the previous
-// one: a cluster head that had a process with its launch facts and has none
-// now (it exited) is no longer formed, and the reconciler is woken, since a
-// kept-up head must be started again members first. A head that is only
-// draining has not exited yet.
+// observeStatus hands one telemetry frame of serverID, and the frame before
+// it, to the watchdog (clusterWatchdog). It only enqueues: the ingest calls it
+// for every frame, and the watchdog's work runs on its own goroutines.
 func (o *clusterOrchestrator) observeStatus(serverID string, prev, next []RuntimeStatusDTO) {
 	if o == nil {
 		return
 	}
-	var exited []string
-	for i := range prev {
-		p := &prev[i]
-		if p.Cluster == nil || p.Instance != 0 || !stateOccupied(p.State) {
-			continue
-		}
-		// A draining head still has its process and holds its members; it
-		// has exited once no process is left.
-		j := slices.IndexFunc(next, func(r RuntimeStatusDTO) bool { return r.SpecID == p.SpecID && r.Instance == 0 })
-		if j < 0 || !stateOccupied(next[j].State) {
-			exited = append(exited, p.SpecID)
-		}
-	}
-	if len(exited) == 0 {
-		return
-	}
-	o.mu.Lock()
-	for _, head := range exited {
-		if st := o.heads[head]; st != nil && st.formed {
-			st.formed, st.phase = false, ""
-			for i := range st.members {
-				st.members[i].State, st.members[i].Code = clusterMemberPending, ""
-			}
-		}
-	}
-	o.mu.Unlock()
-	slog.Info("cluster head exited", "server_id", serverID, "head_spec_ids", exited)
-	o.Trigger()
+	o.watch.enqueue(serverID, prev, next)
 }
 
 // Reconcile is one reconciler pass. It lifts a terminal block whose head
-// document changed, and starts every kept-up head (pinned or force_running)
-// that is cold -- except one an operator stopped, and, during the boot grace,
+// document changed, and starts every kept-up head (pinned or force_running),
+// and every head the watchdog stopped while it served requests, that is cold -- except one an operator stopped, and, during the boot grace,
 // one whose servers have not all reported, since the gateway cannot yet tell
 // whether that cluster still runs. Each start runs in the background, bounded
 // by its own bounds and the server's lifetime; the pass itself only reads.
@@ -1338,6 +1426,13 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 		slog.Warn("cluster reconcile: listing the kept-up heads failed", "err", err)
 		return
 	}
+	o.mu.Lock()
+	for head, st := range o.heads {
+		if st.resume && !slices.Contains(heads, head) {
+			heads = append(heads, head)
+		}
+	}
+	o.mu.Unlock()
 	base := o.deps.base()
 	for _, head := range heads {
 		o.mu.Lock()

@@ -2248,8 +2248,10 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	statuses := runtimeStatusDTOsFromSamples(req.Runtimes, now)
 	prevStatuses := s.RuntimeStatus.statusRows(serverID)
 	s.RuntimeStatus.publish(serverID, statuses)
-	// A cluster head whose process exited is no longer formed, and a kept-up
-	// one is started again members first (clusterOrchestrator.observeStatus).
+	// Every frame, a cluster head's and a member's alike, goes to the cluster
+	// watchdog (clusterOrchestrator.observeStatus): an exited head, a lost
+	// member, a breach, a local start a held member blocks. It only enqueues
+	// the frame; the watchdog works on its own goroutines.
 	s.clusters.observeStatus(serverID, prevStatuses, statuses)
 	// One fold of the sample's rows per spec (foldInstanceRows), which every
 	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.

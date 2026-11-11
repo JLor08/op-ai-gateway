@@ -227,6 +227,31 @@ type ClusterStatusDTO struct {
 	Members       []ClusterMemberStatusDTO `json:"members"`
 	LastFailure   *ClusterFailureDTO       `json:"last_failure,omitempty"`
 	CooldownUntil *time.Time               `json:"cooldown_until,omitempty"`
+	// Breaches are the policy breaches the members' agents report now, by
+	// member position: a peer that connected without being allowed, or a
+	// hold by another head. Ordered by position, kind and peer.
+	Breaches []ClusterBreachDTO `json:"breaches,omitempty"`
+}
+
+// The kinds of a cluster breach (ClusterBreachDTO.Kind).
+const (
+	// ClusterBreachPeer: a peer the member does not allow connected to it.
+	ClusterBreachPeer = "peer"
+	// ClusterBreachForeignHold: the member reports a hold by another head
+	// than this one -- in direct mode a queued second head takes a member
+	// over once the first disconnects.
+	ClusterBreachForeignHold = "foreign_hold"
+)
+
+// ClusterBreachDTO is one breach a member's agent reports: the member's
+// position, the kind and, for a peer breach, the peer's address and when the
+// agent saw it. A member on a server the reader may not manage shows only its
+// position and kind: the peer is a fact about that server's network.
+type ClusterBreachDTO struct {
+	Position int       `json:"position"`
+	Kind     string    `json:"kind"`
+	Peer     string    `json:"peer,omitempty"`
+	At       time.Time `json:"at,omitzero"`
 }
 
 // ClusterMemberStatusDTO is one member's part of a start: its position, its
@@ -256,6 +281,18 @@ type ClusterStatusReader interface {
 	ClusterStatus(headSpecID string) ClusterStatusDTO
 }
 
+// ClusterMeshDriftHandler is what the gateway's cluster orchestration offers
+// beside its ClusterStatusReader: StopDirectMeshClusters stops every direct
+// mesh cluster the derivation withholds, head first, then releases and stops
+// its members, and returns once that is done (each step bounded). The policy
+// pass calls it when it records NetBird's Default policy enabled again,
+// before it pushes the documents that withhold those clusters, so no member
+// is removed under a running head. The reader set by SetClusterStatusReader
+// is asked for it, so the one wiring carries both.
+type ClusterMeshDriftHandler interface {
+	StopDirectMeshClusters(ctx context.Context)
+}
+
 // SetClusterStatusReader sets (or replaces) the reader of the gateway's
 // cluster orchestration state; nil leaves a head's cluster_status cold. A
 // setter for the same reason as SetRuntimeConfigChangedHook: the gateway
@@ -266,8 +303,10 @@ func (s *Service) SetClusterStatusReader(r ClusterStatusReader) {
 
 // headClusterStatus is an enabled head's cluster_status: the orchestration's
 // state, and invalid while the derivation withholds the head (withheld != "")
-// whatever the orchestration last saw.
-func (s *Service) headClusterStatus(headSpecID, withheld string) *ClusterStatusDTO {
+// whatever the orchestration last saw. A breach of a member at one of the
+// hidden positions (a server the reader may not manage) keeps only its
+// position and kind.
+func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *ClusterStatusDTO {
 	st := ClusterStatusDTO{State: ClusterStateCold, Members: []ClusterMemberStatusDTO{}}
 	if s.clusterStatus != nil {
 		st = s.clusterStatus.ClusterStatus(headSpecID)
@@ -278,5 +317,23 @@ func (s *Service) headClusterStatus(headSpecID, withheld string) *ClusterStatusD
 	if withheld != "" {
 		st.State = ClusterStateInvalid
 	}
+	if len(st.Breaches) > 0 {
+		breaches := make([]ClusterBreachDTO, len(st.Breaches))
+		for i, b := range st.Breaches {
+			if slices.Contains(hidden, b.Position) {
+				b = ClusterBreachDTO{Position: b.Position, Kind: b.Kind}
+			}
+			breaches[i] = b
+		}
+		st.Breaches = breaches
+	}
 	return &st
+}
+
+// stopDriftedClusters hands a drift of NetBird's Default policy to the
+// gateway's cluster orchestration (ClusterMeshDriftHandler), when it has one.
+func (s *Service) stopDriftedClusters(ctx context.Context) {
+	if h, ok := s.clusterStatus.(ClusterMeshDriftHandler); ok {
+		h.StopDirectMeshClusters(ctx)
+	}
 }

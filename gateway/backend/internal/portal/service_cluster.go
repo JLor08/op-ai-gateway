@@ -1269,9 +1269,13 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 	}
 	dto.ClusterMembers = make([]ClusterMemberDTO, 0, len(members))
 	allVisible := true
+	var hidden []int
 	for i, m := range members {
 		members[i].visible = m.found && (isSystem(p) || s.callerManagesServer(ctx, p, m.server.ID))
 		allVisible = allVisible && members[i].visible
+		if !members[i].visible {
+			hidden = append(hidden, m.row.Position)
+		}
 		dto.ClusterMembers = append(dto.ClusterMembers, clusterMemberDTO(m, members[i].visible))
 	}
 	dto.ClusterVRAMTotalMB, dto.ClusterRAMTotalMB, dto.ClusterTotalsComplete = clusterTotals(dto, members)
@@ -1297,7 +1301,7 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 		if dto.ClusterWithheldReason, err = s.clusterWithheldReason(ctx, dto.ID, headServer); err != nil {
 			return dto, err
 		}
-		dto.ClusterStatus = s.headClusterStatus(dto.ID, dto.ClusterWithheldReason)
+		dto.ClusterStatus = s.headClusterStatus(dto.ID, dto.ClusterWithheldReason, hidden)
 		transport := dto.RPCTransport
 		if transport == "" {
 			transport = dto.ClusterTransportDefault

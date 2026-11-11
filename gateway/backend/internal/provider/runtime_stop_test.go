@@ -147,3 +147,51 @@ func TestMultiplexerDispatchesRuntimeStop(t *testing.T) {
 		t.Fatalf("upstream requests = %v, want exactly [POST /stop/m]", paths)
 	}
 }
+
+// TestStopRuntimeModelIfEvictable pins the conditional stop: a context marked
+// WithIfEvictable sends ?if_evictable=1 on the same bodiless POST, and the
+// router's 409 runtime.instance_busy comes back as a *RouterError; an
+// unmarked context sends no query.
+func TestStopRuntimeModelIfEvictable(t *testing.T) {
+	var mu sync.Mutex
+	var queries []string
+	busy := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		queries = append(queries, r.URL.RawQuery)
+		refuse := busy
+		mu.Unlock()
+		if refuse {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"code":"runtime.instance_busy","message":"in use"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"state":"stopping"}`)
+	}))
+	defer srv.Close()
+	client := NewOpenAICompatibleClient(srv.Client())
+	target := routing.Target{Provider: routing.ProviderServerAgent, Endpoint: srv.URL, ProviderModel: "head"}
+
+	if !IsIfEvictable(WithIfEvictable(context.Background())) || IsIfEvictable(context.Background()) {
+		t.Fatal("IsIfEvictable does not read WithIfEvictable's mark")
+	}
+	if state, err := client.StopRuntimeModel(WithIfEvictable(context.Background()), target); err != nil || state != RuntimeStopStopping {
+		t.Fatalf("conditional stop = (%q, %v), want (stopping, nil)", state, err)
+	}
+	if _, err := client.StopRuntimeModel(context.Background(), target); err != nil {
+		t.Fatalf("plain stop: %v", err)
+	}
+	mu.Lock()
+	busy = true
+	mu.Unlock()
+	_, err := client.StopRuntimeModel(WithIfEvictable(context.Background()), target)
+	var re *RouterError
+	if !errors.As(err, &re) || re.Code != "runtime.instance_busy" || re.Status != http.StatusConflict {
+		t.Fatalf("busy conditional stop = %v, want a *RouterError runtime.instance_busy 409", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(queries) != 3 || queries[0] != "if_evictable=1" || queries[1] != "" || queries[2] != "if_evictable=1" {
+		t.Fatalf("queries = %q, want if_evictable=1 only on the marked calls", queries)
+	}
+}

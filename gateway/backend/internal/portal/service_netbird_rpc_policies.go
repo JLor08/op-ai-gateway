@@ -336,7 +336,10 @@ func defaultPolicyState(enabled bool) string {
 }
 
 // storeDefaultPolicyState writes state when it differs from the stored one and
-// then notifies every cluster server.
+// then notifies every cluster server. A change to enabled is a drift: the
+// derivation now withholds every direct mesh cluster, so those are stopped
+// head first (stopDriftedClusters) before the documents that withhold them
+// are pushed, which would otherwise remove the members under running heads.
 func (s *Service) storeDefaultPolicyState(ctx context.Context, state string) {
 	if s.settings == nil {
 		return
@@ -352,6 +355,9 @@ func (s *Service) storeDefaultPolicyState(ctx context.Context, state string) {
 	if err := s.settings.SetSystemSetting(ctx, netbirdDefaultPolicyStateKey, string(raw), now); err != nil {
 		slog.Debug("default policy state: store", "state", state, "error", err)
 		return
+	}
+	if state == NetbirdDefaultPolicyEnabled {
+		s.stopDriftedClusters(ctx)
 	}
 	s.notifyAllClusterServers(ctx)
 }

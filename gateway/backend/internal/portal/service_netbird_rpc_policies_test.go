@@ -612,3 +612,51 @@ func TestDenyByDefaultFlipRecordsOnlyFinalState(t *testing.T) {
 		t.Fatalf("flip notified %d times, want one burst of %d", got, burst)
 	}
 }
+
+// driftRecorder is a ClusterStatusReader that also handles the mesh drift,
+// recording how many runtime documents were already notified when it ran.
+type driftRecorder struct {
+	fakeClusterStatus
+	e     *rpcPolicyEnv
+	calls []int
+}
+
+func (d *driftRecorder) StopDirectMeshClusters(context.Context) {
+	d.calls = append(d.calls, d.e.notifications())
+}
+
+// TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying pins the drift's
+// order: once a pass sees NetBird's Default policy enabled again, the gateway
+// stops its direct mesh clusters, head first, BEFORE the documents that
+// withhold them are pushed -- so the members are not removed under a running
+// head. A pass that sees it disabled stops nothing.
+func TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.fake.seedDefaultPolicy("pol-default", false)
+	d := &driftRecorder{e: e}
+	e.svc.SetClusterStatusReader(d)
+	e.svc.ReconcileAllServerNetbird(e.ctx)
+	if len(d.calls) != 0 {
+		t.Fatalf("drift handler calls = %v, want none while Default is disabled", d.calls)
+	}
+
+	e.fake.mu.Lock()
+	for _, p := range e.fake.policies {
+		if p["name"] == "Default" {
+			p["enabled"] = true
+		}
+	}
+	e.fake.mu.Unlock()
+	before := e.notifications()
+	e.svc.reconcileAllServerPolicies(e.ctx)
+	if !slices.Equal(d.calls, []int{before}) {
+		t.Fatalf("drift handler calls = %v, want one before any notification (%d)", d.calls, before)
+	}
+	if e.notifications() == before {
+		t.Fatal("the drift notified no cluster server")
+	}
+}
