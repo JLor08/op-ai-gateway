@@ -3637,6 +3637,7 @@ export function RuntimeAdminSection({
       return;
     }
     setBusy(true);
+    let mapping: PortalModelMapping;
     try {
       // A form does not send a field it does not let you edit. Read-only here
       // => not sent from here: the gateway name and the status belong to the
@@ -3658,6 +3659,7 @@ export function RuntimeAdminSection({
       // lost-update argument applies, so it goes for the same reason.)
       const updated = await api.updateMapping(id, { app_model_name: appName });
       setMappings((current) => (current ?? []).map((m) => (m.id === id ? updated : m)));
+      mapping = updated;
     } catch (err) {
       showError(formatPortalError(err, t));
       setBusy(false);
@@ -3672,7 +3674,12 @@ export function RuntimeAdminSection({
       setSpecMode('list');
     } catch (err) {
       showError(`${t.runtimeSpecPartialFailure}: ${formatPortalError(err, t)}`);
-      setSpecMode('list');
+      // As after a refused create: the form stays open with every entry kept,
+      // a cluster head's members and their GPUs included. The mapping PATCH
+      // above did land, so the Edit now carries the mapping as it answered;
+      // the form's app model name already is that value, and the next save
+      // PATCHes the same name again (a no-op) before it retries the spec.
+      setSpecMode({ kind: 'edit', mapping });
     } finally {
       setBusy(false);
     }

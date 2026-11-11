@@ -12401,6 +12401,48 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     return view;
   }
 
+  it('keeps the edit form, members included, when the spec save is refused, and saves again', async () => {
+    const { fakeApi, putSpecs, updatedMappings } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'renamed' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+      target: { value: '/srv/models' },
+    });
+    fakeApi.putRuntimeSpec.mockRejectedValueOnce(
+      new PortalApiError(400, 'runtime_spec.cluster_member_no_matching_binary', 'server "Beta"'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(new RegExp(t.errorClusterMemberNoMatchingBinary)),
+    ).toBeInTheDocument();
+
+    // Still the form, with every entry: the typed fields and the members.
+    expect((screen.getByLabelText(t.runtimeSpecWorkDir) as HTMLInputElement).value).toBe(
+      '/srv/models',
+    );
+    expect((screen.getByLabelText(t.mappingAppName) as HTMLInputElement).value).toBe('renamed');
+    expect(screen.getByText(t.clusterMemberHidden)).toBeInTheDocument();
+    expect(screen.getAllByTestId('cluster-member-row')).toHaveLength(2);
+    // The mapping PATCH landed before the refusal.
+    expect(updatedMappings).toEqual([{ id: 'map_1', body: { app_model_name: 'renamed' } }]);
+
+    // The second save goes through: the same name again, then the spec.
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(updatedMappings).toEqual([
+      { id: 'map_1', body: { app_model_name: 'renamed' } },
+      { id: 'map_1', body: { app_model_name: 'renamed' } },
+    ]);
+    expect(putSpecs[0].mappingId).toBe('map_1');
+    expect(putSpecs[0].body).toMatchObject({
+      work_dir: '/srv/models',
+      cluster_enabled: true,
+      cluster_members: [visibleMember, hiddenMember],
+    });
+    await waitFor(() =>
+      expect(screen.queryByLabelText(t.runtimeSpecWorkDir)).not.toBeInTheDocument(),
+    );
+  });
+
   it('keeps every cluster field when an unrelated field changes', async () => {
     const { putSpecs } = await openEditAndSave(headSpec());
     expect(screen.getByText(t.clusterMemberHidden)).toBeInTheDocument();
