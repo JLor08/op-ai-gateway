@@ -336,6 +336,27 @@ describe('RpcMemberSection member status', () => {
     expect(within(row).getByText(new RegExp(t.rpcStatusBreaches))).toBeTruthy();
   });
 
+  it('names a member by the gateway display name and keeps its id at hand', async () => {
+    setup({
+      rows: [
+        memberRow({
+          spec_id: 'rpca_rspec_1_srv_1',
+          display_name: 'RPC (unsloth/Qwen3.8-27B)(efyga)',
+        }),
+      ],
+    });
+    const row = await screen.findByTestId('rpc-status-rpca_rspec_1_srv_1');
+    const name = within(row).getByText('RPC (unsloth/Qwen3.8-27B)(efyga)');
+    expect(name).toHaveAccessibleDescription('rpca_rspec_1_srv_1');
+    expect(within(row).queryByText('rpca_rspec_1_srv_1')).toBeNull();
+  });
+
+  it('shows the member id when the gateway sends no display name', async () => {
+    setup({ rows: [memberRow({ spec_id: 'rpcm_1' })] });
+    const row = await screen.findByTestId('rpc-status-rpcm_1');
+    expect(within(row).getByText('rpcm_1')).toBeTruthy();
+  });
+
   it('ignores model rows', async () => {
     setup({ rows: [memberRow({ spec_id: 'model_x', kind: undefined })] });
     expect(await screen.findByText(t.rpcStatusEmpty)).toBeTruthy();

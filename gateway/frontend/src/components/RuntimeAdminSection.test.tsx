@@ -5074,6 +5074,29 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByRole('tab', { name: t.rpcTab })).not.toBeInTheDocument();
   });
 
+  it('names a cluster member row on the Live-Status tab and in its log view', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          spec_id: 'rpca_rspec_1_srv_1',
+          kind: 'rpc_server',
+          model: '',
+          display_name: 'RPC (big)(efyga)',
+          pid: 4300,
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    const row = inRowWith('4300');
+    const name = row.getByText('RPC (big)(efyga)');
+    expect(name).toHaveAccessibleDescription('rpca_rspec_1_srv_1');
+    // A member is no mapping row: no "unresolved" marker.
+    expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
+    fireEvent.click(row.getByRole('button', { name: t.runtimeLogs }));
+    expect(await screen.findByRole('dialog')).toHaveTextContent('RPC (big)(efyga)');
+  });
+
   it('feeds the RPC tab from its own status stream instead of opening a second one', async () => {
     const { fakeApi, stream } = renderSection({
       statusRows: [makeStatus({ spec_id: 'rpcm_live', kind: 'rpc_server' })],

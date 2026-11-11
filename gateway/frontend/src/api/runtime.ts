@@ -584,6 +584,10 @@ export interface RuntimeStatus {
   last_error?: RuntimeError;
   // "rpc_server" for a cluster member's row; absent for a model spec.
   kind?: string;
+  // A cluster member's readable name for this reader, "RPC (<head
+  // model>)(<member server>)" ("—" for a head the reader may not see).
+  // spec_id stays the member's identity; absent from an older gateway.
+  display_name?: string;
   rpc?: RuntimeRpcStatus;
   cluster?: RuntimeClusterStatus;
   // On a waiting spec: the member spec holding the resource it needs.
