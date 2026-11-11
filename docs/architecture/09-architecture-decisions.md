@@ -11745,38 +11745,42 @@ unauthenticated port to the network, lets one head take another's member, or poi
   formation would leave a member evictable while its head runs. A release sticks: a connection the head opened before
   it (a half-open socket of a head that lost power) never re-takes the hold, only a new one does. A direct member that
   still reports the hold of a head that is down is stopped, forced, as well: the rpc-server sets no keepalive, so its
-  half-open connection would otherwise linger. A head server whose telemetry stays away past its stale threshold while
-  the member's server keeps reporting counts as down; the cost is that a failure of only the gateway-to-head-host
-  link, with head and member still talking, aborts that cluster too. A claimed member is never relaunched under its
-  head: a change of its launch waits until the claim ends or an ensure finds no head holding it, and the gateway
-  relaunches the head for any change of a member's launch inputs, so the change normally lands with the next start; a
-  member whose document arrives after the new head connected keeps its old launch until that head stops. A local start
-  on a member host that waits only for a held member makes the gateway ask the head's agent for a conditional stop,
-  which happens only when that agent's own eviction rule lets the head go; otherwise the local start waits. A member's
-  tensor cache outlives its member leaving the document (members are withheld for reasons that pass); it goes when the
-  member serves another head, on an operator's purge, or once no listed member serves it and it has been unused for 7
-  days.
+  half-open connection would otherwise linger. A head server whose telemetry stays away past its stale threshold plus
+  one of its intervals while the member's server keeps reporting (no gap over 15 s of its own) counts as down; a
+  member whose agent reports less often than every 15 s therefore never judges its head silent and waits for the head
+  server's own report, which fails safe. The cost is that a failure of only the gateway-to-head-host link, with head
+  and member still talking, aborts that cluster too. A claimed member is never relaunched under its head: a change of
+  its launch waits until the claim ends or an ensure finds no head holding it, and the gateway relaunches the head for
+  any change of a member's launch inputs, so the change normally lands with the next start; a member whose document
+  arrives after the new head connected keeps its old launch until that head stops. A local start on a member host that
+  waits only for a held member makes the gateway ask the head's agent for a conditional stop, which happens only when
+  that agent's own eviction rule lets the head go; otherwise the local start waits. A member's tensor cache outlives
+  its member leaving the document (members are withheld for reasons that pass); it goes when the member serves another
+  head, on an operator's purge, or once no listed member serves it and it has been unused for 7 days.
 - **(h) A watchdog follows a formed cluster on telemetry, and acts only on the head.** Losing a member aborts the head
   anyway, and a member is removed only through its head. Evidence of a lost member (exit, a new PID, a vanished hold,
   a relay stall) is a suspicion until a head frame that arrived **after** the member's confirms the head still runs
   the same process, because a head that stopped on its own ends its members' sessions too and their frames can arrive
-  first. A member server that falls silent counts as lost after **max(3 × its telemetry interval, 15 s)** (3 s at the
-  default 1 s cadence would stop healthy clusters on a reporting hiccup), never in the gateway's boot grace and never
-  before formation. A confirmed loss stops the head, records `runtime.cluster_member_lost` at that member's position
-  and starts the cluster again after the cooldown if the head was serving requests. Only a frame of the head's own
-  server ends a head: any agent can send any row, and acting on another server's would let one agent stop another
-  tenant's cluster.
+  first. A member server that falls silent counts as lost after **max(3 × its telemetry interval, 15 s) plus one
+  interval** (3 s at the default 1 s cadence would stop healthy clusters on a reporting hiccup, and the extra interval
+  keeps a gap every host shared, which can begin up to one interval after the member's last frame, from reading as a
+  loss), counted from the start of the head server's current run of frames (a run ends at any gap over 15 s), so a
+  head server reporting less often than every 15 s never counts a member stale, which fails safe; never in the
+  gateway's boot grace and never before formation. A confirmed loss stops the head, records
+  `runtime.cluster_member_lost` at that member's position and starts the cluster again after the cooldown if the head
+  was serving requests. Only a frame of the head's own server ends a head: any agent can send any row, and acting on
+  another server's would let one agent stop another tenant's cluster.
 - **(i) Rights on every server, the member side's consent, and positions instead of names.** A write that changes the
   membership, member mode, network, transport or the head binary needs management rights on the head's server and on
   every member server it keeps or adds; one that changes none of them needs rights on the head's server only, so a
   member the caller cannot see never locks them out of their own head. Removing members, turning the cluster off
-  included, needs the head's rights only, like deleting the head: removal only frees the member host. The member side consents per head-server admin
-  group (`rpc_allowed_head_groups` on the server for automatic members, `allowed_head_groups` on a manual spec; an empty
-  list means the member server's own admin groups), and consent binds **every** caller, system scope included: the
-  derivation re-checks it on every document, so a save past it would store a head that is never pushed. Every refusal
-  about a server the caller may not use is `server.not_found`, checked before any member setting is read. Read views
-  name members by **position** only where the caller may not see the server, and inference refusals may carry the
-  recorded cause code and member position (never a server name).
+  included, needs the head's rights only, like deleting the head: removal only frees the member host. The member side
+  consents per head-server admin group (`rpc_allowed_head_groups` on the server for automatic members,
+  `allowed_head_groups` on a manual spec; an empty list means the member server's own admin groups), and consent binds
+  **every** caller, system scope included: the derivation re-checks it on every document, so a save past it would
+  store a head that is never pushed. Every refusal about a server the caller may not use is `server.not_found`,
+  checked before any member setting is read. Read views name members by **position** only where the caller may not see
+  the server, and inference refusals may carry the recorded cause code and member position (never a server name).
 - **(j) A cluster is pushed whole or not at all, and only between agents that both understand it.** The derivation
   reads the configured membership, never liveness; any member that cannot be derived withholds the head and every
   member spec derived from it, so no agent ever receives a partial endpoint list (which would shift `RPC<n>`). Both
