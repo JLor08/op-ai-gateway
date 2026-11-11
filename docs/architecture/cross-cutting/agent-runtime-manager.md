@@ -28,28 +28,28 @@ changed: the resolver sees an ordinary application with ordinary model mappings.
 ```mermaid
 flowchart TB
     subgraph gw["Gateway"]
-        portal["portal.Service\nruntime specs · co-residency\nGPU budgets · limits"]
-        srv["gateway.Server\nPushRuntimeConfig\nruntime status registry"]
-        db[("agent_runtime_specs\nagent_runtime_spec_gpus\nagent_coresidency_rules\nai_server_gpu_budgets\nserver_runtime_reports")]
+        portal["portal.Service<br/>runtime specs · co-residency<br/>GPU budgets · limits"]
+        srv["gateway.Server<br/>PushRuntimeConfig<br/>runtime status registry"]
+        db[("agent_runtime_specs<br/>agent_runtime_spec_gpus<br/>agent_coresidency_rules<br/>ai_server_gpu_budgets<br/>server_runtime_reports")]
     end
 
     subgraph server["AI server host"]
-        agent["server-agent\ninternal/runtime"]
-        router["router\none HTTP port\n(:router_listen)"]
-        m1["model process A\n127.0.0.1:ephemeral"]
-        m2["model process B\n127.0.0.1:ephemeral"]
+        agent["server-agent<br/>internal/runtime"]
+        router["router<br/>one HTTP port<br/>(:router_listen)"]
+        m1["model process A<br/>127.0.0.1:ephemeral"]
+        m2["model process B<br/>127.0.0.1:ephemeral"]
         gpu["nvidia-smi / rocm-smi"]
     end
 
     client["AI client"] -->|"inference"| srv
     portal --> db
     portal -->|"notifyRuntimeChanged"| srv
-    srv -->|"WS runtime_config frame\n(full document + ETag)"| agent
-    agent -->|"GET /api/agent/v1/runtime-config\n(If-None-Match, poll backstop)"| srv
+    srv -->|"WS runtime_config frame<br/>(full document + ETag)"| agent
+    agent -->|"GET /api/agent/v1/runtime-config<br/>(If-None-Match, poll backstop)"| srv
     agent -->|"GET /api/agent/v1/features"| srv
-    agent -->|"telemetry sample:\ncapabilities · runtimes · loaded_models"| srv
+    agent -->|"telemetry sample:<br/>capabilities · runtimes · loaded_models"| srv
     agent -->|"runtime_report (file mode)"| srv
-    srv -->|"proxied inference\n(model name in JSON body)"| router
+    srv -->|"proxied inference<br/>(model name in JSON body)"| router
     router --> m1
     router --> m2
     agent -.->|"measured VRAM by PID"| gpu

@@ -120,9 +120,9 @@ flowchart TB
     end
 
     subgraph Drivers["Three drivers, one selection at startup"]
-        D1["memory\nrouting.MemoryStore / portal.MemoryDirectory / usage.Recorder"]
-        D2["sqlite\n*store.SQLStore + sqliteDialect"]
-        D3["postgres\n*store.SQLStore + postgresDialect"]
+        D1["memory<br/>routing.MemoryStore / portal.MemoryDirectory / usage.Recorder"]
+        D2["sqlite<br/>*store.SQLStore + sqliteDialect"]
+        D3["postgres<br/>*store.SQLStore + postgresDialect"]
     end
 
     H1 --> S1 --> I1
