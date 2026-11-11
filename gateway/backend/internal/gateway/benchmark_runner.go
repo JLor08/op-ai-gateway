@@ -224,6 +224,18 @@ func (s *Server) mappingIsAudioOnly(ctx context.Context, app routing.Application
 	return mappingSpecIsAudioOnly(app, spec, hasSpec), nil
 }
 
+// mappingIsDecisionsOnly is mappingIsAudioOnly's decision twin: it reads the
+// mapping's runtime spec and reports whether its EFFECTIVE flavors are
+// decisions-only (mappingSpecIsDecisionsOnly), which benchmarkSiblingModel must
+// also pass over, since it cannot answer a chat prompt either.
+func (s *Server) mappingIsDecisionsOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
+	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, app, mappingID)
+	if err != nil {
+		return false, err
+	}
+	return mappingSpecIsDecisionsOnly(app, spec, hasSpec), nil
+}
+
 // benchmarkSpecFor resolves the RuntimeSpec the model warmer's
 // benchmarkTarget carries (its .spec field) for later auth resolution via
 // routing.SpecUpstreamAuth, mirroring routing.Resolver.targetFrom's
@@ -813,7 +825,7 @@ func (s *Server) waitModelUnloaded(ctx context.Context, lister provider.LoadedMo
 // application (a distinct AppModelName), for the swap-workaround eviction.
 //
 // The swap sends that sibling a chat prompt, so a sibling that serves only images
-// (mappingIsImagesOnly) or only audio (mappingIsAudioOnly) is passed over, and so is one
+// (mappingIsImagesOnly) or only audio (mappingIsAudioOnly) or only decisions (mappingIsDecisionsOnly) is passed over, and so is one
 // whose runtime spec cannot be read, since whether it serves only images or audio is then
 // unknown.
 func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget) (string, bool) {
@@ -829,6 +841,9 @@ func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget)
 			continue
 		}
 		if audioOnly, err := s.mappingIsAudioOnly(ctx, tgt.app, m.ID); err != nil || audioOnly {
+			continue
+		}
+		if decisionsOnly, err := s.mappingIsDecisionsOnly(ctx, tgt.app, m.ID); err != nil || decisionsOnly {
 			continue
 		}
 		return m.AppModelName, true

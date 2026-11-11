@@ -468,13 +468,14 @@ func vramClusterMemberClaimed(rows []RuntimeStatusDTO, now time.Time) bool {
 
 // vramEnsurePlan decides how the run starts the target: false for a text
 // target, which loads by generating as always, and true for an images-only or
-// audio-only one (mappingSpecIsImagesOnly, mappingSpecIsAudioOnly on
+// audio-only or decisions-only one (mappingSpecIsImagesOnly, mappingSpecIsAudioOnly,
+// mappingSpecIsDecisionsOnly on
 // targetSpec), which has no chat endpoint to generate on and is started
 // through the agent router's ensure route instead. That route needs an agent
 // that declares runtime_ensure; without it the target cannot be started at
 // all, which is refused before anything is written.
 func (s *Server) vramEnsurePlan(serverID string, app routing.Application, targetSpec routing.RuntimeSpec) (bool, error) {
-	if !mappingSpecIsImagesOnly(app, targetSpec, true) && !mappingSpecIsAudioOnly(app, targetSpec, true) {
+	if !mappingSpecIsImagesOnly(app, targetSpec, true) && !mappingSpecIsAudioOnly(app, targetSpec, true) && !mappingSpecIsDecisionsOnly(app, targetSpec, true) {
 		return false, nil
 	}
 	if !s.AgentFeatures.Has(serverID, runtimeEnsureFeature) {

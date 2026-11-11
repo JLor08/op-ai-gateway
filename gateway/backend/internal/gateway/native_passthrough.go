@@ -159,6 +159,15 @@ func targetIsAudioOnly(target routing.Target) bool {
 	return routing.FlavorsAreAudioOnly(target.APIFlavors)
 }
 
+// targetIsDecisionsOnly is targetIsAudioOnly's decision twin: whether target's
+// effective APIFlavors are decisions-only -- see routing.FlavorsAreDecisionsOnly.
+// The text translate dispatch refuses such a target like an images-only or
+// audio-only one (resolveTranslateTarget), and the model listings agree
+// (routing.MappingServesAPIFlavor's openai row).
+func targetIsDecisionsOnly(target routing.Target) bool {
+	return routing.FlavorsAreDecisionsOnly(target.APIFlavors)
+}
+
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
 // RESOLVED target + client API flavor: the native passthrough path when the
 // effective mode for that flavor is passthrough, otherwise the built-in

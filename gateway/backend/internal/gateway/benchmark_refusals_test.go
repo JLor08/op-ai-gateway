@@ -336,7 +336,7 @@ func TestLoadRefusalReasonsNameTheirCodes(t *testing.T) {
 		}
 	}
 	slices.Sort(reasons)
-	if want := []string{"agent_ensure_unsupported", "audio_only", "cluster_head_unsupported", "images_only", "spec_force_stopped"}; !reflect.DeepEqual(reasons, want) {
+	if want := []string{"agent_ensure_unsupported", "audio_only", "cluster_head_unsupported", "decisions_only", "images_only", "spec_force_stopped"}; !reflect.DeepEqual(reasons, want) {
 		t.Fatalf("load refusal reasons = %v, want %v", reasons, want)
 	}
 }

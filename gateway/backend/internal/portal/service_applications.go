@@ -2089,6 +2089,11 @@ type ModelMappingDTO struct {
 	// sent, not omitted. Both markers come out of one spec read
 	// (mappingFlavorMarkers).
 	AudioOnly bool `json:"audio_only"`
+	// DecisionsOnly is AudioOnly's decision twin: the mapping's effective
+	// flavors are decisions-only (routing.FlavorsAreDecisionsOnly), so the
+	// gateway refuses to send it a chat prompt (409 benchmark.decisions_only).
+	// Advisory and always present, like the other markers.
+	DecisionsOnly bool `json:"decisions_only"`
 }
 
 type MappingListResponse struct {
@@ -3292,6 +3297,7 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		CreatedAt:                    mapping.CreatedAt,
 		ImagesOnly:                   markers.ImagesOnly,
 		AudioOnly:                    markers.AudioOnly,
+		DecisionsOnly:                markers.DecisionsOnly,
 	}
 }
 

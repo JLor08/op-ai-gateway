@@ -177,6 +177,10 @@ func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token
 		writeBenchmarkError(w, errBenchmarkAudioOnly)
 		return
 	}
+	if mappingSpecIsDecisionsOnly(v.App, spec, hasSpec) {
+		writeBenchmarkError(w, errBenchmarkDecisionsOnly)
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	run, ok := s.Benchmarks.TryStart(server.ID, "context-probe", "context", len(views), time.Now().UTC(), cancel)
 	if !ok {
@@ -369,6 +373,7 @@ var benchmarkErrRows = []errRow{
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: "benchmark.not_found", msg: "not found"},
 	{err: errBenchmarkImagesOnly, status: http.StatusConflict, code: codeBenchmarkImagesOnly, msg: msgBenchmarkImagesOnly},
 	{err: errBenchmarkAudioOnly, status: http.StatusConflict, code: codeBenchmarkAudioOnly, msg: msgBenchmarkAudioOnly},
+	{err: errBenchmarkDecisionsOnly, status: http.StatusConflict, code: codeBenchmarkDecisionsOnly, msg: msgBenchmarkDecisionsOnly},
 	{err: errBenchmarkSpeechUnavailable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkSpeechUnavailable},
 	{err: errBenchmarkAudioUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkAudioUnmeasurable},
 	{err: errBenchmarkScopeUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkScopeUnmeasurable},

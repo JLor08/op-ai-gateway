@@ -75,7 +75,7 @@ func (s *Server) resolveTarget(ctx context.Context, token *auth.Token, req infer
 // tryProxyNative handed back or never saw (a body whose model the routing
 // probe could not read) -- plus the one spec-flavor refusal that dispatch
 // makes: a resolved target that serves images only (targetIsImagesOnly) or
-// audio only, speech or transcription (targetIsAudioOnly), is refused with
+// audio only, speech or transcription (targetIsAudioOnly), or decisions only (targetIsDecisionsOnly), is refused with
 // routing.ErrNoModelRoute.
 // Every request reaching it is a text request (images, speech and transcription
 // have no translate path), so the refusal needs no flavor test of its own. It is
@@ -99,8 +99,8 @@ func (s *Server) resolveTranslateTarget(r *http.Request, token *auth.Token, req 
 	if err != nil {
 		return target, err
 	}
-	if targetIsImagesOnly(target) || targetIsAudioOnly(target) {
-		slog.Debug("inference request rejected: resolved target serves images or audio only",
+	if targetIsImagesOnly(target) || targetIsAudioOnly(target) || targetIsDecisionsOnly(target) {
+		slog.Debug("inference request rejected: resolved target serves images, audio or decisions only",
 			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
 		return routing.Target{}, routing.ErrNoModelRoute

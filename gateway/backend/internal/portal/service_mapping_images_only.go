@@ -10,14 +10,17 @@ import (
 )
 
 // mappingFlavorMarkers is the pair of advisory markers ModelMappingDTO carries
-// about a mapping's effective flavors: ImagesOnly (routing.FlavorsAreImagesOnly)
-// and AudioOnly (routing.FlavorsAreAudioOnly). They come out of ONE spec read,
+// about a mapping's effective flavors: ImagesOnly (routing.FlavorsAreImagesOnly),
+// AudioOnly (routing.FlavorsAreAudioOnly) and DecisionsOnly
+// (routing.FlavorsAreDecisionsOnly). They come out of ONE spec read,
 // which is why they travel together: reading a server_agent application's specs
 // once per marker would double the cost of every mapping listing. The zero value
 // is "neither", what a failed read reports.
 type mappingFlavorMarkers struct {
 	ImagesOnly bool
 	AudioOnly  bool
+	// DecisionsOnly is AudioOnly's decision twin.
+	DecisionsOnly bool
 }
 
 // mappingsFlavorMarkers returns ModelMappingDTO.ImagesOnly and AudioOnly for
@@ -70,8 +73,9 @@ func (s *Service) mappingFlavorMarkersFor(ctx context.Context, app routing.Appli
 // one, the application's otherwise.
 func effectiveFlavorMarkers(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) mappingFlavorMarkers {
 	return mappingFlavorMarkers{
-		ImagesOnly: effectiveFlavorsAreImagesOnly(app, spec, hasSpec),
-		AudioOnly:  effectiveFlavorsAreAudioOnly(app, spec, hasSpec),
+		ImagesOnly:    effectiveFlavorsAreImagesOnly(app, spec, hasSpec),
+		AudioOnly:     effectiveFlavorsAreAudioOnly(app, spec, hasSpec),
+		DecisionsOnly: routing.FlavorsAreDecisionsOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors),
 	}
 }
 

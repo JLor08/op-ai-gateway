@@ -46,6 +46,13 @@ const (
 	codeBenchmarkAudioOnly = "benchmark.audio_only"
 	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"
 
+	// codeBenchmarkDecisionsOnly is codeBenchmarkImagesOnly for a mapping that
+	// serves only decisions (mappingSpecIsDecisionsOnly): every run that would
+	// send it a chat prompt is refused. Checked after the images and audio
+	// refusals, so a list naming those too keeps their codes.
+	codeBenchmarkDecisionsOnly = "benchmark.decisions_only"
+	msgBenchmarkDecisionsOnly  = "this model, or every model in the run's scope, serves decisions only, so no chat prompt is sent"
+
 	// codeBenchmarkSpeechUnavailable: the SPEECH benchmark (?mode=speech) has no
 	// target in the run's scope. It is the speech benchmark's own refusal, the twin of
 	// the two above for the one mode that inverts their audio-only rule: it runs on
@@ -105,6 +112,7 @@ const (
 var (
 	errBenchmarkImagesOnly             = errors.New(codeBenchmarkImagesOnly)
 	errBenchmarkAudioOnly              = errors.New(codeBenchmarkAudioOnly)
+	errBenchmarkDecisionsOnly          = errors.New(codeBenchmarkDecisionsOnly)
 	errBenchmarkSpeechUnavailable      = errors.New(codeBenchmarkSpeechUnavailable)
 	errBenchmarkAudioUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (audio)")
 	errBenchmarkScopeUnmeasurable      = errors.New(codeBenchmarkSpeechUnavailable + " (images and audio)")
@@ -119,6 +127,7 @@ var (
 const (
 	loadRefusalImagesOnly             = "images_only"
 	loadRefusalAudioOnly              = "audio_only"
+	loadRefusalDecisionsOnly          = "decisions_only"
 	loadRefusalAgentEnsureUnsupported = "agent_ensure_unsupported"
 	loadRefusalSpecForceStopped       = "spec_force_stopped"
 	loadRefusalClusterHead            = "cluster_head_unsupported"
@@ -129,6 +138,7 @@ const (
 var loadRefusalErrs = map[string]error{
 	loadRefusalImagesOnly:             errBenchmarkImagesOnly,
 	loadRefusalAudioOnly:              errBenchmarkAudioOnly,
+	loadRefusalDecisionsOnly:          errBenchmarkDecisionsOnly,
 	loadRefusalAgentEnsureUnsupported: errBenchmarkAgentEnsureUnsupported,
 	loadRefusalSpecForceStopped:       errBenchmarkSpecForceStopped,
 	loadRefusalClusterHead:            errBenchmarkClusterHeadUnsupported,
@@ -145,6 +155,11 @@ const benchmarkSkippedImagesOnly = "images_only"
 // measure as audio either -- no speech or transcription verdict, or no audio
 // request routed to it (benchmarkViewTarget).
 const benchmarkSkippedAudioOnly = "audio_only"
+
+// benchmarkSkippedDecisionsOnly is benchmarkSkippedImagesOnly for a mapping that
+// serves only decisions: every run skips it, since it answers no chat prompt and
+// has no audio to measure.
+const benchmarkSkippedDecisionsOnly = "decisions_only"
 
 // benchmarkSkippedClusterHead is BenchmarkResult.Skipped for a mapping whose spec
 // is a llama.cpp RPC cluster head, which no benchmark measures yet
@@ -199,6 +214,13 @@ func mappingSpecIsAudioOnly(app routing.Application, spec routing.RuntimeSpec, h
 	return routing.FlavorsAreAudioOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors)
 }
 
+// mappingSpecIsDecisionsOnly is mappingSpecIsAudioOnly's decision twin: whether a
+// mapping's EFFECTIVE flavors are decisions-only (routing.FlavorsAreDecisionsOnly),
+// resolved the same way. Every check of it comes after the images and audio ones.
+func mappingSpecIsDecisionsOnly(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) bool {
+	return routing.FlavorsAreDecisionsOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors)
+}
+
 // AudioTargetFlavors is the flavor half of the decision whether a mapping is an audio target
 // of the speed, capacity and both modes (benchmarkViewTarget): its EFFECTIVE flavors serve
 // audio only -- not images-only, and no text flavor, so a chat model that also transcribes
@@ -241,12 +263,17 @@ func loadRefusal(app routing.Application, spec routing.RuntimeSpec, hasSpec bool
 		return loadRefusalClusterHead
 	}
 	imagesOnly := mappingSpecIsImagesOnly(app, spec, hasSpec)
-	if imagesOnly || mappingSpecIsAudioOnly(app, spec, hasSpec) {
+	audioOnly := mappingSpecIsAudioOnly(app, spec, hasSpec)
+	decisionsOnly := mappingSpecIsDecisionsOnly(app, spec, hasSpec)
+	if imagesOnly || audioOnly || decisionsOnly {
 		if !agent {
-			if imagesOnly {
+			switch {
+			case imagesOnly:
 				return loadRefusalImagesOnly
+			case audioOnly:
+				return loadRefusalAudioOnly
 			}
-			return loadRefusalAudioOnly
+			return loadRefusalDecisionsOnly
 		}
 		if !ensureSupported {
 			return loadRefusalAgentEnsureUnsupported
@@ -264,7 +291,7 @@ func loadRefusal(app routing.Application, spec routing.RuntimeSpec, hasSpec bool
 // runtime_ensure, so its target loads without generating.
 func (s *Server) loadTargetFor(ctx context.Context, v portal.BenchmarkTargetView, spec routing.RuntimeSpec, hasSpec bool) benchmarkTarget {
 	tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
-	tgt.loadWithoutGenerating = mappingSpecIsImagesOnly(v.App, spec, hasSpec) || mappingSpecIsAudioOnly(v.App, spec, hasSpec)
+	tgt.loadWithoutGenerating = mappingSpecIsImagesOnly(v.App, spec, hasSpec) || mappingSpecIsAudioOnly(v.App, spec, hasSpec) || mappingSpecIsDecisionsOnly(v.App, spec, hasSpec)
 	return tgt
 }
 
@@ -319,6 +346,8 @@ type benchmarkViewPartition struct {
 	// refuseNothingRunnable names the kind. clusterHeads counts the views skipped
 	// because they are cluster heads.
 	imagesOnly, audioOnly, audioUnmeasurable, clusterHeads int
+	// decisionsOnly counts the views skipped because they serve only decisions.
+	decisionsOnly int
 }
 
 // partitionBenchmarkViews sorts each view (benchmarkViewTarget) into runnable,
@@ -348,6 +377,9 @@ func (s *Server) partitionBenchmarkViews(ctx context.Context, views []portal.Ben
 			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Error: err.Error()})
 		case skipped == benchmarkSkippedImagesOnly:
 			p.imagesOnly++
+			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: skipped})
+		case skipped == benchmarkSkippedDecisionsOnly:
+			p.decisionsOnly++
 			p.recorded = append(p.recorded, BenchmarkResult{MappingID: v.Mapping.ID, GatewayModelName: v.Mapping.GatewayModelName, Skipped: skipped})
 		case skipped == benchmarkSkippedClusterHead:
 			p.clusterHeads++
@@ -399,6 +431,8 @@ func (e *benchmarkViewUnreadable) Unwrap() error { return e.err }
 //     (benchmarkSkippedClusterHead): it starts only through the cluster
 //     orchestration, which a run does not drive.
 //   - A view that serves only images is skipped (benchmarkSkippedImagesOnly).
+//   - A view that serves only decisions, and is not audio-only, is skipped
+//     (benchmarkSkippedDecisionsOnly): it answers no chat prompt and has no audio.
 //   - A view that serves a text flavor (it is not audio-only, mappingSpecIsAudioOnly) is a
 //     chat model and a text target, exactly as before audio was measured: one with a speech
 //     or transcription verdict as well -- an omni model that also transcribes, say -- keeps
@@ -424,6 +458,9 @@ func (s *Server) benchmarkViewTarget(ctx context.Context, v portal.BenchmarkTarg
 		return benchmarkTarget{}, benchmarkSkippedImagesOnly, nil
 	}
 	if !mappingSpecIsAudioOnly(v.App, spec, hasSpec) {
+		if mappingSpecIsDecisionsOnly(v.App, spec, hasSpec) {
+			return benchmarkTarget{}, benchmarkSkippedDecisionsOnly, nil
+		}
 		return s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec), "", nil
 	}
 	if measureAudio && AudioTargetFlavors(v.App, spec, hasSpec) {
@@ -506,7 +543,7 @@ func (p benchmarkViewPartition) refuseNothingRunnable(w http.ResponseWriter) boo
 		return false
 	case p.unreadable > 0:
 		writeBenchmarkRequestFailed(w)
-	case p.clusterHeads > 0 && p.imagesOnly+p.audioOnly+p.audioUnmeasurable == 0:
+	case p.clusterHeads > 0 && p.imagesOnly+p.audioOnly+p.audioUnmeasurable+p.decisionsOnly == 0:
 		writeBenchmarkError(w, errBenchmarkClusterHeadUnsupported)
 	case p.audioUnmeasurable > 0 && p.imagesOnly > 0:
 		writeBenchmarkError(w, errBenchmarkScopeUnmeasurable)
@@ -516,6 +553,8 @@ func (p benchmarkViewPartition) refuseNothingRunnable(w http.ResponseWriter) boo
 		writeBenchmarkError(w, errBenchmarkAudioUnmeasurable)
 	case p.audioOnly > 0:
 		writeBenchmarkError(w, errBenchmarkAudioOnly)
+	case p.decisionsOnly > 0:
+		writeBenchmarkError(w, errBenchmarkDecisionsOnly)
 	default:
 		writeBenchmarkError(w, errBenchmarkImagesOnly)
 	}
