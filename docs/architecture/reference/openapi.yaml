@@ -1403,6 +1403,12 @@ paths:
     get:
       tags: [portal]
       summary: Own usage analytics (fleet-wide with `admin` scope + scope=all)
+      description: >-
+        A row of a llama.cpp RPC cluster request carries `energy_parts` (absent on every
+        other row): one object per host, head first, with `role` (`head` or `member`),
+        `server_name` (only for a server the caller may see), `member` (1-based member
+        number), `energy_wh`, `energy_source` and `cost` (only for a server the caller
+        may see).
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }

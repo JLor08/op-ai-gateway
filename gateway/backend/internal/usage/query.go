@@ -185,6 +185,25 @@ type Row struct {
 	// is an admin who is not the owner: the Activity list shows a lock (SP-2e),
 	// never the content. Mutually exclusive with HasCapture per row.
 	CaptureLocked bool `json:"capture_locked"`
+	// EnergyParts is the energy of each host that served a llama.cpp RPC
+	// cluster request -- the head first, then its members -- resolved at read
+	// time by the portal layer; nil (absent on the wire) for every other row.
+	EnergyParts []RowEnergyPart `json:"energy_parts,omitempty"`
+}
+
+// RowEnergyPart is one host's energy part of a cluster request as the
+// Activity list shows it. ServerName is set only for a server the viewer may
+// see (the head is named as the row names it); a member the viewer may not
+// see is identified by Member alone, and carries no cost, since its cost would
+// reveal its server's price. Member numbers the members of the request from 1,
+// in the order of their parts; 0 for the head.
+type RowEnergyPart struct {
+	Role         string   `json:"role"`
+	ServerName   string   `json:"server_name,omitempty"`
+	Member       int      `json:"member,omitempty"`
+	EnergyWh     float64  `json:"energy_wh"`
+	EnergySource string   `json:"energy_source"`
+	Cost         *float64 `json:"cost,omitempty"`
 }
 
 // Page is one page of the parameterized list.

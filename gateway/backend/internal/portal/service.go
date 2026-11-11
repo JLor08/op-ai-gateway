@@ -2358,7 +2358,7 @@ func (s *Service) Usage(principal auth.Token, q usage.Query) (usage.Page, error)
 	if err != nil {
 		return page, fmt.Errorf("usage: %w", err)
 	}
-	s.attachUsageCost(context.Background(), page.Data)
+	s.attachUsageCost(context.Background(), principal, page.Data)
 	s.attachUsageAccountNames(context.Background(), principal, page.Data)
 	if len(page.Data) == 0 || s.captures == nil {
 		return page, nil
@@ -2525,24 +2525,16 @@ func (s *Service) resolveUsagePrice(ctx context.Context, host string, sysDefault
 // where price is resolved via resolveUsagePrice ONCE per DISTINCT host (not
 // once per row) — O(distinct servers), not O(rows). A row with energy parts
 // (a llama.cpp RPC cluster request) costs the sum of its parts, each at its
-// own host's price; the parts of the whole page are read in one call, and a
-// failed read falls back to pricing every row at its Host. CostEUR is a
-// transient display field: it is never persisted and never read back from a
-// store.
-func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
+// own host's price, and carries the parts themselves (EnergyParts) as the
+// principal may see them (usagePartNamer); the parts of the whole page are
+// read in one call, and a failed read falls back to pricing every row at its
+// Host without parts. CostEUR and EnergyParts are transient display fields:
+// never persisted and never read back from a store.
+func (s *Service) attachUsageCost(ctx context.Context, principal auth.Token, rows []usage.Row) {
 	if len(rows) == 0 {
 		return
 	}
-	sysDefault := s.systemDefaultPricePerKwh(ctx)
-	priceByHost := make(map[string]float64)
-	priceFor := func(host string) float64 {
-		price, cached := priceByHost[host]
-		if !cached {
-			price = s.resolveUsagePrice(ctx, host, sysDefault)
-			priceByHost[host] = price
-		}
-		return price
-	}
+	prices := &usagePricer{s: s, ctx: ctx, sysDefault: s.systemDefaultPricePerKwh(ctx), byHost: map[string]float64{}}
 	ids := make([]string, len(rows))
 	for i := range rows {
 		ids[i] = rows[i].ID
@@ -2552,18 +2544,89 @@ func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
 		log.Printf("portal: energy parts lookup failed for %d rows: %v", len(ids), err)
 		parts = nil
 	}
+	names := &usagePartNamer{s: s, ctx: ctx, principal: principal, byServer: map[string]usagePartName{}}
 	for i := range rows {
 		rowParts := parts[rows[i].ID]
 		if len(rowParts) == 0 {
-			rows[i].CostEUR = rows[i].EnergyWh / 1000 * priceFor(rows[i].Host)
+			rows[i].CostEUR = rows[i].EnergyWh / 1000 * prices.of(rows[i].Host)
 			continue
 		}
-		var cost float64
-		for _, p := range rowParts {
-			cost += p.Wh / 1000 * priceFor(p.ServerID)
-		}
-		rows[i].CostEUR = cost
+		rows[i].CostEUR, rows[i].EnergyParts = rowEnergyParts(rows[i], rowParts, prices, names)
 	}
+}
+
+// rowEnergyParts is row's cost -- the sum of its parts, each at its own
+// host's price -- and the parts as the Activity list shows them: the head
+// named as the row names it, a member named only when names lets the viewer
+// see its server, else an anonymous numbered member without a cost.
+func rowEnergyParts(row usage.Row, parts []usage.EnergyPart, prices *usagePricer, names *usagePartNamer) (float64, []usage.RowEnergyPart) {
+	var total float64
+	out := make([]usage.RowEnergyPart, 0, len(parts))
+	member := 0
+	for _, p := range parts {
+		cost := p.Wh / 1000 * prices.of(p.ServerID)
+		total += cost
+		dto := usage.RowEnergyPart{Role: p.Role, EnergyWh: p.Wh, EnergySource: p.Source}
+		name, visible := row.ServerName, true
+		if p.Role != usage.EventHostRoleHead {
+			member++
+			dto.Member = member
+			name, visible = names.of(p.ServerID)
+		}
+		if visible {
+			dto.ServerName, dto.Cost = name, &cost
+		}
+		out = append(out, dto)
+	}
+	return total, out
+}
+
+// usagePricer resolves each host's electricity price once per usage list
+// (resolveUsagePrice).
+type usagePricer struct {
+	s          *Service
+	ctx        context.Context
+	sysDefault float64
+	byHost     map[string]float64
+}
+
+func (p *usagePricer) of(host string) float64 {
+	price, cached := p.byHost[host]
+	if !cached {
+		price = p.s.resolveUsagePrice(p.ctx, host, p.sysDefault)
+		p.byHost[host] = price
+	}
+	return price
+}
+
+// usagePartName is a member server's name as a viewer may see it.
+type usagePartName struct {
+	name    string
+	visible bool
+}
+
+// usagePartNamer resolves, once per server per usage list, whether the
+// principal may see a member server -- the rule the server list uses
+// (authorizeServer: system scope, an owner, or a manager of one of its admin
+// groups) -- and its name if so.
+type usagePartNamer struct {
+	s         *Service
+	ctx       context.Context
+	principal auth.Token
+	byServer  map[string]usagePartName
+}
+
+func (n *usagePartNamer) of(serverID string) (string, bool) {
+	got, cached := n.byServer[serverID]
+	if !cached {
+		if n.s.routes != nil {
+			if server, err := n.s.authorizeServer(n.ctx, n.principal, serverID); err == nil {
+				got = usagePartName{name: server.Name, visible: true}
+			}
+		}
+		n.byServer[serverID] = got
+	}
+	return got.name, got.visible
 }
 
 // attachUsageAccountNames sets AccountName on each vendor row (non-empty

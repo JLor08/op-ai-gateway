@@ -5,9 +5,13 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -243,5 +247,113 @@ func TestServerFilterNeverCountsAMemberPartTwice(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// countingPartsStore counts the energy-part reads a usage list makes.
+type countingPartsStore struct {
+	usage.Store
+	mu          sync.Mutex
+	batched     int
+	singleReads int
+}
+
+func (c *countingPartsStore) EnergyPartsByEvents(ctx context.Context, ids []string) (map[string][]usage.EnergyPart, error) {
+	c.mu.Lock()
+	c.batched++
+	c.mu.Unlock()
+	return c.Store.EnergyPartsByEvents(ctx, ids)
+}
+
+func (c *countingPartsStore) EnergyParts(ctx context.Context, id string) ([]usage.EnergyPart, error) {
+	c.mu.Lock()
+	c.singleReads++
+	c.mu.Unlock()
+	return c.Store.EnergyParts(ctx, id)
+}
+
+// TestUsageRowsCarryVisibleEnergyParts pins the per-host energy a cluster
+// request's Activity row carries: one part per host, read for the whole page
+// in one call. A member server the caller may not see (the server list's
+// rule) is an anonymous numbered member, with its energy and source but no
+// name and no cost; the head is named as the row itself names it. A
+// single-host row carries no parts at all.
+func TestUsageRowsCarryVisibleEnergyParts(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	routes := routing.NewMemoryStore()
+	for _, s := range []routing.AIServer{
+		{ID: "srv_head", Name: "Head", Domain: "head.example.test", PricePerKwh: 0.30},
+		{ID: "srv_hidden", Name: "Hidden box", Domain: "hidden.example.test", PricePerKwh: 0.20},
+		{ID: "srv_mine", Name: "Mine", Domain: "mine.example.test", PricePerKwh: 0.10},
+	} {
+		if err := routes.CreateAIServer(ctx, s); err != nil {
+			t.Fatalf("CreateAIServer %s: %v", s.ID, err)
+		}
+	}
+	if err := routes.SetServerOwners(ctx, "srv_mine", []string{"usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	rec := usage.NewRecorder()
+	rec.Record(usage.Event{ID: "ev_cluster", UserID: "usr_1", Model: "big", Host: "srv_head", ServerName: "Head", EnergyWh: 3500, EnergySource: "estimated", CreatedAt: now})
+	rec.Record(usage.Event{ID: "ev_plain", UserID: "usr_1", Model: "big", Host: "srv_head", ServerName: "Head", EnergyWh: 1000, EnergySource: "measured", CreatedAt: now.Add(-time.Minute)})
+	if err := rec.SetEnergyParts(ctx, "ev_cluster", []usage.EnergyPart{
+		{ServerID: "srv_head", Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
+		{ServerID: "srv_hidden", Role: usage.EventHostRoleMember, Wh: 500, Source: "estimated"},
+		{ServerID: "srv_mine", Role: usage.EventHostRoleMember, Wh: 2000, Source: "measured"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := &countingPartsStore{Store: rec}
+	svc := NewService(ServiceDeps{Usage: store, Routes: routes, SystemSettings: NewMemorySystemSettings(), Clock: func() time.Time { return now }})
+
+	cost := func(v float64) *float64 { return &v }
+	user := auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}
+	page, err := svc.Usage(user, usage.Query{Page: 1, Limit: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.batched != 1 || store.singleReads != 0 {
+		t.Fatalf("part reads = %d batched, %d single; want one batched read for the page", store.batched, store.singleReads)
+	}
+	rows := map[string]usage.Row{}
+	for _, r := range page.Data {
+		rows[r.ID] = r
+	}
+	want := []usage.RowEnergyPart{
+		{Role: usage.EventHostRoleHead, ServerName: "Head", EnergyWh: 1000, EnergySource: "measured", Cost: cost(0.30)},
+		{Role: usage.EventHostRoleMember, Member: 1, EnergyWh: 500, EnergySource: "estimated"},
+		{Role: usage.EventHostRoleMember, Member: 2, ServerName: "Mine", EnergyWh: 2000, EnergySource: "measured", Cost: cost(0.20)},
+	}
+	if got := rows["ev_cluster"].EnergyParts; !reflect.DeepEqual(got, want) {
+		t.Fatalf("parts = %+v, want %+v", got, want)
+	}
+	raw, err := json.Marshal(rows["ev_cluster"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"srv_hidden", "Hidden box", "srv_mine"} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("row JSON leaks %q: %s", leak, raw)
+		}
+	}
+	plain, err := json.Marshal(rows["ev_plain"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows["ev_plain"].EnergyParts != nil || strings.Contains(string(plain), "energy_parts") {
+		t.Fatalf("single-host row = %s, want no energy_parts", plain)
+	}
+
+	// System scope sees every server.
+	sys := auth.Token{UserID: "usr_sys", Scopes: []string{"gateway:use", "admin", "system"}}
+	page, err = svc.Usage(sys, usage.Query{Page: 1, Limit: 25, ScopeAll: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range page.Data {
+		if r.ID == "ev_cluster" && (r.EnergyParts[1].ServerName != "Hidden box" || r.EnergyParts[1].Cost == nil) {
+			t.Fatalf("system view part = %+v, want the hidden server named with its cost", r.EnergyParts[1])
+		}
 	}
 }
