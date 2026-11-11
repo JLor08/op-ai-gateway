@@ -87,20 +87,47 @@ func (r *headResolver) state(specID string) ([]netip.Addr, bool) {
 // are due. A spec whose domain changed starts over with an empty set.
 func (r *headResolver) refresh(ctx context.Context, domains map[string]string) {
 	now := r.now()
-	var due []string
-	var changed []string
-
 	r.mu.Lock()
-	for id, e := range r.ents {
-		if domains[id] == "" {
-			// A spec that lost its head domain loses its addresses too: report
-			// it so the relay closes the sessions of the old head.
-			if len(e.ips) > 0 {
-				changed = append(changed, id)
-			}
-			delete(r.ents, id)
+	changed := r.dropUntrackedLocked(domains)
+	due, moved := r.dueLocked(domains, now)
+	changed = append(changed, moved...)
+	r.mu.Unlock()
+
+	for _, id := range due {
+		if ctx.Err() != nil {
+			break
+		}
+		if r.resolve(ctx, id, domains[id], now) {
+			changed = append(changed, id)
 		}
 	}
+	if r.onChange != nil && ctx.Err() == nil {
+		for _, id := range changed {
+			r.onChange(id)
+		}
+	}
+}
+
+// dropUntrackedLocked forgets every spec that no longer has a head domain and
+// returns those that had addresses: they lose them too, and are reported so
+// the relay closes the sessions of the old head. r.mu is held.
+func (r *headResolver) dropUntrackedLocked(domains map[string]string) (changed []string) {
+	for id, e := range r.ents {
+		if domains[id] != "" {
+			continue
+		}
+		if len(e.ips) > 0 {
+			changed = append(changed, id)
+		}
+		delete(r.ents, id)
+	}
+	return changed
+}
+
+// dueLocked starts tracking new specs, starts over a spec whose domain
+// changed, and returns the specs due for a lookup at now, plus those whose
+// domain change dropped addresses (changed). r.mu is held.
+func (r *headResolver) dueLocked(domains map[string]string, now time.Time) (due, changed []string) {
 	for id, dom := range domains {
 		if dom == "" {
 			continue
@@ -120,21 +147,7 @@ func (r *headResolver) refresh(ctx context.Context, domains map[string]string) {
 			due = append(due, id)
 		}
 	}
-	r.mu.Unlock()
-
-	for _, id := range due {
-		if ctx.Err() != nil {
-			break
-		}
-		if r.resolve(ctx, id, domains[id], now) {
-			changed = append(changed, id)
-		}
-	}
-	if r.onChange != nil && ctx.Err() == nil {
-		for _, id := range changed {
-			r.onChange(id)
-		}
-	}
+	return due, changed
 }
 
 // resolve looks the domain up and stores a good answer; it reports whether
