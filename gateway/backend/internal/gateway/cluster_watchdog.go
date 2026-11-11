@@ -46,7 +46,9 @@ import (
 //     a kept-up head is not started again at once; a head whose spec is gone
 //     is forgotten. A member that still reports the hold of a direct head
 //     that is not running holds a dead connection -- a half-open one, which
-//     its agent keeps listing -- so it is stopped, forced.
+//     its agent keeps listing -- so it is stopped, forced. A head server
+//     silent past the stale threshold counts as not running the head here:
+//     a host that lost power never reports the head stopped.
 //   - A local start on a member's server that waits only for a held member
 //     (admission_blocked_by) makes the gateway ask the head's agent for a
 //     conditional stop: the head goes only when that agent's own eviction
@@ -547,6 +549,12 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 		return
 	}
 	hr, present, reported := o.headRow(v.plan)
+	// A head server silent past the stale threshold (its host lost power,
+	// say) keeps its last rows, which may still show the head running; its
+	// head is judged gone, so a direct member's hold of it is a dead one.
+	if _, silent := w.silentSince(v.plan.Head.Server.ID); silent {
+		present = false
+	}
 	if v.formed && present && hr.State == agentSpecStateRunning {
 		if _, pending := w.suspects[v.head]; pending {
 			return

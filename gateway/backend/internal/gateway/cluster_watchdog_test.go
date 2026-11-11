@@ -887,3 +887,38 @@ func TestBlockedAdmissionForceStopsADeadDirectHold(t *testing.T) {
 		t.Fatalf("calls = %q, want the relay member released, not stopped", calls)
 	}
 }
+
+// TestDeadHoldOfASilentHeadServerIsForceStopped pins a head host that lost
+// power: its last frame still shows the head running, and no later frame
+// comes, so the head's row never says it stopped. A head server silent past
+// the stale threshold counts as not running the head, and a direct member
+// that still reports its hold is stopped, forced. While the head's server
+// reports, the same member frame changes nothing.
+func TestDeadHoldOfASilentHeadServerIsForceStopped(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "lan")
+	before := f.formed()
+
+	f.advance(5 * time.Second)
+	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	f.settle()
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want none while the head's server reports", calls)
+	}
+
+	f.advance(orchTimings().staleFloor)
+	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	f.settle()
+	if calls := f.agent.recorded()[before:]; !slices.Equal(calls, []string{"member:stop:" + orchMemberSpec(0) + ":force"}) {
+		t.Fatalf("calls = %q, want the dead hold ended by a forced stop", calls)
+	}
+
+	// Over a relay the session ends with the head: nothing to stop.
+	g := newOrchFixture(t, 1, "relay", "lan")
+	before = g.formed()
+	g.advance(20 * time.Second)
+	g.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	g.settle()
+	if calls := g.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("relay calls = %q, want none", calls)
+	}
+}
