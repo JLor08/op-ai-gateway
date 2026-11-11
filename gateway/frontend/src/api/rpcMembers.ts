@@ -18,13 +18,15 @@ export interface RPCMemberSpec {
   // refused with runtime_spec.member_flag_reserved.
   args: string[];
   env: Record<string, string>;
-  // Empty = CPU member. vram_measured_mb is agent-owned and ignored on write.
+  // Empty = CPU member. vram_measured_mb is always 0 here (what a member used
+  // is kept per head on the membership rows) and ignored on write.
   gpus: RuntimeSpecGPU[];
   cache_enabled: boolean;
   device_backend: DeviceBackend;
   ram_estimate_mb: number;
-  // Admin-group ids whose heads may use the member; empty = any head the
-  // caller manages.
+  // Admin-tier group ids whose heads may use the member; any admin-tier group
+  // may be named. Empty = heads linked to the member server's own admin
+  // groups.
   allowed_head_groups: string[];
   // Set while a head's membership names this spec.
   used_by_head_spec_id?: string;

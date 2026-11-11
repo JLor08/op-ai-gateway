@@ -25,10 +25,18 @@ function mbText(mb: number): string {
  */
 export function ClusterTotalCell({
   spec,
+  name,
   axis,
   ownMb,
   t,
-}: Readonly<{ spec: RuntimeSpec; axis: ClusterAxis; ownMb: number; t: Translation }>) {
+}: Readonly<{
+  spec: RuntimeSpec;
+  /** The head's model name, which tells this row's breakdown button apart. */
+  name: string;
+  axis: ClusterAxis;
+  ownMb: number;
+  t: Translation;
+}>) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const view = clusterTotalsView(spec);
   const total = view[axis];
@@ -39,8 +47,15 @@ export function ClusterTotalCell({
   else if (cause === 'hidden') hint = t.clusterIncompleteHidden;
   else if (cause === 'head') hint = t.clusterIncompleteHead;
   else if (cause === 'unknown') hint = t.clusterIncompleteNeutral;
+  // Focusable only when it carries a hint, so a keyboard user can open it;
+  // the tooltip describes the total rather than replacing its name.
   const text = (
-    <Typography component="span" variant="body2" data-testid={`cluster-total-${axis}`}>
+    <Typography
+      component="span"
+      variant="body2"
+      data-testid={`cluster-total-${axis}`}
+      tabIndex={hint ? 0 : undefined}
+    >
       {clusterCellText(total.mb, total.complete)}
     </Typography>
   );
@@ -48,7 +63,13 @@ export function ClusterTotalCell({
     <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
       <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
         <Chip size="small" variant="outlined" label={t.clusterTotalLabel} />
-        {hint ? <Tooltip title={hint}>{text}</Tooltip> : text}
+        {hint ? (
+          <Tooltip title={hint} describeChild>
+            {text}
+          </Tooltip>
+        ) : (
+          text
+        )}
       </Box>
       <Typography variant="caption" color="text.secondary">
         {`${t.clusterOwnValue}: ${mbText(ownMb)}`}
@@ -57,6 +78,7 @@ export function ClusterTotalCell({
         type="button"
         size="small"
         sx={{ p: 0, minWidth: 0 }}
+        aria-label={t.clusterBreakdownFor(axis === 'vram' ? 'VRAM' : 'RAM', name)}
         onClick={(e) => setAnchor(e.currentTarget)}
       >
         {t.clusterBreakdown}
@@ -101,14 +123,16 @@ export function ClusterWithheldNotice({
   const text = `${t.clusterWithheldTitle}: ${formatChatRunErrorCode(reason, t)}`;
   if (compact) {
     return (
-      <Chip
-        size="small"
-        color="warning"
-        variant="outlined"
-        label={formatChatRunErrorCode(reason, t)}
-        title={text}
-        data-testid="cluster-withheld"
-      />
+      <Tooltip title={text} describeChild>
+        <Chip
+          size="small"
+          color="warning"
+          variant="outlined"
+          label={formatChatRunErrorCode(reason, t)}
+          tabIndex={0}
+          data-testid="cluster-withheld"
+        />
+      </Tooltip>
     );
   }
   return (

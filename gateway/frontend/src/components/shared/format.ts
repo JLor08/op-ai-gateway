@@ -181,6 +181,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.cluster_direct_unavailable': 'errorClusterDirectUnavailable',
   'runtime_spec.cluster_member_budget_required': 'errorClusterMemberBudgetRequired',
   'runtime_spec.cluster_tensor_split_required': 'errorClusterTensorSplitRequired',
+  'runtime_spec.cluster_head_binary_version_unknown': 'errorClusterHeadBinaryVersionUnknown',
   'runtime_spec.cluster_port_exhausted': 'errorClusterPortExhausted',
   'runtime_spec.cluster_flag_equals_form': 'errorClusterFlagEqualsForm',
   'runtime_spec.port_conflicts_rpc_member': 'errorRuntimeSpecPortConflictsRpcMember',
@@ -494,13 +495,37 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'model.not_allowed': 'errorModelNotAllowed',
 };
 
+/**
+ * The cluster refusals whose message the gateway builds from the server, spec
+ * or binary at fault (clusterErrDetail and rpcMemberInUseMessage in
+ * internal/gateway). The label says what is wrong; the message, appended in
+ * parentheses, says where -- a head with several members is otherwise
+ * refused without naming the one at fault. A refusal about a member the
+ * caller may not see carries the gateway's generic English text instead.
+ */
+const clusterDetailCodes: ReadonlySet<string> = new Set([
+  'runtime_spec.cluster_member_spec_taken',
+  'runtime_spec.cluster_member_spec_disabled',
+  'runtime_spec.cluster_member_rpc_disabled',
+  'runtime_spec.cluster_member_no_matching_binary',
+  'runtime_spec.cluster_head_binary_version_unknown',
+  'runtime_spec.cluster_version_mismatch',
+  'runtime_spec.cluster_mesh_unavailable',
+  'runtime_spec.cluster_lan_address_required',
+  'runtime_spec.cluster_member_budget_required',
+  'runtime_spec.cluster_tensor_split_required',
+  'runtime.cluster_member_in_use',
+]);
+
 export function formatPortalError(err: unknown, t: Translation): string {
   if (err instanceof PortalApiError) {
     if (err.code === 'runtime.agent_feature_missing' && err.feature) {
       return `${err.code}: ${t.errorRuntimeAgentFeatureMissingNamed(err.feature)}`;
     }
     const labelKey = errorLabelByCode[err.code];
-    return `${err.code}: ${labelKey ? t[labelKey] : err.message}`;
+    if (!labelKey) return `${err.code}: ${err.message}`;
+    const detail = clusterDetailCodes.has(err.code) && err.message ? ` (${err.message})` : '';
+    return `${err.code}: ${t[labelKey]}${detail}`;
   }
   return err instanceof Error ? err.message : String(err);
 }

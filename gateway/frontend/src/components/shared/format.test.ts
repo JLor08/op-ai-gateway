@@ -1130,6 +1130,7 @@ const clusterWireCodes = [
   'runtime_spec.cluster_direct_unavailable',
   'runtime_spec.cluster_member_budget_required',
   'runtime_spec.cluster_tensor_split_required',
+  'runtime_spec.cluster_head_binary_version_unknown',
   'runtime_spec.cluster_port_exhausted',
   'runtime_spec.cluster_flag_equals_form',
   'runtime_spec.port_conflicts_rpc_member',
@@ -1181,18 +1182,63 @@ const clusterWireCodes = [
   'settings.netbird_direct_cluster_exists',
 ] as const;
 
+/**
+ * The refusals whose message the gateway builds from the server, spec or
+ * binary at fault (clusterErrDetail and rpcMemberInUseMessage in
+ * internal/gateway): the label says what is wrong, the message says where.
+ */
+const clusterDetailCodes: readonly string[] = [
+  'runtime_spec.cluster_member_spec_taken',
+  'runtime_spec.cluster_member_spec_disabled',
+  'runtime_spec.cluster_member_rpc_disabled',
+  'runtime_spec.cluster_member_no_matching_binary',
+  'runtime_spec.cluster_head_binary_version_unknown',
+  'runtime_spec.cluster_version_mismatch',
+  'runtime_spec.cluster_mesh_unavailable',
+  'runtime_spec.cluster_lan_address_required',
+  'runtime_spec.cluster_member_budget_required',
+  'runtime_spec.cluster_tensor_split_required',
+  'runtime.cluster_member_in_use',
+];
+
 describe('RPC cluster codes', () => {
   it.each(clusterWireCodes)('labels %s in both locales, never as raw English', (code) => {
     const key = errorLabelByCode[code];
     expect(key, `${code} is not mapped: the operator sees raw English`).toBeDefined();
     const err = new PortalApiError(400, code, 'raw server text');
+    const detail = clusterDetailCodes.includes(code) ? ' (raw server text)' : '';
     for (const locale of ['de', 'en'] as const) {
       const label = messages[locale][key!];
       expect(typeof label).toBe('string');
       expect(String(label).length).toBeGreaterThan(0);
-      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}`);
+      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}${detail}`);
     }
     expect(messages.de[key!]).not.toBe(messages.en[key!]);
+  });
+
+  it('names the server at fault for a detail-carrying refusal', () => {
+    const err = new PortalApiError(
+      400,
+      'runtime_spec.cluster_member_no_matching_binary',
+      'server "gpu-b" has no ggml-rpc-server of version 6950',
+    );
+    expect(formatPortalError(err, messages.en)).toBe(
+      `runtime_spec.cluster_member_no_matching_binary: ${messages.en.errorClusterMemberNoMatchingBinary} (server "gpu-b" has no ggml-rpc-server of version 6950)`,
+    );
+  });
+
+  it('blames the head binary, not the member, when its version is unknown', () => {
+    const key = errorLabelByCode['runtime_spec.cluster_head_binary_version_unknown'];
+    expect(key).toBe('errorClusterHeadBinaryVersionUnknown');
+    expect(messages.de.errorClusterHeadBinaryVersionUnknown).toContain('Head-Binar');
+    expect(messages.en.errorClusterHeadBinaryVersionUnknown).toContain('head binary');
+  });
+
+  it('adds no empty detail', () => {
+    const err = new PortalApiError(400, 'runtime_spec.cluster_version_mismatch', '');
+    expect(formatPortalError(err, messages.en)).toBe(
+      `runtime_spec.cluster_version_mismatch: ${messages.en.errorClusterVersionMismatch}`,
+    );
   });
 
   it.each([

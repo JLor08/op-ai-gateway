@@ -178,6 +178,15 @@ describe('ClusterHeadEditor cluster switch', () => {
     expect(screen.getByText(t.clusterCreateFirst)).toBeInTheDocument();
   });
 
+  it('keeps the device backend label short and names the placeholders beneath it', () => {
+    setup();
+    const select = screen.getByRole('combobox', { name: t.clusterDeviceBackend });
+    expect(t.clusterDeviceBackend).not.toContain('${');
+    expect(select).toHaveAccessibleDescription(t.clusterDeviceBackendHint);
+    expect(t.clusterDeviceBackendHint).toContain('${DEVICES}');
+    expect(t.clusterDeviceBackendHint).toContain('${FIRST_LOCAL_DEVICE}');
+  });
+
   it('shows the expected cold start against the head startup timeout', () => {
     setup();
     expect(screen.getByText(t.clusterColdStart(600))).toBeInTheDocument();
@@ -756,7 +765,7 @@ describe('clusterStateFromSpec / clusterBodyFields', () => {
           server_id: 'srv_a',
           member_spec_id: 'rpcm_1',
           gpus: [{ index: 2, vram_estimate_mb: 1000, vram_measured_mb: 900 }],
-          port: 47001,
+          port: 26001,
         }),
       ],
     } as RuntimeSpec;

@@ -4,6 +4,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  CLUSTER_SPEC_REFRESH_MS,
   OVERRIDE_WRITE_TIMEOUT_MS,
   RESTART_STOP_TIMEOUT_MS,
   RESTART_VANISH_GRACE_MS,
@@ -653,8 +654,9 @@ function renderSection(
     benchmarkMapping: vi.fn(async () => idleBenchmark),
     mappingBenchmarks: opts.mappingBenchmarks ?? vi.fn(async () => []),
     subscribeBenchmark: vi.fn(() => () => {}),
-    // The RPC tab's manual member specs.
+    // The RPC tab's manual member specs and its consent picker.
     rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+    serverAdminGroupCandidates: vi.fn(async () => []),
     createRPCMemberSpec: vi.fn(async () => ({}) as never),
     updateRPCMemberSpec: vi.fn(async () => ({}) as never),
     deleteRPCMemberSpec: vi.fn(async () => undefined),
@@ -1574,6 +1576,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       mappingBenchmarks: vi.fn(async () => []),
       subscribeBenchmark: vi.fn(() => () => {}),
       rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+      serverAdminGroupCandidates: vi.fn(async () => []),
       createRPCMemberSpec: vi.fn(async () => ({}) as never),
       updateRPCMemberSpec: vi.fn(async () => ({}) as never),
       deleteRPCMemberSpec: vi.fn(async () => undefined),
@@ -4951,6 +4954,16 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     renderFileMode();
     await screen.findByText(t.runtimeManagedLocally);
     expect(screen.queryByRole('tab', { name: t.rpcTab })).not.toBeInTheDocument();
+  });
+
+  it('feeds the RPC tab from its own status stream instead of opening a second one', async () => {
+    const { fakeApi, stream } = renderSection({
+      statusRows: [makeStatus({ spec_id: 'rpcm_live', kind: 'rpc_server' })],
+    });
+    fireEvent.click(await screen.findByRole('tab', { name: t.rpcTab }));
+    expect(await screen.findByTestId('rpc-status-rpcm_live')).toBeInTheDocument();
+    expect(fakeApi.subscribeRuntimeStatus).toHaveBeenCalledTimes(1);
+    expect(stream.subscribedServerIds).toHaveLength(1);
   });
 
   it('turns every edit affordance off: no spec form, no co-residency editor, no budget form, no overrides', async () => {
@@ -12215,7 +12228,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     ram_estimate_mb: 1024,
     ram_measured_mb: 900,
     stale: false,
-    port: 47001,
+    port: 26001,
     visible: true,
   };
   const hiddenMember = {
@@ -12361,6 +12374,94 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     expect(within(cell).getByText(t.clusterPhaseMembersReady)).toBeInTheDocument();
   });
 
+  it('re-reads a head spec when its live state changes', async () => {
+    const { fakeApi, storedSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+    });
+    const cell = await screen.findByTestId('cluster-progress-compact');
+    expect(within(cell).getByText(t.clusterPhaseMembersReady)).toBeInTheDocument();
+    const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+
+    storedSpecs.map_1 = headSpec({
+      cluster_status: {
+        state: 'cooling_down',
+        members: [
+          { position: 0, state: 'ready' },
+          { position: 1, state: 'failed' },
+        ],
+      },
+    });
+    stream.push([makeStatus({ spec_id: 'spec_head', state: 'failed' })]);
+
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterStateCoolingDown),
+      ).toBeInTheDocument(),
+    );
+    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(readsBefore + 1);
+  });
+
+  it('does not re-read a head spec for a frame that changes no state', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+    });
+    await screen.findByTestId('cluster-progress-compact');
+    const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+    stream.push([makeStatus({ spec_id: 'spec_head', state: 'starting', in_flight: 2 })]);
+    await act(async () => {});
+    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(readsBefore);
+  });
+
+  it('re-reads a head spec when the list is shown again', async () => {
+    const { storedSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+    });
+    await screen.findByTestId('cluster-progress-compact');
+    await openStatusTab();
+    storedSpecs.map_1 = headSpec({
+      cluster_status: { state: 'formed', phase: 'formed', members: [] },
+    });
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterPhaseFormed),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it('re-reads the head specs on an interval while the list is shown', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { fakeApi, storedSpecs } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+        statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+      });
+      await screen.findByTestId('cluster-progress-compact');
+      storedSpecs.map_1 = headSpec({
+        cluster_status: { state: 'formed', phase: 'formed', members: [] },
+      });
+      const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CLUSTER_SPEC_REFRESH_MS);
+      });
+      expect(fakeApi.runtimeSpec.mock.calls.length).toBe(readsBefore + 1);
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterPhaseFormed),
+        ).toBeInTheDocument(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('drops the cluster status from an override click body', async () => {
     const { putSpecs, stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
@@ -12375,7 +12476,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
   });
 
   it('keeps the cluster on an override click', async () => {
-    const spec = headSpec();
+    const spec = headSpec({ cluster_vram_total_complete: false, cluster_ram_total_complete: true });
     const { putSpecs, stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
       specsByMappingId: { map_1: spec },
@@ -12396,6 +12497,8 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     expect(body).not.toHaveProperty('cluster_warnings');
     expect(body).not.toHaveProperty('cluster_transport_default');
     expect(body).not.toHaveProperty('cluster_totals_complete');
+    expect(body).not.toHaveProperty('cluster_vram_total_complete');
+    expect(body).not.toHaveProperty('cluster_ram_total_complete');
   });
 
   it('sends a spec that is no head as cluster off', async () => {

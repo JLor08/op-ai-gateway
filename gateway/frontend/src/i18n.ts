@@ -2310,12 +2310,14 @@ const de = {
     'Ein Mitglied auf einer Apple-GPU braucht ein GPU-Budget auf seinem Server.',
   errorClusterTensorSplitRequired:
     'Ein Head mit einem Nicht-NVIDIA-Mitglied braucht --tensor-split.',
+  errorClusterHeadBinaryVersionUnknown:
+    'Die Version des Head-Binaries ist unbekannt. Im Tab „Binaries“ seine Version eintragen.',
   errorClusterPortExhausted:
-    'Auf dem Mitglieds-Server ist im RPC-Portbereich 47000-47999 kein Port mehr frei.',
+    'Auf dem Mitglieds-Server ist im RPC-Portbereich 26000-26999 kein Port mehr frei.',
   errorClusterFlagEqualsForm:
     'Cluster-Flags in den Argumenten müssen als getrennte Tokens stehen (--rpc ${RPC_SERVERS}), nicht in der Form --rpc=…',
   errorRuntimeSpecPortConflictsRpcMember:
-    'Der feste Port liegt im RPC-Portbereich 47000-47999 und kollidiert mit einem RPC-Mitglied auf diesem Server.',
+    'Der feste Port liegt im RPC-Portbereich 26000-26999 und kollidiert mit einem RPC-Mitglied auf diesem Server.',
   errorRuntimeSpecDeviceBackendInvalid:
     'Das Geräte-Backend muss auto, cuda, rocm, vulkan, metal oder sycl sein.',
   errorRuntimeSpecMemberFlagReserved:
@@ -2326,7 +2328,7 @@ const de = {
   errorRpcMemberSpecRequestFailed:
     'Die Anfrage zur RPC-Mitglieds-Spezifikation ist fehlgeschlagen.',
   errorBinaryPathInvalid: 'Der Pfad muss ein absoluter Pfad mit höchstens 4096 Zeichen sein.',
-  errorBinaryKindInvalid: 'Die Art muss llama_server, rpc_server oder other sein.',
+  errorBinaryKindInvalid: 'Die Art muss „llama-server“, „ggml-rpc-server“ oder „Sonstige“ sein.',
   errorBinaryVersionInvalid: 'Version, Build und Commit dürfen höchstens 256 Zeichen lang sein.',
   errorBinaryNotFound: 'Binary auf diesem Server nicht gefunden.',
   errorBinaryAgentOwned:
@@ -2345,6 +2347,7 @@ const de = {
   rpcMemberEnabledLabel: 'Als automatisches RPC-Mitglied anbieten',
   rpcAllowedHeadGroups: 'Erlaubte Head-Gruppen',
   rpcAllowedHeadGroupsDefault: 'Keine Auswahl: gilt für die eigenen Admin-Gruppen dieses Servers.',
+  rpcAllowedHeadGroupUnlisted: (id: string) => `Gruppe ${id} (nicht einsehbar)`,
   rpcSettingsSave: 'RPC-Einstellungen speichern',
   rpcSettingsSaved: 'RPC-Einstellungen gespeichert.',
   rpcSettingsNoChanges: 'Keine Änderungen zu speichern.',
@@ -2358,7 +2361,7 @@ const de = {
   rpcMemberBinary: 'Pfad zum ggml-rpc-server (absolut)',
   rpcMemberCache: 'RPC-Cache aktivieren',
   rpcMemberBackend: 'Geräte-Backend',
-  rpcMemberGpuLabel: 'GPU',
+  rpcMemberGpuRow: (n: number) => `GPU-Zeile ${n}`,
   rpcMemberGpuVram: 'VRAM-Schätzung (MB)',
   rpcMemberGpuHint:
     'Ohne GPU-Zeilen läuft das Mitglied auf der CPU. Die Reihenfolge der Zeilen ist die Reihenfolge der Geräte.',
@@ -2409,6 +2412,7 @@ const de = {
   clusterTotalLabel: 'Cluster',
   clusterOwnValue: 'Eigener Wert',
   clusterBreakdown: 'Aufschlüsselung',
+  clusterBreakdownFor: (axis: string, model: string) => `${axis}-Aufschlüsselung: ${model}`,
   clusterBreakdownHead: 'Head',
   clusterBreakdownCpu: 'CPU',
   clusterBreakdownStale: 'veraltet',
@@ -2421,7 +2425,7 @@ const de = {
     'Die llama-server- und ggml-rpc-server-Binaries dieses Servers: vom Agent gemeldete (nur die Version lässt sich überschreiben) und von Hand ergänzte.',
   binariesEmpty: 'Keine Binaries bekannt.',
   binariesAdd: 'Binary hinzufügen',
-  binariesNewTitle: 'Neue Binary',
+  binariesNewTitle: 'Neues Binary',
   binariesEditTitle: 'Binary bearbeiten',
   binariesOverrideTitle: 'Version überschreiben',
   binariesPath: 'Pfad',
@@ -2466,7 +2470,6 @@ const de = {
   clusterMemberStateReady: 'bereit',
   clusterMemberStateHeld: 'gehalten',
   clusterMemberStateFailed: 'fehlgeschlagen',
-  clusterStatusMember: (n: number) => `Mitglied ${n}`,
   clusterStatusMemberHidden: (n: number) => `Mitglied ${n} (nicht sichtbar)`,
   clusterStatusHead: 'Head',
   clusterCooldownUntil: (time: string) => `Neuer Start frühestens ab ${time}`,
@@ -2490,7 +2493,8 @@ const de = {
     `${member}: ein gespeicherter Spitzenwert liegt über dem Budget`,
   clusterPeaksCount: (n: number) => `Über Budget: ${n}`,
   runtimeStopClusterTitle: (name: string) => `${name} stoppen?`,
-  runtimeStopClusterBody: 'Der Head wird gestoppt. Die Mitglieder laufen sonst noch kurz weiter.',
+  runtimeStopClusterBody:
+    'Der Head wird gestoppt. Ohne die Option unten laufen die Mitglieder noch kurz weiter.',
   runtimeStopMembersToo: 'Mitglieder ebenfalls stoppen',
   errorClusterConfigUnacknowledged:
     'Die Cluster-Konfiguration wurde vom Agent nicht bestätigt. Agent und Gateway prüfen.',
@@ -2499,7 +2503,9 @@ const de = {
   errorClusterStopping:
     'Der Cluster wird gerade gestoppt. Nach dem Stopp kann er erneut gestartet werden.',
   clusterBreakdownHiddenCount: (n: number) =>
-    `${n} nicht sichtbare(s) Mitglied(er) nur in der Summe`,
+    n === 1
+      ? '1 nicht sichtbares Mitglied nur in der Summe'
+      : `${n} nicht sichtbare Mitglieder nur in der Summe`,
   errorClusterHeadUnsupported:
     'Dieses Modell ist ein llama.cpp-RPC-Cluster-Head: Laden und Benchmarks unterstützen das noch nicht. Es startet mit seinen Mitgliedern, sobald eine Anfrage es braucht.',
   errorClusterMemberLost:
@@ -2544,7 +2550,9 @@ const de = {
     'Die Spezifikation zuerst speichern; danach lässt sie sich als Cluster-Head einrichten.',
   clusterRpcHint:
     'Ein Cluster-Head braucht ${RPC_SERVERS} genau einmal: als zwei Zeilen „--rpc“ und „${RPC_SERVERS}“ in den Argumenten oder als LLAMA_ARG_RPC=${RPC_SERVERS} in der Umgebung.',
-  clusterDeviceBackend: 'Geräte-Backend (für ${DEVICES} und ${FIRST_LOCAL_DEVICE})',
+  clusterDeviceBackend: 'Geräte-Backend',
+  clusterDeviceBackendHint:
+    'Bestimmt, zu welchen Gerätenamen ${DEVICES} und ${FIRST_LOCAL_DEVICE} aufgelöst werden (z. B. CUDA0 oder Vulkan0).',
   clusterMemberMode: 'Mitgliedsmodus',
   clusterMemberModeAutomatic: 'Automatisch: Server und GPUs hier wählen',
   clusterMemberModeManual: 'Manuell: Mitglieds-Spezifikation auf dem Server',
@@ -6139,12 +6147,14 @@ const en: PortalMessages = {
     'Direct transport in a mesh cluster needs NetBird policy management with deny-by-default on and enforced, and the Default policy seen disabled; use relay instead.',
   errorClusterMemberBudgetRequired: 'A member on an Apple GPU needs a GPU budget on its server.',
   errorClusterTensorSplitRequired: 'A head with a non-NVIDIA member needs --tensor-split.',
+  errorClusterHeadBinaryVersionUnknown:
+    "The head binary's version is unknown. Set this binary's version in the Binaries tab.",
   errorClusterPortExhausted:
-    'The member server has no free port left in the RPC range 47000-47999.',
+    'The member server has no free port left in the RPC range 26000-26999.',
   errorClusterFlagEqualsForm:
     'Cluster flags in args must be separate tokens (--rpc ${RPC_SERVERS}), not the --rpc=… form.',
   errorRuntimeSpecPortConflictsRpcMember:
-    'The fixed port lies in the RPC range 47000-47999 and collides with an RPC member on this server.',
+    'The fixed port lies in the RPC range 26000-26999 and collides with an RPC member on this server.',
   errorRuntimeSpecDeviceBackendInvalid:
     'The device backend must be one of auto, cuda, rocm, vulkan, metal, sycl.',
   errorRuntimeSpecMemberFlagReserved:
@@ -6154,7 +6164,7 @@ const en: PortalMessages = {
   errorRpcMemberSpecNotFound: 'RPC member spec not found.',
   errorRpcMemberSpecRequestFailed: 'The RPC member spec request failed.',
   errorBinaryPathInvalid: 'The path must be an absolute path of at most 4096 characters.',
-  errorBinaryKindInvalid: 'The kind must be one of llama_server, rpc_server, other.',
+  errorBinaryKindInvalid: 'The kind must be one of "llama-server", "ggml-rpc-server" or "Other".',
   errorBinaryVersionInvalid: 'Version, build and commit must be at most 256 characters.',
   errorBinaryNotFound: 'Binary not found on this server.',
   errorBinaryAgentOwned: 'The agent reports this binary; only its version override can be changed.',
@@ -6172,6 +6182,7 @@ const en: PortalMessages = {
   rpcMemberEnabledLabel: 'Offer as an automatic RPC member',
   rpcAllowedHeadGroups: 'Allowed head groups',
   rpcAllowedHeadGroupsDefault: "No selection: applies to this server's own admin groups.",
+  rpcAllowedHeadGroupUnlisted: (id: string) => `Group ${id} (not visible)`,
   rpcSettingsSave: 'Save RPC settings',
   rpcSettingsSaved: 'RPC settings saved.',
   rpcSettingsNoChanges: 'No changes to save.',
@@ -6185,7 +6196,7 @@ const en: PortalMessages = {
   rpcMemberBinary: 'Path to ggml-rpc-server (absolute)',
   rpcMemberCache: 'Enable RPC cache',
   rpcMemberBackend: 'Device backend',
-  rpcMemberGpuLabel: 'GPU',
+  rpcMemberGpuRow: (n: number) => `GPU row ${n}`,
   rpcMemberGpuVram: 'VRAM estimate (MB)',
   rpcMemberGpuHint:
     'Without GPU rows the member runs on the CPU. The row order is the device order.',
@@ -6237,6 +6248,7 @@ const en: PortalMessages = {
   clusterTotalLabel: 'Cluster',
   clusterOwnValue: 'Own value',
   clusterBreakdown: 'Breakdown',
+  clusterBreakdownFor: (axis: string, model: string) => `${axis} breakdown: ${model}`,
   clusterBreakdownHead: 'Head',
   clusterBreakdownCpu: 'CPU',
   clusterBreakdownStale: 'stale',
@@ -6294,7 +6306,6 @@ const en: PortalMessages = {
   clusterMemberStateReady: 'ready',
   clusterMemberStateHeld: 'held',
   clusterMemberStateFailed: 'failed',
-  clusterStatusMember: (n: number) => `Member ${n}`,
   clusterStatusMemberHidden: (n: number) => `Member ${n} (not visible)`,
   clusterStatusHead: 'Head',
   clusterCooldownUntil: (time: string) => `Next start possible from ${time}`,
@@ -6318,7 +6329,7 @@ const en: PortalMessages = {
   clusterPeaksCount: (n: number) => `Above budget: ${n}`,
   runtimeStopClusterTitle: (name: string) => `Stop ${name}?`,
   runtimeStopClusterBody:
-    'The head is stopped. The members otherwise keep running for a short while.',
+    'The head is stopped. Without the option below, the members keep running for a short while.',
   runtimeStopMembersToo: 'Stop the members too',
   errorClusterConfigUnacknowledged:
     'The agent did not acknowledge the cluster configuration. Check the agent and the gateway.',
@@ -6327,7 +6338,9 @@ const en: PortalMessages = {
   errorClusterStopping:
     'The cluster is being stopped. It can be started again once the stop finished.',
   clusterBreakdownHiddenCount: (n: number) =>
-    `${n} member(s) you cannot see are in the totals only`,
+    n === 1
+      ? '1 member you cannot see is in the totals only'
+      : `${n} members you cannot see are in the totals only`,
   errorClusterHeadUnsupported:
     'This model is a llama.cpp RPC cluster head, which loads and benchmarks do not support yet. It starts with its members when a request needs it.',
   errorClusterMemberLost:
@@ -6368,7 +6381,9 @@ const en: PortalMessages = {
   clusterCreateFirst: 'Save the spec first; it can then be set up as a cluster head.',
   clusterRpcHint:
     'A cluster head needs ${RPC_SERVERS} exactly once: as the two lines "--rpc" and "${RPC_SERVERS}" in args, or as LLAMA_ARG_RPC=${RPC_SERVERS} in env.',
-  clusterDeviceBackend: 'Device backend (for ${DEVICES} and ${FIRST_LOCAL_DEVICE})',
+  clusterDeviceBackend: 'Device backend',
+  clusterDeviceBackendHint:
+    'Decides which device names ${DEVICES} and ${FIRST_LOCAL_DEVICE} resolve to (for example CUDA0 or Vulkan0).',
   clusterMemberMode: 'Member mode',
   clusterMemberModeAutomatic: 'Automatic: pick servers and GPUs here',
   clusterMemberModeManual: 'Manual: a member spec on the server',

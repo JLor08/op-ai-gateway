@@ -753,7 +753,11 @@ to full release tags.
   fails safe but wrong: an option missing from it is read as taking no value,
   so its value may be mistaken for an option (the scan's behaviour before the
   table existed), and a removed one is merely unused. `TestLlamaServerValueFlags`
-  pins only a handful of entries, so it does not catch a stale table.
+  pins only a handful of entries, so it does not catch a stale table. The
+  portal keeps a copy of the same table in
+  `gateway/frontend/src/components/shared/clusterArgs.ts` for its pre-save
+  check; regenerate it together with `llama_flags.go`, or the portal and the
+  gateway read the same args differently.
 
 ## 9. Test-authoring rules learned the hard way
 

@@ -184,6 +184,16 @@ export const RESTART_VANISH_GRACE_MS = 8_000;
 export const OVERRIDE_WRITE_TIMEOUT_MS = 30_000;
 
 /**
+ * How often the spec list re-reads the runtime spec of every cluster head
+ * while it is shown. The cluster status, the withheld reason, the totals and
+ * the stored peaks live on the head's spec, not on the status stream, so
+ * without a re-read they would only show what was true when the page loaded.
+ * A change of a head's live state triggers a re-read at once; this interval
+ * catches what moves without one (a member's cooldown, a new breach or peak).
+ */
+export const CLUSTER_SPEC_REFRESH_MS = 10_000;
+
+/**
  * A render-only identity for one row of the two editable row lists (a spec's
  * GPU rows and a server's GPU budgets).
  *
@@ -685,6 +695,8 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     cluster_vram_total_mb,
     cluster_ram_total_mb,
     cluster_totals_complete,
+    cluster_vram_total_complete,
+    cluster_ram_total_complete,
     cluster_network_default,
     cluster_transport_default,
     cluster_warnings,
@@ -1274,9 +1286,11 @@ export function RuntimeAdminSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
-    // The RPC tab's manual member specs (the server settings and the live
-    // member list use updateServer and subscribeRuntimeStatus above).
+    // The RPC tab's manual member specs (the server settings use updateServer
+    // below; the live member list reads this section's status stream). Its
+    // consent picker lists the admin-tier groups the caller can name.
     | 'rpcMemberSpecs'
+    | 'serverAdminGroupCandidates'
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
@@ -2190,6 +2204,67 @@ export function RuntimeAdminSection({
       mountedRef.current = false;
     };
   }, []);
+  // ---- Cluster heads: keep their status current -------------------------
+  // The lazy loader reads each spec once, but a head's spec carries the
+  // cluster's live view (cluster_status, the withheld reason, the totals and
+  // the stored peaks), which moves while the screen is open. So while the spec
+  // list (or the editor beside it) is shown, every head is re-read on an
+  // interval and as soon as the status stream reports a change that can move
+  // its cluster: the head's own state or error, or a member row's state. The
+  // reads go through the cache's ordered-read primitives, so one that overlaps
+  // a write is refused like the lazy one. A failed re-read raises no toast: it
+  // repeats on its own, and the last known spec stays on screen.
+  const clusterHeadIds = mappings.filter((m) => isClusterHead(specsById[m.id])).map((m) => m.id);
+  const clusterHeadKey = clusterHeadIds.join('\u0000');
+  const clusterHeadSpecIds = new Set(
+    clusterHeadIds.map((id) => specsById[id]?.id).filter((id): id is string => Boolean(id)),
+  );
+  const clusterLiveSignature = statusRows
+    .filter((r) => r.kind === 'rpc_server' || clusterHeadSpecIds.has(r.spec_id))
+    .map((r) => `${r.spec_id}#${r.instance}:${r.state}:${r.last_error?.code ?? ''}`)
+    .sort((a, b) => a.localeCompare(b))
+    .join('|');
+  const clusterRefreshActive = tab === 'specs' && clusterHeadKey !== '';
+  function refreshClusterHeads(ids: readonly string[]) {
+    for (const id of ids) {
+      const seen = beginSpecRead(id);
+      api.runtimeSpec(id).then(
+        (spec) => {
+          if (mountedRef.current) commitSpecRead(id, seen, spec);
+        },
+        () => {},
+      );
+    }
+  }
+  useEffect(() => {
+    if (!clusterRefreshActive) return undefined;
+    const ids = clusterHeadKey.split('\u0000');
+    const timer = setInterval(() => refreshClusterHeads(ids), CLUSTER_SPEC_REFRESH_MS);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusterRefreshActive, clusterHeadKey, api]);
+  // What the last run saw for the same set of heads. A changed set of heads
+  // (the lazy load finishing, a head added or removed) only records the new
+  // signature: those heads were just read. Coming back to the list from
+  // another tab re-reads them like a changed signature does.
+  const clusterSignatureRef = useRef<{
+    heads: string;
+    signature: string;
+    active: boolean;
+  } | null>(null);
+  useEffect(() => {
+    const prev = clusterSignatureRef.current;
+    clusterSignatureRef.current = {
+      heads: clusterHeadKey,
+      signature: clusterLiveSignature,
+      active: clusterRefreshActive,
+    };
+    if (!clusterRefreshActive || prev?.heads !== clusterHeadKey) return;
+    if (prev.active && prev.signature === clusterLiveSignature) return;
+    refreshClusterHeads(clusterHeadKey.split('\u0000'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusterRefreshActive, clusterHeadKey, clusterLiveSignature]);
+
   /** Whether override write `run` is over: unmounted, or abandoned. */
   function overrideRunOver(run: number): boolean {
     return !mountedRef.current || overrideRunRef.current !== run;
@@ -3920,7 +3995,13 @@ export function RuntimeAdminSection({
       render: (m) => {
         const spec = specsById[m.id];
         return spec && isClusterHead(spec) ? (
-          <ClusterTotalCell spec={spec} axis="vram" ownMb={totalGpuVram(spec)} t={t} />
+          <ClusterTotalCell
+            spec={spec}
+            name={m.gateway_model_name}
+            axis="vram"
+            ownMb={totalGpuVram(spec)}
+            t={t}
+          />
         ) : (
           formatMb(totalGpuVram(spec))
         );
@@ -3943,7 +4024,7 @@ export function RuntimeAdminSection({
         const spec = specsById[m.id];
         const own = effectiveRam(spec, statusForMapping(m));
         return spec && isClusterHead(spec) ? (
-          <ClusterTotalCell spec={spec} axis="ram" ownMb={own} t={t} />
+          <ClusterTotalCell spec={spec} name={m.gateway_model_name} axis="ram" ownMb={own} t={t} />
         ) : (
           formatMb(own)
         );
@@ -6013,6 +6094,7 @@ export function RuntimeAdminSection({
           t={t}
           api={api}
           server={rpcSavedServer ?? server}
+          statusRows={statusRows}
           onServerSaved={(saved) => setRpcSaved({ server: saved, propKey: rpcContentKey })}
         />
       )}
