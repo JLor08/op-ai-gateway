@@ -1024,7 +1024,7 @@ func (_d *RoutingStoreWithTracing) ReplaceAgentServerBinaries(ctx context.Contex
 	return _d.Store.ReplaceAgentServerBinaries(ctx, serverID, rows)
 }
 
-func (_d *RoutingStoreWithTracing) ReplaceRPCMemberSpec(ctx context.Context, s1 _sourceRouting.RPCMemberSpec, gpus []_sourceRouting.RPCMemberSpecGPU) (err error) {
+func (_d *RoutingStoreWithTracing) ReplaceRPCMemberSpec(ctx context.Context, s _sourceRouting.RPCMemberSpec, gpus []_sourceRouting.RPCMemberSpecGPU) (err error) {
 	ctx, span := Start(ctx, "routing.Store.ReplaceRPCMemberSpec")
 	defer span.End()
 	defer func() {
@@ -1033,7 +1033,7 @@ func (_d *RoutingStoreWithTracing) ReplaceRPCMemberSpec(ctx context.Context, s1 
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.Store.ReplaceRPCMemberSpec(ctx, s1, gpus)
+	return _d.Store.ReplaceRPCMemberSpec(ctx, s, gpus)
 }
 
 func (_d *RoutingStoreWithTracing) ResourceGroupAdminGroups(ctx context.Context, rgID string) (sa1 []string, err error) {
