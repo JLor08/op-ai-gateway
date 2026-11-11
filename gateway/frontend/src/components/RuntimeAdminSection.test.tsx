@@ -12476,7 +12476,11 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
 // The spec PUT is a full document: a save without the cluster fields turns
 // the cluster off and clears its membership. Every save from the form must
 // therefore carry them, a member the caller cannot see included.
-describe('RuntimeAdminSection cluster head round trip', () => {
+// The edit-form round trips here render the whole spec form with the cluster
+// block and its members several times (up to ~1.6 s locally); a shared CI runner
+// under the full suite's parallel load has pushed that past the 5 s default, as
+// for the other form-heavy describes in this file.
+describe('RuntimeAdminSection cluster head round trip', { timeout: 15_000 }, () => {
   const visibleMember = {
     position: 0,
     server_id: 'srv_b',
