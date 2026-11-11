@@ -235,7 +235,7 @@ var portalClusterErrRows = []errRow{
 	{err: portal.ErrClusterLANAckRequired, status: http.StatusBadRequest, code: "runtime.cluster_lan_ack_required", msg: "direct transport in a lan cluster exposes each member's RPC port unauthenticated; acknowledge it with lan_exposure_ack"},
 	{err: portal.ErrClusterMemberBudgetRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_budget_required", msgFn: clusterErrDetail(portal.ErrClusterMemberBudgetRequired, "a member on an Apple GPU needs a GPU budget on its server")},
 	{err: portal.ErrClusterTensorSplitRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_tensor_split_required", msgFn: clusterErrDetail(portal.ErrClusterTensorSplitRequired, "a head with a non-NVIDIA member needs --tensor-split")},
-	{err: portal.ErrClusterPortExhausted, status: http.StatusConflict, code: "runtime_spec.cluster_port_exhausted", msg: "no free port in the RPC range 47000-47999 could be claimed on the member server"},
+	{err: portal.ErrClusterPortExhausted, status: http.StatusConflict, code: "runtime_spec.cluster_port_exhausted", msg: "no free port in the RPC range 26000-26999 could be claimed on the member server"},
 	{err: portal.ErrRuntimeSpecPortConflictsRPCMember, status: http.StatusConflict, code: "runtime_spec.port_conflicts_rpc_member", msg: "listen_port is the RPC port of a cluster member on this server"},
 }
 

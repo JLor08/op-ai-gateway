@@ -78,10 +78,14 @@ const (
 	deviceBackendAuto   = "auto"
 )
 
-// RPC port range a member server's member processes are allocated from.
+// RPC port range a member server's member processes are allocated from. It
+// lies below every default ephemeral port range (Linux 32768-60999, Windows
+// and macOS 49152-65535): the agent's model children listen on ports the
+// kernel picks, and one of those must never hold a member's port, which a
+// member binding every interface would then fail to take.
 const (
-	rpcPortFirst = 47000
-	rpcPortLast  = 47999
+	rpcPortFirst = 26000
+	rpcPortLast  = 26999
 )
 
 // netbirdDefaultPolicyStateKey is the system setting holding what the last

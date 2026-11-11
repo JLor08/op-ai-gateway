@@ -783,17 +783,17 @@ func TestBenchmarkWriteKeepsClusterConfiguration(t *testing.T) {
 func TestAllocateRPCPortSkipsTakenPorts(t *testing.T) {
 	f := newClusterFixture(t)
 	srv := f.member("A")
-	seedApp(t, f.routes, "app_plain", srv.ID, 47000, routing.ServerStatusActive, clusterTestNow)
+	seedApp(t, f.routes, "app_plain", srv.ID, 26000, routing.ServerStatusActive, clusterTestNow)
 	plain, err := f.routes.ApplicationByID(f.ctx, "app_plain")
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain.ProxyListenPort = 47001
+	plain.ProxyListenPort = 26001
 	if err := f.routes.UpdateApplication(f.ctx, plain); err != nil {
 		t.Fatalf("proxy port: %v", err)
 	}
 	agentApp := routing.Application{
-		ID: "app_agent", ServerID: srv.ID, Type: routing.ProviderServerAgent, Port: 47002, Scheme: "http",
+		ID: "app_agent", ServerID: srv.ID, Type: routing.ProviderServerAgent, Port: 26002, Scheme: "http",
 		Status: routing.ServerStatusActive, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow,
 	}
 	if err := f.routes.CreateApplication(f.ctx, agentApp); err != nil {
@@ -804,18 +804,18 @@ func TestAllocateRPCPortSkipsTakenPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.routes.UpsertRuntimeSpec(f.ctx, routing.RuntimeSpec{
-		ID: "rspec_pinned", MappingID: mapping.ID, Binary: "/bin/x", Args: "[]", Env: "{}", ListenPort: 47003,
+		ID: "rspec_pinned", MappingID: mapping.ID, Binary: "/bin/x", Args: "[]", Env: "{}", ListenPort: 26003,
 		CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	other := seedOtherHead(t, f)
-	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: srv.ID, Port: 47004}}, nil); err != nil {
+	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: srv.ID, Port: 26004}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	port, err := f.svc.allocateRPCPort(f.ctx, srv.ID)
-	if err != nil || port != 47005 {
-		t.Fatalf("allocateRPCPort = %d, %v; want 47005", port, err)
+	if err != nil || port != 26005 {
+		t.Fatalf("allocateRPCPort = %d, %v; want 26005", port, err)
 	}
 	// Another server's ports do not count.
 	if port, err := f.svc.allocateRPCPort(f.ctx, f.head.ID); err != nil || port != rpcPortFirst {
@@ -1537,5 +1537,15 @@ func TestPutClusterKeepsAUsageRiseDuringTheSave(t *testing.T) {
 	members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID)
 	if len(members) != 1 || members[0].RAMMeasuredMB != 5000 || members[0].Threads != 4 {
 		t.Fatalf("membership after the save = %+v, want the raised value and the new threads", members)
+	}
+}
+
+// TestRPCPortRangeOutsideEphemeralRanges: a member binds its port while the
+// agent's model children take theirs from the kernel, so the range lies
+// below every default ephemeral range (Linux 32768-60999, Windows and macOS
+// 49152-65535) and a child can never hold a member's port.
+func TestRPCPortRangeOutsideEphemeralRanges(t *testing.T) {
+	if rpcPortFirst != 26000 || rpcPortLast != 26999 || rpcPortLast >= 32768 {
+		t.Fatalf("RPC port range %d-%d, want 26000-26999", rpcPortFirst, rpcPortLast)
 	}
 }
