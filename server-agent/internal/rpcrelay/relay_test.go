@@ -374,9 +374,11 @@ func TestRelayRefusesSecondHead(t *testing.T) {
 	// The newer connection from an allowed head replaces the older one.
 	wantClosed(t, first)
 	roundTrip(t, second, []byte("still here"))
-	// The hold continues across the replacement: taken once, never released.
-	if got := ev.snapshot(); ev.count("held:rpcm_a:rspec_head") != 1 || ev.count("released:rpcm_a") != 0 {
-		t.Fatalf("events = %v, want exactly one held and no release across the replacement", got)
+	// The hold continues across the replacement: never released, and reported
+	// again for the new connection, which takes it back should the gateway
+	// have released the member meanwhile.
+	if got := ev.snapshot(); ev.count("held:rpcm_a:rspec_head") != 2 || ev.count("released:rpcm_a") != 0 {
+		t.Fatalf("events = %v, want a held per connection and no release across the replacement", got)
 	}
 
 	// A source that is not (or no longer) allowlisted is refused and leaves
@@ -530,14 +532,51 @@ func TestRelayClosesOnAllowlistChange(t *testing.T) {
 	mustApply(t, m, cfg)
 	roundTrip(t, c, []byte("same allowlist"))
 
+	// An address added to the list ends no session: a head domain that
+	// resolves to one more address must not cut the running cluster.
 	cfg.AllowedIPs = allow("127.0.0.1", "192.0.2.7")
+	mustApply(t, m, cfg)
+	roundTrip(t, c, []byte("widened allowlist"))
+	if n := ev.count("released:rpcm_a"); n != 0 {
+		t.Fatalf("events = %v, want no release when the peer stays allowed", ev.snapshot())
+	}
+
+	// The peer's own address leaving the list closes its session.
+	cfg.AllowedIPs = allow("192.0.2.7")
 	mustApply(t, m, cfg)
 	wantClosed(t, c)
 	ev.waitCount(t, "released:rpcm_a", 1)
 
 	// The listener itself stays up for the head's reconnect.
+	cfg.AllowedIPs = allow("127.0.0.1")
+	mustApply(t, m, cfg)
 	again := dial(t, cfg.Bind)
 	roundTrip(t, again, []byte("reconnected"))
+}
+
+// TestRelayAllowlistChangeKeepsWaitingAllowedPeer: a connection still waiting
+// for its first byte when the list changes stays usable when its peer is still
+// allowed: it is promoted on its first byte like any other.
+func TestRelayAllowlistChangeKeepsWaitingAllowedPeer(t *testing.T) {
+	ev := &recEvents{}
+	tg := newTarget(t, nil)
+	m := newTestManager(t, ev, always)
+	cfg := relayConfig(t, "rpcm_a", tg, allow("127.0.0.1"))
+	mustApply(t, m, cfg)
+
+	c := dial(t, cfg.Bind)
+	waitUntil(t, 5*time.Second, "connection registered", func() bool {
+		m.mu.Lock()
+		mem := m.members["rpcm_a"]
+		m.mu.Unlock()
+		mem.mu.Lock()
+		defer mem.mu.Unlock()
+		return len(mem.sockets) == 1
+	})
+	cfg.AllowedIPs = allow("127.0.0.1", "192.0.2.7")
+	mustApply(t, m, cfg)
+	roundTrip(t, c, []byte("first byte after the change"))
+	ev.waitCount(t, "held:rpcm_a:rspec_head", 1)
 }
 
 func TestRelayBindMismatchRetries(t *testing.T) {
