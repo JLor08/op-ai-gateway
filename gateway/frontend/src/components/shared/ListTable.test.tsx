@@ -160,3 +160,43 @@ describe('ListTable numeric sorting', () => {
     });
   });
 });
+
+describe('ListTable default sort', () => {
+  function names(): string[] {
+    return screen.getAllByRole('cell').map((cell) => cell.textContent ?? '');
+  }
+
+  function renderSorted(storageKey: string) {
+    return render(
+      <ListTable
+        rows={[
+          { id: '1', name: 'Gamma' },
+          { id: '2', name: 'Alpha' },
+          { id: '3', name: 'Beta' },
+        ]}
+        columns={columns}
+        rowKey={(r) => r.id}
+        labels={labels}
+        storageKey={storageKey}
+        defaultSort={{ id: 'name', order: 'desc' }}
+      />,
+    );
+  }
+
+  it('sorts by the default before the user picks a sort', () => {
+    renderSorted('test.default-sort.initial');
+    expect(names()).toEqual(['Gamma', 'Beta', 'Alpha']);
+  });
+
+  it("keeps the user's choice over the default, unsorted included", async () => {
+    const view = renderSorted('test.default-sort.choice');
+    const header = screen.getByRole('button', { name: 'Name' });
+    // From the default (name, desc) a click on the same column turns the
+    // sort off: the rows keep the order they came in.
+    fireEvent.click(header);
+    await waitFor(() => expect(names()).toEqual(['Gamma', 'Alpha', 'Beta']));
+    view.unmount();
+    renderSorted('test.default-sort.choice');
+    expect(names()).toEqual(['Gamma', 'Alpha', 'Beta']);
+  });
+});

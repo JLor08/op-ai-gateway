@@ -5081,7 +5081,7 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
           spec_id: 'rpca_rspec_1_srv_1',
           kind: 'rpc_server',
           model: '',
-          display_name: 'RPC (big)(efyga)',
+          display_name: 'RPC (big)(Head)',
           pid: 4300,
         }),
       ],
@@ -5089,14 +5089,14 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     stream.setStatus('open');
     await openStatusTab();
     const row = inRowWith('4300');
-    const name = row.getByText('RPC (big)(efyga)');
+    const name = row.getByText('RPC (big)(Head)');
     expect(name).toHaveAccessibleDescription('rpca_rspec_1_srv_1');
     // The column's other names are body2 too.
     expect(name).toHaveClass('MuiTypography-body2');
     // A member is no mapping row: no "unresolved" marker.
     expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
     fireEvent.click(row.getByRole('button', { name: t.runtimeLogs }));
-    expect(await screen.findByRole('dialog')).toHaveTextContent('RPC (big)(efyga)');
+    expect(await screen.findByRole('dialog')).toHaveTextContent('RPC (big)(Head)');
   });
 
   it('shows a cluster member row without a display name by its id, without the unresolved marker', async () => {
@@ -5121,7 +5121,8 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       statusRows: [makeStatus({ spec_id: 'rpcm_live', kind: 'rpc_server' })],
     });
     fireEvent.click(await screen.findByRole('tab', { name: t.rpcTab }));
-    expect(await screen.findByTestId('rpc-status-rpcm_live')).toBeInTheDocument();
+    const region = await screen.findByRole('region', { name: t.rpcStatusTitle });
+    expect(await within(region).findByText('rpcm_live')).toBeInTheDocument();
     expect(fakeApi.subscribeRuntimeStatus).toHaveBeenCalledTimes(1);
     expect(stream.subscribedServerIds).toHaveLength(1);
   });

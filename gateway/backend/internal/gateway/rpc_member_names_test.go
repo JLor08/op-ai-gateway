@@ -133,7 +133,7 @@ func TestRuntimeEventsNameRPCMembers(t *testing.T) {
 	if err := json.Unmarshal([]byte(data), &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.Runtimes[0].DisplayName != "RPC (ggml-rpc-server)(Runtime Events)" || snap.Runtimes[1].DisplayName != "" {
+	if snap.Runtimes[0].DisplayName != "RPC (ggml-rpc-server)" || snap.Runtimes[1].DisplayName != "" {
 		t.Fatalf("snapshot = %+v", snap.Runtimes)
 	}
 }
@@ -197,10 +197,10 @@ func TestRuntimeEventsNameMembersPerReader(t *testing.T) {
 		must(json.Unmarshal([]byte(data), &frame))
 		return frame.Runtimes[0].DisplayName
 	}
-	if got := nameIn(owner); got != "RPC (big-model)(Runtime Events)" {
+	if got := nameIn(owner); got != "RPC (big-model)(Head)" {
 		t.Fatalf("owner sees %q", got)
 	}
-	if got := nameIn(other); got != "RPC (—)(Runtime Events)" {
+	if got := nameIn(other); got != "RPC (—)" {
 		t.Fatalf("the reader without the head sees %q", got)
 	}
 }

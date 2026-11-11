@@ -108,7 +108,31 @@ function setup(
           <RpcMemberSection t={t} api={api} server={next} statusRows={rows} />
         </ToastProvider>,
       ),
+    rerenderRows: (next: RuntimeStatus[]) =>
+      view.rerender(
+        <ToastProvider>
+          <RpcMemberSection t={t} api={api} server={opts.server ?? server} statusRows={next} />
+        </ToastProvider>,
+      ),
   });
+}
+
+// The running members' table row that shows text.
+async function memberTableRow(text: string): Promise<HTMLElement> {
+  const region = await screen.findByRole('region', { name: t.rpcStatusTitle });
+  const cell = await within(region).findByText(text);
+  const row = cell.closest('tr');
+  if (!row) throw new Error(`no table row shows ${text}`);
+  return row as HTMLElement;
+}
+
+// The running members' names, top to bottom.
+function memberNames(): string[] {
+  const table = within(screen.getByRole('region', { name: t.rpcStatusTitle })).getByRole('table');
+  return within(table)
+    .getAllByRole('row')
+    .slice(1)
+    .map((r) => within(r).getAllByRole('cell')[0].textContent ?? '');
 }
 
 afterEach(cleanup);
@@ -297,25 +321,56 @@ describe('RpcMemberSection binary picker', () => {
 });
 
 describe('RpcMemberSection member status', () => {
-  it('shows the holding head only when the spec DTO exposes it', async () => {
+  it('shows whether a head holds a member, never the head itself', async () => {
     setup({
-      specs: [
-        spec({ id: 'rpcm_1', used_by_head_spec_id: 'rspec_visible' }),
-        spec({ id: 'rpcm_2' }),
-      ],
+      specs: [spec({ id: 'rpcm_1', used_by_head_spec_id: 'rspec_visible' })],
       rows: [
         memberRow({ spec_id: 'rpcm_1', rpc: { held_by: 'rspec_visible' } }),
         memberRow({ spec_id: 'rpcm_2', rpc: { held_by: 'rspec_hidden' } }),
+        memberRow({ spec_id: 'rpcm_3' }),
       ],
     });
-    const visible = (await screen.findByTestId('rpc-status-rpcm_1')) as HTMLElement;
-    const hidden = screen.getByTestId('rpc-status-rpcm_2');
-    expect(within(visible).getByText(/rspec_visible/)).toBeTruthy();
-    expect(within(hidden).queryByText(/rspec_hidden/)).toBeNull();
-    expect(within(hidden).getByText(t.rpcStatusHeldElsewhere)).toBeTruthy();
+    const region = await screen.findByRole('region', { name: t.rpcStatusTitle });
+    expect(within(await memberTableRow('rpcm_1')).getByText(t.rpcStatusHeldElsewhere)).toBeTruthy();
+    expect(within(await memberTableRow('rpcm_2')).getByText(t.rpcStatusHeldElsewhere)).toBeTruthy();
+    expect(within(await memberTableRow('rpcm_3')).getByText(t.rpcStatusNotHeld)).toBeTruthy();
+    // The head is in the member's name (resolved for the reader), not here.
+    expect(within(region).queryByText(/rspec_/)).toBeNull();
   });
 
-  it('shows effective VRAM as max(measured, estimate), protocol and badges', async () => {
+  it('shows the columns name, status, occupancy, VRAM and RAM; the protocol only on demand', async () => {
+    setup({ rows: [memberRow({ rpc: { protocol: '8.0.1' } })] });
+    await memberTableRow('rpcm_1');
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent);
+    expect(headers).toEqual([
+      t.tableName,
+      t.tableStatus,
+      t.rpcStatusOccupancy,
+      t.rpcStatusVram,
+      t.rpcStatusRam,
+    ]);
+    expect(screen.queryByText('8.0.1')).toBeNull();
+  });
+
+  it('finds a named member by its spec id once the ID column is shown', async () => {
+    setup({
+      rows: [
+        memberRow({ spec_id: 'rpca_rspec_1_srv_1', display_name: 'RPC (big)(Head)' }),
+        memberRow({ spec_id: 'rpcm_2', display_name: 'RPC (other)(Head)' }),
+      ],
+    });
+    const region = await screen.findByRole('region', { name: t.rpcStatusTitle });
+    await memberTableRow('RPC (big)(Head)');
+    fireEvent.click(within(region).getByRole('button', { name: t.listColumns }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: t.rpcStatusId }));
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
+    fireEvent.change(within(region).getByLabelText(t.listSearchPlaceholder), {
+      target: { value: 'rpca_rspec_1' },
+    });
+    await waitFor(() => expect(memberNames()).toEqual(['RPC (big)(Head)']));
+  });
+
+  it('shows effective VRAM as max(measured, estimate) and the state badges', async () => {
     setup({
       specs: [spec({ gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }] })],
       rows: [
@@ -329,11 +384,38 @@ describe('RpcMemberSection member status', () => {
         }),
       ],
     });
-    const row = await screen.findByTestId('rpc-status-rpcm_1');
-    expect(within(row).getByText(/9000/)).toBeTruthy();
-    expect(within(row).getByText(/8\.0\.1/)).toBeTruthy();
+    const row = await memberTableRow('rpcm_1');
+    expect(within(row).getByText('9000 MB')).toBeTruthy();
     expect(within(row).getByText(t.rpcStatusBindMismatch)).toBeTruthy();
     expect(within(row).getByText(new RegExp(t.rpcStatusBreaches))).toBeTruthy();
+  });
+
+  it('sorts by name and keeps the order when the stream reorders its rows', async () => {
+    const a = memberRow({ spec_id: 'rpcm_a', display_name: 'RPC (alpha)(Head)' });
+    const b = memberRow({ spec_id: 'rpcm_b', display_name: 'RPC (beta)(Head)' });
+    const c = memberRow({ spec_id: 'rpcm_c', display_name: 'RPC (gamma)(Head)' });
+    const view = setup({ rows: [c, a, b] });
+    await memberTableRow('RPC (alpha)(Head)');
+    const sorted = ['RPC (alpha)(Head)', 'RPC (beta)(Head)', 'RPC (gamma)(Head)'];
+    expect(memberNames()).toEqual(sorted);
+    view.rerenderRows([b, c, a]);
+    expect(memberNames()).toEqual(sorted);
+    view.rerenderRows([a, c, b]);
+    expect(memberNames()).toEqual(sorted);
+  });
+
+  it('keeps rows put on a column whose values tie, whatever order the stream sends', async () => {
+    const a = memberRow({ spec_id: 'rpcm_a', display_name: 'RPC (alpha)(Head)' });
+    const b = memberRow({ spec_id: 'rpcm_b', display_name: 'RPC (beta)(Head)' });
+    const view = setup({ rows: [b, a] });
+    await memberTableRow('RPC (alpha)(Head)');
+    // Every row has the same state: sorting by it ties on every row.
+    fireEvent.click(screen.getByRole('button', { name: t.tableStatus }));
+    const order = memberNames();
+    view.rerenderRows([a, b]);
+    expect(memberNames()).toEqual(order);
+    view.rerenderRows([b, a]);
+    expect(memberNames()).toEqual(order);
   });
 
   it('names a member by the gateway display name and keeps its id at hand', async () => {
@@ -341,20 +423,19 @@ describe('RpcMemberSection member status', () => {
       rows: [
         memberRow({
           spec_id: 'rpca_rspec_1_srv_1',
-          display_name: 'RPC (unsloth/Qwen3.8-27B)(efyga)',
+          display_name: 'RPC (unsloth/Qwen3.8-27B)(balthasar)',
         }),
       ],
     });
-    const row = await screen.findByTestId('rpc-status-rpca_rspec_1_srv_1');
-    const name = within(row).getByText('RPC (unsloth/Qwen3.8-27B)(efyga)');
+    const row = await memberTableRow('RPC (unsloth/Qwen3.8-27B)(balthasar)');
+    const name = within(row).getByText('RPC (unsloth/Qwen3.8-27B)(balthasar)');
     expect(name).toHaveAccessibleDescription('rpca_rspec_1_srv_1');
     expect(within(row).queryByText('rpca_rspec_1_srv_1')).toBeNull();
   });
 
   it('shows the member id when the gateway sends no display name', async () => {
     setup({ rows: [memberRow({ spec_id: 'rpcm_1' })] });
-    const row = await screen.findByTestId('rpc-status-rpcm_1');
-    expect(within(row).getByText('rpcm_1')).toBeTruthy();
+    expect(await memberTableRow('rpcm_1')).toBeTruthy();
   });
 
   it('ignores model rows', async () => {
