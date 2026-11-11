@@ -2613,7 +2613,7 @@ const de = {
   clusterMemberServer: 'Server',
   clusterMemberSpec: 'Mitglieds-Spezifikation',
   clusterMemberSpecPick: 'Dieser Server hat mehrere freie Mitglieds-Spezifikationen; eine wählen.',
-  clusterMemberAddConfirm: 'Übernehmen',
+  clusterMemberAddConfirm: 'Hinzufügen',
   clusterCandidatesEmptyAutomatic:
     'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries, dessen Version bekannt sein muss.',
   clusterCandidatesEmptyManual:

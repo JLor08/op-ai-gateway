@@ -501,6 +501,63 @@ describe('ClusterHeadEditor head binary change', () => {
   });
 });
 
+describe('ClusterHeadEditor member GPU names', () => {
+  const gpu = (index: number) => ({ index, vram_estimate_mb: 0, vram_measured_mb: 0 });
+
+  it('names an automatic member GPU as the picker did', async () => {
+    setup({
+      initial: state({
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', gpus: [gpu(1)] }),
+        ]),
+      }),
+      hardwareByServer: { srv_a: hardware([0, 1]) },
+    });
+    const row = screen.getByTestId('cluster-member-row');
+    expect(await within(row).findByText('GPU 1 · RTX 1')).toBeInTheDocument();
+    // The labels of the row's controls stay keyed on the GPU index.
+    expect(
+      within(row).getByRole('button', { name: `${t.clusterMemberGpuRemove}: Alpha GPU 1` }),
+    ).toBeInTheDocument();
+  });
+
+  it('falls back to the index without a hardware report', async () => {
+    const { api } = setup({
+      initial: state({
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', gpus: [gpu(1)] }),
+        ]),
+      }),
+    });
+    await waitFor(() => expect(api.serverHardware).toHaveBeenCalledWith('srv_a'));
+    expect(await screen.findByText(t.clusterMemberHardwareUnavailable)).toBeInTheDocument();
+    expect(within(screen.getByTestId('cluster-member-row')).getByText('GPU 1')).toBeInTheDocument();
+  });
+
+  it('names a manual member GPU from its server report too', async () => {
+    setup({
+      initial: state({
+        memberMode: 'manual',
+        members: clusterRows([
+          member({
+            server_id: 'srv_a',
+            server_name: 'Alpha',
+            member_spec_id: 'rpcm_1',
+            gpus: [gpu(0), gpu(1)],
+          }),
+        ]),
+      }),
+      hardwareByServer: { srv_a: hardware([0, 1]) },
+    });
+    expect(await screen.findByText('GPU 0 · RTX 0, GPU 1 · RTX 1')).toBeInTheDocument();
+  });
+
+  it('confirms an added member with "Hinzufügen" / "Add"', () => {
+    expect(messages.de.clusterMemberAddConfirm).toBe('Hinzufügen');
+    expect(messages.en.clusterMemberAddConfirm).toBe('Add');
+  });
+});
+
 describe('ClusterHeadEditor member order', () => {
   it('moves a member and sends the new order and positions', () => {
     const { latest } = setup({

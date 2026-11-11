@@ -270,6 +270,14 @@ function gpuLabel(gpu: HardwareGPU): string {
   return name ? `GPU ${gpu.index} · ${name}` : `GPU ${gpu.index}`;
 }
 
+// A member GPU as its rows show it: the picker's label when the member
+// server's hardware report names the GPU, else its index alone (no report,
+// a failed read, or a GPU the report does not list).
+function memberGpuLabel(index: number, hostGpus: HostGpus | undefined): string {
+  const gpu = Array.isArray(hostGpus) ? hostGpus.find((g) => g.index === index) : undefined;
+  return gpu ? gpuLabel(gpu) : `GPU ${index}`;
+}
+
 function swap<T>(items: T[], index: number, delta: number): T[] {
   const target = index + delta;
   if (target < 0 || target >= items.length) return items;
@@ -278,18 +286,17 @@ function swap<T>(items: T[], index: number, delta: number): T[] {
   return next;
 }
 
-// Per automatic member server: its reported GPUs, 'unavailable' without a
+// Per visible member server: its reported GPUs, 'unavailable' without a
 // hardware report, 'failed' when the read failed. Each server is read once.
+// Automatic members pick their GPUs from it; every member names its GPUs
+// with it.
 function useMemberHardware(
   api: Pick<PortalApi, 'serverHardware'>,
   value: ClusterHeadState,
 ): Record<string, HostGpus> {
   const [hardwareByServer, setHardwareByServer] = useState<Record<string, HostGpus>>({});
-  const automaticServers =
-    value.memberMode === 'automatic'
-      ? value.members.filter((m) => m.visible).map((m) => m.server_id)
-      : [];
-  const missingHardware = automaticServers.filter((id) => !(id in hardwareByServer));
+  const memberServers = value.members.filter((m) => m.visible).map((m) => m.server_id);
+  const missingHardware = memberServers.filter((id) => !(id in hardwareByServer));
   const missingKey = missingHardware.join(',');
 
   useEffect(() => {
@@ -1126,7 +1133,7 @@ function MemberRow({
           <Typography component="span" variant="body2" color="text.secondary">
             {member.gpus.length === 0
               ? t.rpcMemberCpu
-              : member.gpus.map((g) => `GPU ${g.index}`).join(', ')}
+              : member.gpus.map((g) => memberGpuLabel(g.index, hostGpus)).join(', ')}
           </Typography>
         )}
         {member.port > 0 && (
@@ -1209,7 +1216,7 @@ function MemberRow({
                 <ArrowDownwardIcon fontSize="small" />
               </IconButton>
               <Typography component="span" sx={{ minWidth: 64 }}>
-                {`GPU ${g.index}`}
+                {memberGpuLabel(g.index, hostGpus)}
               </Typography>
               <Field
                 id={`${member.rowKey}-gpu-${g.index}-vram`}
