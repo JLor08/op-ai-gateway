@@ -67,7 +67,8 @@ type RPCMemberSpecDTO struct {
 // PutRPCMemberSpecRequest is the full document of a member spec. Enabled
 // defaults to true. AllowedHeadGroups nil keeps the stored consent on update
 // and defaults to the server's own admin groups on create; an explicit empty
-// list means no head may use the member. GPU rows keep their request order
+// list is stored as empty and, like the default, admits heads linked to the
+// member server's own admin groups. GPU rows keep their request order
 // as the member's device order; vram_measured_mb is ignored.
 type PutRPCMemberSpecRequest struct {
 	Enabled           *bool               `json:"enabled,omitempty"`
