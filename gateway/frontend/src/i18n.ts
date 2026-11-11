@@ -2381,6 +2381,7 @@ const de = {
   rpcStatusBreaches: 'Verstöße',
   agentClockOffset: 'Uhrabweichung des Agents',
   agentClockOffsetUnknown: 'unbekannt',
+  agentClockOffsetWarnLabel: 'Uhrabweichung über 2 s',
   agentClockOffsetHelp:
     'Diagnosewert: Zeitstempel der letzten Telemetrie des Agents minus Empfangszeit am Gateway, inklusive Übertragungszeit; positiv heißt, die Uhr des Agents geht vor. Die Energiezuordnung liest die Messwerte jedes Hosts nach seinen eigenen Zeitstempeln, eine große Abweichung verschiebt also das Fenster, über das sein Anteil gerechnet wird. Unbekannt, bis der Agent nach einem Gateway-Start gemeldet hat.',
   agentClockOffsetWarn:
@@ -2482,7 +2483,7 @@ const de = {
   clusterPeaksHint:
     'Der nächste Start dieser Mitglieder wird abgelehnt, bis das Budget erhöht, die Aufteilung geändert oder die gespeicherte Nutzung zurückgesetzt wird.',
   clusterPeakVram: (member: string, gpu: number, storedMb: number, ceilingMb: number) =>
-    `${member}, GPU ${gpu}: ${storedMb} MB VRAM gespeichert, Budget ${ceilingMb} MB`,
+    `${member}, GPU ${gpu}: ${storedMb} MB VRAM gespeichert, Limit ${ceilingMb} MB (GPU-Budget, ohne Budget der Kartenspeicher)`,
   clusterPeakRam: (member: string, storedMb: number, ceilingMb: number) =>
     `${member}: ${storedMb} MB RAM gespeichert, Speicher des Hosts ${ceilingMb} MB`,
   clusterPeakHidden: (member: string) =>
@@ -6207,6 +6208,7 @@ const en: PortalMessages = {
   rpcStatusBreaches: 'Breaches',
   agentClockOffset: 'Agent clock offset',
   agentClockOffsetUnknown: 'unknown',
+  agentClockOffsetWarnLabel: 'Clock offset above 2 s',
   agentClockOffsetHelp:
     "A diagnostic: the time stamp on the agent's latest telemetry minus the gateway's receive time, transit included; positive means the agent's clock runs ahead. Energy attribution reads each host's samples by its own time stamps, so a large offset shifts the window its share is computed over. Unknown until the agent reports after a gateway start.",
   agentClockOffsetWarn:
@@ -6309,7 +6311,7 @@ const en: PortalMessages = {
   clusterPeaksHint:
     "These members' next start is refused until the budget is raised, the split changed or the stored usage reset.",
   clusterPeakVram: (member: string, gpu: number, storedMb: number, ceilingMb: number) =>
-    `${member}, GPU ${gpu}: ${storedMb} MB VRAM stored, budget ${ceilingMb} MB`,
+    `${member}, GPU ${gpu}: ${storedMb} MB VRAM stored, limit ${ceilingMb} MB (the GPU budget, or the card's memory without one)`,
   clusterPeakRam: (member: string, storedMb: number, ceilingMb: number) =>
     `${member}: ${storedMb} MB RAM stored, host memory ${ceilingMb} MB`,
   clusterPeakHidden: (member: string) => `${member}: a stored peak is above its budget`,

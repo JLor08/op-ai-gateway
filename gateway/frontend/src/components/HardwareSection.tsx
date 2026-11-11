@@ -12,6 +12,7 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import type { HardwareReport, PortalServer } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
@@ -74,6 +75,9 @@ function AgentClockOffset({
   const known = typeof offsetMs === 'number';
   const warning = known && Math.abs(offsetMs) > clockOffsetWarnMs;
   const text = known ? formatClockOffset(offsetMs) : t.agentClockOffsetUnknown;
+  // The span is focusable so the diagnostic tooltip opens from the keyboard
+  // too, and a flagged offset carries an icon with its own name, so the
+  // warning does not rest on colour and weight alone.
   return (
     <Tooltip
       title={
@@ -89,8 +93,21 @@ function AgentClockOffset({
         data-testid="agent-clock-offset"
         data-warning={String(warning)}
         component="span"
-        sx={{ fontWeight: warning ? 600 : undefined }}
+        tabIndex={0}
+        sx={{
+          fontWeight: warning ? 600 : undefined,
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 0.5,
+        }}
       >
+        {warning && (
+          <WarningAmberIcon
+            fontSize="small"
+            color="warning"
+            titleAccess={t.agentClockOffsetWarnLabel}
+          />
+        )}
         {text}
       </Typography>
     </Tooltip>

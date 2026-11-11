@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { HardwareSection } from './HardwareSection';
 import { messages, type Locale } from '../i18n';
 import type { PortalServer, HardwareResponse } from '../api';
@@ -137,6 +137,25 @@ describe('HardwareSection agent clock offset', () => {
     expect(await screen.findByTestId('agent-clock-offset')).toHaveTextContent(
       t.agentClockOffsetUnknown,
     );
+  });
+
+  it('marks a flagged offset with a named warning icon, not by colour alone', async () => {
+    renderWithOffset(2500);
+    const offset = await screen.findByTestId('agent-clock-offset');
+    expect(within(offset).getByRole('img', { name: t.agentClockOffsetWarnLabel })).toBeTruthy();
+    cleanup();
+    renderWithOffset(120);
+    const plain = await screen.findByTestId('agent-clock-offset');
+    expect(within(plain).queryByRole('img')).toBeNull();
+  });
+
+  it('opens the diagnostic tooltip from the keyboard', async () => {
+    renderWithOffset(120);
+    const offset = await screen.findByTestId('agent-clock-offset');
+    expect(offset).toHaveAttribute('tabindex', '0');
+    fireEvent.keyDown(document.body, { key: 'Tab' });
+    act(() => offset.focus());
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.agentClockOffsetHelp);
   });
 
   it('explains in a tooltip that the offset is a diagnostic, and why a large one matters', async () => {
