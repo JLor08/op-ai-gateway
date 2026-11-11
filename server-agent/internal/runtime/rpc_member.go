@@ -46,23 +46,32 @@ func memberBindLocal(spec Spec) error {
 	if bind == "0.0.0.0" {
 		return nil
 	}
-	if want := net.ParseIP(bind); want != nil {
-		if addrs, err := interfaceAddrs(); err == nil {
-			for _, a := range addrs {
-				var ip net.IP
-				switch v := a.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-				if ip != nil && ip.Equal(want) {
-					return nil
-				}
-			}
-		}
+	if want := net.ParseIP(bind); want != nil && hostHasAddr(want) {
+		return nil
 	}
 	return fmt.Errorf("runtime: the rpc bind address %q is not an address of this host; the member is not started until it is", bind)
+}
+
+// hostHasAddr reports whether want is one of this host's addresses; an address
+// list that cannot be read has none.
+func hostHasAddr(want net.IP) bool {
+	addrs, err := interfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip != nil && ip.Equal(want) {
+			return true
+		}
+	}
+	return false
 }
 
 // freeDiskMB reports the free space on a path's volume; a variable so tests
@@ -205,12 +214,9 @@ func memberIdleTimeout(spec Spec) time.Duration {
 // a verdict the spec can never launch as written (not_permitted); the cache
 // directory is created here, before anything is exec'd.
 func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (args, env []string, port int, err error) {
-	prefix := ""
-	if len(gpuIndices(spec)) > 0 {
-		vendors := newDeviceContext(spec, o.gpuVendor, o.gpuVendors).vendors
-		if prefix, err = ResolveDeviceBackend(spec, vendors); err != nil {
-			return nil, nil, 0, fmt.Errorf("runtime: %w", err)
-		}
+	prefix, err := o.memberDevicePrefix(spec)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 	if spec.RPC.Transport == "relay" {
 		if port, err = grabEphemeralPort(); err != nil {
@@ -226,24 +232,49 @@ func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (ar
 		port = spec.RPC.Port
 	}
 	if spec.RPC.CacheEnabled {
-		dir, err := memberCacheDir(o.configFilesDir, spec.RPC.HeadSpecID)
-		if err != nil {
+		if err := o.prepareMemberCache(spec); err != nil {
 			return nil, nil, 0, err
-		}
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, nil, 0, fmt.Errorf("runtime: create rpc cache %s: %w", dir, err)
-		}
-		if err := markMemberCache(dir); err != nil {
-			slog.Warn("runtime: cannot mark the rpc cache for the sweep; without a marker it is never swept, and with an existing marker it may be removed once its head is no longer listed and nothing in it changed for 7 days", "path", dir, "err", err)
-		}
-		if free, err := freeDiskMB(dir); err != nil {
-			slog.Warn("runtime: cannot measure free space for the rpc cache", "path", dir, "err", err)
-		} else if free < memberCacheMinFreeMB {
-			return nil, nil, 0, fmt.Errorf("runtime: rpc cache volume of %s has %d MB free, need at least %d MB", dir, free, memberCacheMinFreeMB)
 		}
 	}
 	env = append(append([]string{}, expandedEnv...), memberEnv(spec, o.configFilesDir)...)
 	return args, env, port, nil
+}
+
+// memberDevicePrefix is the backend prefix of the member's -d device names,
+// "" for a member without GPUs (it runs on CPU).
+func (o *owner) memberDevicePrefix(spec Spec) (string, error) {
+	if len(gpuIndices(spec)) == 0 {
+		return "", nil
+	}
+	vendors := newDeviceContext(spec, o.gpuVendor, o.gpuVendors).vendors
+	prefix, err := ResolveDeviceBackend(spec, vendors)
+	if err != nil {
+		return "", fmt.Errorf("runtime: %w", err)
+	}
+	return prefix, nil
+}
+
+// prepareMemberCache creates the cache-enabled member's per-head cache
+// directory, marks it for the sweep, and refuses the start when its volume
+// has less than memberCacheMinFreeMB free (a volume whose free space cannot be
+// measured does not block it).
+func (o *owner) prepareMemberCache(spec Spec) error {
+	dir, err := memberCacheDir(o.configFilesDir, spec.RPC.HeadSpecID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("runtime: create rpc cache %s: %w", dir, err)
+	}
+	if err := markMemberCache(dir); err != nil {
+		slog.Warn("runtime: cannot mark the rpc cache for the sweep; without a marker it is never swept, and with an existing marker it may be removed once its head is no longer listed and nothing in it changed for 7 days", "path", dir, "err", err)
+	}
+	if free, err := freeDiskMB(dir); err != nil {
+		slog.Warn("runtime: cannot measure free space for the rpc cache", "path", dir, "err", err)
+	} else if free < memberCacheMinFreeMB {
+		return fmt.Errorf("runtime: rpc cache volume of %s has %d MB free, need at least %d MB", dir, free, memberCacheMinFreeMB)
+	}
+	return nil
 }
 
 // pollMemberReady is the member's pollHealth: ready as soon as a TCP connect
@@ -262,25 +293,11 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 			relayErr = o.m.relayListening(spec)
 		}
 		if childUp && relayErr == nil {
-			res := cmdStartResult{specID: specID, proc: proc, ok: true}
-			if banner, found := awaitMemberBanner(proc, deadline); found {
-				res.rpcProtocol = banner.Protocol
-				if want := expectedMemberDevices(spec); len(banner.Devices) != want {
-					res.deviceMismatch = fmt.Sprintf("runtime: the rpc-server listed %d device(s) (%s) but the spec selects %d",
-						len(banner.Devices), strings.Join(banner.Devices, ", "), want)
-				}
-			}
-			o.m.postCmd(res)
+			o.m.postCmd(memberReadyResult(specID, proc, spec, deadline))
 			return
 		}
 		if time.Now().After(deadline) {
-			res := cmdStartResult{specID: specID, proc: proc, err: ErrStartTimeout}
-			if relayErr != nil {
-				res.err = ErrStartFailed
-				res.relayDown = fmt.Sprintf("runtime: the rpc-server is up but its relay is not listening on %s: %v",
-					net.JoinHostPort(spec.RPC.BindIP, strconv.Itoa(spec.RPC.Port)), relayErr)
-			}
-			o.m.postCmd(res)
+			o.m.postCmd(memberTimeoutResult(specID, proc, spec, relayErr))
 			return
 		}
 		select {
@@ -289,6 +306,37 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 		case <-ticker.C:
 		}
 	}
+}
+
+// memberReadyResult is the start result of a member whose port accepts
+// connections (and whose relay listens): its banner's protocol, and a device
+// mismatch when the banner lists another count than the spec selects. A
+// member that printed no complete banner is not checked.
+func memberReadyResult(specID string, proc *runningProc, spec Spec, deadline time.Time) cmdStartResult {
+	res := cmdStartResult{specID: specID, proc: proc, ok: true}
+	banner, found := awaitMemberBanner(proc, deadline)
+	if !found {
+		return res
+	}
+	res.rpcProtocol = banner.Protocol
+	if want := expectedMemberDevices(spec); len(banner.Devices) != want {
+		res.deviceMismatch = fmt.Sprintf("runtime: the rpc-server listed %d device(s) (%s) but the spec selects %d",
+			len(banner.Devices), strings.Join(banner.Devices, ", "), want)
+	}
+	return res
+}
+
+// memberTimeoutResult is the start result of a member still not ready at its
+// deadline: a timeout, or a start failure naming the relay when the child was
+// up but its relay did not listen (relayErr).
+func memberTimeoutResult(specID string, proc *runningProc, spec Spec, relayErr error) cmdStartResult {
+	res := cmdStartResult{specID: specID, proc: proc, err: ErrStartTimeout}
+	if relayErr != nil {
+		res.err = ErrStartFailed
+		res.relayDown = fmt.Sprintf("runtime: the rpc-server is up but its relay is not listening on %s: %v",
+			net.JoinHostPort(spec.RPC.BindIP, strconv.Itoa(spec.RPC.Port)), relayErr)
+	}
+	return res
 }
 
 // memberCacheOrphanAge is how long a cache directory that belongs to no member
@@ -433,15 +481,7 @@ func newMemberCacheSweeper() *memberCacheSweeper {
 // recorded in its name, lies more than memberCacheSweepEvery back. Anything
 // else -- a file, a directory without the marker -- is left alone.
 func (sw *memberCacheSweeper) sweep(root string, keep map[string]bool, now time.Time) {
-	// A head that is no longer listed ends its streak: should it come back
-	// still failing, that is worth a Warn again.
-	sw.mu.Lock()
-	for head := range sw.touchFailed {
-		if !keep[head] {
-			delete(sw.touchFailed, head)
-		}
-	}
-	sw.mu.Unlock()
+	sw.forgetUnlisted(keep)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -459,13 +499,7 @@ func (sw *memberCacheSweeper) sweep(root string, keep map[string]bool, now time.
 			sw.touch(name, dir, now)
 			continue
 		}
-		if at, ok := tombstonePurgedAt(name); ok {
-			if now.Sub(at) < memberCacheSweepEvery {
-				continue
-			}
-		} else if _, err := os.Stat(filepath.Join(dir, memberCacheMarker)); err != nil {
-			continue
-		} else if newest, err := newestModTime(dir); err != nil || now.Sub(newest) < memberCacheOrphanAge {
+		if !sweepable(name, dir, now) {
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {
@@ -474,6 +508,33 @@ func (sw *memberCacheSweeper) sweep(root string, keep map[string]bool, now time.
 		}
 		slog.Info("runtime: removed an unused rpc cache", "path", dir)
 	}
+}
+
+// forgetUnlisted ends the failure streak of every head that is no longer
+// listed: should it come back still failing, that is worth a Warn again.
+func (sw *memberCacheSweeper) forgetUnlisted(keep map[string]bool) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	for head := range sw.touchFailed {
+		if !keep[head] {
+			delete(sw.touchFailed, head)
+		}
+	}
+}
+
+// sweepable reports whether the unlisted directory dir, named name, is the
+// sweep's to remove now: a purge tombstone whose purge lies more than
+// memberCacheSweepEvery back, or a marked member cache whose newest
+// modification lies more than memberCacheOrphanAge back.
+func sweepable(name, dir string, now time.Time) bool {
+	if at, ok := tombstonePurgedAt(name); ok {
+		return now.Sub(at) >= memberCacheSweepEvery
+	}
+	if _, err := os.Stat(filepath.Join(dir, memberCacheMarker)); err != nil {
+		return false
+	}
+	newest, err := newestModTime(dir)
+	return err == nil && now.Sub(newest) >= memberCacheOrphanAge
 }
 
 // touch marks the cache dir of head and sets its marker's times to now. A
