@@ -474,8 +474,8 @@ Three serial scenarios, both servers `lan` servers bound to loopback:
   released and idles out on its 60 s timeout.
 - **(c) member process killed**: the gateway's watchdog stops the head without
   any request and records `runtime.cluster_member_lost`; a request during the
-  cooldown is answered 503 `runtime.cluster_start_failed` without the head
-  starting; once the cooldown ended a request forms the cluster again with a
+  cooldown is answered 503 `runtime.cluster_start_failed`, its message naming
+  `runtime.cluster_member_lost at member 0`, without the head starting; once the cooldown ended a request forms the cluster again with a
   new member process.
 
 A run takes about three minutes, most of it the two waits on timers (the

@@ -94,6 +94,40 @@ func TestClusterGateVerdicts(t *testing.T) {
 		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterStartFailed {
 			t.Fatalf("verdict = %+v, want excluded with %s", v, codeClusterStartFailed)
 		}
+		// The verdict names the recorded failure: its cause and the member.
+		if v.Cause != "runtime.admission_blocked" || v.Position == nil || *v.Position != 0 || v.AtHead {
+			t.Fatalf("verdict = %+v, want the cause runtime.admission_blocked at member 0", v)
+		}
+	})
+	t.Run("cooling down after a lost member", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		f.activeMembers()
+		f.ackAll()
+		f.holdOnHeadEnsure(0)
+		if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		f.o.memberLost(orchHead, 0, evidenceExited, false)
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), orchHeadServer, "map_head")
+		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterStartFailed || v.Cause != codeClusterMemberLost ||
+			v.Position == nil || *v.Position != 0 {
+			t.Fatalf("verdict = %+v, want excluded with %s, cause %s at member 0", v, codeClusterStartFailed, codeClusterMemberLost)
+		}
+		f.o.wait()
+	})
+	t.Run("blocked by a terminal cause", func(t *testing.T) {
+		f := newOrchFixture(t, 1, "relay", "lan")
+		f.activeMembers()
+		f.ackAll()
+		f.agent.memberErr[orchMemberSpec(0)] = orchRefusal(http.StatusConflict, codeClusterVersionMismatch)
+		if err := f.o.Ensure(context.Background(), orchHead); err == nil {
+			t.Fatal("Ensure succeeded, want the member's refusal")
+		}
+		v := newTestClusterGate(f, nil).ClusterGateState(context.Background(), orchHeadServer, "map_head")
+		if v.State != routing.ClusterGateExcluded || v.Code != codeClusterUnavailable || v.Cause != codeClusterVersionMismatch ||
+			v.Position == nil || *v.Position != 0 {
+			t.Fatalf("verdict = %+v, want excluded with %s, cause %s at member 0", v, codeClusterUnavailable, codeClusterVersionMismatch)
+		}
 	})
 	t.Run("withheld", func(t *testing.T) {
 		f := newOrchFixture(t, 1, "relay", "lan")
@@ -437,8 +471,58 @@ func TestCompletionAnswersTheClusterCode(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable || body.Error.Code != codeClusterStartFailed {
 		t.Fatalf("answer = %d %s, want 503 %s", rec.Code, rec.Body.String(), codeClusterStartFailed)
 	}
+	// The message names the recorded failure: its cause and the member.
+	if !strings.Contains(body.Error.Message, "runtime.admission_blocked") || !strings.Contains(body.Error.Message, "member 0") {
+		t.Fatalf("message = %q, want the cause runtime.admission_blocked at member 0", body.Error.Message)
+	}
 	if prov.callCount() != 0 {
 		t.Fatalf("provider calls = %d, want none", prov.callCount())
+	}
+}
+
+// A request for a cluster head that cools down after the watchdog stopped it
+// for a lost member is refused with the stable code, and its message says the
+// cluster lost the member rather than that a start failed.
+func TestCompletionNamesTheLostMember(t *testing.T) {
+	prov := &clusterNotReadyProvider{}
+	srv, f := clusterHeadServer(t, prov)
+	f.o.memberLost(orchHead, 0, evidenceExited, false)
+	f.o.wait()
+
+	rec := postChat(srv, `{"model":"`+orchHeadModel+`","messages":[{"role":"user","content":"hi"}]}`)
+	var body apierror.Body
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", rec.Body.String(), err)
+	}
+	if rec.Code != http.StatusServiceUnavailable || body.Error.Code != codeClusterStartFailed {
+		t.Fatalf("answer = %d %s, want 503 %s", rec.Code, rec.Body.String(), codeClusterStartFailed)
+	}
+	msg := body.Error.Message
+	if !strings.Contains(msg, "lost a member") || strings.Contains(msg, "failed to start") ||
+		!strings.Contains(msg, codeClusterMemberLost) || !strings.Contains(msg, "member 0") {
+		t.Fatalf("message = %q, want the lost member 0 named with %s", msg, codeClusterMemberLost)
+	}
+	if prov.callCount() != 0 {
+		t.Fatalf("provider calls = %d, want none", prov.callCount())
+	}
+}
+
+// The message of a cluster refusal names where the recorded failure happened:
+// the member's position, or the head.
+func TestClusterUnavailableMessageNamesWhere(t *testing.T) {
+	pos := 2
+	for _, tc := range []struct {
+		err  routing.ClusterUnavailableError
+		want string
+	}{
+		{routing.ClusterUnavailableError{Code: codeClusterStartFailed, Cause: codeRuntimeStartTimeout, Position: &pos}, "(cause: runtime.start_timeout at member 2)"},
+		{routing.ClusterUnavailableError{Code: codeClusterStartFailed, Cause: codeRuntimeStartFailed, AtHead: true}, "(cause: runtime.start_failed at the head)"},
+		{routing.ClusterUnavailableError{Code: codeClusterStartFailed, Cause: codeClusterMemberUnreachable}, "(cause: runtime.cluster_member_unreachable)"},
+		{routing.ClusterUnavailableError{Code: codeClusterStartFailed}, "retry shortly"},
+	} {
+		if got := clusterUnavailableMessage(&tc.err); !strings.HasSuffix(got, tc.want) {
+			t.Fatalf("message of %+v = %q, want it to end with %q", tc.err, got, tc.want)
+		}
 	}
 }
 

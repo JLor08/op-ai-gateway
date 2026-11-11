@@ -55,12 +55,18 @@ const (
 // head's spec id, the park bound (ClusterGateParkable: the head's startup
 // timeout plus its slowest member's) and the code a request fails with when
 // the head is all that is left (ClusterGateExcluded, and a parkable head a
-// request cannot wait for).
+// request cannot wait for). A head excluded for a failure the cluster
+// recorded -- cooling down after it, or blocked by a terminal cause --
+// carries that failure too: Cause, its code, and where it happened, the
+// member at Position or the head (AtHead); both unset when neither did.
 type ClusterGateVerdict struct {
 	State     ClusterGateState
 	Head      string
 	ParkBound time.Duration
 	Code      string
+	Cause     string
+	Position  *int
+	AtHead    bool
 }
 
 // ClusterGate answers the gate state of mapping mappingID on server serverID.
@@ -78,14 +84,19 @@ func (r *Resolver) SetClusterGate(g ClusterGate) { r.clusterGate = g }
 
 // ClusterUnavailableError is the request's answer when the only candidates
 // left were cluster heads that cannot serve: Code is the cluster's stable code
-// (runtime.cluster_start_failed while it cools down after a failed start,
-// runtime.cluster_unavailable otherwise), Head the head's spec id. The gateway
-// answers a request whose head's cluster failed to form on the dispatch path
-// with it too, Cause then naming what failed (the start's cause code).
+// (runtime.cluster_start_failed while it cools down after a failed start or a
+// lost member, runtime.cluster_unavailable otherwise), Head the head's spec
+// id. Cause is the code of the failure the cluster recorded, when one excludes
+// the head, and Position (the member) or AtHead says where it happened. The
+// gateway answers a request whose head's cluster failed to form on the
+// dispatch path with it too, Cause then naming what failed (the start's cause
+// code).
 type ClusterUnavailableError struct {
-	Code  string
-	Cause string
-	Head  string
+	Code     string
+	Cause    string
+	Head     string
+	Position *int
+	AtHead   bool
 }
 
 func (e *ClusterUnavailableError) Error() string { return e.Code }
@@ -138,7 +149,7 @@ func (s *clusterSplit) gate(v ClusterGateVerdict, c MappingCandidate, req cluste
 		return false
 	case ClusterGateExcluded:
 		if s.excluded == nil {
-			s.excluded = &ClusterUnavailableError{Code: v.Code, Head: v.Head}
+			s.excluded = &ClusterUnavailableError{Code: v.Code, Head: v.Head, Cause: v.Cause, Position: v.Position, AtHead: v.AtHead}
 		}
 		return false
 	default:

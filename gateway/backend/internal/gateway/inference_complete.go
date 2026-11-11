@@ -17,6 +17,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1200,19 +1201,31 @@ func clusterUnavailable(err error) (*routing.ClusterUnavailableError, bool) {
 	return ce, ok
 }
 
-// clusterUnavailableMessage words a routing.ClusterUnavailableError.
+// clusterUnavailableMessage words a routing.ClusterUnavailableError: what
+// the cluster's code means, and the recorded failure's cause with where it
+// happened (the member's position, or the head), when the error names one.
+// The code stays the stable one; a lost member only changes the wording.
 func clusterUnavailableMessage(ce *routing.ClusterUnavailableError) string {
 	msg := "the model's llama.cpp RPC cluster cannot be started right now"
-	switch ce.Code {
-	case codeClusterStartFailed:
+	switch {
+	case ce.Code == codeClusterStartFailed && ce.Cause == codeClusterMemberLost:
+		msg = "the model's llama.cpp RPC cluster lost a member and was stopped; it is cooling down, retry shortly"
+	case ce.Code == codeClusterStartFailed:
 		msg = "the model's llama.cpp RPC cluster failed to start and is cooling down; retry shortly"
-	case codeClusterMemberUnused:
+	case ce.Code == codeClusterMemberUnused:
 		msg = "the model's llama.cpp RPC cluster started, but a member never joined it; retry shortly"
 	}
-	if ce.Cause != "" && ce.Cause != ce.Code {
-		msg += " (cause: " + ce.Cause + ")"
+	if ce.Cause == "" || ce.Cause == ce.Code {
+		return msg
 	}
-	return msg
+	where := ""
+	switch {
+	case ce.Position != nil:
+		where = " at member " + strconv.Itoa(*ce.Position)
+	case ce.AtHead:
+		where = " at the head"
+	}
+	return msg + " (cause: " + ce.Cause + where + ")"
 }
 
 // clusterRefusalMessages words the agent's refusals of a cluster head that a

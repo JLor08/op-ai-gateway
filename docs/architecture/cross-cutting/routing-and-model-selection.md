@@ -2129,7 +2129,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 | `ErrVoiceUnavailable` | **503** (`routing.voice_unavailable`) | a speech request's `voice` is one that at least one candidate is **known** (from its cached voice list) to lack while an eligible candidate (one that lists it, or of unknown/uncached status) remained, so the voice narrowed the pool to the eligible ones and none of those is usable; answered **instead of** `ErrNoHealthyHost` and only then (§2.5). A voice no candidate is known to lack, or one **every** candidate is known-absent for (fail open), never produces it |
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes`, and for transcription no `transcription: yes` (a model the listing does not name reads as unknown) |
 | `ErrNoRealtimeCandidate` | **409** (`voice_chat.no_realtime_model`) | a request held to real time — a voice chat's ASR or TTS leg — had candidates and every one was measured below the real-time threshold (§10.8); not `ErrNoHealthyHost`, since a retry does not make the model faster |
-| `ClusterUnavailableError` | **503** (`runtime.cluster_start_failed` / `runtime.cluster_unavailable`) | the only candidates left were llama.cpp RPC cluster heads the cluster gate excludes (§11): `runtime.cluster_start_failed` while the head cools down after a failed start, `runtime.cluster_unavailable` otherwise; answered **instead of** `ErrNoHealthyHost` |
+| `ClusterUnavailableError` | **503** (`runtime.cluster_start_failed` / `runtime.cluster_unavailable`) | the only candidates left were llama.cpp RPC cluster heads the cluster gate excludes (§11): `runtime.cluster_start_failed` while the head cools down after a failed start or a lost member, `runtime.cluster_unavailable` otherwise; answered **instead of** `ErrNoHealthyHost`. `Cause`, `Position` and `AtHead` carry the failure the cluster recorded when that is why the head is excluded, and the message names it |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
 | `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server with no *usable* live offering of the model: either no live mapping for it at all, **or** one whose mapping does not carry a `yes` verdict for a capability the endpoint requires (§2.3 site 2). The two share this sentinel deliberately — an override names one server, so there is no second candidate the distinction could steer to |
@@ -2553,10 +2553,14 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   park (`NoPark`, `CheckOnly`), or a resolver without a queue, is served by a parkable head only
   when no running candidate is left; the voice-chat gate then starts the cluster itself through
   the orchestration.
-- **Excluded** (cooling down after a failed start, withheld by the runtime documents, blocked by
-  a terminal cause, a member server not selectable or held by a benchmark): dropped. When nothing
-  else serves the model the request fails with the cluster's code (§8), never
-  `routing.no_healthy_host`. In a model group such a member is unavailable and the walk goes on.
+- **Excluded** (cooling down after a failed start or after the watchdog stopped it for a lost
+  member, withheld by the runtime documents, blocked by a terminal cause, a member server not
+  selectable or held by a benchmark): dropped. When nothing else serves the model the request
+  fails with the cluster's code (§8), never `routing.no_healthy_host`. The code stays the stable
+  one (`runtime.cluster_start_failed` during a cooldown, `runtime.cluster_unavailable`
+  otherwise); a head excluded for a failure the cluster recorded — the cooldown, a terminal
+  block — carries that failure in its verdict, and the message names its cause and where it
+  happened (`(cause: runtime.cluster_member_lost at member 0)`, `… at the head`). In a model group such a member is unavailable and the walk goes on.
 
 Only an agent known to declare `rpc_cluster` is asked about at all (no other agent runs a head),
 so a mapping on any other agent costs the gate no spec read; an agent whose features are not

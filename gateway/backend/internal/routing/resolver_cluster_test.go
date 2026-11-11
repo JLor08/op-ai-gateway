@@ -167,6 +167,23 @@ func TestResolveCoolingDownFailsWithClusterCode(t *testing.T) {
 			}
 		})
 	}
+	t.Run("the recorded failure travels with the code", func(t *testing.T) {
+		now := instanceCapacityNow
+		pos := 1
+		gate := &fakeClusterGate{verdicts: map[string]ClusterGateVerdict{clusterTestMapping: {
+			State: ClusterGateExcluded, Head: clusterTestHead, Code: "runtime.cluster_start_failed",
+			Cause: "runtime.cluster_member_lost", Position: &pos,
+		}}}
+		r, _ := clusterResolver(clusterHeadStore(t, now, 0, 600000), now, gate)
+		r.SetAdmissionController(timeoutAdmission())
+
+		_, err := r.Resolve(context.Background(), auth.Token{}, chatRequest(clusterTestModel))
+		var ce *ClusterUnavailableError
+		if !errors.As(err, &ce) || ce.Code != "runtime.cluster_start_failed" || ce.Cause != "runtime.cluster_member_lost" ||
+			ce.Position == nil || *ce.Position != 1 || ce.AtHead {
+			t.Fatalf("Resolve err = %+v, want the stable code with the cause runtime.cluster_member_lost at member 1", ce)
+		}
+	})
 	t.Run("beside another candidate", func(t *testing.T) {
 		now := instanceCapacityNow
 		store := clusterHeadStore(t, now, 0, 600000)

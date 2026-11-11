@@ -671,12 +671,16 @@ test.describe("(c) member process killed", () => {
 
   // While the head cools down the routing gate excludes it, so the request
   // never reaches the head's agent, and nothing starts the head for it: the
-  // gateway answers at once, 503, with the cluster's code.
+  // gateway answers at once, 503, with the cluster's stable code, and the
+  // message names the failure the cluster recorded and where.
   test("a request during the cooldown is refused with the cluster's code, and the head stays down", async () => {
     const { headSpecId } = mappings.get(DIRECT.label)!;
     const c = await complete(DIRECT.gatewayModel);
     expect(c.status, c.text).toBe(503);
     expect(c.code, c.text).toBe("runtime.cluster_start_failed");
+    const message = (JSON.parse(c.text) as { error: { message: string } }).error.message;
+    expect(message).toContain("lost a member");
+    expect(message).toContain("(cause: runtime.cluster_member_lost at member 0)");
     expect(await headState(headSpecId)).not.toMatch(/^(running|starting|draining)$/);
   });
 

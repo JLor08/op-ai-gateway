@@ -140,12 +140,16 @@ type clusterRoutingGate struct {
 //   - formed: the cluster serves;
 //   - cold or forming: parkable, with the head's startup timeout plus its
 //     slowest member's as the bound;
-//   - cooling down after a failed start: excluded with
+//   - cooling down after a failed start or a lost member: excluded with
 //     runtime.cluster_start_failed;
 //   - withheld by the runtime documents, blocked by a cause only a
 //     configuration change fixes, a member server not selectable or held by a
 //     benchmark, or no orchestration at all: excluded with
 //     runtime.cluster_unavailable.
+//
+// A head excluded for a failure the orchestration recorded (the cooldown, the
+// terminal block) carries that failure's cause and where it happened, so the
+// refused request names it.
 func (g *clusterRoutingGate) ClusterGateState(ctx context.Context, serverID, mappingID string) routing.ClusterGateVerdict {
 	head, ok := g.heads.clusterHead(ctx, serverID, mappingID)
 	if !ok {
@@ -165,13 +169,17 @@ func (g *clusterRoutingGate) ClusterGateState(ctx context.Context, serverID, map
 			return v
 		}
 	}
-	switch o.State(head) {
+	state, failure := o.gateState(head)
+	switch state {
 	case clusterFormed:
 		v.State, v.Code = routing.ClusterGateFormed, ""
 	case clusterCold, clusterForming:
 		v.State, v.ParkBound = routing.ClusterGateParkable, view.bound
 	case clusterCoolingDown:
 		v.Code = codeClusterStartFailed
+	}
+	if failure != nil {
+		v.Cause, v.Position, v.AtHead = failure.Cause, failure.position(), failure.Head
 	}
 	return v
 }
@@ -233,7 +241,7 @@ func (s *Server) readyClusterHead(ctx context.Context, target routing.Target, er
 		slog.Info("inference: the cluster head was not ready and its cluster did not form; answering the cluster's failure", "head_spec_id", spec.ID, "err", eerr)
 		var ce *clusterError
 		if errors.As(eerr, &ce) {
-			return false, &routing.ClusterUnavailableError{Code: ce.Code, Cause: ce.Cause, Head: spec.ID}
+			return false, &routing.ClusterUnavailableError{Code: ce.Code, Cause: ce.Cause, Head: spec.ID, Position: ce.position(), AtHead: ce.Head}
 		}
 		return false, err
 	}

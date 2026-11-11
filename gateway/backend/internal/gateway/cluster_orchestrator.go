@@ -176,6 +176,15 @@ type clusterError struct {
 	Message  string
 }
 
+// position is the failing member's position, nil when no member failed.
+func (e *clusterError) position() *int {
+	if e.Position < 0 {
+		return nil
+	}
+	p := e.Position
+	return &p
+}
+
 func (e *clusterError) Error() string {
 	where := "cluster"
 	switch {
@@ -405,6 +414,27 @@ func (o *clusterOrchestrator) State(head string) clusterGateState {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.stateLocked(o.heads[head])
+}
+
+// gateState is head's gate state with the failure the orchestration recorded
+// for it when that failure is why the head is excluded: while it cools down,
+// or while a terminal cause blocks it. failure is nil otherwise.
+func (o *clusterOrchestrator) gateState(head string) (state clusterGateState, failure *clusterError) {
+	if o == nil {
+		return clusterCold, nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	st := o.heads[head]
+	state = o.stateLocked(st)
+	if st == nil || st.failErr == nil {
+		return state, nil
+	}
+	if state == clusterCoolingDown || (state == clusterInvalid && st.terminal && st.withheld == "") {
+		f := *st.failErr
+		return state, &f
+	}
+	return state, nil
 }
 
 func (o *clusterOrchestrator) stateLocked(st *clusterHeadState) clusterGateState {
