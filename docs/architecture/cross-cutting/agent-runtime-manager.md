@@ -1508,11 +1508,15 @@ owns the bind and device flags:
   when a document moves a listed member to another head (the old head's
   directory goes, unless another member still serves that head); on an
   operator's `POST /rpc/purge-cache/{specID}`; and by a **sweep** of
-  `<config_files_dir>/rpc/*` that removes every directory no member of the
-  current document serves and nothing has modified (the directory or anything
-  in it) for 7 days, which also covers caches orphaned while the agent was down.
-  The sweep runs off the owner goroutine on the first document and then at most
-  once an hour; a purge tombstone (`.purge-<head>-<time>`) left behind by a
+  `<config_files_dir>/rpc/*` that removes every member cache directory (one
+  carrying the agent's `.op-rpc-member-cache` marker, so nothing else in that
+  directory, such as a file-mode spec `rpc`'s config files, is ever removed)
+  that no member of the current document serves and that nothing has modified
+  for 7 days. This also covers caches orphaned while the agent was down. Each
+  sweep touches the caches of the heads listed members serve, so the 7 days
+  count from the last time a member served the head. The sweep runs off the
+  owner goroutine on the first document and then at most once an hour, on
+  document applies and on the owner's housekeeping beat; a purge tombstone (`.purge-<head>-<time>`) left behind by a
   failed removal goes once its purge is an hour old. A member that merely
   leaves the document keeps its cache: members are withheld for reasons that
   pass (a gateway restart that has not heard from every cluster host yet, a
