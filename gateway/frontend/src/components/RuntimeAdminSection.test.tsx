@@ -11901,7 +11901,7 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
         await act(async () => {
           await vi.advanceTimersByTimeAsync(CLUSTER_START_REFRESH_MS);
         });
-        expect(fakeApi.runtimeSpec.mock.calls.length).toBe(reads + 1);
+        expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(reads + 1);
 
         storedSpecs.map_1 = clusterHead({
           cluster_status: { state: 'forming', phase: 'members_starting', members: [] },
