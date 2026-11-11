@@ -142,35 +142,9 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 			return "", false, err
 		}
 	}
-	binary := strings.TrimSpace(req.Binary)
-	if !runtimeSpecBinaryIsAbsolute(binary) {
-		return "", false, ErrRuntimeSpecBinaryRequired
-	}
-	if req.RAMEstimateMB < 0 {
-		return "", false, ErrRuntimeSpecTuningInvalid
-	}
-	if err := validateRuntimeSpecGPUs(req.GPUs); err != nil {
+	binary, backend, err := validateRPCMemberRequest(req)
+	if err != nil {
 		return "", false, err
-	}
-	for k := range req.Env {
-		if !runtimeSpecEnvKeyPattern.MatchString(k) {
-			return "", false, ErrRuntimeSpecEnvInvalid
-		}
-		// Members always select devices with -d, so a visibility variable
-		// would filter a second time and hide the cards from the member.
-		if slices.Contains(runtimeSpecVisibleDevicesVars, strings.ToUpper(strings.TrimSpace(k))) {
-			return "", false, ErrRuntimeSpecVisibleDevicesConflict
-		}
-	}
-	if err := validateRPCMemberArgs(req.Args); err != nil {
-		return "", false, err
-	}
-	backend := strings.TrimSpace(req.DeviceBackend)
-	if backend == "" {
-		backend = "auto"
-	}
-	if !slices.Contains(rpcMemberDeviceBackends, backend) {
-		return "", false, ErrRPCMemberDeviceBackendInvalid
 	}
 	groups, err := s.rpcMemberHeadGroups(ctx, server.ID, req.AllowedHeadGroups, prior)
 	if err != nil {
@@ -180,26 +154,12 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 		return "", false, err
 	}
 	enabled := req.Enabled == nil || *req.Enabled
-	if specID != "" && prior.Enabled && !enabled {
-		if err := s.rpcMemberInUseError(ctx, p, specID); err != nil {
-			return "", false, err
-		}
+	if err := s.checkRPCMemberDisable(ctx, p, prior, enabled); err != nil {
+		return "", false, err
 	}
-	args := req.Args
-	if args == nil {
-		args = []string{}
-	}
-	env := req.Env
-	if env == nil {
-		env = map[string]string{}
-	}
-	argsJSON, err := json.Marshal(args)
+	argsJSON, envJSON, err := encodeRPCMemberLaunch(req)
 	if err != nil {
-		return "", false, ErrRuntimeSpecArgsInvalid
-	}
-	envJSON, err := json.Marshal(env)
-	if err != nil {
-		return "", false, ErrRuntimeSpecEnvInvalid
+		return "", false, err
 	}
 	now := s.clock().UTC()
 	row := routing.RPCMemberSpec{
@@ -207,8 +167,8 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 		ServerID:          server.ID,
 		Enabled:           enabled,
 		Binary:            binary,
-		Args:              string(argsJSON),
-		Env:               string(envJSON),
+		Args:              argsJSON,
+		Env:               envJSON,
 		CacheEnabled:      req.CacheEnabled,
 		DeviceBackend:     backend,
 		RAMEstimateMB:     req.RAMEstimateMB,
@@ -232,6 +192,75 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 	// GPU, so it follows the spec's GPU rows.
 	_, err = s.resyncManualMemberGPUs(ctx, row.ID, gpuRows)
 	return row.ID, true, err
+}
+
+// checkRPCMemberDisable refuses disabling a stored spec (prior, empty for a
+// new one) that a cluster head still uses.
+func (s *Service) checkRPCMemberDisable(ctx context.Context, p auth.Token, prior routing.RPCMemberSpec, enabled bool) error {
+	if prior.ID == "" || !prior.Enabled || enabled {
+		return nil
+	}
+	return s.rpcMemberInUseError(ctx, p, prior.ID)
+}
+
+// validateRPCMemberRequest runs the request-only checks of a member spec
+// write, in order: an absolute binary, a non-negative RAM estimate, the GPU
+// rows, the env keys (no visibility variable: members select devices with
+// -d, so one would filter a second time and hide the cards from the member),
+// the args and the device backend. It returns the trimmed binary and the
+// device backend, "auto" when empty.
+func validateRPCMemberRequest(req PutRPCMemberSpecRequest) (binary, backend string, err error) {
+	binary = strings.TrimSpace(req.Binary)
+	if !runtimeSpecBinaryIsAbsolute(binary) {
+		return "", "", ErrRuntimeSpecBinaryRequired
+	}
+	if req.RAMEstimateMB < 0 {
+		return "", "", ErrRuntimeSpecTuningInvalid
+	}
+	if err := validateRuntimeSpecGPUs(req.GPUs); err != nil {
+		return "", "", err
+	}
+	for k := range req.Env {
+		if !runtimeSpecEnvKeyPattern.MatchString(k) {
+			return "", "", ErrRuntimeSpecEnvInvalid
+		}
+		if slices.Contains(runtimeSpecVisibleDevicesVars, strings.ToUpper(strings.TrimSpace(k))) {
+			return "", "", ErrRuntimeSpecVisibleDevicesConflict
+		}
+	}
+	if err := validateRPCMemberArgs(req.Args); err != nil {
+		return "", "", err
+	}
+	backend = strings.TrimSpace(req.DeviceBackend)
+	if backend == "" {
+		backend = "auto"
+	}
+	if !slices.Contains(rpcMemberDeviceBackends, backend) {
+		return "", "", ErrRPCMemberDeviceBackendInvalid
+	}
+	return binary, backend, nil
+}
+
+// encodeRPCMemberLaunch encodes a member spec's args and env as stored, an
+// absent one as empty.
+func encodeRPCMemberLaunch(req PutRPCMemberSpecRequest) (args, env string, err error) {
+	a := req.Args
+	if a == nil {
+		a = []string{}
+	}
+	e := req.Env
+	if e == nil {
+		e = map[string]string{}
+	}
+	argsJSON, err := json.Marshal(a)
+	if err != nil {
+		return "", "", ErrRuntimeSpecArgsInvalid
+	}
+	envJSON, err := json.Marshal(e)
+	if err != nil {
+		return "", "", ErrRuntimeSpecEnvInvalid
+	}
+	return string(argsJSON), string(envJSON), nil
 }
 
 // DeleteRPCMemberSpec removes a manual member spec. A spec a head still
@@ -324,13 +353,7 @@ func (s *Service) rpcMemberHeadGroups(ctx context.Context, serverID string, requ
 // determined (no hardware report, an unreadable one, or an index the report
 // does not list) keeps the estimate optional.
 func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID string, gpus []RuntimeSpecGPUDTO) error {
-	missing := false
-	for _, g := range gpus {
-		if g.VRAMEstimateMB == 0 {
-			missing = true
-		}
-	}
-	if !missing {
+	if !slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool { return g.VRAMEstimateMB == 0 }) {
 		return nil
 	}
 	hw, ok, err := s.routes.ServerHardwareByServer(ctx, serverID)
@@ -350,15 +373,14 @@ func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID st
 	if err := json.Unmarshal([]byte(hw.ReportJSON), &report); err != nil {
 		return nil
 	}
-	for _, g := range gpus {
-		if g.VRAMEstimateMB != 0 {
-			continue
+	nonNVIDIA := map[int]bool{}
+	for _, rg := range report.GPUs {
+		if !gpuLooksNVIDIA(rg.Name, rg.PCIBusID) {
+			nonNVIDIA[rg.Index] = true
 		}
-		for _, rg := range report.GPUs {
-			if rg.Index == g.Index && !gpuLooksNVIDIA(rg.Name, rg.PCIBusID) {
-				return ErrRPCMemberVRAMEstimateRequired
-			}
-		}
+	}
+	if slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool { return g.VRAMEstimateMB == 0 && nonNVIDIA[g.Index] }) {
+		return ErrRPCMemberVRAMEstimateRequired
 	}
 	return nil
 }
