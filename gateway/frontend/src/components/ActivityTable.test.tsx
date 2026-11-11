@@ -429,7 +429,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         (c) => c.defaultVisible || c.id === 'energy_wh',
       );
 
-      it('lists every host in a keyboard-reachable tooltip, hidden members by number', async () => {
+      it('lists every host with its cost in a keyboard-reachable tooltip, hidden members by number', async () => {
         renderTable({
           columns: energyColumns,
           costUnit: 'eur_cent',
@@ -445,7 +445,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
                   energy_source: 'measured',
                   cost: 0.0008,
                 },
-                { role: 'member', member: 1, energy_wh: 2.4, energy_source: 'estimated' },
+                {
+                  role: 'member',
+                  member: 1,
+                  energy_wh: 2.4,
+                  energy_source: 'estimated',
+                  cost: 0.0005,
+                },
                 {
                   role: 'member',
                   member: 2,
@@ -461,6 +467,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         const total = screen.getByTestId('energy-parts-req_1');
         expect(total).toHaveTextContent('7.913');
         expect(total.getAttribute('tabindex')).toBe('0');
+        expect(total).toHaveAttribute('role', 'button');
+        expect(total).toHaveAccessibleName(t.activityEnergyPartsLabel('7.913'));
         fireEvent.keyDown(document.body, { key: 'Tab' });
         act(() => total.focus());
         const tip = await screen.findByRole('tooltip');
@@ -468,10 +476,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(tip).toHaveTextContent('GPU 1: 3.100 Wh');
         expect(tip).toHaveTextContent('0.0800 ct');
         expect(tip).toHaveTextContent(`${t.activityEnergyPartMember(1)}: 2.400 Wh`);
-        expect(tip).not.toHaveTextContent(`${t.activityEnergyPartMember(1)}: 2.400 Wh ·`);
+        expect(tip).toHaveTextContent(`${t.activityEnergyPartMember(1)}: 2.400 Wh · 0.0500 ct`);
         expect(tip).toHaveTextContent('Box B: 2.413 Wh');
         expect(tip).toHaveTextContent('0.0300 ct');
-        expect(within(tip).getByText('estimated')).toBeInTheDocument();
+        // The source is the energy-source column's chip, with the same help.
+        const chip = within(tip).getByText('estimated');
+        fireEvent.mouseOver(chip);
+        expect(await screen.findByText(t.energySourceHelpEstimated)).toBeInTheDocument();
         expect(total).toHaveAccessibleDescription(expect.stringContaining('Box B'));
       });
 
