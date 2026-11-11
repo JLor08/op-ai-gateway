@@ -69,7 +69,10 @@ See [ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode
 and [Agent-Managed Model Runtime §3.7](../cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster).
 A head is an `agent_runtime_specs` row with `cluster_enabled`; the spec row also
 carries `member_mode` (`automatic` default, `manual`), `cluster_network` and
-`rpc_transport` (`''` = not chosen: the defaults apply), `lan_exposure_ack` and,
+`rpc_transport` (`''` = not chosen: a save that runs the full cluster checks
+resolves it to the default of that moment and stores the result, so a stored
+`''` is only met on a row no such save wrote, and is then read as the default),
+`lan_exposure_ack` and,
 on every spec, `device_backend` (`auto` default). `ai_servers` gains
 `netbird_ip` (the mesh IPv4 the peer sync records), `lan_address` (an IPv4
 literal or `''`), `lan_bind_only`, `rpc_member_enabled` and

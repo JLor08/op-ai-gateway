@@ -1391,8 +1391,12 @@ and in automatic mode the ordered `gpus` (`[]` = a CPU member) with their
 `ram_estimate_mb`. An entry without `server_id` keeps the stored member at its
 position (the read view hides members on servers the caller may not manage).
 `device_backend` (`auto`, `cuda`, `rocm`, `vulkan`, `metal`, `sycl`) is a field of
-every spec. The PUT is a **full document**: omitting `cluster_enabled` turns the
-cluster off and clears the membership, like any omitted field.
+every spec. An empty `cluster_network` or `rpc_transport` means "the default":
+a save that runs the full cluster checks (row 4 below) resolves it to the
+default of that moment and **stores the resolved value**, which the GET then
+returns, so a later NetBird change never flips the network or transport of a
+saved cluster. The PUT is a **full document**: omitting `cluster_enabled` turns
+the cluster off and clears the membership, like any omitted field.
 
 The GET adds the read-only view: each member's `server_name`, measured values,
 `measured_at`, `stale`, `port` and `visible` (false: only `position` is shown),
@@ -1421,7 +1425,7 @@ which is part of the API (`validateClusterHead`, `internal/portal/service_cluste
 | 1 | Cluster off: no `${RPC_SERVERS}` / `${RPC_DEVICES}` anywhere; rights on every former member server | `400 runtime_spec.cluster_rpc_placeholder_without_cluster`; `404 server.not_found` |
 | 2 | The head's document: effective type `llama_cpp`; no `=` form of `--rpc`, `--device`/`-dev`, `--tensor-split`/`-ts`, `--mmproj-device`/`-mmdev` (llama-server refuses it); `${RPC_SERVERS}` as the value of `--rpc` or `LLAMA_ARG_RPC`; exactly once through one of the two; a device list that names `${DEVICES}` or `${RPC_DEVICES}`; a device list parsed after the RPC servers (argv `--device` after `--rpc`, or RPC through env); at least one member; not replicable; an explicit `startup_timeout_seconds` | `400 runtime_spec.cluster_type_invalid`, `.cluster_flag_equals_form`, `.cluster_rpc_placeholder_missing`, `.cluster_rpc_twice`, `.cluster_device_list_missing_rpc`, `.cluster_device_order`, `.cluster_members_required`, `.cluster_head_replicable`, `.cluster_startup_timeout_required` |
 | 3 | The member list: one entry per server, none on the head's server | `400 runtime_spec.cluster_member_server_twice`, `.cluster_member_on_head_server` |
-| 4 | Rights on every member server, former ones included; in manual mode the named spec exists on that server; every member's consent (system scope included). Skipped with 5–8 when the membership, member mode, network, transport and head binary are all as stored | `404 server.not_found` (rights and consent alike, so nothing leaks), `404 rpc_member_spec.not_found` |
+| 4 | Rights on every member server, former ones included; in manual mode the named spec exists on that server; every member's consent (system scope included). Skipped with 5–8 when the membership, member mode, network, transport and head binary are all as stored; the head's own acknowledgement is still required then, so a direct `lan` head saved without `lan_exposure_ack` is refused `runtime.cluster_lan_ack_required` | `404 server.not_found` (rights and consent alike, so nothing leaks), `404 rpc_member_spec.not_found` |
 | 5 | Manual specs: enabled, serving no other head | `400 runtime_spec.cluster_member_spec_disabled`, `409 runtime_spec.cluster_member_spec_taken` |
 | 6 | Automatic members: RPC membership on, a `ggml-rpc-server` of the head binary's version | `400 runtime_spec.cluster_member_rpc_disabled`, `.cluster_member_no_matching_binary` |
 | 7 | Manual members: a binary whose known version differs from the head's (unknown only warns) | `400 runtime_spec.cluster_version_mismatch` |

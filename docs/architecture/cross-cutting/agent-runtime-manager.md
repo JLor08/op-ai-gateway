@@ -1597,7 +1597,18 @@ A cluster head starts **only** when the gateway asks for it, never on its own:
 - A plain `POST /ensure/{model}`, a proxied request, `/live` or any other
   request that finds a cold head (no process, or draining) is refused with
   `503 runtime.cluster_not_ready` instead of starting it. A head that is already
-  starting lets requests queue behind the start.
+  starting lets requests queue behind the start. "Cold" means **no process**,
+  not "no start asked for": while the gateway's marked start still waits for
+  admission (queued, nothing executed yet), an unmarked request is refused all
+  the same, with `503 runtime.cluster_not_ready` and the message
+  `cluster head <spec id> is not running; the gateway starts its cluster`
+  (`handleEnsure`'s check, `headRefusesUnmarked`); it queues only once the start
+  has a process. The gateway's request path parks such a request rather than
+  dispatching it, so in practice this reaches a client only through a server
+  override or a relay that does not retry. An unmarked request that queued
+  behind a start or a drain which then ended without a running head is answered
+  the same way when the head is next looked at for admission, rather than
+  starting it.
 - `POST /ensure/{model}` with the header `X-OP-Cluster-Start: 1` (exactly that
   value) is the only way a cold head starts. The agent first **probes** every
   endpoint: a bare TCP connect per address, closed at once and never written to,
@@ -1760,42 +1771,50 @@ the launch spec form's cluster part; on each member server's **RPC** tab (its
 `rpc_member_enabled` and consent groups, its manual member specs under
 `/api/portal/servers/{id}/rpc-members`, and the live member rows); on each
 server's `lan_address` / `lan_bind_only`; and on each server's **Binaries** tab
-(the inventory, §3.6). The RPC tab is hidden for a file-mode agent, which ignores
-the gateway's documents, member specs and RPC membership alike. The spec PUT is
-a full document: a write that omits `cluster_enabled` turns the cluster off and
-clears the membership, like any omitted field, so every portal path that PUTs a
-spec carries the cluster fields along.
+(the inventory, §3.6). The RPC tab is hidden for a file-mode agent, which
+ignores the gateway's documents, member specs and RPC membership alike. The spec
+PUT is a full document: a write that omits `cluster_enabled` turns the cluster
+off and clears the membership, like any omitted field, so every portal path that
+PUTs a spec carries the cluster fields along.
 
 **Save checks.** A head write runs the cluster checks after the request
 validations, in a fixed order that is part of the API (the codes and the order
-are in [HTTP API Surface](../reference/api-surface.md#rpc-cluster-save-refusals)):
-the head's own document (type `llama_cpp`, no `--flag=value` form of the scanned
-options, `${RPC_SERVERS}` exactly once as the value of `--rpc` or
-`LLAMA_ARG_RPC`, a device list that names the RPC devices and is parsed after
-them, at least one member, not replicable, an explicit startup timeout); the
-member list (one entry per server, none on the head's server); then rights and
-consent, member specs, member binaries, network and transport, and the member
-GPUs (an Apple GPU needs a GPU budget; a known non-NVIDIA GPU needs an estimate
-on an automatic member, and `--tensor-split` on the head, because its share is
-never measured per process). The scan of the head's args steps over option
-values with a table of llama-server's value-taking options at the pinned build
+are in [HTTP API
+Surface](../reference/api-surface.md#rpc-cluster-save-refusals)): the head's own
+document (type `llama_cpp`, no `--flag=value` form of the scanned options,
+`${RPC_SERVERS}` exactly once as the value of `--rpc` or `LLAMA_ARG_RPC`, a
+device list that names the RPC devices and is parsed after them, at least one
+member, not replicable, an explicit startup timeout); the member list (one entry
+per server, none on the head's server); then rights and consent, member specs,
+member binaries, network and transport, and the member GPUs (an Apple GPU needs
+a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
+and `--tensor-split` on the head, because its share is never measured per
+process). The scan of the head's args steps over option values with a table of
+llama-server's value-taking options at the pinned build
 (`internal/portal/llama_flags.go`), so `--alias -dev` is one option and its
 value. When the membership, member mode, network, transport and head binary are
 all as stored, the rights-to-network steps are skipped, so a member the caller
-cannot see does not lock them out of their head. Advisory warnings never refuse a
+cannot see does not lock them out of their head; the one network check that
+still runs is the head's own acknowledgement, so withdrawing `lan_exposure_ack`
+from a direct `lan` head is refused (`runtime.cluster_lan_ack_required`) like a
+missing one. A save that runs the full checks with an empty `cluster_network` or
+`rpc_transport` resolves it to the default of that moment and **stores the
+resolved value**, so a later NetBird change (a server losing its mesh IP, the
+`Default` policy state) never flips the network or transport of a saved cluster;
+it can only make the stored choice underivable. Advisory warnings never refuse a
 save: `cluster_rpc_devices_not_first`, `cluster_mmdev_missing`,
 `cluster_cpu_member_without_tensor_split`,
 `cluster_member_shared_host_without_estimate`,
 `cluster_member_budget_below_device`, `cluster_member_gpu_overlap`,
-`cluster_relay_mesh_deny_by_default_off` and `cluster_member_version_unknown`;
-a member the reader may not see adds none.
+`cluster_relay_mesh_deny_by_default_off` and `cluster_member_version_unknown`; a
+member the reader may not see adds none.
 
 **Ports.** Each member gets an RPC (or relay) port from 47000–47999 on its
 server: the lowest one no application port, TLS proxy port, fixed `listen_port`
-or other member there uses. A member that stays on its server keeps its port. The
-allocator's lock is per process, so a partial unique index on
-`(server_id, port)` (migration 106) turns a race between two gateway processes
-into a conflict; the write allocates once more and then answers
+or other member there uses. A member that stays on its server keeps its port.
+The allocator's lock is per process, so a partial unique index on `(server_id,
+port)` (migration 106) turns a race between two gateway processes into a
+conflict; the write allocates once more and then answers
 `runtime_spec.cluster_port_exhausted`. The other direction is checked where
 ports are typed: a new fixed `listen_port`, application port or TLS proxy port
 equal to a member's port is refused.
@@ -1803,103 +1822,130 @@ equal to a member's port is refused.
 **Derivation.** Each server's runtime document is derived on every read from the
 stored **configuration**, never from whether a member is up. For a head the
 document carries the `cluster` block: one endpoint per member in member order
-(`<address>:<port>`, and the member's device count: its deduplicated GPU rows, or
-1 for a CPU member, which exposes its CPU device), the transport, the network,
-and `generation`, a digest of everything of the members' launch the endpoints do
-not show (binaries and versions, args, device backends, GPU selections, bind
-addresses and ports), so a member-side change relaunches the head. For a member
-server it carries one `rpc_server` spec per membership: the manual spec's id, or
-`rpca_<head spec id>_<server id>`; the binary (an automatic member's
-`ggml-rpc-server` matching the head binary's version, read on every derivation,
-so an inventory change moves it); `-t <threads>` for an automatic member, the
-manual spec's own args and env otherwise; the GPUs with their demand and the RAM
-demand, each `max(stored usage, estimate)`; a 60 s startup and a 60 s idle
-timeout; the generic type and the role `other`, so nothing type-specific probes
-it; and the `rpc` block (head spec id, transport, bind address and port, the
-head's addresses or the domain the member agent resolves, cache switch). The
+(`<address>:<port>`, and the member's device count: its deduplicated GPU rows,
+or 1 for a CPU member, which exposes its CPU device), the transport, the
+network, and `generation`, a digest of everything of the members' launch the
+endpoints do not show (binaries and versions, args, device backends, GPU
+selections, bind addresses and ports), so a member-side change relaunches the
+head. For a member server it carries one `rpc_server` spec per membership: the
+manual spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
+member's `ggml-rpc-server` matching the head binary's version, read on every
+derivation, so an inventory change moves it); `-t <threads>` for an automatic
+member, the manual spec's own args and env otherwise; the GPUs with their demand
+and the RAM demand, each `max(stored usage, estimate)`; a 60 s startup and a
+60 s idle timeout; the generic type and the role `other`, so nothing
+type-specific probes it; and the `rpc` block (head spec id, transport, bind address and port,
+the head's addresses or the domain the member agent resolves, cache switch). The
 addresses follow the network: a mesh member is dialled and bound at its mesh
-IPv4; a LAN member is dialled at `lan_address`, else `Domain` (never the `Domain`
-of a NetBird-enabled server), and binds `0.0.0.0`, or `lan_address` alone with
-`lan_bind_only`. A head's own idle timeout is derived from its measured start and
-benchmark cold start like a replicable spec's, since its cold start waits for
-every member.
+IPv4; a LAN member is dialled at `lan_address`, else `Domain` (never the
+`Domain` of a NetBird-enabled server), and binds `0.0.0.0`, or `lan_address`
+alone with `lan_bind_only`. A head's own idle timeout is derived from its
+measured start and benchmark cold start like a replicable spec's, since its cold
+start waits for every member.
 
 Any member that cannot be derived **withholds the whole cluster**, the head and
-every member spec derived from it, and the head's DTO names the first reason in
-this order (`cluster_withheld_reason`): `runtime.cluster_member_missing` for a
-head with no member at all, then `runtime_config.agent_features_pending` or
-`runtime.cluster_agent_too_old` (an agent of the cluster whose `rpc_cluster`
-declaration is unknown or absent), then per member in member order
-`.cluster_member_missing` (a server, spec or position gone),
-`.cluster_member_disabled` (a disabled manual spec, or RPC membership turned off
-on an automatic member's server), `.cluster_member_consent_withdrawn`,
-`.cluster_member_unmanaged` (no `server_agent` application on the member
-server), `.cluster_port_unknown`, `.cluster_member_no_matching_binary`,
-`.cluster_mesh_unavailable`, `.cluster_address_unknown`,
-`.cluster_direct_unavailable`, `.cluster_lan_ack_required` and
-`.cluster_member_spec_invalid` (a manual spec's stored args or env cannot be
-read). A server whose **own** agent's declaration is unknown has its whole
-document held (the restart case: the gateway cannot yet tell what it runs); a
-remote unknown agent only withholds that cluster from the other servers'
-documents, so it cannot freeze their unrelated models.
+every member spec derived from it, and the head's DTO names the first reason
+found (`cluster_withheld_reason`). The derivation runs in stages, and the first
+stage that finds a reason stops it:
 
-**What re-derives a document.** A head write notifies the head's server and every
-former and new member server; a manual member spec write notifies its server and
-every server of the cluster that uses it (a change of its GPU rows also re-syncs
-the head's membership GPU rows, keeping the measured values by GPU index); a
-write to a server's row, admin groups, NetBird state or binary inventory, or a
-change of what its agent declares, notifies every server that shares a cluster
-with it; and a system settings save or a group delete re-derives every cluster.
-None of these stops a running head itself: they change its document, which is
-launch-affecting, so the agent drains the head and leaves it down (§3.6), and the
-orchestration below starts it again when it is wanted.
+1. **The membership exists**: a head with no member at all is
+   `runtime.cluster_member_missing`.
+2. **Features**: `runtime_config.agent_features_pending` while the `rpc_cluster`
+   declaration of any agent of the cluster, the head's included, is unknown,
+   else `runtime.cluster_agent_too_old` when one lacks it.
+3. **Each member, in member order**: `.cluster_member_missing` (its server, its
+   manual spec or its position is gone), `.cluster_member_disabled` (a disabled
+   manual spec, or RPC membership turned off on an automatic member's server),
+   `.cluster_member_consent_withdrawn`, `.cluster_member_unmanaged` (no
+   `server_agent` application on the member server), `.cluster_port_unknown`;
+   each member runs all five before the next member is looked at.
+4. **Binaries, over all members**: `.cluster_member_no_matching_binary` when an
+   automatic member's server has no `ggml-rpc-server` of the head binary's
+   version, and also when the **head** binary's own version is unknown (no
+   inventory row, or one with neither commit nor build), since then nothing can
+   match. A manual member takes its spec's binary and never fails here.
+5. **The head's own address** in the resolved network (the stored choice, else
+   the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
+   NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;
+   in `lan`, neither `lan_address` nor a usable `Domain`).
+6. **Each member's address, then its bind address**, in member order: the same
+   two reasons, plus `.cluster_address_unknown` for a member with
+   `lan_bind_only` and no `lan_address`.
+7. **Transport**: `.cluster_direct_unavailable` (direct `mesh` without the
+   NetBird policy preconditions), then `.cluster_lan_ack_required` (direct `lan`
+   without the head's acknowledgement).
+8. **Building the member specs**: `.cluster_member_spec_invalid` (a manual
+   spec's stored args or env cannot be read).
+
+A server whose **own** agent's declaration is unknown has its whole document
+held (the restart case: the gateway cannot yet tell what it runs); a remote
+unknown agent only withholds that cluster from the other servers' documents, so
+it cannot freeze their unrelated models.
+
+**What re-derives a document.** A head write notifies the head's server and
+every former and new member server; a manual member spec write notifies its
+server and every server of the cluster that uses it (a change of its GPU rows
+also re-syncs the head's membership GPU rows, keeping the measured values by GPU
+index); a write to a server's row, admin groups, NetBird state or binary
+inventory, or a change of what its agent declares, notifies every server that
+shares a cluster with it; a system settings save or a group delete re-derives
+every cluster; and so does every change of the NetBird `Default` policy state a
+policy pass records (a change to `enabled` first stops the direct mesh clusters,
+head first, then re-derives, [Networking & Mesh
+§12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)). None of these stops
+a running head itself: they change its document, which is launch-affecting, so
+the agent drains the head and leaves it down (§3.6), and the orchestration below
+starts it again when it is wanted.
 
 **Orchestration and the watchdog.** The members-first start, its bounds, the
-cooldown, the terminal block and the request path are in
-[Runtime View §6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)
-and [Routing & Model Selection §11](routing-and-model-selection.md#11-cluster-heads-the-cluster-gate).
-A reconciler pass (every 30 s, at boot, and whenever a document was pushed or a
-head exited) lifts a terminal block whose head document changed, and starts every
-cold head that is pinned or `force_running`, or that the watchdog stopped while
-it was serving requests, except one an operator stopped and, inside the 60 s
-boot grace, one whose servers have not all reported. The orchestration's state
-is in memory; a restarted gateway learns a running cluster again from the agents'
-telemetry and reports `cold` until then. Its read view is the head's
+cooldown, the terminal block and the request path are in [Runtime View
+§6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start) and
+[Routing & Model Selection
+§11](routing-and-model-selection.md#11-cluster-heads-the-cluster-gate). A
+reconciler pass (every 30 s, at boot, and whenever a document was pushed or a
+head exited) lifts a terminal block whose head document changed, and starts
+every cold head that is pinned or `force_running`, or that the watchdog stopped
+while it was serving requests, except one an operator stopped and, inside the
+60 s boot grace, one whose servers have not all reported. The orchestration's state
+is in memory; a restarted gateway learns a running cluster again from the
+agents' telemetry and reports `cold` until then. Its read view is the head's
 `cluster_status` ([HTTP API Surface](../reference/api-surface.md)).
 
 **Member usage.** A member's agent measures its `ggml-rpc-server` like any child
 while the head holds it, and the gateway keeps the values on the membership row
-(`rpc_cluster_members.ram_measured_mb`, `rpc_cluster_member_gpus.vram_measured_mb`),
-not on any spec, by a rule per **run** (one head process from its cluster start
-until it stops; its start instant, `run_started_at`, is stamped on every
-membership row of the head and every usage write names the run it read):
+(`rpc_cluster_members.ram_measured_mb`,
+`rpc_cluster_member_gpus.vram_measured_mb`), not on any spec, by a rule per
+**run** (one head process from its cluster start until it stops; its start
+instant, `run_started_at`, is stamped on every membership row of the head and
+every usage write names the run it read):
 
 - A sample counts only inside a run, only from the server that owns the member,
   and only while the member reports that head's hold.
-- During a run the stored value only rises, and the run's own peak is kept beside
-  it (`run_peak_*`), so a gateway restart in the middle keeps both. A rise pushes
-  nothing: the agent already charges `max(live, demand)`.
+- During a run the stored value only rises, and the run's own peak is kept
+  beside it (`run_peak_*`), so a gateway restart in the middle keeps both. A
+  rise pushes nothing: the agent already charges `max(live, demand)`.
 - When a run that formed ends, its peak replaces the stored value, a lower one
   included, and the member server's document is pushed: after the head
   disconnects the member falls back to its idle footprint, and its agent no
   longer holds the value. A run that never formed replaces nothing.
 - A save that changes the split (members added, removed or reordered, a member's
-  GPUs, the head's args, env or GPUs) marks the kept values **stale** and ends the
-  current run, so that run's peak can never replace them. A stale value is pushed
-  as demand only up to the GPU's budget (else the card's memory) or the host's
-  memory, so a new split that needs less can start; the stale mark clears when a
-  formed run measured every part that holds a value.
+  GPUs, the head's args, env or GPUs) marks the kept values **stale** and ends
+  the current run, so that run's peak can never replace them. A stale value is
+  pushed as demand only up to the GPU's budget (else the card's memory) or the
+  host's memory, so a new split that needs less can start; the stale mark clears
+  when a formed run measured every part that holds a value.
 - A stored peak above what the host admits makes the member's next start a
   terminal `not_permitted`; the head's `cluster_status.peaks_above_budget` names
   it, and `POST …/cluster-members/{serverID}/reset-usage` clears it.
 
-The same samples keep the session records (`rpc_sessions`): a hold opens one, its
-end closes it, a restarted gateway adopts the sessions still held and closes the
-others on each member server's first sample, and a member server whose telemetry
-stays away past the watchdog's stale threshold has its sessions closed at its
-last frame. Usage recording reads them to list a cluster request's member hosts
-([Telemetry §8.4.4](telemetry-usage-observability.md#844-energy-attribution));
-closed sessions are pruned with the telemetry retention.
+The same samples keep the session records (`rpc_sessions`): a hold opens one,
+its end closes it, a restarted gateway adopts the sessions still held and closes
+the others on each member server's first sample, and a member server whose
+telemetry stays away past the watchdog's stale threshold has its sessions closed
+at its last frame. Usage recording reads them to list a cluster request's member
+hosts ([Telemetry
+§8.4.4](telemetry-usage-observability.md#844-energy-attribution)); closed
+sessions are pruned with the telemetry retention.
 
 ## 4. One router port per AI server
 

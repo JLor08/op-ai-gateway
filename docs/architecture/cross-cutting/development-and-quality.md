@@ -44,7 +44,7 @@ screenshots in the same branch.
 | Target | What it does |
 |---|---|
 | `make test` | `test-go` + `test-ui` |
-| `make test-go` | `go test ./...` in `gateway/backend` |
+| `make test-go` | `go test ./...` in `gateway/backend`, then in `server-agent` |
 | `make test-ui` | `vitest run` in `gateway/frontend` |
 | `make test-e2e` | The base Playwright suite in `gateway/e2e` |
 | `make fmt` / `make lint-fix` | `golangci-lint fmt` / `run --fix` across both Go modules |

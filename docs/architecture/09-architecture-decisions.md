@@ -11782,7 +11782,9 @@ unauthenticated port to the network, lets one head take another's member, or poi
 - **(m) Manual start and stop of a head go through the orchestration.** A start answers like a model's start; a stop
   drains the head first, optionally stops the members (`stop_members`), runs under the gateway's lifetime and answers
   `200` when it finished within the early window, else `202 {"state":"stopping"}`, because a drain can outlast the
-  server's write timeout. A head an operator stopped stays down until a manual start or a gateway restart.
+  server's write timeout. After an operator's stop the reconciler does not start the head again (even a pinned or
+  `force_running` one) until a manual start or a gateway restart; request demand may still start it, since the stop
+  is transient like a model's ([ADR-095](#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)).
 
 **Consequence:**
 
