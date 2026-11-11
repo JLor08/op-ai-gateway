@@ -828,6 +828,10 @@ type netbirdState struct {
 	// that race; each call's own NetBird HTTP round trips are still the only cost
 	// (no additional cross-goroutine blocking beyond the reconcile itself).
 	policyMu sync.Mutex
+	// rpcPolicyWrites is when each member server's op-gw-rpc policy was last
+	// written by any policy pass, kept for RPCPolicySettle; guarded by
+	// policyMu (see noteRPCPolicyWritesLocked).
+	rpcPolicyWrites map[string]time.Time
 	// policySideEffectWG tracks the background goroutine UpdateSystemSettings
 	// spawns (see applyPolicySettingsSideEffects) so tests can deterministically
 	// wait for it via waitPolicySideEffects instead of racing a fire-and-forget

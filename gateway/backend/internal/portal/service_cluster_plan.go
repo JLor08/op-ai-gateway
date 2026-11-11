@@ -233,11 +233,13 @@ const adminStateForceRunning = "force_running"
 // members synchronously: the cluster orchestration calls it before it starts
 // a mesh cluster, so the policy that lets the head reach its members exists
 // before the head dials them. A no-op while NetBird or policy management is
-// off; failures are logged by the pass, never returned. It returns the
-// member server ids, sorted, whose policy this pass created or rewrote:
-// NetBird distributes a policy write to the peers asynchronously, so the
-// orchestration lets such a grant settle before the head dials.
-func (s *Service) ReconcileRPCPolicies(ctx context.Context) []string {
+// off; failures are logged by the pass, never returned. It returns every
+// member server whose policy was written within the last RPCPolicySettle,
+// with the write time -- by this pass or by any earlier one (a save's, a
+// fleet pass): NetBird distributes a policy write to the peers
+// asynchronously, so the orchestration lets such a grant settle before the
+// head dials.
+func (s *Service) ReconcileRPCPolicies(ctx context.Context) []RPCPolicyWrite {
 	return s.reconcileRPCPolicies(ctx)
 }
 

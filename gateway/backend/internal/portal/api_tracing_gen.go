@@ -1757,7 +1757,7 @@ func (_d *APIWithTracing) ReconcileGatewayPeer(ctx context.Context) (s1 string, 
 	return _d.API.ReconcileGatewayPeer(ctx)
 }
 
-func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) (sa1 []string) {
+func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) (ra1 []RPCPolicyWrite) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ReconcileRPCPolicies")
 	defer span.End()
 	return _d.API.ReconcileRPCPolicies(ctx)

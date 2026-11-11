@@ -933,7 +933,7 @@ sequenceDiagram
         MA->>M: exec (-H/-p/-d by the agent), TCP-ready
         MA-->>GW: 200 running (reservation armed)
     end
-    GW->>GW: 3. mesh: a member's policy was just written → let it settle (15 s)
+    GW->>GW: 3. mesh: a member's policy written < 15 s ago → wait out the rest
     GW->>HA: 3. POST /ensure/{model}, X-OP-Cluster-Start: 1
     HA->>M: probe every endpoint (connect, no byte)
     HA->>H: exec, health until green
@@ -956,14 +956,16 @@ sequenceDiagram
    member that still reports a hold while its head is not running holds a dead
    connection and is force-stopped first. The first failure cancels the others.
 3. **Head**, one ensure with the cluster-start marker, bounded by its startup
-   timeout plus 30 s. When step 1's policy pass created or rewrote the
-   `op-gw-rpc` policy of one of this cluster's member servers, the head starts
-   only 15 s after that pass (`policySettle`): NetBird distributes a new or
-   changed policy to the peers asynchronously, and a head that dials before
-   the grant arrived hangs in the TCP connect (21 s on Windows) and fails the
-   start. The members start during that wait; a stop or the shutdown ends it
-   as a cancelled start. A pass that wrote nothing for this cluster's members
-   adds no wait. The agent probes every endpoint before it executes
+   timeout plus 30 s. When the `op-gw-rpc` policy of one of this cluster's
+   member servers was written less than 15 s ago (`policySettle`) -- by step
+   1's policy pass or by any earlier one, such as the save that switched the
+   cluster to `mesh` -- the head starts only once 15 s have passed since the
+   latest such write: NetBird distributes a new or changed policy to the peers
+   asynchronously, and a head that dials before the grant arrived hangs in the
+   TCP connect (21 s on Windows) and fails the start. The members start during
+   that wait, which is logged at Info; a stop or the shutdown ends it as a
+   cancelled start. Without a member policy write inside the window there is
+   no wait. The agent probes every endpoint before it executes
    anything, and answers `runtime.cluster_member_unreachable` when one never
    answers.
 4. **Formed**: every member reports the head's hold on telemetry that arrived

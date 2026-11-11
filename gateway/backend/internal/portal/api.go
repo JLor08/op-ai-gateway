@@ -32,7 +32,7 @@ type API interface {
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
 	NotifyClustersOfServer(context.Context, string)
 	KeptUpClusterHeads(context.Context) ([]string, error)
-	ReconcileRPCPolicies(context.Context) []string
+	ReconcileRPCPolicies(context.Context) []RPCPolicyWrite
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AnthropicPromptCachingEnabled(context.Context) bool
 	ApplicationClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)

@@ -186,6 +186,31 @@ const (
 // errors.Is-checkable by callers (e.g. to map to an HTTP status).
 var ErrAuth = errors.New("netbird: authentication failed")
 
+// StatusError is a non-2xx answer other than 401/403 (ErrAuth) from a call
+// made through do: the status and the tolerant message NetBird gave. Its text
+// is the one such errors always had.
+type StatusError struct {
+	Method, Path string
+	Status       int
+	Message      string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("netbird: %s %s: status %d: %s", e.Method, e.Path, e.Status, e.Message)
+}
+
+// IsRefusal reports whether err is NetBird definitively refusing a request:
+// ErrAuth, or a 4xx answer. Such a request changed nothing. Any other error
+// -- a transport failure, a timeout, a 5xx, an unreadable 2xx answer -- does
+// not tell whether it took effect.
+func IsRefusal(err error) bool {
+	if errors.Is(err, ErrAuth) {
+		return true
+	}
+	var se *StatusError
+	return errors.As(err, &se) && se.Status >= 400 && se.Status < 500
+}
+
 // newClient builds a per-call HTTP client with an explicit timeout. It never uses
 // http.DefaultClient (which has no timeout).
 func newClient(timeout time.Duration) *http.Client {
@@ -224,7 +249,7 @@ func do(ctx context.Context, cfg Config, timeout time.Duration, method, path str
 		return ErrAuth
 	}
 	if status < 200 || status >= 300 {
-		return fmt.Errorf("netbird: %s %s: status %d: %s", method, path, status, tolerantMessage(data))
+		return &StatusError{Method: method, Path: path, Status: status, Message: tolerantMessage(data)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {

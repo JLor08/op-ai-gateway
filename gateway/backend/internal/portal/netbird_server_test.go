@@ -37,6 +37,9 @@ type fakeNetbird struct {
 
 	failListPolicies bool // force GET /api/policies to 500 (best-effort reconcile path)
 	failCreatePolicy bool // force POST /api/policies to 500 (best-effort reconcile path)
+	// refuseCreatePolicy, when set, answers POST /api/policies with this 4xx
+	// status: NetBird refusing the policy (a stale group id, say).
+	refuseCreatePolicy int
 
 	mu               sync.Mutex
 	groups           []map[string]any          // seeded with the module group "gateways"
@@ -263,6 +266,11 @@ func newFakeNetbird(t *testing.T) *fakeNetbird {
 		}
 		// POST create.
 		atomic.AddInt32(&f.policyCreates, 1)
+		if f.refuseCreatePolicy != 0 {
+			w.WriteHeader(f.refuseCreatePolicy)
+			_, _ = w.Write([]byte(`{"message":"refused"}`))
+			return
+		}
 		if f.failCreatePolicy {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"message":"boom"}`))
