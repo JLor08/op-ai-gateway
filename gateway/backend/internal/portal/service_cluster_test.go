@@ -1599,3 +1599,25 @@ func TestPutClusterPlaceholderInConfigFileNeedsCluster(t *testing.T) {
 		}
 	}
 }
+
+// TestSetServerNetbirdRefusalNotifiesNobody: a NetBird link refused because
+// its peer is linked to another server changes nothing, so no cluster
+// server is pushed.
+func TestSetServerNetbirdRefusalNotifiesNobody(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+	other := f.member("Other")
+	if err := f.routes.UpdateServerNetbirdLink(f.ctx, other.ID, true, "peer-taken"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.notified = nil
+	f.mu.Unlock()
+	if _, err := f.svc.SetServerNetbird(f.ctx, systemToken(), f.head.ID, true, "peer-taken", nil, false, "", false, false); !errors.Is(err, ErrNetbirdPeerInUse) {
+		t.Fatalf("SetServerNetbird = %v, want %v", err, ErrNetbirdPeerInUse)
+	}
+	if got := f.notifiedServers(); len(got) != 0 {
+		t.Fatalf("notified = %v for a refused link", got)
+	}
+}
