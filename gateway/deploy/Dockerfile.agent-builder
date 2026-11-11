@@ -9,7 +9,7 @@
 # ICEs cross-compiling the std `bytes` package for windows/amd64 ("internal compiler
 # error: 'Replace': two final stores"). Pinning to a patched toolchain fixes it; bump
 # this when you want a newer Go, but never below 1.26.
-FROM golang:1.26.5
+FROM golang:1.27.4
 WORKDIR /src
 # Dependency layer cached separately from the source. NOTE: no BuildKit cache
 # mount here — a cache mount is ephemeral and NOT baked into the image, which would
