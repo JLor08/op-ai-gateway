@@ -79,6 +79,7 @@ import {
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
 import { CONFIG_FILES_MAX, configFileIssues, type ConfigFileIssue } from './shared/configFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
+import { formatArgsText, formatEnvText, parseArgsText, parseEnvText } from './shared/specText';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { mappingColumns, MAPPING_TABLE_STORAGE_KEY } from './shared/mappingColumns';
@@ -95,6 +96,16 @@ import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
+import { RpcMemberSection } from './RpcMemberSection';
+import { BinariesSection } from './BinariesSection';
+import { BinaryPicker, binaryVersionFor, useServerBinaries } from './shared/BinaryPicker';
+import {
+  ClusterHeadEditor,
+  clusterBodyFields,
+  clusterSaveError,
+  clusterStateFromSpec,
+  emptyClusterState,
+} from './ClusterHeadEditor';
 import {
   INSTANCE_PARALLELISM_MAX,
   INSTANCES_MAX,
@@ -116,11 +127,15 @@ import {
 } from './shared/runtimeInstances';
 import { minRealtimeWarning } from './shared/audioMetrics';
 import { runtimeRowPlan, startInstanceLimit } from './shared/runtimeActions';
+import { ClusterProgress } from './ClusterProgress';
+import { ClusterTotalCell, ClusterWithheldNotice } from './ClusterTotalCell';
+import { clusterStatusView } from './shared/clusterStatus';
+import { clusterWithheldReason, isClusterHead } from './shared/clusterTotals';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
 // all, next to the model-mapping tab.
-type Tab = 'mapping' | 'specs' | 'coresidency' | 'limits' | 'status';
+type Tab = 'mapping' | 'specs' | 'coresidency' | 'rpc' | 'binaries' | 'limits' | 'status';
 
 type SpecMode = 'list' | 'create' | { kind: 'edit'; mapping: PortalModelMapping };
 
@@ -288,6 +303,13 @@ function emptySpec(mappingId: string): RuntimeSpec {
     metrics_path: '',
     context_probe_path: '',
     config_files: [],
+    device_backend: 'auto',
+    cluster_enabled: false,
+    member_mode: 'automatic',
+    cluster_network: '',
+    rpc_transport: '',
+    lan_exposure_ack: false,
+    cluster_members: [],
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
@@ -630,6 +652,13 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // instances_min_exceeds_realtime (both derived on every read) have no
   // request counterpart and are dropped.
   //
+  // The cluster configuration (cluster_enabled, member_mode, cluster_network,
+  // rpc_transport, lan_exposure_ack, device_backend, cluster_members) rides
+  // `rest`: an absent cluster_enabled turns the cluster off and clears its
+  // membership. Its read view (the totals, the network and transport
+  // defaults, the warnings and the orchestration status) is derived on every
+  // read and dropped.
+  //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
   // the stored value". Dropping it is therefore exactly what an override
@@ -653,6 +682,14 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     startup_measured_ms,
     effective_idle_timeout_seconds,
     instances_min_exceeds_realtime,
+    cluster_vram_total_mb,
+    cluster_ram_total_mb,
+    cluster_totals_complete,
+    cluster_network_default,
+    cluster_transport_default,
+    cluster_warnings,
+    cluster_withheld_reason,
+    cluster_status,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -787,29 +824,6 @@ function renderVisibilityChip(v: VisibilityValue, t: Translation) {
       sx={v === 'off' ? { color: 'text.secondary' } : undefined}
     />
   );
-}
-
-// One argument per line. Splitting on spaces would corrupt any argument that
-// legitimately contains one (model server command lines routinely have
-// these), so a textarea line IS the argument. Lines are preserved verbatim
-// -- including an internally blank line and one carrying only whitespace --
-// because this form's whole job is faithfully representing a command line:
-// filtering "empty-looking" lines would make a load -> edit(no-op) -> save
-// round trip silently rewrite the spec's args. The ONE exception is a
-// single trailing blank line, which is a textarea artifact (the user's
-// cursor sitting on a fresh last line, or a copy-pasted trailing newline),
-// not a deliberate trailing empty argument.
-function parseArgsText(text: string): string[] {
-  if (text === '') return [];
-  const lines = text.split('\n').map((line) => line.replace(/\r$/, ''));
-  if (lines.length > 1 && lines[lines.length - 1] === '') {
-    lines.pop();
-  }
-  return lines;
-}
-
-function formatArgsText(args: string[]): string {
-  return args.join('\n');
 }
 
 /**
@@ -1017,22 +1031,6 @@ function collectArgsWarnings(args: string[], listenPort: number, t: Translation)
 const placeholderPattern = /\$\{[^}]*\}/g;
 const agentEnvPrefix = 'AGENT_ENV:';
 const agentOwnEnvPrefix = 'OP_AGENT_';
-
-// The agent's base-environment names (server-agent internal/runtime
-// policy_local.go `baseEnvNames`), which it copies from its OWN environment
-// into every child and therefore refuses as spec env keys. Mirrored here so
-// the form says no before the round trip rather than letting the spec save
-// and fail at process start as `not_permitted`.
-//
-// UPPER-CASE and compared upper-cased, exactly as the agent does: Windows
-// resolves environment names case-insensitively, so "Path" and "SystemRoot"
-// -- the only spellings a Windows operator would type -- are the same
-// variables. The four Windows names are not decoration: the agent copies
-// USERPROFILE/LOCALAPPDATA (per-user cache roots) and SYSTEMROOT/WINDIR
-// (system DLLs, and Winsock initialisation) so a Windows child can resolve a
-// home directory and open a socket at all.
-const reservedEnvKeys = ['PATH', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'SYSTEMROOT', 'WINDIR'];
-
 function findPlaceholderViolation(
   text: string,
 ): { kind: 'reserved' | 'malformed'; match: string } | null {
@@ -1199,47 +1197,6 @@ function stableGpuHandle(gpu: HardwareGPU): string {
   const body = uuid.replace(/^GPU-/i, '');
   return body.length > 8 ? `${body.slice(0, 8)}…` : body;
 }
-
-// KEY=value per line, one env var per line. Blank/whitespace-only lines are
-// skipped; a malformed (no "=") line is reported via the existing
-// runtime_spec.env_invalid label so it reads the same way a backend
-// rejection would. Only the KEY portion is trimmed (stray leading
-// indentation from a paste) -- the VALUE is preserved byte-for-byte after
-// the first "=" (a value may legitimately contain "=" itself, and trimming
-// the whole line before splitting would silently eat meaningful leading/
-// trailing whitespace IN the value). A key naming one of the agent's base
-// environment variables is refused outright, in any capitalisation -- see
-// reservedEnvKeys; the ${AGENT_ENV:OP_AGENT_*} / malformed-placeholder checks
-// run separately, over both args and env values together, via
-// validatePlaceholders.
-function parseEnvText(
-  text: string,
-  t: Translation,
-): { env: Record<string, string>; error?: string } {
-  const env: Record<string, string> = {};
-  for (const raw of text.split('\n')) {
-    const line = raw.replace(/\r$/, '');
-    if (line.trim() === '') continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) {
-      return { env: {}, error: t.errorRuntimeSpecEnvInvalid };
-    }
-    const key = line.slice(0, eq).trim();
-    const value = line.slice(eq + 1);
-    if (reservedEnvKeys.includes(key.toUpperCase())) {
-      return { env: {}, error: t.runtimeSpecEnvReserved };
-    }
-    env[key] = value;
-  }
-  return { env };
-}
-
-function formatEnvText(env: Record<string, string>): string {
-  return Object.entries(env)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('\n');
-}
-
 // The per-backend reference table: the Env var name each of these
 // three model servers reads for its own API key, the equivalent --api-key
 // argument, and the client header the token then answers to. Shown whenever
@@ -1317,6 +1274,20 @@ export function RuntimeAdminSection({
     | 'putGpuBudgets'
     | 'runtimeReport'
     | 'subscribeRuntimeStatus'
+    // The RPC tab's manual member specs (the server settings and the live
+    // member list use updateServer and subscribeRuntimeStatus above).
+    | 'rpcMemberSpecs'
+    | 'createRPCMemberSpec'
+    | 'updateRPCMemberSpec'
+    | 'deleteRPCMemberSpec'
+    // The Binaries tab and the binary pickers of the spec form and the RPC tab.
+    | 'serverBinaries'
+    | 'createServerBinary'
+    | 'updateServerBinary'
+    | 'deleteServerBinary'
+    // The cluster head editor's member picker (it reads member GPUs through
+    // serverHardware below).
+    | 'clusterCandidates'
     // The live-status Start and Stop: transient, nothing is written.
     | 'startRuntime'
     | 'stopRuntime'
@@ -1367,6 +1338,11 @@ export function RuntimeAdminSection({
   const [specMode, setSpecMode] = useState<SpecMode>('list');
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
+  // The cluster head whose Stop awaits its confirmation, and the checkbox in it.
+  const [clusterStop, setClusterStop] = useState<{ row: RuntimeStatus; spec: RuntimeSpec } | null>(
+    null,
+  );
+  const [stopMembersToo, setStopMembersToo] = useState(false);
   const [loadingEditFor, setLoadingEditFor] = useState('');
   // Bumped by every launch-spec form open (openEdit, openCreate): an Edit GET
   // fills the form only while it is still the latest one.
@@ -1884,6 +1860,13 @@ export function RuntimeAdminSection({
     );
   }, [gpuBudgetsData]);
 
+  // The server as the RPC tab last saved it: the tab remounts on every tab
+  // switch and the `server` prop is only as fresh as the parent's last fetch.
+  const [rpcSaved, setRpcSaved] = useState<{ server: PortalServer; propKey: string } | null>(null);
+  const rpcContentKey = `${server.id}|${server.rpc_member_enabled ?? false}|${[...(server.rpc_allowed_head_groups ?? [])].sort().join(',')}`;
+  // The override lasts only while the prop still shows what it showed at save
+  // time; once the prop's RPC content moves, the prop is fresher.
+  const rpcSavedServer = rpcSaved?.propKey === rpcContentKey ? rpcSaved.server : null;
   const [maxProcesses, setMaxProcesses] = useState(() => server.runtime_max_processes ?? 0);
   const [limitsBusy, setLimitsBusy] = useState(false);
 
@@ -2412,11 +2395,25 @@ export function RuntimeAdminSection({
     );
   }
 
-  function stopRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec) {
+  // A cluster head's Stop asks first whether its members stop too; any other
+  // spec stops at once.
+  function requestStop(row: RuntimeStatus, spec: RuntimeSpec) {
+    if (spec.cluster_enabled) {
+      setStopMembersToo(false);
+      setClusterStop({ row, spec });
+      return;
+    }
+    stopRuntimeInstance(row, spec);
+  }
+
+  function stopRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec, stopMembers = false) {
     const k = instanceIndex(row);
     void runRuntimeAction(
       runtimeActionKey('stop', row),
-      () => api.stopRuntime(spec.mapping_id, k),
+      () =>
+        stopMembers
+          ? api.stopRuntime(spec.mapping_id, k, true)
+          : api.stopRuntime(spec.mapping_id, k),
       (answer) => {
         const target = instanceTargetName(row, spec, answer.instance);
         return answer.state === 'stopped'
@@ -2625,6 +2622,7 @@ export function RuntimeAdminSection({
   const [appName, setAppName] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [binary, setBinary] = useState('');
+  const serverBinaries = useServerBinaries(api, server.id);
   const [argsText, setArgsText] = useState('');
   const [envText, setEnvText] = useState('');
   const [workDir, setWorkDir] = useState('');
@@ -2727,6 +2725,10 @@ export function RuntimeAdminSection({
   // `config_files` clears the stored set, so this state is what keeps a save of
   // an unrelated field from deleting files that were set through the API.
   const [configFiles, setConfigFiles] = useState<ConfigFileRow[]>([]);
+  // The cluster head configuration and the spec's device backend, bound from
+  // the loaded spec and sent back by buildSpecBody for the same full-document
+  // reason: a save without them turns a cluster head into a plain spec.
+  const [cluster, setCluster] = useState(emptyClusterState);
   // undefined = "no opinion", and the request field is optional so this form
   // can say it. It genuinely has to: with Type on "Auto" the effective kind
   // is detected from the binary's basename, and that detection is Go-only --
@@ -2836,6 +2838,7 @@ export function RuntimeAdminSection({
     setMetricsPath('');
     setContextProbePath('');
     setConfigFiles([]);
+    setCluster(emptyClusterState());
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType(null);
   }
@@ -2906,6 +2909,7 @@ export function RuntimeAdminSection({
         content: f.content,
       })),
     );
+    setCluster(clusterStateFromSpec(spec));
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType({
       type: spec.type,
@@ -3325,7 +3329,22 @@ export function RuntimeAdminSection({
       // and this is the one place that decides what the full document says.
       // Plain {name, content} -- the row key is a render identity only.
       config_files: configFiles.map(({ name, content }) => ({ name, content })),
+      ...clusterBodyFields(cluster),
     };
+  }
+
+  // The cluster save checks the form can make itself (create and edit).
+  function clusterError(args: string[], env: Record<string, string>): string | undefined {
+    const key = clusterSaveError(cluster, {
+      args,
+      env,
+      type: specType,
+      replicable,
+      startupTimeoutSeconds,
+      binary,
+      stored: editingSpecMappingId ? specsById[editingSpecMappingId] : undefined,
+    });
+    return key ? t[key] : undefined;
   }
 
   // Refreshes what a committed spec write (create, edit, spec delete) can
@@ -3411,6 +3430,11 @@ export function RuntimeAdminSection({
     const instancesError = validateInstances(instanceForm(), listenPort, t);
     if (instancesError) {
       showError(instancesError);
+      return;
+    }
+    const clusterProblem = clusterError(args, parsedEnv.env);
+    if (clusterProblem) {
+      showError(clusterProblem);
       return;
     }
     setBusy(true);
@@ -3512,6 +3536,11 @@ export function RuntimeAdminSection({
     const instancesError = validateInstances(instanceForm(), listenPort, t);
     if (instancesError) {
       showError(instancesError);
+      return;
+    }
+    const clusterProblem = clusterError(args, parsedEnv.env);
+    if (clusterProblem) {
+      showError(clusterProblem);
       return;
     }
     setBusy(true);
@@ -3760,6 +3789,58 @@ export function RuntimeAdminSection({
     return live ? runtimeStateLabel(live.state, t) : t.runtimeStatusUnknown;
   }
 
+  function liveStatusChip(m: PortalModelMapping) {
+    const live = statusForMapping(m);
+    const withheld = clusterWithheldReason(specsById[m.id]);
+    if (!live && withheld) {
+      return (
+        <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+          <StatusChip status="standby" label={t.runtimeStatusUnknown} />
+          <ClusterWithheldNotice reason={withheld} t={t} compact />
+        </Box>
+      );
+    }
+    if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
+    const baseChip = (
+      <StatusChip status={runtimeStateBadge(live.state)} label={runtimeStateLabel(live.state, t)} />
+    );
+    const chip = withheld ? (
+      <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+        {baseChip}
+        <ClusterWithheldNotice reason={withheld} t={t} compact />
+      </Box>
+    ) : (
+      baseChip
+    );
+    // A replicable spec's chip is the state of the row that speaks for it
+    // (a running one first, see primaryStatusRows); how many instances run,
+    // against the bounds, is the line under it. Only once the agent
+    // reports the spec at all -- with no row, "0 running" would be a
+    // claim nobody made.
+    const spec = specsById[m.id];
+    if (!spec?.replicable || spec.id === undefined) return chip;
+    return (
+      <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
+        {chip}
+        <Typography variant="caption" color="text.secondary">
+          {instancesSummary(spec.id, spec, runningInstancesBySpecId, t)}
+        </Typography>
+      </Box>
+    );
+  }
+
+  // The live-status chip with the cluster progress of a head beneath it.
+  function liveStatusCell(m: PortalModelMapping) {
+    const chip = liveStatusChip(m);
+    if (!clusterStatusView(specsById[m.id])) return chip;
+    return (
+      <Box sx={{ display: 'grid', gap: 0.5, justifyItems: 'start' }}>
+        {chip}
+        <ClusterProgress spec={specsById[m.id]} t={t} compact />
+      </Box>
+    );
+  }
+
   const columns: ListColumn<PortalModelMapping>[] = [
     {
       id: 'gateway',
@@ -3821,10 +3902,18 @@ export function RuntimeAdminSection({
       id: 'vram_total',
       label: t.runtimeSpecVramTotal,
       value: (m) => {
-        const total = totalGpuVram(specsById[m.id]);
+        const spec = specsById[m.id];
+        const total = isClusterHead(spec) ? (spec?.cluster_vram_total_mb ?? 0) : totalGpuVram(spec);
         return total > 0 ? String(total) : '—';
       },
-      render: (m) => formatMb(totalGpuVram(specsById[m.id])),
+      render: (m) => {
+        const spec = specsById[m.id];
+        return spec && isClusterHead(spec) ? (
+          <ClusterTotalCell spec={spec} axis="vram" ownMb={totalGpuVram(spec)} t={t} />
+        ) : (
+          formatMb(totalGpuVram(spec))
+        );
+      },
       filter: 'text',
       searchable: false,
       numeric: true,
@@ -3833,10 +3922,21 @@ export function RuntimeAdminSection({
       id: 'ram',
       label: t.runtimeSpecRam,
       value: (m) => {
-        const ram = effectiveRam(specsById[m.id], statusForMapping(m));
+        const spec = specsById[m.id];
+        const ram = isClusterHead(spec)
+          ? (spec?.cluster_ram_total_mb ?? 0)
+          : effectiveRam(spec, statusForMapping(m));
         return ram > 0 ? String(ram) : '—';
       },
-      render: (m) => formatMb(effectiveRam(specsById[m.id], statusForMapping(m))),
+      render: (m) => {
+        const spec = specsById[m.id];
+        const own = effectiveRam(spec, statusForMapping(m));
+        return spec && isClusterHead(spec) ? (
+          <ClusterTotalCell spec={spec} axis="ram" ownMb={own} t={t} />
+        ) : (
+          formatMb(own)
+        );
+      },
       filter: 'text',
       searchable: false,
       numeric: true,
@@ -3876,31 +3976,7 @@ export function RuntimeAdminSection({
       filter: 'enum',
       sortable: false,
       searchable: false,
-      render: (m) => {
-        const live = statusForMapping(m);
-        if (!live) return <StatusChip status="standby" label={t.runtimeStatusUnknown} />;
-        const chip = (
-          <StatusChip
-            status={runtimeStateBadge(live.state)}
-            label={runtimeStateLabel(live.state, t)}
-          />
-        );
-        // A replicable spec's chip is the state of the row that speaks for it
-        // (a running one first, see primaryStatusRows); how many instances run,
-        // against the bounds, is the line under it. Only once the agent
-        // reports the spec at all -- with no row, "0 running" would be a
-        // claim nobody made.
-        const spec = specsById[m.id];
-        if (!spec?.replicable || spec.id === undefined) return chip;
-        return (
-          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>
-            {chip}
-            <Typography variant="caption" color="text.secondary">
-              {instancesSummary(spec.id, spec, runningInstancesBySpecId, t)}
-            </Typography>
-          </Box>
-        );
-      },
+      render: (m) => liveStatusCell(m),
     },
     {
       // Task 6: whether the agent's last per-model /metrics and context
@@ -4345,7 +4421,7 @@ export function RuntimeAdminSection({
           runtimeActionsBusy.has(stopKey) ||
           runtimeActionsBusy.has(runtimeActionKey('start', row)),
         title: stopTitle,
-        onClick: () => stopRuntimeInstance(row, spec),
+        onClick: () => requestStop(row, spec),
       });
     }
     const pin = plan.pin;
@@ -4726,11 +4802,14 @@ export function RuntimeAdminSection({
               }
               label={t.runtimeSpecEnabled}
             />
-            <Field
+            <BinaryPicker
               id="runtime-spec-binary"
               label={t.runtimeSpecBinary}
+              t={t}
+              kind="llama_server"
               value={binary}
-              onChange={(e) => setBinary(e.target.value)}
+              onChange={setBinary}
+              binaries={serverBinaries}
               required
               placeholder="/usr/local/bin/llama-server"
             />
@@ -5546,6 +5625,28 @@ export function RuntimeAdminSection({
               </Box>
             </Box>
 
+            {/* Shown for llama.cpp (explicit, or Auto resolved to it), and for
+                any spec that is still a head so the operator can turn the
+                cluster off after a type change. */}
+            {(specType === 'llama_cpp' ||
+              (specType === '' && currentSpec?.effective_type === 'llama_cpp') ||
+              cluster.enabled) && (
+              <ClusterHeadEditor
+                t={t}
+                api={api}
+                mappingId={editingSpecMappingId}
+                headServer={server}
+                stored={currentSpec}
+                value={cluster}
+                onChange={setCluster}
+                args={parseArgsText(argsText)}
+                env={parseEnvText(envText, t).env}
+                headHasGpus={gpuRows.length > 0}
+                startupTimeoutSeconds={startupTimeoutSeconds}
+                headBinaryVersion={binaryVersionFor(serverBinaries, binary.trim())}
+              />
+            )}
+
             <Box sx={{ display: 'flex', gap: 1.5 }}>
               <Button type="submit" variant="contained" disabled={busy}>
                 {editing ? t.save : t.runtimeSpecCreate}
@@ -5760,6 +5861,9 @@ export function RuntimeAdminSection({
         <Tab label={t.runtimeMappingTab} value="mapping" />
         <Tab label={t.runtimeSpecs} value="specs" />
         <Tab label={t.runtimeCoresidency} value="coresidency" />
+        {/* File mode ignores gateway-side documents, so member specs written here would never apply. */}
+        {!fileMode && <Tab label={t.rpcTab} value="rpc" />}
+        <Tab label={t.binariesTab} value="binaries" />
         <Tab label={t.runtimeLimits} value="limits" />
         <Tab label={t.runtimeLiveStatus} value="status" />
       </Tabs>
@@ -5884,6 +5988,15 @@ export function RuntimeAdminSection({
           {renderCoresidencyBody()}
         </Panel>
       )}
+      {tab === 'rpc' && !fileMode && (
+        <RpcMemberSection
+          t={t}
+          api={api}
+          server={rpcSavedServer ?? server}
+          onServerSaved={(saved) => setRpcSaved({ server: saved, propKey: rpcContentKey })}
+        />
+      )}
+      {tab === 'binaries' && <BinariesSection t={t} api={api} serverId={server.id} />}
       {tab === 'limits' && (
         <Panel
           titleId="runtime-limits-heading"
@@ -6099,6 +6212,40 @@ export function RuntimeAdminSection({
         </Panel>
       )}
 
+      <ConfirmDialog
+        open={clusterStop !== null}
+        title={
+          clusterStop
+            ? t.runtimeStopClusterTitle(
+                instanceTargetName(
+                  clusterStop.row,
+                  clusterStop.spec,
+                  instanceIndex(clusterStop.row),
+                ),
+              )
+            : ''
+        }
+        body={t.runtimeStopClusterBody}
+        extra={
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={stopMembersToo}
+                onChange={(e) => setStopMembersToo(e.target.checked)}
+              />
+            }
+            label={t.runtimeStopMembersToo}
+          />
+        }
+        confirmLabel={t.runtimeStop}
+        cancelLabel={t.cancel}
+        onConfirm={() => {
+          const pending = clusterStop;
+          setClusterStop(null);
+          if (pending) stopRuntimeInstance(pending.row, pending.spec, stopMembersToo);
+        }}
+        onCancel={() => setClusterStop(null)}
+      />
       <ConfirmDialog
         open={confirmingDeleteId !== ''}
         title={confirmIsSpecDelete ? t.runtimeSpecDeleteConfirm : t.mappingDeleteConfirm}

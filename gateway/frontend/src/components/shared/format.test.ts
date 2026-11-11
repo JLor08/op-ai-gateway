@@ -8,6 +8,7 @@ import {
   formatDate,
   formatMetric,
   formatPortalError,
+  clusterWarningLabelByCode,
   parseMetricInput,
 } from './format';
 import { PortalApiError } from '../../api';
@@ -1051,6 +1052,20 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     // did not work"), which is why they share one.
     const documentedSharedLabels: Record<string, string[]> = {
       errorRequestFailed: ['request.failed', 'request.invalid_response'],
+      // A cluster head's withheld reason reads like the save refusal that
+      // names the same condition.
+      errorClusterDirectUnavailable: [
+        'runtime.cluster_direct_unavailable',
+        'runtime_spec.cluster_direct_unavailable',
+      ],
+      errorClusterMeshUnavailable: [
+        'runtime.cluster_mesh_unavailable',
+        'runtime_spec.cluster_mesh_unavailable',
+      ],
+      errorClusterMemberNoMatchingBinary: [
+        'runtime.cluster_member_no_matching_binary',
+        'runtime_spec.cluster_member_no_matching_binary',
+      ],
     };
     const codesByLabel = new Map<string, string[]>();
     for (const [code, key] of entries) {
@@ -1065,6 +1080,127 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         `${codes.join(' + ')} share the label ${label}; add them to documentedSharedLabels if that is intended`,
       ).toEqual((documentedSharedLabels[label] ?? []).slice().sort());
     }
+  });
+});
+
+/**
+ * The llama.cpp RPC cluster feature's codes, pinned as LITERALS (see the
+ * lists above for why): the cluster head's save refusals, the manual member
+ * spec and binary inventory refusals, the LAN address check, and the
+ * lifecycle codes that reach the operator through a runtime status
+ * `last_error.code` or a start refusal.
+ */
+const clusterWireCodes = [
+  // The reasons a cluster head is withheld from its agent
+  // (RuntimeSpec.cluster_withheld_reason).
+  'runtime.cluster_address_unknown',
+  'runtime.cluster_direct_unavailable',
+  'runtime.cluster_member_consent_withdrawn',
+  'runtime.cluster_member_disabled',
+  'runtime.cluster_member_missing',
+  'runtime.cluster_member_no_matching_binary',
+  'runtime.cluster_member_spec_invalid',
+  'runtime.cluster_member_unmanaged',
+  'runtime.cluster_mesh_unavailable',
+  'runtime.cluster_port_unknown',
+  'runtime_config.agent_features_pending',
+  // Cluster head save refusals.
+  'runtime_spec.cluster_member_mode_invalid',
+  'runtime_spec.cluster_network_invalid',
+  'runtime_spec.cluster_transport_invalid',
+  'runtime_spec.cluster_type_invalid',
+  'runtime_spec.cluster_rpc_placeholder_missing',
+  'runtime_spec.cluster_rpc_twice',
+  'runtime_spec.cluster_rpc_placeholder_without_cluster',
+  'runtime_spec.cluster_device_list_missing_rpc',
+  'runtime_spec.cluster_device_order',
+  'runtime_spec.cluster_members_required',
+  'runtime_spec.cluster_head_replicable',
+  'runtime_spec.cluster_startup_timeout_required',
+  'runtime_spec.cluster_member_server_twice',
+  'runtime_spec.cluster_member_on_head_server',
+  'runtime_spec.cluster_member_spec_taken',
+  'runtime_spec.cluster_member_spec_disabled',
+  'runtime_spec.cluster_member_rpc_disabled',
+  'runtime_spec.cluster_member_no_matching_binary',
+  'runtime_spec.cluster_version_mismatch',
+  'runtime_spec.cluster_mesh_unavailable',
+  'runtime_spec.cluster_lan_address_required',
+  'runtime_spec.cluster_direct_unavailable',
+  'runtime_spec.cluster_member_budget_required',
+  'runtime_spec.cluster_tensor_split_required',
+  'runtime_spec.cluster_port_exhausted',
+  'runtime_spec.cluster_flag_equals_form',
+  'runtime_spec.port_conflicts_rpc_member',
+  'runtime_spec.device_backend_invalid',
+  'runtime_spec.member_flag_reserved',
+  'runtime_spec.member_vram_estimate_required',
+  // The args-mode visibility rule, which ${DEVICES} now satisfies too.
+  'runtime_spec.visible_devices_args_no_placeholder',
+  // Manual member specs, binary inventory, LAN address.
+  'rpc_member_spec.not_found',
+  'rpc_member_spec.request_failed',
+  'binary.path_invalid',
+  'binary.kind_invalid',
+  'binary.version_invalid',
+  'binary.not_found',
+  'binary.agent_owned',
+  'binary.request_failed',
+  'server.lan_address_invalid',
+  // Gateway runtime codes.
+  'runtime.cluster_lan_ack_required',
+  'runtime.cluster_member_in_use',
+  'runtime.cluster_start_failed',
+  'runtime.cluster_unavailable',
+  'runtime.cluster_member_unused',
+  'runtime.cluster_config_unacknowledged',
+  'runtime.cluster_head_disabled',
+  'runtime.cluster_start_cancelled',
+  'runtime.cluster_stopping',
+  'runtime.cluster_agent_too_old',
+  'runtime.cluster_head_unsupported',
+  // Agent lifecycle codes (runtime status last_error.code).
+  'runtime.device_backend_mismatch',
+  'runtime.rpc_device_count_mismatch',
+  'runtime.rpc_unsupported_build',
+  'runtime.cluster_version_mismatch',
+  'runtime.cluster_member_unreachable',
+  'runtime.bind_mismatch',
+  'runtime.cluster_not_ready',
+  'runtime.instance_busy',
+  'runtime.cache_purge_failed',
+  // System settings.
+  'settings.netbird_direct_cluster_exists',
+] as const;
+
+describe('RPC cluster codes', () => {
+  it.each(clusterWireCodes)('labels %s in both locales, never as raw English', (code) => {
+    const key = errorLabelByCode[code];
+    expect(key, `${code} is not mapped: the operator sees raw English`).toBeDefined();
+    const err = new PortalApiError(400, code, 'raw server text');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale][key!];
+      expect(typeof label).toBe('string');
+      expect(String(label).length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}`);
+    }
+    expect(messages.de[key!]).not.toBe(messages.en[key!]);
+  });
+
+  it.each([
+    'cluster_rpc_devices_not_first',
+    'cluster_mmdev_missing',
+    'cluster_cpu_member_without_tensor_split',
+    'cluster_member_shared_host_without_estimate',
+    'cluster_member_budget_below_device',
+    'cluster_member_gpu_overlap',
+    'cluster_relay_mesh_deny_by_default_off',
+    'cluster_member_version_unknown',
+  ])('labels the advisory warning %s in both locales', (code) => {
+    const key = clusterWarningLabelByCode[code];
+    expect(key, `${code} has no label`).toBeDefined();
+    expect(messages.de[key!].length).toBeGreaterThan(0);
+    expect(messages.de[key!]).not.toBe(messages.en[key!]);
   });
 });
 
@@ -1126,7 +1262,11 @@ describe('manual runtime start and stop refusals', () => {
       Object.keys(errorLabelByCode)
         .filter((code) => code.startsWith('runtime.'))
         .sort(),
-    ).toEqual(runtimeActionWireCodes.filter((code) => code.startsWith('runtime.')).sort());
+    ).toEqual(
+      [...runtimeActionWireCodes, ...clusterWireCodes]
+        .filter((code) => code.startsWith('runtime.'))
+        .sort(),
+    );
   });
 
   it('names the missing feature when the refusal carries one', () => {

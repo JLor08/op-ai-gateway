@@ -1445,7 +1445,7 @@ const de = {
   runtimeSpecVisibleDevicesModeEnv: 'Umgebungsvariable',
   runtimeSpecVisibleDevicesModeArgs: 'Argumente (--device)',
   runtimeSpecVisibleDevicesModeArgsHint:
-    'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}. Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der drei muss vorhanden sein.',
+    'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}, oder das allgemeine ${DEVICES}, das mit dem Geräte-Backend der Spezifikation gerendert wird (auf einem Cluster-Head die RPC-Geräte zuerst). Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der vier muss vorhanden sein. ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen nur das erste Gerät (für -mmdev) und zählen hier nicht.',
   // Runtime-Spec API Token: the MODE controls only -- the header-source
   // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API-Token-Modus',
@@ -1546,7 +1546,7 @@ const de = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} funktioniert nur auf einem macOS-Host; der verbundene Agent läuft auf einem anderen Betriebssystem.',
   runtimeSpecEnvHint:
-    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
+    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
@@ -2160,6 +2160,8 @@ const de = {
   errorRuntimeSpecAdminStateInvalid: 'Ungültiger Admin-Status',
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Für „GPU-Zuweisung erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
+  errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
+    'Im Argument-Modus von „GPU-Zuweisung erzwingen“ muss ein Geräte-Platzhalter in den Argumenten stehen: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} oder ${DEVICES}. Sonst setzt der Agent nichts und die Auswahl geht verloren.',
   errorRuntimeSpecVisibleDevicesConflict:
     'Diese Variable ist bereits von Hand gesetzt. „GPU-Zuweisung erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
   errorRuntimeSpecApplicationNotServerAgent:
@@ -2259,6 +2261,336 @@ const de = {
     'Das Modell konnte nicht gestartet werden. Die Logs der Zeile zeigen, warum.',
   errorRuntimeNotPermitted: 'Der Agent hat den Start dieses Modells nicht zugelassen.',
   errorRuntimeUpstreamGone: 'Der Agent konnte die Anfrage nicht abschließen.',
+  errorClusterMemberModeInvalid: 'Der Mitgliedsmodus muss „automatisch“ oder „manuell“ sein.',
+  errorClusterNetworkInvalid:
+    'Das Cluster-Netz muss „Mesh“ oder „LAN“ sein (oder leer für den Standard).',
+  errorClusterTransportInvalid:
+    'Der RPC-Transport muss „direkt“ oder „Relay“ sein (oder leer für den Standard).',
+  errorClusterTypeInvalid: 'Ein Cluster-Head muss eine llama.cpp-Runtime-Spezifikation sein.',
+  errorClusterRpcPlaceholderMissing:
+    'Ein Cluster-Head braucht ${RPC_SERVERS} als Wert von --rpc in den Argumenten oder von LLAMA_ARG_RPC in der Umgebung.',
+  errorClusterRpcTwice:
+    'Die RPC-Server genau einmal setzen: ${RPC_SERVERS} einmal, entweder über --rpc oder LLAMA_ARG_RPC, nie beides.',
+  errorClusterRpcPlaceholderWithoutCluster:
+    '${RPC_SERVERS} und ${RPC_DEVICES} setzen den Cluster-Modus voraus.',
+  errorClusterDeviceListMissingRpc:
+    'Die Geräteliste eines Cluster-Heads muss die RPC-Geräte mit ${DEVICES} oder ${RPC_DEVICES} nennen, sonst werden die Mitglieder nie genutzt.',
+  errorClusterDeviceOrder:
+    'Die Geräteliste wird geparst, bevor die RPC-Server existieren: --device nach --rpc in die Argumente schreiben oder die RPC-Server über LLAMA_ARG_RPC setzen.',
+  errorClusterMembersRequired: 'Ein Cluster-Head braucht mindestens ein Mitglied.',
+  errorClusterHeadReplicable:
+    'Ein Cluster-Head kann nicht replizierbar sein: jedes Mitglied bedient genau einen Head.',
+  errorClusterStartupTimeoutRequired:
+    'Ein Cluster-Head braucht ein explizit gesetztes „Start-Timeout (s)“.',
+  errorClusterMemberServerTwice:
+    'Ein Server kann nur einmal Mitglied eines Heads sein; die GPUs in einem Mitglied zusammenfassen.',
+  errorClusterMemberOnHeadServer:
+    'Ein Mitglied muss auf einem anderen Server als sein Head laufen.',
+  errorClusterMemberSpecTaken:
+    'Die Mitglieds-Spezifikation bedient bereits einen anderen Cluster-Head.',
+  errorClusterMemberSpecDisabled: 'Die Mitglieds-Spezifikation ist deaktiviert.',
+  errorClusterMemberRpcDisabled:
+    'Der Server bietet in seinen Runtime-Einstellungen keine RPC-Mitgliedschaft an.',
+  errorClusterMemberNoMatchingBinary:
+    'Der Mitglieds-Server hat keinen ggml-rpc-server in der Version des Head-Binaries.',
+  errorClusterVersionMismatch:
+    'Die Version des Mitglieds-Binaries weicht von der des Head-Binaries ab.',
+  errorClusterMeshUnavailable:
+    'Ein Mesh-Cluster braucht NetBird mit Tracking-Gruppe und bekannter Mesh-IP bei Head und allen Mitgliedern.',
+  errorClusterLanAddressRequired:
+    'Ein LAN-Cluster braucht auf jedem Server eine LAN-Adresse: das Feld „LAN-Adresse“ im Server-Formular; auf Servern ohne NetBird genügt die Domain.',
+  errorClusterDirectUnavailable:
+    'Direkter Transport im Mesh-Cluster braucht NetBird-Richtlinienverwaltung mit aktivem Deny-by-default und die als deaktiviert gesehene Default-Richtlinie; stattdessen Relay verwenden.',
+  errorClusterMemberBudgetRequired:
+    'Ein Mitglied auf einer Apple-GPU braucht ein GPU-Budget auf seinem Server.',
+  errorClusterTensorSplitRequired:
+    'Ein Head mit einem Nicht-NVIDIA-Mitglied braucht --tensor-split.',
+  errorClusterPortExhausted:
+    'Auf dem Mitglieds-Server ist im RPC-Portbereich 47000-47999 kein Port mehr frei.',
+  errorClusterFlagEqualsForm:
+    'Cluster-Flags in den Argumenten müssen als getrennte Tokens stehen (--rpc ${RPC_SERVERS}), nicht in der Form --rpc=…',
+  errorRuntimeSpecPortConflictsRpcMember:
+    'Der feste Port liegt im RPC-Portbereich 47000-47999 und kollidiert mit einem RPC-Mitglied auf diesem Server.',
+  errorRuntimeSpecDeviceBackendInvalid:
+    'Das Geräte-Backend muss auto, cuda, rocm, vulkan, metal oder sycl sein.',
+  errorRuntimeSpecMemberFlagReserved:
+    '-H/--host, -p/--port, -d/--device und -c/--cache setzt der Agent und sind in Mitglieds-Argumenten nicht erlaubt.',
+  errorRuntimeSpecMemberVramEstimateRequired:
+    'Auf einem Server ohne NVIDIA-GPUs ist für jede GPU eine VRAM-Schätzung nötig.',
+  errorRpcMemberSpecNotFound: 'RPC-Mitglieds-Spezifikation nicht gefunden.',
+  errorRpcMemberSpecRequestFailed:
+    'Die Anfrage zur RPC-Mitglieds-Spezifikation ist fehlgeschlagen.',
+  errorBinaryPathInvalid: 'Der Pfad muss ein absoluter Pfad mit höchstens 4096 Zeichen sein.',
+  errorBinaryKindInvalid: 'Die Art muss llama_server, rpc_server oder other sein.',
+  errorBinaryVersionInvalid: 'Version, Build und Commit dürfen höchstens 256 Zeichen lang sein.',
+  errorBinaryNotFound: 'Binary auf diesem Server nicht gefunden.',
+  errorBinaryAgentOwned:
+    'Der Agent meldet dieses Binary; nur die Versionsüberschreibung ist änderbar.',
+  errorBinaryRequestFailed: 'Die Binary-Anfrage ist fehlgeschlagen.',
+  errorSettingsNetbirdDirectClusterExists:
+    'Ein direkter Mesh-RPC-Cluster existiert. Auf Relay umstellen oder entfernen, bevor Richtlinienverwaltung, Standard-Sperre oder deren Durchsetzung abgeschaltet wird.',
+  errorServerLanAddressInvalid: 'Die LAN-Adresse muss leer oder eine IPv4-Adresse sein.',
+  errorClusterLanAckRequired:
+    'Direkter Transport in einem LAN-Cluster legt den RPC-Port jedes Mitglieds ohne Authentifizierung offen; im Bereich „RPC-Cluster“ des Heads die Offenlegung bestätigen.',
+  errorClusterMemberInUse: 'Das Mitglied wird von einem Cluster-Head verwendet.',
+  rpcTab: 'RPC',
+  rpcTabIntro:
+    'Dieser Server als RPC-Mitglied eines llama.cpp-Clusters: Angebot, manuelle Mitglieds-Spezifikationen und der Live-Zustand der Mitglieder.',
+  rpcServerSettingsTitle: 'RPC-Einstellungen des Servers',
+  rpcMemberEnabledLabel: 'Als automatisches RPC-Mitglied anbieten',
+  rpcAllowedHeadGroups: 'Erlaubte Head-Gruppen',
+  rpcAllowedHeadGroupsDefault: 'Keine Auswahl: gilt für die eigenen Admin-Gruppen dieses Servers.',
+  rpcSettingsSave: 'RPC-Einstellungen speichern',
+  rpcSettingsSaved: 'RPC-Einstellungen gespeichert.',
+  rpcSettingsNoChanges: 'Keine Änderungen zu speichern.',
+  rpcManualMembersTitle: 'Manuelle Mitglieds-Spezifikationen',
+  rpcManualMembersEmpty: 'Keine manuellen Mitglieds-Spezifikationen.',
+  rpcMemberAdd: 'Mitglieds-Spezifikation hinzufügen',
+  rpcMemberEditTitle: 'Mitglieds-Spezifikation bearbeiten',
+  rpcMemberNewTitle: 'Neue Mitglieds-Spezifikation',
+  rpcMemberCpu: 'CPU-Mitglied',
+  rpcMemberEnabled: 'Aktiviert',
+  rpcMemberBinary: 'Pfad zum ggml-rpc-server (absolut)',
+  rpcMemberCache: 'RPC-Cache aktivieren',
+  rpcMemberBackend: 'Geräte-Backend',
+  rpcMemberGpuLabel: 'GPU',
+  rpcMemberGpuVram: 'VRAM-Schätzung (MB)',
+  rpcMemberGpuHint:
+    'Ohne GPU-Zeilen läuft das Mitglied auf der CPU. Die Reihenfolge der Zeilen ist die Reihenfolge der Geräte.',
+  rpcMemberArgsHint: 'Ein Argument pro Zeile. -H, -p, -d und -c setzt der Agent.',
+  rpcMemberUsedBy: 'Verwendet von Head',
+  rpcMemberDeleteTitle: 'Mitglieds-Spezifikation löschen',
+  rpcMemberDeleteBody: 'Diese Mitglieds-Spezifikation wirklich löschen?',
+  rpcMemberSaved: 'Mitglieds-Spezifikation gespeichert.',
+  rpcMemberDeleted: 'Mitglieds-Spezifikation gelöscht.',
+  rpcStatusTitle: 'Mitglieder im Betrieb',
+  rpcStatusEmpty: 'Keine RPC-Mitglieder aktiv.',
+  rpcStatusHeldBy: 'Gehalten von',
+  rpcStatusHeldByHead: 'Head',
+  rpcStatusNotHeld: 'frei',
+  rpcStatusHeldElsewhere: 'gehalten',
+  rpcStatusProtocol: 'Protokoll',
+  rpcStatusVram: 'VRAM (effektiv)',
+  rpcStatusRam: 'RAM (effektiv)',
+  rpcStatusBindMismatch: 'Bind-Abweichung',
+  rpcStatusBreaches: 'Verstöße',
+  serverNetbirdIpLabel: 'NetBird-IP (Mesh)',
+  serverLanAddressLabel: 'LAN-Adresse',
+  serverLanAddressHelp: 'Optionale IPv4-Adresse dieses Servers im LAN; Grundlage für LAN-Cluster.',
+  serverLanBindOnlyLabel: 'RPC-Mitglieder nur auf dieser Adresse lauschen lassen',
+  serverLanBindOnlyHelp: 'Ohne diese Option lauschen LAN-Mitglieder auf allen Adressen (0.0.0.0).',
+  errorClusterStartFailed:
+    'Der Cluster konnte nicht gestartet werden. Die Logs der Mitglieder und des Heads zeigen den Grund.',
+  errorClusterUnavailable:
+    'Der Cluster ist gerade nicht verfügbar (ein Mitglied ist nicht erreichbar oder nicht bereit).',
+  errorClusterMemberUnused: 'Ein Mitglied des Clusters wird vom Head nicht genutzt.',
+  errorClusterAgentTooOld:
+    'Der Agent auf Head oder Mitglied ist zu alt für RPC-Cluster. Agent aktualisieren.',
+  errorClusterAddressUnknown: 'Die Adresse eines Mitglieds ist unbekannt.',
+  errorClusterMemberConsentWithdrawn: 'Die Freigabe eines Mitglieds wurde widerrufen.',
+  errorClusterMemberDisabled: 'Ein Mitglied ist deaktiviert.',
+  errorClusterMemberMissing: 'Ein Mitglied existiert nicht mehr.',
+  errorClusterMemberSpecInvalid: 'Die Mitglieds-Spezifikation ist ungültig.',
+  errorClusterMemberUnmanaged: 'Ein Mitglied hat keinen verwalteten Agent.',
+  errorClusterPortUnknown: 'Der Port eines Mitglieds ist noch unbekannt.',
+  errorRuntimeConfigAgentFeaturesPending: 'Die Funktionen des Agents sind noch nicht gemeldet.',
+  clusterTotalLabel: 'Cluster',
+  clusterOwnValue: 'Eigener Wert',
+  clusterBreakdown: 'Aufschlüsselung',
+  clusterBreakdownHead: 'Head',
+  clusterBreakdownCpu: 'CPU',
+  clusterBreakdownStale: 'veraltet',
+  clusterIncompleteTooltip: 'Mindestwert: bei diesen Mitgliedern fehlt ein Wert',
+  clusterIncompleteHidden: 'Mindestwert: bei einem nicht sichtbaren Mitglied fehlt ein Wert',
+  clusterIncompleteHead: 'Mindestwert: der eigene Wert des Heads fehlt',
+  clusterIncompleteNeutral: 'Mindestwert: mindestens diese Summe',
+  binariesTab: 'Binaries',
+  binariesIntro:
+    'Die llama-server- und ggml-rpc-server-Binaries dieses Servers: vom Agent gemeldete (nur die Version lässt sich überschreiben) und von Hand ergänzte.',
+  binariesEmpty: 'Keine Binaries bekannt.',
+  binariesAdd: 'Binary hinzufügen',
+  binariesNewTitle: 'Neue Binary',
+  binariesEditTitle: 'Binary bearbeiten',
+  binariesOverrideTitle: 'Version überschreiben',
+  binariesPath: 'Pfad',
+  binariesKind: 'Art',
+  binariesKindLlamaServer: 'llama-server',
+  binariesKindRpcServer: 'ggml-rpc-server',
+  binariesKindOther: 'Sonstige',
+  binariesVersion: 'Version',
+  binariesBuild: 'Build',
+  binariesCommit: 'Commit',
+  binariesSource: 'Quelle',
+  binariesSourceAgent: 'Agent',
+  binariesSourceManual: 'Manuell',
+  binariesOverride: 'Versions-Override (leer = Erkennung nutzen)',
+  binariesOverrideAction: 'Version überschreiben',
+  binariesOverridden: 'überschrieben',
+  binariesEdit: 'Binary bearbeiten',
+  binariesDelete: 'Binary entfernen',
+  binariesDeleteTitle: 'Binary entfernen?',
+  binariesDeleteConfirm: 'Entfernen',
+  binariesVersionUnknown: 'Version unbekannt',
+  binariesNotAllowed: 'Vom Agent nicht erlaubt',
+  binariesSaved: 'Binary gespeichert.',
+  binariesDeleted: 'Binary entfernt.',
+  binariesLoadFailed: 'Die Binaries konnten nicht geladen werden.',
+  binaryPickerHint: 'Aus dem Bestand des Servers wählen oder einen Pfad eingeben.',
+  clusterMembersMatchingBinary: (version: string) =>
+    `Mitglieder nutzen den passenden ggml-rpc-server (Head-Binary: ${version}).`,
+  clusterWithheldTitle: 'Dieser Cluster-Head wird nicht an seinen Agent gesendet',
+  clusterStatusTitle: 'Cluster-Status',
+  clusterStateCold: 'Cluster aus',
+  clusterStateForming: 'Cluster startet',
+  clusterStateFormed: 'Cluster steht',
+  clusterStateCoolingDown: 'Cluster pausiert nach Fehler',
+  clusterStateInvalid: 'Cluster ungültig',
+  clusterPhaseMembersStarting: 'Mitglieder starten',
+  clusterPhaseMembersReady: 'Mitglieder bereit',
+  clusterPhaseHeadStarting: 'Head startet',
+  clusterPhaseFormed: 'Cluster steht',
+  clusterMemberStatePending: 'wartet',
+  clusterMemberStateStarting: 'startet',
+  clusterMemberStateReady: 'bereit',
+  clusterMemberStateHeld: 'gehalten',
+  clusterMemberStateFailed: 'fehlgeschlagen',
+  clusterStatusMember: (n: number) => `Mitglied ${n}`,
+  clusterStatusMemberHidden: (n: number) => `Mitglied ${n} (nicht sichtbar)`,
+  clusterStatusHead: 'Head',
+  clusterCooldownUntil: (time: string) => `Neuer Start frühestens ab ${time}`,
+  clusterLastFailure: (code: string, where: string) => `Letzter Fehler (${where}): ${code}`,
+  runtimeStopClusterTitle: (name: string) => `${name} stoppen?`,
+  runtimeStopClusterBody: 'Der Head wird gestoppt. Die Mitglieder laufen sonst noch kurz weiter.',
+  runtimeStopMembersToo: 'Mitglieder ebenfalls stoppen',
+  errorClusterConfigUnacknowledged:
+    'Die Cluster-Konfiguration wurde vom Agent nicht bestätigt. Agent und Gateway prüfen.',
+  errorClusterHeadDisabled: 'Der Cluster-Head ist deaktiviert.',
+  errorClusterStartCancelled: 'Der Cluster-Start wurde abgebrochen.',
+  errorClusterStopping:
+    'Der Cluster wird gerade gestoppt. Nach dem Stopp kann er erneut gestartet werden.',
+  clusterBreakdownHiddenCount: (n: number) =>
+    `${n} nicht sichtbare(s) Mitglied(er) nur in der Summe`,
+  errorClusterHeadUnsupported:
+    'Dieser Head kann nicht als Cluster laufen (Agent oder Binary unterstützt das nicht).',
+  errorRuntimeDeviceBackendMismatch:
+    'Das gewählte Geräte-Backend passt nicht zu den GPUs dieses Servers.',
+  errorRuntimeRpcDeviceCountMismatch:
+    'Der RPC-Server meldet eine andere Anzahl Geräte als konfiguriert.',
+  errorRuntimeRpcUnsupportedBuild: 'Dieses Binary wurde ohne RPC-Unterstützung gebaut.',
+  errorRuntimeClusterVersionMismatch: 'Die Versionen von Head und Mitglied stimmen nicht überein.',
+  errorRuntimeClusterMemberUnreachable:
+    'Ein Cluster-Mitglied war vor dem Start des Heads nicht erreichbar.',
+  errorRuntimeBindMismatch: 'Der RPC-Server lauscht nicht auf der konfigurierten Adresse.',
+  errorRuntimeClusterNotReady:
+    'Der Cluster-Head startet nur über den Cluster-Start; die Mitglieder sind noch nicht bereit.',
+  errorRuntimeInstanceBusy: 'Die Instanz ist beschäftigt und wird jetzt nicht gestoppt.',
+  errorRuntimeCachePurgeFailed: 'Der RPC-Cache des Mitglieds konnte nicht geleert werden.',
+  clusterWarnRpcDevicesNotFirst: 'Die RPC-Geräte stehen nicht an erster Stelle der Geräteliste.',
+  clusterWarnMmdevMissing:
+    'Für den Multimodal-Projektor ist kein Gerät gesetzt (--mmproj-device fehlt).',
+  clusterWarnCpuMemberWithoutTensorSplit:
+    'Ein CPU-Mitglied ohne --tensor-split bekommt womöglich zu viel oder gar nichts.',
+  clusterWarnSharedHostWithoutEstimate:
+    'Ein Mitglied teilt sich den Host mit anderen Modellen, ohne VRAM-Schätzung.',
+  clusterWarnBudgetBelowDevice:
+    'Das GPU-Budget eines Mitglieds liegt unter dem Speicher des Geräts.',
+  clusterWarnGpuOverlap:
+    'Die GPUs eines Mitglieds überschneiden sich mit denen anderer Mitglieder oder Modelle auf demselben Server.',
+  clusterWarnRelayMeshDenyOff:
+    'Relay im Mesh ohne aktives Deny-by-default schützt die Mitglieder nicht vor anderen Peers.',
+  clusterWarnMemberVersionUnknown:
+    'Die Version eines Mitglieds-Binaries ist unbekannt; die Übereinstimmung mit dem Head ist ungeprüft.',
+  // The cluster head editor of a llama.cpp launch spec.
+  clusterTitle: 'RPC-Cluster',
+  clusterIntro:
+    'Als Cluster-Head lädt diese llama.cpp-Spezifikation einen Teil des Modells auf ggml-rpc-server-Mitglieder auf anderen Servern aus.',
+  clusterEnabledLabel: 'Als Cluster-Head betreiben',
+  clusterCreateFirst:
+    'Die Spezifikation zuerst speichern; danach lässt sie sich als Cluster-Head einrichten.',
+  clusterRpcHint:
+    'Ein Cluster-Head braucht ${RPC_SERVERS} genau einmal: als zwei Zeilen „--rpc“ und „${RPC_SERVERS}“ in den Argumenten oder als LLAMA_ARG_RPC=${RPC_SERVERS} in der Umgebung.',
+  clusterDeviceBackend: 'Geräte-Backend (für ${DEVICES} und ${FIRST_LOCAL_DEVICE})',
+  clusterMemberMode: 'Mitgliedsmodus',
+  clusterMemberModeAutomatic: 'Automatisch: Server und GPUs hier wählen',
+  clusterMemberModeManual: 'Manuell: Mitglieds-Spezifikation auf dem Server',
+  clusterModeSwitchTitle: 'Mitgliedsmodus wechseln',
+  clusterModeSwitchBody:
+    'Der Wechsel ersetzt die Mitgliederliste: alle bisherigen Mitglieder werden entfernt. Ein laufender Cluster wird beim Speichern gestoppt.',
+  clusterModeSwitchConfirm: 'Modus wechseln',
+  clusterNetwork: 'Netz',
+  clusterDefaultOption: (value: string) => `Standard (${value})`,
+  clusterDefaultOptionUnknown: 'Standard (beim Speichern bestimmt)',
+  clusterNetworkMesh: 'Mesh (NetBird)',
+  clusterNetworkLan: 'LAN (ohne NetBird)',
+  clusterNetworkReasonMesh:
+    'Standard ist Mesh: Head und alle Mitglieder haben NetBird mit Tracking-Gruppe und bekannter Mesh-IP.',
+  clusterNetworkReasonLan:
+    'Standard ist LAN: nicht jeder beteiligte Server hat NetBird mit Tracking-Gruppe und bekannter Mesh-IP.',
+  clusterNetworkReasonUnknown:
+    'Der Standard ergibt sich beim Speichern: Mesh, wenn Head und alle Mitglieder NetBird mit bekannter Mesh-IP haben, sonst LAN.',
+  clusterLanAddressHint:
+    'Im LAN wählt der Head jedes Mitglied über dessen LAN-Adresse an: das Feld „LAN-Adresse“ im Server-Formular (Server → Bearbeiten), ohne sie die Domain des Servers. Server mit NetBird brauchen die LAN-Adresse immer.',
+  clusterLanAddressHeadMissing:
+    'Dieser Server hat NetBird, aber keine LAN-Adresse: im Server-Formular unter „LAN-Adresse“ eintragen, sonst wird ein LAN-Cluster abgelehnt.',
+  clusterTransport: 'Transport',
+  clusterTransportDirect: 'Direkt',
+  clusterTransportRelay: 'Relay',
+  clusterTransportReasonMeshDirect:
+    'Standard ist direkt: die vom Gateway verwalteten NetBird-Richtlinien lassen nur den Head an die Mitglieder.',
+  clusterTransportReasonMeshRelay:
+    'Standard ist Relay: direkter Transport im Mesh braucht NetBird-Richtlinienverwaltung mit erzwungenem Deny-by-default und deaktivierter Default-Richtlinie.',
+  clusterTransportReasonLan: 'Im LAN ist direkt der Standard.',
+  clusterTransportReasonUnknown: 'Der Standard ergibt sich beim Speichern aus dem Netz.',
+  clusterTransportExplain:
+    'Direkt: der Head verbindet sich unmittelbar mit dem RPC-Port des Mitglieds, der schnellste Weg. Relay: der Agent des Mitglieds nimmt die Verbindung an und lässt nur diesen Head durch; ein zusätzlicher Sprung, dafür auf genau einen Head beschränkt.',
+  clusterLanAckTitle: 'RPC-Ports im LAN offenlegen',
+  clusterLanAckBody:
+    'Mit direktem Transport im LAN ist der RPC-Port jedes Mitglieds ohne Authentifizierung auf allen Schnittstellen des Mitglieds erreichbar (oder auf seiner Bind-Adresse). Wer ihn erreicht, kann Speicher belegen und Berechnungen auf den Geräten des Mitglieds ausführen. Relay oder eine Bind-Adresse grenzen das ein.',
+  clusterLanAckConfirm: 'Offenlegung bestätigen',
+  clusterLanAckGiven: 'Die Offenlegung der RPC-Ports im LAN ist bestätigt.',
+  clusterLanAckMissing: 'Direkter Transport im LAN braucht die Bestätigung der Offenlegung.',
+  clusterLanAckReview: 'Offenlegung prüfen …',
+  clusterLanAckWithdraw: 'Bestätigung zurückziehen',
+  clusterMembers: 'Mitglieder',
+  clusterMembersHint:
+    'Die Reihenfolge ist die --rpc-Reihenfolge: sie bestimmt die Gerätenamen RPC0, RPC1, … und die Positionen in --tensor-split.',
+  clusterMembersEmpty: 'Noch keine Mitglieder.',
+  clusterMemberHidden: 'Ein Mitglied auf einem Server, den Sie nicht sehen können',
+  clusterMembersLocked:
+    'Ein Mitglied liegt auf einem Server, den Sie nicht verwalten: Cluster-Schalter, Mitglieder, Modus, Netz, Transport und das Binary des Heads kann nur ändern, wer alle Mitglieds-Server verwalten darf. Die übrigen Felder des Heads bleiben bearbeitbar.',
+  errorClusterHeadBinaryLocked:
+    'Das Binary des Heads lässt sich nicht ändern, solange ein Mitglied auf einem Server liegt, den Sie nicht verwalten: der Wechsel prüft die Versionen aller Mitglieder neu.',
+  clusterMemberHardwareFailed: 'Die Hardware-Angaben dieses Servers konnten nicht geladen werden.',
+  clusterMemberHardwareUnavailable: 'Für diesen Server liegt noch kein Hardware-Bericht vor.',
+  clusterMemberAdd: 'Mitglied hinzufügen',
+  clusterMemberServer: 'Server',
+  clusterMemberSpec: 'Mitglieds-Spezifikation',
+  clusterMemberSpecPick: 'Dieser Server hat mehrere freie Mitglieds-Spezifikationen; eine wählen.',
+  clusterMemberAddConfirm: 'Übernehmen',
+  clusterCandidatesEmptyAutomatic:
+    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries; der Head muss mit einem Binary bekannter Version gespeichert sein.',
+  clusterCandidatesEmptyManual:
+    'Kein Server steht zur Wahl. Er braucht eine freie, aktivierte Mitglieds-Spezifikation (Reiter „RPC“), die diesen Head zulässt.',
+  clusterCandidatesFailed: 'Die möglichen Mitglieds-Server konnten nicht geladen werden.',
+  clusterMemberRemove: 'Mitglied entfernen',
+  clusterMemberGpus: 'GPUs (Reihenfolge = Geräte-Reihenfolge im Mitglied)',
+  clusterMemberGpuAdd: 'GPU hinzufügen',
+  clusterMemberGpuRemove: 'GPU entfernen',
+  clusterMemberNoGpusReported: 'Dieser Server meldet keine GPUs.',
+  clusterMemberThreads: 'Threads (-t, 0 = Standard)',
+  clusterMemberRamEstimate: 'RAM-Schätzung (MB)',
+  clusterMemberMeasured: 'gemessen',
+  clusterMemberPort: 'Port',
+  clusterWarnings: 'Hinweise zum Cluster',
+  clusterTotals: 'Cluster gesamt',
+  clusterTotalsLowerBound: 'mindestens, nicht alle Teile sind bekannt',
+  clusterColdStart: (seconds: number) =>
+    `Ein kalter Start startet erst alle Mitglieder, dann den Head; er kann so lange dauern wie das Start-Timeout des Heads (${seconds} s) plus das des langsamsten Mitglieds. Das Start-Timeout des Heads muss gesetzt sein.`,
+  clusterDeviceOrderHint:
+    'Die RPC-Geräte gehören an den Anfang der Geräteliste (--device ${DEVICES} ordnet sie so): die Ausgabeschicht landet auf dem letzten Gerät, und --fit füllt von hinten, so bleiben beide lokal.',
+  clusterMmdevHint:
+    'Die Geräteliste beginnt mit RPC-Geräten: für ein Vision-Modell -mmdev ${FIRST_LOCAL_DEVICE} setzen, sonst landet der Projektor auf RPC0.',
+  clusterNoDeviceListHint: 'Ohne Geräteliste stellt llama.cpp die RPC-Geräte selbst an den Anfang.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -4983,7 +5315,7 @@ const en: PortalMessages = {
   runtimeSpecVisibleDevicesModeEnv: 'Environment variable',
   runtimeSpecVisibleDevicesModeArgs: 'Arguments (--device)',
   runtimeSpecVisibleDevicesModeArgsHint:
-    'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build. It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the three must be present.',
+    'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build, or the generic ${DEVICES}, rendered with the device backend of the spec (on a cluster head the RPC devices first). It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the four must be present. ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name only the first device (for -mmdev) and do not count here.',
   // Runtime-Spec API Token: the MODE controls only -- the header-source
   // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API token mode',
@@ -5075,7 +5407,7 @@ const en: PortalMessages = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} only works on a macOS host; the connected agent runs on a different operating system.',
   runtimeSpecEnvHint:
-    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
+    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:
@@ -5633,6 +5965,8 @@ const en: PortalMessages = {
   errorRuntimeSpecAdminStateInvalid: 'Invalid admin state',
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Enforcing GPU assignment needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',
+  errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
+    'In arguments mode, enforcing GPU assignment needs a device placeholder in the args: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} or ${DEVICES}. Otherwise the agent sets nothing and the selection is lost.',
   errorRuntimeSpecVisibleDevicesConflict:
     'This variable is already set by hand. Enforcing GPU assignment and your own entry are two sources for one value — remove one of them.',
   errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',
@@ -5723,6 +6057,326 @@ const en: PortalMessages = {
   errorRuntimeStartFailed: "The model failed to start. The row's logs show why.",
   errorRuntimeNotPermitted: 'The agent did not permit this model to start.',
   errorRuntimeUpstreamGone: 'The agent could not complete the request.',
+  errorClusterMemberModeInvalid: 'The member mode must be "automatic" or "manual".',
+  errorClusterNetworkInvalid:
+    'The cluster network must be "mesh" or "lan" (or empty for the default).',
+  errorClusterTransportInvalid:
+    'The RPC transport must be "direct" or "relay" (or empty for the default).',
+  errorClusterTypeInvalid: 'A cluster head must be a llama.cpp runtime spec.',
+  errorClusterRpcPlaceholderMissing:
+    'A cluster head needs ${RPC_SERVERS} as the value of --rpc in args or of LLAMA_ARG_RPC in env.',
+  errorClusterRpcTwice:
+    'Set the RPC servers exactly once: ${RPC_SERVERS} once, through either --rpc or LLAMA_ARG_RPC, never both.',
+  errorClusterRpcPlaceholderWithoutCluster: '${RPC_SERVERS} and ${RPC_DEVICES} need cluster mode.',
+  errorClusterDeviceListMissingRpc:
+    "A cluster head's device list must name the RPC devices with ${DEVICES} or ${RPC_DEVICES}, otherwise the members are never used.",
+  errorClusterDeviceOrder:
+    'The device list is parsed before the RPC servers exist: put --device after --rpc in args, or set the RPC servers through LLAMA_ARG_RPC.',
+  errorClusterMembersRequired: 'A cluster head needs at least one member.',
+  errorClusterHeadReplicable:
+    'A cluster head cannot be replicable: each member serves exactly one head.',
+  errorClusterStartupTimeoutRequired:
+    'A cluster head needs an explicitly set "Startup timeout (s)".',
+  errorClusterMemberServerTwice:
+    'A server can be a member of a head only once; combine its GPUs into one member.',
+  errorClusterMemberOnHeadServer: 'A member must run on a different server than its head.',
+  errorClusterMemberSpecTaken: 'The member spec already serves another cluster head.',
+  errorClusterMemberSpecDisabled: 'The member spec is disabled.',
+  errorClusterMemberRpcDisabled:
+    'The server does not offer RPC membership in its runtime settings.',
+  errorClusterMemberNoMatchingBinary:
+    "The member server has no ggml-rpc-server of the head binary's version.",
+  errorClusterVersionMismatch: "The member binary's version differs from the head binary's.",
+  errorClusterMeshUnavailable:
+    'A mesh cluster needs NetBird with a tracking group and a known mesh IP on the head and every member.',
+  errorClusterLanAddressRequired:
+    'A LAN cluster needs a LAN address on every server: the "LAN address" field in the server form; on servers without NetBird the domain is enough.',
+  errorClusterDirectUnavailable:
+    'Direct transport in a mesh cluster needs NetBird policy management with deny-by-default on and enforced, and the Default policy seen disabled; use relay instead.',
+  errorClusterMemberBudgetRequired: 'A member on an Apple GPU needs a GPU budget on its server.',
+  errorClusterTensorSplitRequired: 'A head with a non-NVIDIA member needs --tensor-split.',
+  errorClusterPortExhausted:
+    'The member server has no free port left in the RPC range 47000-47999.',
+  errorClusterFlagEqualsForm:
+    'Cluster flags in args must be separate tokens (--rpc ${RPC_SERVERS}), not the --rpc=… form.',
+  errorRuntimeSpecPortConflictsRpcMember:
+    'The fixed port lies in the RPC range 47000-47999 and collides with an RPC member on this server.',
+  errorRuntimeSpecDeviceBackendInvalid:
+    'The device backend must be one of auto, cuda, rocm, vulkan, metal, sycl.',
+  errorRuntimeSpecMemberFlagReserved:
+    '-H/--host, -p/--port, -d/--device and -c/--cache are set by the agent and cannot be used in member args.',
+  errorRuntimeSpecMemberVramEstimateRequired:
+    'A VRAM estimate is required for every GPU on a server without NVIDIA GPUs.',
+  errorRpcMemberSpecNotFound: 'RPC member spec not found.',
+  errorRpcMemberSpecRequestFailed: 'The RPC member spec request failed.',
+  errorBinaryPathInvalid: 'The path must be an absolute path of at most 4096 characters.',
+  errorBinaryKindInvalid: 'The kind must be one of llama_server, rpc_server, other.',
+  errorBinaryVersionInvalid: 'Version, build and commit must be at most 256 characters.',
+  errorBinaryNotFound: 'Binary not found on this server.',
+  errorBinaryAgentOwned: 'The agent reports this binary; only its version override can be changed.',
+  errorBinaryRequestFailed: 'The binary request failed.',
+  errorSettingsNetbirdDirectClusterExists:
+    'A direct mesh RPC cluster exists. Switch it to relay or remove it before turning off policy management, deny-by-default or its enforcement.',
+  errorServerLanAddressInvalid: 'The LAN address must be empty or an IPv4 address.',
+  errorClusterLanAckRequired:
+    'Direct transport in a LAN cluster exposes each member\'s RPC port unauthenticated; confirm the exposure in the head\'s "RPC cluster" section.',
+  errorClusterMemberInUse: 'The member is used by a cluster head.',
+  rpcTab: 'RPC',
+  rpcTabIntro:
+    'This server as an RPC member of a llama.cpp cluster: the offer, manual member specs and the live state of the members.',
+  rpcServerSettingsTitle: 'Server RPC settings',
+  rpcMemberEnabledLabel: 'Offer as an automatic RPC member',
+  rpcAllowedHeadGroups: 'Allowed head groups',
+  rpcAllowedHeadGroupsDefault: "No selection: applies to this server's own admin groups.",
+  rpcSettingsSave: 'Save RPC settings',
+  rpcSettingsSaved: 'RPC settings saved.',
+  rpcSettingsNoChanges: 'No changes to save.',
+  rpcManualMembersTitle: 'Manual member specs',
+  rpcManualMembersEmpty: 'No manual member specs.',
+  rpcMemberAdd: 'Add member spec',
+  rpcMemberEditTitle: 'Edit member spec',
+  rpcMemberNewTitle: 'New member spec',
+  rpcMemberCpu: 'CPU member',
+  rpcMemberEnabled: 'Enabled',
+  rpcMemberBinary: 'Path to ggml-rpc-server (absolute)',
+  rpcMemberCache: 'Enable RPC cache',
+  rpcMemberBackend: 'Device backend',
+  rpcMemberGpuLabel: 'GPU',
+  rpcMemberGpuVram: 'VRAM estimate (MB)',
+  rpcMemberGpuHint:
+    'Without GPU rows the member runs on the CPU. The row order is the device order.',
+  rpcMemberArgsHint: 'One argument per line. -H, -p, -d and -c are set by the agent.',
+  rpcMemberUsedBy: 'Used by head',
+  rpcMemberDeleteTitle: 'Delete member spec',
+  rpcMemberDeleteBody: 'Really delete this member spec?',
+  rpcMemberSaved: 'Member spec saved.',
+  rpcMemberDeleted: 'Member spec deleted.',
+  rpcStatusTitle: 'Running members',
+  rpcStatusEmpty: 'No RPC members active.',
+  rpcStatusHeldBy: 'Held by',
+  rpcStatusHeldByHead: 'head',
+  rpcStatusNotHeld: 'free',
+  rpcStatusHeldElsewhere: 'held',
+  rpcStatusProtocol: 'Protocol',
+  rpcStatusVram: 'VRAM (effective)',
+  rpcStatusRam: 'RAM (effective)',
+  rpcStatusBindMismatch: 'Bind mismatch',
+  rpcStatusBreaches: 'Breaches',
+  serverNetbirdIpLabel: 'NetBird IP (mesh)',
+  serverLanAddressLabel: 'LAN address',
+  serverLanAddressHelp:
+    'Optional IPv4 address of this server on the LAN; the basis for LAN clusters.',
+  serverLanBindOnlyLabel: 'Listen RPC members only on this address',
+  serverLanBindOnlyHelp: 'Without this, LAN members listen on all addresses (0.0.0.0).',
+  errorClusterStartFailed:
+    "The cluster failed to start. The members' and the head's logs show why.",
+  errorClusterUnavailable:
+    'The cluster is not available right now (a member is unreachable or not ready).',
+  errorClusterMemberUnused: 'A cluster member is not used by the head.',
+  errorClusterAgentTooOld:
+    'The agent on the head or a member is too old for RPC clusters. Update the agent.',
+  errorClusterAddressUnknown: "A member's address is unknown.",
+  errorClusterMemberConsentWithdrawn: "A member's consent was withdrawn.",
+  errorClusterMemberDisabled: 'A member is disabled.',
+  errorClusterMemberMissing: 'A member no longer exists.',
+  errorClusterMemberSpecInvalid: 'The member spec is invalid.',
+  errorClusterMemberUnmanaged: 'A member has no managed agent.',
+  errorClusterPortUnknown: "A member's port is not known yet.",
+  errorRuntimeConfigAgentFeaturesPending: 'The agent has not reported its features yet.',
+  clusterTotalLabel: 'Cluster',
+  clusterOwnValue: 'Own value',
+  clusterBreakdown: 'Breakdown',
+  clusterBreakdownHead: 'Head',
+  clusterBreakdownCpu: 'CPU',
+  clusterBreakdownStale: 'stale',
+  clusterIncompleteTooltip: 'Lower bound: a value is missing for these members',
+  clusterIncompleteHidden: 'Lower bound: a value is missing for a member you cannot see',
+  clusterIncompleteHead: "Lower bound: the head's own value is missing",
+  clusterIncompleteNeutral: 'Lower bound: at least this total',
+  binariesTab: 'Binaries',
+  binariesIntro:
+    'The llama-server and ggml-rpc-server binaries on this server: those the agent reports (only the version can be overridden) and ones added by hand.',
+  binariesEmpty: 'No binaries known.',
+  binariesAdd: 'Add binary',
+  binariesNewTitle: 'New binary',
+  binariesEditTitle: 'Edit binary',
+  binariesOverrideTitle: 'Override version',
+  binariesPath: 'Path',
+  binariesKind: 'Kind',
+  binariesKindLlamaServer: 'llama-server',
+  binariesKindRpcServer: 'ggml-rpc-server',
+  binariesKindOther: 'Other',
+  binariesVersion: 'Version',
+  binariesBuild: 'Build',
+  binariesCommit: 'Commit',
+  binariesSource: 'Source',
+  binariesSourceAgent: 'Agent',
+  binariesSourceManual: 'Manual',
+  binariesOverride: 'Version override (empty = use detection)',
+  binariesOverrideAction: 'Override version',
+  binariesOverridden: 'overridden',
+  binariesEdit: 'Edit binary',
+  binariesDelete: 'Remove binary',
+  binariesDeleteTitle: 'Remove binary?',
+  binariesDeleteConfirm: 'Remove',
+  binariesVersionUnknown: 'Version unknown',
+  binariesNotAllowed: 'Not allowed by the agent',
+  binariesSaved: 'Binary saved.',
+  binariesDeleted: 'Binary removed.',
+  binariesLoadFailed: 'The binaries could not be loaded.',
+  binaryPickerHint: "Pick from the server's inventory or type a path.",
+  clusterMembersMatchingBinary: (version: string) =>
+    `Members use the matching ggml-rpc-server (head binary: ${version}).`,
+  clusterWithheldTitle: 'This cluster head is not sent to its agent',
+  clusterStatusTitle: 'Cluster status',
+  clusterStateCold: 'Cluster off',
+  clusterStateForming: 'Cluster starting',
+  clusterStateFormed: 'Cluster formed',
+  clusterStateCoolingDown: 'Cluster paused after a failure',
+  clusterStateInvalid: 'Cluster invalid',
+  clusterPhaseMembersStarting: 'Members starting',
+  clusterPhaseMembersReady: 'Members ready',
+  clusterPhaseHeadStarting: 'Head starting',
+  clusterPhaseFormed: 'Cluster formed',
+  clusterMemberStatePending: 'pending',
+  clusterMemberStateStarting: 'starting',
+  clusterMemberStateReady: 'ready',
+  clusterMemberStateHeld: 'held',
+  clusterMemberStateFailed: 'failed',
+  clusterStatusMember: (n: number) => `Member ${n}`,
+  clusterStatusMemberHidden: (n: number) => `Member ${n} (not visible)`,
+  clusterStatusHead: 'Head',
+  clusterCooldownUntil: (time: string) => `Next start possible from ${time}`,
+  clusterLastFailure: (code: string, where: string) => `Last failure (${where}): ${code}`,
+  runtimeStopClusterTitle: (name: string) => `Stop ${name}?`,
+  runtimeStopClusterBody:
+    'The head is stopped. The members otherwise keep running for a short while.',
+  runtimeStopMembersToo: 'Stop the members too',
+  errorClusterConfigUnacknowledged:
+    'The agent did not acknowledge the cluster configuration. Check the agent and the gateway.',
+  errorClusterHeadDisabled: 'The cluster head is disabled.',
+  errorClusterStartCancelled: 'The cluster start was cancelled.',
+  errorClusterStopping:
+    'The cluster is being stopped. It can be started again once the stop finished.',
+  clusterBreakdownHiddenCount: (n: number) =>
+    `${n} member(s) you cannot see are in the totals only`,
+  errorClusterHeadUnsupported:
+    'This head cannot run as a cluster (the agent or binary does not support it).',
+  errorRuntimeDeviceBackendMismatch: "The chosen device backend does not match this server's GPUs.",
+  errorRuntimeRpcDeviceCountMismatch:
+    'The RPC server reports a different number of devices than configured.',
+  errorRuntimeRpcUnsupportedBuild: 'This binary was built without RPC support.',
+  errorRuntimeClusterVersionMismatch: "The head's and the member's versions do not match.",
+  errorRuntimeClusterMemberUnreachable: 'A cluster member was unreachable before the head started.',
+  errorRuntimeBindMismatch: 'The RPC server is not listening on the configured address.',
+  errorRuntimeClusterNotReady:
+    'The cluster head only starts through a cluster start; the members are not ready yet.',
+  errorRuntimeInstanceBusy: 'The instance is busy and is not stopped right now.',
+  errorRuntimeCachePurgeFailed: "The member's RPC cache could not be purged.",
+  clusterWarnRpcDevicesNotFirst: 'The RPC devices are not first in the device list.',
+  clusterWarnMmdevMissing:
+    'No device is set for the multimodal projector (--mmproj-device is missing).',
+  clusterWarnCpuMemberWithoutTensorSplit:
+    'A CPU member without --tensor-split may get too much or nothing.',
+  clusterWarnSharedHostWithoutEstimate:
+    'A member shares its host with other models without a VRAM estimate.',
+  clusterWarnBudgetBelowDevice: "A member's GPU budget is below the device's memory.",
+  clusterWarnGpuOverlap:
+    "A member's GPUs overlap with those of other members or models on the same server.",
+  clusterWarnRelayMeshDenyOff:
+    'Relay in the mesh without deny-by-default on does not protect members from other peers.',
+  clusterWarnMemberVersionUnknown:
+    "A member binary's version is unknown; the match with the head is unchecked.",
+  // The cluster head editor of a llama.cpp launch spec.
+  clusterTitle: 'RPC cluster',
+  clusterIntro:
+    'As a cluster head this llama.cpp spec offloads part of the model to ggml-rpc-server members on other servers.',
+  clusterEnabledLabel: 'Run as a cluster head',
+  clusterCreateFirst: 'Save the spec first; it can then be set up as a cluster head.',
+  clusterRpcHint:
+    'A cluster head needs ${RPC_SERVERS} exactly once: as the two lines "--rpc" and "${RPC_SERVERS}" in args, or as LLAMA_ARG_RPC=${RPC_SERVERS} in env.',
+  clusterDeviceBackend: 'Device backend (for ${DEVICES} and ${FIRST_LOCAL_DEVICE})',
+  clusterMemberMode: 'Member mode',
+  clusterMemberModeAutomatic: 'Automatic: pick servers and GPUs here',
+  clusterMemberModeManual: 'Manual: a member spec on the server',
+  clusterModeSwitchTitle: 'Switch member mode',
+  clusterModeSwitchBody:
+    'Switching replaces the member list: every current member is removed. A running cluster is stopped on save.',
+  clusterModeSwitchConfirm: 'Switch mode',
+  clusterNetwork: 'Network',
+  clusterDefaultOption: (value: string) => `Default (${value})`,
+  clusterDefaultOptionUnknown: 'Default (decided on save)',
+  clusterNetworkMesh: 'Mesh (NetBird)',
+  clusterNetworkLan: 'LAN (no NetBird)',
+  clusterNetworkReasonMesh:
+    'The default is mesh: the head and every member have NetBird with a tracking group and a known mesh IP.',
+  clusterNetworkReasonLan:
+    'The default is LAN: not every server involved has NetBird with a tracking group and a known mesh IP.',
+  clusterNetworkReasonUnknown:
+    'The default is decided on save: mesh when the head and every member have NetBird with a known mesh IP, else LAN.',
+  clusterLanAddressHint:
+    'On a LAN the head dials each member at its LAN address: the "LAN address" field in the server form (Servers → Edit), else the server\'s domain. Servers with NetBird always need the LAN address.',
+  clusterLanAddressHeadMissing:
+    'This server has NetBird but no LAN address: enter one under "LAN address" in the server form, or a LAN cluster is refused.',
+  clusterTransport: 'Transport',
+  clusterTransportDirect: 'Direct',
+  clusterTransportRelay: 'Relay',
+  clusterTransportReasonMeshDirect:
+    'The default is direct: the NetBird policies the gateway manages let only the head reach the members.',
+  clusterTransportReasonMeshRelay:
+    'The default is relay: direct transport in the mesh needs NetBird policy management with deny-by-default enforced and the Default policy disabled.',
+  clusterTransportReasonLan: 'On a LAN, direct is the default.',
+  clusterTransportReasonUnknown: 'The default is decided on save from the network.',
+  clusterTransportExplain:
+    "Direct: the head connects straight to the member's RPC port, the fastest path. Relay: the member's agent accepts the connection and lets only this head through; one more hop, but limited to exactly one head.",
+  clusterLanAckTitle: 'Expose RPC ports on the LAN',
+  clusterLanAckBody:
+    "With direct transport on a LAN, each member's RPC port is reachable unauthenticated on all of the member's interfaces (or on its bind address). Anyone who reaches it can allocate memory and run graphs on the member's devices. Relay or a bind address narrows this.",
+  clusterLanAckConfirm: 'Confirm exposure',
+  clusterLanAckGiven: 'The exposure of the RPC ports on the LAN is confirmed.',
+  clusterLanAckMissing: 'Direct transport on a LAN needs the exposure confirmed.',
+  clusterLanAckReview: 'Review exposure …',
+  clusterLanAckWithdraw: 'Withdraw confirmation',
+  clusterMembers: 'Members',
+  clusterMembersHint:
+    'The order is the --rpc order: it decides the device names RPC0, RPC1, … and the --tensor-split positions.',
+  clusterMembersEmpty: 'No members yet.',
+  clusterMemberHidden: 'A member on a server you cannot see',
+  clusterMembersLocked:
+    "A member runs on a server you do not manage: the cluster switch, members, mode, network, transport and the head's binary can only be changed by someone who manages every member server. The head's other fields stay editable.",
+  errorClusterHeadBinaryLocked:
+    "The head's binary cannot change while a member runs on a server you do not manage: a switch checks every member's version again.",
+  clusterMemberHardwareFailed: "This server's hardware details could not be loaded.",
+  clusterMemberHardwareUnavailable: 'This server has no hardware report yet.',
+  clusterMemberAdd: 'Add member',
+  clusterMemberServer: 'Server',
+  clusterMemberSpec: 'Member spec',
+  clusterMemberSpecPick: 'This server has several free member specs; pick one.',
+  clusterMemberAddConfirm: 'Add',
+  clusterCandidatesEmptyAutomatic:
+    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s version; the head must be saved with a binary of known version.',
+  clusterCandidatesEmptyManual:
+    'No server is available. It needs a free, enabled member spec ("RPC" tab) that admits this head.',
+  clusterCandidatesFailed: 'The possible member servers could not be loaded.',
+  clusterMemberRemove: 'Remove member',
+  clusterMemberGpus: 'GPUs (order = device order in the member)',
+  clusterMemberGpuAdd: 'Add GPU',
+  clusterMemberGpuRemove: 'Remove GPU',
+  clusterMemberNoGpusReported: 'This server reports no GPUs.',
+  clusterMemberThreads: 'Threads (-t, 0 = default)',
+  clusterMemberRamEstimate: 'RAM estimate (MB)',
+  clusterMemberMeasured: 'measured',
+  clusterMemberPort: 'Port',
+  clusterWarnings: 'Cluster notes',
+  clusterTotals: 'Cluster total',
+  clusterTotalsLowerBound: 'at least, not every part is known',
+  clusterColdStart: (seconds: number) =>
+    `A cold start starts every member first, then the head; it can take as long as the head's startup timeout (${seconds} s) plus the slowest member's. The head's startup timeout must be set.`,
+  clusterDeviceOrderHint:
+    'The RPC devices belong first in the device list (--device ${DEVICES} orders them so): the output layer lands on the last device and --fit fills from the back, so both stay local.',
+  clusterMmdevHint:
+    'The device list starts with RPC devices: for a vision model set -mmdev ${FIRST_LOCAL_DEVICE}, or the projector lands on RPC0.',
+  clusterNoDeviceListHint: 'Without a device list llama.cpp puts the RPC devices first itself.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the

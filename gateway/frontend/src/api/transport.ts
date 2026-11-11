@@ -130,6 +130,40 @@ export async function request<T>(
   return payload as T;
 }
 
+// Counterpart to request<T> for an endpoint that answers 204 No Content on
+// success: request<T> treats an empty body as an invalid response, so a delete
+// that returns nothing needs its own reader. A failure still carries the JSON
+// error body and throws the same PortalApiError.
+export async function requestNoContent(
+  fetcher: Fetcher,
+  path: string,
+  options: { method?: string; body?: unknown } = {},
+): Promise<void> {
+  const headers: Record<string, string> = {};
+  const init: RequestInit = { headers, credentials: 'include' };
+  if (options.method) {
+    init.method = options.method;
+  }
+  if (options.method && options.method !== 'GET') {
+    headers['X-OP-CSRF'] = '1';
+  }
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(options.body);
+  }
+  const response = await fetcher(path, init);
+  if (response.ok) return;
+  const payload = await readJSON(response);
+  const error = isErrorPayload(payload) ? payload.error : undefined;
+  const fallbackCode = response.status === 413 ? 'request.body_too_large' : 'request.failed';
+  throw new PortalApiError(
+    response.status,
+    error?.code ?? fallbackCode,
+    error?.message ?? (response.statusText || 'request failed'),
+    typeof error?.feature === 'string' ? error.feature : undefined,
+  );
+}
+
 // Binary counterpart to request<T> for an endpoint that answers with raw bytes (a synthesized
 // audio clip) rather than JSON -- reading that body as JSON would throw on perfectly valid
 // audio. The request is set up exactly like request<T>'s (session cookie, X-OP-CSRF on a mutating
