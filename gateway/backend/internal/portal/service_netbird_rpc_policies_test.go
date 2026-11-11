@@ -857,3 +857,44 @@ func TestRPCPolicyWithheldClusterGetsNoGrant(t *testing.T) {
 		t.Fatal("a withheld cluster's member got a policy")
 	}
 }
+
+// TestRPCPolicyPassReportsWrittenMembers pins what ReconcileRPCPolicies tells
+// the cluster orchestration: the member servers whose policy the pass created
+// or rewrote, sorted -- a grant NetBird has yet to hand to the peers -- and
+// nothing for a pass that left every policy as it was. A write answered with
+// an error still counts: it may have landed.
+func TestRPCPolicyPassReportsWrittenMembers(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a", "b"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"b", 47001}, rpcMemberSeed{"a", 47002})
+	if got := e.svc.ReconcileRPCPolicies(e.ctx); !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("first pass reported %v, want both created policies [a b]", got)
+	}
+
+	u := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a", "b"} {
+		u.server(id)
+	}
+	spec, _ := u.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001}, rpcMemberSeed{"b", 47002})
+	seedRPCReadPolicy(u.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001})
+	seedRPCReadPolicy(u.fake, "pol-b", "b", rpcRule{"g-head", "g-b", 47002})
+	if got := u.svc.ReconcileRPCPolicies(u.ctx); len(got) != 0 {
+		t.Fatalf("pass over matching policies reported %v, want none", got)
+	}
+	u.setMembers(spec, rpcMemberSeed{"a", 47009}, rpcMemberSeed{"b", 47002})
+	if got := u.svc.ReconcileRPCPolicies(u.ctx); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("pass after a's port change reported %v, want [a]", got)
+	}
+
+	f := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		f.server(id)
+	}
+	f.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	f.fake.failCreatePolicy = true
+	if got := f.svc.ReconcileRPCPolicies(f.ctx); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("pass whose create was answered with an error reported %v, want [a]", got)
+	}
+}

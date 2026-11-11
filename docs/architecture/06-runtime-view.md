@@ -933,6 +933,7 @@ sequenceDiagram
         MA->>M: exec (-H/-p/-d by the agent), TCP-ready
         MA-->>GW: 200 running (reservation armed)
     end
+    GW->>GW: 3. mesh: a member's policy was just written → let it settle (15 s)
     GW->>HA: 3. POST /ensure/{model}, X-OP-Cluster-Start: 1
     HA->>M: probe every endpoint (connect, no byte)
     HA->>H: exec, health until green
@@ -950,11 +951,19 @@ sequenceDiagram
    spec with this cluster's `generation`, each member's spec), within 30 s. A
    plan the documents moved past meanwhile is read again rather than waited out.
 2. **Members, in parallel**, each within its startup timeout plus 10 s, arming
-   a reservation that lasts the head's bound plus 60 s. In direct transport a
+   a reservation that lasts the head's bound plus 60 s (plus the policy settle
+   of step 3 when one is pending). In direct transport a
    member that still reports a hold while its head is not running holds a dead
    connection and is force-stopped first. The first failure cancels the others.
 3. **Head**, one ensure with the cluster-start marker, bounded by its startup
-   timeout plus 30 s. The agent probes every endpoint before it executes
+   timeout plus 30 s. When step 1's policy pass created or rewrote the
+   `op-gw-rpc` policy of one of this cluster's member servers, the head starts
+   only 15 s after that pass (`policySettle`): NetBird distributes a new or
+   changed policy to the peers asynchronously, and a head that dials before
+   the grant arrived hangs in the TCP connect (21 s on Windows) and fails the
+   start. The members start during that wait; a stop or the shutdown ends it
+   as a cancelled start. A pass that wrote nothing for this cluster's members
+   adds no wait. The agent probes every endpoint before it executes
    anything, and answers `runtime.cluster_member_unreachable` when one never
    answers.
 4. **Formed**: every member reports the head's hold on telemetry that arrived

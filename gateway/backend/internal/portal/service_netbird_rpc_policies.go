@@ -242,11 +242,15 @@ func rpcPolicyMatches(p netbird.Policy, rules []rpcRule) bool {
 // with the prefix whose server has no mesh member anymore are removed. A
 // store error skips the whole pass: nothing is created or deleted from a
 // cluster list that could not be read. Best-effort, errors are Debug-logged.
-func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Config, servers []routing.AIServer, policies []netbird.Policy) {
+// It returns the member server ids, sorted, whose policy it created or
+// rewrote (applyRPCPolicy: a write was sent): NetBird hands a policy write to
+// the peers asynchronously, so a grant written now may not be in force yet
+// (ReconcileRPCPolicies).
+func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Config, servers []routing.AIServer, policies []netbird.Policy) (changed []string) {
 	clusters, err := s.rpcClusters(ctx, servers, true)
 	if err != nil {
 		slog.Debug("rpc policy reconcile: read clusters", "error", err)
-		return
+		return nil
 	}
 	desired := desiredRPCRules(clusters)
 	byID := make(map[string]routing.AIServer, len(servers))
@@ -266,7 +270,9 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 	sort.Strings(ids)
 	for _, id := range ids {
 		cur, ok := existing[id]
-		applyRPCPolicy(ctx, ncfg, byID[id], desired[id], cur, ok)
+		if applyRPCPolicy(ctx, ncfg, byID[id], desired[id], cur, ok) {
+			changed = append(changed, id)
+		}
 	}
 	for id, p := range existing {
 		if _, ok := desired[id]; ok {
@@ -276,6 +282,7 @@ func (s *Service) reconcileRPCPoliciesWith(ctx context.Context, ncfg netbird.Con
 			slog.Debug("rpc policy reconcile: delete", "server_id", id, "error", err)
 		}
 	}
+	return changed
 }
 
 // existingRPCPolicies indexes the op-gw-rpc policies by member server id.
@@ -298,49 +305,57 @@ func existingRPCPolicies(policies []netbird.Policy) (existing map[string]netbird
 }
 
 // applyRPCPolicy creates memberServer's policy when there is none (exists
-// false) and rewrites cur when it does not grant exactly rules. Best-effort.
-func applyRPCPolicy(ctx context.Context, ncfg netbird.Config, memberServer routing.AIServer, rules []rpcRule, cur netbird.Policy, exists bool) {
+// false) and rewrites cur when it does not grant exactly rules. Best-effort;
+// it reports whether it sent a write. A write whose answer was an error
+// counts too: a timeout or an unreadable answer does not prove the write did
+// not land, and a caller that waits for a grant to settle must not skip it.
+func applyRPCPolicy(ctx context.Context, ncfg netbird.Config, memberServer routing.AIServer, rules []rpcRule, cur netbird.Policy, exists bool) bool {
 	req := desiredRPCPolicyRequest(memberServer, rules)
 	switch {
 	case !exists:
 		if _, err := netbird.CreatePolicy(ctx, ncfg, netbirdCallTimeout, req); err != nil {
 			slog.Debug("rpc policy reconcile: create", "server_id", memberServer.ID, "error", err)
 		}
+		return true
 	case !rpcPolicyMatches(cur, rules):
 		if _, err := netbird.UpdatePolicy(ctx, ncfg, netbirdCallTimeout, cur.ID, req); err != nil {
 			slog.Debug("rpc policy reconcile: update", "server_id", memberServer.ID, "error", err)
 		}
+		return true
 	}
+	return false
 }
 
 // reconcileRPCPolicies is the synchronous hook of every cluster, membership
 // and member write: it reconciles the RPC policy family on its own policy
 // snapshot, so a head that was just saved can reach its members before it
 // starts. Gated on the module and on policy management; best-effort and never
-// fails the write that called it.
-func (s *Service) reconcileRPCPolicies(ctx context.Context) {
+// fails the write that called it. It returns the member server ids whose
+// policy the pass created or rewrote (reconcileRPCPoliciesWith); the writes
+// that call it ignore them.
+func (s *Service) reconcileRPCPolicies(ctx context.Context) []string {
 	s.netbird.policyMu.Lock()
 	defer s.netbird.policyMu.Unlock()
 	cfg, ok, err := s.NetbirdConfig(ctx)
 	if err != nil || !ok {
-		return
+		return nil
 	}
 	if !s.NetbirdPolicySettings(ctx, 0).ManagePolicies {
-		return
+		return nil
 	}
 	ncfg := netbird.Config{URL: cfg.URL, Token: cfg.Token}
 	policies, err := netbird.ListPolicies(ctx, ncfg, netbirdCallTimeout)
 	if err != nil {
 		slog.Debug("rpc policy reconcile: list policies", "error", err)
-		return
+		return nil
 	}
 	servers, err := s.routes.AIServers(ctx)
 	if err != nil {
 		slog.Debug("rpc policy reconcile: list servers", "error", err)
-		return
+		return nil
 	}
 	s.recordDefaultPolicyState(ctx, policies)
-	s.reconcileRPCPoliciesWith(ctx, ncfg, servers, policies)
+	return s.reconcileRPCPoliciesWith(ctx, ncfg, servers, policies)
 }
 
 // recordDefaultPolicyState stores what a policy pass saw of NetBird's built-in

@@ -34,7 +34,12 @@ import (
 //     reports a hold while its head is not running holds a dead connection,
 //     so it is force-stopped first.
 //  3. Head: one ensure with the cluster-start mark, bounded by the head's
-//     startup timeout plus a margin.
+//     startup timeout plus a margin. When step one's policy pass created or
+//     rewrote the NetBird policy of one of this cluster's members, the head
+//     starts only policySettle after that pass: NetBird distributes a policy
+//     to the peers asynchronously, and a head that dials before the grant
+//     arrived hangs in the TCP connect (21 s on Windows) and fails the start.
+//     The members start during that wait.
 //  4. Formed: every member reports the head's hold, on telemetry that arrived
 //     after the head's start began, within the same bound; otherwise the head
 //     is stopped and the start fails with runtime.cluster_member_unused.
@@ -209,7 +214,7 @@ func (e *clusterError) Error() string {
 type clusterPortal interface {
 	ClusterPlan(ctx context.Context, headSpecID string) (portal.ClusterPlan, error)
 	AgentRuntimeConfig(ctx context.Context, serverID string) (portal.AgentRuntimeConfigDTO, error)
-	ReconcileRPCPolicies(ctx context.Context)
+	ReconcileRPCPolicies(ctx context.Context) []string
 	KeptUpClusterHeads(ctx context.Context) ([]string, error)
 }
 
@@ -287,6 +292,10 @@ type clusterTimings struct {
 	// failure and no cooldown, and the requests it woke would otherwise start
 	// the next failing start at once.
 	planRetry time.Duration
+	// policySettle is how long after a policy pass that wrote a member's
+	// NetBird policy the head is started: NetBird hands a policy write to the
+	// peers asynchronously.
+	policySettle time.Duration
 }
 
 func defaultClusterTimings() clusterTimings {
@@ -295,7 +304,7 @@ func defaultClusterTimings() clusterTimings {
 		cooldown: 60 * time.Second, codeWait: 2 * time.Second, stopWait: 60 * time.Second,
 		memberMargin: 10 * time.Second, headMargin: 30 * time.Second, reserveMargin: 60 * time.Second,
 		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
-		sessionWait: 10 * time.Second, planRetry: 5 * time.Second,
+		sessionWait: 10 * time.Second, planRetry: 5 * time.Second, policySettle: 15 * time.Second,
 	}
 }
 
@@ -647,7 +656,10 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) (release *po
 	o.beginStart(head, plan)
 	o.openRun(ctx, head, plan)
 
-	plan, ce := o.applyConfig(ctx, head, plan)
+	plan, settle, ce := o.applyConfig(ctx, head, plan)
+	if settle != nil {
+		defer settle.Stop()
+	}
 	fp := o.fingerprint(ctx, plan)
 	if ce != nil {
 		return nil, o.fail(ctx, head, ce, fp)
@@ -665,10 +677,13 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) (release *po
 	if err := o.awaitReleases(ctx, head); err != nil {
 		return nil, o.fail(ctx, head, &clusterError{Code: codeClusterStartFailed, Position: -1, Message: err.Error()}, fp)
 	}
-	if ce := o.startMembers(ctx, head, plan, agents, headBound+o.t.reserveMargin); ce != nil {
+	if ce := o.startMembers(ctx, head, plan, agents, headBound+o.t.reserveMargin+o.settleSpan(settle)); ce != nil {
 		return failed(ce)
 	}
 	o.setPhase(head, portal.ClusterPhaseMembersReady)
+	if ce := awaitPolicySettle(ctx, settle); ce != nil {
+		return failed(ce)
+	}
 
 	o.setPhase(head, portal.ClusterPhaseHeadStarting)
 	watch := o.watchHolds(ctx, plan)
@@ -888,12 +903,33 @@ const agentSpecStateDraining = "draining"
 // document no longer carries plan's generation), the plan is read again --
 // at most maxPlanRereads times -- rather than waiting out the bound for an
 // acknowledgement that can never come.
-func (o *clusterOrchestrator) applyConfig(ctx context.Context, head string, plan portal.ClusterPlan) (portal.ClusterPlan, *clusterError) {
+//
+// settle, when not nil, fires policySettle after the policy pass ended,
+// because the pass wrote the policy of one of the final plan's member
+// servers; the head starts only once it fired (awaitPolicySettle). The
+// caller stops it.
+func (o *clusterOrchestrator) applyConfig(ctx context.Context, head string, plan portal.ClusterPlan) (_ portal.ClusterPlan, settle *time.Timer, _ *clusterError) {
 	cctx, cancel := context.WithTimeout(ctx, o.t.configWait)
 	defer cancel()
+	var changed []string
 	if plan.Network == clusterNetworkMesh {
-		o.reconcilePolicies(cctx, head)
+		changed = o.reconcilePolicies(cctx, head)
+		if len(changed) > 0 {
+			settle = time.NewTimer(o.t.policySettle)
+		}
 	}
+	plan, ce := o.awaitConfigRereading(ctx, cctx, head, plan)
+	if settle != nil && !planHasMemberServer(plan, changed) {
+		settle.Stop()
+		settle = nil
+	}
+	return plan, settle, ce
+}
+
+// awaitConfigRereading is applyConfig's acknowledgement wait, reading the plan
+// again -- at most maxPlanRereads times -- while the runtime documents have
+// moved past it.
+func (o *clusterOrchestrator) awaitConfigRereading(ctx, cctx context.Context, head string, plan portal.ClusterPlan) (portal.ClusterPlan, *clusterError) {
 	for reread := 0; ; reread++ {
 		ce, stale := o.awaitConfig(ctx, cctx, plan)
 		if !stale {
@@ -916,20 +952,58 @@ func (o *clusterOrchestrator) applyConfig(ctx context.Context, head string, plan
 	}
 }
 
+// planHasMemberServer reports whether one of plan's members runs on a server
+// in ids.
+func planHasMemberServer(plan portal.ClusterPlan, ids []string) bool {
+	return slices.ContainsFunc(plan.Members, func(m portal.ClusterPlanMember) bool {
+		return slices.Contains(ids, m.Server.ID)
+	})
+}
+
+// settleSpan is how much a pending policy settle may delay the head: the whole
+// policySettle when one is armed (the members' reservations cover it), else
+// nothing.
+func (o *clusterOrchestrator) settleSpan(settle *time.Timer) time.Duration {
+	if settle == nil {
+		return 0
+	}
+	return o.t.policySettle
+}
+
+// awaitPolicySettle waits until settle fires -- the policy a pass just wrote
+// for a member had policySettle to reach the peers -- or the start ends. A
+// nil settle (no member's policy changed) does not wait. A start that ends
+// during the wait answers as cancelled.
+func awaitPolicySettle(ctx context.Context, settle *time.Timer) *clusterError {
+	if settle == nil {
+		return nil
+	}
+	select {
+	case <-settle.C:
+		return nil
+	case <-ctx.Done():
+		return &clusterError{Code: codeClusterUnavailable, Cause: codeClusterStartCancelled, Position: -1}
+	}
+}
+
 // reconcilePolicies runs the portal's RPC policy pass and waits for it until
-// ctx ends (see applyConfig).
-func (o *clusterOrchestrator) reconcilePolicies(ctx context.Context, head string) {
-	done := make(chan struct{})
+// ctx ends (see applyConfig). It returns the member server ids whose policy
+// the pass created or rewrote; none when the pass did not finish in time
+// (its writes, if any, are then left to the next pass and the start does not
+// wait for them).
+func (o *clusterOrchestrator) reconcilePolicies(ctx context.Context, head string) []string {
+	done := make(chan []string, 1)
 	o.wg.Add(1)
 	go func() {
 		defer o.wg.Done()
-		defer close(done)
-		o.deps.portal.ReconcileRPCPolicies(ctx)
+		done <- o.deps.portal.ReconcileRPCPolicies(ctx)
 	}()
 	select {
-	case <-done:
+	case changed := <-done:
+		return changed
 	case <-ctx.Done():
 		slog.Info("cluster start: the RPC policy pass did not finish within the configuration bound; going on", "head_spec_id", head)
+		return nil
 	}
 }
 

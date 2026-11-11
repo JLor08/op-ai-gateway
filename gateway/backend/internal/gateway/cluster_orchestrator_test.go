@@ -42,7 +42,7 @@ func orchTimings() clusterTimings {
 		cooldown: 60 * time.Second, codeWait: 200 * time.Millisecond, stopWait: 300 * time.Millisecond,
 		memberMargin: 20 * time.Millisecond, headMargin: 50 * time.Millisecond, reserveMargin: 60 * time.Millisecond,
 		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
-		sessionWait: 50 * time.Millisecond, planRetry: 5 * time.Second,
+		sessionWait: 50 * time.Millisecond, planRetry: 5 * time.Second, policySettle: 200 * time.Millisecond,
 	}
 }
 
@@ -63,8 +63,11 @@ type orchPortal struct {
 	planReads int
 	afterPlan func(p *orchPortal)
 	// reconcileGate, when set, holds the policy pass until it closes (a pass
-	// stuck behind another on the policy lock; it ignores ctx).
+	// stuck behind another on the policy lock; it ignores ctx). changed is
+	// what the pass reports it wrote: the member servers whose policy it
+	// created or rewrote.
 	reconcileGate chan struct{}
+	changed       []string
 	// withheld, when set, is the derivation's reason: the plan is read as
 	// withheld (no members, no network or transport), as the portal answers.
 	withheld string
@@ -123,14 +126,15 @@ func (p *orchPortal) AgentRuntimeConfig(_ context.Context, serverID string) (por
 	return doc, nil
 }
 
-func (p *orchPortal) ReconcileRPCPolicies(context.Context) {
+func (p *orchPortal) ReconcileRPCPolicies(context.Context) []string {
 	p.mu.Lock()
 	p.reconciles++
-	gate := p.reconcileGate
+	gate, changed := p.reconcileGate, slices.Clone(p.changed)
 	p.mu.Unlock()
 	if gate != nil {
 		<-gate
 	}
+	return changed
 }
 
 func (p *orchPortal) KeptUpClusterHeads(ctx context.Context) ([]string, error) {
@@ -1230,5 +1234,103 @@ func TestReconcileListsKeptUpHeadsAfterAChange(t *testing.T) {
 	f.o.Reconcile(ctx)
 	if n := reads(); n != 3 {
 		t.Fatalf("kept-up listings = %d once the list aged out, want three", n)
+	}
+}
+
+// TestEnsureClusterWaitsForPolicySettle pins the settle after a policy write:
+// when step one's pass created or rewrote the NetBird policy of one of the
+// cluster's members, the members start at once but the head only
+// policySettle after the pass (NetBird hands the grant to the peers
+// asynchronously), and the members' reservations cover that wait.
+func TestEnsureClusterWaitsForPolicySettle(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "mesh")
+	f.ackAll()
+	f.portal.changed = []string{orchMemberServer(0)}
+	var headAt time.Time
+	f.agent.onHeadEnsure = func() {
+		headAt = time.Now()
+		f.hold(0)
+	}
+	settle := f.o.t.policySettle
+
+	began := time.Now()
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if waited := headAt.Sub(began); waited < settle {
+		t.Fatalf("the head started %v into the start, want at least the %v policy settle", waited, settle)
+	}
+	want := []string{"member:ensure:" + orchMemberSpec(0), "head:ensure:" + orchHeadModel + ":cluster"}
+	if calls := f.agent.recorded(); !slices.Equal(calls, want) {
+		t.Fatalf("calls = %q, want %q (members start during the settle)", calls, want)
+	}
+	f.agent.mu.Lock()
+	reserve := f.agent.reserves[orchMemberSpec(0)]
+	f.agent.mu.Unlock()
+	if wantReserve := orchHeadBound + f.o.t.reserveMargin + settle; reserve != wantReserve {
+		t.Fatalf("member reservation = %v, want %v (the head's bound, the margin and the settle)", reserve, wantReserve)
+	}
+}
+
+// TestEnsureClusterNoSettleWithoutMemberPolicyChange pins that a pass that
+// wrote nothing, or only the policy of a server outside this cluster, does
+// not delay the head.
+func TestEnsureClusterNoSettleWithoutMemberPolicyChange(t *testing.T) {
+	for name, changed := range map[string][]string{
+		"unchanged":     nil,
+		"other cluster": {"srv_elsewhere"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newOrchFixture(t, 1, "direct", "mesh")
+			f.ackAll()
+			f.holdOnHeadEnsure(0)
+			f.portal.changed = changed
+			f.o.t.policySettle = 5 * time.Second
+
+			began := time.Now()
+			if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+				t.Fatalf("Ensure: %v", err)
+			}
+			if elapsed := time.Since(began); elapsed >= f.o.t.policySettle {
+				t.Fatalf("the start took %v, want no policy settle", elapsed)
+			}
+		})
+	}
+}
+
+// TestEnsureClusterStopEndsPolicySettle pins that a stop during the settle
+// ends the start at once, as a cancellation, without starting the head.
+func TestEnsureClusterStopEndsPolicySettle(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "mesh")
+	f.ackAll()
+	f.portal.changed = []string{orchMemberServer(0)}
+	f.o.t.policySettle = time.Minute
+
+	started := make(chan error, 1)
+	go func() { started <- f.o.Ensure(context.Background(), orchHead) }()
+	if call := <-f.agent.arrived; call != "member:ensure:"+orchMemberSpec(0) {
+		t.Fatalf("first call = %q, want the member's ensure", call)
+	}
+	began := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- f.o.Stop(context.Background(), orchHead, false) }()
+
+	select {
+	case err := <-started:
+		ce := clusterErrOf(t, err)
+		if ce.Code != codeClusterUnavailable || ce.Cause != codeClusterStartCancelled {
+			t.Fatalf("start = %+v, want cluster_unavailable with start_cancelled", ce)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the start kept waiting out the policy settle after a stop")
+	}
+	if elapsed := time.Since(began); elapsed > 2*time.Second {
+		t.Fatalf("the start ended %v after the stop, want promptly", elapsed)
+	}
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if n := f.agent.count("head:ensure:"); n != 0 {
+		t.Fatalf("head ensures = %d, want none", n)
 	}
 }

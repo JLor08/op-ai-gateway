@@ -440,7 +440,15 @@ cluster (a spec saved or deleted that was or becomes a head or has members, a
 member spec a head uses, an application edit or delete or a server delete on a
 server that takes part in a cluster) also runs the pass synchronously, and a cluster start runs it first, so a head that was just saved
 can reach its members before it starts; a write that touches no cluster never
-waits on NetBird for it. A store error skips the whole pass rather than deleting policies of
+waits on NetBird for it. A written policy is not in force at once: NetBird
+distributes a new or changed policy to the peers asynchronously. The pass
+therefore reports the member servers whose policy it created or rewrote (a
+write answered with an error counts, since it may have landed), and when the
+pass run before a mesh cluster start wrote one of that cluster's members, the
+orchestration starts the head only 15 s later, letting the members start
+meanwhile ([Runtime View §6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)).
+Without the wait the head's first connect to a member's mesh IP ran into a
+grant that had not arrived yet and hung until the TCP connect timed out. A store error skips the whole pass rather than deleting policies of
 clusters it failed to read.
 
 **NetBird policies only allow; the `Default` policy decides what they are worth.**

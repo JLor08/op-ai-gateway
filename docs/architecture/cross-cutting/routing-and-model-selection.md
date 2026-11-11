@@ -2540,8 +2540,9 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   start per head however many requests signal. When the start ends, formed or failed, every
   request parked for the head's server is woken (`admissionQueue.releaseAll`). The park is bound
   by the **cluster's own bound** — the longest a start may take: the configuration acknowledgement
-  wait (30 s), the slowest member's startup timeout plus 10 s and the head's plus 30 s, which also
-  covers the formation — clipped by the head application's `timeout_ms`, not by
+  wait (30 s), the slowest member's startup timeout plus 10 s, the 15 s a mesh start waits for a
+  member's freshly written NetBird policy to reach the peers (always counted: the bound is an
+  upper bound), and the head's startup timeout plus 30 s, which also covers the formation — clipped by the head application's `timeout_ms`, not by
   `admission_queue_timeout_seconds`; a turn that
   parks on other candidates at their cap as well waits for the later of the two, and a request
   keeps the cluster's bound for its later turns once it parked for one (a plain model and a group

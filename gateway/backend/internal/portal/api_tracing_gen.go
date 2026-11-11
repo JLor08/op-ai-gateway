@@ -1757,11 +1757,10 @@ func (_d *APIWithTracing) ReconcileGatewayPeer(ctx context.Context) (s1 string, 
 	return _d.API.ReconcileGatewayPeer(ctx)
 }
 
-func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) {
+func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) (sa1 []string) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ReconcileRPCPolicies")
 	defer span.End()
-	_d.API.ReconcileRPCPolicies(ctx)
-	return
+	return _d.API.ReconcileRPCPolicies(ctx)
 }
 
 func (_d *APIWithTracing) RefreshVendorAccountModels(ctx context.Context, t1 auth.Token, s1 string) (v1 VendorAccountDTO, r1 RefreshResult, err error) {

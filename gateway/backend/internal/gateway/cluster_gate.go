@@ -56,10 +56,12 @@ func (o *clusterOrchestrator) viewOf(plan portal.ClusterPlan) clusterGateView {
 
 // parkBound is the longest a start takes whose head starts within head and
 // whose slowest member within slowest: step one's configuration wait, the
-// members' bound and the head's bound, which also covers the formation (the
-// bounds at the top of cluster_orchestrator.go).
+// members' bound, the policy settle a head may wait for after a member's
+// NetBird policy was written (always counted: it is only an upper bound),
+// and the head's bound, which also covers the formation (the bounds at the
+// top of cluster_orchestrator.go).
 func (o *clusterOrchestrator) parkBound(head, slowest time.Duration) time.Duration {
-	return o.t.configWait + slowest + o.t.memberMargin + head + o.t.headMargin
+	return o.t.configWait + slowest + o.t.memberMargin + o.t.policySettle + head + o.t.headMargin
 }
 
 // gateView is head's gate view, from the cache while it answers. A stale or
