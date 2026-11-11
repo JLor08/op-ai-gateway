@@ -154,8 +154,12 @@ func binaryInventoryChanged(stored, rows []routing.ServerBinary) bool {
 // Limitation: the inventory carries no file identity (size, mtime or digest),
 // so a binary replaced at the same path whose first probe fails keeps the
 // replaced binary's identity until a probe of the new file succeeds (the agent
-// retries with a backoff of up to an hour). The cluster start's own version
-// and banner checks still catch a mismatch.
+// retries with a backoff of up to an hour). An rpc-server row takes its
+// identity from a llama-server in the same directory; if that sibling leaves
+// the allowlist for good, nothing probes the rpc-server again, and its row
+// keeps the sibling's last identity for as long as the agent reports the
+// path. The cluster start's own version and banner checks still catch a
+// mismatch.
 func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
 	known := make(map[string]routing.ServerBinary, len(stored))
 	for _, b := range stored {
