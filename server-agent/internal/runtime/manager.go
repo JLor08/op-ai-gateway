@@ -1571,6 +1571,7 @@ func (o *owner) run() {
 			if !o.closing {
 				o.scanIdle()
 				o.dispatchMeasurement()
+				o.sweepTick()
 			}
 		case <-o.m.hostWake:
 			o.turn++

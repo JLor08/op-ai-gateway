@@ -371,7 +371,11 @@ func TestMemberCacheSweepRemovesStaleOrphans(t *testing.T) {
 		if err := os.WriteFile(blob, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		for _, p := range []string{blob, dir} {
+		marker := filepath.Join(dir, memberCacheMarker)
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{blob, marker, dir} {
 			if err := os.Chtimes(p, mtime, mtime); err != nil {
 				t.Fatal(err)
 			}
@@ -379,6 +383,16 @@ func TestMemberCacheSweepRemovesStaleOrphans(t *testing.T) {
 		return dir
 	}
 	staleOrphan := mk("rspec_gone", old)
+	// A directory the agent did not create as a member cache (no marker) is
+	// never the sweep's, however old: config files of a spec whose id is
+	// "rpc" share this directory, and an operator may keep things here.
+	foreign := filepath.Join(root, "rpc", "not_a_cache")
+	if err := os.MkdirAll(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(foreign, old, old); err != nil {
+		t.Fatal(err)
+	}
 	freshOrphan := mk("rspec_recent", time.Now().Add(-time.Hour))
 	listedOld := mk("rspec_listed", old)
 	// An old directory with one recent file in it is in use, not stale.
@@ -409,11 +423,68 @@ func TestMemberCacheSweepRemovesStaleOrphans(t *testing.T) {
 		_, e2 := os.Stat(oldTomb)
 		return os.IsNotExist(e1) && os.IsNotExist(e2)
 	})
-	for _, keep := range []string{freshOrphan, listedOld, touched, newTomb, file} {
+	for _, keep := range []string{freshOrphan, listedOld, touched, newTomb, file, foreign} {
 		if _, err := os.Stat(keep); err != nil {
 			t.Errorf("%s was swept: %v", filepath.Base(keep), err)
 		}
 	}
+	// The listed head's cache was touched: its 7 days start again now, so it
+	// survives that long after its member leaves the document.
+	if fi, err := os.Stat(listedOld); err != nil || time.Since(fi.ModTime()) > time.Minute {
+		t.Fatalf("listed cache not touched by the sweep: %v, %v", fi, err)
+	}
+}
+
+// TestMemberCacheSweepTouchesListedCachesWithoutDocuments: the sweep also runs
+// on the owner's housekeeping beat (still at most once per
+// memberCacheSweepEvery), so a listed head's cache is touched while its
+// member stays listed even when no new document arrives -- a cluster that ran
+// unchanged for weeks and is then turned off keeps its cache for 7 days.
+func TestMemberCacheSweepTouchesListedCachesWithoutDocuments(t *testing.T) {
+	shrinkTimings(t)
+	setIdleTick(t, 20*time.Millisecond)
+	orig := memberCacheSweepEvery
+	memberCacheSweepEvery = 50 * time.Millisecond
+	t.Cleanup(func() { memberCacheSweepEvery = orig })
+	root := t.TempDir()
+	dir := filepath.Join(root, "rpc", "rspec_listed")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, memberCacheMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := cacheTestManager(t, root)
+	listed := memberSpec("rpcm_l", "rspec_listed")
+	listed.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{listed}, ETag: "1"})
+
+	old := time.Now().Add(-memberCacheOrphanAge - time.Hour)
+	for range 2 {
+		if err := os.Chtimes(dir, old, old); err != nil {
+			t.Fatal(err)
+		}
+		waitUntil(t, 5*time.Second, "listed cache touched again", func() bool {
+			fi, err := os.Stat(dir)
+			return err == nil && time.Since(fi.ModTime()) < time.Minute
+		})
+	}
+}
+
+// TestMemberCacheDirCarriesMarker: the cache directory the agent creates for a
+// member carries the marker that makes it the sweep's.
+func TestMemberCacheDirCarriesMarker(t *testing.T) {
+	shrinkTimings(t)
+	root := t.TempDir()
+	origFree := freeDiskMB
+	freeDiskMB = func(string) (int, error) { return 1 << 20, nil }
+	t.Cleanup(func() { freeDiskMB = origFree })
+	m := cacheTestManager(t, root)
+	m.Apply(Config{Specs: []Spec{cachingMember(t, "rpcm_a", "rspec_h1")}, ETag: "1"})
+	waitUntil(t, 5*time.Second, "cache dir with its marker", func() bool {
+		_, err := os.Stat(filepath.Join(root, "rpc", "rspec_h1", memberCacheMarker))
+		return err == nil
+	})
 }
 
 // TestMemberCacheSweepThrottled: the sweep runs on the first document and then
@@ -427,8 +498,14 @@ func TestMemberCacheSweepThrottled(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chtimes(dir, old, old); err != nil {
+		marker := filepath.Join(dir, memberCacheMarker)
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
 			t.Fatal(err)
+		}
+		for _, p := range []string{marker, dir} {
+			if err := os.Chtimes(p, old, old); err != nil {
+				t.Fatal(err)
+			}
 		}
 		return dir
 	}
