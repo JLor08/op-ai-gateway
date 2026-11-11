@@ -1284,6 +1284,52 @@ describe('RuntimeAdminSection launch specs list', () => {
 });
 
 describe('RuntimeAdminSection create (mapping + spec)', () => {
+  async function openCreate() {
+    const view = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    return view;
+  }
+
+  it('offers the RPC cluster block for a new spec with the llama.cpp type', async () => {
+    const { putSpecs } = await openCreate();
+    expect(screen.queryByRole('checkbox', { name: t.clusterEnabledLabel })).not.toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama/server' },
+    });
+
+    // Members need the saved spec, so the switch waits for the first save;
+    // the device backend is set on the new spec already.
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+    expect(screen.getByText(t.clusterCreateFirst)).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterDeviceBackend }));
+    fireEvent.click(await screen.findByRole('option', { name: 'vulkan' }));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      type: 'llama_cpp',
+      device_backend: 'vulkan',
+      cluster_enabled: false,
+      cluster_members: [],
+    });
+  });
+
+  it('offers the RPC cluster block for a new Auto spec whose binary resolves to llama.cpp', async () => {
+    await openCreate();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/vllm' },
+    });
+    expect(screen.queryByRole('checkbox', { name: t.clusterEnabledLabel })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama.cpp/bin/llama-server' },
+    });
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: t.clusterDeviceBackend })).toBeInTheDocument();
+  });
+
   it('creates a mapping+spec through the form', async () => {
     const { created, putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -16,6 +16,7 @@ import { messages } from '../i18n';
 import { PortalApiError } from '../api';
 import type {
   ClusterCandidate,
+  ClusterCandidateList,
   ClusterMember,
   HardwareResponse,
   PortalServer,
@@ -115,18 +116,27 @@ function setup(
     headBinaryVersion?: string;
     server?: PortalServer;
     resetMemberUsage?: (serverId: string) => Promise<RuntimeSpec>;
+    headBinary?: string;
+    // The listing per head binary the request names; others answer `candidates`.
+    candidatesByBinary?: Record<string, ClusterCandidateList>;
   } = {},
 ) {
   const api = {
-    clusterCandidates: vi.fn(async () => ({ data: opts.candidates ?? [] })),
+    clusterCandidates: vi.fn(
+      async (_mappingId: string, _mode: string, binary = ''): Promise<ClusterCandidateList> =>
+        opts.candidatesByBinary?.[binary] ?? { data: opts.candidates ?? [] },
+    ),
     serverHardware: vi.fn(async (id: string) => {
       if (opts.hardwareFailing?.includes(id)) throw new Error('hardware read failed');
       return opts.hardwareByServer?.[id] ?? ({ available: false } as HardwareResponse);
     }),
   };
   const latest: { value: ClusterHeadState } = { value: opts.initial ?? state() };
+  const binary = { set: (_b: string) => {} };
   function Harness() {
     const [value, setValue] = useState<ClusterHeadState>(latest.value);
+    const [headBinary, setHeadBinary] = useState(opts.headBinary ?? '');
+    binary.set = setHeadBinary;
     return (
       <ClusterHeadEditor
         t={t}
@@ -144,12 +154,13 @@ function setup(
         headHasGpus={opts.headHasGpus ?? false}
         startupTimeoutSeconds={600}
         headBinaryVersion={opts.headBinaryVersion}
+        headBinary={headBinary}
         resetMemberUsage={opts.resetMemberUsage}
       />
     );
   }
   render(<Harness />);
-  return { api, latest };
+  return { api, latest, setHeadBinary: (b: string) => act(() => binary.set(b)) };
 }
 
 // MUI's select is not native: open it, then pick the option.
@@ -226,7 +237,9 @@ describe('ClusterHeadEditor member mode', () => {
     expect(screen.queryByRole('combobox', { name: t.clusterMemberServer })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: t.clusterMemberAdd })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
-    await waitFor(() => expect(api.clusterCandidates).toHaveBeenLastCalledWith('map_1', 'manual'));
+    await waitFor(() =>
+      expect(api.clusterCandidates).toHaveBeenLastCalledWith('map_1', 'manual', ''),
+    );
   });
 });
 
@@ -268,6 +281,172 @@ describe('ClusterHeadEditor member binaries', () => {
   });
 });
 
+describe('ClusterHeadEditor head binary change', () => {
+  const alpha = (compatible: boolean): ClusterCandidate => ({
+    server_id: 'srv_a',
+    server_name: 'Alpha',
+    compatible,
+    ...(compatible ? { rpc_binary: '/opt/llama/ggml-rpc-server', rpc_binary_version: 'b1' } : {}),
+  });
+  const beta: ClusterCandidate = {
+    server_id: 'srv_b',
+    server_name: 'Beta',
+    compatible: true,
+    rpc_binary: '/opt/b2/ggml-rpc-server',
+    rpc_binary_version: 'b2',
+  };
+
+  it('re-checks the members against a changed head binary', async () => {
+    const { api, setHeadBinary } = setup({
+      initial: state({
+        members: clusterRows([member({ server_id: 'srv_a', server_name: 'Alpha' })]),
+      }),
+      headBinary: '/opt/llama/llama-server',
+      candidatesByBinary: {
+        '/opt/llama/llama-server': { data: [alpha(true)], head_binary_known: true },
+        '/opt/b2/llama-server': { data: [alpha(false), beta], head_binary_known: true },
+      },
+    });
+    await waitFor(() =>
+      expect(api.clusterCandidates).toHaveBeenCalledWith(
+        'map_1',
+        'automatic',
+        '/opt/llama/llama-server',
+      ),
+    );
+    expect(screen.queryByTestId('cluster-member-problem')).not.toBeInTheDocument();
+
+    setHeadBinary('/opt/b2/llama-server');
+    expect(await screen.findByTestId('cluster-member-problem')).toHaveTextContent(
+      t.clusterMemberNoMatchingRpcBinary,
+    );
+    expect(api.clusterCandidates).toHaveBeenLastCalledWith(
+      'map_1',
+      'automatic',
+      '/opt/b2/llama-server',
+    );
+  });
+
+  it('flags an automatic member whose server is no longer offered', async () => {
+    setup({
+      initial: state({
+        members: clusterRows([member({ server_id: 'srv_a', server_name: 'Alpha' })]),
+      }),
+      headBinary: '/opt/llama/llama-server',
+      candidatesByBinary: { '/opt/llama/llama-server': { data: [beta], head_binary_known: true } },
+    });
+    expect(await screen.findByTestId('cluster-member-problem')).toHaveTextContent(
+      t.clusterMemberNotOffered,
+    );
+  });
+
+  it('says so once when the head binary has no known version', async () => {
+    setup({
+      initial: state({
+        members: clusterRows([member({ server_id: 'srv_a', server_name: 'Alpha' })]),
+      }),
+      headBinary: '/somewhere/llama-server',
+      candidatesByBinary: {
+        '/somewhere/llama-server': { data: [alpha(false)], head_binary_known: false },
+      },
+    });
+    expect(await screen.findByTestId('cluster-head-version-unknown')).toHaveTextContent(
+      t.errorClusterHeadBinaryVersionUnknown,
+    );
+    expect(screen.queryByTestId('cluster-member-problem')).not.toBeInTheDocument();
+  });
+
+  it('reads a quickly typed binary once, after the pause', async () => {
+    const { api, setHeadBinary } = setup({ headBinary: '/opt/llama/llama-server' });
+    await waitFor(() => expect(api.clusterCandidates).toHaveBeenCalledTimes(1));
+    setHeadBinary('/opt/b');
+    setHeadBinary('/opt/b2');
+    setHeadBinary('/opt/b2/llama-server');
+    await waitFor(() =>
+      expect(api.clusterCandidates).toHaveBeenLastCalledWith(
+        'map_1',
+        'automatic',
+        '/opt/b2/llama-server',
+      ),
+    );
+    expect(api.clusterCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes an open picker for the new head binary', async () => {
+    const { api, setHeadBinary } = setup({
+      headBinary: '/opt/llama/llama-server',
+      candidatesByBinary: {
+        '/opt/llama/llama-server': { data: [alpha(true)], head_binary_known: true },
+        '/opt/b2/llama-server': { data: [alpha(false), beta], head_binary_known: true },
+      },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    expect(screen.getByTestId('cluster-candidate-binary')).toBeInTheDocument();
+
+    setHeadBinary('/opt/b2/llama-server');
+    await waitFor(() =>
+      expect(api.clusterCandidates).toHaveBeenLastCalledWith(
+        'map_1',
+        'automatic',
+        '/opt/b2/llama-server',
+      ),
+    );
+    // Alpha has no matching ggml-rpc-server any more: the choice is gone and
+    // only Beta is offered.
+    await waitFor(() =>
+      expect(screen.queryByTestId('cluster-candidate-binary')).not.toBeInTheDocument(),
+    );
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterMemberServer }));
+    const options = within(screen.getByRole('listbox')).getAllByRole('option');
+    expect(options.map((o) => o.textContent)).toEqual(['—', 'Beta']);
+  });
+
+  it('flags a manual member whose spec binary is of another version, and offers only matching specs', async () => {
+    setup({
+      initial: state({
+        memberMode: 'manual',
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', member_spec_id: 'rpcm_old' }),
+        ]),
+      }),
+      headBinary: '/opt/llama/llama-server',
+      candidatesByBinary: {
+        '/opt/llama/llama-server': {
+          data: [
+            {
+              server_id: 'srv_a',
+              server_name: 'Alpha',
+              member_specs: [memberSpec('rpcm_old')],
+              incompatible_member_specs: ['rpcm_old'],
+              compatible: false,
+            },
+            {
+              server_id: 'srv_b',
+              server_name: 'Beta',
+              member_specs: [memberSpec('rpcm_new'), memberSpec('rpcm_stale')],
+              incompatible_member_specs: ['rpcm_stale'],
+              compatible: true,
+            },
+          ],
+          head_binary_known: true,
+        },
+      },
+    });
+    expect(await screen.findByTestId('cluster-member-problem')).toHaveTextContent(
+      t.clusterMemberVersionMismatch,
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    pick(t.clusterMemberServer, 'Beta');
+    // One compatible spec left: it is taken without asking.
+    expect(screen.queryByText(t.clusterMemberSpecPick)).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.clusterMemberAddConfirm })).toBeEnabled(),
+    );
+  });
+});
+
 describe('ClusterHeadEditor member order', () => {
   it('moves a member and sends the new order and positions', () => {
     const { latest } = setup({
@@ -304,7 +483,9 @@ describe('ClusterHeadEditor automatic members', () => {
       hardwareByServer: { srv_a: hardware([0, 1]) },
     });
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
-    await waitFor(() => expect(api.clusterCandidates).toHaveBeenCalledWith('map_1', 'automatic'));
+    await waitFor(() =>
+      expect(api.clusterCandidates).toHaveBeenCalledWith('map_1', 'automatic', ''),
+    );
     await screen.findByRole('combobox', { name: t.clusterMemberServer });
     pick(t.clusterMemberServer, 'Alpha');
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
@@ -389,7 +570,7 @@ describe('ClusterHeadEditor manual members', () => {
       ],
     });
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
-    await waitFor(() => expect(api.clusterCandidates).toHaveBeenCalledWith('map_1', 'manual'));
+    await waitFor(() => expect(api.clusterCandidates).toHaveBeenCalledWith('map_1', 'manual', ''));
     await screen.findByRole('combobox', { name: t.clusterMemberServer });
     pick(t.clusterMemberServer, 'Alpha');
     expect(screen.getByText(t.clusterMemberSpecPick)).toBeInTheDocument();

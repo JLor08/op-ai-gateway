@@ -2617,10 +2617,16 @@ const de = {
   clusterMemberSpecPick: 'Dieser Server hat mehrere freie Mitglieds-Spezifikationen; eine wählen.',
   clusterMemberAddConfirm: 'Übernehmen',
   clusterCandidatesEmptyAutomatic:
-    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries; der Head muss mit einem Binary bekannter Version gespeichert sein.',
+    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries, dessen Version bekannt sein muss.',
   clusterCandidatesEmptyManual:
     'Kein Server steht zur Wahl. Er braucht eine freie, aktivierte Mitglieds-Spezifikation (Reiter „RPC“), die diesen Head zulässt.',
   clusterCandidatesFailed: 'Die möglichen Mitglieds-Server konnten nicht geladen werden.',
+  clusterMemberNoMatchingRpcBinary:
+    'Dieser Server hat keinen ggml-rpc-server in der Version des Head-Binaries; so lässt sich der Head nicht speichern.',
+  clusterMemberNotOffered:
+    'Dieser Server bietet diesem Head keine RPC-Mitgliedschaft an (Reiter „RPC“ des Servers); so lässt sich der Head nicht speichern.',
+  clusterMemberVersionMismatch:
+    'Das Binary dieser Mitglieds-Spezifikation hat eine andere Version als das Head-Binary; so lässt sich der Head nicht speichern.',
   clusterMemberRemove: 'Mitglied entfernen',
   clusterMemberGpus: 'GPUs (Reihenfolge = Geräte-Reihenfolge im Mitglied)',
   clusterMemberGpuAdd: 'GPU hinzufügen',
@@ -6454,10 +6460,16 @@ const en: PortalMessages = {
   clusterMemberSpecPick: 'This server has several free member specs; pick one.',
   clusterMemberAddConfirm: 'Add',
   clusterCandidatesEmptyAutomatic:
-    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s version; the head must be saved with a binary of known version.',
+    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s version, which must be known.',
   clusterCandidatesEmptyManual:
     'No server is available. It needs a free, enabled member spec ("RPC" tab) that admits this head.',
   clusterCandidatesFailed: 'The possible member servers could not be loaded.',
+  clusterMemberNoMatchingRpcBinary:
+    "This server has no ggml-rpc-server of the head binary's version; the head cannot be saved like this.",
+  clusterMemberNotOffered:
+    'This server does not offer RPC membership to this head (the server\'s "RPC" tab); the head cannot be saved like this.',
+  clusterMemberVersionMismatch:
+    "This member spec's binary is a different version than the head binary; the head cannot be saved like this.",
   clusterMemberRemove: 'Remove member',
   clusterMemberGpus: 'GPUs (order = device order in the member)',
   clusterMemberGpuAdd: 'Add GPU',

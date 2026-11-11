@@ -133,6 +133,20 @@ export interface ClusterCandidate {
   rpc_binary?: string;
   rpc_binary_version?: string;
   member_specs?: RPCMemberSpec[];
+  // Automatic: the server has a ggml-rpc-server of the head binary's version
+  // (rpc_binary names it). Manual: at least one listed member spec's binary
+  // is not of another version. Absent from an older gateway.
+  compatible?: boolean;
+  // Manual: the listed member specs whose binary is of another version than
+  // the head binary's; the save refuses them.
+  incompatible_member_specs?: string[];
+}
+
+// The candidates listing: the candidates and whether the head binary's
+// version is known (absent from an older gateway).
+export interface ClusterCandidateList {
+  data: ClusterCandidate[];
+  head_binary_known?: boolean;
 }
 
 // One operator-supplied config file the agent writes into the spec's per-spec
@@ -827,10 +841,12 @@ export function runtimeApi(fetcher: Fetcher) {
         { method: 'POST', body: stopMembers ? { instance, stop_members: true } : { instance } },
       ),
     // The servers the cluster head on this mapping may add as members.
-    clusterCandidates: (mappingId: string, mode: ClusterMemberMode) =>
-      request<{ data: ClusterCandidate[] }>(
+    // headBinary is the head binary the form has, matched instead of the
+    // stored spec's; '' asks for the stored one.
+    clusterCandidates: (mappingId: string, mode: ClusterMemberMode, headBinary = '') =>
+      request<ClusterCandidateList>(
         fetcher,
-        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-candidates${buildQueryString({ mode })}`,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-candidates${buildQueryString({ mode, binary: headBinary })}`,
       ),
     // Clears the stored usage of the member on serverId of the cluster head on
     // this mapping -- the way out of a stored peak above the member's budget,

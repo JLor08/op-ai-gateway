@@ -4,7 +4,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   audioCppSpecFlavorDefaults,
+  autoDetectsLlamaCpp,
   flavorsAreImagesOnly,
+  formSpecIsLlamaCpp,
   formSpecIsStableDiffusion,
   specFlavorsAfterTypeSwitch,
   stableDiffusionSpecFlavorDefaults,
@@ -436,5 +438,33 @@ describe('specFlavorsAfterTypeSwitch for audio_cpp', () => {
       remembered: null,
     });
     expect(toAudio?.values.apiFlavors).not.toBe(audioCppSpecFlavorDefaults.apiFlavors);
+  });
+});
+
+describe('formSpecIsLlamaCpp', () => {
+  it.each([
+    ['/usr/bin/llama-server', true],
+    ['/opt/x/LLAMA_CPP_server', true],
+    ['/opt/x/llama.cpp-server', true],
+    // The base name decides, like routing.DetectRuntimeSpecType.
+    ['/opt/llama.cpp/bin/server', false],
+    // vllm is checked first.
+    ['/opt/vllm-llama-server', false],
+    ['', false],
+  ])('reads Auto with the binary %s as llama.cpp: %s', (binary, want) => {
+    expect(autoDetectsLlamaCpp(binary)).toBe(want);
+    expect(formSpecIsLlamaCpp('', binary, null)).toBe(want);
+  });
+
+  it('follows an explicit type and the loaded Auto spec while its binary is unchanged', () => {
+    expect(formSpecIsLlamaCpp('llama_cpp', '/opt/x/server', null)).toBe(true);
+    expect(formSpecIsLlamaCpp('vllm', '/usr/bin/llama-server', null)).toBe(false);
+    const loaded = {
+      type: '' as const,
+      binary: '/opt/custom',
+      effective_type: 'llama_cpp' as const,
+    };
+    expect(formSpecIsLlamaCpp('', '/opt/custom', loaded)).toBe(true);
+    expect(formSpecIsLlamaCpp('', '/opt/other', loaded)).toBe(false);
   });
 });
