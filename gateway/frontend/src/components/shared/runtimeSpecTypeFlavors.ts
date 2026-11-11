@@ -96,7 +96,10 @@ export function formSpecIsStableDiffusion(
  * cluster block a new llama.cpp spec offers before the gateway resolved it.
  */
 export function autoDetectsLlamaCpp(binary: string): boolean {
-  const name = (binary.trim().split('/').at(-1) ?? '').toLowerCase();
+  // Like Go's filepath.Base: trailing slashes do not count.
+  let path = binary.trim();
+  while (path.endsWith('/')) path = path.slice(0, -1);
+  const name = (path.split('/').at(-1) ?? '').toLowerCase();
   if (name.includes('vllm')) return false;
   return ['llama-server', 'llama_cpp', 'llama.cpp'].some((marker) => name.includes(marker));
 }

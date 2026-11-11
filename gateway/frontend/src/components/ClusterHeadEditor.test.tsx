@@ -126,6 +126,10 @@ function setup(
       async (_mappingId: string, _mode: string, binary = ''): Promise<ClusterCandidateList> =>
         opts.candidatesByBinary?.[binary] ?? { data: opts.candidates ?? [] },
     ),
+    applicationClusterCandidates: vi.fn(
+      async (_appId: string, _mode: string, binary = ''): Promise<ClusterCandidateList> =>
+        opts.candidatesByBinary?.[binary] ?? { data: opts.candidates ?? [] },
+    ),
     serverHardware: vi.fn(async (id: string) => {
       if (opts.hardwareFailing?.includes(id)) throw new Error('hardware read failed');
       return opts.hardwareByServer?.[id] ?? ({ available: false } as HardwareResponse);
@@ -142,6 +146,7 @@ function setup(
         t={t}
         api={api}
         mappingId={opts.mappingId ?? 'map_1'}
+        applicationId="app_1"
         headServer={opts.server ?? headServer}
         stored={opts.stored as RuntimeSpec | undefined}
         value={value}
@@ -183,10 +188,31 @@ describe('ClusterHeadEditor cluster switch', () => {
     expect(screen.queryByText(t.clusterRpcHint)).not.toBeInTheDocument();
   });
 
-  it('cannot turn a spec that is not saved yet into a head', () => {
-    setup({ initial: emptyClusterState(), mappingId: '' });
-    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
-    expect(screen.getByText(t.clusterCreateFirst)).toBeInTheDocument();
+  it('sets up a head on a spec that is not saved yet from the application listing', async () => {
+    const { api, latest } = setup({
+      initial: emptyClusterState(),
+      mappingId: '',
+      headBinary: '/opt/llama/llama-server',
+      candidates: [
+        { server_id: 'srv_a', server_name: 'Alpha', compatible: true, rpc_binary: '/b' },
+      ],
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.clusterEnabledLabel }));
+    expect(latest.value.enabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.clusterMemberAddConfirm })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(latest.value.members.map((m) => m.server_id)).toEqual(['srv_a']);
+    expect(api.applicationClusterCandidates).toHaveBeenCalledWith(
+      'app_1',
+      'automatic',
+      '/opt/llama/llama-server',
+    );
+    expect(api.clusterCandidates).not.toHaveBeenCalled();
   });
 
   it('keeps the device backend label short and names the placeholders beneath it', () => {
@@ -337,6 +363,34 @@ describe('ClusterHeadEditor head binary change', () => {
     });
     expect(await screen.findByTestId('cluster-member-problem')).toHaveTextContent(
       t.clusterMemberNotOffered,
+    );
+  });
+
+  it('flags a manual member whose spec is no longer offered', async () => {
+    setup({
+      initial: state({
+        memberMode: 'manual',
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', member_spec_id: 'rpcm_gone' }),
+        ]),
+      }),
+      headBinary: '/opt/llama/llama-server',
+      candidatesByBinary: {
+        '/opt/llama/llama-server': {
+          data: [
+            {
+              server_id: 'srv_a',
+              server_name: 'Alpha',
+              member_specs: [memberSpec('rpcm_other')],
+              compatible: true,
+            },
+          ],
+          head_binary_known: true,
+        },
+      },
+    });
+    expect(await screen.findByTestId('cluster-member-problem')).toHaveTextContent(
+      t.clusterMemberSpecNotOffered,
     );
   });
 

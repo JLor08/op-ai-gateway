@@ -55,7 +55,10 @@ describe('memberProblem', () => {
     ]);
     expect(memberProblem(member('a', 's1'), 'manual', manual)).toBeUndefined();
     expect(memberProblem(member('a', 's2'), 'manual', manual)).toBe('version_mismatch');
-    expect(memberProblem(member('z', 's9'), 'manual', manual)).toBeUndefined();
+    // A spec the listing no longer offers (disabled, consent withdrawn, taken
+    // by another head) is a problem of its own, on a listed server or not.
+    expect(memberProblem(member('a', 's9'), 'manual', manual)).toBe('spec_not_offered');
+    expect(memberProblem(member('z', 's9'), 'manual', manual)).toBe('spec_not_offered');
   });
 });
 

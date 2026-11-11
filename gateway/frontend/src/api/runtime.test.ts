@@ -419,6 +419,18 @@ describe('runtimeApi RPC cluster', () => {
     expect(got.data[0].server_id).toBe('s1');
   });
 
+  it('GETs the cluster candidates of a new spec per application', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: [], head_binary_known: true }));
+    await createPortalApi(fetcher).applicationClusterCandidates(
+      'app/1',
+      'manual',
+      '/opt/llama/llama-server',
+    );
+    expect(fetcher.mock.calls[0][0]).toBe(
+      '/api/portal/applications/app%2F1/runtime/cluster-candidates?mode=manual&binary=%2Fopt%2Fllama%2Fllama-server',
+    );
+  });
+
   it('sends the form head binary with the cluster candidates request', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: [], head_binary_known: false }));
     const got = await createPortalApi(fetcher).clusterCandidates(

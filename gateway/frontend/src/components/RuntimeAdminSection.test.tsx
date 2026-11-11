@@ -667,6 +667,7 @@ function renderSection(
     deleteServerBinary: vi.fn(async () => undefined),
     // The cluster head editor's member picker.
     clusterCandidates: vi.fn(async () => ({ data: [] })),
+    applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
     resetClusterMemberUsage:
       opts.resetClusterMemberUsage ??
       vi.fn(async (mappingId: string) => storedSpecs[mappingId] as RuntimeSpec),
@@ -1300,10 +1301,8 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       target: { value: '/opt/llama/server' },
     });
 
-    // Members need the saved spec, so the switch waits for the first save;
-    // the device backend is set on the new spec already.
-    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
-    expect(screen.getByText(t.clusterCreateFirst)).toBeInTheDocument();
+    // The device backend is set on the new spec already.
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeEnabled();
     fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterDeviceBackend }));
     fireEvent.click(await screen.findByRole('option', { name: 'vulkan' }));
 
@@ -1326,8 +1325,76 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
       target: { value: '/opt/llama.cpp/bin/llama-server' },
     });
-    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeEnabled();
     expect(screen.getByRole('combobox', { name: t.clusterDeviceBackend })).toBeInTheDocument();
+  });
+
+  // Fills a new llama.cpp head with one automatic member from the
+  // application-scoped listing.
+  async function fillNewHead(fakeApi: { applicationClusterCandidates: ReturnType<typeof vi.fn> }) {
+    fakeApi.applicationClusterCandidates.mockResolvedValue({
+      data: [{ server_id: 'srv_a', server_name: 'Alpha', compatible: true, rpc_binary: '/b' }],
+      head_binary_known: true,
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama/llama-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '-m\n/m.gguf\n--rpc\n${RPC_SERVERS}' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecStartupTimeout), {
+      target: { value: '600' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.clusterEnabledLabel }));
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterTransport }));
+    fireEvent.click(await screen.findByRole('option', { name: t.clusterTransportRelay }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.clusterMemberServer }));
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: 'Alpha' }));
+    const confirm = screen.getByRole('button', { name: t.clusterMemberAddConfirm });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    fireEvent.click(confirm);
+    expect(await screen.findByTestId('cluster-member-row')).toHaveTextContent('Alpha');
+  }
+
+  it('creates a cluster head with its members in the first write', async () => {
+    const { fakeApi, putSpecs } = await openCreate();
+    await fillNewHead(fakeApi);
+    expect(fakeApi.applicationClusterCandidates).toHaveBeenCalledWith(
+      'app_1',
+      'automatic',
+      '/opt/llama/llama-server',
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      cluster_enabled: true,
+      rpc_transport: 'relay',
+      startup_timeout_seconds: 600,
+    });
+    expect(putSpecs[0].body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a']);
+  });
+
+  it('keeps the form, members included, as the Edit of the new mapping when the first write is refused', async () => {
+    const { fakeApi, putSpecs } = await openCreate();
+    await fillNewHead(fakeApi);
+    fakeApi.putRuntimeSpec.mockRejectedValueOnce(
+      new PortalApiError(400, 'runtime_spec.cluster_member_no_matching_binary', 'server "Alpha"'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    expect(
+      await screen.findByText(new RegExp(t.errorClusterMemberNoMatchingBinary)),
+    ).toBeInTheDocument();
+    // Still the form, now the Edit of the mapping the create made, with
+    // every entry kept.
+    expect(screen.getByTestId('cluster-member-row')).toHaveTextContent('Alpha');
+    expect((screen.getByLabelText(t.runtimeSpecArgs) as HTMLTextAreaElement).value).toContain(
+      '${RPC_SERVERS}',
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].mappingId).toBe('map_created');
+    expect(putSpecs[0].body.cluster_members?.map((m) => m.server_id)).toEqual(['srv_a']);
   });
 
   it('creates a mapping+spec through the form', async () => {
@@ -1631,6 +1698,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       updateServerBinary: vi.fn(async () => ({}) as never),
       deleteServerBinary: vi.fn(async () => undefined),
       clusterCandidates: vi.fn(async () => ({ data: [] })),
+      applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
       resetClusterMemberUsage: vi.fn(async () => ({}) as never),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
@@ -7307,6 +7375,9 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    // The refused create stays open as the new mapping's Edit; leaving it
+    // brings the list back.
+    fireEvent.click(await screen.findByRole('button', { name: t.cancel }));
 
     const del = await screen.findByRole('button', { name: t.mappingDelete });
     expect(del).toBeEnabled();

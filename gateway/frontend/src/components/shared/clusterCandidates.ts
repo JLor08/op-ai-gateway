@@ -25,21 +25,40 @@ export const CANDIDATES_DEBOUNCE_MS = 400;
 
 const idle: CandidatesState = { loading: false, failed: false, candidates: [], headKnown: true };
 
+// Where the head lives: its mapping once the spec is saved, else (a new spec)
+// the application it is created on.
+export interface CandidatesScope {
+  mappingId: string;
+  applicationId: string;
+}
+
+function readCandidates(
+  api: Pick<PortalApi, 'clusterCandidates' | 'applicationClusterCandidates'>,
+  scope: CandidatesScope,
+  mode: ClusterMemberMode,
+  headBinary: string,
+) {
+  return scope.mappingId
+    ? api.clusterCandidates(scope.mappingId, mode, headBinary)
+    : api.applicationClusterCandidates(scope.applicationId, mode, headBinary);
+}
+
 /**
- * Reads the candidates of the head on mappingId in mode for headBinary while
+ * Reads the candidates of the head in scope in mode for headBinary while
  * active, again whenever one of them or reloadKey changes. A changed binary
  * is read after CANDIDATES_DEBOUNCE_MS; the previous list stays, marked
  * loading, until the new one lands.
  */
 export function useClusterCandidates(
-  api: Pick<PortalApi, 'clusterCandidates'>,
-  mappingId: string,
+  api: Pick<PortalApi, 'clusterCandidates' | 'applicationClusterCandidates'>,
+  scope: CandidatesScope,
   mode: ClusterMemberMode,
   headBinary: string,
   active: boolean,
   reloadKey: number,
 ): CandidatesState {
   const [state, setState] = useState<CandidatesState>(idle);
+  const { mappingId, applicationId } = scope;
   const lastBinaryRef = useRef<string | null>(null);
   useEffect(() => {
     if (!active) return undefined;
@@ -49,7 +68,7 @@ export function useClusterCandidates(
     setState((cur) => ({ ...cur, loading: true, failed: false }));
     const timer = setTimeout(
       () => {
-        api.clusterCandidates(mappingId, mode, headBinary).then(
+        readCandidates(api, { mappingId, applicationId }, mode, headBinary).then(
           (res) => {
             if (cancelled) return;
             setState({
@@ -70,7 +89,7 @@ export function useClusterCandidates(
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [api, mappingId, mode, headBinary, active, reloadKey]);
+  }, [api, mappingId, applicationId, mode, headBinary, active, reloadKey]);
   return active ? state : idle;
 }
 
@@ -93,7 +112,19 @@ export function offeredCandidates(
   return state.candidates.filter((c) => candidateCompatible(c) && !taken.has(c.server_id));
 }
 
-export type MemberProblem = 'no_matching_binary' | 'not_offered' | 'version_mismatch';
+export type MemberProblem =
+  'no_matching_binary' | 'not_offered' | 'version_mismatch' | 'spec_not_offered';
+
+// A manual member's problem: its spec is no longer offered to the head
+// (disabled, its consent withdrawn, or taken by another head), or its
+// binary is of another version than the head's.
+function manualMemberProblem(
+  specId: string,
+  c: ClusterCandidate | undefined,
+): MemberProblem | undefined {
+  if (!c?.member_specs?.some((s) => s.id === specId)) return 'spec_not_offered';
+  return c.incompatible_member_specs?.includes(specId) ? 'version_mismatch' : undefined;
+}
 
 /**
  * Why a visible member would make the save refuse the head with the form's
@@ -108,11 +139,7 @@ export function memberProblem(
 ): MemberProblem | undefined {
   if (!member.visible || state.loading || state.failed) return undefined;
   const c = state.candidates.find((x) => x.server_id === member.server_id);
-  if (mode === 'manual') {
-    return c?.incompatible_member_specs?.includes(member.member_spec_id)
-      ? 'version_mismatch'
-      : undefined;
-  }
+  if (mode === 'manual') return manualMemberProblem(member.member_spec_id, c);
   if (!state.headKnown) return undefined;
   if (!c) return 'not_offered';
   return candidateCompatible(c) ? undefined : 'no_matching_binary';

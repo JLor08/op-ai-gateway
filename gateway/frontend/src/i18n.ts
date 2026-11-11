@@ -2552,8 +2552,6 @@ const de = {
   clusterIntro:
     'Als Cluster-Head lädt diese llama.cpp-Spezifikation einen Teil des Modells auf ggml-rpc-server-Mitglieder auf anderen Servern aus.',
   clusterEnabledLabel: 'Als Cluster-Head betreiben',
-  clusterCreateFirst:
-    'Die Spezifikation zuerst speichern; danach lässt sie sich als Cluster-Head einrichten.',
   clusterRpcHint:
     'Ein Cluster-Head braucht ${RPC_SERVERS} genau einmal: als zwei Zeilen „--rpc“ und „${RPC_SERVERS}“ in den Argumenten oder als LLAMA_ARG_RPC=${RPC_SERVERS} in der Umgebung.',
   clusterDeviceBackend: 'Geräte-Backend',
@@ -2627,6 +2625,8 @@ const de = {
     'Dieser Server bietet diesem Head keine RPC-Mitgliedschaft an (Reiter „RPC“ des Servers); so lässt sich der Head nicht speichern.',
   clusterMemberVersionMismatch:
     'Das Binary dieser Mitglieds-Spezifikation hat eine andere Version als das Head-Binary; so lässt sich der Head nicht speichern.',
+  clusterMemberSpecNotOffered:
+    'Diese Mitglieds-Spezifikation steht dem Head nicht mehr zur Verfügung (deaktiviert, Zustimmung entzogen oder von einem anderen Head belegt); so lässt sich der Head nicht speichern.',
   clusterMemberRemove: 'Mitglied entfernen',
   clusterMemberGpus: 'GPUs (Reihenfolge = Geräte-Reihenfolge im Mitglied)',
   clusterMemberGpuAdd: 'GPU hinzufügen',
@@ -6400,7 +6400,6 @@ const en: PortalMessages = {
   clusterIntro:
     'As a cluster head this llama.cpp spec offloads part of the model to ggml-rpc-server members on other servers.',
   clusterEnabledLabel: 'Run as a cluster head',
-  clusterCreateFirst: 'Save the spec first; it can then be set up as a cluster head.',
   clusterRpcHint:
     'A cluster head needs ${RPC_SERVERS} exactly once: as the two lines "--rpc" and "${RPC_SERVERS}" in args, or as LLAMA_ARG_RPC=${RPC_SERVERS} in env.',
   clusterDeviceBackend: 'Device backend',
@@ -6474,6 +6473,8 @@ const en: PortalMessages = {
     'This server does not offer RPC membership to this head (the server\'s "RPC" tab); the head cannot be saved like this.',
   clusterMemberVersionMismatch:
     "This member spec's binary is a different version than the head binary; the head cannot be saved like this.",
+  clusterMemberSpecNotOffered:
+    'This member spec is no longer available to the head (disabled, its consent withdrawn, or taken by another head); the head cannot be saved like this.',
   clusterMemberRemove: 'Remove member',
   clusterMemberGpus: 'GPUs (order = device order in the member)',
   clusterMemberGpuAdd: 'Add GPU',

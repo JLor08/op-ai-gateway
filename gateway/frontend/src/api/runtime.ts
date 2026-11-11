@@ -848,6 +848,17 @@ export function runtimeApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-candidates${buildQueryString({ mode, binary: headBinary })}`,
       ),
+    // The same listing for a head not stored yet: a new runtime spec on the
+    // application, matched against the form's head binary.
+    applicationClusterCandidates: (
+      applicationId: string,
+      mode: ClusterMemberMode,
+      headBinary = '',
+    ) =>
+      request<ClusterCandidateList>(
+        fetcher,
+        `/api/portal/applications/${encodeURIComponent(applicationId)}/runtime/cluster-candidates${buildQueryString({ mode, binary: headBinary })}`,
+      ),
     // Clears the stored usage of the member on serverId of the cluster head on
     // this mapping -- the way out of a stored peak above the member's budget,
     // which its next start would be refused for -- and answers the head's

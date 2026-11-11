@@ -446,6 +446,9 @@ describe('formSpecIsLlamaCpp', () => {
     ['/usr/bin/llama-server', true],
     ['/opt/x/LLAMA_CPP_server', true],
     ['/opt/x/llama.cpp-server', true],
+    // Trailing slashes do not count, as in Go's filepath.Base.
+    ['/usr/bin/llama-server/', true],
+    ['/opt/x/llama-server//', true],
     // The base name decides, like routing.DetectRuntimeSpecType.
     ['/opt/llama.cpp/bin/server', false],
     // vllm is checked first.

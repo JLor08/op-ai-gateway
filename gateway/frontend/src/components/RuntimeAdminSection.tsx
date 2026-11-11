@@ -1303,6 +1303,7 @@ export function RuntimeAdminSection({
     // The cluster head editor's member picker (it reads member GPUs through
     // serverHardware below).
     | 'clusterCandidates'
+    | 'applicationClusterCandidates'
     | 'resetClusterMemberUsage'
     // The live-status Start and Stop: transient, nothing is written.
     | 'startRuntime'
@@ -3578,7 +3579,12 @@ export function RuntimeAdminSection({
       setSpecMode('list');
     } catch (err) {
       showError(`${t.runtimeSpecPartialFailure}: ${formatPortalError(err, t)}`);
-      setSpecMode('list');
+      // The mapping exists now, so the form stays open as its Edit with every
+      // entry kept -- a cluster head's members and their GPUs included -- and
+      // the operator fixes what was refused and saves again. Leaving for the
+      // list would throw the entries away.
+      setGatewayName(mapping.gateway_model_name);
+      setSpecMode({ kind: 'edit', mapping });
     } finally {
       setBusy(false);
     }
@@ -5730,6 +5736,7 @@ export function RuntimeAdminSection({
                 t={t}
                 api={api}
                 mappingId={editingSpecMappingId}
+                applicationId={application.id}
                 headServer={server}
                 stored={currentSpec}
                 value={cluster}

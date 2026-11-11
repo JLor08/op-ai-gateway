@@ -354,6 +354,7 @@ function memberProblemText(problem: MemberProblem | undefined, t: Translation): 
   if (problem === 'no_matching_binary') return t.clusterMemberNoMatchingRpcBinary;
   if (problem === 'not_offered') return t.clusterMemberNotOffered;
   if (problem === 'version_mismatch') return t.clusterMemberVersionMismatch;
+  if (problem === 'spec_not_offered') return t.clusterMemberSpecNotOffered;
   return undefined;
 }
 
@@ -642,6 +643,7 @@ export function ClusterHeadEditor({
   t,
   api,
   mappingId,
+  applicationId,
   headServer,
   stored,
   value,
@@ -655,9 +657,12 @@ export function ClusterHeadEditor({
   resetMemberUsage,
 }: Readonly<{
   t: Translation;
-  api: Pick<PortalApi, 'clusterCandidates' | 'serverHardware'>;
-  // '' while the spec is being created: the candidates are read per mapping.
+  api: Pick<PortalApi, 'clusterCandidates' | 'applicationClusterCandidates' | 'serverHardware'>;
+  // '' while the spec is being created: the candidates are then read per
+  // application, and the first save stores the head with its members.
   mappingId: string;
+  // The application the spec belongs to, for the listing of a new spec.
+  applicationId: string;
   headServer: PortalServer;
   // The loaded spec: the read view's defaults, warnings and totals.
   stored?: RuntimeSpec;
@@ -714,10 +719,10 @@ export function ClusterHeadEditor({
   const hardwareByServer = useMemberHardware(api, value);
   const candidates = useClusterCandidates(
     api,
-    mappingId,
+    { mappingId, applicationId },
     value.memberMode,
     headBinary.trim(),
-    value.enabled && mappingId !== '',
+    value.enabled,
     candidatesReload,
   );
 
@@ -849,17 +854,12 @@ export function ClusterHeadEditor({
         control={
           <Checkbox
             checked={value.enabled}
-            disabled={switchLocked || (mappingId === '' && !value.enabled)}
+            disabled={switchLocked}
             onChange={(e) => patch({ enabled: e.target.checked })}
           />
         }
         label={t.clusterEnabledLabel}
       />
-      {mappingId === '' && !value.enabled && (
-        <Typography variant="caption" color="text.secondary">
-          {t.clusterCreateFirst}
-        </Typography>
-      )}
       {locked && <Alert severity="info">{t.clusterMembersLocked}</Alert>}
       {value.enabled && (
         <>
@@ -1004,11 +1004,7 @@ export function ClusterHeadEditor({
 
           {picker === null ? (
             <Box>
-              <Button
-                startIcon={<AddIcon />}
-                disabled={locked || mappingId === ''}
-                onClick={openPicker}
-              >
+              <Button startIcon={<AddIcon />} disabled={locked} onClick={openPicker}>
                 {t.clusterMemberAdd}
               </Button>
             </Box>
