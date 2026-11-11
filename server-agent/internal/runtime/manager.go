@@ -1456,6 +1456,9 @@ type owner struct {
 	// the owner writes a spec's config files under. Fixed for the process
 	// lifetime, so a plain field like gpuVendor above.
 	configFilesDir string
+	// lastCacheSweep is when the last sweep of the rpc cache root started
+	// (maybeSweepMemberCaches); zero before the first document.
+	lastCacheSweep time.Time
 	// vramHeadroomMB is ManagerOptions.VRAMHeadroomMB, never negative. Fixed
 	// for the process lifetime, so a plain field like gpuVendor above; read
 	// only by buildSnapshot's auto-detected budgets.
@@ -1696,14 +1699,16 @@ func (o *owner) applyConfig(cfg Config) {
 	o.allowedPairs = cfg.AllowedPairs()
 
 	// A member's cache belongs to the head it serves: remember who served which
-	// head before this document, to drop the caches it orphans.
+	// head before this document, to drop the cache of a head a member no
+	// longer serves. Caches of members that left the document are the sweep's.
 	memberHeads := make(map[string]string)
 	for id, st := range o.specs {
 		if st.instance == 0 && st.spec.IsRPCServer() {
 			memberHeads[id] = st.spec.RPC.HeadSpecID
 		}
 	}
-	defer o.purgeDepartedMemberCaches(memberHeads, cfg.Specs)
+	defer o.purgeChangedHeadCaches(memberHeads, cfg.Specs)
+	defer o.maybeSweepMemberCaches(cfg.Specs)
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))

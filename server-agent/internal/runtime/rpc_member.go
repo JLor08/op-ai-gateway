@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
 package runtime
 
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -283,11 +287,30 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 	}
 }
 
-// purgeDepartedMemberCaches removes the cache directory of every member spec in
-// before whose head changed in after or that left it, unless another member in
-// after still serves that head. The directories are removed off the owner
-// goroutine: a cache can hold many gigabytes.
-func (o *owner) purgeDepartedMemberCaches(before map[string]string, after []Spec) {
+// memberCacheOrphanAge is how long a cache directory that belongs to no member
+// of the current document must have gone unmodified before the sweep removes
+// it. A member leaves the document for reasons that pass (a gateway restart
+// that has not heard from every cluster host yet, an operator turning the
+// cluster off for a while), and its head's cache is what makes the next start
+// fast, so only a cache nobody has touched for this long is dropped.
+const memberCacheOrphanAge = 7 * 24 * time.Hour
+
+// memberCacheSweepEvery is how often, at most, a document apply sweeps the
+// cache root, and how old a purge tombstone must be before the sweep removes
+// it (a younger one may still be under removal by its purge).
+const memberCacheSweepEvery = time.Hour
+
+// purgeTombstonePrefix starts the name a purged cache directory is moved to
+// before it is removed (purgeMemberCache).
+const purgeTombstonePrefix = ".purge-"
+
+// purgeChangedHeadCaches removes the cache directory of every member spec in
+// before that is still in after but now serves another head, unless another
+// member in after still serves the old head. A member that left the document
+// keeps its cache: the sweep (sweepMemberCaches) removes it once it has been
+// unused long enough. The directories are removed off the owner goroutine: a
+// cache can hold many gigabytes.
+func (o *owner) purgeChangedHeadCaches(before map[string]string, after []Spec) {
 	if o.configFilesDir == "" {
 		return
 	}
@@ -300,21 +323,114 @@ func (o *owner) purgeDepartedMemberCaches(before map[string]string, after []Spec
 		}
 	}
 	for id, head := range before {
-		if current[id] == head || serving[head] {
+		if now, listed := current[id]; !listed || now == head || serving[head] {
 			continue
 		}
 		dir, err := memberCacheDir(o.configFilesDir, head)
 		if err != nil {
 			continue
 		}
-		o.m.wg.Add(1)
-		go func() {
-			defer o.m.wg.Done()
+		o.m.wg.Go(func() {
 			if err := os.RemoveAll(dir); err != nil {
 				slog.Warn("runtime: purge rpc cache", "path", dir, "err", err)
 			}
-		}()
+		})
 	}
+}
+
+// maybeSweepMemberCaches starts a sweep of the cache root against specs, the
+// document just applied, on the first apply and then at most once per
+// memberCacheSweepEvery. The sweep runs off the owner goroutine.
+func (o *owner) maybeSweepMemberCaches(specs []Spec) {
+	if o.configFilesDir == "" || o.closing {
+		return
+	}
+	now := time.Now()
+	if !o.lastCacheSweep.IsZero() && now.Sub(o.lastCacheSweep) < memberCacheSweepEvery {
+		return
+	}
+	o.lastCacheSweep = now
+	keep := make(map[string]bool)
+	for _, spec := range specs {
+		if spec.IsRPCServer() {
+			keep[spec.RPC.HeadSpecID] = true
+		}
+	}
+	root := filepath.Join(o.configFilesDir, "rpc")
+	o.m.wg.Go(func() { sweepMemberCaches(root, keep, now) })
+}
+
+// sweepMemberCaches removes from root every directory that is no head in keep
+// and whose newest modification, its own or of anything inside it, lies more
+// than memberCacheOrphanAge before now; this covers caches orphaned while the
+// agent was down. A purge tombstone is removed once its purge, recorded in
+// its name, lies more than memberCacheSweepEvery back. Anything that is not a
+// directory is left alone.
+func sweepMemberCaches(root string, keep map[string]bool, now time.Time) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Warn("runtime: sweep rpc caches", "path", root, "err", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !e.IsDir() || keep[name] {
+			continue
+		}
+		dir := filepath.Join(root, name)
+		if at, ok := tombstonePurgedAt(name); ok {
+			if now.Sub(at) < memberCacheSweepEvery {
+				continue
+			}
+		} else if newest, err := newestModTime(dir); err != nil || now.Sub(newest) < memberCacheOrphanAge {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("runtime: sweep rpc cache", "path", dir, "err", err)
+			continue
+		}
+		slog.Info("runtime: removed an unused rpc cache", "path", dir)
+	}
+}
+
+// tombstonePurgedAt reads the purge time out of a tombstone's name
+// (".purge-<head>-<unix nanoseconds>"); ok is false for any other name.
+func tombstonePurgedAt(name string) (time.Time, bool) {
+	rest, found := strings.CutPrefix(name, purgeTombstonePrefix)
+	if !found {
+		return time.Time{}, false
+	}
+	i := strings.LastIndexByte(rest, '-')
+	if i < 0 {
+		return time.Time{}, false
+	}
+	nanos, err := strconv.ParseInt(rest[i+1:], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, nanos), true
+}
+
+// newestModTime is the latest modification time of dir and everything below
+// it.
+func newestModTime(dir string) (time.Time, error) {
+	var newest time.Time
+	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if t := info.ModTime(); t.After(newest) {
+			newest = t
+		}
+		return nil
+	})
+	return newest, err
 }
 
 // permitMember is the member-specific half of LocalPolicy.Permit: the agent

@@ -392,7 +392,7 @@ func (o *owner) purgeMemberCache(specID string) purgeOutcome {
 	}
 	// The leading dot and the timestamp give the tombstone a name that is no
 	// head's cache directory (head IDs are the gateway's spec IDs).
-	tomb := filepath.Join(filepath.Dir(dir), ".purge-"+filepath.Base(dir)+"-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	tomb := filepath.Join(filepath.Dir(dir), purgeTombstonePrefix+filepath.Base(dir)+"-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := os.Rename(dir, tomb); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return purgeOutcome{}
