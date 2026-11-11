@@ -158,15 +158,7 @@ func (s *Service) CreateManualServerBinary(ctx context.Context, p auth.Token, se
 	// a write -- also a partial one.
 	defer s.NotifyClustersOfServer(ctx, server.ID)
 	row := routing.ServerBinary{ServerID: server.ID, Path: req.Path, Kind: kind, ReportedAt: s.clock().UTC()}
-	if req.Version != nil {
-		row.Version = *req.Version
-	}
-	if req.Build != nil {
-		row.Build = *req.Build
-	}
-	if req.Commit != nil {
-		row.Commit = *req.Commit
-	}
+	applyBinaryVersionFields(&row, req)
 	if err := s.routes.UpsertManualServerBinary(ctx, row); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return ServerBinaryDTO{}, ErrBinaryAgentOwned
@@ -188,14 +180,8 @@ func (s *Service) UpdateServerBinary(ctx context.Context, p auth.Token, serverID
 	if err != nil {
 		return ServerBinaryDTO{}, err
 	}
-	if !validBinaryPath(req.Path) {
-		return ServerBinaryDTO{}, ErrBinaryPathInvalid
-	}
-	if req.Kind != nil && !validBinaryKind(*req.Kind) {
-		return ServerBinaryDTO{}, ErrBinaryKindInvalid
-	}
-	if !validBinaryText(req.Version, req.Build, req.Commit, req.VersionOverride) {
-		return ServerBinaryDTO{}, ErrBinaryVersionInvalid
+	if err := validateBinaryUpdate(req); err != nil {
+		return ServerBinaryDTO{}, err
 	}
 	row, ok, err := s.binaryRow(ctx, server.ID, req.Path)
 	if err != nil {
@@ -212,15 +198,7 @@ func (s *Service) UpdateServerBinary(ctx context.Context, p auth.Token, serverID
 		if req.Kind != nil {
 			row.Kind = *req.Kind
 		}
-		if req.Version != nil {
-			row.Version = *req.Version
-		}
-		if req.Build != nil {
-			row.Build = *req.Build
-		}
-		if req.Commit != nil {
-			row.Commit = *req.Commit
-		}
+		applyBinaryVersionFields(&row, req)
 		if err := s.routes.UpsertManualServerBinary(ctx, row); err != nil {
 			return ServerBinaryDTO{}, mapBinaryStoreErr(err)
 		}
@@ -231,6 +209,35 @@ func (s *Service) UpdateServerBinary(ctx context.Context, p auth.Token, serverID
 		}
 	}
 	return s.binaryDTOByPath(ctx, server.ID, req.Path)
+}
+
+// validateBinaryUpdate is UpdateServerBinary's request validation: the
+// path, a given kind and the length of every version text, in that order.
+func validateBinaryUpdate(req PutServerBinaryRequest) error {
+	if !validBinaryPath(req.Path) {
+		return ErrBinaryPathInvalid
+	}
+	if req.Kind != nil && !validBinaryKind(*req.Kind) {
+		return ErrBinaryKindInvalid
+	}
+	if !validBinaryText(req.Version, req.Build, req.Commit, req.VersionOverride) {
+		return ErrBinaryVersionInvalid
+	}
+	return nil
+}
+
+// applyBinaryVersionFields sets the version, build and commit the request
+// gives on row; an absent field keeps the row's value.
+func applyBinaryVersionFields(row *routing.ServerBinary, req PutServerBinaryRequest) {
+	if req.Version != nil {
+		row.Version = *req.Version
+	}
+	if req.Build != nil {
+		row.Build = *req.Build
+	}
+	if req.Commit != nil {
+		row.Commit = *req.Commit
+	}
 }
 
 // DeleteManualServerBinary removes an operator-entered row; an agent-owned

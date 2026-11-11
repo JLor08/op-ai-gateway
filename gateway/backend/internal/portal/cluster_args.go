@@ -128,67 +128,16 @@ func isOneOf(name string, set []string) bool {
 func scanClusterArgs(args []string, env map[string]string) clusterArgScan {
 	scan := clusterArgScan{rpcArgIndex: -1, deviceArgIndex: -1}
 	for _, a := range args {
-		scan.rpcPlaceholderCount += strings.Count(a, placeholderRPCServers)
-		if strings.Contains(a, placeholderRPCServers) || strings.Contains(a, placeholderRPCDevices) {
-			scan.clusterPlaceholder = true
-		}
+		scan.countPlaceholders(a)
 	}
 	for _, v := range env {
-		scan.rpcPlaceholderCount += strings.Count(v, placeholderRPCServers)
-		if strings.Contains(v, placeholderRPCServers) || strings.Contains(v, placeholderRPCDevices) {
-			scan.clusterPlaceholder = true
-		}
+		scan.countPlaceholders(v)
 	}
 	argDeviceList := ""
 	for i := 0; i < len(args); i++ {
-		name, value, attached := normalizeLlamaFlag(args[i])
-		scanned := true
-		switch {
-		case isOneOf(name, clusterRPCFlags):
-			scan.rpcInArgs = true
-			scan.rpcArgCount++
-			if scan.rpcArgIndex < 0 {
-				scan.rpcArgIndex = i
-			}
-			if strings.Contains(flagValue(args, i, value, attached), placeholderRPCServers) {
-				scan.rpcValueHasPlaceholder = true
-			}
-		case isOneOf(name, clusterDeviceFlags):
-			if !scan.deviceInArgs {
-				scan.deviceArgIndex = i
-			}
-			scan.deviceInArgs = true
-			argDeviceList = flagValue(args, i, value, attached)
-		case isOneOf(name, clusterTensorSplitFlags):
-			scan.tensorSplit = true
-		case isOneOf(name, clusterMMDevFlags):
-			scan.mmdev = true
-		default:
-			scanned = false
-		}
-		if scanned && attached {
-			scan.equalsForm = true
-		}
-		// Step over the option's value, so a value that looks like an option
-		// ("--alias -dev") is not read as one.
-		if !attached {
-			i += llamaServerValueFlags[name]
-		}
+		i = scan.scanArg(args, i, &argDeviceList)
 	}
-	if v, ok := envValue(env, envLlamaArgRPC); ok {
-		scan.rpcInEnv = true
-		if strings.Contains(v, placeholderRPCServers) {
-			scan.rpcValueHasPlaceholder = true
-		}
-	}
-	envDeviceList, envDevice := envValue(env, envLlamaArgDevice)
-	scan.deviceInEnv = envDevice
-	if _, ok := envValue(env, envLlamaArgTensorSplit); ok {
-		scan.tensorSplit = true
-	}
-	if _, ok := envValue(env, envMtmdBackendDevice); ok {
-		scan.mmdev = true
-	}
+	envDeviceList := scan.scanEnv(env)
 	switch {
 	case scan.deviceInArgs:
 		scan.deviceList = argDeviceList
@@ -198,6 +147,75 @@ func scanClusterArgs(args []string, env map[string]string) clusterArgScan {
 	scan.deviceHasRPC = strings.Contains(scan.deviceList, placeholderDevices) ||
 		strings.Contains(scan.deviceList, placeholderRPCDevices)
 	return scan
+}
+
+// countPlaceholders adds one arg or env value's ${RPC_SERVERS} occurrences
+// and notes any cluster placeholder in it.
+func (c *clusterArgScan) countPlaceholders(v string) {
+	c.rpcPlaceholderCount += strings.Count(v, placeholderRPCServers)
+	if strings.Contains(v, placeholderRPCServers) || strings.Contains(v, placeholderRPCDevices) {
+		c.clusterPlaceholder = true
+	}
+}
+
+// scanArg reads the option at args[i]: a scanned option's position and value
+// (the device list into argDeviceList), and whether it is written in the "="
+// form. It returns the index of the option's last element: an option's value
+// is stepped over, so a value that looks like an option ("--alias -dev") is
+// not read as one.
+func (c *clusterArgScan) scanArg(args []string, i int, argDeviceList *string) int {
+	name, value, attached := normalizeLlamaFlag(args[i])
+	scanned := true
+	switch {
+	case isOneOf(name, clusterRPCFlags):
+		c.rpcInArgs = true
+		c.rpcArgCount++
+		if c.rpcArgIndex < 0 {
+			c.rpcArgIndex = i
+		}
+		if strings.Contains(flagValue(args, i, value, attached), placeholderRPCServers) {
+			c.rpcValueHasPlaceholder = true
+		}
+	case isOneOf(name, clusterDeviceFlags):
+		if !c.deviceInArgs {
+			c.deviceArgIndex = i
+		}
+		c.deviceInArgs = true
+		*argDeviceList = flagValue(args, i, value, attached)
+	case isOneOf(name, clusterTensorSplitFlags):
+		c.tensorSplit = true
+	case isOneOf(name, clusterMMDevFlags):
+		c.mmdev = true
+	default:
+		scanned = false
+	}
+	if scanned && attached {
+		c.equalsForm = true
+	}
+	if attached {
+		return i
+	}
+	return i + llamaServerValueFlags[name]
+}
+
+// scanEnv reads the options set through their environment variables and
+// returns the env device list.
+func (c *clusterArgScan) scanEnv(env map[string]string) string {
+	if v, ok := envValue(env, envLlamaArgRPC); ok {
+		c.rpcInEnv = true
+		if strings.Contains(v, placeholderRPCServers) {
+			c.rpcValueHasPlaceholder = true
+		}
+	}
+	deviceList, ok := envValue(env, envLlamaArgDevice)
+	c.deviceInEnv = ok
+	if _, ok := envValue(env, envLlamaArgTensorSplit); ok {
+		c.tensorSplit = true
+	}
+	if _, ok := envValue(env, envMtmdBackendDevice); ok {
+		c.mmdev = true
+	}
+	return deviceList
 }
 
 // envValue looks key up exactly: llama-server reads its variables by their

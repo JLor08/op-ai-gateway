@@ -83,30 +83,45 @@ func (s *Service) ClusterPlan(ctx context.Context, headSpecID string) (ClusterPl
 		return ClusterPlan{}, err
 	}
 	for _, row := range rows {
-		spec, ok := d.members[row.ServerID]
-		if !ok {
-			return withheldPlan(plan, ClusterWithheldMemberMissing), nil
-		}
-		srv, err := s.routes.AIServerByID(ctx, row.ServerID)
-		if err != nil {
-			if ignoreNotFound(err) == nil {
-				return withheldPlan(plan, ClusterWithheldMemberMissing), nil
-			}
-			return ClusterPlan{}, err
-		}
-		app, ok, err := s.serverAgentApplication(ctx, row.ServerID)
+		m, reason, err := s.clusterPlanMember(ctx, row, d)
 		if err != nil {
 			return ClusterPlan{}, err
 		}
-		if !ok {
-			return withheldPlan(plan, ClusterWithheldMemberUnmanaged), nil
+		if reason != "" {
+			return withheldPlan(plan, reason), nil
 		}
-		plan.Members = append(plan.Members, ClusterPlanMember{
-			Position: row.Position, Server: srv, Application: app,
-			SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds,
-		})
+		plan.Members = append(plan.Members, m)
 	}
 	return plan, nil
+}
+
+// clusterPlanMember is the plan entry of one membership row of a derivable
+// cluster d, or the reason it can no longer be planned: its member spec is
+// not in the derivation or its server is gone (member missing), or the
+// server lost its server_agent application (member unmanaged).
+func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMember, d clusterDerivation) (ClusterPlanMember, string, error) {
+	spec, ok := d.members[row.ServerID]
+	if !ok {
+		return ClusterPlanMember{}, ClusterWithheldMemberMissing, nil
+	}
+	srv, err := s.routes.AIServerByID(ctx, row.ServerID)
+	if err != nil {
+		if ignoreNotFound(err) == nil {
+			return ClusterPlanMember{}, ClusterWithheldMemberMissing, nil
+		}
+		return ClusterPlanMember{}, "", err
+	}
+	app, ok, err := s.serverAgentApplication(ctx, row.ServerID)
+	if err != nil {
+		return ClusterPlanMember{}, "", err
+	}
+	if !ok {
+		return ClusterPlanMember{}, ClusterWithheldMemberUnmanaged, nil
+	}
+	return ClusterPlanMember{
+		Position: row.Position, Server: srv, Application: app,
+		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds,
+	}, "", nil
 }
 
 func withheldPlan(plan ClusterPlan, reason string) ClusterPlan {
@@ -163,27 +178,52 @@ func (s *Service) KeptUpClusterHeads(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	var heads []string
+	err = s.forEachAgentSpec(ctx, servers, func(_ routing.AIServer, spec routing.RuntimeSpec) error {
+		if spec.ClusterEnabled && spec.Enabled && (spec.Pinned || spec.AdminState == adminStateForceRunning) {
+			heads = append(heads, spec.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return heads, nil
+}
+
+// forEachAgentSpec calls fn for every runtime spec of every server_agent
+// application on servers, server by server, in the store's order. The first
+// error, of a read or of fn, ends the walk and is returned.
+func (s *Service) forEachAgentSpec(ctx context.Context, servers []routing.AIServer, fn func(srv routing.AIServer, spec routing.RuntimeSpec) error) error {
 	for _, srv := range servers {
 		apps, err := s.routes.ApplicationsByServer(ctx, srv.ID)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, app := range apps {
 			if app.Type != routing.ProviderServerAgent {
 				continue
 			}
-			specs, err := s.routes.RuntimeSpecsByApplication(ctx, app.ID)
-			if err != nil {
-				return nil, err
-			}
-			for _, spec := range specs {
-				if spec.ClusterEnabled && spec.Enabled && (spec.Pinned || spec.AdminState == adminStateForceRunning) {
-					heads = append(heads, spec.ID)
-				}
+			if err := s.forEachSpecOfApplication(ctx, srv, app.ID, fn); err != nil {
+				return err
 			}
 		}
 	}
-	return heads, nil
+	return nil
+}
+
+// forEachSpecOfApplication calls fn for every runtime spec of appID, a
+// server_agent application on srv.
+func (s *Service) forEachSpecOfApplication(ctx context.Context, srv routing.AIServer, appID string, fn func(srv routing.AIServer, spec routing.RuntimeSpec) error) error {
+	specs, err := s.routes.RuntimeSpecsByApplication(ctx, appID)
+	if err != nil {
+		return err
+	}
+	for _, spec := range specs {
+		if err := fn(srv, spec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // adminStateForceRunning is the admin_state that keeps a spec up.

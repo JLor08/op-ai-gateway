@@ -3892,51 +3892,12 @@ func (m *MemoryStore) setClusterMembersLocked(headSpecID string, members []Clust
 	if _, ok := m.runtimeSpecs[headSpecID]; !ok {
 		return storeerr.ErrNotFound
 	}
-	positions := make(map[int]struct{}, len(members))
-	servers := make(map[string]struct{}, len(members))
-	specs := make(map[string]struct{}, len(members))
-	for _, mem := range members {
-		if _, ok := m.servers[mem.ServerID]; !ok {
-			return storeerr.ErrNotFound
-		}
-		if _, dup := positions[mem.Position]; dup {
-			return storeerr.ErrConflict
-		}
-		if _, dup := servers[mem.ServerID]; dup {
-			return storeerr.ErrConflict
-		}
-		positions[mem.Position], servers[mem.ServerID] = struct{}{}, struct{}{}
-		if mem.Port != 0 && m.clusterPortTakenLocked(headSpecID, mem.ServerID, mem.Port) {
-			return storeerr.ErrConflict
-		}
-		if mem.MemberSpecID == "" {
-			continue
-		}
-		if _, dup := specs[mem.MemberSpecID]; dup {
-			return storeerr.ErrConflict
-		}
-		specs[mem.MemberSpecID] = struct{}{}
-		for head, others := range m.clusterMembers {
-			if head == headSpecID {
-				continue
-			}
-			for _, o := range others {
-				if o.MemberSpecID == mem.MemberSpecID {
-					return storeerr.ErrConflict
-				}
-			}
-		}
+	servers, err := m.checkClusterMembersLocked(headSpecID, members)
+	if err != nil {
+		return err
 	}
-	gpuKeys := make(map[string]struct{}, len(gpus))
-	for _, g := range gpus {
-		if _, ok := servers[g.ServerID]; !ok {
-			return storeerr.ErrNotFound
-		}
-		key := fmt.Sprintf("%s/%d", g.ServerID, g.GPUIndex)
-		if _, dup := gpuKeys[key]; dup {
-			return storeerr.ErrConflict
-		}
-		gpuKeys[key] = struct{}{}
+	if err := checkClusterMemberGPUs(servers, gpus); err != nil {
+		return err
 	}
 	storedM := make([]ClusterMember, len(members))
 	for i, mem := range members {
@@ -3950,6 +3911,72 @@ func (m *MemoryStore) setClusterMembersLocked(headSpecID string, members []Clust
 	}
 	m.clusterMembers[headSpecID] = storedM
 	m.clusterMemberGPUs[headSpecID] = storedG
+	return nil
+}
+
+// checkClusterMembersLocked enforces on members what the tables enforce,
+// member by member: the server exists, (head, position) and (head, server)
+// are unique, a non-zero port is free on its server, and a manual member
+// spec is used once across all heads. It returns the set of member servers.
+// The caller holds m.mu.
+func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []ClusterMember) (map[string]struct{}, error) {
+	positions := make(map[int]struct{}, len(members))
+	servers := make(map[string]struct{}, len(members))
+	specs := make(map[string]struct{}, len(members))
+	for _, mem := range members {
+		if _, ok := m.servers[mem.ServerID]; !ok {
+			return nil, storeerr.ErrNotFound
+		}
+		if !addOnce(positions, mem.Position) || !addOnce(servers, mem.ServerID) {
+			return nil, storeerr.ErrConflict
+		}
+		if mem.Port != 0 && m.clusterPortTakenLocked(headSpecID, mem.ServerID, mem.Port) {
+			return nil, storeerr.ErrConflict
+		}
+		if mem.MemberSpecID == "" {
+			continue
+		}
+		if !addOnce(specs, mem.MemberSpecID) || m.memberSpecUsedElsewhereLocked(headSpecID, mem.MemberSpecID) {
+			return nil, storeerr.ErrConflict
+		}
+	}
+	return servers, nil
+}
+
+// addOnce adds k to set and reports whether it was not there yet.
+func addOnce[K comparable](set map[K]struct{}, k K) bool {
+	if _, dup := set[k]; dup {
+		return false
+	}
+	set[k] = struct{}{}
+	return true
+}
+
+// memberSpecUsedElsewhereLocked reports whether a head other than headSpecID
+// uses the manual member spec. The caller holds m.mu.
+func (m *MemoryStore) memberSpecUsedElsewhereLocked(headSpecID, memberSpecID string) bool {
+	for head, others := range m.clusterMembers {
+		if head != headSpecID && slices.ContainsFunc(others, func(o ClusterMember) bool { return o.MemberSpecID == memberSpecID }) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkClusterMemberGPUs requires a membership row in the same call for each
+// GPU row's server (ErrNotFound) and a unique (server, index) (ErrConflict).
+func checkClusterMemberGPUs(servers map[string]struct{}, gpus []ClusterMemberGPU) error {
+	gpuKeys := make(map[string]struct{}, len(gpus))
+	for _, g := range gpus {
+		if _, ok := servers[g.ServerID]; !ok {
+			return storeerr.ErrNotFound
+		}
+		key := fmt.Sprintf("%s/%d", g.ServerID, g.GPUIndex)
+		if _, dup := gpuKeys[key]; dup {
+			return storeerr.ErrConflict
+		}
+		gpuKeys[key] = struct{}{}
+	}
 	return nil
 }
 
