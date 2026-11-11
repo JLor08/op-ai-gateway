@@ -74,10 +74,10 @@ type AgentClusterEndpointDTO struct {
 
 // AgentClusterHeadDTO makes a model spec a cluster head: its members in
 // member order (the order fixes the RPC<n> numbering), the transport and the
-// network. Generation is a digest of the member configuration that the
-// endpoints do not show (binaries and their versions, args, device backends,
-// GPU selections, bind addresses), so a member-side change relaunches the
-// head.
+// network. Generation is a digest of every member launch input the
+// endpoints do not show (binaries and their versions, args, env, the cache
+// switch, device backends, GPU selections, bind addresses), so whatever
+// relaunches a member relaunches the head.
 type AgentClusterHeadDTO struct {
 	Endpoints  []AgentClusterEndpointDTO `json:"endpoints"`
 	Transport  string                    `json:"transport"`
@@ -405,24 +405,28 @@ func clusterHeadIdentity(headServer routing.AIServer, network string) (ips []str
 }
 
 // memberGenerationPart is one member's share of the head's generation:
-// everything of the member's launch that decides what devices the head sees
-// and whether its build talks to the head's.
+// every input of the member's launch. Whatever relaunches a member must
+// relaunch its head as well, since a head whose member restarts under it
+// aborts mid-request; beyond that it records what decides which devices the
+// head sees and whether the member's build talks to the head's.
 type memberGenerationPart struct {
-	Kind          string   `json:"kind"`
-	ID            string   `json:"id"`
-	Server        string   `json:"server"`
-	Binary        string   `json:"binary"`
-	Args          []string `json:"args"`
-	DeviceBackend string   `json:"device_backend"`
-	Version       string   `json:"version"`
-	Commit        string   `json:"commit"`
-	Build         string   `json:"build"`
-	DeviceCount   int      `json:"device_count"`
-	GPUs          []int    `json:"gpus"`
-	Transport     string   `json:"transport"`
-	Network       string   `json:"network"`
-	Bind          string   `json:"bind"`
-	Port          int      `json:"port"`
+	Kind          string            `json:"kind"`
+	ID            string            `json:"id"`
+	Server        string            `json:"server"`
+	Binary        string            `json:"binary"`
+	Args          []string          `json:"args"`
+	Env           map[string]string `json:"env"`
+	CacheEnabled  bool              `json:"cache_enabled"`
+	DeviceBackend string            `json:"device_backend"`
+	Version       string            `json:"version"`
+	Commit        string            `json:"commit"`
+	Build         string            `json:"build"`
+	DeviceCount   int               `json:"device_count"`
+	GPUs          []int             `json:"gpus"`
+	Transport     string            `json:"transport"`
+	Network       string            `json:"network"`
+	Bind          string            `json:"bind"`
+	Port          int               `json:"port"`
 }
 
 // buildCluster assembles a derivable cluster: the head's block and each
@@ -458,7 +462,8 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			kind = memberModeManual
 		}
 		parts = append(parts, memberGenerationPart{
-			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Args: spec.Args, DeviceBackend: spec.DeviceBackend,
+			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Args: spec.Args, Env: spec.Env,
+			CacheEnabled: spec.RPC.CacheEnabled, DeviceBackend: spec.DeviceBackend,
 			Version: m.binary.EffectiveVersion(),
 			Commit:  commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: transport, Network: network,
 			Bind: m.bindIP, Port: m.row.Port,

@@ -832,3 +832,55 @@ func TestAgentRuntimeConfigPropagatesSettingsReadError(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentRuntimeConfigGenerationCoversEveryMemberLaunchInput: a member's
+// env and its cache switch relaunch the member, so they move the head's
+// generation too and the head relaunches with it instead of losing the
+// member under a running model.
+func TestAgentRuntimeConfigGenerationCoversEveryMemberLaunchInput(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	f.clusterAgents(a.ID, b.ID)
+	spec := f.manualSpec(a.ID, RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 5000})
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: a.ID, MemberSpecID: spec.ID})
+	req.MemberMode = "manual"
+	head := f.mustPut(req)
+	generation := func(headID string) string {
+		t.Helper()
+		hs, ok := specByID(f.config(f.head.ID), headID)
+		if !ok || hs.Cluster == nil {
+			t.Fatalf("head %s withheld", headID)
+		}
+		return hs.Cluster.Generation
+	}
+	putSpec := func(r PutRPCMemberSpecRequest) {
+		t.Helper()
+		r.Binary, r.GPUs = clusterRPCBinary, []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 5000}}
+		if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), a.ID, spec.ID, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := generation(head.ID)
+	putSpec(PutRPCMemberSpecRequest{Env: map[string]string{"GGML_SCHED_MAX_COPIES": "1"}})
+	afterEnv := generation(head.ID)
+	if afterEnv == before {
+		t.Fatal("generation unchanged by the manual member's env")
+	}
+	putSpec(PutRPCMemberSpecRequest{Env: map[string]string{"GGML_SCHED_MAX_COPIES": "1"}, CacheEnabled: true})
+	if generation(head.ID) == afterEnv {
+		t.Fatal("generation unchanged by the manual member's cache switch")
+	}
+
+	second, err := f.svc.CreateMapping(f.ctx, ownerToken(), f.app.ID, CreateMappingRequest{GatewayModelName: "big2", AppModelName: "big2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto := f.putFor(second.ID, clusterHeadRequest(autoMember(b.ID, 0)))
+	before = generation(auto.ID)
+	cached := clusterHeadRequest(autoMember(b.ID, 0))
+	cached.ClusterMembers[0].CacheEnabled = true
+	f.putFor(second.ID, cached)
+	if generation(auto.ID) == before {
+		t.Fatal("generation unchanged by the automatic member's cache switch")
+	}
+}
