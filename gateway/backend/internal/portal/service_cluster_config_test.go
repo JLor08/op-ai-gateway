@@ -884,3 +884,42 @@ func TestAgentRuntimeConfigGenerationCoversEveryMemberLaunchInput(t *testing.T) 
 		t.Fatal("generation unchanged by the automatic member's cache switch")
 	}
 }
+
+// TestAgentRuntimeConfigPeerFeaturesFromPersistedVersion: after a gateway
+// restart a peer whose live declaration is not known yet counts as declaring
+// rpc_cluster when its last reported agent version has it, so the host that
+// reports first does not cut a running cluster.
+func TestAgentRuntimeConfigPeerFeaturesFromPersistedVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name, version, reason string
+	}{
+		{"current agent", "0.18.0", ""},
+		{"newer agent", "v0.19.2-rc1", ""},
+		{"older agent", "0.17.4", ClusterWithheldAgentTooOld},
+		{"no version reported", "", ClusterWithheldFeaturesPending},
+		{"unreadable version", "dev", ClusterWithheldFeaturesPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClusterFixture(t)
+			a := f.member("A")
+			f.clusterAgents(a.ID)
+			head := f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+			if tc.version != "" {
+				if err := f.routes.UpsertTelemetry(f.ctx, routing.ServerTelemetry{
+					ServerID: a.ID, ReportedAt: clusterTestNow, AgentVersion: tc.version, UpdatedAt: clusterTestNow,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			delete(f.svc.agentFeatures.(fakeAgentFeatures), a.ID)
+			_, pushed := specByID(f.config(f.head.ID), head.ID)
+			if got := f.withheldReason(); got != tc.reason || pushed != (tc.reason == "") {
+				t.Fatalf("reason = %q pushed = %v, want reason %q", got, pushed, tc.reason)
+			}
+			// The viewer's own unknown declaration still holds its document.
+			if !f.config(a.ID).AwaitsAgentFeatures {
+				t.Fatal("member document served while its own agent's features are unknown")
+			}
+		})
+	}
+}

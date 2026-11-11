@@ -3073,9 +3073,12 @@ type AgentRuntimeConfigDTO struct {
 	// serving it without the cluster would make the agent stop a running
 	// head or member after a gateway restart, until its declaration arrived.
 	// An unknown declaration of ANOTHER server of the cluster does not hold
-	// the document; it only withholds that cluster's head or member from it
+	// the document. That server counts by the agent version it last
+	// reported, and only when that does not tell either is the cluster's
+	// head or member withheld from the document
 	// (ClusterWithheldFeaturesPending), so a member host that stays away
-	// cannot freeze every other model on the head's server.
+	// cannot freeze every other model on the head's server, and the host
+	// that reports first after a gateway restart keeps its cluster.
 	//
 	// The specs of a held document are derived as stored, as for an agent that
 	// runs instances (Service.specAsPushed). The flag itself is never on the

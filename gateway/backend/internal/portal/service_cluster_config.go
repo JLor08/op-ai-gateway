@@ -26,6 +26,10 @@ import (
 // as a model.
 const AgentFeatureRPCCluster = "rpc_cluster"
 
+// agentRPCClusterSince is the first agent version that declares
+// AgentFeatureRPCCluster.
+var agentRPCClusterSince = [3]int{0, 18, 0}
+
 // AgentSpecKindRPCServer is the runtime-document kind of a cluster member
 // spec; a model spec has no kind.
 const AgentSpecKindRPCServer = "rpc_server"
@@ -34,8 +38,9 @@ const AgentSpecKindRPCServer = "rpc_server"
 // (RuntimeSpecDTO.ClusterWithheldReason). The head and every member spec
 // derived from it are withheld together, so an agent never receives a
 // partial endpoint list. ClusterWithheldFeaturesPending withholds the
-// cluster while the declaration of an agent of it is unknown; a server whose
-// OWN agent's declaration is unknown has its whole document held instead
+// cluster while the declaration of an agent of it is unknown and its last
+// reported version does not tell either; a server whose OWN agent's
+// declaration is unknown has its whole document held instead
 // (AgentRuntimeConfigDTO.AwaitsAgentFeatures), while the other servers'
 // documents go out without that cluster's head or member.
 const (
@@ -165,7 +170,11 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 	for _, m := range states {
 		serverIDs = append(serverIDs, m.row.ServerID)
 	}
-	if reason, hold := s.clusterFeatureReason(viewerID, serverIDs); reason != "" {
+	reason, hold, err := s.clusterFeatureReason(ctx, viewerID, serverIDs)
+	if err != nil {
+		return clusterDerivation{}, err
+	}
+	if reason != "" {
 		d := withheld(reason)
 		d.hold = hold
 		return d, nil
@@ -230,30 +239,98 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 // document has declared, the gateway cannot tell what it runs. A REMOTE
 // unknown agent only withholds the cluster from the viewer's document --
 // holding the whole document for it would freeze every other model on the
-// viewer for as long as that other host stays away.
-func (s *Service) clusterFeatureReason(viewerID string, serverIDs []string) (reason string, hold bool) {
+// viewer for as long as that other host stays away. viewerID "" is no
+// document's: every server is a peer.
+//
+// A peer's live declaration is unknown after every gateway start until that
+// host reports, and one host always reports first. So a peer counts by the
+// agent version it last reported (peerFeatureReason): withholding the
+// cluster until every host has reported would make the first host's agent
+// drain a running head or member on every gateway restart.
+func (s *Service) clusterFeatureReason(ctx context.Context, viewerID string, serverIDs []string) (reason string, hold bool, err error) {
 	if s.agentFeatures == nil {
-		return ClusterWithheldAgentTooOld, false
+		return ClusterWithheldAgentTooOld, false, nil
 	}
-	if !s.agentFeatures.Known(viewerID) {
-		return ClusterWithheldFeaturesPending, true
+	if viewerID != "" && !s.agentFeatures.Known(viewerID) {
+		return ClusterWithheldFeaturesPending, true, nil
 	}
 	pending, old := false, false
 	for _, id := range serverIDs {
+		r := ""
 		switch {
-		case !s.agentFeatures.Known(id):
-			pending = true
-		case !s.agentFeatures.Has(id, AgentFeatureRPCCluster):
-			old = true
+		case s.agentFeatures.Known(id):
+			if !s.agentFeatures.Has(id, AgentFeatureRPCCluster) {
+				r = ClusterWithheldAgentTooOld
+			}
+		default:
+			if r, err = s.peerFeatureReason(ctx, id); err != nil {
+				return "", false, err
+			}
 		}
+		pending = pending || r == ClusterWithheldFeaturesPending
+		old = old || r == ClusterWithheldAgentTooOld
 	}
 	if pending {
-		return ClusterWithheldFeaturesPending, false
+		return ClusterWithheldFeaturesPending, false, nil
 	}
 	if old {
-		return ClusterWithheldAgentTooOld, false
+		return ClusterWithheldAgentTooOld, false, nil
 	}
-	return "", false
+	return "", false, nil
+}
+
+// peerFeatureReason judges a server whose live declaration is unknown by the
+// agent version of its last telemetry: one that declares rpc_cluster counts
+// as declaring it, an older one is too old, and none (or one that does not
+// parse) leaves the declaration pending. The host's next report replaces the
+// guess with its declaration.
+func (s *Service) peerFeatureReason(ctx context.Context, serverID string) (string, error) {
+	telemetry, ok, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return ClusterWithheldFeaturesPending, nil
+	}
+	version, parsed := parseAgentVersion(telemetry.AgentVersion)
+	switch {
+	case !parsed:
+		return ClusterWithheldFeaturesPending, nil
+	case compareAgentVersions(version, agentRPCClusterSince) < 0:
+		return ClusterWithheldAgentTooOld, nil
+	}
+	return "", nil
+}
+
+// parseAgentVersion reads "MAJOR.MINOR.PATCH" with an optional "v" prefix
+// and an optional pre-release or build suffix, which it ignores.
+func parseAgentVersion(raw string) ([3]int, bool) {
+	var out [3]int
+	v := strings.TrimPrefix(strings.TrimSpace(raw), "v")
+	if i := strings.IndexAny(v, "-+"); i >= 0 {
+		v = v[:i]
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func compareAgentVersions(a, b [3]int) int {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] - b[i]
+		}
+	}
+	return 0
 }
 
 // checkDerivedMember is the membership part of deriveCluster for the member
