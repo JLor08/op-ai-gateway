@@ -101,10 +101,26 @@ func TestHandlePortalClusterCandidates(t *testing.T) {
 		t.Fatalf("list = %d %s", rec.Code, rec.Body.String())
 	}
 	var list struct {
-		Data []portal.ClusterCandidateDTO `json:"data"`
+		Data            []portal.ClusterCandidateDTO `json:"data"`
+		HeadBinaryKnown *bool                        `json:"head_binary_known"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.Data == nil {
-		t.Fatalf("body %s err=%v, want a data array", rec.Body.String(), err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.Data == nil || list.HeadBinaryKnown == nil {
+		t.Fatalf("body %s err=%v, want a data array and head_binary_known", rec.Body.String(), err)
+	}
+	// The form's head binary rides as ?binary=; one the head server's
+	// inventory does not list has no known version.
+	rec = rpcMemberDo(t, srv, http.MethodGet, base+"?mode=automatic&binary=%2Fopt%2Fllama%2Fllama-server", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list with binary = %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.HeadBinaryKnown == nil || *list.HeadBinaryKnown {
+		t.Fatalf("body %s err=%v, want head_binary_known false", rec.Body.String(), err)
+	}
+	must(srv.Routes.UpsertManualServerBinary(ctx, routing.ServerBinary{ServerID: serverID, Path: "/opt/llama/llama-server", Kind: "llama_server", Commit: "2bc46ba", Build: "1"}))
+	rec = rpcMemberDo(t, srv, http.MethodGet, base+"?mode=automatic&binary=%2Fopt%2Fllama%2Fllama-server", "")
+	list.HeadBinaryKnown = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.HeadBinaryKnown == nil || !*list.HeadBinaryKnown {
+		t.Fatalf("body %s err=%v, want head_binary_known true for a listed binary", rec.Body.String(), err)
 	}
 	rec = rpcMemberDo(t, srv, http.MethodGet, base+"?mode=sideways", "")
 	if rec.Code != http.StatusBadRequest || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_mode_invalid" {

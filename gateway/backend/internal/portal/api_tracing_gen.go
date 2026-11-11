@@ -405,7 +405,7 @@ func (_d *APIWithTracing) ClaudeAliasTarget(ctx context.Context, t1 auth.Token, 
 	return _d.API.ClaudeAliasTarget(ctx, t1, s1)
 }
 
-func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string) (ca1 []ClusterCandidateDTO, err error) {
+func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string) (c2 ClusterCandidateList, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ClusterCandidates")
 	defer span.End()
 	defer func() {
@@ -414,7 +414,7 @@ func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, 
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.ClusterCandidates(ctx, t1, s1, s2)
+	return _d.API.ClusterCandidates(ctx, t1, s1, s2, s3)
 }
 
 func (_d *APIWithTracing) ClusterPlan(ctx context.Context, s1 string) (c2 ClusterPlan, err error) {

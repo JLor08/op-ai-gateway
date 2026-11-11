@@ -2565,15 +2565,22 @@ paths:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
       - { name: mode, in: query, required: false, schema: { type: string, enum: [automatic, manual] } }
+      - { name: binary, in: query, required: false, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Servers the llama.cpp RPC cluster head on the mapping may add as members ({"data":[...]})
+      summary: Servers the llama.cpp RPC cluster head on the mapping may add as members ({"data":[...],"head_binary_known":bool})
       description: >
         Servers other than the head's that the caller manages and whose member
-        consent admits the head (system scope included). automatic (default):
-        servers offering RPC membership with a ggml-rpc-server of the head
-        binary's version; manual: servers with enabled member specs serving no
-        other head. Refusals as the runtime-spec PUT's.
+        consent admits the head (system scope included). binary is the head
+        binary the operator's form has (default: the stored spec's); its
+        version is read from the head server's inventory as the save check
+        reads it, and head_binary_known says whether it is known. automatic
+        (default): servers offering RPC membership, compatible when they have
+        a ggml-rpc-server of the head binary's version; manual: servers with
+        enabled member specs serving no other head, with
+        incompatible_member_specs naming the specs whose binary's known
+        version differs from the head binary's. Refusals as the runtime-spec
+        PUT's.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }

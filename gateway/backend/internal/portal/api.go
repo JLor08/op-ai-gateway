@@ -54,7 +54,7 @@ type API interface {
 	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
-	ClusterCandidates(context.Context, auth.Token, string, string) ([]ClusterCandidateDTO, error)
+	ClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	ClusterPlan(context.Context, string) (ClusterPlan, error)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
 	CommitVoiceTurn(context.Context, auth.Token, string, string, AssistantTurn, string) error
