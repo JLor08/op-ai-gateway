@@ -289,16 +289,50 @@ func TestRelayLinkRecordsRefusals(t *testing.T) {
 		c.Read(make([]byte, 1))
 		c.Close()
 	}
-	waitFor(t, "refusals recorded", func() bool {
+	waitFor(t, "refusal recorded", func() bool {
 		tel, _ := l.telemetry("rpcm_a")
-		return tel.Refusals == maxRelayBreaches+3
+		return len(tel.Breaches) == 1
 	})
+	time.Sleep(50 * time.Millisecond)
 	tel, _ := l.telemetry("rpcm_a")
-	if len(tel.Breaches) != maxRelayBreaches || tel.Breaches[0].Peer != "127.0.0.1" || tel.Breaches[0].At.IsZero() {
-		t.Fatalf("breaches = %+v, want the last %d, each naming the peer and time", tel.Breaches, maxRelayBreaches)
+	if len(tel.Breaches) != 1 || tel.Breaches[0].Peer != "127.0.0.1" || tel.Breaches[0].At.IsZero() {
+		t.Fatalf("breaches = %+v, want one entry per peer, naming the peer and the time it was first seen", tel.Breaches)
 	}
 	if got := members.holdLog(); len(got) != 0 {
 		t.Fatalf("holds = %v, want none from a refused peer", got)
+	}
+}
+
+// TestRelayLinkBreachesExpireAndCap: the relay keeps refused peers like the
+// observer does: one entry per peer, first-seen time kept, the newest
+// maxRelayBreaches peers, and a peer drops out breachKeep after it was last
+// refused, even when nothing is refused any more.
+func TestRelayLinkBreachesExpireAndCap(t *testing.T) {
+	l := newRelayLink(func() []runtimectl.Status { return nil }, &fakeMembers{})
+	t.Cleanup(l.close)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return now }
+
+	l.Refused("rpcm_a", net.ParseIP("192.0.2.1"))
+	first := now
+	now = now.Add(time.Minute)
+	l.Refused("rpcm_a", net.ParseIP("192.0.2.1"))
+	tel, _ := l.telemetry("rpcm_a")
+	if len(tel.Breaches) != 1 || !tel.Breaches[0].At.Equal(first) {
+		t.Fatalf("breaches = %+v, want one entry first seen at %v", tel.Breaches, first)
+	}
+
+	for i := 2; i <= maxRelayBreaches+3; i++ {
+		l.Refused("rpcm_a", net.IPv4(192, 0, 2, byte(i)))
+	}
+	tel, _ = l.telemetry("rpcm_a")
+	if len(tel.Breaches) != maxRelayBreaches || tel.Breaches[len(tel.Breaches)-1].Peer != net.IPv4(192, 0, 2, byte(maxRelayBreaches+3)).String() {
+		t.Fatalf("breaches = %+v, want the newest %d peers", tel.Breaches, maxRelayBreaches)
+	}
+
+	now = now.Add(breachKeep)
+	if tel, _ := l.telemetry("rpcm_a"); len(tel.Breaches) != 0 {
+		t.Fatalf("breaches = %+v, want none %v after the last refusal", tel.Breaches, breachKeep)
 	}
 }
 

@@ -316,3 +316,19 @@ func TestPurgeCacheFailureIs500(t *testing.T) {
 		t.Fatalf("cache dir gone although the purge failed: %v", err)
 	}
 }
+
+// TestRouterModelsOmitsMembers: an rpc_server member serves no model, so
+// /v1/models never lists it -- not as an empty id, running or not.
+func TestRouterModelsOmitsMembers(t *testing.T) {
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{onDemandMember(t, "rpcm_a"), baseSpec("spec-a", "model-a")}})
+	ensureMember(t, m, "rpcm_a", 0)
+
+	rec := httptest.NewRecorder()
+	NewRouter(m).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	got := decodeJSON[modelsResponse](t, rec.Body)
+	if len(got.Data) != 1 || got.Data[0].ID != "model-a" {
+		t.Fatalf("/v1/models data = %+v, want only model-a", got.Data)
+	}
+}

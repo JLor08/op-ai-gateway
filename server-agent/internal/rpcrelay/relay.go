@@ -19,11 +19,12 @@
 //     running; the relay never starts a member.
 //   - One head per member: a newer connection that delivers its first byte
 //     replaces the older forwarding one (the head reconnects during its own
-//     startup), and the hold carries across the replacement.
+//     startup), and the hold carries across the replacement; it is reported
+//     again for the new connection.
 //   - At most MaxSockets accepted connections per member are open at once, and
 //     each has FirstByteTimeout to send its first byte.
 //   - Every session is closed when its member's relay is removed (drain, stop),
-//     when the allowlist changes, and on Close.
+//     when an allowlist change drops its peer's address, and on Close.
 package rpcrelay
 
 import (
@@ -97,8 +98,10 @@ type Config struct {
 // them. Implementations must not call back into the Manager.
 type Events interface {
 	// Held: a head connected to the member and sent its first byte while the
-	// member was running. It is not repeated when a newer connection replaces
-	// the forwarding one.
+	// member was running. It is reported for every connection that becomes
+	// the forwarding one, a replacement included (the hold carries across it,
+	// so a repeat changes nothing unless the hold was ended elsewhere
+	// meanwhile, by the gateway releasing the member).
 	Held(specID, headSpecID string, since time.Time)
 	// Released: the forwarding session ended and no newer one replaced it.
 	Released(specID string)
@@ -165,7 +168,8 @@ func NewManager(ev Events, running func(specID string) bool) *Manager {
 // Apply makes the running relays match cfgs: it starts the new ones, removes
 // the ones no longer listed (closing their sessions), and replaces one whose
 // bind address, target, head or stall threshold changed. A relay whose
-// allowlist changed keeps its listener but closes every session. An invalid
+// allowlist changed keeps its listener and its sessions, except those whose
+// peer the new list no longer allows. An invalid
 // config is left out, as if it were not listed, and reported in the returned
 // error; the valid ones are applied regardless.
 func (m *Manager) Apply(cfgs []Config) error {
@@ -376,7 +380,9 @@ type member struct {
 	// allowGen counts allowlist changes. A connection is checked against the
 	// list of one generation and registered only while that generation still
 	// stands, so a change that lands in between cannot miss it: the change
-	// bumps the generation before it closes the registered sessions.
+	// bumps the generation before it re-checks the registered sessions,
+	// moving those still allowed to the new generation and closing the
+	// others.
 	allowGen   uint64
 	sockets    map[*session]struct{}
 	active     *session // the session forwarding to the member
@@ -398,22 +404,36 @@ func (mem *member) sameShape(cfg Config) bool {
 }
 
 // updateAllowlist installs a new allowlist function; when the set it yields
-// differs from the last one, every session is closed, so no connection admitted
-// under the old list outlives it.
+// differs from the last one, every session whose peer the new set does not
+// allow is closed, so no connection admitted under the old list outlives its
+// entry. A session whose peer is still allowed is kept: a head domain that
+// resolves to one more address must not cut the cluster it serves.
 func (mem *member) updateAllowlist(f func() []net.IP, allowed []string) {
 	changed := !slices.Equal(mem.allowed, allowed)
+	var revoked []*session
 	mem.mu.Lock()
 	mem.cfg.AllowedIPs = f
 	if changed {
 		mem.allowGen++
+		for s := range mem.sockets {
+			if _, ok := slices.BinarySearch(allowed, s.peer); ok {
+				s.allowGen = mem.allowGen
+				continue
+			}
+			revoked = append(revoked, s)
+		}
 	}
 	mem.mu.Unlock()
 	if !changed {
 		return
 	}
 	mem.allowed = allowed
-	slog.Info("rpcrelay: allowlist changed; closing the member's sessions", "spec", mem.cfg.SpecID)
-	mem.closeSessions()
+	if len(revoked) > 0 {
+		slog.Info("rpcrelay: allowlist changed; closing the sessions of peers it no longer allows", "spec", mem.cfg.SpecID, "sessions", len(revoked))
+	}
+	for _, s := range revoked {
+		s.closeConns()
+	}
 }
 
 // start binds the relay, or starts retrying when it cannot.
@@ -522,7 +542,7 @@ func (mem *member) admit(c net.Conn) {
 	if hook := mem.m.admitHook; hook != nil {
 		hook()
 	}
-	s := &session{mem: mem, client: c, allowGen: gen}
+	s := &session{mem: mem, client: c, peer: peer.String(), allowGen: gen}
 	mem.mu.Lock()
 	if mem.ctx.Err() != nil || mem.allowGen != gen {
 		// Removed, or the allowlist this peer was checked against was
@@ -609,7 +629,10 @@ func (mem *member) stop() {
 type session struct {
 	mem    *member
 	client net.Conn
-	// allowGen is the allowlist generation the peer was admitted under.
+	// peer is the client's source address, as the allowlist spells it.
+	peer string
+	// allowGen is the allowlist generation the peer was last checked
+	// against; guarded by mem.mu.
 	allowGen uint64
 
 	mu         sync.Mutex
@@ -670,7 +693,8 @@ func (s *session) serve() {
 }
 
 // promote makes s the member's forwarding session: an older one is closed, and
-// the hold is reported unless one already stands (the replacement keeps it).
+// the hold is reported for s (a replacement keeps the hold; reporting it again
+// takes it back when the gateway released the member meanwhile).
 func (s *session) promote(tc net.Conn) bool {
 	mem := s.mem
 	mem.evMu.Lock()
@@ -682,15 +706,12 @@ func (s *session) promote(tc net.Conn) bool {
 	}
 	old := mem.active
 	mem.active = s
-	wasHeld := mem.held
 	mem.held = true
 	mem.mu.Unlock()
 	if old != nil {
 		old.closeConns()
 	}
-	if !wasHeld {
-		mem.m.ev.Held(mem.cfg.SpecID, mem.cfg.HeadSpecID, time.Now())
-	}
+	mem.m.ev.Held(mem.cfg.SpecID, mem.cfg.HeadSpecID, time.Now())
 	return true
 }
 

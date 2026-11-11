@@ -79,11 +79,12 @@ func TestSampleCarriesRPCStatus(t *testing.T) {
 	a.relays.telMu.Lock()
 	a.relays.telFor("rpcm_a").BindMismatch = true
 	a.relays.telMu.Unlock()
+	seen := time.Now()
+	obsMember := &observedMember{}
+	obsMember.breaches.note(seen, "100.64.0.9")
+	obsMember.breaches.note(seen.Add(time.Second), "100.64.0.10")
 	a.rpcObs.mu.Lock()
-	a.rpcObs.members["rpcm_a"] = &observedMember{breaches: []runtimectl.RPCBreach{
-		{Peer: "100.64.0.9", At: held},
-		{Peer: "100.64.0.10", At: held.Add(time.Second)},
-	}}
+	a.rpcObs.members["rpcm_a"] = obsMember
 	a.rpcObs.mu.Unlock()
 
 	var got sample.RuntimeSample
@@ -148,13 +149,19 @@ func TestSampleModelRowHasNoRPCKeys(t *testing.T) {
 func TestSampleCarriesClusterLaunch(t *testing.T) {
 	row := runtimectl.Status{
 		SpecID: "rspec_h", Model: "m", State: runtimectl.StateRunning,
-		Cluster: &runtimectl.ClusterStatus{Launched: []string{"100.64.0.5:47001"}, Version: "b1234"},
+		Cluster: &runtimectl.ClusterStatus{Launched: []string{"100.64.0.5:47001"}},
 	}
 	a, poster, _ := rpcTelemetryAgent(t, row)
 	a.collectOnce(context.Background())
 	r := runtimeRow(t, poster, "rspec_h")
-	if r.Cluster == nil || len(r.Cluster.Launched) != 1 || r.Cluster.Launched[0] != "100.64.0.5:47001" || r.Cluster.Version != "b1234" {
+	if r.Cluster == nil || len(r.Cluster.Launched) != 1 || r.Cluster.Launched[0] != "100.64.0.5:47001" {
 		t.Fatalf("cluster = %+v", r.Cluster)
+	}
+	// The block carries the launch facts only: the agent records no cluster
+	// version (the gateway knows every binary's from the inventory).
+	raw, _ := json.Marshal(r.Cluster)
+	if string(raw) != `{"launched":["100.64.0.5:47001"]}` {
+		t.Fatalf("cluster wire form = %s", raw)
 	}
 }
 
@@ -318,5 +325,21 @@ func TestRunWaitsForObserverGoroutines(t *testing.T) {
 	}
 	if !finished.Load() {
 		t.Fatal("Run returned while a connection listing was still in flight")
+	}
+}
+
+// TestLoadedModelsOmitMembers: a running rpc_server member serves no model, so
+// it never appears in loaded_models (its row's model is empty).
+func TestLoadedModelsOmitMembers(t *testing.T) {
+	member := runtimectl.Status{
+		SpecID: "rpcm_a", State: runtimectl.StateRunning, Kind: runtimectl.SpecKindRPCServer, PID: 1,
+		RPCMember: &runtimectl.RPCMember{HeadSpecID: "rspec_h", Transport: "direct", BindIP: "127.0.0.1", Port: 1},
+		RPC:       &runtimectl.RPCStatus{},
+	}
+	model := runtimectl.Status{SpecID: "rspec_m", Model: "m", State: runtimectl.StateRunning}
+	a, poster, _ := rpcTelemetryAgent(t, member, model)
+	a.collectOnce(context.Background())
+	if got := poster.last().LoadedModels; len(got) != 1 || got[0] != "m" {
+		t.Fatalf("loaded_models = %q, want only the model", got)
 	}
 }

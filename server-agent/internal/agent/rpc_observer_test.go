@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/netip"
 	"op-ai-server-agent/internal/collector"
 	"slices"
@@ -232,6 +233,59 @@ func TestObserverErrorKeepsLastObservation(t *testing.T) {
 	}
 }
 
+// levelCounter counts the log records of one message at each level.
+type levelCounter struct {
+	msg string
+	mu  sync.Mutex
+	n   map[slog.Level]int
+}
+
+func (h *levelCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (h *levelCounter) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.mu.Lock()
+		h.n[r.Level]++
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *levelCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *levelCounter) WithGroup(string) slog.Handler      { return h }
+
+func (h *levelCounter) count(l slog.Level) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n[l]
+}
+
+// TestObserverListingFailureWarnsOncePerStreak: a member whose connections
+// cannot be listed has no hold observed, so the failure is a Warn -- once per
+// streak of failures, not every poll; a successful listing ends the streak.
+func TestObserverListingFailureWarnsOncePerStreak(t *testing.T) {
+	h := &levelCounter{msg: "agent: rpc member connection listing failed; its head's hold cannot be observed", n: map[slog.Level]int{}}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	f := newObsFixture(t, directMember())
+	ctx := context.Background()
+	fail := func(int32) ([]collector.Conn, error) { return nil, errors.New("lsof failed") }
+	f.obs.conns = fail
+	for range 3 {
+		f.obs.pollAll(ctx)
+	}
+	if n := h.count(slog.LevelWarn); n != 1 {
+		t.Fatalf("Warns = %d after three failed listings, want 1", n)
+	}
+	f.obs.conns = func(int32) ([]collector.Conn, error) { return nil, nil }
+	f.obs.pollAll(ctx)
+	f.obs.conns = fail
+	f.obs.pollAll(ctx)
+	if n := h.count(slog.LevelWarn); n != 2 {
+		t.Fatalf("Warns = %d after a new streak, want 2", n)
+	}
+}
+
 func TestObserverUsesResolvedHeadDomain(t *testing.T) {
 	m := directMember()
 	m.RPCMember = &runtimectl.RPCMember{HeadSpecID: "rspec_h", Transport: "direct", BindIP: "100.64.0.5", Port: 47001, HeadDomain: "head.example"}
@@ -309,5 +363,79 @@ func TestMemberObserverFeedsRelayAllowlistAndResyncs(t *testing.T) {
 	}
 	if statusCalls.Load() == 0 {
 		t.Fatal("a changed resolution did not re-sync the relays")
+	}
+}
+
+// TestObserverReleaseIsSticky: once the gateway releases a direct member, the
+// head connections that existed before the release no longer hold it -- a
+// half-open socket of a head that lost power stays ESTABLISHED indefinitely
+// and must not re-take the hold every poll. A connection first seen after the
+// release is a new one and holds again. A hold the observer re-posted just
+// before it noticed the release is withdrawn.
+func TestObserverReleaseIsSticky(t *testing.T) {
+	f := newObsFixture(t)
+	var mu sync.Mutex
+	row := directMember()
+	f.obs.status = func() []runtimectl.Status {
+		mu.Lock()
+		defer mu.Unlock()
+		return []runtimectl.Status{row}
+	}
+	tick := func() { f.now.Add(int64(observerInterval)) }
+	f.set(connFrom(obsHead, 5000))
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "rpcm_a=rspec_h" {
+		t.Fatalf("hold = %s, want the head's", got)
+	}
+
+	tick()
+	mu.Lock()
+	row.RPCReleasedAt = time.Unix(0, f.now.Load())
+	mu.Unlock()
+	tick()
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "rpcm_a=" {
+		t.Fatalf("after the release the observer reported %s, want the hold withdrawn", got)
+	}
+	f.holds.mu.Lock()
+	n := len(f.holds.log)
+	f.holds.mu.Unlock()
+	for range 3 {
+		tick()
+		f.obs.pollAll(context.Background())
+	}
+	f.holds.mu.Lock()
+	extra := slices.Clone(f.holds.log[n:])
+	f.holds.mu.Unlock()
+	if len(extra) != 0 {
+		t.Fatalf("the released connection was reported again: %v", extra)
+	}
+
+	// The head reconnects: the new tuple holds, the half-open one still listed.
+	tick()
+	f.set(connFrom(obsHead, 5000), connFrom(obsHead, 5001))
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "rpcm_a=rspec_h" {
+		t.Fatalf("hold = %s after a new head connection, want the head's", got)
+	}
+}
+
+// TestObserverReleaseSparesLaterConnections: a connection the observer first
+// sees after the release is not one the release ended, even when the observer
+// notices the release only in that same poll.
+func TestObserverReleaseSparesLaterConnections(t *testing.T) {
+	f := newObsFixture(t)
+	row := directMember()
+	f.obs.status = func() []runtimectl.Status { return []runtimectl.Status{row} }
+	f.set(connFrom(obsHead, 5000))
+	f.obs.pollAll(context.Background())
+
+	f.now.Add(int64(observerInterval))
+	row.RPCReleasedAt = time.Unix(0, f.now.Load())
+	f.now.Add(int64(observerInterval))
+	f.set(connFrom(obsHead, 5002))
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "rpcm_a=rspec_h" {
+		t.Fatalf("hold = %s, want a connection opened after the release to hold", got)
 	}
 }

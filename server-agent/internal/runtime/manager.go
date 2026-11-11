@@ -1428,6 +1428,11 @@ type specState struct {
 	// claim is an rpc_server member's hold and reservation (rpc_hold.go): while
 	// either stands the member is never idle-unloaded nor an eviction victim.
 	claim memberClaim
+	// relaunchDeferred marks a claimed member whose launch shape changed under
+	// its running process: it is relaunched once the claim ends (claimEnded),
+	// since killing it now would abort the head that uses it. Cleared when the
+	// process exits.
+	relaunchDeferred bool
 	// admissionBlockedBy names the claimed member a waiting admission of this
 	// spec could only proceed by evicting; empty otherwise. admitAndStart
 	// decides it on every ask, and it is dropped once nothing waits any more.
@@ -1456,6 +1461,9 @@ type owner struct {
 	// the owner writes a spec's config files under. Fixed for the process
 	// lifetime, so a plain field like gpuVendor above.
 	configFilesDir string
+	// lastCacheSweep is when the last sweep of the rpc cache root started
+	// (maybeSweepMemberCaches); zero before the first document.
+	lastCacheSweep time.Time
 	// vramHeadroomMB is ManagerOptions.VRAMHeadroomMB, never negative. Fixed
 	// for the process lifetime, so a plain field like gpuVendor above; read
 	// only by buildSnapshot's auto-detected budgets.
@@ -1696,14 +1704,16 @@ func (o *owner) applyConfig(cfg Config) {
 	o.allowedPairs = cfg.AllowedPairs()
 
 	// A member's cache belongs to the head it serves: remember who served which
-	// head before this document, to drop the caches it orphans.
+	// head before this document, to drop the cache of a head a member no
+	// longer serves. Caches of members that left the document are the sweep's.
 	memberHeads := make(map[string]string)
 	for id, st := range o.specs {
 		if st.instance == 0 && st.spec.IsRPCServer() {
 			memberHeads[id] = st.spec.RPC.HeadSpecID
 		}
 	}
-	defer o.purgeDepartedMemberCaches(memberHeads, cfg.Specs)
+	defer o.purgeChangedHeadCaches(memberHeads, cfg.Specs)
+	defer o.maybeSweepMemberCaches(cfg.Specs)
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))
@@ -1955,6 +1965,19 @@ func (o *owner) reconcileSpec(st *specState, spec Spec) {
 			cancelTimer(o.m, &st.backoffTimer)
 			o.setState(st, StateStopped)
 		}
+	case changed && st.proc != nil && spec.AdminState != "force_stopped" && spec.IsRPCServer() && st.claimed() &&
+		(st.relaunchDeferred || !sameLaunchShape(prevSpec, spec)):
+		// A member a head holds or has reserved is part of a running cluster:
+		// a member has no requests in flight, so a drain would kill it at once
+		// and the head with it. Its relaunch waits for the claim to end -- the
+		// gateway relaunches the head for a change of the member's launch, and
+		// releases the member when that head stops (claimEnded). Once deferred
+		// it stays deferred: the running process has the old shape, whatever
+		// a later document says.
+		if !st.relaunchDeferred {
+			slog.Info("runtime: the member's launch changed while a head uses it; it is relaunched once the head lets go", "spec", spec.ID)
+		}
+		st.relaunchDeferred = true
 	case changed && st.proc != nil && spec.AdminState != "force_stopped" && !sameLaunchShape(prevSpec, spec):
 		// I7 fix (issue #63): a LIVE child whose LAUNCH SHAPE changed must
 		// be relaunched with it. Before this, applyConfig stored the new
@@ -4436,6 +4459,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	cancelTimer(o.m, &proc.stableTimer)
 	st.proc = nil
 	st.rpcProtocol = ""
+	st.relaunchDeferred = false
 	// A hold and a reservation are claims on a running member: with its process
 	// gone there is nothing left to hold, and the start a reservation covered has
 	// ended. The admission wake that follows every exit re-asks whoever waited
@@ -5461,6 +5485,7 @@ func (o *owner) snapshotStatus() []Status {
 			member := *st.spec.RPC
 			member.HeadIPs = slices.Clone(member.HeadIPs)
 			s.RPCMember = &member
+			s.RPCReleasedAt = st.claim.releasedAt
 			s.RPC = &RPCStatus{
 				HeldBy:        st.claim.heldBy,
 				HeldSince:     st.claim.heldSince,
@@ -5474,9 +5499,7 @@ func (o *owner) snapshotStatus() []Status {
 		}
 		// A head's launch facts: its endpoints cannot change under a live
 		// process (a different set relaunches it), so while the process exists
-		// the spec's endpoints are the ones it was started against. The
-		// cluster's build version is not recorded here: the agent never
-		// executes the binary on a status read.
+		// the spec's endpoints are the ones it was started against.
 		if st.spec.IsClusterHead() && st.proc != nil {
 			launched := make([]string, len(st.spec.Cluster.Endpoints))
 			for i, ep := range st.spec.Cluster.Endpoints {

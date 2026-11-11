@@ -425,7 +425,8 @@ func (rt *router) serveRunning(w http.ResponseWriter, _ *http.Request) {
 // and model listing both read this endpoint expecting the full set. A spec is
 // listed once, by its base name, however many instances it runs (#340): an
 // instance is a process of a model, not a model of its own, so only the
-// instance-0 rows -- which every spec has -- are listed.
+// instance-0 rows -- which every spec has -- are listed. An rpc_server member
+// serves no model and is never listed.
 type modelEntry struct {
 	ID     string `json:"id"`
 	Object string `json:"object"`
@@ -443,7 +444,7 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	}
 	data := make([]modelEntry, 0, len(statuses))
 	for _, st := range statuses {
-		if st.Instance != 0 {
+		if st.Instance != 0 || st.Kind == SpecKindRPCServer {
 			continue
 		}
 		data = append(data, modelEntry{ID: st.Model, Object: "model"})

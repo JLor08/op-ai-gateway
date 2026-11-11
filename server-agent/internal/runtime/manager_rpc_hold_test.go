@@ -344,3 +344,95 @@ func TestClaimedMemberIsPinnedForAdmission(t *testing.T) {
 		t.Fatal("a reserved member does not read pinned")
 	}
 }
+
+// TestReleaseRecordsReleasedAt: every release of a member stamps the time on
+// its status row (RPCReleasedAt), which the direct-mode observer reads to tell
+// the connections the release ended from a head's new one; the stamp moves on
+// with each release.
+func TestReleaseRecordsReleasedAt(t *testing.T) {
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{onDemandMember(t, "rpcm_a")}})
+	ensureMember(t, m, "rpcm_a", 30*time.Second)
+	if at := statusFor(m, "rpcm_a").RPCReleasedAt; !at.IsZero() {
+		t.Fatalf("RPCReleasedAt = %v before any release, want zero", at)
+	}
+
+	before := time.Now()
+	if err := m.ReleaseMember(context.Background(), "rpcm_a"); err != nil {
+		t.Fatal(err)
+	}
+	first := statusFor(m, "rpcm_a").RPCReleasedAt
+	if first.Before(before) {
+		t.Fatalf("RPCReleasedAt = %v, want at or after %v", first, before)
+	}
+
+	// A release of a member nothing claims still counts: a hold the observer
+	// reported just before may land after it.
+	time.Sleep(5 * time.Millisecond)
+	if err := m.ReleaseMember(context.Background(), "rpcm_a"); err != nil {
+		t.Fatal(err)
+	}
+	if second := statusFor(m, "rpcm_a").RPCReleasedAt; !second.After(first) {
+		t.Fatalf("RPCReleasedAt = %v after a second release, want later than %v", second, first)
+	}
+}
+
+// TestClaimedMemberRelaunchWaitsForClaimEnd: a launch-shape change of a member
+// its head holds or has reserved does not kill it under the running head (the
+// head would abort mid-request); the member keeps its process until the claim
+// ends, and is relaunched with the new shape only then. Each claim ending
+// counts: the hold going while the reservation stands defers further.
+func TestClaimedMemberRelaunchWaitsForClaimEnd(t *testing.T) {
+	shrinkTimings(t)
+	spec := onDemandMember(t, "rpcm_a")
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "1"})
+	ensureMember(t, m, "rpcm_a", 30*time.Second)
+	m.SetMemberHold("rpcm_a", "rspec_h", time.Now())
+	pid := statusFor(m, "rpcm_a").PID
+
+	changed := spec
+	changed.Env = map[string]string{"OP_TEST_MEMBER_EDIT": "1"}
+	m.Apply(Config{Specs: []Spec{changed}, ETag: "2"})
+	time.Sleep(200 * time.Millisecond)
+	if s := statusFor(m, "rpcm_a"); s.State != StateRunning || s.PID != pid {
+		t.Fatalf("member = %s pid %d after a launch-shape change while claimed, want running pid %d", s.State, s.PID, pid)
+	}
+
+	m.SetMemberHold("rpcm_a", "", time.Time{}) // the reservation still stands
+	time.Sleep(200 * time.Millisecond)
+	if s := statusFor(m, "rpcm_a"); s.State != StateRunning || s.PID != pid {
+		t.Fatalf("member = %s pid %d with its reservation standing, want running pid %d", s.State, s.PID, pid)
+	}
+
+	if err := m.ReleaseMember(context.Background(), "rpcm_a"); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, "the old member process leaves once nothing claims it", func() bool {
+		s := statusFor(m, "rpcm_a")
+		return s.PID != pid
+	})
+	ensureMember(t, m, "rpcm_a", 0)
+	if s := statusFor(m, "rpcm_a"); s.State != StateRunning || s.PID == pid {
+		t.Fatalf("member = %s pid %d, want running on a new process", s.State, s.PID)
+	}
+}
+
+// TestUnclaimedMemberRelaunchesAtOnce: without a claim a member's launch-shape
+// change relaunches it like any spec.
+func TestUnclaimedMemberRelaunchesAtOnce(t *testing.T) {
+	shrinkTimings(t)
+	spec := onDemandMember(t, "rpcm_a")
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "1"})
+	ensureMember(t, m, "rpcm_a", 0)
+	pid := statusFor(m, "rpcm_a").PID
+
+	changed := spec
+	changed.Env = map[string]string{"OP_TEST_MEMBER_EDIT": "1"}
+	m.Apply(Config{Specs: []Spec{changed}, ETag: "2"})
+	waitUntil(t, 5*time.Second, "unclaimed member drained", func() bool {
+		return statusFor(m, "rpcm_a").PID != pid
+	})
+}

@@ -33,9 +33,17 @@ type observation struct {
 	// HeldBy is the head spec ID when a connection from an allowed head
 	// address exists.
 	HeldBy string
+	// HeadConns are the connections from an allowed head address, each as its
+	// local and remote endpoint: a head that reconnects opens a new one.
+	HeadConns []connTuple
 	// Breaches are the distinct remote addresses that are neither an allowed
 	// head nor this host.
 	Breaches []netip.Addr
+}
+
+// connTuple names one TCP connection.
+type connTuple struct {
+	Local, Remote netip.AddrPort
 }
 
 // classifyConns sorts the member's connections on the bind port. A remote in
@@ -56,6 +64,7 @@ func classifyConns(conns []collector.Conn, bind netip.AddrPort, headIPs, ownIPs 
 		switch {
 		case slices.Contains(headIPs, remote):
 			obs.HeldBy = headSpecID
+			obs.HeadConns = append(obs.HeadConns, connTuple{Local: c.Local, Remote: c.Remote})
 		case slices.Contains(ownIPs, remote):
 		case !slices.Contains(obs.Breaches, remote):
 			obs.Breaches = append(obs.Breaches, remote)
@@ -77,8 +86,15 @@ type observedMember struct {
 	empty    int
 	inflight bool
 	errLog   bool
-	breaches []runtimectl.RPCBreach // oldest first; At is first seen
-	lastSeen map[string]time.Time
+	breaches breachLog
+	// headSeen is when each listed head connection was first seen.
+	headSeen map[connTuple]time.Time
+	// releasedAt is the last gateway release the observer has applied, and
+	// released the head connections it ended: they hold no more, however
+	// long they stay listed (a head that lost power leaves its socket
+	// ESTABLISHED on the member, which sets no keepalive).
+	releasedAt time.Time
+	released   map[connTuple]bool
 }
 
 // rpcHolds is the runtime surface the observer reports holds to.
@@ -204,13 +220,53 @@ func (o *rpcObserver) pruneLocked(statuses []runtimectl.Status) {
 func (o *rpcObserver) memberLocked(st runtimectl.Status) *observedMember {
 	m := o.members[st.SpecID]
 	if m == nil {
-		m = &observedMember{lastSeen: map[string]time.Time{}}
+		m = &observedMember{}
 		o.members[st.SpecID] = m
 	}
 	if m.pid != st.PID {
 		m.pid, m.holding, m.empty, m.errLog = st.PID, false, 0, false
+		// A new process has none of the old one's connections, and a release
+		// that came before it ended none of its own.
+		m.headSeen, m.released, m.releasedAt = map[connTuple]time.Time{}, map[connTuple]bool{}, st.RPCReleasedAt
 	}
 	return m
+}
+
+// applyReleaseLocked brings the member's head connections in line with the
+// gateway's releases and returns the ones that hold: listed, and first seen
+// after the last release. A release not applied yet ends every connection
+// first seen at or before it; withdraw then reports that a hold the observer
+// may have re-posted after the release must be taken back. A released
+// connection that is no longer listed is forgotten.
+func (m *observedMember) applyReleaseLocked(conns []connTuple, releasedAt, now time.Time) (holding []connTuple, withdraw bool) {
+	listed := make(map[connTuple]bool, len(conns))
+	for _, c := range conns {
+		listed[c] = true
+		if _, ok := m.headSeen[c]; !ok {
+			m.headSeen[c] = now
+		}
+	}
+	for c := range m.headSeen {
+		if !listed[c] {
+			delete(m.headSeen, c)
+			delete(m.released, c)
+		}
+	}
+	if releasedAt.After(m.releasedAt) {
+		m.releasedAt, withdraw = releasedAt, true
+		m.holding, m.empty = false, 0
+		for c, seen := range m.headSeen {
+			if !seen.After(releasedAt) {
+				m.released[c] = true
+			}
+		}
+	}
+	for _, c := range conns {
+		if !m.released[c] {
+			holding = append(holding, c)
+		}
+	}
+	return holding, withdraw
 }
 
 // poll lists one member's connections and applies the result.
@@ -223,12 +279,14 @@ func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 	m.inflight = false
 	if err != nil {
 		// Keep the last observation: a failed listing says nothing about
-		// the head.
+		// the head. While listings fail no new hold is seen, so a member the
+		// head starts using now is unprotected once its reservation ends:
+		// worth a Warn, once per streak.
 		first := !m.errLog
 		m.errLog = true
 		o.mu.Unlock()
 		if first {
-			slog.Debug("agent: rpc member connection listing failed", "spec", st.SpecID, "err", err)
+			slog.Warn("agent: rpc member connection listing failed; its head's hold cannot be observed", "spec", st.SpecID, "err", err)
 		}
 		return
 	}
@@ -243,7 +301,15 @@ func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 	var since time.Time
 	var release bool
 	o.mu.Lock()
-	o.noteBreachesLocked(m, obs.Breaches, now)
+	peers := make([]string, len(obs.Breaches))
+	for i, ip := range obs.Breaches {
+		peers[i] = ip.String()
+	}
+	m.breaches.note(now, peers...)
+	holding, withdraw := m.applyReleaseLocked(obs.HeadConns, st.RPCReleasedAt, now)
+	if len(holding) == 0 {
+		obs.HeldBy = ""
+	}
 	switch {
 	case obs.HeldBy != "":
 		if !m.holding {
@@ -265,7 +331,7 @@ func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 		return
 	}
 	switch {
-	case release:
+	case release || (withdraw && holder == ""):
 		o.holds.SetMemberHold(st.SpecID, "", time.Time{})
 	case holder != "":
 		o.holds.SetMemberHold(st.SpecID, holder, since)
@@ -287,29 +353,47 @@ func (o *rpcObserver) headIPs(specID string, rpc *runtimectl.RPCMember) []netip.
 	return out
 }
 
-// noteBreachesLocked records the peers seen now and expires those not seen
-// for breachKeep; the list is capped at its most recent maxRelayBreaches.
-func (o *rpcObserver) noteBreachesLocked(m *observedMember, seen []netip.Addr, now time.Time) {
-	for _, ip := range seen {
-		key := ip.String()
-		if _, ok := m.lastSeen[key]; !ok {
-			m.breaches = append(m.breaches, runtimectl.RPCBreach{Peer: key, At: now})
-		}
-		m.lastSeen[key] = now
+// breachLog keeps the peers seen on a member that are not on its allowlist:
+// one entry per peer, At the time it was first seen, oldest first. A peer
+// drops out breachKeep after it was last seen, and only the most recent
+// maxRelayBreaches peers are kept. The zero value is ready to use; it is not
+// safe for concurrent use.
+type breachLog struct {
+	list     []runtimectl.RPCBreach
+	lastSeen map[string]time.Time
+}
+
+// note records peers seen at now and expires the entries not seen since
+// breachKeep before now.
+func (b *breachLog) note(now time.Time, peers ...string) {
+	if b.lastSeen == nil {
+		b.lastSeen = map[string]time.Time{}
 	}
-	m.breaches = slices.DeleteFunc(m.breaches, func(b runtimectl.RPCBreach) bool {
-		if now.Sub(m.lastSeen[b.Peer]) >= breachKeep {
-			delete(m.lastSeen, b.Peer)
+	for _, peer := range peers {
+		if _, ok := b.lastSeen[peer]; !ok {
+			b.list = append(b.list, runtimectl.RPCBreach{Peer: peer, At: now})
+		}
+		b.lastSeen[peer] = now
+	}
+	b.list = slices.DeleteFunc(b.list, func(e runtimectl.RPCBreach) bool {
+		if now.Sub(b.lastSeen[e.Peer]) >= breachKeep {
+			delete(b.lastSeen, e.Peer)
 			return true
 		}
 		return false
 	})
-	if n := len(m.breaches); n > maxRelayBreaches {
-		for _, b := range m.breaches[:n-maxRelayBreaches] {
-			delete(m.lastSeen, b.Peer)
+	if n := len(b.list); n > maxRelayBreaches {
+		for _, e := range b.list[:n-maxRelayBreaches] {
+			delete(b.lastSeen, e.Peer)
 		}
-		m.breaches = slices.Clone(m.breaches[n-maxRelayBreaches:])
+		b.list = slices.Clone(b.list[n-maxRelayBreaches:])
 	}
+}
+
+// snapshot expires what is due at now and returns a copy of the rest.
+func (b *breachLog) snapshot(now time.Time) []runtimectl.RPCBreach {
+	b.note(now)
+	return slices.Clone(b.list)
 }
 
 // telemetry returns a copy of what the observer saw of member specID.
@@ -323,7 +407,7 @@ func (o *rpcObserver) telemetry(specID string) (observerTelemetry, bool) {
 	if m == nil {
 		return observerTelemetry{}, false
 	}
-	return observerTelemetry{Breaches: slices.Clone(m.breaches)}, true
+	return observerTelemetry{Breaches: m.breaches.snapshot(o.now())}, true
 }
 
 // newMemberObserver wires the observer and head resolver of this host's

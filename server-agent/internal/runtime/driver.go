@@ -198,9 +198,15 @@ type Driver struct {
 	// when the document itself has not changed. instancesWithheld is whether
 	// that config actually had a replicable flag cleared, kept only to Warn
 	// once per transition into that state rather than on every Sync.
+	// appliedRPC is the same for rpc_cluster: whether the last applied config
+	// kept its rpc_server members and cluster heads.
 	appliedInstances  bool
 	appliedRPC        bool
 	instancesWithheld bool
+	// rpcWithheld is whether the last applied config had cluster specs
+	// dropped because the gateway does not declare rpc_cluster, kept to Warn
+	// once per transition like instancesWithheld.
+	rpcWithheld bool
 	// active is the CURRENT feature-negotiation outcome (Sync step 1),
 	// read from a different goroutine (Active, called from
 	// internal/agent.collectOnce on whatever goroutine is building a
@@ -432,13 +438,12 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	if !instances {
 		effective, withheld = withoutReplicable(cfg)
 	}
+	rpcWithheld := false
 	if !rpc {
-		var dropped bool
-		if effective, dropped = withoutRPCCluster(effective); dropped {
-			slog.Warn("runtime: the gateway does not declare rpc_cluster; rpc_server members and cluster heads are not run until it does")
-		}
+		effective, rpcWithheld = withoutRPCCluster(effective)
 	}
 	d.noteInstancesWithheld(withheld)
+	d.noteRPCWithheld(rpcWithheld)
 	d.mgr.Apply(effective)
 	d.applied = true
 	d.appliedSpecCount = len(cfg.Specs)
@@ -524,6 +529,20 @@ func (d *Driver) noteInstancesWithheld(withheld bool) {
 		slog.Info("runtime: replicable specs are honoured again (the gateway declares runtime_instances, or no spec opts in any more)")
 	}
 	d.instancesWithheld = withheld
+}
+
+// noteRPCWithheld logs the transition into, and out of, a state in which the
+// applied config had its rpc_server members and cluster heads dropped because
+// the gateway does not declare rpc_cluster -- once per transition, not on
+// every apply.
+func (d *Driver) noteRPCWithheld(withheld bool) {
+	switch {
+	case withheld && !d.rpcWithheld:
+		slog.Warn("runtime: the gateway does not declare rpc_cluster; rpc_server members and cluster heads are not run until it does")
+	case !withheld && d.rpcWithheld:
+		slog.Info("runtime: rpc_server members and cluster heads are run again (the gateway declares rpc_cluster, or the document carries none any more)")
+	}
+	d.rpcWithheld = withheld
 }
 
 // featureActive fetches the gateway's currently declared feature set and

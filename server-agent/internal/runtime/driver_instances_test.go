@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -254,5 +255,44 @@ func TestParseConfigDropsRPCKindWithoutGatewayFeature(t *testing.T) {
 	}
 	if got := mgr.lastApplied(); len(got.Specs) != 1 {
 		t.Fatalf("applied specs = %+v, want the rpc specs dropped again", got.Specs)
+	}
+}
+
+// withheldRPCWarn is the Driver's exact Warn for a document whose cluster specs
+// it withholds because the gateway does not declare rpc_cluster.
+const withheldRPCWarn = "runtime: the gateway does not declare rpc_cluster; rpc_server members and cluster heads are not run until it does"
+
+// TestDriverWarnsOncePerRPCWithheldTransition: re-applying documents while the
+// gateway still does not declare rpc_cluster logs the Warn once, not on every
+// apply; a declaration ends the streak and a withdrawal starts a new one.
+func TestDriverWarnsOncePerRPCWithheldTransition(t *testing.T) {
+	logs := withCountedLogs(t)
+	member := Spec{ID: "rpcm_1", Kind: SpecKindRPCServer, RPC: &RPCMember{Transport: "direct", BindIP: "127.0.0.1", Port: 47001}}
+	plain := Spec{ID: "P", UpstreamModel: "p"}
+	src := &fakeSource{cfg: Config{ETag: "e1", Specs: []Spec{member, plain}}, changed: true}
+	mgr := &fakeManager{}
+	features, setFeatures := newSwitchableFeaturesServer(t, []string{runtimeManagerFeature, gatewayFeatureRuntimeInstances})
+	d := newDriver(mgr, src, features, nil, "")
+	ctx := context.Background()
+
+	for i := range 3 {
+		src.mu.Lock()
+		src.cfg.ETag = "e" + strconv.Itoa(i+1)
+		src.mu.Unlock()
+		d.Sync(ctx, nil)
+	}
+	if n := mgr.applyCount(); n != 3 {
+		t.Fatalf("Apply calls = %d, want 3 (each document is new)", n)
+	}
+	if n := logs.count(withheldRPCWarn); n != 1 {
+		t.Fatalf("withheld Warns = %d after three applies, want 1", n)
+	}
+
+	setFeatures([]string{runtimeManagerFeature, gatewayFeatureRuntimeInstances, gatewayFeatureRPCCluster})
+	d.Sync(ctx, nil)
+	setFeatures([]string{runtimeManagerFeature, gatewayFeatureRuntimeInstances})
+	d.Sync(ctx, nil)
+	if n := logs.count(withheldRPCWarn); n != 2 {
+		t.Fatalf("withheld Warns = %d after a withdrawal, want 2", n)
 	}
 }

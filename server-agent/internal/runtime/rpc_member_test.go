@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
 package runtime
 
 import (
@@ -331,16 +334,119 @@ func TestMemberCachePurgedOnHeadChange(t *testing.T) {
 		return os.IsNotExist(err)
 	})
 
-	// Leaving the document drops the current head's cache too.
+	// Leaving the document keeps the cache: a member is withheld for reasons
+	// that pass (a gateway restart that has not heard from every cluster host
+	// yet), and its head's cache is what makes the next start fast.
+	dir2 := filepath.Join(root, "rpc", "rspec_h2")
 	waitUntil(t, 5*time.Second, "member running on the new head", func() bool {
-		_, err := os.Stat(filepath.Join(root, "rpc", "rspec_h2"))
+		_, err := os.Stat(dir2)
 		return err == nil
 	})
 	m.Apply(Config{ETag: "4"})
-	waitUntil(t, 5*time.Second, "departed member cache purged", func() bool {
-		_, err := os.Stat(filepath.Join(root, "rpc", "rspec_h2"))
+	waitUntil(t, 5*time.Second, "departed member stopped", func() bool {
+		return statusFor(m, "rpcm_a") == nil
+	})
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(dir2); err != nil {
+		t.Fatalf("cache of a member that left the document was purged: %v", err)
+	}
+}
+
+// TestMemberCacheSweepRemovesStaleOrphans: the sweep of the cache root removes
+// what belongs to no member of the current document and has not changed for
+// memberCacheOrphanAge -- caches orphaned while the agent was down included --
+// and keeps a recent orphan, every cache a listed member serves however old it
+// is, and anything that is not a directory. A purge tombstone left behind goes
+// once its purge is older than memberCacheSweepEvery.
+func TestMemberCacheSweepRemovesStaleOrphans(t *testing.T) {
+	shrinkTimings(t)
+	root := t.TempDir()
+	old := time.Now().Add(-memberCacheOrphanAge - time.Hour)
+	mk := func(name string, mtime time.Time) string {
+		dir := filepath.Join(root, "rpc", name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		blob := filepath.Join(dir, "blob")
+		if err := os.WriteFile(blob, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{blob, dir} {
+			if err := os.Chtimes(p, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	staleOrphan := mk("rspec_gone", old)
+	freshOrphan := mk("rspec_recent", time.Now().Add(-time.Hour))
+	listedOld := mk("rspec_listed", old)
+	// An old directory with one recent file in it is in use, not stale.
+	touched := mk("rspec_touched", old)
+	if err := os.WriteFile(filepath.Join(touched, "new"), []byte("y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(touched, old, old); err != nil {
+		t.Fatal(err)
+	}
+	oldTomb := mk(".purge-rspec_x-"+strconv.FormatInt(time.Now().Add(-2*memberCacheSweepEvery).UnixNano(), 10), time.Now())
+	newTomb := mk(".purge-rspec_y-"+strconv.FormatInt(time.Now().UnixNano(), 10), old)
+	file := filepath.Join(root, "rpc", "note.txt")
+	if err := os.WriteFile(file, []byte("z"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(file, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	m := cacheTestManager(t, root)
+	listed := memberSpec("rpcm_l", "rspec_listed")
+	listed.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{listed}, ETag: "1"})
+
+	waitUntil(t, 5*time.Second, "stale orphan and old tombstone swept", func() bool {
+		_, e1 := os.Stat(staleOrphan)
+		_, e2 := os.Stat(oldTomb)
+		return os.IsNotExist(e1) && os.IsNotExist(e2)
+	})
+	for _, keep := range []string{freshOrphan, listedOld, touched, newTomb, file} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("%s was swept: %v", filepath.Base(keep), err)
+		}
+	}
+}
+
+// TestMemberCacheSweepThrottled: the sweep runs on the first document and then
+// at most once per memberCacheSweepEvery, however many documents arrive.
+func TestMemberCacheSweepThrottled(t *testing.T) {
+	shrinkTimings(t)
+	root := t.TempDir()
+	old := time.Now().Add(-memberCacheOrphanAge - time.Hour)
+	staleDir := func(name string) string {
+		dir := filepath.Join(root, "rpc", name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(dir, old, old); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	first := staleDir("rspec_first")
+	m := cacheTestManager(t, root)
+	m.Apply(Config{ETag: "1"})
+	// Its removal also proves the first sweep has listed the root.
+	waitUntil(t, 5*time.Second, "first sweep ran", func() bool {
+		_, err := os.Stat(first)
 		return os.IsNotExist(err)
 	})
+
+	second := staleDir("rspec_second")
+	m.Apply(Config{ETag: "2"})
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(second); err != nil {
+		t.Fatalf("a second document inside the sweep interval swept again: %v", err)
+	}
 }
 
 func TestMemberCacheFreeDiskFloor(t *testing.T) {

@@ -1180,6 +1180,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-reportTicker.C:
 			a.sendSystemReport(ctx)
 			a.resendRuntimeReport(ctx)
+			a.resendBinaries()
 		case <-certTickerC:
 			a.triggerCertSync(ctx)
 		case <-a.certWake:
@@ -1191,6 +1192,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-runtimeTickerC:
 			a.triggerRuntimeSync(ctx, nil)
 		case data := <-a.runtimeWake:
+			if data == nil {
+				// A nil wake is the transport's (re)connect: whatever was
+				// in flight on the old connection may never have arrived.
+				a.resendBinaries()
+			}
 			a.triggerRuntimeSync(ctx, data)
 		case data := <-a.runtimeLogWake:
 			// Applying the gateway's watch command is a bounded, purely
@@ -1212,6 +1218,14 @@ func (a *Agent) Run(ctx context.Context) error {
 			// instance until then.
 			a.collectOnce(ctx)
 		}
+	}
+}
+
+// resendBinaries makes the next sample carry the binary inventory again
+// (binaryInventory.resend); a no-op without one.
+func (a *Agent) resendBinaries() {
+	if a.binaries != nil {
+		a.binaries.resend()
 	}
 }
 
@@ -2529,8 +2543,10 @@ func (a *Agent) collectOnce(ctx context.Context) {
 				// answer yet) -- only StateRunning counts, matching the
 				// design spec's own §7 "flat loaded_models list carries
 				// only truly loaded models" rule and Manager.LoadedModels'
-				// identical StateRunning-only filter.
-				if st.State == runtimectl.StateRunning {
+				// identical StateRunning-only filter. An rpc_server member
+				// serves no model (its row's model is empty), so it is never
+				// one, the same rule Manager.LoadedModels applies.
+				if st.State == runtimectl.StateRunning && st.Kind != runtimectl.SpecKindRPCServer {
 					loaded = append(loaded, st.Model)
 				}
 			}
