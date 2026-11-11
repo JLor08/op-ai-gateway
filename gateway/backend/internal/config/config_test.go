@@ -1328,3 +1328,27 @@ func TestConfigInstanceEnvFallsBackOnJunk(t *testing.T) {
 		}
 	}
 }
+
+// The decision endpoints' JSON body cap is its own setting.
+func TestLoadMaxDecisionsBodyBytesDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES", "")
+	if err := os.Unsetenv("OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES"); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxDecisionsBodyBytes != 33554432 {
+		t.Fatalf("MaxDecisionsBodyBytes = %d, want 33554432 (32 MiB)", cfg.MaxDecisionsBodyBytes)
+	}
+}
+
+func TestLoadMaxDecisionsBodyBytesOverride(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES", "1048576")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxDecisionsBodyBytes != 1048576 {
+		t.Fatalf("MaxDecisionsBodyBytes = %d, want 1048576", cfg.MaxDecisionsBodyBytes)
+	}
+}
