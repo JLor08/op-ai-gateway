@@ -613,23 +613,39 @@ func TestDenyByDefaultFlipRecordsOnlyFinalState(t *testing.T) {
 	}
 }
 
-// driftRecorder is a ClusterStatusReader that also handles the mesh drift,
-// recording how many runtime documents were already notified when it ran.
+// driftRecorder is a ClusterStatusReader that also handles the mesh drift: it
+// records how many runtime documents were already notified when it ran, and
+// holds the drift's stop until gate closes.
 type driftRecorder struct {
 	fakeClusterStatus
-	e     *rpcPolicyEnv
-	calls []int
+	e       *rpcPolicyEnv
+	gate    chan struct{}
+	entered chan struct{}
+	mu      sync.Mutex
+	calls   []int
 }
 
 func (d *driftRecorder) StopDirectMeshClusters(context.Context) {
+	d.mu.Lock()
 	d.calls = append(d.calls, d.e.notifications())
+	d.mu.Unlock()
+	d.entered <- struct{}{}
+	<-d.gate
 }
 
-// TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying pins the drift's
-// order: once a pass sees NetBird's Default policy enabled again, the gateway
-// stops its direct mesh clusters, head first, BEFORE the documents that
-// withhold them are pushed -- so the members are not removed under a running
-// head. A pass that sees it disabled stops nothing.
+func (d *driftRecorder) recorded() []int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.calls)
+}
+
+// TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying pins the drift: once
+// a pass sees NetBird's Default policy enabled again, the gateway stops its
+// direct mesh clusters, head first, BEFORE the documents that withhold them
+// are pushed -- so no member is removed under a running head -- and it does
+// so off the policy lock: the pass returns, and another policy pass runs,
+// while the stop is under way. A pass that sees Default disabled stops
+// nothing.
 func TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying(t *testing.T) {
 	e := newRPCPolicyEnv(t, true)
 	for _, id := range []string{"head", "a"} {
@@ -637,11 +653,12 @@ func TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying(t *testing.T) {
 	}
 	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
 	e.fake.seedDefaultPolicy("pol-default", false)
-	d := &driftRecorder{e: e}
+	d := &driftRecorder{e: e, gate: make(chan struct{}), entered: make(chan struct{}, 4)}
 	e.svc.SetClusterStatusReader(d)
 	e.svc.ReconcileAllServerNetbird(e.ctx)
-	if len(d.calls) != 0 {
-		t.Fatalf("drift handler calls = %v, want none while Default is disabled", d.calls)
+	e.svc.waitPolicySideEffects()
+	if calls := d.recorded(); len(calls) != 0 {
+		t.Fatalf("drift handler calls = %v, want none while Default is disabled", calls)
 	}
 
 	e.fake.mu.Lock()
@@ -651,12 +668,39 @@ func TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying(t *testing.T) {
 		}
 	}
 	e.fake.mu.Unlock()
-	before := e.notifications()
-	e.svc.reconcileAllServerPolicies(e.ctx)
-	if !slices.Equal(d.calls, []int{before}) {
-		t.Fatalf("drift handler calls = %v, want one before any notification (%d)", d.calls, before)
+	passDone := make(chan struct{})
+	go func() {
+		e.svc.reconcileAllServerPolicies(e.ctx)
+		close(passDone)
+	}()
+	select {
+	case <-d.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drift handler was not called")
 	}
-	if e.notifications() == before {
-		t.Fatal("the drift notified no cluster server")
+	select {
+	case <-passDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the policy pass waited for the drift's cluster stops")
+	}
+	second := make(chan struct{})
+	go func() {
+		e.svc.reconcileAllServerPolicies(e.ctx)
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a policy pass was blocked while the drift's cluster stops ran")
+	}
+	atHandler := d.recorded()[0]
+	close(d.gate)
+	e.svc.waitPolicySideEffects()
+	if calls := d.recorded(); len(calls) != 1 {
+		t.Fatalf("drift handler calls = %v, want one", calls)
+	}
+	if e.notifications() <= atHandler {
+		t.Fatalf("notifications = %d after the drift, want more than the %d seen when the clusters were stopped",
+			e.notifications(), atHandler)
 	}
 }

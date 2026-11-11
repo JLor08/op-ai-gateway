@@ -32,6 +32,16 @@ func (f *orchFixture) frame(serverID string, rows ...RuntimeStatusDTO) {
 // it began has ended.
 func (f *orchFixture) settle() { f.o.wait() }
 
+// confirm feeds a frame of the head's server that shows the head still
+// running with its process: what confirms a member loss a member frame
+// showed.
+func (f *orchFixture) confirm() {
+	f.t.Helper()
+	f.settle()
+	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	f.settle()
+}
+
 func watchHeadRow(state string) RuntimeStatusDTO {
 	return RuntimeStatusDTO{
 		SpecID: orchHead, Model: orchHeadModel, State: state, PID: 100,
@@ -131,6 +141,10 @@ func TestWatchdogStopsHeadOnMemberExit(t *testing.T) {
 
 	f.frame(orchMemberServer(1), RuntimeStatusDTO{SpecID: orchMemberSpec(1), State: "crashed", Kind: "rpc_server"})
 	f.settle()
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want nothing before a head frame confirms the loss", calls)
+	}
+	f.confirm()
 	f.expectWatchdogStop(before, 1)
 }
 
@@ -141,7 +155,7 @@ func TestWatchdogStopsHeadOnPIDChange(t *testing.T) {
 	before := f.formed()
 
 	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 999))
-	f.settle()
+	f.confirm()
 	f.expectWatchdogStop(before, 0)
 }
 
@@ -153,7 +167,7 @@ func TestWatchdogStopsHeadOnRelayStall(t *testing.T) {
 	stalled := watchMemberRow(1, orchHead, 11)
 	stalled.RPC.Stalled = true
 	f.frame(orchMemberServer(1), stalled)
-	f.settle()
+	f.confirm()
 	f.expectWatchdogStop(before, 1)
 }
 
@@ -173,8 +187,58 @@ func TestWatchdogStopsHeadOnSessionClosed(t *testing.T) {
 	f := newOrchFixture(t, 2, "relay", "lan")
 	before := f.formed()
 	f.frame(orchMemberServer(1), watchMemberRow(1, "", 11))
-	f.settle()
+	f.confirm()
 	f.expectWatchdogStop(before, 1)
+}
+
+// TestWatchdogDropsLossWhenHeadStoppedItself pins the suspicion: a head that
+// stops by itself (idle, eviction, crash) ends its members' sessions, and a
+// member's frame may arrive before the head's. A later head frame that shows
+// the head stopped, or another process, drops the suspicion: no failure, no
+// cooldown, no stop.
+func TestWatchdogDropsLossWhenHeadStoppedItself(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		head RuntimeStatusDTO
+	}{
+		{"stopped", RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped}},
+		{"another process", func() RuntimeStatusDTO { r := watchHeadRow(agentSpecStateRunning); r.PID = 101; return r }()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOrchFixture(t, 2, "relay", "lan")
+			before := f.formed()
+			f.frame(orchMemberServer(1), watchMemberRow(1, "", 11))
+			f.settle()
+			f.frame(orchHeadServer, tc.head)
+			f.settle()
+			if n := f.agent.count("head:stop:"); n != 0 {
+				t.Fatalf("calls = %q, want no stop of a head that stopped by itself", f.agent.recorded()[before:])
+			}
+			status := f.o.ClusterStatus(orchHead)
+			if status.LastFailure != nil || status.CooldownUntil != nil {
+				t.Fatalf("status = %+v, want no failure and no cooldown", status)
+			}
+			// A later head frame confirms nothing: the suspicion is gone.
+			f.confirm()
+			if n := f.agent.count("head:stop:"); n != 0 {
+				t.Fatalf("calls = %q, want the dropped suspicion to stay dropped", f.agent.recorded()[before:])
+			}
+		})
+	}
+}
+
+// TestWatchdogNeedsAHeldBaseline pins the baseline of the exit and PID
+// evidence: a member that the frame before did not show held by the head
+// (a frame from before the cluster formed) gives none.
+func TestWatchdogNeedsAHeldBaseline(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	before := f.formed()
+	f.statuses.publish(orchMemberServer(0), []RuntimeStatusDTO{watchMemberRow(0, "", 10)})
+	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 77))
+	f.confirm()
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls = %q, want no loss without a held baseline", calls)
+	}
 }
 
 // TestWatchdogIgnoresStaleInGrace pins stale telemetry: a member server that
@@ -202,6 +266,21 @@ func TestWatchdogIgnoresStaleInGrace(t *testing.T) {
 		t.Fatalf("state = %v, want formed", st)
 	}
 
+	// The member reports every second again, so its interval reads 1 s; then
+	// it is silent for 10 s: more than three intervals, less than the 15 s
+	// floor.
+	for range watchGapSamples + 1 {
+		f.advance(time.Second)
+		f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	}
+	f.advance(10 * time.Second)
+	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	f.settle()
+	if calls := f.agent.recorded()[before:]; len(calls) != 0 {
+		t.Fatalf("calls after 10 s of silence = %q, want none below the floor", calls)
+	}
+
+	f.advance(10 * time.Second)
 	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
 	f.settle()
 	f.expectWatchdogStop(before, 0)
@@ -213,10 +292,11 @@ func TestWatchdogIgnoresStaleInGrace(t *testing.T) {
 func TestWatchdogRestartsAHeadThatWasInUse(t *testing.T) {
 	f := newOrchFixture(t, 1, "relay", "lan")
 	f.formed()
+	f.frame(orchMemberServer(0), RuntimeStatusDTO{SpecID: orchMemberSpec(0), State: "crashed", Kind: "rpc_server"})
+	f.settle()
 	busy := watchHeadRow(agentSpecStateRunning)
 	busy.InFlight = 1
 	f.frame(orchHeadServer, busy)
-	f.frame(orchMemberServer(0), RuntimeStatusDTO{SpecID: orchMemberSpec(0), State: "crashed", Kind: "rpc_server"})
 	f.settle()
 	if st := f.o.State(orchHead); st != clusterCoolingDown {
 		t.Fatalf("state = %v, want cooling down", st)
@@ -241,7 +321,7 @@ func TestWatchdogRestartsAHeadThatWasInUse(t *testing.T) {
 	// Formed again and no longer in use: a second loss is not restarted.
 	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
 	f.frame(orchMemberServer(0), RuntimeStatusDTO{SpecID: orchMemberSpec(0), State: "crashed", Kind: "rpc_server"})
-	f.settle()
+	f.confirm()
 	f.advance(61 * time.Second)
 	f.o.Reconcile(context.Background())
 	f.settle()
@@ -259,8 +339,8 @@ func blockedFrame(i int) []RuntimeStatusDTO {
 	}
 }
 
-// TestBlockedAdmissionTriggersConditionalHeadStop pins the removal for a local start: a local
-// start on a member's server that waits only for the held member makes the
+// TestBlockedAdmissionTriggersConditionalHeadStop pins the removal for a
+// local start: a local start on a member's server that waits only for the held member makes the
 // gateway ask the head's agent for a conditional stop, and once the head is
 // gone the members are released -- the head first, then its members. Nothing
 // failed, so nothing cools down.
@@ -388,7 +468,7 @@ func TestIngestForeignHeldByIsBreach(t *testing.T) {
 	}
 
 	f.frame(orchMemberServer(1), watchMemberRow(1, "rspec_other", 11))
-	f.settle()
+	f.confirm()
 	status = f.o.ClusterStatus(orchHead)
 	if len(status.Breaches) != 2 || status.Breaches[1].Position != 1 || status.Breaches[1].Kind != portal.ClusterBreachForeignHold ||
 		status.Breaches[1].Peer != "" {
@@ -397,11 +477,23 @@ func TestIngestForeignHeldByIsBreach(t *testing.T) {
 	f.expectWatchdogStop(before, 1)
 
 	// A breach that ends leaves the list.
-	f.frame(orchMemberServer(0), watchMemberRow(0, "", 10))
+	f.frame(orchMemberServer(1), watchMemberRow(1, "", 11))
+	f.settle()
+	if status := f.o.ClusterStatus(orchHead); len(status.Breaches) != 1 || status.Breaches[0].Position != 0 {
+		t.Fatalf("breaches = %+v, want only member 0's once member 1 reports none", status.Breaches)
+	}
+	// A position the plan no longer has leaves the list as well.
+	f.portal.mu.Lock()
+	f.portal.plan.Members = f.portal.plan.Members[1:]
+	f.portal.plan.Members[0].Position = 0
+	f.portal.mu.Unlock()
+	if _, err := f.o.plan(context.Background(), orchHead); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
 	f.frame(orchMemberServer(1), watchMemberRow(1, "", 11))
 	f.settle()
 	if status := f.o.ClusterStatus(orchHead); len(status.Breaches) != 0 {
-		t.Fatalf("breaches = %+v, want none once the members report none", status.Breaches)
+		t.Fatalf("breaches = %+v, want none: member 0's server left the plan", status.Breaches)
 	}
 
 	// Telemetry that shows the head running and its members held by another
@@ -525,6 +617,8 @@ func TestWatchdogEnqueueDoesNotBlock(t *testing.T) {
 	f.agent.mu.Unlock()
 
 	f.frame(orchMemberServer(0), RuntimeStatusDTO{SpecID: orchMemberSpec(0), State: "crashed", Kind: "rpc_server"})
+	f.settle()
+	f.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
 	for range 50 {
 		returned := make(chan struct{})
 		go func() {
@@ -544,8 +638,8 @@ func TestWatchdogEnqueueDoesNotBlock(t *testing.T) {
 	}
 }
 
-// TestBenchmarkDrainOnMemberServerRefused pins removal through the head for the benchmarks' drains:
-// a member is removed only through its head, and a drain force-stops only the
+// TestBenchmarkDrainOnMemberServerRefused pins removal through the head for
+// the benchmarks' drains: a member is removed only through its head, and a drain force-stops only the
 // server's own launch specs, so a VRAM run on a server where a cluster holds
 // (or has reserved) a member is refused before anything is written, naming
 // the reason; an unclaimed member, which idles out by itself, refuses
@@ -634,5 +728,30 @@ func TestStartWaitsForAPendingRelease(t *testing.T) {
 	calls := f.agent.recorded()
 	if slices.Index(calls, "member:release:"+orchMemberSpec(0)) > slices.Index(calls[1:], "member:ensure:"+orchMemberSpec(0))+1 {
 		t.Fatalf("calls = %q, want the release before the second ensure", calls)
+	}
+}
+
+// TestWatchdogCodesAreStableWireStrings pins the codes the watchdog writes
+// and reads: the portal maps the first, the agent answers the second.
+func TestWatchdogCodesAreStableWireStrings(t *testing.T) {
+	for _, tc := range []struct{ got, want string }{
+		{codeClusterMemberLost, "runtime.cluster_member_lost"},
+		{codeRuntimeInstanceBusy, "runtime.instance_busy"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("stable error code drift: got %q, want %q", tc.got, tc.want)
+		}
+	}
+}
+
+// TestWatchdogRetriesAFailedStop pins the one retry of the watchdog's stop.
+func TestWatchdogRetriesAFailedStop(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	before := f.formed()
+	f.agent.headStopErr = orchRefusal(http.StatusBadGateway, "runtime.upstream_gone")
+	f.frame(orchMemberServer(0), RuntimeStatusDTO{SpecID: orchMemberSpec(0), State: "crashed", Kind: "rpc_server"})
+	f.confirm()
+	if n := f.agent.count("head:stop:"); n != 2 {
+		t.Fatalf("calls = %q, want the stop tried twice", f.agent.recorded()[before:])
 	}
 }

@@ -20,19 +20,24 @@ import (
 // telemetry. Losing a member aborts its head, and a member is removed only
 // through its head (head first), so every rule here acts on the head:
 //
-//   - Positive evidence that a formed cluster lost a member -- the member's
-//     process exited, its PID changed, it no longer reports its head's hold
-//     (the session closed, or another head holds it), or its relay reports a
-//     stall -- stops the head and releases the members after it. The member
-//     is recorded as the cause of a cooldown (runtime.cluster_member_lost),
-//     and a head that served requests then is started again once the
-//     cooldown ended; a kept-up head is started again by the reconciler
-//     anyway. Evidence counts only while the head's own telemetry shows it
-//     running: a head that drains or stopped releases its members by itself.
+//   - Positive evidence that a formed cluster lost a member -- the member,
+//     held by the head in the frame before, exited, changed its PID, no
+//     longer reports the head's hold (the session closed, or another head
+//     holds it), or its relay reports a stall -- is a suspicion first: a head
+//     that stops by itself (idle, eviction, crash) ends its members' sessions
+//     too, and the member's frame may arrive before the head's. Only a frame
+//     of the head's server that arrived after the member's, and still shows
+//     the head running with the same process, confirms it; any other head
+//     frame drops it. A confirmed loss stops the head and releases the
+//     members after it. The member is recorded as the cause of a cooldown
+//     (runtime.cluster_member_lost), and a head that served requests then is
+//     started again once the cooldown ended; a kept-up head is started again
+//     by the reconciler anyway.
 //   - Stale telemetry: a member server that has not reported for three of its
-//     telemetry intervals counts as lost too, but only on a fresh frame of the
-//     head's server that shows the head running, never inside the gateway's
-//     boot grace, and never before the cluster formed.
+//     telemetry intervals, and at least staleFloor, counts as lost too, but
+//     only on a fresh frame of the head's server that shows the head running,
+//     never inside the gateway's boot grace, and never before the cluster
+//     formed.
 //   - A head that exited (its launch facts gone from its server's telemetry)
 //     is no longer formed; its members are released and the reconciler is
 //     woken. A member that still reports the hold of a direct head that is
@@ -90,17 +95,30 @@ type clusterWatchdog struct {
 	queue    []string
 	running  bool
 	arrivals map[string]*watchArrivals
+	seq      uint64
 
 	// Owned by the one worker goroutine that runs at a time: when a member
 	// release or a blocked admission was last acted on, by member key.
 	released map[string]time.Time
 	asked    map[string]time.Time
+	suspects map[string]watchSuspicion // by head
 }
 
 // watchFrame is a server's frame pair not yet handled: the frame before the
-// first one that arrived, and the latest one.
+// first one that arrived, and the latest one with its arrival sequence.
 type watchFrame struct {
 	prev, next []RuntimeStatusDTO
+	seq        uint64
+}
+
+// watchSuspicion is a member loss a member frame showed, waiting for a head
+// frame that arrived after it (seq): position and evidence of the member,
+// and the head's process as the registry showed it then.
+type watchSuspicion struct {
+	position int
+	evidence string
+	seq      uint64
+	headPID  int
 }
 
 // watchArrivals is when a server's frames arrived: the last one and the
@@ -114,7 +132,7 @@ type watchArrivals struct {
 func newClusterWatchdog(o *clusterOrchestrator) *clusterWatchdog {
 	return &clusterWatchdog{
 		o: o, pending: map[string]*watchFrame{}, arrivals: map[string]*watchArrivals{},
-		released: map[string]time.Time{}, asked: map[string]time.Time{},
+		released: map[string]time.Time{}, asked: map[string]time.Time{}, suspects: map[string]watchSuspicion{},
 	}
 }
 
@@ -133,10 +151,11 @@ func (w *clusterWatchdog) enqueue(serverID string, prev, next []RuntimeStatusDTO
 		a.n++
 	}
 	a.last = now
+	w.seq++
 	if f := w.pending[serverID]; f != nil {
-		f.next = next
+		f.next, f.seq = next, w.seq
 	} else {
-		w.pending[serverID] = &watchFrame{prev: prev, next: next}
+		w.pending[serverID] = &watchFrame{prev: prev, next: next, seq: w.seq}
 		w.queue = append(w.queue, serverID)
 	}
 	start := !w.running
@@ -170,7 +189,7 @@ func (w *clusterWatchdog) drain() {
 		f := w.pending[id]
 		delete(w.pending, id)
 		w.mu.Unlock()
-		w.handle(id, f.prev, f.next)
+		w.handle(id, f.prev, f.next, f.seq)
 	}
 }
 
@@ -228,19 +247,40 @@ func (o *clusterOrchestrator) watchViews() []watchView {
 	return views
 }
 
-// handle is the worker's turn for one frame pair of serverID.
-func (w *clusterWatchdog) handle(serverID string, prev, next []RuntimeStatusDTO) {
+// handle is the worker's turn for one frame pair of serverID; seq is the
+// arrival sequence of next.
+func (w *clusterWatchdog) handle(serverID string, prev, next []RuntimeStatusDTO, seq uint64) {
 	o := w.o
 	for _, head := range exitedHeads(prev, next) {
 		w.headExited(serverID, head)
 	}
 	for _, v := range o.watchViews() {
 		if v.plan.Head.Server.ID == serverID {
+			w.confirmSuspicion(v, next, seq)
 			w.checkStale(v, next)
 		}
-		w.checkMembers(v, serverID, prev, next)
+		w.checkMembers(v, serverID, prev, next, seq)
 	}
 	w.checkBlocked(serverID, next)
+}
+
+// confirmSuspicion decides v's pending suspicion on a frame of its head's
+// server: a frame that arrived after the member's and shows the head running
+// with the process the suspicion saw confirms the loss; any other head frame
+// that arrived after it drops the suspicion.
+func (w *clusterWatchdog) confirmSuspicion(v watchView, next []RuntimeStatusDTO, seq uint64) {
+	sus, ok := w.suspects[v.head]
+	if !ok || seq <= sus.seq {
+		return
+	}
+	delete(w.suspects, v.head)
+	r, ok := findInstanceRow(next, v.head)
+	if !ok || r.State != agentSpecStateRunning || r.PID != sus.headPID {
+		slog.Debug("cluster watchdog: the head stopped by itself; a member's lost session is no loss",
+			"head_spec_id", v.head, "position", sus.position, "evidence", sus.evidence)
+		return
+	}
+	w.o.memberLost(v.head, sus.position, sus.evidence, headInUse(r))
 }
 
 // exitedHeads lists the cluster heads that had a process with their launch
@@ -321,7 +361,8 @@ func (w *clusterWatchdog) checkStale(v watchView, next []RuntimeStatusDTO) {
 		if since.Before(v.formedAt) {
 			since = v.formedAt
 		}
-		if limit := clusterStaleIntervals * w.interval(m.Server.ID); now.Sub(since) > limit {
+		limit := max(clusterStaleIntervals*w.interval(m.Server.ID), o.t.staleFloor)
+		if now.Sub(since) > limit {
 			o.memberLost(v.head, m.Position, evidenceStale, headInUse(headRow))
 			return
 		}
@@ -347,9 +388,9 @@ func (o *clusterOrchestrator) headRow(plan portal.ClusterPlan) (row RuntimeStatu
 }
 
 // checkMembers applies the member rules to v's members on serverID: the
-// breaches, the positive evidence of a lost member, and the release of a dead
-// direct hold.
-func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next []RuntimeStatusDTO) {
+// breaches, the positive evidence of a lost member (a suspicion until a later
+// head frame confirms it), and the release of a dead direct hold.
+func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next []RuntimeStatusDTO, seq uint64) {
 	o := w.o
 	var here []portal.ClusterPlanMember
 	for _, m := range v.plan.Members {
@@ -360,15 +401,19 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 	if len(here) == 0 {
 		return
 	}
-	o.noteBreaches(v.head, serverID, here, next)
+	o.noteBreaches(v.head, serverID, v.plan.Members, here, next)
 	if v.busy {
+		delete(w.suspects, v.head)
 		return
 	}
 	hr, present, reported := o.headRow(v.plan)
 	if v.formed && present && hr.State == agentSpecStateRunning {
+		if _, pending := w.suspects[v.head]; pending {
+			return
+		}
 		for _, m := range here {
 			if ev := memberEvidence(prev, next, m.SpecID, v.head); ev != "" {
-				o.memberLost(v.head, m.Position, ev, headInUse(hr))
+				w.suspects[v.head] = watchSuspicion{position: m.Position, evidence: ev, seq: seq, headPID: hr.PID}
 				return
 			}
 		}
@@ -392,29 +437,34 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 }
 
 // memberEvidence is the positive evidence, if any, that the member spec lost
-// head between the frames prev and next. A member without a process in prev
-// gives no baseline, except for a stall, which next shows by itself.
+// head between the frames prev and next. Only a member that prev shows held
+// by head gives a baseline -- a frame from before the cluster formed shows no
+// hold, so a member restarted for the start is no loss -- except for a stall,
+// which next shows by itself.
 func memberEvidence(prev, next []RuntimeStatusDTO, spec, head string) string {
 	n, nok := findInstanceRow(next, spec)
 	p, pok := findInstanceRow(prev, spec)
 	switch {
 	case nok && stateOccupied(n.State) && n.RPC != nil && n.RPC.Stalled:
 		return evidenceStalled
-	case !pok || !stateOccupied(p.State):
+	case !pok || !stateOccupied(p.State) || p.RPC == nil || p.RPC.HeldBy != head:
 		return ""
 	case !nok || !stateOccupied(n.State):
 		return evidenceExited
 	case p.PID != 0 && n.PID != 0 && p.PID != n.PID:
 		return evidencePIDChanged
-	case p.RPC != nil && p.RPC.HeldBy == head && (n.RPC == nil || n.RPC.HeldBy != head):
+	case n.RPC == nil || n.RPC.HeldBy != head:
 		return evidenceSessionClosed
 	}
 	return ""
 }
 
 // noteBreaches replaces head's breaches of the members here (all on
-// serverID) by what next reports, and logs each one not listed before.
-func (o *clusterOrchestrator) noteBreaches(head, serverID string, here []portal.ClusterPlanMember, next []RuntimeStatusDTO) {
+// serverID) by what next reports, drops those of positions no longer among
+// members (the head's plan), and logs each one not listed before.
+func (o *clusterOrchestrator) noteBreaches(head, serverID string, members, here []portal.ClusterPlanMember,
+	next []RuntimeStatusDTO,
+) {
 	var found []portal.ClusterBreachDTO
 	positions := make([]int, 0, len(here))
 	for _, m := range here {
@@ -437,7 +487,10 @@ func (o *clusterOrchestrator) noteBreaches(head, serverID string, here []portal.
 		return
 	}
 	old := st.breaches
-	breaches := slices.DeleteFunc(slices.Clone(old), func(b portal.ClusterBreachDTO) bool { return slices.Contains(positions, b.Position) })
+	breaches := slices.DeleteFunc(slices.Clone(old), func(b portal.ClusterBreachDTO) bool {
+		inPlan := slices.ContainsFunc(members, func(m portal.ClusterPlanMember) bool { return m.Position == b.Position })
+		return !inPlan || slices.Contains(positions, b.Position)
+	})
 	breaches = append(breaches, found...)
 	st.breaches = breaches
 	slices.SortFunc(st.breaches, func(a, b portal.ClusterBreachDTO) int {
@@ -494,8 +547,16 @@ func (o *clusterOrchestrator) memberLost(head string, position int, evidence str
 		"position", position, "evidence", evidence, "restart_after_cooldown", inUse)
 	if !o.goAction(func(ctx context.Context) {
 		defer o.unmarkStopping(head)
-		if err := o.Stop(ctx, head, false); err != nil {
-			slog.Warn("cluster watchdog: stopping the head failed", "head_spec_id", head, "err", err)
+		// One retry: the head aborts once a member is gone, so a stop that
+		// failed (an agent restarting, a store read timing out) is worth one
+		// more try; after it the head idles out, and its exit releases the
+		// members.
+		for attempt := range 2 {
+			err := o.Stop(ctx, head, false)
+			if err == nil || ctx.Err() != nil {
+				break
+			}
+			slog.Warn("cluster watchdog: stopping the head failed", "head_spec_id", head, "attempt", attempt+1, "err", err)
 		}
 		if inUse {
 			time.AfterFunc(o.t.cooldown, o.Trigger)
@@ -526,8 +587,9 @@ func (o *clusterOrchestrator) goAction(fn func(ctx context.Context)) bool {
 	return true
 }
 
-// claimIdle takes head's stop marker for a removal the watchdog begins, when neither a start nor a stop of the head runs; ok false
-// otherwise. The returned func gives the marker back.
+// claimIdle takes head's stop marker for a removal the watchdog begins, when
+// neither a start nor a stop of the head runs; ok false otherwise. The
+// returned func gives the marker back.
 func (o *clusterOrchestrator) claimIdle(head string) (func(), bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -735,6 +797,8 @@ func (o *clusterOrchestrator) conditionalStop(ctx context.Context, head string, 
 	o.markStopped(head)
 	o.releaseMembers(ctx, head, members, agents)
 }
+
+var _ portal.ClusterMeshDriftHandler = (*clusterOrchestrator)(nil)
 
 // StopDirectMeshClusters stops every direct mesh cluster the derivation now
 // withholds (portal.ClusterWithheldDirectUnavailable: NetBird's Default policy

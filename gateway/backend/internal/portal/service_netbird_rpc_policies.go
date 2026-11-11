@@ -335,11 +335,21 @@ func defaultPolicyState(enabled bool) string {
 	return NetbirdDefaultPolicyDisabled
 }
 
+// clusterDriftStopTimeout bounds the cluster stops and the notification that
+// follow a drift of NetBird's Default policy (storeDefaultPolicyState): each
+// head's drain is bounded by the orchestration's own stop bound, the heads
+// stop in parallel.
+const clusterDriftStopTimeout = 5 * time.Minute
+
 // storeDefaultPolicyState writes state when it differs from the stored one and
 // then notifies every cluster server. A change to enabled is a drift: the
 // derivation now withholds every direct mesh cluster, so those are stopped
 // head first (stopDriftedClusters) before the documents that withhold them
 // are pushed, which would otherwise remove the members under running heads.
+// Every caller holds the policy lock, and the stops take a minute or more, so
+// they and the notification after them run on their own goroutine, under
+// their own deadline and never the caller's context (a request's may end
+// with its response); that goroutine never takes the policy lock.
 func (s *Service) storeDefaultPolicyState(ctx context.Context, state string) {
 	if s.settings == nil {
 		return
@@ -356,10 +366,18 @@ func (s *Service) storeDefaultPolicyState(ctx context.Context, state string) {
 		slog.Debug("default policy state: store", "state", state, "error", err)
 		return
 	}
-	if state == NetbirdDefaultPolicyEnabled {
-		s.stopDriftedClusters(ctx)
+	if state != NetbirdDefaultPolicyEnabled {
+		s.notifyAllClusterServers(ctx)
+		return
 	}
-	s.notifyAllClusterServers(ctx)
+	s.netbird.policySideEffectWG.Add(1)
+	go func() {
+		defer s.netbird.policySideEffectWG.Done()
+		dctx, cancel := context.WithTimeout(context.Background(), clusterDriftStopTimeout)
+		defer cancel()
+		s.stopDriftedClusters(dctx)
+		s.notifyAllClusterServers(dctx)
+	}()
 }
 
 // NetbirdDefaultPolicyStateView returns the last recorded state of NetBird's

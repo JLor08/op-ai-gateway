@@ -246,10 +246,10 @@ const (
 // ClusterBreachDTO is one breach a member's agent reports: the member's
 // position, the kind and, for a peer breach, the peer's address and when the
 // agent saw it. A member on a server the reader may not manage shows only its
-// position and kind: the peer is a fact about that server's network.
+// position: the kind, the peer and the time are facts about that server.
 type ClusterBreachDTO struct {
 	Position int       `json:"position"`
-	Kind     string    `json:"kind"`
+	Kind     string    `json:"kind,omitempty"`
 	Peer     string    `json:"peer,omitempty"`
 	At       time.Time `json:"at,omitzero"`
 }
@@ -305,7 +305,7 @@ func (s *Service) SetClusterStatusReader(r ClusterStatusReader) {
 // state, and invalid while the derivation withholds the head (withheld != "")
 // whatever the orchestration last saw. A breach of a member at one of the
 // hidden positions (a server the reader may not manage) keeps only its
-// position and kind.
+// position.
 func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *ClusterStatusDTO {
 	st := ClusterStatusDTO{State: ClusterStateCold, Members: []ClusterMemberStatusDTO{}}
 	if s.clusterStatus != nil {
@@ -321,7 +321,7 @@ func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *
 		breaches := make([]ClusterBreachDTO, len(st.Breaches))
 		for i, b := range st.Breaches {
 			if slices.Contains(hidden, b.Position) {
-				b = ClusterBreachDTO{Position: b.Position, Kind: b.Kind}
+				b = ClusterBreachDTO{Position: b.Position}
 			}
 			breaches[i] = b
 		}

@@ -259,8 +259,10 @@ type clusterTimings struct {
 	// does not count stale telemetry.
 	bootGrace time.Duration
 	// minAgentInterval is the least telemetry interval the watchdog assumes
-	// for a server, whatever shorter gaps it saw.
+	// for a server, whatever shorter gaps it saw; staleFloor the least
+	// silence it counts as stale, whatever the interval.
 	minAgentInterval time.Duration
+	staleFloor       time.Duration
 	// blockedRetry is how long the watchdog waits before it asks again to
 	// remove a cluster a local start waits for; releaseRetry how long before
 	// it releases again a member that still reports a dead hold.
@@ -273,7 +275,7 @@ func defaultClusterTimings() clusterTimings {
 		unit: time.Second, configWait: 30 * time.Second, poll: 250 * time.Millisecond,
 		cooldown: 60 * time.Second, codeWait: 2 * time.Second, stopWait: 60 * time.Second,
 		memberMargin: 10 * time.Second, headMargin: 30 * time.Second, reserveMargin: 60 * time.Second,
-		bootGrace: 60 * time.Second, minAgentInterval: time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
+		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
 	}
 }
 
@@ -1244,7 +1246,9 @@ func (o *clusterOrchestrator) Stop(ctx context.Context, head string, stopMembers
 			return err
 		}
 	}
-	plan, err := o.deps.portal.ClusterPlan(ctx, head)
+	rctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
+	plan, err := o.deps.portal.ClusterPlan(rctx, head)
+	cancel()
 	if err != nil {
 		return err
 	}
@@ -1410,8 +1414,9 @@ func (o *clusterOrchestrator) observeStatus(serverID string, prev, next []Runtim
 
 // Reconcile is one reconciler pass. It lifts a terminal block whose head
 // document changed, and starts every kept-up head (pinned or force_running),
-// and every head the watchdog stopped while it served requests, that is cold -- except one an operator stopped, and, during the boot grace,
-// one whose servers have not all reported, since the gateway cannot yet tell
+// and every head the watchdog stopped while it served requests, that is cold
+// -- except one an operator stopped, and, during the boot grace, one whose
+// servers have not all reported, since the gateway cannot yet tell
 // whether that cluster still runs. Each start runs in the background, bounded
 // by its own bounds and the server's lifetime; the pass itself only reads.
 func (o *clusterOrchestrator) Reconcile(ctx context.Context) {

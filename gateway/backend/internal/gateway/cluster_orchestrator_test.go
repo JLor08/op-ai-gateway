@@ -41,7 +41,7 @@ func orchTimings() clusterTimings {
 		unit: 10 * time.Millisecond, configWait: 300 * time.Millisecond, poll: 5 * time.Millisecond,
 		cooldown: 60 * time.Second, codeWait: 200 * time.Millisecond, stopWait: 300 * time.Millisecond,
 		memberMargin: 20 * time.Millisecond, headMargin: 50 * time.Millisecond, reserveMargin: 60 * time.Millisecond,
-		bootGrace: 60 * time.Second, minAgentInterval: time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
+		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
 	}
 }
 

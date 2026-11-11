@@ -1320,7 +1320,7 @@ func TestClusterBreachPeerHiddenForHiddenMember(t *testing.T) {
 	}
 	want := []ClusterBreachDTO{
 		{Position: 0, Kind: ClusterBreachPeer, Peer: "100.64.0.8", At: at},
-		{Position: 1, Kind: ClusterBreachPeer},
+		{Position: 1},
 	}
 	if got.ClusterStatus == nil || !slices.Equal(got.ClusterStatus.Breaches, want) {
 		t.Fatalf("owner breaches = %+v, want the hidden member's peer left out", got.ClusterStatus)
