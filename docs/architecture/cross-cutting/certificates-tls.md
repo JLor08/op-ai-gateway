@@ -279,11 +279,11 @@ mode flip can never resurrect a stale flag from the opposite mode.
 ```mermaid
 stateDiagram-v2
     [*] --> http: application created (scheme=http)
-    http --> https: agent reports tls_active=true\nfor this app's ProxyListenPort\n(server IN scope)
-    https --> https: agent reports tls_active=false\n(server IN scope) — DECLINED:\nno automatic downgrade,\napp stays https and is UNREACHABLE
-    https --> http: server leaves switch scope\n(mode change / override flip) —\nUNCONDITIONAL scope-exit revert
-    http --> http: missing/absent route report\n(never forwards, never reverts)
-    https --> https: missing/absent route report\n(never reverts on silence)
+    http --> https: agent reports tls_active=true<br/>for this app's ProxyListenPort<br/>(server IN scope)
+    https --> https: agent reports tls_active=false<br/>(server IN scope) — DECLINED,<br/>no automatic downgrade,<br/>app stays https and is UNREACHABLE
+    https --> http: server leaves switch scope<br/>(mode change / override flip) —<br/>UNCONDITIONAL scope-exit revert
+    http --> http: missing/absent route report<br/>(never forwards, never reverts)
+    https --> https: missing/absent route report<br/>(never reverts on silence)
 ```
 
 `ReconcileHTTPSSwitch` (`internal/portal/service_https_switch.go`, riding the
@@ -600,10 +600,10 @@ sequenceDiagram
         GW-->>SA: desired {listen, upstream, app_id}[]
         SA->>SA: proxy.Manager reconciles TLS listeners
     end
-    Note over GW,SA: gateway's own agentListenerManager loads the\nsame kind=gateway leaf into its mesh-TLS listener
+    Note over GW,SA: gateway's own agentListenerManager loads the<br/>same kind=gateway leaf into its mesh-TLS listener
     SA->>GW: WSS connect / telemetry (TLS handshake with mesh leaf)
     GW->>GW: AgentTransportRegistry.Report(serverID, tls=true)
-    Note over GW: feeds cert_mesh_require_tls arming (§5.1)\nand the HTTPS-switch reconcile (§7)
+    Note over GW: feeds cert_mesh_require_tls arming (§5.1)<br/>and the HTTPS-switch reconcile (§7)
 ```
 
 ## 11. Configuration reference

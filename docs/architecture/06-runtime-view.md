@@ -74,7 +74,7 @@ sequenceDiagram
 
     C->>GW: POST /v1/audio/speech {model, input, voice} (Bearer token)
     GW->>GW: authenticate (bearer or loopback, never a session)
-    GW->>GW: validate: model + input; response_format wav or pcm (wav only when not streaming); stream boolean
+    GW->>GW: validate: model + input, response_format wav or pcm (wav only when not streaming), stream boolean
     Note over GW: 400 speech.* here, before any admission, not recorded
     GW->>R: resolve(model, openai_audio, required capability speech)
     R-->>GW: candidate with speech: yes, or 404 no_model_route / model_not_capable
@@ -852,7 +852,7 @@ sequenceDiagram
     GW->>RT: proxied request (app_model_name in JSON body)
     RT->>RT: buffer body, read `model` + `stream`
     RT->>MG: EnsureRunning(upstream model)
-    MG->>MG: Permit (local policy) → Admit (co-residency · limit · per-GPU VRAM · host RAM; victims: grace-protected, same role first)
+    MG->>MG: Permit (local policy) → Admit (co-residency · limit · per-GPU VRAM · host RAM)<br/>victims: grace-protected, same role first
     Note over MG: stopped → starting
     MG->>CH: exec (argv, scratch env, loopback port)
     MG->>CH: poll health until green (or startup_timeout_seconds)

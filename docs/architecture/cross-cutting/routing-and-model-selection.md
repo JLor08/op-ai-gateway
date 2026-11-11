@@ -331,31 +331,31 @@ derived from the client's requested name, per token (§2.1).
 ```mermaid
 flowchart TD
     Start["Resolve(token, req)"] --> Override{"req.ServerOverrideID set?"}
-    Override -->|yes| SO["resolveServerOverride:\nforce exact server,\nbypass groups/affinity/provisioning"]
-    Override -->|no| IsGroup{"req.Model is an\nactive ModelGroup?"}
+    Override -->|yes| SO["resolveServerOverride:<br/>force exact server,<br/>bypass groups/affinity/provisioning"]
+    Override -->|no| IsGroup{"req.Model is an<br/>active ModelGroup?"}
     IsGroup -->|yes, locked| ErrLocked["ErrNoModelRoute"]
-    IsGroup -->|yes| Group["resolveGroup:\npriority walk / sticky pin\n(see §5)"]
+    IsGroup -->|yes| Group["resolveGroup:<br/>priority walk / sticky pin<br/>(see §5)"]
     IsGroup -->|"no, but locked (group-only)"| ErrLocked
-    IsGroup -->|no| Affinity{"token pinned via\nRouteAffinity and\nstill valid + provisioned?"}
-    Affinity -->|hit| ReuseTarget["selectPinned: an instance of the\npinned mapping on the pinned server\n(see §10.10); touch session reservation"]
+    IsGroup -->|no| Affinity{"token pinned via<br/>RouteAffinity and<br/>still valid + provisioned?"}
+    Affinity -->|hit| ReuseTarget["selectPinned: an instance of the<br/>pinned mapping on the pinned server<br/>(see §10.10); touch session reservation"]
     Affinity -->|miss| LoadCands["Store.ActiveMappingsForModel(model, flavor)"]
-    LoadCands --> FilterProv["filterProvisioned\n(resource-group gate)"]
-    FilterProv --> FilterCap["filterCapable\n(required-capability gate,\nsee §2.3)"]
-    FilterCap -->|"emptied, and the request\nrequired a capability"| ErrCap["404: ErrModelNotCapable"]
-    FilterCap --> Voice["voice filter (speech only,\nfail-open, see §2.5)"]
-    Voice --> Realtime["filterRealtime\n(voice chat legs only, see §10.8)"]
-    Realtime -->|"every candidate\nmeasured too slow"| ErrRT["409: ErrNoRealtimeCandidate\n(voice_chat.no_realtime_model)"]
-    Realtime --> Expand["expandInstances\n(running instances, every turn, see §10.1)"]
+    LoadCands --> FilterProv["filterProvisioned<br/>(resource-group gate)"]
+    FilterProv --> FilterCap["filterCapable<br/>(required-capability gate,<br/>see §2.3)"]
+    FilterCap -->|"emptied, and the request<br/>required a capability"| ErrCap["404: ErrModelNotCapable"]
+    FilterCap --> Voice["voice filter (speech only,<br/>fail-open, see §2.5)"]
+    Voice --> Realtime["filterRealtime<br/>(voice chat legs only, see §10.8)"]
+    Realtime -->|"every candidate<br/>measured too slow"| ErrRT["409: ErrNoRealtimeCandidate<br/>(voice_chat.no_realtime_model)"]
+    Realtime --> Expand["expandInstances<br/>(running instances, every turn, see §10.1)"]
     Expand --> Select["selectCandidate (see §3)"]
-    Select -->|all candidates at\neffective cap| Queue["AdmissionController.WaitForSlot\n(see §6), demand signal\nto the instance scaler (see §10.3)"]
+    Select -->|all candidates at<br/>effective cap| Queue["AdmissionController.WaitForSlot<br/>(see §6), demand signal<br/>to the instance scaler (see §10.3)"]
     Queue -->|slot signalled / recheck tick| Expand
-    Queue -->|timeout / full / ctx done| ErrQueue["503: ErrAdmissionQueueTimeout\n/ ErrAdmissionQueueFull"]
+    Queue -->|timeout / full / ctx done| ErrQueue["503: ErrAdmissionQueueTimeout<br/>/ ErrAdmissionQueueFull"]
     Select -->|no reachable/viable candidate| ErrHost["ErrNoHealthyHost"]
     Select -->|picked| Build["targetFrom(ctx, candidate, apiFlavor)"]
-    Build --> Pin{"AffinityTTLSeconds > 0\nand token.ID set?"}
+    Build --> Pin{"AffinityTTLSeconds > 0<br/>and token.ID set?"}
     Pin -->|yes| Upsert["UpsertAffinity + reservation.touch"]
     Pin -->|no| Dispatch
-    Upsert --> Dispatch["Target{Endpoint, ProviderModel,\nTimeout, APIToken, ...}\n→ provider.Multiplexer"]
+    Upsert --> Dispatch["Target{Endpoint, ProviderModel,<br/>Timeout, APIToken, ...}<br/>→ provider.Multiplexer"]
     ReuseTarget --> Dispatch
     SO --> Dispatch
 ```
@@ -426,23 +426,23 @@ listing switches (`offer`/`hide_target`, see
 
 ```mermaid
 flowchart TD
-    Req["client's requested model\n(inferencePreflight)"] --> Row{"exact override row\nfor this name?"}
+    Req["client's requested model<br/>(inferencePreflight)"] --> Row{"exact override row<br/>for this name?"}
     Row -->|yes| Eff["effective model"]
-    Row -->|no| Alias{"generated Claude alias\nof this token?\n(claude_model_aliases, §2.4)"}
-    Alias -->|"yes: its real target,\nresolved once"| Eff
-    Alias -->|no| Catch{"catch-all\nModelOverride set?"}
+    Row -->|no| Alias{"generated Claude alias<br/>of this token?<br/>(claude_model_aliases, §2.4)"}
+    Alias -->|"yes: its real target,<br/>resolved once"| Eff
+    Alias -->|no| Catch{"catch-all<br/>ModelOverride set?"}
     Catch -->|yes| Eff
     Catch -->|no| Eff
-    Eff --> Opt{"UnknownModelRedirect\nopted in?"}
+    Eff --> Opt{"UnknownModelRedirect<br/>opted in?"}
     Opt -->|no| Gates
-    Opt -->|yes| Applies{"does the effective name apply?\n(callableFor = Callable minus the\nservice allowlist; widened by\nUnknownModelRedirectBlocked)"}
+    Opt -->|yes| Applies{"does the effective name apply?<br/>(callableFor = Callable minus the<br/>service allowlist; widened by<br/>UnknownModelRedirectBlocked)"}
     Applies -->|yes| Gates
-    Applies -->|no| Marker{"LastUsedModel\ncandidateFor?"}
+    Applies -->|no| Marker{"LastUsedModel<br/>candidateFor?"}
     Marker -->|yes| UseMarker["redirect onto the marker"] --> Gates
-    Marker -->|no| Fallback{"UnknownModelFallback\ncandidateFor?"}
+    Marker -->|no| Fallback{"UnknownModelFallback<br/>candidateFor?"}
     Fallback -->|yes| UseFB["redirect onto the fallback"] --> Gates
-    Fallback -->|no| Keep["keep the requested model\n(today's error)"] --> Gates
-    Gates["pre-Resolve gates, unchanged:\nserver-override re-authorization,\nservice-token model allowlist,\nrate/quota/budget\n→ Resolver.Resolve (§2)"]
+    Fallback -->|no| Keep["keep the requested model<br/>(today's error)"] --> Gates
+    Gates["pre-Resolve gates, unchanged:<br/>server-override re-authorization,<br/>service-token model allowlist,<br/>rate/quota/budget<br/>→ Resolver.Resolve (§2)"]
 ```
 
 **The invariant.** The redirect target passes every pre-`Resolve` gate exactly
@@ -1622,10 +1622,10 @@ priority/weight, and a bounded per-model metric tiebreak:
 
 ```mermaid
 flowchart LR
-    Base["base = 1000\n+ priority × 20\n+ weight"] --> Penalties["− activeRequests × 25\n− queueDepth × 20\n− latencyMS × 0.2\n− errorRate × 200\n− 500 if telemetry stale (> 2 min) / missing"]
+    Base["base = 1000<br/>+ priority × 20<br/>+ weight"] --> Penalties["− activeRequests × 25<br/>− queueDepth × 20<br/>− latencyMS × 0.2<br/>− errorRate × 200<br/>− 500 if telemetry stale (> 2 min) / missing"]
     Penalties --> Gate{"score ≤ 0 ?"}
-    Gate -->|yes| NonViable["non-viable — excluded\n(the viability gate)"]
-    Gate -->|no| Tiebreak["+ metricTiebreak(route)\n(bounded ≤ 70, ≤ 120 for audio)"]
+    Gate -->|yes| NonViable["non-viable — excluded<br/>(the viability gate)"]
+    Gate -->|no| Tiebreak["+ metricTiebreak(route)<br/>(bounded ≤ 70, ≤ 120 for audio)"]
     Tiebreak --> Final["final score"]
 ```
 
@@ -1955,8 +1955,8 @@ queue, lost-wakeup-safe by construction:
 stateDiagram-v2
     [*] --> Enqueued: WaitForSlot(serverIDs, timeout)
     Enqueued --> Rejected: queue at max_depth (immediate, 503)
-    Enqueued --> Signalled: release(serverID) hits the\nFRONT unsignalled waiter watching it
-    Enqueued --> Rechecked: 250ms liveness re-check elapses\n(no release required)
+    Enqueued --> Signalled: release(serverID) hits the<br/>FRONT unsignalled waiter watching it
+    Enqueued --> Rechecked: 250ms liveness re-check elapses<br/>(no release required)
     Enqueued --> TimedOut: wall-clock deadline elapsed (503)
     Enqueued --> Cancelled: ctx.Done()
     Signalled --> Dequeued: removed from FIFO on signal

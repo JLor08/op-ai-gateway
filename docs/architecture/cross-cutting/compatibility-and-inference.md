@@ -48,39 +48,39 @@ convention.
 ```mermaid
 flowchart TD
     subgraph Edges["Edge (internal/gateway)"]
-        Chat["POST /v1/chat/completions\n/openai/v1/chat/completions"]
-        Resp["POST /v1/responses\n/openai/v1/responses"]
-        Msg["POST /v1/messages\n/anthropic/v1/messages"]
+        Chat["POST /v1/chat/completions<br/>/openai/v1/chat/completions"]
+        Resp["POST /v1/responses<br/>/openai/v1/responses"]
+        Msg["POST /v1/messages<br/>/anthropic/v1/messages"]
         CT["POST /v1/messages/count_tokens"]
-        Img["POST /v1/images/generations\n/openai/v1/images/generations"]
-        ImgEdit["POST /v1/images/edits (multipart)\n/openai/v1/images/edits"]
-        Speech["POST /v1/audio/speech\n/openai/v1/audio/speech"]
-        Transcribe["POST /v1/audio/transcriptions (multipart)\n/openai/v1/audio/transcriptions"]
-        TranscribeD["POST /v1/audio/transcriptions/details (multipart, one-shot)\n/openai/v1/audio/transcriptions/details"]
+        Img["POST /v1/images/generations<br/>/openai/v1/images/generations"]
+        ImgEdit["POST /v1/images/edits (multipart)<br/>/openai/v1/images/edits"]
+        Speech["POST /v1/audio/speech<br/>/openai/v1/audio/speech"]
+        Transcribe["POST /v1/audio/transcriptions (multipart)<br/>/openai/v1/audio/transcriptions"]
+        TranscribeD["POST /v1/audio/transcriptions/details (multipart, one-shot)<br/>/openai/v1/audio/transcriptions/details"]
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
-    Resp --> NativeGate{"endpointModeFor(target,\nopenai_responses)"}
-    Msg --> NativeGate2{"endpointModeFor(target,\nanthropic_messages)"}
-    CT --> CountTok["compat.CountAnthropicTokens\n(word-count estimate, no upstream call)"]
-    Img --> CapGate{"Resolve with\nRequiredCapabilities=[image]"}
+    Resp --> NativeGate{"endpointModeFor(target,<br/>openai_responses)"}
+    Msg --> NativeGate2{"endpointModeFor(target,<br/>anthropic_messages)"}
+    CT --> CountTok["compat.CountAnthropicTokens<br/>(word-count estimate, no upstream call)"]
+    Img --> CapGate{"Resolve with<br/>RequiredCapabilities=[image]"}
     CapGate -->|refused| Reject3["404 routing.model_not_capable"]
-    CapGate -->|target| Native3["relayImages -> proxyNative:\nforward raw body\nto upstream /v1/images/generations"]
-    ImgEdit --> CapGateE{"Resolve with\nRequiredCapabilities=[image_edit]"}
-    CapGateE -->|refused| Reject4["404 routing.model_not_capable /\nimages.edit_unavailable"]
-    CapGateE -->|target| Native4["relayImageEdit -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/images/edits"]
-    Speech --> CapGateS{"Resolve with\nRequiredCapabilities=[speech]"}
+    CapGate -->|target| Native3["relayImages -> proxyNative:<br/>forward raw body<br/>to upstream /v1/images/generations"]
+    ImgEdit --> CapGateE{"Resolve with<br/>RequiredCapabilities=[image_edit]"}
+    CapGateE -->|refused| Reject4["404 routing.model_not_capable /<br/>images.edit_unavailable"]
+    CapGateE -->|target| Native4["relayImageEdit -> proxyNative:<br/>multipart body verbatim (or rebuilt once)<br/>to upstream /v1/images/edits"]
+    Speech --> CapGateS{"Resolve with<br/>RequiredCapabilities=[speech]"}
     CapGateS -->|refused| Reject5["404 routing.model_not_capable"]
-    CapGateS -->|target| Native5["relaySpeech -> proxyNative:\nJSON body to upstream /v1/audio/speech,\nbinary audio/wav streamed back"]
-    Transcribe --> CapGateT{"Resolve with\nRequiredCapabilities=[transcription]"}
+    CapGateS -->|target| Native5["relaySpeech -> proxyNative:<br/>JSON body to upstream /v1/audio/speech,<br/>binary audio/wav streamed back"]
+    Transcribe --> CapGateT{"Resolve with<br/>RequiredCapabilities=[transcription]"}
     TranscribeD --> CapGateT
-    CapGateT -->|refused| Reject6["404 routing.model_not_capable /\ntranscription.unavailable"]
-    CapGateT -->|target| Native6["relayTranscription -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/audio/transcriptions\n(or /details for the one-shot twin),\nJSON response buffered, metered, written"]
+    CapGateT -->|refused| Reject6["404 routing.model_not_capable /<br/>transcription.unavailable"]
+    CapGateT -->|target| Native6["relayTranscription -> proxyNative:<br/>multipart body verbatim (or rebuilt once)<br/>to upstream /v1/audio/transcriptions<br/>(or /details for the one-shot twin),<br/>JSON response buffered, metered, written"]
 
-    NativeGate -->|passthrough| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
+    NativeGate -->|passthrough| Native["proxyNative:<br/>forward raw body byte-for-byte<br/>to upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
     NativeGate -->|disabled| Reject1["404 responses.endpoint_disabled"]
-    NativeGate2 -->|passthrough| Native2["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/messages"]
+    NativeGate2 -->|passthrough| Native2["proxyNative:<br/>forward raw body byte-for-byte<br/>to upstream /v1/messages"]
     NativeGate2 -->|translate| ParseMsg["compat.ParseAnthropicMessages"]
     NativeGate2 -->|disabled| Reject2["404 messages.endpoint_disabled"]
 
@@ -88,24 +88,24 @@ flowchart TD
     ParseResp --> Req
     ParseMsg --> Req
 
-    Req --> Resolve["routing.Resolver.Resolve\n(model+flavor → Target)"]
-    Resolve --> Mux["provider.Multiplexer\n(dispatch by target.Provider)"]
-    Native --> ProxyMux["provider.Multiplexer.ProxyNative\n(dispatch by target.Provider)"]
+    Req --> Resolve["routing.Resolver.Resolve<br/>(model+flavor → Target)"]
+    Resolve --> Mux["provider.Multiplexer<br/>(dispatch by target.Provider)"]
+    Native --> ProxyMux["provider.Multiplexer.ProxyNative<br/>(dispatch by target.Provider)"]
     Native2 --> ProxyMux
     Native3 --> ProxyMux
     Native4 --> ProxyMux
     Native5 --> ProxyMux
     Native6 --> ProxyMux
 
-    Mux --> Ollama["OllamaClient\n/api/chat"]
-    Mux --> OAIC["OpenAICompatibleClient\n{prefix}/chat/completions (default /v1)"]
+    Mux --> Ollama["OllamaClient<br/>/api/chat"]
+    Mux --> OAIC["OpenAICompatibleClient<br/>{prefix}/chat/completions (default /v1)"]
     Mux --> Mock["Mock (dev/test)"]
     ProxyMux --> OAIC
 
     Ollama --> RenderChat["compat.OpenAIChatResponse"]
     OAIC --> RenderChat
     Mock --> RenderChat
-    RenderChat -.->|or Responses/Anthropic render\nper originating edge| Client["client"]
+    RenderChat -.->|or Responses/Anthropic render<br/>per originating edge| Client["client"]
 ```
 
 Each of the three POST inference edges (chat completions, Responses, Messages)

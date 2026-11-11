@@ -358,44 +358,44 @@ in.
 
 ```mermaid
 flowchart TD
-    A["Incoming request"] --> B{"X-OP-Internal-Auth\nmatches process secret?"}
-    B -- yes --> C["Trusted-loopback principal\n(session-shaped, never elevated)"]
+    A["Incoming request"] --> B{"X-OP-Internal-Auth<br/>matches process secret?"}
+    B -- yes --> C["Trusted-loopback principal<br/>(session-shaped, never elevated)"]
     B -- no / absent --> D{"Endpoint class"}
 
-    D -- "Portal / Admin / System\n(/api/portal, /api/admin, /api/system)" --> E{"Session cookie present?"}
+    D -- "Portal / Admin / System<br/>(/api/portal, /api/admin, /api/system)" --> E{"Session cookie present?"}
     E -- yes --> F{"Unsafe method?"}
     F -- yes --> G{"X-OP-CSRF: 1 present?"}
     G -- no --> X1["403 auth.csrf_required"]
-    G -- yes --> H["Session principal\n(sessionPrincipal)"]
+    G -- yes --> H["Session principal<br/>(sessionPrincipal)"]
     F -- no --> H
     E -- no --> I{"Authorization: Bearer present?"}
-    I -- yes --> J["Bearer principal\n(TokenStore.LookupBearer)"]
+    I -- yes --> J["Bearer principal<br/>(TokenStore.LookupBearer)"]
     I -- no --> X2["401 auth.invalid_token"]
-    H --> K{"requireWebScope:\nservice-token? has scope?"}
+    H --> K{"requireWebScope:<br/>service-token? has scope?"}
     J --> K
     K -- fail --> X3["401 / 403"]
     K -- pass --> L["Handler runs"]
 
-    D -- "/v1/chat/completions\n(/openai/v1/... alias)" --> M{"Session cookie OR Bearer?"}
-    M --> N["requireWebAnyScope:\ngateway:use OR llm:invoke"]
-    N -- "session + optional\nX-OP-Run-As-Token" --> O["AuthorizeRunAsToken\n(ownership + active + scope)"]
+    D -- "/v1/chat/completions<br/>(/openai/v1/... alias)" --> M{"Session cookie OR Bearer?"}
+    M --> N["requireWebAnyScope:<br/>gateway:use OR llm:invoke"]
+    N -- "session + optional<br/>X-OP-Run-As-Token" --> O["AuthorizeRunAsToken<br/>(ownership + active + scope)"]
     N -- pass --> L
 
-    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
+    D -- "/v1/responses, /v1/messages,<br/>/v1/messages/count_tokens,<br/>model-listing endpoints" --> P["Bearer ONLY<br/>(authenticate / requireAnyScope)"]
     P -- no/invalid bearer --> X2
     P -- pass --> L
 
-    D -- "/v1/images/generations, /v1/images/edits,\n/v1/audio/speech, /v1/audio/transcriptions,\n/v1/audio/transcriptions/live, /v1/audio/voices\n(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
-    R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
+    D -- "/v1/images/generations, /v1/images/edits,<br/>/v1/audio/speech, /v1/audio/transcriptions,<br/>/v1/audio/transcriptions/live, /v1/audio/voices<br/>(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth<br/>matches secret?"}
+    R -- yes --> S["Loopback principal<br/>(session-shaped, never elevated)"]
     R -- no --> T{"Authorization: Bearer present?"}
-    T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
+    T -- yes --> U["Bearer principal<br/>(TokenStore.LookupBearer)"]
     T -- no --> X2
-    S --> V{"requireInternalOrBearerAnyScope:\ngateway:use OR llm:invoke"}
+    S --> V{"requireInternalOrBearerAnyScope:<br/>gateway:use OR llm:invoke"}
     U --> V
-    V -- "loopback + optional\nX-OP-Run-As-Token" --> O
+    V -- "loopback + optional<br/>X-OP-Run-As-Token" --> O
     V -- pass --> L
 
-    D -- "/api/agent/v1/*" --> Q["Agent bearer secret\nvs agent_tokens\n(separate token universe)"]
+    D -- "/api/agent/v1/*" --> Q["Agent bearer secret<br/>vs agent_tokens<br/>(separate token universe)"]
     Q -- pass --> L
 ```
 
@@ -799,25 +799,25 @@ flowchart TB
     AD -->|always| ADS
     SA -->|always| GU
     SA -->|always| ADS
-    SA -.->|"only while session\nis elevated (step-up)"| SYS
+    SA -.->|"only while session<br/>is elevated (step-up)"| SYS
 
     subgraph Groups["Admin-groups (user_groups, tier=admin)"]
         OWN["owner"]
-        MGR["manager\n(6 boolean flags)"]
+        MGR["manager<br/>(6 boolean flags)"]
         MEM["member"]
     end
 
     OWN -->|"all 6 flags implicitly"| MGR
-    MGR -->|"can_manage_servers"| SRV["server_admin_groups\n-> AI server(s)"]
-    MGR -->|"can_manage_services"| SVC["service_admin_groups\n-> service account(s)"]
-    MGR -->|"can_manage_resources"| RG["resource_group_admin_groups\n-> resource group(s)"]
-    MGR -->|"can_manage_vendor_accounts"| VA["vendor_account_admin_groups\n-> vendor account(s)"]
-    MGR -->|"can_manage_users"| USRS["users assignable\ninto the group"]
+    MGR -->|"can_manage_servers"| SRV["server_admin_groups<br/>-> AI server(s)"]
+    MGR -->|"can_manage_services"| SVC["service_admin_groups<br/>-> service account(s)"]
+    MGR -->|"can_manage_resources"| RG["resource_group_admin_groups<br/>-> resource group(s)"]
+    MGR -->|"can_manage_vendor_accounts"| VA["vendor_account_admin_groups<br/>-> vendor account(s)"]
+    MGR -->|"can_manage_users"| USRS["users assignable<br/>into the group"]
 
-    SRV -.->|"owner-equivalent,\nscoped to that resource"| ADS
-    SVC -.->|"owner-equivalent,\nscoped to that resource"| ADS
-    RG -.->|"owner-equivalent,\nscoped to that resource"| ADS
-    VA -.->|"by share level,\nscoped to that account"| ADS
+    SRV -.->|"owner-equivalent,<br/>scoped to that resource"| ADS
+    SVC -.->|"owner-equivalent,<br/>scoped to that resource"| ADS
+    RG -.->|"owner-equivalent,<br/>scoped to that resource"| ADS
+    VA -.->|"by share level,<br/>scoped to that account"| ADS
 ```
 
 ## 12. Delegated & resource-scoped authorization
@@ -831,13 +831,13 @@ delegate straight up to it:
 flowchart LR
     M["authorizeMapping"] --> A["authorizeApplication"]
     A --> S["authorizeServer"]
-    S --> D{"principal.HasScope\n('system')?"}
+    S --> D{"principal.HasScope<br/>('system')?"}
     D -- yes --> OK["authorized"]
-    D -- no --> E{"principal.UserID in\nserver_owners?"}
+    D -- no --> E{"principal.UserID in<br/>server_owners?"}
     E -- yes --> OK
-    E -- no --> F{"principal co-manages\na linked admin-group\nwith can_manage_servers?"}
+    E -- no --> F{"principal co-manages<br/>a linked admin-group<br/>with can_manage_servers?"}
     F -- yes --> OK
-    F -- no --> NF["ErrServerNotFound\n(404 — no existence leak,\nnever a distinguishable 403)"]
+    F -- no --> NF["ErrServerNotFound<br/>(404 — no existence leak,<br/>never a distinguishable 403)"]
 ```
 
 A plain `admin` scope with no ownership and no delegated group reach gets the

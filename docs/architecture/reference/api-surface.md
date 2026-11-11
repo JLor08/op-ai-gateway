@@ -43,11 +43,11 @@ The five `/api/agent/v1/*` handlers are registered identically on **both** the p
 ```mermaid
 flowchart TD
     Req[Incoming request] --> Dispatch{"Which listener?"}
-    Dispatch -->|main HTTP listener| PubMux["s.mux (public)\nserveWith(..., public=true)"]
-    Dispatch -->|"dedicated agent listener\n(NetBird-only, if configured)"| AgentMux["s.agentMux\nserveWith(..., public=false)\n+ withAgentListenerContext"]
-    PubMux --> AgentAuth["authenticateAgent\n(agent-token bearer)"]
+    Dispatch -->|main HTTP listener| PubMux["s.mux (public)<br/>serveWith(..., public=true)"]
+    Dispatch -->|"dedicated agent listener<br/>(NetBird-only, if configured)"| AgentMux["s.agentMux<br/>serveWith(..., public=false)<br/>+ withAgentListenerContext"]
+    PubMux --> AgentAuth["authenticateAgent<br/>(agent-token bearer)"]
     AgentMux --> AgentAuth
-    AgentAuth --> Handlers["telemetry / stream / system-report\ncertificate / ca / proxy-routes / download"]
+    AgentAuth --> Handlers["telemetry / stream / system-report<br/>certificate / ca / proxy-routes / download"]
 ```
 
 Only requests that actually arrived on `agentMux` get `r.TLS` transport-hop reporting recorded (a public-mux request may be proxied over plaintext loopback internally and would misrepresent the real mesh transport).

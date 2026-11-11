@@ -10,11 +10,11 @@ Both binaries are env-first: every setting has a built-in default, can be overri
 flowchart LR
     subgraph Backend["op-ai-gateway (internal/config)"]
         direction LR
-        BE1[built-in default] --> BE2["config file\n(OP_AI_GATEWAY_CONFIG)"] --> BE3["env var\nOP_AI_GATEWAY_*"]
+        BE1[built-in default] --> BE2["config file<br/>(OP_AI_GATEWAY_CONFIG)"] --> BE3["env var<br/>OP_AI_GATEWAY_*"]
     end
     subgraph Agent["op-ai-server-agent (server-agent/internal/config)"]
         direction LR
-        A1[built-in default] --> A2["config file\n(OP_AGENT_CONFIG)"] --> A3["env var\nOP_AGENT_*"] --> A4["CLI flag\n-gateway-url, -token, ..."]
+        A1[built-in default] --> A2["config file<br/>(OP_AGENT_CONFIG)"] --> A3["env var<br/>OP_AGENT_*"] --> A4["CLI flag<br/>-gateway-url, -token, ..."]
     end
 ```
 

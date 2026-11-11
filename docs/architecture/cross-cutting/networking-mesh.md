@@ -19,20 +19,20 @@ flowchart TB
     end
 
     subgraph host["Gateway host (docker-compose)"]
-        nginx["nginx edge\n:80 / :443"]
+        nginx["nginx edge<br/>:80 / :443"]
         subgraph netns["shared network namespace"]
-            sidecar["NetBird sidecar\n(netbird-enroll-entrypoint.sh)"]
-            backend["gateway backend\nop-ai-gateway\n(binds wt0 100.x.x.x)"]
+            sidecar["NetBird sidecar<br/>(netbird-enroll-entrypoint.sh)"]
+            backend["gateway backend<br/>op-ai-gateway<br/>(binds wt0 100.x.x.x)"]
         end
     end
 
     subgraph mesh["NetBird overlay (self-hosted or cloud)"]
-        mgmt["Management API\n/api/groups /api/peers\n/api/policies /api/setup-keys"]
+        mgmt["Management API<br/>/api/groups /api/peers<br/>/api/policies /api/setup-keys"]
     end
 
     subgraph server["AI server host"]
-        agentpeer["NetBird peer\n(wt0)"]
-        agent["server-agent\nop-ai-server-agent"]
+        agentpeer["NetBird peer<br/>(wt0)"]
+        agent["server-agent<br/>op-ai-server-agent"]
         app["Ollama / llama.cpp / vLLM"]
     end
 
@@ -41,7 +41,7 @@ flowchart TB
     backend -.->|"admin PAT (Token header)"| mgmt
     backend <-->|"WireGuard tunnel"| agentpeer
     sidecar <-->|"WireGuard tunnel"| mgmt
-    agent -->|"Bearer agent token\nHTTP(S) + WSS\nvia wt0"| backend
+    agent -->|"Bearer agent token<br/>HTTP(S) + WSS<br/>via wt0"| backend
     agent -->|"localhost"| app
 ```
 

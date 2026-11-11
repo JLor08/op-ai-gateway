@@ -225,9 +225,9 @@ sequenceDiagram
     participant Pres as AgentPresenceRegistry
 
     Note over A: every OP_AGENT_INTERVAL (default 1s)
-    A->>GW: POST /api/agent/v1/telemetry (Bearer token)\nor WS frame {type:"telemetry"} on /api/agent/v1/stream
+    A->>GW: POST /api/agent/v1/telemetry (Bearer token)<br/>or WS frame {type:"telemetry"} on /api/agent/v1/stream
     GW->>GW: authenticateAgent → serverID (from token)
-    GW->>GW: telemetryFromRequest (routing summary)\n+ telemetrySampleFromRequest (rich sample, bounds-checked)
+    GW->>GW: telemetryFromRequest (routing summary)<br/>+ telemetrySampleFromRequest (rich sample, bounds-checked)
     GW->>St: AIServerByID(serverID)
     St-->>GW: server (404 → agent.unknown_server)
     GW->>St: UpsertTelemetry (routing summary: cpu_load, ram_*, vram_*, gpu_count)
@@ -2922,18 +2922,18 @@ result:
 
 ```mermaid
 flowchart TD
-    Start["Un-priced usage.Event\n(energy_source == '')"] --> T1{"Tier 1: measured\nContinuous power-telemetry\ncoverage of [start,end]?\n(max gap 2× the 1s cadence)"}
-    T1 -->|yes| M["Integrate ∫ power(t)/concurrency(t) dt\nover the request's own window,\nshared with concurrent sibling requests"]
-    T1 -->|no| T2{"Tier 2: estimated\nServer.EstimatedWatts set?"}
-    T2 -->|yes| E["Integrate a flat wattage × PUE,\nsame concurrency-sharing model"]
-    T2 -->|no| U{"Is the row token-metered?\n(billing_unit == '')"}
-    U -->|yes| T3["Tier 3: modeled\nWh = coeff × OutputTokens\n(mapping coefficient, else system default)"]
-    U -->|no| X["unpriceable\nNOT a tier: no tier could apply.\n0 Wh, stamped, terminal"]
+    Start["Un-priced usage.Event<br/>(energy_source == '')"] --> T1{"Tier 1: measured<br/>Continuous power-telemetry<br/>coverage of [start,end]?<br/>(max gap 2× the 1s cadence)"}
+    T1 -->|yes| M["Integrate ∫ power(t)/concurrency(t) dt<br/>over the request's own window,<br/>shared with concurrent sibling requests"]
+    T1 -->|no| T2{"Tier 2: estimated<br/>Server.EstimatedWatts set?"}
+    T2 -->|yes| E["Integrate a flat wattage × PUE,<br/>same concurrency-sharing model"]
+    T2 -->|no| U{"Is the row token-metered?<br/>(billing_unit == '')"}
+    U -->|yes| T3["Tier 3: modeled<br/>Wh = coeff × OutputTokens<br/>(mapping coefficient, else system default)"]
+    U -->|no| X["unpriceable<br/>NOT a tier: no tier could apply.<br/>0 Wh, stamped, terminal"]
     M --> Result["EnergyResult{WhTotal, WhMarginal, Source}"]
     E --> Result
     T3 --> Result
     X --> Result
-    Result --> Idle["WhMarginal subtracts an idle baseline:\noperator IdleWatts override,\nelse idleTracker's rolling-minimum estimate"]
+    Result --> Idle["WhMarginal subtracts an idle baseline:<br/>operator IdleWatts override,<br/>else idleTracker's rolling-minimum estimate"]
     Idle --> Store["UpdateUsageEventEnergy(id, WhTotal, WhMarginal, Source)"]
 ```
 
@@ -3223,17 +3223,17 @@ issue #119
 ```mermaid
 flowchart LR
     subgraph "Request time (synchronous)"
-        A["Inference request served"] --> B["extractClientSession:\nsession id/source/agent id"]
-        B --> C["recordUsage:\nsplit input/cached/cache_write/output\nenergy_wh = 0, energy_source = \"\""]
-        C --> D["usage.Store.Record\n(usage_events row)"]
-        D --> E["usage.Broker.Publish()\n→ Activity/Active SSE refetch"]
+        A["Inference request served"] --> B["extractClientSession:<br/>session id/source/agent id"]
+        B --> C["recordUsage:<br/>split input/cached/cache_write/output<br/>energy_wh = 0, energy_source = \"\""]
+        C --> D["usage.Store.Record<br/>(usage_events row)"]
+        D --> E["usage.Broker.Publish()<br/>→ Activity/Active SSE refetch"]
     end
     subgraph "Energy reconciliation (async, every 15s)"
-        F["UnpricedUsageEvents\n(settled + within backfill window)"] --> G["ComputeEnergy\n(measured/estimated/modeled,\nelse unpriceable)"]
+        F["UnpricedUsageEvents<br/>(settled + within backfill window)"] --> G["ComputeEnergy<br/>(measured/estimated/modeled,<br/>else unpriceable)"]
         G --> H["UpdateUsageEventEnergy"]
     end
     subgraph "Read time (portal layer)"
-        I["UsageStats / UsageGroups / row read"] --> J["resolve price per kWh\n(server override, else system default)"]
+        I["UsageStats / UsageGroups / row read"] --> J["resolve price per kWh<br/>(server override, else system default)"]
         J --> K["CostEUR = EnergyWh/1000 × price"]
     end
     D -.-> F
