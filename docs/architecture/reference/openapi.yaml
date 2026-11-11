@@ -2526,6 +2526,58 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage:
+    description: >
+      Clears the stored usage of one member of the llama.cpp RPC cluster head on
+      the mapping: its stored VRAM per GPU and RAM, their stale mark and the
+      current run's peaks. The member's demand pushed to its host is
+      max(stored usage, estimate), so this is the way out of a stored peak above
+      the member's GPU budget or host memory (cluster_status.peaks_above_budget),
+      which its next start would be refused for. The member server's runtime
+      document is pushed. Authorized on the head (through its mapping) and on
+      the member's server.
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: serverID, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Reset a cluster member's stored usage
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404':
+          description: >
+            The Error envelope with `mapping.not_found` (the head's authorization
+            no-leak collapse), `runtime_spec.not_found` (the mapping has no
+            spec), `server.not_found` (a member server the caller may not
+            manage, or none) or `runtime_spec.cluster_member_not_found` (the
+            server is no member of the head).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '500':
+          description: The Error envelope with `runtime_spec.request_failed` (a store read or write failed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/mappings/{id}/runtime/cluster-candidates:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: mode, in: query, required: false, schema: { type: string, enum: [automatic, manual] } }
+    get:
+      tags: [portal]
+      summary: Servers the llama.cpp RPC cluster head on the mapping may add as members ({"data":[...]})
+      description: >
+        Servers other than the head's that the caller manages and whose member
+        consent admits the head (system scope included). automatic (default):
+        servers offering RPC membership with a ggml-rpc-server of the head
+        binary's version; manual: servers with enabled member specs serving no
+        other head. Refusals as the runtime-spec PUT's.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/applications/{id}/runtime/coresidency:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -2576,6 +2628,82 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/servers/{id}/rpc-members:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: The server's manual llama.cpp RPC cluster member specs ({"data":[...]})
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a manual member spec (full document)
+      description: >
+        400 runtime_spec.member_flag_reserved (-H/-p/-d/-c belong to the agent),
+        runtime_spec.device_backend_invalid, runtime_spec.member_vram_estimate_required.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '201': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/servers/{id}/rpc-members/{specID}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: specID, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Replace a manual member spec (full document)
+      description: >
+        Refusals as on create, 404 rpc_member_spec.not_found, and 409
+        runtime.cluster_member_in_use when disabling a spec a head uses.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      tags: [portal]
+      summary: Delete a manual member spec
+      description: 409 runtime.cluster_member_in_use while a head uses it.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '204': { description: Deleted. }
+  /api/portal/servers/{id}/binaries:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: The server's binary inventory ({"data":[...]})
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Add a manual binary row
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '201': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    put:
+      tags: [portal]
+      summary: Edit a manual row, or set the version override of any row (path in the body)
+      description: 409 binary.agent_owned for anything but the override on an agent-reported row.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      tags: [portal]
+      summary: Remove a manual binary row (?path=)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Removed. }
   /api/portal/servers/{id}/runtime/report:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }

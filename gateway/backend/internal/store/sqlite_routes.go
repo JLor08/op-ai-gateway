@@ -25,8 +25,9 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_group_ids, netbird_peer_managed, netbird_policy_override, netbird_allow_ping,
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
-			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
+			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		host.ID,
 		host.Name,
 		host.Domain,
@@ -59,6 +60,11 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 		host.HTTPSSwitchOverride,
 		host.RuntimeMaxProcesses,
 		host.ManagedRuntimeOnly,
+		host.NetbirdIP,
+		host.LANAddress,
+		host.LANBindOnly,
+		host.RPCMemberEnabled,
+		host.RPCAllowedHeadGroups,
 	)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -69,6 +75,8 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 	return nil
 }
 
+// UpdateAIServer writes the server row from host, except netbird_ip, which
+// only the NetBird state writes set (see routing.ServerStore).
 func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
@@ -78,7 +86,8 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_group_ids = ?, netbird_peer_managed = ?, netbird_policy_override = ?, netbird_allow_ping = ?,
 			netbird_ping_exclude = ?, agent_presence_timeout_seconds = ?,
 			estimated_watts = ?, idle_watts = ?, price_per_kwh = ?, pue = ?, price_unit = ?, system_group_id = ?,
-			certificate_override = ?, https_switch_override = ?, runtime_max_processes = ?, managed_runtime_only = ?
+			certificate_override = ?, https_switch_override = ?, runtime_max_processes = ?, managed_runtime_only = ?,
+			lan_address = ?, lan_bind_only = ?, rpc_member_enabled = ?, rpc_allowed_head_groups = ?
 		where id = ?`,
 		host.Name,
 		host.Domain,
@@ -110,6 +119,10 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 		host.HTTPSSwitchOverride,
 		host.RuntimeMaxProcesses,
 		host.ManagedRuntimeOnly,
+		host.LANAddress,
+		host.LANBindOnly,
+		host.RPCMemberEnabled,
+		host.RPCAllowedHeadGroups,
 		host.ID,
 	)
 	if err != nil {
@@ -126,7 +139,8 @@ func (s *SQLiteStore) AIServerByID(ctx context.Context, id string) (routing.AISe
 			netbird_group_ids, netbird_peer_managed, netbird_policy_override, netbird_allow_ping,
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
-			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only
+			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
+			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups
 		from ai_servers
 		where id = ?`, id)
 	return scanAIServer(row)
@@ -140,7 +154,8 @@ func (s *SQLiteStore) AIServers(ctx context.Context) ([]routing.AIServer, error)
 			netbird_group_ids, netbird_peer_managed, netbird_policy_override, netbird_allow_ping,
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
-			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only
+			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
+			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups
 		from ai_servers
 		order by id`)
 	if err != nil {
@@ -190,13 +205,14 @@ func (s *SQLiteStore) UpdateServerNetbirdKey(ctx context.Context, id string, ena
 }
 
 // UpdateServerNetbirdLink is the system-admin linkage editor: it sets the
-// NetBird enabled flag + peer id and RESETS netbird_connected to 0 with a
-// targeted UPDATE (only those three columns), so a stale connection state is
-// not shown until the sync loop re-confirms from the new peer id.
+// NetBird enabled flag + peer id and RESETS netbird_connected to 0 and
+// netbird_ip to "" with a targeted UPDATE (only those four columns), so a stale
+// connection state or mesh address is not shown until the sync loop re-confirms
+// from the new peer id.
 func (s *SQLiteStore) UpdateServerNetbirdLink(ctx context.Context, id string, enabled bool, peerID string) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
-		set netbird_enabled = ?, netbird_peer_id = ?, netbird_connected = 0
+		set netbird_enabled = ?, netbird_peer_id = ?, netbird_ip = '', netbird_connected = 0
 		where id = ?`,
 		enabled,
 		peerID,
@@ -209,21 +225,43 @@ func (s *SQLiteStore) UpdateServerNetbirdLink(ctx context.Context, id string, en
 }
 
 // UpdateServerNetbirdState writes the peer-synced server state — the domain
-// (from the peer's DNS name), the peer id, and the connected flag — with a
-// targeted UPDATE (only those three columns), so the peer-sync loop cannot race
-// a concurrent full-row write.
-func (s *SQLiteStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error {
+// (from the peer's DNS name), the peer id, the peer's mesh IP, and the
+// connected flag — with a targeted UPDATE (only those four columns), so it
+// overwrites no other column. See routing.NetbirdStateStore for what a
+// concurrent full-row write can still write back.
+func (s *SQLiteStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
-		set domain = ?, netbird_peer_id = ?, netbird_connected = ?
+		set domain = ?, netbird_peer_id = ?, netbird_ip = ?, netbird_connected = ?
 		where id = ?`,
 		domain,
 		peerID,
+		ip,
 		connected,
 		id,
 	)
 	if err != nil {
 		return fmt.Errorf("update server netbird state: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// ClearServerNetbirdIP empties only netbird_ip, with a targeted UPDATE.
+func (s *SQLiteStore) ClearServerNetbirdIP(ctx context.Context, id string) error {
+	result, err := s.exec(ctx, `update ai_servers set netbird_ip = '' where id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("clear server netbird ip: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateServerLastSeen writes only last_seen_at and updated_at, with a
+// targeted UPDATE, so the telemetry heartbeat overwrites no other column.
+func (s *SQLiteStore) UpdateServerLastSeen(ctx context.Context, id string, lastSeenAt, updatedAt time.Time) error {
+	result, err := s.exec(ctx, `update ai_servers set last_seen_at = ?, updated_at = ? where id = ?`,
+		lastSeenAt.UTC(), updatedAt.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update server last seen: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -389,7 +427,8 @@ func (s *SQLiteStore) ServersByOwner(ctx context.Context, userID string) ([]rout
 			s.netbird_group_ids, s.netbird_peer_managed, s.netbird_policy_override, s.netbird_allow_ping,
 			s.netbird_ping_exclude, s.agent_presence_timeout_seconds,
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
-			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only
+			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only,
+			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups
 		from ai_servers s
 		join server_owners o on o.server_id = s.id
 		where o.user_id = ?
@@ -512,7 +551,8 @@ func (s *SQLiteStore) ServersByAdminGroups(ctx context.Context, groupIDs []strin
 			s.netbird_group_ids, s.netbird_peer_managed, s.netbird_policy_override, s.netbird_allow_ping,
 			s.netbird_ping_exclude, s.agent_presence_timeout_seconds,
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
-			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only
+			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only,
+			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups
 		from ai_servers s
 		join server_admin_groups g on g.server_id = s.id
 		where g.group_id in (`+strings.Join(placeholders, ",")+`)
@@ -771,6 +811,7 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 	var host routing.AIServer
 	var lastSeenAt sql.NullTime
 	var netbirdEnabled, netbirdConnected, netbirdPeerManaged, netbirdAllowPing, netbirdPingExclude, managedRuntimeOnly int64
+	var lanBindOnly, rpcMemberEnabled int64
 	err := row.Scan(
 		&host.ID,
 		&host.Name,
@@ -804,6 +845,11 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 		&host.HTTPSSwitchOverride,
 		&host.RuntimeMaxProcesses,
 		&managedRuntimeOnly,
+		&host.NetbirdIP,
+		&host.LANAddress,
+		&lanBindOnly,
+		&rpcMemberEnabled,
+		&host.RPCAllowedHeadGroups,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.AIServer{}, ErrNotFound
@@ -820,6 +866,8 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 	host.NetbirdAllowPing = netbirdAllowPing != 0
 	host.NetbirdPingExclude = netbirdPingExclude != 0
 	host.ManagedRuntimeOnly = managedRuntimeOnly != 0
+	host.LANBindOnly = lanBindOnly != 0
+	host.RPCMemberEnabled = rpcMemberEnabled != 0
 	return host, nil
 }
 

@@ -30,11 +30,15 @@ type API interface {
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
+	NotifyClustersOfServer(context.Context, string)
+	KeptUpClusterHeads(context.Context) ([]string, error)
+	ReconcileRPCPolicies(context.Context)
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
 	AnthropicPromptCachingEnabled(context.Context) bool
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeRuntimeAction(context.Context, auth.Token, string) (RuntimeActionScope, error)
+	AuthorizeClusterMemberUsageReset(context.Context, auth.Token, string, string) (routing.ClusterMember, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
 	BeginVendorAccountConnect(context.Context, auth.Token, string) (string, error)
 	BeginVendorAccountDeviceConnect(context.Context, auth.Token, string) (string, string, error)
@@ -50,6 +54,8 @@ type API interface {
 	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
+	ClusterCandidates(context.Context, auth.Token, string, string) ([]ClusterCandidateDTO, error)
+	ClusterPlan(context.Context, string) (ClusterPlan, error)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
 	CommitVoiceTurn(context.Context, auth.Token, string, string, AssistantTurn, string) error
 	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)
@@ -78,6 +84,11 @@ type API interface {
 	DeleteMessageAudio(context.Context, auth.Token, string, string) error
 	DeleteModelGroup(context.Context, auth.Token, string) error
 	DeleteProject(context.Context, auth.Token, string) error
+	DeleteRPCMemberSpec(context.Context, auth.Token, string, string) error
+	ServerBinaries(context.Context, auth.Token, string) ([]ServerBinaryDTO, error)
+	CreateManualServerBinary(context.Context, auth.Token, string, PutServerBinaryRequest) (ServerBinaryDTO, error)
+	UpdateServerBinary(context.Context, auth.Token, string, PutServerBinaryRequest) (ServerBinaryDTO, error)
+	DeleteManualServerBinary(context.Context, auth.Token, string, string) error
 	DeleteResourceGroup(context.Context, auth.Token, string) error
 	DeleteRuntimeSpec(context.Context, auth.Token, string) error
 	DeleteServer(context.Context, auth.Token, string, bool) (bool, error)
@@ -140,6 +151,7 @@ type API interface {
 	MyProjects(context.Context, auth.Token) ([]ProjectRefDTO, error)
 	NetbirdAgentDownloadOnly(context.Context) bool
 	NetbirdConfig(context.Context) (NetbirdConfig, bool, error)
+	NetbirdDefaultPolicyStateView(context.Context) (string, time.Time)
 	NetbirdGatewayPeerID(context.Context) string
 	NetbirdGroups(context.Context) ([]netbird.Group, error)
 	NetbirdKeyFileConfigured() bool
@@ -161,7 +173,9 @@ type API interface {
 	PublicLanguage(context.Context) string
 	PublicTheme(context.Context) string
 	PublicThemeView(context.Context) ThemePublicView
+	PutRPCMemberSpec(context.Context, auth.Token, string, string, PutRPCMemberSpecRequest) (RPCMemberSpecDTO, error)
 	PutRuntimeSpec(context.Context, auth.Token, string, PutRuntimeSpecRequest) (RuntimeSpecDTO, error)
+	RPCMemberSpecs(context.Context, auth.Token, string) ([]RPCMemberSpecDTO, error)
 	ReassignGroupsOwnedBy(context.Context, auth.Token, string) error
 	ReconcileCertificates(context.Context)
 	ReconcileGatewayPeer(context.Context) (string, bool, error)

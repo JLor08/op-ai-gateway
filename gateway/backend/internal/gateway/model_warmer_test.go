@@ -342,3 +342,50 @@ func TestModelWarmerSkipsAServerWithABenchmark(t *testing.T) {
 		}
 	})
 }
+
+// TestWarmerSkipsClusterHeads: a llama.cpp RPC cluster head starts only
+// members first, through the cluster orchestration, and the agent refuses a
+// plain request for a head that has not formed -- so the warmer never warms
+// one, and warms a sibling of the same name that is no head instead.
+func TestWarmerSkipsClusterHeads(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	for i, srvID := range []string{"srv-head", "srv-text"} {
+		if err := mem.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".example.test", Provider: routing.ProviderMock, Endpoint: "mock://" + srvID, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer: %v", err)
+		}
+		if err := mem.CreateApplication(ctx, routing.Application{ID: "app-" + srvID, ServerID: srvID, Type: routing.ProviderServerAgent, Port: 8081 + i, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication: %v", err)
+		}
+	}
+	child := func(id, appID, gateway, upstream string, head bool) {
+		t.Helper()
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: appID, GatewayModelName: gateway, AppModelName: upstream, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", id, err)
+		}
+		if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-" + id, MappingID: id, Binary: "/opt/bin/server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, ClusterEnabled: head, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", id, err)
+		}
+	}
+	// "big" exists only as a head. "shared" as a head (sorted first, map-a)
+	// and a plain text child (map-b).
+	child("map-big", "app-srv-head", "big", "up-big", true)
+	child("map-a-shared", "app-srv-head", "shared", "up-shared-head", true)
+	child("map-b-shared", "app-srv-text", "shared", "up-shared-text", false)
+
+	fake := newColdLister(nil)
+	w := newModelWarmer(&Server{Provider: fake, Routes: mem})
+
+	w.Warm(ctx, "big")
+	waitWarmIdle(t, w, "big")
+	if got := fake.streamedModels(); len(got) != 0 {
+		t.Fatalf("streamed = %v, want no warm of a cluster head", got)
+	}
+
+	w.Warm(ctx, "shared")
+	waitWarmIdle(t, w, "shared")
+	if got := fake.streamedModels(); len(got) != 1 || got[0] != "up-shared-text" {
+		t.Fatalf("streamed = %v, want exactly [up-shared-text] (the sibling that is no head)", got)
+	}
+}

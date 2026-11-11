@@ -355,7 +355,7 @@ func newRouter(m managerPort) *router {
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// M9: every control path answers one method -- GET, or POST for
-	// /ensure/{model} and /stop/{model}; a different method on one of these paths falls
+	// /ensure/{model}, /stop/{model}, /live/{model} and /rpc/...; a different method on one of these paths falls
 	// through to the model-routed proxy instead (the ordinary "everything
 	// else" case), rather than getting the control treatment regardless
 	// of method.
@@ -375,6 +375,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveStop(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, livePathPrefix):
 		rt.serveLive(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, rpcPathPrefix):
+		rt.serveRPC(w, r)
 	default:
 		rt.serveProxy(w, r)
 	}
@@ -423,7 +425,8 @@ func (rt *router) serveRunning(w http.ResponseWriter, _ *http.Request) {
 // and model listing both read this endpoint expecting the full set. A spec is
 // listed once, by its base name, however many instances it runs (#340): an
 // instance is a process of a model, not a model of its own, so only the
-// instance-0 rows -- which every spec has -- are listed.
+// instance-0 rows -- which every spec has -- are listed. An rpc_server member
+// serves no model and is never listed.
 type modelEntry struct {
 	ID     string `json:"id"`
 	Object string `json:"object"`
@@ -441,7 +444,7 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	}
 	data := make([]modelEntry, 0, len(statuses))
 	for _, st := range statuses {
-		if st.Instance != 0 {
+		if st.Instance != 0 || st.Kind == SpecKindRPCServer {
 			continue
 		}
 		data = append(data, modelEntry{ID: st.Model, Object: "model"})
@@ -713,6 +716,14 @@ type ensureResponse struct {
 //     that leaves while the child is starting gets an error and so nothing to
 //     release; the start still comes up with nothing in flight, and the idle
 //     policy applies to it as after any request.
+//   - The header ClusterStartHeader with the value "1" makes the call the
+//     gateway's cluster start (Manager.EnsureClusterHead), the only call that
+//     starts a cold cluster head: it probes the head's member endpoints first
+//     and answers 503 runtime.cluster_member_unreachable when one stays
+//     unreachable for the head's startup bound, exec'ing nothing. Without the
+//     header a cold head is refused with 503 runtime.cluster_not_ready, as a
+//     proxied request for it is. For any other model the header changes
+//     nothing.
 //   - release() runs BEFORE the answer is written, since nothing is proxied:
 //     the start counts as one use (LastUsed is stamped) and leaves nothing in
 //     flight. The answer is written only while the client is still there.
@@ -728,7 +739,11 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(w, err)
 		return
 	}
-	_, release, err := rt.m.EnsureRunning(r.Context(), model)
+	ensure := rt.m.EnsureRunning
+	if heads, ok := rt.m.(clusterHeadPort); ok && r.Header.Get(ClusterStartHeader) == "1" {
+		ensure = heads.EnsureClusterHead
+	}
+	_, release, err := ensure(r.Context(), model)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
@@ -739,6 +754,19 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 	}
 	refreshWriteDeadline(w)
 	writeJSON(w, http.StatusOK, ensureResponse{Status: "running"})
+}
+
+// clusterHeadPort is the part of *Manager the cluster start needs, asserted
+// per request like stopPort; a manager without it serves a marked ensure as an
+// unmarked one.
+type clusterHeadPort interface {
+	EnsureClusterHead(ctx context.Context, model string) (endpoint string, release func(), err error)
+}
+
+// conditionalStopPort is the part of *Manager the conditional stop (POST
+// /stop/{model}?if_evictable=1) needs, asserted per request like stopPort.
+type conditionalStopPort interface {
+	StopIfEvictable(ctx context.Context, model string) (StopState, error)
 }
 
 // stopPort is the part of *Manager that POST /stop/{model} needs. It is kept
@@ -777,6 +805,12 @@ type stopResponse struct {
 // the protected floor, 409 runtime.instance_not_highest while a higher
 // instance of the spec has a process, or 502 runtime.upstream_gone for any
 // other failure, such as the manager shutting down.
+//
+// With ?if_evictable=1 it is the conditional stop (Manager.StopIfEvictable):
+// the same answers, plus 409 runtime.instance_busy when the agent's own
+// eviction rule would not let the instance go right now. A manager that cannot
+// stop conditionally refuses it the same way rather than stopping
+// unconditionally.
 func (rt *router) serveStop(w http.ResponseWriter, r *http.Request) {
 	model := strings.TrimPrefix(r.URL.Path, stopPathPrefix)
 	stopper, ok := rt.m.(stopPort)
@@ -789,12 +823,142 @@ func (rt *router) serveStop(w http.ResponseWriter, r *http.Request) {
 		writeBodyReadError(w, err)
 		return
 	}
-	state, err := stopper.Stop(r.Context(), model)
+	stop := stopper.Stop
+	if v := r.URL.Query().Get("if_evictable"); v == "1" || v == "true" {
+		stop = refuseConditionalStop
+		if cond, ok := rt.m.(conditionalStopPort); ok {
+			stop = cond.StopIfEvictable
+		}
+	}
+	state, err := stop(r.Context(), model)
 	if err != nil {
 		writeSentinelError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, stopResponse{State: state})
+}
+
+// refuseConditionalStop answers a conditional stop a manager cannot judge.
+func refuseConditionalStop(context.Context, string) (StopState, error) {
+	return "", fmt.Errorf("%w: this agent cannot stop conditionally", ErrInstanceBusy)
+}
+
+// rpcPathPrefix is the path prefix of the member routes, POST
+// /rpc/{action}/{specID}: everything after the action's "/" is the member's
+// spec ID.
+const rpcPathPrefix = "/rpc/"
+
+// memberPort is the part of *Manager the member routes need, asserted per
+// request like stopPort, so the managerPort fakes of the other routes need not
+// grow it; a manager without it manages no member.
+type memberPort interface {
+	EnsureMember(ctx context.Context, specID string, reserve time.Duration) error
+	ReleaseMember(ctx context.Context, specID string) error
+	StopMember(ctx context.Context, specID string, force bool) (StopState, error)
+	PurgeMemberCache(ctx context.Context, specID string) error
+}
+
+// memberResponse is the success body of every member route.
+type memberResponse struct {
+	State string `json:"state"`
+}
+
+// codeBadRequest answers a member route whose query cannot be used.
+const codeBadRequest = "runtime.bad_request"
+
+// serveRPC handles the member routes, which address an rpc_server member by
+// its spec ID -- a member has no upstream model, so the model routes never
+// reach it, and these never reach a model spec:
+//
+//   - POST /rpc/ensure/{specID}?reserve_seconds=N starts the member and
+//     answers 200 {"state":"running"} once it accepts TCP connections, with a
+//     reservation of N seconds armed (Manager.EnsureMember). One long call like
+//     POST /ensure/{model}, with the same refusals: 503 admission_blocked, 502
+//     not_permitted or start_failed, 504 start_timeout. N is a whole number
+//     from 0 (no reservation, the default) to a day; anything else is 400
+//     runtime.bad_request, refused before anything starts.
+//   - POST /rpc/release/{specID} ends the member's reservation and hold and
+//     answers 200 {"state":"released"} (Manager.ReleaseMember).
+//   - POST /rpc/stop/{specID}[?force=1] stops the member with the answers of
+//     POST /stop/{model}, and 409 runtime.cluster_member_in_use while it is
+//     held or reserved unless forced (Manager.StopMember).
+//   - POST /rpc/purge-cache/{specID} removes the member's tensor cache for its
+//     head and answers 200 {"state":"purged"}, 409
+//     runtime.cluster_member_in_use while it is held or reserved, or 500
+//     runtime.cache_purge_failed when the filesystem refuses
+//     (Manager.PurgeMemberCache).
+//
+// An unknown action, an empty or unknown spec ID, a spec that is not a member,
+// and a router without a manager all answer 404 runtime.model_not_managed. Any
+// body is read and discarded, as on the other control routes.
+func (rt *router) serveRPC(w http.ResponseWriter, r *http.Request) {
+	action, specID, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, rpcPathPrefix), "/")
+	members, ok := rt.m.(memberPort)
+	if !ok || specID == "" {
+		writeSentinelError(w, ErrModelNotManaged)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		writeBodyReadError(w, err)
+		return
+	}
+	switch action {
+	case "ensure":
+		rt.serveMemberEnsure(w, r, members, specID)
+	case "release":
+		rt.answerMember(w, members.ReleaseMember(r.Context(), specID), "released")
+	case "stop":
+		force := r.URL.Query().Get("force")
+		state, err := members.StopMember(r.Context(), specID, force == "1" || force == "true")
+		rt.answerMember(w, err, string(state))
+	case "purge-cache":
+		rt.answerMember(w, members.PurgeMemberCache(r.Context(), specID), "purged")
+	default:
+		writeSentinelError(w, ErrModelNotManaged)
+	}
+}
+
+// serveMemberEnsure is POST /rpc/ensure/{specID} (see serveRPC).
+func (rt *router) serveMemberEnsure(w http.ResponseWriter, r *http.Request, members memberPort, specID string) {
+	reserve, ok := parseReserveSeconds(r.URL.Query().Get("reserve_seconds"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, codeBadRequest,
+			"reserve_seconds must be a whole number of seconds from 0 to "+strconv.Itoa(int(maxMemberReservation/time.Second)))
+		return
+	}
+	if err := members.EnsureMember(r.Context(), specID, reserve); err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	if r.Context().Err() != nil {
+		return // the client left as the start succeeded; nobody reads an answer
+	}
+	refreshWriteDeadline(w)
+	writeJSON(w, http.StatusOK, memberResponse{State: "running"})
+}
+
+// parseReserveSeconds reads reserve_seconds: absent is no reservation, and a
+// value must be a whole number of seconds within maxMemberReservation.
+func parseReserveSeconds(v string) (time.Duration, bool) {
+	if v == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > int(maxMemberReservation/time.Second) {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
+}
+
+// answerMember writes a member route's answer: the refusal err maps to, or 200
+// with state.
+func (rt *router) answerMember(w http.ResponseWriter, err error, state string) {
+	if err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, memberResponse{State: state})
 }
 
 // serveLive handles POST /live/{model}: the full-duplex relay to a managed
@@ -1894,7 +2058,7 @@ const (
 )
 
 // sentinelCode maps a Manager error to the design doc §6.5 stable wire code
-// and HTTP status. Any error that is not one of the nine named sentinels
+// and HTTP status. Any error that is not one of the named sentinels
 // (including a raw upstream connection failure or non-2xx status, which
 // carry no Manager sentinel of their own) falls through to
 // runtime.upstream_gone/502 -- the same code the design doc assigns to "the
@@ -1910,11 +2074,19 @@ const (
 // or starting), and a request whose address moved while it was admitted
 // (errAddressMoved); runtime.instance_demand_unknown answers an ensure of a
 // burst instance whose demand is not known yet, which the gateway retries
-// shortly, by which time a sibling has usually been measured. The two stop
-// refusals (POST /stop/{model}) are 409s as well: the stop conflicts with the
+// shortly, by which time a sibling has usually been measured. The stop
+// refusals (POST /stop/{model}, POST /rpc/stop/{specID}) are 409s as well: the stop conflicts with the
 // spec's protected floor (runtime.instance_protected) or with the ordering of
 // its instances (runtime.instance_not_highest), and the operator resolves either
-// by changing the spec or stopping the higher instance first.
+// by changing the spec or stopping the higher instance first. A member's
+// (runtime.cluster_member_in_use) conflicts with the head holding it: the
+// cluster is stopped head first. runtime.cache_purge_failed (500) is the agent's
+// own filesystem refusing to remove a member cache. The cluster refusals are
+// 503s, "not now, the gateway orchestrates and retries": a cold cluster head
+// asked for without the cluster start (runtime.cluster_not_ready), and a
+// cluster start whose member probe gave up (runtime.cluster_member_unreachable).
+// A conditional stop the eviction rule refuses is a 409
+// (runtime.instance_busy): the stop conflicts with the instance's use.
 func sentinelCode(err error) (code string, status int) {
 	switch {
 	case errors.Is(err, ErrModelNotManaged):
@@ -1935,6 +2107,16 @@ func sentinelCode(err error) (code string, status int) {
 		return "runtime.instance_protected", http.StatusConflict
 	case errors.Is(err, ErrInstanceNotHighest):
 		return "runtime.instance_not_highest", http.StatusConflict
+	case errors.Is(err, ErrMemberInUse):
+		return "runtime.cluster_member_in_use", http.StatusConflict
+	case errors.Is(err, ErrCachePurgeFailed):
+		return "runtime.cache_purge_failed", http.StatusInternalServerError
+	case errors.Is(err, ErrClusterNotReady):
+		return "runtime.cluster_not_ready", http.StatusServiceUnavailable
+	case errors.Is(err, ErrClusterMemberUnreachable):
+		return codeClusterMemberUnreach, http.StatusServiceUnavailable
+	case errors.Is(err, ErrInstanceBusy):
+		return "runtime.instance_busy", http.StatusConflict
 	default:
 		return codeUpstreamGone, http.StatusBadGateway
 	}

@@ -14,11 +14,13 @@ import (
 
 // runtimeSpecParityRows is how many agent_runtime_specs rows the column-parity
 // fixture seeds, computed the same way as applicationParityRows: the readers
-// carry FIVE integer-boolean columns (enabled, pinned, set_visible_devices,
-// responses_live_timings_enabled, replicable), two same-typed columns are only
+// carry SEVEN integer-boolean columns (enabled, pinned, set_visible_devices,
+// responses_live_timings_enabled, replicable, cluster_enabled,
+// lan_exposure_ack), two same-typed columns are only
 // distinguishable by value if they differ in at least one seeded row, so each
-// needs its own DISTINCT pattern. With r rows there are 2^r patterns, so r must
-// satisfy 2^r >= 5 -- three rows suffice (2^3 = 8 >= 5).
+// needs its own DISTINCT, non-empty pattern. With r rows there are 2^r - 1
+// non-empty patterns, so r must satisfy 2^r - 1 >= 7 -- three rows suffice
+// (2^3 - 1 = 7), with no pattern to spare.
 const runtimeSpecParityRows = 3
 
 // runtimeSpecParityBools is the bit-pattern table, one row per integer-boolean
@@ -31,12 +33,14 @@ const runtimeSpecParityRows = 3
 // fixture existed, TestRoutingStoreRuntimeSpecs flipped ONLY
 // responses_live_timings_enabled and left the others true in every row, so a
 // swap among those was invisible.
-var runtimeSpecParityBools = [5][runtimeSpecParityRows]bool{
+var runtimeSpecParityBools = [7][runtimeSpecParityRows]bool{
 	{true, true, false},  // enabled
 	{false, true, true},  // pinned
 	{false, false, true}, // set_visible_devices
 	{true, false, false}, // responses_live_timings_enabled
 	{true, false, true},  // replicable
+	{false, true, false}, // cluster_enabled
+	{true, true, true},   // lan_exposure_ack
 }
 
 // runtimeSpecParityBoolNames names the runtimeSpecParityBools rows in scan
@@ -44,6 +48,7 @@ var runtimeSpecParityBools = [5][runtimeSpecParityRows]bool{
 // shared by the distinguishability guard and the schema-coverage guard.
 var runtimeSpecParityBoolNames = []string{
 	"enabled", "pinned", "set_visible_devices", "responses_live_timings_enabled", "replicable",
+	"cluster_enabled", "lan_exposure_ack",
 }
 
 // TestConformanceRuntimeSpecReadersAgreeOnEveryColumn is the agent_runtime_specs
@@ -115,6 +120,14 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 			{routing.APIFlavorAnthropic},
 		}
 
+		// The RPC-cluster string columns carry values distinct per row, none
+		// of them the DDL default, so an omitted column cannot read back as
+		// the default it would fall back to.
+		memberModes := [runtimeSpecParityRows]string{"manual", "automatic", "manual"}
+		clusterNetworks := [runtimeSpecParityRows]string{"lan", "mesh", "lan"}
+		rpcTransports := [runtimeSpecParityRows]string{"relay", "direct", "relay"}
+		deviceBackends := [runtimeSpecParityRows]string{"cuda", "vulkan", "rocm"}
+
 		want := make([]routing.RuntimeSpec, 0, runtimeSpecParityRows)
 		for i := 0; i < runtimeSpecParityRows; i++ {
 			idx := strconv.Itoa(i)
@@ -157,6 +170,12 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				MaxInstances:                8 + i,
 				InstanceParallelism:         4 + i,
 				StartupMeasuredMS:           45000 + int64(i),
+				ClusterEnabled:              runtimeSpecParityBools[5][i],
+				MemberMode:                  memberModes[i],
+				ClusterNetwork:              clusterNetworks[i],
+				RPCTransport:                rpcTransports[i],
+				LANExposureAck:              runtimeSpecParityBools[6][i],
+				DeviceBackend:               deviceBackends[i],
 				APIFlavors:                  apiFlavors[i],
 				ResponsesMode:               responsesModes[i],
 				MessagesMode:                messagesModes[i],
@@ -254,10 +273,10 @@ func TestAgentRuntimeSpecsSchemaColumnsAllCovered(t *testing.T) {
 			seeded: []string{
 				"admin_state", "admission_wait_timeout_seconds", "api_flavors", "api_token",
 				"api_token_header", "api_token_header_source", "api_token_mode", "args", "binary_path",
-				"config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
-				"id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
-				"max_instances", "messages_mode", "metrics_path", "min_instances", "ram_estimate_mb",
-				"ram_measured_mb", "responses_mode", "startup_measured_ms", "startup_timeout_seconds",
+				"cluster_network", "config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
+				"device_backend", "id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
+				"max_instances", "member_mode", "messages_mode", "metrics_path", "min_instances", "ram_estimate_mb",
+				"ram_measured_mb", "responses_mode", "rpc_transport", "startup_measured_ms", "startup_timeout_seconds",
 				"type", "updated_at", "visible_devices_mode", "work_dir",
 			},
 			ignored: map[string]string{},

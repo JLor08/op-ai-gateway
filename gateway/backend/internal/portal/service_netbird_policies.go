@@ -366,6 +366,7 @@ func (s *Service) reconcileServerPolicy(ctx context.Context, serverID string) {
 		slog.Debug("policy reconcile: list policies", "server_id", serverID, "error", err)
 		return
 	}
+	s.recordDefaultPolicyState(ctx, policies)
 	s.reconcileServerPolicyWith(ctx, ncfg, set, server, policies)
 }
 
@@ -957,6 +958,7 @@ func (s *Service) reconcileAllServerPolicies(ctx context.Context) {
 		slog.Debug("reconcile policies: list servers", "error", err)
 		return
 	}
+	s.recordDefaultPolicyState(ctx, policies)
 	for _, server := range servers {
 		if server.NetbirdEnabled {
 			s.reconcileServerPolicyWith(ctx, ncfg, set, server, policies)
@@ -970,6 +972,8 @@ func (s *Service) reconcileAllServerPolicies(ctx context.Context) {
 	// Fleet-wide ICMP ping-allow policies (same snapshot, same lock).
 	s.reconcilePingGatewayPolicyWith(ctx, ncfg, set, servers, policies)
 	s.reconcilePingServersPolicyWith(ctx, ncfg, set, servers, policies)
+	// Per-member RPC cluster policies (same snapshot, same lock).
+	s.reconcileRPCPoliciesWith(ctx, ncfg, servers, policies)
 }
 
 // netbirdPolicyToRequest converts a read-shape Policy back into a write-shape
@@ -1003,7 +1007,8 @@ func netbirdPolicyToRequest(p netbird.Policy) netbird.PolicyRequest {
 // denyOn is true the Default policy is DISABLED (so only explicit allow policies
 // permit traffic); when false it is re-ENABLED. Best-effort/void: it lists policies,
 // finds "Default", and re-PUTs it only when its enabled state actually needs to flip
-// (no-op when already in the target state or the policy is absent).
+// (no-op when already in the target state or the policy is absent). The Default
+// policy's final state is recorded for the cluster derivation.
 func (s *Service) applyDenyByDefault(ctx context.Context, ncfg netbird.Config, denyOn bool) {
 	s.netbird.policyMu.Lock()
 	defer s.netbird.policyMu.Unlock()
@@ -1017,16 +1022,21 @@ func (s *Service) applyDenyByDefault(ctx context.Context, ncfg netbird.Config, d
 			continue
 		}
 		want := !denyOn // deny ON => Default disabled
-		if policies[i].Enabled == want {
-			return
+		if policies[i].Enabled != want {
+			req := netbirdPolicyToRequest(policies[i])
+			req.Enabled = want
+			if _, err := netbird.UpdatePolicy(ctx, ncfg, netbirdCallTimeout, policies[i].ID, req); err != nil {
+				slog.Debug("deny-by-default apply: update", "error", err)
+				// The flip failed: what the snapshot showed is still true.
+				s.recordDefaultPolicyState(ctx, policies)
+				return
+			}
 		}
-		req := netbirdPolicyToRequest(policies[i])
-		req.Enabled = want
-		if _, err := netbird.UpdatePolicy(ctx, ncfg, netbirdCallTimeout, policies[i].ID, req); err != nil {
-			slog.Debug("deny-by-default apply: update", "error", err)
-		}
+		// Only the final state is recorded, never the pre-flip one.
+		s.storeDefaultPolicyState(ctx, defaultPolicyState(want))
 		return
 	}
+	s.recordDefaultPolicyState(ctx, policies)
 }
 
 // enforceDenyByDefault disables NetBird's catch-all "Default" policy (best-effort).

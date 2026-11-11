@@ -87,6 +87,14 @@ func (s *Server) handlePortalMappingItem(w http.ResponseWriter, r *http.Request)
 		s.handlePortalMappingRuntimeSpec(w, r, token, parts[0])
 		return
 	}
+	if len(parts) == 3 && parts[1] == "runtime" && parts[2] == "cluster-candidates" && parts[0] != "" {
+		s.handlePortalClusterCandidates(w, r, token, parts[0])
+		return
+	}
+	if len(parts) == 5 && parts[1] == "runtime" && parts[2] == "cluster-members" && parts[4] == "reset-usage" && parts[0] != "" && parts[3] != "" {
+		s.handlePortalClusterMemberResetUsage(w, r, token, parts[0], parts[3])
+		return
+	}
 	if len(parts) == 3 && parts[1] == "runtime" && parts[0] != "" {
 		s.handlePortalMappingRuntimeAction(w, r, token, parts[0], parts[2])
 		return

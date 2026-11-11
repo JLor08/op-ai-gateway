@@ -743,6 +743,13 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	if proxyPortTaken {
 		return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
 	}
+	if memberPort, err := s.rpcMemberPortTaken(ctx, server.ID, port); err != nil {
+		return ApplicationDTO{}, err
+	} else if memberPort {
+		// The store's unique (server_id, port) sees applications only; an
+		// llama.cpp RPC cluster member on the server holds this port.
+		return ApplicationDTO{}, ErrApplicationConflict
+	}
 	if appType == routing.ProviderServerAgent {
 		exists, err := s.serverAgentApplicationExistsOnServer(ctx, server.ID, "")
 		if err != nil {
@@ -876,6 +883,11 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	// exist). Fired BEFORE reconcileServerPolicy so a slow NetBird round trip
 	// cannot delay the push this fix exists to make prompt.
 	s.notifyRuntimeChangedForApplication(server.ID, "", app.Type)
+	// A server_agent application is what a cluster member's document needs at
+	// all, so a head withheld for a member without one can now be pushed.
+	if app.Type == routing.ProviderServerAgent {
+		s.NotifyClustersOfServer(ctx, server.ID)
+	}
 	// Best-effort: a new application changes the server's active port set, so its
 	// NetBird access policy (if managed) may need to grow. reconcileServerPolicy
 	// gates internally on the module + policy management and never errors.
@@ -903,6 +915,16 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// notifyRuntimeChangedForApplication -- retyping AWAY from server_agent
 	// must notify too).
 	previousType := app.Type
+	// The server's clusters, read before a retype away from server_agent
+	// hides its own heads from clusterServersOfServer: a server_agent
+	// application decides whether the server's member processes and heads can
+	// be pushed, so a retype either way notifies every server of them. A
+	// retype TO server_agent is read after the write instead, once the
+	// application's heads are visible; one read covers every case.
+	var clusterServers []string
+	if previousType == routing.ProviderServerAgent {
+		clusterServers = s.clusterServersOfServer(ctx, server.ID)
+	}
 	// Captured for the same reason, and read only by the warning below: once
 	// applyProxyExclusion has run, the port it released is gone from app.
 	previousProxyListenPort := app.ProxyListenPort
@@ -1009,6 +1031,13 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		}
 		if proxyPortTaken {
 			return ApplicationDTO{}, ErrApplicationProxyListenPortConflict
+		}
+	}
+	if req.Port != nil && port != app.Port {
+		if memberPort, err := s.rpcMemberPortTaken(ctx, server.ID, port); err != nil {
+			return ApplicationDTO{}, err
+		} else if memberPort {
+			return ApplicationDTO{}, ErrApplicationConflict
 		}
 	}
 	// The same "at most one server_agent application per server" invariant the
@@ -1336,6 +1365,18 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// see notifyRuntimeChangedForApplication for why over-notifying is the
 	// deliberate choice here.
 	s.notifyRuntimeChangedForApplication(server.ID, previousType, app.Type)
+	if previousType != routing.ProviderServerAgent && app.Type == routing.ProviderServerAgent {
+		clusterServers = s.clusterServersOfServer(ctx, server.ID)
+	}
+	for _, id := range clusterServers {
+		s.notifyRuntimeChanged(id)
+	}
+	// Only a server that takes part in a cluster has RPC grants for this
+	// write to move; the pass waits on NetBird, which no other application
+	// edit should.
+	if len(clusterServers) > 0 {
+		s.reconcileRPCPolicies(ctx)
+	}
 	// Best-effort: a port/status change may alter the server's active port set, so
 	// its NetBird access policy (if managed) may need to be updated. Gates
 	// internally on the module + policy management and never errors.
@@ -1349,8 +1390,22 @@ func (s *Service) DeleteApplication(ctx context.Context, principal auth.Token, a
 	if err != nil {
 		return err
 	}
+	// Read before the delete, which cascades the server's cluster heads: their
+	// member servers' documents lose the members derived from them, and a
+	// server_agent application is what a member's document needs at all.
+	clusterServers := s.clusterServersOfServer(ctx, server.ID)
 	if err := s.routes.DeleteApplication(ctx, app.ID); err != nil {
 		return err
+	}
+	if app.Type == routing.ProviderServerAgent {
+		for _, id := range clusterServers {
+			if id != server.ID {
+				s.notifyRuntimeChanged(id)
+			}
+		}
+		if len(clusterServers) > 0 {
+			s.reconcileRPCPolicies(ctx)
+		}
 	}
 	// Best-effort: deleting the server_agent application empties the server's
 	// runtime-config document (AgentRuntimeConfig's "no server_agent
@@ -1759,7 +1814,8 @@ func (s *Service) proxyListenPortTakenOnServer(ctx context.Context, serverID str
 			return true, nil
 		}
 	}
-	return false, nil
+	// An llama.cpp RPC cluster member on the server listens there too.
+	return s.rpcMemberPortTaken(ctx, serverID, port)
 }
 
 // serverAgentApplicationExistsOnServer reports whether serverID already has a
@@ -2668,8 +2724,22 @@ func (s *Service) DeleteMapping(ctx context.Context, principal auth.Token, mappi
 	if err != nil {
 		return err
 	}
+	// A cluster head's spec cascades with the mapping, and with it the member
+	// processes derived into each member server's document.
+	var clusterServers []string
+	if spec, ok, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID); err == nil && ok && spec.ClusterEnabled {
+		clusterServers = s.clusterServers(ctx, spec.ID)
+	}
 	if err := s.routes.DeleteMapping(ctx, mapping.ID); err != nil {
 		return err
+	}
+	for _, id := range clusterServers {
+		if id != server.ID {
+			s.notifyRuntimeChanged(id)
+		}
+	}
+	if len(clusterServers) > 0 {
+		s.reconcileRPCPolicies(ctx)
 	}
 	// Best-effort, after the successful store write: the store cascades the
 	// mapping's runtime spec, its GPU rows and its co-residency pairs, so

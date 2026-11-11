@@ -4,6 +4,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  CLUSTER_SPEC_REFRESH_MS,
   OVERRIDE_WRITE_TIMEOUT_MS,
   RESTART_STOP_TIMEOUT_MS,
   RESTART_VANISH_GRACE_MS,
@@ -30,6 +31,7 @@ import type {
   RuntimeReport,
   RuntimeReportContent,
   RuntimeSpec,
+  ServerBinary,
   RuntimeLogBatch,
   RuntimeLogState,
   RuntimeStatus,
@@ -331,6 +333,8 @@ function renderSection(
     benchmarkStatus?: PortalApi['benchmarkStatus'];
     probeMappingContext?: PortalApi['probeMappingContext'];
     probeMappingVram?: PortalApi['probeMappingVram'];
+    // The cluster head editor's per-member usage reset.
+    resetClusterMemberUsage?: PortalApi['resetClusterMemberUsage'];
     // The launch-spec form reads a mapping's benchmark history to find the
     // newest applicable VRAM measurement for its per-GPU apply affordance.
     mappingBenchmarks?: PortalApi['mappingBenchmarks'];
@@ -374,6 +378,8 @@ function renderSection(
     gpuBudgetsFailing?: boolean;
     gpuBudgetsFailsOnCall?: number;
     hardware?: HardwareResponse;
+    // The server's binary inventory (the Binaries tab and the pickers).
+    binaries?: ServerBinary[];
     runtimeMaxProcesses?: number;
     // Task 22: the file-mode/feature-negotiation report, and the live SSE.
     report?: RuntimeReport;
@@ -648,6 +654,22 @@ function renderSection(
     benchmarkMapping: vi.fn(async () => idleBenchmark),
     mappingBenchmarks: opts.mappingBenchmarks ?? vi.fn(async () => []),
     subscribeBenchmark: vi.fn(() => () => {}),
+    // The RPC tab's manual member specs and its consent picker.
+    rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+    serverAdminGroupCandidates: vi.fn(async () => []),
+    createRPCMemberSpec: vi.fn(async () => ({}) as never),
+    updateRPCMemberSpec: vi.fn(async () => ({}) as never),
+    deleteRPCMemberSpec: vi.fn(async () => undefined),
+    // The Binaries tab and the binary pickers.
+    serverBinaries: vi.fn(async () => ({ data: opts.binaries ?? [] })),
+    createServerBinary: vi.fn(async () => ({}) as never),
+    updateServerBinary: vi.fn(async () => ({}) as never),
+    deleteServerBinary: vi.fn(async () => undefined),
+    // The cluster head editor's member picker.
+    clusterCandidates: vi.fn(async () => ({ data: [] })),
+    resetClusterMemberUsage:
+      opts.resetClusterMemberUsage ??
+      vi.fn(async (mappingId: string) => storedSpecs[mappingId] as RuntimeSpec),
   };
 
   const view = render(
@@ -1553,6 +1575,17 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       benchmarkMapping: vi.fn(async () => idleBenchmark),
       mappingBenchmarks: vi.fn(async () => []),
       subscribeBenchmark: vi.fn(() => () => {}),
+      rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+      serverAdminGroupCandidates: vi.fn(async () => []),
+      createRPCMemberSpec: vi.fn(async () => ({}) as never),
+      updateRPCMemberSpec: vi.fn(async () => ({}) as never),
+      deleteRPCMemberSpec: vi.fn(async () => undefined),
+      serverBinaries: vi.fn(async () => ({ data: [] })),
+      createServerBinary: vi.fn(async () => ({}) as never),
+      updateServerBinary: vi.fn(async () => ({}) as never),
+      deleteServerBinary: vi.fn(async () => undefined),
+      clusterCandidates: vi.fn(async () => ({ data: [] })),
+      resetClusterMemberUsage: vi.fn(async () => ({}) as never),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     };
@@ -3287,6 +3320,23 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // spec stored through a FORM save carries `[]`, one from an older fixture
     // carries nothing, and the override must restate exactly what it read.
     ...(spec.config_files !== undefined ? { config_files: spec.config_files } : {}),
+    // The cluster configuration rides the same way: an absent cluster_enabled
+    // would clear a head's membership. Its read view never travels back.
+    ...Object.fromEntries(
+      (
+        [
+          'device_backend',
+          'cluster_enabled',
+          'member_mode',
+          'cluster_network',
+          'rpc_transport',
+          'lan_exposure_ack',
+          'cluster_members',
+        ] as const
+      )
+        .filter((key) => spec[key] !== undefined)
+        .map((key) => [key, spec[key]]),
+    ),
   };
 }
 
@@ -3448,6 +3498,52 @@ describe('RuntimeAdminSection live status list', () => {
     );
     // Visible in the row itself, not hidden behind a hover-only tooltip.
     expect(screen.getByText('CUDA error: out of memory')).toBeInTheDocument();
+  });
+
+  // A lifecycle failure with a stable code reads as the code's label, so a
+  // cluster failure the agent reports in English still reaches the operator
+  // in the portal's language; the raw message stays in the tooltip.
+  it('labels a last error that carries a stable code', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          state: 'start_failed',
+          last_error: {
+            message: 'rpc member 10.0.0.2:50052 unreachable',
+            at: '2026-07-15T14:32:00Z',
+            exit_code: 1,
+            failures: 1,
+            code: 'runtime.cluster_member_unreachable',
+          },
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText(t.errorRuntimeClusterMemberUnreachable)).toBeInTheDocument();
+    expect(screen.queryByText('rpc member 10.0.0.2:50052 unreachable')).not.toBeInTheDocument();
+  });
+
+  it('shows the raw message of a last error whose code this build does not know', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          state: 'start_failed',
+          last_error: {
+            message: 'something new went wrong',
+            at: '2026-07-15T14:32:00Z',
+            exit_code: 1,
+            failures: 1,
+            code: 'runtime.some_future_code',
+          },
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    expect(await screen.findByText('something new went wrong')).toBeInTheDocument();
   });
 
   it('replaces the row set on every frame instead of appending', async () => {
@@ -4811,6 +4907,63 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     // separate part of the async file-mode load), so await it rather than read
     // it synchronously — a plain getByText races the render under CI load.
     expect(await screen.findByText(t.runtimeIneffectiveSpecs)).toBeInTheDocument();
+  });
+
+  it('offers a Binaries tab that also shows in file mode', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('tab', { name: t.binariesTab }));
+    expect(await screen.findByText(t.binariesEmpty)).toBeInTheDocument();
+    cleanup();
+    renderFileMode();
+    await screen.findByText(t.runtimeManagedLocally);
+    expect(screen.getByRole('tab', { name: t.binariesTab })).toBeInTheDocument();
+  });
+
+  it('fills the spec form binary from the server inventory and still takes free text', async () => {
+    renderSection({
+      binaries: [
+        {
+          path: '/opt/llama/llama-server',
+          kind: 'llama_server',
+          version: 'b1',
+          version_override: '',
+          effective_version: 'b1',
+          build: '',
+          commit: '',
+          version_source: 'agent',
+          source: 'agent',
+          allowed: true,
+          reported_at: '',
+        } satisfies ServerBinary,
+      ],
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const field = await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.mouseDown(field);
+    fireEvent.click(await screen.findByText('/opt/llama/llama-server'));
+    expect((field as HTMLInputElement).value).toBe('/opt/llama/llama-server');
+    fireEvent.change(field, { target: { value: '/somewhere/else' } });
+    expect((field as HTMLInputElement).value).toBe('/somewhere/else');
+  });
+
+  it('offers an RPC tab that renders the member settings, and hides it in file mode', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('tab', { name: t.rpcTab }));
+    expect(await screen.findByLabelText(t.rpcMemberEnabledLabel)).toBeInTheDocument();
+    cleanup();
+    renderFileMode();
+    await screen.findByText(t.runtimeManagedLocally);
+    expect(screen.queryByRole('tab', { name: t.rpcTab })).not.toBeInTheDocument();
+  });
+
+  it('feeds the RPC tab from its own status stream instead of opening a second one', async () => {
+    const { fakeApi, stream } = renderSection({
+      statusRows: [makeStatus({ spec_id: 'rpcm_live', kind: 'rpc_server' })],
+    });
+    fireEvent.click(await screen.findByRole('tab', { name: t.rpcTab }));
+    expect(await screen.findByTestId('rpc-status-rpcm_live')).toBeInTheDocument();
+    expect(fakeApi.subscribeRuntimeStatus).toHaveBeenCalledTimes(1);
+    expect(stream.subscribedServerIds).toHaveLength(1);
   });
 
   it('turns every edit affordance off: no spec form, no co-residency editor, no budget form, no overrides', async () => {
@@ -7666,6 +7819,8 @@ describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
       t.runtimeMappingTab,
       t.runtimeSpecs,
       t.runtimeCoresidency,
+      t.rpcTab,
+      t.binariesTab,
       t.runtimeLimits,
       t.runtimeLiveStatus,
     ]);
@@ -9839,7 +9994,9 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, 
     const rendered = renderSection({ application: { ...application, ...parent } });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
-    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), { target: { value: binary } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: binary },
+    });
     return rendered;
   }
 
@@ -11531,6 +11688,44 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     expect(screen.queryByText(t.runtimeStartedRunning('Alpha #2'))).not.toBeInTheDocument();
   });
 
+  describe('on a cluster head', () => {
+    const clusterHead = () => fullSpec({ pinned: false, cluster_enabled: true });
+
+    async function clickStop() {
+      const view = renderActions([instanceRow(0)], clusterHead());
+      await openStatusTab();
+      await waitForRowActions('4100', t.runtimeStop);
+      fireEvent.click(inRowWith('4100').getByRole('button', { name: t.runtimeStop }));
+      return view;
+    }
+
+    it('asks first, offers stopping the members (off by default) and sends a plain stop', async () => {
+      const { fakeApi } = await clickStop();
+      const dialog = await screen.findByRole('dialog');
+      expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+      const box = within(dialog).getByRole('checkbox', { name: t.runtimeStopMembersToo });
+      expect(box).not.toBeChecked();
+      fireEvent.click(within(dialog).getByRole('button', { name: t.runtimeStop }));
+      await waitFor(() => expect(fakeApi.stopRuntime).toHaveBeenCalledTimes(1));
+      expect(fakeApi.stopRuntime).toHaveBeenCalledWith('map_1', 0);
+    });
+
+    it('sends stop_members once the checkbox is ticked', async () => {
+      const { fakeApi } = await clickStop();
+      const dialog = await screen.findByRole('dialog');
+      fireEvent.click(within(dialog).getByRole('checkbox', { name: t.runtimeStopMembersToo }));
+      fireEvent.click(within(dialog).getByRole('button', { name: t.runtimeStop }));
+      await waitFor(() => expect(fakeApi.stopRuntime).toHaveBeenCalledWith('map_1', 0, true));
+    });
+
+    it('stops nothing when the dialog is cancelled', async () => {
+      const { fakeApi } = await clickStop();
+      const dialog = await screen.findByRole('dialog');
+      fireEvent.click(within(dialog).getByRole('button', { name: t.cancel }));
+      expect(fakeApi.stopRuntime).not.toHaveBeenCalled();
+    });
+  });
+
   it('Stop POSTs the mapping and the instance index and says it is stopping', async () => {
     const { fakeApi, putSpecs } = renderActions([instanceRow(0)], single());
     await openStatusTab();
@@ -12014,5 +12209,379 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
     // The 202's text says the instance starts and where its progress shows.
     expect(messages.en.runtimeStartedStarting('X')).toMatch(/starting/);
     expect(messages.en.runtimeStartedStarting('X')).toMatch(/status rows/);
+  });
+});
+
+// The spec PUT is a full document: a save without the cluster fields turns
+// the cluster off and clears its membership. Every save from the form must
+// therefore carry them, a member the caller cannot see included.
+describe('RuntimeAdminSection cluster head round trip', () => {
+  const visibleMember = {
+    position: 0,
+    server_id: 'srv_b',
+    server_name: 'Beta',
+    member_spec_id: '',
+    gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 7000 }],
+    threads: 8,
+    cache_enabled: true,
+    device_backend: 'cuda' as const,
+    ram_estimate_mb: 1024,
+    ram_measured_mb: 900,
+    stale: false,
+    port: 26001,
+    visible: true,
+  };
+  const hiddenMember = {
+    position: 1,
+    server_id: '',
+    server_name: '',
+    member_spec_id: '',
+    gpus: [],
+    threads: 0,
+    cache_enabled: false,
+    device_backend: '' as const,
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
+    stale: false,
+    port: 0,
+    visible: false,
+  };
+  function headSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
+    return makeSpec({
+      configured: true,
+      id: 'spec_head',
+      mapping_id: 'map_1',
+      enabled: true,
+      type: 'llama_cpp',
+      binary: '/opt/llama/llama-server',
+      args: ['-m', '/m.gguf', '--rpc', '${RPC_SERVERS}', '--device', '${DEVICES}'],
+      startup_timeout_seconds: 900,
+      device_backend: 'cuda',
+      cluster_enabled: true,
+      member_mode: 'automatic',
+      cluster_network: 'lan',
+      rpc_transport: 'direct',
+      lan_exposure_ack: true,
+      cluster_members: [visibleMember, hiddenMember],
+      cluster_network_default: '',
+      cluster_transport_default: 'direct',
+      cluster_warnings: ['cluster_member_gpu_overlap'],
+      cluster_vram_total_mb: 16000,
+      cluster_ram_total_mb: 4096,
+      cluster_totals_complete: false,
+      ...overrides,
+    });
+  }
+
+  async function openEditAndSave(spec: RuntimeSpec) {
+    const view = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return view;
+  }
+
+  it('keeps every cluster field when an unrelated field changes', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    expect(screen.getByText(t.clusterMemberHidden)).toBeInTheDocument();
+    expect(screen.getByText(t.clusterWarnGpuOverlap)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+      target: { value: '/srv/models' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body.work_dir).toBe('/srv/models');
+    expect(body).toMatchObject({
+      cluster_enabled: true,
+      member_mode: 'automatic',
+      cluster_network: 'lan',
+      rpc_transport: 'direct',
+      lan_exposure_ack: true,
+      device_backend: 'cuda',
+      cluster_members: [visibleMember, hiddenMember],
+    });
+    // The read-only cluster view never travels back.
+    expect(body).not.toHaveProperty('cluster_warnings');
+    expect(body).not.toHaveProperty('cluster_network_default');
+    expect(body).not.toHaveProperty('cluster_vram_total_mb');
+  });
+
+  const formingStatus = {
+    state: 'forming' as const,
+    phase: 'members_ready' as const,
+    members: [
+      { position: 0, state: 'ready' as const },
+      { position: 1, state: 'starting' as const },
+    ],
+  };
+
+  it('shows the cluster progress in the editor header and keeps it out of the PUT', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec({ cluster_status: formingStatus }));
+    const progress = screen.getByTestId('cluster-progress');
+    expect(within(progress).getByText(t.clusterPhaseMembersReady)).toBeInTheDocument();
+    expect(within(progress).getByText(`Beta: ${t.clusterMemberStateReady}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).not.toHaveProperty('cluster_status');
+  });
+
+  it('resets a member usage and shows the head the gateway answers', async () => {
+    const answer = headSpec({
+      cluster_vram_total_mb: 9000,
+      cluster_members: [
+        {
+          ...visibleMember,
+          ram_measured_mb: 0,
+          gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+        },
+        hiddenMember,
+      ],
+    });
+    const reset = vi.fn(async () => answer);
+    const view = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec() },
+      resetClusterMemberUsage: reset,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByTestId('cluster-totals')).toHaveTextContent('VRAM ≥ 16000 MB');
+
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Beta` }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('map_1', 'srv_b'));
+    await waitFor(() =>
+      expect(screen.getByTestId('cluster-totals')).toHaveTextContent('VRAM ≥ 9000 MB'),
+    );
+    expect(screen.queryByText(`${t.clusterMemberMeasured} 900 MB`)).not.toBeInTheDocument();
+    expect(view.putSpecs).toHaveLength(0);
+  });
+
+  it('shows the compact cluster status in the live-status cell', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head' })],
+    });
+    const cell = await screen.findByTestId('cluster-progress-compact');
+    expect(within(cell).getByText(t.clusterPhaseMembersReady)).toBeInTheDocument();
+  });
+
+  it('re-reads a head spec when its live state changes', async () => {
+    const { fakeApi, storedSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+    });
+    const cell = await screen.findByTestId('cluster-progress-compact');
+    expect(within(cell).getByText(t.clusterPhaseMembersReady)).toBeInTheDocument();
+    const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+
+    storedSpecs.map_1 = headSpec({
+      cluster_status: {
+        state: 'cooling_down',
+        members: [
+          { position: 0, state: 'ready' },
+          { position: 1, state: 'failed' },
+        ],
+      },
+    });
+    stream.push([makeStatus({ spec_id: 'spec_head', state: 'failed' })]);
+
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterStateCoolingDown),
+      ).toBeInTheDocument(),
+    );
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore + 1);
+  });
+
+  it('does not re-read a head spec for a frame that changes no state', async () => {
+    const { fakeApi, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+    });
+    await screen.findByTestId('cluster-progress-compact');
+    const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+    stream.push([makeStatus({ spec_id: 'spec_head', state: 'starting', in_flight: 2 })]);
+    await act(async () => {});
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore);
+  });
+
+  it('re-reads a head spec when the list is shown again', async () => {
+    const { storedSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+    });
+    await screen.findByTestId('cluster-progress-compact');
+    await openStatusTab();
+    storedSpecs.map_1 = headSpec({
+      cluster_status: { state: 'formed', phase: 'formed', members: [] },
+    });
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterPhaseFormed),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it('re-reads the head specs on an interval while the list is shown', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { fakeApi, storedSpecs } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+        statusRows: [makeStatus({ spec_id: 'spec_head', state: 'starting' })],
+      });
+      await screen.findByTestId('cluster-progress-compact');
+      storedSpecs.map_1 = headSpec({
+        cluster_status: { state: 'formed', phase: 'formed', members: [] },
+      });
+      const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CLUSTER_SPEC_REFRESH_MS);
+      });
+      expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore + 1);
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterPhaseFormed),
+        ).toBeInTheDocument(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops the cluster status from an override click body', async () => {
+    const { putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: headSpec({ cluster_status: formingStatus }) },
+      statusRows: [makeStatus({ spec_id: 'spec_head' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimePinRunning }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).not.toHaveProperty('cluster_status');
+  });
+
+  it('keeps the cluster on an override click', async () => {
+    const spec = headSpec({ cluster_vram_total_complete: false, cluster_ram_total_complete: true });
+    const { putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_head' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimePinRunning }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body).toMatchObject({
+      admin_state: 'force_running',
+      cluster_enabled: true,
+      lan_exposure_ack: true,
+      cluster_members: spec.cluster_members,
+    });
+    expect(body).not.toHaveProperty('cluster_warnings');
+    expect(body).not.toHaveProperty('cluster_transport_default');
+    expect(body).not.toHaveProperty('cluster_totals_complete');
+    expect(body).not.toHaveProperty('cluster_vram_total_complete');
+    expect(body).not.toHaveProperty('cluster_ram_total_complete');
+  });
+
+  it('sends a spec that is no head as cluster off', async () => {
+    const { putSpecs } = await openEditAndSave(
+      makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/llama-server' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toMatchObject({
+      cluster_enabled: false,
+      member_mode: 'automatic',
+      cluster_members: [],
+      device_backend: 'auto',
+    });
+  });
+
+  it('refuses a head save the gateway would refuse, before the round trip', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '-m\n/m.gguf' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorClusterRpcPlaceholderMissing)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('refuses the cluster placeholders on a spec that is no head', async () => {
+    const { putSpecs } = await openEditAndSave(
+      makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/llama-server' }),
+    );
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: '--rpc\n${RPC_SERVERS}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorClusterRpcPlaceholderWithoutCluster)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('refuses a head binary switch while a member is hidden, before the round trip', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama-b2/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorClusterHeadBinaryLocked)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('shows the cluster section for an Auto type that resolves to llama.cpp', async () => {
+    await openEditAndSave(
+      makeSpec({
+        configured: true,
+        mapping_id: 'map_1',
+        type: '',
+        effective_type: 'llama_cpp',
+        binary: '/usr/bin/llama-server',
+      }),
+    );
+    expect(screen.getByRole('checkbox', { name: t.clusterEnabledLabel })).toBeInTheDocument();
+  });
+
+  it('hides the cluster section for a spec that is no llama.cpp head', async () => {
+    await openEditAndSave(
+      makeSpec({
+        configured: true,
+        mapping_id: 'map_1',
+        type: '',
+        effective_type: 'vllm',
+        binary: '/usr/bin/vllm',
+      }),
+    );
+    expect(screen.queryByRole('checkbox', { name: t.clusterEnabledLabel })).not.toBeInTheDocument();
+  });
+
+  it('accepts the device placeholders as plain placeholders', async () => {
+    const { putSpecs } = await openEditAndSave(headSpec());
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: {
+        value:
+          '--rpc\n${RPC_SERVERS}\n--device\n${RPC_DEVICES},${DEVICES}\n-mmdev\n${FIRST_LOCAL_DEVICE}\n--alias\n${CUDA_FIRST_DEVICE}',
+      },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
   });
 });

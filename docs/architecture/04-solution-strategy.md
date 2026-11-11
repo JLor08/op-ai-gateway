@@ -54,6 +54,16 @@ so routing, TLS and the mesh surface are untouched, and the whole capability is
 negotiated by feature flag, so an agent without it behaves exactly as before.
 → [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md).
 
+The same machinery spans hosts for a model too large for one: a **llama.cpp RPC
+cluster** runs a head `llama-server` on one AI server and `ggml-rpc-server`
+members on others. The gateway configures the members, starts them before the
+head, holds them while the head uses them, accounts their memory and energy and
+narrows who can reach them, but never carries the tensor traffic itself; each
+member host's agent still owns admission and the bind of its own listener.
+Transport (direct or through an agent relay) and network (NetBird mesh or plain
+LAN) are chosen per cluster.
+→ [ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster).
+
 ## 4.5 Two auth modes, layered authorization
 
 Browsers authenticate with a **session cookie + CSRF header**; programs use

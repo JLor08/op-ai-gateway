@@ -221,6 +221,18 @@ func (_d *APIWithTracing) AuthorizeBenchmarkScope(ctx context.Context, t1 auth.T
 	return _d.API.AuthorizeBenchmarkScope(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) AuthorizeClusterMemberUsageReset(ctx context.Context, t1 auth.Token, s1 string, s2 string) (c2 routing.ClusterMember, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeClusterMemberUsageReset")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AuthorizeClusterMemberUsageReset(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) AuthorizeRunAsToken(ctx context.Context, t1 auth.Token, s1 string) (t2 auth.Token, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeRunAsToken")
 	defer span.End()
@@ -393,6 +405,30 @@ func (_d *APIWithTracing) ClaudeAliasTarget(ctx context.Context, t1 auth.Token, 
 	return _d.API.ClaudeAliasTarget(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) ClusterCandidates(ctx context.Context, t1 auth.Token, s1 string, s2 string) (ca1 []ClusterCandidateDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ClusterCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ClusterCandidates(ctx, t1, s1, s2)
+}
+
+func (_d *APIWithTracing) ClusterPlan(ctx context.Context, s1 string) (c2 ClusterPlan, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ClusterPlan")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ClusterPlan(ctx, s1)
+}
+
 func (_d *APIWithTracing) CommitAssistant(ctx context.Context, t1 auth.Token, s1 string, a1 AssistantTurn, s2 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CommitAssistant")
 	defer span.End()
@@ -487,6 +523,18 @@ func (_d *APIWithTracing) CreateGroup(ctx context.Context, t1 auth.Token, c2 Cre
 		}
 	}()
 	return _d.API.CreateGroup(ctx, t1, c2)
+}
+
+func (_d *APIWithTracing) CreateManualServerBinary(ctx context.Context, t1 auth.Token, s1 string, p1 PutServerBinaryRequest) (s2 ServerBinaryDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CreateManualServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.CreateManualServerBinary(ctx, t1, s1, p1)
 }
 
 func (_d *APIWithTracing) CreateMapping(ctx context.Context, t1 auth.Token, s1 string, c2 CreateMappingRequest) (m1 ModelMappingDTO, err error) {
@@ -661,6 +709,18 @@ func (_d *APIWithTracing) DeleteGroup(ctx context.Context, t1 auth.Token, s1 str
 	return _d.API.DeleteGroup(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) DeleteManualServerBinary(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteManualServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteManualServerBinary(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) DeleteMapping(ctx context.Context, t1 auth.Token, s1 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteMapping")
 	defer span.End()
@@ -707,6 +767,18 @@ func (_d *APIWithTracing) DeleteProject(ctx context.Context, t1 auth.Token, s1 s
 		}
 	}()
 	return _d.API.DeleteProject(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) DeleteRPCMemberSpec(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteRPCMemberSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteRPCMemberSpec(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) DeleteResourceGroup(ctx context.Context, t1 auth.Token, s1 string) (err error) {
@@ -1073,6 +1145,18 @@ func (_d *APIWithTracing) HealthCheckIntervalSeconds(ctx context.Context) (i1 in
 	return _d.API.HealthCheckIntervalSeconds(ctx)
 }
 
+func (_d *APIWithTracing) KeptUpClusterHeads(ctx context.Context) (sa1 []string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.KeptUpClusterHeads")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.KeptUpClusterHeads(ctx)
+}
+
 func (_d *APIWithTracing) ListApplications(ctx context.Context, t1 auth.Token, s1 string) (a1 ApplicationListResponse, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ListApplications")
 	defer span.End()
@@ -1361,6 +1445,12 @@ func (_d *APIWithTracing) NetbirdConfig(ctx context.Context) (n1 NetbirdConfig, 
 	return _d.API.NetbirdConfig(ctx)
 }
 
+func (_d *APIWithTracing) NetbirdDefaultPolicyStateView(ctx context.Context) (s1 string, t1 time.Time) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.NetbirdDefaultPolicyStateView")
+	defer span.End()
+	return _d.API.NetbirdDefaultPolicyStateView(ctx)
+}
+
 func (_d *APIWithTracing) NetbirdGatewayPeerID(ctx context.Context) (s1 string) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.NetbirdGatewayPeerID")
 	defer span.End()
@@ -1441,6 +1531,13 @@ func (_d *APIWithTracing) NetbirdTokenStatus(ctx context.Context) (n1 NetbirdTok
 		}
 	}()
 	return _d.API.NetbirdTokenStatus(ctx)
+}
+
+func (_d *APIWithTracing) NotifyClustersOfServer(ctx context.Context, s1 string) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.NotifyClustersOfServer")
+	defer span.End()
+	_d.API.NotifyClustersOfServer(ctx, s1)
+	return
 }
 
 func (_d *APIWithTracing) PollVendorAccountDeviceConnect(ctx context.Context, t1 auth.Token, s1 string) (b1 bool, err error) {
@@ -1581,6 +1678,18 @@ func (_d *APIWithTracing) PublicThemeView(ctx context.Context) (t1 ThemePublicVi
 	return _d.API.PublicThemeView(ctx)
 }
 
+func (_d *APIWithTracing) PutRPCMemberSpec(ctx context.Context, t1 auth.Token, s1 string, s2 string, p1 PutRPCMemberSpecRequest) (r1 RPCMemberSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PutRPCMemberSpec")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.PutRPCMemberSpec(ctx, t1, s1, s2, p1)
+}
+
 func (_d *APIWithTracing) PutRuntimeSpec(ctx context.Context, t1 auth.Token, s1 string, p1 PutRuntimeSpecRequest) (r1 RuntimeSpecDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PutRuntimeSpec")
 	defer span.End()
@@ -1591,6 +1700,18 @@ func (_d *APIWithTracing) PutRuntimeSpec(ctx context.Context, t1 auth.Token, s1 
 		}
 	}()
 	return _d.API.PutRuntimeSpec(ctx, t1, s1, p1)
+}
+
+func (_d *APIWithTracing) RPCMemberSpecs(ctx context.Context, t1 auth.Token, s1 string) (ra1 []RPCMemberSpecDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RPCMemberSpecs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RPCMemberSpecs(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) ReassignGroupsOwnedBy(ctx context.Context, t1 auth.Token, s1 string) (err error) {
@@ -1622,6 +1743,13 @@ func (_d *APIWithTracing) ReconcileGatewayPeer(ctx context.Context) (s1 string, 
 		}
 	}()
 	return _d.API.ReconcileGatewayPeer(ctx)
+}
+
+func (_d *APIWithTracing) ReconcileRPCPolicies(ctx context.Context) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ReconcileRPCPolicies")
+	defer span.End()
+	_d.API.ReconcileRPCPolicies(ctx)
+	return
 }
 
 func (_d *APIWithTracing) RefreshVendorAccountModels(ctx context.Context, t1 auth.Token, s1 string) (v1 VendorAccountDTO, r1 RefreshResult, err error) {
@@ -2006,6 +2134,18 @@ func (_d *APIWithTracing) ServerAvailability(ctx context.Context, t1 auth.Token,
 		}
 	}()
 	return _d.API.ServerAvailability(ctx, t1, s1, d1)
+}
+
+func (_d *APIWithTracing) ServerBinaries(ctx context.Context, t1 auth.Token, s1 string) (sa1 []ServerBinaryDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServerBinaries")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ServerBinaries(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) ServerHardware(ctx context.Context, t1 auth.Token, s1 string) (s2 routing.ServerHardware, b1 bool, err error) {
@@ -2544,6 +2684,18 @@ func (_d *APIWithTracing) UpdateServer(ctx context.Context, t1 auth.Token, s1 st
 		}
 	}()
 	return _d.API.UpdateServer(ctx, t1, s1, u1)
+}
+
+func (_d *APIWithTracing) UpdateServerBinary(ctx context.Context, t1 auth.Token, s1 string, p1 PutServerBinaryRequest) (s2 ServerBinaryDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.UpdateServerBinary")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.UpdateServerBinary(ctx, t1, s1, p1)
 }
 
 func (_d *APIWithTracing) UpdateService(ctx context.Context, t1 auth.Token, s1 string, u1 UpdateServiceRequest) (s2 ServiceDTO, err error) {

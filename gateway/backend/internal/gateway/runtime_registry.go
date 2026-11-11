@@ -28,6 +28,67 @@ type RuntimeErrorDTO struct {
 	ExitCode   int       `json:"exit_code"`
 	Failures   int       `json:"failures"`
 	StderrTail string    `json:"stderr_tail,omitempty"`
+	// Code is the agent's stable code for a lifecycle failure it maps to a
+	// specific cause (runtime.device_backend_mismatch,
+	// runtime.rpc_unsupported_build, runtime.cluster_version_mismatch, ...);
+	// "" for a plain failure. The router's answer to the start stays the
+	// generic sentinel, so this is where the cause travels.
+	Code string `json:"code,omitempty"`
+}
+
+// RuntimeRPCStatusDTO is an rpc_server member's live state (mirrors the
+// agent's rpc telemetry key for key): the head spec that holds it and since
+// when, the end of an armed reservation, the protocol version and device
+// count it announced, whether it listens somewhere other than where its head
+// dials it, peers that connected without being allowed, its tensor cache
+// size and whether it stopped making progress. The wire decode uses this
+// type as well (agentRuntimeSample.RPC): the two shapes are one contract.
+type RuntimeRPCStatusDTO struct {
+	HeldBy        string                `json:"held_by,omitempty"`
+	HeldSince     time.Time             `json:"held_since,omitzero"`
+	ReservedUntil time.Time             `json:"reserved_until,omitzero"`
+	Protocol      string                `json:"protocol,omitempty"`
+	DeviceCount   int                   `json:"device_count"`
+	BindMismatch  bool                  `json:"bind_mismatch"`
+	Breaches      []RuntimeBreachStatus `json:"breaches,omitempty"`
+	CacheMB       int                   `json:"cache_mb"`
+	Stalled       bool                  `json:"stalled"`
+}
+
+// RuntimeBreachStatus is one peer that connected to a member without being on
+// its allowlist.
+type RuntimeBreachStatus struct {
+	Peer string    `json:"peer"`
+	At   time.Time `json:"at"`
+}
+
+// RuntimeClusterStatusDTO is a cluster head's launch facts while its process
+// exists: the member endpoints it was started against.
+type RuntimeClusterStatusDTO struct {
+	Launched []string `json:"launched"`
+}
+
+// clone returns a copy of r that shares no slice with it.
+func (r *RuntimeRPCStatusDTO) clone() *RuntimeRPCStatusDTO {
+	if r == nil {
+		return nil
+	}
+	out := *r
+	out.Breaches = append([]RuntimeBreachStatus(nil), r.Breaches...)
+	if len(out.Breaches) == 0 {
+		out.Breaches = nil
+	}
+	return &out
+}
+
+// clone returns a copy of c that shares no slice with it.
+func (c *RuntimeClusterStatusDTO) clone() *RuntimeClusterStatusDTO {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.Launched = append([]string{}, c.Launched...)
+	return &out
 }
 
 // RuntimeGPUStatusDTO is one GPU's measured VRAM for a managed process, as
@@ -136,6 +197,15 @@ type RuntimeStatusDTO struct {
 	// is unchanged and remains the persisted path.
 	RAMMeasuredMB int              `json:"ram_measured_mb,omitempty"`
 	LastError     *RuntimeErrorDTO `json:"last_error,omitempty"`
+	// Kind is "rpc_server" for an RPC cluster member and "" for a model. RPC
+	// is a member's live state, Cluster a head's launch facts while its
+	// process exists, and AdmissionBlockedBy names, on a spec waiting for
+	// room, the held member that blocks it. All mirror the agent's telemetry
+	// and are absent for a model that is none of those.
+	Kind               string                   `json:"kind,omitempty"`
+	RPC                *RuntimeRPCStatusDTO     `json:"rpc,omitempty"`
+	Cluster            *RuntimeClusterStatusDTO `json:"cluster,omitempty"`
+	AdmissionBlockedBy string                   `json:"admission_blocked_by,omitempty"`
 	// ImageOptions is the image-generation options this stable_diffusion_cpp
 	// child's capability document states (sampler/scheduler names, output
 	// formats, size and batch limits, the server's own defaults), as the agent

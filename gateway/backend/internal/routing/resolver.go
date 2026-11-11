@@ -91,23 +91,57 @@ var errPinServerUnusable = errors.New("routing: pinned server no longer serves")
 // capped set itself -- every candidate that passed the gates, all at their cap -- and
 // instancePool whether it holds an instance candidate: a request that must not park
 // is served from it (selectWithoutParking) instead of waiting.
+//
+// The cluster fields carry the cold or forming cluster heads of the same selection
+// (cluster_gate.go): clusterPool the heads, never dispatched while the request can
+// wait, clusterDemands one demand per head, clusterBound the longest park bound among
+// them, and clusterFallback the code a request that can neither wait nor be served
+// fails with. pool is empty when the heads are all the request could use.
 type atCapacityError struct {
 	demand       *DemandSignal
 	pool         []MappingCandidate
 	instancePool bool
+
+	clusterPool     []MappingCandidate
+	clusterDemands  []DemandSignal
+	clusterBound    time.Duration
+	clusterFallback *ClusterUnavailableError
 }
 
 func (e *atCapacityError) Error() string { return errAllAtCapacity.Error() }
 
 func (e *atCapacityError) Unwrap() error { return errAllAtCapacity }
 
-// parkDemand returns the demand an all-at-capacity err carries, if any.
-func parkDemand(err error) (DemandSignal, bool) {
-	var ac *atCapacityError
-	if !errors.As(err, &ac) || ac.demand == nil {
-		return DemandSignal{}, false
+// withCluster adds split's parked cluster heads to e.
+func (e *atCapacityError) withCluster(split clusterSplit) *atCapacityError {
+	e.clusterPool, e.clusterDemands, e.clusterBound, e.clusterFallback = split.parked, split.demands, split.bound, split.fallback
+	return e
+}
+
+// overflowDemand is the demand a request that must not park signals once it was served
+// on sel from e's pools: the head's own when sel is a parked cluster head, the instance
+// demand otherwise (nil when there is none).
+func (e *atCapacityError) overflowDemand(sel MappingCandidate) *DemandSignal {
+	for i := range e.clusterDemands {
+		if slices.Contains(e.clusterDemands[i].MappingIDs, sel.Mapping.ID) {
+			return &e.clusterDemands[i]
+		}
 	}
-	return *ac.demand, true
+	return e.demand
+}
+
+// parkDemands returns the demands an all-at-capacity err carries: its instance demand,
+// if any, and one per parked cluster head.
+func parkDemands(err error) []DemandSignal {
+	var ac *atCapacityError
+	if !errors.As(err, &ac) {
+		return nil
+	}
+	var out []DemandSignal
+	if ac.demand != nil {
+		out = append(out, *ac.demand)
+	}
+	return append(out, ac.clusterDemands...)
 }
 
 // signalDemand hands the sink each demand a request about to wait in the admission
@@ -585,6 +619,7 @@ type Resolver struct {
 	instanceActivity  InstanceActivityChecker
 	demand            DemandSink
 	liveSlots         LiveSlotChecker
+	clusterGate       ClusterGate // SetClusterGate; nil = no cluster heads
 	realtimeMinFactor float64     // SetAudioRealtimeMinFactor; 0 gates nothing
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
 	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
@@ -959,6 +994,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	if queueTimeout > 0 {
 		deadline = start.Add(queueTimeout)
 	}
+	// clusterBound is the longest cluster park bound any turn of this request parked
+	// under (cluster_gate.go).
+	var clusterBound time.Duration
 
 	for {
 		// The mappings' running instances are read on EVERY turn, not once with the
@@ -970,17 +1008,20 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 		var ac *atCapacityError
 		if neverParks(req) && errors.As(err, &ac) {
 			selected, ok, err = r.selectWithoutParking(ctx, ac, req.Model, audioRequest(req), now)
-			if ok && ac.demand != nil {
-				r.signalOverflow(req, *ac.demand)
+			if d := ac.overflowDemand(selected); ok && d != nil {
+				r.signalOverflow(req, *d)
 			}
 		}
-		if errors.Is(err, errAllAtCapacity) {
+		if errors.As(err, &ac) {
 			// All candidates at cap + a wired controller: park until a slot frees, then retry.
-			var demands []DemandSignal
-			if d, ok := parkDemand(err); ok {
-				demands = append(demands, d)
-			}
-			if werr := r.parkTurn(ctx, deadline, serverIDs, demands...); werr != nil {
+			// A turn that parks on cold cluster heads waits for the cluster's own bound
+			// (parkDeadline) instead of the queue's alone. The bound stays the request's
+			// once it parked for a cluster: woken by the formation and finding the formed
+			// head at its cap, it must not time out at once on a queue timeout it outlived
+			// while the cluster formed.
+			clusterBound = max(clusterBound, ac.clusterBound)
+			turnDeadline := parkDeadline(start, deadline, clusterBound, len(ac.pool) == 0)
+			if werr := r.parkTurn(ctx, turnDeadline, serverIDs, parkDemands(err)...); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
 			now = r.clock()
@@ -1847,6 +1888,12 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
+	// A pin to a cluster head that has not formed is passed over and kept: the fresh
+	// selection parks the request for the cluster (or excludes the head), which a pinned
+	// request, served at once on its pinned server, would not.
+	if v := r.clusterVerdict(ctx, MappingCandidate{Server: server, Application: app, Mapping: mapping}); v.State != ClusterGateNone && v.State != ClusterGateFormed {
+		return Target{}, false, nil
+	}
 	// One keyed capability read serves both the live-progress annotation and the
 	// capability gate on the pinned mapping; the read, and the different failure
 	// posture each answer takes, are documented on affinityCapabilityVerdict.
@@ -2176,7 +2223,11 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	// Pass 1: the reachable/selectable/non-busy candidates (CandidateServesNow, the one
 	// statement of these gates), less any instance the request already tried and found
 	// gone (ExcludeInstanceKeys) -- a hard filter on every admission turn, so a parked
-	// request never comes back to it.
+	// request never comes back to it -- and less every cluster head that has not formed
+	// (cluster_gate.go): a cold or forming one is set aside to park on, an excluded one
+	// dropped.
+	var split clusterSplit
+	who := clusterDemandOf{apiFlavor: NormalizeAPIFlavor(req.APIFlavor), live: req.LiveSession}
 	reachable := make([]MappingCandidate, 0, len(candidates))
 	for _, c := range candidates {
 		if len(req.ExcludeInstanceKeys) > 0 && slices.Contains(req.ExcludeInstanceKeys, InstanceKey(c.Mapping.ID, c.Instance)) {
@@ -2185,10 +2236,13 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 		if !r.CandidateServesNow(c) {
 			continue
 		}
+		if !split.gate(r.clusterVerdict(ctx, c), c, who) {
+			continue
+		}
 		reachable = append(reachable, c)
 	}
 	if len(reachable) == 0 {
-		return MappingCandidate{}, false, nil
+		return r.selectClusterOnly(ctx, split, req, now)
 	}
 
 	// Context-fit hard filter, with fail-open: keep candidates whose known context
@@ -2211,6 +2265,39 @@ func (r *Resolver) selectCandidate(ctx context.Context, candidates []MappingCand
 	sel, ok, err := r.selectUnderCap(ctx, pool, req, now, instancePool)
 	if ok {
 		sel.InstancePool = instancePool
+	}
+	// Every candidate that may be dispatched is at its cap: the request parks on them and
+	// on the cold cluster heads alike, and a cold head's demand starts its cluster.
+	var ac *atCapacityError
+	if errors.As(err, &ac) {
+		return sel, ok, ac.withCluster(split)
+	}
+	if !ok && err == nil && len(split.parked) > 0 {
+		return r.selectClusterOnly(ctx, split, req, now)
+	}
+	return sel, ok, err
+}
+
+// selectClusterOnly is selectCandidate's answer when no candidate that may be
+// dispatched is left. Cold or forming cluster heads park the request (an
+// all-at-capacity error carrying them); without a queue to park in, a head is
+// served at once -- its cluster is signalled to start, and the gateway retries a
+// request the head refuses as not ready once it formed. With no parkable head, an
+// excluded one answers the cluster's code; with none at all there is no candidate.
+func (r *Resolver) selectClusterOnly(ctx context.Context, split clusterSplit, req inference.Request, now time.Time) (MappingCandidate, bool, error) {
+	if len(split.parked) == 0 {
+		if split.excluded != nil {
+			return MappingCandidate{}, false, split.excluded
+		}
+		return MappingCandidate{}, false, nil
+	}
+	ac := (&atCapacityError{}).withCluster(split)
+	if r.admission != nil {
+		return MappingCandidate{}, false, ac
+	}
+	sel, ok, err := r.selectWithoutParking(ctx, ac, req.Model, audioRequest(req), now)
+	if d := ac.overflowDemand(sel); ok && d != nil {
+		r.signalOverflow(req, *d)
 	}
 	return sel, ok, err
 }
@@ -2361,6 +2448,12 @@ func (r *Resolver) signalOverflow(req inference.Request, d DemandSignal) {
 // viable. It signals nothing: its caller hands the sink the demand once the selection
 // succeeded (signalOverflow), so a request that could not be served signals no demand.
 // model only labels the log lines of the selection; audio is as for argmaxByScore.
+//
+// The cold cluster heads ac carries come last: a request that cannot wait is served on
+// a running candidate at its cap rather than on a head whose cluster still has to form,
+// and on a head rather than not at all (the gate that only selects starts the cluster
+// itself). A request no pool can serve fails with the cluster's code when there were
+// heads, and with no candidate otherwise.
 func (r *Resolver) selectWithoutParking(ctx context.Context, ac *atCapacityError, model string, audio bool, now time.Time) (MappingCandidate, bool, error) {
 	var sel MappingCandidate
 	ok := false
@@ -2370,13 +2463,24 @@ func (r *Resolver) selectWithoutParking(ctx context.Context, ac *atCapacityError
 			return MappingCandidate{}, false, err
 		}
 	}
-	if !ok {
-		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, audio, now, ""); err != nil || !ok {
+	if !ok && len(ac.pool) > 0 {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.pool, model, audio, now, ""); err != nil {
 			return MappingCandidate{}, false, err
 		}
 	}
-	sel.InstancePool = ac.instancePool
-	return sel, true, nil
+	if ok {
+		sel.InstancePool = ac.instancePool
+		return sel, true, nil
+	}
+	if len(ac.clusterPool) > 0 {
+		if sel, ok, err = r.selectWithSwapProtection(ctx, ac.clusterPool, model, audio, now, ""); err != nil || ok {
+			return sel, ok, err
+		}
+	}
+	if ac.clusterFallback != nil {
+		return MappingCandidate{}, false, ac.clusterFallback
+	}
+	return MappingCandidate{}, false, nil
 }
 
 // leastLoadedInstances is the instance candidates of pool with the fewest requests in
@@ -3021,11 +3125,19 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 // instance signals -- one per member, by its own model and mappings. first is the
 // earliest at-capacity member in walk order, with its capped selection: what a request
 // that must not park is served from instead of waiting.
+//
+// clusterBound is the longest park bound of the cold cluster heads among them, and
+// capped whether any member had a candidate other than such a head at its cap
+// (parkDeadline). clusterErr is the first cluster error a member was unavailable with:
+// what the group answers when nothing serves it and nothing parks.
 type parkMaterial struct {
-	servers   []string
-	queueSecs int
-	demand    []DemandSignal
-	first     *atCapacityMember
+	servers      []string
+	queueSecs    int
+	demand       []DemandSignal
+	first        *atCapacityMember
+	clusterBound time.Duration
+	capped       bool
+	clusterErr   *ClusterUnavailableError
 }
 
 // atCapacityMember is one group member found at capacity: its name and the capped
@@ -3042,11 +3154,16 @@ type atCapacityMember struct {
 func (p *parkMaterial) add(m parkMaterial) {
 	p.servers = append(p.servers, m.servers...)
 	p.queueSecs = max(p.queueSecs, m.queueSecs)
+	p.clusterBound = max(p.clusterBound, m.clusterBound)
+	p.capped = p.capped || m.capped
 	if p.first == nil {
 		p.first = m.first
 	}
+	if p.clusterErr == nil {
+		p.clusterErr = m.clusterErr
+	}
 	for _, d := range m.demand {
-		if !slices.ContainsFunc(p.demand, func(have DemandSignal) bool { return have.Model == d.Model }) {
+		if !slices.ContainsFunc(p.demand, func(have DemandSignal) bool { return have.Model == d.Model && have.ClusterHead == d.ClusterHead }) {
 			p.demand = append(p.demand, d)
 		}
 	}
@@ -3074,16 +3191,20 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 		return MappingCandidate{}, memberUnavailable, parkMaterial{}, nil // live, but every candidate gated
 	}
 	selected, ok, serr := r.selectCandidate(ctx, cands, req, now)
-	if errors.Is(serr, errAllAtCapacity) {
-		pm := parkMaterial{servers: distinctServerIDs(cands), queueSecs: maxQueueTimeoutSecs(cands)}
-		if d, has := parkDemand(serr); has {
-			pm.demand = []DemandSignal{d}
-		}
-		var ac *atCapacityError
-		if errors.As(serr, &ac) {
-			pm.first = &atCapacityMember{name: name, ac: ac}
+	var ac *atCapacityError
+	if errors.As(serr, &ac) {
+		pm := parkMaterial{
+			servers: distinctServerIDs(cands), queueSecs: maxQueueTimeoutSecs(cands), demand: parkDemands(serr),
+			first: &atCapacityMember{name: name, ac: ac}, clusterBound: ac.clusterBound, capped: len(ac.pool) > 0,
 		}
 		return MappingCandidate{}, memberAtCapacity, pm, nil
+	}
+	// A member whose heads cannot serve is unavailable like any gated member; the
+	// walk goes on, and the group answers the cluster's code only when nothing else
+	// serves it.
+	var ce *ClusterUnavailableError
+	if errors.As(serr, &ce) {
+		return MappingCandidate{}, memberUnavailable, parkMaterial{clusterErr: ce}, nil
 	}
 	if serr != nil {
 		return MappingCandidate{}, memberUnavailable, parkMaterial{}, serr
@@ -3190,6 +3311,9 @@ func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members
 			park.add(pm)
 		case memberUnavailable:
 			anyLive = true // has a live mapping, just gated / non-viable
+			if park.clusterErr == nil {
+				park.clusterErr = pm.clusterErr
+			}
 		}
 		// memberNoMapping contributes nothing (no live mapping).
 	}
@@ -3409,7 +3533,8 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// established on the first queue so the queue's internal liveness re-check cannot re-arm
 	// the full budget every iteration (mirrors the main Resolve deadline semantics), counted
 	// from the request's admission start (admissionStart) when the caller set one.
-	var deadline time.Time
+	var deadline, start time.Time
+	var clusterBound time.Duration
 	for {
 		name, sel, park, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.walk())
 		if err != nil {
@@ -3431,21 +3556,33 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 			if !ok {
 				return Target{}, ErrNoHealthyHost
 			}
-			if len(park.demand) > 0 {
+			// A cold cluster head that serves signals its own cluster's demand.
+			if d := park.first.ac.overflowDemand(sel); d != nil && d.ClusterHead != "" {
+				r.signalOverflow(g.req, *d)
+			} else if len(park.demand) > 0 {
 				r.signalOverflow(g.req, park.demand[0])
 			}
 			return serve(park.first.name, sel)
 		}
 		if len(park.servers) > 0 && r.admission != nil {
 			queueTimeout := time.Duration(park.queueSecs) * time.Second
+			if start.IsZero() {
+				start = admissionStart(g.req, g.now)
+			}
 			if queueTimeout > 0 && deadline.IsZero() {
-				deadline = admissionStart(g.req, g.now).Add(queueTimeout)
+				deadline = start.Add(queueTimeout)
 			}
 			// Once a finite deadline is established it is enforced on EVERY subsequent
 			// wake (parkTurn) — even if the current at-capacity union is now all-unbounded
 			// (e.g. the sole bounded-timeout member went down mid-queue). A finite wait must
 			// never be silently promoted back to unbounded.
-			if werr := r.parkTurn(ctx, deadline, distinctStrings(park.servers), park.demand...); werr != nil {
+			//
+			// A turn that parks on cold cluster heads waits for the cluster's own bound
+			// instead (parkDeadline), and the longest cluster bound any turn parked under
+			// stays the request's, as on the plain path.
+			clusterBound = max(clusterBound, park.clusterBound)
+			turnDeadline := parkDeadline(start, deadline, clusterBound, !park.capped)
+			if werr := r.parkTurn(ctx, turnDeadline, distinctStrings(park.servers), park.demand...); werr != nil {
 				return Target{}, werr // ErrAdmissionQueueTimeout / ErrAdmissionQueueFull / ctx err
 			}
 			g.now = r.clock()
@@ -3456,6 +3593,9 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 		// members DO have live mappings but all are gated it is ErrNoHealthyHost.
 		if !anyLive {
 			return Target{}, ErrNoModelRoute
+		}
+		if park.clusterErr != nil {
+			return Target{}, park.clusterErr
 		}
 		return Target{}, ErrNoHealthyHost
 	}

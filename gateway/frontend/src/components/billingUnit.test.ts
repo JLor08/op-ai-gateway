@@ -51,9 +51,14 @@ describe('help key tables', () => {
       '',
       'estimated',
       'measured',
+      'member_unpriced',
       'modeled',
       'unpriceable',
     ]);
+  });
+
+  it('explains a cluster request missing a member share as a lower bound', () => {
+    expect(ENERGY_SOURCE_HELP_KEYS['member_unpriced']).toBe('energySourceHelpMemberUnpriced');
   });
 
   it('has no entry for an unknown value, so no tooltip is invented for it', () => {

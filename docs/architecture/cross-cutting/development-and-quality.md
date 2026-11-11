@@ -61,7 +61,7 @@ screenshots in the same branch.
 | Target | What it does |
 |---|---|
 | `make test` | `test-go` + `test-ui` |
-| `make test-go` | `go test ./...` in `gateway/backend` |
+| `make test-go` | `go test ./...` in `gateway/backend`, then in `server-agent` |
 | `make test-ui` | `vitest run` in `gateway/frontend` |
 | `make test-e2e` | The base Playwright suite in `gateway/e2e` |
 | `make fmt` / `make lint-fix` | `golangci-lint fmt` / `run --fix` across both Go modules |
@@ -199,8 +199,14 @@ reports success on a broken corpus is worse than no checker.
   `npm test`.
 - **E2E runtime job**: installs the frontend and e2e dependencies and
   Chromium, warms the Go build cache for the gateway, the agent and the
-  suite's stub server, and runs `npm run e2e:runtime` — the one Playwright
-  suite CI runs ([§6.1](#61-e2eruntime--the-one-suite-with-real-child-processes)).
+  suite's stub server, and runs `npm run e2e:runtime`
+  ([§6.1](#61-e2eruntime--real-child-processes-from-a-stub-model-server)).
+- **E2E RPC cluster job**: builds `llama-server` and `ggml-rpc-server`
+  CPU-only at the pinned llama.cpp commit (cached by commit and a digest of the
+  build flags), fetches the `stories260K.gguf` model (cached), and runs
+  `npm run e2e:rpc-cluster`
+  ([§6.2](#62-e2erpc-cluster--a-real-llamacpp-rpc-cluster)). These two are the
+  Playwright suites CI runs.
 
 ## 6. Test suites
 
@@ -277,6 +283,9 @@ reports success on a broken corpus is worse than no checker.
   `e2e:certificates`, `e2e:active`, `e2e:health` / `e2e:health-modelsync`,
   `e2e:groups`, `e2e:limits`, `e2e:logs`, `e2e:perf`, `e2e:projects`,
   `e2e:resource-groups`,
+  `e2e:rpc-cluster` (a real llama.cpp RPC cluster: the gateway, two real
+  server-agents, a real `llama-server` head and a real `ggml-rpc-server`
+  member; [§6.2](#62-e2erpc-cluster--a-real-llamacpp-rpc-cluster)),
   `e2e:runtime` (agent-managed model runtime end to end: the REAL server-agent
   binary starts REAL child processes from a stub model server module in
   `gateway/e2e/e2e-runtime/fixtures/stubserver`, which the suite builds but
@@ -323,19 +332,22 @@ reports success on a broken corpus is worse than no checker.
   buffered after the upstream's `500` "requires a model configured with
   `mode=streaming`", and an offline or verdict-less model answered buffered up
   front with no `stream` part sent; local-only like every suite but
-  `e2e:runtime`),
+  `e2e:runtime` and `e2e:rpc-cluster`),
   and `e2e:system-admin-mode`. These suites run the gateway in **memory
   mode** — fast, but see the conformance-suite caveat above for what memory
   mode cannot catch. Changes to invite/auth UI or visibility models are
   expected to require matching spec updates; plan the e2e rewrite as part of
   such a change.
 
-> **Only `e2e:runtime` runs in CI; the other 23 Playwright suites do not.**
-> `.github/workflows/ci.yml` has six jobs — `go`, `docs`, `sonar-scripts`,
-> `opencode-config-script`, `frontend`, and `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
-> least-exercised subsystem, and the one whose three-commit regression no gate
-> noticed — issue #24). Every **other** suite is still a **local-only gate a
-> pull request can pass without running**: `make test-e2e` runs the base suite
+> **Only `e2e:runtime` and `e2e:rpc-cluster` run in CI; the other 23 Playwright
+> suites do not.** `.github/workflows/ci.yml` has seven jobs — `go`, `docs`,
+> `sonar-scripts`, `opencode-config-script`, `frontend`, `e2e-runtime` and
+> `e2e-rpc-cluster`. `e2e-runtime` runs `npm run e2e:runtime` alone (the
+> agent-managed runtime, whose three-commit regression no gate once noticed —
+> issue #24); `e2e-rpc-cluster` runs `npm run e2e:rpc-cluster` alone (the only
+> proof of RPC cluster mode against real llama.cpp processes). Every **other**
+> suite is still a **local-only gate a pull request can pass without
+> running**: `make test-e2e` runs the base suite
 > alone, and nothing in the Makefile enumerates the scenario suites. Likewise
 > the three e2e fixture Go modules
 > (`e2e-certificates/fakeacme`, `e2e-smtp/mailcatcher`,
@@ -344,10 +356,10 @@ reports success on a broken corpus is worse than no checker.
 > outside `sonar.sources`, so they are formatted, vetted and linted only by hand
 > in the module directory — which is also why a new fixture module needs no
 > registration anywhere. A reader who sees a rich suite catalogue should not
-> assume CI enforces all of it: it enforces exactly one suite, which changes both
+> assume CI enforces all of it: it enforces exactly two suites, which changes both
 > review expectations and any decision to invest in the rest.
 
-### 6.1 `e2e:runtime` — the one suite with real child processes
+### 6.1 `e2e:runtime` — real child processes from a stub model server
 
 Config `gateway/e2e/playwright.runtime.config.ts`, spec
 `gateway/e2e/e2e-runtime/runtime.spec.ts`. Six serial scenarios exercise the
@@ -452,6 +464,40 @@ admin. Reusing that "Standard" pair — the shortcut `e2e:certificates` uses —
 **SQL-driver-only** shortcut that silently fails in memory mode. Creating the two
 groups through the raw portal API rather than the UI is the established pattern:
 they are precondition, not the feature under test.
+
+### 6.2 `e2e:rpc-cluster` — a real llama.cpp RPC cluster
+
+Config `gateway/e2e/playwright.rpc-cluster.config.ts`, spec
+`gateway/e2e/e2e-rpc-cluster/rpc-cluster.spec.ts`. Pure API (no browser, no
+frontend build): the gateway in memory mode and two real server-agents on one
+machine, each registered as its own AI server; the head server's agent runs a
+real `llama-server` cluster head, the member server's agent a real
+`ggml-rpc-server`. The in-process tests fake every one of those processes, so
+this suite is the only proof that the members-first start, the watchdog and
+the member usage work against the real builds. It needs two inputs and fails
+(never skips) without them: `OP_E2E_LLAMA_BIN_DIR`, a directory with
+`llama-server` and `ggml-rpc-server` of one RPC-enabled build of the pinned
+commit, and `OP_E2E_RPC_MODEL`, the path to `stories260K.gguf`.
+`OP_E2E_KEEP_LOGS=1` keeps the agents' logs.
+
+Three serial scenarios, both servers `lan` servers bound to loopback:
+
+- **(a) relay transport, head in env mode** and **(b) direct transport, head
+  in args mode**: a request for the cold head parks at the routing gate while
+  the gateway starts the cluster, and is answered once it formed; the member
+  reports the head's hold; the member's measured RAM is stored on the head and
+  survives the stop (the formed run's peak). (a) stops with `stop_members`, so
+  the member stops with the head; (b) stops without it, so the member is only
+  released and idles out on its 60 s timeout.
+- **(c) member process killed**: the gateway's watchdog stops the head without
+  any request and records `runtime.cluster_member_lost`; a request during the
+  cooldown is answered 503 `runtime.cluster_start_failed`, its message naming
+  `runtime.cluster_member_lost at member 0`, without the head starting; once
+  the cooldown ended a request forms the cluster again with a new member
+  process.
+
+A run takes about three minutes, most of it the two waits on timers (the
+member idle-out and the cooldown).
 
 ## 7. SonarQube quality gate (local)
 
@@ -687,19 +733,48 @@ to full release tags.
   `THIRD-PARTY-NOTICES.md`. Dependency-license policy: see
   [Licensing](licensing.md).
 - **Generated code** is excluded from analysis (`**/*_gen.go`): the OTel
-  method-tracing decorators regenerate via
-  `go generate ./internal/portal/...` (gowrap) followed by the license-header
-  script. The `portal.API` interface itself is interfacer-generated in
-  origin but the generator no longer works on the current codebase —
-  signature changes are maintained by hand (see §11.4).
-- **Concretely, when you add a method to `routing.RuntimeStore` or
-  `portal.API`:** run `go generate ./internal/tracing/...`, which rewrites all
-  three generated targets and **strips the SPDX headers** from
-  `internal/account/api_tracing_gen.go` and `internal/portal/api_tracing_gen.go`;
-  running `scripts/add-license-headers.sh` afterwards restores them to a zero net
-  diff. Without that second step the generate leaves two files with spurious
-  diffs. And `internal/portal/api.go` carries a "DO NOT EDIT" banner but **must**
-  be hand-edited, so the edit is not the violation it looks like.
+  method-tracing decorators are generated by gowrap. The `portal.API`
+  interface itself is interfacer-generated in origin but the generator no
+  longer works on the current codebase — signature changes are maintained by
+  hand (see §11.4).
+- **Concretely, when you add a method to `routing.Store` or `portal.API`:** run
+  `go generate ./internal/tracing/...` (in `gateway/backend`). gowrap rewrites
+  the three generated targets (`internal/tracing/routingstore_gen.go`,
+  `internal/account/api_tracing_gen.go`, `internal/portal/api_tracing_gen.go`)
+  and **does not preserve their SPDX headers**; the package's last
+  `go:generate` step, in `internal/tracing/zz_license_headers.go` (its name sorts
+  after every generated file, and `go generate` runs a package's files in name
+  order), runs `scripts/add-license-headers.sh` on exactly those three files, so
+  the command ends diff-clean. **Every regeneration must keep the headers:**
+  running one generated file's embedded directive alone (for example
+  `go generate ./internal/portal`) skips that step, and then
+  `scripts/add-license-headers.sh <file>` (it takes file arguments since this
+  step exists; without arguments it sweeps every in-scope file) must follow, or
+  the file lands without its license header. A missing header is a licensing
+  defect, not a cosmetic diff
+  ([ADR-001](../09-architecture-decisions.md#adr-001--license-agpl-30-only)).
+  And `internal/portal/api.go` carries a "DO NOT EDIT" banner but **must** be
+  hand-edited, so the edit is not the violation it looks like.
+- **Hand-maintained tables copied from llama.cpp follow its pin.**
+  `internal/portal/llama_flags.go` (`llamaServerValueFlags`) lists every
+  llama-server option that takes a value, with the number of argv elements the
+  value occupies, at the pinned llama.cpp build
+  (`2bc46baa9207d098d03741ac394e7faaf1a955b6`, the commit the CI RPC cluster
+  job builds). The cluster head save checks use it to step over option values,
+  so an argument such as `--alias -dev` is read as one option and its value,
+  not as a device flag. There is no generator in the repository: the table was
+  extracted from that commit's `common/arg.cpp` (every option registered for
+  the server example or common to all examples whose definition carries a value
+  hint, short and long spellings alike, 304 entries), and **it must be
+  regenerated the same way whenever the pinned commit moves**. A stale table
+  fails safe but wrong: an option missing from it is read as taking no value,
+  so its value may be mistaken for an option (the scan's behaviour before the
+  table existed), and a removed one is merely unused. `TestLlamaServerValueFlags`
+  pins only a handful of entries, so it does not catch a stale table. The
+  portal keeps a copy of the same table in
+  `gateway/frontend/src/components/shared/clusterArgs.ts` for its pre-save
+  check; regenerate it together with `llama_flags.go`, or the portal and the
+  gateway read the same args differently.
 
 ## 9. Test-authoring rules learned the hard way
 

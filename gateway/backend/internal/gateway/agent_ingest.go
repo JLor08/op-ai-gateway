@@ -118,6 +118,12 @@ type agentTelemetryRequest struct {
 	// see runtimeConfigAckFeature for why the NAME, not this field's presence,
 	// is what the gateway gates on.
 	RuntimeConfigAppliedETag string `json:"runtime_config_applied_etag"`
+	// Binaries is the agent's binary inventory (its allowlisted llama.cpp
+	// binaries with kind and version). A pointer tells the three states
+	// apart: absent means "unchanged" and leaves the stored inventory alone
+	// (the agent omits it unless it changed), an empty array means the agent
+	// allows no binaries and replaces the agent rows with nothing.
+	Binaries *[]agentBinarySample `json:"binaries,omitempty"`
 }
 
 // agentRuntimeGPUSample is one GPU's measured VRAM inside an
@@ -146,6 +152,7 @@ type agentRuntimeError struct {
 	ExitCode   int       `json:"exit_code"`
 	Failures   int       `json:"failures"`
 	StderrTail string    `json:"stderr_tail,omitempty"`
+	Code       string    `json:"code,omitempty"`
 }
 
 // agentRuntimeCapabilityVerdict is one capability's answer inside an
@@ -449,6 +456,12 @@ type agentRuntimeSample struct {
 	RAMMeasuredMB int                     `json:"ram_measured_mb,omitempty"`
 	GPUs          []agentRuntimeGPUSample `json:"gpus,omitempty"`
 	LastError     *agentRuntimeError      `json:"last_error,omitempty"`
+	// Kind, RPC, Cluster and AdmissionBlockedBy are the cluster telemetry; see
+	// RuntimeStatusDTO's fields of the same names, whose types decode them.
+	Kind               string                   `json:"kind,omitempty"`
+	RPC                *RuntimeRPCStatusDTO     `json:"rpc,omitempty"`
+	Cluster            *RuntimeClusterStatusDTO `json:"cluster,omitempty"`
+	AdmissionBlockedBy string                   `json:"admission_blocked_by,omitempty"`
 }
 
 // agentRuntimeImageOptions mirrors the agent's sample.RuntimeImageOptions (the
@@ -610,6 +623,10 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			ContextProbe:        rt.ContextProbe,
 			LiveProgressSupport: rt.LiveProgressSupport,
 			ImageOptions:        rt.ImageOptions.toProvider(),
+			Kind:                rt.Kind,
+			RPC:                 rt.RPC.clone(),
+			Cluster:             rt.Cluster.clone(),
+			AdmissionBlockedBy:  rt.AdmissionBlockedBy,
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.
@@ -642,6 +659,7 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 				ExitCode:   rt.LastError.ExitCode,
 				Failures:   rt.LastError.Failures,
 				StderrTail: clampRuntimeStderrTail(rt.LastError.StderrTail),
+				Code:       rt.LastError.Code,
 			}
 		}
 		out = append(out, dto)
@@ -1036,10 +1054,11 @@ const startupWriteBackThresholdPercent = 10
 // failure handling are writeBackRuntimeRAM's, through the same memo.
 //
 // The ingest writes this outside the portal service, whose write paths push a
-// changed document themselves, so a write for a replicable spec pushes
-// serverID's runtime config here, once per sample however many specs moved.
-// A spec that is not replicable is pushed its stored idle timeout, which the
-// measurement does not change, so its write pushes nothing.
+// changed document themselves, so a write for a replicable spec or a cluster
+// head (portal.DerivesIdleTimeout) pushes serverID's runtime config here, once
+// per sample however many specs moved. Any other spec is pushed its stored
+// idle timeout, which the measurement does not change, so its write pushes
+// nothing.
 func (s *Server) writeBackRuntimeStartup(ctx context.Context, serverID string, folded map[string]foldedSpec, memo runtimeSpecMemo) {
 	if s.Routes == nil {
 		return
@@ -1059,7 +1078,7 @@ func (s *Server) writeBackRuntimeStartup(ctx context.Context, serverID string, f
 			continue
 		}
 		spec.StartupMeasuredMS = measured
-		push = push || spec.Replicable
+		push = push || portal.DerivesIdleTimeout(*spec)
 	}
 	if push {
 		s.PushRuntimeConfig(serverID)
@@ -2120,9 +2139,9 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		slog.Error("agent telemetry: telemetry update failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.telemetry_update_failed", message: "telemetry update failed", cause: err}
 	}
-	server.LastSeenAt = &telemetry.ReportedAt
-	server.UpdatedAt = telemetry.UpdatedAt
-	if err := s.Routes.UpdateAIServer(ctx, server); err != nil {
+	// A targeted write: the server row read above may already be older than a
+	// portal save, and writing it back whole would undo that save.
+	if err := s.Routes.UpdateServerLastSeen(ctx, serverID, telemetry.ReportedAt, telemetry.UpdatedAt); err != nil {
 		slog.Error("agent telemetry: server update failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.server_update_failed", message: "server update failed", cause: err}
 	}
@@ -2143,6 +2162,13 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		s.EnergyIdle.Observe(server.ID, serverPowerW(sample, pue), now)
 	}
 	s.ServerPerf.publish(sample)
+	// The agent's clock offset, shown on the server: energy attribution reads
+	// every host's samples by the agent's own time stamps, so a skewed member
+	// clock shifts the window its energy part integrates. A sample without a
+	// time stamp of its own carries the receive time and says nothing.
+	if !req.ReportedAt.IsZero() {
+		s.AgentPresence.ReportClockOffset(serverID, req.ReportedAt.Sub(now))
+	}
 	// A fresh agent report wins over the gateway poll for this server's apps.
 	s.LoadedModels.SetAgentReport(serverID, req.LoadedModels)
 	// Record what the agent says it has INSTALLED (Phase 2 certificate
@@ -2179,6 +2205,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// once, above) rather than re-parsing req.Capabilities.
 	knewFeatures := s.AgentFeatures.Known(serverID)
 	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
+	hadRPCCluster := s.AgentFeatures.Has(serverID, rpcClusterFeature)
 	if capsReadable {
 		s.AgentFeatures.Set(serverID, caps)
 	} else {
@@ -2197,6 +2224,13 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// pushes nothing: it holds the document.
 	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances) {
 		s.PushRuntimeConfig(serverID)
+	}
+	// A cluster is pushed only while every agent of it declares rpc_cluster
+	// and every declaration is known (an unknown one withholds the cluster
+	// from the other servers' documents), so the same two moves push every
+	// server sharing a cluster with this one (its own document included).
+	if capsReadable && s.Portal != nil && (!knewFeatures || slices.Contains(caps, rpcClusterFeature) != hadRPCCluster) {
+		s.Portal.NotifyClustersOfServer(ctx, serverID)
 	}
 	// Record WHICH runtime-config document this agent says it has APPLIED, and
 	// do it BEFORE the status publish two lines below. That ordering is a
@@ -2219,10 +2253,23 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// The registry keeps every row as the agent sent it, one per instance of a
 	// replicable spec; only the store write-backs below fold them per spec.
 	statuses := runtimeStatusDTOsFromSamples(req.Runtimes, now)
+	prevStatuses := s.RuntimeStatus.statusRows(serverID)
 	s.RuntimeStatus.publish(serverID, statuses)
+	// Every frame, a cluster head's and a member's alike, goes to the cluster
+	// watchdog (clusterOrchestrator.observeStatus): an exited head, a lost
+	// member, a breach, a local start a held member blocks. It only enqueues
+	// the frame; the watchdog works on its own goroutines.
+	s.clusters.observeStatus(serverID, prevStatuses, statuses)
+	capped := statuses[:min(len(statuses), maxRuntimeSamplesPerSample)]
+	// Best-effort write-back of the cluster members' measured usage onto
+	// their membership rows by the peak rule, and of the members' session
+	// records -- see clusterUsage.observe. A member spec has no runtime spec
+	// row, so the per-spec write-backs below never see its measurement. Never
+	// rejects the sample.
+	s.clusterUsage.observe(ctx, serverID, capped)
 	// One fold of the sample's rows per spec (foldInstanceRows), which every
 	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.
-	folded := foldInstanceRows(statuses[:min(len(statuses), maxRuntimeSamplesPerSample)])
+	folded := foldInstanceRows(capped)
 	// Best-effort write-back of each spec's measured VRAM onto its launch
 	// spec -- see writeBackRuntimeVRAM. Never rejects the sample; a failure
 	// here is logged and dropped.
@@ -2264,6 +2311,9 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		// sample; a failure here is logged and dropped.
 		s.writeBackRuntimeCapabilities(ctx, serverID, req.Runtimes)
 	}
+	// Best-effort replacement of the agent-reported binary inventory. A
+	// no-op unless this sample carries the field. Never rejects the sample.
+	s.writeBackBinaries(ctx, serverID, req.Binaries, now)
 	s.maybeFireReactivation(ctx, server)
 	return nil
 }

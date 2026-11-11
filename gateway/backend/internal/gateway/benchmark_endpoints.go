@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"time"
 )
@@ -292,6 +293,12 @@ func (s *Server) startVRAMProbe(w http.ResponseWriter, r *http.Request, token au
 	if !ok {
 		return
 	}
+	// A cluster head's VRAM is spread over its members: a run on the head's server
+	// alone would label a share as the model's (codeClusterHeadUnsupported).
+	if v.App.Type == routing.ProviderServerAgent && hasSpec && spec.ClusterEnabled {
+		writeBenchmarkError(w, errBenchmarkClusterHeadUnsupported)
+		return
+	}
 	tgt := s.benchmarkTargetFor(r.Context(), v.Server, v.App, v.Mapping, spec, hasSpec)
 	plan, err := s.vramRunPlan(r.Context(), tgt)
 	if err != nil {
@@ -367,6 +374,7 @@ var benchmarkErrRows = []errRow{
 	{err: errBenchmarkScopeUnmeasurable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkScopeUnmeasurable},
 	{err: errBenchmarkAgentEnsureUnsupported, status: http.StatusConflict, code: codeBenchmarkAgentEnsureUnsupported, msg: msgBenchmarkAgentEnsureUnsupported},
 	{err: errBenchmarkSpecForceStopped, status: http.StatusConflict, code: codeBenchmarkSpecForceStopped, msg: msgBenchmarkSpecForceStopped},
+	{err: errBenchmarkClusterHeadUnsupported, status: http.StatusConflict, code: codeClusterHeadUnsupported, msg: msgClusterHeadUnsupported},
 }
 
 // writeBenchmarkError maps the AuthorizeBenchmarkScope sentinels and the

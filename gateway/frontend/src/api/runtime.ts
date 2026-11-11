@@ -10,8 +10,9 @@
 // portal_runtime_endpoints}.go byte-for-byte -- see those files, not this
 // comment, as the source of truth if the two ever drift.
 
-import { type Fetcher, request, subscribeSSE } from './transport';
+import { type Fetcher, buildQueryString, request, subscribeSSE } from './transport';
 import type { EndpointMode } from './models';
+import type { RPCMemberSpec } from './rpcMembers';
 
 // One per-GPU VRAM demand row on a runtime spec. vram_estimate_mb is
 // operator-owned (round-tripped from a PUT verbatim); vram_measured_mb is
@@ -22,6 +23,116 @@ export interface RuntimeSpecGPU {
   index: number;
   vram_estimate_mb: number;
   vram_measured_mb: number;
+}
+
+export type DeviceBackend = 'auto' | 'cuda' | 'rocm' | 'vulkan' | 'metal' | 'sycl';
+export type ClusterMemberMode = 'automatic' | 'manual';
+export type ClusterNetwork = 'mesh' | 'lan';
+export type RpcTransport = 'direct' | 'relay';
+
+// One GPU of a cluster member (Go ClusterMemberGPUDTO): its host index, the
+// operator's VRAM estimate (written) and the measured VRAM (read-only).
+export interface ClusterMemberGPU {
+  index: number;
+  vram_estimate_mb: number;
+  vram_measured_mb: number;
+}
+
+// One member of a cluster head, in --rpc order (Go ClusterMemberDTO). On a
+// write the inputs are server_id and, by member mode, member_spec_id (manual)
+// or gpus (ordered; empty = CPU member), threads, cache_enabled,
+// device_backend and ram_estimate_mb (automatic). Everything else is
+// read-only: server_name, the measured values with measured_at and stale (a
+// value kept from before a change of the distribution), and port, the member's
+// RPC or relay port. visible is false for a member on a server the caller may
+// not manage: the entry then carries only its position.
+export interface ClusterMember {
+  position: number;
+  server_id: string;
+  server_name: string;
+  member_spec_id: string;
+  gpus: ClusterMemberGPU[];
+  threads: number;
+  cache_enabled: boolean;
+  device_backend: DeviceBackend | '';
+  ram_estimate_mb: number;
+  ram_measured_mb: number;
+  measured_at?: string;
+  stale: boolean;
+  port: number;
+  visible: boolean;
+}
+
+export type ClusterState = 'cold' | 'forming' | 'formed' | 'cooling_down' | 'invalid';
+export type ClusterPhase = 'members_starting' | 'members_ready' | 'head_starting' | 'formed';
+export type ClusterMemberState = 'pending' | 'starting' | 'ready' | 'held' | 'failed';
+
+// One member's part of a start, by position (never by name: a member on a
+// server the caller may not see stays anonymous). `code` names a failure.
+export interface ClusterMemberStatus {
+  position: number;
+  state: ClusterMemberState;
+  code?: string;
+}
+
+// The last failed start: the cause's code, the member position that failed
+// (absent when it was the head or the cluster as a whole), whether it was the
+// head, and when.
+export interface ClusterFailure {
+  code: string;
+  position?: number;
+  head?: boolean;
+  at: string;
+}
+
+// A policy breach a member's agent reports (Go ClusterBreachDTO): a peer the
+// member does not allow connected to it ("peer", with the peer's address), or
+// the member reports a hold by another head ("foreign_hold"). A member on a
+// server the caller may not manage carries only its position. `kind` stays a
+// plain string: a kind a newer gateway adds is shown as its wire value.
+export interface ClusterBreach {
+  position: number;
+  kind?: string;
+  peer?: string;
+  at?: string;
+}
+
+// A stored member peak above what the member's host admits (Go
+// ClusterPeakAboveBudgetDTO): one GPU's VRAM above its budget (or the card),
+// or the member's RAM above the host's memory. The member's next start is
+// refused until the budget is raised, the split changed or the stored usage
+// reset. A member on a server the caller may not manage carries only its
+// position.
+export interface ClusterPeakAboveBudget {
+  position: number;
+  resource?: 'vram' | 'ram';
+  gpu_index?: number;
+  stored_mb?: number;
+  ceiling_mb?: number;
+}
+
+// The gateway's orchestration state of one cluster head (Go ClusterStatusDTO).
+export interface ClusterStatus {
+  state: ClusterState;
+  phase?: ClusterPhase;
+  members: ClusterMemberStatus[];
+  last_failure?: ClusterFailure;
+  cooldown_until?: string;
+  // Absent when there is none (and from an older gateway).
+  breaches?: ClusterBreach[];
+  peaks_above_budget?: ClusterPeakAboveBudget[];
+}
+
+// A server a head may add as a member (Go ClusterCandidateDTO). Automatic
+// mode fills rpc_binary / rpc_binary_version (the server's ggml-rpc-server
+// matching the head's binary); manual mode fills member_specs (the server's
+// free member specs).
+export interface ClusterCandidate {
+  server_id: string;
+  server_name: string;
+  rpc_binary?: string;
+  rpc_binary_version?: string;
+  member_specs?: RPCMemberSpec[];
 }
 
 // One operator-supplied config file the agent writes into the spec's per-spec
@@ -204,6 +315,50 @@ export interface RuntimeSpec {
   // THIS per-spec value, never by capability booleans and never by the
   // best-of-all-mappings ModelDTO.role.
   role: ModelRole;
+  // The cluster fields below are OPTIONAL here, though the real wire DTO always
+  // carries them, so existing RuntimeSpec fixtures compile unchanged (the
+  // certificate_override precedent). A PUT is a full document: a save that
+  // omits cluster_enabled stores false and clears the membership, so every
+  // editor that round-trips a spec must send the cluster fields it read back.
+  //
+  // GPU backend the generic device placeholders render for. Never "" on the
+  // wire (a stored "" reads as "auto").
+  device_backend?: DeviceBackend;
+  // llama.cpp RPC cluster head configuration (see ClusterMember). member_mode
+  // is never "" on the wire. With cluster_enabled false the membership is
+  // cleared on save.
+  cluster_enabled?: boolean;
+  member_mode?: ClusterMemberMode;
+  // "" on a write resolves to cluster_network_default / cluster_transport_default.
+  cluster_network?: ClusterNetwork | '';
+  rpc_transport?: RpcTransport | '';
+  // The operator's acknowledgement a direct lan cluster requires.
+  lan_exposure_ack?: boolean;
+  cluster_members?: ClusterMember[];
+  // READ-ONLY, derived on every read and only filled on a cluster head: the
+  // head's own demand plus every member's (each part max(measured, estimate)),
+  // a flag for whether a part was unknown (the totals are then lower bounds),
+  // what an empty network/transport resolves to, and the advisory warning
+  // codes (see clusterWarningLabelByCode). Excluded from the PUT request.
+  cluster_vram_total_mb?: number;
+  cluster_ram_total_mb?: number;
+  // Per axis: false when a part of that total is unknown, so it is a lower
+  // bound (a CPU member has no VRAM part and never makes VRAM one).
+  // cluster_totals_complete is both together; an older gateway sends only it.
+  cluster_totals_complete?: boolean;
+  cluster_vram_total_complete?: boolean;
+  cluster_ram_total_complete?: boolean;
+  cluster_network_default?: ClusterNetwork | '';
+  cluster_transport_default?: RpcTransport | '';
+  cluster_warnings?: string[];
+  // READ-ONLY: the stable error code (see errorLabelByCode) naming why the
+  // gateway does not send this head's cluster to its agent; empty when it
+  // does. Excluded from the PUT request.
+  cluster_withheld_reason?: string;
+  // READ-ONLY, only on a cluster head and absent from an older gateway: the
+  // orchestration state and the progress of the running or last start.
+  // Excluded from the PUT request.
+  cluster_status?: ClusterStatus;
 }
 
 // A full-document upsert of a runtime spec: every field is applied verbatim
@@ -241,6 +396,16 @@ export type PutRuntimeSpecRequest = Omit<
   | 'startup_measured_ms'
   | 'effective_idle_timeout_seconds'
   | 'instances_min_exceeds_realtime'
+  | 'cluster_vram_total_mb'
+  | 'cluster_ram_total_mb'
+  | 'cluster_totals_complete'
+  | 'cluster_vram_total_complete'
+  | 'cluster_ram_total_complete'
+  | 'cluster_network_default'
+  | 'cluster_transport_default'
+  | 'cluster_warnings'
+  | 'cluster_withheld_reason'
+  | 'cluster_status'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).
@@ -312,6 +477,34 @@ export interface RuntimeError {
   exit_code: number;
   failures: number;
   stderr_tail?: string;
+  // Stable error code of a lifecycle failure (e.g. runtime.bind_mismatch,
+  // runtime.device_backend_mismatch); the portal labels it through
+  // errorLabelByCode. Absent for failures without one.
+  code?: string;
+}
+
+// One peer that reached an RPC member without being the holding head.
+export interface RpcBreach {
+  peer: string;
+  at: string;
+}
+
+// The RPC member telemetry of a status row with kind "rpc_server".
+export interface RuntimeRpcStatus {
+  held_by?: string;
+  held_since?: string;
+  reserved_until?: string;
+  protocol?: string;
+  device_count?: number;
+  bind_mismatch?: boolean;
+  breaches?: RpcBreach[];
+  cache_mb?: number;
+  stalled?: boolean;
+}
+
+// What a running cluster head launched with.
+export interface RuntimeClusterStatus {
+  launched?: string[];
 }
 
 // One GPU's measured VRAM as carried on THIS status frame (mirrors the Go
@@ -375,6 +568,12 @@ export interface RuntimeStatus {
   // while unknown (0 is the unknown sentinel and is omitted on the wire).
   startup_ms?: number;
   last_error?: RuntimeError;
+  // "rpc_server" for a cluster member's row; absent for a model spec.
+  kind?: string;
+  rpc?: RuntimeRpcStatus;
+  cluster?: RuntimeClusterStatus;
+  // On a waiting spec: the member spec holding the resource it needs.
+  admission_blocked_by?: string;
   // Whether the agent's last per-model probe of its `/metrics` and context
   // (e.g. llama.cpp `/props`) endpoints actually reached the server, mirroring
   // the Go RuntimeStatusDTO's own closed set:
@@ -619,12 +818,29 @@ export function runtimeApi(fetcher: Fetcher) {
     // The live-status Stop: asks the agent to drain instance `instance` now,
     // transiently -- demand can start it again. The agent refuses an instance
     // the spec keeps up (runtime.instance_protected) and one with a higher
-    // sibling running (runtime.instance_not_highest).
-    stopRuntime: (mappingId: string, instance: number) =>
+    // sibling running (runtime.instance_not_highest). For a cluster head,
+    // `stopMembers` also stops the cluster's members once the head stopped.
+    stopRuntime: (mappingId: string, instance: number, stopMembers = false) =>
       request<RuntimeActionAnswer>(
         fetcher,
         `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/stop`,
-        { method: 'POST', body: { instance } },
+        { method: 'POST', body: stopMembers ? { instance, stop_members: true } : { instance } },
+      ),
+    // The servers the cluster head on this mapping may add as members.
+    clusterCandidates: (mappingId: string, mode: ClusterMemberMode) =>
+      request<{ data: ClusterCandidate[] }>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-candidates${buildQueryString({ mode })}`,
+      ),
+    // Clears the stored usage of the member on serverId of the cluster head on
+    // this mapping -- the way out of a stored peak above the member's budget,
+    // which its next start would be refused for -- and answers the head's
+    // spec as it reads afterwards.
+    resetClusterMemberUsage: (mappingId: string, serverId: string) =>
+      request<RuntimeSpec>(
+        fetcher,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-members/${encodeURIComponent(serverId)}/reset-usage`,
+        { method: 'POST' },
       ),
     runtimeCoresidency: (appId: string) =>
       request<CoResidency>(

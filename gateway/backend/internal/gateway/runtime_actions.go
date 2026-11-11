@@ -88,6 +88,20 @@ var runtimeAgentCodes = map[string]struct {
 	"runtime.start_failed":           {http.StatusBadGateway, "the model failed to start"},
 	"runtime.not_permitted":          {http.StatusBadGateway, "the agent did not permit the model to start"},
 	"runtime.upstream_gone":          {http.StatusBadGateway, "the agent could not complete the request"},
+	codeClusterNotReady:              {http.StatusServiceUnavailable, "the cluster head is not running; the gateway starts its cluster members first"},
+	codeClusterMemberUnreachable:     {http.StatusServiceUnavailable, "the cluster head could not reach every member"},
+	codeClusterMemberInUse:           {http.StatusConflict, "the cluster member is held by its head; stop the cluster instead, head first"},
+}
+
+// clusterErrorStatus is the status a cluster start's or stop's error answers
+// with: a cluster the runtime documents withhold is a conflict with its
+// configuration (409), every failed start a failure behind the gateway (502).
+// A start a stop or the shutdown ended, or one refused while a stop runs, is
+// 503 whatever its code (writeClusterError).
+var clusterErrorStatus = map[string]int{
+	codeClusterUnavailable:  http.StatusConflict,
+	codeClusterStartFailed:  http.StatusBadGateway,
+	codeClusterMemberUnused: http.StatusBadGateway,
 }
 
 // handlePortalMappingRuntimeAction dispatches POST
@@ -137,6 +151,10 @@ func (s *Server) startRuntimeInstance(w http.ResponseWriter, r *http.Request, to
 	if !s.refuseAgentWithout(w, serverID, runtimeEnsureFeature) {
 		return
 	}
+	if scope.Spec.ClusterEnabled {
+		s.startClusterHead(w, r, scope)
+		return
+	}
 	ensurer, ok := s.Provider.(provider.RuntimeEnsurer)
 	if !ok {
 		writeJSON(w, http.StatusServiceUnavailable, apierror.Response(codeRuntimeAgentUnavailable, "this gateway's provider cannot start a model through the agent", ""))
@@ -166,6 +184,26 @@ func (s *Server) startRuntimeInstance(w http.ResponseWriter, r *http.Request, to
 		s.runRuntimeStart(ensurer, scope, k, claimed, start)
 	}()
 	s.awaitRuntimeStart(w, r, k, start)
+}
+
+// startClusterHead is the manual start of a cluster head: the cluster
+// orchestration's members-first start (clusterOrchestrator.StartManual) in
+// the background, answered like a model's start -- 200 running when the
+// cluster formed within the early-answer window, the start's error when it
+// failed within it, else 202 starting. A head is never replicable, so the
+// answer names instance 0. A manual start overrides the head's cooldown and a
+// terminal block, and ends a park an operator's stop set.
+func (s *Server) startClusterHead(w http.ResponseWriter, r *http.Request, scope portal.RuntimeActionScope) {
+	start := newRuntimeStart(scope, 0)
+	s.runtimeStarts.Add(1)
+	go func() {
+		defer s.runtimeStarts.Done()
+		err := s.clusters.StartManual(s.lifetime(), scope.Spec.ID)
+		if !start.deliver(err) {
+			start.logOutcome(s.lifetime(), err)
+		}
+	}()
+	s.awaitRuntimeStart(w, r, 0, start)
 }
 
 // errRuntimeMaxInstances: no index below the spec's max_instances (or the
@@ -219,11 +257,16 @@ func (s *Server) claimStartInstance(ctx context.Context, scope portal.RuntimeAct
 // ensure. waiting is true while the handler still takes the answer; once it
 // has left (the window ran out, or its client went away) the background ensure
 // logs its outcome instead. attrs name the start in those log records.
+//
+// A cluster head's manual stop uses the same hand-off (newRuntimeStop): its
+// drain can outlast the server's write timeout, so it answers like a start.
+// msgs are the three log messages of logOutcome.
 type runtimeStart struct {
 	mu      sync.Mutex
 	waiting bool
 	answer  chan error // buffered 1
 	attrs   []any
+	msgs    [3]string // success, shutdown, failure
 }
 
 func newRuntimeStart(scope portal.RuntimeActionScope, k int) *runtimeStart {
@@ -231,7 +274,23 @@ func newRuntimeStart(scope portal.RuntimeActionScope, k int) *runtimeStart {
 		answer:  make(chan error, 1),
 		waiting: true,
 		attrs:   []any{"mapping_id", scope.Mapping.ID, "server_id", scope.Server.ID, "instance", routing.InstanceAddress(scope.Mapping.AppModelName, k)},
+		msgs: [3]string{
+			"runtime start: started an instance",
+			"runtime start: the gateway's shutdown ended a start",
+			"runtime start: starting an instance failed",
+		},
 	}
+}
+
+// newRuntimeStop is the hand-off of a cluster head's manual stop.
+func newRuntimeStop(scope portal.RuntimeActionScope) *runtimeStart {
+	st := newRuntimeStart(scope, 0)
+	st.msgs = [3]string{
+		"runtime stop: stopped a cluster head",
+		"runtime stop: the gateway's shutdown ended a cluster stop",
+		"runtime stop: stopping a cluster head failed",
+	}
+	return st
 }
 
 // logOutcome logs the outcome of a start nobody waits for any more: a success
@@ -240,11 +299,11 @@ func newRuntimeStart(scope portal.RuntimeActionScope, k int) *runtimeStart {
 func (st *runtimeStart) logOutcome(base context.Context, err error) {
 	switch {
 	case err == nil:
-		slog.Info("runtime start: started an instance", st.attrs...)
+		slog.Info(st.msgs[0], st.attrs...)
 	case base.Err() != nil:
-		slog.Debug("runtime start: the gateway's shutdown ended a start", st.attrs...)
+		slog.Debug(st.msgs[1], st.attrs...)
 	default:
-		slog.Warn("runtime start: starting an instance failed", append(slices.Clone(st.attrs), "err", err)...)
+		slog.Warn(st.msgs[2], append(slices.Clone(st.attrs), "err", err)...)
 	}
 }
 
@@ -304,6 +363,13 @@ func (s *Server) runRuntimeStart(ensurer provider.RuntimeEnsurer, scope portal.R
 // arrived while the client left is logged here as the background ensure would
 // have logged it, since that ensure already handed it over (deliver).
 func (s *Server) awaitRuntimeStart(w http.ResponseWriter, r *http.Request, k int, start *runtimeStart) {
+	s.awaitRuntimeAction(w, r, k, start, "starting", agentSpecStateRunning)
+}
+
+// awaitRuntimeAction is awaitRuntimeStart for any background action: 200 with
+// done when the action succeeded within the early-answer window, its error
+// when it failed within it, else 202 with pending.
+func (s *Server) awaitRuntimeAction(w http.ResponseWriter, r *http.Request, k int, start *runtimeStart, pending, done string) {
 	window := s.runtimeStartWindow
 	if window <= 0 {
 		window = defaultRuntimeStartWindow
@@ -316,7 +382,7 @@ func (s *Server) awaitRuntimeStart(w http.ResponseWriter, r *http.Request, k int
 	case <-timer.C:
 		var answered bool
 		if answered, err = start.detach(); !answered {
-			writeJSON(w, http.StatusAccepted, runtimeActionAnswer{Instance: k, State: "starting"})
+			writeJSON(w, http.StatusAccepted, runtimeActionAnswer{Instance: k, State: pending})
 			return
 		}
 	case <-r.Context().Done():
@@ -329,7 +395,7 @@ func (s *Server) awaitRuntimeStart(w http.ResponseWriter, r *http.Request, k int
 		writeRuntimeAgentError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, runtimeActionAnswer{Instance: k, State: agentSpecStateRunning})
+	writeJSON(w, http.StatusOK, runtimeActionAnswer{Instance: k, State: done})
 }
 
 // awaitInstanceReported returns once serverID's status reports instance k of
@@ -375,6 +441,9 @@ func instanceReported(rows []RuntimeStatusDTO, specID string, k int) bool {
 // runtimeStopRequest is POST .../runtime/stop's body. Instance is required.
 type runtimeStopRequest struct {
 	Instance *int `json:"instance"`
+	// StopMembers, for a cluster head only, also stops the cluster's members
+	// once the head stopped; otherwise they idle out on their short timeout.
+	StopMembers bool `json:"stop_members"`
 }
 
 // runtimeActionAnswer is a manual start's or stop's success body.
@@ -417,6 +486,10 @@ func (s *Server) stopRuntimeInstance(w http.ResponseWriter, r *http.Request, tok
 	if !s.refuseAgentWithout(w, scope.Server.ID, runtimeStopFeature) {
 		return
 	}
+	if scope.Spec.ClusterEnabled {
+		s.stopClusterHead(w, r, scope, *req.Instance, req.StopMembers)
+		return
+	}
 	stopper, ok := s.Provider.(provider.RuntimeStopper)
 	if !ok {
 		writeJSON(w, http.StatusServiceUnavailable, apierror.Response(codeRuntimeAgentUnavailable, "this gateway's provider cannot stop a model through the agent", ""))
@@ -433,6 +506,42 @@ func (s *Server) stopRuntimeInstance(w http.ResponseWriter, r *http.Request, tok
 	}
 	writeJSON(w, http.StatusOK, runtimeActionAnswer{Instance: k, State: state})
 }
+
+// stopClusterHead is the manual stop of a cluster head: the head is drained
+// first and the stop waits, bounded, for its stopped state, then (with
+// stopMembers) the members are released and stopped
+// (clusterOrchestrator.StopManual). The stop runs in the background under the
+// server's lifetime, never the request's, and is answered like a start: 200
+// stopped when it finished within the early-answer window, its error when it
+// failed within it, else 202 stopping -- a drain can take longer than the
+// server's write timeout allows a response to wait. Unlike a model's
+// instance, a pinned or force_running head is drained rather than refused:
+// for a head those mean that the gateway keeps it up, and the gateway leaves
+// a head an operator stopped down until a manual start. A head runs instance
+// 0 alone, so any other index is runtime.model_not_managed, as the agent
+// would answer.
+func (s *Server) stopClusterHead(w http.ResponseWriter, r *http.Request, scope portal.RuntimeActionScope, k int, stopMembers bool) {
+	if k != 0 {
+		writeJSON(w, http.StatusNotFound, apierror.Response("runtime.model_not_managed", runtimeAgentCodes["runtime.model_not_managed"].msg, ""))
+		return
+	}
+	stop := newRuntimeStop(scope)
+	s.runtimeStarts.Add(1)
+	go func() {
+		defer s.runtimeStarts.Done()
+		ctx, cancel := context.WithTimeout(s.lifetime(), runtimeStopTimeout+clusterStopBound)
+		defer cancel()
+		err := s.clusters.StopManual(ctx, scope.Spec.ID, stopMembers)
+		if !stop.deliver(err) {
+			stop.logOutcome(s.lifetime(), err)
+		}
+	}()
+	s.awaitRuntimeAction(w, r, 0, stop, provider.RuntimeStopStopping, provider.RuntimeStopStopped)
+}
+
+// clusterStopBound bounds a manual cluster stop's wait for the head to stop
+// and its member calls, on top of the head's stop call.
+const clusterStopBound = 90 * time.Second
 
 // refuseAgentWithout answers when serverID's agent cannot serve an action that
 // needs feature, and reports whether the action may go on: 503
@@ -475,6 +584,11 @@ func writeFeatureMissing(w http.ResponseWriter, feature string) {
 // as 504 runtime.agent_timeout, an agent the gateway could not reach as 503
 // runtime.agent_unavailable, and anything else as 502 runtime.agent_error.
 func writeRuntimeAgentError(w http.ResponseWriter, err error) {
+	var ce *clusterError
+	if errors.As(err, &ce) {
+		writeClusterError(w, ce)
+		return
+	}
 	var re *provider.RouterError
 	if errors.As(err, &re) {
 		if known, ok := runtimeAgentCodes[re.Code]; ok {
@@ -492,6 +606,39 @@ func writeRuntimeAgentError(w http.ResponseWriter, err error) {
 	default:
 		writeJSON(w, http.StatusBadGateway, apierror.Response(codeRuntimeAgentError, "the agent request failed", ""))
 	}
+}
+
+// clusterErrorBody is a cluster start's error envelope: the code with the
+// cause's code beside it and the failing member's position, or head: true.
+type clusterErrorBody struct {
+	Error struct {
+		Code     string `json:"code"`
+		Message  string `json:"message"`
+		Cause    string `json:"cause,omitempty"`
+		Position *int   `json:"position,omitempty"`
+		Head     bool   `json:"head,omitempty"`
+	} `json:"error"`
+}
+
+// writeClusterError answers a cluster start's error at its code's status
+// (clusterErrorStatus; 502 for any other).
+func writeClusterError(w http.ResponseWriter, ce *clusterError) {
+	status, ok := clusterErrorStatus[ce.Code]
+	if !ok {
+		status = http.StatusBadGateway
+	}
+	if ce.Cause == codeClusterStartCancelled || ce.Cause == codeClusterStopping {
+		// A start a stop or the shutdown ended, or one refused while a stop
+		// runs: nothing is wrong with the cluster, try again later.
+		status = http.StatusServiceUnavailable
+	}
+	var body clusterErrorBody
+	body.Error.Code, body.Error.Message, body.Error.Cause, body.Error.Head = ce.Code, ce.Error(), ce.Cause, ce.Head
+	if ce.Position >= 0 {
+		p := ce.Position
+		body.Error.Position = &p
+	}
+	writeJSON(w, status, body)
 }
 
 // runtimeInstanceTarget is the agent target of instance k of scope's mapping:
@@ -516,12 +663,12 @@ func runtimeInstanceTarget(scope portal.RuntimeActionScope, k int) routing.Targe
 }
 
 // lifetime is the server's lifetime context (baseCtx), or the background
-// context on a server built without one.
+// context while none is installed.
 func (s *Server) lifetime() context.Context {
-	if s.baseCtx == nil {
-		return context.Background()
+	if ctx := s.baseCtx.Load(); ctx != nil {
+		return *ctx
 	}
-	return s.baseCtx
+	return context.Background()
 }
 
 // waitRuntimeStarts returns once every manual start's background ensure has

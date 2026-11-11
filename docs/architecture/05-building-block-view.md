@@ -118,6 +118,26 @@ flowchart TB
 | `theme` | Loads and validates external, data-only themes from the themes directory. |
 | `ttlcache` | A leaf package: the generic TTL memoizer (`Cache[T]`, with a generation-guarded `Invalidate` so a read already in flight cannot re-arm a just-invalidated value) behind every hot-path setting read. The gateway's `settingCache[T]` is an alias of it; `portal` uses it directly for the sharing switches the routing grant and the effective-level gates read ([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)). It lives in its own package because `portal` may not import `gateway`. |
 
+**The llama.cpp RPC cluster mode adds no package; it spans three**
+([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster),
+[Agent-Managed Model Runtime §3.7](cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster)).
+In `portal`: the head save checks, member planning, port allocation and read
+view (`service_cluster.go`, `cluster_args.go` with the pinned build's option
+table `llama_flags.go`), the derivation into the runtime documents
+(`service_cluster_config.go`), the plan the orchestration reads
+(`service_cluster_plan.go`), manual member specs (`service_rpc_members.go`), a
+server's RPC settings (`service_server_rpc.go`), the binary inventory
+(`service_binaries.go`) and the `op-gw-rpc-*` NetBird policy family
+(`service_netbird_rpc_policies.go`). In `gateway`: the **cluster
+orchestration** (`cluster_orchestrator.go`: the members-first start, stops,
+cooldown and the reconciler pass), the **watchdog** (`cluster_watchdog.go`: the
+telemetry follower that stops a head whose member was lost), the member usage
+and session records (`cluster_usage.go`), the request path's cluster gate and
+retry (`cluster_gate.go`), and the inventory ingest (`agent_ingest_binaries.go`).
+In `routing`: the gate's interface and the three gate states
+(`cluster_gate.go`). The orchestration's state lives in memory and is rebuilt
+from telemetry after a restart.
+
 **The sanctioned seam for a service → server callback.**
 `gateway.ServerDeps.SetRuntimeConfigChangedHook func(func(serverID string))`
 exists because `portalService` and the gateway `Server` are never in scope in the
@@ -210,7 +230,7 @@ section (`DashboardVendorUsage`, which reads the stored usage snapshots from the
 vendor-accounts list and never calls a vendor,
 [§5.4](cross-cutting/external-vendor-accounts.md#54-reading-it-and-what-is-deferred)).
 
-Three additions worth knowing when looking for code on this side:
+Additions worth knowing when looking for code on this side:
 
 - The `api.ts` barrel also carries a **`runtime` domain module**
   (`api/runtime.ts`) covering mapping-scoped launch specs, application-scoped
@@ -231,6 +251,23 @@ Three additions worth knowing when looking for code on this side:
   `components/shared/ResourceFallback.tsx` (`resourceState()` +
   `<ResourceFallback>`) was extracted there as the canonical
   loading/error/stale-error/ready rendering for `useResource` call sites.
+- **The llama.cpp RPC cluster screens** ([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster))
+  live inside `RuntimeAdminSection` too. `ClusterHeadEditor.tsx` is the cluster
+  part of the launch spec form (head switch, members in `--rpc` order, member
+  mode, network, transport, the LAN acknowledgement and the args hints); the form
+  owns its state and sends it with every save, because the spec PUT is a full
+  document. `shared/clusterArgs.ts` mirrors the gateway's head save checks in the
+  gateway's order, so the form refuses before the round trip while the gateway
+  stays the authority. `ClusterProgress.tsx` (over `shared/clusterStatus.ts`)
+  renders the head's `cluster_status` as a step progress, and
+  `ClusterTotalCell.tsx` (over `shared/clusterTotals.ts`) the cluster totals with
+  the head's own value beneath; both know a hidden member by its position only.
+  Two server tabs belong to it: **RPC** (`RpcMemberSection.tsx`: the server's RPC
+  membership and consent, its manual member specs and the live member rows;
+  hidden for a file-mode agent) and **Binaries** (`BinariesSection.tsx`: the
+  inventory with version overrides and manual rows), whose entries
+  `shared/BinaryPicker.tsx` offers to every binary field. The API modules are
+  `api/rpcMembers.ts` and `api/binaries.ts`.
 - **The live transcription client** (`gateway/frontend/src/components/chat/`, issue #266, [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)) is the portal's microphone-to-gateway streaming path. `captureWorklet.ts` (an `AudioWorkletProcessor`, bundled
   separately by Vite as `?worker&url`) takes the microphone as one channel, resamples it to 16 kHz and posts
   s16le PCM in ~100 ms batches, with its audio logic in the testable `livePcm.ts`; `liveTranscription.ts`
@@ -283,7 +320,19 @@ Three additions worth knowing when looking for code on this side:
 | `certinstall` | Fetches/installs mesh certificates for the local AI server. |
 | `proxy` | The TLS-terminating reverse proxy in front of the AI server (`cert_mode=proxy`). |
 | `runtime` | The [agent-managed model runtime](cross-cutting/agent-runtime-manager.md): launch-spec wire types, the admission policy, the agent-local security policy, the process manager, the log ring buffer, the router, both config sources, the features client, the redacted report builder, and the driver. |
+| `rpcrelay` | A leaf package: the byte relay in front of a llama.cpp RPC cluster member in relay transport — the allowlist checked on accept before any read, the dial on the first byte, one forwarding session per member, keepalive and the stall signal ([Agent-Managed Model Runtime §3.6](cross-cutting/agent-runtime-manager.md#the-relay)). |
 | `config` | Agent configuration (env `OP_AGENT_*`, config file, flags). |
+
+The RPC cluster member side spans three packages: in `runtime`, the member
+kind's command line, cache and readiness (`rpc_member.go`), holds, reservations
+and the member routes' manager half (`rpc_hold.go`), the head guard and its
+pre-exec probe (`cluster_head.go`), the exit classification (`rpc_classify.go`)
+and the device tokens and backend resolution (`cluster_devices.go`); in `agent`,
+the relay set (`rpc_relay.go`), the direct-mode connection observer
+(`rpc_observer.go`), the head-domain resolver (`rpc_identity.go`), the merged
+`rpc` telemetry block (`rpc_telemetry.go`) and the binary inventory
+(`binaries.go`); in `collector`, the per-process established-connection
+listing (`conns.go`); and `rpcrelay` above.
 
 `internal/runtime` is modelled on `internal/proxy` (focused files) and is worth
 naming file by file, because two of its properties are what make the component

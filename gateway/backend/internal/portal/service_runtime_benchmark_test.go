@@ -125,6 +125,21 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		// instances_min_exceeds_realtime is derived on every read from the spec's
 		// minimum and the mapping's audio ramp, never stored: a read-only warning.
 		"instances_min_exceeds_realtime": true,
+		// The cluster totals, the network/transport defaults and the warnings
+		// are derived on every read from the membership, the servers and the
+		// settings, never stored: read-only echoes. So is the reason a head is
+		// withheld from its runtime document, and the gateway's in-memory
+		// orchestration state of the head.
+		"cluster_status":              true,
+		"cluster_vram_total_mb":       true,
+		"cluster_ram_total_mb":        true,
+		"cluster_totals_complete":     true,
+		"cluster_vram_total_complete": true,
+		"cluster_ram_total_complete":  true,
+		"cluster_network_default":     true,
+		"cluster_transport_default":   true,
+		"cluster_warnings":            true,
+		"cluster_withheld_reason":     true,
 	}
 	writeOnlyInRequest := map[string]bool{
 		// api_token: nil=keep/""=clear/value=replace-and-seal -- the DTO only
@@ -206,6 +221,21 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		EffectiveType:               string(routing.RuntimeSpecTypeVLLM), // read-only; must NOT appear in want below
 		ResolvedMetricsPath:         "/metrics",                          // read-only; must NOT appear in want below
 		ResolvedContextProbePath:    "/v1/models",                        // read-only; must NOT appear in want below
+		DeviceBackend:               "vulkan",
+		ClusterEnabled:              true,
+		MemberMode:                  "manual",
+		ClusterNetwork:              "lan",
+		RPCTransport:                "direct",
+		LANExposureAck:              true,
+		ClusterMembers:              []ClusterMemberDTO{{Position: 0, ServerID: "srv_m", MemberSpecID: "rpcm_x", Visible: true}},
+		ClusterVRAMTotalMB:          24000,                             // read-only; must NOT appear in want below
+		ClusterRAMTotalMB:           8000,                              // read-only; must NOT appear in want below
+		ClusterTotalsComplete:       true,                              // read-only; must NOT appear in want below
+		ClusterVRAMTotalComplete:    true,                              // read-only; must NOT appear in want below
+		ClusterRAMTotalComplete:     true,                              // read-only; must NOT appear in want below
+		ClusterNetworkDefault:       "lan",                             // read-only; must NOT appear in want below
+		ClusterTransportDefault:     "direct",                          // read-only; must NOT appear in want below
+		ClusterWarnings:             []string{"cluster_mmdev_missing"}, // read-only; must NOT appear in want below
 	}
 	req := putRequestFromDTO(dto)
 	want := PutRuntimeSpecRequest{
@@ -241,6 +271,13 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		Type:                        dto.Type,
 		MetricsPath:                 dto.MetricsPath,
 		ContextProbePath:            dto.ContextProbePath,
+		DeviceBackend:               dto.DeviceBackend,
+		ClusterEnabled:              dto.ClusterEnabled,
+		MemberMode:                  dto.MemberMode,
+		ClusterNetwork:              dto.ClusterNetwork,
+		RPCTransport:                dto.RPCTransport,
+		LANExposureAck:              dto.LANExposureAck,
+		ClusterMembers:              dto.ClusterMembers,
 	}
 	if !reflect.DeepEqual(req, want) {
 		t.Fatalf("putRequestFromDTO dropped or altered a field:\n got %#v\nwant %#v", req, want)

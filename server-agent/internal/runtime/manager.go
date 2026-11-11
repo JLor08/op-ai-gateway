@@ -59,6 +59,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -253,6 +254,10 @@ type ManagerOptions struct {
 	// GPUVendorNone, is the correct answer for a CPU-only host and makes
 	// that option a no-op rather than an error.
 	GPUVendor GPUVendor
+
+	// GPUVendors is the full detected vendor set (see GPUVendors). Optional;
+	// empty falls back to GPUVendor alone.
+	GPUVendors GPUVendors
 	// LogBufferBytes / LogBufferTotalBytes size the per-spec managed-process
 	// output retention and its fleet-wide ceiling (see LogStore). Both are
 	// OPERATOR settings from the agent's own local config -- memory on an AI
@@ -367,6 +372,11 @@ type Manager struct {
 	// no measurement.
 	ramMeasurer atomic.Pointer[ramMeasurerFunc]
 
+	// relayGate is the agent's word on whether a relay-mode member's relay is
+	// listening (SetMemberRelayGate). Written by its installer, read by the
+	// member's readiness poll off the owner goroutine; nil means no gate.
+	relayGate atomic.Pointer[func(specID string) error]
+
 	// hostInfo is the latest hardware figures the agent's collect loop pushed
 	// (SetHostInfo): device totals and live available RAM. Same discipline as
 	// measurer above -- the owner only reads it, the collect loop only writes
@@ -438,6 +448,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		policy:              opts.Policy,
 		getenv:              getenv,
 		gpuVendor:           opts.GPUVendor,
+		gpuVendors:          opts.GPUVendors,
 		specsFromLocalFile:  opts.SpecsFromLocalFile,
 		configFilesDir:      opts.ConfigFilesDir,
 		vramHeadroomMB:      max(0, opts.VRAMHeadroomMB),
@@ -539,7 +550,7 @@ func (m *Manager) Apply(cfg Config) {
 // how the gateway adds capacity; a request the router forwards is admitted with
 // EnsureServing instead, which never starts a burst instance.
 func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
-	return m.ensure(ctx, upstreamModel, false)
+	return m.ensure(ctx, cmdEnsure{model: upstreamModel})
 }
 
 // EnsureServing is EnsureRunning for a PLAIN request -- one the router forwards
@@ -569,15 +580,17 @@ func (m *Manager) EnsureRunning(ctx context.Context, upstreamModel string) (endp
 // the address and reads the instance's state (handleEnsure), so no start can
 // slip in between the check and the request it lets through.
 func (m *Manager) EnsureServing(ctx context.Context, upstreamModel string) (endpoint string, release func(), err error) {
-	return m.ensure(ctx, upstreamModel, true)
+	return m.ensure(ctx, cmdEnsure{model: upstreamModel, serving: true})
 }
 
-// ensure is EnsureRunning and EnsureServing; serving marks a plain request
-// (cmdEnsure.serving).
-func (m *Manager) ensure(ctx context.Context, upstreamModel string, serving bool) (endpoint string, release func(), err error) {
+// ensure is EnsureRunning, EnsureServing and EnsureMember: it posts c, with a
+// fresh reply channel, and waits for the answer (cmdEnsure says what each
+// field asks for).
+func (m *Manager) ensure(ctx context.Context, c cmdEnsure) (endpoint string, release func(), err error) {
 	reply := make(chan ensureOutcome, 1)
+	c.reply = reply
 	select {
-	case m.cmds <- cmdEnsure{model: upstreamModel, reply: reply, serving: serving}:
+	case m.cmds <- c:
 	case <-ctx.Done():
 		return "", nil, ctx.Err()
 	case <-m.done:
@@ -942,6 +955,14 @@ type cmdEnsure struct {
 	// serving is set by EnsureServing: a plain request, which a burst instance
 	// serves only while it is running or starting (plainRequestRefused).
 	serving bool
+	// member is set by EnsureMember: model is then an rpc_server spec ID, and
+	// nothing else resolves (memberState). reserve is the reservation the
+	// member is given once it is running (armReservation); 0 arms none.
+	member  bool
+	reserve time.Duration
+	// clusterStart is set by EnsureClusterHead: the gateway's cluster start,
+	// the one ensure that may start a cold cluster head (headRefusesUnmarked).
+	clusterStart bool
 }
 
 func (cmdEnsure) isCommand() {}
@@ -979,6 +1000,14 @@ type cmdStartResult struct {
 	proc   *runningProc
 	ok     bool
 	err    error
+	// rpcProtocol is the protocol version an rpc_server member announced in its
+	// startup banner; deviceMismatch, when set, is the verdict that the banner
+	// lists a different number of devices than the spec selects.
+	rpcProtocol    string
+	deviceMismatch string
+	// relayDown, when set, is why a relay member's relay was still not
+	// listening at the startup deadline although its child was up.
+	relayDown string
 }
 
 func (cmdStartResult) isCommand() {}
@@ -1107,6 +1136,11 @@ type ensureWaiter struct {
 	// request has been waiting longest gets the freed slot rather than
 	// whichever spec Go's randomized map iteration happened to visit first.
 	queuedAt time.Time
+	// reserve is cmdEnsure.reserve, armed when this waiter is served.
+	reserve time.Duration
+	// clusterStart is cmdEnsure.clusterStart: this waiter wants a cold cluster
+	// head started (specState.wantsStart).
+	clusterStart bool
 }
 
 // runningProc is one live generation of a managed process. Its pointer
@@ -1156,6 +1190,21 @@ type specState struct {
 	// copies of one unchanged base are DeepEqual, which is what keeps an
 	// unchanged push from restarting instances.
 	spec Spec
+
+	// rpcProtocol is the RPC protocol version the running rpc_server member
+	// announced in its startup banner; empty when none was seen.
+	rpcProtocol string
+	// bindMismatch: this member's bind address was not an address of this
+	// host at its last start attempt, or its relay never listened. Cleared
+	// by the next start that passes the check.
+	bindMismatch bool
+
+	// terminalSpec is a snapshot of the spec as it was when a cluster process
+	// earned a terminal verdict (terminalCode): retrying the same spec cannot
+	// end differently, so admission, wakes and ensures leave it resting at
+	// not_permitted until the spec itself changes. Nil when there is none.
+	terminalSpec *Spec
+	terminalCode string
 
 	// instance is this state's instance index k: 0 for the spec's own process
 	// (and for every spec that never replicates), k >= 1 for a further
@@ -1375,6 +1424,20 @@ type specState struct {
 	drainedFor []string
 
 	pending []*ensureWaiter
+
+	// claim is an rpc_server member's hold and reservation (rpc_hold.go): while
+	// either stands the member is never idle-unloaded nor an eviction victim.
+	claim memberClaim
+	// relaunchDeferred marks a claimed member whose launch shape changed under
+	// its running process: it is relaunched once the claim ends (claimEnded),
+	// or by the next ensure that finds no head holding it (handleEnsure),
+	// since killing it while held would abort the head that uses it. Cleared
+	// when the process exits.
+	relaunchDeferred bool
+	// admissionBlockedBy names the claimed member a waiting admission of this
+	// spec could only proceed by evicting; empty otherwise. admitAndStart
+	// decides it on every ask, and it is dropped once nothing waits any more.
+	admissionBlockedBy string
 }
 
 // owner holds every piece of state the single serialized goroutine touches.
@@ -1386,6 +1449,10 @@ type owner struct {
 	// not change under a running agent), so it is a plain field read by the
 	// owner goroutine and never written after construction.
 	gpuVendor GPUVendor
+	// gpuVendors is every vendor the host's GPU detection found, in precedence
+	// order. Only the generic device tokens' "auto" backend reads it; the
+	// single gpuVendor above keeps driving visibility and budgets.
+	gpuVendors GPUVendors
 	// specsFromLocalFile is ManagerOptions.SpecsFromLocalFile -- fixed for
 	// the process lifetime, so a plain field like gpuVendor above. Its only
 	// use is the masking rule for the reported launch command; see the option's
@@ -1395,6 +1462,11 @@ type owner struct {
 	// the owner writes a spec's config files under. Fixed for the process
 	// lifetime, so a plain field like gpuVendor above.
 	configFilesDir string
+	// lastCacheSweep is when the last sweep of the rpc cache root started
+	// (maybeSweepMemberCaches); zero before the first document.
+	lastCacheSweep time.Time
+	// cacheSweeper runs those sweeps; created by the first.
+	cacheSweeper *memberCacheSweeper
 	// vramHeadroomMB is ManagerOptions.VRAMHeadroomMB, never negative. Fixed
 	// for the process lifetime, so a plain field like gpuVendor above; read
 	// only by buildSnapshot's auto-detected budgets.
@@ -1502,6 +1574,7 @@ func (o *owner) run() {
 			if !o.closing {
 				o.scanIdle()
 				o.dispatchMeasurement()
+				o.sweepTick()
 			}
 		case <-o.m.hostWake:
 			o.turn++
@@ -1550,7 +1623,19 @@ func (o *owner) handle(cmd command) {
 	case cmdLoadedModels:
 		c.reply <- o.loadedModels()
 	case cmdStop:
-		c.reply <- o.stopInstance(c.model)
+		c.reply <- o.handleStop(c)
+	case cmdStopMember:
+		c.reply <- o.stopMember(c.specID, c.force)
+	case cmdReleaseMember:
+		c.reply <- o.releaseMember(c.specID)
+	case cmdSetMemberHold:
+		o.setMemberHold(c)
+	case cmdReservationExpired:
+		o.handleReservationExpired(c)
+	case cmdPurgeMemberCache:
+		c.reply <- o.purgeMemberCache(c.specID)
+	case cmdClusterHeadInfo:
+		c.reply <- o.clusterHeadInfo(c.model)
 	case cmdResolve:
 		_, base, k, ok := o.resolveAddress(c.model)
 		c.reply <- resolvedAddress{base: base, k: k, ok: ok}
@@ -1621,6 +1706,18 @@ func (o *owner) applyConfig(cfg Config) {
 	}
 	o.cfg = cfg
 	o.allowedPairs = cfg.AllowedPairs()
+
+	// A member's cache belongs to the head it serves: remember who served which
+	// head before this document, to drop the cache of a head a member no
+	// longer serves. Caches of members that left the document are the sweep's.
+	memberHeads := make(map[string]string)
+	for id, st := range o.specs {
+		if st.instance == 0 && st.spec.IsRPCServer() {
+			memberHeads[id] = st.spec.RPC.HeadSpecID
+		}
+	}
+	defer o.purgeChangedHeadCaches(memberHeads, cfg.Specs)
+	defer o.maybeSweepMemberCaches(cfg.Specs)
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))
@@ -1743,7 +1840,9 @@ func (o *owner) applyConfig(cfg Config) {
 		}
 		// protected() is the pre-instance "pinned || force_running" for
 		// instance 0 of a spec that never replicates, and folds the
-		// min_instances floor in for a replicable one.
+		// min_instances floor in for a replicable one. A protected cluster
+		// head is asked too and stays down (wantsUp): only the gateway's
+		// cluster start brings one up.
 		if st.protected() && st.proc == nil && st.state != StateBackoff {
 			start = append(start, id)
 		}
@@ -1858,6 +1957,9 @@ func (o *owner) reconcileSpec(st *specState, spec Spec) {
 	changed := !reflect.DeepEqual(st.spec, spec)
 	prevSpec := st.spec
 	st.spec = spec
+	if changed {
+		st.terminalSpec, st.terminalCode = nil, ""
+	}
 	switch {
 	case changed && st.proc == nil:
 		switch st.state {
@@ -1867,6 +1969,19 @@ func (o *owner) reconcileSpec(st *specState, spec Spec) {
 			cancelTimer(o.m, &st.backoffTimer)
 			o.setState(st, StateStopped)
 		}
+	case changed && st.proc != nil && spec.AdminState != "force_stopped" && spec.IsRPCServer() && st.claimed() &&
+		(st.relaunchDeferred || !sameLaunchShape(prevSpec, spec)):
+		// A member a head holds or has reserved is part of a running cluster:
+		// a member has no requests in flight, so a drain would kill it at once
+		// and the head with it. Its relaunch waits for the claim to end -- the
+		// gateway relaunches the head for a change of the member's launch, and
+		// releases the member when that head stops (claimEnded). Once deferred
+		// it stays deferred: the running process has the old shape, whatever
+		// a later document says.
+		if !st.relaunchDeferred {
+			slog.Info("runtime: the member's launch changed while a head uses it; it is relaunched once the head lets go", "spec", spec.ID)
+		}
+		st.relaunchDeferred = true
 	case changed && st.proc != nil && spec.AdminState != "force_stopped" && !sameLaunchShape(prevSpec, spec):
 		// I7 fix (issue #63): a LIVE child whose LAUNCH SHAPE changed must
 		// be relaunched with it. Before this, applyConfig stored the new
@@ -1974,6 +2089,18 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Replicable = false
 		s.MinInstances = 0
 		s.MaxInstances = 0
+		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
+		// decide what is exec'd and how (a member's bind and port, a head's
+		// ordered endpoint list). The one exception is the connection
+		// allowlist (RPC.HeadIPs/HeadDomain), which the agent applies to a
+		// running member live, so an allowlist edit must not bounce it. The
+		// RPC struct is copied before clearing: the Spec shares the pointer.
+		if s.RPC != nil {
+			rpc := *s.RPC
+			rpc.HeadIPs = nil
+			rpc.HeadDomain = ""
+			s.RPC = &rpc
+		}
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
@@ -2005,7 +2132,9 @@ func sameLaunchShape(a, b Spec) bool {
 func (o *owner) rebuildUpstreamIndex() {
 	o.byUpstream = make(map[string]string, len(o.specs))
 	for id, st := range o.specs {
-		if st.instance != 0 {
+		if st.instance != 0 || st.spec.Kind == SpecKindRPCServer {
+			// An rpc_server member serves no model: indexed, it would sit under
+			// the empty upstream name and could shadow a real lookup.
 			continue
 		}
 		// M4 fix: this used to collapse silently, with map iteration order
@@ -2059,43 +2188,30 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
 		return
 	}
-	specID, _, k, ok := o.resolveAddress(c.model)
-	if !ok {
-		c.reply <- ensureOutcome{err: ErrModelNotManaged}
+	st, err := o.ensureTarget(c)
+	if err != nil {
+		c.reply <- ensureOutcome{err: err}
 		return
 	}
-	st := o.specs[specID]
-	// force_stopped applies to every instance of the spec, and is read
-	// off instance 0 -- the pushed spec itself -- before a further instance
-	// could be created for nothing.
-	if st.spec.AdminState == "force_stopped" {
-		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
-		return
-	}
-	if k > 0 {
-		// Decided before instanceForRequest, which would create the instance, or
-		// retire a crashed or start_failed one and start a fresh one -- the start
-		// is exactly what a plain request must not cause for a burst instance
-		// (EnsureServing).
-		// The retirement it may cause: a burst instance resting at a failure
-		// stays only until it is named again, and deleting it creates and starts
-		// nothing. Left in place, a row the gateway keeps naming for a moment
-		// (its telemetry lags) would read crashed until the next Apply.
-		if c.serving && o.plainRequestRefused(st, k) {
-			key := InstanceKey(st.spec.ID, k)
-			if failed := o.specs[key]; failed != nil && failed.spentBurst() {
-				o.retire(key, failed)
-			}
-			c.reply <- ensureOutcome{err: ErrInstanceNoCapacity}
-			return
-		}
-		st = o.instanceForRequest(st, k)
-		specID = st.spec.ID
+	specID := st.spec.ID
+	if c.member && st.relaunchDeferred && st.state == StateRunning && st.proc != nil && st.claim.heldBy == "" {
+		// A member whose relaunch waits for its claim, asked for again while
+		// no head is connected to it (at most a reservation stands): this is
+		// a cluster start, and its head must form against the current launch.
+		// Nothing uses the old process, so it drains now and the ensure waits
+		// for the relaunch like any request that finds its spec draining.
+		st.relaunchDeferred = false
+		o.beginDrain(specID)
 	}
 	if st.state == StateRunning && st.proc != nil {
 		st.inFlight++
 		st.lastUsed = time.Now()
+		o.armReservation(st, c.reserve)
 		c.reply <- ensureOutcome{endpoint: endpointFor(st.proc.port), specID: specID, proc: st.proc}
+		return
+	}
+	if terminalHeld(st) {
+		c.reply <- ensureOutcome{err: ErrNotPermitted}
 		return
 	}
 	if st.state == StateNotPermitted && time.Since(st.notPermittedAt) < notPermittedRetryInterval {
@@ -2104,6 +2220,15 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	}
 	if st.state == StatePendingVRAMUnknown && time.Since(st.notPermittedAt) < notPermittedRetryInterval {
 		c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
+		return
+	}
+	// A cold cluster head starts only for the gateway's cluster start (see
+	// cluster_head.go); any other request is refused, so the gateway
+	// orchestrates the cluster first. Decided after the verdicts above, so a
+	// head that cannot run is reported as such rather than sending the gateway
+	// off to bring its members up for nothing.
+	if !c.clusterStart && headRefusesUnmarked(st) {
+		c.reply <- ensureOutcome{err: fmt.Errorf("%w: cluster head %s is not running; the gateway starts its cluster", ErrClusterNotReady, specID)}
 		return
 	}
 	// A burst instance is never queued behind anything but its own start: its
@@ -2119,7 +2244,7 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 
-	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now()}
+	w := &ensureWaiter{reply: c.reply, queuedAt: time.Now(), reserve: c.reserve, clusterStart: c.clusterStart}
 	if st.spec.AdmissionWaitTimeoutSeconds > 0 {
 		d := time.Duration(st.spec.AdmissionWaitTimeoutSeconds) * time.Second
 		reply := c.reply
@@ -2129,6 +2254,53 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 	}
 	st.pending = append(st.pending, w)
 	o.admitAndStart(specID)
+}
+
+// ensureTarget resolves what an ensure names to the state it is admitted as,
+// or answers it with a refusal. A member ensure names an rpc_server spec by ID
+// and reaches nothing else (memberState); every other ensure names an instance
+// address (resolveAddress), which never reaches a member: a member is not in
+// the upstream index. force_stopped applies to every instance of a spec and is
+// read off instance 0 -- the pushed spec itself -- before a further instance
+// could be created for nothing.
+func (o *owner) ensureTarget(c cmdEnsure) (*specState, error) {
+	if c.member {
+		st, ok := o.memberState(c.model)
+		if !ok {
+			return nil, ErrModelNotManaged
+		}
+		if st.spec.AdminState == "force_stopped" {
+			return nil, ErrAdmissionBlocked
+		}
+		return st, nil
+	}
+	specID, _, k, ok := o.resolveAddress(c.model)
+	if !ok {
+		return nil, ErrModelNotManaged
+	}
+	st := o.specs[specID]
+	if st.spec.AdminState == "force_stopped" {
+		return nil, ErrAdmissionBlocked
+	}
+	if k == 0 {
+		return st, nil
+	}
+	// Decided before instanceForRequest, which would create the instance, or
+	// retire a crashed or start_failed one and start a fresh one -- the start is
+	// exactly what a plain request must not cause for a burst instance
+	// (EnsureServing).
+	// The retirement it may cause: a burst instance resting at a failure stays
+	// only until it is named again, and deleting it creates and starts nothing.
+	// Left in place, a row the gateway keeps naming for a moment (its telemetry
+	// lags) would read crashed until the next Apply.
+	if c.serving && o.plainRequestRefused(st, k) {
+		key := InstanceKey(st.spec.ID, k)
+		if failed := o.specs[key]; failed != nil && failed.spentBurst() {
+			o.retire(key, failed)
+		}
+		return nil, ErrInstanceNoCapacity
+	}
+	return o.instanceForRequest(st, k), nil
 }
 
 // resolveAddress is Manager.ResolveAddress on the owner, and the rule
@@ -2237,6 +2409,7 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 			if w.reply == c.reply {
 				cancelTimer(o.m, &w.timer)
 				st.pending = append(st.pending[:i:i], st.pending[i+1:]...)
+				o.noteWaitEnded(st)
 				err := c.err
 				if err == nil {
 					err = context.Canceled
@@ -2323,6 +2496,7 @@ func (o *owner) handleWaiterTimeout(c cmdWaiterTimeout) {
 		if w.reply == c.reply {
 			w.timer = nil // this IS that timer's own callback; nothing left to Stop()
 			st.pending = append(st.pending[:i:i], st.pending[i+1:]...)
+			o.noteWaitEnded(st)
 			c.reply <- ensureOutcome{err: ErrAdmissionBlocked}
 			return
 		}
@@ -2351,6 +2525,7 @@ func (o *owner) failPending(st *specState, err error) {
 		w.reply <- ensureOutcome{err: err}
 	}
 	st.pending = nil
+	o.noteWaitEnded(st)
 }
 
 // succeedPending resolves and clears every waiter queued on st with st's
@@ -2361,6 +2536,7 @@ func (o *owner) succeedPending(st *specState, specID string) {
 	for _, w := range st.pending {
 		cancelTimer(o.m, &w.timer)
 		st.inFlight++
+		o.armReservation(st, w.reserve)
 		w.reply <- ensureOutcome{endpoint: ep, specID: specID, proc: st.proc}
 	}
 	st.pending = nil
@@ -2412,9 +2588,29 @@ func (o *owner) deleteState(id string) {
 // event, leaving a request queued on it to its admission timeout. Every refusal
 // goes through here or through setPendingVRAMUnknown.
 func (o *owner) setNotPermitted(st *specState, message string) {
+	o.setNotPermittedCode(st, message, "")
+}
+
+// terminalHeld reports whether st rests under a terminal verdict that its
+// current spec still matches.
+func terminalHeld(st *specState) bool {
+	return st.terminalSpec != nil && reflect.DeepEqual(*st.terminalSpec, st.spec)
+}
+
+// setTerminalVerdict is setNotPermittedCode for a verdict that no retry can
+// change: the spec is remembered, and stays refused until it differs.
+func (o *owner) setTerminalVerdict(st *specState, message, code string) {
+	snapshot := st.spec
+	st.terminalSpec, st.terminalCode = &snapshot, code
+	o.setNotPermittedCode(st, message, code)
+}
+
+// setNotPermittedCode is setNotPermitted for a verdict that carries a stable
+// error code.
+func (o *owner) setNotPermittedCode(st *specState, message, code string) {
 	o.setState(st, StateNotPermitted)
 	st.notPermittedAt = time.Now() // (re)start the rate-limit window -- see specState.notPermittedAt
-	st.lastError = &LastError{Message: message, At: time.Now()}
+	st.lastError = &LastError{Message: message, At: time.Now(), Code: code}
 	o.failPending(st, ErrNotPermitted)
 	o.wakeSiblingsWaitingFor(st)
 }
@@ -2526,13 +2722,14 @@ func (o *owner) vramBootstrapEligible(st *specState) bool {
 
 // wantsUp reports whether anything wants st running right now: a queued
 // request, or its being protected -- an operator pin / force_running on
-// instance 0, or an instance inside the min_instances floor (protected). It is
+// instance 0, or an instance inside the min_instances floor (protected) -- and
+// for a cluster head only a queued cluster start (specState.wantsStart). It is
 // admitAndStart's own admission precondition, factored out so the cold-start
 // bootstrap memory-pressure escalation (onProcExited, task 4.4) can ask the
 // identical question -- an eviction to free RAM for a retry is worth nothing if
 // no retry is coming.
 func (o *owner) wantsUp(st *specState) bool {
-	return len(st.pending) > 0 || st.protected()
+	return st.wantsStart()
 }
 
 // specForInstance returns the Spec instance k of base runs as (#340): base
@@ -2581,9 +2778,22 @@ func (st *specState) protected() bool {
 // promise is worth nothing if an admission may evict a protected instance, and
 // a further instance of a pinned spec must not read as pinned merely because
 // its copy carries the field.
+//
+// A cluster head that is force_running reads pinned as well: for a head,
+// force_running means the gateway keeps it up (headKeptUp).
+//
+// An rpc_server member under a hold or a reservation (claimed) reads pinned
+// too: a head is using it, or is about to, and evicting it would abort that
+// head's cluster.
 func (st *specState) pinnedForAdmission() bool {
+	return st.pinnedBySpec() || st.claimed()
+}
+
+// pinnedBySpec is pinnedForAdmission without a member's claim: what the
+// pushed spec alone makes of the instance.
+func (st *specState) pinnedBySpec() bool {
 	if !st.spec.Replicable {
-		return st.spec.Pinned
+		return st.spec.Pinned || headKeptUp(st.spec)
 	}
 	return st.protected()
 }
@@ -2824,6 +3034,10 @@ func (o *owner) admitAndStart(specID string) {
 	if st == nil || st.proc != nil || st.state == StateBackoff {
 		return
 	}
+	if terminalHeld(st) {
+		o.failPending(st, ErrNotPermitted)
+		return
+	}
 	// Every verdict below rewrites these from scratch, and so does every return
 	// before one: a spec nobody wants up, or one force-stopped, is neither a RAM
 	// nor a grace waiter, and a stale true must never be able to select it for a
@@ -2832,6 +3046,18 @@ func (o *owner) admitAndStart(specID string) {
 	st.waitingOnGrace = false
 	st.waitingOnDemand = false
 	st.waitingOnSibling = false
+	// The claimed member blocking this admission is decided afresh on every ask
+	// and recorded once, on the way out, so a wait that stays blocked by the
+	// same member does not ring the transitions doorbell on every re-ask.
+	blockedBy := ""
+	defer func() { o.setAdmissionBlockedBy(st, blockedBy) }()
+	// A cold cluster head starts only for a cluster start. A request queued
+	// without the mark -- one that waited for a start or a drain that has since
+	// ended -- would otherwise start it here, so it is answered as handleEnsure
+	// answers it now.
+	if st.spec.IsClusterHead() && !st.clusterStartQueued() && len(st.pending) > 0 {
+		o.failPending(st, fmt.Errorf("%w: cluster head %s is not running; the gateway starts its cluster", ErrClusterNotReady, specID))
+	}
 	if !o.wantsUp(st) {
 		return
 	}
@@ -2843,6 +3069,17 @@ func (o *owner) admitAndStart(specID string) {
 	if err := o.policy.Permit(st.spec); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
+	}
+	// Checked before admission, so nothing is evicted for a member that
+	// cannot bind; refused like a Permit failure, so a retry is rate-limited
+	// and nothing loops.
+	if st.spec.IsRPCServer() {
+		if err := memberBindLocal(st.spec); err != nil {
+			st.bindMismatch = true
+			o.setNotPermittedCode(st, err.Error(), codeBindMismatch)
+			return
+		}
+		st.bindMismatch = false
 	}
 
 	// The protected instances of a spec start lowest index first, on every path
@@ -2926,6 +3163,16 @@ func (o *owner) admitAndStart(specID string) {
 	case dec.Reason == StateNotPermitted:
 		o.setNotPermitted(st, dec.Message)
 	case dec.Reason == StatePendingVRAMUnknown:
+		// The unknown-demand refusal reads a pinned occupant as one that never
+		// leaves, and a claimed member reads pinned. A claim does end, though:
+		// when it is the claim alone that refuses the start, the start waits
+		// instead -- queued, state untouched, the member named -- and the end of
+		// the claim asks it again (claimEnded), when the ordinary rules,
+		// the one-shot bootstrap among them, decide.
+		if member := o.claimedMemberBlocking(snap, demand); member != "" {
+			blockedBy = member
+			return
+		}
 		o.setPendingVRAMUnknown(st, dec.Message)
 	case dec.Wait:
 		// Leave st queued; a later release, exit or Apply re-triggers this
@@ -2936,6 +3183,7 @@ func (o *owner) admitAndStart(specID string) {
 		// that is the one Wait nothing need ever resolve. See
 		// noteAdmissionWait.
 		o.noteAdmissionWait(st, dec.Message)
+		blockedBy = o.claimedMemberBlocking(snap, demand)
 	case len(dec.Evict) > 0:
 		if dec.VRAMBootstrap {
 			// This Evict spent the candidate's one-shot VRAM bootstrap (rule 4
@@ -3567,6 +3815,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			Spec:     specBase(st.spec),
 			Instance: st.instance,
 			Surplus:  st.burst(),
+			Member:   st.spec.IsRPCServer(),
 			GPUs:     gpus,
 			RAMMB:    max(liveRAM, demand.RAMMB),
 			InFlight: st.inFlight,
@@ -3790,7 +4039,7 @@ func (o *owner) startProcess(st *specState) {
 	// substitutes a decimal string for ${PORT}), so this dry run with a
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
-	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
@@ -3801,13 +4050,13 @@ func (o *owner) startProcess(st *specState) {
 	// rate-limited -- and before a port is acquired or anything is written. The
 	// checks are port-independent for the same reason the one above is. Only the
 	// filesystem writes, further down, are start failures.
-	if _, err := planSpecConfigFiles(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+	if _, err := planSpecConfigFiles(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
 
 	port := spec.ListenPort
-	if port == 0 {
+	if port == 0 && !spec.IsRPCServer() {
 		p, err := grabEphemeralPort()
 		if err != nil {
 			o.setState(st, StateStartFailed)
@@ -3819,7 +4068,7 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	ex, err := expandSpec(spec, port, o.gpuVendor, o.getenv, o.configFilesDir)
+	ex, err := expandSpec(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port
@@ -3835,7 +4084,7 @@ func (o *owner) startProcess(st *specState) {
 	// full disk, failed rename) -- a start failure that backs off and retries,
 	// the same shape as the ephemeral-port failure above, and NOT a
 	// not_permitted verdict, which would claim the config can never work.
-	if err := writeSpecConfigFiles(spec, port, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+	if err := writeSpecConfigFiles(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, err.Error(), 0, "")
 		o.failPending(st, ErrStartFailed)
@@ -3844,6 +4093,16 @@ func (o *owner) startProcess(st *specState) {
 	}
 
 	args, env := ex.args, ex.env
+	if spec.IsRPCServer() {
+		// A member's command line is the operator's arguments plus the
+		// agent-owned -d/-H/-p/-c, and its port is the one it binds. Everything
+		// here is deterministic, so a failure is a verdict, not a start failure.
+		var err error
+		if args, env, port, err = o.prepareMember(spec, ex.args, ex.env); err != nil {
+			o.setNotPermitted(st, err.Error())
+			return
+		}
+	}
 	// The reportable form of this exact launch, built from the SAME expansion
 	// (never a second one that could disagree with it) and masked here, at the
 	// point of substitution, so no plaintext resolved command is ever retained
@@ -3951,6 +4210,11 @@ func (o *owner) pollHealth(specID string, proc *runningProc, spec Spec) {
 		startupTimeout = 30 * time.Second
 	}
 	deadline := proc.startedAt.Add(startupTimeout)
+
+	if spec.IsRPCServer() {
+		o.pollMemberReady(specID, proc, spec, deadline)
+		return
+	}
 
 	healthPath := spec.HealthPath
 	if healthPath == "" {
@@ -4081,7 +4345,17 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		slog.Debug("runtime: discarding start result for a draining generation", "spec", c.specID, "ok", c.ok)
 		return
 	}
+	if c.ok && c.deviceMismatch != "" {
+		// The member is listening but exposes the wrong devices: serving
+		// requests with it would silently shrink the cluster. Refuse it before
+		// it is ever reported running; only a config change can fix it.
+		o.setTerminalVerdict(st, c.deviceMismatch, codeRPCDeviceCountMismatch)
+		o.terminateNow(st, c.proc)
+		return
+	}
 	if c.ok {
+		st.rpcProtocol = c.rpcProtocol
+		st.terminalSpec, st.terminalCode = nil, ""
 		if st.hasRunBefore {
 			st.restarts++
 		}
@@ -4120,6 +4394,19 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// busy for this wake, so a request queued for another spec Waits for
 		// their release instead of evicting the process just handed out.
 		o.wakeAfterStart()
+		return
+	}
+
+	if c.relayDown != "" {
+		// The rpc-server came up but its relay never listened, so the head
+		// could not have reached it.
+		o.setState(st, StateStartFailed)
+		o.recordFailure(st, c.relayDown, 0, "")
+		st.lastError.Code = codeBindMismatch
+		st.bindMismatch = true
+		o.failPending(st, ErrStartFailed)
+		o.terminateNow(st, c.proc)
+		o.enterBackoff(st)
 		return
 	}
 
@@ -4184,6 +4471,13 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	cancelTimer(o.m, &proc.drainTimer)
 	cancelTimer(o.m, &proc.stableTimer)
 	st.proc = nil
+	st.rpcProtocol = ""
+	st.relaunchDeferred = false
+	// A hold and a reservation are claims on a running member: with its process
+	// gone there is nothing left to hold, and the start a reservation covered has
+	// ended. The admission wake that follows every exit re-asks whoever waited
+	// for the room.
+	o.dropClaim(st)
 	// C3 fix: the generation's requests are dead by definition. Without
 	// this, a request in flight when the child crashed left InFlight stuck
 	// above zero forever, and Admit's isEvictable (which requires
@@ -4361,6 +4655,25 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		o.wakeAdmissionCandidates()
 		return
 	}
+
+	// A cluster head or rpc_server member that died with a known llama.cpp RPC
+	// message is classified. A terminal verdict on a START that never became
+	// healthy cannot be fixed by retrying, so it rests as not_permitted without
+	// backoff; every other classified exit keeps the ordinary handling below
+	// and only gains its error code.
+	rule, classified := matchExitRule(st.spec, tail)
+	class := rule.class
+	if classified && class.Terminal && !wasHealthy {
+		o.setTerminalVerdict(st, exitClassMessage(rule, exitCode), class.Code)
+		st.lastError.ExitCode, st.lastError.StderrTail = exitCode, tail
+		o.wakeAdmissionCandidates()
+		return
+	}
+	defer func() {
+		if classified && st.lastError != nil {
+			st.lastError.Code = class.Code
+		}
+	}()
 
 	if wasHealthy {
 		o.setState(st, StateCrashed)
@@ -4585,12 +4898,17 @@ func (o *owner) hostRAMBudgetSnapshot() int {
 // instance, instanceForRequest; a plain request only retires it, handleEnsure)
 // or the next Apply; any waiter still queued on it would never be served, so it
 // is failed here.
+//
+// A CLUSTER HEAD never enters it either, for the same reason: only the
+// gateway's cluster start brings a head up (cluster_head.go), after bringing
+// its members up, so a timer here could never start it. It rests at the
+// failure until that start, which is the retry.
 func (o *owner) enterBackoff(st *specState) {
 	if o.closing {
 		o.setState(st, StateStopped)
 		return
 	}
-	if st.burst() {
+	if st.burst() || st.spec.IsClusterHead() {
 		o.failPending(st, ErrStartFailed)
 		return
 	}
@@ -5049,10 +5367,10 @@ type wakeCandidate struct {
 // in the ordering below -- so keeping it in step with admitAndStart's rule is
 // what makes the wake fair, not what makes it correct.
 func wantsWake(st *specState) bool {
-	if st.proc != nil || st.state == StateBackoff {
+	if st.proc != nil || st.state == StateBackoff || terminalHeld(st) {
 		return false
 	}
-	return len(st.pending) > 0 || st.protected()
+	return st.wantsStart()
 }
 
 // lessByQueueAge is wakeAdmission's wake order: oldest queued
@@ -5111,17 +5429,23 @@ func (o *owner) scanIdle() {
 		if st.proc == nil || st.state != StateRunning {
 			continue
 		}
-		if st.protected() {
+		if st.protected() || st.claimed() {
 			continue
 		}
-		if st.spec.IdleTimeoutSeconds <= 0 || st.inFlight != 0 {
+		isMember := st.spec.Kind == SpecKindRPCServer
+		if (st.spec.IdleTimeoutSeconds <= 0 && !isMember) || st.inFlight != 0 {
 			continue
 		}
 		if o.higherSiblingRuns(st) {
 			continue
 		}
 		idle := time.Duration(st.spec.IdleTimeoutSeconds) * time.Second
-		if now.Sub(st.lastUsed) >= idle {
+		since := st.lastUsed
+		if isMember {
+			idle = memberIdleTimeout(st.spec)
+			since = st.claim.idleSince(st.lastUsed)
+		}
+		if now.Sub(since) >= idle {
 			o.beginDrain(id)
 		}
 	}
@@ -5135,21 +5459,23 @@ func (o *owner) snapshotStatus() []Status {
 			// gateway sees exactly the rows it always did for a spec that never
 			// replicates and a newer one folds instance rows by spec; the
 			// instance address as the model; and the instance index.
-			SpecID:    specBase(st.spec),
-			Instance:  st.instance,
-			Model:     InstanceAddress(st.spec.UpstreamModel, st.instance),
-			StartupMS: st.startupMS,
-			State:     st.state,
-			Since:     st.since,
-			InFlight:  st.inFlight,
-			Restarts:  st.restarts,
-			LastError: st.lastError,
+			SpecID:      specBase(st.spec),
+			Instance:    st.instance,
+			Model:       InstanceAddress(st.spec.UpstreamModel, st.instance),
+			StartupMS:   st.startupMS,
+			RPCProtocol: st.rpcProtocol,
+			State:       st.state,
+			Since:       st.since,
+			InFlight:    st.inFlight,
+			Restarts:    st.restarts,
+			LastError:   st.lastError,
 			// Probe config (Task 9): pure struct copies of the spec's own
 			// resolved fields, no I/O -- this runs on the owner's single
 			// command goroutine, which must never block on a network probe.
 			Type:             st.spec.Type,
 			MetricsPath:      st.spec.MetricsPath,
 			ContextProbePath: st.spec.ContextProbePath,
+			Kind:             st.spec.Kind,
 		}
 		if st.measuredVRAM != nil {
 			// M3 fix: hand out a COPY, not the same map the measurer
@@ -5168,15 +5494,51 @@ func (o *owner) snapshotStatus() []Status {
 			s.PID = st.proc.pid
 			s.Port = st.proc.port
 		}
+		if st.spec.IsRPCServer() {
+			member := *st.spec.RPC
+			member.HeadIPs = slices.Clone(member.HeadIPs)
+			s.RPCMember = &member
+			s.RPCReleasedAt = st.claim.releasedAt
+			s.RPC = &RPCStatus{
+				HeldBy:        st.claim.heldBy,
+				HeldSince:     st.claim.heldSince,
+				ReservedUntil: st.claim.reservedUntil,
+				BindMismatch:  st.bindMismatch,
+				// A start that verified the banner proved the device count equal
+				// to the expected one, so the expected count is what the member
+				// exposes; a member that is not running exposes none.
+				DeviceCount: st.memberDeviceCount(),
+			}
+		}
+		// A head's launch facts: its endpoints cannot change under a live
+		// process (a different set relaunches it), so while the process exists
+		// the spec's endpoints are the ones it was started against.
+		if st.spec.IsClusterHead() && st.proc != nil {
+			launched := make([]string, len(st.spec.Cluster.Endpoints))
+			for i, ep := range st.spec.Cluster.Endpoints {
+				launched[i] = ep.Address
+			}
+			s.Cluster = &ClusterStatus{Launched: launched}
+		}
+		s.AdmissionBlockedBy = st.admissionBlockedBy
 		out = append(out, s)
 	}
 	return out
 }
 
+// memberDeviceCount is the number of devices a running rpc_server member
+// exposes, 0 while it is not running.
+func (st *specState) memberDeviceCount() int {
+	if st.state != StateRunning || st.proc == nil {
+		return 0
+	}
+	return expectedMemberDevices(st.spec)
+}
+
 func (o *owner) loadedModels() []string {
 	var out []string
 	for _, st := range o.specs {
-		if st.state == StateRunning {
+		if st.state == StateRunning && st.spec.Kind != SpecKindRPCServer {
 			out = append(out, InstanceAddress(st.spec.UpstreamModel, st.instance))
 		}
 	}
@@ -5202,6 +5564,9 @@ func (o *owner) handleClose() {
 			cancelTimer(o.m, &st.backoffTimer)
 			o.setState(st, StateStopped)
 		}
+		// Registered in m.wg like the backoff timer; nothing is idle-scanned or
+		// admitted again, so the reservation has nothing left to guard.
+		cancelTimer(o.m, &st.claim.reservationTimer)
 		o.failPending(st, ErrManagerClosed)
 		if st.proc != nil {
 			o.beginDrain(id)

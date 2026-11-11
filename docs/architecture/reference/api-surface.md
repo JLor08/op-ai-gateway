@@ -326,7 +326,7 @@ routing resolves it deterministically instead (first account in id order wins).
 | `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked by the group's **manual** traversal order + live per-mapping score (it does not model `member_order`, `loaded_only` or `min_tokens_per_second`, so such a group may be served in a different order than shown) |
 | `/api/portal/model-groups`, `/model-groups/{id}` | GET/POST, GET/PUT/DELETE | **`admin`** | Model-group CRUD (global-admin capability) |
 | `/api/portal/model-settings/{name}` | PUT | **`admin`** | Set a model's visibility |
-| `/api/portal/servers`, `/servers/{id}[/...]` | GET/POST, GET/PATCH/DELETE + sub-paths (energy, admin-groups, applications, agent-token, resource-groups, models, certificate, https-switch-override, ping) | `gateway:use` + object-level ownership inside `portal.Service` | AI server CRUD and per-server management surface |
+| `/api/portal/servers`, `/servers/{id}[/...]` | GET/POST, GET/PATCH/DELETE + sub-paths (energy, admin-groups, applications, agent-token, resource-groups, models, certificate, https-switch-override, ping, rpc-members, binaries) | `gateway:use` + object-level ownership inside `portal.Service` | AI server CRUD and per-server management surface. The server document also carries the llama.cpp RPC cluster settings ([RPC clusters](#rpc-clusters) below): `lan_address` (`''` or an IPv4 literal, else `400 server.lan_address_invalid`), `lan_bind_only`, `rpc_member_enabled` and `rpc_allowed_head_groups` (admin-tier group ids, else `400 server.admin_group_invalid`; `[]` = the server's own admin groups), and read-only `netbird_ip` and `clock_offset_ms` (the agent's clock minus the gateway's at the latest sample, signed, `null` until reported). A DELETE of a server that is a member of a cluster head is `409 runtime.cluster_member_in_use`: remove the member from the head first, because the membership would otherwise vanish silently and shift the head's `RPC<n>` names |
 | `/api/portal/applications/{id}` | GET/PATCH/DELETE | `gateway:use` + ownership | Application (inference backend) CRUD |
 | `/api/portal/mappings/{id}` | PATCH/DELETE | `gateway:use` + ownership | Model-mapping CRUD. The mapping DTO — here and on the create/list responses — carries `capabilities` in exactly the shape the model-servers rows use (`capability`, `verdict` `"yes"`/`"no"` only, `source`, `checked_at`), alphabetical and **always an array, never `null`**; an absent entry is UNKNOWN, which is the one thing the folded `is_mtp`/`vision_capable` booleans beside it cannot express (both fold a `"no"` row and a missing row to `false`). PATCH and POST both accept `capability_verdicts`, a map keyed by capability name and the authoritative per-capability field: `"yes"`/`"no"` writes a `manual` row when it differs from the STORED row (a missing row counts as different, which is what makes unknown → `"no"` a real transition rather than a silent no-op); `""` DELETES the row, returning the capability to unknown — the only way back out of a `manual` verdict, which outranks every probe and the vision benchmark for as long as it stands; an absent key states nothing, so a save made for an unrelated reason cannot touch a capability. It rides on this PATCH rather than on a DELETE of its own because the mapping form seeds once and never re-syncs, so a reset applied separately would be undone by the operator's next unrelated edit; the response is therefore post-write truth. The `is_mtp`/`vision_capable` booleans beside it are the LEGACY compatibility path and are compared against the two-state fold instead, so an unconditional `vision_capable: false` from a client that submits every field on every save writes nothing — which is deliberate, and is why they cannot state a negative or reach unknown. Any capability name may be RESET (the vocabulary is open) and names are trimmed; the one narrowing is keyed on the (name, verdict) PAIR rather than the name: `live_progress: "no"` and either verdict on `speculation_observed` may not be STATED, because a `manual` row outranks every probe permanently and a manual `live_progress: "no"` would silently disable the operator's own `responses_live_timings_enabled` switch on a different endpoint, with no way to repair it from the mapping form. `live_progress: "yes"` stays accepted on purpose — it is the only opt-in a `llama_swap`/`litellm`/`tgi`/`custom` mapping ever had for an exact mid-stream count on `/v1/chat/completions`, where the same verdict is read in both directions. Five rejections are `400`s: a blank name (`mapping.capability_name_required`), a value outside `"yes"`/`"no"`/`""` (`mapping.capability_verdict_invalid`, so a typo is refused rather than read as a reset), a reserved (name, verdict) pair (`mapping.capability_reserved` — the RESET `""` is never refused, so a row stored by an older build stays correctable), stating a capability whose `is_mtp`/`vision_capable` boolean the same request also sends (`mapping.capability_conflict`), and two keys that name the same capability once trimmed (`mapping.capability_duplicate` — the same conflict in another shape, refused rather than resolved, because both intents would reach one last-write-wins upsert and the verdict that landed would follow Go's map iteration order). Unlike the capability upsert on this path, which is best-effort, a failing delete fails the request. The DTO also carries `images_only`: `true` when the mapping's effective flavors — the spec's for an agent-launched child with a spec, the application's otherwise — name `openai_images` and neither text flavor, the rule the benchmark starters refuse on (below). It carries `audio_only` beside it, the speech twin: `true` when the effective flavors name `openai_audio` and neither text flavor (a list naming both non-text flavors sets both markers), always sent, never omitted, from the same single spec read. Each costs no read of its own: one `RuntimeSpecsByApplication` read on a `server_agent` application's list and one spec read on the create and update returns serve both; a failed read gives `false` for both and a warning log, because the markers are advisory and the starters' own check fails closed. `capability_verdicts.image_edit` is the operator's **edit opt-out**: edit capability is derived from `image: yes` ([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)), so `"no"` removes it for that mapping while generation keeps working, `""` returns it to derived, and `"yes"` is stored but inert (it cannot grant what `image` does not); `(image_edit, no)` is **not** a reserved pair (it is the opt-out), `(image, no)` still is, and so are `(speech, no)`, `(transcription, no)`, `(transcription_streaming, no)` and `(speech_clone, no)` (`reservedManualVerdicts[speech][no]`, `[transcription][no]`, `[transcription_streaming][no]` and `[speech_clone][no]`: a manual `no` would outrank the audio.cpp probe entitled to write it; the `yes` direction of each is writable). `transcription_streaming` is the mode-derived verdict streaming transcription keys on (`yes` = the model is `mode=streaming`, `no` = offline, absent = unknown; ASR models only), written by the same two producers — the gateway health loop for a static `audio_cpp` app, and the agent (0.9.2) for an agent-launched child — as the other audio verdicts ([ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)); `speech_clone` is the task-derived refinement the chat picker excludes a voice-clone model on (`yes` = `clon`, `no` = `tts`, absent = unknown; speech models only), written by those same two producers (the agent since 0.10.1, issue #252, [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)); and an agent cannot report `image_edit` at all (it is on the ingest's reserved agent names). The DTO carries the audio benchmark's metrics (#340) beside the text ones, always present: `audio_rate_x` (× real time), `audio_ttfa_ms` (time to first audio or text), `audio_realtime_concurrency` with `audio_concurrency_limit` (`performance`, `resources`, `cap`, or `""` for none) and the read-only `audio_metrics_updated_at` (`null` = never written). The PATCH edits the first four like the text metrics: a present key is the operator's value, written with manual provenance whatever `metrics_locked` says, and the lock then keeps the benchmark from overwriting it. The count and its limit are **one pair** (`applyAudioMetrics`, `internal/portal/service_applications.go`): a count needs one of the three limits beside it (a measured `0` is a result), a limit needs a count of `0` to `2147483647` (the `integer` column's range), and `audio_concurrency_limit: ""` sent alone (or with a count of `0`) clears both. A metric value no measurement could yield, or no column could hold, answers `400 mapping.metric_invalid` — a negative text metric or an integer one (`load_time_ms`, `context_size`, `max_concurrency`, `recommended_concurrency`) above `2147483647`, and since #340 on the PATCH a negative or non-finite `audio_rate_x`, a negative `audio_ttfa_ms`, a count without a limit or above `2147483647`, a limit other than the three or `""`, a limit without a count, or `""` beside a non-zero count; and the audio benchmark's metrics on a full mapping row (`routing.ErrAudioMetricsInvalid`: a negative or non-finite `audio_rate_x`, a negative `audio_ttfa_ms` or `load_time_ms`, an `audio_realtime_concurrency` without the `audio_concurrency_limit` it was measured with, a limit other than `performance`/`resources`/`cap`), checked by every store driver before it writes the row |
 | `/api/portal/agent-binaries`, `/agent-binaries/{...}` | GET | `gateway:use` | List / download ServerAgent release binaries for manual install |
@@ -594,6 +594,7 @@ refusals of its own. The refusals, all stable codes:
 | `benchmark.speech_unavailable` | 409 | For `speed`, `capacity` or `both`: nothing in the scope is runnable and an audio-only mapping in it cannot be measured as audio yet (no speech or transcription verdict, or a clone model that lists no preset voice); when images-only mappings are skipped beside it the message names both kinds. For a **speech** benchmark (`?mode=speech`): no target in its scope: a mapping that does not synthesize speech, or a voice-cloning (`speech_clone`) model that lists **no** preset voice (a reference-only clone), which needs a reference voice the benchmark does not have. A clone model with a cached preset is a target since issue #306 ([ADR-076](../09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)), so this wording stays correct for a reference-only clone alone. An application or server scope answers it only when **every** mapping in its scope is skipped. The portal shows one bilingual label for the code (`errorBenchmarkSpeechUnavailable`) that states every case, not the server's message |
 | `benchmark.agent_ensure_unsupported` | 409 | A Load or VRAM benchmark of an images-only (or audio-only) `server_agent` mapping whose agent has not declared `runtime_ensure`, including one that has not reported since the gateway restarted |
 | `benchmark.spec_force_stopped` | 409 | A Load of a mapping whose launch spec's `admin_state` is `force_stopped` |
+| `runtime.cluster_head_unsupported` | 409 | A Load, VRAM run, or `speed`/`capacity`/`both` run of a mapping whose spec is a llama.cpp RPC cluster head: a head starts only members first, through the cluster orchestration, and a VRAM run would measure the head's share alone. Checked before every other Load refusal. An application or server scope skips a head (`skipped: "cluster_head"`) and answers this code only when every mapping in it is a head. The model list's Load refusal reason is `cluster_head_unsupported` |
 | `benchmark.request_failed` | 500 | A store read failed before the run started. Among them: for a mapping-scope starter on a `server_agent` application, the spec read, which fails closed; for an application or server scope with nothing runnable, a spec read that failed while not every mapping is images-only; for a speech benchmark, the voices-cache read of a clone mapping (the only mapping whose benchmark reads that cache), which fails a mapping-scope run, while an application or server scope records it as that mapping's error result and answers 500 only when nothing else is runnable |
 | `benchmark.no_models` | 400 | The scope has no mappings |
 | `benchmark.mode_invalid`, `benchmark.scope_invalid` | 400 | An unknown `mode` or scope |
@@ -661,7 +662,11 @@ semantics.
 | `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
 | `/api/portal/mappings/{id}/runtime/start` | POST | mapping | **Transient manual start** (the live-status Play): starts one more instance of the mapping's managed model and writes nothing, so it then follows the normal idle, eviction and burst rules. No body. Refused while a benchmark run holds the server (`409 runtime_spec.server_benchmarking`, as the spec PUT). `200 {"instance":k,"state":"running"}` when the agent reports it running within 5 s, the agent's refusal when it answers within 5 s, otherwise `202 {"instance":k,"state":"starting"}` while the start completes in the background. See the start and stop conventions below |
 | `/api/portal/mappings/{id}/runtime/stop` | POST | mapping | **Transient manual stop** (the live-status Stop): `{"instance":k}` (required, 0–63) drains that one instance now and writes nothing, so demand can start it again. Needs the agent feature `runtime_stop` (agent 0.17.0). `200 {"instance":k,"state":"stopping"\|"stopped"}`, the agent's answer passed through. Refused while a benchmark run holds the server, like the start |
-| `/api/portal/mappings/{id}/probe-vram` | POST | mapping (`AuthorizeBenchmarkScope`, **not** the mapping write rule above) | The **VRAM benchmark**: force-stop every managed spec on the server (*the target included*), load this one model, and report its VRAM. `202` + the initial `BenchmarkStatus`; the result arrives on the benchmark status poll / SSE as `results[].vram`. Reserves the server like any benchmark (`409 benchmark.already_running`, checked before the refusals below, and `409 benchmark.server_in_use`). See the six refusals below and [§11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs) |
+| `/api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage` | POST | mapping + member server | **Reset a cluster member's stored usage**: clears the stored VRAM per GPU and RAM of the member on `{serverID}` of the llama.cpp RPC cluster head on the mapping, their stale mark and the current run's peaks, and pushes the member server's runtime document (its demand is `max(stored usage, estimate)`). The way out of a stored peak above the member's budget (`cluster_status.peaks_above_budget`). No body. `200` the head's runtime spec; `404 server.not_found` for a member server the caller may not manage, `404 runtime_spec.cluster_member_not_found` for a server that is no member of the head |
+| `/api/portal/mappings/{id}/runtime/cluster-candidates?mode=automatic\|manual` | GET | mapping | `{"data":[…]}`: the servers the cluster head on the mapping may add as members, sorted by name: servers other than the head's that the caller manages and whose consent admits the head (system scope included). `automatic` (the default) lists only servers that offer RPC membership and have a `ggml-rpc-server` of the head binary's version (`rpc_binary`, `rpc_binary_version`), which needs the stored head's version known; `manual` lists servers with enabled member specs that serve no other head (`member_specs`). Refusals as the spec PUT's ([RPC clusters](#rpc-clusters)) |
+| `/api/portal/servers/{id}/rpc-members`, `/rpc-members/{specID}` | GET/POST, PUT/DELETE | server | The server's **manual** cluster member specs (`rpc_server` processes an operator defines; [RPC clusters](#rpc-clusters)). POST creates (`201`), PUT replaces the full document (`binary`, `args`, `env`, `gpus` in device order with `vram_estimate_mb`, `ram_estimate_mb`, `cache_enabled`, `device_backend`, `enabled` default true, `allowed_head_groups`: omitted keeps the stored list on update and defaults to the server's own admin groups on create), DELETE answers `204`. `used_by_head_spec_id` is set only when the caller may see the head's server. `400 runtime_spec.member_flag_reserved` for `-H`/`-p`/`-d`/`-c` in any spelling (the agent owns them), `runtime_spec.device_backend_invalid`, `runtime_spec.member_vram_estimate_required` (a GPU known to be non-NVIDIA without an estimate), `404 rpc_member_spec.not_found`; disabling or deleting a spec a head uses is `409 runtime.cluster_member_in_use` |
+| `/api/portal/servers/{id}/binaries` | GET/POST/PUT/DELETE | server | The server's **binary inventory**: `{"data":[…]}` of `path`, `kind` (`llama_server`, `rpc_server`, `other`), the agent-detected `version`/`build`/`commit` with `version_source`, the operator's `version_override`, `effective_version` (the override when set, else the detected one: what version matching uses), `source` (`agent` or `manual`), `allowed` and `reported_at`. POST adds a manual row (`201`), PUT edits a manual row or sets the version override of either kind (the path travels in the body, never in the URL), DELETE `?path=` removes a manual row (`204`). An agent row is read-only except its override: `409 binary.agent_owned`; `400 binary.path_invalid` (not absolute, over 4096 characters), `binary.kind_invalid`, `binary.version_invalid` (over 256 characters), `404 binary.not_found` |
+| `/api/portal/mappings/{id}/probe-vram` | POST | mapping (`AuthorizeBenchmarkScope`, **not** the mapping write rule above) | The **VRAM benchmark**: force-stop every managed spec on the server (*the target included*), load this one model, and report its VRAM. `202` + the initial `BenchmarkStatus`; the result arrives on the benchmark status poll / SSE as `results[].vram`. Reserves the server like any benchmark (`409 benchmark.already_running`, checked before the refusals below, and `409 benchmark.server_in_use`). See the seven refusals below and [§11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs) |
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's co-residency document, `{"mode":"opt_out"\|"opt_in","pairs":[{"a","b","verdict":"allow"\|"forbid"}]}`: its per-server **mode** (what a pair with no entry means, default `opt_out`) and the complete set of its **explicit** pair verdicts, each canonical (`a < b`). `pairs` is always a non-nil array; the effective allowed-pair list the agent receives is derived from both and is not part of this document ([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)). The PUT is a full replace of the explicit pairs; an empty or absent `mode` leaves the stored mode unchanged, an empty `verdict` is an `allow`, and `400` `runtime_coresidency.mode_invalid` / `runtime_coresidency.pair_invalid` reject an unknown mode / a bad pair or verdict |
 | `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout`, `binary_path_os_mismatch`, `api_flavors_not_on_application` and `api_flavors_text_on_stable_diffusion` ([Agent-Managed Model Runtime §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows)) |
 | `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
@@ -713,6 +718,29 @@ Conventions worth stating, because each is a judgement call a client depends on:
     runtime.instance_protected` (below the spec's protected floor: the agent
     would restart it at once), `409 runtime.instance_not_highest` (a higher
     instance of the spec runs) and `404 runtime.model_not_managed`.
+  - **A llama.cpp RPC cluster head** (`cluster_enabled`) starts and stops
+    through the gateway's cluster orchestration instead, always as instance 0.
+    **Start** runs the members-first start in the background (configuration
+    acknowledged, members, the head with the cluster-start marker, formation)
+    and answers like a model's start: `200 running` once the cluster formed
+    within the early-answer window, the start's error within it, else `202
+    starting`. It overrides the head's cooldown and a terminal block. **Stop**
+    drains the head first, waits (bounded) for its stopped state on the status
+    stream, then — only with the optional body field `stop_members: true` —
+    releases and stops each member; without it the members idle out on their
+    short timeout once the head's holds end. It runs under the gateway's
+    lifetime, not the request's, and answers `200 stopped` when it finished
+    within the early-answer window, its error within it, else `202 stopping`
+    (a drain can outlast the server's write timeout). A pinned or
+    `force_running` head is drained, not refused with
+    `runtime.instance_protected`: for a head those mean that the gateway keeps
+    it up. A head an operator stopped is **parked** — the gateway's reconciler
+    does not start it again — until a manual start or a gateway restart;
+    request demand may still start it. Any `instance` other than 0 is `404
+    runtime.model_not_managed`. A start that a stop or the shutdown ended, or
+    one asked for while a stop of the head runs, is `503
+    runtime.cluster_unavailable` with `error.cause`
+    `runtime.cluster_start_cancelled` or `runtime.cluster_stopping`.
   - **An agent refusal keeps the agent's code** at the router's status
     (`runtime.instance_no_capacity`, `runtime.instance_demand_unknown`,
     `runtime.admission_blocked`, `runtime.start_timeout`, `runtime.start_failed`,
@@ -787,7 +815,36 @@ Conventions worth stating, because each is a judgement call a client depends on:
   concurrency the mapping's audio ramp measured as a ceiling — only an
   `audio_concurrency_limit` of `performance` is one, a measured `0` included — so
   the minimum would keep more instances warm than one host keeps above real time
-  (`minInstancesExceedRealtime`, `internal/portal/service_runtime.go`). The PUT refuses, in
+  (`minInstancesExceedRealtime`, `internal/portal/service_runtime.go`). On an
+  enabled cluster head the GET also carries the read-only **`cluster_status`**,
+  the gateway's in-memory orchestration state of the head (no PUT counterpart;
+  absent on any other spec): `state` (`cold`, `forming`, `formed`,
+  `cooling_down`, `invalid` — invalid while the runtime documents withhold the
+  head or a terminal cause blocks automatic starts), `phase`
+  (`members_starting`, `members_ready`, `head_starting`, `formed`), `members`
+  (`position`, `state` — `pending`, `starting`, `ready`, `held`, `failed` — and
+  a failed member's `code`; positions only, never server names, so a member on
+  a server the caller may not see stays anonymous), `last_failure` (`code`, the
+  failing member's `position` or `head: true`, `at`), `cooldown_until`,
+  `breaches` (`position`, `kind` — `peer` or `foreign_hold` — and for a peer its
+  address and `at`) and `peaks_above_budget` (`position`, `resource` — `vram`
+  with the GPU's `gpu_index`, or `ram` — `stored_mb` and `ceiling_mb`: a stored,
+  not stale, member peak above its GPU's budget (the card without one) or above
+  the host's memory, which the member's next start is refused for until the
+  budget is raised, the split changed or the member's usage reset). A breach or
+  peak of a member the caller may not see keeps only its `position`. A
+  restarted gateway starts from `cold` and learns a running cluster again from
+  the agents' telemetry. Beside it the head carries the read-only cluster
+  totals `cluster_vram_total_mb` / `cluster_ram_total_mb` (the head's own
+  effective demand plus every member's, each part `max(measured, estimate)`),
+  `cluster_vram_total_complete` / `cluster_ram_total_complete` (false when a
+  part of that total is unknown, so it is a lower bound; a CPU member has no
+  VRAM part) and `cluster_totals_complete` (both). A member's measured usage is
+  kept per run: during a run of the head the stored value only rises, a formed
+  run's peak replaces it when the head stops, and a run that never formed
+  replaces nothing. A save that changes the split (members added, removed or
+  reordered, a member's GPUs, the head's launch) keeps the values as a stale
+  floor and ends the current run, so that run's peak never replaces them. The PUT refuses, in
   this order: a negative `min_instances`, `max_instances` or
   `instance_parallelism` `400 runtime_spec.tuning_invalid`; a `min_instances` or
   `max_instances` above 64 (`MaxInstanceIndex` + 1), an `instance_parallelism`
@@ -797,7 +854,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   it starts an instance, and the column is int4);
   `replicable` with a non-zero `listen_port` `400
   runtime_spec.instances_need_ephemeral_port` (`validateRuntimeSpecInstances`).
-- **The VRAM benchmark writes neither of those two fields**, and its six
+- **The VRAM benchmark writes neither of those two fields**, and its seven
   refusals are all `409` — none of them is a malformed request; each is a
   conflict with the server's current state. They are checked **before** the
   server is reserved, so a refused run writes no spec and reserves nothing:
@@ -810,6 +867,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   | `benchmark.vram_isolation_blocked` | A spec already carries an operator override (the target's own included), or a spec *other than the target* is pinned. The message names the spec |
   | `benchmark.agent_ensure_unsupported` | The target is images-only and its agent has not declared `runtime_ensure`, so the run could load it only by generating, which its upstream cannot serve. It is the Load's code; with the name declared, the run loads through the router's ensure route instead, and its report carries the warning `first_generation_not_measured` |
   | `benchmark.vram_declared_gpu_missing` | The target's launch spec declares a GPU index the host does not report. A card the run cannot see never holds still, so every stability window would burn its bound and the run could reach no number. The message names the index |
+  | `benchmark.vram_cluster_member_held` | A llama.cpp RPC cluster holds, or has reserved, a member on the server. The drain force-stops only the server's launch specs and a member is removed only through its head, so the run would measure beside a process it cannot stop; it is refused rather than stopping a cluster the operator did not name |
 
   The result rides `BenchmarkStatus.results[].vram`, and `vram` **absent** means
   the run never reached the measurement phase, while `vram` **present** with
@@ -972,6 +1030,10 @@ spec PUT's authorization and benchmark refusals above, and these codes of their 
 | the agent's `runtime.instance_no_capacity`, `.instance_demand_unknown`, `.instance_protected`, `.instance_not_highest` | 409 — passed through |
 | the agent's `runtime.model_not_managed` | 404 — passed through |
 | the agent's `runtime.admission_blocked` / `.start_timeout` / `.start_failed`, `.not_permitted`, `.upstream_gone` | 503 / 504 / 502 — passed through |
+| the agent's `runtime.cluster_not_ready`, `.cluster_member_unreachable` / `.cluster_member_in_use` | 503 / 409 — passed through |
+| `runtime.cluster_start_failed` | 502 — a cluster head's members-first start failed; `error.cause` is the cause's code (the agent's code, the specific one its telemetry reported, or `runtime.cluster_config_unacknowledged` when an agent did not acknowledge a document carrying its part in time) and `error.position` the failing member's position, or `error.head: true`. The head then cools down; a cause of `runtime.rpc_unsupported_build`, `.cluster_version_mismatch`, `.device_backend_mismatch` or `.rpc_device_count_mismatch` blocks automatic starts until the head's runtime document changes. A manual start overrides both |
+| `runtime.cluster_member_unused` | 502 — the head started but the member at `error.position` never reported its hold within the head's startup timeout plus 30 s; the head was stopped |
+| `runtime.cluster_unavailable` | 409 — the cluster cannot start: `error.cause` is the reason the runtime documents withhold it (`runtime.cluster_*`, `runtime.cluster_head_disabled`), `runtime_spec.not_found`, or `runtime.action_failed` (a store read failed; the details are logged, never answered). **503** when `error.cause` is `runtime.cluster_start_cancelled` (a stop or the shutdown ended the start; nothing cools down) or `runtime.cluster_stopping` (a stop of the head is under way) |
 
 The application endpoints' unmapped fallback is **500 `application.request_failed`**
 (`writePortalApplicationError`), not the `runtime_spec.request_failed` in the row
@@ -1313,6 +1375,79 @@ above were added. The three live-timings codes are wired on the same pattern:
 `portalApplicationErrRows` (400 and 409) and `portalRuntimeSpecErrRows` (400)
 — each of those three rows with an `msgFn` rather than a static `msg`, so the
 message names the offending type.
+
+#### RPC clusters
+
+A llama.cpp RPC cluster head is a launch spec with `cluster_enabled`
+([ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster),
+[Agent-Managed Model Runtime §3.7](../cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster)).
+The runtime-spec PUT carries its configuration beside the ordinary fields:
+`member_mode` (`automatic`, the default, or `manual`), `cluster_network`
+(`mesh`, `lan`, or `""` for the default), `rpc_transport` (`direct`, `relay`, or
+`""` for the default), `lan_exposure_ack`, and `cluster_members` in member order
+(the `--rpc` order): each `{server_id}` plus, in manual mode, `member_spec_id`,
+and in automatic mode the ordered `gpus` (`[]` = a CPU member) with their
+`vram_estimate_mb`, `threads`, `cache_enabled`, `device_backend` and
+`ram_estimate_mb`. An entry without `server_id` keeps the stored member at its
+position (the read view hides members on servers the caller may not manage).
+`device_backend` (`auto`, `cuda`, `rocm`, `vulkan`, `metal`, `sycl`) is a field of
+every spec. An empty `cluster_network` or `rpc_transport` means "the default":
+a save that runs the full cluster checks (row 4 below) resolves it to the
+default of that moment and **stores the resolved value**, which the GET then
+returns, so a later NetBird change never flips the network or transport of a
+saved cluster. The PUT is a **full document**: omitting `cluster_enabled` turns
+the cluster off and clears the membership, like any omitted field.
+
+The GET adds the read-only view: each member's `server_name`, measured values,
+`measured_at`, `stale`, `port` and `visible` (false: only `position` is shown),
+the cluster totals and their completeness flags,
+`cluster_network_default` / `cluster_transport_default` (what an empty value
+resolves to; the network default is empty while a member is hidden),
+`cluster_warnings` (advisory: `cluster_rpc_devices_not_first`,
+`cluster_mmdev_missing`, `cluster_cpu_member_without_tensor_split`,
+`cluster_member_shared_host_without_estimate`,
+`cluster_member_budget_below_device`, `cluster_member_gpu_overlap`,
+`cluster_relay_mesh_deny_by_default_off`, `cluster_member_version_unknown`),
+`cluster_withheld_reason` (why the runtime documents do not carry the enabled
+head, [§3.7](../cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster))
+and `cluster_status` (above).
+
+#### RPC cluster save refusals
+
+The enum checks run with the request validations: `400
+runtime_spec.cluster_member_mode_invalid`, `.cluster_network_invalid`,
+`.cluster_transport_invalid`, `runtime_spec.device_backend_invalid`. The cluster
+checks that read the store run after every request validation, in this order,
+which is part of the API (`validateClusterHead`, `internal/portal/service_cluster.go`):
+
+| # | Check | Refusal |
+|---|---|---|
+| 1 | Cluster off: no `${RPC_SERVERS}` / `${RPC_DEVICES}` in args, env or a config file's content. Dropping the membership needs the head's rights only, as deleting the head does | `400 runtime_spec.cluster_rpc_placeholder_without_cluster` |
+| 2 | The head's document: effective type `llama_cpp`; no `=` form of `--rpc`, `--device`/`-dev`, `--tensor-split`/`-ts`, `--mmproj-device`/`-mmdev` (llama-server refuses it); `${RPC_SERVERS}` as the value of `--rpc` or `LLAMA_ARG_RPC`; exactly once through one of the two; a device list that names `${DEVICES}` or `${RPC_DEVICES}`; a device list parsed after the RPC servers (argv `--device` after `--rpc`, or RPC through env); at least one member; not replicable; an explicit `startup_timeout_seconds` | `400 runtime_spec.cluster_type_invalid`, `.cluster_flag_equals_form`, `.cluster_rpc_placeholder_missing`, `.cluster_rpc_twice`, `.cluster_device_list_missing_rpc`, `.cluster_device_order`, `.cluster_members_required`, `.cluster_head_replicable`, `.cluster_startup_timeout_required` |
+| 3 | The member list: one entry per server, none on the head's server | `400 runtime_spec.cluster_member_server_twice`, `.cluster_member_on_head_server` |
+| 4 | Rights on every member server the write keeps or adds (a member it drops needs none: removal only frees the host); in manual mode the named spec exists on that server; every member's consent (system scope included). Skipped with 5–8 when the membership, member mode, network, transport and head binary are all as stored and every manual member's spec still exists; the head's own acknowledgement is still required then, so a direct `lan` head saved without `lan_exposure_ack` is refused `runtime.cluster_lan_ack_required` | `404 server.not_found` (rights and consent alike, so nothing leaks), `404 rpc_member_spec.not_found` |
+| 5 | Manual specs: enabled, serving no other head | `400 runtime_spec.cluster_member_spec_disabled`, `409 runtime_spec.cluster_member_spec_taken` |
+| 6 | Automatic members: RPC membership on, a `ggml-rpc-server` of the head binary's version (an unknown head version is refused last, row 12) | `400 runtime_spec.cluster_member_rpc_disabled`, `.cluster_member_no_matching_binary` |
+| 7 | Manual members: a binary whose known version differs from the head's (unknown only warns) | `400 runtime_spec.cluster_version_mismatch` |
+| 8 | Network (mesh: NetBird with a tracking group and mesh IP on every server; lan: a LAN address everywhere, `lan_address` on NetBird-enabled servers), then transport (direct mesh: the NetBird policy preconditions; direct lan: the acknowledgement) | `400 runtime_spec.cluster_mesh_unavailable`, `.cluster_lan_address_required`, `.cluster_direct_unavailable`, `runtime.cluster_lan_ack_required` |
+| 9 | Member GPUs (also for a member the caller cannot see): a GPU budget for an Apple GPU, an estimate for a known non-NVIDIA GPU of an automatic member, `--tensor-split` on the head for any member with known non-NVIDIA GPUs | `400 runtime_spec.cluster_member_budget_required`, `runtime_spec.member_vram_estimate_required`, `runtime_spec.cluster_tensor_split_required` |
+| 10 | A port in 26000–26999 on each new member's server (below every default ephemeral range, so no model child holds it) | `409 runtime_spec.cluster_port_exhausted` |
+| 11 | A new or changed fixed `listen_port` equal to a cluster member's port on the server | `409 runtime_spec.port_conflicts_rpc_member` |
+| 12 | Automatic members need the head binary's version known (add it in the Binaries tab); the newest save code, so the last refusal of the write | `400 runtime_spec.cluster_head_binary_version_unknown` |
+
+An application port is `application.port_conflict`, a TLS proxy port
+`application.proxy_listen_port_conflict`. Storing the membership can still be
+refused by state the checks could not hold (a member spec or port another
+gateway process took since: `409 runtime_spec.cluster_member_spec_taken`,
+`.cluster_port_exhausted`; a member server deleted since: `404
+server.not_found`); such a refusal stores nothing, neither the membership nor
+the spec row. A save that keeps a member carries its measured values over,
+but rewrites the membership only while the stored values are the ones it read,
+so a value the gateway measured during the save survives it. Refusals that name a server or binary
+carry that detail only for a caller who may see the server. The NetBird system
+settings refuse turning policy management, deny-by-default or its enforcement
+off while a direct mesh cluster exists: `409 settings.netbird_direct_cluster_exists`
+([Networking & Mesh §12](../cross-cutting/networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)).
 
 ### Vendor accounts (Anbieter)
 

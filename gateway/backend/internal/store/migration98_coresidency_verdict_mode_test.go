@@ -81,14 +81,12 @@ func TestMigration98And99UpgradeAnExistingCoResidencyDeployment(t *testing.T) {
 			{"srv_m98b", "app_m98b", routing.ProviderServerAgent, 8099},
 			{"srv_m98c", "app_m98c", routing.ProviderVLLM, 8100},
 		} {
-			if err := s.CreateAIServer(ctx, routing.AIServer{
+			seedBaselineServer(ctx, t, s, routing.AIServer{
 				ID: host.serverID, Name: host.serverID, Provider: routing.ProviderVLLM,
 				Endpoint: "http://" + host.serverID + ":8000",
 				Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 				CreatedAt: now, UpdatedAt: now,
-			}); err != nil {
-				t.Fatalf("create server %s: %v", host.serverID, err)
-			}
+			})
 			if err := s.CreateApplication(ctx, routing.Application{
 				ID: host.appID, ServerID: host.serverID, Type: host.appType, Port: host.port, Scheme: "http",
 				APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
@@ -151,14 +149,12 @@ func TestMigration98And99UpgradeAnExistingCoResidencyDeployment(t *testing.T) {
 		}
 
 		// New applications are opt_out.
-		if err := s.CreateAIServer(ctx, routing.AIServer{
+		seedBaselineServer(ctx, t, s, routing.AIServer{
 			ID: "srv_m98_new", Name: "srv_m98_new", Provider: routing.ProviderVLLM,
 			Endpoint: "http://srv_m98_new:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create post-upgrade server: %v", err)
-		}
+		})
 		if err := s.CreateApplication(ctx, routing.Application{
 			ID: "app_m98_new", ServerID: "srv_m98_new", Type: routing.ProviderServerAgent, Port: 8101, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

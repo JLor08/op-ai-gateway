@@ -155,3 +155,28 @@ func (q *admissionQueue) release(serverID string) {
 		return
 	}
 }
+
+// releaseAll wakes and dequeues EVERY waiter watching serverID: a cluster that
+// formed (or failed to) on serverID is news for every request parked for it,
+// not a single freed slot. Each woken waiter re-runs its selection; one the
+// cluster cannot take yet parks again. No-op if nil, empty or none watches it.
+func (q *admissionQueue) releaseAll(serverID string) {
+	if q == nil || serverID == "" {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	kept := q.waiters[:0]
+	for _, w := range q.waiters {
+		if _, ok := w.servers[serverID]; !ok {
+			kept = append(kept, w)
+			continue
+		}
+		select {
+		case w.ch <- struct{}{}:
+		default:
+		}
+	}
+	clear(q.waiters[len(kept):])
+	q.waiters = kept
+}

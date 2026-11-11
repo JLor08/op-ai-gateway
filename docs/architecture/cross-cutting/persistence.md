@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 102 migrations in order, same as
+- **Only-pending.** A fresh install runs all 106 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -470,7 +470,8 @@ evidence.
 
 **Adding a column to `ai_servers` requires seven edit sites in
 `internal/store/sqlite_routes.go`, not four:** `CreateAIServer` (columns,
-placeholders, args), `UpdateAIServer` (set-list, args), `AIServerByID`,
+placeholders, args), `UpdateAIServer` (set-list, args; a column with its own
+targeted writer, such as `netbird_ip`, is left out of it), `AIServerByID`,
 `AIServers`, `ServersByOwner`, `ServersByAdminGroups`, and `scanAIServer` —
 because each read path inlines its own copy of the column list instead of sharing
 a constant, and all four selects feed the same scanner. New columns are appended
@@ -665,6 +666,40 @@ only a rename that actually landed invalidates anything and a save that did not
 change the name drops nothing. `MemoryStore` mirrors it in both update methods. A
 caller never has to remember to invalidate, which is why the health loop's writer
 needs no rename awareness of its own.
+
+**The llama.cpp RPC cluster tables (migrations 103–106) follow the same three
+rules, and add two of their own**
+([ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster),
+[Data Model](../reference/data-model.md#llamacpp-rpc-clusters)). Manual member
+specs are a sibling table (`rpc_member_specs`, `rpc_member_spec_gpus`), not
+`agent_runtime_specs` rows with a nullable `mapping_id`: that would need a SQLite
+table rebuild and would break the `on conflict(mapping_id)` upsert, every
+per-application spec join through `model_mappings` and the ingest's ownership
+chain. The membership (`rpc_cluster_members`, `rpc_cluster_member_gpus`) is
+replaced whole by `SetClusterMembers` in one transaction and carries three
+uniqueness rules that `MemoryStore` mirrors with its own guards: one row per
+(head, position) and per (head, server), one head per manual member spec (a
+partial unique index where `member_spec_id <> ''`), and, since migration 106,
+one member per (server, port) for every allocated port (a partial unique index
+where `port <> 0`, because the portal's port allocator locks per process only).
+The two of their own: **a cluster write classifies a foreign-key violation
+before a unique one** (`classifyRPCWrite`: an unknown head or server is
+`ErrNotFound`, a duplicate `ErrConflict`), because SQLite's unique classifier
+matches any "constraint failed" message, foreign keys included; and **every
+member usage write is conditional on the run it read**
+(`UpdateClusterMemberUsage` applies only while the row's `run_started_at` is
+still that run, and reports whether it applied), so a value read before a
+portal save that reset the run can never overwrite it. `rpc_sessions` has no
+foreign keys at all: a session records what happened and outlives the head or
+membership it names (an open one of a membership deleted meanwhile is closed on
+the member server's next sample), and its closed rows are pruned with the
+telemetry retention. The SQL store binds every cluster time it writes or
+compares in UTC (session bounds, `measured_at`, `run_started_at`, the
+`usage_event_hosts` time), whatever zone the caller's value carries: SQLite
+stores and compares times as text, so a value in another zone would compare by
+its wall clock, not its instant, and a request would get the wrong member hosts.
+`MemoryStore.DeleteAIServer` drops the server's binaries,
+member specs and memberships by hand, like the other per-server maps.
 
 One nuance to the general note that FK violations are invisible in the memory
 driver: **for the runtime tables they are not.** The memory store hand-rolls the

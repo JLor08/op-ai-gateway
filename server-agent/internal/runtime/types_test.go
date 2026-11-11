@@ -1069,3 +1069,127 @@ func TestReservedSpecIDRule(t *testing.T) {
 		}
 	}
 }
+
+const rpcClusterDocumentJSON = `{
+  "specs": [
+    {"id": "rpcm_1", "kind": "rpc_server", "binary": "/bin/rpc-server", "device_backend": "cuda",
+     "rpc": {"head_spec_id": "rspec_h", "transport": "relay", "bind_ip": "100.64.0.5", "port": 47001,
+             "head_ips": ["100.64.0.2"], "head_domain": "", "cache_enabled": true}},
+    {"id": "rspec_h", "model": "big", "upstream_model": "big", "binary": "/bin/llama-server",
+     "cluster": {"transport": "direct", "network": "mesh", "generation": "g7", "endpoints": [
+       {"address": "100.64.0.5:47001", "device_count": 2},
+       {"address": "100.64.0.6:47001", "device_count": 1}]}}
+  ],
+  "coresident": [["rpcm_1", "rspec_h"]]
+}`
+
+func TestParseConfigRPCServerSpecRoundTrips(t *testing.T) {
+	cfg, err := ParseConfig([]byte(rpcClusterDocumentJSON))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if len(cfg.Specs) != 2 {
+		t.Fatalf("specs = %d, want 2", len(cfg.Specs))
+	}
+	member, head := cfg.Specs[0], cfg.Specs[1]
+	if !member.IsRPCServer() || member.IsClusterHead() {
+		t.Fatalf("member: IsRPCServer=%v IsClusterHead=%v, want true/false", member.IsRPCServer(), member.IsClusterHead())
+	}
+	if member.DeviceBackend != "cuda" || member.RPC.Port != 47001 || member.RPC.BindIP != "100.64.0.5" ||
+		member.RPC.HeadSpecID != "rspec_h" || !member.RPC.CacheEnabled || len(member.RPC.HeadIPs) != 1 {
+		t.Fatalf("member decoded wrongly: %+v", member.RPC)
+	}
+	if !head.IsClusterHead() || head.IsRPCServer() {
+		t.Fatalf("head: IsClusterHead=%v IsRPCServer=%v, want true/false", head.IsClusterHead(), head.IsRPCServer())
+	}
+	eps := head.Cluster.Endpoints
+	if len(eps) != 2 || eps[0].Address != "100.64.0.5:47001" || eps[0].DeviceCount != 2 || eps[1].Address != "100.64.0.6:47001" {
+		t.Fatalf("endpoints = %+v, want the document order preserved", eps)
+	}
+	if head.Cluster.Transport != "direct" || head.Cluster.Network != "mesh" || head.Cluster.Generation != "g7" {
+		t.Fatalf("cluster = %+v", head.Cluster)
+	}
+	if len(cfg.Coresident) != 1 {
+		t.Fatalf("coresident = %v, want the member/head pair kept", cfg.Coresident)
+	}
+}
+
+func TestParseConfigDemotesInvalidRPCServer(t *testing.T) {
+	member := func(extra string) string {
+		return `{"id": "bad", "kind": "rpc_server", ` + extra + `}`
+	}
+	for name, spec := range map[string]string{
+		"no rpc settings":    member(`"binary": "/b"`),
+		"zero port":          member(`"rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 0}`),
+		"negative port":      member(`"rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": -1}`),
+		"port out of range":  member(`"rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 70000}`),
+		"listen port set":    member(`"listen_port": 9001, "rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 47001}`),
+		"upstream model set": member(`"upstream_model": "m", "rpc": {"transport": "direct", "bind_ip": "100.64.0.5", "port": 47001}`),
+		"no transport":       member(`"rpc": {"bind_ip": "100.64.0.5", "port": 47001}`),
+		"unknown transport":  member(`"rpc": {"transport": "tunnel", "bind_ip": "100.64.0.5", "port": 47001}`),
+		"no bind ip":         member(`"rpc": {"transport": "direct", "port": 47001}`),
+		"bind ip not an ip":  member(`"rpc": {"transport": "relay", "bind_ip": "member.lan", "port": 47001}`),
+		"unknown kind":       `{"id": "bad", "kind": "future_kind"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := `{"specs": [` + spec + `, {"id": "ok", "upstream_model": "m"}], "coresident": [["bad", "ok"]]}`
+			cfg, err := ParseConfig([]byte(raw))
+			if err != nil {
+				t.Fatalf("ParseConfig: %v (one bad spec must not fail the document)", err)
+			}
+			if len(cfg.Specs) != 1 || cfg.Specs[0].ID != "ok" {
+				t.Fatalf("specs = %+v, want only the valid spec", cfg.Specs)
+			}
+			if len(cfg.Coresident) != 0 {
+				t.Fatalf("coresident = %v, want the pair naming the dropped spec removed", cfg.Coresident)
+			}
+		})
+	}
+}
+
+func TestSameLaunchShapeRPCAllowlistIsNotLaunchAffecting(t *testing.T) {
+	base := func() Spec {
+		return Spec{ID: "m", Kind: SpecKindRPCServer, RPC: &RPCMember{Port: 47001, BindIP: "1.2.3.4", HeadIPs: []string{"1.1.1.1"}, HeadDomain: "a.example"}}
+	}
+	a, b := base(), base()
+	b.RPC.HeadIPs = []string{"2.2.2.2", "3.3.3.3"}
+	b.RPC.HeadDomain = "b.example"
+	if !sameLaunchShape(a, b) {
+		t.Fatal("changing RPC.HeadIPs/HeadDomain changed the launch shape; the allowlist is applied live")
+	}
+	if a.RPC.HeadIPs[0] != "1.1.1.1" || a.RPC.HeadDomain != "a.example" {
+		t.Fatal("sameLaunchShape modified its argument's RPC struct")
+	}
+	for name, mutate := range map[string]func(*Spec){
+		"port":           func(s *Spec) { s.RPC.Port = 47002 },
+		"bind ip":        func(s *Spec) { s.RPC.BindIP = "5.6.7.8" },
+		"cache":          func(s *Spec) { s.RPC.CacheEnabled = true },
+		"device backend": func(s *Spec) { s.DeviceBackend = "vulkan" },
+		"kind":           func(s *Spec) { s.Kind = SpecKindModel },
+	} {
+		c := base()
+		mutate(&c)
+		if sameLaunchShape(a, c) {
+			t.Errorf("changing %s kept the launch shape, want a relaunch", name)
+		}
+	}
+
+	head := func(addrs ...string) Spec {
+		c := &ClusterHead{Transport: "direct", Network: "mesh"}
+		for _, ad := range addrs {
+			c.Endpoints = append(c.Endpoints, ClusterEndpoint{Address: ad, DeviceCount: 1})
+		}
+		return Spec{ID: "h", Cluster: c}
+	}
+	if sameLaunchShape(head("a:1", "b:1"), head("b:1", "a:1")) {
+		t.Error("reordering Cluster.Endpoints kept the launch shape; the order fixes RPC<n> numbering")
+	}
+	if !sameLaunchShape(head("a:1", "b:1"), head("a:1", "b:1")) {
+		t.Error("identical heads differ in launch shape")
+	}
+	regenerated := head("a:1", "b:1")
+	regenerated.Cluster.Generation = "g2"
+	if sameLaunchShape(head("a:1", "b:1"), regenerated) {
+		t.Error("a new cluster generation kept the launch shape, want a relaunch")
+	}
+}

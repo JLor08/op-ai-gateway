@@ -424,6 +424,16 @@ type AgentPresenceReader interface {
 	ReportingWithin(serverID string, window time.Duration) bool
 }
 
+// AgentClockOffsetReader exposes each ServerAgent's clock offset: the agent's
+// own time stamp on its latest telemetry sample minus the gateway's receive
+// time of that sample (positive = the agent's clock runs ahead; the transit
+// time reads as a small negative share). ok=false means the agent has not
+// reported since the gateway started. A nil reader reports nothing.
+// Satisfied by *gateway.AgentPresenceRegistry.
+type AgentClockOffsetReader interface {
+	ClockOffset(serverID string) (offset time.Duration, ok bool)
+}
+
 // AgentCertReportReader exposes what a server's ServerAgent last reported about the
 // certificate it has INSTALLED (Phase 2 distribution), so the certificate list can
 // show an "installed" state and the CA-rotation brake can tell whether a rotated
@@ -476,6 +486,9 @@ type ServiceDeps struct {
 	// AgentPresenceReader). nil = every server reads as "inactive"/"unconfigured"
 	// (never "active") — the same lenient-on-absence pattern as Reachability/LoadedModels.
 	AgentPresence AgentPresenceReader
+	// AgentClockOffsets lets serverDTO show each agent's clock offset
+	// (clock_offset_ms; see AgentClockOffsetReader). nil = always unknown.
+	AgentClockOffsets AgentClockOffsetReader
 	// AgentCertReports lets the certificate list + the CA-rotation propagation
 	// brakes read what each ServerAgent reports as installed/durably trusted (see
 	// AgentCertReportReader). nil = never reported: the existing server-leaf brake
@@ -831,26 +844,30 @@ type netbirdState struct {
 }
 
 type Service struct {
-	users            UserReader
-	tokens           TokenRepository
-	usage            usage.Store
-	routes           routing.Store
-	models           provider.ModelLister
-	settings         SystemSettingsStore
-	uiPrefs          UIPreferencesStore
-	captures         CaptureReader
-	chats            ChatStore
-	reachability     AppHealthReader
-	loadedModels     LoadedModelReader
-	agentPresence    AgentPresenceReader
-	agentCertReports AgentCertReportReader
-	agentTransport   AgentTransportReader
-	agentFeatures    AgentFeatureReader
-	proxyStatus      ProxyRouteStatusReader
-	groups           GroupStore
-	groupCache       GroupCache
-	projects         ProjectStore
-	cipher           *capture.Cipher
+	users             UserReader
+	tokens            TokenRepository
+	usage             usage.Store
+	routes            routing.Store
+	models            provider.ModelLister
+	settings          SystemSettingsStore
+	uiPrefs           UIPreferencesStore
+	captures          CaptureReader
+	chats             ChatStore
+	reachability      AppHealthReader
+	loadedModels      LoadedModelReader
+	agentPresence     AgentPresenceReader
+	agentClockOffsets AgentClockOffsetReader
+	agentCertReports  AgentCertReportReader
+	agentTransport    AgentTransportReader
+	agentFeatures     AgentFeatureReader
+	// clusterStatus reads the gateway's cluster orchestration state for a
+	// head's read view (SetClusterStatusReader); nil before it is wired.
+	clusterStatus ClusterStatusReader
+	proxyStatus   ProxyRouteStatusReader
+	groups        GroupStore
+	groupCache    GroupCache
+	projects      ProjectStore
+	cipher        *capture.Cipher
 	// cert groups the certificate/edge-cert subsystem's fields (see certState
 	// above): the certificate-only cipher, edge-delivery config/state, the ACME
 	// challenge store, the certMu/edgeMu/certGWDNSMu mutexes (and the state
@@ -936,6 +953,11 @@ type Service struct {
 	// silently losing conflict detection. The network ListModels call runs
 	// OUTSIDE this lock, so only the fast local read+write section serializes.
 	reconcileMu sync.Mutex
+	// clusterWriteMu serializes the operator's runtime-spec writes
+	// (writeRuntimeSpecAs) with the manual member spec writes and deletes: a
+	// cluster head's save allocates member ports and claims manual member
+	// specs, both check-then-act across specs, and reads the specs it claims.
+	clusterWriteMu sync.Mutex
 }
 
 // waitPolicySideEffects blocks until any in-flight settings-triggered NetBird
@@ -1004,26 +1026,27 @@ func NewService(deps ServiceDeps) *Service {
 		vendorClient = &http.Client{Timeout: vendorConnectHTTPTimeout}
 	}
 	svc := &Service{
-		users:            deps.Users,
-		tokens:           deps.Tokens,
-		usage:            deps.Usage,
-		routes:           deps.Routes,
-		models:           deps.ModelLister,
-		settings:         deps.SystemSettings,
-		uiPrefs:          deps.UIPrefs,
-		captures:         deps.Captures,
-		chats:            deps.Chats,
-		reachability:     deps.Reachability,
-		loadedModels:     deps.LoadedModels,
-		agentPresence:    deps.AgentPresence,
-		agentCertReports: deps.AgentCertReports,
-		agentTransport:   deps.AgentTransport,
-		agentFeatures:    deps.AgentFeatures,
-		proxyStatus:      deps.ProxyStatus,
-		groups:           deps.Groups,
-		groupCache:       deps.GroupCache,
-		projects:         deps.Projects,
-		cipher:           deps.Cipher,
+		users:             deps.Users,
+		tokens:            deps.Tokens,
+		usage:             deps.Usage,
+		routes:            deps.Routes,
+		models:            deps.ModelLister,
+		settings:          deps.SystemSettings,
+		uiPrefs:           deps.UIPrefs,
+		captures:          deps.Captures,
+		chats:             deps.Chats,
+		reachability:      deps.Reachability,
+		loadedModels:      deps.LoadedModels,
+		agentPresence:     deps.AgentPresence,
+		agentClockOffsets: deps.AgentClockOffsets,
+		agentCertReports:  deps.AgentCertReports,
+		agentTransport:    deps.AgentTransport,
+		agentFeatures:     deps.AgentFeatures,
+		proxyStatus:       deps.ProxyStatus,
+		groups:            deps.Groups,
+		groupCache:        deps.GroupCache,
+		projects:          deps.Projects,
+		cipher:            deps.Cipher,
 		cert: certState{
 			cipher:            deps.CertCipher,
 			edgeOutputDir:     deps.CertEdgeOutputDir,
@@ -1589,6 +1612,14 @@ type ServerDTO struct {
 	// within the effective window), "inactive" (an agent token is configured but
 	// not currently reporting), or "unconfigured" (no agent token at all).
 	AgentStatus string `json:"agent_status"`
+	// ClockOffsetMS is the agent's clock offset in milliseconds: the time
+	// stamp the agent put on its latest telemetry sample minus the gateway's
+	// receive time of it, signed (positive = the agent's clock runs ahead).
+	// Energy attribution reads each host's samples by the agent's own time
+	// stamps, so a large offset shifts the window a host's energy part
+	// integrates. Derived, never stored; null until the agent reports after
+	// the gateway started.
+	ClockOffsetMS *int64 `json:"clock_offset_ms"`
 	// TLSProxyState says what the gateway's TLS proxy is doing on this server,
 	// so the per-application proxy opt-out can be rendered with a true reason
 	// instead of appearing out of nowhere: "out_of_scope" | "unknown" |
@@ -1631,6 +1662,18 @@ type ServerDTO struct {
 	// secret in either field.
 	SystemGroupID   string `json:"system_group_id"`
 	SystemGroupName string `json:"system_group_name"`
+	// NetbirdIP is the peer's mesh address as last synced; read-only (never
+	// accepted in a request), "" when unknown or NetBird is off.
+	NetbirdIP string `json:"netbird_ip"`
+	// LANAddress is the optional IPv4 LAN address the server uses for RPC
+	// cluster traffic; LANBindOnly makes an RPC member listen on it only.
+	LANAddress  string `json:"lan_address"`
+	LANBindOnly bool   `json:"lan_bind_only"`
+	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
+	// member; RPCAllowedHeadGroups are the admin-group ids whose heads may
+	// use it. Always a non-nil list.
+	RPCMemberEnabled     bool     `json:"rpc_member_enabled"`
+	RPCAllowedHeadGroups []string `json:"rpc_allowed_head_groups"`
 }
 
 type ServerListResponse struct {
@@ -1678,6 +1721,13 @@ type CreateServerRequest struct {
 	// set (system-scope only), every chosen AdminGroupIDs entry's parent must
 	// equal it, or the create is rejected as a parent mismatch.
 	SystemGroupID string `json:"system_group_id"`
+	// RPC cluster settings (nil = default: empty / false / no head groups).
+	// LANAddress must be empty or an IPv4 literal; every RPCAllowedHeadGroups
+	// entry must be an existing admin group.
+	LANAddress           *string   `json:"lan_address,omitempty"`
+	LANBindOnly          *bool     `json:"lan_bind_only,omitempty"`
+	RPCMemberEnabled     *bool     `json:"rpc_member_enabled,omitempty"`
+	RPCAllowedHeadGroups *[]string `json:"rpc_allowed_head_groups,omitempty"`
 }
 
 type UpdateServerRequest struct {
@@ -1707,6 +1757,12 @@ type UpdateServerRequest struct {
 	// PriceUnit is the display unit for PricePerKwh; a supplied "" normalizes
 	// to the default ("eur_cent" via NormalizePriceUnit).
 	PriceUnit *string `json:"price_unit,omitempty"`
+	// RPC cluster settings; same validation as on create. A supplied empty
+	// LANAddress or head-group list clears the value.
+	LANAddress           *string   `json:"lan_address,omitempty"`
+	LANBindOnly          *bool     `json:"lan_bind_only,omitempty"`
+	RPCMemberEnabled     *bool     `json:"rpc_member_enabled,omitempty"`
+	RPCAllowedHeadGroups *[]string `json:"rpc_allowed_head_groups,omitempty"`
 }
 
 func (s *Service) CurrentUser(ctx context.Context, token auth.Token) (CurrentUser, error) {
@@ -2351,15 +2407,73 @@ func (s *Service) UsageStats(principal auth.Token, q usage.Query) (usage.Stats, 
 		return stats, fmt.Errorf("usage stats: %w", err)
 	}
 	ctx := context.Background()
+	sysDefault := s.systemDefaultPricePerKwh(ctx)
 	if byServer, err := s.usage.EnergyByServer(ctx, q); err == nil {
-		sysDefault := s.systemDefaultPricePerKwh(ctx)
 		var totalCost float64
 		for host, wh := range byServer {
 			totalCost += wh / 1000 * s.resolveUsagePrice(ctx, host, sysDefault)
 		}
 		stats.Totals.TotalCostEUR = totalCost
 	}
+	for _, b := range s.filteredServerMemberParts(ctx, q, "") {
+		stats.Totals.TotalEnergyWh += b.EnergyWh
+		stats.Totals.TotalCostEUR += b.EnergyWh / 1000 * s.resolveUsagePrice(ctx, b.Host, sysDefault)
+	}
 	return stats, nil
+}
+
+// filteredServerMemberParts returns, for a usage query filtered by server
+// (Server or ServerExact), the energy the selected servers drew as llama.cpp
+// RPC cluster members for requests other servers served, within the caller's
+// scope and every other filter: energy-only MemberParts buckets per
+// (groupBy value, member server). They add Wh and cost to an aggregate, never
+// a request, count or token -- those stay with the serving server, and the
+// request list (Usage) is not touched. A query without a server filter, no
+// matching server, or a failed read yields nothing (cost and energy are
+// best-effort display values here).
+func (s *Service) filteredServerMemberParts(ctx context.Context, q usage.Query, groupBy string) []usage.GroupBucket {
+	hosts := s.serverFilterHosts(ctx, q)
+	if len(hosts) == 0 {
+		return nil
+	}
+	// The store leaves out the requests the server filter itself selects, by
+	// their own server name snapshot as the base aggregate matched them:
+	// they already count in full. hosts (resolved by current names) only
+	// chooses whose parts are added.
+	buckets, err := s.usage.MemberPartEnergy(ctx, q, hosts, groupBy)
+	if err != nil {
+		log.Printf("portal: member part energy lookup failed: %v", err)
+		return nil
+	}
+	return buckets
+}
+
+// serverFilterHosts resolves q's server filter to server ids by the servers'
+// current names, as the stores match a request's server: Server is a
+// case-insensitive substring of the name or the id, ServerExact the exact
+// name (case-insensitive). nil when q has no server filter.
+func (s *Service) serverFilterHosts(ctx context.Context, q usage.Query) []string {
+	exact := q.HasServerExact || q.ServerExact != ""
+	if (q.Server == "" && !exact) || s.routes == nil {
+		return nil
+	}
+	servers, err := s.routes.AIServers(ctx)
+	if err != nil {
+		log.Printf("portal: server list for a usage server filter failed: %v", err)
+		return nil
+	}
+	needle := strings.ToLower(q.Server)
+	var hosts []string
+	for _, srv := range servers {
+		if q.Server != "" && !strings.Contains(strings.ToLower(srv.Name), needle) && !strings.Contains(strings.ToLower(srv.ID), needle) {
+			continue
+		}
+		if exact && !strings.EqualFold(srv.Name, q.ServerExact) {
+			continue
+		}
+		hosts = append(hosts, srv.ID)
+	}
+	return hosts
 }
 
 // UsageTimeSeries returns the bucketed activity time-series under the same scope
@@ -2409,22 +2523,46 @@ func (s *Service) resolveUsagePrice(ctx context.Context, host string, sysDefault
 
 // attachUsageCost sets CostEUR on each row: (EnergyWh/1000) * price(Host),
 // where price is resolved via resolveUsagePrice ONCE per DISTINCT host (not
-// once per row) — O(distinct servers), not O(rows). CostEUR is a transient
-// display field: it is never persisted and never read back from a store.
+// once per row) — O(distinct servers), not O(rows). A row with energy parts
+// (a llama.cpp RPC cluster request) costs the sum of its parts, each at its
+// own host's price; the parts of the whole page are read in one call, and a
+// failed read falls back to pricing every row at its Host. CostEUR is a
+// transient display field: it is never persisted and never read back from a
+// store.
 func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
 	if len(rows) == 0 {
 		return
 	}
 	sysDefault := s.systemDefaultPricePerKwh(ctx)
 	priceByHost := make(map[string]float64)
-	for i := range rows {
-		host := rows[i].Host
+	priceFor := func(host string) float64 {
 		price, cached := priceByHost[host]
 		if !cached {
 			price = s.resolveUsagePrice(ctx, host, sysDefault)
 			priceByHost[host] = price
 		}
-		rows[i].CostEUR = rows[i].EnergyWh / 1000 * price
+		return price
+	}
+	ids := make([]string, len(rows))
+	for i := range rows {
+		ids[i] = rows[i].ID
+	}
+	parts, err := s.usage.EnergyPartsByEvents(ctx, ids)
+	if err != nil {
+		log.Printf("portal: energy parts lookup failed for %d rows: %v", len(ids), err)
+		parts = nil
+	}
+	for i := range rows {
+		rowParts := parts[rows[i].ID]
+		if len(rowParts) == 0 {
+			rows[i].CostEUR = rows[i].EnergyWh / 1000 * priceFor(rows[i].Host)
+			continue
+		}
+		var cost float64
+		for _, p := range rowParts {
+			cost += p.Wh / 1000 * priceFor(p.ServerID)
+		}
+		rows[i].CostEUR = cost
 	}
 }
 
@@ -3791,6 +3929,19 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		priceUnit = *req.PriceUnit
 	}
 	priceUnit = NormalizePriceUnit(priceUnit)
+	// RPC cluster settings are validated last, after every pre-existing check.
+	lanAddress := ""
+	if req.LANAddress != nil {
+		if lanAddress, err = normalizeLANAddress(*req.LANAddress); err != nil {
+			return ServerDTO{}, err
+		}
+	}
+	var headGroups []string
+	if req.RPCAllowedHeadGroups != nil {
+		if headGroups, err = s.validateRPCHeadGroups(ctx, *req.RPCAllowedHeadGroups); err != nil {
+			return ServerDTO{}, err
+		}
+	}
 	now := s.clock().UTC()
 	server := routing.AIServer{
 		ID: "srv_" + compactRandomHex(16), Name: name, Domain: domain, ServerPathSuffix: serverPath,
@@ -3804,6 +3955,10 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		PricePerKwh:                 pricePerKwh,
 		Pue:                         pue,
 		PriceUnit:                   priceUnit,
+		LANAddress:                  lanAddress,
+		LANBindOnly:                 req.LANBindOnly != nil && *req.LANBindOnly,
+		RPCMemberEnabled:            req.RPCMemberEnabled != nil && *req.RPCMemberEnabled,
+		RPCAllowedHeadGroups:        encodeRPCHeadGroups(headGroups),
 		CreatedAt:                   now, UpdatedAt: now,
 	}
 	if err := s.routes.CreateAIServer(ctx, server); err != nil {
@@ -3909,6 +4064,11 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 		// configured; turning it OFF is always allowed. UpdateServer never
 		// generates a setup key (that is create/regenerate only).
 		server.NetbirdEnabled = *req.NetbirdEnabled && s.NetbirdModuleEnabled(ctx)
+		// The peer sync skips non-NetBird servers, so a stale mesh address
+		// would never be refreshed: drop it whenever the flag ends up off.
+		if !server.NetbirdEnabled {
+			server.NetbirdIP = ""
+		}
 	}
 	if req.AgentPresenceTimeoutSeconds != nil {
 		if *req.AgentPresenceTimeoutSeconds < 0 {
@@ -3952,6 +4112,29 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	if req.PriceUnit != nil {
 		server.PriceUnit = NormalizePriceUnit(*req.PriceUnit)
 	}
+	// RPC cluster settings: validated after every pre-existing check.
+	if req.LANAddress != nil {
+		v, err := normalizeLANAddress(*req.LANAddress)
+		if err != nil {
+			return ServerDTO{}, err
+		}
+		server.LANAddress = v
+	}
+	if req.LANBindOnly != nil {
+		server.LANBindOnly = *req.LANBindOnly
+	}
+	if req.RPCMemberEnabled != nil {
+		server.RPCMemberEnabled = *req.RPCMemberEnabled
+	}
+	if req.RPCAllowedHeadGroups != nil {
+		ids, err := s.validateRPCHeadGroups(ctx, *req.RPCAllowedHeadGroups)
+		if err != nil {
+			return ServerDTO{}, err
+		}
+		server.RPCAllowedHeadGroups = encodeRPCHeadGroups(ids)
+	} else if server.RPCAllowedHeadGroups == "" {
+		server.RPCAllowedHeadGroups = "[]"
+	}
 	// A non-NetBird server must have a domain (mirrors the create-path guard). Only
 	// a NetBird-enabled server may have an empty domain (auto-managed by the sync
 	// loop); disabling NetBird on an as-yet-unsynced (empty-domain) server without
@@ -3962,6 +4145,13 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	server.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateAIServer(ctx, server); err != nil {
 		return ServerDTO{}, err
+	}
+	// The full-row write leaves the mesh address to the NetBird state
+	// writes, so the one dropped above is cleared on its own.
+	if req.NetbirdEnabled != nil && !server.NetbirdEnabled {
+		if err := s.routes.ClearServerNetbirdIP(ctx, server.ID); err != nil {
+			return ServerDTO{}, err
+		}
 	}
 	// Best-effort, immediately after the successful row write and long before
 	// the NetBird round trip below: the AI SERVER row is row 1 of THE RULE's
@@ -3991,6 +4181,12 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	// row change has already landed, and owners are no part of the document, so
 	// a failing owner write must not swallow the announcement.
 	s.notifyRuntimeChanged(server.ID)
+	// The row is also an input of every cluster the server takes part in: its
+	// mesh IP, LAN address and bind switch, Domain, NetBird enablement, RPC
+	// membership and consent shape the head's endpoints and every member's
+	// network settings, and decide whether the cluster is pushed at all. The
+	// fan-out runs after the peer rename below, which can move the Domain.
+	defer s.NotifyClustersOfServer(ctx, server.ID)
 	if req.OwnerIDs != nil {
 		if err := s.routes.SetServerOwners(ctx, server.ID, ownerIDs); err != nil {
 			return ServerDTO{}, err
@@ -4044,6 +4240,10 @@ func (s *Service) SetServerAdminGroups(ctx context.Context, principal auth.Token
 	if server.SystemGroupID != "" && systemGroupID != server.SystemGroupID {
 		return ServerDTO{}, ErrServerAdminGroupParentMismatch
 	}
+	// The admin groups are the default consent of a cluster member and the
+	// groups a head is admitted by, so every cluster of the server follows
+	// them -- also after a partial write.
+	defer s.NotifyClustersOfServer(ctx, server.ID)
 	current, err := s.routes.ServerAdminGroups(ctx, id)
 	if err != nil {
 		return ServerDTO{}, err
@@ -4168,7 +4368,7 @@ func (s *Service) reconcileServerPeerName(ctx context.Context, id, peerID, serve
 	if peer.DNSLabel != "" {
 		newDomain = peer.DNSLabel
 	}
-	if uErr := s.routes.UpdateServerNetbirdState(ctx, id, newDomain, peer.ID, peer.Connected); uErr != nil {
+	if uErr := s.routes.UpdateServerNetbirdState(ctx, id, newDomain, peer.ID, peer.IP, peer.Connected); uErr != nil {
 		slog.Debug("netbird: server-rename reconcile: persist state failed", "server_id", id, "error", uErr)
 		return domain, connected
 	}
@@ -4186,6 +4386,16 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 	if err != nil {
 		return false, err
 	}
+	// A cluster member is refused like its manual member spec: the delete
+	// would take the membership row with it, and the head would then run on
+	// fewer members than its operator configured. Remove the member from the
+	// head first.
+	if err := s.clusterMemberServerInUse(ctx, principal, server.ID); err != nil {
+		return false, err
+	}
+	// The server's own cluster heads go with it, and with them the members
+	// derived into their member servers' documents.
+	clusterServers := s.clusterServersOfServer(ctx, server.ID)
 	// Best-effort: delete the per-server tracking group ("op-gw-<id>") from NetBird
 	// before removing the row. A NetBird error must NOT fail the delete (log + drop).
 	if server.NetbirdGroupID != "" {
@@ -4221,6 +4431,17 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 	}
 	if err := s.routes.DeleteAIServer(ctx, server.ID); err != nil {
 		return false, err
+	}
+	for _, sid := range clusterServers {
+		if sid != server.ID {
+			s.notifyRuntimeChanged(sid)
+		}
+	}
+	// The server's own policy as a member goes with its row; its heads' grants
+	// to other members go with the heads. A server in no cluster has no grant
+	// to remove, and its delete never waits on that pass.
+	if len(clusterServers) > 0 {
+		s.reconcileRPCPolicies(ctx)
 	}
 	return netbirdCleanupFailed, nil
 }
@@ -4551,6 +4772,7 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		CertificateOverride:         server.CertificateOverride,
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
 		AgentStatus:                 s.agentStatus(ctx, server, values, settingsOK),
+		ClockOffsetMS:               s.agentClockOffsetMS(server.ID),
 		TLSProxyState:               s.tlsProxyState(server, values, settingsOK),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
 		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
@@ -4563,9 +4785,28 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		AdminGroups:                 adminGroups,
 		SystemGroupID:               server.SystemGroupID,
 		SystemGroupName:             systemGroupName,
+		NetbirdIP:                   server.NetbirdIP,
+		LANAddress:                  server.LANAddress,
+		LANBindOnly:                 server.LANBindOnly,
+		RPCMemberEnabled:            server.RPCMemberEnabled,
+		RPCAllowedHeadGroups:        decodeRPCHeadGroups(server.RPCAllowedHeadGroups),
 		// NetbirdSetupKey / NetbirdSetupCommand are display-once and deliberately
 		// NOT set here — a Get/List DTO must never carry them.
 	}, nil
+}
+
+// agentClockOffsetMS returns serverID's agent clock offset in milliseconds,
+// nil when unknown (no reader, or no sample since the gateway started).
+func (s *Service) agentClockOffsetMS(serverID string) *int64 {
+	if s.agentClockOffsets == nil {
+		return nil
+	}
+	offset, ok := s.agentClockOffsets.ClockOffset(serverID)
+	if !ok {
+		return nil
+	}
+	ms := offset.Milliseconds()
+	return &ms
 }
 
 // agentStatus derives the live 3-state agent_status for a server: "active"

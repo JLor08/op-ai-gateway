@@ -165,6 +165,17 @@ export function ApplicationSection({
     // Agent-runtime-manager (Task 20): forwarded to RuntimeAdminSection when a
     // server_agent application's "manage models" drill-down opens it instead
     // of MappingSection.
+    | 'rpcMemberSpecs'
+    | 'serverAdminGroupCandidates'
+    | 'createRPCMemberSpec'
+    | 'updateRPCMemberSpec'
+    | 'deleteRPCMemberSpec'
+    | 'serverBinaries'
+    | 'createServerBinary'
+    | 'updateServerBinary'
+    | 'deleteServerBinary'
+    | 'clusterCandidates'
+    | 'resetClusterMemberUsage'
     | 'runtimeSpec'
     | 'putRuntimeSpec'
     | 'deleteRuntimeSpec'

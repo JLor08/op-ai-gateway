@@ -4,11 +4,17 @@
 #
 # Idempotently insert the AGPL-3.0 SPDX header into every in-scope source file.
 # Safe to re-run: files that already carry an SPDX-License-Identifier are skipped.
+#
+# With file arguments only those files are processed (paths relative to the
+# caller's directory); without arguments every in-scope tracked or new file is.
 set -euo pipefail
 
 SPDX="SPDX-License-Identifier: AGPL-3.0-only"
 COPY="Copyright (C) 2026 OnPrem AI Gateway contributors"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve explicit file arguments before changing directory.
+ARGS=()
+for a in "$@"; do ARGS+=("$(cd "$(dirname "$a")" && pwd)/$(basename "$a")"); done
 cd "$ROOT"
 
 is_excluded() {
@@ -84,6 +90,12 @@ while IFS= read -r f; do
   add_header "$f"
   after="$(grep -c "SPDX-License-Identifier" "$f" || true)"
   if [ "$before" = "0" ] && [ "$after" != "0" ]; then count=$((count + 1)); fi
-done < <(cat <(git ls-files) <(git ls-files --others --exclude-standard) | sort -u)
+done < <(
+  if [ "${#ARGS[@]}" -gt 0 ]; then
+    for a in "${ARGS[@]}"; do printf '%s\n' "${a#"$ROOT"/}"; done
+  else
+    cat <(git ls-files) <(git ls-files --others --exclude-standard) | sort -u
+  fi
+)
 
 echo "add-license-headers: added header to $count file(s)"

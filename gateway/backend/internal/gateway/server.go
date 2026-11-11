@@ -309,6 +309,13 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetClusterStatusReader is the same wiring conduit for the cluster
+	// orchestration's state: it is portal.Service.SetClusterStatusReader
+	// itself, called ONCE by cmd/gateway's buildGatewayServer with the
+	// just-built Server's ClusterStatusReader, so a cluster head's runtime
+	// spec shows where its start stands. Server never stores or reads this
+	// field. nil is correct for any Server built without cmd/gateway.
+	SetClusterStatusReader func(portal.ClusterStatusReader)
 	// SetAudioBenchmarkTrigger is the same wiring conduit for the app-health loop's
 	// one-time automatic audio benchmark: cmd/gateway's buildGatewayServer calls it ONCE
 	// with the just-built Server's TriggerAudioBenchmark, and until then the loop's
@@ -494,6 +501,22 @@ type Server struct {
 	// one instance index at the same time. Built in New; a bare &Server{} leaves
 	// it nil, which holds nothing.
 	instanceClaims *instanceClaims
+	// clusters is the llama.cpp RPC cluster orchestration
+	// (cluster_orchestrator.go): the members-first start of a cluster head,
+	// its stop, and the reconciler that keeps pinned and force_running heads
+	// up. New builds it whenever a portal is wired; nil otherwise, which every
+	// method treats as no orchestration.
+	clusters *clusterOrchestrator
+	// clusterUsage keeps the cluster members' measured usage and session
+	// records (cluster_usage.go), fed by the telemetry ingest and told of
+	// every run by the orchestration. New builds it whenever a route store is
+	// wired; nil otherwise, which every method treats as nothing to keep.
+	clusterUsage *clusterUsage
+	// clusterHeads tells recordUsage which mappings are llama.cpp RPC cluster
+	// heads, from the instance source's spec cache (knownClusterHead), so a
+	// completed cluster request lists its member hosts for energy attribution. New sets it
+	// with the resolver's instance source; nil lists nothing.
+	clusterHeads completedClusterHeadSource
 	// runtimeStarts counts the portal's manual starts whose ensure runs in the
 	// background (runtime_actions.go); cancelling the server's lifetime
 	// (baseCtx) ends each one's ensure. Only tests join them
@@ -571,9 +594,10 @@ type Server struct {
 	// derives each open agent WebSocket's lifetime from it: a shutdown watcher sends
 	// 1001 GoingAway when baseCtx is cancelled (SIGTERM), so http.Server.Shutdown
 	// finishes promptly and the agent reconnects via the fast clean-close path.
-	// Defaults to context.Background() in New; cmd/gateway replaces it via
-	// SetBaseContext before serving.
-	baseCtx context.Context
+	// Unset it reads as context.Background() (lifetime); cmd/gateway installs
+	// it via SetBaseContext before serving, after the background loops built
+	// with the server started -- which read it meanwhile, hence the atomic.
+	baseCtx atomic.Pointer[context.Context]
 	// agentMu guards agentListenerActive/agentListenerAddr below: main() sets them
 	// once before serving starts, but the upcoming live-rebind manager (Task 4)
 	// updates them at runtime while request handlers (the netbird_only gate) and
@@ -1141,7 +1165,6 @@ func New(deps ServerDeps) *Server {
 		audioConcurrencyMax:         positiveOr(deps.AudioConcurrencyMax, defaultAudioConcurrencyMax),
 		mux:                         http.NewServeMux(),
 		agentMux:                    http.NewServeMux(),
-		baseCtx:                     context.Background(),
 		internalAuthSecret:          deps.InternalAuthSecret,
 		users:                       deps.Users,
 		ChatRuns:                    deps.ChatRuns,
@@ -1206,8 +1229,8 @@ func New(deps ServerDeps) *Server {
 		// the audio benchmark judges a ramp level by, so "real time" means one thing.
 		resolver.SetAudioRealtimeMinFactor(s.audioRealtimeMinFactor)
 	}
-	// The instance scaler is the resolver's demand sink: a request about to park
-	// because every instance of its model is busy asks it for another. It needs
+	// The instance scaler takes the resolver's instance demand: a request about to
+	// park because every instance of its model is busy asks it for another. It needs
 	// the built Server for the provider (read at each signal, so a provider without
 	// the ensure route starts nothing), the upstream credential and the shutdown
 	// context, and it counts instances through the resolver's own instance source.
@@ -1224,15 +1247,89 @@ func New(deps ServerDeps) *Server {
 			},
 			authCtx: s.upstreamAuthCtx,
 			wake:    admission.release,
-			base:    func() context.Context { return s.baseCtx },
+			base:    s.lifetime,
 			now:     time.Now,
 			claims:  s.instanceClaims,
 		}, deps.InstanceScaleCooldown)
-		resolver.SetDemandSink(s.instanceScaler)
+		// The resolver's one demand sink fans out: a request parked for a cold
+		// llama.cpp RPC cluster head asks the cluster orchestration to form it,
+		// every other demand goes to the instance scaler. The cluster gate reads
+		// a mapping's spec through the instance source's cache, so a mapping that
+		// is no head costs nothing beyond the read instance expansion makes. Both
+		// read s.clusters at each call: it is built below.
+		clusters := func() *clusterOrchestrator { return s.clusters }
+		resolver.SetDemandSink(demandFanout{scaler: s.instanceScaler, clusters: clusters})
+		resolver.SetClusterGate(&clusterRoutingGate{heads: instances, clusters: clusters, busy: benchmarks})
+		s.clusterHeads = instances
+	}
+	if deps.Routes != nil {
+		// Session bounds are compared with usage event times, which are UTC.
+		s.clusterUsage = newClusterUsage(deps.Routes, s.PushRuntimeConfig, func() time.Time { return time.Now().UTC() })
+		routes := deps.Routes
+		s.clusterUsage.lastSeen = func(ctx context.Context, serverID string) (time.Time, bool) {
+			srv, err := routes.AIServerByID(ctx, serverID)
+			if err != nil || srv.LastSeenAt == nil {
+				return time.Time{}, false
+			}
+			return *srv.LastSeenAt, true
+		}
+	}
+	if s.Portal != nil {
+		var runs clusterRunObserver
+		if s.clusterUsage != nil {
+			runs = s.clusterUsage
+		}
+		s.clusters = newClusterOrchestrator(clusterOrchestratorDeps{
+			portal: s.Portal,
+			agents: func() clusterAgentClient {
+				agents, _ := s.Provider.(clusterAgentClient)
+				return agents
+			},
+			statuses: runtimeStatus,
+			authCtx:  s.upstreamAuthCtx,
+			base:     s.lifetime,
+			now:      time.Now,
+			// A start's end wakes every request parked for the head's server.
+			wake: admission.releaseAll,
+			runs: runs,
+		}, defaultClusterTimings())
 	}
 	s.routes()
 	return s
 }
+
+// ClusterStatusReader is the cluster orchestration's state as the portal
+// reads it (portal.ClusterStatusReader), nil on a server without one.
+func (s *Server) ClusterStatusReader() portal.ClusterStatusReader {
+	if s.clusters == nil {
+		return nil
+	}
+	return s.clusters
+}
+
+// clusterReconcileInterval is how often the cluster reconciler runs a pass
+// without a trigger: it picks up a kept-up head whose cooldown ended.
+const clusterReconcileInterval = 30 * time.Second
+
+// ClusterReconcileInterval is the cluster reconciler's tick period.
+func (s *Server) ClusterReconcileInterval() time.Duration { return clusterReconcileInterval }
+
+// ClusterReconcileTrigger is the channel that wakes the cluster reconciler
+// beside its tick: a pushed runtime document, an exited head. nil (never
+// fires) on a server without an orchestration.
+func (s *Server) ClusterReconcileTrigger() <-chan struct{} { return s.clusters.TriggerChannel() }
+
+// ReconcileClusters is one cluster reconciler pass
+// (clusterOrchestrator.Reconcile): at boot, on every pushed runtime document,
+// when a head exits and on the tick, it starts the pinned and force_running
+// cluster heads members first. cmd/gateway runs it through startCancellable.
+func (s *Server) ReconcileClusters(ctx context.Context) { s.clusters.Reconcile(ctx) }
+
+// WaitClusterStarts returns once every cluster start and reconciler-spawned
+// start has ended. cmd/gateway calls it in its cleanup, after the server's
+// lifetime was cancelled (which ends each start) and before the store
+// closes, so no start reads a closed store.
+func (s *Server) WaitClusterStarts() { s.clusters.wait() }
 
 // chatAudioCaps is the pair of caps the run executors bound a speech turn's audio by: the
 // most decoded PCM bytes the whole turn may keep (maxChatAudioBytes) and the per-blob
@@ -1343,7 +1440,7 @@ func (s *Server) SetBaseContext(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.baseCtx = ctx
+	s.baseCtx.Store(&ctx)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

@@ -121,6 +121,37 @@ type Event struct {
 	CostEUR float64 `json:"cost_eur"`
 }
 
+// EventHostRoleHead and EventHostRoleMember are the roles of an event's hosts
+// and energy parts: the server the request was routed to (Event.Host), and an
+// RPC member that head used while it served the request.
+const (
+	EventHostRoleHead   = "head"
+	EventHostRoleMember = "member"
+)
+
+// EventHost lists one server that took part in serving a usage event. A
+// cluster request names its head ("head") and every RPC member ("member") so
+// each host's energy can be priced on its own and overlap queries on a member
+// server also see the cluster events that used it. CreatedAt is a copy of the
+// event's created_at so the per-server window scan needs no join.
+type EventHost struct {
+	EventID   string
+	ServerID  string
+	Role      string
+	CreatedAt time.Time
+}
+
+// EnergyPart is one host's share of an event's energy: Wh attributed, the
+// marginal part of it, and how it was derived.
+type EnergyPart struct {
+	EventID    string
+	ServerID   string
+	Role       string
+	Wh         float64
+	MarginalWh float64
+	Source     string
+}
+
 type Store interface {
 	// Record persists event. The memory Recorder always returns nil (an
 	// in-memory append cannot fail); *store.SQLiteStore returns the real
@@ -158,23 +189,60 @@ type Store interface {
 	// whose own [CreatedAt-latency, CreatedAt] window overlaps [from, to]. Used by
 	// the energy reconciler to reconstruct how many concurrent requests a server
 	// was serving during a target event's window.
+	//
+	// An event also matches when it lists serverID in its event hosts (see
+	// RecordEventHosts), so a cluster member sees the cluster requests it
+	// served. An event is returned at most once.
 	UsageEventsForServerWindow(ctx context.Context, serverID string, from, to time.Time) ([]Event, error)
-	// EnergyByServer sums EnergyWh grouped by Host (server id) over the SAME
+	// RecordEventHosts stores the hosts of usage events. Recording a
+	// (event, server) pair that already exists keeps the stored row.
+	RecordEventHosts(ctx context.Context, hosts []EventHost) error
+	// EventHosts lists an event's hosts, head first, then by server id.
+	EventHosts(ctx context.Context, eventID string) ([]EventHost, error)
+	// SetEnergyParts replaces an event's per-host energy parts.
+	SetEnergyParts(ctx context.Context, eventID string, parts []EnergyPart) error
+	// EnergyParts lists an event's per-host energy parts, head first, then by
+	// server id.
+	EnergyParts(ctx context.Context, eventID string) ([]EnergyPart, error)
+	// EnergyPartsByEvents lists the energy parts of each of eventIDs, keyed by
+	// event id, each list head first, then by server id. An event without
+	// parts is absent from the map.
+	EnergyPartsByEvents(ctx context.Context, eventIDs []string) (map[string][]EnergyPart, error)
+	// EnergyByServer sums EnergyWh grouped by host (server id) over the SAME
 	// filtered set Stats(q) would compute (same predicate as matchUsage/
 	// usageWhere) — used by the portal layer to weight the aggregate cost
-	// total per server price (see portal.Service.UsageStats). A host with no
-	// matching rows is simply absent from the returned map (never a
-	// zero-valued entry).
+	// total per server price (see portal.Service.UsageStats). An event with
+	// energy parts counts each part under the part's host; any other event
+	// counts under its own Host. A host with no matching rows is simply absent
+	// from the returned map (never a zero-valued entry).
 	EnergyByServer(ctx context.Context, q Query) (map[string]float64, error)
 	// UsageGroups aggregates the filtered set GROUP BY (dimension, host). groupBy is
 	// one of session|server|user|token|model (validated by the caller). Returns one
-	// bucket per (group value, host).
+	// bucket per (group value, host). An event with energy parts counts in the
+	// bucket of its own Host, with the head part's energy; each other part's
+	// energy goes to a separate MemberParts bucket of that part's host in the
+	// same group, so the requests are counted once and every part can be
+	// priced at, and shown under, its host.
 	UsageGroups(ctx context.Context, q Query, groupBy string) ([]GroupBucket, error)
+	// MemberPartEnergy sums the energy parts drawn on one of hosts for the
+	// events that match q apart from its server filter and that the server
+	// filter does not select (matched like every query, on the request's own
+	// server_name snapshot and Host: such a request already counts in full in
+	// the filtered aggregate, its member parts included), as MemberParts
+	// buckets per (groupBy value, part host). groupBy "" groups by host only
+	// (Key ""). The portal uses it to show a server's share of other servers'
+	// cluster requests in an aggregate filtered by that server, passing the
+	// filtered query itself. No hosts reads nothing.
+	MemberPartEnergy(ctx context.Context, q Query, hosts []string, groupBy string) ([]GroupBucket, error)
 }
 
 type Recorder struct {
 	mu     sync.RWMutex
 	events []Event
+	// hosts and parts hold the per-event host and energy-part rows, keyed by
+	// event id, in insertion order.
+	hosts map[string][]EventHost
+	parts map[string][]EnergyPart
 
 	// ResolveUserName, when non-nil, maps a user_id to a human-readable owner
 	// name for ScopeAll queries. Default nil -> UserName stays empty.
@@ -239,8 +307,8 @@ func (r *Recorder) UnpricedUsageEvents(_ context.Context, notBefore, notAfter ti
 	return matched, nil
 }
 
-// UsageEventsForServerWindow returns the events on serverID (Host==serverID)
-// whose own [CreatedAt-latency, CreatedAt] window overlaps [from, to]
+// UsageEventsForServerWindow returns the events on serverID (Host==serverID,
+// or listing serverID among their event hosts) whose own [CreatedAt-latency, CreatedAt] window overlaps [from, to]
 // (inclusive on both ends, matching a closed-interval overlap test). Unlike the
 // SQL store, this scans the full in-memory set directly — no widen-then-filter
 // margin is needed since every event is already resident.
@@ -249,7 +317,7 @@ func (r *Recorder) UsageEventsForServerWindow(_ context.Context, serverID string
 	defer r.mu.RUnlock()
 	out := make([]Event, 0)
 	for _, e := range r.events {
-		if e.Host != serverID {
+		if e.Host != serverID && !r.listsHostLocked(e.ID, serverID) {
 			continue
 		}
 		start := e.CreatedAt.Add(-time.Duration(e.LatencyMS) * time.Millisecond)
@@ -260,6 +328,131 @@ func (r *Recorder) UsageEventsForServerWindow(_ context.Context, serverID string
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+// listsHostLocked reports whether eventID lists serverID among its hosts.
+// The caller holds r.mu.
+func (r *Recorder) listsHostLocked(eventID, serverID string) bool {
+	for _, h := range r.hosts[eventID] {
+		if h.ServerID == serverID {
+			return true
+		}
+	}
+	return false
+}
+
+// hasEventLocked reports whether an event with id was recorded. The caller
+// holds r.mu.
+func (r *Recorder) hasEventLocked(id string) bool {
+	for _, e := range r.events {
+		if e.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordEventHosts stores hosts, keeping an existing row for a repeated
+// (event, server) pair. Like the SQL stores' foreign key, an event id that was
+// never recorded is an error and the whole call writes nothing.
+func (r *Recorder) RecordEventHosts(_ context.Context, hosts []EventHost) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, h := range hosts {
+		if !r.hasEventLocked(h.EventID) {
+			return fmt.Errorf("usage event host: unknown event %q", h.EventID)
+		}
+	}
+	if r.hosts == nil {
+		r.hosts = make(map[string][]EventHost)
+	}
+	for _, h := range hosts {
+		if r.listsHostLocked(h.EventID, h.ServerID) {
+			continue
+		}
+		r.hosts[h.EventID] = append(r.hosts[h.EventID], h)
+	}
+	return nil
+}
+
+// EventHosts returns eventID's hosts, head first, then by server id.
+func (r *Recorder) EventHosts(_ context.Context, eventID string) ([]EventHost, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := append([]EventHost{}, r.hosts[eventID]...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if hi, hj := out[i].Role == EventHostRoleHead, out[j].Role == EventHostRoleHead; hi != hj {
+			return hi
+		}
+		return out[i].ServerID < out[j].ServerID
+	})
+	return out, nil
+}
+
+// SetEnergyParts replaces eventID's energy parts. Like the SQL stores, an
+// unknown event (with parts to store) and two parts for one server are errors,
+// and a failed call leaves the previous parts untouched.
+func (r *Recorder) SetEnergyParts(_ context.Context, eventID string, parts []EnergyPart) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(parts) > 0 && !r.hasEventLocked(eventID) {
+		return fmt.Errorf("usage event energy part: unknown event %q", eventID)
+	}
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		if seen[p.ServerID] {
+			return fmt.Errorf("usage event energy part: duplicate server %q", p.ServerID)
+		}
+		seen[p.ServerID] = true
+	}
+	if r.parts == nil {
+		r.parts = make(map[string][]EnergyPart)
+	}
+	if len(parts) == 0 {
+		delete(r.parts, eventID)
+		return nil
+	}
+	stored := make([]EnergyPart, len(parts))
+	for i, p := range parts {
+		p.EventID = eventID
+		stored[i] = p
+	}
+	r.parts[eventID] = stored
+	return nil
+}
+
+// EnergyParts returns eventID's energy parts, head first, then by server id.
+func (r *Recorder) EnergyParts(_ context.Context, eventID string) ([]EnergyPart, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sortedPartsLocked(eventID), nil
+}
+
+// EnergyPartsByEvents returns the energy parts of each of eventIDs, keyed by
+// event id; an event without parts is absent.
+func (r *Recorder) EnergyPartsByEvents(_ context.Context, eventIDs []string) (map[string][]EnergyPart, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string][]EnergyPart)
+	for _, id := range eventIDs {
+		if parts := r.sortedPartsLocked(id); len(parts) > 0 {
+			out[id] = parts
+		}
+	}
+	return out, nil
+}
+
+// sortedPartsLocked returns a copy of eventID's parts, head first, then by
+// server id. The caller holds r.mu.
+func (r *Recorder) sortedPartsLocked(eventID string) []EnergyPart {
+	out := append([]EnergyPart{}, r.parts[eventID]...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if hi, hj := out[i].Role == EventHostRoleHead, out[j].Role == EventHostRoleHead; hi != hj {
+			return hi
+		}
+		return out[i].ServerID < out[j].ServerID
+	})
+	return out
 }
 
 func (r *Recorder) ByUser(userID string) []Event {
@@ -379,10 +572,11 @@ func (r *Recorder) Stats(q Query) (Stats, error) {
 	}, nil
 }
 
-// EnergyByServer sums EnergyWh grouped by Host over the events matching q
+// EnergyByServer sums EnergyWh grouped by host over the events matching q
 // (same matchUsage predicate Stats/Query use), for the portal layer to
-// derive a per-server-price-weighted total cost. A host with no matching
-// rows is absent from the returned map.
+// derive a per-server-price-weighted total cost. An event with energy parts
+// counts each part under the part's host, any other event under its Host. A
+// host with no matching rows is absent from the returned map.
 func (r *Recorder) EnergyByServer(_ context.Context, q Query) (map[string]float64, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -391,9 +585,31 @@ func (r *Recorder) EnergyByServer(_ context.Context, q Query) (map[string]float6
 		if !matchUsage(q, e, nil) {
 			continue
 		}
-		out[e.Host] += e.EnergyWh
+		parts := r.parts[e.ID]
+		if len(parts) == 0 {
+			out[e.Host] += e.EnergyWh
+			continue
+		}
+		for _, p := range parts {
+			out[p.ServerID] += p.Wh
+		}
 	}
 	return out, nil
+}
+
+// headEnergyLocked returns the energy of e that counts under e.Host: its
+// part on that host when e has parts, else all of it. The caller holds r.mu.
+func (r *Recorder) headEnergyLocked(e Event) float64 {
+	parts := r.parts[e.ID]
+	if len(parts) == 0 {
+		return e.EnergyWh
+	}
+	for _, p := range parts {
+		if p.ServerID == e.Host {
+			return p.Wh
+		}
+	}
+	return 0
 }
 
 // usageGroupKey returns the group-by value of e for the given dimension, and
@@ -451,7 +667,7 @@ func (r *Recorder) UsageGroups(_ context.Context, q Query, groupBy string) ([]Gr
 		b.OutputTokens += e.OutputTokens
 		b.CachedTokens += e.CachedTokens
 		b.CacheWriteTokens += e.CacheWriteTokens
-		b.EnergyWh += e.EnergyWh
+		b.EnergyWh += r.headEnergyLocked(e)
 		if e.CreatedAt.Before(b.FirstAt) {
 			b.FirstAt = e.CreatedAt
 		}
@@ -463,7 +679,93 @@ func (r *Recorder) UsageGroups(_ context.Context, q Query, groupBy string) ([]Gr
 	for _, b := range acc {
 		out = append(out, *b)
 	}
-	return out, nil
+	// The other hosts' parts add energy only, in buckets of their own: the
+	// request is already counted above.
+	return append(out, r.memberPartBucketsLocked(q, groupBy, nil)...), nil
+}
+
+// MemberPartEnergy sums the parts drawn on hosts for events served by any
+// other host, mirroring the SQL stores.
+func (r *Recorder) MemberPartEnergy(_ context.Context, q Query, hosts []string, groupBy string) ([]GroupBucket, error) {
+	if groupBy != "" {
+		if _, ok := usageGroupKey(groupBy, Event{}); !ok {
+			return nil, fmt.Errorf("member part energy: invalid group_by %q", groupBy)
+		}
+	}
+	if len(hosts) == 0 {
+		return []GroupBucket{}, nil
+	}
+	selected := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		selected[h] = true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.memberPartBucketsLocked(q, groupBy, selected), nil
+}
+
+// hasServerFilter reports whether q filters by server.
+func hasServerFilter(q Query) bool {
+	return q.Server != "" || q.HasServerExact || q.ServerExact != ""
+}
+
+// memberPartBucketsLocked sums, per (groupBy value, part host), the energy of
+// every part on a host other than its event's own. With a nil selected it
+// reads the events matching q; with a non-nil selected (MemberPartEnergy) the
+// events matching q apart from its server filter that the server filter does
+// not select, and only their parts on a selected host. groupBy "" leaves Key
+// empty. The caller holds r.mu.
+func (r *Recorder) memberPartBucketsLocked(q Query, groupBy string, selected map[string]bool) []GroupBucket {
+	acc := memberPartAccumulator{acc: map[memberPartKey]*GroupBucket{}}
+	unfiltered := q
+	if selected != nil {
+		unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
+	}
+	for _, e := range r.events {
+		if !matchUsage(unfiltered, e, nil) || (selected != nil && hasServerFilter(q) && matchServer(q, e)) {
+			continue
+		}
+		key := ""
+		if groupBy != "" {
+			key, _ = usageGroupKey(groupBy, e)
+		}
+		for _, p := range r.parts[e.ID] {
+			if p.ServerID != e.Host && (selected == nil || selected[p.ServerID]) {
+				acc.add(key, p.ServerID, p.Wh)
+			}
+		}
+	}
+	return acc.buckets()
+}
+
+// memberPartKey is one member part bucket: the groupBy value and the part's
+// host.
+type memberPartKey struct{ key, host string }
+
+// memberPartAccumulator sums member part energy per memberPartKey, keeping
+// the buckets in the order they were first seen.
+type memberPartAccumulator struct {
+	acc   map[memberPartKey]*GroupBucket
+	order []memberPartKey
+}
+
+func (a *memberPartAccumulator) add(key, host string, wh float64) {
+	id := memberPartKey{key, host}
+	b := a.acc[id]
+	if b == nil {
+		b = &GroupBucket{Key: key, Host: host, MemberParts: true}
+		a.acc[id] = b
+		a.order = append(a.order, id)
+	}
+	b.EnergyWh += wh
+}
+
+func (a *memberPartAccumulator) buckets() []GroupBucket {
+	out := make([]GroupBucket, 0, len(a.order))
+	for _, id := range a.order {
+		out = append(out, *a.acc[id])
+	}
+	return out
 }
 
 // TimeSeries buckets the events matching q (From/To window + UserID/ScopeAll
@@ -483,6 +785,22 @@ func (r *Recorder) TimeSeries(q Query, bucketSecs int) (TimeSeries, error) {
 	return ComputeTimeSeries(matched, q.From, q.To, bucketSecs), nil
 }
 
+// matchServer reports whether e satisfies q's server filter (Server,
+// ServerExact), matched on the request's own server_name snapshot and host;
+// true when q has none.
+func matchServer(q Query, e Event) bool {
+	if q.Server != "" {
+		needle := strings.ToLower(q.Server)
+		if !strings.Contains(strings.ToLower(e.ServerName), needle) && !strings.Contains(strings.ToLower(e.Host), needle) {
+			return false
+		}
+	}
+	if (q.HasServerExact || q.ServerExact != "") && !strings.EqualFold(e.ServerName, q.ServerExact) {
+		return false
+	}
+	return true
+}
+
 // matchUsage reports whether e satisfies q. resolveName, when non-nil, supplies
 // the resolved owner name so the Owner filter can match it in addition to
 // user_id (the ScopeAll list); pass nil where SQLite would have no users join.
@@ -499,13 +817,7 @@ func matchUsage(q Query, e Event, resolveName func(string) string) bool {
 	if q.Model != "" && !strings.Contains(strings.ToLower(e.Model), strings.ToLower(q.Model)) {
 		return false
 	}
-	if q.Server != "" {
-		needle := strings.ToLower(q.Server)
-		if !strings.Contains(strings.ToLower(e.ServerName), needle) && !strings.Contains(strings.ToLower(e.Host), needle) {
-			return false
-		}
-	}
-	if (q.HasServerExact || q.ServerExact != "") && !strings.EqualFold(e.ServerName, q.ServerExact) {
+	if !matchServer(q, e) {
 		return false
 	}
 	if (q.HasSessionIDExact || q.SessionIDExact != "") && !strings.EqualFold(e.SessionID, q.SessionIDExact) {

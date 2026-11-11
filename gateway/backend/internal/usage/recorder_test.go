@@ -1173,3 +1173,172 @@ func containsID(ids []string, want string) bool {
 	}
 	return false
 }
+
+func TestRecorderUsageEventsForServerWindowIncludesMemberRows(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_cluster", Host: "srv_head", LatencyMS: 10000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_local", Host: "srv_member", LatencyMS: 10000, CreatedAt: at})
+	if err := rec.RecordEventHosts(ctx, []EventHost{
+		{EventID: "ev_cluster", ServerID: "srv_head", Role: "head", CreatedAt: at},
+		{EventID: "ev_cluster", ServerID: "srv_member", Role: "member", CreatedAt: at},
+		{EventID: "ev_local", ServerID: "srv_member", Role: "head", CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("record hosts: %v", err)
+	}
+	from := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 11, 5, 10, 0, 20, 0, time.UTC)
+	got, err := rec.UsageEventsForServerWindow(ctx, "srv_member", from, to)
+	if err != nil {
+		t.Fatalf("window: %v", err)
+	}
+	if ids := idsOf(got); len(ids) != 2 || !containsID(ids, "ev_cluster") || !containsID(ids, "ev_local") {
+		t.Fatalf("member ids = %v, want both once", ids)
+	}
+	got, _ = rec.UsageEventsForServerWindow(ctx, "srv_head", from, to)
+	if ids := idsOf(got); len(ids) != 1 || ids[0] != "ev_cluster" {
+		t.Fatalf("head ids = %v, want [ev_cluster] once", ids)
+	}
+	got, _ = rec.UsageEventsForServerWindow(ctx, "srv_other", from, to)
+	if len(got) != 0 {
+		t.Fatalf("unrelated ids = %v, want none", idsOf(got))
+	}
+}
+
+func TestRecorderEventHostsAndEnergyParts(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev1", Host: "srv_head", CreatedAt: at})
+	hosts := []EventHost{
+		{EventID: "ev1", ServerID: "srv_b", Role: "member", CreatedAt: at},
+		{EventID: "ev1", ServerID: "srv_head", Role: "head", CreatedAt: at},
+	}
+	if err := rec.RecordEventHosts(ctx, hosts); err != nil {
+		t.Fatalf("record hosts: %v", err)
+	}
+	if err := rec.RecordEventHosts(ctx, hosts[:1]); err != nil {
+		t.Fatalf("re-record hosts: %v", err)
+	}
+	got, err := rec.EventHosts(ctx, "ev1")
+	if err != nil || len(got) != 2 || got[0].ServerID != "srv_head" || got[1].ServerID != "srv_b" {
+		t.Fatalf("hosts = %+v err=%v, want head first, no duplicate", got, err)
+	}
+	parts := []EnergyPart{
+		{EventID: "ev1", ServerID: "srv_head", Role: "head", Wh: 0.1, MarginalWh: 0.01, Source: "measured"},
+		{EventID: "ev1", ServerID: "srv_b", Role: "member", Wh: 0.5, MarginalWh: 0.25, Source: "modeled"},
+	}
+	if err := rec.SetEnergyParts(ctx, "ev1", parts); err != nil {
+		t.Fatalf("set parts: %v", err)
+	}
+	gotParts, err := rec.EnergyParts(ctx, "ev1")
+	if err != nil || len(gotParts) != 2 || gotParts[0] != parts[0] || gotParts[1] != parts[1] {
+		t.Fatalf("parts = %+v err=%v, want %+v", gotParts, err, parts)
+	}
+	if err := rec.SetEnergyParts(ctx, "ev1", parts[:1]); err != nil {
+		t.Fatalf("replace parts: %v", err)
+	}
+	if gotParts, _ = rec.EnergyParts(ctx, "ev1"); len(gotParts) != 1 {
+		t.Fatalf("after replace = %+v, want 1", gotParts)
+	}
+}
+
+// TestRecorderPricesPartsByPartHost mirrors the SQL stores: a cluster
+// request's energy counts under the host of each part, a request without parts
+// under its own host, and the request itself is counted once.
+func TestRecorderPricesPartsByPartHost(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_cluster", UserID: "u1", Model: "big", Host: "srv_head", EnergyWh: 3000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_plain", UserID: "u1", Model: "big", Host: "srv_head", EnergyWh: 1000, CreatedAt: at})
+	if err := rec.SetEnergyParts(ctx, "ev_cluster", []EnergyPart{
+		{ServerID: "srv_mem", Role: EventHostRoleMember, Wh: 2000},
+		{ServerID: "srv_head", Role: EventHostRoleHead, Wh: 1000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := Query{UserID: "u1"}
+
+	byServer, _ := rec.EnergyByServer(ctx, q)
+	if len(byServer) != 2 || byServer["srv_head"] != 2000 || byServer["srv_mem"] != 2000 {
+		t.Fatalf("energy by server = %v", byServer)
+	}
+	buckets, _ := rec.UsageGroups(ctx, q, "model")
+	got := map[string]GroupBucket{}
+	for _, b := range buckets {
+		got[b.Host] = b
+	}
+	if len(got) != 2 || got["srv_head"].Count != 2 || got["srv_head"].EnergyWh != 2000 || got["srv_mem"].Count != 0 || got["srv_mem"].EnergyWh != 2000 || got["srv_mem"].Key != "big" {
+		t.Fatalf("groups = %+v", got)
+	}
+	parts, _ := rec.EnergyPartsByEvents(ctx, []string{"ev_cluster", "ev_plain"})
+	if len(parts) != 1 || len(parts["ev_cluster"]) != 2 || parts["ev_cluster"][0].ServerID != "srv_head" {
+		t.Fatalf("parts by events = %+v, want ev_cluster's parts, head first", parts)
+	}
+}
+
+// TestRecorderMemberPartBuckets mirrors the SQL stores' member-part buckets:
+// flagged, never merged into the host's own request bucket, and
+// MemberPartEnergy over the selected hosts.
+func TestRecorderMemberPartBuckets(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_cluster", UserID: "u1", Model: "big", Host: "srv_head", ServerName: "Head", InputTokens: 7, EnergyWh: 3000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_local", UserID: "u1", Model: "big", Host: "srv_mem", ServerName: "Member", InputTokens: 3, EnergyWh: 500, CreatedAt: at})
+	if err := rec.SetEnergyParts(ctx, "ev_cluster", []EnergyPart{
+		{ServerID: "srv_head", Role: EventHostRoleHead, Wh: 1000},
+		{ServerID: "srv_mem", Role: EventHostRoleMember, Wh: 2000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := Query{UserID: "u1"}
+	buckets, _ := rec.UsageGroups(ctx, q, "model")
+	var own, member int
+	for _, b := range buckets {
+		switch {
+		case b.Host == "srv_mem" && b.MemberParts && b.Count == 0 && b.EnergyWh == 2000 && b.Key == "big":
+			member++
+		case b.Host == "srv_mem" && !b.MemberParts && b.Count == 1 && b.EnergyWh == 500:
+			own++
+		}
+	}
+	if own != 1 || member != 1 {
+		t.Fatalf("buckets = %+v, want srv_mem's own bucket and a separate member-part bucket", buckets)
+	}
+	got, _ := rec.MemberPartEnergy(ctx, q, []string{"srv_mem"}, "server")
+	if len(got) != 1 || got[0].Key != "Head" || got[0].Host != "srv_mem" || !got[0].MemberParts || got[0].EnergyWh != 2000 {
+		t.Fatalf("member part energy = %+v", got)
+	}
+	if got, _ := rec.MemberPartEnergy(ctx, Query{UserID: "u1", ServerExact: "Head", HasServerExact: true}, []string{"srv_mem"}, ""); len(got) != 0 {
+		t.Fatalf("member part energy with the head's request selected = %+v, want none", got)
+	}
+}
+
+// TestRecorderMemberPartEnergyExcludesByTheRequestFilter mirrors the SQL
+// stores: requests the server filter selects by their own snapshot name are
+// left out, whatever their server is called today.
+func TestRecorderMemberPartEnergyExcludesByTheRequestFilter(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_renamed", UserID: "u1", Host: "srv_h", ServerName: "gpu-a", EnergyWh: 3000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_deleted", UserID: "u1", Host: "srv_gone", ServerName: "gpu-c", EnergyWh: 3000, CreatedAt: at})
+	for id, host := range map[string]string{"ev_renamed": "srv_h", "ev_deleted": "srv_gone"} {
+		if err := rec.SetEnergyParts(ctx, id, []EnergyPart{
+			{ServerID: host, Role: EventHostRoleHead, Wh: 1000},
+			{ServerID: "srv_m", Role: EventHostRoleMember, Wh: 2000},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := rec.MemberPartEnergy(ctx, Query{UserID: "u1", Server: "gpu"}, []string{"srv_m"}, ""); len(got) != 0 {
+		t.Fatalf("member parts under a filter that selects their requests = %+v, want none", got)
+	}
+	got, _ := rec.MemberPartEnergy(ctx, Query{UserID: "u1", ServerExact: "gpu-b", HasServerExact: true}, []string{"srv_m"}, "")
+	if len(got) != 1 || got[0].Host != "srv_m" || got[0].EnergyWh != 4000 {
+		t.Fatalf("member parts filtered by the member = %+v, want srv_m 4000 Wh", got)
+	}
+}

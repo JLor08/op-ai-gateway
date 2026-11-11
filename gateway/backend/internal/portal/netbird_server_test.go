@@ -821,7 +821,7 @@ func TestSetServerNetbird(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateServer: %v", err)
 	}
-	if err := routeStore.UpdateServerNetbirdState(context.Background(), plain.ID, "s.local", "peer-old", true); err != nil {
+	if err := routeStore.UpdateServerNetbirdState(context.Background(), plain.ID, "s.local", "peer-old", "", true); err != nil {
 		t.Fatalf("seed connected state: %v", err)
 	}
 
@@ -2127,7 +2127,7 @@ func TestUpdateServerRenamesNetbirdPeerAndUpdatesDomain(t *testing.T) {
 		t.Fatalf("CreateServer: %v", err)
 	}
 	// Link the server to peer-1 directly in the store (as the sync loop/linkage would).
-	if err := routeStore.UpdateServerNetbirdState(ctx, dto.ID, "old-domain", "peer-1", true); err != nil {
+	if err := routeStore.UpdateServerNetbirdState(ctx, dto.ID, "old-domain", "peer-1", "", true); err != nil {
 		t.Fatalf("link peer: %v", err)
 	}
 

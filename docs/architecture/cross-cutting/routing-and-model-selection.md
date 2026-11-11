@@ -2129,6 +2129,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 | `ErrVoiceUnavailable` | **503** (`routing.voice_unavailable`) | a speech request's `voice` is one that at least one candidate is **known** (from its cached voice list) to lack while an eligible candidate (one that lists it, or of unknown/uncached status) remained, so the voice narrowed the pool to the eligible ones and none of those is usable; answered **instead of** `ErrNoHealthyHost` and only then (§2.5). A voice no candidate is known to lack, or one **every** candidate is known-absent for (fail open), never produces it |
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes`, and for transcription no `transcription: yes` (a model the listing does not name reads as unknown) |
 | `ErrNoRealtimeCandidate` | **409** (`voice_chat.no_realtime_model`) | a request held to real time — a voice chat's ASR or TTS leg — had candidates and every one was measured below the real-time threshold (§10.8); not `ErrNoHealthyHost`, since a retry does not make the model faster |
+| `ClusterUnavailableError` | **503** (`runtime.cluster_start_failed` / `runtime.cluster_unavailable`) | the only candidates left were llama.cpp RPC cluster heads the cluster gate excludes (§11): `runtime.cluster_start_failed` while the head cools down after a failed start or a lost member, `runtime.cluster_unavailable` otherwise; answered **instead of** `ErrNoHealthyHost`. `Cause`, `Position` and `AtHead` carry the failure the cluster recorded when that is why the head is excluded, and the message names it |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
 | `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server with no *usable* live offering of the model: either no live mapping for it at all, **or** one whose mapping does not carry a `yes` verdict for a capability the endpoint requires (§2.3 site 2). The two share this sentinel deliberately — an override names one server, so there is no second candidate the distinction could steer to |
@@ -2520,6 +2521,80 @@ request whose every instance on the pinned server it has already found gone
 stays where it is — an instance going away is no reason to move a session off its server — while
 an override in that state has no host left (`ErrNoHealthyHost`). A group pin records the instance
 its member was served on too (`upsertGroupPin`); the group walk does not read it back.
+
+## 11. Cluster heads: the cluster gate
+
+A llama.cpp RPC cluster head serves only once its cluster formed: its members started first,
+then the head with the cluster-start mark, which only the gateway's cluster orchestration sends.
+The agent refuses any other request for a head that has not formed (`runtime.cluster_not_ready`),
+so the resolver asks a **cluster gate** (`routing.ClusterGate`, the gateway's
+`clusterRoutingGate`) about every `server_agent` candidate's instance 0 on every selection turn.
+The gate reads the mapping's spec through the instance source's spec cache, so a mapping that is
+no head costs nothing beyond that cached read. A head is in one of three states:
+
+- **Formed**: an ordinary candidate.
+- **Parkable** (cold or forming): never dispatched while the request can wait. Selection sets it
+  aside and treats it as at capacity, so the request parks (§6.3); the demand it signals names
+  the head (`DemandSignal.ClusterHead`), and the gateway's demand fan-out hands it to the cluster
+  orchestration instead of the instance scaler, which starts the cluster in the background, one
+  start per head however many requests signal. When the start ends, formed or failed, every
+  request parked for the head's server is woken (`admissionQueue.releaseAll`). The park is bound
+  by the **cluster's own bound** — the longest a start may take: the configuration acknowledgement
+  wait (30 s), the slowest member's startup timeout plus 10 s and the head's plus 30 s, which also
+  covers the formation — clipped by the head application's `timeout_ms`, not by
+  `admission_queue_timeout_seconds`; a turn that
+  parks on other candidates at their cap as well waits for the later of the two, and a request
+  keeps the cluster's bound for its later turns once it parked for one (a plain model and a group
+  alike). Cluster parks wait in the same global admission queue as every other park, so they count
+  toward `admission_queue_max_depth`: a burst of requests for a cold head can fill the queue and be
+  refused `routing.admission_queue_full`, and so can the other requests arriving meanwhile. Only a
+  `timeout_ms` shorter than that bound can end a park while the cluster still forms
+  (`routing.admission_queue_timeout`); the client's retry then finds it formed. A request that must not
+  park (`NoPark`, `CheckOnly`), or a resolver without a queue, is served by a parkable head only
+  when no running candidate is left; the voice-chat gate then starts the cluster itself through
+  the orchestration.
+- **Excluded** (cooling down after a failed start, after the watchdog stopped it for a lost
+  member or after the head crashed, withheld by the runtime documents, blocked by a terminal
+  cause, a member server not selectable or held by a benchmark): dropped. A crash records the
+  agent's own code as the cause, or `runtime.cluster_head_crashed` when the exit carried none.
+  When nothing else serves the model the request fails with the cluster's code (§8), never
+  `routing.no_healthy_host`. The code stays the stable one (`runtime.cluster_start_failed`
+  during a cooldown, `runtime.cluster_unavailable` otherwise); a head excluded for a failure the
+  cluster recorded — the cooldown, a terminal block — carries that failure in its verdict, and
+  the message names its cause and where it happened
+  (`(cause: runtime.cluster_member_lost at member 0)`, `… at the head`). In a model group such a
+  member is unavailable and the walk goes on.
+
+  **Naming the cause in an inference refusal is deliberate.** The message may carry the
+  recorded cause code and the member's **position**, never a server name: positions are the
+  anonymous member identity the portal already shows a caller who may not see a member's
+  server, and the cause codes are stable public error codes. With them an API client can tell
+  a transient failure (a member loss, `runtime.cluster_member_lost`,
+  `.cluster_member_unreachable`, or a crash of the head, `runtime.cluster_head_crashed`: retry
+  after the cooldown) from a block that needs the operator (`.cluster_version_mismatch`,
+  `.device_backend_mismatch`, `.rpc_device_count_mismatch`, `.rpc_unsupported_build`: no
+  retry helps until the head's configuration changes). The cost is that an application client
+  sees operator diagnostics such as `runtime.cluster_version_mismatch at member 0`; nothing in
+  them names a host, an address or a setting.
+
+Only an agent known to declare `rpc_cluster` is asked about at all (no other agent runs a head),
+so a mapping on any other agent costs the gate no spec read; an agent whose features are not
+known yet (it has not reported since the gateway started) is not gated, and a request reaching a
+head there is handled on the dispatch path below. A sticky pin to a head that has not formed is
+passed over and kept, so the fresh selection parks the request. A request that reached a head
+in the race between its selection and a stop of the head (the agent's
+`runtime.cluster_not_ready`, buffered or streamed, before any byte was
+relayed) has the cluster started again — bounded by the request and its application's
+`timeout_ms` — and is sent to the same head **once** more; a second refusal is its answer, and a
+start that fails is answered with the cluster's own code (`runtime.cluster_start_failed`,
+`.cluster_member_unused` or `.cluster_unavailable`, the cause in the message). Every refusal of
+a head that reaches a client — `runtime.cluster_not_ready` or `.cluster_member_unreachable`,
+through a relay that does not retry or a server override, which is not gated — is a **503** with
+the agent's code, never `502 provider.unavailable`; the native relays forward the agent's error
+envelope at its status. The model warmer skips heads, and Loads,
+VRAM runs, the speed, capacity and both benchmark modes and the audio benchmark refuse a head
+with `runtime.cluster_head_unsupported` (an application or server scope skips it as
+`cluster_head`).
 
 ## Related chapters
 

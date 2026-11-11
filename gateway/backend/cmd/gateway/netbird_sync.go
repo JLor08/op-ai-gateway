@@ -32,7 +32,30 @@ const netbirdSyncMinInterval = 30 * time.Second
 // interface no longer needs it.
 type serverStore interface {
 	AIServers(ctx context.Context) ([]routing.AIServer, error)
-	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error
+	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
+}
+
+// clusterNotifyingStore is the routing store the NetBird peer sync and the
+// agent reactivation write through: after every successful
+// UpdateServerNetbirdState it notifies every server sharing a llama.cpp RPC
+// cluster with the written one (portal.Service.NotifyClustersOfServer). The
+// peer sync is the writer of a server's mesh IP and its NetBird Domain, and a
+// cluster's endpoints, bind addresses and head identity are derived from
+// both, so without it a moved mesh IP would only reach the cluster's agents
+// on their next poll. Both writers write only on a real change.
+type clusterNotifyingStore struct {
+	routing.Store
+	notify func(ctx context.Context, serverID string)
+}
+
+func (s clusterNotifyingStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error {
+	if err := s.Store.UpdateServerNetbirdState(ctx, id, domain, peerID, ip, connected); err != nil {
+		return err
+	}
+	if s.notify != nil {
+		s.notify(ctx, id)
+	}
+	return nil
 }
 
 // netbirdSettings is the settings source the peer loop reads the resolved NetBird
@@ -49,7 +72,7 @@ type onlineEventFunc func(serverID string)
 // netbirdStateStore is the write side syncServerNetbirdOnce needs — a subset of
 // serverStore, so any serverStore satisfies it.
 type netbirdStateStore interface {
-	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error
+	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
 }
 
 // netbirdReconciler is the group+policy loop's (Loop B) dependency: one fleet pass
@@ -148,8 +171,8 @@ func syncServerNetbirdOnce(ctx context.Context, ncfg netbird.Config, timeout tim
 	// genuine false->true transition (not on a mere domain/peer-id change while
 	// already connected).
 	wasConnected := server.NetbirdConnected
-	if peer.ID != server.NetbirdPeerID || newDomain != server.Domain || peer.Connected != server.NetbirdConnected {
-		if err := store.UpdateServerNetbirdState(ctx, server.ID, newDomain, peer.ID, peer.Connected); err != nil {
+	if peer.ID != server.NetbirdPeerID || peer.IP != server.NetbirdIP || newDomain != server.Domain || peer.Connected != server.NetbirdConnected {
+		if err := store.UpdateServerNetbirdState(ctx, server.ID, newDomain, peer.ID, peer.IP, peer.Connected); err != nil {
 			slog.Debug("netbird sync: update server state failed", "server_id", server.ID, "error", err)
 			return false, false
 		}

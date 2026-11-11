@@ -168,6 +168,10 @@ func (s *SQLiteStore) UnpricedUsageEvents(ctx context.Context, notBefore, notAft
 // [from, to]. Used by the energy reconciler to reconstruct how many concurrent
 // requests a server was serving during a target event's window.
 //
+// A cluster request is recorded on its head, so an event also matches when it
+// lists serverID in usage_event_hosts (the member side of the request); the
+// IN-subquery keeps each event to a single row either way.
+//
 // To stay dialect-neutral (sqlite and postgres differ on interval arithmetic),
 // the underlying fetch widens BOTH bounds by energyMaxRequestWindow — the lower
 // bound so a sibling that started before `from` but is still running is not
@@ -176,12 +180,16 @@ func (s *SQLiteStore) UnpricedUsageEvents(ctx context.Context, notBefore, notAft
 // not missed either — and the exact overlap test runs in Go over the fetched
 // rows.
 func (s *SQLiteStore) UsageEventsForServerWindow(ctx context.Context, serverID string, from, to time.Time) ([]usage.Event, error) {
+	lo, hi := from.Add(-energyMaxRequestWindow), to.Add(energyMaxRequestWindow)
 	rows, err := s.query(ctx, `
 		select `+usageEventColumns+`
 		from usage_events as e
-		where e.host = ? and e.created_at >= ? and e.created_at <= ?
+		where e.created_at >= ? and e.created_at <= ?
+			and (e.host = ? or e.id in (
+				select h.event_id from usage_event_hosts as h
+				where h.server_id = ? and h.created_at >= ? and h.created_at <= ?))
 		order by e.created_at asc, e.id asc`,
-		serverID, from.Add(-energyMaxRequestWindow), to.Add(energyMaxRequestWindow))
+		lo, hi, serverID, serverID, lo, hi)
 	if err != nil {
 		return nil, fmt.Errorf("usage events for server window: %w", err)
 	}
@@ -438,6 +446,32 @@ var usageSortColumns = map[string]string{
 	"token_name":        "e.token_name",
 }
 
+// usageServerConds returns usageWhere's server predicates (Server, ServerExact)
+// on e, in usageWhere's order, so MemberPartEnergy can leave out exactly the
+// requests a server filter selects.
+func usageServerConds(dl dialect, q usage.Query) ([]string, []any) {
+	il := dl.ilike()
+	var conds []string
+	var args []any
+	if q.Server != "" {
+		like := "%" + q.Server + "%"
+		conds = append(conds, "(e.server_name "+il+" ? or e.host "+il+" ?)")
+		args = append(args, like, like)
+	}
+	// Exact (case-insensitive equality via lower()=lower(), NOT ilike — a value
+	// with a `_`/`%` must match literally, so LIKE-wildcard semantics are wrong)
+	// filters used to expand a group into its member rows. Mirrors matchUsage's
+	// EqualFold and is standard on both sqlite and postgres.
+	// Fire on the presence flag OR a non-empty value: the flag path lets an exact
+	// filter match the EMPTY value (empty-key group expansion) while existing
+	// callers that set only the value still fire (backward-compatible).
+	if q.HasServerExact || q.ServerExact != "" {
+		conds = append(conds, "lower(e.server_name) = lower(?)")
+		args = append(args, q.ServerExact)
+	}
+	return conds, args
+}
+
 // usageWhere builds the parameterized WHERE shared by Query and Stats. dl is
 // the caller's dialect (for the ilike() operator, since sqlite LIKE and
 // postgres ILIKE are the case-insensitive spellings on their respective
@@ -467,22 +501,9 @@ func usageWhere(dl dialect, q usage.Query, ownerNameExpr string) (string, []any)
 		conds = append(conds, "e.model "+il+" ?")
 		args = append(args, "%"+q.Model+"%")
 	}
-	if q.Server != "" {
-		like := "%" + q.Server + "%"
-		conds = append(conds, "(e.server_name "+il+" ? or e.host "+il+" ?)")
-		args = append(args, like, like)
-	}
-	// Exact (case-insensitive equality via lower()=lower(), NOT ilike — a value
-	// with a `_`/`%` must match literally, so LIKE-wildcard semantics are wrong)
-	// filters used to expand a group into its member rows. Mirrors matchUsage's
-	// EqualFold and is standard on both sqlite and postgres.
-	// Fire on the presence flag OR a non-empty value: the flag path lets an exact
-	// filter match the EMPTY value (empty-key group expansion) while existing
-	// callers that set only the value still fire (backward-compatible).
-	if q.HasServerExact || q.ServerExact != "" {
-		conds = append(conds, "lower(e.server_name) = lower(?)")
-		args = append(args, q.ServerExact)
-	}
+	serverConds, serverArgs := usageServerConds(dl, q)
+	conds = append(conds, serverConds...)
+	args = append(args, serverArgs...)
 	if q.HasSessionIDExact || q.SessionIDExact != "" {
 		conds = append(conds, "lower(e.session_id) = lower(?)")
 		args = append(args, q.SessionIDExact)
@@ -827,13 +848,56 @@ func (s *SQLiteStore) Stats(q usage.Query) (usage.Stats, error) {
 	}, nil
 }
 
+// usagePartsJoin joins each event's energy parts (alias p): an event with
+// parts yields one row per part, any other event one row with p's columns
+// null. partHostExpr and partWhExpr then name the host and the watt-hours that
+// row is priced at, so a cluster request is priced per host and every other
+// request on its own host exactly as before.
+const (
+	usagePartsJoin = " left join usage_event_energy_parts as p on p.event_id = e.id"
+	partHostExpr   = "coalesce(p.server_id, e.host)"
+	partWhExpr     = "coalesce(p.wh, e.energy_wh)"
+)
+
+// partsSQL is how an aggregate prices its events: the join it adds and the
+// host and watt-hour expressions each joined row is priced at.
+type partsSQL struct{ join, host, wh string }
+
+var (
+	// pricedByParts prices a cluster request per energy part (usagePartsJoin).
+	pricedByParts = partsSQL{usagePartsJoin, partHostExpr, partWhExpr}
+	// pricedByHost prices every request on its own host: the same result as
+	// pricedByParts while no event has parts, without the join.
+	pricedByHost = partsSQL{"", "e.host", "e.energy_wh"}
+)
+
+// energyPartsPricing picks pricedByHost while usage_event_energy_parts is
+// empty, which it stays on a gateway that never priced a cluster request, so
+// those gateways do not pay for the parts join on every aggregate. A part
+// written between this check and the aggregate is seen by the next call.
+func (s *SQLStore) energyPartsPricing(ctx context.Context) (partsSQL, error) {
+	var n int
+	if err := s.queryRow(ctx, `select count(*) from (select 1 from usage_event_energy_parts limit 1) as any_part`).Scan(&n); err != nil {
+		return partsSQL{}, fmt.Errorf("check energy parts: %w", err)
+	}
+	if n == 0 {
+		return pricedByHost, nil
+	}
+	return pricedByParts, nil
+}
+
 // EnergyByServer sums energy_wh grouped by host over the SAME filtered set
 // usageWhere(q) applies to Stats, for the portal layer to derive a
-// per-server-price-weighted total cost (see portal.Service.UsageStats). A
-// host with no matching rows is simply absent from the returned map.
+// per-server-price-weighted total cost (see portal.Service.UsageStats). An
+// event with energy parts counts each part under the part's host. A host with
+// no matching rows is simply absent from the returned map.
 func (s *SQLiteStore) EnergyByServer(ctx context.Context, q usage.Query) (map[string]float64, error) {
 	where, args := usageWhere(s.dl, q, "")
-	rows, err := s.query(ctx, "select e.host, sum(e.energy_wh) from usage_events as e"+where+" group by e.host", args...)
+	pricing, err := s.energyPartsPricing(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("energy by server: %w", err)
+	}
+	rows, err := s.query(ctx, "select "+pricing.host+", sum("+pricing.wh+") from usage_events as e"+pricing.join+where+" group by "+pricing.host, args...)
 	if err != nil {
 		return nil, fmt.Errorf("energy by server: %w", err)
 	}
@@ -896,7 +960,8 @@ func (s *SQLStore) systemDefaultPricePerKwh(ctx context.Context) (float64, error
 // UsageAggregateSince sums, for the principal identified by (principalType,
 // principalID), the request COUNT and total TOKEN count recorded in
 // usage_events with created_at >= since, plus a price-weighted COST: energy_wh
-// is summed grouped by host, then each host's contribution is weighted by
+// is summed grouped by host (a cluster request's energy parts each under the
+// part's host), then each host's contribution is weighted by
 // (energy_wh/1000) * price(host) — that server's own ai_servers.price_per_kwh
 // when set (> 0), else the system-wide energy_default_price_per_kwh default
 // (mirrors portal.Service.attachUsageCost/resolveUsagePrice's exact fallback,
@@ -916,8 +981,15 @@ func (s *SQLStore) UsageAggregateSince(ctx context.Context, principalType, princ
 		return 0, 0, 0, fmt.Errorf("usage aggregate: %w", err)
 	}
 
+	// Priced per energy part, like EnergyByServer: a cluster request's member
+	// parts at each member's own price.
+	pricing, err := s.energyPartsPricing(ctx)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("usage aggregate energy: %w", err)
+	}
 	rows, err := s.query(ctx,
-		"select host, coalesce(sum(energy_wh), 0) from usage_events where "+col+" = ? and created_at >= ? group by host",
+		"select "+pricing.host+", coalesce(sum("+pricing.wh+"), 0) from usage_events as e"+pricing.join+
+			" where e."+col+" = ? and e.created_at >= ? group by "+pricing.host,
 		principalID, since)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("usage aggregate energy: %w", err)
@@ -1039,19 +1111,35 @@ func usageGroupColumn(groupBy string) (string, bool) {
 // fold buckets by dimension while weighting cost per host price. groupBy is a
 // fixed dimension keyword (session|server|user|token|model), NEVER interpolated
 // from user input; an unknown value is an error.
+//
+// An event with energy parts counts in its own host's bucket with the energy
+// of its part on that host (hp); each part on another host adds its energy,
+// and nothing else, to a separate MemberParts bucket of that host in the same
+// group.
 func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy string) ([]usage.GroupBucket, error) {
 	col, ok := usageGroupColumn(groupBy)
 	if !ok {
 		return nil, fmt.Errorf("usage groups: invalid group_by %q", groupBy)
 	}
 	where, args := usageWhere(s.dl, q, "")
+	pricing, err := s.energyPartsPricing(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("usage groups: %w", err)
+	}
+	byParts := pricing == pricedByParts
+	energyExpr, partsJoin := "e.energy_wh", ""
+	if byParts {
+		energyExpr = "case when exists (select 1 from usage_event_energy_parts as ap where ap.event_id = e.id)" +
+			" then coalesce(hp.wh, 0) else e.energy_wh end"
+		partsJoin = " left join usage_event_energy_parts as hp on hp.event_id = e.id and hp.server_id = e.host"
+	}
 	sqlText := "select e." + col + " as gkey, e.host," +
 		" count(*)," +
 		" sum(case when e.status = 'error' or e.http_status >= 400 then 1 else 0 end)," +
 		" sum(case when e.billing_unit <> '' then 1 else 0 end)," +
 		" sum(e.input_tokens), sum(e.output_tokens), sum(e.cached_tokens), sum(e.cache_write_tokens)," +
-		" sum(e.energy_wh), min(e.created_at), max(e.created_at)" +
-		usageEventsFromClause + where +
+		" sum(" + energyExpr + "), min(e.created_at), max(e.created_at)" +
+		usageEventsFromClause + partsJoin + where +
 		" group by e." + col + ", e.host"
 	rows, err := s.query(ctx, sqlText, args...)
 	if err != nil {
@@ -1081,6 +1169,219 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	}
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("iterate usage groups: %w", err)
+	}
+	if !byParts {
+		return out, nil
+	}
+	members, err := s.memberPartBuckets(ctx, col, where, args, nil)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, members...), nil
+}
+
+// MemberPartEnergy sums the energy parts drawn on one of hosts for the events
+// that match q apart from its server filter and that the server filter does
+// not select (by the same predicates usageWhere applies, on the request's own
+// server_name snapshot and host), as MemberParts buckets per (groupBy value,
+// part host); groupBy "" leaves Key empty. No hosts reads nothing.
+func (s *SQLiteStore) MemberPartEnergy(ctx context.Context, q usage.Query, hosts []string, groupBy string) ([]usage.GroupBucket, error) {
+	col := ""
+	if groupBy != "" {
+		var ok bool
+		if col, ok = usageGroupColumn(groupBy); !ok {
+			return nil, fmt.Errorf("member part energy: invalid group_by %q", groupBy)
+		}
+	}
+	if len(hosts) == 0 {
+		return []usage.GroupBucket{}, nil
+	}
+	serverConds, serverArgs := usageServerConds(s.dl, q)
+	unfiltered := q
+	unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
+	where, args := usageWhere(s.dl, unfiltered, "")
+	if len(serverConds) > 0 {
+		cond := "not (" + strings.Join(serverConds, " and ") + ")"
+		if where == "" {
+			where = " where " + cond
+		} else {
+			where += " and " + cond
+		}
+		args = append(args, serverArgs...)
+	}
+	return s.memberPartBuckets(ctx, col, where, args, hosts)
+}
+
+// memberPartBuckets sums, per (event column col, part host), the energy of
+// every part on a host other than its event's own, over the events where
+// selects (usageWhere's clause and args). col "" groups by the part host only
+// and leaves Key empty. Non-empty hosts keeps only parts on one of hosts.
+// Every bucket is a MemberParts bucket.
+func (s *SQLiteStore) memberPartBuckets(ctx context.Context, col, where string, args []any, hosts []string) ([]usage.GroupBucket, error) {
+	keyExpr, groupExpr := "''", "p.server_id"
+	if col != "" {
+		keyExpr, groupExpr = "e."+col, "e."+col+", p.server_id"
+	}
+	if len(hosts) > 0 {
+		cond := "p.server_id in (" + strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",") + ")"
+		if where == "" {
+			where = " where " + cond
+		} else {
+			where += " and " + cond
+		}
+		extended := make([]any, 0, len(args)+len(hosts))
+		extended = append(extended, args...)
+		for _, h := range hosts {
+			extended = append(extended, h)
+		}
+		args = extended
+	}
+	rows, err := s.query(ctx, "select "+keyExpr+", p.server_id, sum(p.wh)"+usageEventsFromClause+
+		" join usage_event_energy_parts as p on p.event_id = e.id and p.server_id <> e.host"+where+
+		" group by "+groupExpr, args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage member parts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]usage.GroupBucket, 0)
+	for rows.Next() {
+		b := usage.GroupBucket{MemberParts: true}
+		if err := rows.Scan(&b.Key, &b.Host, &b.EnergyWh); err != nil {
+			return nil, fmt.Errorf("scan usage member part: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage member parts: %w", err)
+	}
+	return out, nil
+}
+
+// RecordEventHosts inserts hosts; a (event, server) pair already stored keeps
+// its row, so a retried record is harmless. A host naming an unknown event is
+// rejected by the foreign key.
+func (s *SQLiteStore) RecordEventHosts(ctx context.Context, hosts []usage.EventHost) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin record event hosts: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, h := range hosts {
+		if _, err := s.execOn(ctx, tx, `
+			insert into usage_event_hosts (event_id, server_id, role, created_at)
+			values (?, ?, ?, ?)
+			on conflict (event_id, server_id) do nothing`,
+			h.EventID, h.ServerID, h.Role, h.CreatedAt.UTC()); err != nil {
+			return fmt.Errorf("insert usage event host: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// EventHosts lists an event's hosts, head first, then by server id.
+func (s *SQLiteStore) EventHosts(ctx context.Context, eventID string) ([]usage.EventHost, error) {
+	rows, err := s.query(ctx, `
+		select event_id, server_id, role, created_at
+		from usage_event_hosts where event_id = ?
+		order by case role when 'head' then 0 else 1 end, server_id`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("list usage event hosts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]usage.EventHost, 0)
+	for rows.Next() {
+		var h usage.EventHost
+		if err := rows.Scan(&h.EventID, &h.ServerID, &h.Role, &h.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan usage event host: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage event hosts: %w", err)
+	}
+	return out, nil
+}
+
+// SetEnergyParts atomically replaces an event's per-host energy parts.
+func (s *SQLiteStore) SetEnergyParts(ctx context.Context, eventID string, parts []usage.EnergyPart) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin set energy parts: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := s.execOn(ctx, tx, `delete from usage_event_energy_parts where event_id = ?`, eventID); err != nil {
+		return fmt.Errorf("clear usage event energy parts: %w", err)
+	}
+	for _, p := range parts {
+		if _, err := s.execOn(ctx, tx, `
+			insert into usage_event_energy_parts (event_id, server_id, role, wh, marginal_wh, source)
+			values (?, ?, ?, ?, ?, ?)`,
+			eventID, p.ServerID, p.Role, p.Wh, p.MarginalWh, p.Source); err != nil {
+			return fmt.Errorf("insert usage event energy part: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// EnergyPartsByEvents lists the energy parts of each of eventIDs, keyed by
+// event id, head first, then by server id; an event without parts is absent.
+// No ids reads nothing.
+func (s *SQLiteStore) EnergyPartsByEvents(ctx context.Context, eventIDs []string) (map[string][]usage.EnergyPart, error) {
+	out := make(map[string][]usage.EnergyPart)
+	if len(eventIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(eventIDs))
+	args := make([]any, len(eventIDs))
+	for i, id := range eventIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.query(ctx, `
+		select event_id, server_id, role, wh, marginal_wh, source
+		from usage_event_energy_parts where event_id in (`+strings.Join(placeholders, ",")+`)
+		order by event_id, case role when 'head' then 0 else 1 end, server_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list usage event energy parts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p usage.EnergyPart
+		if err := rows.Scan(&p.EventID, &p.ServerID, &p.Role, &p.Wh, &p.MarginalWh, &p.Source); err != nil {
+			return nil, fmt.Errorf("scan usage event energy part: %w", err)
+		}
+		out[p.EventID] = append(out[p.EventID], p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage event energy parts: %w", err)
+	}
+	return out, nil
+}
+
+// EnergyParts lists an event's per-host energy parts, head first, then by
+// server id.
+func (s *SQLiteStore) EnergyParts(ctx context.Context, eventID string) ([]usage.EnergyPart, error) {
+	rows, err := s.query(ctx, `
+		select event_id, server_id, role, wh, marginal_wh, source
+		from usage_event_energy_parts where event_id = ?
+		order by case role when 'head' then 0 else 1 end, server_id`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("list usage event energy parts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]usage.EnergyPart, 0)
+	for rows.Next() {
+		var p usage.EnergyPart
+		if err := rows.Scan(&p.EventID, &p.ServerID, &p.Role, &p.Wh, &p.MarginalWh, &p.Source); err != nil {
+			return nil, fmt.Errorf("scan usage event energy part: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage event energy parts: %w", err)
 	}
 	return out, nil
 }

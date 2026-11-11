@@ -80,14 +80,12 @@ func assertMigration100Columns(ctx context.Context, t *testing.T, s *SQLStore) {
 // precedent's value.
 func seedMigration100Spec(ctx context.Context, t *testing.T, s *SQLStore, now time.Time) {
 	t.Helper()
-	if err := s.CreateAIServer(ctx, routing.AIServer{
+	seedBaselineServer(ctx, t, s, routing.AIServer{
 		ID: "srv_m100", Name: "m100", Provider: routing.ProviderVLLM,
 		Endpoint: "http://srv_m100:8000",
 		Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 		CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create server: %v", err)
-	}
+	})
 	if err := s.CreateApplication(ctx, routing.Application{
 		ID: "app_m100", ServerID: "srv_m100", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

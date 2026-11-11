@@ -25,7 +25,7 @@ func (f *fakeReactStore) AIServerByID(_ context.Context, id string) (routing.AIS
 	return f.servers[id], nil
 }
 
-func (f *fakeReactStore) UpdateServerNetbirdState(context.Context, string, string, string, bool) error {
+func (f *fakeReactStore) UpdateServerNetbirdState(context.Context, string, string, string, string, bool) error {
 	return nil
 }
 

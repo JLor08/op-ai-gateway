@@ -476,15 +476,23 @@ func (s *Server) ensureVoiceLeg(ctx context.Context, ensurer provider.RuntimeEns
 }
 
 // ensureVoiceTarget is one ensure of target through the ensure route, under the load
-// loop's deadline.
+// loop's deadline. A llama.cpp RPC cluster head is started through the cluster
+// orchestration instead -- members first, joined if a start of it runs already -- under
+// the same deadline: the agent refuses the plain ensure for a head.
 func (s *Server) ensureVoiceTarget(ctx context.Context, ensurer provider.RuntimeEnsurer, target routing.Target) error {
-	// The spec only words the failure (its start timeout); a failed read is no reason
-	// to refuse to start the model.
+	// The spec words a failure (its start timeout) and tells a cluster head apart; a
+	// failed read is no reason to refuse to start the model.
 	var spec routing.RuntimeSpec
 	if s.Routes != nil {
 		spec, _, _ = s.Routes.RuntimeSpecByMapping(ctx, target.RouteID)
 	}
-	return s.ensureLoadAttempt(ensurer, target, spec)(ctx, s.newLoadBound(target))
+	bound := s.newLoadBound(target)
+	if spec.ClusterEnabled {
+		cctx, cancel := context.WithDeadline(ctx, bound.deadline)
+		defer cancel()
+		return s.clusters.Ensure(cctx, spec.ID)
+	}
+	return s.ensureLoadAttempt(ensurer, target, spec)(ctx, bound)
 }
 
 // reselectVoiceLeg moves leg l off its selected instance, which the agent refused as gone

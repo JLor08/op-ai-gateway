@@ -87,6 +87,7 @@ const SERVER_LIST_POLL_MS = 5000;
 // helperText slot of its own, so the two halves are wired by id -- the reason
 // must be announced on focus, not hidden behind a hover.
 const MANAGED_RUNTIME_ONLY_HELP_ID = 'server-managed-runtime-only-help';
+const LAN_BIND_ONLY_HELP_ID = 'server-lan-bind-only-help';
 
 const serverStatusClassByKey: Record<ServerStatus, BadgeStatus> = {
   active: 'active',
@@ -208,6 +209,16 @@ export function ServerList({
     | 'runtimeSpec'
     | 'putRuntimeSpec'
     | 'deleteRuntimeSpec'
+    | 'rpcMemberSpecs'
+    | 'createRPCMemberSpec'
+    | 'updateRPCMemberSpec'
+    | 'deleteRPCMemberSpec'
+    | 'serverBinaries'
+    | 'createServerBinary'
+    | 'updateServerBinary'
+    | 'deleteServerBinary'
+    | 'clusterCandidates'
+    | 'resetClusterMemberUsage'
     | 'runtimeCoresidency'
     | 'putRuntimeCoresidency'
     | 'runtimeWarnings'
@@ -282,6 +293,14 @@ export function ServerList({
   // into a policy write.
   const [managedRuntimeOnly, setManagedRuntimeOnly] = useState(false);
   const [managedRuntimeOnlySeed, setManagedRuntimeOnlySeed] = useState(false);
+  // LAN address and "listen only on it" (RPC clusters, edit form only). Same
+  // seed discipline as managed_runtime_only: the PATCH carries a field only
+  // when the operator changed it, since an omitted field means "unchanged"
+  // and an empty lan_address means "clear".
+  const [lanAddress, setLanAddress] = useState('');
+  const [lanAddressSeed, setLanAddressSeed] = useState('');
+  const [lanBindOnly, setLanBindOnly] = useState(false);
+  const [lanBindOnlySeed, setLanBindOnlySeed] = useState(false);
   // Admin-group linkage (Phase B, spec 2026-08-10): the admin-tier groups the
   // caller may create/link a server into. Fetched once (mirrors adminUsers,
   // gated on isAdmin -- only an admin/system_admin ever reaches the create
@@ -583,6 +602,10 @@ export function ServerList({
     // "off" rather than leaking undefined into a controlled checkbox.
     setManagedRuntimeOnly(Boolean(server.managed_runtime_only));
     setManagedRuntimeOnlySeed(Boolean(server.managed_runtime_only));
+    setLanAddress(server.lan_address ?? '');
+    setLanAddressSeed(server.lan_address ?? '');
+    setLanBindOnly(Boolean(server.lan_bind_only));
+    setLanBindOnlySeed(Boolean(server.lan_bind_only));
     setEditAdminGroupIds(server.admin_groups.map((g) => g.id));
     setEditSystemGroupId('');
     setMode({ kind: 'edit', server });
@@ -737,6 +760,8 @@ export function ServerList({
       if (managedRuntimeOnly !== managedRuntimeOnlySeed) {
         body.managed_runtime_only = managedRuntimeOnly;
       }
+      if (lanAddress.trim() !== lanAddressSeed) body.lan_address = lanAddress.trim();
+      if (lanBindOnly !== lanBindOnlySeed) body.lan_bind_only = lanBindOnly;
       const updated = await api.updateServer(mode.server.id, body);
       setServers((current) => current.map((row) => (row.id === updated.id ? updated : row)));
       setMode('list');
@@ -1293,6 +1318,46 @@ export function ServerList({
                 {t.serverManagedRuntimeOnlyHelp}
               </Typography>
             </Box>
+            {editServer && (
+              <>
+                {editServer.netbird_ip && (
+                  <Field
+                    id="server-netbird-ip"
+                    label={t.serverNetbirdIpLabel}
+                    value={editServer.netbird_ip}
+                    onChange={() => {}}
+                    readOnly
+                  />
+                )}
+                <Field
+                  id="server-lan-address"
+                  label={t.serverLanAddressLabel}
+                  value={lanAddress}
+                  onChange={(e) => setLanAddress(e.target.value)}
+                  helperText={t.serverLanAddressHelp}
+                />
+                <Box>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={lanBindOnly}
+                        onChange={(e) => setLanBindOnly(e.target.checked)}
+                        slotProps={{ input: { 'aria-describedby': LAN_BIND_ONLY_HELP_ID } }}
+                      />
+                    }
+                    label={t.serverLanBindOnlyLabel}
+                  />
+                  <Typography
+                    id={LAN_BIND_ONLY_HELP_ID}
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ display: 'block' }}
+                  >
+                    {t.serverLanBindOnlyHelp}
+                  </Typography>
+                </Box>
+              </>
+            )}
             {isAdmin && (
               <MultiSelectField
                 id="server-owners"

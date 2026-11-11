@@ -81,6 +81,7 @@ export const ENERGY_SOURCE_HELP_KEYS: Record<string, HelpMessageKey> = {
   estimated: 'energySourceHelpEstimated',
   modeled: 'energySourceHelpModeled',
   unpriceable: 'energySourceHelpUnpriceable',
+  member_unpriced: 'energySourceHelpMemberUnpriced',
   '': 'energySourceHelpPending',
 };
 

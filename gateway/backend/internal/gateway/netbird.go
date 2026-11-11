@@ -346,6 +346,12 @@ type systemNetbirdStatusDTO struct {
 	DefaultPolicyPresent bool   `json:"default_policy_present"`
 	DefaultPolicyEnabled bool   `json:"default_policy_enabled"`
 	DenyByDefaultDrift   bool   `json:"deny_by_default_drift"`
+	// DefaultPolicyState is what the last policy pass recorded of the Default
+	// policy ("enabled", "disabled" or "unknown"), and DefaultPolicyStateAt
+	// when that state was first seen (empty when unknown). Unlike
+	// DefaultPolicyEnabled it needs no live NetBird call.
+	DefaultPolicyState   string `json:"default_policy_state"`
+	DefaultPolicyStateAt string `json:"default_policy_state_at"`
 }
 
 // handleSystemNetbirdStatus reports the NetBird-only transport status (system
@@ -394,6 +400,11 @@ func (s *Server) handleSystemNetbirdStatus(w http.ResponseWriter, r *http.Reques
 	}
 	settings := s.Portal.SystemSettingsView(ctx)
 	deny := settings.NetbirdDenyByDefault
+	defaultState, defaultStateAt := s.Portal.NetbirdDefaultPolicyStateView(ctx)
+	stateAt := ""
+	if !defaultStateAt.IsZero() {
+		stateAt = defaultStateAt.UTC().Format(time.RFC3339)
+	}
 	writeJSON(w, http.StatusOK, systemNetbirdStatusDTO{
 		AgentListenerActive:    s.AgentListenerActive(),
 		AgentListenerAddr:      s.AgentListenerAddr(),
@@ -411,6 +422,8 @@ func (s *Server) handleSystemNetbirdStatus(w http.ResponseWriter, r *http.Reques
 		DefaultPolicyPresent:   defaultPresent,
 		DefaultPolicyEnabled:   defaultEnabled,
 		DenyByDefaultDrift:     deny && defaultPresent && defaultEnabled,
+		DefaultPolicyState:     defaultState,
+		DefaultPolicyStateAt:   stateAt,
 	})
 }
 

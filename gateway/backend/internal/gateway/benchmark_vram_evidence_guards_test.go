@@ -411,6 +411,7 @@ func TestVRAMRefusalCodesAreStableWireStrings(t *testing.T) {
 		{codeBenchmarkVRAMIsolationUnavailable, "benchmark.vram_isolation_unavailable"},
 		{codeBenchmarkVRAMNoGPUSamples, "benchmark.vram_no_gpu_samples"},
 		{codeBenchmarkVRAMIsolationBlocked, "benchmark.vram_isolation_blocked"},
+		{codeBenchmarkVRAMClusterMemberHeld, "benchmark.vram_cluster_member_held"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("stable error code drift: got %q, want %q", tc.got, tc.want)

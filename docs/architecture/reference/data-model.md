@@ -63,6 +63,35 @@ what these five tables are for, and §4 below for their field semantics.
 | `ai_server_gpu_budgets` | Per-GPU VRAM ceiling for a server, PK `(server_id, gpu_index)`, plus the one-time `expected_uuid`/`expected_name` drift snapshot. |
 | `server_runtime_reports` | 1:1 latest runtime-config report per server (upsert-overwrite), for an agent whose configuration source is a local file: an opaque validated JSON blob with env values already masked (a spec's `config_files` are dropped by the ingest and never stored). |
 
+### llama.cpp RPC clusters
+
+See [ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)
+and [Agent-Managed Model Runtime §3.7](../cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster).
+A head is an `agent_runtime_specs` row with `cluster_enabled`; the spec row also
+carries `member_mode` (`automatic` default, `manual`), `cluster_network` and
+`rpc_transport` (`''` = not chosen: a save that runs the full cluster checks
+resolves it to the default of that moment and stores the result, so a stored
+`''` is only met on a row no such save wrote, and is then read as the default),
+`lan_exposure_ack` and,
+on every spec, `device_backend` (`auto` default). `ai_servers` gains
+`netbird_ip` (the mesh IPv4 the peer sync records; the full-row server update never writes it), `lan_address` (an IPv4
+literal or `''`), `lan_bind_only`, `rpc_member_enabled` and
+`rpc_allowed_head_groups` (a JSON array of admin-group ids, `'[]'` = the
+server's own admin groups). The service layer normalises an empty
+`member_mode`, `device_backend` or consent list to its default on every write
+and reads an empty one as that default.
+
+| Table | Purpose |
+|---|---|
+| `server_binaries` | The binary inventory per server, PK `(server_id, path)`, cascade with the server: `kind` (`llama_server`, `rpc_server`, `other`), `version`, `build`, `commit`, `version_source` (`agent`, `path`, or empty), `source` (`agent` rows are replaced on every agent report, `manual` rows are the operator's), `allowed` (the agent's allowlist status), `reported_at`, and `version_override`, the operator's correction of a detected version, in its own column so that replacing the agent's rows never touches it. |
+| `rpc_member_specs` | A **manual** member: one row per operator-defined `ggml-rpc-server` process on a server (id `rpcm_<hex>`, cascade with the server): `enabled`, `binary_path`, opaque-JSON `args`/`env`, `cache_enabled`, `device_backend`, `ram_estimate_mb` and `allowed_head_groups` (the member side's consent, a JSON array). Not an `agent_runtime_specs` row: it has no mapping. |
+| `rpc_member_spec_gpus` | A manual member's GPUs, PK `(spec_id, gpu_index)`, cascade with the spec: `position` (the member's device order) and `vram_estimate_mb`. No measured column: usage is kept per head on the membership. |
+| `rpc_cluster_members` | A head's membership, PK `(head_spec_id, server_id)` (a server joins a head once), unique `(head_spec_id, position)` (`position` is the operator's member order, the `--rpc` order), cascade with the head spec and the server. `member_spec_id` names the manual spec (`''` = an automatic member, which has no spec row; a partial unique index makes a manual spec serve one head); `threads`, `cache_enabled`, `device_backend` and `ram_estimate_mb` are an automatic member's settings; `port` the member's RPC or relay port (a partial unique index on `(server_id, port)` where `port <> 0`, migration 106). The measured usage lives here for both modes: `ram_measured_mb` with `measured_at` (NULL until measured) and `stale`, and the current run's `run_peak_ram_mb`, `run_head_instance` and `run_started_at` (the run's identity). |
+| `rpc_cluster_member_gpus` | A membership's GPUs, PK `(head_spec_id, server_id, gpu_index)`, FK to the membership row (cascade): `position`, an automatic member's `vram_estimate_mb`, and `vram_measured_mb` / `run_peak_vram_mb` for both modes. |
+| `rpc_sessions` | Which member server a head instance used and when: `head_spec_id`, `instance`, `member_server_id`, `since`, and `until` (NULL while open). No foreign keys; closed rows are pruned with the telemetry retention. Read when a cluster request completes, to list its member hosts. |
+| `usage_event_hosts` | Every server that served a cluster request's usage event, PK `(event_id, server_id)`, cascade with the event: the head's server (`role = head`) and each member server in session at completion (`role = member`) and a copy of the event's `created_at`, so the `(server_id, created_at)` index answers a member host's window scan without a join. |
+| `usage_event_energy_parts` | An event's energy split per host, PK `(event_id, server_id)`, cascade with the event: `role`, `wh`, `marginal_wh` and the part's `source` (`measured`, `estimated`, `member_unpriced`), priced at that host's own price ([Telemetry §8.4.4](../cross-cutting/telemetry-usage-observability.md#844-energy-attribution)). |
+
 ### Model groups
 
 | Table | Purpose |
@@ -346,7 +375,7 @@ service, or project that produced it.
 | `vendorauth.TokenSet` | `internal/vendorauth/tokens.go` | The OAuth token set sealed into `VendorAccount.OAuthTokens`: access/refresh tokens, expiry, and the OpenAI ChatGPT account id + plan type. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, energy fields, and the `(BillingUnit, BillingQuantity)` billable measure. `usage.Row` embeds it, so the pair reaches the Activity list API with no DTO in between. `usage.Row` adds two read-time fields that are **not** columns and are never persisted: `user_name` (all-scope lists only) and `account_name` (the vendor account's display name, set only for a viewer who may read the account: its owner, a co-manager of it while it is shared or full, a member that can route to it through a resource group, or a system admin; [Telemetry §8.4.1](../cross-cutting/telemetry-usage-observability.md#841-the-usage-event)). |
 
-## 4. Migration history (102 migrations)
+## 4. Migration history (106 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -605,6 +634,15 @@ catch-all `model_override`, which has its own column).
 | 100 | `runtime_spec_instances` | Adds five columns to `agent_runtime_specs` through `addColumnIfMissing` (#340, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place)): `replicable integer not null default 0` (an integer boolean exactly like `pinned`), `min_instances`, `max_instances` and `instance_parallelism` (each `integer not null default 0`), the operator's settings for running a spec as several processes, and `startup_measured_ms bigint not null default 0`, the agent's measured startup the effective idle timeout of a replicable spec is derived from. The ownership split is migration 96's: the four settings are operator-owned (`UpsertRuntimeSpec` writes them on every save), the measurement is agent-owned (`UpdateRuntimeSpecStartupMeasured` writes it, and an operator re-save never touches it, the memory store copying the stored value forward). The defaults are the whole upgrade story: `0` — not replicable — runs every pre-existing spec as the one process it always was, and `0` counts mean none / no explicit limit (at most 64 instances, `MaxInstanceIndex` 63) / one request at a time; `0` ms is "nothing measured yet", never "starts instantly". `startup_measured_ms` is a Go `int64`, so [ADR-005](../09-architecture-decisions.md#adr-005--postgresql-needs-wide-column-types) makes it `bigint`. No backfill (nothing to derive them from); append-only, so a fresh install gets them by replaying this migration. |
 | 101 | `model_mapping_audio_metrics` | Adds the audio benchmark's metrics to `model_mappings` ([ADR-093](../09-architecture-decisions.md#adr-093--audio-benchmarks-mirror-the-text-modes-a-real-time-threshold-and-a-concurrency-ceiling)): `audio_rate_x double precision` and `audio_ttfa_ms bigint` — **nullable, no default**, following migration 95 (the store writes NULL for a zero and reads NULL as zero, so a mapping never measured stays distinguishable) — `audio_realtime_concurrency integer not null default 0` (like `max_concurrency`), `audio_concurrency_limit text not null default ''` (why the ramp stopped: `performance`, `resources` or `cap`; like `metrics_source`) and `audio_metrics_updated_at` (the dialect's nullable timestamp, like `metrics_updated_at`). They are part of the `metrics_locked` group: `UpdateMappingAudioMetrics` writes them only while the mapping is unlocked and stamps `metrics_source`/`metrics_updated_at` as the text writers do, plus the audio stamp. The ramp's count and limit are **one result**: written together or not at all, and the count is read only beside a non-empty limit, so a measured `0` (under `performance` not real-time even alone, under `resources` nothing measurable) needs no NULL of its own. Every pre-existing mapping reads back unmeasured. |
 | 102 | `route_affinity_instance` | Adds `route_affinity.instance integer not null default 0`: the instance of the mapping's spec a token-affinity pin chose, so a pinned client can keep landing on one process. The default is the upgrade story — instance 0 is byte-for-byte the address every pin denoted before replicable specs existed — so there is nothing to backfill. Migration 42's SQLite path drops and recreates `route_affinity` in a frozen shape without this column; that is safe only because the ledger always runs 42 before 102, and a test that replays 42 on a head database has to replay 102 after it (`TestMigration42RouteAffinityNullableUpgrade` does). |
+
+### llama.cpp RPC cluster mode
+
+| # | Migration | Purpose |
+|---|---|---|
+| 103 | `rpc_cluster_columns` | Adds the head and member settings to `agent_runtime_specs` (`cluster_enabled`, `lan_exposure_ack` integer booleans default `0`; `member_mode` default `'automatic'`; `device_backend` default `'auto'`; `cluster_network` and `rpc_transport` default `''`), the member-side addressing and consent to `ai_servers` (`netbird_ip`, `lan_address` default `''`; `lan_bind_only`, `rpc_member_enabled` default `0`; `rpc_allowed_head_groups` default `'[]'`), and creates `server_binaries`. Every column through `addColumnIfMissing`, so every pre-existing spec is exactly the model spec it was and every server offers no RPC membership. |
+| 104 | `rpc_cluster_tables` | Creates `rpc_member_specs`, `rpc_member_spec_gpus`, `rpc_cluster_members` (with the partial unique index on `member_spec_id`), `rpc_cluster_member_gpus` (composite FK to its membership row) and `rpc_sessions` with its two indexes. Manual member specs get their own table instead of a nullable `agent_runtime_specs.mapping_id`, which would have needed a SQLite table rebuild and broken the mapping-keyed upsert and joins. |
+| 105 | `usage_event_hosts` | Creates `usage_event_hosts` (with the `(server_id, created_at)` index) and `usage_event_energy_parts`, both cascading from `usage_events`: the per-host rows and energy parts of a cluster request. |
+| 106 | `rpc_member_port_unique` | A partial unique index on `rpc_cluster_members(server_id, port)` where `port <> 0`: the portal's port allocator locks per process, so two gateway processes could pick one port on a server; the index turns the second write into a conflict the portal retries. The table was new in 104 and its ports come only from that allocator, so no stored row can violate it. |
 
 ### Responses live timings
 

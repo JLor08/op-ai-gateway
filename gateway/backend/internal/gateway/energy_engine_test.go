@@ -709,3 +709,47 @@ func TestEnergyComputeMarginalNeverExceedsTotal(t *testing.T) {
 		})
 	}
 }
+
+// TestTier2AppliesPUE pins that Tier 2 multiplies the configured
+// EstimatedWatts by the PUE exactly as Tier 1 multiplies a measured reading:
+// the facility overhead does not depend on whether the server's own draw was
+// measured or configured. The idle baseline is subtracted from the
+// PUE-scaled draw, as Tier 1 does.
+func TestTier2AppliesPUE(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	end := base.Add(10 * time.Second)
+	ev := usage.Event{CreatedAt: end, LatencyMS: 10000}
+	cfg := ServerEnergyConfig{EstimatedWatts: 80, Pue: 1.5}
+	idleW := 20.0
+
+	res := ComputeEnergy(ev, nil, nil, cfg, idleW, 0, 0)
+	if res.Source != "estimated" {
+		t.Fatalf("Source = %q, want %q", res.Source, "estimated")
+	}
+	requireCloseWh(t, "WhTotal", res.WhTotal, 120.0*10/3600)
+	requireCloseWh(t, "WhMarginal", res.WhMarginal, 100.0*10/3600)
+
+	part, ok := ComputeEnergyPart(ev, nil, nil, cfg, idleW)
+	if !ok || part.Source != "estimated" {
+		t.Fatalf("part = %+v ok=%v, want an estimated part", part, ok)
+	}
+	requireCloseWh(t, "part WhTotal", part.WhTotal, 120.0*10/3600)
+}
+
+// TestEnergyPartNeverModels pins that a host's part is Tier 1 or Tier 2 only:
+// with neither telemetry coverage nor EstimatedWatts it reports no result
+// rather than a per-token figure, since Tier 3 prices a whole request.
+func TestEnergyPartNeverModels(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	end := base.Add(10 * time.Second)
+	ev := usage.Event{CreatedAt: end, LatencyMS: 10000, OutputTokens: 500}
+
+	if res, ok := ComputeEnergyPart(ev, nil, nil, ServerEnergyConfig{}, 0); ok {
+		t.Fatalf("part = %+v, want none without telemetry or EstimatedWatts", res)
+	}
+	res, ok := ComputeEnergyPart(ev, constPowerSamples(base, 10, 72), nil, ServerEnergyConfig{EstimatedWatts: 999}, 0)
+	if !ok || res.Source != "measured" {
+		t.Fatalf("part = %+v ok=%v, want measured", res, ok)
+	}
+	requireCloseWh(t, "WhTotal", res.WhTotal, 72.0*10/3600)
+}

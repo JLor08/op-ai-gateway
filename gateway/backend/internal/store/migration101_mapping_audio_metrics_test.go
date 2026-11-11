@@ -51,6 +51,17 @@ func seedBaselineMapping(ctx context.Context, t *testing.T, s *SQLStore, m routi
 		m.ID, m.ApplicationID, m.GatewayModelName, m.AppModelName, m.Status, m.CreatedAt, m.UpdatedAt)
 }
 
+// seedBaselineServer inserts an ai_servers row naming only the columns every
+// schema version has, so a test that seeds before migrating forward does not
+// depend on the head's column set (CreateAIServer names every column added
+// since, which an older database lacks). Everything else takes its default.
+func seedBaselineServer(ctx context.Context, t *testing.T, s *SQLStore, h routing.AIServer) {
+	t.Helper()
+	mustExec(ctx, t, s, `insert into ai_servers (id, name, provider, endpoint, status, health_status, created_at, updated_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?)`,
+		h.ID, h.Name, h.Provider, h.Endpoint, h.Status, h.HealthStatus, h.CreatedAt, h.UpdatedAt)
+}
+
 // migration101Columns is every column migration 101 adds to model_mappings.
 var migration101Columns = []string{
 	"audio_rate_x", "audio_ttfa_ms", "audio_realtime_concurrency", "audio_concurrency_limit", "audio_metrics_updated_at",
@@ -112,14 +123,12 @@ func assertMigration101Columns(ctx context.Context, t *testing.T, s *SQLStore) {
 // names the audio columns, which a database stopped at version 100 lacks.
 func seedMigration101Mapping(ctx context.Context, t *testing.T, s *SQLStore, now time.Time) {
 	t.Helper()
-	if err := s.CreateAIServer(ctx, routing.AIServer{
+	seedBaselineServer(ctx, t, s, routing.AIServer{
 		ID: "srv_m101", Name: "m101", Provider: routing.ProviderAudioCpp,
 		Endpoint: "http://srv_m101:8000",
 		Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 		CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create server: %v", err)
-	}
+	})
 	if err := s.CreateApplication(ctx, routing.Application{
 		ID: "app_m101", ServerID: "srv_m101", Type: routing.ProviderAudioCpp, Port: 8101, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive,

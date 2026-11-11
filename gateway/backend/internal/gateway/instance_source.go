@@ -61,8 +61,11 @@ type instanceSpecEntry struct {
 	replicable   bool
 	maxInstances int
 	parallelism  int
-	startedAt    time.Time
-	until        time.Time
+	// clusterHead marks a llama.cpp RPC cluster head (RuntimeSpec.ClusterEnabled),
+	// which the cluster gate reads through the same cache (clusterHead).
+	clusterHead bool
+	startedAt   time.Time
+	until       time.Time
 }
 
 // fresh reports whether the entry still answers at now.
@@ -163,6 +166,62 @@ func (s *instanceSource) InstanceView(ctx context.Context, serverID string, m ro
 	slices.Sort(view.Present)
 	view.Present = slices.Compact(view.Present)
 	return view, true
+}
+
+// clusterHead reports whether mapping mappingID on serverID is a llama.cpp RPC
+// cluster head, and its spec id. Only an agent KNOWN to declare rpc_cluster
+// runs a head -- the runtime documents withhold every cluster from the others
+// -- so, like InstanceView, it asks the agent's features first and an agent
+// without the feature costs no spec read; one that has it is answered from the
+// spec cache instance expansion reads (spec). An agent whose features are not
+// known yet (it has not reported since the gateway started) is not gated: a
+// request that reaches a head there is refused as not ready and answered, or
+// retried, on the dispatch path (readyClusterHead).
+func (s *instanceSource) clusterHead(ctx context.Context, serverID, mappingID string) (string, bool) {
+	if s == nil || !s.features.Has(serverID, rpcClusterFeature) {
+		return "", false
+	}
+	e := s.spec(ctx, mappingID)
+	if !e.found || !e.clusterHead {
+		return "", false
+	}
+	return e.specID, true
+}
+
+// knownClusterHead is clusterHead for a request that already completed
+// (recordClusterHosts): routing read the mapping's spec when it chose the
+// target, so the cached entry answers whatever its age, and the store is read
+// only when there is no entry at all (dropped after instanceSpecRetention, or
+// a target chosen without the instance source). A request on any mapping
+// therefore pays no store read on completion while its entry is kept.
+func (s *instanceSource) knownClusterHead(ctx context.Context, serverID, mappingID string) (string, bool) {
+	if s == nil || !s.features.Has(serverID, rpcClusterFeature) {
+		return "", false
+	}
+	s.mu.Lock()
+	e, hit := s.specs[mappingID]
+	s.mu.Unlock()
+	if !hit {
+		e = s.spec(ctx, mappingID)
+	}
+	if !e.found || !e.clusterHead {
+		return "", false
+	}
+	return e.specID, true
+}
+
+// specIsClusterHead reports whether mappingID's spec is a llama.cpp RPC
+// cluster head, through the spec cache (spec): one store read per mapping
+// and cache period, whatever the number of callers. known is false when no
+// spec could be read (a failed read with no earlier good one, or a caller
+// whose context ended).
+func (s *instanceSource) specIsClusterHead(ctx context.Context, mappingID string) (head, known bool) {
+	e := s.spec(ctx, mappingID)
+	// A failed read, or a caller gone before the answer came, knows nothing.
+	if e.failed || ctx.Err() != nil {
+		return false, false
+	}
+	return e.found && e.clusterHead, true
 }
 
 // spec returns mapping mappingID's spec, from the cache while its entry is
@@ -276,6 +335,7 @@ func (s *instanceSource) remember(mappingID string, startedAt, readAt time.Time,
 			replicable:   spec.Replicable,
 			maxInstances: spec.MaxInstances,
 			parallelism:  spec.InstanceParallelism,
+			clusterHead:  spec.ClusterEnabled,
 			until:        readAt.Add(instanceSpecCacheTTL),
 		}
 	}

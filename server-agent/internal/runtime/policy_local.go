@@ -222,6 +222,17 @@ func VisibleDevicesVar(vendor GPUVendor) string {
 	}
 }
 
+// injectedVisibleDevicesVar is the single rule for whether the agent puts a
+// visibility variable into the child's environment, and which one: only for a
+// SetVisibleDevices spec in env mode on a vendor that has such a variable.
+// Empty means nothing is injected and the child sees the declared host indices.
+func injectedVisibleDevicesVar(spec Spec, vendor GPUVendor) string {
+	if !spec.SetVisibleDevices || spec.VisibleDevicesMode == VisibleDevicesModeArgs {
+		return ""
+	}
+	return VisibleDevicesVar(vendor)
+}
+
 // visibleDevicesOwnedVars is the set of environment variables the
 // SetVisibleDevices option OWNS: a spec may not hand-set any of them while the
 // option is on (ExpandPlaceholders refuses the pair outright -- trap 3).
@@ -413,6 +424,12 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	}
 	if !binaryAllowed {
 		return fmt.Errorf("runtime: binary %q is not in the allowed-binaries list", spec.Binary)
+	}
+
+	if spec.IsRPCServer() {
+		if err := permitMember(spec); err != nil {
+			return err
+		}
 	}
 
 	// R2: an EMPTY work_dir means "run beside the binary" (effectiveWorkDir),
@@ -805,8 +822,8 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // that performed the substitution. command.go turns that into the masked,
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
-func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
-	ex, err := expandSpec(spec, port, vendor, getenv, configFilesDir)
+func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, vendor, vendors, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -886,7 +903,10 @@ var deviceBackendByToken = map[string]string{
 // surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
 // secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
 // expandSpec resolves and masks them, expandConfigFileContent refuses them.
-func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string) (value string, handled bool, err error) {
+func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string, dev deviceContext) (value string, handled bool, err error) {
+	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
+		return v, true, derr
+	}
 	if inner == "PORT" {
 		return strconv.Itoa(port), true, nil
 	}
@@ -939,6 +959,226 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	return "", false, nil
 }
 
+// placeholderExpander resolves the placeholders of one spec's args and env
+// values (expandSpec): the spec, its port and GPU list, the agent's
+// environment and config-files base, and the device context the generic
+// device tokens resolve against.
+type placeholderExpander struct {
+	spec           Spec
+	port           int
+	gpuIDs         string
+	configFilesDir string
+	dev            deviceContext
+	getenv         func(string) string
+}
+
+// expand resolves every placeholder in s in one left-to-right pass over the
+// ORIGINAL text, returning the result and the secret spans it recorded; the
+// first placeholder that fails ends the pass with its error.
+func (e placeholderExpander) expand(s string) (string, []secretSpan, error) {
+	matches := placeholderPattern.FindAllStringIndex(s, -1)
+	if len(matches) == 0 {
+		return s, nil, nil
+	}
+	var b strings.Builder
+	var spans []secretSpan
+	copied := 0
+	for _, m := range matches {
+		b.WriteString(s[copied:m[0]])
+		copied = m[1]
+		match := s[m[0]:m[1]]
+		inner := match[2 : len(match)-1] // strip "${" and "}"
+		if err := e.writeToken(&b, &spans, match, inner); err != nil {
+			return "", nil, err
+		}
+	}
+	b.WriteString(s[copied:])
+	return b.String(), spans, nil
+}
+
+// writeToken writes the resolution of one placeholder (match, whose text
+// between "${" and "}" is inner) to b, recording a secret span in spans when
+// it carries a secret. The classification order is load-bearing (see
+// ExpandPlaceholders): the clear-text tokens, ${API_TOKEN}, ${AGENT_ENV:NAME},
+// the PORT/AGENT_ENV near-miss refusal, and finally pass-through as literal
+// text.
+func (e placeholderExpander) writeToken(b *strings.Builder, spans *[]secretSpan, match, inner string) error {
+	if v, handled, resolveErr := resolveNonSecretToken(inner, e.spec, e.port, e.gpuIDs, e.configFilesDir, e.dev); handled {
+		if resolveErr != nil {
+			return resolveErr
+		}
+		b.WriteString(v)
+		return nil
+	}
+
+	// EXACT match only, like ${MODEL}/${*_DEVICES}: a near-miss such as
+	// ${API_TOKENS} is NOT resolved and passes through as literal text
+	// (it does not join the PORT/AGENT_ENV near-miss guard below).
+	// Unlike those clear-text siblings, ${API_TOKEN} carries a SECRET --
+	// the decrypted per-mapping upstream token the gateway pushed on the
+	// wire in spec.APIToken -- so it records its OWN secret span here,
+	// exactly the way ${AGENT_ENV:NAME} does, so maskSecretSpans scrubs
+	// it from the reported command wherever it landed. This is NOT the
+	// AGENT_ENV branch: that reads the agent's OWN environment via
+	// getenv; this reads a wire field, and the two must not be folded.
+	// An empty spec.APIToken (mode off, app-unset, or a fail-closed
+	// decrypt) is a HARD ERROR -- never a silent empty substitution.
+	if inner == "API_TOKEN" {
+		return e.writeAPIToken(b, spans)
+	}
+
+	if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
+		return e.writeAgentEnv(b, spans, name)
+	}
+
+	// Not a valid ${PORT} or ${AGENT_ENV:NAME}. Near-miss iff the
+	// upper-cased inner text STARTS WITH one of the two supported
+	// prefixes -- this also catches the empty-name ${AGENT_ENV:}
+	// falling through from the case above. Anything else (including
+	// text that merely CONTAINS "PORT" or "AGENT_ENV") passes
+	// through untouched -- see the doc comment above for why this
+	// must be a prefix match, not Contains.
+	upper := strings.ToUpper(inner)
+	if strings.HasPrefix(upper, "PORT") || strings.HasPrefix(upper, "AGENT_ENV") {
+		return fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", match)
+	}
+	b.WriteString(match)
+	return nil
+}
+
+// writeAPIToken writes the spec's api token, recording its secret span (see
+// writeToken).
+func (e placeholderExpander) writeAPIToken(b *strings.Builder, spans *[]secretSpan) error {
+	if e.spec.APIToken == "" {
+		return fmt.Errorf("${API_TOKEN} cannot be resolved: no api_token was provided for this spec (mode off, app-unset, or a fail-closed decrypt)")
+	}
+	start := b.Len()
+	b.WriteString(e.spec.APIToken)
+	*spans = append(*spans, secretSpan{start: start, end: b.Len(), name: "API_TOKEN", mask: "${API_TOKEN}"})
+	return nil
+}
+
+// writeAgentEnv writes the value of the agent's own environment variable name
+// for ${AGENT_ENV:NAME}, recording its secret span.
+func (e placeholderExpander) writeAgentEnv(b *strings.Builder, spans *[]secretSpan, name string) error {
+	// CASE-INSENSITIVE, and that is a security property, not a
+	// nicety (S1). The refusal decides whether a
+	// gateway-supplied spec may read the agent's OWN namespace;
+	// the LOOKUP it guards is os.Getenv, which on Windows is
+	// GetEnvironmentVariableW and resolves case-INSENSITIVELY.
+	// A case-sensitive guard in front of a case-insensitive
+	// lookup is not a guard: ${AGENT_ENV:op_agent_token} walked
+	// straight past it and received OP_AGENT_TOKEN -- the
+	// agent's gateway bearer credential, which authenticates the
+	// certificate endpoint that issues a private key. The value
+	// then has a ready path back to the gateway even without
+	// network egress from the child, because a model server that
+	// echoes its argv (vLLM and llama.cpp both do) and then
+	// exits non-zero has that line captured into
+	// LastError.StderrTail and reported upward.
+	//
+	// Deliberately folded on unix too, where a variable named
+	// "op_agent_token" IS distinct from "OP_AGENT_TOKEN":
+	// refusing that hypothetical is the safe direction, and one
+	// rule on every platform is the only version a reader can
+	// check. Note the near-miss classifier in writeToken
+	// already upper-cases before comparing -- the asymmetry was
+	// visible inside the one function this code was part of.
+	if strings.HasPrefix(strings.ToUpper(name), agentOwnEnvPrefix) {
+		return fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
+	}
+	val := e.getenv(name)
+	if val == "" {
+		return fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
+	}
+	// The ONE place a secret enters a resolved string, and
+	// therefore the one place its extent can be recorded exactly.
+	start := b.Len()
+	b.WriteString(val)
+	*spans = append(*spans, secretSpan{start: start, end: b.Len(), name: name, mask: "${AGENT_ENV:" + name + "}"})
+	return nil
+}
+
+// checkSpecEnv refuses a spec env that sets an agent-owned name, and the two
+// set_visible_devices traps, before anything is built (expandSpec). envKeys are
+// the spec's env keys, sorted.
+func checkSpecEnv(spec Spec, envKeys []string, gpuIDs string) error {
+	// Every baseEnvNames entry is agent-owned, not spec-negotiable: refuse
+	// outright rather than let a spec silently override one (see
+	// docs/architecture/cross-cutting/agent-runtime-manager.md §3.2's
+	// PATH/HOME/etc. reservation, and baseEnvNames for why the reservation
+	// set IS the base set rather than a copy of it that can drift). This is
+	// checked unconditionally, even when the
+	// agent's own environment defines none of them, because the rule is
+	// about which party controls these keys, not about detecting an actual
+	// collision.
+	for _, k := range envKeys {
+		// Case-insensitive for the same reason as the AGENT_ENV guard
+		// (writeAgentEnv, S2): on Windows the native spelling is "Path", and os/exec
+		// deduplicates the child's environment case-insensitively there --
+		// so a spec key of "Path" passed this reservation and then WON
+		// against the agent-provided PATH, handing a gateway-supplied spec
+		// exactly the control over library and helper-binary resolution
+		// this rule exists to keep agent-side. Refusing a lowercase "path"
+		// on unix, where it is a different variable, is the safe direction.
+		// The same fold is what makes the Windows names here meaningful at
+		// all: a spec key of "SystemRoot" -- the ONLY spelling a Windows
+		// operator would ever type -- is a DLL-resolution hijack of exactly
+		// the class this reservation exists to close, and an unfolded
+		// comparison against "SYSTEMROOT" would wave it through.
+		if slices.Contains(baseEnvNames, strings.ToUpper(k)) {
+			return fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
+		}
+	}
+
+	// Trap 3, and trap 1, in that order -- both BEFORE any value is built, so
+	// a spec that can never launch fails on the same validate-before-acquire
+	// path as every other refusal here (startProcess's dry run reaches this
+	// code before grabEphemeralPort). Both are vendor-independent; see the
+	// SetVisibleDevices section of ExpandPlaceholders' doc comment for why.
+	if spec.SetVisibleDevices {
+		for _, k := range envKeys {
+			if slices.Contains(visibleDevicesOwnedVars, strings.ToUpper(k)) {
+				return fmt.Errorf("runtime: spec env %q conflicts with set_visible_devices: this spec both asks the agent to set the gpu visibility variable and sets one by hand, and the two cannot be resolved into a single unambiguous answer -- turn set_visible_devices off, or remove the env entry", k)
+			}
+		}
+		if gpuIDs == "" {
+			return fmt.Errorf("runtime: set_visible_devices is on but this spec declares no gpus: an empty visible-devices value means NO device is visible, not every device, so the child would see no gpu at all -- add the gpu rows this model runs on, or turn set_visible_devices off")
+		}
+	}
+	return nil
+}
+
+// agentBaseEnv is the agent-provided block of a child's environment, in order:
+// baseEnvNames from the agent's OWN environment, each only if actually present
+// -- never fabricated, and never the agent's full environment (see
+// expandSpec's doc comment); which of them exist is what makes this list
+// correct on both platform families (see baseEnvNames). Then the agent-owned
+// visibility variable: it joins the agent-provided block, not the spec block,
+// because that is what it is -- a value this agent computed from local
+// hardware. It cannot collide with a spec key: checkSpecEnv's conflict
+// refusal is what guarantees that, exactly as the baseEnvNames reservation
+// guarantees it for PATH. A "" name means Apple or an unrecognised stack:
+// nothing is added and the child's environment is byte-identical to the
+// SetVisibleDevices-off one. Last, a cluster head runs with the RPC backend's
+// collective communication off: it is unsupported across rpc-server members,
+// and agent-owned like the visibility variable.
+func agentBaseEnv(spec Spec, vendor GPUVendor, gpuIDs string, getenv func(string) string) []string {
+	env := make([]string, 0, len(baseEnvNames)+2)
+	for _, name := range baseEnvNames {
+		if v := getenv(name); v != "" {
+			env = append(env, name+"="+v)
+		}
+	}
+	if name := injectedVisibleDevicesVar(spec, vendor); name != "" {
+		env = append(env, name+"="+gpuIDs)
+	}
+	if spec.IsClusterHead() {
+		env = append(env, "GGML_RPC_NO_COMM=1")
+	}
+	return env
+}
+
 // expandSpec is ExpandPlaceholders' worker. Everything in ExpandPlaceholders'
 // doc comment describes this function; the exported wrapper exists only
 // because most callers want nothing but the argv and environment.
@@ -950,108 +1190,14 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 // observable; it changes no classification and no error. A failing match
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
-func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
+// vendors is the host's detected vendor set, which only the generic device
+// tokens (${DEVICES}, ${FIRST_LOCAL_DEVICE}) consult to resolve an "auto"
+// device backend; nil falls back to the single vendor.
+func expandSpec(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
+	dev := newDeviceContext(spec, vendor, vendors)
 
-	expand := func(s string) (string, []secretSpan, error) {
-		matches := placeholderPattern.FindAllStringIndex(s, -1)
-		if len(matches) == 0 {
-			return s, nil, nil
-		}
-		var b strings.Builder
-		var spans []secretSpan
-		copied := 0
-		for _, m := range matches {
-			b.WriteString(s[copied:m[0]])
-			copied = m[1]
-			match := s[m[0]:m[1]]
-			inner := match[2 : len(match)-1] // strip "${" and "}"
-
-			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir); handled {
-				if resolveErr != nil {
-					return "", nil, resolveErr
-				}
-				b.WriteString(v)
-				continue
-			}
-
-			// EXACT match only, like ${MODEL}/${*_DEVICES}: a near-miss such as
-			// ${API_TOKENS} is NOT resolved and passes through as literal text
-			// (it does not join the PORT/AGENT_ENV near-miss guard below).
-			// Unlike those clear-text siblings, ${API_TOKEN} carries a SECRET --
-			// the decrypted per-mapping upstream token the gateway pushed on the
-			// wire in spec.APIToken -- so it records its OWN secret span here,
-			// exactly the way ${AGENT_ENV:NAME} does, so maskSecretSpans scrubs
-			// it from the reported command wherever it landed. This is NOT the
-			// AGENT_ENV branch: that reads the agent's OWN environment via
-			// getenv; this reads a wire field, and the two must not be folded.
-			// An empty spec.APIToken (mode off, app-unset, or a fail-closed
-			// decrypt) is a HARD ERROR -- never a silent empty substitution.
-			if inner == "API_TOKEN" {
-				if spec.APIToken == "" {
-					return "", nil, fmt.Errorf("${API_TOKEN} cannot be resolved: no api_token was provided for this spec (mode off, app-unset, or a fail-closed decrypt)")
-				}
-				start := b.Len()
-				b.WriteString(spec.APIToken)
-				spans = append(spans, secretSpan{start: start, end: b.Len(), name: "API_TOKEN", mask: "${API_TOKEN}"})
-				continue
-			}
-
-			if name, ok := strings.CutPrefix(inner, "AGENT_ENV:"); ok && name != "" {
-				// CASE-INSENSITIVE, and that is a security property, not a
-				// nicety (S1). The refusal decides whether a
-				// gateway-supplied spec may read the agent's OWN namespace;
-				// the LOOKUP it guards is os.Getenv, which on Windows is
-				// GetEnvironmentVariableW and resolves case-INSENSITIVELY.
-				// A case-sensitive guard in front of a case-insensitive
-				// lookup is not a guard: ${AGENT_ENV:op_agent_token} walked
-				// straight past it and received OP_AGENT_TOKEN -- the
-				// agent's gateway bearer credential, which authenticates the
-				// certificate endpoint that issues a private key. The value
-				// then has a ready path back to the gateway even without
-				// network egress from the child, because a model server that
-				// echoes its argv (vLLM and llama.cpp both do) and then
-				// exits non-zero has that line captured into
-				// LastError.StderrTail and reported upward.
-				//
-				// Deliberately folded on unix too, where a variable named
-				// "op_agent_token" IS distinct from "OP_AGENT_TOKEN":
-				// refusing that hypothetical is the safe direction, and one
-				// rule on every platform is the only version a reader can
-				// check. Note the near-miss classifier ten lines below
-				// already upper-cases before comparing -- the asymmetry was
-				// visible inside this one function.
-				if strings.HasPrefix(strings.ToUpper(name), agentOwnEnvPrefix) {
-					return "", nil, fmt.Errorf("agent environment variable %q is in the agent's own %s namespace and may not be read via ${AGENT_ENV:...} (this would let a gateway-supplied spec exfiltrate the agent's own credentials)", name, agentOwnEnvPrefix)
-				}
-				val := getenv(name)
-				if val == "" {
-					return "", nil, fmt.Errorf("required agent environment variable %q is not set (referenced via ${AGENT_ENV:%s})", name, name)
-				}
-				// The ONE place a secret enters a resolved string, and
-				// therefore the one place its extent can be recorded exactly.
-				start := b.Len()
-				b.WriteString(val)
-				spans = append(spans, secretSpan{start: start, end: b.Len(), name: name, mask: "${AGENT_ENV:" + name + "}"})
-				continue
-			}
-
-			// Not a valid ${PORT} or ${AGENT_ENV:NAME}. Near-miss iff the
-			// upper-cased inner text STARTS WITH one of the two supported
-			// prefixes -- this also catches the empty-name ${AGENT_ENV:}
-			// falling through from the case above. Anything else (including
-			// text that merely CONTAINS "PORT" or "AGENT_ENV") passes
-			// through untouched -- see the doc comment above for why this
-			// must be a prefix match, not Contains.
-			upper := strings.ToUpper(inner)
-			if strings.HasPrefix(upper, "PORT") || strings.HasPrefix(upper, "AGENT_ENV") {
-				return "", nil, fmt.Errorf("malformed placeholder %s looks like a PORT or AGENT_ENV reference but does not match the expected syntax", match)
-			}
-			b.WriteString(match)
-		}
-		b.WriteString(s[copied:])
-		return b.String(), spans, nil
-	}
+	expand := placeholderExpander{spec: spec, port: port, gpuIDs: gpuIDs, configFilesDir: configFilesDir, dev: dev, getenv: getenv}.expand
 
 	expandedArgs := make([]string, len(spec.Args))
 	argSpans := make([][]secretSpan, len(spec.Args))
@@ -1070,80 +1216,23 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 	}
 	sort.Strings(envKeys)
 
-	// Every baseEnvNames entry is agent-owned, not spec-negotiable: refuse
-	// outright rather than let a spec silently override one (see
-	// docs/architecture/cross-cutting/agent-runtime-manager.md §3.2's
-	// PATH/HOME/etc. reservation, and baseEnvNames for why the reservation
-	// set IS the base set rather than a copy of it that can drift). This is
-	// checked unconditionally, even when the
-	// agent's own environment defines none of them, because the rule is
-	// about which party controls these keys, not about detecting an actual
-	// collision.
-	for _, k := range envKeys {
-		// Case-insensitive for the same reason as the AGENT_ENV guard above
-		// (S2): on Windows the native spelling is "Path", and os/exec
-		// deduplicates the child's environment case-insensitively there --
-		// so a spec key of "Path" passed this reservation and then WON
-		// against the agent-provided PATH, handing a gateway-supplied spec
-		// exactly the control over library and helper-binary resolution
-		// this rule exists to keep agent-side. Refusing a lowercase "path"
-		// on unix, where it is a different variable, is the safe direction.
-		// The same fold is what makes the Windows names here meaningful at
-		// all: a spec key of "SystemRoot" -- the ONLY spelling a Windows
-		// operator would ever type -- is a DLL-resolution hijack of exactly
-		// the class this reservation exists to close, and an unfolded
-		// comparison against "SYSTEMROOT" would wave it through.
-		if slices.Contains(baseEnvNames, strings.ToUpper(k)) {
-			return expandedSpec{}, fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
-		}
+	if err := checkSpecEnv(spec, envKeys, gpuIDs); err != nil {
+		return expandedSpec{}, err
 	}
 
-	// Trap 3, and trap 1, in that order -- both BEFORE any value is built, so
-	// a spec that can never launch fails on the same validate-before-acquire
-	// path as every other refusal here (startProcess's dry run reaches this
-	// code before grabEphemeralPort). Both are vendor-independent; see the
-	// SetVisibleDevices section of the doc comment for why.
-	if spec.SetVisibleDevices {
-		for _, k := range envKeys {
-			if slices.Contains(visibleDevicesOwnedVars, strings.ToUpper(k)) {
-				return expandedSpec{}, fmt.Errorf("runtime: spec env %q conflicts with set_visible_devices: this spec both asks the agent to set the gpu visibility variable and sets one by hand, and the two cannot be resolved into a single unambiguous answer -- turn set_visible_devices off, or remove the env entry", k)
-			}
-		}
-		if gpuIDs == "" {
-			return expandedSpec{}, fmt.Errorf("runtime: set_visible_devices is on but this spec declares no gpus: an empty visible-devices value means NO device is visible, not every device, so the child would see no gpu at all -- add the gpu rows this model runs on, or turn set_visible_devices off")
-		}
-	}
-
-	// Minimal base: baseEnvNames from the agent's OWN environment, each only
-	// if actually present -- never fabricated, and never the agent's full
-	// environment (see doc comment above). Which of them exist is what makes
-	// this list correct on both platform families; see baseEnvNames.
-	resultEnv := make([]string, 0, len(envKeys)+len(baseEnvNames)+1)
+	// Minimal base: the agent-provided block (agentBaseEnv), then the spec's
+	// own entries.
+	base := agentBaseEnv(spec, vendor, gpuIDs, getenv)
+	resultEnv := make([]string, 0, len(envKeys)+len(base))
 	// Index-aligned with resultEnv throughout: every append below appends to
 	// all three, so a later reader can never be off by one between a value
 	// and its provenance.
 	resultSpans := make([][]secretSpan, 0, cap(resultEnv))
 	fromSpec := make([]bool, 0, cap(resultEnv))
-	for _, name := range baseEnvNames {
-		if v := getenv(name); v != "" {
-			resultEnv = append(resultEnv, name+"="+v)
-			resultSpans = append(resultSpans, nil)
-			fromSpec = append(fromSpec, false)
-		}
-	}
-	// The agent-owned visibility variable joins the agent-provided base block,
-	// not the spec block, because that is what it is: a value this agent
-	// computed from local hardware. It cannot collide with a spec key -- the
-	// conflict refusal above is what guarantees that, exactly as the
-	// baseEnvNames reservation guarantees it for PATH. A "" name means Apple
-	// or an unrecognised stack: nothing is appended and the child's
-	// environment is byte-identical to the SetVisibleDevices-off one.
-	if spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs {
-		if name := VisibleDevicesVar(vendor); name != "" {
-			resultEnv = append(resultEnv, name+"="+gpuIDs)
-			resultSpans = append(resultSpans, nil)
-			fromSpec = append(fromSpec, false)
-		}
+	for _, kv := range base {
+		resultEnv = append(resultEnv, kv)
+		resultSpans = append(resultSpans, nil)
+		fromSpec = append(fromSpec, false)
 	}
 	for _, k := range envKeys {
 		v, spans, expandErr := expand(spec.Env[k])

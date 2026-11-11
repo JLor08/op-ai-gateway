@@ -710,8 +710,16 @@ export type ModelServerRow = {
 //                               feature.
 //   spec_force_stopped       -- the launch spec's admin override is
 //                               force_stopped, which a Load never lifts.
+//   cluster_head_unsupported -- the launch spec is a llama.cpp RPC cluster
+//                               head, which starts only with its members.
+//                               Its 409 is runtime.cluster_head_unsupported,
+//                               the one reason not under benchmark.*.
 export type LoadRefusal =
-  'images_only' | 'audio_only' | 'agent_ensure_unsupported' | 'spec_force_stopped';
+  | 'images_only'
+  | 'audio_only'
+  | 'agent_ensure_unsupported'
+  | 'spec_force_stopped'
+  | 'cluster_head_unsupported';
 
 // One capability verdict on a ModelServerRow, mirroring the backend's
 // ModelServerCapabilityDTO field-for-field: which capability, its verdict

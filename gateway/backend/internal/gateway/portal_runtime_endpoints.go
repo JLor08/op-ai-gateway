@@ -5,12 +5,15 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/store"
+	"slices"
 	"strings"
 	"time"
 )
@@ -61,6 +64,57 @@ func (s *Server) handlePortalMappingRuntimeSpec(w http.ResponseWriter, r *http.R
 	}
 }
 
+// handlePortalClusterCandidates serves GET
+// /api/portal/mappings/{mappingID}/runtime/cluster-candidates?mode=automatic|manual:
+// the servers the cluster head on that mapping may add as members, as
+// {"data": [...]}. Authorization (the head's mapping, each candidate server,
+// member consent) happens inside portal.Service.ClusterCandidates.
+func (s *Server) handlePortalClusterCandidates(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID string) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	list, err := s.Portal.ClusterCandidates(r.Context(), token, mappingID, r.URL.Query().Get("mode"))
+	if err != nil {
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": list})
+}
+
+// handlePortalClusterMemberResetUsage serves POST
+// /api/portal/mappings/{mappingID}/runtime/cluster-members/{serverID}/reset-usage:
+// it clears the stored usage of the member on serverID of the cluster head on
+// that mapping (the way out of a stored peak above the member's budget, which
+// its next start would be refused for) and answers the head's runtime spec.
+// Authorization -- the head's mapping and the member's server -- happens
+// inside portal.Service.AuthorizeClusterMemberUsageReset; the reset itself
+// runs beside the telemetry ingest that writes the same row (clusterUsage),
+// which also pushes the member server's document.
+func (s *Server) handlePortalClusterMemberResetUsage(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID, serverID string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	m, err := s.Portal.AuthorizeClusterMemberUsageReset(r.Context(), token, mappingID, serverID)
+	if err != nil {
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	if err := s.clusterUsage.reset(r.Context(), m.HeadSpecID, m.ServerID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// The member left between the authorization and the reset.
+			err = portal.ErrClusterMemberNotFound
+		}
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	dto, err := s.Portal.GetRuntimeSpec(r.Context(), token, mappingID)
+	if err != nil {
+		writePortalRuntimeSpecError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
 // portalRuntimeSpecErrRows are writePortalRuntimeSpecError's mapper-specific
 // rows (checked before sharedErrorMap); portal.ErrMappingNotFound (the
 // 404-no-leak collapse from authorizeMapping) maps identically elsewhere and
@@ -80,7 +134,7 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecVisibleDevicesNoGPUs, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_no_gpus", msg: "set_visible_devices requires at least one gpu row: an empty visible-devices value hides every gpu from the model"},
 	{err: portal.ErrRuntimeSpecVisibleDevicesConflict, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_conflict", msg: "set_visible_devices conflicts with a gpu visibility variable set by hand in env"},
 	{err: portal.ErrRuntimeSpecVisibleDevicesModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_mode_invalid", msg: "visible_devices_mode must be \"env\" or \"args\""},
-	{err: portal.ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_args_no_placeholder", msg: "args mode requires one of ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} in args"},
+	{err: portal.ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_args_no_placeholder", msg: "args mode requires one of ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES} in args"},
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
@@ -145,8 +199,66 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecServerBenchmarking, status: http.StatusConflict, code: "runtime_spec.server_benchmarking", msg: "a benchmark run is holding this server; a launch-spec change now would contaminate its measurement"},
 }
 
+// portalClusterErrRows are the cluster head refusals of a runtime-spec write
+// and of the cluster-candidates listing. Every row is 400 except the three 409s
+// (a member spec another head uses, a member server without a free RPC
+// port, a listen_port a member holds: well-formed, but in conflict with
+// other specs). Rows whose
+// refusal names the server or binary at fault surface the service's detail
+// through clusterErrDetail; the server-not-found answer for a member server
+// the caller may not use is the shared server row.
+var portalClusterErrRows = []errRow{
+	{err: portal.ErrClusterMemberNotFound, status: http.StatusNotFound, code: "runtime_spec.cluster_member_not_found", msg: "the server is no member of this cluster head"},
+	{err: portal.ErrClusterMemberModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_mode_invalid", msg: "member_mode must be \"automatic\" or \"manual\""},
+	{err: portal.ErrClusterNetworkInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_network_invalid", msg: "cluster_network must be \"mesh\" or \"lan\" (or empty for the default)"},
+	{err: portal.ErrClusterTransportInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_transport_invalid", msg: "rpc_transport must be \"direct\" or \"relay\" (or empty for the default)"},
+	{err: portal.ErrClusterTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_type_invalid", msg: "a cluster head must be a llama_cpp runtime spec"},
+	{err: portal.ErrClusterFlagEqualsForm, status: http.StatusBadRequest, code: "runtime_spec.cluster_flag_equals_form", msg: "llama-server refuses --flag=value: write --rpc, --device/-dev, --tensor-split/-ts and --mmproj-device/-mmdev with their value as the next argument"},
+	{err: portal.ErrClusterRPCPlaceholderMissing, status: http.StatusBadRequest, code: "runtime_spec.cluster_rpc_placeholder_missing", msg: "a cluster head needs ${RPC_SERVERS} as the value of --rpc in args or of LLAMA_ARG_RPC in env"},
+	{err: portal.ErrClusterRPCTwice, status: http.StatusBadRequest, code: "runtime_spec.cluster_rpc_twice", msg: "set the RPC servers exactly once: ${RPC_SERVERS} once, through either --rpc or LLAMA_ARG_RPC, never both"},
+	{err: portal.ErrClusterRPCPlaceholderWithoutCluster, status: http.StatusBadRequest, code: "runtime_spec.cluster_rpc_placeholder_without_cluster", msg: "${RPC_SERVERS} and ${RPC_DEVICES} need cluster mode"},
+	{err: portal.ErrClusterDeviceListMissingRPC, status: http.StatusBadRequest, code: "runtime_spec.cluster_device_list_missing_rpc", msg: "a cluster head's device list must name the RPC devices with ${DEVICES} or ${RPC_DEVICES}, else the members are never used"},
+	{err: portal.ErrClusterDeviceOrder, status: http.StatusBadRequest, code: "runtime_spec.cluster_device_order", msg: "the device list is parsed before the RPC servers exist: put --device after --rpc in args, or set the RPC servers through LLAMA_ARG_RPC"},
+	{err: portal.ErrClusterMembersRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_members_required", msg: "a cluster head needs at least one member"},
+	{err: portal.ErrClusterHeadReplicable, status: http.StatusBadRequest, code: "runtime_spec.cluster_head_replicable", msg: "a cluster head cannot be replicable: each member serves one head"},
+	{err: portal.ErrClusterStartupTimeoutRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_startup_timeout_required", msg: "a cluster head needs an explicit startup_timeout_seconds"},
+	{err: portal.ErrClusterMemberServerTwice, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_server_twice", msg: "a server can be a member of a head only once; combine its GPUs into one member"},
+	{err: portal.ErrClusterMemberOnHeadServer, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_on_head_server", msg: "a member must run on another server than its head"},
+	{err: portal.ErrClusterMemberSpecTaken, status: http.StatusConflict, code: "runtime_spec.cluster_member_spec_taken", msgFn: clusterErrDetail(portal.ErrClusterMemberSpecTaken, "the member spec serves another cluster head")},
+	{err: portal.ErrClusterMemberSpecDisabled, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_spec_disabled", msgFn: clusterErrDetail(portal.ErrClusterMemberSpecDisabled, "the member spec is disabled")},
+	{err: portal.ErrClusterMemberRPCDisabled, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_rpc_disabled", msgFn: clusterErrDetail(portal.ErrClusterMemberRPCDisabled, "the server does not offer RPC membership in its runtime settings")},
+	{err: portal.ErrClusterMemberNoMatchingBinary, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_no_matching_binary", msgFn: clusterErrDetail(portal.ErrClusterMemberNoMatchingBinary, "the member server has no ggml-rpc-server of the head binary's version")},
+	{err: portal.ErrClusterVersionMismatch, status: http.StatusBadRequest, code: "runtime_spec.cluster_version_mismatch", msgFn: clusterErrDetail(portal.ErrClusterVersionMismatch, "the member binary's version differs from the head binary's")},
+	{err: portal.ErrClusterMeshUnavailable, status: http.StatusBadRequest, code: "runtime_spec.cluster_mesh_unavailable", msgFn: clusterErrDetail(portal.ErrClusterMeshUnavailable, "a mesh cluster needs NetBird with a tracking group and a known mesh IP on the head and every member")},
+	{err: portal.ErrClusterLANAddressRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_lan_address_required", msgFn: clusterErrDetail(portal.ErrClusterLANAddressRequired, "a lan cluster needs a LAN address on every server, and lan_address on NetBird-enabled ones")},
+	{err: portal.ErrClusterDirectUnavailable, status: http.StatusBadRequest, code: "runtime_spec.cluster_direct_unavailable", msg: "direct transport in a mesh cluster needs NetBird policy management with deny-by-default on and enforced, and the Default policy seen disabled; use relay"},
+	{err: portal.ErrClusterLANAckRequired, status: http.StatusBadRequest, code: "runtime.cluster_lan_ack_required", msg: "direct transport in a lan cluster exposes each member's RPC port unauthenticated; acknowledge it with lan_exposure_ack"},
+	{err: portal.ErrClusterMemberBudgetRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_budget_required", msgFn: clusterErrDetail(portal.ErrClusterMemberBudgetRequired, "a member on an Apple GPU needs a GPU budget on its server")},
+	{err: portal.ErrClusterTensorSplitRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_tensor_split_required", msgFn: clusterErrDetail(portal.ErrClusterTensorSplitRequired, "a head with a non-NVIDIA member needs --tensor-split")},
+	{err: portal.ErrClusterPortExhausted, status: http.StatusConflict, code: "runtime_spec.cluster_port_exhausted", msg: "no free port in the RPC range 26000-26999 could be claimed on the member server"},
+	{err: portal.ErrRuntimeSpecPortConflictsRPCMember, status: http.StatusConflict, code: "runtime_spec.port_conflicts_rpc_member", msg: "listen_port is the RPC port of a cluster member on this server"},
+	{err: portal.ErrClusterHeadBinaryVersionUnknown, status: http.StatusBadRequest, code: "runtime_spec.cluster_head_binary_version_unknown", msgFn: clusterErrDetail(portal.ErrClusterHeadBinaryVersionUnknown, "the version of the head binary is unknown; add it in the Binaries tab")},
+}
+
+// clusterErrDetail surfaces the detail a cluster refusal was wrapped with
+// (fmt.Errorf("%w: ...")), else fallback.
+func clusterErrDetail(sentinel error, fallback string) func(error) string {
+	return func(err error) string {
+		if detail, ok := strings.CutPrefix(err.Error(), sentinel.Error()+": "); ok {
+			return detail
+		}
+		return fallback
+	}
+}
+
+// portalRuntimeSpecErrors is writePortalRuntimeSpecError's table: the
+// runtime-spec rows, the cluster rows, and the member-spec rows a cluster
+// write shares with the member-spec API (an unknown member spec, an invalid
+// device backend, a missing VRAM estimate).
+var portalRuntimeSpecErrors = slices.Concat(portalRuntimeSpecErrRows, portalClusterErrRows, portalRPCMemberErrRows)
+
 func writePortalRuntimeSpecError(w http.ResponseWriter, err error) {
-	writeMappedError(w, err, portalRuntimeSpecErrRows, http.StatusInternalServerError, "runtime_spec.request_failed", "runtime spec request failed")
+	writeMappedError(w, err, portalRuntimeSpecErrors, http.StatusInternalServerError, "runtime_spec.request_failed", "runtime spec request failed")
 }
 
 // --- Task 9: runtime status SSE + file-mode report view ---------------------

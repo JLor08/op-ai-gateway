@@ -38,7 +38,11 @@ type RunningProc struct {
 	// orderVictims draws surplus instances before every other idle victim. It
 	// changes only WHICH victim goes first, never WHETHER one may go.
 	Surplus bool
-	GPUs    map[int]int // gpu index -> effective VRAM MB
+	// Member marks an rpc_server cluster member. The kind is exempt from the
+	// co-residency matrix (pairAllowed): a member runs next to anything, and
+	// anything next to it, while VRAM, RAM and the process limit still apply.
+	Member bool
+	GPUs   map[int]int // gpu index -> effective VRAM MB
 	// RAMMB is the EFFECTIVE host RAM the process occupies, in MB: the live
 	// measurement when the agent has one, floored at the spec's pushed demand.
 	// It is host-scoped -- one number per process, not per GPU -- and Admit
@@ -769,7 +773,7 @@ func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []Runn
 		if !shares {
 			continue
 		}
-		closed := !pairAllowed(snap.Allowed, base, r)
+		closed := !pairAllowed(snap.Allowed, base, spec.IsRPCServer(), r)
 		if found && !outranksAsBlocker(closed, r.SpecID, pairClosed, blocker.SpecID) {
 			continue
 		}
@@ -812,10 +816,18 @@ func outranksAsBlocker(closed bool, id string, bestClosed bool, bestID string) b
 // pairAllowed reports whether a candidate of base spec candidateBase may run
 // next to r. Siblings (r is an instance of the same spec) always may: the
 // gateway's matrix never holds a self-pair, so reading one would make every
-// spec matrix-incompatible with its own instances. Any other pair is looked up
-// by BASE spec IDs, so an instance inherits its spec's verdicts on either side
-// of the pair and the matrix needs no entries per instance (#340).
-func pairAllowed(allowed map[[2]string]bool, candidateBase string, r RunningProc) bool {
+// spec matrix-incompatible with its own instances. So may every pair with an
+// rpc_server member on either side (candidateMember, r.Member): a member lends
+// its devices to a head on another host and serves no model of its own, so the
+// matrix, which records which models may share a host, has nothing to say
+// about it -- its resources are still charged like any process's. Any other
+// pair is looked up by BASE spec IDs, so an instance inherits its spec's
+// verdicts on either side of the pair and the matrix needs no entries per
+// instance (#340).
+func pairAllowed(allowed map[[2]string]bool, candidateBase string, candidateMember bool, r RunningProc) bool {
+	if candidateMember || r.Member {
+		return true
+	}
 	occupantBase := baseOf(r)
 	return occupantBase == candidateBase || allowed[PairKey(candidateBase, occupantBase)]
 }
@@ -1321,7 +1333,7 @@ func pinnedUnknownCandidateRefusal(running []RunningProc, gpuIdx []int) (Decisio
 // by base spec (pairAllowed), so an instance carries its spec's verdicts.
 func (a *admission) ruleMatrix() {
 	for _, r := range a.running {
-		if pairAllowed(a.snap.Allowed, a.base, r) {
+		if pairAllowed(a.snap.Allowed, a.base, a.spec.IsRPCServer(), r) {
 			continue
 		}
 		if a.evictable(r) {

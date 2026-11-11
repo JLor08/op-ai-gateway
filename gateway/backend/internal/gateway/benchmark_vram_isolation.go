@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"sort"
 	"time"
 )
@@ -48,6 +49,13 @@ const (
 	// operator-owned override, or a spec OTHER than the target is pinned. The
 	// message names the blocking spec.
 	codeBenchmarkVRAMIsolationBlocked = "benchmark.vram_isolation_blocked"
+
+	// codeBenchmarkVRAMClusterMemberHeld: a llama.cpp RPC cluster holds or
+	// has reserved a member on the server. The drain force-stops only the
+	// server's launch specs, and a member is removed only through its head,
+	// so the run would measure beside a member it cannot stop.
+	codeBenchmarkVRAMClusterMemberHeld = "benchmark.vram_cluster_member_held"
+	msgBenchmarkVRAMClusterMemberHeld  = "a llama.cpp RPC cluster uses a member on this server; stop that cluster (head first) and run again"
 
 	// codeBenchmarkVRAMAgentEnsureUnsupported: the target is images-only or
 	// audio-only, so it has no chat endpoint to be loaded by generating on, and the agent
@@ -351,6 +359,13 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 	if err != nil {
 		return vramRunPlanned{}, err
 	}
+	// A cluster member on this server is no launch spec, so the drain cannot
+	// stop it, and while a cluster holds or has reserved it nothing but its
+	// head may remove it. Refused rather than stopping the head: the run
+	// would end a cluster the operator did not name.
+	if vramClusterMemberClaimed(s.RuntimeStatus.statusRows(serverID), time.Now()) {
+		return vramRunPlanned{}, &vramRefusal{code: codeBenchmarkVRAMClusterMemberHeld, msg: msgBenchmarkVRAMClusterMemberHeld}
+	}
 	planned := vramRunPlanned{baseline: baseline, specIDs: specIDs, targetSpecID: targetSpec.ID}
 	// P1 again, by the other route: an agent-managed application whose target
 	// mapping has no ENABLED spec has no agent-managed process to measure --
@@ -440,6 +455,15 @@ func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (sp
 	}
 	sort.Strings(specIDs)
 	return specIDs, targetSpec, nil
+}
+
+// vramClusterMemberClaimed reports whether rows, a server's runtime status,
+// show an RPC cluster member that a head holds or that is reserved for a
+// start at now. An unclaimed member idles out by itself.
+func vramClusterMemberClaimed(rows []RuntimeStatusDTO, now time.Time) bool {
+	return slices.ContainsFunc(rows, func(r RuntimeStatusDTO) bool {
+		return r.RPC != nil && stateOccupied(r.State) && (r.RPC.HeldBy != "" || r.RPC.ReservedUntil.After(now))
+	})
 }
 
 // vramEnsurePlan decides how the run starts the target: false for a text

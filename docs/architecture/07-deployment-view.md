@@ -102,11 +102,31 @@ is configured with `OP_AGENT_GATEWAY_URL` and a per-server `OP_AGENT_TOKEN`
 runs unprivileged where possible, collecting the richest telemetry each platform
 allows. See [Telemetry](cross-cutting/telemetry-usage-observability.md).
 
+**An AI server that is a llama.cpp RPC cluster member opens one more listener per
+member** ([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)).
+Every other managed process binds loopback behind the agent's router; a member's
+`ggml-rpc-server` (direct transport) or the agent's relay in front of it (relay
+transport) listens on a port the gateway allocates from **26000–26999** on that
+server (below every default ephemeral range, so no process that lets the kernel
+pick its port ever holds it), bound to the server's mesh IPv4 in a `mesh` cluster, and in a `lan`
+cluster to every interface or, with `lan_bind_only`, to the server's
+`lan_address`. A host firewall must let the head's host reach that port; in a
+mesh the gateway's managed `op-gw-rpc-<server id>` NetBird policy grants exactly
+that ([`gateway/deploy/README-netbird.md`](../../gateway/deploy/README-netbird.md)
+§6.1). The member's agent needs `ggml-rpc-server` (and the head's agent
+`llama-server`) of **one** llama.cpp build in its local binary allowlist, which
+its inventory then reports, and `config_files_dir` for a member's tensor cache
+(`cache_enabled`).
+The head itself needs nothing new: it dials out to its members.
+
 ## 7.6 Startup & background work
 
 On startup the gateway loads configuration (env-first), opens the store, applies
 pending migrations (when `OP_AI_GATEWAY_AUTO_MIGRATE` is on), seeds the bootstrap
 admin/token if configured, loads external themes, and starts background
 reconcilers: certificate renewal/reconcile, NetBird token auto-rotation, energy
-reconciliation, availability/telemetry retention pruning, and (opportunistic)
-benchmark scheduling.
+reconciliation, availability/telemetry retention pruning (closed RPC cluster
+sessions included), (opportunistic) benchmark scheduling, and the cluster
+reconciler, which every 30 s, at boot and whenever a runtime document was pushed
+or a head exited starts the llama.cpp RPC cluster heads that should be up
+([Agent-Managed Model Runtime §3.7](cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster)).

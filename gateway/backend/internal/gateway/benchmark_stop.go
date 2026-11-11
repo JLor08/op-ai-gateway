@@ -38,6 +38,7 @@ const (
 	benchmarkStopReasonStopTimeout          = "stop_timeout"
 	benchmarkStopReasonLateStart            = "late_start"
 	benchmarkStopReasonFormerlyPinned       = "formerly_pinned"
+	benchmarkStopReasonClusterMember        = "cluster_member"
 )
 
 // benchmarkStopWaitBound: the 60 s poll that delivers the override to an agent
@@ -243,8 +244,10 @@ func (s *Server) clearBenchmarkStop(ctx context.Context, serverID string, ov *be
 // writing it would only widen the override's footprint.
 //
 // reason is set when nothing can be stopped for this target: no_spec (the
-// target has no launch spec), no_status (the frame has no row for it), or the
-// selection frame's own reason. With an empty stop set and pinsSettled false,
+// target has no launch spec), no_status (the frame has no row for it),
+// cluster_member (an RPC cluster member runs on the server: it is no launch
+// spec, and only its head may remove it), or the selection frame's own
+// reason. With an empty stop set and pinsSettled false,
 // it is formerly_pinned: the start cannot be confirmed.
 func (s *Server) benchmarkStopSet(ctx context.Context, tgt benchmarkTarget) (sel benchmarkStopSelection, reason string) {
 	if tgt.spec.ID == "" {
@@ -273,6 +276,11 @@ func benchmarkStopSelectionOf(rows []RuntimeStatusDTO, targetID string, unpinned
 	}
 	var stopSet []string
 	for _, row := range rows {
+		// An RPC cluster member is no launch spec, and only its head may
+		// remove it: the stop-all stops nothing beside one.
+		if row.RPC != nil && !benchmarkRowQuiet(row) {
+			return benchmarkStopSelection{}, benchmarkStopReasonClusterMember
+		}
 		if !benchmarkRowQuiet(row) || (row.SpecID == targetID && row.State != agentSpecStateStopped) {
 			stopSet = append(stopSet, row.SpecID)
 		}

@@ -2,7 +2,14 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it, vi } from 'vitest';
-import { createPortalApi, PortalApiError, type CoResidency, type RuntimeSpec } from '../api';
+import {
+  createPortalApi,
+  PortalApiError,
+  type CoResidency,
+  type PutRuntimeSpecRequest,
+  type RuntimeSpec,
+  type RuntimeStatus,
+} from '../api';
 import { formatPortalError } from '../components/shared/format';
 import { messages } from '../i18n';
 
@@ -329,6 +336,19 @@ describe('runtimeApi manual start and stop', () => {
     expect(got).toEqual({ instance: 0, state: 'stopping' });
   });
 
+  it('sends stop_members only when the members are to be stopped too', async () => {
+    const fetcher = vi
+      .fn()
+      .mockImplementation(async () => jsonResponse({ instance: 0, state: 'stopping' }));
+    const api = createPortalApi(fetcher);
+
+    await api.stopRuntime('map_1', 0, true);
+    await api.stopRuntime('map_1', 0, false);
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ instance: 0, stop_members: true });
+    expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual({ instance: 0 });
+  });
+
   it('carries the missing feature of a runtime.agent_feature_missing refusal', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       jsonResponse(
@@ -350,5 +370,100 @@ describe('runtimeApi manual start and stop', () => {
     expect((err as PortalApiError).status).toBe(409);
     expect((err as PortalApiError).code).toBe('runtime.agent_feature_missing');
     expect((err as PortalApiError).feature).toBe('runtime_stop');
+  });
+});
+
+// The RPC cluster additions: the cluster-candidates read and the request
+// shape of a cluster head save.
+describe('runtimeApi RPC cluster', () => {
+  it('POSTs a member usage reset with both ids URL-encoded and answers the head spec', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ id: 'spec_head', cluster_enabled: true }));
+    const got = await createPortalApi(fetcher).resetClusterMemberUsage('map/1', 'srv/b');
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/mappings/map%2F1/runtime/cluster-members/srv%2Fb/reset-usage');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(got).toMatchObject({ id: 'spec_head', cluster_enabled: true });
+  });
+
+  it('carries the 404 of a server that is no member', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          error: {
+            code: 'runtime_spec.cluster_member_not_found',
+            message: 'the server is no member of this cluster head',
+          },
+        },
+        404,
+      ),
+    );
+    const err = await createPortalApi(fetcher)
+      .resetClusterMemberUsage('map_1', 'srv_x')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PortalApiError);
+    expect((err as PortalApiError).code).toBe('runtime_spec.cluster_member_not_found');
+    expect(formatPortalError(err, messages.en)).toBe(
+      `runtime_spec.cluster_member_not_found: ${messages.en.errorClusterMemberNotFound}`,
+    );
+  });
+
+  it('GETs the cluster candidates for a mode, mapping id URL-encoded', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: [{ server_id: 's1' }] }));
+    const got = await createPortalApi(fetcher).clusterCandidates('map/1', 'manual');
+    expect(fetcher.mock.calls[0][0]).toBe(
+      '/api/portal/mappings/map%2F1/runtime/cluster-candidates?mode=manual',
+    );
+    expect(got.data[0].server_id).toBe('s1');
+  });
+
+  it('carries the cluster fields on a PUT and excludes the read-only totals', () => {
+    const body: PutRuntimeSpecRequest = {
+      ...({} as PutRuntimeSpecRequest),
+      device_backend: 'auto',
+      cluster_enabled: true,
+      member_mode: 'automatic',
+      cluster_network: 'mesh',
+      rpc_transport: 'relay',
+      lan_exposure_ack: false,
+      cluster_members: [],
+    };
+    expect(body.cluster_enabled).toBe(true);
+    const bad: PutRuntimeSpecRequest = {
+      ...body,
+      // @ts-expect-error cluster_vram_total_mb is derived, not part of the request
+      cluster_vram_total_mb: 1,
+    };
+    expect(bad).toBeDefined();
+  });
+
+  it('types the RPC telemetry on a status row', () => {
+    const row: RuntimeStatus = {
+      ...({} as RuntimeStatus),
+      kind: 'rpc_server',
+      rpc: {
+        held_by: 'rspec_1',
+        held_since: '2026-01-01T00:00:00Z',
+        reserved_until: '',
+        protocol: '8.0.1',
+        device_count: 2,
+        bind_mismatch: false,
+        breaches: [{ peer: '100.64.0.9', at: '2026-01-01T00:00:00Z' }],
+        cache_mb: 0,
+        stalled: false,
+      },
+      cluster: { launched: ['100.64.0.5:26001'] },
+      admission_blocked_by: 'rpcm_x',
+      last_error: {
+        code: 'runtime.bind_mismatch',
+        message: 'm',
+        at: '',
+        exit_code: 0,
+        failures: 1,
+      },
+    };
+    expect(row.rpc?.breaches?.[0].peer).toBe('100.64.0.9');
   });
 });

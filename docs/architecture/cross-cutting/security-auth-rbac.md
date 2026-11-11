@@ -586,6 +586,66 @@ Certificate issuance and mTLS between the gateway and its agents is covered in
 [Certificates & TLS](certificates-tls.md); the mesh listener itself in
 [Networking & Mesh](networking-mesh.md).
 
+### 8.4 RPC clusters: rights on every server, consent and anonymous positions
+
+A llama.cpp RPC cluster head drives processes on **other** servers
+([ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)):
+its members allocate memory and run graphs on their hosts' devices for whoever
+holds them, over a protocol with no authentication. So a cluster crosses the
+server boundary the runtime write rule above was built on, and four rules keep
+that from becoming a way around it (`internal/portal/service_cluster.go`):
+
+1. **Rights on every server involved.** A head write that changes the
+   membership, the member mode, the network, the transport or the head's binary
+   needs the runtime write rule on the head's server **and** on every member
+   server the write keeps or adds. A member the write drops needs no rights on
+   its server, and turning the cluster off needs the head's rights only, as
+   deleting the head always did: removal only frees the member host, while
+   consent and rights protect additions. A write that changes none of them
+   needs it on the head's server only, so a member on a server the caller
+   cannot see never locks them out of their own head. Manual member specs, a server's RPC
+   settings and its binary inventory authorize through `authorizeServer`, and
+   the member usage reset needs both the head's mapping and the member's server.
+2. **The member side's consent, with no bypass.** A member admits a head only
+   when one of the head server's admin groups is in its consent list: the
+   server's `rpc_allowed_head_groups` for an automatic member, the manual
+   spec's `allowed_head_groups` for a manual one; an empty list means the
+   member server's own admin groups. Consent binds **every** caller, system
+   scope included, at save, in the candidate list and in the derivation, which
+   re-checks it for every document: withdrawing consent takes the member away
+   from the head (`runtime.cluster_member_consent_withdrawn`), and a system-scope
+   save past it would only store a head that is never pushed. A system admin who
+   wants a cross-group member sets the member's consent groups. Any existing
+   admin-tier group may be named, since the member's owner may consent to a
+   group they do not manage.
+3. **404, never a hint.** A member server the caller may not manage, or whose
+   consent does not admit the head, is `server.not_found`, checked **before**
+   any member check that would read that server's settings (its RPC switch, its
+   binaries, its addresses), so a refusal never tells a caller about a server it
+   may not use. The candidate list offers only servers that pass both. Refusals
+   that name a server or a binary carry that detail only for a caller who may
+   see the server; `runtime.cluster_member_in_use` names the head's server only
+   when the caller may manage it.
+4. **Positions, not names.** A member on a server the caller may not manage
+   appears in the head's read view by its position alone (`visible: false`),
+   contributes only to the totals, adds no warning, and leaves the network
+   default empty; `cluster_status` names members, breaches and peaks by position
+   only; and an inference refusal may name the recorded cause code and member
+   position, never a server name
+   ([Routing & Model Selection §11](routing-and-model-selection.md#11-cluster-heads-the-cluster-gate)).
+   A member's energy share appears only aggregated, under the member server,
+   within the reader's own usage scope, never as another principal's request
+   ([Telemetry §8.4.5](telemetry-usage-observability.md#845-cost-and-currency)).
+
+On the member host the agent enforces what the gateway configured, and no more:
+it binds only the address the gateway pushed, the relay admits only the head's
+addresses, and the observer reports any other peer as a breach
+([Agent-Managed Model Runtime §3.6](agent-runtime-manager.md#36-rpc-cluster-members-and-heads)).
+The residual exposures (a `lan` direct member open to its network, DNS in the
+`lan` allowlist, a routing head on the mesh) are recorded in
+[§11 risks](../11-risks-and-technical-debt.md#111-operational-risks) and
+[Networking & Mesh §12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc).
+
 ## 9. TOTP two-factor authentication
 
 `internal/totp` implements RFC 6238 (HMAC-SHA1, 6 digits, 30-second step, ±1

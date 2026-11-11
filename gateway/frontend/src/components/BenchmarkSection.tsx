@@ -379,6 +379,7 @@ function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'audio_only') return t.benchmarkResultSkippedAudioOnly;
   if (r.skipped === 'not_speech') return t.benchmarkResultSkippedNotSpeech;
   if (r.skipped === 'speech_clone') return t.benchmarkResultSkippedSpeechClone;
+  if (r.skipped === 'cluster_head') return t.benchmarkResultSkippedClusterHead;
   if (r.error) return r.error;
   if (isAudioResult(r)) return audioResultLine(r, t);
   if (isSpeechResult(r)) return speechResultLine(r, t);

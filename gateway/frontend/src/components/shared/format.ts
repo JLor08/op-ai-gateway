@@ -64,6 +64,8 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.admin_state_invalid': 'errorRuntimeSpecAdminStateInvalid',
   'runtime_spec.visible_devices_no_gpus': 'errorRuntimeSpecVisibleDevicesNoGpus',
   'runtime_spec.visible_devices_conflict': 'errorRuntimeSpecVisibleDevicesConflict',
+  'runtime_spec.visible_devices_args_no_placeholder':
+    'errorRuntimeSpecVisibleDevicesArgsNoPlaceholder',
   'runtime_spec.application_not_server_agent': 'errorRuntimeSpecApplicationNotServerAgent',
   // Issue #81 part 2 (design D10): the three refusals part 1 introduced. THREE
   // distinct labels on purpose -- the whole-map "reuses a label for two codes
@@ -112,6 +114,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'benchmark.vram_no_gpu_samples': 'errorBenchmarkVramNoGpuSamples',
   'benchmark.vram_isolation_blocked': 'errorBenchmarkVramIsolationBlocked',
   'benchmark.vram_declared_gpu_missing': 'errorBenchmarkVramDeclaredGpuMissing',
+  // A llama.cpp RPC cluster holds or has reserved a member on the server: the
+  // drain cannot stop a member (only its head can), so the run would measure
+  // beside it.
+  'benchmark.vram_cluster_member_held': 'errorBenchmarkVramClusterMemberHeld',
   // A launch-spec write refused because a benchmark run is holding that
   // server: one override click mid-run is what contaminates its measurement.
   'runtime_spec.server_benchmarking': 'errorRuntimeSpecServerBenchmarking',
@@ -150,6 +156,87 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime.start_failed': 'errorRuntimeStartFailed',
   'runtime.not_permitted': 'errorRuntimeNotPermitted',
   'runtime.upstream_gone': 'errorRuntimeUpstreamGone',
+  'runtime_spec.cluster_member_mode_invalid': 'errorClusterMemberModeInvalid',
+  'runtime_spec.cluster_network_invalid': 'errorClusterNetworkInvalid',
+  'runtime_spec.cluster_transport_invalid': 'errorClusterTransportInvalid',
+  'runtime_spec.cluster_type_invalid': 'errorClusterTypeInvalid',
+  'runtime_spec.cluster_rpc_placeholder_missing': 'errorClusterRpcPlaceholderMissing',
+  'runtime_spec.cluster_rpc_twice': 'errorClusterRpcTwice',
+  'runtime_spec.cluster_rpc_placeholder_without_cluster':
+    'errorClusterRpcPlaceholderWithoutCluster',
+  'runtime_spec.cluster_device_list_missing_rpc': 'errorClusterDeviceListMissingRpc',
+  'runtime_spec.cluster_device_order': 'errorClusterDeviceOrder',
+  'runtime_spec.cluster_members_required': 'errorClusterMembersRequired',
+  'runtime_spec.cluster_head_replicable': 'errorClusterHeadReplicable',
+  'runtime_spec.cluster_startup_timeout_required': 'errorClusterStartupTimeoutRequired',
+  'runtime_spec.cluster_member_server_twice': 'errorClusterMemberServerTwice',
+  'runtime_spec.cluster_member_on_head_server': 'errorClusterMemberOnHeadServer',
+  'runtime_spec.cluster_member_spec_taken': 'errorClusterMemberSpecTaken',
+  'runtime_spec.cluster_member_spec_disabled': 'errorClusterMemberSpecDisabled',
+  'runtime_spec.cluster_member_rpc_disabled': 'errorClusterMemberRpcDisabled',
+  'runtime_spec.cluster_member_no_matching_binary': 'errorClusterMemberNoMatchingBinary',
+  'runtime_spec.cluster_version_mismatch': 'errorClusterVersionMismatch',
+  'runtime_spec.cluster_mesh_unavailable': 'errorClusterMeshUnavailable',
+  'runtime_spec.cluster_lan_address_required': 'errorClusterLanAddressRequired',
+  'runtime_spec.cluster_direct_unavailable': 'errorClusterDirectUnavailable',
+  'runtime_spec.cluster_member_budget_required': 'errorClusterMemberBudgetRequired',
+  'runtime_spec.cluster_tensor_split_required': 'errorClusterTensorSplitRequired',
+  'runtime_spec.cluster_head_binary_version_unknown': 'errorClusterHeadBinaryVersionUnknown',
+  'runtime_spec.cluster_port_exhausted': 'errorClusterPortExhausted',
+  'runtime_spec.cluster_flag_equals_form': 'errorClusterFlagEqualsForm',
+  'runtime_spec.port_conflicts_rpc_member': 'errorRuntimeSpecPortConflictsRpcMember',
+  'runtime_spec.device_backend_invalid': 'errorRuntimeSpecDeviceBackendInvalid',
+  'runtime_spec.member_flag_reserved': 'errorRuntimeSpecMemberFlagReserved',
+  'runtime_spec.member_vram_estimate_required': 'errorRuntimeSpecMemberVramEstimateRequired',
+  'rpc_member_spec.not_found': 'errorRpcMemberSpecNotFound',
+  'rpc_member_spec.request_failed': 'errorRpcMemberSpecRequestFailed',
+  'binary.path_invalid': 'errorBinaryPathInvalid',
+  'binary.kind_invalid': 'errorBinaryKindInvalid',
+  'binary.version_invalid': 'errorBinaryVersionInvalid',
+  'binary.not_found': 'errorBinaryNotFound',
+  'binary.agent_owned': 'errorBinaryAgentOwned',
+  'binary.request_failed': 'errorBinaryRequestFailed',
+  'settings.netbird_direct_cluster_exists': 'errorSettingsNetbirdDirectClusterExists',
+  'server.lan_address_invalid': 'errorServerLanAddressInvalid',
+  'runtime.cluster_lan_ack_required': 'errorClusterLanAckRequired',
+  'runtime.cluster_member_in_use': 'errorClusterMemberInUse',
+  'runtime.cluster_start_failed': 'errorClusterStartFailed',
+  'runtime.cluster_unavailable': 'errorClusterUnavailable',
+  'runtime.cluster_member_unused': 'errorClusterMemberUnused',
+  'runtime.cluster_config_unacknowledged': 'errorClusterConfigUnacknowledged',
+  'runtime.cluster_head_disabled': 'errorClusterHeadDisabled',
+  'runtime.cluster_start_cancelled': 'errorClusterStartCancelled',
+  'runtime.cluster_stopping': 'errorClusterStopping',
+  'runtime.cluster_agent_too_old': 'errorClusterAgentTooOld',
+  'runtime.cluster_address_unknown': 'errorClusterAddressUnknown',
+  'runtime.cluster_direct_unavailable': 'errorClusterDirectUnavailable',
+  'runtime.cluster_member_consent_withdrawn': 'errorClusterMemberConsentWithdrawn',
+  'runtime.cluster_member_disabled': 'errorClusterMemberDisabled',
+  'runtime.cluster_member_missing': 'errorClusterMemberMissing',
+  'runtime.cluster_member_no_matching_binary': 'errorClusterMemberNoMatchingBinary',
+  'runtime.cluster_member_spec_invalid': 'errorClusterMemberSpecInvalid',
+  'runtime.cluster_member_unmanaged': 'errorClusterMemberUnmanaged',
+  'runtime.cluster_mesh_unavailable': 'errorClusterMeshUnavailable',
+  'runtime.cluster_port_unknown': 'errorClusterPortUnknown',
+  'runtime_config.agent_features_pending': 'errorRuntimeConfigAgentFeaturesPending',
+  // A Load or benchmark of a cluster head (the model list's load_refusal
+  // cluster_head_unsupported answers under this code too).
+  'runtime.cluster_head_unsupported': 'errorClusterHeadUnsupported',
+  // The watchdog stopped a formed head because it lost a member (the cluster
+  // status names the member's position).
+  'runtime.cluster_member_lost': 'errorClusterMemberLost',
+  'runtime.cluster_head_crashed': 'errorClusterHeadCrashed',
+  // The member usage reset of a server that is no member of the head (404).
+  'runtime_spec.cluster_member_not_found': 'errorClusterMemberNotFound',
+  'runtime.device_backend_mismatch': 'errorRuntimeDeviceBackendMismatch',
+  'runtime.rpc_device_count_mismatch': 'errorRuntimeRpcDeviceCountMismatch',
+  'runtime.rpc_unsupported_build': 'errorRuntimeRpcUnsupportedBuild',
+  'runtime.cluster_version_mismatch': 'errorRuntimeClusterVersionMismatch',
+  'runtime.cluster_member_unreachable': 'errorRuntimeClusterMemberUnreachable',
+  'runtime.bind_mismatch': 'errorRuntimeBindMismatch',
+  'runtime.cluster_not_ready': 'errorRuntimeClusterNotReady',
+  'runtime.instance_busy': 'errorRuntimeInstanceBusy',
+  'runtime.cache_purge_failed': 'errorRuntimeCachePurgeFailed',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',
@@ -409,13 +496,37 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'model.not_allowed': 'errorModelNotAllowed',
 };
 
+/**
+ * The cluster refusals whose message the gateway builds from the server, spec
+ * or binary at fault (clusterErrDetail and rpcMemberInUseMessage in
+ * internal/gateway). The label says what is wrong; the message, appended in
+ * parentheses, says where -- a head with several members is otherwise
+ * refused without naming the one at fault. A refusal about a member the
+ * caller may not see carries the gateway's generic English text instead.
+ */
+const clusterDetailCodes: ReadonlySet<string> = new Set([
+  'runtime_spec.cluster_member_spec_taken',
+  'runtime_spec.cluster_member_spec_disabled',
+  'runtime_spec.cluster_member_rpc_disabled',
+  'runtime_spec.cluster_member_no_matching_binary',
+  'runtime_spec.cluster_head_binary_version_unknown',
+  'runtime_spec.cluster_version_mismatch',
+  'runtime_spec.cluster_mesh_unavailable',
+  'runtime_spec.cluster_lan_address_required',
+  'runtime_spec.cluster_member_budget_required',
+  'runtime_spec.cluster_tensor_split_required',
+  'runtime.cluster_member_in_use',
+]);
+
 export function formatPortalError(err: unknown, t: Translation): string {
   if (err instanceof PortalApiError) {
     if (err.code === 'runtime.agent_feature_missing' && err.feature) {
       return `${err.code}: ${t.errorRuntimeAgentFeatureMissingNamed(err.feature)}`;
     }
     const labelKey = errorLabelByCode[err.code];
-    return `${err.code}: ${labelKey ? t[labelKey] : err.message}`;
+    if (!labelKey) return `${err.code}: ${err.message}`;
+    const detail = clusterDetailCodes.has(err.code) && err.message ? ` (${err.message})` : '';
+    return `${err.code}: ${t[labelKey]}${detail}`;
   }
   return err instanceof Error ? err.message : String(err);
 }
@@ -477,3 +588,16 @@ export function formatDate(value: string | null | undefined, fallback: string): 
   }
   return parsed.toLocaleString();
 }
+
+// Advisory cluster warning codes (RuntimeSpec.cluster_warnings): they never
+// refuse a save, so they are not wire error codes and live in their own map.
+export const clusterWarningLabelByCode: Partial<Record<string, MessageKey>> = {
+  cluster_rpc_devices_not_first: 'clusterWarnRpcDevicesNotFirst',
+  cluster_mmdev_missing: 'clusterWarnMmdevMissing',
+  cluster_cpu_member_without_tensor_split: 'clusterWarnCpuMemberWithoutTensorSplit',
+  cluster_member_shared_host_without_estimate: 'clusterWarnSharedHostWithoutEstimate',
+  cluster_member_budget_below_device: 'clusterWarnBudgetBelowDevice',
+  cluster_member_gpu_overlap: 'clusterWarnGpuOverlap',
+  cluster_relay_mesh_deny_by_default_off: 'clusterWarnRelayMeshDenyOff',
+  cluster_member_version_unknown: 'clusterWarnMemberVersionUnknown',
+};

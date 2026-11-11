@@ -225,13 +225,31 @@ type AIServer struct {
 	// created on it (migration 66, Task 3; enforced in Task 6+). Routing
 	// never reads it (absent from the candidate join).
 	ManagedRuntimeOnly bool
-	Provider           string
-	Endpoint           string
-	Status             string
-	HealthStatus       string
-	LastSeenAt         *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// NetbirdIP is the server's NetBird mesh address (migration 103), the
+	// address an RPC cluster head reaches the server's members on over the
+	// mesh. "" = unknown. Routing never reads it. Written only by the NetBird
+	// state writes, never by UpdateAIServer.
+	NetbirdIP string
+	// LANAddress is the server's LAN address (migration 103) for cluster
+	// networks that bypass NetBird. "" = none. Routing never reads it.
+	LANAddress string
+	// LANBindOnly makes a member listen on LANAddress only instead of every
+	// interface (migration 103).
+	LANBindOnly bool
+	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
+	// cluster member (migration 103).
+	RPCMemberEnabled bool
+	// RPCAllowedHeadGroups is the member side's consent (migration 103): an
+	// opaque JSON array of user-group ids whose cluster heads may use this
+	// server as a member. "[]" = none.
+	RPCAllowedHeadGroups string
+	Provider             string
+	Endpoint             string
+	Status               string
+	HealthStatus         string
+	LastSeenAt           *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 const (
@@ -1321,7 +1339,15 @@ type Certificate struct {
 // lives in NetbirdStateStore; agent tokens live in AgentTokenStore.
 type ServerStore interface {
 	CreateAIServer(ctx context.Context, host AIServer) error
+	// UpdateAIServer writes the server row from host, except netbird_ip: the
+	// mesh address is written only by the NetBird state writes below
+	// (UpdateServerNetbirdState, UpdateServerNetbirdLink, ClearServerNetbirdIP),
+	// so a full-row write from a stale read cannot bring an old one back.
 	UpdateAIServer(ctx context.Context, host AIServer) error
+	// UpdateServerLastSeen writes only last_seen_at and updated_at, the agent
+	// telemetry heartbeat, so a sample cannot write back a row it read before
+	// a concurrent portal save. An unknown id is ErrNotFound.
+	UpdateServerLastSeen(ctx context.Context, id string, lastSeenAt, updatedAt time.Time) error
 	AIServerByID(ctx context.Context, id string) (AIServer, error)
 	AIServers(ctx context.Context) ([]AIServer, error)
 	SetServerHealth(ctx context.Context, serverID, health string) error
@@ -1374,15 +1400,22 @@ type NetbirdStateStore interface {
 	// non-NetBird server flips the flag on).
 	UpdateServerNetbirdKey(ctx context.Context, id string, enabled bool, setupKeyID, groupID string) error
 	// UpdateServerNetbirdLink is the system-admin linkage editor: it sets the
-	// NetBird enabled flag + peer id and RESETS netbird_connected (a targeted
-	// UPDATE), so a stale connection state is not shown until the sync loop
-	// re-confirms from the new peer id.
+	// NetBird enabled flag + peer id and RESETS netbird_connected and netbird_ip
+	// (a targeted UPDATE), so a stale connection state or mesh address is not
+	// shown until the sync loop re-confirms from the new peer id.
 	UpdateServerNetbirdLink(ctx context.Context, id string, enabled bool, peerID string) error
 	// UpdateServerNetbirdState writes the peer-synced server state — the domain
-	// (from the peer's DNS name), the peer id, and the connected flag — as a
-	// targeted UPDATE (only those three columns), so it cannot race a concurrent
-	// full-row write.
-	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID string, connected bool) error
+	// (from the peer's DNS name), the peer id, the peer's mesh IP, and the
+	// connected flag — as a targeted UPDATE (only those four columns), so it
+	// overwrites no other column. A full-row UpdateAIServer from an older read
+	// can still write back the domain, peer id and connected flag (the next
+	// sync pass restores them), never the mesh IP. An empty ip clears
+	// netbird_ip.
+	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
+	// ClearServerNetbirdIP empties only netbird_ip, for a server whose NetBird
+	// flag was turned off (the peer sync no longer refreshes its address). An
+	// unknown id is ErrNotFound.
+	ClearServerNetbirdIP(ctx context.Context, id string) error
 	// UpdateServerNetbirdGroups writes only netbird_group_ids — the opaque JSON
 	// mirror of the peer's policy groups (a targeted UPDATE that touches only that
 	// one column), so it cannot race a concurrent full-row or state write.
@@ -2950,6 +2983,24 @@ type RuntimeSpec struct {
 	// insert and PRESERVED on every later update, so an operator's
 	// full-document save -- which arrives with 0 -- never erases it.
 	StartupMeasuredMS int64
+	// ClusterEnabled marks a head spec that spans llama.cpp RPC members
+	// (migration 103). Operator-owned.
+	ClusterEnabled bool
+	// MemberMode is how members are chosen for a head: "automatic" (the
+	// default; the gateway selects them) or "manual" (migration 103).
+	MemberMode string
+	// ClusterNetwork is the network a head reaches its members on: "mesh" or
+	// "lan"; "" = not chosen (migration 103).
+	ClusterNetwork string
+	// RPCTransport is how head and member talk: "direct" or "relay"; "" = not
+	// chosen (migration 103).
+	RPCTransport string
+	// LANExposureAck records the operator's acknowledgement that a member
+	// reachable on the LAN is exposed outside NetBird (migration 103).
+	LANExposureAck bool
+	// DeviceBackend is the GPU backend the binary was built for: "auto" (the
+	// default), "cuda", "rocm", "vulkan", "metal" or "sycl" (migration 103).
+	DeviceBackend string
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
@@ -3148,6 +3199,43 @@ type ServerGPUBudget struct {
 	UpdatedAt    time.Time
 }
 
+// ServerBinary is one entry of a server's llama.cpp binary inventory
+// (server_binaries, migration 103). Source says who owns the row: "agent" rows
+// are the agent's reported allowlist, replaced on every report; "manual" rows
+// are operator entries. Version is the detected (or entered) version and
+// VersionOverride the operator's correction of it, kept apart so a fresh
+// agent report never erases it; use EffectiveVersion for the one to act on.
+// VersionSource is how Version was determined: "agent", "path" or "manual".
+// Allowed is the agent-reported allowlist status.
+type ServerBinary struct {
+	ServerID        string
+	Path            string
+	Kind            string
+	Version         string
+	VersionOverride string
+	Build           string
+	Commit          string
+	VersionSource   string
+	Source          string
+	Allowed         bool
+	ReportedAt      time.Time
+}
+
+// The server_binaries.source values.
+const (
+	BinarySourceAgent  = "agent"
+	BinarySourceManual = "manual"
+)
+
+// EffectiveVersion is the operator's override when set, else the detected
+// version.
+func (b ServerBinary) EffectiveVersion() string {
+	if b.VersionOverride != "" {
+		return b.VersionOverride
+	}
+	return b.Version
+}
+
 // ServerRuntimeReport is the latest agent-managed runtime configuration
 // reported UPWARD by a server's ServerAgent when it is configured from a
 // local file on the AI server instead of from the gateway
@@ -3265,6 +3353,29 @@ type RuntimeStore interface {
 	// for its server (1:1, upsert-overwrite — mirrors UpsertServerHardware).
 	// An unknown ServerID is ErrNotFound (FK violation).
 	UpsertServerRuntimeReport(ctx context.Context, report ServerRuntimeReport) error
+	// ServerBinaries lists serverID's binary inventory (agent-reported and
+	// manual rows), ordered by path. Always non-nil, empty when none.
+	ServerBinaries(ctx context.Context, serverID string) ([]ServerBinary, error)
+	// ReplaceAgentServerBinaries makes rows the complete set of
+	// source='agent' entries for serverID in one transaction: agent rows
+	// absent from rows are deleted, the rest are inserted or refreshed. It
+	// never touches source='manual' rows, never changes VersionOverride of a
+	// surviving row, and skips a reported path a manual row already owns.
+	// rows' ServerID and Source are ignored (forced to serverID and 'agent').
+	// Unknown serverID is ErrNotFound.
+	ReplaceAgentServerBinaries(ctx context.Context, serverID string, rows []ServerBinary) error
+	// UpsertManualServerBinary inserts or updates the operator-entered row at
+	// (b.ServerID, b.Path) with source='manual' and version_source='manual'.
+	// A path an agent row owns is ErrConflict (override its version with
+	// SetServerBinaryVersionOverride instead); unknown server is ErrNotFound.
+	UpsertManualServerBinary(ctx context.Context, b ServerBinary) error
+	// DeleteManualServerBinary removes the manual row at (serverID, path);
+	// ErrNotFound when there is none (an agent row is never deleted here).
+	DeleteManualServerBinary(ctx context.Context, serverID, path string) error
+	// SetServerBinaryVersionOverride sets (or, with "", clears) the operator's
+	// version correction on the row at (serverID, path) of either source;
+	// ErrNotFound when the row does not exist.
+	SetServerBinaryVersionOverride(ctx context.Context, serverID, path, version string) error
 	// ServerRuntimeReportByServer returns the latest runtime report for
 	// serverID; ok is false when no report has ever been stored for that
 	// server (not an error) — mirrors ServerHardwareByServer.
@@ -3416,6 +3527,7 @@ type Store interface {
 	LimitsStore
 	CertificateStore
 	RuntimeStore
+	RPCClusterStore
 	VendorAccountStore
 }
 
@@ -3454,4 +3566,173 @@ func applicationServesEndpoint(app Application, fineFlavor string) bool {
 	default:
 		return applicationHasAPIFlavor(app, NormalizeAPIFlavor(fineFlavor))
 	}
+}
+
+// RPCMemberSpec is an operator-defined (manual) llama.cpp RPC member: one
+// member process on ServerID (rpc_member_specs, migration 104). Binary, Args
+// and Env are the operator's launch settings; AllowedHeadGroups is the member
+// side's consent, an opaque JSON array of user-group ids.
+type RPCMemberSpec struct {
+	ID                string
+	ServerID          string
+	Enabled           bool
+	Binary            string
+	Args              string
+	Env               string
+	CacheEnabled      bool
+	DeviceBackend     string
+	RAMEstimateMB     int
+	AllowedHeadGroups string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// RPCMemberSpecGPU is one GPU a manual member serves, keyed by (SpecID,
+// GPUIndex).
+type RPCMemberSpecGPU struct {
+	SpecID         string
+	GPUIndex       int
+	Position       int
+	VRAMEstimateMB int
+}
+
+// ClusterMember is one member of a cluster head's membership
+// (rpc_cluster_members), keyed by (HeadSpecID, ServerID) and ordered by
+// Position. MemberSpecID names the manual member spec; "" is an automatic
+// member, whose settings (Threads, CacheEnabled, DeviceBackend, RAMEstimateMB)
+// and Port live here instead. The measured and run-peak fields are usage the
+// agent reported for this head; the zero time means "not yet".
+type ClusterMember struct {
+	HeadSpecID      string
+	Position        int
+	ServerID        string
+	MemberSpecID    string
+	Threads         int
+	CacheEnabled    bool
+	DeviceBackend   string
+	RAMEstimateMB   int
+	Port            int
+	RAMMeasuredMB   int
+	MeasuredAt      time.Time
+	Stale           bool
+	RunPeakRAMMB    int
+	RunHeadInstance int
+	RunStartedAt    time.Time
+}
+
+// ClusterMemberGPU is one GPU of a membership row (rpc_cluster_member_gpus),
+// keyed by (HeadSpecID, ServerID, GPUIndex); it disappears with its membership
+// row.
+type ClusterMemberGPU struct {
+	HeadSpecID     string
+	ServerID       string
+	GPUIndex       int
+	Position       int
+	VRAMEstimateMB int
+	VRAMMeasuredMB int
+	RunPeakVRAMMB  int
+}
+
+// RPCSession records that head instance Instance of HeadSpecID used
+// MemberServerID from Since; Until is nil while the session is open.
+type RPCSession struct {
+	HeadSpecID     string
+	Instance       int
+	MemberServerID string
+	Since          time.Time
+	Until          *time.Time
+}
+
+// RPCClusterStore persists llama.cpp RPC cluster members, membership and
+// sessions (migration 104).
+type RPCClusterStore interface {
+	// UpsertRPCMemberSpec inserts or updates the manual member spec by ID,
+	// keeping CreatedAt on update. An unknown ServerID is ErrNotFound.
+	UpsertRPCMemberSpec(ctx context.Context, s RPCMemberSpec) error
+	// RPCMemberSpecByID returns the spec; ok is false when it does not exist.
+	RPCMemberSpecByID(ctx context.Context, id string) (RPCMemberSpec, bool, error)
+	// RPCMemberSpecsByServer lists serverID's member specs ordered by ID.
+	// Always non-nil.
+	RPCMemberSpecsByServer(ctx context.Context, serverID string) ([]RPCMemberSpec, error)
+	// DeleteRPCMemberSpec removes the spec and its GPU rows; ErrNotFound when
+	// it does not exist.
+	DeleteRPCMemberSpec(ctx context.Context, id string) error
+	// SetRPCMemberSpecGPUs atomically replaces specID's GPU rows. An unknown
+	// spec is ErrNotFound, a duplicate GPUIndex ErrConflict.
+	SetRPCMemberSpecGPUs(ctx context.Context, specID string, gpus []RPCMemberSpecGPU) error
+	// RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then
+	// index. Always non-nil.
+	RPCMemberSpecGPUs(ctx context.Context, specID string) ([]RPCMemberSpecGPU, error)
+	// ReplaceRPCMemberSpec is UpsertRPCMemberSpec and SetRPCMemberSpecGPUs
+	// in one transaction: the spec and exactly gpus as its GPU rows are
+	// stored together, or nothing is. An unknown ServerID is ErrNotFound, a
+	// duplicate GPUIndex ErrConflict.
+	ReplaceRPCMemberSpec(ctx context.Context, s RPCMemberSpec, gpus []RPCMemberSpecGPU) error
+	// SetClusterMembers atomically replaces every membership row (and its GPU
+	// rows) of headSpecID. Carrying measured fields over per (server,
+	// gpu_index) is the caller's job. An unknown head or member server is
+	// ErrNotFound; a duplicate position, a duplicate server, or a manual
+	// member spec already used by another membership row is ErrConflict.
+	SetClusterMembers(ctx context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error
+	// SetClusterMembersIf is SetClusterMembers, but only while the stored
+	// rows still carry what the caller read them as: exactly the membership
+	// rows of expect (by server) with the same RAMMeasuredMB, Stale,
+	// RunPeakRAMMB, RunHeadInstance and RunStartedAt, and exactly the GPU
+	// rows of expectGPUs (by server and index) with the same VRAMMeasuredMB
+	// and RunPeakVRAMMB. A usage write, a run begun or ended, or any other
+	// rewrite since then makes it store nothing and report applied false, so
+	// a caller that carries measured values over never writes back an older
+	// read of them. MeasuredAt is not compared: it only moves with the
+	// values. Errors are SetClusterMembers'.
+	SetClusterMembersIf(ctx context.Context, headSpecID string, expect []ClusterMember, expectGPUs []ClusterMemberGPU, members []ClusterMember, gpus []ClusterMemberGPU) (applied bool, err error)
+	// ClusterMembers returns headSpecID's membership ordered by position and
+	// its GPU rows ordered by server, position, index. Both always non-nil.
+	ClusterMembers(ctx context.Context, headSpecID string) ([]ClusterMember, []ClusterMemberGPU, error)
+	// ClusterMembershipsByServer is the reverse index: every membership row
+	// whose member is serverID, ordered by head spec ID. Always non-nil.
+	ClusterMembershipsByServer(ctx context.Context, serverID string) ([]ClusterMember, error)
+	// ClusterMemberBySpec returns the membership row that uses the manual
+	// member spec; ok is false when none does.
+	ClusterMemberBySpec(ctx context.Context, memberSpecID string) (ClusterMember, bool, error)
+	// UpdateClusterMemberUsage writes the measured fields (RAMMeasuredMB,
+	// MeasuredAt, Stale, RunPeakRAMMB) of the existing membership row m and
+	// the measured fields (VRAMMeasuredMB, RunPeakVRAMMB) of each given GPU
+	// row, but only while the stored row is still in the run the caller read:
+	// its run_started_at equals m.RunStartedAt (the zero time matches no run).
+	// It never writes the run identity (RunStartedAt, RunHeadInstance). A
+	// membership rewrite in between that reset the run -- a change of the
+	// distribution, which also marks the values stale -- makes it write
+	// nothing and report applied false, so a value read before that rewrite
+	// is never written back over it. A missing row is ErrNotFound; a GPU row
+	// that does not exist is skipped.
+	UpdateClusterMemberUsage(ctx context.Context, m ClusterMember, gpus []ClusterMemberGPU) (applied bool, err error)
+	// BeginClusterMemberRun stamps every membership row of headSpecID with a
+	// new run (RunStartedAt = startedAt, RunHeadInstance = headInstance) and
+	// clears the run peaks of the rows and their GPU rows.
+	BeginClusterMemberRun(ctx context.Context, headSpecID string, startedAt time.Time, headInstance int) error
+	// EndClusterMemberRun clears the run of serverID's membership row of
+	// headSpecID (RunStartedAt, RunHeadInstance and the run peaks of the row
+	// and its GPU rows) when the row is in the run that started at
+	// startedAt; ended reports whether it was. A missing row is ErrNotFound.
+	EndClusterMemberRun(ctx context.Context, headSpecID, serverID string, startedAt time.Time) (ended bool, err error)
+	// OpenRPCSession appends an open session.
+	OpenRPCSession(ctx context.Context, s RPCSession) error
+	// CloseRPCSessions sets Until on every open session of (headSpecID,
+	// instance, memberServerID); closing none is not an error.
+	CloseRPCSessions(ctx context.Context, headSpecID string, instance int, memberServerID string, until time.Time) error
+	// RPCSessionsAt lists the sessions of (headSpecID, instance) in force at
+	// at: Since <= at and (Until nil or Until >= at), ordered by Since, then
+	// member server ID. Always non-nil.
+	RPCSessionsAt(ctx context.Context, headSpecID string, instance int, at time.Time) ([]RPCSession, error)
+	// OpenRPCSessionsByMember lists the open sessions (Until nil) on
+	// memberServerID, of every head and instance, ordered by head spec ID,
+	// then instance, then Since. Always non-nil.
+	OpenRPCSessionsByMember(ctx context.Context, memberServerID string) ([]RPCSession, error)
+	// OpenRPCSessions lists every open session (Until nil), ordered by member
+	// server ID, then head spec ID, instance and Since. Always non-nil.
+	OpenRPCSessions(ctx context.Context) ([]RPCSession, error)
+	// PruneRPCSessions deletes every closed session whose Until is before
+	// before; an open session is never pruned. Sessions are kept like
+	// telemetry: the telemetry retention loop calls it with its cutoff.
+	PruneRPCSessions(ctx context.Context, before time.Time) error
 }

@@ -16,10 +16,13 @@ const defaultAgentPresenceWindow = 180 * time.Second
 // freshness window. In-memory, nil-safe; one shared instance is written by the
 // agent-ingest handler and read by the app-health loop.
 type AgentPresenceRegistry struct {
-	mu     sync.RWMutex
-	seen   map[string]time.Time
-	window time.Duration
-	now    func() time.Time
+	mu   sync.RWMutex
+	seen map[string]time.Time
+	// offsets holds each agent's clock offset from its latest telemetry
+	// sample (ReportClockOffset).
+	offsets map[string]time.Duration
+	window  time.Duration
+	now     func() time.Time
 }
 
 func NewAgentPresenceRegistry(window time.Duration) *AgentPresenceRegistry {
@@ -27,9 +30,10 @@ func NewAgentPresenceRegistry(window time.Duration) *AgentPresenceRegistry {
 		window = defaultAgentPresenceWindow
 	}
 	return &AgentPresenceRegistry{
-		seen:   make(map[string]time.Time),
-		window: window,
-		now:    func() time.Time { return time.Now().UTC() },
+		seen:    make(map[string]time.Time),
+		offsets: make(map[string]time.Duration),
+		window:  window,
+		now:     func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -94,6 +98,31 @@ func (r *AgentPresenceRegistry) ReportReactivated(serverID string, window time.D
 	return !had || now.Sub(prev) > window
 }
 
+// ReportClockOffset records serverID's agent clock offset: the time stamp the
+// agent put on its latest telemetry sample minus the gateway's receive time
+// of it (positive = the agent's clock runs ahead). No-op on nil or empty id.
+func (r *AgentPresenceRegistry) ReportClockOffset(serverID string, offset time.Duration) {
+	if r == nil || serverID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.offsets[serverID] = offset
+	r.mu.Unlock()
+}
+
+// ClockOffset returns serverID's latest agent clock offset (see
+// ReportClockOffset); ok is false for a nil registry or an agent that has
+// not reported a time stamp since the gateway started.
+func (r *AgentPresenceRegistry) ClockOffset(serverID string) (time.Duration, bool) {
+	if r == nil {
+		return 0, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	offset, ok := r.offsets[serverID]
+	return offset, ok
+}
+
 // Retain evicts entries for servers not in the live set (bounds memory).
 func (r *AgentPresenceRegistry) Retain(live map[string]struct{}) {
 	if r == nil {
@@ -104,6 +133,11 @@ func (r *AgentPresenceRegistry) Retain(live map[string]struct{}) {
 	for id := range r.seen {
 		if _, ok := live[id]; !ok {
 			delete(r.seen, id)
+		}
+	}
+	for id := range r.offsets {
+		if _, ok := live[id]; !ok {
+			delete(r.offsets, id)
 		}
 	}
 }

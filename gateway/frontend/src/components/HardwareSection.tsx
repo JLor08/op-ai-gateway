@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { Box, Table, TableBody, TableCell, TableHead, TableRow, Typography } from '@mui/material';
+import type { ReactNode } from 'react';
+import {
+  Box,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
+  Tooltip,
+  Typography,
+} from '@mui/material';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import type { HardwareReport, PortalServer } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
@@ -18,7 +29,7 @@ function dash(s: string | undefined): string {
 }
 
 // A labeled key/value grid group (System / CPU / Mainboard / BIOS).
-function KVGroup({ title, rows }: Readonly<{ title: string; rows: [string, string][] }>) {
+function KVGroup({ title, rows }: Readonly<{ title: string; rows: [string, ReactNode][] }>) {
   const visible = rows.filter(([, v]) => v !== '—');
   if (visible.length === 0) return null;
   return (
@@ -39,6 +50,67 @@ function KVGroup({ title, rows }: Readonly<{ title: string; rows: [string, strin
         </TableBody>
       </Table>
     </Box>
+  );
+}
+
+// Energy attribution covers a host's request window from that host's own
+// samples and accepts telemetry gaps up to 2 s; an agent clock off by more
+// than that moves its samples out of the window, and the host's energy share
+// drops to the estimate. A smaller offset shifts the window by no more than
+// the gap attribution already tolerates, so only a larger one is flagged.
+const clockOffsetWarnMs = 2000;
+
+function formatClockOffset(ms: number): string {
+  return `${ms > 0 ? '+' : ''}${ms} ms`;
+}
+
+/**
+ * The agent's clock offset (the server DTO's clock_offset_ms), a diagnostic for
+ * energy attribution and telemetry timing on every agent-reporting server.
+ */
+function AgentClockOffset({
+  offsetMs,
+  t,
+}: Readonly<{ offsetMs: number | null | undefined; t: Translation }>) {
+  const known = typeof offsetMs === 'number';
+  const warning = known && Math.abs(offsetMs) > clockOffsetWarnMs;
+  const text = known ? formatClockOffset(offsetMs) : t.agentClockOffsetUnknown;
+  // The span is focusable so the diagnostic tooltip opens from the keyboard
+  // too, and a flagged offset carries an icon with its own name, so the
+  // warning does not rest on colour and weight alone.
+  return (
+    <Tooltip
+      title={
+        <Box sx={{ display: 'grid', gap: 0.5 }}>
+          <span>{t.agentClockOffsetHelp}</span>
+          {warning && <span>{t.agentClockOffsetWarn}</span>}
+        </Box>
+      }
+    >
+      <Typography
+        variant="body2"
+        color={warning ? 'warning.main' : 'text.secondary'}
+        data-testid="agent-clock-offset"
+        data-warning={String(warning)}
+        component="span"
+        tabIndex={0}
+        sx={{
+          fontWeight: warning ? 600 : undefined,
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 0.5,
+        }}
+      >
+        {warning && (
+          <WarningAmberIcon
+            fontSize="small"
+            color="warning"
+            titleAccess={t.agentClockOffsetWarnLabel}
+          />
+        )}
+        {text}
+      </Typography>
+    </Tooltip>
   );
 }
 
@@ -101,6 +173,10 @@ export function HardwareSection({
             [t.hardwareArch, dash(report.arch)],
             [t.hardwareHostname, dash(report.hostname)],
             [t.hardwareAgentVersion, dash(report.agent_version)],
+            [
+              t.agentClockOffset,
+              <AgentClockOffset key="clock" offsetMs={server.clock_offset_ms} t={t} />,
+            ],
             [t.hardwareCollectedAt, collected],
           ]}
         />

@@ -292,6 +292,7 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 		{errBenchmarkScopeUnmeasurable, "benchmark.speech_unavailable", "no model in the run's scope can be measured: each serves only images, or serves audio only and cannot be measured yet (it has no speech or transcription verdict, or it clones a voice and lists no preset voice)"},
 		{errBenchmarkAgentEnsureUnsupported, "benchmark.agent_ensure_unsupported", "this model serves only images, and starting it without a chat prompt needs the agent feature runtime_ensure (agent 0.8.0 or newer), or the agent has not reported since the gateway restarted"},
 		{errBenchmarkSpecForceStopped, "benchmark.spec_force_stopped", "this model's runtime spec is force-stopped; clear the admin override before loading it"},
+		{errBenchmarkClusterHeadUnsupported, "runtime.cluster_head_unsupported", "this model is a llama.cpp RPC cluster head, which loads and benchmarks do not support yet; it starts with its members when a request needs it"},
 	} {
 		rec := httptest.NewRecorder()
 		writeBenchmarkError(rec, tc.err)
@@ -323,18 +324,19 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 	}
 }
 
-// Each Load refusal reason is the suffix of the code its sentinel answers,
-// and the set is closed: the model list carries the same strings.
+// Each Load refusal reason is the last part of the code its sentinel answers
+// (benchmark.<reason>, or runtime.<reason> for the cluster head's), and the
+// set is closed: the model list carries the same strings.
 func TestLoadRefusalReasonsNameTheirCodes(t *testing.T) {
 	reasons := make([]string, 0, len(loadRefusalErrs))
 	for reason, err := range loadRefusalErrs {
 		reasons = append(reasons, reason)
-		if err.Error() != "benchmark."+reason {
-			t.Fatalf("loadRefusalErrs[%q] = %q, want benchmark.%s", reason, err.Error(), reason)
+		if err.Error() != "benchmark."+reason && err.Error() != "runtime."+reason {
+			t.Fatalf("loadRefusalErrs[%q] = %q, want benchmark.%s or runtime.%s", reason, err.Error(), reason, reason)
 		}
 	}
 	slices.Sort(reasons)
-	if want := []string{"agent_ensure_unsupported", "audio_only", "images_only", "spec_force_stopped"}; !reflect.DeepEqual(reasons, want) {
+	if want := []string{"agent_ensure_unsupported", "audio_only", "cluster_head_unsupported", "images_only", "spec_force_stopped"}; !reflect.DeepEqual(reasons, want) {
 		t.Fatalf("load refusal reasons = %v, want %v", reasons, want)
 	}
 }
@@ -994,4 +996,45 @@ func TestStartVRAMProbeRefusesAnUnreadableSpec(t *testing.T) {
 		t.Fatalf("status = %d code = %q, want 500 %s", status, code, codeBenchmarkRequestFailed)
 	}
 	f.assertNothingReserved(t)
+}
+
+// TestLoadBenchmarkRefusesClusterHead: a generating Load, a VRAM run and the
+// speed, capacity and both modes cannot run on a llama.cpp RPC cluster head:
+// it starts only members first, through the cluster orchestration, and a VRAM
+// run would measure the head's own share alone. Each refuses with 409
+// runtime.cluster_head_unsupported before it reserves anything, and an
+// application- or server-scope run skips a head (cluster_head).
+func TestLoadBenchmarkRefusesClusterHead(t *testing.T) {
+	text := []string{routing.APIFlavorOpenAI}
+	agentApp := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: text}
+	head := routing.RuntimeSpec{APIFlavors: text, ClusterEnabled: true}
+	if got := loadRefusal(agentApp, head, true, true); got != loadRefusalClusterHead {
+		t.Fatalf("loadRefusal(head) = %q, want %q", got, loadRefusalClusterHead)
+	}
+	head.AdminState = vramAdminStateForceStopped
+	if got := loadRefusal(agentApp, head, true, true); got != loadRefusalClusterHead {
+		t.Fatalf("loadRefusal(force-stopped head) = %q, want %q: clearing the override would not make the Load possible", got, loadRefusalClusterHead)
+	}
+
+	f := newRefusalFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	if err := f.specs.Store.CreateMapping(ctx, routing.ModelMapping{ID: "rf_head", ApplicationID: "rf_agent", GatewayModelName: "gw-rf_head", AppModelName: "up-rf_head", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := f.specs.Store.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "rs_rf_head", MappingID: "rf_head", Enabled: true, ClusterEnabled: true, StartupTimeoutSeconds: 60, Binary: "/opt/bin/server", Args: "[]", Env: "{}", HealthPath: "/health", APIFlavors: text, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	for _, path := range []string{"/api/portal/mappings/rf_head/load", "/api/portal/mappings/rf_head/probe-vram", "/api/portal/mappings/rf_head/benchmark?mode=speed"} {
+		status, code, body := f.post(t, path)
+		if status != http.StatusConflict || code != codeClusterHeadUnsupported {
+			t.Fatalf("POST %s = %d %s, want 409 %s", path, status, body, codeClusterHeadUnsupported)
+		}
+		f.assertNothingReserved(t)
+	}
+
+	p := f.srv.partitionBenchmarkViews(ctx, []portal.BenchmarkTargetView{{App: routing.Application{ID: "rf_agent", Type: routing.ProviderServerAgent, APIFlavors: text}, Mapping: routing.ModelMapping{ID: "rf_head", GatewayModelName: "gw-rf_head"}}}, true)
+	if len(p.runnable) != 0 || len(p.recorded) != 1 || p.recorded[0].Skipped != benchmarkSkippedClusterHead || p.clusterHeads != 1 {
+		t.Fatalf("partition = %+v, want the head skipped as %s", p, benchmarkSkippedClusterHead)
+	}
 }

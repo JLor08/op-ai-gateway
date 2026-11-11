@@ -135,6 +135,10 @@ var migrations = []migration{
 	{version: 100, name: "runtime_spec_instances", up: migration100Up},
 	{version: 101, name: "model_mapping_audio_metrics", up: migration101Up},
 	{version: 102, name: "route_affinity_instance", up: migration102Up},
+	{version: 103, name: "rpc_cluster_columns", up: migration103Up},
+	{version: 104, name: "rpc_cluster_tables", up: migration104Up},
+	{version: 105, name: "usage_event_hosts", up: migration105Up},
+	{version: 106, name: "rpc_member_port_unique", up: migration106Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4524,4 +4528,227 @@ func migration101Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // (TestMigration42RouteAffinityNullableUpgrade does).
 func migration102Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "route_affinity", "instance integer not null default 0")
+}
+
+// migration103Up adds the llama.cpp RPC cluster columns and the per-server
+// binary inventory.
+//
+// agent_runtime_specs gains the head/member settings: cluster_enabled (a head
+// that spans RPC members) and lan_exposure_ack (the operator's acknowledgement
+// that a LAN-bound member is reachable without NetBird) are integer-booleans
+// defaulting to 0; member_mode defaults to 'automatic', device_backend to
+// 'auto', and cluster_network / rpc_transport to the empty string, which reads
+// as "not chosen" and is only meaningful while cluster_enabled. Every spec
+// that existed before is therefore exactly the model spec it was.
+//
+// ai_servers gains the member-side addressing and consent: netbird_ip and
+// lan_address (the addresses a head may reach the member on), lan_bind_only,
+// rpc_member_enabled (the server offers automatic RPC members) and
+// rpc_allowed_head_groups (an opaque JSON array of group ids, '[]' = none).
+//
+// server_binaries is the inventory of llama.cpp binaries per server, keyed by
+// (server_id, path). Rows with source 'agent' are the agent's reported
+// allowlist and are replaced on every report; rows with source 'manual' are
+// operator entries (a file-mode agent never reports). version_override is the
+// operator's correction of a detected version: it lives in its own column so
+// replacing the agent's report never touches it. allowed is the agent-reported
+// allowlist status and reported_at the report time.
+//
+// Append-only: no existing migration or the v60-frozen baseline is touched;
+// addColumnIfMissing and `create table if not exists` make the step replayable
+// on both dialects.
+func migration103Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"cluster_enabled integer not null default 0",
+		"member_mode text not null default 'automatic'",
+		"cluster_network text not null default ''",
+		"rpc_transport text not null default ''",
+		"lan_exposure_ack integer not null default 0",
+		"device_backend text not null default 'auto'",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", col); err != nil {
+			return err
+		}
+	}
+	for _, col := range []string{
+		"netbird_ip text not null default ''",
+		"lan_address text not null default ''",
+		"lan_bind_only integer not null default 0",
+		"rpc_member_enabled integer not null default 0",
+		"rpc_allowed_head_groups text not null default '[]'",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
+			return err
+		}
+	}
+	ts := dl.timestampType()
+	return execTx(ctx, tx, dl, `create table if not exists server_binaries (
+		server_id text not null references ai_servers(id) on delete cascade,
+		path text not null,
+		kind text not null default '',
+		version text not null default '',
+		version_override text not null default '',
+		build text not null default '',
+		"commit" text not null default '',
+		version_source text not null default '',
+		source text not null default 'agent',
+		allowed integer not null default 0,
+		reported_at `+ts+` not null,
+		primary key (server_id, path)
+	)`)
+}
+
+// migration104Up adds the llama.cpp RPC cluster membership tables.
+//
+// rpc_member_specs holds an operator-defined (manual) member: one row per
+// member process on a server, with its binary, operator args, environment and
+// RAM estimate, plus allowed_head_groups (an opaque JSON array of user-group
+// ids, the member side's consent). rpc_member_spec_gpus lists the GPUs such a
+// member serves, keyed by (spec_id, gpu_index). Both cascade from the server
+// (and the GPU rows from the spec), so a deleted server leaves no member spec.
+//
+// rpc_cluster_members is the membership of a head spec: one row per member
+// server, ordered by position. Unique (head_spec_id, position) keeps the order
+// well defined and unique (head_spec_id, server_id) lets a server join a head
+// once; the latter is also the target of the composite FK the per-member GPU
+// rows use, so they vanish with their membership row. member_spec_id names the
+// manual member spec (empty = automatic member, which has no spec row); a partial
+// unique index on it where it is not empty makes a manual spec serve one head
+// only. A head spec or a server that is deleted takes its membership with it.
+// The measured / run-peak columns are usage the agent reports: ram_measured_mb
+// with measured_at (NULL until measured) and stale, run_peak_ram_mb with the
+// head instance and start time of the run that produced it.
+//
+// rpc_sessions records which member a head instance used and when: since, and
+// until while the session is open (NULL). The indexes serve the per-instance
+// lookup and the per-member time-range scan.
+//
+// Every statement is `if not exists`, so the step replays on both dialects.
+func migration104Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	for _, stmt := range []string{
+		`create table if not exists rpc_member_specs (
+			id text primary key,
+			server_id text not null references ai_servers(id) on delete cascade,
+			enabled integer not null default 1,
+			binary_path text not null default '',
+			args text not null default '',
+			env text not null default '',
+			cache_enabled integer not null default 0,
+			device_backend text not null default 'auto',
+			ram_estimate_mb integer not null default 0,
+			allowed_head_groups text not null default '[]',
+			created_at ` + ts + ` not null,
+			updated_at ` + ts + ` not null
+		)`,
+		`create index if not exists idx_rpc_member_specs_server on rpc_member_specs(server_id)`,
+		`create table if not exists rpc_member_spec_gpus (
+			spec_id text not null references rpc_member_specs(id) on delete cascade,
+			gpu_index integer not null,
+			position integer not null default 0,
+			vram_estimate_mb integer not null default 0,
+			primary key (spec_id, gpu_index)
+		)`,
+		`create table if not exists rpc_cluster_members (
+			head_spec_id text not null references agent_runtime_specs(id) on delete cascade,
+			position integer not null,
+			server_id text not null references ai_servers(id) on delete cascade,
+			member_spec_id text not null default '',
+			threads integer not null default 0,
+			cache_enabled integer not null default 0,
+			device_backend text not null default 'auto',
+			ram_estimate_mb integer not null default 0,
+			port integer not null default 0,
+			ram_measured_mb integer not null default 0,
+			measured_at ` + ts + `,
+			stale integer not null default 0,
+			run_peak_ram_mb integer not null default 0,
+			run_head_instance integer not null default 0,
+			run_started_at ` + ts + `,
+			primary key (head_spec_id, server_id),
+			unique (head_spec_id, position)
+		)`,
+		`create index if not exists idx_rpc_cluster_members_server on rpc_cluster_members(server_id)`,
+		`create unique index if not exists idx_rpc_cluster_members_member_spec
+			on rpc_cluster_members(member_spec_id) where member_spec_id <> ''`,
+		`create table if not exists rpc_cluster_member_gpus (
+			head_spec_id text not null,
+			server_id text not null,
+			gpu_index integer not null,
+			position integer not null default 0,
+			vram_estimate_mb integer not null default 0,
+			vram_measured_mb integer not null default 0,
+			run_peak_vram_mb integer not null default 0,
+			primary key (head_spec_id, server_id, gpu_index),
+			foreign key (head_spec_id, server_id)
+				references rpc_cluster_members(head_spec_id, server_id) on delete cascade
+		)`,
+		`create table if not exists rpc_sessions (
+			head_spec_id text not null,
+			instance integer not null default 0,
+			member_server_id text not null,
+			since ` + ts + ` not null,
+			until ` + ts + `
+		)`,
+		`create index if not exists idx_rpc_sessions_head on rpc_sessions(head_spec_id, instance)`,
+		`create index if not exists idx_rpc_sessions_member on rpc_sessions(member_server_id, since)`,
+	} {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration105Up adds the per-host rows of a usage event.
+//
+// usage_event_hosts lists every server that served an event: a cluster
+// request names its head and each RPC member, so overlap queries on a member
+// server also find the cluster events it took part in. created_at copies the
+// event's created_at so the (server_id, created_at) index answers the window
+// scan without a join. usage_event_energy_parts splits an event's energy per
+// host (watt-hours, the marginal share and the derivation source) so each
+// host can be priced separately. Both cascade from usage_events and the
+// (event_id, server_id) key keeps a host listed once per event.
+//
+// Every statement is `if not exists`, so the step replays on both dialects.
+func migration105Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	for _, stmt := range []string{
+		`create table if not exists usage_event_hosts (
+			event_id text not null references usage_events(id) on delete cascade,
+			server_id text not null,
+			role text not null default 'head',
+			created_at ` + ts + ` not null,
+			primary key (event_id, server_id)
+		)`,
+		`create index if not exists idx_usage_event_hosts_server on usage_event_hosts(server_id, created_at)`,
+		`create table if not exists usage_event_energy_parts (
+			event_id text not null references usage_events(id) on delete cascade,
+			server_id text not null,
+			role text not null default 'head',
+			wh double precision not null default 0,
+			marginal_wh double precision not null default 0,
+			source text not null default '',
+			primary key (event_id, server_id)
+		)`,
+	} {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration106Up makes a member's RPC port unique on its server: a partial
+// unique index on rpc_cluster_members(server_id, port) for every allocated
+// port (0 = none yet). The portal allocates the lowest free port in the RPC
+// range under a process-local lock, so two gateway processes saving heads
+// at the same time could pick the same port on one server; the index turns
+// the second write into a conflict the portal retries. The membership table
+// is new in migration 104 and its rows come only from that allocator, so no
+// stored data can violate the index. `if not exists`, so the step replays.
+func migration106Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return execTx(ctx, tx, dl, `create unique index if not exists idx_rpc_cluster_members_server_port
+		on rpc_cluster_members(server_id, port) where port <> 0`)
 }

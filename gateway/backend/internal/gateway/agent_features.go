@@ -77,7 +77,21 @@ import (
 // every spec as its one process (runtime.Driver.Sync). A gateway build without
 // the name therefore never receives two rows for one spec, which it would read
 // as one spec flapping between them.
-var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature, runtimeInstancesFeature}
+//
+// rpc_cluster is one-sided the same way: the agent declares the identical
+// string for what it runs, and each side reads the other's. This gateway's
+// declaration (rpcClusterFeature) says its runtime documents may carry
+// rpc_server member specs and cluster heads; the agent honours a document's
+// kind, cluster and rpc fields only while this list carries the name, so a
+// file-mode document or an older gateway can never start a member as a model.
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature, runtimeInstancesFeature, rpcClusterFeature}
+
+// rpcClusterFeature says this gateway derives llama.cpp RPC cluster heads and
+// their rpc_server members into runtime documents; the agent's declaration of
+// the same string says it runs them, and a cluster is derived only while every
+// agent of it declares it (portal.AgentFeatureRPCCluster, the module's one
+// spelling, through which the document reads the agent's declaration).
+const rpcClusterFeature = portal.AgentFeatureRPCCluster
 
 // runtimeInstancesFeature says this gateway understands the status of an agent
 // that runs several instances of one replicable runtime spec (#340): one status

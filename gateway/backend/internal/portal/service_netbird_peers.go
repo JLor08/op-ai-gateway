@@ -126,6 +126,9 @@ func (s *Service) RegenerateNetbirdKey(ctx context.Context, principal auth.Token
 	// server / first enrollment skips this entirely). Best-effort throughout — a
 	// NetBird error is Debug-logged and never aborts key generation.
 	if server.NetbirdPeerID != "" || server.NetbirdGroupID != "" {
+		// Clearing the peer linkage clears the mesh IP every cluster of the
+		// server addresses it by.
+		defer s.NotifyClustersOfServer(ctx, server.ID)
 		ncfg := netbird.Config{URL: cfg.URL, Token: cfg.Token}
 		if server.NetbirdGroupID != "" {
 			if g, gErr := netbird.GetGroup(ctx, ncfg, netbirdCallTimeout, server.NetbirdGroupID); gErr == nil {
@@ -147,7 +150,7 @@ func (s *Service) RegenerateNetbirdKey(ctx context.Context, principal auth.Token
 		}
 		// Clear the local linkage so the sync doesn't keep resolving the deleted peer;
 		// the domain is preserved (never-clear-domain).
-		if uErr := s.routes.UpdateServerNetbirdState(ctx, server.ID, server.Domain, "", false); uErr != nil {
+		if uErr := s.routes.UpdateServerNetbirdState(ctx, server.ID, server.Domain, "", "", false); uErr != nil {
 			slog.Debug("netbird: clear peer linkage on regenerate failed", "server_id", server.ID, "error", uErr)
 		}
 	}
@@ -288,6 +291,7 @@ func (s *Service) ReconcileAllServerNetbird(ctx context.Context) {
 		if policies, lErr := netbird.ListPolicies(ctx, ncfg, netbirdCallTimeout); lErr != nil {
 			slog.Debug("reconcile all: list policies", "error", lErr)
 		} else {
+			s.recordDefaultPolicyState(ctx, policies)
 			for _, server := range servers {
 				if !server.NetbirdEnabled {
 					continue
@@ -303,6 +307,8 @@ func (s *Service) ReconcileAllServerNetbird(ctx context.Context) {
 			// Fleet-wide ICMP ping-allow policies (same snapshot, same lock).
 			s.reconcilePingGatewayPolicyWith(ctx, ncfg, set, servers, policies)
 			s.reconcilePingServersPolicyWith(ctx, ncfg, set, servers, policies)
+			// Per-member RPC cluster policies (same snapshot, same lock).
+			s.reconcileRPCPoliciesWith(ctx, ncfg, servers, policies)
 		}
 		s.netbird.policyMu.Unlock()
 	}
@@ -509,6 +515,10 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 			}
 		}
 	}
+	// NetBird enablement, the tracking group, the mesh IP and the Domain shape
+	// every cluster of the server (NotifyClustersOfServer); each write below
+	// can move one, also when a later step fails. Nothing above wrote.
+	defer s.NotifyClustersOfServer(ctx, id)
 	// Disable: delete the per-server tracking group (best-effort, only when one was
 	// stored + the module is configured) and ALWAYS clear the local linkage (group
 	// id + policy-group mirror) alongside the disable link write (which also resets
@@ -588,7 +598,7 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 				if peer.DNSLabel != "" {
 					domain = peer.DNSLabel
 				}
-				_ = s.routes.UpdateServerNetbirdState(ctx, id, domain, peer.ID, peer.Connected)
+				_ = s.routes.UpdateServerNetbirdState(ctx, id, domain, peer.ID, peer.IP, peer.Connected)
 				// Tracking group create-on-link: reuse the stored id, else find-or-create
 				// "op-gw-<id>" and persist it (keeping the setup-key id).
 				trackingID := server.NetbirdGroupID

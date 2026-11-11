@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"op-ai-gateway/internal/benchaudio"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"slices"
@@ -455,11 +456,12 @@ func (s *Server) audioColdPassAfterStop(ctx context.Context, call audioMeasureCa
 
 // pushBenchmarkLoadTime pushes tgt's server its runtime config after a benchmark wrote a load
 // time for tgt's mapping. A replicable spec's pushed idle timeout is derived from that
-// load_time_ms, and the write is outside the portal service, whose write paths push a changed
-// document themselves. A spec that is not replicable is pushed its stored idle timeout, which
-// a load time does not change, so nothing is pushed for it.
+// load_time_ms, and so is a cluster head's (portal.DerivesIdleTimeout), and the write is
+// outside the portal service, whose write paths push a changed document themselves. Any other
+// spec is pushed its stored idle timeout, which a load time does not change, so nothing is
+// pushed for it.
 func (s *Server) pushBenchmarkLoadTime(tgt benchmarkTarget, loadMS int) {
-	if loadMS > 0 && tgt.spec.Replicable {
+	if loadMS > 0 && portal.DerivesIdleTimeout(tgt.spec) {
 		s.PushRuntimeConfig(tgt.server.ID)
 	}
 }
@@ -763,10 +765,21 @@ func audioLevelOf(k int, rates []float64) audioLevel {
 // its next poll. That refusal is retried every coldLoadPollGap for as long as the stop path
 // waits for a document to reach an agent (benchmarkStopWaitBound); any other answer, and
 // that one once the bound is spent, is the ensure's.
+//
+// A llama.cpp RPC cluster head is refused (errBenchmarkClusterHeadUnsupported): the
+// agent starts a head only members first, through the cluster orchestration, which the
+// audio benchmark does not drive. The classification skips heads before a ramp is
+// planned (benchmarkViewTarget); this keeps a target built any other way from sending
+// the head a plain ensure the agent would refuse.
 func (s *Server) ensureAudioInstance(ctx context.Context, target routing.Target, restored bool) error {
 	ensurer, ok := s.Provider.(provider.RuntimeEnsurer)
 	if !ok {
 		return errBenchmarkNoRuntimeEnsure
+	}
+	if s.Routes != nil {
+		if spec, found, err := s.Routes.RuntimeSpecByMapping(ctx, target.RouteID); err == nil && found && spec.ClusterEnabled {
+			return errBenchmarkClusterHeadUnsupported
+		}
 	}
 	deadline := time.Now().Add(benchmarkStopWaitBound)
 	for {

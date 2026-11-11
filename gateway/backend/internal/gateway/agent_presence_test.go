@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -124,5 +125,26 @@ func TestAgentPresenceRegistryReportReactivated(t *testing.T) {
 	}
 	if _, ok := r.seen[""]; ok {
 		t.Fatal("empty id must never be recorded")
+	}
+}
+
+// TestIngestRecordsAgentClockOffset pins that each telemetry sample records
+// its agent's clock offset: the agent's own reported_at minus the gateway's
+// receive time, signed (positive = the agent runs ahead).
+func TestIngestRecordsAgentClockOffset(t *testing.T) {
+	srv := NewTestServer()
+	if _, ok := srv.AgentPresence.ClockOffset("mock-host-qwen"); ok {
+		t.Fatal("an offset before any sample")
+	}
+	for _, skew := range []time.Duration{5 * time.Second, -7 * time.Second} {
+		at := time.Now().UTC().Add(skew).Format(time.RFC3339Nano)
+		req, raw := ingestReq(t, `{"agent_version":"0.1.0","reported_at":"`+at+`","os":"linux","arch":"amd64","host":{"cpu_util_pct":1}}`)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		got, ok := srv.AgentPresence.ClockOffset("mock-host-qwen")
+		if !ok || got > skew+time.Second || got < skew-time.Second {
+			t.Fatalf("offset = %v ok=%v, want about %v", got, ok, skew)
+		}
 	}
 }

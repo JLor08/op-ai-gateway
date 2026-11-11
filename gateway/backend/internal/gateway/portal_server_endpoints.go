@@ -176,6 +176,18 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		s.handlePortalServerEnergy(w, r, token, parts[0])
 		return
 	}
+	if (len(parts) == 2 || len(parts) == 3) && parts[1] == "rpc-members" && parts[0] != "" {
+		specID := ""
+		if len(parts) == 3 {
+			specID = parts[2]
+		}
+		s.handlePortalServerRPCMembers(w, r, token, parts[0], specID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "binaries" && parts[0] != "" {
+		s.handlePortalServerBinaries(w, r, token, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "gpu-budgets" && parts[0] != "" {
 		s.handlePortalServerGPUBudgets(w, r, token, parts[0])
 		return
@@ -438,6 +450,7 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrServerRuntimeLimitInvalid, status: http.StatusBadRequest, code: "server.runtime_limit_invalid", msg: "runtime_max_processes must be >= 0"},
 	{err: portal.ErrGPUBudgetInvalid, status: http.StatusBadRequest, code: "server.gpu_budget_invalid", msg: "gpu budget index/budget_mb must be >= 0 and index must be unique"},
 	{err: portal.ErrServerEnergyConfigInvalid, status: http.StatusBadRequest, code: "server.energy_config_invalid", msg: "estimated_watts, idle_watts, price_per_kwh and pue must be >= 0"},
+	{err: portal.ErrServerLANAddressInvalid, status: http.StatusBadRequest, code: "server.lan_address_invalid", msg: "lan_address must be empty or an IPv4 address"},
 	{err: portal.ErrServerAdminGroupRequired, status: http.StatusBadRequest, code: "server.admin_group_required", msg: "at least one admin group is required"},
 	{err: portal.ErrServerAdminGroupInvalid, status: http.StatusBadRequest, code: "server.admin_group_invalid", msg: "admin group is invalid"},
 	{err: portal.ErrServerAdminGroupParentMismatch, status: http.StatusBadRequest, code: "server.admin_group_parent_mismatch", msg: "admin groups must share one parent system group"},
@@ -448,6 +461,9 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrNetbirdKeyFileNotConfigured, status: http.StatusConflict, code: "netbird.key_file_not_configured", msg: "netbird key file is not configured"},
 	{err: portal.ErrNetbirdNetworkRangeInvalid, status: http.StatusBadRequest, code: "system.netbird_network_range_invalid", msg: "network range must be a valid CIDR"},
 	{err: netbird.ErrAuth, status: http.StatusBadGateway, code: "netbird.auth_failed", msg: "netbird authentication failed"},
+	// Deleting a server that is a cluster member is refused like deleting its
+	// manual member spec.
+	{err: portal.ErrRPCMemberInUse, status: http.StatusConflict, code: "runtime.cluster_member_in_use", msg: "member is used by a cluster head", msgFn: rpcMemberInUseMessage},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeServerNotFound, msg: msgServerNotFound},
 }
 

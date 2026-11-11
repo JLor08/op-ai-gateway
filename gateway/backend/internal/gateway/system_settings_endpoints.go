@@ -186,6 +186,10 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("system.netbird_interval_order", "netbird peer-sync interval must be <= the reconcile interval (both >= 10s)", ""))
 				return
 			}
+			if errors.Is(err, portal.ErrNetbirdDirectClusterExists) {
+				writeJSON(w, http.StatusConflict, apierror.Response("settings.netbird_direct_cluster_exists", "a direct mesh RPC cluster exists; switch it to relay or remove it before turning off policy management, deny-by-default or its enforcement", ""))
+				return
+			}
 			if errors.Is(err, portal.ErrNetbirdTokenRotateBeforeInvalid) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("system.netbird_token_rotate_before_invalid", "netbird token rotate-before-days must be >= 0", ""))
 				return

@@ -1484,6 +1484,22 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
     });
 
+    it('renders a skipped cluster head as its skip', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: true,
+          total: 2,
+          done: 1,
+          results: [result({ gateway_model_name: 'big-model', skipped: 'cluster_head' })],
+        }),
+      );
+      expect(
+        await screen.findByText(`big-model: ${t.benchmarkResultSkippedClusterHead}`),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
     // Every run kind that sends a chat prompt gets the notice.
     it.each(['speed', 'capacity', 'both', 'vision'])(
       'names the skipped and the unmeasured mappings once a %s run has finished',

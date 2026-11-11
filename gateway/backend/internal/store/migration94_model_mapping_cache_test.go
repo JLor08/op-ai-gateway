@@ -58,14 +58,12 @@ func TestMigration94CreatesModelMappingCache(t *testing.T) {
 
 		// A mapping written before the table existed: the parent the new table
 		// has to hang off after the upgrade.
-		if err := s.CreateAIServer(ctx, routing.AIServer{
+		seedBaselineServer(ctx, t, s, routing.AIServer{
 			ID: "srv_m94", Name: "m94", Provider: routing.ProviderVLLM,
 			Endpoint: "http://srv_m94:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create server: %v", err)
-		}
+		})
 		if err := s.CreateApplication(ctx, routing.Application{
 			ID: "app_m94", ServerID: "srv_m94", Type: routing.ProviderServerAgent, Port: 8094, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

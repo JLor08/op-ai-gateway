@@ -1565,12 +1565,15 @@ func TestConformanceServerNetbirdColumns(t *testing.T) {
 		}
 
 		// UpdateServerNetbirdState touches ONLY domain + peer_id + connected.
-		if err := s.UpdateServerNetbirdState(ctx, "srvnb", "peer.netbird.cloud", "peer-2", false); err != nil {
+		if err := s.UpdateServerNetbirdState(ctx, "srvnb", "peer.netbird.cloud", "peer-2", "100.64.0.5", false); err != nil {
 			t.Fatalf("update netbird state: %v", err)
 		}
 		got, err = s.AIServerByID(ctx, "srvnb")
 		if err != nil {
 			t.Fatalf("by id after state: %v", err)
+		}
+		if got.NetbirdIP != "100.64.0.5" {
+			t.Fatalf("after state: netbird_ip = %q, want 100.64.0.5", got.NetbirdIP)
 		}
 		assertNetbird("after UpdateServerNetbirdState", got, true, "sk-2", "grp-2", "peer-2", false)
 		if got.Domain != "peer.netbird.cloud" {
@@ -1581,7 +1584,7 @@ func TestConformanceServerNetbirdColumns(t *testing.T) {
 		if err := s.UpdateServerNetbirdKey(ctx, "nope", true, "x", "y"); err != ErrNotFound {
 			t.Fatalf("UpdateServerNetbirdKey(unknown) = %v, want ErrNotFound", err)
 		}
-		if err := s.UpdateServerNetbirdState(ctx, "nope", "d", "p", true); err != ErrNotFound {
+		if err := s.UpdateServerNetbirdState(ctx, "nope", "d", "p", "", true); err != ErrNotFound {
 			t.Fatalf("UpdateServerNetbirdState(unknown) = %v, want ErrNotFound", err)
 		}
 	})
@@ -1626,7 +1629,7 @@ func TestConformanceServerNetbirdLink(t *testing.T) {
 		}
 
 		// Simulate a synced/connected state so the link write can reset it.
-		if err := s.UpdateServerNetbirdState(ctx, "srvlink", "peer.netbird.cloud", "peer-old", true); err != nil {
+		if err := s.UpdateServerNetbirdState(ctx, "srvlink", "peer.netbird.cloud", "peer-old", "100.64.0.9", true); err != nil {
 			t.Fatalf("update netbird state: %v", err)
 		}
 
@@ -1641,6 +1644,9 @@ func TestConformanceServerNetbirdLink(t *testing.T) {
 		}
 		if !got.NetbirdEnabled || got.NetbirdPeerID != "peer-new" || got.NetbirdConnected {
 			t.Fatalf("after link = {enabled:%v peer:%q conn:%v}, want {true peer-new false}", got.NetbirdEnabled, got.NetbirdPeerID, got.NetbirdConnected)
+		}
+		if got.NetbirdIP != "" {
+			t.Fatalf("after link: netbird_ip = %q, want reset to empty", got.NetbirdIP)
 		}
 		if got.Domain != "peer.netbird.cloud" || got.NetbirdSetupKeyID != "sk-9" || got.NetbirdGroupID != "grp-9" {
 			t.Fatalf("after link leaked other cols: domain=%q key=%q grp=%q", got.Domain, got.NetbirdSetupKeyID, got.NetbirdGroupID)

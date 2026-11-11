@@ -249,3 +249,40 @@ func TestCreateServerRejectsNegativeAgentPresenceTimeoutSeconds(t *testing.T) {
 		t.Fatal("CreateServer(-5) should reject a negative agent_presence_timeout_seconds")
 	}
 }
+
+// fakeAgentClockOffsets is a test AgentClockOffsetReader.
+type fakeAgentClockOffsets map[string]time.Duration
+
+func (f fakeAgentClockOffsets) ClockOffset(serverID string) (time.Duration, bool) {
+	d, ok := f[serverID]
+	return d, ok
+}
+
+// TestServerDTOClockOffset pins clock_offset_ms: the signed difference between
+// the agent's own time stamp on its latest sample and the gateway's receive
+// time, in milliseconds (positive = the agent's clock runs ahead), and null
+// while the agent has not reported since the gateway started.
+func TestServerDTOClockOffset(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	svc, _ := newAgentStatusTestService(t, now, fakeAgentPresenceReader{reporting: map[string]bool{}})
+	offsets := fakeAgentClockOffsets{}
+	svc.agentClockOffsets = offsets
+
+	dto, err := svc.CreateServer(context.Background(), adminToken(), CreateServerRequest{Name: "S1", Domain: "s1.example.test", AdminGroupIDs: []string{testAdminGroupID}})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	if dto.ClockOffsetMS != nil {
+		t.Fatalf("clock_offset_ms = %d, want null before a report", *dto.ClockOffsetMS)
+	}
+	for _, offset := range []time.Duration{1500 * time.Millisecond, -2750 * time.Millisecond} {
+		offsets[dto.ID] = offset
+		got, err := svc.GetServer(context.Background(), systemAdminToken(), dto.ID)
+		if err != nil {
+			t.Fatalf("GetServer: %v", err)
+		}
+		if got.ClockOffsetMS == nil || *got.ClockOffsetMS != offset.Milliseconds() {
+			t.Fatalf("clock_offset_ms = %v, want %d", got.ClockOffsetMS, offset.Milliseconds())
+		}
+	}
+}

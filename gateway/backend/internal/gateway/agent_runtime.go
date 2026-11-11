@@ -204,6 +204,9 @@ const defaultPushRuntimeConfigSpacing = 250 * time.Millisecond
 // goroutine.
 func (s *Server) PushRuntimeConfig(serverID string) {
 	s.runtimePush.notify(serverID, s.pushRuntimeConfigSpacing, s.pushRuntimeConfigPass)
+	// A changed document may change a cluster: a kept-up head to start, or a
+	// head blocked by a terminal cause whose configuration was fixed.
+	s.clusters.DocumentsChanged()
 }
 
 // pushRuntimeConfigPass is one pass of serverID's push worker: it derives the
@@ -429,6 +432,13 @@ type agentRuntimeReportSpec struct {
 	Replicable   bool `json:"replicable,omitempty"`
 	MinInstances int  `json:"min_instances,omitempty"`
 	MaxInstances int  `json:"max_instances,omitempty"`
+	// Kind, DeviceBackend, Cluster and RPC are the llama.cpp RPC cluster
+	// fields (AgentRuntimeSpecDTO's), omitempty like the DTO's. None carries a
+	// secret: addresses, ports and the head's identity.
+	Kind          string                      `json:"kind,omitempty"`
+	DeviceBackend string                      `json:"device_backend,omitempty"`
+	Cluster       *portal.AgentClusterHeadDTO `json:"cluster,omitempty"`
+	RPC           *portal.AgentRPCMemberDTO   `json:"rpc,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

@@ -39,6 +39,15 @@ const maxSampleGap = 2 * time.Second
 // UpdateUsageEventEnergy writes by id with no source predicate.
 const energySourceUnpriceable = "unpriceable"
 
+// energySourceMemberUnpriced marks a llama.cpp RPC cluster request one of
+// whose member hosts had neither telemetry coverage (Tier 1) nor a configured
+// wattage (Tier 2): that member's energy part is 0 Wh with this source, and
+// the request's energy_source is this value too, because its energy_wh then
+// lacks that host's share and so is a lower bound rather than any tier's
+// figure. Like "unpriceable" it is provenance, not a tier, and terminal: the
+// operator remedy is the member server's estimated_watts.
+const energySourceMemberUnpriced = "member_unpriced"
+
 // ServerEnergyConfig carries the per-server, operator-set energy knobs
 // (mirroring routing.AIServer.EstimatedWatts/IdleWatts/Pue) that this pure
 // engine needs. It exists so ComputeEnergy doesn't need to import/depend on
@@ -221,7 +230,7 @@ func siblingWindow(ev usage.Event) (time.Time, time.Time) {
 //   - Tier 1 ("measured"): real per-server power telemetry (samples), when it
 //     gives continuous coverage of the event's [start,end] request window.
 //   - Tier 2 ("estimated"): the server's configured EstimatedWatts (cfg),
-//     when Tier 1 doesn't apply and EstimatedWatts is set.
+//     times the PUE, when Tier 1 doesn't apply and EstimatedWatts is set.
 //   - Tier 3 ("modeled"): a Wh-per-output-token coefficient (mappingCoeff,
 //     falling back to sysDefaultWhPerToken), when neither above applies AND
 //     ev's measure is tokens (ev.BillingUnit == usage.BillingUnitTokens).
@@ -257,10 +266,41 @@ func ComputeEnergy(ev usage.Event, samples []routing.TelemetrySample, siblings [
 			return res
 		}
 	}
-	if cfg.EstimatedWatts > 0 {
-		return estimatedEnergy(start, end, siblings, cfg.EstimatedWatts, idleW)
+	if res, ok := estimatedPart(start, end, siblings, cfg, pue, idleW); ok {
+		return res
 	}
 	return modeledEnergy(ev, mappingCoeff, sysDefaultWhPerToken)
+}
+
+// ComputeEnergyPart computes one host's share of ev's energy, for a request
+// served by several hosts (a llama.cpp RPC cluster: the head and its members).
+// It applies Tier 1 and Tier 2 exactly as ComputeEnergy does, with this
+// host's samples, siblings (every OTHER event the host served whose window
+// could overlap ev's, including cluster events that list it), configuration
+// and idle draw, and never Tier 3: a Wh-per-output-token coefficient prices
+// a whole request, not one host's share of it. ok is false when neither tier
+// applies; the caller decides what that host's missing share means.
+func ComputeEnergyPart(ev usage.Event, samples []routing.TelemetrySample, siblings []usage.Event, cfg ServerEnergyConfig, idleW float64) (EnergyResult, bool) {
+	start := ev.CreatedAt.Add(-time.Duration(ev.LatencyMS) * time.Millisecond)
+	end := ev.CreatedAt
+	pue := effectivePue(cfg, 0)
+	if end.After(start) {
+		if res, ok := measuredEnergy(start, end, samples, siblings, pue, idleW); ok {
+			return res, true
+		}
+	}
+	return estimatedPart(start, end, siblings, cfg, pue, idleW)
+}
+
+// estimatedPart applies Tier 2 when cfg has an EstimatedWatts: the configured
+// draw times the PUE, as Tier 1 multiplies a measured reading -- the
+// facility's overhead does not depend on whether the server's own draw was
+// measured or configured.
+func estimatedPart(start, end time.Time, siblings []usage.Event, cfg ServerEnergyConfig, pue, idleW float64) (EnergyResult, bool) {
+	if cfg.EstimatedWatts <= 0 {
+		return EnergyResult{}, false
+	}
+	return estimatedEnergy(start, end, siblings, cfg.EstimatedWatts*pue, idleW), true
 }
 
 // measuredEnergy attempts Tier 1: it sorts a copy of samples, checks that
@@ -430,11 +470,11 @@ func concurrencyAt(cc []interval, a, b time.Time) int {
 }
 
 // estimatedEnergy implements Tier 2: the same concurrency-shared integration
-// as Tier 1, but over a flat `watts` for the whole window instead of a
-// per-sample power curve. A degenerate window (end<=start) yields dt=0 for
-// every interval (concurrencyBreakpoints returns nil), so WhTotal/WhMarginal
-// are both 0 — Source is still "estimated" (Tier 2 ran; it just integrated
-// over nothing).
+// as Tier 1, but over a flat `watts` (already PUE-scaled by the caller) for
+// the whole window instead of a per-sample power curve. A degenerate window
+// (end<=start) yields dt=0 for every interval (concurrencyBreakpoints returns
+// nil), so WhTotal/WhMarginal are both 0 — Source is still "estimated" (Tier
+// 2 ran; it just integrated over nothing).
 func estimatedEnergy(start, end time.Time, siblings []usage.Event, watts, idleW float64) EnergyResult {
 	cc := concurrencyBreakpoints(start, end, siblings)
 	var total, marginal float64

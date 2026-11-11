@@ -96,8 +96,8 @@ var (
 	// that is not "env" or "args". HTTP 400.
 	ErrRuntimeSpecVisibleDevicesModeInvalid = errors.New("runtime_spec.visible_devices_mode_invalid")
 	// ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder rejects set_visible_devices
-	// in args mode when none of the three device placeholders
-	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}) appears in args: the
+	// in args mode when none of the device-list placeholders
+	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES}) appears in args: the
 	// agent would inject no visibility and the selection would be lost. HTTP 400.
 	ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder = errors.New("runtime_spec.visible_devices_args_no_placeholder")
 	// ErrRuntimeSpecAPITokenModeInvalid rejects an api_token_mode that is not
@@ -595,6 +595,49 @@ type RuntimeSpecDTO struct {
 	// PutRuntimeSpecRequest. It is NOT ModelDTO.Role, which folds every mapping of
 	// a model NAME into its best-ranked role; this is the role of one spec.
 	Role string `json:"role"`
+	// DeviceBackend is the GPU backend the generic device placeholders render
+	// for ("auto", "cuda", "rocm", "vulkan", "metal", "sycl"); never "" on the
+	// wire, a stored "" reads as "auto".
+	DeviceBackend string `json:"device_backend"`
+	// ClusterEnabled makes the spec a llama.cpp RPC cluster head; MemberMode,
+	// ClusterNetwork, RPCTransport, LANExposureAck and ClusterMembers are its
+	// cluster configuration (see PutRuntimeSpecRequest). MemberMode is never
+	// "" on the wire (a stored "" reads as "automatic").
+	ClusterEnabled bool               `json:"cluster_enabled"`
+	MemberMode     string             `json:"member_mode"`
+	ClusterNetwork string             `json:"cluster_network"`
+	RPCTransport   string             `json:"rpc_transport"`
+	LANExposureAck bool               `json:"lan_exposure_ack"`
+	ClusterMembers []ClusterMemberDTO `json:"cluster_members"`
+	// ClusterVRAMTotalMB / ClusterRAMTotalMB are the head's own effective
+	// demand plus every member's, each part max(measured, estimate);
+	// ClusterVRAMTotalComplete / ClusterRAMTotalComplete are false when a part
+	// of that total is unknown, so it is a lower bound (a CPU member has no
+	// VRAM part, so it never makes the VRAM total one), and
+	// ClusterTotalsComplete is both together. ClusterNetworkDefault / ClusterTransportDefault are
+	// what an empty cluster_network / rpc_transport resolves to for the stored
+	// membership, and ClusterWarnings lists the advisory cluster warning codes.
+	// All READ-ONLY, derived on every read, and only filled on a cluster head.
+	ClusterVRAMTotalMB       int      `json:"cluster_vram_total_mb"`
+	ClusterRAMTotalMB        int      `json:"cluster_ram_total_mb"`
+	ClusterTotalsComplete    bool     `json:"cluster_totals_complete"`
+	ClusterVRAMTotalComplete bool     `json:"cluster_vram_total_complete"`
+	ClusterRAMTotalComplete  bool     `json:"cluster_ram_total_complete"`
+	ClusterNetworkDefault    string   `json:"cluster_network_default"`
+	ClusterTransportDefault  string   `json:"cluster_transport_default"`
+	ClusterWarnings          []string `json:"cluster_warnings"`
+	// ClusterWithheldReason is why an enabled cluster head is not in its
+	// server's runtime document (a ClusterWithheld* code: an agent too old
+	// or not heard from, a member missing, disabled or no longer
+	// consenting, an unknown address or port, NetBird preconditions, no
+	// matching member binary); "" when it is pushed. READ-ONLY, derived on
+	// every read.
+	ClusterWithheldReason string `json:"cluster_withheld_reason,omitempty"`
+	// ClusterStatus is the gateway's orchestration state of an enabled
+	// cluster head (ClusterStatusDTO): where a start stands, which member
+	// position failed and why, and the cooldown. READ-ONLY, read on every
+	// read from the gateway's memory; nil on a spec that is no enabled head.
+	ClusterStatus *ClusterStatusDTO `json:"cluster_status,omitempty"`
 }
 
 // ConfigFileDTO is one operator-supplied config file of a runtime spec: a
@@ -695,6 +738,24 @@ type PutRuntimeSpecRequest struct {
 	// means none: a PUT that omits them clears the stored set. Validated by
 	// validateRuntimeSpecConfigFiles.
 	ConfigFiles []ConfigFileDTO `json:"config_files,omitempty"`
+	// DeviceBackend: see RuntimeSpecDTO; "" stores "auto".
+	DeviceBackend string `json:"device_backend"`
+	// ClusterEnabled turns the spec into a llama.cpp RPC cluster head with the
+	// members in ClusterMembers, in that order (the --rpc order, and so the
+	// order of the head's RPC<n> devices). MemberMode is "automatic" (""
+	// stores it: each entry names a server, its ordered GPU selection and the
+	// member settings) or "manual" (each entry names a server and the
+	// rpc_server member spec on it). ClusterNetwork ("mesh" or "lan") and
+	// RPCTransport ("direct" or "relay") default from the membership when
+	// empty; LANExposureAck is the operator's acknowledgement a direct lan
+	// cluster requires. With ClusterEnabled false the membership is cleared.
+	// Checked by validateClusterHead.
+	ClusterEnabled bool               `json:"cluster_enabled"`
+	MemberMode     string             `json:"member_mode"`
+	ClusterNetwork string             `json:"cluster_network"`
+	RPCTransport   string             `json:"rpc_transport"`
+	LANExposureAck bool               `json:"lan_exposure_ack"`
+	ClusterMembers []ClusterMemberDTO `json:"cluster_members"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -704,7 +765,7 @@ type PutRuntimeSpecRequest struct {
 // mapping's runtime configuration without special-casing non-server_agent
 // applications.
 func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) (RuntimeSpecDTO, error) {
-	mapping, app, _, err := s.authorizeMapping(ctx, principal, mappingID)
+	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
@@ -742,6 +803,10 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			ResolvedMetricsPath:      resolvedMetrics,
 			ResolvedContextProbePath: resolvedContext,
 			Role:                     role,
+			DeviceBackend:            deviceBackendAuto,
+			MemberMode:               memberModeAutomatic,
+			ClusterMembers:           []ClusterMemberDTO{},
+			ClusterWarnings:          []string{},
 		}, nil
 	}
 	gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
@@ -750,6 +815,9 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	}
 	dto, err := runtimeSpecDTO(spec, gpus, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
+	if dto, err = s.withClusterView(ctx, principal, server, dto); err != nil {
 		return RuntimeSpecDTO{}, err
 	}
 	return s.withRuntimeSpecRole(ctx, dto)
@@ -813,7 +881,7 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
-	dto, err := s.putRuntimeSpec(ctx, mapping, app, server, req, "")
+	dto, err := s.putRuntimeSpec(ctx, mapping, app, server, req, "", &principal)
 	if err != nil {
 		return dto, err
 	}
@@ -902,16 +970,44 @@ func (s *Service) serverIsBenchmarking(serverID string) bool {
 //
 // The notification fires exactly when writeRuntimeSpec reports stored: once
 // UpsertRuntimeSpec has succeeded, also when the GPU-row write or the
-// read-back after it fails. The returned document carries the derived Role
-// (withRuntimeSpecRole), which writeRuntimeSpec's batch callers have no use for
-// and so never pay a read for.
-func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string) (RuntimeSpecDTO, error) {
-	dto, stored, err := s.writeRuntimeSpec(ctx, mapping, app, req, expectSpecID)
-	if stored {
+// read-back after it fails. A cluster head's write also notifies every member
+// server it had or now has, since each one's document carries the member
+// processes derived from the head. The returned document carries the derived
+// Role (withRuntimeSpecRole), which writeRuntimeSpec's batch callers have no
+// use for and so never pay a read for, and, for an operator's write
+// (principal set), the cluster view a GET returns.
+//
+// principal is the operator for PutRuntimeSpec and nil for a benchmark
+// writer; see writeRuntimeSpecAs for what it changes.
+func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string, principal *auth.Token) (RuntimeSpecDTO, error) {
+	w, err := s.writeRuntimeSpecAs(ctx, mapping, app, req, expectSpecID, principal)
+	if w.stored {
 		s.notifyRuntimeChanged(server.ID)
+		for _, id := range w.memberServers {
+			if id != server.ID {
+				s.notifyRuntimeChanged(id)
+			}
+		}
+		// A benchmark writer (nil principal) only rewrites measurements and
+		// pinned settings of an existing spec: it cannot change the cluster
+		// flag, the network or the membership, so there is nothing for the
+		// policies to follow. Neither is there for a write that is no cluster
+		// head before or after and has no membership: the pass waits on
+		// NetBird, which a plain model save must never do.
+		if principal != nil && w.touchesCluster {
+			// The head's members may have changed: open the RPC ports the
+			// saved cluster needs before anything starts it.
+			s.reconcileRPCPolicies(ctx)
+		}
 	}
+	dto := w.dto
 	if err != nil {
 		return dto, err
+	}
+	if principal != nil {
+		if dto, err = s.withClusterView(ctx, *principal, server, dto); err != nil {
+			return dto, err
+		}
 	}
 	// The write-back is the document the portal commits into the same per-mapping
 	// cache a GET fills, so it carries the derived role like a GET does. Read AFTER
@@ -933,34 +1029,139 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 // SetRuntimeSpecGPUs or a failed read-back after it reports stored alongside
 // its error. An error before the upsert stored nothing.
 func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, req PutRuntimeSpecRequest, expectSpecID string) (dto RuntimeSpecDTO, stored bool, err error) {
+	w, err := s.writeRuntimeSpecAs(ctx, mapping, app, req, expectSpecID, nil)
+	return w.dto, w.stored, err
+}
+
+// runtimeSpecWrite is what writeRuntimeSpecAs did: the stored document,
+// whether anything reached the store, the member servers of a cluster head
+// (before and after the write) whose documents the write changed, and
+// whether the write touched a cluster at all (the spec was or is a head, or
+// had or has members).
+type runtimeSpecWrite struct {
+	dto            RuntimeSpecDTO
+	stored         bool
+	memberServers  []string
+	touchesCluster bool
+}
+
+// writeRuntimeSpecAs is writeRuntimeSpec with the cluster configuration:
+// principal is the operator of PutRuntimeSpec, whose write is checked and
+// applied in full (validateClusterHead, then the membership rows after the
+// spec row). A benchmark writer passes nil and keeps the stored cluster
+// columns and membership verbatim: it carries no principal to authorize a
+// membership change with, it only ever means to change admin_state, pinned
+// or replicable, and a restore must not fail because a member server changed
+// since the run started.
+func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelMapping, app routing.Application, req PutRuntimeSpecRequest, expectSpecID string, principal *auth.Token) (runtimeSpecWrite, error) {
 	if app.Type != routing.ProviderServerAgent {
-		return RuntimeSpecDTO{}, false, ErrRuntimeSpecNotServerAgent
+		return runtimeSpecWrite{}, ErrRuntimeSpecNotServerAgent
 	}
 	// Validate everything that can fail BEFORE mutating/persisting anything.
 	fields, err := validateRuntimeSpecRequest(req)
 	if err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
+	}
+	if principal != nil {
+		// Port allocation and the one-head-per-manual-member rule are
+		// check-then-act across specs; serializing the operator writes keeps
+		// two saves from taking the same port or member.
+		s.clusterWriteMu.Lock()
+		defer s.clusterWriteMu.Unlock()
 	}
 	prior, err := s.priorRuntimeSpec(ctx, mapping.ID, expectSpecID)
 	if err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
 	}
 	spec, err := s.runtimeSpecRow(mapping.ID, req, fields, prior)
 	if err != nil {
-		return RuntimeSpecDTO{}, false, err
+		return runtimeSpecWrite{}, err
 	}
-	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
-		return RuntimeSpecDTO{}, false, err
+	// The cluster checks and the listen-port check read the store and are
+	// the newest refusals, so they run after everything above, the row's own
+	// preparation (the token seal) included.
+	plan := keepStoredCluster(prior, fields)
+	if principal != nil {
+		if plan, err = s.operatorClusterPlan(ctx, *principal, app, req, fields, prior); err != nil {
+			return runtimeSpecWrite{}, err
+		}
 	}
-	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
-		return RuntimeSpecDTO{}, true, err
+	plan.applyTo(&spec)
+	w := runtimeSpecWrite{
+		memberServers:  plan.memberServers,
+		touchesCluster: plan.enabled || len(plan.memberServers) > 0 || (prior.ok && prior.spec.ClusterEnabled),
+	}
+	if err := s.storeRuntimeSpec(ctx, spec, req, prior, &plan, &w); err != nil {
+		return w, err
 	}
 	storedGPUs, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
-		return RuntimeSpecDTO{}, true, err
+		return w, err
 	}
-	dto, err = runtimeSpecDTO(spec, storedGPUs, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
-	return dto, true, err
+	w.dto, err = runtimeSpecDTO(spec, storedGPUs, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
+	return w, err
+}
+
+// operatorClusterPlan runs the store-reading checks of an operator's write,
+// the newest refusals of the write, in order: the cluster checks
+// (validateClusterHead), the listen-port check, and the unknown head binary
+// version, the newest save code, appended last so a body that is also
+// invalid for an older reason keeps that answer. It runs with the cluster
+// write lock held (writeRuntimeSpecAs).
+func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app routing.Application, req PutRuntimeSpecRequest, fields runtimeSpecFields, prior runtimeSpecPrior) (clusterPlan, error) {
+	plan, err := s.validateClusterHead(ctx, p, app, req, fields, prior)
+	if err != nil {
+		return clusterPlan{}, err
+	}
+	if err := s.checkListenPortFree(ctx, app.ServerID, req.ListenPort, prior); err != nil {
+		return clusterPlan{}, err
+	}
+	if plan.headVersionUnknown {
+		return clusterPlan{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
+			ErrClusterHeadBinaryVersionUnknown, fields.binary)
+	}
+	return plan, nil
+}
+
+// storeRuntimeSpec stores spec, its GPU rows and, when plan writes them, its
+// membership, and records in w whether anything reached the store. For an
+// operator's write it runs with the cluster write lock held
+// (writeRuntimeSpecAs).
+//
+// The membership write is the step that can still be refused by state the
+// checks could not hold (a member spec or port another gateway process took,
+// a member server deleted since). It goes first wherever the head row exists
+// already, so such a refusal stores nothing, rather than a head whose cluster
+// columns no longer match its membership. A new head's membership needs its
+// row; a refused membership takes the new row away again, so the refusal
+// stores nothing there either.
+func (s *Service) storeRuntimeSpec(ctx context.Context, spec routing.RuntimeSpec, req PutRuntimeSpecRequest, prior runtimeSpecPrior, plan *clusterPlan, w *runtimeSpecWrite) error {
+	if plan.writeMembers && prior.ok {
+		if err := s.writeClusterMembers(ctx, spec.ID, plan); err != nil {
+			return err
+		}
+		w.stored = true
+	}
+	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
+		return err
+	}
+	w.stored = true
+	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
+		return err
+	}
+	if !plan.writeMembers || prior.ok {
+		return nil
+	}
+	err := s.writeClusterMembers(ctx, spec.ID, plan)
+	if err == nil {
+		return nil
+	}
+	if delErr := s.routes.DeleteRuntimeSpec(ctx, spec.ID); delErr == nil {
+		w.stored = false
+	} else {
+		slog.Warn("runtime spec: could not remove a new cluster head whose membership was refused", "spec_id", spec.ID, "err", delErr)
+	}
+	return err
 }
 
 // runtimeSpecFields is a PutRuntimeSpecRequest after
@@ -983,6 +1184,10 @@ type runtimeSpecFields struct {
 	healthPath         string
 	healthTimeout      int
 	startupTimeout     int
+	deviceBackend      string
+	memberMode         string
+	clusterNetwork     string
+	rpcTransport       string
 }
 
 // validateRuntimeSpecRequest runs every request validation of a runtime-spec
@@ -1123,6 +1328,13 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		return runtimeSpecFields{}, err
 	}
 	if err = validateRuntimeSpecInstances(req); err != nil {
+		return runtimeSpecFields{}, err
+	}
+	// The device backend and the three cluster enums run after the instance
+	// settings, for the same reason again: they are newer than every check
+	// above. The cluster checks that read the store follow in
+	// validateClusterHead, after this function.
+	if f.deviceBackend, f.memberMode, f.clusterNetwork, f.rpcTransport, err = validateClusterEnums(req); err != nil {
 		return runtimeSpecFields{}, err
 	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
@@ -1512,10 +1724,24 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 	if !ok {
 		return ErrRuntimeSpecNotFound
 	}
+	// A cluster head's membership goes with it, and with it the member
+	// processes derived into each member server's document.
+	members, _, err := s.routes.ClusterMembers(ctx, spec.ID)
+	if err != nil {
+		return err
+	}
 	if err := s.routes.DeleteRuntimeSpec(ctx, spec.ID); err != nil {
 		return err
 	}
 	s.notifyRuntimeChanged(server.ID)
+	for _, m := range members {
+		if m.ServerID != server.ID {
+			s.notifyRuntimeChanged(m.ServerID)
+		}
+	}
+	if spec.ClusterEnabled || len(members) > 0 {
+		s.reconcileRPCPolicies(ctx)
+	}
 	return nil
 }
 
@@ -1541,14 +1767,18 @@ var runtimeSpecVisibleDevicesVars = []string{
 	"HIP_VISIBLE_DEVICES",
 }
 
-// runtimeSpecDevicePlaceholders are the three llama.cpp --device placeholders
-// the agent expands (mirrors the agent's own token set in policy_local.go).
-// In args mode at least one must appear in the spec's args, else the
-// selection would silently vanish.
+// runtimeSpecDevicePlaceholders are the llama.cpp --device placeholders the
+// agent expands that name every local GPU of the spec (mirrors the agent's
+// own token set in policy_local.go): the three per-backend lists and the
+// generic ${DEVICES}. In args mode at least one must appear in the spec's
+// args, else the selection would silently vanish. The single-device tokens
+// (${FIRST_LOCAL_DEVICE}, ${CUDA_FIRST_DEVICE}, ...) do not count: they do
+// not restrict offloading to the selected GPUs.
 var runtimeSpecDevicePlaceholders = []string{
 	"${CUDA_DEVICES}",
 	"${VULKAN_DEVICES}",
 	"${METAL_DEVICES}",
+	placeholderDevices,
 }
 
 func argsHaveDevicePlaceholder(args []string) bool {
@@ -1974,6 +2204,14 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		EffectiveType:               string(effectiveType),
 		ResolvedMetricsPath:         resolvedMetrics,
 		ResolvedContextProbePath:    resolvedContext,
+		DeviceBackend:               normalizeDeviceBackend(spec.DeviceBackend),
+		ClusterEnabled:              spec.ClusterEnabled,
+		MemberMode:                  normalizeMemberMode(spec.MemberMode),
+		ClusterNetwork:              spec.ClusterNetwork,
+		RPCTransport:                spec.RPCTransport,
+		LANExposureAck:              spec.LANExposureAck,
+		ClusterMembers:              []ClusterMemberDTO{},
+		ClusterWarnings:             []string{},
 	}, nil
 }
 
@@ -2271,6 +2509,9 @@ func (s *Service) SetServerGPUBudgets(ctx context.Context, principal auth.Token,
 		return nil, err
 	}
 	s.notifyRuntimeChanged(server.ID)
+	// A budget is also the ceiling of a stale cluster member value on this
+	// server (memberDemand), which the member's document carries.
+	s.NotifyClustersOfServer(ctx, server.ID)
 	stored, err := s.routes.ServerGPUBudgets(ctx, server.ID)
 	if err != nil {
 		return nil, err
@@ -2500,7 +2741,7 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //	request happened to change.
 //
 // A new write path can be checked against that one sentence, because
-// AgentRuntimeConfig (below) derives the whole document from exactly seven
+// AgentRuntimeConfig (below) derives the whole document from exactly eight
 // kinds of row. A path needs a notification if and only if it writes one of
 // them:
 //
@@ -2517,6 +2758,16 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     batched read) -> each spec's role (routing.DeriveRole). The role is a
 //     document field like any other, so a verdict write moves the document
 //     and its ETag
+//  8. the llama.cpp RPC CLUSTERS the server takes part in, as a head or a
+//     member -> a head's cluster block and the rpc_server member specs
+//     (deriveCluster). A cluster is derived from rows of EVERY server in it:
+//     the membership rows and their GPU rows, the manual member specs and
+//     their GPU rows, each server's row (addresses, bind switch, Domain,
+//     NetBird state, RPC membership, consent), its admin groups (consent),
+//     its server_agent application, its binary inventory and GPU budgets and
+//     hardware report (a stale member value's ceiling), the head spec, and
+//     the NetBird policy settings. So a write to any of them notifies every
+//     server of every cluster it touches, not only the server it writes.
 //
 // Call sites, by row: (1) UpdateServer; (2) CreateApplication /
 // UpdateApplication / DeleteApplication, via
@@ -2529,7 +2780,26 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // setBenchmarkRuntimeSpecs, after the batch's last write, once for each server
 // a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets; (7) the
 // operator's verdicts are written by CreateMapping / UpdateMapping, which are
-// already row 3's call sites and notify after the capability write has landed.
+// already row 3's call sites and notify after the capability write has landed;
+// (8) every server of the cluster (clusterServers, NotifyClustersOfServer)
+// from PutRuntimeSpec and DeleteRuntimeSpec (the head and its membership),
+// DeleteMapping / DeleteApplication / DeleteServer (a cascaded head),
+// PutRPCMemberSpec (a manual member, and the membership GPU rows it re-syncs),
+// CreateApplication / UpdateApplication (a server_agent application, which
+// a member needs), UpdateServer, SetServerAdminGroups, SetServerNetbird,
+// RegenerateNetbirdKey, SetServerGPUBudgets, the manual binary inventory
+// writers and UpdateSystemSettings; outside this service the NetBird peer
+// sync (cmd/gateway clusterNotifyingStore), the telemetry ingest's inventory
+// write and its rpc_cluster declaration push through NotifyClustersOfServer
+// too. A benchmark write on a head notifies only the head's server, since a
+// member's document never reads the head's admin_state or pinned flag.
+// DeleteGroup re-derives every cluster (notifyAllClusterServers): its cascade
+// removes server admin-group links, which are consent inputs. Two cluster
+// inputs are deliberately left to the agents' 60 s poll, each a whole write
+// path: the agent's own usage writeback onto the membership rows (exempt like
+// the VRAM writeback below), and the agent's hardware report (the gateway's
+// ingest writes it; it only moves the card and host-memory ceiling of a STALE
+// member value, a figure the agent reports itself).
 //
 // The "never which field" half is the load-bearing half. A "relevant fields"
 // allow-list inside a write path would be a second, uncompiled copy of
@@ -2565,18 +2835,29 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 //     decides whether one is. The agent's poll reconciles the new role.
 //
 // Two writes outside this service DO push, because each moves a document
-// field the agent does not already hold: a replicable spec's pushed idle
-// timeout is derived (effectiveIdleTimeoutSeconds) from the spec's
+// field the agent does not already hold: the pushed idle timeout of a
+// replicable spec or a cluster head (DerivesIdleTimeout) is derived
+// (effectiveIdleTimeoutSeconds) from the spec's
 // startup_measured_ms (row 4) and its mapping's load_time_ms (row 3), and
 // neither figure is the agent's own value for that field. The telemetry
 // ingest writes startup_measured_ms (gateway.Server.writeBackRuntimeStartup,
 // only on a move of more than 10 %, so jitter pushes nothing) and the speed
 // benchmark writes load_time_ms (gateway.Server.measureSpeedTarget); each
-// pushes that server's document after a write for a replicable spec, through
+// pushes that server's document after a write for such a spec, through
 // gateway.Server.PushRuntimeConfig -- the push this hook runs -- and only for
-// a replicable spec, since the derived timeout is the one field either moves.
+// such a spec, since the derived timeout is the one field either moves.
 // Any other writer of load_time_ms, an audio benchmark included, pushes the
 // same way.
+//
+// The cluster members' measured usage (rpc_cluster_members and its GPU rows)
+// is a document input of the member server's rpc_server spec (its demand is
+// max(stored usage, estimate)), written outside this service by the gateway's
+// telemetry ingest (gateway.clusterUsage). It follows the agent's-own-writeback
+// exemption above for the rises during a run: the agent charges max(live,
+// demand) itself, so a push would only echo it its own measurement. It pushes
+// the member server's document when a formed run's end replaces the stored
+// value (after the head disconnects, the agent no longer holds the value) and
+// when an operator resets a member's stored usage.
 //
 // One input of the document is not a row: whether the server's agent declares
 // the runtime_instances feature (AgentFeatureReader, Service.specAsPushed),
@@ -2586,7 +2867,11 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // AwaitsAgentFeatures). The agent declares it in its telemetry, outside this
 // service, so the gateway's ingest pushes that server's document itself when
 // the declaration becomes known or changes (gateway.Server.
-// ingestTelemetrySample).
+// ingestTelemetrySample). Likewise whether every agent of a cluster the server
+// takes part in declares rpc_cluster, and whether all those declarations are
+// known (deriveCluster): the ingest notifies every server of those clusters
+// (NotifyClustersOfServer) when a declaration becomes known or rpc_cluster
+// changes.
 func (s *Service) notifyRuntimeChanged(serverID string) {
 	if s.runtimeChanged != nil {
 		s.runtimeChanged(serverID)
@@ -2784,6 +3069,19 @@ type AgentRuntimeSpecDTO struct {
 	Replicable   bool `json:"replicable,omitempty"`
 	MinInstances int  `json:"min_instances,omitempty"`
 	MaxInstances int  `json:"max_instances,omitempty"`
+	// Kind is "" for a model spec and AgentSpecKindRPCServer for a llama.cpp
+	// RPC cluster member, which runs no model: it has no model names, listen
+	// port or probe paths, and carries RPC instead. DeviceBackend is the
+	// compute backend the agent renders device placeholders (and a member's
+	// -d) for; omitted for "auto", which an absent field means. Cluster makes
+	// a model spec a cluster head. All four are omitempty, so the document of
+	// a spec that uses none of them is the one it was before clusters
+	// existed; the agent honours them only while this gateway declares
+	// rpc_cluster.
+	Kind          string               `json:"kind,omitempty"`
+	DeviceBackend string               `json:"device_backend,omitempty"`
+	Cluster       *AgentClusterHeadDTO `json:"cluster,omitempty"`
+	RPC           *AgentRPCMemberDTO   `json:"rpc,omitempty"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -2821,6 +3119,18 @@ type AgentRuntimeConfigDTO struct {
 	// that runs instances retire every instance beyond the first -- the
 	// protected ones included -- until the declaration arrived.
 	//
+	// A document is held, too, while it would carry a llama.cpp RPC cluster
+	// head or member and serverID's OWN agent declaration is not known:
+	// serving it without the cluster would make the agent stop a running
+	// head or member after a gateway restart, until its declaration arrived.
+	// An unknown declaration of ANOTHER server of the cluster does not hold
+	// the document. That server counts by the agent version it last
+	// reported, and only when that does not tell either is the cluster's
+	// head or member withheld from the document
+	// (ClusterWithheldFeaturesPending), so a member host that stays away
+	// cannot freeze every other model on the head's server, and the host
+	// that reports first after a gateway restart keeps its cluster.
+	//
 	// The specs of a held document are derived as stored, as for an agent that
 	// runs instances (Service.specAsPushed). The flag itself is never on the
 	// wire, and so not in the ETag: the document an instance agent gets once
@@ -2852,6 +3162,11 @@ type AgentRuntimeConfigDTO struct {
 //
 // Per-GPU VRAMMB: max(measured, estimate) -- see agentRuntimeSpecDTO. 0 means
 // unknown (both source fields are 0).
+//
+// A llama.cpp RPC cluster head goes out with its cluster block or not at all
+// (deriveCluster withholds the whole cluster rather than push a partial
+// endpoint list), and after the server's own specs come the rpc_server
+// members it runs for heads on other servers (memberSpecsForServer).
 //
 // The empty document means exactly one thing: "this server is genuinely not
 // running anything managed" -- an empty serverID, no such AIServer row
@@ -2993,6 +3308,22 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
+		// A cluster head goes out with its cluster block, or not at all: a
+		// head whose cluster cannot be derived in full is withheld (and its
+		// member specs with it); while this server's own agent has not
+		// declared its features, the document is held.
+		var cluster *AgentClusterHeadDTO
+		if spec.ClusterEnabled {
+			block, reason, hold, err := s.clusterHeadBlock(ctx, spec, server)
+			if err != nil {
+				return AgentRuntimeConfigDTO{}, err
+			}
+			awaitsFeatures = awaitsFeatures || hold
+			if reason != "" {
+				continue
+			}
+			cluster = block
+		}
 		// The spec as this server's agent can run it: without the instance
 		// settings for an agent that does not declare runtime_instances.
 		pushed := s.specAsPushed(serverID, spec)
@@ -3015,6 +3346,12 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		specDTO.Role = string(routing.DeriveRole(et, routing.YesCapabilities(capsByMapping[spec.MappingID])))
 		specDTO.MetricsPath = mp
 		specDTO.ContextProbePath = cp
+		specDTO.Cluster = cluster
+		// "auto" is what an absent device_backend means to the agent, so the
+		// document of a spec that never chose a backend stays as it was.
+		if backend := normalizeDeviceBackend(spec.DeviceBackend); backend != deviceBackendAuto {
+			specDTO.DeviceBackend = backend
+		}
 		specIDByMapping[spec.MappingID] = spec.ID
 		specDTOs = append(specDTOs, specDTO)
 	}
@@ -3030,6 +3367,15 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
+	// The rpc_server members this server runs for other servers' cluster
+	// heads. They are exempt from co-residency pairs (the agent admits them
+	// by VRAM and RAM alone), so they join the specs after the pairs' input.
+	members, membersHold, err := s.memberSpecsForServer(ctx, serverID)
+	if err != nil {
+		return AgentRuntimeConfigDTO{}, err
+	}
+	specDTOs = append(specDTOs, members...)
+	awaitsFeatures = awaitsFeatures || membersHold
 	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
 	dto := agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses)
 	dto.AwaitsAgentFeatures = awaitsFeatures
@@ -3258,8 +3604,10 @@ func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 
 // effectiveIdleTimeoutSeconds is the idle timeout the runtime-config document
 // pushes for spec, whose mapping's benchmark cold start is loadTimeMS. A spec
-// that is not replicable gets its stored IdleTimeoutSeconds as it is, 0 still
-// meaning "never unload". A replicable one gets the largest of its stored
+// that is neither replicable nor a cluster head (DerivesIdleTimeout) gets its
+// stored IdleTimeoutSeconds as it is, 0 still meaning "never unload". A
+// replicable one, and a cluster head, whose cold start waits for every member
+// first, gets the largest of its stored
 // value -- where 0 means "no manual override", not "never" -- factor times its
 // startup in seconds, rounded up, and floorSec. The startup is the slower of
 // the agent's measured startup and the benchmark's cold start, so an instance
@@ -3268,7 +3616,7 @@ func instanceIdleDefaults(factor float64, floorSec int) (float64, int) {
 // replicable spec is never pushed 0, so its unprotected instances always idle
 // out. The result is held at maxDerivedIdleTimeoutSeconds.
 func effectiveIdleTimeoutSeconds(spec routing.RuntimeSpec, loadTimeMS int64, factor float64, floorSec int) int {
-	if !spec.Replicable {
+	if !DerivesIdleTimeout(spec) {
 		return spec.IdleTimeoutSeconds
 	}
 	derivedSec := derivedIdleSeconds(factor, max(spec.StartupMeasuredMS, loadTimeMS))

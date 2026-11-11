@@ -134,6 +134,29 @@ mesh (allow `op-gw-portal` → the AI-server groups on the app ports).
 > through the portal so it gets a tracking group. With `netbird_manage_policies` **off**, add the
 > policies by hand as above.
 
+### 6.1 llama.cpp RPC clusters on the mesh
+
+A cluster head reaches each RPC member on a port the gateway allocates on the member server
+(26000–26999, below every default ephemeral range; the portal shows it per member). With `netbird_manage_policies` **on**, the gateway
+maintains one policy per member server, `op-gw-rpc-<member server id>`: the head server's tracking
+group → the member server's tracking group, TCP, on that member's port only. Do not edit it; a manual
+edit is restored on the next reconcile.
+
+- **Direct transport** on the mesh needs policy management **on**, deny-by-default **on and enforced**,
+  and NetBird's built-in `Default` policy **disabled**: the member's RPC port is unauthenticated, and the
+  policy is its only gate. The portal refuses a direct mesh cluster otherwise, and refuses to turn those
+  switches off while one exists.
+- **Relay transport** works without policy management: the agent's relay admits only the head's mesh IP.
+  With deny-by-default on and policy management **off**, add the rule by hand, one per member: allow
+  the head server's group → the member server's group, TCP, on the member's port (direct or relay, as
+  the portal shows it). Until that rule exists the head cannot connect and its start fails with
+  `runtime.cluster_member_unreachable`.
+
+> **A cluster head must not be a NetBird routing peer or exit node.** The member trusts the head's mesh
+> IP. A head that routes a network (a NetBird network route, or a masquerading exit node) lets every host
+> of that network reach the members under the head's address, unseen by the gateway. Run heads on hosts
+> that do not route, or accept that exposure.
+
 ## 7. Host firewall (defense-in-depth)
 
 Optionally drop inbound `8081` on every host interface except `wt0` (e.g. an `iptables`/`nftables`

@@ -19,7 +19,7 @@ Two test families per module:
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
    compared against a checked-in allowlist — 68 edges across 29 packages in
-   `op-ai-gateway`, 24 edges across 12 packages in `op-ai-server-agent`. Any
+   `op-ai-gateway`, 25 edges across 13 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed
    edge that no longer exists fails too, so an over-generous entry cannot sit
@@ -60,6 +60,14 @@ a signal it belongs in the manager instead. The reverse edge is impossible
 anyway: `internal/agent` declares the feature registry that `internal/runtime`
 intersects against, so `runtime → agent` would be an import cycle, which is why
 the intersection lives on the `runtime` side.
+
+`internal/rpcrelay` (the byte relay in front of a llama.cpp RPC cluster member,
+[Agent-Managed Model Runtime §3.6](agent-runtime-manager.md#the-relay)) is a
+leaf: its allowlist entry is empty, and its one importer is `internal/agent`
+(the edge `agent → rpcrelay`). It is network-facing code that admits or refuses
+peers, so it stays a self-contained package that knows nothing of the runtime:
+the agent tells it the allowlist and the target, and it reports holds, breaches
+and stalls back through callbacks.
 
 Two structural consequences of these rules that read like DRY violations and are
 not:
