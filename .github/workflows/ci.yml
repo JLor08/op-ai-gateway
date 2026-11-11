@@ -4,9 +4,10 @@
 # Continuous integration: format check, lint, build, and test for the Go
 # backend + server-agent and the React/TypeScript frontend; the docs
 # consistency check; the offline tests of the local Sonar tooling; the offline
-# test of the opencode config generator (gen-opencode-config.sh); and the
-# e2e:runtime Playwright suite. Ready to run as soon as a runner is attached to
-# the repository.
+# test of the opencode config generator (gen-opencode-config.sh); the
+# e2e:runtime Playwright suite; and the e2e:rpc-cluster suite against a real
+# llama.cpp build. Ready to run as soon as a runner is attached to the
+# repository.
 name: CI
 
 on:
@@ -207,3 +208,91 @@ jobs:
       - name: Run the runtime e2e suite
         working-directory: gateway/e2e
         run: npm run e2e:runtime
+
+  e2e-rpc-cluster:
+    name: E2E (llama.cpp RPC cluster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The only proof of RPC cluster mode against real llama.cpp processes: the
+    # gateway and two real server-agents on one runner, a llama-server cluster
+    # head on one AI server and a ggml-rpc-server member on the other, started
+    # members first by the gateway, answering a completion. Uses a CPU-only
+    # build of the pinned llama.cpp commit and the tiny stories260K model, both
+    # cached.
+    env:
+      LLAMA_CPP_COMMIT: 2bc46baa9207d098d03741ac394e7faaf1a955b6
+      # Static libraries, so the two binaries run from wherever they are
+      # copied; no OpenSSL (the suite never downloads a model through
+      # llama-server). Change LLAMA_CPP_BUILD_TAG with these flags: it is part
+      # of the cache key.
+      LLAMA_CPP_CMAKE_FLAGS: -DGGML_RPC=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+      LLAMA_CPP_BUILD_TAG: cpu-rpc-static-v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # As in e2e-runtime: the configs fall back to $GOCACHE when it is set.
+      - name: Point GOCACHE at a writable path
+        run: echo "GOCACHE=$RUNNER_TEMP/op-e2e-go-build" >> "$GITHUB_ENV"
+      - name: Restore the llama.cpp build
+        id: llama-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/llama-cpp-rpc/bin
+          key: llama-cpp-${{ runner.os }}-${{ env.LLAMA_CPP_COMMIT }}-${{ env.LLAMA_CPP_BUILD_TAG }}
+      # A shallow fetch of exactly the pinned commit. The build number
+      # llama-server reports is then 1; the agent and the gateway match head
+      # and member builds on the commit, which is exact.
+      - name: Build llama-server and ggml-rpc-server
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          src="$RUNNER_TEMP/llama.cpp"
+          git init -q "$src"
+          git -C "$src" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$src" fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git -C "$src" checkout -q --detach FETCH_HEAD
+          # shellcheck disable=SC2086 # the flags are a word list on purpose
+          cmake -S "$src" -B "$src/build" $LLAMA_CPP_CMAKE_FLAGS
+          cmake --build "$src/build" --config Release -j "$(nproc)" --target llama-server ggml-rpc-server
+          mkdir -p ~/llama-cpp-rpc/bin
+          cp "$src/build/bin/llama-server" "$src/build/bin/ggml-rpc-server" ~/llama-cpp-rpc/bin/
+      # The agent versions an ggml-rpc-server by the llama-server beside it,
+      # from `llama-server --version`; a build that does not report the pinned
+      # commit would fail the cluster save, so fail here first and clearly.
+      - name: Check the llama.cpp build
+        run: |
+          ~/llama-cpp-rpc/bin/llama-server --version 2>&1 | tee /dev/stderr | grep -q "commit ${LLAMA_CPP_COMMIT:0:7}"
+          test -x ~/llama-cpp-rpc/bin/ggml-rpc-server
+      - name: Restore the test model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/llama-cpp-models/stories260K.gguf
+          key: model-stories260K-gguf-v1
+      - name: Download the test model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/llama-cpp-models
+          curl -fsSL --retry 3 -o ~/llama-cpp-models/stories260K.gguf \
+            https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+      - name: Check the test model
+        run: test "$(head -c 4 ~/llama-cpp-models/stories260K.gguf)" = "GGUF"
+      - name: Install e2e dependencies
+        working-directory: gateway/e2e
+        run: npm ci
+      # The suite's webServer builds the gateway with a 120s timeout and its
+      # beforeAll builds the agent; warm both (as e2e-runtime does).
+      - name: Warm the Go build cache
+        run: |
+          (cd gateway/backend && go build -o /dev/null ./cmd/gateway)
+          (cd server-agent && go build -o /dev/null .)
+      - name: Run the RPC cluster e2e suite
+        working-directory: gateway/e2e
+        run: |
+          export OP_E2E_LLAMA_BIN_DIR="$HOME/llama-cpp-rpc/bin"
+          export OP_E2E_RPC_MODEL="$HOME/llama-cpp-models/stories260K.gguf"
+          npm run e2e:rpc-cluster
