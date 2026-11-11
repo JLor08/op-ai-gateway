@@ -229,13 +229,13 @@ jobs:
       LLAMA_CPP_CMAKE_FLAGS: -DGGML_RPC=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
       LLAMA_CPP_TARGETS: llama-server ggml-rpc-server
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "26"
       # As in e2e-runtime: the configs fall back to $GOCACHE when it is set.
       - name: Point GOCACHE at a writable path
         run: echo "GOCACHE=$RUNNER_TEMP/op-e2e-go-build" >> "$GITHUB_ENV"
