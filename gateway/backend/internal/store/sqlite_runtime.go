@@ -616,35 +616,54 @@ func (s *SQLiteStore) ReplaceAgentServerBinaries(ctx context.Context, serverID s
 	if exists == 0 {
 		return ErrNotFound
 	}
+	stale, err := s.staleAgentBinaryPaths(ctx, tx, serverID, rows)
+	if err != nil {
+		return err
+	}
+	for _, path := range stale {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from server_binaries where server_id = ? and path = ? and source = 'agent'`), serverID, path); err != nil {
+			return fmt.Errorf("delete stale agent binary: %w", err)
+		}
+	}
+	if err := s.upsertAgentBinaries(ctx, tx, serverID, rows); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// staleAgentBinaryPaths lists, inside tx, the paths of serverID's
+// source='agent' rows that rows no longer report. The cursor is closed
+// before it returns, so the caller's writes in tx follow a finished read.
+func (s *SQLiteStore) staleAgentBinaryPaths(ctx context.Context, tx *sql.Tx, serverID string, rows []routing.ServerBinary) ([]string, error) {
 	reported := make(map[string]struct{}, len(rows))
 	for _, r := range rows {
 		reported[r.Path] = struct{}{}
 	}
 	existing, err := tx.QueryContext(ctx, s.dl.rebind(`select path from server_binaries where server_id = ? and source = 'agent'`), serverID)
 	if err != nil {
-		return fmt.Errorf("list agent binaries: %w", err)
+		return nil, fmt.Errorf("list agent binaries: %w", err)
 	}
+	defer func() { _ = existing.Close() }()
 	var stale []string
 	for existing.Next() {
 		var path string
 		if err := existing.Scan(&path); err != nil {
-			_ = existing.Close()
-			return fmt.Errorf("scan agent binary: %w", err)
+			return nil, fmt.Errorf("scan agent binary: %w", err)
 		}
 		if _, keep := reported[path]; !keep {
 			stale = append(stale, path)
 		}
 	}
 	if err := existing.Err(); err != nil {
-		_ = existing.Close()
-		return fmt.Errorf("iterate agent binaries: %w", err)
+		return nil, fmt.Errorf("iterate agent binaries: %w", err)
 	}
-	_ = existing.Close()
-	for _, path := range stale {
-		if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from server_binaries where server_id = ? and path = ? and source = 'agent'`), serverID, path); err != nil {
-			return fmt.Errorf("delete stale agent binary: %w", err)
-		}
-	}
+	return stale, nil
+}
+
+// upsertAgentBinaries inserts or refreshes, inside tx, each of rows as a
+// source='agent' row of serverID; a path a manual row owns is left alone
+// (the conflict update is guarded by source = 'agent').
+func (s *SQLiteStore) upsertAgentBinaries(ctx context.Context, tx *sql.Tx, serverID string, rows []routing.ServerBinary) error {
 	for _, r := range rows {
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
 			insert into server_binaries (server_id, path, kind, version, build, "commit", version_source, source, allowed, reported_at)
@@ -658,7 +677,7 @@ func (s *SQLiteStore) ReplaceAgentServerBinaries(ctx context.Context, serverID s
 			return fmt.Errorf("upsert agent binary: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // UpsertManualServerBinary inserts or updates the operator-entered row at

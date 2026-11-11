@@ -1252,36 +1252,47 @@ func (o *clusterOrchestrator) watchHolds(ctx context.Context, plan portal.Cluste
 	wctx, cancel := context.WithCancel(ctx)
 	frames := make(chan serverFrame, runtimeStatusSubBuffer)
 	var wg sync.WaitGroup
+	for _, id := range memberServers(plan) {
+		_, updates, unsubscribe := o.deps.statuses.subscribe(id)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer unsubscribe()
+			forwardFrames(wctx, id, updates, frames)
+		}()
+	}
+	return &holdWatch{frames: frames, stop: func() { cancel(); wg.Wait() }}
+}
+
+// memberServers lists plan's member servers once each, in member order.
+func memberServers(plan portal.ClusterPlan) []string {
 	var servers []string
 	for _, m := range plan.Members {
 		if !slices.Contains(servers, m.Server.ID) {
 			servers = append(servers, m.Server.ID)
 		}
 	}
-	for _, id := range servers {
-		_, updates, unsubscribe := o.deps.statuses.subscribe(id)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer unsubscribe()
-			for {
-				select {
-				case rows, open := <-updates:
-					if !open {
-						return
-					}
-					select {
-					case frames <- serverFrame{serverID: id, rows: rows}:
-					case <-wctx.Done():
-						return
-					}
-				case <-wctx.Done():
-					return
-				}
+	return servers
+}
+
+// forwardFrames hands every frame of serverID that arrives on updates to
+// frames, until updates closes or ctx ends.
+func forwardFrames(ctx context.Context, serverID string, updates <-chan []RuntimeStatusDTO, frames chan<- serverFrame) {
+	for {
+		select {
+		case rows, open := <-updates:
+			if !open {
+				return
 			}
-		}()
+			select {
+			case frames <- serverFrame{serverID: serverID, rows: rows}:
+			case <-ctx.Done():
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
 	}
-	return &holdWatch{frames: frames, stop: func() { cancel(); wg.Wait() }}
 }
 
 // await is step four: it returns once every member's latest fresh frame shows
