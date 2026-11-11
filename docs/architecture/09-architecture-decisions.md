@@ -11745,7 +11745,9 @@ unauthenticated port to the network, lets one head take another's member, or poi
   formation would leave a member evictable while its head runs. A release sticks: a connection the head opened
   before it (a half-open socket of a head that lost power) never re-takes the hold, only a new one does. A direct
   member that still reports the hold of a head that is down is stopped, forced, as well: the rpc-server sets no
-  keepalive, so its half-open connection would otherwise linger. A claimed member is never relaunched under its
+  keepalive, so its half-open connection would otherwise linger. A head server whose telemetry stays away past its
+  stale threshold while the member's server keeps reporting counts as down; the cost is that a failure of only the
+  gateway-to-head-host link, with head and member still talking, aborts that cluster too. A claimed member is never relaunched under its
   head: a change of its launch waits until the claim ends or an ensure finds no head holding it, and the gateway
   relaunches the head for any change of a member's launch inputs, so the change normally lands with the next start; a
   member whose document arrives after the new head connected keeps its old launch until that head stops. A local
