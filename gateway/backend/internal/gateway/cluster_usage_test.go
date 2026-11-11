@@ -640,6 +640,9 @@ func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	k, kruns := newRunFixture(t)
 	k.ackAll()
 	k.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	// Handled on its own: a frame that arrives while the watchdog still
+	// holds this one replaces it, and the exit below would never be seen.
+	k.settle()
 	k.hold(0, 1)
 	if err := k.o.Ensure(context.Background(), orchHead); err != nil {
 		t.Fatalf("Ensure: %v", err)

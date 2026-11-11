@@ -1542,10 +1542,8 @@ render exactly what the spec declares, so nothing here has to change for it.
   cache directory, measured **off the collect loop** and reused for 60 s: the
   telemetry path never walks a large directory every sample, and a first read
   reports 0 until the first measurement lands.
-- A **head's `cluster` block**: `launched` (the endpoint addresses the running
-  process was started against, present while the head has a process) and
-  `version` (the llama.cpp build the cluster agreed on, empty when nothing
-  recorded it; the agent never executes a binary to fill it on a status read).
+- A **head's `cluster` block**: `launched`, the endpoint addresses the running
+  process was started against, present while the head has a process.
 
 A model row carries none of these keys, so an agent without cluster specs is
 byte-neutral for the gateway's decoder.

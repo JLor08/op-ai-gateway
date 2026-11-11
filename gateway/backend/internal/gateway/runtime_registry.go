@@ -63,11 +63,9 @@ type RuntimeBreachStatus struct {
 }
 
 // RuntimeClusterStatusDTO is a cluster head's launch facts while its process
-// exists: the member endpoints it was started against and the llama.cpp build
-// version the cluster agreed on ("" when nothing recorded it).
+// exists: the member endpoints it was started against.
 type RuntimeClusterStatusDTO struct {
 	Launched []string `json:"launched"`
-	Version  string   `json:"version"`
 }
 
 // clone returns a copy of r that shares no slice with it.
