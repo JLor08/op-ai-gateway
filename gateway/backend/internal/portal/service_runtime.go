@@ -1082,17 +1082,8 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	// preparation (the token seal) included.
 	plan := keepStoredCluster(prior, fields)
 	if principal != nil {
-		if plan, err = s.validateClusterHead(ctx, *principal, app, req, fields, prior); err != nil {
+		if plan, err = s.operatorClusterPlan(ctx, *principal, app, req, fields, prior); err != nil {
 			return runtimeSpecWrite{}, err
-		}
-		if err := s.checkListenPortFree(ctx, app.ServerID, req.ListenPort, prior); err != nil {
-			return runtimeSpecWrite{}, err
-		}
-		// The newest save code: appended after every refusal above, so a body
-		// that is also invalid for an older reason keeps that answer.
-		if plan.headVersionUnknown {
-			return runtimeSpecWrite{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
-				ErrClusterHeadBinaryVersionUnknown, fields.binary)
 		}
 	}
 	plan.applyTo(&spec)
@@ -1100,35 +1091,8 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 		memberServers:  plan.memberServers,
 		touchesCluster: plan.enabled || len(plan.memberServers) > 0 || (prior.ok && prior.spec.ClusterEnabled),
 	}
-	// The membership write is the step that can still be refused by state
-	// the checks could not hold (a member spec or port another gateway
-	// process took, a member server deleted since). It goes first wherever
-	// the head row exists already, so such a refusal stores nothing, rather
-	// than a head whose cluster columns no longer match its membership.
-	if plan.writeMembers && prior.ok {
-		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
-			return w, err
-		}
-		w.stored = true
-	}
-	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
+	if err := s.storeRuntimeSpec(ctx, spec, req, prior, &plan, &w); err != nil {
 		return w, err
-	}
-	w.stored = true
-	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
-		return w, err
-	}
-	// A new head's membership needs its row; a refused membership takes the
-	// new row away again, so the refusal stores nothing here either.
-	if plan.writeMembers && !prior.ok {
-		if err := s.writeClusterMembers(ctx, spec.ID, &plan); err != nil {
-			if delErr := s.routes.DeleteRuntimeSpec(ctx, spec.ID); delErr == nil {
-				w.stored = false
-			} else {
-				slog.Warn("runtime spec: could not remove a new cluster head whose membership was refused", "spec_id", spec.ID, "err", delErr)
-			}
-			return w, err
-		}
 	}
 	storedGPUs, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 	if err != nil {
@@ -1136,6 +1100,68 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	}
 	w.dto, err = runtimeSpecDTO(spec, storedGPUs, app, mapping, s.effectiveIdleTimeout(app.ServerID, spec, mapping))
 	return w, err
+}
+
+// operatorClusterPlan runs the store-reading checks of an operator's write,
+// the newest refusals of the write, in order: the cluster checks
+// (validateClusterHead), the listen-port check, and the unknown head binary
+// version, the newest save code, appended last so a body that is also
+// invalid for an older reason keeps that answer. It runs with the cluster
+// write lock held (writeRuntimeSpecAs).
+func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app routing.Application, req PutRuntimeSpecRequest, fields runtimeSpecFields, prior runtimeSpecPrior) (clusterPlan, error) {
+	plan, err := s.validateClusterHead(ctx, p, app, req, fields, prior)
+	if err != nil {
+		return clusterPlan{}, err
+	}
+	if err := s.checkListenPortFree(ctx, app.ServerID, req.ListenPort, prior); err != nil {
+		return clusterPlan{}, err
+	}
+	if plan.headVersionUnknown {
+		return clusterPlan{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
+			ErrClusterHeadBinaryVersionUnknown, fields.binary)
+	}
+	return plan, nil
+}
+
+// storeRuntimeSpec stores spec, its GPU rows and, when plan writes them, its
+// membership, and records in w whether anything reached the store. For an
+// operator's write it runs with the cluster write lock held
+// (writeRuntimeSpecAs).
+//
+// The membership write is the step that can still be refused by state the
+// checks could not hold (a member spec or port another gateway process took,
+// a member server deleted since). It goes first wherever the head row exists
+// already, so such a refusal stores nothing, rather than a head whose cluster
+// columns no longer match its membership. A new head's membership needs its
+// row; a refused membership takes the new row away again, so the refusal
+// stores nothing there either.
+func (s *Service) storeRuntimeSpec(ctx context.Context, spec routing.RuntimeSpec, req PutRuntimeSpecRequest, prior runtimeSpecPrior, plan *clusterPlan, w *runtimeSpecWrite) error {
+	if plan.writeMembers && prior.ok {
+		if err := s.writeClusterMembers(ctx, spec.ID, plan); err != nil {
+			return err
+		}
+		w.stored = true
+	}
+	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
+		return err
+	}
+	w.stored = true
+	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
+		return err
+	}
+	if !plan.writeMembers || prior.ok {
+		return nil
+	}
+	err := s.writeClusterMembers(ctx, spec.ID, plan)
+	if err == nil {
+		return nil
+	}
+	if delErr := s.routes.DeleteRuntimeSpec(ctx, spec.ID); delErr == nil {
+		w.stored = false
+	} else {
+		slog.Warn("runtime spec: could not remove a new cluster head whose membership was refused", "spec_id", spec.ID, "err", delErr)
+	}
+	return err
 }
 
 // runtimeSpecFields is a PutRuntimeSpecRequest after
