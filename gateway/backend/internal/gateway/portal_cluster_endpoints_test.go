@@ -101,10 +101,26 @@ func TestHandlePortalClusterCandidates(t *testing.T) {
 		t.Fatalf("list = %d %s", rec.Code, rec.Body.String())
 	}
 	var list struct {
-		Data []portal.ClusterCandidateDTO `json:"data"`
+		Data            []portal.ClusterCandidateDTO `json:"data"`
+		HeadBinaryKnown *bool                        `json:"head_binary_known"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.Data == nil {
-		t.Fatalf("body %s err=%v, want a data array", rec.Body.String(), err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.Data == nil || list.HeadBinaryKnown == nil {
+		t.Fatalf("body %s err=%v, want a data array and head_binary_known", rec.Body.String(), err)
+	}
+	// The form's head binary rides as ?binary=; one the head server's
+	// inventory does not list has no known version.
+	rec = rpcMemberDo(t, srv, http.MethodGet, base+"?mode=automatic&binary=%2Fopt%2Fllama%2Fllama-server", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list with binary = %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.HeadBinaryKnown == nil || *list.HeadBinaryKnown {
+		t.Fatalf("body %s err=%v, want head_binary_known false", rec.Body.String(), err)
+	}
+	must(srv.Routes.UpsertManualServerBinary(ctx, routing.ServerBinary{ServerID: serverID, Path: "/opt/llama/llama-server", Kind: "llama_server", Commit: "2bc46ba", Build: "1"}))
+	rec = rpcMemberDo(t, srv, http.MethodGet, base+"?mode=automatic&binary=%2Fopt%2Fllama%2Fllama-server", "")
+	list.HeadBinaryKnown = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.HeadBinaryKnown == nil || !*list.HeadBinaryKnown {
+		t.Fatalf("body %s err=%v, want head_binary_known true for a listed binary", rec.Body.String(), err)
 	}
 	rec = rpcMemberDo(t, srv, http.MethodGet, base+"?mode=sideways", "")
 	if rec.Code != http.StatusBadRequest || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_mode_invalid" {
@@ -116,6 +132,25 @@ func TestHandlePortalClusterCandidates(t *testing.T) {
 	rec = rpcMemberDo(t, srv, http.MethodGet, "/api/portal/mappings/map_nope/runtime/cluster-candidates", "")
 	if rec.Code != http.StatusNotFound || rpcMemberErrCode(t, rec) != "mapping.not_found" {
 		t.Fatalf("unknown mapping = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The application-scoped listing serves a head that is not stored yet.
+	appBase := "/api/portal/applications/app_head/runtime/cluster-candidates"
+	rec = rpcMemberDo(t, srv, http.MethodGet, appBase+"?mode=automatic&binary=%2Fopt%2Fllama%2Fllama-server", "")
+	list.Data, list.HeadBinaryKnown = nil, nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); rec.Code != http.StatusOK || err != nil || list.Data == nil || list.HeadBinaryKnown == nil || !*list.HeadBinaryKnown {
+		t.Fatalf("application list = %d %s err=%v", rec.Code, rec.Body.String(), err)
+	}
+	rec = rpcMemberDo(t, srv, http.MethodGet, appBase+"?mode=sideways", "")
+	if rec.Code != http.StatusBadRequest || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_mode_invalid" {
+		t.Fatalf("application bad mode = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec = rpcMemberDo(t, srv, http.MethodPost, appBase, ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("application post = %d", rec.Code)
+	}
+	rec = rpcMemberDo(t, srv, http.MethodGet, "/api/portal/applications/app_nope/runtime/cluster-candidates", "")
+	if rec.Code != http.StatusNotFound || rpcMemberErrCode(t, rec) != "application.not_found" {
+		t.Fatalf("unknown application = %d %s", rec.Code, rec.Body.String())
 	}
 
 	// A cluster head write refused through the HTTP surface answers its code.

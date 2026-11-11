@@ -71,7 +71,8 @@ func TestClusterGateVerdicts(t *testing.T) {
 		g := newTestClusterGate(f, nil)
 		v := g.ClusterGateState(context.Background(), orchHeadServer, "map_head")
 		// 10 units for the head plus 8 for the slowest member, 10 ms each,
-		// and the start's configuration wait (300 ms) and margins (20 + 50 ms).
+		// and the start's configuration wait (300 ms) and margins (20 + 50 ms);
+		// a lan cluster waits for no NetBird policy.
 		if v.State != routing.ClusterGateParkable || v.Head != orchHead || v.ParkBound != 550*time.Millisecond {
 			t.Fatalf("cold verdict = %+v, want parkable for %s with a 550ms bound", v, orchHead)
 		}
@@ -667,8 +668,9 @@ func TestClusterGateViewFirstReadIsSingleFlight(t *testing.T) {
 	}
 	close(blocking.release)
 	for range askers {
-		if v := <-views; v.bound != 520*time.Millisecond {
-			t.Fatalf("view bound = %v, want the plan's 520ms", v.bound)
+		want := 520 * time.Millisecond
+		if v := <-views; v.bound != want {
+			t.Fatalf("view bound = %v, want the plan's %v", v.bound, want)
 		}
 	}
 	if n := blocking.readCount(); n != 1 {

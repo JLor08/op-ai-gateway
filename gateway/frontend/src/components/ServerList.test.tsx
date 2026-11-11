@@ -323,6 +323,7 @@ function baseServerListApi(): ServerListApi {
     updateServerBinary: vi.fn(async () => ({}) as never),
     deleteServerBinary: vi.fn(async () => undefined),
     clusterCandidates: vi.fn(async () => ({ data: [] })),
+    applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
     resetClusterMemberUsage: vi.fn(async () => ({}) as never),
     deleteServer: vi.fn(async () => ({ ok: true })),
     downloadAgentBinary: vi.fn(async () => new Blob()),

@@ -4092,17 +4092,18 @@ func (o *owner) startProcess(st *specState) {
 		return
 	}
 
-	args, env := ex.args, ex.env
 	if spec.IsRPCServer() {
 		// A member's command line is the operator's arguments plus the
 		// agent-owned -d/-H/-p/-c, and its port is the one it binds. Everything
 		// here is deterministic, so a failure is a verdict, not a start failure.
+		// ex grows by those entries, so what is reported below is what runs.
 		var err error
-		if args, env, port, err = o.prepareMember(spec, ex.args, ex.env); err != nil {
+		if ex, port, err = o.prepareMember(spec, ex); err != nil {
 			o.setNotPermitted(st, err.Error())
 			return
 		}
 	}
+	args, env := ex.args, ex.env
 	// The reportable form of this exact launch, built from the SAME expansion
 	// (never a second one that could disagree with it) and masked here, at the
 	// point of substitution, so no plaintext resolved command is ever retained

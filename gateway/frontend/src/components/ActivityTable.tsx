@@ -31,14 +31,11 @@ import { ServerLabelText } from './shared/ServerLabelText';
 import { StatusChip } from './shared/StatusChip';
 import { usageChipStatus } from './shared/status';
 import { ColumnFilter } from './shared/ColumnFilter';
+import { EnergyPartsCell } from './EnergyPartsCell';
 import { useColumnDrag, columnDragSx, type DragPlace } from './shared/columnDrag';
 import type { ColumnDef, ColumnId } from './activityColumns';
-import {
-  BILLING_UNIT_HELP_KEYS,
-  ENERGY_SOURCE_HELP_KEYS,
-  isTokenMetered,
-  type HelpMessageKey,
-} from './billingUnit';
+import { BILLING_UNIT_HELP_KEYS, ENERGY_SOURCE_HELP_KEYS, isTokenMetered } from './billingUnit';
+import { chipWithHelp } from './chipWithHelp';
 
 const LIMIT_OPTIONS = [25, 50, 100];
 
@@ -75,9 +72,9 @@ const TEXT_FILTER_COLUMNS = new Set<ColumnId>([
 // The em dash carries a tooltip, so the reason is one hover away rather than a
 // mystery.
 //
-// renderCell and these two helpers are module-level and therefore do NOT close
-// over the component's `t`; it is threaded through as an explicit parameter
-// instead. A module-level mutable would be the alternative, and it would make
+// renderCell, this helper and chipWithHelp (chipWithHelp.tsx) are
+// module-level and therefore do NOT close over the component's `t`; it is
+// threaded through as an explicit parameter instead. A module-level mutable would be the alternative, and it would make
 // the rendered language depend on call order.
 function tokenCountCell(row: UsageEvent, value: number, t: Translation): ReactNode {
   if (isTokenMetered(row)) return value;
@@ -86,39 +83,6 @@ function tokenCountCell(row: UsageEvent, value: number, t: Translation): ReactNo
       <span>—</span>
     </Tooltip>
   );
-}
-
-// An opaque wire enum, rendered as a chip with its RAW value plus an explanatory
-// tooltip. The raw label is the portal's forward-compatibility convention: an
-// unrecognised value from a newer backend must show as itself rather than as a
-// misleading label -- and it gets NO tooltip, because a wrong explanation is
-// worse than none.
-function chipWithHelp(
-  value: string,
-  helpKeys: Record<string, HelpMessageKey>,
-  t: Translation,
-): ReactNode {
-  const body = value ? <Chip size="small" variant="outlined" label={value} /> : <span>—</span>;
-  const helpKey = helpKeys[value];
-  // No cast on this lookup: HelpMessageKey is derived from the keys of
-  // Translation, so a missing or misspelled key fails the build here instead of
-  // silently rendering nothing.
-  //
-  // The lookup CAN be undefined at runtime even though its type says otherwise:
-  // tsconfig has `strict` but not `noUncheckedIndexedAccess`, so an index into a
-  // Record<string, ...> is typed as if it always hit. An unrecognised wire value
-  // (a newer backend's energy_source, any billing_unit outside the two known
-  // ones) yields undefined here. `billingUnit.test.ts` pins that lookup.
-  //
-  // The early return below is a SIMPLIFICATION, not a correctness guard: MUI's
-  // Tooltip already suppresses itself on a falsy `title`, so deleting it would
-  // render the same DOM -- it only avoids wrapping `body` in a Tooltip that
-  // would do nothing. What actually holds the "an unknown value gets NO tooltip"
-  // rule is the test: ActivityTable.test.tsx hovers an unrecognised
-  // energy_source and waits past MUI's enter delay before asserting the absence,
-  // so inventing a fallback tooltip here fails it.
-  if (!helpKey) return body;
-  return <Tooltip title={t[helpKey]}>{body}</Tooltip>;
 }
 
 function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
@@ -164,17 +128,13 @@ function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
       return row.stream ? '✓' : '–';
     case 'provider_model':
       return row.provider_model;
-    case 'energy_wh':
-      return row.energy_wh ? row.energy_wh.toFixed(3) : '—';
-    case 'energy_marginal_wh':
-      return row.energy_marginal_wh ? row.energy_marginal_wh.toFixed(3) : '—';
     case 'energy_source':
       return chipWithHelp(row.energy_source ?? '', ENERGY_SOURCE_HELP_KEYS, t);
     case 'billing_unit':
       return chipWithHelp(row.billing_unit ?? '', BILLING_UNIT_HELP_KEYS, t);
     case 'billing_quantity':
-      // Guarded on the UNIT, not on the value -- unlike the energy cells above,
-      // and deliberately so. This column IS the measure for a non-token row, so
+      // Guarded on the UNIT, not on the value -- unlike the energy cells
+      // (EnergyPartsCell.tsx), and deliberately so. This column IS the measure for a non-token row, so
       // a quantity of 0 is a measurement (every FAILED image request has one)
       // and must read as `0`; only a token-metered row, where the quantity does
       // not apply at all, gets the em dash. Same rule as tokenCountCell, applied
@@ -309,6 +269,17 @@ export function ActivityTable({
         return tokenCell(row);
       case 'cost_eur':
         return formatCost(row.cost_eur, costUnit, currencyFactor);
+      case 'energy_wh':
+      case 'energy_marginal_wh':
+        return (
+          <EnergyPartsCell
+            row={row}
+            figure={col.id === 'energy_wh' ? 'total' : 'marginal'}
+            t={t}
+            costUnit={costUnit}
+            currencyFactor={currencyFactor}
+          />
+        );
       default:
         return renderCell(row, col.id, t);
     }

@@ -218,6 +218,7 @@ export function ServerList({
     | 'updateServerBinary'
     | 'deleteServerBinary'
     | 'clusterCandidates'
+    | 'applicationClusterCandidates'
     | 'resetClusterMemberUsage'
     | 'runtimeCoresidency'
     | 'putRuntimeCoresidency'

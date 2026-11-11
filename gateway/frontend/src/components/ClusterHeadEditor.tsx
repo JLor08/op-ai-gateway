@@ -57,6 +57,14 @@ import {
   scanClusterArgs,
   type ClusterArgScan,
 } from './shared/clusterArgs';
+import {
+  compatibleMemberSpecs,
+  memberProblem,
+  offeredCandidates,
+  useClusterCandidates,
+  type CandidatesState,
+  type MemberProblem,
+} from './shared/clusterCandidates';
 
 const deviceBackends: DeviceBackend[] = ['auto', 'cuda', 'rocm', 'vulkan', 'metal', 'sycl'];
 
@@ -262,6 +270,14 @@ function gpuLabel(gpu: HardwareGPU): string {
   return name ? `GPU ${gpu.index} · ${name}` : `GPU ${gpu.index}`;
 }
 
+// A member GPU as its rows show it: the picker's label when the member
+// server's hardware report names the GPU, else its index alone (no report,
+// a failed read, or a GPU the report does not list).
+function memberGpuLabel(index: number, hostGpus: HostGpus | undefined): string {
+  const gpu = Array.isArray(hostGpus) ? hostGpus.find((g) => g.index === index) : undefined;
+  return gpu ? gpuLabel(gpu) : `GPU ${index}`;
+}
+
 function swap<T>(items: T[], index: number, delta: number): T[] {
   const target = index + delta;
   if (target < 0 || target >= items.length) return items;
@@ -270,18 +286,17 @@ function swap<T>(items: T[], index: number, delta: number): T[] {
   return next;
 }
 
-// Per automatic member server: its reported GPUs, 'unavailable' without a
+// Per visible member server: its reported GPUs, 'unavailable' without a
 // hardware report, 'failed' when the read failed. Each server is read once.
+// Automatic members pick their GPUs from it; every member names its GPUs
+// with it.
 function useMemberHardware(
   api: Pick<PortalApi, 'serverHardware'>,
   value: ClusterHeadState,
 ): Record<string, HostGpus> {
   const [hardwareByServer, setHardwareByServer] = useState<Record<string, HostGpus>>({});
-  const automaticServers =
-    value.memberMode === 'automatic'
-      ? value.members.filter((m) => m.visible).map((m) => m.server_id)
-      : [];
-  const missingHardware = automaticServers.filter((id) => !(id in hardwareByServer));
+  const memberServers = value.members.filter((m) => m.visible).map((m) => m.server_id);
+  const missingHardware = memberServers.filter((id) => !(id in hardwareByServer));
   const missingKey = missingHardware.join(',');
 
   useEffect(() => {
@@ -304,6 +319,50 @@ function useMemberHardware(
     };
   }, [api, missingKey]);
   return hardwareByServer;
+}
+
+// What the open picker offers and what is chosen in it: the compatible
+// candidates that are no member yet, the chosen server, its compatible member
+// specs and the one to add, and whether the choice can be added (not while
+// the list is being read again).
+function pickerChoice(
+  picker: PickerState | null,
+  candidates: CandidatesState,
+  value: ClusterHeadState,
+): {
+  offered: ClusterCandidate[];
+  chosen: ClusterCandidate | undefined;
+  chosenSpecs: RPCMemberSpec[];
+  chosenSpecId: string;
+  canAdd: boolean;
+} {
+  if (!picker) {
+    return { offered: [], chosen: undefined, chosenSpecs: [], chosenSpecId: '', canAdd: false };
+  }
+  const taken = new Set(value.members.map((m) => m.server_id));
+  const offered = offeredCandidates(candidates, taken);
+  const chosen = offered.find((c) => c.server_id === picker.serverId);
+  const chosenSpecs = chosen ? compatibleMemberSpecs(chosen) : [];
+  const chosenSpecId = pickedMemberSpecId(value.memberMode, chosenSpecs, picker.specId);
+  const specReady = value.memberMode === 'automatic' || chosenSpecId !== '';
+  const canAdd = chosen !== undefined && !candidates.loading && specReady;
+  return { offered, chosen, chosenSpecs, chosenSpecId, canAdd };
+}
+
+// Whether automatic members cannot be matched because the head binary's
+// version is unknown (as the listing last read says).
+function headVersionKnownMissing(mode: ClusterMemberMode, candidates: CandidatesState): boolean {
+  if (mode !== 'automatic' || candidates.loading || candidates.failed) return false;
+  return !candidates.headKnown;
+}
+
+// The text of a member's problem with the form's head binary.
+function memberProblemText(problem: MemberProblem | undefined, t: Translation): string | undefined {
+  if (problem === 'no_matching_binary') return t.clusterMemberNoMatchingRpcBinary;
+  if (problem === 'not_offered') return t.clusterMemberNotOffered;
+  if (problem === 'version_mismatch') return t.clusterMemberVersionMismatch;
+  if (problem === 'spec_not_offered') return t.clusterMemberSpecNotOffered;
+  return undefined;
 }
 
 // The text of the network select's default option: the default the gateway
@@ -487,10 +546,8 @@ function ClusterTotalsLine({ t, totals }: Readonly<{ t: Translation; totals: Clu
   );
 }
 
+// The open picker's choice: the server, and in manual mode its member spec.
 type PickerState = {
-  loading: boolean;
-  failed: boolean;
-  candidates: ClusterCandidate[];
   serverId: string;
   specId: string;
 };
@@ -500,6 +557,7 @@ type PickerState = {
 function MemberPicker({
   t,
   picker,
+  candidates,
   onPickerChange,
   offered,
   chosen,
@@ -511,6 +569,7 @@ function MemberPicker({
 }: Readonly<{
   t: Translation;
   picker: PickerState;
+  candidates: CandidatesState;
   onPickerChange: (next: PickerState) => void;
   offered: ClusterCandidate[];
   chosen: ClusterCandidate | undefined;
@@ -520,10 +579,10 @@ function MemberPicker({
   onAdd: () => void;
   onCancel: () => void;
 }>) {
-  const settledEmpty = !picker.loading && !picker.failed && offered.length === 0;
+  const settledEmpty = !candidates.loading && !candidates.failed && offered.length === 0;
   return (
     <Box sx={{ display: 'grid', gap: 1, maxWidth: 480 }}>
-      {picker.failed && <Alert severity="error">{t.clusterCandidatesFailed}</Alert>}
+      {candidates.failed && <Alert severity="error">{t.clusterCandidatesFailed}</Alert>}
       {settledEmpty && (
         <Alert severity="info">
           {memberMode === 'automatic'
@@ -535,7 +594,7 @@ function MemberPicker({
         <SelectField
           id="cluster-member-server"
           label={t.clusterMemberServer}
-          value={picker.serverId}
+          value={chosen ? picker.serverId : ''}
           onChange={(e) =>
             onPickerChange({ ...picker, serverId: String(e.target.value), specId: '' })
           }
@@ -591,6 +650,7 @@ export function ClusterHeadEditor({
   t,
   api,
   mappingId,
+  applicationId,
   headServer,
   stored,
   value,
@@ -599,13 +659,17 @@ export function ClusterHeadEditor({
   env,
   headHasGpus,
   startupTimeoutSeconds,
+  headBinary = '',
   headBinaryVersion = '',
   resetMemberUsage,
 }: Readonly<{
   t: Translation;
-  api: Pick<PortalApi, 'clusterCandidates' | 'serverHardware'>;
-  // '' while the spec is being created: the candidates are read per mapping.
+  api: Pick<PortalApi, 'clusterCandidates' | 'applicationClusterCandidates' | 'serverHardware'>;
+  // '' while the spec is being created: the candidates are then read per
+  // application, and the first save stores the head with its members.
   mappingId: string;
+  // The application the spec belongs to, for the listing of a new spec.
+  applicationId: string;
   headServer: PortalServer;
   // The loaded spec: the read view's defaults, warnings and totals.
   stored?: RuntimeSpec;
@@ -620,6 +684,9 @@ export function ClusterHeadEditor({
   // unknown). Members carry no binary of their own: each runs the server's
   // ggml-rpc-server matching this one.
   headBinaryVersion?: string;
+  // The head's binary as the form has it: the member candidates and the
+  // members' compatibility are read for it, not for the stored binary.
+  headBinary?: string;
   // Clears the stored usage of the member on a server and answers the head's
   // spec as it reads afterwards (the caller keeps that as the loaded spec).
   // Without it, as for a spec not saved yet, no member offers a reset.
@@ -628,6 +695,8 @@ export function ClusterHeadEditor({
   const [pendingMode, setPendingMode] = useState<ClusterMemberMode | null>(null);
   const [pendingAck, setPendingAck] = useState<ClusterHeadState | null>(null);
   const [picker, setPicker] = useState<PickerState | null>(null);
+  // Bumped when the picker opens, so it lists what is true now.
+  const [candidatesReload, setCandidatesReload] = useState(0);
   const [pendingReset, setPendingReset] = useState<{ serverId: string; name: string } | null>(null);
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState('');
@@ -655,6 +724,14 @@ export function ClusterHeadEditor({
   const locked = value.members.some((m) => !m.visible);
   const switchLocked = locked && !value.enabled && !stored?.cluster_enabled;
   const hardwareByServer = useMemberHardware(api, value);
+  const candidates = useClusterCandidates(
+    api,
+    { mappingId, applicationId },
+    value.memberMode,
+    headBinary.trim(),
+    value.enabled,
+    candidatesReload,
+  );
 
   const scan = scanClusterArgs(args, env);
   const network = effectiveNetwork(value, stored);
@@ -685,22 +762,17 @@ export function ClusterHeadEditor({
     patch({ members: value.members.map((m) => (m.rowKey === rowKey ? { ...m, ...next } : m)) });
   }
 
-  async function openPicker() {
-    setPicker({ loading: true, failed: false, candidates: [], serverId: '', specId: '' });
-    try {
-      const res = await api.clusterCandidates(mappingId, value.memberMode);
-      setPicker({ loading: false, failed: false, candidates: res.data, serverId: '', specId: '' });
-    } catch {
-      setPicker({ loading: false, failed: true, candidates: [], serverId: '', specId: '' });
-    }
+  function openPicker() {
+    setPicker({ serverId: '', specId: '' });
+    setCandidatesReload((n) => n + 1);
   }
 
-  const taken = new Set(value.members.map((m) => m.server_id));
-  const offered = picker?.candidates.filter((c) => !taken.has(c.server_id)) ?? [];
-  const chosen = offered.find((c) => c.server_id === picker?.serverId);
-  const chosenSpecs = chosen?.member_specs ?? [];
-  const chosenSpecId = pickedMemberSpecId(value.memberMode, chosenSpecs, picker?.specId ?? '');
-  const canAdd = !!chosen && (value.memberMode === 'automatic' || chosenSpecId !== '');
+  const { offered, chosen, chosenSpecs, chosenSpecId, canAdd } = pickerChoice(
+    picker,
+    candidates,
+    value,
+  );
+  const headVersionUnknown = headVersionKnownMissing(value.memberMode, candidates);
 
   function addChosen() {
     if (!chosen || !canAdd) return;
@@ -789,17 +861,12 @@ export function ClusterHeadEditor({
         control={
           <Checkbox
             checked={value.enabled}
-            disabled={switchLocked || (mappingId === '' && !value.enabled)}
+            disabled={switchLocked}
             onChange={(e) => patch({ enabled: e.target.checked })}
           />
         }
         label={t.clusterEnabledLabel}
       />
-      {mappingId === '' && !value.enabled && (
-        <Typography variant="caption" color="text.secondary">
-          {t.clusterCreateFirst}
-        </Typography>
-      )}
       {locked && <Alert severity="info">{t.clusterMembersLocked}</Alert>}
       {value.enabled && (
         <>
@@ -904,6 +971,7 @@ export function ClusterHeadEditor({
                     patch({ members: value.members.filter((x) => x.rowKey !== m.rowKey) })
                   }
                   onPatch={(next) => patchMember(m.rowKey, next)}
+                  problem={memberProblemText(memberProblem(m, value.memberMode, candidates), t)}
                   onResetUsage={
                     resettable(m.server_id)
                       ? () =>
@@ -920,6 +988,11 @@ export function ClusterHeadEditor({
               ),
             )}
           </Box>
+          {headVersionUnknown && (
+            <Alert severity="warning" data-testid="cluster-head-version-unknown">
+              {t.errorClusterHeadBinaryVersionUnknown}
+            </Alert>
+          )}
           {value.members.length > 0 && (
             <Typography
               variant="caption"
@@ -938,11 +1011,7 @@ export function ClusterHeadEditor({
 
           {picker === null ? (
             <Box>
-              <Button
-                startIcon={<AddIcon />}
-                disabled={locked || mappingId === ''}
-                onClick={() => void openPicker()}
-              >
+              <Button startIcon={<AddIcon />} disabled={locked} onClick={openPicker}>
                 {t.clusterMemberAdd}
               </Button>
             </Box>
@@ -950,6 +1019,7 @@ export function ClusterHeadEditor({
             <MemberPicker
               t={t}
               picker={picker}
+              candidates={candidates}
               onPickerChange={setPicker}
               offered={offered}
               chosen={chosen}
@@ -1014,6 +1084,7 @@ function MemberRow({
   onPatch,
   onResetUsage,
   resetBusy = false,
+  problem,
 }: Readonly<{
   t: Translation;
   member: ClusterMemberRow;
@@ -1029,6 +1100,8 @@ function MemberRow({
   // Undefined when the member has no stored usage to reset.
   onResetUsage?: () => void;
   resetBusy?: boolean;
+  // Why the save would refuse this member with the form's head binary.
+  problem?: string;
 }>) {
   const name = member.server_name || member.server_id;
   const selected = new Set(member.gpus.map((g) => g.index));
@@ -1060,7 +1133,7 @@ function MemberRow({
           <Typography component="span" variant="body2" color="text.secondary">
             {member.gpus.length === 0
               ? t.rpcMemberCpu
-              : member.gpus.map((g) => `GPU ${g.index}`).join(', ')}
+              : member.gpus.map((g) => memberGpuLabel(g.index, hostGpus)).join(', ')}
           </Typography>
         )}
         {member.port > 0 && (
@@ -1106,6 +1179,11 @@ function MemberRow({
           </IconButton>
         </Box>
       </Box>
+      {problem && (
+        <Alert severity="error" data-testid="cluster-member-problem">
+          {problem}
+        </Alert>
+      )}
       {automatic && (
         <>
           <Typography variant="caption" color="text.secondary">
@@ -1138,7 +1216,7 @@ function MemberRow({
                 <ArrowDownwardIcon fontSize="small" />
               </IconButton>
               <Typography component="span" sx={{ minWidth: 64 }}>
-                {`GPU ${g.index}`}
+                {memberGpuLabel(g.index, hostGpus)}
               </Typography>
               <Field
                 id={`${member.rowKey}-gpu-${g.index}-vram`}

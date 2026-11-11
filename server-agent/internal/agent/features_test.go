@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.18.0" {
-		t.Fatalf("Version = %q, want 0.18.0 (the RPC cluster branch's single MINOR bump from 0.17.0; runtime_stop keeps Since 0.17.0)", Version)
+	if Version != "0.18.1" {
+		t.Fatalf("Version = %q, want 0.18.1 (the RPC cluster follow-up's PATCH bump; runtime_stop keeps Since 0.17.0)", Version)
 	}
 }
 
@@ -639,7 +639,7 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.18.0" {
-		t.Fatalf("Version = %q, want 0.18.0", Version)
+	if Version != "0.18.1" {
+		t.Fatalf("Version = %q, want 0.18.1 (a PATCH bump: rpc_cluster keeps Since 0.18.0)", Version)
 	}
 }

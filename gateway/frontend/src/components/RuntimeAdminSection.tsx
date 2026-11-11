@@ -69,6 +69,7 @@ import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
 import { runtimeSpecTemplate } from './shared/runtimeSpecTemplate';
 import {
+  formSpecIsLlamaCpp,
   formSpecIsStableDiffusion,
   specFlavorsAfterTypeSwitch,
   textFlavorsOnStableDiffusion,
@@ -131,6 +132,7 @@ import { ClusterProgress } from './ClusterProgress';
 import { ClusterTotalCell, ClusterWithheldNotice } from './ClusterTotalCell';
 import { clusterStatusView } from './shared/clusterStatus';
 import { clusterWithheldReason, isClusterHead } from './shared/clusterTotals';
+import { useClusterHeadRefresh } from './shared/useClusterHeadRefresh';
 
 // Area 1 (Task 20) is "Launch specs"; areas 2-3 (Task 21) are co-residency and
 // server limits; area 4 (Task 22) is "Live status". One tab strip carries them
@@ -183,15 +185,11 @@ export const RESTART_VANISH_GRACE_MS = 8_000;
  */
 export const OVERRIDE_WRITE_TIMEOUT_MS = 30_000;
 
-/**
- * How often the spec list re-reads the runtime spec of every cluster head
- * while it is shown. The cluster status, the withheld reason, the totals and
- * the stored peaks live on the head's spec, not on the status stream, so
- * without a re-read they would only show what was true when the page loaded.
- * A change of a head's live state triggers a re-read at once; this interval
- * catches what moves without one (a member's cooldown, a new breach or peak).
- */
-export const CLUSTER_SPEC_REFRESH_MS = 10_000;
+export {
+  CLUSTER_SPEC_REFRESH_MS,
+  CLUSTER_START_NOTICE_MS,
+  CLUSTER_START_REFRESH_MS,
+} from './shared/useClusterHeadRefresh';
 
 /**
  * A render-only identity for one row of the two editable row lists (a spec's
@@ -1302,6 +1300,7 @@ export function RuntimeAdminSection({
     // The cluster head editor's member picker (it reads member GPUs through
     // serverHardware below).
     | 'clusterCandidates'
+    | 'applicationClusterCandidates'
     | 'resetClusterMemberUsage'
     // The live-status Start and Stop: transient, nothing is written.
     | 'startRuntime'
@@ -2205,65 +2204,19 @@ export function RuntimeAdminSection({
     };
   }, []);
   // ---- Cluster heads: keep their status current -------------------------
-  // The lazy loader reads each spec once, but a head's spec carries the
-  // cluster's live view (cluster_status, the withheld reason, the totals and
-  // the stored peaks), which moves while the screen is open. So while the spec
-  // list (or the editor beside it) is shown, every head is re-read on an
-  // interval and as soon as the status stream reports a change that can move
-  // its cluster: the head's own state or error, or a member row's state. The
-  // reads go through the cache's ordered-read primitives, so one that overlaps
-  // a write is refused like the lazy one. A failed re-read raises no toast: it
-  // repeats on its own, and the last known spec stays on screen.
-  const clusterHeadIds = mappings.filter((m) => isClusterHead(specsById[m.id])).map((m) => m.id);
-  const clusterHeadKey = clusterHeadIds.join('\u0000');
-  const clusterHeadSpecIds = new Set(
-    clusterHeadIds.map((id) => specsById[id]?.id).filter((id): id is string => Boolean(id)),
-  );
-  const clusterLiveSignature = statusRows
-    .filter((r) => r.kind === 'rpc_server' || clusterHeadSpecIds.has(r.spec_id))
-    .map((r) => `${r.spec_id}#${r.instance}:${r.state}:${r.last_error?.code ?? ''}`)
-    .sort((a, b) => a.localeCompare(b))
-    .join('|');
-  const clusterRefreshActive = tab === 'specs' && clusterHeadKey !== '';
-  function refreshClusterHeads(ids: readonly string[]) {
-    for (const id of ids) {
-      const seen = beginSpecRead(id);
-      api.runtimeSpec(id).then(
-        (spec) => {
-          if (mountedRef.current) commitSpecRead(id, seen, spec);
-        },
-        () => {},
-      );
-    }
-  }
-  useEffect(() => {
-    if (!clusterRefreshActive) return undefined;
-    const ids = clusterHeadKey.split('\u0000');
-    const timer = setInterval(() => refreshClusterHeads(ids), CLUSTER_SPEC_REFRESH_MS);
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clusterRefreshActive, clusterHeadKey, api]);
-  // What the last run saw for the same set of heads. A changed set of heads
-  // (the lazy load finishing, a head added or removed) only records the new
-  // signature: those heads were just read. Coming back to the list from
-  // another tab re-reads them like a changed signature does.
-  const clusterSignatureRef = useRef<{
-    heads: string;
-    signature: string;
-    active: boolean;
-  } | null>(null);
-  useEffect(() => {
-    const prev = clusterSignatureRef.current;
-    clusterSignatureRef.current = {
-      heads: clusterHeadKey,
-      signature: clusterLiveSignature,
-      active: clusterRefreshActive,
-    };
-    if (!clusterRefreshActive || prev?.heads !== clusterHeadKey) return;
-    if (prev.active && prev.signature === clusterLiveSignature) return;
-    refreshClusterHeads(clusterHeadKey.split('\u0000'));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clusterRefreshActive, clusterHeadKey, clusterLiveSignature]);
+  // The spec list, its editor and the Live-Status tab show a head's cluster
+  // status off its spec (see useClusterHeadRefresh).
+  const clusterRefresh = useClusterHeadRefresh({
+    api,
+    mappings,
+    specsById,
+    statusRows,
+    view: tab,
+    active: tab === 'specs' || tab === 'status',
+    beginRead: beginSpecRead,
+    commitRead: commitSpecRead,
+    mountedRef,
+  });
 
   /** Whether override write `run` is over: unmounted, or abandoned. */
   function overrideRunOver(run: number): boolean {
@@ -2461,7 +2414,7 @@ export function RuntimeAdminSection({
   function startRuntimeInstance(row: RuntimeStatus, spec: RuntimeSpec) {
     void runRuntimeAction(
       runtimeActionKey('start', row),
-      () => api.startRuntime(spec.mapping_id),
+      () => (spec.cluster_enabled ? startClusterHead(spec) : api.startRuntime(spec.mapping_id)),
       (answer) => {
         const target = instanceTargetName(row, spec, answer.instance);
         return answer.state === 'starting'
@@ -2469,6 +2422,20 @@ export function RuntimeAdminSection({
           : t.runtimeStartedRunning(target);
       },
     );
+  }
+
+  // A cluster head's start: its row says the start was asked for at once, and
+  // the head is re-read quickly until the start shows in its cluster status.
+  async function startClusterHead(spec: RuntimeSpec): Promise<RuntimeActionAnswer> {
+    clusterRefresh.requestStart(spec.mapping_id);
+    try {
+      const answer = await api.startRuntime(spec.mapping_id);
+      clusterRefresh.settleStart(spec.mapping_id, true);
+      return answer;
+    } catch (err) {
+      clusterRefresh.settleStart(spec.mapping_id, false);
+      throw err;
+    }
   }
 
   // A cluster head's Stop asks first whether its members stop too; any other
@@ -3577,7 +3544,12 @@ export function RuntimeAdminSection({
       setSpecMode('list');
     } catch (err) {
       showError(`${t.runtimeSpecPartialFailure}: ${formatPortalError(err, t)}`);
-      setSpecMode('list');
+      // The mapping exists now, so the form stays open as its Edit with every
+      // entry kept -- a cluster head's members and their GPUs included -- and
+      // the operator fixes what was refused and saves again. Leaving for the
+      // list would throw the entries away.
+      setGatewayName(mapping.gateway_model_name);
+      setSpecMode({ kind: 'edit', mapping });
     } finally {
       setBusy(false);
     }
@@ -3630,6 +3602,7 @@ export function RuntimeAdminSection({
       return;
     }
     setBusy(true);
+    let mapping: PortalModelMapping;
     try {
       // A form does not send a field it does not let you edit. Read-only here
       // => not sent from here: the gateway name and the status belong to the
@@ -3651,6 +3624,7 @@ export function RuntimeAdminSection({
       // lost-update argument applies, so it goes for the same reason.)
       const updated = await api.updateMapping(id, { app_model_name: appName });
       setMappings((current) => (current ?? []).map((m) => (m.id === id ? updated : m)));
+      mapping = updated;
     } catch (err) {
       showError(formatPortalError(err, t));
       setBusy(false);
@@ -3665,7 +3639,12 @@ export function RuntimeAdminSection({
       setSpecMode('list');
     } catch (err) {
       showError(`${t.runtimeSpecPartialFailure}: ${formatPortalError(err, t)}`);
-      setSpecMode('list');
+      // As after a refused create: the form stays open with every entry kept,
+      // a cluster head's members and their GPUs included. The mapping PATCH
+      // above did land, so the Edit now carries the mapping as it answered;
+      // the form's app model name already is that value, and the next save
+      // PATCHes the same name again (a no-op) before it retries the spec.
+      setSpecMode({ kind: 'edit', mapping });
     } finally {
       setBusy(false);
     }
@@ -4212,6 +4191,33 @@ export function RuntimeAdminSection({
     );
   }
 
+  // A cluster head's progress on its Live-Status row: the spec list's compact
+  // view, off the same spec, and a notice from the press of Start until the
+  // start shows in it.
+  function clusterLiveProgress(row: RuntimeStatus) {
+    const mapping = mappingForStatus(row);
+    const spec = mapping ? specsById[mapping.id] : undefined;
+    if (!mapping || !spec?.cluster_enabled || instanceIndex(row) !== 0) return null;
+    return (
+      <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start', flexBasis: '100%' }}>
+        {/* A live region that is always there, so a screen reader announces
+            the notice when it appears. */}
+        <Box role="status" aria-live="polite">
+          {clusterRefresh.startPending(mapping.id) && (
+            <Chip
+              size="small"
+              variant="outlined"
+              color="info"
+              label={t.clusterStartRequested}
+              data-testid="cluster-start-requested"
+            />
+          )}
+        </Box>
+        <ClusterProgress spec={spec} t={t} compact />
+      </Box>
+    );
+  }
+
   const statusColumns: ListColumn<RuntimeStatus>[] = [
     {
       id: 'model',
@@ -4333,6 +4339,7 @@ export function RuntimeAdminSection({
               }
             />
           )}
+          {clusterLiveProgress(row)}
         </Box>
       ),
     },
@@ -5721,16 +5728,15 @@ export function RuntimeAdminSection({
               </Box>
             </Box>
 
-            {/* Shown for llama.cpp (explicit, or Auto resolved to it), and for
-                any spec that is still a head so the operator can turn the
-                cluster off after a type change. */}
-            {(specType === 'llama_cpp' ||
-              (specType === '' && currentSpec?.effective_type === 'llama_cpp') ||
-              cluster.enabled) && (
+            {/* Shown for llama.cpp (explicit, or Auto resolving to it, a new
+                spec included), and for any spec that is still a head so the
+                operator can turn the cluster off after a type change. */}
+            {(formSpecIsLlamaCpp(specType, binary, specLoadedType) || cluster.enabled) && (
               <ClusterHeadEditor
                 t={t}
                 api={api}
                 mappingId={editingSpecMappingId}
+                applicationId={application.id}
                 headServer={server}
                 stored={currentSpec}
                 value={cluster}
@@ -5739,6 +5745,7 @@ export function RuntimeAdminSection({
                 env={parseEnvText(envText, t).env}
                 headHasGpus={gpuRows.length > 0}
                 startupTimeoutSeconds={startupTimeoutSeconds}
+                headBinary={binary}
                 headBinaryVersion={binaryVersionFor(serverBinaries, binary.trim())}
                 resetMemberUsage={
                   editingSpecMappingId && currentSpec?.configured
