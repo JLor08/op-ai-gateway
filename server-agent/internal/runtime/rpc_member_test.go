@@ -472,8 +472,9 @@ func TestMemberCacheSweepJudgesAgeByMarker(t *testing.T) {
 	}
 }
 
-// touchFailedWarn is the sweeper's exact Warn for a marker it cannot touch.
-const touchFailedWarn = "runtime: cannot touch the rpc cache marker; the cache's age keeps running and the sweep may remove it 7 days after its last successful touch"
+// touchFailedWarn is the sweeper's exact Warn for a marker it cannot create or
+// touch.
+const touchFailedWarn = "runtime: cannot mark or touch the rpc cache marker; the cache is kept while its head is listed, and may be removed once its head is no longer listed and nothing in it changed for 7 days"
 
 // TestMemberCacheTouchFailureWarnsOncePerStreak: a marker touch that fails
 // (on Windows, a sharing violation while another process holds the file) is
@@ -775,5 +776,59 @@ func TestRPCServerStatusReportsDeviceCount(t *testing.T) {
 	s := statusFor(m, "rpcm_a")
 	if s.RPC == nil || s.RPC.DeviceCount != 1 {
 		t.Fatalf("status rpc = %+v, want device_count 1 (a CPU member exposes one device)", s.RPC)
+	}
+}
+
+// TestMemberCacheMarkFailureWarnsOncePerStreak: a marker the sweep cannot
+// create is the same failure as one it cannot touch: one Warn per head per
+// streak, not one every hourly sweep, and the touch is not attempted on a
+// marker that is not there.
+func TestMemberCacheMarkFailureWarnsOncePerStreak(t *testing.T) {
+	logs := withCountedLogs(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "rpccache_a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := map[string]bool{"rpccache_a": true}
+	sw := newMemberCacheSweeper()
+	sw.mark = func(string) error { return errors.New("read-only volume") }
+	touched := 0
+	sw.chtimes = func(string, time.Time, time.Time) error { touched++; return nil }
+	for range 3 {
+		sw.sweep(root, keep, time.Now())
+	}
+	if n := logs.count(touchFailedWarn); n != 1 {
+		t.Fatalf("Warns = %d after three sweeps that cannot create the marker, want 1", n)
+	}
+	if touched != 0 {
+		t.Fatalf("touched %d time(s) a marker that could not be created", touched)
+	}
+	sw.mark = markMemberCache
+	sw.sweep(root, keep, time.Now())
+	sw.mark = func(string) error { return errors.New("read-only volume") }
+	sw.sweep(root, keep, time.Now())
+	if n := logs.count(touchFailedWarn); n != 2 {
+		t.Fatalf("Warns = %d after a success and a new failure, want 2", n)
+	}
+}
+
+// TestMemberCacheTouchStreakEndsWhenHeadLeaves: a head that leaves the listed
+// set ends its failure streak, so if it comes back still failing it is warned
+// about again.
+func TestMemberCacheTouchStreakEndsWhenHeadLeaves(t *testing.T) {
+	logs := withCountedLogs(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "rpccache_a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sw := newMemberCacheSweeper()
+	sw.chtimes = func(string, time.Time, time.Time) error { return errors.New("sharing violation") }
+	listed := map[string]bool{"rpccache_a": true}
+	sw.sweep(root, listed, time.Now())
+	sw.sweep(root, listed, time.Now())
+	sw.sweep(root, map[string]bool{}, time.Now())
+	sw.sweep(root, listed, time.Now())
+	if n := logs.count(touchFailedWarn); n != 2 {
+		t.Fatalf("Warns = %d, want 2: one per streak, the head's departure ending the first", n)
 	}
 }
