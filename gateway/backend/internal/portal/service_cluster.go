@@ -258,9 +258,9 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 // one is newer than the request validations -- and in this order, which is
 // part of the API like that function's:
 //
-//  1. cluster off: ${RPC_SERVERS}/${RPC_DEVICES} anywhere in args or env, then
-//     the caller's rights on every former member server (dropping the
-//     membership changes their documents); nothing else.
+//  1. cluster off: ${RPC_SERVERS}/${RPC_DEVICES} anywhere in args or env;
+//     nothing else. Dropping the membership only frees the member hosts, so
+//     the head's rights suffice, as for deleting the head.
 //  2. cluster on, the head's own document: effective type llama_cpp, no
 //     "=" form of the scanned options (llama-server refuses it),
 //     ${RPC_SERVERS} as the value of --rpc or LLAMA_ARG_RPC, exactly once
@@ -278,7 +278,8 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 //     to that list because it decides which member builds are compatible
 //     (step 6 and 7); a switch, even to the same build at another path, runs
 //     every member check.
-//  4. rights: the caller manages every member server, former ones included,
+//  4. rights: the caller manages every member server the write keeps or
+//     adds (a member it drops needs no rights: removal only frees the host),
 //     and every member consents to the head (its member spec's
 //     allowed_head_groups in manual mode, the server's rpc_allowed_head_groups
 //     in automatic mode, intersected with the head server's admin groups; an
@@ -323,9 +324,6 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 		if scan.clusterPlaceholder {
 			return clusterPlan{}, ErrClusterRPCPlaceholderWithoutCluster
 		}
-		if err := s.authorizeFormerMembers(ctx, p, prevMembers, nil); err != nil {
-			return clusterPlan{}, err
-		}
 		plan.writeMembers = len(prevMembers) > 0
 		return plan, nil
 	}
@@ -352,7 +350,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 		if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !req.LANExposureAck {
 			return clusterPlan{}, ErrClusterLANAckRequired
 		}
-	} else if err := s.checkClusterMembership(ctx, p, headServer, f, req, prior, entries, prevMembers, &plan); err != nil {
+	} else if err := s.checkClusterMembership(ctx, p, headServer, f, req, prior, entries, &plan); err != nil {
 		return clusterPlan{}, err
 	}
 	if err := s.checkClusterMemberGPUs(ctx, entries, scan); err != nil {
@@ -542,8 +540,8 @@ func (s *Service) loadEntrySpec(ctx context.Context, e *clusterEntry, spec routi
 // checkClusterMembership is steps 4 to 8 of validateClusterHead, for a write
 // that changes the membership, the member mode, the network or the
 // transport. It resolves plan's network and transport.
-func (s *Service) checkClusterMembership(ctx context.Context, p auth.Token, headServer routing.AIServer, f runtimeSpecFields, req PutRuntimeSpecRequest, prior runtimeSpecPrior, entries []clusterEntry, prevMembers []routing.ClusterMember, plan *clusterPlan) error {
-	if err := s.authorizeClusterMembers(ctx, p, headServer.ID, entries, prevMembers); err != nil {
+func (s *Service) checkClusterMembership(ctx context.Context, p auth.Token, headServer routing.AIServer, f runtimeSpecFields, req PutRuntimeSpecRequest, prior runtimeSpecPrior, entries []clusterEntry, plan *clusterPlan) error {
+	if err := s.authorizeClusterMembers(ctx, p, headServer.ID, entries); err != nil {
 		return err
 	}
 	headSpecID := ""
@@ -563,7 +561,7 @@ func (s *Service) checkClusterMembership(ctx context.Context, p auth.Token, head
 
 // authorizeClusterMembers is step 4 of validateClusterHead. It fills each
 // entry's server and, in manual mode, its member spec.
-func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, headServerID string, entries []clusterEntry, prevMembers []routing.ClusterMember) error {
+func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, headServerID string, entries []clusterEntry) error {
 	for i := range entries {
 		if entries[i].req.ServerID == "" {
 			return ErrServerNotFound
@@ -573,9 +571,6 @@ func (s *Service) authorizeClusterMembers(ctx context.Context, p auth.Token, hea
 			return err
 		}
 		entries[i].server, entries[i].visible = server, true
-	}
-	if err := s.authorizeFormerMembers(ctx, p, prevMembers, entries); err != nil {
-		return err
 	}
 	headGroups, err := s.routes.ServerAdminGroups(ctx, headServerID)
 	if err != nil {
@@ -620,22 +615,6 @@ func (s *Service) memberConsentAdmits(ctx context.Context, consentRaw, memberSer
 		}
 	}
 	return consentAdmits(consent, headGroups), nil
-}
-
-// authorizeFormerMembers requires the caller's rights on every former member
-// server the write drops: removing a member changes that server's document
-// as much as adding one does.
-func (s *Service) authorizeFormerMembers(ctx context.Context, p auth.Token, prevMembers []routing.ClusterMember, entries []clusterEntry) error {
-	for _, m := range prevMembers {
-		kept := slices.ContainsFunc(entries, func(e clusterEntry) bool { return e.req.ServerID == m.ServerID })
-		if kept {
-			continue
-		}
-		if _, err := s.authorizeServer(ctx, p, m.ServerID); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // consentAdmits reports whether a member's consent groups admit a head whose

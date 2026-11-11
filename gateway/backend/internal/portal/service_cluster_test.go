@@ -954,10 +954,10 @@ func TestClusterForeignMemberHiddenInDTO(t *testing.T) {
 	if members, _, _ := f.routes.ClusterMembers(f.ctx, head.ID); len(members) != 2 || members[1].ServerID != foreign.ID {
 		t.Fatalf("membership after the owner's re-save = %+v", members)
 	}
-	// A membership change still needs rights on every member server: drop
-	// the owner's own member, keep the hidden one.
+	// A membership change still needs rights on every member server it
+	// keeps: change the owner's own member, keep the hidden one.
 	change := putRequestFromDTO(got)
-	change.ClusterMembers = change.ClusterMembers[1:]
+	change.ClusterMembers[0].Threads = 4
 	if _, err := f.put(ownerToken(), change); !errors.Is(err, ErrServerNotFound) {
 		t.Fatalf("owner membership change = %v, want server not found", err)
 	}
@@ -1334,4 +1334,63 @@ func TestClusterBreachPeerHiddenForHiddenMember(t *testing.T) {
 	if sys.ClusterStatus == nil || len(sys.ClusterStatus.Breaches) != 2 || sys.ClusterStatus.Breaches[1].Peer != "100.64.0.9" {
 		t.Fatalf("system breaches = %+v, want both peers", sys.ClusterStatus)
 	}
+}
+
+// TestPutClusterRemovingMembersNeedsHeadRightsOnly: removing a member only
+// frees its host, so a head owner who cannot manage a member server may
+// still drop that member or turn the cluster off -- as deleting the head
+// already allowed. Adding a member still needs rights and consent.
+func TestPutClusterRemovingMembersNeedsHeadRightsOnly(t *testing.T) {
+	setup := func(t *testing.T) (*clusterFixture, ServerDTO, RuntimeSpecDTO) {
+		f := newClusterFixture(t)
+		mine := f.member("Mine")
+		foreign := f.foreignServer("Foreign")
+		if _, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID))); err != nil {
+			t.Fatalf("system save: %v", err)
+		}
+		got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f, foreign, got
+	}
+	t.Run("drop the hidden member", func(t *testing.T) {
+		f, foreign, got := setup(t)
+		drop := putRequestFromDTO(got)
+		drop.ClusterMembers = drop.ClusterMembers[:1]
+		if _, err := f.put(ownerToken(), drop); err != nil {
+			t.Fatalf("owner drops the hidden member = %v", err)
+		}
+		members, _, _ := f.routes.ClusterMembers(f.ctx, got.ID)
+		if len(members) != 1 || members[0].ServerID == foreign.ID {
+			t.Fatalf("membership = %+v", members)
+		}
+		if !slices.Contains(f.notifiedServers(), foreign.ID) {
+			t.Fatalf("notified = %v, want the dropped member's server", f.notifiedServers())
+		}
+	})
+	t.Run("cluster off", func(t *testing.T) {
+		f, foreign, got := setup(t)
+		off := putRequestFromDTO(got)
+		off.ClusterEnabled, off.ClusterMembers = false, nil
+		off.Args = []string{"-m", "/models/big.gguf"}
+		if _, err := f.put(ownerToken(), off); err != nil {
+			t.Fatalf("owner turns the cluster off = %v", err)
+		}
+		if members, _, _ := f.routes.ClusterMembers(f.ctx, got.ID); len(members) != 0 {
+			t.Fatalf("membership after cluster off = %+v", members)
+		}
+		if !slices.Contains(f.notifiedServers(), foreign.ID) {
+			t.Fatalf("notified = %v, want the former member's server", f.notifiedServers())
+		}
+	})
+	t.Run("adding still needs rights", func(t *testing.T) {
+		f, _, got := setup(t)
+		other := f.foreignServer("Other")
+		add := putRequestFromDTO(got)
+		add.ClusterMembers = []ClusterMemberDTO{add.ClusterMembers[0], autoMember(other.ID)}
+		if _, err := f.put(ownerToken(), add); !errors.Is(err, ErrServerNotFound) {
+			t.Fatalf("owner adds a foreign member = %v, want server not found", err)
+		}
+	})
 }
