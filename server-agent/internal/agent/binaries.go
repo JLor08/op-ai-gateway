@@ -38,6 +38,11 @@ const (
 	// binaryOutputLimit caps the captured --version output; the version line
 	// is at the top and a runaway child must not fill memory.
 	binaryOutputLimit = 64 << 10
+	// binaryRetryFirst is how long after a `--version` run that yielded no
+	// version the binary is run again; each further failure doubles the wait,
+	// up to binaryRetryCap.
+	binaryRetryFirst = 30 * time.Second
+	binaryRetryCap   = time.Hour
 )
 
 // binaryWaitDelay bounds how long a --version run may linger after its
@@ -61,13 +66,28 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 type BinaryInfo = sample.BinaryInfo
 
 // cachedVersion is a version run result valid for one (size, mtime) of a file.
-// A failed run is cached too: the same bytes fail the same way, and rerunning
-// a broken binary every rescan would only burn the timeout.
+// A run that yielded a version is final for those bytes. One that did not is
+// retried after a backoff: it may have ended at the timeout on a loaded host
+// (an agent starting next to busy GPUs), and a missing version withholds every
+// automatic cluster that needs the binary, so it must not stick until the
+// file changes. The backoff, binaryRetryFirst doubling up to binaryRetryCap,
+// keeps a binary that never answers from burning the timeout every rescan.
 type cachedVersion struct {
 	size                   int64
 	mtime                  time.Time
 	version, build, commit string
 	ok                     bool
+	failures               int       // consecutive runs without a version
+	retryAt                time.Time // when a failed run may be retried
+}
+
+// retryBackoff is the wait after the n-th consecutive failed run (n >= 1).
+func retryBackoff(n int) time.Duration {
+	d := binaryRetryFirst
+	for i := 1; i < n && d < binaryRetryCap; i++ {
+		d *= 2
+	}
+	return min(d, binaryRetryCap)
 }
 
 var llamaVersionLine = regexp.MustCompile(`(?m)^version:\s*(\S+)\s*\(build\s+(\S+?),\s*commit\s+([0-9A-Za-z]+)\)`)
@@ -124,10 +144,12 @@ func binaryKind(path string) string {
 // version of a llama_server in the same directory, else whatever its path
 // says, and any other binary is listed without a version.
 func scanBinaries(allowed []string, stat func(string) (fs.FileInfo, error), runVersion func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
-	return scanBinariesCtx(context.Background(), allowed, stat, runVersion, cache)
+	return scanBinariesCtx(context.Background(), time.Now(), allowed, stat, runVersion, cache)
 }
 
-func scanBinariesCtx(ctx context.Context, allowed []string, stat func(string) (fs.FileInfo, error), runVersion func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
+// scanBinariesCtx is scanBinaries at the time now (which decides whether a
+// failed version run is due again), ending early when ctx does.
+func scanBinariesCtx(ctx context.Context, now time.Time, allowed []string, stat func(string) (fs.FileInfo, error), runVersion func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
 	out := make([]BinaryInfo, 0, len(allowed))
 	byDir := map[string]int{} // directory -> index of its first agent-versioned llama_server
 	seen := map[string]bool{}
@@ -146,7 +168,12 @@ func scanBinariesCtx(ctx context.Context, allowed []string, stat func(string) (f
 		if bi.Kind == binaryKindLlamaServer {
 			if err == nil && ctx.Err() == nil {
 				cv, hit := cache[p]
-				if !hit || cv.size != fi.Size() || !cv.mtime.Equal(fi.ModTime()) {
+				same := hit && cv.size == fi.Size() && cv.mtime.Equal(fi.ModTime())
+				if !same || (!cv.ok && !now.Before(cv.retryAt)) {
+					failures := 0
+					if same {
+						failures = cv.failures
+					}
 					cv = cachedVersion{size: fi.Size(), mtime: fi.ModTime()}
 					rctx, cancel := context.WithTimeout(ctx, binaryVersionTimeout)
 					text, rerr := runVersion(rctx, p)
@@ -157,6 +184,10 @@ func scanBinariesCtx(ctx context.Context, allowed []string, stat func(string) (f
 					}
 					if rerr == nil || text != "" {
 						cv.version, cv.build, cv.commit, cv.ok = parseLlamaVersion(text)
+					}
+					if !cv.ok {
+						cv.failures = failures + 1
+						cv.retryAt = now.Add(retryBackoff(cv.failures))
 					}
 					if cache != nil {
 						cache[p] = cv
@@ -249,7 +280,7 @@ func newBinaryInventory(allowed []string) *binaryInventory {
 // rescan recomputes the inventory and stores it.
 func (b *binaryInventory) rescan(ctx context.Context) {
 	b.scanMu.Lock()
-	list := scanBinariesCtx(ctx, b.allowed, b.stat, b.runVersion, b.cache)
+	list := scanBinariesCtx(ctx, time.Now(), b.allowed, b.stat, b.runVersion, b.cache)
 	b.scanMu.Unlock()
 	if ctx.Err() != nil {
 		return
@@ -260,10 +291,25 @@ func (b *binaryInventory) rescan(ctx context.Context) {
 	b.mu.Unlock()
 }
 
-// run rescans immediately and then every binaryRescanInterval until ctx ends.
+// nextRetry is the earliest time a failed version run is due again, and
+// whether any is pending.
+func (b *binaryInventory) nextRetry() (time.Time, bool) {
+	b.scanMu.Lock()
+	defer b.scanMu.Unlock()
+	var next time.Time
+	for _, cv := range b.cache {
+		if !cv.ok && (next.IsZero() || cv.retryAt.Before(next)) {
+			next = cv.retryAt
+		}
+	}
+	return next, !next.IsZero()
+}
+
+// run rescans immediately and then every binaryRescanInterval until ctx ends,
+// earlier when a failed version run is due again before that.
 func (b *binaryInventory) run(ctx context.Context) {
 	b.rescan(ctx)
-	t := time.NewTicker(binaryRescanInterval)
+	t := time.NewTimer(b.untilNextScan())
 	defer t.Stop()
 	for {
 		select {
@@ -271,8 +317,30 @@ func (b *binaryInventory) run(ctx context.Context) {
 			return
 		case <-t.C:
 			b.rescan(ctx)
+			t.Reset(b.untilNextScan())
 		}
 	}
+}
+
+// untilNextScan is how long run waits for its next rescan.
+func (b *binaryInventory) untilNextScan() time.Duration {
+	wait := binaryRescanInterval
+	if next, ok := b.nextRetry(); ok {
+		wait = min(wait, max(time.Until(next), 0))
+	}
+	return wait
+}
+
+// resend makes the next sample carry the inventory again, though it did not
+// change since it was last delivered. A delivery is only the transport
+// accepting the sample: a frame written to a connection that then dropped, or
+// a sample the gateway accepted while its store write failed, never stored it.
+// The agent calls it when its connection to the gateway is re-established and
+// on the system-report cadence.
+func (b *binaryInventory) resend() {
+	b.mu.Lock()
+	b.sentOnce = false
+	b.mu.Unlock()
 }
 
 // pending returns the inventory to attach to the next sample, or nil when

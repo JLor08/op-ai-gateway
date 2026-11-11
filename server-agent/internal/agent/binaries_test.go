@@ -13,13 +13,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-const stage0Output = "version: 0.9.0-dev (build 1, commit 2bc46ba)\nbuilt with AppleClang 21.0.0.21000401 for Darwin arm64\n"
+const llamaVersionOutput = "version: 0.9.0-dev (build 1, commit 2bc46ba)\nbuilt with AppleClang 21.0.0.21000401 for Darwin arm64\n"
 
 type fakeFileInfo struct {
 	size  int64
@@ -38,8 +39,8 @@ func statFake(fi fakeFileInfo) func(string) (fs.FileInfo, error) {
 	return func(string) (fs.FileInfo, error) { return fi, nil }
 }
 
-func TestParseLlamaVersionStage0Output(t *testing.T) {
-	v, b, c, ok := parseLlamaVersion(stage0Output)
+func TestParseLlamaVersionOutput(t *testing.T) {
+	v, b, c, ok := parseLlamaVersion(llamaVersionOutput)
 	if !ok || v != "0.9.0-dev" || b != "1" || c != "2bc46ba" {
 		t.Fatalf("got %q %q %q %v", v, b, c, ok)
 	}
@@ -75,7 +76,7 @@ func TestRPCServerInheritsSiblingVersion(t *testing.T) {
 		if p != "/opt/l/llama-server" {
 			t.Fatalf("executed %s", p)
 		}
-		return stage0Output, nil
+		return llamaVersionOutput, nil
 	}
 	got := scanBinaries([]string{"/opt/l/llama-server", "/opt/l/ggml-rpc-server", "/opt/other/b99/rpc-server", "/opt/x/tool"},
 		statFake(fakeFileInfo{size: 1}), run, map[string]cachedVersion{})
@@ -98,7 +99,7 @@ func TestRPCServerInheritsSiblingVersion(t *testing.T) {
 
 func TestVersionRunCachedByStat(t *testing.T) {
 	runs := 0
-	run := func(context.Context, string) (string, error) { runs++; return stage0Output, nil }
+	run := func(context.Context, string) (string, error) { runs++; return llamaVersionOutput, nil }
 	cache := map[string]cachedVersion{}
 	fi := fakeFileInfo{size: 10, mtime: time.Unix(100, 0)}
 	paths := []string{"/opt/l/llama-server"}
@@ -133,7 +134,7 @@ func TestSampleCarriesBinariesOnlyOnChange(t *testing.T) {
 	poster := &capturePoster{}
 	a := NewFromDeps(config.Config{Interval: time.Hour, RuntimeAllowedBinaries: []string{"/opt/l/llama-server"}}, Deps{Poster: poster})
 	a.binaries.stat = statFake(fakeFileInfo{size: 1})
-	out := stage0Output
+	out := llamaVersionOutput
 	a.binaries.runVersion = func(context.Context, string) (string, error) { return out, nil }
 
 	a.collectOnce(context.Background())
@@ -202,7 +203,23 @@ func writeScript(t *testing.T, body string) string {
 }
 
 func TestExecVersionReturnsWhenGrandchildHoldsStdout(t *testing.T) {
-	p := writeScript(t, "sleep 30 &\nsleep 30\n")
+	// The background sleep is the grandchild that keeps the output pipe open;
+	// the script records its pid so the test kills it rather than leaving it
+	// behind. exec makes the foreground sleep the direct child itself, which
+	// the context kills.
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	p := writeScript(t, "sleep 30 &\necho $! > '"+pidFile+"'\nexec sleep 30\n")
+	t.Cleanup(func() {
+		raw, err := os.ReadFile(pidFile)
+		if err != nil {
+			return
+		}
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Kill()
+			}
+		}
+	})
 	orig := binaryWaitDelay
 	binaryWaitDelay = 200 * time.Millisecond
 	defer func() { binaryWaitDelay = orig }()
@@ -263,7 +280,7 @@ func TestFailedPostDoesNotMarkBinariesDelivered(t *testing.T) {
 	poster := &flakyPoster{}
 	a := NewFromDeps(config.Config{Interval: time.Hour, RuntimeAllowedBinaries: []string{"/opt/l/llama-server"}}, Deps{Poster: poster})
 	a.binaries.stat = statFake(fakeFileInfo{size: 1})
-	a.binaries.runVersion = func(context.Context, string) (string, error) { return stage0Output, nil }
+	a.binaries.runVersion = func(context.Context, string) (string, error) { return llamaVersionOutput, nil }
 	a.binaries.rescan(context.Background())
 	poster.fail.Store(true)
 	a.collectOnce(context.Background())
@@ -278,5 +295,167 @@ func TestFailedPostDoesNotMarkBinariesDelivered(t *testing.T) {
 	}
 	if poster.samples[2].Binaries != nil {
 		t.Fatal("inventory resent after a successful post")
+	}
+}
+
+// TestFailedVersionProbeRetriedWithBackoff: a --version run that yields no
+// version (a deadline under load, a failed exec) is not cached for the file's
+// size and mtime for good: it is run again once its backoff has passed --
+// binaryRetryFirst after the first failure, doubling with each further one --
+// and a run that succeeds is cached for good.
+func TestFailedVersionProbeRetriedWithBackoff(t *testing.T) {
+	runs := 0
+	fail := true
+	run := func(context.Context, string) (string, error) {
+		runs++
+		if fail {
+			return "", context.DeadlineExceeded
+		}
+		return llamaVersionOutput, nil
+	}
+	cache := map[string]cachedVersion{}
+	stat := statFake(fakeFileInfo{size: 10, mtime: time.Unix(100, 0)})
+	paths := []string{"/opt/l/llama-server"}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	scan := func(at time.Time) []BinaryInfo {
+		return scanBinariesCtx(context.Background(), at, paths, stat, run, cache)
+	}
+
+	if got := scan(t0); got[0].Version != "" || runs != 1 {
+		t.Fatalf("first scan: %+v, runs %d", got, runs)
+	}
+	scan(t0.Add(binaryRetryFirst - time.Second))
+	if runs != 1 {
+		t.Fatalf("runs = %d inside the first backoff, want 1", runs)
+	}
+	scan(t0.Add(binaryRetryFirst))
+	if runs != 2 {
+		t.Fatalf("runs = %d once the first backoff passed, want 2", runs)
+	}
+	second := t0.Add(binaryRetryFirst)
+	scan(second.Add(2*binaryRetryFirst - time.Second))
+	if runs != 2 {
+		t.Fatalf("runs = %d inside the doubled backoff, want 2", runs)
+	}
+	fail = false
+	if got := scan(second.Add(2 * binaryRetryFirst)); got[0].Version != "0.9.0-dev" || runs != 3 {
+		t.Fatalf("scan after the doubled backoff: %+v, runs %d", got, runs)
+	}
+	scan(second.Add(24 * time.Hour))
+	if runs != 3 {
+		t.Fatalf("runs = %d after a success, want it cached", runs)
+	}
+}
+
+// TestFailedVersionProbeBackoffIsCapped: the backoff never exceeds
+// binaryRetryCap, however often the run fails.
+func TestFailedVersionProbeBackoffIsCapped(t *testing.T) {
+	runs := 0
+	run := func(context.Context, string) (string, error) { runs++; return "", errors.New("boom") }
+	cache := map[string]cachedVersion{}
+	stat := statFake(fakeFileInfo{size: 10, mtime: time.Unix(100, 0)})
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for range 20 {
+		scanBinariesCtx(context.Background(), at, []string{"/opt/l/llama-server"}, stat, run, cache)
+		at = at.Add(binaryRetryCap)
+	}
+	if runs != 20 {
+		t.Fatalf("runs = %d over 20 scans binaryRetryCap apart, want 20", runs)
+	}
+}
+
+// TestInventoryNextRetry: the inventory names the earliest pending retry, so
+// its loop rescans then rather than at the next full interval.
+func TestInventoryNextRetry(t *testing.T) {
+	b := newBinaryInventory([]string{"/opt/l/llama-server"})
+	b.stat = statFake(fakeFileInfo{size: 1})
+	b.runVersion = func(context.Context, string) (string, error) { return "", errors.New("boom") }
+	before := time.Now()
+	b.rescan(context.Background())
+	next, ok := b.nextRetry()
+	if !ok || next.Before(before.Add(binaryRetryFirst)) || next.After(time.Now().Add(binaryRetryFirst)) {
+		t.Fatalf("nextRetry = %v, %v; want about %v from the scan", next, ok, binaryRetryFirst)
+	}
+	b.runVersion = func(context.Context, string) (string, error) { return llamaVersionOutput, nil }
+	b.cache = map[string]cachedVersion{}
+	b.rescan(context.Background())
+	if _, ok := b.nextRetry(); ok {
+		t.Fatal("nextRetry reported a retry with every probe succeeded")
+	}
+}
+
+// TestInventoryResendOnRequest: an inventory already delivered is attached
+// again after resend, though nothing changed: a frame the transport wrote but
+// the gateway never stored is not lost for good.
+func TestInventoryResendOnRequest(t *testing.T) {
+	poster := &capturePoster{}
+	a := NewFromDeps(config.Config{Interval: time.Hour, RuntimeAllowedBinaries: []string{"/opt/l/llama-server"}}, Deps{Poster: poster})
+	a.binaries.stat = statFake(fakeFileInfo{size: 1})
+	a.binaries.runVersion = func(context.Context, string) (string, error) { return llamaVersionOutput, nil }
+	a.binaries.rescan(context.Background())
+	a.collectOnce(context.Background())
+	a.collectOnce(context.Background())
+	if poster.last().Binaries != nil {
+		t.Fatal("unchanged inventory resent without a request")
+	}
+	a.binaries.resend()
+	a.collectOnce(context.Background())
+	if b := poster.last().Binaries; b == nil || len(*b) != 1 {
+		t.Fatalf("inventory after resend = %+v, want it attached again", b)
+	}
+	a.collectOnce(context.Background())
+	if poster.last().Binaries != nil {
+		t.Fatal("inventory attached again after the resend was delivered")
+	}
+}
+
+// TestInventoryResentOnReconnectAndPeriodically: Run attaches the unchanged
+// inventory again when the transport reconnects (a nil runtime wake) and on
+// the system-report cadence.
+func TestInventoryResentOnReconnectAndPeriodically(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		report time.Duration
+		wake   bool
+	}{
+		{"reconnect", time.Hour, true},
+		{"periodic", 30 * time.Millisecond, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			poster := &runtimeWakePoster{wake: make(chan json.RawMessage, 1)}
+			cfg := config.Config{Interval: 5 * time.Millisecond, SystemReportInterval: tc.report, RuntimeAllowedBinaries: []string{"/opt/l/llama-server"}}
+			a := NewFromDeps(cfg, Deps{Poster: poster})
+			a.binaries.stat = statFake(fakeFileInfo{size: 1})
+			a.binaries.runVersion = func(context.Context, string) (string, error) { return llamaVersionOutput, nil }
+			withInventory := func() int {
+				poster.mu.Lock()
+				defer poster.mu.Unlock()
+				n := 0
+				for _, s := range poster.samples {
+					if s.Binaries != nil {
+						n++
+					}
+				}
+				return n
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = a.Run(ctx)
+			}()
+			defer func() { cancel(); <-done }()
+
+			waitUntil(t, 2*time.Second, func() bool { return withInventory() == 1 })
+			if tc.wake {
+				time.Sleep(50 * time.Millisecond)
+				if n := withInventory(); n != 1 {
+					t.Fatalf("inventory attached %d times without a reconnect, want 1", n)
+				}
+				poster.wake <- nil
+			}
+			waitUntil(t, 2*time.Second, func() bool { return withInventory() >= 2 })
+		})
 	}
 }
