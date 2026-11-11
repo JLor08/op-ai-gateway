@@ -5,7 +5,7 @@
 // ggml-rpc-server binaries the agent reports (read-only except for a version
 // override) next to the rows an operator adds by hand.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Alert,
   Box,
@@ -84,6 +84,13 @@ export function BinariesSection({
   const [editor, setEditor] = useState<Editor | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ServerBinary | null>(null);
+
+  // An editor for a row the list no longer has (deleted here or elsewhere)
+  // closes: its save could only answer not-found.
+  useEffect(() => {
+    if (!data || !editor || editor.mode === 'new') return;
+    if (!data.data.some((b) => b.path === editor.path)) setEditor(null);
+  }, [data, editor]);
 
   function patch(next: Partial<Editor>) {
     setEditor((e) => (e ? { ...e, ...next } : e));

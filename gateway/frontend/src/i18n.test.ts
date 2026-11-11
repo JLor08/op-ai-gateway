@@ -4596,3 +4596,34 @@ describe('audio metrics (#340) i18n keys', () => {
     expect(messages.en.runtimeLogsIntro).toMatch(/several instances/);
   });
 });
+
+describe('RPC cluster wording', () => {
+  it('counts hidden members with a real singular and plural', () => {
+    expect(messages.de.clusterBreakdownHiddenCount(1)).toBe(
+      '1 nicht sichtbares Mitglied nur in der Summe',
+    );
+    expect(messages.de.clusterBreakdownHiddenCount(3)).toBe(
+      '3 nicht sichtbare Mitglieder nur in der Summe',
+    );
+    expect(messages.en.clusterBreakdownHiddenCount(1)).toBe(
+      '1 member you cannot see is in the totals only',
+    );
+    expect(messages.en.clusterBreakdownHiddenCount(2)).toBe(
+      '2 members you cannot see are in the totals only',
+    );
+  });
+
+  it('names binary kinds by their UI labels, not their wire values', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const m = messages[locale];
+      expect(m.errorBinaryKindInvalid).toContain(m.binariesKindLlamaServer);
+      expect(m.errorBinaryKindInvalid).toContain(m.binariesKindRpcServer);
+      expect(m.errorBinaryKindInvalid).toContain(m.binariesKindOther);
+      expect(m.errorBinaryKindInvalid).not.toMatch(/llama_server|rpc_server/);
+    }
+  });
+
+  it('gives a new binary its neuter article in German', () => {
+    expect(messages.de.binariesNewTitle).toBe('Neues Binary');
+  });
+});

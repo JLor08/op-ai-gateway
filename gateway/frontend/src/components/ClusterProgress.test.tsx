@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClusterProgress } from './ClusterProgress';
 import { formatDate } from './shared/format';
@@ -246,5 +246,32 @@ describe('ClusterProgress', () => {
     const cell = screen.getByTestId('cluster-progress-compact');
     expect(within(cell).getByText(t.clusterBreachesCount(1))).toBeInTheDocument();
     expect(within(cell).getByText(t.clusterPeaksCount(2))).toBeInTheDocument();
+  });
+
+  it('the compact breach and peak details are reachable by keyboard', async () => {
+    render(
+      <ClusterProgress
+        spec={head({
+          state: 'cold',
+          members: [],
+          breaches: [{ position: 1 }],
+          peaks_above_budget: [
+            { position: 0, resource: 'ram', stored_mb: 70000, ceiling_mb: 65536 },
+          ],
+        })}
+        t={t}
+        compact
+      />,
+    );
+    const breach = screen.getByText(t.clusterBreachesCount(1)).closest('[tabindex]') as HTMLElement;
+    const peak = screen.getByText(t.clusterPeaksCount(1)).closest('[tabindex]') as HTMLElement;
+    expect(breach.getAttribute('tabindex')).toBe('0');
+    expect(peak.getAttribute('tabindex')).toBe('0');
+    fireEvent.keyDown(document.body, { key: 'Tab' });
+    act(() => peak.focus());
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      t.clusterPeakRam('Alpha', 70000, 65536),
+    );
+    expect(peak).toHaveAccessibleDescription(t.clusterPeakRam('Alpha', 70000, 65536));
   });
 });

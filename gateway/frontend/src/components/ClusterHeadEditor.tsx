@@ -486,6 +486,7 @@ export function ClusterHeadEditor({
       <SelectField
         id="cluster-device-backend"
         label={t.clusterDeviceBackend}
+        helperText={t.clusterDeviceBackendHint}
         value={value.deviceBackend}
         onChange={(e) => patch({ deviceBackend: e.target.value as DeviceBackend })}
         sx={{ maxWidth: 360 }}

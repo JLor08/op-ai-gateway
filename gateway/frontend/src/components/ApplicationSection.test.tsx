@@ -243,6 +243,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       putRuntimeSpec: vi.fn(async () => makeRuntimeSpec()),
       deleteRuntimeSpec: vi.fn(async () => ({ ok: true })),
       rpcMemberSpecs: vi.fn(async () => ({ data: [] })),
+      serverAdminGroupCandidates: vi.fn(async () => []),
       createRPCMemberSpec: vi.fn(async () => ({}) as never),
       updateRPCMemberSpec: vi.fn(async () => ({}) as never),
       deleteRPCMemberSpec: vi.fn(async () => undefined),

@@ -8,7 +8,13 @@ import { RpcMemberSection } from './RpcMemberSection';
 import { ToastProvider } from './shared/ToastProvider';
 import { PortalApiError } from '../api/transport';
 import { messages } from '../i18n';
-import type { PortalServer, RPCMemberSpec, RuntimeStatus, ServerBinary } from '../api';
+import type {
+  AdminGroupCandidate,
+  PortalServer,
+  RPCMemberSpec,
+  RuntimeStatus,
+  ServerBinary,
+} from '../api';
 
 const t = messages.de;
 
@@ -66,11 +72,20 @@ function setup(
     deleteError?: unknown;
     server?: PortalServer;
     binaries?: ServerBinary[];
+    groupCandidates?: AdminGroupCandidate[];
+    groupCandidatesError?: unknown;
   } = {},
 ) {
   const api = {
     serverBinaries: vi.fn().mockResolvedValue({ data: opts.binaries ?? [] }),
     rpcMemberSpecs: vi.fn().mockResolvedValue({ data: opts.specs ?? [] }),
+    serverAdminGroupCandidates: vi
+      .fn()
+      .mockImplementation(() =>
+        opts.groupCandidatesError
+          ? Promise.reject(opts.groupCandidatesError)
+          : Promise.resolve(opts.groupCandidates ?? []),
+      ),
     createRPCMemberSpec: vi.fn().mockResolvedValue(spec()),
     updateRPCMemberSpec: vi.fn().mockResolvedValue(spec()),
     deleteRPCMemberSpec: vi
@@ -79,21 +94,18 @@ function setup(
         opts.deleteError ? Promise.reject(opts.deleteError) : Promise.resolve(undefined),
       ),
     updateServer: vi.fn().mockResolvedValue(server),
-    subscribeRuntimeStatus: vi.fn((_id: string, onData: (rows: RuntimeStatus[]) => void) => {
-      onData(opts.rows ?? []);
-      return () => {};
-    }),
   };
+  const rows = opts.rows ?? [];
   const view = render(
     <ToastProvider>
-      <RpcMemberSection t={t} api={api} server={opts.server ?? server} />
+      <RpcMemberSection t={t} api={api} server={opts.server ?? server} statusRows={rows} />
     </ToastProvider>,
   );
   return Object.assign(api, {
     rerenderServer: (next: PortalServer) =>
       view.rerender(
         <ToastProvider>
-          <RpcMemberSection t={t} api={api} server={next} />
+          <RpcMemberSection t={t} api={api} server={next} statusRows={rows} />
         </ToastProvider>,
       ),
   });
@@ -135,10 +147,10 @@ describe('RpcMemberSection manual member specs', () => {
       target: { value: 'FOO=bar' },
     });
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
-    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 0: ${t.runtimeSpecGpuIndex}`), {
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuRow(1)}: ${t.runtimeSpecGpuIndex}`), {
       target: { value: '1' },
     });
-    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 1: ${t.rpcMemberGpuVram}`), {
+    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuRow(1)}: ${t.rpcMemberGpuVram}`), {
       target: { value: '8000' },
     });
     fireEvent.click(screen.getByLabelText(t.rpcMemberCache));
@@ -178,7 +190,7 @@ describe('RpcMemberSection manual member specs', () => {
       await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
     );
     fireEvent.click(
-      screen.getByRole('button', { name: `${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} 0` }),
+      screen.getByRole('button', { name: `${t.modelGroupMoveDown}: ${t.rpcMemberGpuRow(1)}` }),
     );
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalled());
@@ -386,7 +398,13 @@ describe('RpcMemberSection settings state', () => {
         <ToastProvider>
           <button onClick={() => setShown((v) => !v)}>toggle</button>
           {shown && (
-            <RpcMemberSection t={t} api={api} server={saved ?? server} onServerSaved={setSaved} />
+            <RpcMemberSection
+              t={t}
+              api={api}
+              server={saved ?? server}
+              statusRows={[]}
+              onServerSaved={setSaved}
+            />
           )}
         </ToastProvider>
       );
@@ -402,18 +420,105 @@ describe('RpcMemberSection settings state', () => {
     expect(screen.getByLabelText(t.rpcMemberEnabledLabel)).toBeChecked();
   });
 
-  it('drops the stored measured VRAM when a GPU index is edited', async () => {
-    const api = setup({
-      specs: [spec({ gpus: [{ index: 0, vram_estimate_mb: 100, vram_measured_mb: 777 }] })],
-    });
+  it('keeps the GPU row names while an index is typed', async () => {
+    const api = setup({ specs: [spec()] });
     fireEvent.click(
       await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
     );
-    fireEvent.change(screen.getByLabelText(`${t.rpcMemberGpuLabel} 0: ${t.runtimeSpecGpuIndex}`), {
-      target: { value: '2' },
-    });
+    const index = screen.getByLabelText(`${t.rpcMemberGpuRow(1)}: ${t.runtimeSpecGpuIndex}`);
+    fireEvent.change(index, { target: { value: '' } });
+    fireEvent.change(index, { target: { value: '2' } });
+    expect(screen.getByLabelText(`${t.rpcMemberGpuRow(1)}: ${t.runtimeSpecGpuIndex}`)).toBe(index);
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalled());
-    expect(api.updateRPCMemberSpec.mock.calls[0][2].gpus[0].vram_measured_mb).toBe(0);
+    expect(api.updateRPCMemberSpec.mock.calls[0][2].gpus[0]).toEqual({
+      index: 2,
+      vram_estimate_mb: 8000,
+      vram_measured_mb: 0,
+    });
+  });
+});
+
+describe('RpcMemberSection consent groups', () => {
+  const lab: AdminGroupCandidate = {
+    id: 'g3',
+    name: 'Lab',
+    parent_group_id: 'sys',
+    parent_group_name: 'System',
+  };
+
+  it('offers every admin group the caller can list, beyond the server own', async () => {
+    const api = setup({ groupCandidates: [lab] });
+    fireEvent.click(await screen.findByLabelText('Lab'));
+    fireEvent.click(screen.getByRole('button', { name: t.rpcSettingsSave }));
+    await waitFor(() =>
+      expect(api.updateServer).toHaveBeenCalledWith('srv_1', { rpc_allowed_head_groups: ['g3'] }),
+    );
+    expect(screen.getByLabelText('Ops')).toBeTruthy();
+  });
+
+  it('offers the listed groups in the member spec editor too', async () => {
+    const api = setup({ groupCandidates: [lab] });
+    await screen.findByLabelText('Lab');
+    fireEvent.click(screen.getByRole('button', { name: t.rpcMemberAdd }));
+    fireEvent.change(screen.getByLabelText(t.rpcMemberBinary), { target: { value: '/x' } });
+    fireEvent.click(within(screen.getByRole('form')).getByLabelText('Lab'));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(api.createRPCMemberSpec).toHaveBeenCalled());
+    expect(api.createRPCMemberSpec.mock.calls[0][1].allowed_head_groups).toEqual(['g3']);
+  });
+
+  it('shows a stored group the caller cannot list as checked', async () => {
+    setup({ server: { ...server, rpc_allowed_head_groups: ['g9'] } });
+    const unlisted = await screen.findByLabelText(t.rpcAllowedHeadGroupUnlisted('g9'));
+    expect(unlisted).toBeChecked();
+    expect(screen.queryByText(t.rpcAllowedHeadGroupsDefault)).toBeNull();
+    fireEvent.click(unlisted);
+    expect(screen.getByText(t.rpcAllowedHeadGroupsDefault)).toBeTruthy();
+  });
+
+  it('shows a member spec group the caller cannot list as checked', async () => {
+    setup({ specs: [spec({ allowed_head_groups: ['g9'] })] });
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
+    );
+    expect(
+      within(screen.getByRole('form')).getByLabelText(t.rpcAllowedHeadGroupUnlisted('g9')),
+    ).toBeChecked();
+  });
+
+  it('falls back to the server own groups when the list cannot be read', async () => {
+    setup({ groupCandidatesError: new Error('denied') });
+    expect(await screen.findByLabelText('Ops')).toBeTruthy();
+    expect(screen.getByLabelText('Research')).toBeTruthy();
+  });
+});
+
+describe('RpcMemberSection editor lifetime', () => {
+  it('closes the editor when the edited spec is gone', async () => {
+    const api = setup({ specs: [spec()] });
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
+    );
+    expect(screen.getByRole('form')).toBeTruthy();
+    api.rpcMemberSpecs.mockResolvedValue({ data: [] });
+    fireEvent.click(screen.getByRole('button', { name: `${t.runtimeSpecDelete}: rpcm_1` }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await waitFor(() => expect(api.rpcMemberSpecs).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole('form', { hidden: true })).toBeNull());
+  });
+
+  it('keeps a new spec editor open across a reload', async () => {
+    const api = setup({ specs: [spec()] });
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
+    api.rpcMemberSpecs.mockResolvedValue({ data: [] });
+    fireEvent.click(screen.getByRole('button', { name: `${t.runtimeSpecDelete}: rpcm_1` }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await waitFor(() => expect(screen.queryByText('rpcm_1')).toBeNull());
+    expect(screen.getByRole('form', { hidden: true })).toBeTruthy();
   });
 });

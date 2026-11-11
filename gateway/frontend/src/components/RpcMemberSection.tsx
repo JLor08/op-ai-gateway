@@ -5,7 +5,7 @@
 // settings, the manual member specs an operator configures by hand, and the
 // live state of the RPC members running on the server.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -21,6 +21,7 @@ import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import type {
+  AdminGroupCandidate,
   DeviceBackend,
   PortalServer,
   PutRPCMemberSpecRequest,
@@ -66,7 +67,7 @@ function isAbsolutePath(p: string): boolean {
   return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
 }
 
-type GpuRow = { rowKey: number; index: string; vramMb: string; measured: number };
+type GpuRow = { rowKey: number; index: string; vramMb: string };
 
 type EditorState = {
   // '' while creating.
@@ -111,7 +112,6 @@ function editorFor(spec: RPCMemberSpec): EditorState {
       rowKey: nextRowKey(),
       index: String(g.index),
       vramMb: g.vram_estimate_mb ? String(g.vram_estimate_mb) : '',
-      measured: g.vram_measured_mb,
     })),
     cache: spec.cache_enabled,
     backend: spec.device_backend || 'auto',
@@ -156,7 +156,9 @@ function buildBody(
       break;
     }
     seen.add(index);
-    gpus.push({ index, vram_estimate_mb: vram, vram_measured_mb: r.measured });
+    // A member spec stores no measurement (member usage lives on the head's
+    // membership rows), and the gateway ignores the field on write.
+    gpus.push({ index, vram_estimate_mb: vram, vram_measured_mb: 0 });
   }
   const ram = nonNegativeInt(ed.ramMb);
   if (ram === null) errors.ram = t.errorRuntimeSpecGpuInvalid;
@@ -176,16 +178,17 @@ function buildBody(
   };
 }
 
-// max(live measurement, stored measurement, operator estimate), summed over
-// the member's GPUs. A member without a stored spec (an automatic one) has
-// only the live measurement.
+// max(live measurement, operator estimate), summed over the member's GPUs.
+// A member without a stored spec (an automatic one) has only the live
+// measurement. The spec carries no stored measurement: what a member used is
+// kept per head on the membership rows, not on the spec.
 function effectiveVramMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): number {
   const live = new Map((row.gpus ?? []).map((g) => [g.index, g.vram_measured_mb]));
   if (!spec) return [...live.values()].reduce((a, b) => a + b, 0);
   const specIdx = new Set(spec.gpus.map((g) => g.index));
   let sum = 0;
   for (const g of spec.gpus) {
-    sum += Math.max(live.get(g.index) ?? 0, g.vram_measured_mb, g.vram_estimate_mb);
+    sum += Math.max(live.get(g.index) ?? 0, g.vram_estimate_mb);
   }
   for (const [idx, mb] of live) if (!specIdx.has(idx)) sum += mb;
   return sum;
@@ -195,10 +198,36 @@ function effectiveRamMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): nu
   return Math.max(row.ram_measured_mb ?? 0, spec?.ram_estimate_mb ?? 0);
 }
 
+// The consent picker's options: the server's own admin groups, then every
+// other admin-tier group the caller can list (a system admin lists them all),
+// then any selected id neither list names -- a group set through the API or
+// one the caller cannot list -- so a stored consent is never invisible.
+function groupOptionsFor(
+  own: readonly { id: string; name: string }[],
+  listed: readonly AdminGroupCandidate[],
+  selected: readonly string[],
+  t: Translation,
+): { value: string; label: string }[] {
+  const options = own.map((g) => ({ value: g.id, label: g.name }));
+  const known = new Set(options.map((o) => o.value));
+  for (const g of listed) {
+    if (known.has(g.id)) continue;
+    known.add(g.id);
+    options.push({ value: g.id, label: g.name });
+  }
+  for (const id of selected) {
+    if (known.has(id)) continue;
+    known.add(id);
+    options.push({ value: id, label: t.rpcAllowedHeadGroupUnlisted(id) });
+  }
+  return options;
+}
+
 export function RpcMemberSection({
   t,
   api,
   server,
+  statusRows,
   onServerSaved,
 }: Readonly<{
   t: Translation;
@@ -210,18 +239,34 @@ export function RpcMemberSection({
     | 'deleteRPCMemberSpec'
     | 'serverBinaries'
     | 'updateServer'
-    | 'subscribeRuntimeStatus'
+    | 'serverAdminGroupCandidates'
   >;
   server: PortalServer;
+  // The server's live runtime status, from the parent's status stream: one
+  // stream per server, not one per section.
+  statusRows: readonly RuntimeStatus[];
   // Receives the server returned by a settings save, so a parent that keeps
   // the tab's state across switches can feed it back as `server`.
   onServerSaved?: (server: PortalServer) => void;
 }>) {
   const { showError, showSuccess } = useToast();
-  const groupOptions = useMemo(
-    () => server.admin_groups.map((g) => ({ value: g.id, label: g.name })),
-    [server.admin_groups],
-  );
+  // The admin-tier groups the caller can list. A failed read leaves the
+  // server's own groups, which the picker always offers.
+  const [listedGroups, setListedGroups] = useState<AdminGroupCandidate[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.serverAdminGroupCandidates().then(
+      (groups) => {
+        if (!cancelled) setListedGroups(groups);
+      },
+      () => {
+        if (!cancelled) setListedGroups([]);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
 
   // ---- 1. Server RPC settings ---------------------------------------------
   // The form holds unsaved edits. `seed` is the saved state the server prop
@@ -305,10 +350,7 @@ export function RpcMemberSection({
       const next = used.length === 0 ? 0 : Math.max(...used) + 1;
       return {
         ...e,
-        gpuRows: [
-          ...e.gpuRows,
-          { rowKey: nextRowKey(), index: String(next), vramMb: '', measured: 0 },
-        ],
+        gpuRows: [...e.gpuRows, { rowKey: nextRowKey(), index: String(next), vramMb: '' }],
       };
     });
   }
@@ -358,14 +400,15 @@ export function RpcMemberSection({
     }
   }
 
-  // ---- 3. Member status stream --------------------------------------------
-  const [rows, setRows] = useState<RuntimeStatus[]>([]);
-  const onFrame = useCallback((next: RuntimeStatus[]) => setRows(next), []);
+  // An editor for a spec the list no longer has (deleted here or elsewhere)
+  // closes: its save could only answer not-found.
   useEffect(() => {
-    setRows([]);
-    return api.subscribeRuntimeStatus(server.id, onFrame);
-  }, [api, server.id, onFrame]);
-  const memberRows = rows.filter((r) => r.kind === 'rpc_server');
+    if (!specsData || !editor || editor.id === '') return;
+    if (!specsData.data.some((s) => s.id === editor.id)) setEditor(null);
+  }, [specsData, editor]);
+
+  // ---- 3. Member status ---------------------------------------------------
+  const memberRows = statusRows.filter((r) => r.kind === 'rpc_server');
   const specById = useMemo(() => new Map(specs.map((s) => [s.id, s])), [specs]);
 
   return (
@@ -387,7 +430,7 @@ export function RpcMemberSection({
           />
           <CheckboxGroup
             legend={t.rpcAllowedHeadGroups}
-            options={groupOptions}
+            options={groupOptionsFor(server.admin_groups, listedGroups, headGroups, t)}
             selected={headGroups}
             onToggle={(v) => setHeadGroups((g) => toggle(g, v))}
           />
@@ -534,7 +577,7 @@ export function RpcMemberSection({
                 >
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveUp}: ${t.rpcMemberGpuLabel} ${row.index}`}
+                    aria-label={`${t.modelGroupMoveUp}: ${t.rpcMemberGpuRow(idx + 1)}`}
                     disabled={idx === 0}
                     onClick={() => moveGpu(idx, -1)}
                   >
@@ -542,7 +585,7 @@ export function RpcMemberSection({
                   </IconButton>
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveDown}: ${t.rpcMemberGpuLabel} ${row.index}`}
+                    aria-label={`${t.modelGroupMoveDown}: ${t.rpcMemberGpuRow(idx + 1)}`}
                     disabled={idx === editor.gpuRows.length - 1}
                     onClick={() => moveGpu(idx, 1)}
                   >
@@ -552,18 +595,18 @@ export function RpcMemberSection({
                     id={`rpc-member-gpu-index-${row.rowKey}`}
                     label={t.runtimeSpecGpuIndex}
                     inputProps={{
-                      'aria-label': `${t.rpcMemberGpuLabel} ${row.index}: ${t.runtimeSpecGpuIndex}`,
+                      'aria-label': `${t.rpcMemberGpuRow(idx + 1)}: ${t.runtimeSpecGpuIndex}`,
                     }}
                     type="number"
                     value={row.index}
-                    onChange={(e) => patchGpu(idx, { index: e.target.value, measured: 0 })}
+                    onChange={(e) => patchGpu(idx, { index: e.target.value })}
                     sx={{ maxWidth: 160 }}
                   />
                   <Field
                     id={`rpc-member-gpu-vram-${row.rowKey}`}
                     label={t.rpcMemberGpuVram}
                     inputProps={{
-                      'aria-label': `${t.rpcMemberGpuLabel} ${row.index}: ${t.rpcMemberGpuVram}`,
+                      'aria-label': `${t.rpcMemberGpuRow(idx + 1)}: ${t.rpcMemberGpuVram}`,
                     }}
                     type="number"
                     value={row.vramMb}
@@ -572,7 +615,7 @@ export function RpcMemberSection({
                   />
                   <Button
                     size="small"
-                    aria-label={`${t.runtimeSpecGpuRemove}: ${t.rpcMemberGpuLabel} ${row.index}`}
+                    aria-label={`${t.runtimeSpecGpuRemove}: ${t.rpcMemberGpuRow(idx + 1)}`}
                     onClick={() =>
                       patchEditor({ gpuRows: editor.gpuRows.filter((_, i) => i !== idx) })
                     }
@@ -623,7 +666,7 @@ export function RpcMemberSection({
             />
             <CheckboxGroup
               legend={t.rpcAllowedHeadGroups}
-              options={groupOptions}
+              options={groupOptionsFor(server.admin_groups, listedGroups, editor.groups, t)}
               selected={editor.groups}
               onToggle={(v) => patchEditor({ groups: toggle(editor.groups, v) })}
             />

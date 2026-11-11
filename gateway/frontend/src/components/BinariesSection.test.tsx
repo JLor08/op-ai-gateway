@@ -143,6 +143,29 @@ describe('BinariesSection', () => {
     );
   });
 
+  it('closes the editor when the edited row is gone', async () => {
+    const api = setup([manual]);
+    fireEvent.click(await screen.findByLabelText(`${t.binariesEdit}: /srv/custom/rpc-server`));
+    expect(screen.getByLabelText(t.binariesVersion)).toBeTruthy();
+    api.serverBinaries.mockResolvedValue({ data: [] });
+    fireEvent.click(screen.getByLabelText(`${t.binariesDelete}: /srv/custom/rpc-server`));
+    fireEvent.click(await screen.findByRole('button', { name: t.binariesDeleteConfirm }));
+    await waitFor(() => expect(api.serverBinaries).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByLabelText(t.binariesVersion)).toBeNull());
+  });
+
+  it('keeps a new row editor open across a reload', async () => {
+    const api = setup([manual]);
+    fireEvent.click(await screen.findByRole('button', { name: t.binariesAdd }));
+    api.serverBinaries.mockResolvedValue({ data: [] });
+    fireEvent.click(screen.getByLabelText(`${t.binariesDelete}: /srv/custom/rpc-server`));
+    fireEvent.click(await screen.findByRole('button', { name: t.binariesDeleteConfirm }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText(`${t.binariesEdit}: /srv/custom/rpc-server`)).toBeNull(),
+    );
+    expect(screen.getByLabelText(t.binariesPath)).toBeTruthy();
+  });
+
   it('shows the localized error when a save is refused', async () => {
     setup([], {
       createServerBinary: vi

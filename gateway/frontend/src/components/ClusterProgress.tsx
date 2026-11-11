@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { Alert, Box, Chip, Step, StepLabel, Stepper, Typography } from '@mui/material';
+import { Alert, Box, Chip, Step, StepLabel, Stepper, Tooltip, Typography } from '@mui/material';
 import type { ClusterMemberState, ClusterPhase, ClusterState, RuntimeSpec } from '../api';
 import type { Translation } from './shared/types';
 import { formatChatRunErrorCode, formatDate } from './shared/format';
@@ -73,12 +73,38 @@ function breachText(b: ClusterBreachView, t: Translation): string {
 
 function peakText(p: ClusterPeakView, t: Translation): string {
   const who = memberName(p, t);
-  const known = p.storedMb !== undefined && p.ceilingMb !== undefined;
-  if (known && p.resource === 'vram' && p.gpuIndex !== undefined) {
-    return t.clusterPeakVram(who, p.gpuIndex, p.storedMb!, p.ceilingMb!);
+  const { storedMb, ceilingMb } = p;
+  if (storedMb === undefined || ceilingMb === undefined) return t.clusterPeakHidden(who);
+  if (p.resource === 'vram' && p.gpuIndex !== undefined) {
+    return t.clusterPeakVram(who, p.gpuIndex, storedMb, ceilingMb);
   }
-  if (known && p.resource === 'ram') return t.clusterPeakRam(who, p.storedMb!, p.ceilingMb!);
+  if (p.resource === 'ram') return t.clusterPeakRam(who, storedMb, ceilingMb);
   return t.clusterPeakHidden(who);
+}
+
+/**
+ * A compact chip whose details sit in a tooltip: focusable, so a keyboard
+ * user can open it, and described by it, so a screen reader reads it. A chip
+ * whose details would only repeat its label is a plain chip.
+ */
+function DetailChip({
+  label,
+  details,
+  warning,
+}: Readonly<{ label: string; details: string; warning: boolean }>) {
+  const color = warning ? 'warning' : 'default';
+  if (details === label) {
+    return <Chip size="small" variant="outlined" color={color} label={label} />;
+  }
+  return (
+    <Tooltip
+      title={details}
+      describeChild
+      slotProps={{ tooltip: { sx: { whiteSpace: 'pre-line' } } }}
+    >
+      <Chip size="small" variant="outlined" color={color} label={label} tabIndex={0} />
+    </Tooltip>
+  );
 }
 
 function MemberChip({ m, t }: Readonly<{ m: ClusterMemberView; t: Translation }>) {
@@ -117,18 +143,16 @@ export function ClusterProgress({
     : '';
 
   if (compact) {
-    const forming = view.state === 'forming' && view.phase;
+    const phase = view.state === 'forming' ? view.phase : undefined;
     return (
       <Box
         sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}
         data-testid="cluster-progress-compact"
       >
-        <Chip
-          size="small"
-          variant="outlined"
-          color={view.state === 'cooling_down' || view.state === 'invalid' ? 'warning' : 'default'}
-          label={forming ? phaseLabel(view.phase!, t) : stateLabel(view.state, t)}
-          title={stateLabel(view.state, t)}
+        <DetailChip
+          label={phase ? phaseLabel(phase, t) : stateLabel(view.state, t)}
+          details={stateLabel(view.state, t)}
+          warning={view.state === 'cooling_down' || view.state === 'invalid'}
         />
         {view.members.map((m) => (
           <MemberChip key={m.position} m={m} t={t} />
@@ -144,21 +168,17 @@ export function ClusterProgress({
           </Typography>
         )}
         {view.breaches.length > 0 && (
-          <Chip
-            size="small"
-            variant="outlined"
-            color="warning"
+          <DetailChip
             label={t.clusterBreachesCount(view.breaches.length)}
-            title={view.breaches.map((b) => breachText(b, t)).join('\n')}
+            details={view.breaches.map((b) => breachText(b, t)).join('\n')}
+            warning
           />
         )}
         {view.peaks.length > 0 && (
-          <Chip
-            size="small"
-            variant="outlined"
-            color="warning"
+          <DetailChip
             label={t.clusterPeaksCount(view.peaks.length)}
-            title={view.peaks.map((p) => peakText(p, t)).join('\n')}
+            details={view.peaks.map((p) => peakText(p, t)).join('\n')}
+            warning
           />
         )}
       </Box>

@@ -166,6 +166,7 @@ export function ApplicationSection({
     // server_agent application's "manage models" drill-down opens it instead
     // of MappingSection.
     | 'rpcMemberSpecs'
+    | 'serverAdminGroupCandidates'
     | 'createRPCMemberSpec'
     | 'updateRPCMemberSpec'
     | 'deleteRPCMemberSpec'
