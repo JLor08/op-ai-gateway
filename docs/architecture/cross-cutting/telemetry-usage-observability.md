@@ -3362,8 +3362,8 @@ result; the cold pass is its warm-up. `load_time_ms` = the cold pass's time to
 first output minus the warm pass's, recorded only when the cold start was
 confirmed and the cold pass was the slower — unknown, never bogus, exactly the text
 rule — and stored in the mapping's existing `load_time_ms`. When the stop-all wrote
-the target's own `force_stopped`, the cold pass rides out the router's `503` until
-the clear reaches the agent. A missing byte rate is learned before the stop-all when
+the target's own `force_stopped`, or an earlier target's stop-all wrote and cleared
+it, the cold pass rides out the router's `503` until the clear reaches the agent. A missing byte rate is learned before the stop-all when
 the run stops the server's models, so a speech benchmark that fails stops nothing; a
 run that does not stop takes the cold pass first, timed to its first audio without
 counting audio, and learns the rate after it, so its own synthesis cannot warm the

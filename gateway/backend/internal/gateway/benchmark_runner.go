@@ -15,6 +15,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strings"
 	"time"
 )
@@ -522,7 +523,8 @@ type coldStart struct {
 	// pid 0 (agentColdStart).
 	// For any other target the loaded-models probe confirmed it absent (ensureColdLoadByEviction).
 	confirmed bool
-	// rideOutStop: the target's own force_stopped was or may have been written, so the cold
+	// rideOutStop: the target's own force_stopped was or may have been written, by its own
+	// stop-all or by an earlier target's whose clear was written (agentColdStart), so the cold
 	// pass rides the router's 503 until the clear reaches the agent (coldPassAfterStop).
 	rideOutStop bool
 }
@@ -655,15 +657,28 @@ func modelLoaded(ctx context.Context, lister provider.LoadedModelLister, target 
 //     (benchmarkOthersStopped). A neighbour that runs would be evicted inside the cold pass
 //     under a closed co-residency matrix, and one that can start by itself might start inside
 //     it. This branch writes nothing and returns no error.
+//
+// Either way, a target whose force_stopped an earlier stop-all of the run wrote and cleared
+// (benchmarkOverrides.cleared) rides the router's 503 in its cold pass (rideOutStop). The clear
+// is stored before the stop-all returns, but the agent applies it only when the document reaches
+// it -- at once over a WebSocket, at its next poll without one -- and nothing between the two
+// targets waits for that when this target's own stop-all stops nothing, does not run, or no
+// longer may.
 func (s *Server) agentColdStart(ctx context.Context, tgt benchmarkTarget) (coldStart, error) {
+	var cs coldStart
 	if coldLoadStopsAll(tgt) {
-		return s.preStopServer(ctx, tgt)
+		var err error
+		if cs, err = s.preStopServer(ctx, tgt); err != nil {
+			return cs, err
+		}
+	} else {
+		resident, known := s.agentTargetResident(ctx, tgt)
+		cs.confirmed = known && !resident && benchmarkOthersStopped(s.RuntimeStatus.statusSnapshot(tgt.server.ID), tgt.spec.ID)
 	}
-	resident, known := s.agentTargetResident(ctx, tgt)
-	if !known || resident || !benchmarkOthersStopped(s.RuntimeStatus.statusSnapshot(tgt.server.ID), tgt.spec.ID) {
-		return coldStart{}, nil
+	if tgt.overrides != nil && slices.Contains(tgt.overrides.cleared, tgt.spec.ID) {
+		cs.rideOutStop = true
 	}
-	return coldStart{confirmed: true}, nil
+	return cs, nil
 }
 
 // coldLoadStopsAll reports whether ensureColdLoad, asked now, runs the stop-all for tgt
@@ -854,8 +869,9 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 	// this target's result error, not the run's (of the stop-all's and the unpin's failures, only
 	// a failed re-pin reaches the run's error, endBenchmarkUnpin): no pass runs, and
 	// measureSpeedTarget writes nothing. When the stop-all wrote, or may have written,
-	// the target's own force_stopped (cold.rideOutStop), the cold pass rides the router's 503
-	// until the clear reaches the agent (coldPassAfterStop).
+	// the target's own force_stopped, or an earlier target's stop-all wrote and cleared it
+	// (cold.rideOutStop), the cold pass rides the router's 503 until the clear reaches the
+	// agent (coldPassAfterStop).
 	cold, err := s.ensureColdLoad(ctx, tgt)
 	if err != nil {
 		res.Error = err.Error()

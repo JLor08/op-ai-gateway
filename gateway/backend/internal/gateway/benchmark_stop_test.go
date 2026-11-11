@@ -488,13 +488,18 @@ func TestPreStopWaitRules(t *testing.T) {
 
 // TestPreStopFailedClearIsTheResultError: a clear that fails on a store error
 // is the target's result error, before any pass; the lease keeps naming the
-// spec, and stops are off for the rest of the run.
+// spec, and stops are off for the rest of the run. A neighbour whose clear in
+// the same batch succeeded is measured later without a stop, and its cold pass
+// rides the router's 503 until that clear reaches the agent.
 func TestPreStopFailedClearIsTheResultError(t *testing.T) {
 	withCapturedSlogAtTheDefaultLevel(t) // keeps the run's Warn and Info lines out of the test output
 	const want = "launch specs may still be force_stopped after the benchmark: rs_map1; clear the overrides in the runtime section"
 	t.Run("speed", func(t *testing.T) {
 		logs := withCapturedSlogAtTheDefaultLevel(t)
-		f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map1", "running", 801), stopAllSpecOf("map2", "running", 802), stopAllSpecOf("mapx", "stopped", 0)}})
+		// The agent applies the clear 150 ms after it was written, as an agent
+		// does whenever the document is still on its way: map2's cold pass
+		// starts before map2's force_stopped is lifted.
+		f := newStopAllFixture(t, stopAllOpts{specs: []stopAllSpec{stopAllSpecOf("map1", "running", 801), stopAllSpecOf("map2", "running", 802), stopAllSpecOf("mapx", "stopped", 0)}, clearDelay: 150 * time.Millisecond})
 		f.portal.failClear["rs_map1"] = errors.New("store: disk I/O error")
 		// A direct client starts the unmeasured x while map1's clear is written, so
 		// map2's stop-all would find a running model if stops were still on.
@@ -527,9 +532,13 @@ func TestPreStopFailedClearIsTheResultError(t *testing.T) {
 			t.Fatalf("batches = %v, want no stop for map2, though x runs: a failed clear turns stops off", got)
 		}
 		// Without a stop, map2 next to the running x is measured without a
-		// load time.
+		// load time, and without an error: its cold pass rode the 503 of the
+		// force_stopped map1's stop-all wrote and cleared.
 		if row := f.speedRow(t, "map2"); row.Error != "" || row.LoadTimeMS != 0 {
 			t.Fatalf("map2 history = load %d ms, error %q; want no load time and no error", row.LoadTimeMS, row.Error)
+		}
+		if got := f.events.count("chat m2 503"); got < 1 {
+			t.Fatalf("map2's cold pass met %d 503s, want at least one: it starts before the clear reaches the agent", got)
 		}
 		assertLoggedOnce(t, logs, "WARN", "benchmark: could not restore an admin override", map[string]string{"spec_id": "rs_map1", "err": "store: disk I/O error"})
 	})
