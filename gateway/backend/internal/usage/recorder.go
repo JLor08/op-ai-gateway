@@ -716,9 +716,7 @@ func hasServerFilter(q Query) bool {
 // not select, and only their parts on a selected host. groupBy "" leaves Key
 // empty. The caller holds r.mu.
 func (r *Recorder) memberPartBucketsLocked(q Query, groupBy string, selected map[string]bool) []GroupBucket {
-	type gk struct{ key, host string }
-	acc := make(map[gk]*GroupBucket)
-	order := make([]gk, 0)
+	acc := memberPartAccumulator{acc: map[memberPartKey]*GroupBucket{}}
 	unfiltered := q
 	if selected != nil {
 		unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
@@ -732,22 +730,40 @@ func (r *Recorder) memberPartBucketsLocked(q Query, groupBy string, selected map
 			key, _ = usageGroupKey(groupBy, e)
 		}
 		for _, p := range r.parts[e.ID] {
-			if p.ServerID == e.Host || (selected != nil && !selected[p.ServerID]) {
-				continue
+			if p.ServerID != e.Host && (selected == nil || selected[p.ServerID]) {
+				acc.add(key, p.ServerID, p.Wh)
 			}
-			id := gk{key, p.ServerID}
-			b := acc[id]
-			if b == nil {
-				b = &GroupBucket{Key: key, Host: p.ServerID, MemberParts: true}
-				acc[id] = b
-				order = append(order, id)
-			}
-			b.EnergyWh += p.Wh
 		}
 	}
-	out := make([]GroupBucket, 0, len(order))
-	for _, id := range order {
-		out = append(out, *acc[id])
+	return acc.buckets()
+}
+
+// memberPartKey is one member part bucket: the groupBy value and the part's
+// host.
+type memberPartKey struct{ key, host string }
+
+// memberPartAccumulator sums member part energy per memberPartKey, keeping
+// the buckets in the order they were first seen.
+type memberPartAccumulator struct {
+	acc   map[memberPartKey]*GroupBucket
+	order []memberPartKey
+}
+
+func (a *memberPartAccumulator) add(key, host string, wh float64) {
+	id := memberPartKey{key, host}
+	b := a.acc[id]
+	if b == nil {
+		b = &GroupBucket{Key: key, Host: host, MemberParts: true}
+		a.acc[id] = b
+		a.order = append(a.order, id)
+	}
+	b.EnergyWh += wh
+}
+
+func (a *memberPartAccumulator) buckets() []GroupBucket {
+	out := make([]GroupBucket, 0, len(a.order))
+	for _, id := range a.order {
+		out = append(out, *a.acc[id])
 	}
 	return out
 }
