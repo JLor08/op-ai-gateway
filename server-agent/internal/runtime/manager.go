@@ -1430,8 +1430,9 @@ type specState struct {
 	claim memberClaim
 	// relaunchDeferred marks a claimed member whose launch shape changed under
 	// its running process: it is relaunched once the claim ends (claimEnded),
-	// since killing it now would abort the head that uses it. Cleared when the
-	// process exits.
+	// or by the next ensure that finds no head holding it (handleEnsure),
+	// since killing it while held would abort the head that uses it. Cleared
+	// when the process exits.
 	relaunchDeferred bool
 	// admissionBlockedBy names the claimed member a waiting admission of this
 	// spec could only proceed by evicting; empty otherwise. admitAndStart
@@ -1571,6 +1572,7 @@ func (o *owner) run() {
 			if !o.closing {
 				o.scanIdle()
 				o.dispatchMeasurement()
+				o.sweepTick()
 			}
 		case <-o.m.hostWake:
 			o.turn++
@@ -2190,6 +2192,15 @@ func (o *owner) handleEnsure(c cmdEnsure) {
 		return
 	}
 	specID := st.spec.ID
+	if c.member && st.relaunchDeferred && st.state == StateRunning && st.proc != nil && st.claim.heldBy == "" {
+		// A member whose relaunch waits for its claim, asked for again while
+		// no head is connected to it (at most a reservation stands): this is
+		// a cluster start, and its head must form against the current launch.
+		// Nothing uses the old process, so it drains now and the ensure waits
+		// for the relaunch like any request that finds its spec draining.
+		st.relaunchDeferred = false
+		o.beginDrain(specID)
+	}
 	if st.state == StateRunning && st.proc != nil {
 		st.inFlight++
 		st.lastUsed = time.Now()

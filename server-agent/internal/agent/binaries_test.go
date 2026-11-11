@@ -459,3 +459,49 @@ func TestInventoryResentOnReconnectAndPeriodically(t *testing.T) {
 		})
 	}
 }
+
+// TestFailedProbeThenFileGoneLeavesNoRetry: a binary whose --version run
+// failed and which then disappears (deleted, turned into a directory, or no
+// longer stat-able) leaves no pending retry behind: nothing could ever run it
+// again, and a retry time in the past would make the rescan loop spin.
+func TestFailedProbeThenFileGoneLeavesNoRetry(t *testing.T) {
+	for name, gone := range map[string]func(string) (fs.FileInfo, error){
+		"deleted":   func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist },
+		"directory": statFake(fakeFileInfo{mode: fs.ModeDir}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBinaryInventory([]string{"/opt/l/llama-server"})
+			b.stat = statFake(fakeFileInfo{size: 1})
+			b.runVersion = func(context.Context, string) (string, error) { return "", errors.New("boom") }
+			b.rescan(context.Background())
+			if _, ok := b.nextRetry(); !ok {
+				t.Fatal("no retry pending after a failed probe")
+			}
+			b.stat = gone
+			b.rescan(context.Background())
+			if next, ok := b.nextRetry(); ok {
+				t.Fatalf("nextRetry = %v after the binary disappeared, want none", next)
+			}
+		})
+	}
+}
+
+// TestNextRetryIgnoresPathsNoLongerAllowed: a failed entry for a path the
+// allowlist no longer names is never rescanned, so it schedules nothing.
+func TestNextRetryIgnoresPathsNoLongerAllowed(t *testing.T) {
+	b := newBinaryInventory([]string{"/opt/l/llama-server"})
+	b.cache["/opt/old/llama-server"] = cachedVersion{retryAt: time.Now().Add(-time.Hour), failures: 1}
+	if next, ok := b.nextRetry(); ok {
+		t.Fatalf("nextRetry = %v for a path outside the allowlist, want none", next)
+	}
+}
+
+// TestUntilNextScanHasAFloor: a retry already due never makes the rescan loop
+// wait less than a second.
+func TestUntilNextScanHasAFloor(t *testing.T) {
+	b := newBinaryInventory([]string{"/opt/l/llama-server"})
+	b.cache["/opt/l/llama-server"] = cachedVersion{retryAt: time.Now().Add(-time.Hour), failures: 1}
+	if got := b.untilNextScan(); got < time.Second {
+		t.Fatalf("untilNextScan = %v with a retry overdue, want at least 1s", got)
+	}
+}

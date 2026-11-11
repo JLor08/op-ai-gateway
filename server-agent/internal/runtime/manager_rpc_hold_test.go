@@ -436,3 +436,37 @@ func TestUnclaimedMemberRelaunchesAtOnce(t *testing.T) {
 		return statusFor(m, "rpcm_a").PID != pid
 	})
 }
+
+// TestEnsureRelaunchesDeferredMemberWithoutHold: an ensure for a member whose
+// relaunch waits for its claim, while no head holds it (only a reservation
+// remains), drains it and answers with a process on the current launch, so the
+// head the gateway starts next forms against the new shape. With the hold
+// standing the ensure keeps the running process.
+func TestEnsureRelaunchesDeferredMemberWithoutHold(t *testing.T) {
+	shrinkTimings(t)
+	spec := onDemandMember(t, "rpcm_a")
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "1"})
+	ensureMember(t, m, "rpcm_a", 30*time.Second)
+	m.SetMemberHold("rpcm_a", "rspec_h", time.Now())
+	pid := statusFor(m, "rpcm_a").PID
+
+	changed := spec
+	changed.Env = map[string]string{"OP_TEST_MEMBER_EDIT": "1"}
+	m.Apply(Config{Specs: []Spec{changed}, ETag: "2"})
+
+	ensureMember(t, m, "rpcm_a", 30*time.Second)
+	if s := statusFor(m, "rpcm_a"); s.PID != pid {
+		t.Fatalf("pid = %d after an ensure while held, want the running %d", s.PID, pid)
+	}
+
+	m.SetMemberHold("rpcm_a", "", time.Time{}) // the reservation still stands
+	ensureMember(t, m, "rpcm_a", 30*time.Second)
+	s := statusFor(m, "rpcm_a")
+	if s.State != StateRunning || s.PID == pid || s.PID == 0 {
+		t.Fatalf("member = %s pid %d after an ensure with no hold, want running on a new process", s.State, s.PID)
+	}
+	if memberRPC(t, m, "rpcm_a").ReservedUntil.IsZero() {
+		t.Fatal("the relaunched member carries no reservation from the ensure")
+	}
+}

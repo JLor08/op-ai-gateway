@@ -232,6 +232,7 @@ func (o *owner) prepareMember(spec Spec, expandedArgs, expandedEnv []string) (ar
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, nil, 0, fmt.Errorf("runtime: create rpc cache %s: %w", dir, err)
 		}
+		markMemberCache(dir)
 		if free, err := freeDiskMB(dir); err != nil {
 			slog.Warn("runtime: cannot measure free space for the rpc cache", "path", dir, "err", err)
 		} else if free < memberCacheMinFreeMB {
@@ -295,10 +296,18 @@ func (o *owner) pollMemberReady(specID string, proc *runningProc, spec Spec, dea
 // fast, so only a cache nobody has touched for this long is dropped.
 const memberCacheOrphanAge = 7 * 24 * time.Hour
 
-// memberCacheSweepEvery is how often, at most, a document apply sweeps the
-// cache root, and how old a purge tombstone must be before the sweep removes
-// it (a younger one may still be under removal by its purge).
-const memberCacheSweepEvery = time.Hour
+// memberCacheSweepEvery is how often, at most, the cache root is swept, and
+// how old a purge tombstone must be before the sweep removes it (a younger one
+// may still be under removal by its purge). A variable so tests can shorten
+// it.
+var memberCacheSweepEvery = time.Hour
+
+// memberCacheMarker is the empty file the agent puts into every member cache
+// directory it creates. The sweep removes only directories that carry it (and
+// its own purge tombstones): the cache root is <config_files_dir>/rpc, which a
+// file-mode spec with the id "rpc" shares for its config files, and anything
+// else found there is not the agent's to delete.
+const memberCacheMarker = ".op-rpc-member-cache"
 
 // purgeTombstonePrefix starts the name a purged cache directory is moved to
 // before it is removed (purgeMemberCache).
@@ -338,9 +347,23 @@ func (o *owner) purgeChangedHeadCaches(before map[string]string, after []Spec) {
 	}
 }
 
+// markMemberCache puts the sweep's marker into a member cache directory; a
+// failure only means the sweep will never remove that directory.
+func markMemberCache(dir string) {
+	f, err := os.OpenFile(filepath.Join(dir, memberCacheMarker), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		slog.Warn("runtime: cannot mark the rpc cache for the sweep", "path", dir, "err", err)
+		return
+	}
+	f.Close()
+}
+
 // maybeSweepMemberCaches starts a sweep of the cache root against specs, the
-// document just applied, on the first apply and then at most once per
-// memberCacheSweepEvery. The sweep runs off the owner goroutine.
+// document in force, on the first apply and then at most once per
+// memberCacheSweepEvery: from a document apply, and from the owner's
+// housekeeping beat once a document has been applied (sweepTick), so a
+// listed head's cache is touched while no new document arrives. The sweep runs
+// off the owner goroutine.
 func (o *owner) maybeSweepMemberCaches(specs []Spec) {
 	if o.configFilesDir == "" || o.closing {
 		return
@@ -360,12 +383,26 @@ func (o *owner) maybeSweepMemberCaches(specs []Spec) {
 	o.m.wg.Go(func() { sweepMemberCaches(root, keep, now) })
 }
 
-// sweepMemberCaches removes from root every directory that is no head in keep
-// and whose newest modification, its own or of anything inside it, lies more
-// than memberCacheOrphanAge before now; this covers caches orphaned while the
-// agent was down. A purge tombstone is removed once its purge, recorded in
-// its name, lies more than memberCacheSweepEvery back. Anything that is not a
-// directory is left alone.
+// sweepTick is the housekeeping beat's sweep: the document in force, but only
+// once one has been applied (the first apply sweeps first), so the agent
+// never sweeps against the empty set it starts with.
+func (o *owner) sweepTick() {
+	if o.lastCacheSweep.IsZero() {
+		return
+	}
+	o.maybeSweepMemberCaches(o.cfg.Specs)
+}
+
+// sweepMemberCaches sweeps the cache root. The cache of every head in keep is
+// touched (its modification time set to now, and marked if it is not), so the
+// age the sweep judges is the time since a member last served that head, not
+// since its tensors were written: they are written once and then only read.
+// Every other directory that carries memberCacheMarker and whose newest
+// modification, its own or of anything inside it, lies more than
+// memberCacheOrphanAge before now is removed; this covers caches orphaned
+// while the agent was down. A purge tombstone is removed once its purge,
+// recorded in its name, lies more than memberCacheSweepEvery back. Anything
+// else -- a file, a directory without the marker -- is left alone.
 func sweepMemberCaches(root string, keep map[string]bool, now time.Time) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -376,14 +413,23 @@ func sweepMemberCaches(root string, keep map[string]bool, now time.Time) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if !e.IsDir() || keep[name] {
+		if !e.IsDir() {
 			continue
 		}
 		dir := filepath.Join(root, name)
+		if keep[name] {
+			markMemberCache(dir)
+			if err := os.Chtimes(dir, now, now); err != nil {
+				slog.Warn("runtime: touch rpc cache", "path", dir, "err", err)
+			}
+			continue
+		}
 		if at, ok := tombstonePurgedAt(name); ok {
 			if now.Sub(at) < memberCacheSweepEvery {
 				continue
 			}
+		} else if _, err := os.Stat(filepath.Join(dir, memberCacheMarker)); err != nil {
+			continue
 		} else if newest, err := newestModTime(dir); err != nil || now.Sub(newest) < memberCacheOrphanAge {
 			continue
 		}

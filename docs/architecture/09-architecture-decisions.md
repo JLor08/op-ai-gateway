@@ -11746,12 +11746,14 @@ unauthenticated port to the network, lets one head take another's member, or poi
   before it (a half-open socket of a head that lost power) never re-takes the hold, only a new one does. A direct
   member that still reports the hold of a head that is down is stopped, forced, as well: the rpc-server sets no
   keepalive, so its half-open connection would otherwise linger. A claimed member is never relaunched under its
-  head: a change of its launch waits until the claim ends, and the gateway relaunches the head for any change of a
-  member's launch inputs. A local start on a member host that waits only for a held member makes the gateway ask the
-  head's agent for a conditional stop, which happens only when that agent's own eviction rule lets the head go;
-  otherwise the local start waits. A member's tensor cache outlives its member leaving the document (members are
-  withheld for reasons that pass); it goes when the member serves another head, on an operator's purge, or once no
-  listed member serves it and it has been unused for 7 days.
+  head: a change of its launch waits until the claim ends or an ensure finds no head holding it, and the gateway
+  relaunches the head for any change of a member's launch inputs, so the change normally lands with the next start; a
+  member whose document arrives after the new head connected keeps its old launch until that head stops. A local
+  start on a member host that waits only for a held member makes the gateway ask the head's agent for a conditional
+  stop, which happens only when that agent's own eviction rule lets the head go; otherwise the local start waits. A
+  member's tensor cache outlives its member leaving the document (members are withheld for reasons that pass); it goes
+  when the member serves another head, on an operator's purge, or once no listed member serves it and it has been
+  unused for 7 days.
 - **(h) A watchdog follows a formed cluster on telemetry, and acts only on the head.** Losing a member aborts the head
   anyway, and a member is removed only through its head. Evidence of a lost member (exit, a new PID, a vanished hold,
   a relay stall) is a suspicion until a head frame that arrived **after** the member's confirms the head still runs
