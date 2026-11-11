@@ -192,7 +192,7 @@ servers, models, launch specifications, users, and policies in a bilingual
 
 | llama.cpp RPC cluster head (editor header, then its RPC cluster section) |
 | :---: |
-| ![Runtime spec editor of llama-3.3-70b on gpu-node-a: the header, then the RPC cluster section of a configured cluster that has not been started yet ("Cluster off"), with two automatic members](docs/images/portal-rpc-cluster.png) |
+| ![Runtime spec editor of llama-3.3-70b on gpu-node-a: the header, then the RPC cluster section of a configured cluster that has not been started yet, with two automatic members](docs/images/portal-rpc-cluster.png) |
 
 ## How it works
 
