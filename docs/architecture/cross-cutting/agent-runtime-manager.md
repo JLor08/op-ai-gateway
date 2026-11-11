@@ -1689,14 +1689,23 @@ A cluster head starts **only** when the gateway asks for it, never on its own:
 The agent reads the tail of a failed cluster process's output against a small,
 explicit table of llama.cpp messages, applied only to heads and `rpc_server`
 members (model specs are never classified), and attaches a stable code to
-`last_error.code`:
+`last_error.code`. The rows are in precedence order: when the tail holds
+several of the messages, the first row that matches decides, wherever in the
+tail its message stands. Causes come before the errors they lead to.
+llama.cpp registers an RPC device only for a member it connected to and shook
+hands with, so an unreachable member, a failed handshake or a protocol
+mismatch is followed by `invalid device: RPC<n>` when the head's `--device`
+list names that member's device. That tail is an unreachable member
+(non-terminal), or a version mismatch, never a backend mismatch. A failed
+handshake or protocol mismatch also wins over a `Failed to connect` printed
+with it, since the member was reached.
 
 | Message (source) | Code | Terminal |
 |---|---|---|
-| `invalid device: ` (head), `unknown device: ` / `No devices found` (member) | `runtime.device_backend_mismatch` | yes |
 | `RPC not supported in this build` | `runtime.rpc_unsupported_build` | yes |
 | `RPC handshake failed`, `protocol version mismatch` | `runtime.cluster_version_mismatch` | yes |
 | `Failed to connect` (head) | `runtime.cluster_member_unreachable` | no |
+| `invalid device: ` (head), `unknown device: ` / `No devices found` (member) | `runtime.device_backend_mismatch` | yes |
 
 A member's banner device-count mismatch is terminal too
 (`runtime.rpc_device_count_mismatch`). A **terminal** verdict is one no retry

@@ -60,6 +60,53 @@ func TestClassifyExitTable(t *testing.T) {
 	}
 }
 
+// unreachableMemberTail is a Windows head's output (CRLF line endings) when a
+// member cannot be reached: llama.cpp registers RPC devices only for members it
+// connected to, so the --device list then names a device that does not exist.
+const unreachableMemberTail = "load_backend: loaded RPC backend from C:\\llama\\ggml-rpc.dll\r\n" +
+	"E Failed to connect to 100.108.217.35:26000\r\n" +
+	"error while handling argument \"--device\": invalid device: RPC1\r\n" +
+	"\r\n" +
+	"usage:\r\n" +
+	"-h,    --help, --usage                 print usage and exit\r\n"
+
+// TestClassifyExitCausesBeforeConsequences: when a tail carries a cause and the
+// device error it leads to, the cause decides. An unreachable member makes
+// its RPC device missing, so "invalid device" follows "Failed to connect":
+// the verdict is the non-terminal unreachable member, never the terminal
+// backend mismatch. A failed handshake or a protocol mismatch likewise leaves
+// the member's device unregistered and wins over the device rules (and, being
+// the more specific cause, over a "Failed to connect" printed with it); an
+// RPC-less build wins over everything.
+func TestClassifyExitCausesBeforeConsequences(t *testing.T) {
+	member := memberSpec("rpcm_a", "rspec_h")
+	head := classifyHeadSpec()
+	unreachable := exitClass{"runtime.cluster_member_unreachable", false}
+	version := exitClass{"runtime.cluster_version_mismatch", true}
+	cases := []struct {
+		name string
+		spec Spec
+		tail string
+		want exitClass
+	}{
+		{"real unreachable tail", head, unreachableMemberTail, unreachable},
+		{"unreachable, device error printed first", head, "invalid device: RPC1\nFailed to connect to 100.64.0.5:47001\n", unreachable},
+		{"handshake then invalid device", head, "RPC handshake failed\r\ninvalid device: RPC0\r\n", version},
+		{"protocol mismatch then invalid device", head, "protocol version mismatch\ninvalid device: RPC0\n", version},
+		{"handshake reported with failed connect", head, "RPC handshake failed\nFailed to connect to 100.64.0.5:47001\ninvalid device: RPC0\n", version},
+		{"member protocol mismatch then unknown device", member, "protocol version mismatch\nunknown device: CUDA0\n", version},
+		{"no RPC build wins over all", head, "RPC not supported in this build\nFailed to connect\nRPC handshake failed\ninvalid device: RPC0\n", exitClass{"runtime.rpc_unsupported_build", true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := classifyExit(c.spec, c.tail)
+			if !ok || got != c.want {
+				t.Fatalf("classifyExit = %+v, %v; want %+v", got, ok, c.want)
+			}
+		})
+	}
+}
+
 func TestParseMemberBannerFromRealOutput(t *testing.T) {
 	got, ok := parseMemberBanner(strings.Split(realMemberBanner, "\n"))
 	if !ok || got.Protocol != "8.0.1" || len(got.Devices) != 2 || got.Devices[0] != "MTL0" || got.Devices[1] != "CPU" {
