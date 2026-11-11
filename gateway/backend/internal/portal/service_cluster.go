@@ -272,7 +272,8 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 // one is newer than the request validations -- and in this order, which is
 // part of the API like that function's:
 //
-//  1. cluster off: ${RPC_SERVERS}/${RPC_DEVICES} anywhere in args or env;
+//  1. cluster off: ${RPC_SERVERS}/${RPC_DEVICES} anywhere in args, env or
+//     a config file's content (the agent resolves them in all three);
 //     nothing else. Dropping the membership only frees the member hosts, so
 //     the head's rights suffice, as for deleting the head.
 //  2. cluster on, the head's own document: effective type llama_cpp, no
@@ -336,7 +337,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	plan.readMembers, plan.readGPUs = prevMembers, prevGPUs
 	scan := scanClusterArgs(req.Args, req.Env)
 	if !req.ClusterEnabled {
-		if scan.clusterPlaceholder {
+		if scan.clusterPlaceholder || configFilesHaveClusterPlaceholder(req.ConfigFiles) {
 			return clusterPlan{}, ErrClusterRPCPlaceholderWithoutCluster
 		}
 		plan.writeMembers = len(prevMembers) > 0

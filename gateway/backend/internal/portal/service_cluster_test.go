@@ -1549,3 +1549,19 @@ func TestRPCPortRangeOutsideEphemeralRanges(t *testing.T) {
 		t.Fatalf("RPC port range %d-%d, want 26000-26999", rpcPortFirst, rpcPortLast)
 	}
 }
+
+// TestPutClusterPlaceholderInConfigFileNeedsCluster: the agent resolves
+// ${RPC_SERVERS} and ${RPC_DEVICES} in config files too and refuses them
+// outside a head, so the save refuses them there as it does in args and env.
+func TestPutClusterPlaceholderInConfigFileNeedsCluster(t *testing.T) {
+	for _, placeholder := range []string{"${RPC_SERVERS}", "${RPC_DEVICES}"} {
+		f := newClusterFixture(t)
+		req := PutRuntimeSpecRequest{
+			Enabled: true, Binary: clusterHeadBinary, Type: "llama_cpp", Args: []string{"--models-preset", "${CONFIG_DIR}/presets.ini"},
+			ConfigFiles: []ConfigFileDTO{{Name: "presets.ini", Content: "[big]\nrpc = " + placeholder + "\n"}},
+		}
+		if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterRPCPlaceholderWithoutCluster) {
+			t.Fatalf("%s in a config file of a non-head = %v, want %v", placeholder, err, ErrClusterRPCPlaceholderWithoutCluster)
+		}
+	}
+}
