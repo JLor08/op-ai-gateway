@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -334,13 +335,21 @@ func (s *Server) handleRuntimeEvents(w http.ResponseWriter, r *http.Request, tok
 
 	snapshot, ch, unsub := s.RuntimeStatus.subscribe(serverID)
 	defer unsub()
-	if !writePerfEvent(w, flusher, "snapshot", runtimeStatusEventDTO{Runtimes: nonNilRuntimeStatuses(snapshot)}) {
+	// RPC members are named for this reader: what the name may say depends
+	// on the heads the reader may see.
+	namer := &rpcMemberNamer{
+		resolve: func(ctx context.Context, ids []string) (map[string]string, error) {
+			return s.Portal.RPCMemberDisplayNames(ctx, token, serverID, ids)
+		},
+		now: time.Now,
+	}
+	ctx := r.Context()
+	if !writePerfEvent(w, flusher, "snapshot", runtimeStatusEventDTO{Runtimes: nonNilRuntimeStatuses(namer.apply(ctx, snapshot))}) {
 		return
 	}
 
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
-	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
@@ -349,7 +358,7 @@ func (s *Server) handleRuntimeEvents(w http.ResponseWriter, r *http.Request, tok
 			if !open {
 				return
 			}
-			if !writePerfEvent(w, flusher, "update", runtimeStatusEventDTO{Runtimes: nonNilRuntimeStatuses(statuses)}) {
+			if !writePerfEvent(w, flusher, "update", runtimeStatusEventDTO{Runtimes: nonNilRuntimeStatuses(namer.apply(ctx, statuses))}) {
 				return
 			}
 		case <-heartbeat.C:

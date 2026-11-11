@@ -176,6 +176,7 @@ type API interface {
 	PublicThemeView(context.Context) ThemePublicView
 	PutRPCMemberSpec(context.Context, auth.Token, string, string, PutRPCMemberSpecRequest) (RPCMemberSpecDTO, error)
 	PutRuntimeSpec(context.Context, auth.Token, string, PutRuntimeSpecRequest) (RuntimeSpecDTO, error)
+	RPCMemberDisplayNames(context.Context, auth.Token, string, []string) (map[string]string, error)
 	RPCMemberSpecs(context.Context, auth.Token, string) ([]RPCMemberSpecDTO, error)
 	ReassignGroupsOwnedBy(context.Context, auth.Token, string) error
 	ReconcileCertificates(context.Context)

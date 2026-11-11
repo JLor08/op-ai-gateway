@@ -5755,6 +5755,10 @@ blocks it) and, inside `last_error`, `code`. Their sources, the merge rules and
 the cache-size measurement are in
 [§3.6](#36-rpc-cluster-members-and-heads); a member row is never HTTP-probed, so
 its `context_size`, `active_requests` and `queue_depth` stay at their zero values.
+The agent knows a member only by its spec id; the readable name the portal shows
+(`display_name`, [HTTP API Surface](../reference/api-surface.md)) is added by the
+gateway's status stream for each reader, from the stored membership, and is never
+pushed to the agent.
 
 **One status row per instance** (#340). `Status()` and the sample's `runtimes`
 carry a row per instance, identified by the pair (`spec_id`, `instance`), never by

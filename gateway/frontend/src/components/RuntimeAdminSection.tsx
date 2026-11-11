@@ -97,7 +97,7 @@ import { MappingForm, type MappingFormValues } from './MappingForm';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
-import { RpcMemberSection } from './RpcMemberSection';
+import { RpcMemberName, RpcMemberSection } from './RpcMemberSection';
 import { BinariesSection } from './BinariesSection';
 import { BinaryPicker, binaryVersionFor, useServerBinaries } from './shared/BinaryPicker';
 import {
@@ -2150,6 +2150,12 @@ export function RuntimeAdminSection({
     return mappingForStatus(row)?.gateway_model_name ?? '';
   }
 
+  // The name a row is shown by: its mapping's gateway name, a cluster
+  // member's display name, else what the agent reports.
+  function statusRowName(row: RuntimeStatus): string {
+    return gatewayNameFor(row) || row.display_name || row.model || row.spec_id;
+  }
+
   // The spec whose managed-process output is being watched, or null. Opening
   // this is what MAKES the agent stream that spec (the gateway asks on the
   // first viewer and stops on the last), so it is deliberately per-row state
@@ -2407,7 +2413,7 @@ export function RuntimeAdminSection({
    * instances are told apart by it.
    */
   function instanceTargetName(row: RuntimeStatus, spec: RuntimeSpec, k: number): string {
-    const name = gatewayNameFor(row) || row.model || row.spec_id;
+    const name = statusRowName(row);
     return spec.replicable || k > 0 ? `${name} #${k}` : name;
   }
 
@@ -4262,9 +4268,13 @@ export function RuntimeAdminSection({
       // leaving the operator to infer it from a nearly empty actions cell.
       //
       // Search/sort key carries every name a searching operator might type.
-      value: (row) => [gatewayNameFor(row), row.model, row.spec_id].filter(Boolean).join(' '),
+      value: (row) =>
+        [gatewayNameFor(row), row.display_name, row.model, row.spec_id].filter(Boolean).join(' '),
       filter: 'text',
       render: (row) => {
+        // A cluster member is no mapping row: its name, without the
+        // unresolved marker.
+        if (row.kind === 'rpc_server') return <RpcMemberName row={row} variant="body2" />;
         const mapping = mappingForStatus(row);
         const reported = row.model || row.spec_id;
         if (mapping === undefined) {
@@ -4450,7 +4460,7 @@ export function RuntimeAdminSection({
         onClick: () =>
           setLogSpec({
             specId: row.spec_id,
-            title: gatewayNameFor(row) || row.model || row.spec_id,
+            title: statusRowName(row),
             // The view is spec-wide: every instance writes into the spec's
             // one buffer, so for a replicable spec it says whose lines are
             // whose -- from whichever instance row it is opened.

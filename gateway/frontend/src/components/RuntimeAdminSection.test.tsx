@@ -5074,6 +5074,48 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     expect(screen.queryByRole('tab', { name: t.rpcTab })).not.toBeInTheDocument();
   });
 
+  it('names a cluster member row on the Live-Status tab and in its log view', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({
+          spec_id: 'rpca_rspec_1_srv_1',
+          kind: 'rpc_server',
+          model: '',
+          display_name: 'RPC (big)(efyga)',
+          pid: 4300,
+        }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    const row = inRowWith('4300');
+    const name = row.getByText('RPC (big)(efyga)');
+    expect(name).toHaveAccessibleDescription('rpca_rspec_1_srv_1');
+    // The column's other names are body2 too.
+    expect(name).toHaveClass('MuiTypography-body2');
+    // A member is no mapping row: no "unresolved" marker.
+    expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
+    fireEvent.click(row.getByRole('button', { name: t.runtimeLogs }));
+    expect(await screen.findByRole('dialog')).toHaveTextContent('RPC (big)(efyga)');
+  });
+
+  it('shows a cluster member row without a display name by its id, without the unresolved marker', async () => {
+    const { stream } = renderSection({
+      statusRows: [
+        makeStatus({ spec_id: 'rpcm_old', kind: 'rpc_server', model: '', pid: 4301 }),
+        // A plain row no mapping matches: its marker proves the spec loads have
+        // settled, so the member row's missing marker is not just "too early".
+        makeStatus({ spec_id: 'spec_orphan', model: 'orphan-model', pid: 4302 }),
+      ],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    expect(await screen.findByText(t.runtimeStatusUnresolvedShort)).toBeInTheDocument();
+    const row = inRowWith('4301');
+    expect(row.getByText('rpcm_old')).toBeInTheDocument();
+    expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
+  });
+
   it('feeds the RPC tab from its own status stream instead of opening a second one', async () => {
     const { fakeApi, stream } = renderSection({
       statusRows: [makeStatus({ spec_id: 'rpcm_live', kind: 'rpc_server' })],

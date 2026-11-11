@@ -13,6 +13,7 @@ import {
   Checkbox,
   FormControlLabel,
   IconButton,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
@@ -238,6 +239,35 @@ function groupOptionsFor(
     options.push({ value: id, label: t.rpcAllowedHeadGroupUnlisted(id) });
   }
   return options;
+}
+
+/**
+ * A cluster member's row label: its display name from the gateway, with its
+ * spec id (the identity support asks for) in a tooltip; the id itself from
+ * an older gateway that sends no name.
+ */
+export function RpcMemberName({
+  row,
+  variant,
+}: Readonly<{
+  row: RuntimeStatus;
+  /** The text variant of the surrounding names (the RPC tab's body1 by default). */
+  variant?: 'body1' | 'body2';
+}>) {
+  if (!row.display_name) {
+    return (
+      <Typography component="span" variant={variant} sx={{ fontFamily: 'monospace' }}>
+        {row.spec_id}
+      </Typography>
+    );
+  }
+  return (
+    <Tooltip title={row.spec_id} describeChild>
+      <Typography component="span" variant={variant} tabIndex={0} data-testid="rpc-member-name">
+        {row.display_name}
+      </Typography>
+    </Tooltip>
+  );
 }
 
 export function RpcMemberSection({
@@ -721,9 +751,7 @@ export function RpcMemberSection({
                   data-testid={`rpc-status-${row.spec_id}`}
                   sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
                 >
-                  <Typography component="span" sx={{ fontFamily: 'monospace' }}>
-                    {row.spec_id}
-                  </Typography>
+                  <RpcMemberName row={row} />
                   <StatusChip
                     status={runtimeStateBadge(row.state)}
                     label={runtimeStateLabel(row.state, t)}

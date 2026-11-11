@@ -206,6 +206,13 @@ type RuntimeStatusDTO struct {
 	RPC                *RuntimeRPCStatusDTO     `json:"rpc,omitempty"`
 	Cluster            *RuntimeClusterStatusDTO `json:"cluster,omitempty"`
 	AdmissionBlockedBy string                   `json:"admission_blocked_by,omitempty"`
+
+	// DisplayName is an RPC member's readable name for the reader of the
+	// status stream ("RPC (<head model>)(<member server>)",
+	// portal.Service.RPCMemberDisplayNames). The registry never sets it: the
+	// name depends on what the reader may see, so the status stream adds it
+	// per subscriber (rpcMemberNamer). SpecID stays the member's identity.
+	DisplayName string `json:"display_name,omitempty"`
 	// ImageOptions is the image-generation options this stable_diffusion_cpp
 	// child's capability document states (sampler/scheduler names, output
 	// formats, size and batch limits, the server's own defaults), as the agent
