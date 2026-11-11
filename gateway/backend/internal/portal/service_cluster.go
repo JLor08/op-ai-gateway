@@ -52,6 +52,11 @@ var (
 	// ErrRuntimeSpecPortConflictsRPCMember refuses a fixed listen_port that a
 	// cluster member on the same server already uses as its RPC port.
 	ErrRuntimeSpecPortConflictsRPCMember = errors.New("runtime_spec.port_conflicts_rpc_member")
+	// ErrClusterHeadBinaryVersionUnknown refuses a head with automatic
+	// members whose binary has no known version: the members' matching
+	// ggml-rpc-server cannot be chosen without it. The newest save code, so
+	// the last refusal of the write (writeRuntimeSpecAs).
+	ErrClusterHeadBinaryVersionUnknown = errors.New("runtime_spec.cluster_head_binary_version_unknown")
 )
 
 // Advisory cluster warning codes (RuntimeSpecDTO.ClusterWarnings). They never
@@ -164,6 +169,10 @@ type clusterPlan struct {
 	// allocated lists the members whose port this write allocated (indices
 	// into members); the others keep the port their server's row had.
 	allocated []int
+	// headVersionUnknown: the membership checks found automatic members and
+	// no known version of the head binary to match them on. The write is
+	// refused for it after every other check (ErrClusterHeadBinaryVersionUnknown).
+	headVersionUnknown bool
 	// readMembers and readGPUs are the stored rows the plan was built from:
 	// the membership is replaced only while it still holds them, so measured
 	// values the gateway wrote since are never overwritten with an older
@@ -306,7 +315,10 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 //     about that server's settings.
 //  5. manual specs: exists on that server, enabled, not used by another head.
 //  6. automatic members: RPC membership enabled on the server, a
-//     ggml-rpc-server whose version matches the head binary's.
+//     ggml-rpc-server whose version matches the head binary's. When the head
+//     binary's version is unknown there is nothing to match; that refusal
+//     (ErrClusterHeadBinaryVersionUnknown) is the newest save code and comes
+//     last of the whole write, after the listen-port check.
 //  7. manual members: a member binary whose known version differs from the
 //     head's (unknown only warns).
 //  8. network (mesh: NetBird with tracking group and mesh IP everywhere; lan:
@@ -582,10 +594,10 @@ func (s *Service) checkClusterMembership(ctx context.Context, p auth.Token, head
 	if err := s.checkClusterMemberSpecs(ctx, entries, headSpecID); err != nil {
 		return err
 	}
-	if err := s.checkClusterMemberBinaries(ctx, headServer.ID, f.binary, entries); err != nil {
+	var err error
+	if plan.headVersionUnknown, err = s.checkClusterMemberBinaries(ctx, headServer.ID, f.binary, entries); err != nil {
 		return err
 	}
-	var err error
 	plan.network, plan.transport, err = s.checkClusterNetwork(ctx, headServer, entries, plan.network, plan.transport, req.LANExposureAck)
 	return err
 }
@@ -701,32 +713,34 @@ func binaryVersionsComparable(a, b routing.ServerBinary) bool {
 // cache limits), so automatic members get the ggml-rpc-server matching the
 // head binary's version and need the head's version known; a manual member's
 // binary is the operator's choice and refused only when both versions are
-// known and differ.
-func (s *Service) checkClusterMemberBinaries(ctx context.Context, headServerID, headBinary string, entries []clusterEntry) error {
+// known and differ. headVersionUnknown reports automatic members with no
+// head version to match them on; the caller refuses that last of all.
+func (s *Service) checkClusterMemberBinaries(ctx context.Context, headServerID, headBinary string, entries []clusterEntry) (headVersionUnknown bool, err error) {
 	head, headListed, err := s.BinaryVersionFor(ctx, headServerID, headBinary)
 	if err != nil {
-		return err
+		return false, err
 	}
 	headKnown := headListed && binaryVersionKnown(head)
 	for _, e := range entries {
 		if e.manual || e.server.RPCMemberEnabled {
 			continue
 		}
-		return fmt.Errorf("%w: server %q does not offer RPC membership in its runtime settings", ErrClusterMemberRPCDisabled, e.server.Name)
+		return false, fmt.Errorf("%w: server %q does not offer RPC membership in its runtime settings", ErrClusterMemberRPCDisabled, e.server.Name)
 	}
 	for _, e := range entries {
 		if e.manual {
 			continue
 		}
 		if !headKnown {
-			return fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab", ErrClusterMemberNoMatchingBinary, headBinary)
+			headVersionUnknown = true
+			continue
 		}
 		_, ok, err := s.MatchingRPCBinary(ctx, e.server.ID, head)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !ok {
-			return fmt.Errorf("%w: server %q has no ggml-rpc-server of version %s", ErrClusterMemberNoMatchingBinary, e.server.Name, head.EffectiveVersion())
+			return false, fmt.Errorf("%w: server %q has no ggml-rpc-server of version %s", ErrClusterMemberNoMatchingBinary, e.server.Name, head.EffectiveVersion())
 		}
 	}
 	for _, e := range entries {
@@ -735,14 +749,14 @@ func (s *Service) checkClusterMemberBinaries(ctx context.Context, headServerID, 
 		}
 		member, ok, err := s.BinaryVersionFor(ctx, e.server.ID, e.spec.Binary)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if ok && binaryVersionKnown(member) && binaryVersionsComparable(head, member) && !binariesSameVersion(head, member) {
-			return fmt.Errorf("%w: member binary %s on server %q is version %s, the head's is %s",
+			return false, fmt.Errorf("%w: member binary %s on server %q is version %s, the head's is %s",
 				ErrClusterVersionMismatch, e.spec.Binary, e.server.Name, member.EffectiveVersion(), head.EffectiveVersion())
 		}
 	}
-	return nil
+	return headVersionUnknown, nil
 }
 
 // netbirdMeshReady reports whether a server can take part in a mesh

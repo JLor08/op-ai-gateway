@@ -1088,6 +1088,12 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 		if err := s.checkListenPortFree(ctx, app.ServerID, req.ListenPort, prior); err != nil {
 			return runtimeSpecWrite{}, err
 		}
+		// The newest save code: appended after every refusal above, so a body
+		// that is also invalid for an older reason keeps that answer.
+		if plan.headVersionUnknown {
+			return runtimeSpecWrite{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
+				ErrClusterHeadBinaryVersionUnknown, fields.binary)
+		}
 	}
 	plan.applyTo(&spec)
 	w := runtimeSpecWrite{

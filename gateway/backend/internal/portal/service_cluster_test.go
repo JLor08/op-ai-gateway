@@ -427,7 +427,15 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			f.binary(srv.ID, clusterRPCBinary, BinaryKindRPCServer, "9999fff")
 			r.ClusterMembers = []ClusterMemberDTO{autoMember(srv.ID)}
 		}), ErrClusterMemberNoMatchingBinary},
-		{"head binary version unknown", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.Binary = "/usr/local/bin/llama-server" }), ErrClusterMemberNoMatchingBinary},
+		{"head binary version unknown", with(func(_ *clusterFixture, r *PutRuntimeSpecRequest) { r.Binary = "/usr/local/bin/llama-server" }), ErrClusterHeadBinaryVersionUnknown},
+		{"head binary version unknown, manual members only", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.Binary, r.MemberMode = "/usr/local/bin/llama-server", "manual"
+			spec, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), r.ClusterMembers[0].ServerID, "", PutRPCMemberSpecRequest{Binary: clusterRPCBinary})
+			if err != nil {
+				t.Fatalf("spec: %v", err)
+			}
+			r.ClusterMembers[0].MemberSpecID = spec.ID
+		}), nil},
 		{"manual member of another version", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			r.MemberMode = "manual"
 			srv := r.ClusterMembers[0].ServerID
@@ -570,8 +578,34 @@ func TestPutClusterHeadVersionUnknownMessage(t *testing.T) {
 	req := clusterHeadRequest(autoMember(f.member("A").ID))
 	req.Binary = "/usr/local/bin/llama-server"
 	_, err := f.put(ownerToken(), req)
-	if !errors.Is(err, ErrClusterMemberNoMatchingBinary) || !strings.Contains(err.Error(), "Binaries tab") {
+	if !errors.Is(err, ErrClusterHeadBinaryVersionUnknown) || !strings.Contains(err.Error(), "Binaries tab") {
 		t.Fatalf("err = %v, want the head-version-unknown refusal naming the Binaries tab", err)
+	}
+}
+
+// TestPutClusterHeadVersionUnknownIsTheLastRefusal: the newest save code
+// runs after every other check, so a body that also fails an older one
+// keeps that answer.
+func TestPutClusterHeadVersionUnknownIsTheLastRefusal(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	other := seedOtherHead(t, f)
+	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: f.head.ID, Port: 26500}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*PutRuntimeSpecRequest)
+		want   error
+	}{
+		"direct lan without acknowledgement": {func(r *PutRuntimeSpecRequest) { r.RPCTransport = "direct" }, ErrClusterLANAckRequired},
+		"listen port of a member":            {func(r *PutRuntimeSpecRequest) { r.ListenPort = 26500 }, ErrRuntimeSpecPortConflictsRPCMember},
+	} {
+		req := clusterHeadRequest(autoMember(a.ID))
+		req.Binary = "/usr/local/bin/llama-server"
+		tc.mutate(&req)
+		if _, err := f.put(ownerToken(), req); !errors.Is(err, tc.want) {
+			t.Errorf("%s with an unknown head version = %v, want %v", name, err, tc.want)
+		}
 	}
 }
 

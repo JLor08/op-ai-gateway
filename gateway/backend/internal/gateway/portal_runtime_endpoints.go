@@ -237,6 +237,7 @@ var portalClusterErrRows = []errRow{
 	{err: portal.ErrClusterTensorSplitRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_tensor_split_required", msgFn: clusterErrDetail(portal.ErrClusterTensorSplitRequired, "a head with a non-NVIDIA member needs --tensor-split")},
 	{err: portal.ErrClusterPortExhausted, status: http.StatusConflict, code: "runtime_spec.cluster_port_exhausted", msg: "no free port in the RPC range 26000-26999 could be claimed on the member server"},
 	{err: portal.ErrRuntimeSpecPortConflictsRPCMember, status: http.StatusConflict, code: "runtime_spec.port_conflicts_rpc_member", msg: "listen_port is the RPC port of a cluster member on this server"},
+	{err: portal.ErrClusterHeadBinaryVersionUnknown, status: http.StatusBadRequest, code: "runtime_spec.cluster_head_binary_version_unknown", msgFn: clusterErrDetail(portal.ErrClusterHeadBinaryVersionUnknown, "the version of the head binary is unknown; add it in the Binaries tab")},
 }
 
 // clusterErrDetail surfaces the detail a cluster refusal was wrapped with
