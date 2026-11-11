@@ -131,11 +131,11 @@ type purgeOutcome struct {
 
 // isCommand marks each member command as an owner command; the markers have no
 // body.
-func (cmdStopMember) isCommand()         {}
-func (cmdReleaseMember) isCommand()      {}
-func (cmdSetMemberHold) isCommand()      {}
-func (cmdReservationExpired) isCommand() {}
-func (cmdPurgeMemberCache) isCommand()   {}
+func (cmdStopMember) isCommand()         { /* marker method: the type is the command */ }
+func (cmdReleaseMember) isCommand()      { /* marker method: the type is the command */ }
+func (cmdSetMemberHold) isCommand()      { /* marker method: the type is the command */ }
+func (cmdReservationExpired) isCommand() { /* marker method: the type is the command */ }
+func (cmdPurgeMemberCache) isCommand()   { /* marker method: the type is the command */ }
 
 // askOwner posts c and waits for its answer on reply. The owner answers in the
 // very turn it reads the command, before it could stop and close done, so a

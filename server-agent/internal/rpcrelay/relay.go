@@ -349,12 +349,14 @@ func isLocalIP(ip net.IP) bool {
 	return false
 }
 
+// nopEvents is the Events of a Manager nobody listens to: every report is
+// dropped on purpose.
 type nopEvents struct{}
 
-func (nopEvents) Held(string, string, time.Time) {}
-func (nopEvents) Released(string)                {}
-func (nopEvents) Refused(string, net.IP)         {}
-func (nopEvents) Stalled(string)                 {}
+func (nopEvents) Held(string, string, time.Time) { /* nobody listens */ }
+func (nopEvents) Released(string)                { /* nobody listens */ }
+func (nopEvents) Refused(string, net.IP)         { /* nobody listens */ }
+func (nopEvents) Stalled(string)                 { /* nobody listens */ }
 
 // --- one member's relay -------------------------------------------------------------
 

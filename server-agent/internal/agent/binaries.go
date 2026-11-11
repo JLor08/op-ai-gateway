@@ -362,7 +362,7 @@ func (b *binaryInventory) pending() (*[]BinaryInfo, func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.ready || (b.sentOnce && b.sentHash == b.hash) {
-		return nil, func() {}
+		return nil, func() { /* nothing attached: nothing to mark delivered */ }
 	}
 	list, h := append([]BinaryInfo{}, b.current...), b.hash
 	return &list, func() {

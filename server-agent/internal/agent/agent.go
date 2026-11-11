@@ -2611,7 +2611,7 @@ func (a *Agent) collectOnce(ctx context.Context) {
 			"cert_mode", s.CertMode,
 			"cert_fingerprint_set", s.CertFingerprint != "")
 	}
-	binDelivered := func() {}
+	binDelivered := func() { /* no inventory is attached, so there is no delivery to record */ }
 	if a.binaries != nil {
 		s.Binaries, binDelivered = a.binaries.pending()
 	}
