@@ -1513,15 +1513,19 @@ owns the bind and device flags:
   directory, such as a file-mode spec `rpc`'s config files, is ever removed)
   that no member of the current document serves and that nothing has modified
   for 7 days. This also covers caches orphaned while the agent was down. Each
-  sweep touches the caches of the heads listed members serve, so the 7 days
-  count from the last time a member served the head. The sweep runs off the
-  owner goroutine on the first document and then at most once an hour, on
-  document applies and on the owner's housekeeping beat; a purge tombstone (`.purge-<head>-<time>`) left behind by a
-  failed removal goes once its purge is an hour old. A member that merely
-  leaves the document keeps its cache: members are withheld for reasons that
-  pass (a gateway restart that has not heard from every cluster host yet, a
-  cluster turned off for a while), and the cache is what makes the next start
-  fast.
+  sweep touches the marker of every cache whose head a listed member serves, and
+  the marker's time is what counts, so the 7 days run from the last time a
+  member served the head. The marker is touched rather than the directory
+  because Windows refuses to change a directory's times while another process
+  (Explorer, the indexer, a virus scanner) holds it open; a touch that fails
+  anyway is a Warn once per head until a touch succeeds again. The sweep runs
+  off the owner goroutine on the first document and then at most once an hour,
+  on document applies and on the owner's housekeeping beat; a purge tombstone
+  (`.purge-<head>-<time>`) left behind by a failed removal goes once its purge
+  is an hour old. A member that merely leaves the document keeps its cache:
+  members are withheld for reasons that pass (a gateway restart that has not
+  heard from every cluster host yet, a cluster turned off for a while), and the
+  cache is what makes the next start fast.
 - **Readiness is a TCP connect** to the child's port (the port speaks the ggml
   RPC protocol, not HTTP, so the agent never sends it a probe request and the
   collect loop never HTTP-probes a member). For a relay member the member is

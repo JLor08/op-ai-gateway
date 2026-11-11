@@ -428,10 +428,81 @@ func TestMemberCacheSweepRemovesStaleOrphans(t *testing.T) {
 			t.Errorf("%s was swept: %v", filepath.Base(keep), err)
 		}
 	}
-	// The listed head's cache was touched: its 7 days start again now, so it
-	// survives that long after its member leaves the document.
-	if fi, err := os.Stat(listedOld); err != nil || time.Since(fi.ModTime()) > time.Minute {
-		t.Fatalf("listed cache not touched by the sweep: %v, %v", fi, err)
+	// The listed head's cache was touched -- its marker, not the directory,
+	// which Windows may refuse while another process holds it open: its 7
+	// days start again now, so it survives that long after its member leaves
+	// the document.
+	if fi, err := os.Stat(filepath.Join(listedOld, memberCacheMarker)); err != nil || time.Since(fi.ModTime()) > time.Minute {
+		t.Fatalf("listed cache's marker not touched by the sweep: %v, %v", fi, err)
+	}
+}
+
+// TestMemberCacheSweepJudgesAgeByMarker: an unlisted cache whose marker was
+// touched recently is in use however old the rest of the directory is; one
+// whose marker and contents are all old goes.
+func TestMemberCacheSweepJudgesAgeByMarker(t *testing.T) {
+	root := t.TempDir()
+	old := time.Now().Add(-memberCacheOrphanAge - time.Hour)
+	mk := func(name string, markerTime time.Time) string {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		blob, marker := filepath.Join(dir, "blob"), filepath.Join(dir, memberCacheMarker)
+		for _, p := range []string{blob, marker} {
+			if err := os.WriteFile(p, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for p, at := range map[string]time.Time{blob: old, marker: markerTime, dir: old} {
+			if err := os.Chtimes(p, at, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	recent := mk("rspec_recent", time.Now().Add(-time.Hour))
+	stale := mk("rspec_stale", old)
+	newMemberCacheSweeper().sweep(root, nil, time.Now())
+	if _, err := os.Stat(recent); err != nil {
+		t.Fatalf("cache with a recently touched marker was swept: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale cache kept: %v", err)
+	}
+}
+
+// touchFailedWarn is the sweeper's exact Warn for a marker it cannot touch.
+const touchFailedWarn = "runtime: cannot touch the rpc cache marker; the cache's age keeps running and the sweep may remove it 7 days after its last successful touch"
+
+// TestMemberCacheTouchFailureWarnsOncePerStreak: a marker touch that fails
+// (on Windows, a sharing violation while another process holds the file) is
+// a Warn once per head per streak of failures, not on every hourly sweep; a
+// successful touch ends the streak.
+func TestMemberCacheTouchFailureWarnsOncePerStreak(t *testing.T) {
+	logs := withCountedLogs(t)
+	root := t.TempDir()
+	for _, head := range []string{"rspec_a", "rspec_b"} {
+		if err := os.MkdirAll(filepath.Join(root, head), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keep := map[string]bool{"rspec_a": true, "rspec_b": true}
+	sw := newMemberCacheSweeper()
+	fail := func(string, time.Time, time.Time) error { return errors.New("sharing violation") }
+	sw.chtimes = fail
+	for range 3 {
+		sw.sweep(root, keep, time.Now())
+	}
+	if n := logs.count(touchFailedWarn); n != 2 {
+		t.Fatalf("Warns = %d after three failing sweeps of two heads, want 2 (one per head)", n)
+	}
+	sw.chtimes = os.Chtimes
+	sw.sweep(root, keep, time.Now())
+	sw.chtimes = fail
+	sw.sweep(root, keep, time.Now())
+	if n := logs.count(touchFailedWarn); n != 4 {
+		t.Fatalf("Warns = %d after a success and a new failure, want 4", n)
 	}
 }
 
@@ -461,11 +532,12 @@ func TestMemberCacheSweepTouchesListedCachesWithoutDocuments(t *testing.T) {
 
 	old := time.Now().Add(-memberCacheOrphanAge - time.Hour)
 	for range 2 {
-		if err := os.Chtimes(dir, old, old); err != nil {
+		marker := filepath.Join(dir, memberCacheMarker)
+		if err := os.Chtimes(marker, old, old); err != nil {
 			t.Fatal(err)
 		}
-		waitUntil(t, 5*time.Second, "listed cache touched again", func() bool {
-			fi, err := os.Stat(dir)
+		waitUntil(t, 5*time.Second, "listed cache's marker touched again", func() bool {
+			fi, err := os.Stat(marker)
 			return err == nil && time.Since(fi.ModTime()) < time.Minute
 		})
 	}
