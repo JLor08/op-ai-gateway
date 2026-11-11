@@ -82,6 +82,22 @@ function peakText(p: ClusterPeakView, t: Translation): string {
   return t.clusterPeakHidden(who);
 }
 
+// Stable keys for lines that carry no id of their own: the member's position
+// and the line, with a running count on an exact repeat.
+function keyedLines<T extends { position: number }>(
+  items: T[],
+  text: (item: T) => string,
+): { key: string; text: string }[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    const line = text(item);
+    const base = `${item.position}|${line}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return { key: n === 0 ? base : `${base}|${n}`, text: line };
+  });
+}
+
 /**
  * A compact chip whose details sit in a tooltip: focusable, so a keyboard
  * user can open it, and described by it, so a screen reader reads it. A chip
@@ -226,9 +242,9 @@ export function ClusterProgress({
           <Typography variant="body2" sx={{ fontWeight: 600 }}>
             {t.clusterBreachesTitle}
           </Typography>
-          {view.breaches.map((b, i) => (
-            <Typography key={i} variant="body2" data-testid="cluster-breach">
-              {breachText(b, t)}
+          {keyedLines(view.breaches, (b) => breachText(b, t)).map((line) => (
+            <Typography key={line.key} variant="body2" data-testid="cluster-breach">
+              {line.text}
             </Typography>
           ))}
         </Alert>
@@ -239,9 +255,9 @@ export function ClusterProgress({
             {t.clusterPeaksTitle}
           </Typography>
           <Typography variant="body2">{t.clusterPeaksHint}</Typography>
-          {view.peaks.map((p, i) => (
-            <Typography key={i} variant="body2" data-testid="cluster-peak">
-              {peakText(p, t)}
+          {keyedLines(view.peaks, (p) => peakText(p, t)).map((line) => (
+            <Typography key={line.key} variant="body2" data-testid="cluster-peak">
+              {line.text}
             </Typography>
           ))}
         </Alert>

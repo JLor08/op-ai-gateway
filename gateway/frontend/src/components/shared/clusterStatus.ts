@@ -84,7 +84,7 @@ function stepsFor(state: ClusterState, phase: ClusterPhase | undefined): Cluster
     state === 'formed'
       ? clusterPhases.length - 1
       : clusterPhases.indexOf(phase ?? 'members_starting');
-  const current = at < 0 ? 0 : at;
+  const current = Math.max(at, 0);
   return clusterPhases.map((p, i) => {
     let step: ClusterStepState = 'pending';
     if (i < current || state === 'formed') step = 'done';

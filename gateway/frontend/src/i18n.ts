@@ -2475,10 +2475,14 @@ const de = {
   clusterCooldownUntil: (time: string) => `Neuer Start frühestens ab ${time}`,
   clusterLastFailure: (code: string, where: string) => `Letzter Fehler (${where}): ${code}`,
   clusterBreachesTitle: 'Richtlinienverstöße der Mitglieder',
-  clusterBreachPeer: (member: string, peer: string, at: string) =>
-    `${member}: ein nicht erlaubter Peer hat sich verbunden (${peer}${at ? `, ${at}` : ''})`,
-  clusterBreachForeignHold: (member: string, at: string) =>
-    `${member}: wird von einem anderen Head gehalten${at ? ` (seit ${at})` : ''}`,
+  clusterBreachPeer: (member: string, peer: string, at: string) => {
+    const details = (at ? [peer, at] : [peer]).join(', ');
+    return `${member}: ein nicht erlaubter Peer hat sich verbunden (${details})`;
+  },
+  clusterBreachForeignHold: (member: string, at: string) => {
+    const since = at ? ` (seit ${at})` : '';
+    return `${member}: wird von einem anderen Head gehalten${since}`;
+  },
   clusterBreachHidden: (member: string) => `${member}: ein Verstoß wurde gemeldet`,
   clusterBreachOther: (member: string, kind: string) => `${member}: Verstoß (${kind})`,
   clusterBreachesCount: (n: number) => `Verstöße: ${n}`,
@@ -6313,10 +6317,14 @@ const en: PortalMessages = {
   clusterCooldownUntil: (time: string) => `Next start possible from ${time}`,
   clusterLastFailure: (code: string, where: string) => `Last failure (${where}): ${code}`,
   clusterBreachesTitle: 'Member policy breaches',
-  clusterBreachPeer: (member: string, peer: string, at: string) =>
-    `${member}: a peer it does not allow connected (${peer}${at ? `, ${at}` : ''})`,
-  clusterBreachForeignHold: (member: string, at: string) =>
-    `${member}: held by another head${at ? ` (since ${at})` : ''}`,
+  clusterBreachPeer: (member: string, peer: string, at: string) => {
+    const details = (at ? [peer, at] : [peer]).join(', ');
+    return `${member}: a peer it does not allow connected (${details})`;
+  },
+  clusterBreachForeignHold: (member: string, at: string) => {
+    const since = at ? ` (since ${at})` : '';
+    return `${member}: held by another head${since}`;
+  },
   clusterBreachHidden: (member: string) => `${member}: a breach was reported`,
   clusterBreachOther: (member: string, kind: string) => `${member}: breach (${kind})`,
   clusterBreachesCount: (n: number) => `Breaches: ${n}`,

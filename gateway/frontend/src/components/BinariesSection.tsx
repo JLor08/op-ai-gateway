@@ -50,6 +50,12 @@ function kindLabel(kind: string, t: Translation): string {
   return t.binariesKindOther;
 }
 
+function editorTitle(mode: Editor['mode'] | undefined, t: Translation): string {
+  if (mode === 'new') return t.binariesNewTitle;
+  if (mode === 'override') return t.binariesOverrideTitle;
+  return t.binariesEditTitle;
+}
+
 function editorFor(mode: Editor['mode'], b?: ServerBinary): Editor {
   return {
     mode,
@@ -140,12 +146,7 @@ export function BinariesSection({
     }
   }
 
-  const title =
-    editor?.mode === 'new'
-      ? t.binariesNewTitle
-      : editor?.mode === 'override'
-        ? t.binariesOverrideTitle
-        : t.binariesEditTitle;
+  const title = editorTitle(editor?.mode, t);
 
   return (
     <Panel

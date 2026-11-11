@@ -12,7 +12,9 @@ export type ServerBinaryKind = 'llama_server' | 'rpc_server' | 'other';
 
 export interface ServerBinary {
   path: string;
-  kind: ServerBinaryKind | string;
+  // One of ServerBinaryKind; typed wider so a kind a newer gateway adds still
+  // reads (the portal shows it as Other).
+  kind: string;
   // Detected (agent) or entered (manual) version, build and commit.
   version: string;
   version_override: string;

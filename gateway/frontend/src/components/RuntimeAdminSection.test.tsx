@@ -12400,7 +12400,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
         within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterStateCoolingDown),
       ).toBeInTheDocument(),
     );
-    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(readsBefore + 1);
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore + 1);
   });
 
   it('does not re-read a head spec for a frame that changes no state', async () => {
@@ -12413,7 +12413,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
     stream.push([makeStatus({ spec_id: 'spec_head', state: 'starting', in_flight: 2 })]);
     await act(async () => {});
-    expect(fakeApi.runtimeSpec.mock.calls.length).toBe(readsBefore);
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore);
   });
 
   it('re-reads a head spec when the list is shown again', async () => {
@@ -12451,7 +12451,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(CLUSTER_SPEC_REFRESH_MS);
       });
-      expect(fakeApi.runtimeSpec.mock.calls.length).toBe(readsBefore + 1);
+      expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore + 1);
       await waitFor(() =>
         expect(
           within(screen.getByTestId('cluster-progress-compact')).getByText(t.clusterPhaseFormed),
