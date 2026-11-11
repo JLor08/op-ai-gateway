@@ -1473,7 +1473,21 @@ owns the bind and device flags:
 - `-H`/`-p` follow the transport. `direct` binds `rpc.bind_ip` and `rpc.port`
   exactly (a mesh address, `0.0.0.0` on a LAN, or the server's LAN address).
   `relay` binds the child to `127.0.0.1` on an ephemeral port and listens on
-  `rpc.bind_ip:rpc.port` with the agent's own relay (below).
+  `rpc.bind_ip:rpc.port` with the agent's own relay (below). The parser drops a
+  member (logged, the rest of the document applies) whose `rpc.transport` is
+  neither `direct` nor `relay` (an empty one included: the relay and the
+  observer each act on exactly one, so such a member would run and never be
+  held), whose `rpc.bind_ip` is not an IP address, whose port lies outside
+  1–65535, that has no `rpc` block, or that sets `listen_port` or
+  `upstream_model`.
+- **A launch change while claimed waits.** A launch-shape change of a member
+  that a head holds or has reserved does not drain it: a member has no request
+  in flight, so the drain would kill it at once and abort the head mid-request.
+  The relaunch is deferred until the claim ends (the hold ends and nothing
+  reserves it, or the gateway releases it when the head stops); the member then
+  drains and comes back with its current launch. The gateway relaunches the
+  head for any change of a member's launch inputs, which is what ends the claim
+  ([§3.7](#37-the-gateways-half-of-a-cluster)).
 - `GGML_RPC_NO_RDMA=1` is set: the transport is plain TCP, and an RDMA probe
   stalls the start.
 - With `rpc.cache_enabled` the member starts with `-c` and
@@ -1483,9 +1497,20 @@ owns the bind and device flags:
   could leave the directory is refused. A cache-enabled member with no
   `config_files_dir` is refused (`runtime.not_permitted`), and so is one whose
   cache volume has less than 5120 MB free (a volume whose free space cannot be
-  measured does not block the start). The cache of a
-  head the member no longer serves is purged when the document changes it, and
-  `POST /rpc/purge-cache/{specID}` purges it on request.
+  measured does not block the start). A cache is removed in three cases only:
+  when a document moves a listed member to another head (the old head's
+  directory goes, unless another member still serves that head); on an
+  operator's `POST /rpc/purge-cache/{specID}`; and by a **sweep** of
+  `<config_files_dir>/rpc/*` that removes every directory no member of the
+  current document serves and nothing has modified (the directory or anything
+  in it) for 7 days, which also covers caches orphaned while the agent was down.
+  The sweep runs off the owner goroutine on the first document and then at most
+  once an hour; a purge tombstone (`.purge-<head>-<time>`) left behind by a
+  failed removal goes once its purge is an hour old. A member that merely
+  leaves the document keeps its cache: members are withheld for reasons that
+  pass (a gateway restart that has not heard from every cluster host yet, a
+  cluster turned off for a while), and the cache is what makes the next start
+  fast.
 - **Readiness is a TCP connect** to the child's port (the port speaks the ggml
   RPC protocol, not HTTP, so the agent never sends it a probe request and the
   collect loop never HTTP-probes a member). For a relay member the member is
@@ -1538,14 +1563,16 @@ render exactly what the spec declares, so nothing here has to change for it.
   connection observer. `bind_mismatch` is true when **either** the runtime or
   the relay says so. `breaches` is the union of the relay's refused peers and
   the observer's unexpected peers, deduplicated by peer address (the newest
-  sighting wins), the newest sixteen. `cache_mb` is the size of the member's
+  sighting wins), the newest sixteen. Both sources keep a peer the same way:
+  one entry per peer with the time it was first seen, dropped 10 minutes after
+  it was last seen. `cache_mb` is the size of the member's
   cache directory, measured **off the collect loop** and reused for 60 s: the
   telemetry path never walks a large directory every sample, and a first read
   reports 0 until the first measurement lands.
 - A **head's `cluster` block**: `launched` (the endpoint addresses the running
-  process was started against, present while the head has a process) and
-  `version` (the llama.cpp build the cluster agreed on, empty when nothing
-  recorded it; the agent never executes a binary to fill it on a status read).
+  process was started against, present while the head has a process). The
+  agent records no cluster build version: the gateway knows every binary's
+  version from the inventory below.
 
 A model row carries none of these keys, so an agent without cluster specs is
 byte-neutral for the gateway's decoder.
@@ -1564,6 +1591,15 @@ Two independent things claim a member:
   without a head connection (one empty poll can be a listing racing a
   reconnect). A hold for a member without a process is ignored, and a member's
   exit drops its hold and reservation.
+- A **release** (`POST /rpc/release`, the gateway's word that the head is not
+  running) ends both, and it sticks: in direct mode the observer stops counting
+  every head connection it first saw at or before the release, so a half-open
+  socket of a head that lost power (the rpc-server sets no keepalive, so it
+  stays `ESTABLISHED` indefinitely) cannot re-take the hold on the next poll;
+  only a connection first seen after the release holds again, and a hold the
+  observer re-posted just before it noticed the release is withdrawn. In relay
+  mode the session keeps no hold after a release until a connection becomes
+  the forwarding one again (a new one, or a replacement).
 - A **reservation** is armed by `POST /rpc/ensure/{specID}?reserve_seconds=N`
   once the member is running, covers the gap between the member starting and
   the head connecting, is never shortened by a later ensure, and expires on its
@@ -1581,7 +1617,7 @@ the field to decide whether to remove the cluster, head first.
 | `POST /rpc/ensure/{specID}?reserve_seconds=N` | Start the member (through normal admission), arm the reservation | `200 {"state":"running"}` once it is TCP-ready and, for a relay member, its relay listens; `404 runtime.model_not_managed` for anything that is not an `rpc_server` spec; `503 runtime.admission_blocked`; `502 runtime.not_permitted` / `runtime.start_failed`; `504 runtime.start_timeout`; `400 runtime.bad_request` |
 | `POST /rpc/release/{specID}` | End the reservation and the hold (the head is not running) | `200 {"state":"released"}` |
 | `POST /rpc/stop/{specID}` | Stop the member | `200` `stopping` / `stopped`; `409 runtime.cluster_member_in_use` while it is claimed, unless `?force=1` (then the claim is dropped) |
-| `POST /rpc/purge-cache/{specID}` | Remove the member's per-head cache directory | `200 {"state":"purged"}`; `409 runtime.cluster_member_in_use` while claimed; `500 runtime.cache_purge_failed` |
+| `POST /rpc/purge-cache/{specID}` | Remove the member's per-head cache directory. An **operator tool** on the agent router: the gateway never calls it (the agent purges on its own as described under the cache above) | `200 {"state":"purged"}`; `409 runtime.cluster_member_in_use` while claimed; `500 runtime.cache_purge_failed` |
 
 A member whose `bind_ip` is not an address of this host (and not `0.0.0.0`) is
 **not started**, in either transport: the agent records
@@ -1675,7 +1711,9 @@ child. It is the member's access control:
   byte, so a payload-less probe (the head's pre-exec probe, the readiness check)
   never reaches the rpc-server and never takes a hold.
 - **One head per member.** A newer allowed connection that delivers its first
-  byte replaces the forwarding session; the hold survives the replacement.
+  byte replaces the forwarding session; the hold survives the replacement and
+  is reported again for the new connection, so it is taken back if the gateway
+  released the member meanwhile.
   At most four sockets (counting those that have not sent a byte), a 10 s
   first-byte deadline, TCP keepalive (idle 30 s, 10 s interval, 3 probes: a
   vanished head is noticed in about a minute).
@@ -1683,7 +1721,10 @@ child. It is the member's access control:
   measured from the last client byte, the relay reports `stalled`; it clears
   when the session ends or another takes the hold.
 - **Allowlist edits are live.** A changed allowlist keeps the listener and
-  closes every session; only a changed bind or target replaces the relay. The
+  closes only the sessions whose peer it no longer allows: a head domain that
+  resolves to one more address (several A records, a second interface) must
+  not cut the running cluster. Only a changed bind or target replaces the
+  relay. The
   head resolver reports a changed answer, and also a spec that **loses** its
   head domain while it had addresses, so sessions from the old head's addresses
   end. The relay set is derived from the runtime status after every sync,
@@ -1706,7 +1747,9 @@ disconnects, so a foreign peer must be reported, not mistaken for the head.
 Breaches are kept for 10 minutes after the last sighting, newest sixteen. The
 observer can report an intruder but cannot prevent it; the member's bind address
 and the network's policy are what narrow exposure. A failed listing keeps the
-last observation.
+last observation and is logged at Warn, once per streak of failures: while
+listings fail no new hold is seen, so a member its head starts using is
+unprotected once its reservation ends.
 
 #### Loopback-only, and its exceptions
 
@@ -1734,12 +1777,21 @@ such line, the path-derived version below applies instead. An `rpc-server` is
 never executed: it inherits the version of a `llama-server` in the same
 directory (`agent`), else whatever its path says (`path`: a `b<digits>` tag as
 the build, a 7 to 40 character hex segment containing at least one a-f letter as
-the commit), else it has no version. Results are cached by (path, size, mtime).
-The inventory is rescanned every 5 minutes on its own goroutine, off the collect
-loop, and each sample carries the last computed result. Entries that are not
+the commit), else it has no version. A run that yields a version is cached by
+(path, size, mtime) for good. One that does not (the timeout on a loaded host,
+a failed exec, output without the line) is retried for the same bytes after a
+backoff, 30 s after the first failure and doubling up to an hour: a missing
+version withholds every automatic cluster that needs the binary, so a
+transient failure must not stick until the file changes. The inventory is
+rescanned every 5 minutes on its own goroutine, off the collect loop, and
+earlier when a retry is due; each sample carries the last computed result. Entries that are not
 regular files are skipped: with `runtime_allow_binary_dirs` an allowed entry may
 name a directory, which is not expanded. The list is sent on the first sample
-after the first completed scan and then only when its hash changes; an empty
+after the first completed scan and then only when its hash changes, and again,
+unchanged, whenever the connection to the gateway is re-established and on the
+system-report cadence: a delivery is only the transport accepting the sample,
+and a frame lost with its connection, or a gateway store write that failed,
+would otherwise leave the gateway without it until a binary changes. An empty
 list means the agent allows no binaries, and an unchanged inventory omits the
 field.
 
