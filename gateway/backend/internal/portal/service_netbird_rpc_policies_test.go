@@ -947,6 +947,60 @@ func TestRPCPolicyPassReportsRecentWrites(t *testing.T) {
 	}
 }
 
+// TestRPCPolicyMatchingPassKeepsAnEarlierWrite pins the owner's scenario: the
+// save's pass writes a member's policy; seconds later the start's pass runs
+// successfully, finds the policy matching, writes nothing and prunes -- and
+// still reports the save's write, so the start waits for the rest of its
+// window.
+func TestRPCPolicyMatchingPassKeepsAnEarlierWrite(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	advance := e.rpcPolicyClock()
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.reconcile() // the save's pass creates the policy
+	// NetBird now holds the policy as written.
+	e.fake.mu.Lock()
+	e.fake.policies = nil
+	e.fake.mu.Unlock()
+	seedRPCReadPolicy(e.fake, "pol-a", "a", rpcRule{"g-head", "g-a", 47001})
+	creates, updates := e.fake.policyCreateCountByName("op-gw-rpc-a"), e.fake.policyUpdateCount()
+
+	advance(3 * time.Second)
+	want := []RPCPolicyWrite{{ServerID: "a", WrittenAt: rpcPolicyNow}}
+	if got := e.svc.ReconcileRPCPolicies(e.ctx); !slices.Equal(got, want) {
+		t.Fatalf("the start's matching pass reported %v, want the save's write %v", got, want)
+	}
+	if e.fake.policyCreateCountByName("op-gw-rpc-a") != creates || e.fake.policyUpdateCount() != updates {
+		t.Fatal("the start's pass wrote the matching policy again")
+	}
+}
+
+// TestRPCPolicyWriteFromTheFutureAgesOut pins a backward step of the wall
+// clock: a write recorded "in the future" is taken as written now, so it ages
+// out RPCPolicySettle after the step rather than after the clock caught up.
+func TestRPCPolicyWriteFromTheFutureAgesOut(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	advance := e.rpcPolicyClock()
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.reconcile()
+	advance(-time.Hour) // the clock steps back
+	stepped := rpcPolicyNow.Add(-time.Hour)
+	if got := e.recentWrites(); !slices.Equal(got, []RPCPolicyWrite{{ServerID: "a", WrittenAt: stepped}}) {
+		t.Fatalf("writes after the step = %v, want a's write taken as written now (%v)", got, stepped)
+	}
+	e.fake.failListPolicies = true // the next pass only prunes
+	e.reconcile()
+	advance(RPCPolicySettle)
+	if got := e.recentWrites(); len(got) != 0 {
+		t.Fatalf("writes %v after the step = %v, want none", RPCPolicySettle, got)
+	}
+}
+
 // TestRPCPolicyRefusedWriteIsNoWrite pins which failed writes count: a create
 // NetBird definitively refuses (a 4xx) changed nothing and is not recorded; a
 // create whose outcome is unknown (a 5xx) may have landed and is.

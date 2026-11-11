@@ -16,7 +16,6 @@ import (
 	"op-ai-gateway/internal/routing"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -926,7 +925,9 @@ func (o *clusterOrchestrator) applyConfig(ctx context.Context, head string, plan
 
 // armPolicySettle returns a timer that fires once policySettle has passed
 // since the latest of writes that grants one of plan's member servers, or
-// nil when no such write is that recent. It logs the wait.
+// nil when no such write is that recent. The wait never exceeds
+// policySettle, so a write time in the future (the wall clock stepped back)
+// cannot stretch it. It logs the wait.
 func (o *clusterOrchestrator) armPolicySettle(head string, plan portal.ClusterPlan, writes []portal.RPCPolicyWrite) *time.Timer {
 	var latest time.Time
 	var servers []string
@@ -939,12 +940,12 @@ func (o *clusterOrchestrator) armPolicySettle(head string, plan portal.ClusterPl
 			latest = w.WrittenAt
 		}
 	}
-	wait := latest.Add(o.t.policySettle).Sub(o.deps.now())
+	wait := min(latest.Add(o.t.policySettle).Sub(o.deps.now()), o.t.policySettle)
 	if len(servers) == 0 || wait <= 0 {
 		return nil
 	}
-	slog.Info(fmt.Sprintf("cluster start: waiting %s for the RPC policy of servers %s to reach the peers", wait.Round(time.Millisecond), strings.Join(servers, ", ")),
-		"head_spec_id", head)
+	slog.Info("cluster start: waiting for member RPC policies to settle",
+		"head_spec_id", head, "wait", wait, "servers", servers)
 	return time.NewTimer(wait)
 }
 

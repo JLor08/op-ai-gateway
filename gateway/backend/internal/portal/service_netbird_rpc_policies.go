@@ -312,21 +312,35 @@ func (s *Service) noteRPCPolicyWritesLocked(written []string, known map[string]r
 	for _, id := range written {
 		s.netbird.rpcPolicyWrites[id] = now
 	}
-	for id, at := range s.netbird.rpcPolicyWrites {
+	for id := range s.netbird.rpcPolicyWrites {
+		at := s.rpcPolicyWriteAtLocked(id, now)
 		if _, ok := known[id]; !ok || now.Sub(at) >= RPCPolicySettle {
 			delete(s.netbird.rpcPolicyWrites, id)
 		}
 	}
 }
 
+// rpcPolicyWriteAtLocked is server id's recorded write time, taken as now --
+// and stored so -- when it lies after now: the wall clock stepped back since
+// the write, and the write then ages out RPCPolicySettle after the step
+// rather than once the clock has caught up. The caller holds policyMu.
+func (s *Service) rpcPolicyWriteAtLocked(id string, now time.Time) time.Time {
+	at := s.netbird.rpcPolicyWrites[id]
+	if at.After(now) {
+		at = now
+		s.netbird.rpcPolicyWrites[id] = at
+	}
+	return at
+}
+
 // recentRPCPolicyWritesLocked returns the member policy writes of the last
-// RPCPolicySettle, by any pass, sorted by server id. The caller holds
-// policyMu.
+// RPCPolicySettle, by any pass, sorted by server id; a write time after now
+// counts as now (rpcPolicyWriteAtLocked). The caller holds policyMu.
 func (s *Service) recentRPCPolicyWritesLocked() []RPCPolicyWrite {
 	now := s.clock()
 	var out []RPCPolicyWrite
-	for id, at := range s.netbird.rpcPolicyWrites {
-		if now.Sub(at) < RPCPolicySettle {
+	for id := range s.netbird.rpcPolicyWrites {
+		if at := s.rpcPolicyWriteAtLocked(id, now); now.Sub(at) < RPCPolicySettle {
 			out = append(out, RPCPolicyWrite{ServerID: id, WrittenAt: at})
 		}
 	}

@@ -1298,6 +1298,24 @@ func TestEnsureClusterWaitsOnlyTheRestOfAnEarlierWrite(t *testing.T) {
 	}
 }
 
+// TestEnsureClusterSettleIsCappedAfterAClockStep pins that a write time in the
+// future (the wall clock stepped back since) never makes the head wait longer
+// than policySettle.
+func TestEnsureClusterSettleIsCappedAfterAClockStep(t *testing.T) {
+	f := newOrchFixture(t, 1, "direct", "mesh")
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	f.portal.writes = []portal.RPCPolicyWrite{{ServerID: orchMemberServer(0), WrittenAt: f.clock().Add(time.Hour)}}
+
+	began := time.Now()
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if elapsed := time.Since(began); elapsed < f.o.t.policySettle || elapsed > 5*time.Second {
+		t.Fatalf("the start took %v, want about the %v settle, not the hour to the write's time", elapsed, f.o.t.policySettle)
+	}
+}
+
 // TestEnsureClusterNoSettleWithoutRecentMemberPolicyWrite pins that no write,
 // a write for a server outside this cluster, and a member write older than
 // the window do not delay the head.
