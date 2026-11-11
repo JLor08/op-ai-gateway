@@ -293,12 +293,7 @@ func gpusOf(gpus []routing.ClusterMemberGPU, serverID string) []routing.ClusterM
 // written, so a stable member costs one read per sample; the write applies
 // only while the row is still in the run it read.
 func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO) {
-	vram := make(map[int]int, len(row.GPUs))
-	for _, g := range row.GPUs[:min(len(row.GPUs), maxRuntimeGPUsPerSample)] {
-		if g.VRAMMeasuredMB > 0 {
-			vram[g.Index] = max(vram[g.Index], g.VRAMMeasuredMB)
-		}
-	}
+	vram := measuredVRAM(row)
 	if row.RAMMeasuredMB <= 0 && len(vram) == 0 {
 		return
 	}
@@ -312,13 +307,41 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 	if !ok || cur.RunStartedAt.IsZero() {
 		return
 	}
-	peak, stored := false, false
-	if r := row.RAMMeasuredMB; r > 0 {
-		if r > cur.RunPeakRAMMB {
-			cur.RunPeakRAMMB, peak = r, true
+	peak, stored := raiseMeasured(&cur, gpus, row.RAMMeasuredMB, vram)
+	if !peak && !stored {
+		return
+	}
+	if stored {
+		cur.MeasuredAt = u.now()
+	}
+	if _, err := u.store.UpdateClusterMemberUsage(ctx, cur, gpus); err != nil {
+		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+	}
+}
+
+// measuredVRAM is row's measured VRAM per GPU index, its largest reading of
+// each GPU among the first maxRuntimeGPUsPerSample; a reading of 0 is unknown
+// and left out.
+func measuredVRAM(row RuntimeStatusDTO) map[int]int {
+	vram := make(map[int]int, len(row.GPUs))
+	for _, g := range row.GPUs[:min(len(row.GPUs), maxRuntimeGPUsPerSample)] {
+		if g.VRAMMeasuredMB > 0 {
+			vram[g.Index] = max(vram[g.Index], g.VRAMMeasuredMB)
 		}
-		if r > cur.RAMMeasuredMB {
-			cur.RAMMeasuredMB, stored = r, true
+	}
+	return vram
+}
+
+// raiseMeasured raises cur's and gpus' run peaks and stored values, each only
+// upwards, to ram (0: unknown) and the per-GPU vram, and reports whether a
+// run peak rose and whether a stored value rose.
+func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, ram int, vram map[int]int) (peak, stored bool) {
+	if ram > 0 {
+		if ram > cur.RunPeakRAMMB {
+			cur.RunPeakRAMMB, peak = ram, true
+		}
+		if ram > cur.RAMMeasuredMB {
+			cur.RAMMeasuredMB, stored = ram, true
 		}
 	}
 	for i := range gpus {
@@ -330,15 +353,7 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 			gpus[i].VRAMMeasuredMB, stored = v, true
 		}
 	}
-	if !peak && !stored {
-		return
-	}
-	if stored {
-		cur.MeasuredAt = u.now()
-	}
-	if _, err := u.store.UpdateClusterMemberUsage(ctx, cur, gpus); err != nil {
-		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
-	}
+	return peak, stored
 }
 
 // runBegan begins a run of head: every member row is stamped with the run's
@@ -518,15 +533,7 @@ func (u *clusterUsage) reset(ctx context.Context, head, serverID string) error {
 // adopted while still held, closed otherwise); a sync that failed in part is
 // tried again on the next frame, so it never opens a session twice.
 func (u *clusterUsage) syncSessions(ctx context.Context, serverID string, held map[string]bool, now time.Time) {
-	u.mu.Lock()
-	synced := u.seen[serverID]
-	open := map[string]bool{}
-	for k := range u.open {
-		if k.member == serverID {
-			open[k.head] = true
-		}
-	}
-	u.mu.Unlock()
+	synced, open := u.openSessionsOf(serverID)
 	if !synced {
 		stored, err := u.store.OpenRPCSessionsByMember(ctx, serverID)
 		if err != nil {
@@ -539,20 +546,7 @@ func (u *clusterUsage) syncSessions(ctx context.Context, serverID string, held m
 	}
 	ok := true
 	for head, h := range held {
-		key := rpcSessionKey{head: head, member: serverID}
-		switch {
-		case h && open[head]:
-			u.setOpen(key, true)
-		case h:
-			if err := u.store.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: head, Instance: clusterHeadInstance, MemberServerID: serverID, Since: now}); err != nil {
-				slog.Debug("cluster member usage: opening a session failed", "head_spec_id", head, "server_id", serverID, "err", err)
-				ok = false
-				continue
-			}
-			u.setOpen(key, true)
-		case open[head]:
-			ok = u.closeSession(ctx, key, now) && ok
-		}
+		ok = u.syncSession(ctx, rpcSessionKey{head: head, member: serverID}, h, open[head], now) && ok
 	}
 	for head := range open {
 		if _, member := held[head]; !member {
@@ -564,6 +558,40 @@ func (u *clusterUsage) syncSessions(ctx context.Context, serverID string, held m
 		u.seen[serverID] = true
 		u.mu.Unlock()
 	}
+}
+
+// openSessionsOf reports whether serverID's sessions were synced with the
+// store, and the heads whose session with serverID the gateway holds open.
+func (u *clusterUsage) openSessionsOf(serverID string) (synced bool, open map[string]bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	open = map[string]bool{}
+	for k := range u.open {
+		if k.member == serverID {
+			open[k.head] = true
+		}
+	}
+	return u.seen[serverID], open
+}
+
+// syncSession brings key's session in line with a frame: held tells whether
+// the frame shows the head's hold, open whether a session is open. A hold
+// opens a session unless one is open, and an open session without the hold
+// is closed. It reports whether the store took every write.
+func (u *clusterUsage) syncSession(ctx context.Context, key rpcSessionKey, held, open bool, now time.Time) bool {
+	switch {
+	case held && open:
+		u.setOpen(key, true)
+	case held:
+		if err := u.store.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: key.head, Instance: clusterHeadInstance, MemberServerID: key.member, Since: now}); err != nil {
+			slog.Debug("cluster member usage: opening a session failed", "head_spec_id", key.head, "server_id", key.member, "err", err)
+			return false
+		}
+		u.setOpen(key, true)
+	case open:
+		return u.closeSession(ctx, key, now)
+	}
+	return true
 }
 
 func (u *clusterUsage) setOpen(key rpcSessionKey, open bool) {
