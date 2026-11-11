@@ -5,7 +5,10 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
 	"path"
 	"strings"
 )
@@ -16,13 +19,18 @@ const rpcMemberHiddenHead = "—"
 
 // RPCMemberDisplayNames names the RPC member processes specIDs that run on
 // serverID for the reader p, by their agent spec id: "RPC (<head>)(<member
-// server>)". <head> is the gateway model name of the head the member serves;
-// a head p may not see (its mapping is beyond p's rights) shows as "—", so
-// nothing about it leaks. A manual member spec that serves no head shows its
-// binary's file name instead, and an id that matches neither gets no name.
-// The names are resolved from the stored membership on every call, so a
-// renamed model or server shows at once. One call reads the server's
-// membership once and each head once, however many ids it names.
+// server>)". <head> is the gateway model name of the head the member serves.
+// It is "—" for a head p may not see (its mapping is beyond p's rights) and
+// for a head whose spec or mapping is gone, so nothing about such a head
+// leaks. A manual member spec that serves no head shows its binary's file
+// name instead, and an id that matches neither gets no name.
+//
+// The names are resolved from the stored rows on every call, so a renamed
+// model or server shows at once. One call reads the server's membership once,
+// its manual member specs at most once, and each head once, however many ids
+// it names. A store error on those reads fails the call. The rights check on
+// a head's mapping (authorizeMapping) answers not-found for its own store
+// errors too, so such an error shows that head as "—" until the next call.
 func (s *Service) RPCMemberDisplayNames(ctx context.Context, p auth.Token, serverID string, specIDs []string) (map[string]string, error) {
 	srv, err := s.authorizeServer(ctx, p, serverID)
 	if err != nil {
@@ -58,6 +66,9 @@ type memberNamer struct {
 	serverID string
 	headOf   map[string]string // agent spec id -> head spec id
 	heads    map[string]string // head spec id -> label
+	// manual holds the server's manual member specs by id, read on first
+	// need.
+	manual map[string]routing.RPCMemberSpec
 }
 
 // label is the <head> part of id's name; ok is false when id is no member
@@ -75,11 +86,30 @@ func (r *memberNamer) label(ctx context.Context, id string) (string, bool, error
 		}
 		return "", false, nil
 	}
-	spec, ok, err := r.s.routes.RPCMemberSpecByID(ctx, id)
-	if err != nil || !ok || spec.ServerID != r.serverID {
+	spec, ok, err := r.manualSpec(ctx, id)
+	if err != nil || !ok {
 		return "", false, err
 	}
 	return path.Base(strings.ReplaceAll(spec.Binary, "\\", "/")), true, nil
+}
+
+// manualSpec is the manual member spec id on the server, read with the
+// server's other specs on the first call.
+func (r *memberNamer) manualSpec(ctx context.Context, id string) (routing.RPCMemberSpec, bool, error) {
+	if r.manual == nil {
+		specs, err := r.s.routes.RPCMemberSpecsByServer(ctx, r.serverID)
+		if err != nil {
+			return routing.RPCMemberSpec{}, false, err
+		}
+		r.manual = make(map[string]routing.RPCMemberSpec, len(specs))
+		for _, spec := range specs {
+			if spec.ServerID == r.serverID {
+				r.manual[spec.ID] = spec
+			}
+		}
+	}
+	spec, ok := r.manual[id]
+	return spec, ok, nil
 }
 
 // headLabel is the gateway model name of the head spec headSpecID, or
@@ -89,16 +119,31 @@ func (r *memberNamer) headLabel(ctx context.Context, headSpecID string) (string,
 	if label, ok := r.heads[headSpecID]; ok {
 		return label, nil
 	}
-	label := rpcMemberHiddenHead
-	spec, ok, err := r.s.routes.RuntimeSpecByID(ctx, headSpecID)
+	label, err := r.readHeadLabel(ctx, headSpecID)
 	if err != nil {
 		return "", err
 	}
-	if ok {
-		if mapping, _, _, err := r.s.authorizeMapping(ctx, r.p, spec.MappingID); err == nil {
-			label = mapping.GatewayModelName
-		}
-	}
 	r.heads[headSpecID] = label
 	return label, nil
+}
+
+// readHeadLabel reads headLabel's answer. The spec and the mapping are read
+// first so that a store error fails the call instead of hiding the head.
+func (r *memberNamer) readHeadLabel(ctx context.Context, headSpecID string) (string, error) {
+	spec, ok, err := r.s.routes.RuntimeSpecByID(ctx, headSpecID)
+	if err != nil || !ok {
+		return rpcMemberHiddenHead, err
+	}
+	if _, err := r.s.routes.MappingByID(ctx, spec.MappingID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return rpcMemberHiddenHead, nil
+		}
+		return "", err
+	}
+	// Beyond the reader's rights the head stays hidden: not an error.
+	mapping, _, _, err := r.s.authorizeMapping(ctx, r.p, spec.MappingID)
+	if err != nil {
+		return rpcMemberHiddenHead, nil
+	}
+	return mapping.GatewayModelName, nil
 }

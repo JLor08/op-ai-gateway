@@ -51,7 +51,9 @@ func TestRPCMemberDisplayNamesManual(t *testing.T) {
 	req.MemberMode = "manual"
 	f.mustPut(req)
 
-	names, err := f.svc.RPCMemberDisplayNames(f.ctx, ownerToken(), srv.ID, []string{used.ID, free.ID})
+	elsewhere := f.manualSpec(f.member("N").ID)
+
+	names, err := f.svc.RPCMemberDisplayNames(f.ctx, ownerToken(), srv.ID, []string{used.ID, free.ID, elsewhere.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +61,28 @@ func TestRPCMemberDisplayNamesManual(t *testing.T) {
 		used.ID: "RPC (big)(M)",
 		// No head uses it: its binary's file name stands in for the head.
 		free.ID: "RPC (ggml-rpc-server)(M)",
+		// A spec of another server is no member here and gets no name.
 	}
+	if !maps.Equal(names, want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+}
+
+// An automatic member whose membership row is gone still names its head
+// from its id; a head whose spec is gone shows as "—".
+func TestRPCMemberDisplayNamesWithoutAMembershipRow(t *testing.T) {
+	f := newClusterFixture(t)
+	efyga := f.member("efyga")
+	head := f.mustPut(clusterHeadRequest(autoMember(efyga.ID)))
+	if err := f.routes.SetClusterMembers(f.ctx, head.ID, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{automaticMemberAgentSpecID(head.ID, efyga.ID), automaticMemberAgentSpecID("rspec_gone", efyga.ID)}
+	names, err := f.svc.RPCMemberDisplayNames(f.ctx, ownerToken(), efyga.ID, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{ids[0]: "RPC (big)(efyga)", ids[1]: "RPC (—)(efyga)"}
 	if !maps.Equal(names, want) {
 		t.Fatalf("names = %v, want %v", names, want)
 	}
@@ -92,7 +115,12 @@ func TestRPCMemberDisplayNamesHideAHeadTheReaderMayNotSee(t *testing.T) {
 // countingRoutes counts the store reads one resolution makes.
 type countingRoutes struct {
 	routing.Store
-	memberships, heads atomic.Int32
+	memberships, heads, manual atomic.Int32
+}
+
+func (c *countingRoutes) RPCMemberSpecsByServer(ctx context.Context, serverID string) ([]routing.RPCMemberSpec, error) {
+	c.manual.Add(1)
+	return c.Store.RPCMemberSpecsByServer(ctx, serverID)
 }
 
 func (c *countingRoutes) ClusterMembershipsByServer(ctx context.Context, serverID string) ([]routing.ClusterMember, error) {
@@ -105,8 +133,8 @@ func (c *countingRoutes) RuntimeSpecByID(ctx context.Context, id string) (routin
 	return c.Store.RuntimeSpecByID(ctx, id)
 }
 
-// One call reads the server's membership once and each head once, however
-// many rows name them.
+// One call reads the server's membership once, its manual member specs at
+// most once, and each head once, however many rows name them.
 func TestRPCMemberDisplayNamesReadEachHeadOnce(t *testing.T) {
 	f := newClusterFixture(t)
 	efyga := f.member("efyga")
@@ -115,10 +143,13 @@ func TestRPCMemberDisplayNamesReadEachHeadOnce(t *testing.T) {
 	if err := f.routes.SetClusterMembers(f.ctx, other, []routing.ClusterMember{{Position: 0, ServerID: efyga.ID, Port: 26200}}, nil); err != nil {
 		t.Fatal(err)
 	}
+	freeA, freeB := f.manualSpec(efyga.ID), f.manualSpec(efyga.ID)
 	ids := []string{
 		automaticMemberAgentSpecID(head.ID, efyga.ID),
 		automaticMemberAgentSpecID(other, efyga.ID),
 		automaticMemberAgentSpecID(head.ID, efyga.ID),
+		freeA.ID,
+		freeB.ID,
 	}
 	counting := &countingRoutes{Store: f.routes}
 	f.svc.routes = counting
@@ -126,10 +157,10 @@ func TestRPCMemberDisplayNamesReadEachHeadOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) != 2 || names[ids[1]] != "RPC (other)(efyga)" {
+	if len(names) != 4 || names[ids[1]] != "RPC (other)(efyga)" {
 		t.Fatalf("names = %v", names)
 	}
-	if m, h := counting.memberships.Load(), counting.heads.Load(); m != 1 || h != 2 {
-		t.Fatalf("store reads: memberships %d, heads %d; want 1 and 2", m, h)
+	if m, h, s := counting.memberships.Load(), counting.heads.Load(), counting.manual.Load(); m != 1 || h != 2 || s != 1 {
+		t.Fatalf("store reads: memberships %d, heads %d, manual specs %d; want 1, 2 and 1", m, h, s)
 	}
 }

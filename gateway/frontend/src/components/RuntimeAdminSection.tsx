@@ -4272,9 +4272,11 @@ export function RuntimeAdminSection({
         [gatewayNameFor(row), row.display_name, row.model, row.spec_id].filter(Boolean).join(' '),
       filter: 'text',
       render: (row) => {
+        // A cluster member is no mapping row: its name, without the
+        // unresolved marker.
+        if (row.kind === 'rpc_server') return <RpcMemberName row={row} variant="body2" />;
         const mapping = mappingForStatus(row);
         const reported = row.model || row.spec_id;
-        if (row.kind === 'rpc_server') return <RpcMemberName row={row} />;
         if (mapping === undefined) {
           return (
             <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'start' }}>

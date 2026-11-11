@@ -246,17 +246,24 @@ function groupOptionsFor(
  * spec id (the identity support asks for) in a tooltip; the id itself from
  * an older gateway that sends no name.
  */
-export function RpcMemberName({ row }: Readonly<{ row: RuntimeStatus }>) {
+export function RpcMemberName({
+  row,
+  variant,
+}: Readonly<{
+  row: RuntimeStatus;
+  /** The text variant of the surrounding names (the RPC tab's body1 by default). */
+  variant?: 'body1' | 'body2';
+}>) {
   if (!row.display_name) {
     return (
-      <Typography component="span" sx={{ fontFamily: 'monospace' }}>
+      <Typography component="span" variant={variant} sx={{ fontFamily: 'monospace' }}>
         {row.spec_id}
       </Typography>
     );
   }
   return (
     <Tooltip title={row.spec_id} describeChild>
-      <Typography component="span" tabIndex={0} data-testid="rpc-member-name">
+      <Typography component="span" variant={variant} tabIndex={0} data-testid="rpc-member-name">
         {row.display_name}
       </Typography>
     </Tooltip>

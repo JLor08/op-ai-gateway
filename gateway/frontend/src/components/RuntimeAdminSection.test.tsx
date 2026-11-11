@@ -5091,10 +5091,26 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
     const row = inRowWith('4300');
     const name = row.getByText('RPC (big)(efyga)');
     expect(name).toHaveAccessibleDescription('rpca_rspec_1_srv_1');
+    // The column's other names are body2 too.
+    expect(name).toHaveClass('MuiTypography-body2');
     // A member is no mapping row: no "unresolved" marker.
     expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
     fireEvent.click(row.getByRole('button', { name: t.runtimeLogs }));
     expect(await screen.findByRole('dialog')).toHaveTextContent('RPC (big)(efyga)');
+  });
+
+  it('shows a cluster member row without a display name by its id, without the unresolved marker', async () => {
+    const { stream } = renderSection({
+      statusRows: [makeStatus({ spec_id: 'rpcm_old', kind: 'rpc_server', model: '', pid: 4301 })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    const row = inRowWith('4301');
+    expect(row.getByText('rpcm_old')).toBeInTheDocument();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
   });
 
   it('feeds the RPC tab from its own status stream instead of opening a second one', async () => {
