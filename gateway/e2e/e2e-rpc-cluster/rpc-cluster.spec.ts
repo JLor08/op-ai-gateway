@@ -167,7 +167,7 @@ type RuntimeRow = {
   pid?: number;
   kind?: string;
   rpc?: { held_by?: string; reserved_until?: string; device_count: number; protocol?: string };
-  cluster?: { launched: string[]; version: string };
+  cluster?: { launched: string[] };
   last_error?: { code?: string; message?: string };
 };
 
