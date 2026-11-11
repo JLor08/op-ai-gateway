@@ -2607,12 +2607,17 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 // checkDirectClusterSwitches refuses a request that turns manage-policies,
 // deny-by-default or deny-enforcement from on to off while a direct mesh
 // cluster exists (ErrNetbirdDirectClusterExists). Saving a switch that is
-// already off, or leaving it on, is never refused.
+// already off, or leaving it on, is never refused. The current switches are
+// read strictly: a failed read is returned, since reading every switch as off
+// would let the save turn the protection off under a running cluster.
 func (s *Service) checkDirectClusterSwitches(ctx context.Context, req UpdateSystemSettingsRequest) error {
 	if req.NetbirdManagePolicies == nil && req.NetbirdDenyByDefault == nil && req.NetbirdDenyByDefaultEnforce == nil {
 		return nil
 	}
-	values := s.systemSettingValues(ctx)
+	values, err := s.readSystemSettings(ctx)
+	if err != nil {
+		return err
+	}
 	turnsOff := func(req *bool, current bool) bool { return req != nil && !*req && current }
 	if !turnsOff(req.NetbirdManagePolicies, NetbirdManagePolicies(values)) &&
 		!turnsOff(req.NetbirdDenyByDefault, NetbirdDenyByDefault(values)) &&

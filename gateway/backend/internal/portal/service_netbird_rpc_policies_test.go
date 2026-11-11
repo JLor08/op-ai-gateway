@@ -494,6 +494,23 @@ func TestSettingsRefuseSwitchOffWhileDirectMeshClusterExists(t *testing.T) {
 	}
 }
 
+// TestSettingsSwitchOffCheckFailsOnUnreadableSettings: the guard that keeps
+// a direct mesh cluster's protection on reads the current switches strictly.
+// A failed read is the save's error, never every switch read as off, which
+// would let the save turn the protection off under a running cluster.
+func TestSettingsSwitchOffCheckFailsOnUnreadableSettings(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "direct", rpcMemberSeed{"a", 47001})
+	e.svc.settings = &failingSettings{SystemSettingsStore: e.svc.settings, fail: true}
+	err := e.svc.checkDirectClusterSwitches(e.ctx, UpdateSystemSettingsRequest{NetbirdManagePolicies: boolPtr(false)})
+	if err == nil || errors.Is(err, ErrNetbirdDirectClusterExists) {
+		t.Fatalf("err = %v, want the settings read error", err)
+	}
+}
+
 func TestSettingsAllowSwitchOffWithoutDirectMeshCluster(t *testing.T) {
 	setup := map[string]func(*rpcPolicyEnv){
 		"no cluster":    func(*rpcPolicyEnv) {},
