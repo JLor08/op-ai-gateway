@@ -807,7 +807,8 @@ func (s *Service) NotifyClustersOfServer(ctx context.Context, serverID string) {
 
 // notifyAllClusterServers notifies every server of every cluster: the
 // NetBird policy settings decide whether any direct mesh cluster may be
-// pushed. Best-effort.
+// pushed. Each head's servers are read once, and a fleet without a cluster
+// notifies nobody. Best-effort.
 func (s *Service) notifyAllClusterServers(ctx context.Context) {
 	if s.runtimeChanged == nil || s.routes == nil {
 		return
@@ -817,9 +818,15 @@ func (s *Service) notifyAllClusterServers(ctx context.Context) {
 		slog.Debug("cluster notification: server list failed", "err", err)
 		return
 	}
-	var ids []string
+	var heads []string
 	for _, srv := range servers {
-		for _, id := range s.clusterServersOfServer(ctx, srv.ID) {
+		for _, head := range s.clusterHeadsOfServer(ctx, srv.ID) {
+			heads = appendUnique(heads, head)
+		}
+	}
+	var ids []string
+	for _, head := range heads {
+		for _, id := range s.clusterServers(ctx, head) {
 			ids = appendUnique(ids, id)
 		}
 	}

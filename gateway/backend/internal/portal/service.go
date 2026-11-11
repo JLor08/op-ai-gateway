@@ -4430,8 +4430,11 @@ func (s *Service) DeleteServer(ctx context.Context, principal auth.Token, id str
 		}
 	}
 	// The server's own policy as a member goes with its row; its heads' grants
-	// to other members go with the heads.
-	s.reconcileRPCPolicies(ctx)
+	// to other members go with the heads. A server in no cluster has no grant
+	// to remove, and its delete never waits on that pass.
+	if len(clusterServers) > 0 {
+		s.reconcileRPCPolicies(ctx)
+	}
 	return netbirdCleanupFailed, nil
 }
 

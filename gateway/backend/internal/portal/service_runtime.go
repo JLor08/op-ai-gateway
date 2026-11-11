@@ -991,8 +991,10 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		// A benchmark writer (nil principal) only rewrites measurements and
 		// pinned settings of an existing spec: it cannot change the cluster
 		// flag, the network or the membership, so there is nothing for the
-		// policies to follow.
-		if principal != nil {
+		// policies to follow. Neither is there for a write that is no cluster
+		// head before or after and has no membership: the pass waits on
+		// NetBird, which a plain model save must never do.
+		if principal != nil && w.touchesCluster {
 			// The head's members may have changed: open the RPC ports the
 			// saved cluster needs before anything starts it.
 			s.reconcileRPCPolicies(ctx)
@@ -1032,12 +1034,15 @@ func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMap
 }
 
 // runtimeSpecWrite is what writeRuntimeSpecAs did: the stored document,
-// whether anything reached the store, and the member servers of a cluster
-// head (before and after the write) whose documents the write changed.
+// whether anything reached the store, the member servers of a cluster head
+// (before and after the write) whose documents the write changed, and
+// whether the write touched a cluster at all (the spec was or is a head, or
+// had or has members).
 type runtimeSpecWrite struct {
-	dto           RuntimeSpecDTO
-	stored        bool
-	memberServers []string
+	dto            RuntimeSpecDTO
+	stored         bool
+	memberServers  []string
+	touchesCluster bool
 }
 
 // writeRuntimeSpecAs is writeRuntimeSpec with the cluster configuration:
@@ -1088,7 +1093,10 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
 		return runtimeSpecWrite{}, err
 	}
-	w := runtimeSpecWrite{stored: true, memberServers: plan.memberServers}
+	w := runtimeSpecWrite{
+		stored: true, memberServers: plan.memberServers,
+		touchesCluster: plan.enabled || len(plan.memberServers) > 0 || (prior.ok && prior.spec.ClusterEnabled),
+	}
 	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
 		return w, err
 	}
@@ -1680,7 +1688,9 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 			s.notifyRuntimeChanged(m.ServerID)
 		}
 	}
-	s.reconcileRPCPolicies(ctx)
+	if spec.ClusterEnabled || len(members) > 0 {
+		s.reconcileRPCPolicies(ctx)
+	}
 	return nil
 }
 

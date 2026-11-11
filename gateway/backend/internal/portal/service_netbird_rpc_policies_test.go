@@ -704,3 +704,64 @@ func TestDefaultPolicyDriftStopsDirectClustersBeforeNotifying(t *testing.T) {
 			e.notifications(), atHandler)
 	}
 }
+
+// TestRPCPolicyPassOnlyForClusterWrites: a write that touches no cluster makes
+// no RPC policy pass, so a deployment without clusters never waits on NetBird
+// for a model save. The writes that also reconcile the server's own access
+// policy list once for that, never a second time.
+func TestRPCPolicyPassOnlyForClusterWrites(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	e.server("plain")
+	app := seedServerAgentApplication(t, e.routes, "plain", rpcPolicyNow)
+	mapping, err := e.svc.CreateMapping(e.ctx, systemToken(), app.ID, CreateMappingRequest{GatewayModelName: "small", AppModelName: "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lists := func(what string, want int32, op func() error) {
+		t.Helper()
+		before := e.fake.policyListCount()
+		if err := op(); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if got := e.fake.policyListCount() - before; got != want {
+			t.Fatalf("%s listed policies %d times, want %d", what, got, want)
+		}
+	}
+	lists("PutRuntimeSpec", 0, func() error {
+		_, err := e.svc.PutRuntimeSpec(e.ctx, systemToken(), mapping.ID, PutRuntimeSpecRequest{Enabled: true, Binary: "/opt/llama/llama-server"})
+		return err
+	})
+	lists("DeleteRuntimeSpec", 0, func() error { return e.svc.DeleteRuntimeSpec(e.ctx, systemToken(), mapping.ID) })
+	lists("UpdateApplication", 1, func() error {
+		port := 9001
+		_, err := e.svc.UpdateApplication(e.ctx, systemToken(), app.ID, UpdateApplicationRequest{Port: &port})
+		return err
+	})
+	lists("DeleteApplication", 1, func() error { return e.svc.DeleteApplication(e.ctx, systemToken(), app.ID) })
+	lists("DeleteServer", 1, func() error {
+		_, err := e.svc.DeleteServer(e.ctx, systemToken(), "plain", false)
+		return err
+	})
+}
+
+// TestRPCPolicyPassForClusterApplicationWrites: an application write on a
+// server that takes part in a cluster still reconciles the RPC policies.
+func TestRPCPolicyPassForClusterApplicationWrites(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"head", "a"} {
+		e.server(id)
+	}
+	e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001})
+	apps, err := e.routes.ApplicationsByServer(e.ctx, "head")
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("apps = %+v err=%v", apps, err)
+	}
+	before := e.fake.policyListCount()
+	port := 9001
+	if _, err := e.svc.UpdateApplication(e.ctx, systemToken(), apps[0].ID, UpdateApplicationRequest{Port: &port}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.fake.policyListCount() - before; got != 2 {
+		t.Fatalf("UpdateApplication on a head server listed policies %d times, want 2 (access policy + RPC family)", got)
+	}
+}
