@@ -96,24 +96,66 @@ func (s *Server) writeBackBinaries(ctx context.Context, serverID string, reporte
 		return
 	}
 	keepKnownBinaryVersions(rows, stored)
+	changed := binaryInventoryChanged(stored, rows)
 	if err := s.Routes.ReplaceAgentServerBinaries(ctx, serverID, rows); err != nil {
 		slog.Warn("agent binary inventory write failed", "server_id", serverID, "err", err)
 		return
 	}
 	// The inventory decides an automatic cluster member's binary and every
-	// member's version in its head's generation; the agent sends it only when
-	// it changed, so every server sharing a cluster with this one is pushed.
-	if s.Portal != nil {
+	// member's version in its head's generation, so a change re-derives
+	// every server sharing a cluster with this one. The agent also resends
+	// its inventory unchanged (on every reconnect and on the system-report
+	// cadence, so a lost frame or a failed write heals); such a resend only
+	// refreshes the rows' report time and notifies nobody.
+	if changed && s.Portal != nil {
 		s.Portal.NotifyClustersOfServer(ctx, serverID)
 	}
 }
 
-// keepKnownBinaryVersions gives a reported row without any version the
-// version its agent row already carries at the same path. The agent sends no
-// version when its --version probe failed or timed out (a busy host at agent
-// start), and taking that as "unknown" would withhold every automatic cluster
-// whose binary it is until the file changed; a report that carries a version
-// replaces the kept one.
+// binaryInventoryChanged reports whether writing rows as the server's agent
+// inventory changes what stored holds, apart from the report time: a path
+// added or gone, or a reported field of a path that differs. A reported path
+// a manual row owns is skipped by the write, so it changes nothing.
+func binaryInventoryChanged(stored, rows []routing.ServerBinary) bool {
+	agent := make(map[string]routing.ServerBinary, len(stored))
+	manual := make(map[string]bool, len(stored))
+	for _, b := range stored {
+		if b.Source == routing.BinarySourceAgent {
+			agent[b.Path] = b
+		} else {
+			manual[b.Path] = true
+		}
+	}
+	written := 0
+	for _, r := range rows {
+		if manual[r.Path] {
+			continue
+		}
+		written++
+		b, ok := agent[r.Path]
+		if !ok || b.Kind != r.Kind || b.Version != r.Version || b.Build != r.Build || b.Commit != r.Commit ||
+			b.VersionSource != r.VersionSource || b.Allowed != r.Allowed {
+			return true
+		}
+	}
+	return written != len(agent)
+}
+
+// keepKnownBinaryVersions keeps the identity (version, build, commit) the
+// agent's --version probe found for a path when a re-report of that path
+// carries none from a probe: the probe failed or timed out (a busy host at
+// agent start), and the agent then reports only what the path says, if
+// anything. Taking that as the binary's identity would withhold every
+// automatic cluster whose binary it is, or -- for a path with a build tag --
+// move the head's generation until the probe succeeds again, which relaunches
+// the head twice. A report the agent probed replaces the kept identity, and a
+// report without any identity keeps whatever the row had.
+//
+// Limitation: the inventory carries no file identity (size, mtime or digest),
+// so a binary replaced at the same path whose first probe fails keeps the
+// replaced binary's identity until a probe of the new file succeeds (the agent
+// retries with a backoff of up to an hour). The cluster start's own version
+// and banner checks still catch a mismatch.
 func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
 	known := make(map[string]routing.ServerBinary, len(stored))
 	for _, b := range stored {
@@ -123,10 +165,12 @@ func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
 	}
 	for i := range rows {
 		r := &rows[i]
-		if r.Version != "" || r.Build != "" || r.Commit != "" {
+		b, ok := known[r.Path]
+		if !ok || r.VersionSource == binaryVersionSrcAgent {
 			continue
 		}
-		if b, ok := known[r.Path]; ok {
+		bare := r.Version == "" && r.Build == "" && r.Commit == ""
+		if b.VersionSource == binaryVersionSrcAgent || bare {
 			r.Version, r.Build, r.Commit, r.VersionSource = b.Version, b.Build, b.Commit, b.VersionSource
 		}
 	}
