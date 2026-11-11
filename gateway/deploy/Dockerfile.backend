@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 
-FROM golang:1.25 AS builder
+# Pinned to an exact Go patch release. Not to 1.27 yet: its net/http regression deadlocks
+# the live-transcription relay (docs/architecture/cross-cutting/development-and-quality.md,
+# section 1).
+FROM golang:1.26.5 AS builder
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -13,7 +16,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /gateway ./cmd/gateway
 RUN mkdir -p /data /shared/certs
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=builder /gateway /gateway
 COPY --from=builder --chown=65532:65532 /data /data
 # Baked external themes (see gateway/deploy/themes/README.md). Matches the

@@ -11,7 +11,7 @@ test: test-go test-ui
 
 # Install the pinned linter (also used by CI). Requires Go on PATH.
 lint-install:
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 
 # Format both Go modules in place (gofumpt + goimports via golangci-lint).
 fmt:

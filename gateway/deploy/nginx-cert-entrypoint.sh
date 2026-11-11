@@ -22,7 +22,7 @@
 # Both jobs are best-effort: every failure path degrades and still hands control to
 # the stock entrypoint, so this wrapper can never be the reason nginx does not run.
 #
-# POSIX sh: the nginx:1.27-alpine image has no bash. `openssl` is not in that image
+# POSIX sh: the nginx:1.30-alpine image has no bash. `openssl` is not in that image
 # either -- Dockerfile.frontend installs it (apk add --no-cache openssl).
 #
 # NGINX_STOCK_ENTRYPOINT overrides the stock entrypoint path FOR TESTING ONLY; it

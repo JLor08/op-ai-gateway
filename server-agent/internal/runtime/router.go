@@ -1903,7 +1903,7 @@ func spliceWithCancel(ctx context.Context, dst io.Writer, src io.ReadCloser) err
 		return err
 	case <-ctx.Done():
 		src.Close() //nolint:errcheck // best-effort: only unblocking the pending Read
-		<-copyDone  // drain so the goroutine above is never leaked
+		<-copyDone  //nolint:errcheck // drain so the goroutine above is never leaked; its error is not an upstream failure
 		return nil
 	}
 }

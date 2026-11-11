@@ -39,7 +39,7 @@ set -eu
 
 cd "$(dirname "$0")"
 
-NGINX_IMAGE=nginx:1.27-alpine
+NGINX_IMAGE=nginx:1.30-alpine
 CONFIGMAP=k8s/nginx-configmap.yaml
 REQUIRED_HEADERS="X-OP-Internal-Auth X-OP-Internal-User X-OP-Server-Override X-OP-Server-Override-Force X-OP-Edge-Self-Probe X-OP-Edge-Scheme"
 

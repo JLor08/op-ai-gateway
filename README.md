@@ -306,7 +306,7 @@ browser over SSE. The complete endpoint reference is in
 
 ## Local development
 
-Requires **Go 1.26+** and **Node.js 22+**.
+Requires **Go 1.26+** and **Node.js 26+**.
 
 ```bash
 make dev
