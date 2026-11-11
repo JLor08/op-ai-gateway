@@ -43,6 +43,10 @@ const (
 	// up to binaryRetryCap.
 	binaryRetryFirst = 30 * time.Second
 	binaryRetryCap   = time.Hour
+	// binaryRescanGap is the least the rescan loop ever waits, whatever
+	// retry is due: a retry time that stays in the past must not make it
+	// spin.
+	binaryRescanGap = time.Second
 )
 
 // binaryWaitDelay bounds how long a --version run may linger after its
@@ -160,6 +164,11 @@ func scanBinariesCtx(ctx context.Context, now time.Time, allowed []string, stat 
 		seen[p] = true
 		bi := BinaryInfo{Path: p, Kind: binaryKind(p), Allowed: true}
 		fi, err := stat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			// Nothing here can be run: forget any cached run, so a failed
+			// one leaves no retry behind that could never happen.
+			delete(cache, p)
+		}
 		if err == nil && !fi.Mode().IsRegular() {
 			// With runtime_allow_binary_dirs an entry may name a directory;
 			// it is not expanded and is not a binary.
@@ -291,14 +300,15 @@ func (b *binaryInventory) rescan(ctx context.Context) {
 	b.mu.Unlock()
 }
 
-// nextRetry is the earliest time a failed version run is due again, and
-// whether any is pending.
+// nextRetry is the earliest time a failed version run of an allowed path is
+// due again, and whether any is pending.
 func (b *binaryInventory) nextRetry() (time.Time, bool) {
 	b.scanMu.Lock()
 	defer b.scanMu.Unlock()
 	var next time.Time
-	for _, cv := range b.cache {
-		if !cv.ok && (next.IsZero() || cv.retryAt.Before(next)) {
+	for _, p := range b.allowed {
+		cv, ok := b.cache[p]
+		if ok && !cv.ok && (next.IsZero() || cv.retryAt.Before(next)) {
 			next = cv.retryAt
 		}
 	}
@@ -322,11 +332,12 @@ func (b *binaryInventory) run(ctx context.Context) {
 	}
 }
 
-// untilNextScan is how long run waits for its next rescan.
+// untilNextScan is how long run waits for its next rescan: the rescan
+// interval, shorter when a retry is due earlier, never below binaryRescanGap.
 func (b *binaryInventory) untilNextScan() time.Duration {
 	wait := binaryRescanInterval
 	if next, ok := b.nextRetry(); ok {
-		wait = min(wait, max(time.Until(next), 0))
+		wait = min(wait, max(time.Until(next), binaryRescanGap))
 	}
 	return wait
 }
