@@ -835,13 +835,25 @@ func (s *SQLiteStore) Stats(q usage.Query) (usage.Stats, error) {
 	}, nil
 }
 
+// usagePartsJoin joins each event's energy parts (alias p): an event with
+// parts yields one row per part, any other event one row with p's columns
+// null. partHostExpr and partWhExpr then name the host and the watt-hours that
+// row is priced at, so a cluster request is priced per host and every other
+// request on its own host exactly as before.
+const (
+	usagePartsJoin = " left join usage_event_energy_parts as p on p.event_id = e.id"
+	partHostExpr   = "coalesce(p.server_id, e.host)"
+	partWhExpr     = "coalesce(p.wh, e.energy_wh)"
+)
+
 // EnergyByServer sums energy_wh grouped by host over the SAME filtered set
 // usageWhere(q) applies to Stats, for the portal layer to derive a
-// per-server-price-weighted total cost (see portal.Service.UsageStats). A
-// host with no matching rows is simply absent from the returned map.
+// per-server-price-weighted total cost (see portal.Service.UsageStats). An
+// event with energy parts counts each part under the part's host. A host with
+// no matching rows is simply absent from the returned map.
 func (s *SQLiteStore) EnergyByServer(ctx context.Context, q usage.Query) (map[string]float64, error) {
 	where, args := usageWhere(s.dl, q, "")
-	rows, err := s.query(ctx, "select e.host, sum(e.energy_wh) from usage_events as e"+where+" group by e.host", args...)
+	rows, err := s.query(ctx, "select "+partHostExpr+", sum("+partWhExpr+") from usage_events as e"+usagePartsJoin+where+" group by "+partHostExpr, args...)
 	if err != nil {
 		return nil, fmt.Errorf("energy by server: %w", err)
 	}
@@ -904,7 +916,8 @@ func (s *SQLStore) systemDefaultPricePerKwh(ctx context.Context) (float64, error
 // UsageAggregateSince sums, for the principal identified by (principalType,
 // principalID), the request COUNT and total TOKEN count recorded in
 // usage_events with created_at >= since, plus a price-weighted COST: energy_wh
-// is summed grouped by host, then each host's contribution is weighted by
+// is summed grouped by host (a cluster request's energy parts each under the
+// part's host), then each host's contribution is weighted by
 // (energy_wh/1000) * price(host) — that server's own ai_servers.price_per_kwh
 // when set (> 0), else the system-wide energy_default_price_per_kwh default
 // (mirrors portal.Service.attachUsageCost/resolveUsagePrice's exact fallback,
@@ -924,8 +937,11 @@ func (s *SQLStore) UsageAggregateSince(ctx context.Context, principalType, princ
 		return 0, 0, 0, fmt.Errorf("usage aggregate: %w", err)
 	}
 
+	// Priced per energy part, like EnergyByServer: a cluster request's member
+	// parts at each member's own price.
 	rows, err := s.query(ctx,
-		"select host, coalesce(sum(energy_wh), 0) from usage_events where "+col+" = ? and created_at >= ? group by host",
+		"select "+partHostExpr+", coalesce(sum("+partWhExpr+"), 0) from usage_events as e"+usagePartsJoin+
+			" where e."+col+" = ? and e.created_at >= ? group by "+partHostExpr,
 		principalID, since)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("usage aggregate energy: %w", err)
@@ -1047,6 +1063,10 @@ func usageGroupColumn(groupBy string) (string, bool) {
 // fold buckets by dimension while weighting cost per host price. groupBy is a
 // fixed dimension keyword (session|server|user|token|model), NEVER interpolated
 // from user input; an unknown value is an error.
+//
+// An event with energy parts counts in its own host's bucket with the energy
+// of its part on that host (hp), and each part on another host adds its
+// energy, and nothing else, to that host's bucket in the same group.
 func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy string) ([]usage.GroupBucket, error) {
 	col, ok := usageGroupColumn(groupBy)
 	if !ok {
@@ -1058,8 +1078,11 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 		" sum(case when e.status = 'error' or e.http_status >= 400 then 1 else 0 end)," +
 		" sum(case when e.billing_unit <> '' then 1 else 0 end)," +
 		" sum(e.input_tokens), sum(e.output_tokens), sum(e.cached_tokens), sum(e.cache_write_tokens)," +
-		" sum(e.energy_wh), min(e.created_at), max(e.created_at)" +
-		usageEventsFromClause + where +
+		" sum(case when exists (select 1 from usage_event_energy_parts as ap where ap.event_id = e.id)" +
+		" then coalesce(hp.wh, 0) else e.energy_wh end), min(e.created_at), max(e.created_at)" +
+		usageEventsFromClause +
+		" left join usage_event_energy_parts as hp on hp.event_id = e.id and hp.server_id = e.host" +
+		where +
 		" group by e." + col + ", e.host"
 	rows, err := s.query(ctx, sqlText, args...)
 	if err != nil {
@@ -1090,7 +1113,42 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("iterate usage groups: %w", err)
 	}
-	return out, nil
+	return s.addMemberPartBuckets(ctx, out, col, where, args)
+}
+
+// addMemberPartBuckets adds to buckets the energy of every energy part on a
+// host other than its event's own, under (the event's group value, the part's
+// host): into that bucket when buckets has it, else as a bucket of its own
+// that counts no requests.
+func (s *SQLiteStore) addMemberPartBuckets(ctx context.Context, buckets []usage.GroupBucket, col, where string, args []any) ([]usage.GroupBucket, error) {
+	rows, err := s.query(ctx, "select e."+col+", p.server_id, sum(p.wh)"+usageEventsFromClause+
+		" join usage_event_energy_parts as p on p.event_id = e.id and p.server_id <> e.host"+where+
+		" group by e."+col+", p.server_id", args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage groups parts: %w", err)
+	}
+	defer rows.Close()
+	index := make(map[[2]string]int, len(buckets))
+	for i, b := range buckets {
+		index[[2]string{b.Key, b.Host}] = i
+	}
+	for rows.Next() {
+		var key, host string
+		var wh float64
+		if err := rows.Scan(&key, &host, &wh); err != nil {
+			return nil, fmt.Errorf("scan usage group part: %w", err)
+		}
+		if i, ok := index[[2]string{key, host}]; ok {
+			buckets[i].EnergyWh += wh
+			continue
+		}
+		index[[2]string{key, host}] = len(buckets)
+		buckets = append(buckets, usage.GroupBucket{Key: key, Host: host, EnergyWh: wh})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage group parts: %w", err)
+	}
+	return buckets, nil
 }
 
 // RecordEventHosts inserts hosts; a (event, server) pair already stored keeps
@@ -1160,6 +1218,41 @@ func (s *SQLiteStore) SetEnergyParts(ctx context.Context, eventID string, parts 
 		}
 	}
 	return tx.Commit()
+}
+
+// EnergyPartsByEvents lists the energy parts of each of eventIDs, keyed by
+// event id, head first, then by server id; an event without parts is absent.
+// No ids reads nothing.
+func (s *SQLiteStore) EnergyPartsByEvents(ctx context.Context, eventIDs []string) (map[string][]usage.EnergyPart, error) {
+	out := make(map[string][]usage.EnergyPart)
+	if len(eventIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(eventIDs))
+	args := make([]any, len(eventIDs))
+	for i, id := range eventIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.query(ctx, `
+		select event_id, server_id, role, wh, marginal_wh, source
+		from usage_event_energy_parts where event_id in (`+strings.Join(placeholders, ",")+`)
+		order by event_id, case role when 'head' then 0 else 1 end, server_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list usage event energy parts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p usage.EnergyPart
+		if err := rows.Scan(&p.EventID, &p.ServerID, &p.Role, &p.Wh, &p.MarginalWh, &p.Source); err != nil {
+			return nil, fmt.Errorf("scan usage event energy part: %w", err)
+		}
+		out[p.EventID] = append(out[p.EventID], p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage event energy parts: %w", err)
+	}
+	return out, nil
 }
 
 // EnergyParts lists an event's per-host energy parts, head first, then by

@@ -1087,3 +1087,27 @@ func TestSessionCloseHasItsOwnBudget(t *testing.T) {
 		t.Fatalf("the kept-up heads were listed on an ended context: %v", keptErr)
 	}
 }
+
+// TestUnheardSessionCloseNeverPrecedesItsStart: after the gateway's clock
+// stepped backwards, its start can lie before a session it finds open; the
+// session then closes at its own start, never with an end before its start
+// (an interval the member-energy lookup could not place).
+func TestUnheardSessionCloseNeverPrecedesItsStart(t *testing.T) {
+	f := newUsageFixture(t)
+	since := f.clock()
+	if err := f.store.OpenRPCSession(f.ctx, routing.RPCSession{HeadSpecID: usageHead, MemberServerID: usageGPUServer, Since: since}); err != nil {
+		t.Fatal(err)
+	}
+	bootAt := since.Add(-time.Minute)
+	f.u.lastSeen = func(context.Context, string) (time.Time, bool) { return time.Time{}, false }
+	if !f.u.closeUnheardSessions(f.ctx, bootAt, func(string) bool { return false }) {
+		t.Fatal("the sweep reported a failure")
+	}
+	rows, err := f.store.RPCSessionsAt(f.ctx, usageHead, 0, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Until == nil || !rows[0].Until.Equal(since) {
+		t.Fatalf("sessions = %+v, want one closed at its start %v", rows, since)
+	}
+}

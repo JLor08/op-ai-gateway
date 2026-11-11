@@ -424,6 +424,16 @@ type AgentPresenceReader interface {
 	ReportingWithin(serverID string, window time.Duration) bool
 }
 
+// AgentClockOffsetReader exposes each ServerAgent's clock offset: the agent's
+// own time stamp on its latest telemetry sample minus the gateway's receive
+// time of that sample (positive = the agent's clock runs ahead; the transit
+// time reads as a small negative share). ok=false means the agent has not
+// reported since the gateway started. A nil reader reports nothing.
+// Satisfied by *gateway.AgentPresenceRegistry.
+type AgentClockOffsetReader interface {
+	ClockOffset(serverID string) (offset time.Duration, ok bool)
+}
+
 // AgentCertReportReader exposes what a server's ServerAgent last reported about the
 // certificate it has INSTALLED (Phase 2 distribution), so the certificate list can
 // show an "installed" state and the CA-rotation brake can tell whether a rotated
@@ -476,6 +486,9 @@ type ServiceDeps struct {
 	// AgentPresenceReader). nil = every server reads as "inactive"/"unconfigured"
 	// (never "active") — the same lenient-on-absence pattern as Reachability/LoadedModels.
 	AgentPresence AgentPresenceReader
+	// AgentClockOffsets lets serverDTO show each agent's clock offset
+	// (clock_offset_ms; see AgentClockOffsetReader). nil = always unknown.
+	AgentClockOffsets AgentClockOffsetReader
 	// AgentCertReports lets the certificate list + the CA-rotation propagation
 	// brakes read what each ServerAgent reports as installed/durably trusted (see
 	// AgentCertReportReader). nil = never reported: the existing server-leaf brake
@@ -831,21 +844,22 @@ type netbirdState struct {
 }
 
 type Service struct {
-	users            UserReader
-	tokens           TokenRepository
-	usage            usage.Store
-	routes           routing.Store
-	models           provider.ModelLister
-	settings         SystemSettingsStore
-	uiPrefs          UIPreferencesStore
-	captures         CaptureReader
-	chats            ChatStore
-	reachability     AppHealthReader
-	loadedModels     LoadedModelReader
-	agentPresence    AgentPresenceReader
-	agentCertReports AgentCertReportReader
-	agentTransport   AgentTransportReader
-	agentFeatures    AgentFeatureReader
+	users             UserReader
+	tokens            TokenRepository
+	usage             usage.Store
+	routes            routing.Store
+	models            provider.ModelLister
+	settings          SystemSettingsStore
+	uiPrefs           UIPreferencesStore
+	captures          CaptureReader
+	chats             ChatStore
+	reachability      AppHealthReader
+	loadedModels      LoadedModelReader
+	agentPresence     AgentPresenceReader
+	agentClockOffsets AgentClockOffsetReader
+	agentCertReports  AgentCertReportReader
+	agentTransport    AgentTransportReader
+	agentFeatures     AgentFeatureReader
 	// clusterStatus reads the gateway's cluster orchestration state for a
 	// head's read view (SetClusterStatusReader); nil before it is wired.
 	clusterStatus ClusterStatusReader
@@ -1011,26 +1025,27 @@ func NewService(deps ServiceDeps) *Service {
 		vendorClient = &http.Client{Timeout: vendorConnectHTTPTimeout}
 	}
 	svc := &Service{
-		users:            deps.Users,
-		tokens:           deps.Tokens,
-		usage:            deps.Usage,
-		routes:           deps.Routes,
-		models:           deps.ModelLister,
-		settings:         deps.SystemSettings,
-		uiPrefs:          deps.UIPrefs,
-		captures:         deps.Captures,
-		chats:            deps.Chats,
-		reachability:     deps.Reachability,
-		loadedModels:     deps.LoadedModels,
-		agentPresence:    deps.AgentPresence,
-		agentCertReports: deps.AgentCertReports,
-		agentTransport:   deps.AgentTransport,
-		agentFeatures:    deps.AgentFeatures,
-		proxyStatus:      deps.ProxyStatus,
-		groups:           deps.Groups,
-		groupCache:       deps.GroupCache,
-		projects:         deps.Projects,
-		cipher:           deps.Cipher,
+		users:             deps.Users,
+		tokens:            deps.Tokens,
+		usage:             deps.Usage,
+		routes:            deps.Routes,
+		models:            deps.ModelLister,
+		settings:          deps.SystemSettings,
+		uiPrefs:           deps.UIPrefs,
+		captures:          deps.Captures,
+		chats:             deps.Chats,
+		reachability:      deps.Reachability,
+		loadedModels:      deps.LoadedModels,
+		agentPresence:     deps.AgentPresence,
+		agentClockOffsets: deps.AgentClockOffsets,
+		agentCertReports:  deps.AgentCertReports,
+		agentTransport:    deps.AgentTransport,
+		agentFeatures:     deps.AgentFeatures,
+		proxyStatus:       deps.ProxyStatus,
+		groups:            deps.Groups,
+		groupCache:        deps.GroupCache,
+		projects:          deps.Projects,
+		cipher:            deps.Cipher,
 		cert: certState{
 			cipher:            deps.CertCipher,
 			edgeOutputDir:     deps.CertEdgeOutputDir,
@@ -1596,6 +1611,14 @@ type ServerDTO struct {
 	// within the effective window), "inactive" (an agent token is configured but
 	// not currently reporting), or "unconfigured" (no agent token at all).
 	AgentStatus string `json:"agent_status"`
+	// ClockOffsetMS is the agent's clock offset in milliseconds: the time
+	// stamp the agent put on its latest telemetry sample minus the gateway's
+	// receive time of it, signed (positive = the agent's clock runs ahead).
+	// Energy attribution reads each host's samples by the agent's own time
+	// stamps, so a large offset shifts the window a host's energy part
+	// integrates. Derived, never stored; null until the agent reports after
+	// the gateway started.
+	ClockOffsetMS *int64 `json:"clock_offset_ms"`
 	// TLSProxyState says what the gateway's TLS proxy is doing on this server,
 	// so the per-application proxy opt-out can be rendered with a true reason
 	// instead of appearing out of nowhere: "out_of_scope" | "unknown" |
@@ -2441,22 +2464,46 @@ func (s *Service) resolveUsagePrice(ctx context.Context, host string, sysDefault
 
 // attachUsageCost sets CostEUR on each row: (EnergyWh/1000) * price(Host),
 // where price is resolved via resolveUsagePrice ONCE per DISTINCT host (not
-// once per row) — O(distinct servers), not O(rows). CostEUR is a transient
-// display field: it is never persisted and never read back from a store.
+// once per row) — O(distinct servers), not O(rows). A row with energy parts
+// (a llama.cpp RPC cluster request) costs the sum of its parts, each at its
+// own host's price; the parts of the whole page are read in one call, and a
+// failed read falls back to pricing every row at its Host. CostEUR is a
+// transient display field: it is never persisted and never read back from a
+// store.
 func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
 	if len(rows) == 0 {
 		return
 	}
 	sysDefault := s.systemDefaultPricePerKwh(ctx)
 	priceByHost := make(map[string]float64)
-	for i := range rows {
-		host := rows[i].Host
+	priceFor := func(host string) float64 {
 		price, cached := priceByHost[host]
 		if !cached {
 			price = s.resolveUsagePrice(ctx, host, sysDefault)
 			priceByHost[host] = price
 		}
-		rows[i].CostEUR = rows[i].EnergyWh / 1000 * price
+		return price
+	}
+	ids := make([]string, len(rows))
+	for i := range rows {
+		ids[i] = rows[i].ID
+	}
+	parts, err := s.usage.EnergyPartsByEvents(ctx, ids)
+	if err != nil {
+		log.Printf("portal: energy parts lookup failed for %d rows: %v", len(ids), err)
+		parts = nil
+	}
+	for i := range rows {
+		rowParts := parts[rows[i].ID]
+		if len(rowParts) == 0 {
+			rows[i].CostEUR = rows[i].EnergyWh / 1000 * priceFor(rows[i].Host)
+			continue
+		}
+		var cost float64
+		for _, p := range rowParts {
+			cost += p.Wh / 1000 * priceFor(p.ServerID)
+		}
+		rows[i].CostEUR = cost
 	}
 }
 
@@ -4656,6 +4703,7 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		CertificateOverride:         server.CertificateOverride,
 		HTTPSSwitchOverride:         server.HTTPSSwitchOverride,
 		AgentStatus:                 s.agentStatus(ctx, server, values, settingsOK),
+		ClockOffsetMS:               s.agentClockOffsetMS(server.ID),
 		TLSProxyState:               s.tlsProxyState(server, values, settingsOK),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
 		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
@@ -4676,6 +4724,20 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		// NetbirdSetupKey / NetbirdSetupCommand are display-once and deliberately
 		// NOT set here — a Get/List DTO must never carry them.
 	}, nil
+}
+
+// agentClockOffsetMS returns serverID's agent clock offset in milliseconds,
+// nil when unknown (no reader, or no sample since the gateway started).
+func (s *Service) agentClockOffsetMS(serverID string) *int64 {
+	if s.agentClockOffsets == nil {
+		return nil
+	}
+	offset, ok := s.agentClockOffsets.ClockOffset(serverID)
+	if !ok {
+		return nil
+	}
+	ms := offset.Milliseconds()
+	return &ms
 }
 
 // agentStatus derives the live 3-state agent_status for a server: "active"

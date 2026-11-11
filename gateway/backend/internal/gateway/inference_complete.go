@@ -824,6 +824,8 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	}
 	if err := s.Usage.Record(event); err != nil {
 		slog.Error("usage record failed", "id", id, "err", err)
+	} else {
+		s.recordClusterHosts(event, target)
 	}
 	// A recorded row means the activity views may be stale; signal subscribers.
 	// Fire-and-forget and unconditional: a spurious signal only triggers a refetch
@@ -903,6 +905,53 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// truth.
 	if p, ok := principalFor(token); ok {
 		s.Limiter.Record(p, int64(resp.Usage.TotalTokens), 0)
+	}
+}
+
+// clusterHostsTimeout bounds recordClusterHosts' store work; it runs on the
+// completed request's goroutine.
+const clusterHostsTimeout = 5 * time.Second
+
+// recordClusterHosts lists, for a request a llama.cpp RPC cluster head served,
+// the head's server and every member server the head held when the request
+// completed (its open session records at ev.CreatedAt), so the energy
+// reconciler prices each host's part and every member host's overlap reads
+// see the request. The list is fixed here, at completion, so whichever of a
+// member host's requests is priced first, all of them see the same set.
+// Sessions and ev.CreatedAt are both the gateway's own clock. A request on
+// any other mapping lists nothing. Best-effort: a failure is logged and the
+// request is then priced on its head's host alone.
+func (s *Server) recordClusterHosts(ev usage.Event, target routing.Target) {
+	if s.clusterHeads == nil || s.Routes == nil || target.RouteID == "" || target.ServerID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), clusterHostsTimeout)
+	defer cancel()
+	head, ok := s.clusterHeads.clusterHead(ctx, target.ServerID, target.RouteID)
+	if !ok {
+		return
+	}
+	// A head serves as instance 0 (target.Instance() is 0 for every head),
+	// the instance its sessions are recorded under.
+	sessions, err := s.Routes.RPCSessionsAt(ctx, head, clusterHeadInstance, ev.CreatedAt)
+	if err != nil {
+		slog.Warn("usage: listing a cluster request's members failed; its energy is priced on the head's host alone", "id", ev.ID, "head_spec_id", head, "err", err)
+		return
+	}
+	hosts := []usage.EventHost{{EventID: ev.ID, ServerID: target.ServerID, Role: usage.EventHostRoleHead, CreatedAt: ev.CreatedAt}}
+	listed := map[string]bool{target.ServerID: true}
+	for _, sess := range sessions {
+		if listed[sess.MemberServerID] {
+			continue
+		}
+		listed[sess.MemberServerID] = true
+		hosts = append(hosts, usage.EventHost{EventID: ev.ID, ServerID: sess.MemberServerID, Role: usage.EventHostRoleMember, CreatedAt: ev.CreatedAt})
+	}
+	if len(hosts) == 1 {
+		return
+	}
+	if err := s.Usage.RecordEventHosts(ctx, hosts); err != nil {
+		slog.Warn("usage: recording a cluster request's hosts failed; its energy is priced on the head's host alone", "id", ev.ID, "head_spec_id", head, "err", err)
 	}
 }
 

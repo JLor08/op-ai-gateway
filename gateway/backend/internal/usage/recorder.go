@@ -121,6 +121,14 @@ type Event struct {
 	CostEUR float64 `json:"cost_eur"`
 }
 
+// EventHostRoleHead and EventHostRoleMember are the roles of an event's hosts
+// and energy parts: the server the request was routed to (Event.Host), and an
+// RPC member that head used while it served the request.
+const (
+	EventHostRoleHead   = "head"
+	EventHostRoleMember = "member"
+)
+
 // EventHost lists one server that took part in serving a usage event. A
 // cluster request names its head ("head") and every RPC member ("member") so
 // each host's energy can be priced on its own and overlap queries on a member
@@ -196,16 +204,24 @@ type Store interface {
 	// EnergyParts lists an event's per-host energy parts, head first, then by
 	// server id.
 	EnergyParts(ctx context.Context, eventID string) ([]EnergyPart, error)
-	// EnergyByServer sums EnergyWh grouped by Host (server id) over the SAME
+	// EnergyPartsByEvents lists the energy parts of each of eventIDs, keyed by
+	// event id, each list head first, then by server id. An event without
+	// parts is absent from the map.
+	EnergyPartsByEvents(ctx context.Context, eventIDs []string) (map[string][]EnergyPart, error)
+	// EnergyByServer sums EnergyWh grouped by host (server id) over the SAME
 	// filtered set Stats(q) would compute (same predicate as matchUsage/
 	// usageWhere) — used by the portal layer to weight the aggregate cost
-	// total per server price (see portal.Service.UsageStats). A host with no
-	// matching rows is simply absent from the returned map (never a
-	// zero-valued entry).
+	// total per server price (see portal.Service.UsageStats). An event with
+	// energy parts counts each part under the part's host; any other event
+	// counts under its own Host. A host with no matching rows is simply absent
+	// from the returned map (never a zero-valued entry).
 	EnergyByServer(ctx context.Context, q Query) (map[string]float64, error)
 	// UsageGroups aggregates the filtered set GROUP BY (dimension, host). groupBy is
 	// one of session|server|user|token|model (validated by the caller). Returns one
-	// bucket per (group value, host).
+	// bucket per (group value, host). An event with energy parts counts in the
+	// bucket of its own Host, with the head part's energy, and adds each other
+	// part's energy to the bucket of that part's host (in the same group), so
+	// the requests are counted once and every part can be priced at its host.
 	UsageGroups(ctx context.Context, q Query, groupBy string) ([]GroupBucket, error)
 }
 
@@ -354,7 +370,7 @@ func (r *Recorder) EventHosts(_ context.Context, eventID string) ([]EventHost, e
 	defer r.mu.RUnlock()
 	out := append([]EventHost{}, r.hosts[eventID]...)
 	sort.SliceStable(out, func(i, j int) bool {
-		if hi, hj := out[i].Role == "head", out[j].Role == "head"; hi != hj {
+		if hi, hj := out[i].Role == EventHostRoleHead, out[j].Role == EventHostRoleHead; hi != hj {
 			return hi
 		}
 		return out[i].ServerID < out[j].ServerID
@@ -398,14 +414,34 @@ func (r *Recorder) SetEnergyParts(_ context.Context, eventID string, parts []Ene
 func (r *Recorder) EnergyParts(_ context.Context, eventID string) ([]EnergyPart, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.sortedPartsLocked(eventID), nil
+}
+
+// EnergyPartsByEvents returns the energy parts of each of eventIDs, keyed by
+// event id; an event without parts is absent.
+func (r *Recorder) EnergyPartsByEvents(_ context.Context, eventIDs []string) (map[string][]EnergyPart, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string][]EnergyPart)
+	for _, id := range eventIDs {
+		if parts := r.sortedPartsLocked(id); len(parts) > 0 {
+			out[id] = parts
+		}
+	}
+	return out, nil
+}
+
+// sortedPartsLocked returns a copy of eventID's parts, head first, then by
+// server id. The caller holds r.mu.
+func (r *Recorder) sortedPartsLocked(eventID string) []EnergyPart {
 	out := append([]EnergyPart{}, r.parts[eventID]...)
 	sort.SliceStable(out, func(i, j int) bool {
-		if hi, hj := out[i].Role == "head", out[j].Role == "head"; hi != hj {
+		if hi, hj := out[i].Role == EventHostRoleHead, out[j].Role == EventHostRoleHead; hi != hj {
 			return hi
 		}
 		return out[i].ServerID < out[j].ServerID
 	})
-	return out, nil
+	return out
 }
 
 func (r *Recorder) ByUser(userID string) []Event {
@@ -525,10 +561,11 @@ func (r *Recorder) Stats(q Query) (Stats, error) {
 	}, nil
 }
 
-// EnergyByServer sums EnergyWh grouped by Host over the events matching q
+// EnergyByServer sums EnergyWh grouped by host over the events matching q
 // (same matchUsage predicate Stats/Query use), for the portal layer to
-// derive a per-server-price-weighted total cost. A host with no matching
-// rows is absent from the returned map.
+// derive a per-server-price-weighted total cost. An event with energy parts
+// counts each part under the part's host, any other event under its Host. A
+// host with no matching rows is absent from the returned map.
 func (r *Recorder) EnergyByServer(_ context.Context, q Query) (map[string]float64, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -537,9 +574,31 @@ func (r *Recorder) EnergyByServer(_ context.Context, q Query) (map[string]float6
 		if !matchUsage(q, e, nil) {
 			continue
 		}
-		out[e.Host] += e.EnergyWh
+		parts := r.parts[e.ID]
+		if len(parts) == 0 {
+			out[e.Host] += e.EnergyWh
+			continue
+		}
+		for _, p := range parts {
+			out[p.ServerID] += p.Wh
+		}
 	}
 	return out, nil
+}
+
+// headEnergyLocked returns the energy of e that counts under e.Host: its
+// part on that host when e has parts, else all of it. The caller holds r.mu.
+func (r *Recorder) headEnergyLocked(e Event) float64 {
+	parts := r.parts[e.ID]
+	if len(parts) == 0 {
+		return e.EnergyWh
+	}
+	for _, p := range parts {
+		if p.ServerID == e.Host {
+			return p.Wh
+		}
+	}
+	return 0
 }
 
 // usageGroupKey returns the group-by value of e for the given dimension, and
@@ -597,12 +656,32 @@ func (r *Recorder) UsageGroups(_ context.Context, q Query, groupBy string) ([]Gr
 		b.OutputTokens += e.OutputTokens
 		b.CachedTokens += e.CachedTokens
 		b.CacheWriteTokens += e.CacheWriteTokens
-		b.EnergyWh += e.EnergyWh
+		b.EnergyWh += r.headEnergyLocked(e)
 		if e.CreatedAt.Before(b.FirstAt) {
 			b.FirstAt = e.CreatedAt
 		}
 		if e.CreatedAt.After(b.LastAt) {
 			b.LastAt = e.CreatedAt
+		}
+	}
+	// The other hosts' parts add energy only, under their own host in the
+	// event's group: the request is already counted above.
+	for _, e := range r.events {
+		if !matchUsage(q, e, nil) {
+			continue
+		}
+		key, _ := usageGroupKey(groupBy, e)
+		for _, p := range r.parts[e.ID] {
+			if p.ServerID == e.Host {
+				continue
+			}
+			id := gk{key, p.ServerID}
+			b := acc[id]
+			if b == nil {
+				b = &GroupBucket{Key: key, Host: p.ServerID}
+				acc[id] = b
+			}
+			b.EnergyWh += p.Wh
 		}
 	}
 	out := make([]GroupBucket, 0, len(acc))

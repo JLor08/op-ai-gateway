@@ -2162,6 +2162,13 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		s.EnergyIdle.Observe(server.ID, serverPowerW(sample, pue), now)
 	}
 	s.ServerPerf.publish(sample)
+	// The agent's clock offset, shown on the server: energy attribution reads
+	// every host's samples by the agent's own time stamps, so a skewed member
+	// clock shifts the window its energy part integrates. A sample without a
+	// time stamp of its own carries the receive time and says nothing.
+	if !req.ReportedAt.IsZero() {
+		s.AgentPresence.ReportClockOffset(serverID, req.ReportedAt.Sub(now))
+	}
 	// A fresh agent report wins over the gateway poll for this server's apps.
 	s.LoadedModels.SetAgentReport(serverID, req.LoadedModels)
 	// Record what the agent says it has INSTALLED (Phase 2 certificate

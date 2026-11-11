@@ -704,6 +704,12 @@ func (u *clusterUsage) closeUnheard(ctx context.Context, member string, sessions
 		if known && !last.Before(s.Since) && last.Before(bootAt) {
 			until = last
 		}
+		// After the gateway's clock stepped backwards its start can lie
+		// before the session's; a session never ends before it began, or no
+		// lookup of the sessions in force at an instant could place it.
+		if until.Before(s.Since) {
+			until = s.Since
+		}
 		if err := u.store.CloseRPCSessions(ctx, s.HeadSpecID, s.Instance, member, until); err != nil {
 			slog.Debug("cluster member usage: closing an unheard member's session failed", "head_spec_id", s.HeadSpecID, "server_id", member, "err", err)
 			ok = false

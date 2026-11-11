@@ -512,6 +512,11 @@ type Server struct {
 	// every run by the orchestration. New builds it whenever a route store is
 	// wired; nil otherwise, which every method treats as nothing to keep.
 	clusterUsage *clusterUsage
+	// clusterHeads tells recordUsage which mappings are llama.cpp RPC cluster
+	// heads, through the instance source's spec cache, so a completed cluster
+	// request lists its member hosts for energy attribution. New sets it
+	// with the resolver's instance source; nil lists nothing.
+	clusterHeads clusterHeadSource
 	// runtimeStarts counts the portal's manual starts whose ensure runs in the
 	// background (runtime_actions.go); cancelling the server's lifetime
 	// (baseCtx) ends each one's ensure. Only tests join them
@@ -1255,6 +1260,7 @@ func New(deps ServerDeps) *Server {
 		clusters := func() *clusterOrchestrator { return s.clusters }
 		resolver.SetDemandSink(demandFanout{scaler: s.instanceScaler, clusters: clusters})
 		resolver.SetClusterGate(&clusterRoutingGate{heads: instances, clusters: clusters, busy: benchmarks})
+		s.clusterHeads = instances
 	}
 	if deps.Routes != nil {
 		s.clusterUsage = newClusterUsage(deps.Routes, s.PushRuntimeConfig, time.Now)

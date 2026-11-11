@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"testing"
 	"time"
@@ -186,3 +187,88 @@ func TestUsagePartsWriteContractSQL(t *testing.T) {
 		})
 	})
 }
+
+// TestUsageCostPricesPartsByPartHost pins that the store's per-host energy
+// sums attribute a cluster request's energy to the host of each part (head and
+// members), while a request without parts stays on its own host, and that
+// counts are never multiplied by the parts: EnergyByServer, UsageGroups and
+// the cost of UsageAggregateSince.
+func TestUsageCostPricesPartsByPartHost(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		for _, srv := range []routing.AIServer{
+			{ID: "srv_head", Name: "head", Domain: "head.example.test", PricePerKwh: 0.25},
+			{ID: "srv_mem", Name: "mem", Domain: "mem.example.test", PricePerKwh: 0.5},
+		} {
+			srv.Provider, srv.Endpoint = routing.ProviderOllama, "http://"+srv.Domain+":11434"
+			srv.Status, srv.HealthStatus, srv.CreatedAt, srv.UpdatedAt = routing.ServerStatusActive, routing.HealthHealthy, now, now
+			if err := s.CreateAIServer(ctx, srv); err != nil {
+				t.Fatalf("create %s: %v", srv.ID, err)
+			}
+		}
+		for _, e := range []usage.Event{
+			{ID: "ev_cluster", UserID: "u1", Model: "big", Host: "srv_head", EnergyWh: 3000, EnergySource: "measured", Status: "ok", HTTPStatus: 200, CreatedAt: now},
+			{ID: "ev_plain", UserID: "u1", Model: "big", Host: "srv_head", EnergyWh: 1000, EnergySource: "measured", Status: "ok", HTTPStatus: 200, CreatedAt: now},
+		} {
+			s.Record(e)
+			if err := s.LastUsageError(); err != nil {
+				t.Fatalf("record %s: %v", e.ID, err)
+			}
+		}
+		if err := s.SetEnergyParts(ctx, "ev_cluster", []usage.EnergyPart{
+			{ServerID: "srv_head", Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
+			{ServerID: "srv_mem", Role: usage.EventHostRoleMember, Wh: 2000, Source: "measured"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		q := usage.Query{UserID: "u1"}
+
+		byServer, err := s.EnergyByServer(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(byServer) != 2 || !closeTo(byServer["srv_head"], 2000) || !closeTo(byServer["srv_mem"], 2000) {
+			t.Fatalf("energy by server = %v, want head 2000 and member 2000", byServer)
+		}
+
+		buckets, err := s.UsageGroups(ctx, q, "model")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]usage.GroupBucket{}
+		for _, b := range buckets {
+			if b.Key != "big" {
+				t.Fatalf("bucket %+v under an unexpected key", b)
+			}
+			got[b.Host] = b
+		}
+		if len(got) != 2 || got["srv_head"].Count != 2 || !closeTo(got["srv_head"].EnergyWh, 2000) ||
+			got["srv_mem"].Count != 0 || !closeTo(got["srv_mem"].EnergyWh, 2000) {
+			t.Fatalf("groups = %+v, want head 2 requests/2000 Wh and member 0 requests/2000 Wh", got)
+		}
+
+		requests, _, cost, err := s.UsageAggregateSince(ctx, routing.PrincipalTypeUser, "u1", now.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// head 2 kWh × 0.25 + member 2 kWh × 0.5.
+		if requests != 2 || !closeTo(cost, 1.5) {
+			t.Fatalf("aggregate = %d requests, cost %v; want 2 and 1.5", requests, cost)
+		}
+
+		parts, err := s.EnergyPartsByEvents(ctx, []string{"ev_cluster", "ev_plain", "ev_missing"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(parts) != 1 || len(parts["ev_cluster"]) != 2 || parts["ev_cluster"][0].ServerID != "srv_head" || parts["ev_cluster"][1].ServerID != "srv_mem" {
+			t.Fatalf("parts by events = %+v, want ev_cluster's two parts, head first", parts)
+		}
+		if none, err := s.EnergyPartsByEvents(ctx, nil); err != nil || len(none) != 0 {
+			t.Fatalf("parts of no events = %v err=%v", none, err)
+		}
+	})
+}
+
+// closeTo tolerates postgres' float4 energy columns.
+func closeTo(a, b float64) bool { return a-b < 1e-3 && b-a < 1e-3 }

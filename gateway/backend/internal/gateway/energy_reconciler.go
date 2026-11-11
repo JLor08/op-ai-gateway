@@ -44,7 +44,7 @@ const (
 // implemented as a *Server method rather than a free function taking a narrow
 // dependency interface because reconcileEnergyEvent calls this package's own
 // unexported energy-engine helpers (effectivePue, serverPowerW, modeledEnergy,
-// ComputeEnergy, maxSampleGap) directly -- those are only reachable from
+// ComputeEnergy, ComputeEnergyPart, maxSampleGap) directly -- those are only reachable from
 // within package gateway. The caller is expected to run this in its own
 // goroutine (`go srv.StartEnergyReconciler(ctx, interval)`) and cancel ctx on
 // shutdown; it blocks until then.
@@ -120,19 +120,10 @@ func (s *Server) reconcileEnergyOnce(ctx context.Context, now time.Time) {
 }
 
 // reconcileEnergyEvent attributes + persists energy for exactly one usage
-// event. It honors the three engine contracts the pure ComputeEnergy engine
-// does NOT resolve on its own:
-//
-//  1. UsageEventsForServerWindow returns the target event itself alongside its
-//     siblings -- it is filtered out by id before being passed to
-//     ComputeEnergy, which always counts the target as +1 on its own.
-//  2. The system-wide PUE default is folded into cfg.Pue via effectivePue
-//     BEFORE calling ComputeEnergy (which internally calls
-//     effectivePue(cfg, 0) and so has no visibility into a system default).
-//  3. The effective idle wattage (idleW) is resolved here -- the server's own
-//     IdleWatts override wins, else the emergent per-server rolling-minimum
-//     from s.EnergyIdle -- and passed as ComputeEnergy's explicit idleW
-//     parameter (the engine ignores cfg.IdleWatts).
+// event: the event's own host as before (ComputeEnergy over the inputs
+// hostEnergyInput reads, honoring the engine's contracts), plus, for a
+// llama.cpp RPC cluster request, one part per member host
+// (clusterEnergyParts).
 //
 // Any lookup/store error that is NOT "the referenced row no longer exists" is
 // treated as transient: the event is left unpriced (skipped, no stamp) and is
@@ -154,54 +145,40 @@ func (s *Server) reconcileEnergyEvent(ctx context.Context, ev usage.Event, now t
 		return
 	}
 
-	// Contract 2: fold the system PUE default into cfg.Pue up front.
-	cfg := ServerEnergyConfig{
-		EstimatedWatts: server.EstimatedWatts,
-		Pue:            effectivePue(ServerEnergyConfig{Pue: server.Pue}, sysDefaultPue),
+	head, err := s.hostEnergyInput(ctx, ev, server, sysDefaultPue)
+	if err != nil {
+		slog.Debug("energy reconcile: host input lookup failed", "event_id", ev.ID, "server_id", ev.Host, "err", err)
+		return
 	}
+	res := ComputeEnergy(ev, head.samples, head.siblings, head.cfg, head.idleW, mappingCoeff, sysDefaultWhPerToken)
 
-	// Contract 3: resolve the effective idle wattage.
-	idleW := server.IdleWatts
-	if idleW <= 0 {
-		idleW = s.EnergyIdle.Idle(server.ID)
+	// A llama.cpp RPC cluster request lists the members its head held when
+	// it completed; each of their hosts adds its own part.
+	hosts, err := s.Usage.EventHosts(ctx, ev.ID)
+	if err != nil {
+		slog.Debug("energy reconcile: event hosts lookup failed", "event_id", ev.ID, "err", err)
+		return
 	}
-
-	start := ev.CreatedAt.Add(-time.Duration(ev.LatencyMS) * time.Millisecond)
-	end := ev.CreatedAt
-
-	// Telemetry samples are only useful when Tier 1 could possibly apply
-	// (end > start); ComputeEnergy itself gates Tier 1 on the same condition,
-	// so skipping the store round-trip on a degenerate (zero/negative-latency)
-	// window changes nothing about the result.
-	var samples []routing.TelemetrySample
-	if end.After(start) {
-		samples, err = s.Routes.TelemetrySamples(ctx, ev.Host, start.Add(-maxSampleGap), end.Add(maxSampleGap), 0)
-		if err != nil {
-			slog.Debug("energy reconcile: telemetry samples lookup failed", "event_id", ev.ID, "server_id", ev.Host, "err", err)
+	parts, res, ok := s.clusterEnergyParts(ctx, ev, hosts, res, sysDefaultPue)
+	if !ok {
+		return
+	}
+	if len(parts) > 0 {
+		// The parts are written before the stamp: a stamped event is never
+		// priced again, so a stamp without its parts would stay without them.
+		if err := s.Usage.SetEnergyParts(ctx, ev.ID, parts); err != nil {
+			slog.Debug("energy reconcile: energy parts write failed", "event_id", ev.ID, "err", err)
 			return
 		}
 	}
-
-	rawSiblings, err := s.Usage.UsageEventsForServerWindow(ctx, ev.Host, start, end)
-	if err != nil {
-		slog.Debug("energy reconcile: sibling events lookup failed", "event_id", ev.ID, "server_id", ev.Host, "err", err)
-		return
-	}
-	// Contract 1: UsageEventsForServerWindow includes the target event itself.
-	siblings := make([]usage.Event, 0, len(rawSiblings))
-	for _, sib := range rawSiblings {
-		if sib.ID == ev.ID {
-			continue
-		}
-		siblings = append(siblings, sib)
-	}
-
-	res := ComputeEnergy(ev, samples, siblings, cfg, idleW, mappingCoeff, sysDefaultWhPerToken)
 	s.finalizeEnergyEvent(ctx, ev, res)
 
 	// Calibration: only on a genuine per-request power MEASUREMENT, only on a
 	// TOKEN-METERED row, only with a resolvable mapping to calibrate, and only
-	// with real output tokens to divide by.
+	// with real output tokens to divide by. For a cluster request "measured"
+	// means every part was measured (the weakest part sets the source), so the
+	// coefficient learns the whole cluster's energy per token -- the figure
+	// Tier 3 then prices a whole request with -- and never a share of it.
 	//
 	// The billing-unit conjunct is explicit rather than implied. The divide at
 	// the next line is guarded today only by OutputTokens > 0, which holds only
@@ -219,6 +196,154 @@ func (s *Server) reconcileEnergyEvent(ctx context.Context, ev usage.Event, now t
 			slog.Debug("energy reconcile: calibration write failed", "mapping_id", mappingID, "err", err)
 		}
 	}
+}
+
+// hostEnergyInput is what pricing one host's share of an event needs: the
+// host's energy configuration (system PUE default folded in), its effective
+// idle draw, its telemetry around the event's window and the other events it
+// served in that window.
+type hostEnergyInput struct {
+	cfg      ServerEnergyConfig
+	idleW    float64
+	samples  []routing.TelemetrySample
+	siblings []usage.Event
+}
+
+// hostEnergyInput reads server's inputs for pricing its share of ev. It
+// honors the three engine contracts the pure engine does NOT resolve on its
+// own:
+//
+//  1. UsageEventsForServerWindow returns the target event itself alongside its
+//     siblings -- it is filtered out by id here, since the engine always
+//     counts the target as +1 on its own. The siblings include every cluster
+//     event that lists server among its hosts, so a member host's power is
+//     split over its own requests and the cluster requests that used it.
+//  2. The system-wide PUE default is folded into cfg.Pue via effectivePue
+//     (the engine calls effectivePue(cfg, 0) and so has no visibility into a
+//     system default).
+//  3. The effective idle wattage is resolved here -- the server's own
+//     IdleWatts override wins, else the emergent per-server rolling-minimum
+//     from s.EnergyIdle.
+func (s *Server) hostEnergyInput(ctx context.Context, ev usage.Event, server routing.AIServer, sysDefaultPue float64) (hostEnergyInput, error) {
+	in := hostEnergyInput{
+		cfg: ServerEnergyConfig{
+			EstimatedWatts: server.EstimatedWatts,
+			Pue:            effectivePue(ServerEnergyConfig{Pue: server.Pue}, sysDefaultPue),
+		},
+		idleW: server.IdleWatts,
+	}
+	if in.idleW <= 0 {
+		in.idleW = s.EnergyIdle.Idle(server.ID)
+	}
+
+	start := ev.CreatedAt.Add(-time.Duration(ev.LatencyMS) * time.Millisecond)
+	end := ev.CreatedAt
+
+	// Telemetry samples are only useful when Tier 1 could possibly apply
+	// (end > start); the engine itself gates Tier 1 on the same condition,
+	// so skipping the store round-trip on a degenerate (zero/negative-latency)
+	// window changes nothing about the result.
+	if end.After(start) {
+		samples, err := s.Routes.TelemetrySamples(ctx, server.ID, start.Add(-maxSampleGap), end.Add(maxSampleGap), 0)
+		if err != nil {
+			return hostEnergyInput{}, err
+		}
+		in.samples = samples
+	}
+
+	rawSiblings, err := s.Usage.UsageEventsForServerWindow(ctx, server.ID, start, end)
+	if err != nil {
+		return hostEnergyInput{}, err
+	}
+	in.siblings = make([]usage.Event, 0, len(rawSiblings))
+	for _, sib := range rawSiblings {
+		if sib.ID == ev.ID {
+			continue
+		}
+		in.siblings = append(in.siblings, sib)
+	}
+	return in, nil
+}
+
+// clusterEnergyParts splits a cluster request's energy into per-host parts.
+// head is the head host's result, computed as for any request. An event
+// listing no host besides its own gets no parts and keeps head. ok is false
+// when a lookup failed: the event is left unpriced and retried.
+//
+// Otherwise each member host's part is its own Tier 1 or Tier 2 share of the
+// request (ComputeEnergyPart); a member with neither is a 0 Wh part marked
+// energySourceMemberUnpriced. energy_wh is the sum of the parts and
+// energy_source the weakest of them, member_unpriced weakest of all. A head
+// priced by Tier 3 (or unpriceable) gets no parts: a per-token figure is
+// calibrated from whole-cluster energy and already prices every host, so
+// adding member parts to it would count them twice.
+func (s *Server) clusterEnergyParts(ctx context.Context, ev usage.Event, hosts []usage.EventHost, head EnergyResult, sysDefaultPue float64) (parts []usage.EnergyPart, total EnergyResult, ok bool) {
+	members := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if h.ServerID != ev.Host {
+			members = append(members, h.ServerID)
+		}
+	}
+	if len(members) == 0 || (head.Source != "measured" && head.Source != "estimated") {
+		return nil, head, true
+	}
+	parts = append(parts, usage.EnergyPart{
+		EventID: ev.ID, ServerID: ev.Host, Role: usage.EventHostRoleHead,
+		Wh: head.WhTotal, MarginalWh: head.WhMarginal, Source: head.Source,
+	})
+	total = head
+	for _, member := range members {
+		part, err := s.memberEnergyPart(ctx, ev, member, sysDefaultPue)
+		if err != nil {
+			slog.Debug("energy reconcile: member part lookup failed", "event_id", ev.ID, "server_id", member, "err", err)
+			return nil, EnergyResult{}, false
+		}
+		parts = append(parts, usage.EnergyPart{
+			EventID: ev.ID, ServerID: member, Role: usage.EventHostRoleMember,
+			Wh: part.WhTotal, MarginalWh: part.WhMarginal, Source: part.Source,
+		})
+		total.WhTotal += part.WhTotal
+		total.WhMarginal += part.WhMarginal
+		total.Source = weakerEnergySource(total.Source, part.Source)
+	}
+	return parts, total, true
+}
+
+// memberEnergyPart prices member's share of ev. A member server that no
+// longer exists can never report again, so it is unpriced rather than
+// retried.
+func (s *Server) memberEnergyPart(ctx context.Context, ev usage.Event, member string, sysDefaultPue float64) (EnergyResult, error) {
+	server, err := s.Routes.AIServerByID(ctx, member)
+	if errors.Is(err, store.ErrNotFound) {
+		return EnergyResult{Source: energySourceMemberUnpriced}, nil
+	}
+	if err != nil {
+		return EnergyResult{}, err
+	}
+	in, err := s.hostEnergyInput(ctx, ev, server, sysDefaultPue)
+	if err != nil {
+		return EnergyResult{}, err
+	}
+	if res, ok := ComputeEnergyPart(ev, in.samples, in.siblings, in.cfg, in.idleW); ok {
+		return res, nil
+	}
+	return EnergyResult{Source: energySourceMemberUnpriced}, nil
+}
+
+// energySourceRank orders the sources a part can carry from strongest to
+// weakest.
+var energySourceRank = map[string]int{
+	"measured":                 0,
+	"estimated":                1,
+	energySourceMemberUnpriced: 2,
+}
+
+// weakerEnergySource returns the weaker of two part sources.
+func weakerEnergySource(a, b string) string {
+	if energySourceRank[b] > energySourceRank[a] {
+		return b
+	}
+	return a
 }
 
 // energyMappingCoeff resolves a usage event's own per-token energy

@@ -1243,3 +1243,38 @@ func TestRecorderEventHostsAndEnergyParts(t *testing.T) {
 		t.Fatalf("after replace = %+v, want 1", gotParts)
 	}
 }
+
+// TestRecorderPricesPartsByPartHost mirrors the SQL stores: a cluster
+// request's energy counts under the host of each part, a request without parts
+// under its own host, and the request itself is counted once.
+func TestRecorderPricesPartsByPartHost(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_cluster", UserID: "u1", Model: "big", Host: "srv_head", EnergyWh: 3000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_plain", UserID: "u1", Model: "big", Host: "srv_head", EnergyWh: 1000, CreatedAt: at})
+	if err := rec.SetEnergyParts(ctx, "ev_cluster", []EnergyPart{
+		{ServerID: "srv_mem", Role: EventHostRoleMember, Wh: 2000},
+		{ServerID: "srv_head", Role: EventHostRoleHead, Wh: 1000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := Query{UserID: "u1"}
+
+	byServer, _ := rec.EnergyByServer(ctx, q)
+	if len(byServer) != 2 || byServer["srv_head"] != 2000 || byServer["srv_mem"] != 2000 {
+		t.Fatalf("energy by server = %v", byServer)
+	}
+	buckets, _ := rec.UsageGroups(ctx, q, "model")
+	got := map[string]GroupBucket{}
+	for _, b := range buckets {
+		got[b.Host] = b
+	}
+	if len(got) != 2 || got["srv_head"].Count != 2 || got["srv_head"].EnergyWh != 2000 || got["srv_mem"].Count != 0 || got["srv_mem"].EnergyWh != 2000 || got["srv_mem"].Key != "big" {
+		t.Fatalf("groups = %+v", got)
+	}
+	parts, _ := rec.EnergyPartsByEvents(ctx, []string{"ev_cluster", "ev_plain"})
+	if len(parts) != 1 || len(parts["ev_cluster"]) != 2 || parts["ev_cluster"][0].ServerID != "srv_head" {
+		t.Fatalf("parts by events = %+v, want ev_cluster's parts, head first", parts)
+	}
+}

@@ -2304,3 +2304,7 @@ func (f *fakeUsage) SetEnergyParts(ctx context.Context, eventID string, parts []
 func (f *fakeUsage) EnergyParts(ctx context.Context, eventID string) ([]usage.EnergyPart, error) {
 	return f.recorder().EnergyParts(ctx, eventID)
 }
+
+func (f *fakeUsage) EnergyPartsByEvents(ctx context.Context, eventIDs []string) (map[string][]usage.EnergyPart, error) {
+	return f.recorder().EnergyPartsByEvents(ctx, eventIDs)
+}

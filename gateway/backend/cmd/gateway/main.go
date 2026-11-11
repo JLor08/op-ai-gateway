@@ -1003,7 +1003,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SystemSettings: b.SystemSettings, UIPrefs: b.UIPrefs, Captures: b.Captures, Chats: b.Chats,
 		Cipher: b.Cipher, CertCipher: b.CertCipher,
 		CertEdgeOutputDir: cfg.CertEdgeOutputDir, CertEdgeProbeTarget: cfg.CertEdgeProbeTarget,
-		Reachability: appHealth, LoadedModels: loadedModels, AgentPresence: agentPresence, AgentFeatures: agentFeatures,
+		Reachability: appHealth, LoadedModels: loadedModels, AgentPresence: agentPresence, AgentClockOffsets: agentPresence, AgentFeatures: agentFeatures,
 		AgentCertReports: agentCertReports, AgentTransport: agentTransport,
 		ProxyStatus: proxyStatusReader{reg: agentProxyStatus},
 		Groups:      b.Groups, GroupCache: groups, Projects: b.Projects,

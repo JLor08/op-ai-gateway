@@ -583,7 +583,7 @@ state forward.
 ### 8.4.1 The usage event
 
 Every served request (success or failure) produces exactly one `usage.Event`
-(`gateway/backend/internal/usage/query.go`), recorded once at the single accounting
+(`gateway/backend/internal/usage/recorder.go`), recorded once at the single accounting
 choke point, `Server.recordUsage` (`inference_complete.go`). Its fields cover full attribution:
 user/token/service/project id+name, session id/source/agent id, the vendor
 account id that served it (`account_id`, `''` off the vendor path; the account's
@@ -2925,7 +2925,7 @@ flowchart TD
     Start["Un-priced usage.Event\n(energy_source == '')"] --> T1{"Tier 1: measured\nContinuous power-telemetry\ncoverage of [start,end]?\n(max gap 2× the 1s cadence)"}
     T1 -->|yes| M["Integrate ∫ power(t)/concurrency(t) dt\nover the request's own window,\nshared with concurrent sibling requests"]
     T1 -->|no| T2{"Tier 2: estimated\nServer.EstimatedWatts set?"}
-    T2 -->|yes| E["Integrate a flat wattage,\nsame concurrency-sharing model"]
+    T2 -->|yes| E["Integrate a flat wattage × PUE,\nsame concurrency-sharing model"]
     T2 -->|no| U{"Is the row token-metered?\n(billing_unit == '')"}
     U -->|yes| T3["Tier 3: modeled\nWh = coeff × OutputTokens\n(mapping coefficient, else system default)"]
     U -->|no| X["unpriceable\nNOT a tier: no tier could apply.\n0 Wh, stamped, terminal"]
@@ -2948,9 +2948,61 @@ env `OP_AI_GATEWAY_ENERGY_IDLE_WINDOW_SECONDS`), fed by `ingestTelemetrySample`
 right after every persisted telemetry sample. A measured Tier-1 event also
 EWMA-calibrates its mapping's `energy_wh_per_token` coefficient (alpha 0.2), so
 Tier-3 estimates for that mapping improve over time from real Tier-1 observations.
-A system-wide Power Usage Effectiveness (PUE) multiplier (`effectivePue`) is applied
-on top of every tier's raw server-watts figure: the server's own configured value,
-else a system default, else 1.0.
+A Power Usage Effectiveness (PUE) multiplier (`effectivePue`) is applied
+on top of the server-watts figure of Tier 1 (each measured reading) and Tier 2
+(the configured `EstimatedWatts`) alike: the server's own configured value,
+else the system default, else 1.0. The facility's overhead does not depend on
+whether a server's own draw was measured or configured, so a server that drops
+from Tier 1 to Tier 2 keeps its PUE, and the idle baseline is subtracted from
+the PUE-scaled draw in both tiers. Tier 3 has no PUE: its coefficient is
+calibrated from Tier-1 energy, which already carries it.
+
+**Per-host energy parts (llama.cpp RPC clusters).** A cluster request is
+served by its head and the RPC members the head drives, each on its own host.
+No per-process power exists, so a member's share is a share of its host's
+power, split over every request that host served in the window.
+
+- **Member set, fixed at completion.** `recordUsage` (`recordClusterHosts`)
+  asks whether the target mapping is a cluster head (through the instance
+  source's spec cache) and, if so, writes `usage_event_hosts` rows for the
+  head's server (`role = head`) and every member server whose session record
+  (`rpc_sessions`, head instance 0) is in force at the event's `created_at`
+  (`role = member`). Sessions and `created_at` are both the gateway's own
+  clock. `UsageEventsForServerWindow` returns an event both for its own host
+  and for every server it lists, so a member host's own requests and the
+  cluster requests that used it share that host's power, and the result does
+  not depend on which of them is priced first.
+- **Parts.** The reconciler prices the head's share exactly as any request
+  (`ComputeEnergy` over the head's samples, siblings, configuration, PUE and
+  idle baseline) and each member's share with `ComputeEnergyPart` over that
+  member host's own inputs. A part uses Tier 1 or Tier 2 only: Tier 3 prices a
+  whole request from its output tokens and cannot express one host's share. A
+  member with neither telemetry coverage nor `EstimatedWatts` (or whose server
+  was deleted) is a 0 Wh part with source `member_unpriced`. A member's
+  telemetry gap over 2 s, samples not yet ingested, or a skewed agent clock
+  that moves its samples out of the window drop that part to Tier 2; there is
+  no skew correction, so the server DTO shows each agent's clock offset
+  (`clock_offset_ms`: the agent's time stamp on its latest sample minus the
+  gateway's receive time, signed, positive when the agent runs ahead).
+- **Combining.** The parts are stored in `usage_event_energy_parts` before the
+  event is stamped (a stamped event is never priced again). `energy_wh` and
+  `energy_marginal_wh` are the parts' sums and `energy_source` the weakest
+  part (`measured` > `estimated` > `member_unpriced`); `member_unpriced` says
+  the figure lacks a host's share and is a lower bound. When the head itself
+  falls to Tier 3 (or `unpriceable`), the request is priced by that result
+  alone and gets no parts: the per-token coefficient is calibrated from
+  whole-cluster energy, so adding member parts would count them twice. A
+  single-host request never gets parts.
+- **Calibration** fires only when the combined source is `measured`, i.e.
+  every part was measured, and then learns the whole cluster's marginal energy
+  per output token.
+- **Formation energy.** A request that waited while its cluster formed has a
+  window that covers the formation, so each host's formation draw falls into
+  the parts of the requests that waited, as a single-host cold start does.
+- **Visibility.** Parts feed only aggregates and costs: the request rows and
+  their owner stay as they are (`host` is the head's server), and a member
+  server's share appears only as Wh inside sums, never as another principal's
+  request detail.
 
 **Tier 3 is a TOKEN-ONLY surface, and a non-token row is stamped
 `unpriceable`.** `Wh = coeff × OutputTokens` is denominated in watt-hours per
@@ -3012,7 +3064,18 @@ Cost is a **transient, read-time** figure — never a DB column, never touched b
 store scanner. The portal layer (`portal/service.go`) resolves each server's price
 per kWh (`AIServer.PricePerKwh` when set, else the system-wide
 `energy_default_price_per_kwh` setting) and derives `CostEUR = EnergyWh / 1000 ×
-price` on `UsageStats`/`UsageGroups`/per-row reads. Each AI server also carries a
+price` on `UsageStats`/`UsageGroups`/per-row reads.
+
+**A request with energy parts is priced per part** (§8.4.4): its cost is
+Σ part Wh / 1000 × that part host's price, so each member server's share is
+charged at that member's own `price_per_kwh`. Every per-host sum honours
+this: `EnergyByServer` and `UsageAggregateSince` left-join
+`usage_event_energy_parts` and group by the part's host (a request without
+parts by its own host), `UsageGroups` counts the request once in its own
+host's bucket with the head part's energy and adds every other part's energy
+to that part host's bucket in the same group, and the per-row cost reads the
+page's parts in one call (`EnergyPartsByEvents`). The in-memory
+`usage.Recorder` mirrors the SQL stores. Each AI server also carries a
 display-only `PriceUnit` (migration 37) so the operator's configured currency/unit
 label round-trips even though the underlying figure is always computed in the same
 base unit.
