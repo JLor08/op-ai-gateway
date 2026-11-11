@@ -455,6 +455,32 @@ var usageSortColumns = map[string]string{
 // list); the Owner filter then LIKE-matches it in addition to e.user_id.
 // Numeric filters iterate NumericColumns in a sorted key order so the
 // positional args are deterministic.
+// usageServerConds returns usageWhere's server predicates (Server, ServerExact)
+// on e, in usageWhere's order, so MemberPartEnergy can leave out exactly the
+// requests a server filter selects.
+func usageServerConds(dl dialect, q usage.Query) ([]string, []any) {
+	il := dl.ilike()
+	var conds []string
+	var args []any
+	if q.Server != "" {
+		like := "%" + q.Server + "%"
+		conds = append(conds, "(e.server_name "+il+" ? or e.host "+il+" ?)")
+		args = append(args, like, like)
+	}
+	// Exact (case-insensitive equality via lower()=lower(), NOT ilike — a value
+	// with a `_`/`%` must match literally, so LIKE-wildcard semantics are wrong)
+	// filters used to expand a group into its member rows. Mirrors matchUsage's
+	// EqualFold and is standard on both sqlite and postgres.
+	// Fire on the presence flag OR a non-empty value: the flag path lets an exact
+	// filter match the EMPTY value (empty-key group expansion) while existing
+	// callers that set only the value still fire (backward-compatible).
+	if q.HasServerExact || q.ServerExact != "" {
+		conds = append(conds, "lower(e.server_name) = lower(?)")
+		args = append(args, q.ServerExact)
+	}
+	return conds, args
+}
+
 func usageWhere(dl dialect, q usage.Query, ownerNameExpr string) (string, []any) {
 	il := dl.ilike()
 	conds := make([]string, 0)
@@ -475,22 +501,9 @@ func usageWhere(dl dialect, q usage.Query, ownerNameExpr string) (string, []any)
 		conds = append(conds, "e.model "+il+" ?")
 		args = append(args, "%"+q.Model+"%")
 	}
-	if q.Server != "" {
-		like := "%" + q.Server + "%"
-		conds = append(conds, "(e.server_name "+il+" ? or e.host "+il+" ?)")
-		args = append(args, like, like)
-	}
-	// Exact (case-insensitive equality via lower()=lower(), NOT ilike — a value
-	// with a `_`/`%` must match literally, so LIKE-wildcard semantics are wrong)
-	// filters used to expand a group into its member rows. Mirrors matchUsage's
-	// EqualFold and is standard on both sqlite and postgres.
-	// Fire on the presence flag OR a non-empty value: the flag path lets an exact
-	// filter match the EMPTY value (empty-key group expansion) while existing
-	// callers that set only the value still fire (backward-compatible).
-	if q.HasServerExact || q.ServerExact != "" {
-		conds = append(conds, "lower(e.server_name) = lower(?)")
-		args = append(args, q.ServerExact)
-	}
+	serverConds, serverArgs := usageServerConds(dl, q)
+	conds = append(conds, serverConds...)
+	args = append(args, serverArgs...)
 	if q.HasSessionIDExact || q.SessionIDExact != "" {
 		conds = append(conds, "lower(e.session_id) = lower(?)")
 		args = append(args, q.SessionIDExact)
@@ -1121,10 +1134,11 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	return append(out, members...), nil
 }
 
-// MemberPartEnergy sums, over the events matching q, the energy parts drawn
-// on one of hosts for events whose own host is none of them, as MemberParts
-// buckets per (groupBy value, part host); groupBy "" leaves Key empty. No
-// hosts reads nothing.
+// MemberPartEnergy sums the energy parts drawn on one of hosts for the events
+// that match q apart from its server filter and that the server filter does
+// not select (by the same predicates usageWhere applies, on the request's own
+// server_name snapshot and host), as MemberParts buckets per (groupBy value,
+// part host); groupBy "" leaves Key empty. No hosts reads nothing.
 func (s *SQLiteStore) MemberPartEnergy(ctx context.Context, q usage.Query, hosts []string, groupBy string) ([]usage.GroupBucket, error) {
 	col := ""
 	if groupBy != "" {
@@ -1136,34 +1150,43 @@ func (s *SQLiteStore) MemberPartEnergy(ctx context.Context, q usage.Query, hosts
 	if len(hosts) == 0 {
 		return []usage.GroupBucket{}, nil
 	}
-	where, args := usageWhere(s.dl, q, "")
+	serverConds, serverArgs := usageServerConds(s.dl, q)
+	unfiltered := q
+	unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
+	where, args := usageWhere(s.dl, unfiltered, "")
+	if len(serverConds) > 0 {
+		cond := "not (" + strings.Join(serverConds, " and ") + ")"
+		if where == "" {
+			where = " where " + cond
+		} else {
+			where += " and " + cond
+		}
+		args = append(args, serverArgs...)
+	}
 	return s.memberPartBuckets(ctx, col, where, args, hosts)
 }
 
 // memberPartBuckets sums, per (event column col, part host), the energy of
 // every part on a host other than its event's own, over the events where
 // selects (usageWhere's clause and args). col "" groups by the part host only
-// and leaves Key empty. Non-empty hosts keeps only parts on one of hosts of
-// events whose own host is none of them. Every bucket is a MemberParts bucket.
+// and leaves Key empty. Non-empty hosts keeps only parts on one of hosts.
+// Every bucket is a MemberParts bucket.
 func (s *SQLiteStore) memberPartBuckets(ctx context.Context, col, where string, args []any, hosts []string) ([]usage.GroupBucket, error) {
 	keyExpr, groupExpr := "''", "p.server_id"
 	if col != "" {
 		keyExpr, groupExpr = "e."+col, "e."+col+", p.server_id"
 	}
 	if len(hosts) > 0 {
-		in := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
-		cond := "p.server_id in (" + in + ") and e.host not in (" + in + ")"
+		cond := "p.server_id in (" + strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",") + ")"
 		if where == "" {
 			where = " where " + cond
 		} else {
 			where += " and " + cond
 		}
-		extended := make([]any, 0, len(args)+2*len(hosts))
+		extended := make([]any, 0, len(args)+len(hosts))
 		extended = append(extended, args...)
-		for range 2 {
-			for _, h := range hosts {
-				extended = append(extended, h)
-			}
+		for _, h := range hosts {
+			extended = append(extended, h)
 		}
 		args = extended
 	}

@@ -498,3 +498,46 @@ func TestReconcileMemberOfTwoClustersSplitsThreeWays(t *testing.T) {
 	requireCloseWh(t, "local request", f.event("ev_local").EnergyWh, third)
 	requireCloseWh(t, "cluster a", f.event("ev_a").EnergyWh, 1.0+third)
 }
+
+// TestCalibrationHeadCheckUsesTheSpecCache pins that the reconciler's "is
+// this mapping a cluster head" check on a measured request without parts goes
+// through the instance source's spec cache, so a run of such requests on one
+// mapping reads its spec once, not once per request; and that a failed read
+// still skips the calibration.
+func TestCalibrationHeadCheckUsesTheSpecCache(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	setup := func(reader *countingSpecReader) *energyFixture {
+		f := newEnergyFixture(t, 0, 0)
+		f.srv.clusterHeads = newInstanceSource(reader, newAgentFeaturesRegistry(), newRuntimeStatusRegistry())
+		f.createServer("srv1", routing.AIServer{})
+		f.constPower("srv1", clusterEnergyBase, 36, 100)
+		f.createMapping("map1", "app1", "srv1", 8080, routing.ModelMapping{GatewayModelName: "gw", AppModelName: "upstream"})
+		for _, id := range []string{"ev1", "ev2", "ev3"} {
+			if err := f.usage.Record(usage.Event{ID: id, Host: "srv1", RouteID: "map1", CreatedAt: end, LatencyMS: 36000, OutputTokens: 1000}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, id := range []string{"ev1", "ev2", "ev3"} {
+			f.reconcile(id)
+		}
+		return f
+	}
+
+	t.Run("no head: one read, calibrated", func(t *testing.T) {
+		reader := &countingSpecReader{specs: map[string]routing.RuntimeSpec{"map1": {ID: "rspec1", MappingID: "map1"}}}
+		f := setup(reader)
+		if len(reader.reads) != 1 {
+			t.Fatalf("spec reads = %v, want one for three requests", reader.reads)
+		}
+		if m := f.mapping("map1"); m.MetricsSource != "energy" {
+			t.Fatalf("mapping = %+v, want calibrated", m)
+		}
+	})
+
+	t.Run("failed read: not calibrated", func(t *testing.T) {
+		f := setup(&countingSpecReader{err: errors.New("store down")})
+		if m := f.mapping("map1"); m.EnergyWhPerToken != 0 || m.MetricsSource == "energy" {
+			t.Fatalf("mapping = %+v, want no calibration after a failed spec read", m)
+		}
+	})
+}

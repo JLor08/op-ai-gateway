@@ -19,6 +19,12 @@ func (f fakeClusterHeads) knownClusterHead(ctx context.Context, serverID, mappin
 	return f.clusterHead(ctx, serverID, mappingID)
 }
 
+// specIsClusterHead answers the reconciler's check from the same table.
+func (f fakeClusterHeads) specIsClusterHead(_ context.Context, mappingID string) (head, known bool) {
+	_, head = f[mappingID]
+	return head, true
+}
+
 // TestRecordUsageListsClusterMembers pins that a request served by a cluster
 // head lists, when it completes, the head and every member the head held at
 // that moment (from the session records), so each host's energy part can be

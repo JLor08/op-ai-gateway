@@ -177,3 +177,71 @@ func TestMemberServerFilterShowsAggregatedShare(t *testing.T) {
 		t.Fatalf("stats filtered by Head = %+v, want R in full: 3000 Wh, 0.30 + 0.20", stats.Totals)
 	}
 }
+
+// TestServerFilterNeverCountsAMemberPartTwice pins the regression: a request
+// the server filter selects by its own (snapshot) server name counts in full,
+// its member parts included, even when its server was renamed or deleted
+// since -- the member's share is not added a second time because the member
+// also matches the filter by its current name.
+func TestServerFilterNeverCountsAMemberPartTwice(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		servers []routing.AIServer
+	}{
+		{"head renamed", []routing.AIServer{
+			{ID: "srv_h", Name: "x-renamed", Domain: "h.example.test", PricePerKwh: 0.30},
+			{ID: "srv_m", Name: "gpu-b", Domain: "m.example.test", PricePerKwh: 0.10},
+		}},
+		{"head deleted", []routing.AIServer{
+			{ID: "srv_m", Name: "gpu-b", Domain: "m.example.test", PricePerKwh: 0.10},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			routes := routing.NewMemoryStore()
+			for _, s := range tc.servers {
+				if err := routes.CreateAIServer(ctx, s); err != nil {
+					t.Fatal(err)
+				}
+			}
+			settings := NewMemorySystemSettings()
+			if err := settings.SetSystemSetting(ctx, "energy_default_price_per_kwh", "0.30", now); err != nil {
+				t.Fatal(err)
+			}
+			rec := usage.NewRecorder()
+			rec.Record(usage.Event{ID: "ev_r", UserID: "usr_1", Host: "srv_h", ServerName: "gpu-a", TotalTokens: 10, EnergyWh: 3000, EnergySource: "measured", CreatedAt: now})
+			if err := rec.SetEnergyParts(ctx, "ev_r", []usage.EnergyPart{
+				{ServerID: "srv_h", Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
+				{ServerID: "srv_m", Role: usage.EventHostRoleMember, Wh: 2000, Source: "measured"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			svc := NewService(ServiceDeps{Usage: rec, Routes: routes, SystemSettings: settings, Clock: func() time.Time { return now }})
+			user := auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}
+			q := usage.Query{Server: "gpu"}
+
+			stats, err := svc.UsageStats(user, q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// head 1 kWh × 0.30 + member 2 kWh × 0.10, once.
+			if stats.Totals.TotalRequests != 1 || !approxEq(stats.Totals.TotalEnergyWh, 3000) || !approxEq(stats.Totals.TotalCostEUR, 0.50) {
+				t.Fatalf("stats = %+v, want R once: 3000 Wh, 0.50", stats.Totals)
+			}
+			groups, err := svc.UsageGroups(user, q, "server")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]float64{"gpu-a": 1000, "gpu-b": 2000}
+			if len(groups) != len(want) {
+				t.Fatalf("groups = %+v, want %v", groups, want)
+			}
+			for _, g := range groups {
+				if wh, ok := want[g.Key]; !ok || !approxEq(g.EnergyWh, wh) {
+					t.Fatalf("group %q = %+v, want %v Wh", g.Key, g, want[g.Key])
+				}
+			}
+		})
+	}
+}

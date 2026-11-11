@@ -224,13 +224,15 @@ type Store interface {
 	// same group, so the requests are counted once and every part can be
 	// priced at, and shown under, its host.
 	UsageGroups(ctx context.Context, q Query, groupBy string) ([]GroupBucket, error)
-	// MemberPartEnergy sums, over the events matching q, the energy parts
-	// drawn on one of hosts for events whose own Host is none of them (an
-	// event served by a selected host already counts in full), as MemberParts
+	// MemberPartEnergy sums the energy parts drawn on one of hosts for the
+	// events that match q apart from its server filter and that the server
+	// filter does not select (matched like every query, on the request's own
+	// server_name snapshot and Host: such a request already counts in full in
+	// the filtered aggregate, its member parts included), as MemberParts
 	// buckets per (groupBy value, part host). groupBy "" groups by host only
 	// (Key ""). The portal uses it to show a server's share of other servers'
-	// cluster requests in an aggregate filtered by that server; q then carries
-	// no server filter. No hosts reads nothing.
+	// cluster requests in an aggregate filtered by that server, passing the
+	// filtered query itself. No hosts reads nothing.
 	MemberPartEnergy(ctx context.Context, q Query, hosts []string, groupBy string) ([]GroupBucket, error)
 }
 
@@ -702,17 +704,27 @@ func (r *Recorder) MemberPartEnergy(_ context.Context, q Query, hosts []string, 
 	return r.memberPartBucketsLocked(q, groupBy, selected), nil
 }
 
+// hasServerFilter reports whether q filters by server.
+func hasServerFilter(q Query) bool {
+	return q.Server != "" || q.HasServerExact || q.ServerExact != ""
+}
+
 // memberPartBucketsLocked sums, per (groupBy value, part host), the energy of
-// every part on a host other than its event's own, over the events matching
-// q. A non-nil selected keeps only parts on a selected host of events whose
-// own host is not selected. groupBy "" leaves Key empty. The caller holds
-// r.mu.
+// every part on a host other than its event's own. With a nil selected it
+// reads the events matching q; with a non-nil selected (MemberPartEnergy) the
+// events matching q apart from its server filter that the server filter does
+// not select, and only their parts on a selected host. groupBy "" leaves Key
+// empty. The caller holds r.mu.
 func (r *Recorder) memberPartBucketsLocked(q Query, groupBy string, selected map[string]bool) []GroupBucket {
 	type gk struct{ key, host string }
 	acc := make(map[gk]*GroupBucket)
 	order := make([]gk, 0)
+	unfiltered := q
+	if selected != nil {
+		unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
+	}
 	for _, e := range r.events {
-		if !matchUsage(q, e, nil) || (selected != nil && selected[e.Host]) {
+		if !matchUsage(unfiltered, e, nil) || (selected != nil && hasServerFilter(q) && matchServer(q, e)) {
 			continue
 		}
 		key := ""
@@ -757,6 +769,22 @@ func (r *Recorder) TimeSeries(q Query, bucketSecs int) (TimeSeries, error) {
 	return ComputeTimeSeries(matched, q.From, q.To, bucketSecs), nil
 }
 
+// matchServer reports whether e satisfies q's server filter (Server,
+// ServerExact), matched on the request's own server_name snapshot and host;
+// true when q has none.
+func matchServer(q Query, e Event) bool {
+	if q.Server != "" {
+		needle := strings.ToLower(q.Server)
+		if !strings.Contains(strings.ToLower(e.ServerName), needle) && !strings.Contains(strings.ToLower(e.Host), needle) {
+			return false
+		}
+	}
+	if (q.HasServerExact || q.ServerExact != "") && !strings.EqualFold(e.ServerName, q.ServerExact) {
+		return false
+	}
+	return true
+}
+
 // matchUsage reports whether e satisfies q. resolveName, when non-nil, supplies
 // the resolved owner name so the Owner filter can match it in addition to
 // user_id (the ScopeAll list); pass nil where SQLite would have no users join.
@@ -773,13 +801,7 @@ func matchUsage(q Query, e Event, resolveName func(string) string) bool {
 	if q.Model != "" && !strings.Contains(strings.ToLower(e.Model), strings.ToLower(q.Model)) {
 		return false
 	}
-	if q.Server != "" {
-		needle := strings.ToLower(q.Server)
-		if !strings.Contains(strings.ToLower(e.ServerName), needle) && !strings.Contains(strings.ToLower(e.Host), needle) {
-			return false
-		}
-	}
-	if (q.HasServerExact || q.ServerExact != "") && !strings.EqualFold(e.ServerName, q.ServerExact) {
+	if !matchServer(q, e) {
 		return false
 	}
 	if (q.HasSessionIDExact || q.SessionIDExact != "") && !strings.EqualFold(e.SessionID, q.SessionIDExact) {

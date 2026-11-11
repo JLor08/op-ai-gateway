@@ -2435,9 +2435,11 @@ func (s *Service) filteredServerMemberParts(ctx context.Context, q usage.Query, 
 	if len(hosts) == 0 {
 		return nil
 	}
-	unfiltered := q
-	unfiltered.Server, unfiltered.ServerExact, unfiltered.HasServerExact = "", "", false
-	buckets, err := s.usage.MemberPartEnergy(ctx, unfiltered, hosts, groupBy)
+	// The store leaves out the requests the server filter itself selects, by
+	// their own server name snapshot as the base aggregate matched them:
+	// they already count in full. hosts (resolved by current names) only
+	// chooses whose parts are added.
+	buckets, err := s.usage.MemberPartEnergy(ctx, q, hosts, groupBy)
 	if err != nil {
 		log.Printf("portal: member part energy lookup failed: %v", err)
 		return nil

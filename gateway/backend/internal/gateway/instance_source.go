@@ -210,6 +210,20 @@ func (s *instanceSource) knownClusterHead(ctx context.Context, serverID, mapping
 	return e.specID, true
 }
 
+// specIsClusterHead reports whether mappingID's spec is a llama.cpp RPC
+// cluster head, through the spec cache (spec): one store read per mapping
+// and cache period, whatever the number of callers. known is false when no
+// spec could be read (a failed read with no earlier good one, or a caller
+// whose context ended).
+func (s *instanceSource) specIsClusterHead(ctx context.Context, mappingID string) (head, known bool) {
+	e := s.spec(ctx, mappingID)
+	// A failed read, or a caller gone before the answer came, knows nothing.
+	if e.failed || ctx.Err() != nil {
+		return false, false
+	}
+	return e.found && e.clusterHead, true
+}
+
 // spec returns mapping mappingID's spec, from the cache while its entry is
 // fresh. A miss reads the store, once per mapping at a time: the first request
 // to miss reads (read), and every request that misses while that read is in

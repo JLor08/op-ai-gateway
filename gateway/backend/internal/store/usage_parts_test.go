@@ -344,12 +344,65 @@ func assertMemberPartBuckets(t *testing.T, st usage.Store, q usage.Query) {
 	if len(got) != 1 || got[0].Key != "Head" || !closeTo(got[0].EnergyWh, 2000) {
 		t.Fatalf("member part energy by server = %+v, want under the request's group value", got)
 	}
-	// A request whose own host is selected already counts in full.
-	got, err = st.MemberPartEnergy(ctx, q, []string{"srv_mem", "srv_head"}, "")
+	// A request the server filter selects already counts in full.
+	selectsHead := q
+	selectsHead.ServerExact, selectsHead.HasServerExact = "Head", true
+	got, err = st.MemberPartEnergy(ctx, selectsHead, []string{"srv_mem"}, "")
 	if err != nil || len(got) != 0 {
-		t.Fatalf("member part energy with the head selected = %+v err=%v, want none", got, err)
+		t.Fatalf("member part energy with the head's request selected = %+v err=%v, want none", got, err)
 	}
 	if got, err := st.MemberPartEnergy(ctx, q, nil, ""); err != nil || len(got) != 0 {
 		t.Fatalf("member part energy of no hosts = %+v err=%v", got, err)
+	}
+}
+
+// TestMemberPartEnergyExcludesByTheRequestFilter pins that MemberPartEnergy
+// leaves out every request the server filter itself selects -- matched, like
+// the base query, by the request's own server_name snapshot or host -- even
+// when the serving server was renamed or deleted since, so a filtered
+// aggregate never counts such a request's member part twice.
+func TestMemberPartEnergyExcludesByTheRequestFilter(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		for _, e := range []usage.Event{
+			// Served by srv_h while it was named gpu-a (renamed since).
+			{ID: "ev_renamed", UserID: "u1", Host: "srv_h", ServerName: "gpu-a", EnergyWh: 3000, Status: "ok", HTTPStatus: 200, CreatedAt: now},
+			// Served by a server deleted since.
+			{ID: "ev_deleted", UserID: "u1", Host: "srv_gone", ServerName: "gpu-c", EnergyWh: 3000, Status: "ok", HTTPStatus: 200, CreatedAt: now},
+		} {
+			s.Record(e)
+			if err := s.LastUsageError(); err != nil {
+				t.Fatalf("record %s: %v", e.ID, err)
+			}
+		}
+		for _, id := range []string{"ev_renamed", "ev_deleted"} {
+			host := map[string]string{"ev_renamed": "srv_h", "ev_deleted": "srv_gone"}[id]
+			if err := s.SetEnergyParts(ctx, id, []usage.EnergyPart{
+				{ServerID: host, Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
+				{ServerID: "srv_m", Role: usage.EventHostRoleMember, Wh: 2000, Source: "measured"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		assertMemberPartEnergyExcludesByTheRequestFilter(t, s)
+	})
+}
+
+// assertMemberPartEnergyExcludesByTheRequestFilter runs the expectations of
+// TestMemberPartEnergyExcludesByTheRequestFilter on st.
+func assertMemberPartEnergyExcludesByTheRequestFilter(t *testing.T, st usage.Store) {
+	t.Helper()
+	ctx := context.Background()
+	// "gpu" selects both requests by their snapshot names; srv_m (gpu-b
+	// today) is the only server the current names resolve.
+	got, err := st.MemberPartEnergy(ctx, usage.Query{UserID: "u1", Server: "gpu"}, []string{"srv_m"}, "")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("member parts under a filter that selects their requests = %+v err=%v, want none", got, err)
+	}
+	// Filtered by the member alone, neither request is selected: both parts count.
+	got, err = st.MemberPartEnergy(ctx, usage.Query{UserID: "u1", ServerExact: "gpu-b", HasServerExact: true}, []string{"srv_m"}, "")
+	if err != nil || len(got) != 1 || got[0].Host != "srv_m" || !closeTo(got[0].EnergyWh, 4000) {
+		t.Fatalf("member parts filtered by the member = %+v err=%v, want srv_m 4000 Wh", got, err)
 	}
 }

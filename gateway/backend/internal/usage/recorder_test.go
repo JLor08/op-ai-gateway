@@ -1312,7 +1312,33 @@ func TestRecorderMemberPartBuckets(t *testing.T) {
 	if len(got) != 1 || got[0].Key != "Head" || got[0].Host != "srv_mem" || !got[0].MemberParts || got[0].EnergyWh != 2000 {
 		t.Fatalf("member part energy = %+v", got)
 	}
-	if got, _ := rec.MemberPartEnergy(ctx, q, []string{"srv_mem", "srv_head"}, ""); len(got) != 0 {
-		t.Fatalf("member part energy with the head selected = %+v, want none", got)
+	if got, _ := rec.MemberPartEnergy(ctx, Query{UserID: "u1", ServerExact: "Head", HasServerExact: true}, []string{"srv_mem"}, ""); len(got) != 0 {
+		t.Fatalf("member part energy with the head's request selected = %+v, want none", got)
+	}
+}
+
+// TestRecorderMemberPartEnergyExcludesByTheRequestFilter mirrors the SQL
+// stores: requests the server filter selects by their own snapshot name are
+// left out, whatever their server is called today.
+func TestRecorderMemberPartEnergyExcludesByTheRequestFilter(t *testing.T) {
+	ctx := context.Background()
+	rec := NewRecorder()
+	at := time.Date(2026, 11, 5, 10, 0, 10, 0, time.UTC)
+	rec.Record(Event{ID: "ev_renamed", UserID: "u1", Host: "srv_h", ServerName: "gpu-a", EnergyWh: 3000, CreatedAt: at})
+	rec.Record(Event{ID: "ev_deleted", UserID: "u1", Host: "srv_gone", ServerName: "gpu-c", EnergyWh: 3000, CreatedAt: at})
+	for id, host := range map[string]string{"ev_renamed": "srv_h", "ev_deleted": "srv_gone"} {
+		if err := rec.SetEnergyParts(ctx, id, []EnergyPart{
+			{ServerID: host, Role: EventHostRoleHead, Wh: 1000},
+			{ServerID: "srv_m", Role: EventHostRoleMember, Wh: 2000},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := rec.MemberPartEnergy(ctx, Query{UserID: "u1", Server: "gpu"}, []string{"srv_m"}, ""); len(got) != 0 {
+		t.Fatalf("member parts under a filter that selects their requests = %+v, want none", got)
+	}
+	got, _ := rec.MemberPartEnergy(ctx, Query{UserID: "u1", ServerExact: "gpu-b", HasServerExact: true}, []string{"srv_m"}, "")
+	if len(got) != 1 || got[0].Host != "srv_m" || got[0].EnergyWh != 4000 {
+		t.Fatalf("member parts filtered by the member = %+v, want srv_m 4000 Wh", got)
 	}
 }

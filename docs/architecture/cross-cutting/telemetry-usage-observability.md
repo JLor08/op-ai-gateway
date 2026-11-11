@@ -3098,11 +3098,15 @@ that drew it:
   substring or exact `server_exact`) selects the requests that server served,
   as before, and then adds the energy the matching servers drew as members of
   other servers' cluster requests: the portal resolves the filter to server
-  ids by the servers' current names and asks `MemberPartEnergy` for the parts
-  on those ids of requests served by any other host, under the caller's scope
-  and every other filter. That adds Wh and cost only, never a request, count
-  or token. A request served by a matching server already counts in full, its
-  member parts included. The request list (`Usage`) and the time series are
+  ids by the servers' current names, which only chooses whose parts are added,
+  and passes the filtered query to `MemberPartEnergy`. The store sums the
+  parts on those ids of the requests the server filter does *not* select,
+  judged by the very predicates the base query uses (the request's own
+  `server_name` snapshot and `host`), under the caller's scope and every
+  other filter. So a request the filter selects counts in full in the base
+  aggregate, its member parts included, and is never added again -- also when
+  its server was renamed or deleted since. The supplement adds Wh and cost
+  only, never a request, count or token. The request list (`Usage`) and the time series are
   unchanged: they show requests, and a member server served none of these.
 - *Scope.* The supplement follows the caller's usage scope like every other
   usage read: a non-admin sees the member shares of their own requests only.

@@ -910,10 +910,13 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 
 // completedClusterHeadSource answers, for a request that completed, whether
 // its mapping is a cluster head (and the head's spec id) without reading the
-// store for a mapping routing already looked up; satisfied by the instance
-// source.
+// store for a mapping routing already looked up, and the energy reconciler
+// the same question through the spec cache; satisfied by the instance source.
 type completedClusterHeadSource interface {
 	knownClusterHead(ctx context.Context, serverID, mappingID string) (string, bool)
+	// specIsClusterHead reports whether mappingID's spec is a cluster head,
+	// from the spec cache; known is false when no spec could be read.
+	specIsClusterHead(ctx context.Context, mappingID string) (head, known bool)
 }
 
 // clusterHostsTimeout bounds recordClusterHosts' store work; it runs on the

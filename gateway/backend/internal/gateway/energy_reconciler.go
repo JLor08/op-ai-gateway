@@ -230,9 +230,20 @@ func (s *Server) clearEnergyParts(ctx context.Context, ev usage.Event) bool {
 }
 
 // mappingIsClusterHead reports whether mappingID's runtime spec is a
-// llama.cpp RPC cluster head. A failed read counts as a head: calibration is
-// then skipped, which only delays it.
+// llama.cpp RPC cluster head, through the instance source's spec cache when
+// the server has one (so a run of measured requests on one mapping reads its
+// spec once per cache period, not once per request), else by a store read. A
+// spec that cannot be read counts as a head: calibration is then skipped,
+// which only delays it.
 func (s *Server) mappingIsClusterHead(ctx context.Context, mappingID string) bool {
+	if s.clusterHeads != nil {
+		head, known := s.clusterHeads.specIsClusterHead(ctx, mappingID)
+		if !known {
+			slog.Debug("energy reconcile: runtime spec unknown; calibration skipped", "mapping_id", mappingID)
+			return true
+		}
+		return head
+	}
 	spec, found, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
 	if err != nil {
 		slog.Debug("energy reconcile: runtime spec lookup failed; calibration skipped", "mapping_id", mappingID, "err", err)
