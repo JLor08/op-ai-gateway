@@ -89,6 +89,9 @@ export type UsageEnergyPart = {
   // 1-based number of a member within its request; absent for the head.
   member?: number;
   energy_wh: number;
+  // The host's draw above its idle draw (its whole draw when none is known);
+  // the parts' marginal_wh sum to the row's energy_marginal_wh.
+  marginal_wh: number;
   energy_source: string;
   cost?: number;
 };

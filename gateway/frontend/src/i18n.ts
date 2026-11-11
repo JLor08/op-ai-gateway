@@ -3453,6 +3453,9 @@ const de = {
   activityEnergyPartHead: 'Head',
   activityEnergyPartMember: (n: number) => `Mitglied ${n}`,
   activityEnergyPartsLabel: (wh: string) => `Energie ${wh} Wh, je Host aufgeschlüsselt`,
+  activityEnergyMarginalPartsTitle: 'Energie marginal je Host',
+  activityEnergyMarginalPartsLabel: (wh: string) =>
+    `Energie marginal ${wh} Wh, je Host aufgeschlüsselt`,
   activityMixedUnitsHint: (n: number) => `Summe ohne ${n} nicht in Token abgerechnete Anfrage(n).`,
   energySourceHelpMeasured:
     'Gemessen: echte Leistungstelemetrie des Servers deckt das Zeitfenster dieser Anfrage lückenlos ab.',
@@ -7262,6 +7265,9 @@ const en: PortalMessages = {
   activityEnergyPartHead: 'Head',
   activityEnergyPartMember: (n: number) => `Member ${n}`,
   activityEnergyPartsLabel: (wh: string) => `Energy ${wh} Wh, broken down per host`,
+  activityEnergyMarginalPartsTitle: 'Marginal energy per host',
+  activityEnergyMarginalPartsLabel: (wh: string) =>
+    `Marginal energy ${wh} Wh, broken down per host`,
   activityMixedUnitsHint: (n: number) => `Sum excludes ${n} request(s) that are not token-metered.`,
   energySourceHelpMeasured:
     'Measured: real power telemetry from the server covers this request’s window without gaps.',

@@ -3095,8 +3095,11 @@ parts by its own host), `UsageGroups` counts the request once in its own
 host's bucket with the head part's energy and adds every other part's energy
 to that part host's bucket in the same group, and the per-row cost reads the
 page's parts in one call (`EnergyPartsByEvents`). The same read gives each
-cluster row of the Activity list its `energy_parts` — every host's Wh, source
-and cost, shown in a tooltip on the energy cell. A member server the caller
+cluster row of the Activity list its `energy_parts` — every host's Wh, marginal
+Wh, source and cost, shown in a tooltip on the energy and the marginal energy
+cell (the marginal one without cost, which is priced on the whole draw); the
+parts' marginal Wh sum to the row's `energy_marginal_wh`, a host without a
+known idle draw contributing its whole draw. A member server the caller
 may not see (the server list's rule) keeps its identity hidden ("Member N", no
 name, no id) but shows its Wh, source and cost like the others: the row's own
 cost contains its price, which is not secret from a requester whose request

@@ -21,45 +21,83 @@ function partLabel(part: UsageEnergyPart, t: Translation): string {
     : t.activityEnergyPartMember(part.member ?? 0);
 }
 
+// Which energy figure a cell shows: the whole draw (energy_wh) or the draw
+// above each host's idle draw (energy_marginal_wh). Cost is priced on the
+// whole draw, so only the total figure lists it.
+export type EnergyFigure = 'total' | 'marginal';
+
+type FigureView = {
+  row: (row: UsageEvent) => number | undefined;
+  part: (part: UsageEnergyPart) => number;
+  withCost: boolean;
+  title: (t: Translation) => string;
+  label: (t: Translation, wh: string) => string;
+  testId: string;
+};
+
+const FIGURES: Record<EnergyFigure, FigureView> = {
+  total: {
+    row: (row) => row.energy_wh,
+    part: (part) => part.energy_wh,
+    withCost: true,
+    title: (t) => t.activityEnergyPartsTitle,
+    label: (t, wh) => t.activityEnergyPartsLabel(wh),
+    testId: 'energy-parts',
+  },
+  marginal: {
+    row: (row) => row.energy_marginal_wh,
+    part: (part) => part.marginal_wh,
+    withCost: false,
+    title: (t) => t.activityEnergyMarginalPartsTitle,
+    label: (t, wh) => t.activityEnergyMarginalPartsLabel(wh),
+    testId: 'energy-marginal-parts',
+  },
+};
+
 /**
- * The Activity table's energy cell. A llama.cpp RPC cluster request carries
- * the energy of each host that served it; its total is a focusable, named
- * button that opens a tooltip listing every host with its watt-hours, its
- * source (the same chip and help as the energy-source column) and its cost.
- * Any other row is the plain figure.
+ * An Activity table energy cell (figure: the energy or the marginal energy
+ * column). A llama.cpp RPC cluster request carries the energy of each host
+ * that served it; its figure is a focusable, named button that opens a
+ * tooltip listing every host with that figure, its source (the same chip and
+ * help as the energy-source column) and, for the total, its cost. Any other
+ * row is the plain figure.
  */
 export function EnergyPartsCell({
   row,
+  figure,
   t,
   costUnit,
   currencyFactor,
 }: Readonly<{
   row: UsageEvent;
+  figure: EnergyFigure;
   t: Translation;
   costUnit: CurrencyUnit;
   currencyFactor: number;
 }>) {
-  const total = row.energy_wh ? whText(row.energy_wh) : '—';
+  const view = FIGURES[figure];
+  const value = view.row(row);
+  const total = value ? whText(value) : '—';
   const parts = row.energy_parts ?? [];
   if (parts.length === 0) return total;
+  const costText = (part: UsageEnergyPart): string =>
+    view.withCost && part.cost !== undefined
+      ? ` · ${formatCost(part.cost, costUnit, currencyFactor)}`
+      : '';
   const title = (
     <Box sx={{ display: 'grid', gap: 0.5 }}>
       <Typography variant="caption" sx={{ fontWeight: 600 }}>
-        {t.activityEnergyPartsTitle}
+        {view.title(t)}
       </Typography>
-      {parts.map((part, i) => {
-        const cost =
-          part.cost === undefined ? '' : ` · ${formatCost(part.cost, costUnit, currencyFactor)}`;
-        return (
-          <Box
-            key={`${part.role}-${part.member ?? 0}-${i}`}
-            sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}
-          >
-            <Typography variant="caption">{`${partLabel(part, t)}: ${whText(part.energy_wh)} Wh${cost}`}</Typography>
-            {part.energy_source && chipWithHelp(part.energy_source, ENERGY_SOURCE_HELP_KEYS, t)}
-          </Box>
-        );
-      })}
+      {parts.map((part, i) => (
+        <Box
+          key={`${part.role}-${part.member ?? 0}-${i}`}
+          sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}
+        >
+          <Typography variant="caption">{`${partLabel(part, t)}: ${whText(view.part(part))} Wh${costText(part)}`}</Typography>
+          {part.energy_source && chipWithHelp(part.energy_source, ENERGY_SOURCE_HELP_KEYS, t)}
+        </Box>
+      ))}
     </Box>
   );
   return (
@@ -69,8 +107,8 @@ export function EnergyPartsCell({
         variant="body2"
         tabIndex={0}
         role="button"
-        aria-label={t.activityEnergyPartsLabel(total)}
-        data-testid={`energy-parts-${row.id}`}
+        aria-label={view.label(t, total)}
+        data-testid={`${view.testId}-${row.id}`}
         sx={{ textDecoration: 'underline dotted', cursor: 'help' }}
       >
         {total}

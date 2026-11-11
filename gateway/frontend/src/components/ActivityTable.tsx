@@ -128,10 +128,6 @@ function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
       return row.stream ? '✓' : '–';
     case 'provider_model':
       return row.provider_model;
-    case 'energy_wh':
-      return row.energy_wh ? row.energy_wh.toFixed(3) : '—';
-    case 'energy_marginal_wh':
-      return row.energy_marginal_wh ? row.energy_marginal_wh.toFixed(3) : '—';
     case 'energy_source':
       return chipWithHelp(row.energy_source ?? '', ENERGY_SOURCE_HELP_KEYS, t);
     case 'billing_unit':
@@ -274,8 +270,15 @@ export function ActivityTable({
       case 'cost_eur':
         return formatCost(row.cost_eur, costUnit, currencyFactor);
       case 'energy_wh':
+      case 'energy_marginal_wh':
         return (
-          <EnergyPartsCell row={row} t={t} costUnit={costUnit} currencyFactor={currencyFactor} />
+          <EnergyPartsCell
+            row={row}
+            figure={col.id === 'energy_wh' ? 'total' : 'marginal'}
+            t={t}
+            costUnit={costUnit}
+            currencyFactor={currencyFactor}
+          />
         );
       default:
         return renderCell(row, col.id, t);

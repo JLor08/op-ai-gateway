@@ -300,9 +300,9 @@ func TestUsageRowsCarryVisibleEnergyParts(t *testing.T) {
 	rec.Record(usage.Event{ID: "ev_cluster", UserID: "usr_1", Model: "big", Host: "srv_head", ServerName: "Head", EnergyWh: 3500, EnergySource: "estimated", CreatedAt: now})
 	rec.Record(usage.Event{ID: "ev_plain", UserID: "usr_1", Model: "big", Host: "srv_head", ServerName: "Head", EnergyWh: 1000, EnergySource: "measured", CreatedAt: now.Add(-time.Minute)})
 	if err := rec.SetEnergyParts(ctx, "ev_cluster", []usage.EnergyPart{
-		{ServerID: "srv_head", Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
-		{ServerID: "srv_hidden", Role: usage.EventHostRoleMember, Wh: 500, Source: "estimated"},
-		{ServerID: "srv_mine", Role: usage.EventHostRoleMember, Wh: 2000, Source: "measured"},
+		{ServerID: "srv_head", Role: usage.EventHostRoleHead, Wh: 1000, MarginalWh: 600, Source: "measured"},
+		{ServerID: "srv_hidden", Role: usage.EventHostRoleMember, Wh: 500, MarginalWh: 300, Source: "estimated"},
+		{ServerID: "srv_mine", Role: usage.EventHostRoleMember, Wh: 2000, MarginalWh: 2000, Source: "measured"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -323,9 +323,9 @@ func TestUsageRowsCarryVisibleEnergyParts(t *testing.T) {
 		rows[r.ID] = r
 	}
 	want := []usage.RowEnergyPart{
-		{Role: usage.EventHostRoleHead, ServerName: "Head", EnergyWh: 1000, EnergySource: "measured", Cost: cost(0.30)},
-		{Role: usage.EventHostRoleMember, Member: 1, EnergyWh: 500, EnergySource: "estimated", Cost: cost(0.10)},
-		{Role: usage.EventHostRoleMember, Member: 2, ServerName: "Mine", EnergyWh: 2000, EnergySource: "measured", Cost: cost(0.20)},
+		{Role: usage.EventHostRoleHead, ServerName: "Head", EnergyWh: 1000, MarginalWh: 600, EnergySource: "measured", Cost: cost(0.30)},
+		{Role: usage.EventHostRoleMember, Member: 1, EnergyWh: 500, MarginalWh: 300, EnergySource: "estimated", Cost: cost(0.10)},
+		{Role: usage.EventHostRoleMember, Member: 2, ServerName: "Mine", EnergyWh: 2000, MarginalWh: 2000, EnergySource: "measured", Cost: cost(0.20)},
 	}
 	if got := rows["ev_cluster"].EnergyParts; !reflect.DeepEqual(got, want) {
 		t.Fatalf("parts = %+v, want %+v", got, want)
@@ -333,6 +333,9 @@ func TestUsageRowsCarryVisibleEnergyParts(t *testing.T) {
 	raw, err := json.Marshal(rows["ev_cluster"])
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"marginal_wh":300`) {
+		t.Fatalf("row JSON = %s, want each part's marginal_wh", raw)
 	}
 	for _, leak := range []string{"srv_hidden", "Hidden box", "srv_mine"} {
 		if strings.Contains(string(raw), leak) {

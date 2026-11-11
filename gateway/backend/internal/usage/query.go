@@ -198,12 +198,16 @@ type Row struct {
 // source and cost are shown like every other part's, since the row's own
 // energy and cost contain them and its price is not secret from a requester
 // whose request it served. Member numbers the members of the request from 1,
-// in the order of their parts; 0 for the head.
+// in the order of their parts; 0 for the head. MarginalWh is the host's draw
+// above its idle draw over the request (its whole draw when no idle draw is
+// known); the parts' MarginalWh sum to the row's EnergyMarginalWh as their Wh
+// sum to its EnergyWh.
 type RowEnergyPart struct {
 	Role         string   `json:"role"`
 	ServerName   string   `json:"server_name,omitempty"`
 	Member       int      `json:"member,omitempty"`
 	EnergyWh     float64  `json:"energy_wh"`
+	MarginalWh   float64  `json:"marginal_wh"`
 	EnergySource string   `json:"energy_source"`
 	Cost         *float64 `json:"cost,omitempty"`
 }

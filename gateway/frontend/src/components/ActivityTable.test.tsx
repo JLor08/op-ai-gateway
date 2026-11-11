@@ -442,6 +442,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
                   role: 'head',
                   server_name: 'GPU 1',
                   energy_wh: 3.1,
+                  marginal_wh: 1.6,
                   energy_source: 'measured',
                   cost: 0.0008,
                 },
@@ -449,6 +450,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
                   role: 'member',
                   member: 1,
                   energy_wh: 2.4,
+                  marginal_wh: 1.4,
                   energy_source: 'estimated',
                   cost: 0.0005,
                 },
@@ -457,6 +459,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
                   member: 2,
                   server_name: 'Box B',
                   energy_wh: 2.413,
+                  marginal_wh: 1.5,
                   energy_source: 'measured',
                   cost: 0.0003,
                 },
@@ -490,6 +493,72 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         renderTable({ columns: energyColumns, rows: [makeRow({ energy_wh: 2.5 })] });
         expect(screen.queryByTestId('energy-parts-req_1')).toBeNull();
         expect(screen.getByRole('cell', { name: '2.500' })).toBeInTheDocument();
+      });
+    });
+
+    describe('energy_marginal_wh cell of a cluster request', () => {
+      const marginalColumns = ACTIVITY_COLUMNS.filter(
+        (c) => c.defaultVisible || c.id === 'energy_marginal_wh',
+      );
+
+      it('lists the marginal energy of every host in the same keyboard-reachable tooltip', async () => {
+        renderTable({
+          columns: marginalColumns,
+          rows: [
+            makeRow({
+              energy_wh: 7.913,
+              energy_marginal_wh: 4.5,
+              energy_parts: [
+                {
+                  role: 'head',
+                  server_name: 'GPU 1',
+                  energy_wh: 3.1,
+                  marginal_wh: 1.6,
+                  energy_source: 'measured',
+                  cost: 0.0008,
+                },
+                {
+                  role: 'member',
+                  member: 1,
+                  energy_wh: 2.4,
+                  marginal_wh: 1.4,
+                  energy_source: 'estimated',
+                  cost: 0.0005,
+                },
+                {
+                  role: 'member',
+                  member: 2,
+                  server_name: 'Box B',
+                  energy_wh: 2.413,
+                  marginal_wh: 1.5,
+                  energy_source: 'measured',
+                  cost: 0.0003,
+                },
+              ],
+            }),
+          ],
+        });
+        const total = screen.getByTestId('energy-marginal-parts-req_1');
+        expect(total).toHaveTextContent('4.500');
+        expect(total.getAttribute('tabindex')).toBe('0');
+        expect(total).toHaveAttribute('role', 'button');
+        expect(total).toHaveAccessibleName(t.activityEnergyMarginalPartsLabel('4.500'));
+        fireEvent.keyDown(document.body, { key: 'Tab' });
+        act(() => total.focus());
+        const tip = await screen.findByRole('tooltip');
+        expect(tip).toHaveTextContent(t.activityEnergyMarginalPartsTitle);
+        expect(tip).toHaveTextContent('GPU 1: 1.600 Wh');
+        expect(tip).toHaveTextContent(`${t.activityEnergyPartMember(1)}: 1.400 Wh`);
+        expect(tip).toHaveTextContent('Box B: 1.500 Wh');
+        // Cost is priced on the whole draw, so the marginal view shows none.
+        expect(tip).not.toHaveTextContent('ct');
+        expect(within(tip).getByText('estimated')).toBeInTheDocument();
+      });
+
+      it('keeps a single-host row a plain number', () => {
+        renderTable({ columns: marginalColumns, rows: [makeRow({ energy_marginal_wh: 1.25 })] });
+        expect(screen.queryByTestId('energy-marginal-parts-req_1')).toBeNull();
+        expect(screen.getByRole('cell', { name: '1.250' })).toBeInTheDocument();
       });
     });
 

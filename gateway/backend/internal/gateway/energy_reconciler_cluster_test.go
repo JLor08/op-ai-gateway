@@ -541,3 +541,37 @@ func TestCalibrationHeadCheckUsesTheSpecCache(t *testing.T) {
 		}
 	})
 }
+
+// TestReconcileClusterMarginalIsTheSumOfThePartMarginals pins the marginal
+// side of a cluster request's parts: each part keeps its own host's marginal
+// figure and energy_marginal_wh is exactly their sum, whatever each host's
+// idle draw is -- a host with a known idle draw contributes its draw above
+// it, one with none known contributes its whole draw (marginal equals total
+// there), and an unpriced member contributes nothing.
+func TestReconcileClusterMarginalIsTheSumOfThePartMarginals(t *testing.T) {
+	end := clusterEnergyBase.Add(36 * time.Second)
+	f := newEnergyFixture(t, 0, 0)
+	f.createServer("srv-head", routing.AIServer{IdleWatts: 40})
+	f.createServer("srv-mem", routing.AIServer{})
+	f.createServer("srv-dark", routing.AIServer{})
+	f.constPower("srv-head", clusterEnergyBase, 36, 100)
+	f.constPower("srv-mem", clusterEnergyBase, 36, 200)
+	f.recordClusterEvent(usage.Event{ID: "ev_cluster", CreatedAt: end, LatencyMS: 36000, OutputTokens: 100}, "srv-head", "srv-mem", "srv-dark")
+
+	f.reconcile("ev_cluster")
+
+	ev := f.event("ev_cluster")
+	parts := f.parts("ev_cluster")
+	// head (100 - 40) W x 36 s = 0.6 Wh; member 200 W x 36 s = 2 Wh, no idle
+	// known; the dark member 0.
+	requireCloseWh(t, "head marginal", parts["srv-head"].MarginalWh, 0.6)
+	requireCloseWh(t, "member marginal", parts["srv-mem"].MarginalWh, 2.0)
+	requireCloseWh(t, "member total", parts["srv-mem"].Wh, 2.0)
+	requireCloseWh(t, "dark member marginal", parts["srv-dark"].MarginalWh, 0)
+	sum := 0.0
+	for _, p := range parts {
+		sum += p.MarginalWh
+	}
+	requireCloseWh(t, "energy_marginal_wh", ev.EnergyMarginalWh, sum)
+	requireCloseWh(t, "energy_marginal_wh", ev.EnergyMarginalWh, 2.6)
+}

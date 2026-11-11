@@ -2569,7 +2569,7 @@ func rowEnergyParts(row usage.Row, parts []usage.EnergyPart, prices *usagePricer
 	for _, p := range parts {
 		cost := p.Wh / 1000 * prices.of(p.ServerID)
 		total += cost
-		dto := usage.RowEnergyPart{Role: p.Role, EnergyWh: p.Wh, EnergySource: p.Source}
+		dto := usage.RowEnergyPart{Role: p.Role, EnergyWh: p.Wh, MarginalWh: p.MarginalWh, EnergySource: p.Source}
 		name, visible := row.ServerName, true
 		if p.Role != usage.EventHostRoleHead {
 			member++
