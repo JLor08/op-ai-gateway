@@ -906,3 +906,88 @@ sequenceDiagram
         B->>B: apply compiled built-in theme
     end
 ```
+
+## 6.9 llama.cpp RPC cluster: members-first start
+
+A cluster head serves only once its members run and hold it, and an agent never
+starts a cold head by itself, so the gateway's cluster orchestration
+(`internal/gateway/cluster_orchestrator.go`) starts it, one start per head at a
+time ([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)):
+
+```mermaid
+sequenceDiagram
+    participant C as AI client
+    participant GW as Gateway (resolver, orchestration)
+    participant MA as member agent(s)
+    participant M as ggml-rpc-server (or relay)
+    participant HA as head agent
+    participant H as llama-server --rpc
+
+    C->>GW: inference for the head's model
+    GW->>GW: cluster gate: head cold → park, signal the orchestration
+    GW->>GW: 1. mesh: reconcile the RPC NetBird policies
+    GW->>MA: 1. wait for the document ack (≤ 30 s)
+    GW->>HA: 1. wait for the document ack
+    par every member
+        GW->>MA: 2. POST /rpc/ensure/{specID}?reserve_seconds=N
+        MA->>M: exec (-H/-p/-d by the agent), TCP-ready
+        MA-->>GW: 200 running (reservation armed)
+    end
+    GW->>HA: 3. POST /ensure/{model}, X-OP-Cluster-Start: 1
+    HA->>M: probe every endpoint (connect, no byte)
+    HA->>H: exec, health until green
+    H->>M: connect (first byte → hold)
+    HA-->>GW: 200 running
+    MA-->>GW: 4. telemetry: held_by = head (fresh frames only)
+    GW->>GW: formed → wake the parked requests
+    GW->>HA: proxied request
+    H-->>C: tokens
+```
+
+1. **Configuration applied.** For a `mesh` cluster the RPC policies are
+   reconciled first; then the head's agent and every member's agent must
+   acknowledge a document that carries their part of this cluster (the head's
+   spec with this cluster's `generation`, each member's spec), within 30 s. A
+   plan the documents moved past meanwhile is read again rather than waited out.
+2. **Members, in parallel**, each within its startup timeout plus 10 s, arming
+   a reservation that lasts the head's bound plus 60 s. In direct transport a
+   member that still reports a hold while its head is not running holds a dead
+   connection and is force-stopped first. The first failure cancels the others.
+3. **Head**, one ensure with the cluster-start marker, bounded by its startup
+   timeout plus 30 s. The agent probes every endpoint before it executes
+   anything, and answers `runtime.cluster_member_unreachable` when one never
+   answers.
+4. **Formed**: every member reports the head's hold on telemetry that arrived
+   after the head's start began, within the same bound; otherwise the head is
+   stopped and the start fails `runtime.cluster_member_unused`.
+
+A failed start names its cause (the agent's code, the specific one read from
+its telemetry when the router answered only `start_failed`, `start_timeout` or
+`not_permitted`) and the member position or the head, releases the members it
+reserved, and cools the head down for 60 s; a cause no retry can fix blocks
+automatic starts until the head's document changes. Every request parked for
+the head's server is woken when the start ends, formed or failed. A start that
+finds the telemetry already showing the cluster formed (a restarted gateway
+under a running cluster) does nothing.
+
+**After formation, the watchdog** (`cluster_watchdog.go`) follows the agents'
+frames on its own worker, off the ingest path. A member that exited, changed its
+PID, lost the head's hold or whose relay reports a stall is a suspicion; only a
+head frame that arrived after the member's and still shows the head running the
+same process confirms it, because a head that stopped on its own ends its
+members' sessions too. A member server silent for max(3 × its telemetry
+interval, 15 s) counts as lost on a fresh head frame, never in the boot grace or
+before formation. A confirmed loss drains the head, releases the members, records
+`runtime.cluster_member_lost` at that position and cools down; a head that was
+serving requests starts again once the cooldown ended. A head that exits on its
+own releases its members and wakes the reconciler. A local start on a member host
+that waits only for a held member (`admission_blocked_by`) makes the gateway ask
+the head's agent for a conditional stop (`POST /stop/{model}?if_evictable=1`);
+the agent stops the head only when its own eviction rule allows it. A peer a
+member does not allow, or a hold by another head, is a breach: logged and listed
+in the head's `cluster_status` by member position.
+
+**A stop** (manual, watchdog, conditional, NetBird drift) always goes head first:
+drain the head, wait (bounded, 60 s) for its stopped state on the status stream,
+then release every member, and only for a manual stop with `stop_members` stop
+them. A released member idles out on its 60 s timeout.

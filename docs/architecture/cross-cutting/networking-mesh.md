@@ -152,7 +152,8 @@ becomes the live agent listener within one interval, with no restart.
 ## 5. Per-server NetBird settings
 
 `routing.AIServer` carries seven NetBird columns (migrations 18–19, 20, 21,
-24–25):
+24–25), plus the mesh IPv4 the peer sync records (`NetbirdIP`, migration 103,
+the address a `mesh` RPC cluster dials, §12):
 
 | Field | Meaning |
 |---|---|
@@ -399,6 +400,81 @@ should be set to the server's own mesh IP (or `127.0.0.1`). See
 | `NB_ENROLL_KEY_FILE` (sidecar) | `/shared/netbird-setup-key` | Must equal the backend's key-file path (§9). |
 
 See [Configuration](configuration.md) for the full variable list.
+
+## 12. RPC cluster policies (`op-gw-rpc`)
+
+A llama.cpp RPC cluster ([ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster),
+[Agent-Managed Model Runtime §3.7](agent-runtime-manager.md#37-the-gateways-half-of-a-cluster))
+on the `mesh` network dials its members at their **mesh IPv4**, which the peer
+sync stores per server (`ai_servers.netbird_ip`, written with the domain, peer
+id and connected flag, and cleared when the peer linkage is cleared). A server
+takes part in a mesh cluster only with NetBird on, a tracking group and a known
+mesh IP. A `lan` cluster uses no NetBird state at all: it reaches members at
+their `lan_address` (an IPv4 literal, with `lan_bind_only` to listen there
+alone), else their `Domain`, which is why a NetBird-enabled server needs
+`lan_address` in a `lan` cluster: the peer sync rewrites its `Domain` to the
+NetBird DNS name.
+
+**One managed policy per member server.** While `manage_policies` is on, Loop B
+also reconciles the `op-gw-rpc-<member server id>` family
+(`service_netbird_rpc_policies.go`), against the same `ListPolicies` snapshot
+and under the same lock as the other families. Each policy holds one
+accept / TCP / unidirectional rule per grant: from a head server's tracking
+group to the member server's tracking group, on that member's RPC port
+(direct) or relay port (relay) only, so another head on the mesh cannot reach
+it. Grants are deduplicated and sorted so the desired policy is stable, and the
+drift check accepts exactly those rules and the managed description, nothing
+else. The family covers every `mesh` cluster, in either transport, with no
+per-server include or exclude; a policy whose server has no mesh member any
+more is deleted. The prefix is deliberately not `op-gw-access-`, so the status
+endpoint's managed-policy count does not count these. Every cluster,
+membership and member write also runs the pass synchronously, and a cluster
+start runs it first, so a head that was just saved can reach its members before
+it starts. A store error skips the whole pass rather than deleting policies of
+clusters it failed to read.
+
+**NetBird policies only allow; the `Default` policy decides what they are worth.**
+While NetBird's built-in `Default` (all-to-all) policy is enabled, a member's
+port is open to the whole mesh whatever the managed rule says. Every policy pass
+therefore records what it saw of `Default` in the system setting
+`netbird_default_policy_state` (`{"state":"enabled"|"disabled"|"unknown","at":…}`,
+rewritten only on a change, so `at` is when the state was first seen; an absent
+`Default` counts as disabled, since then nothing allows all traffic). The
+consequences:
+
+- **`direct` transport on the mesh** is offered and pushed only while the
+  gateway manages policies, deny-by-default is on and enforced, and the last
+  pass saw `Default` disabled; a save without that is refused
+  (`runtime_spec.cluster_direct_unavailable`), and `unknown` (no pass yet) counts
+  as not disabled.
+- **A drift to `enabled`** withholds every direct mesh cluster from the runtime
+  documents. Before those documents are pushed (which would remove the members
+  under running heads), the gateway stops each such cluster head first, on a
+  goroutine of its own with its own deadline, never under the policy lock.
+- **The three switches cannot be turned off under a direct mesh cluster.** A
+  system settings save that turns `manage_policies`, deny-by-default or its
+  enforcement from on to off while one exists is refused
+  (`settings.netbird_direct_cluster_exists`); saving a switch that is already
+  off, or leaving it on, never is.
+- **`relay` transport on the mesh needs none of this.** The relay's allowlist
+  (the head's mesh IPv4, checked before a byte is read) is the gate; with
+  deny-by-default off the portal only warns
+  (`cluster_relay_mesh_deny_by_default_off`). Without policy management the
+  operator adds the head → member rule by hand
+  ([`gateway/deploy/README-netbird.md`](../../../gateway/deploy/README-netbird.md) §6);
+  until it exists the head's pre-exec probe answers
+  `runtime.cluster_member_unreachable`.
+
+**What a mesh cluster trusts.** WireGuard binds a packet's inner source address
+to the sending peer's key, so the allowlist and the policy amount to peer
+authentication only while the head's mesh IP carries the head host's own
+traffic. A head that is a NetBird **routing peer** or a masquerading exit node
+lets the network it routes reach the members under its mesh IP, unseen by the
+gateway: heads must not route networks, or the operator accepts that. In direct
+mode the policy is the only gate, so a manually widened policy or an extra peer
+in the head's tracking group reaches the member; the drift check, the refusal
+above and the member's breach reports (by member position in the head's
+`cluster_status`) limit, but cannot prevent, that.
 
 ## Related chapters
 

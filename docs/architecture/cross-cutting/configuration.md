@@ -112,6 +112,19 @@ The ServerAgent (`op-ai-server-agent`, one process per monitored AI server) is c
 - **Resource accounting** (`OP_AGENT_VRAM_HEADROOM_MB`, `OP_AGENT_HOST_RAM_RESERVE_MB`, `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB`): three **env-only** integers (megabytes; no flag and no config-file key, so they resolve env > default) that tune the admission budgets the agent now derives by default: the headroom held back from each auto-detected per-GPU VRAM budget (default `0`), the host RAM held back from the host-RAM pool (default `2048`), and the conservative RAM charged to a spec of unknown RAM demand on its first start (default `4096`, `0` = off). A negative or malformed value falls back to the default rather than failing the load. They are operator-only: the gateway can never supply them ([ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides), [ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory), [ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)).
 - **Eviction grace** (`OP_AGENT_EVICTION_GRACE_SECONDS`): a fourth **env-only** integer (seconds; no flag and no config-file key) for how long after a managed model was last used the agent will not evict it to make room for another start (default `30`, `0` = off, at most `86400`; a negative, fractional, malformed or larger value falls back to the default rather than failing the load). A start that could only be made room for by evicting a protected model waits instead and is woken when the window expires. It is operator-only like the settings above: the gateway never supplies it, and what *is* evictable is chosen same-role first from the role the gateway pushes ([ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct), [Agent-Managed Model Runtime §5.4](agent-runtime-manager.md#54-eviction-queueing-and-drain)).
 
+- **llama.cpp RPC clusters add no setting on either binary**
+  ([ADR-096](../09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)).
+  A cluster is configured in the portal and stored with the head's launch spec
+  and the servers involved (member mode, network, transport, members; each
+  server's `lan_address`, `lan_bind_only`, RPC membership and consent). On the
+  agent, the existing settings decide what a cluster may do there: the binary
+  allowlist must name the `llama-server` (head) or `ggml-rpc-server` (member) of
+  the build the cluster uses, and is what the agent's binary inventory reports;
+  a member's tensor cache lives under `config_files_dir` (`rpc/<head spec id>/`).
+  The one cluster value the gateway keeps in its system settings,
+  `netbird_default_policy_state`, is written by the NetBird policy pass and is
+  not operator input ([Networking & Mesh §12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)).
+
 See [Configuration & Environment Variables (Reference)](../reference/config-env.md) for the full `OP_AGENT_*` table with every default and floor/clamp rule.
 
 That reference **opens by claiming an exhaustive listing** of every environment

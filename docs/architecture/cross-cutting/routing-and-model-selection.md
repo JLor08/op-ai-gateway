@@ -2560,14 +2560,27 @@ no head costs nothing beyond that cached read. A head is in one of three states:
   one (`runtime.cluster_start_failed` during a cooldown, `runtime.cluster_unavailable`
   otherwise); a head excluded for a failure the cluster recorded — the cooldown, a terminal
   block — carries that failure in its verdict, and the message names its cause and where it
-  happened (`(cause: runtime.cluster_member_lost at member 0)`, `… at the head`). In a model group such a member is unavailable and the walk goes on.
+  happened (`(cause: runtime.cluster_member_lost at member 0)`, `… at the head`). In a model
+  group such a member is unavailable and the walk goes on.
+
+  **Naming the cause in an inference refusal is deliberate.** The message may carry the
+  recorded cause code and the member's **position**, never a server name: positions are the
+  anonymous member identity the portal already shows a caller who may not see a member's
+  server, and the cause codes are stable public error codes. With them an API client can tell
+  a transient member loss (`runtime.cluster_member_lost`, `.cluster_member_unreachable`: retry
+  after the cooldown) from a block that needs the operator (`.cluster_version_mismatch`,
+  `.device_backend_mismatch`, `.rpc_device_count_mismatch`, `.rpc_unsupported_build`: no
+  retry helps until the head's configuration changes). The cost is that an application client
+  sees operator diagnostics such as `runtime.cluster_version_mismatch at member 0`; nothing in
+  them names a host, an address or a setting.
 
 Only an agent known to declare `rpc_cluster` is asked about at all (no other agent runs a head),
 so a mapping on any other agent costs the gate no spec read; an agent whose features are not
 known yet (it has not reported since the gateway started) is not gated, and a request reaching a
 head there is handled on the dispatch path below. A sticky pin to a head that has not formed is
-passed over and kept, so the fresh selection parks the request. A request that reached a head in the race between its selection and a stop of the
-head (the agent's `runtime.cluster_not_ready`, buffered or streamed, before any byte was
+passed over and kept, so the fresh selection parks the request. A request that reached a head
+in the race between its selection and a stop of the head (the agent's
+`runtime.cluster_not_ready`, buffered or streamed, before any byte was
 relayed) has the cluster started again — bounded by the request and its application's
 `timeout_ms` — and is sent to the same head **once** more; a second refusal is its answer, and a
 start that fails is answered with the cluster's own code (`runtime.cluster_start_failed`,

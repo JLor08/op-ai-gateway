@@ -1717,7 +1717,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-102-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-106-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2221,7 +2221,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-102-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-106-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open
@@ -2956,6 +2956,17 @@ whether a server's own draw was measured or configured, so a server that drops
 from Tier 1 to Tier 2 keeps its PUE, and the idle baseline is subtracted from
 the PUE-scaled draw in both tiers. Tier 3 has no PUE: its coefficient is
 calibrated from Tier-1 energy, which already carries it.
+
+**Tier 2 applying the PUE is a behaviour change** (it came with the RPC cluster
+mode's per-host parts, which price a member's share by Tier 1 or Tier 2 and must
+treat both alike). Before it, Tier 2 integrated the raw `EstimatedWatts` and
+only Tier 1 was scaled. So on a server with `EstimatedWatts` set and an
+effective PUE above 1, every row priced by Tier 2 since the change carries that
+factor more energy and cost than an equal row before it. Rows stamped before the
+change are never re-priced (a stamped event is final), so a report or a
+`CostBudget` period that spans the change shows a step on such servers, and a
+budget tightens mid-period by the PUE factor for the rest of it. Servers with
+power telemetry (Tier 1) and servers with a PUE of 1 see no difference.
 
 **Per-host energy parts (llama.cpp RPC clusters).** A cluster request is
 served by its head and the RPC members the head drives, each on its own host.

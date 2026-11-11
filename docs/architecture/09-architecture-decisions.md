@@ -636,7 +636,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -692,7 +692,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -861,7 +861,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1056,7 +1056,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1271,7 +1271,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-102-migrations),
+[§4](reference/data-model.md#4-migration-history-106-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1497,7 +1497,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-102-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-106-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1644,7 +1644,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-102-migrations),
+[§4](reference/data-model.md#4-migration-history-106-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3608,7 +3608,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-102-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-106-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3832,7 +3832,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-102-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-106-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4864,7 +4864,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4990,7 +4990,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5133,7 +5133,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-102-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-106-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7638,7 +7638,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-102-migrations),
+[Data Model](reference/data-model.md#4-migration-history-106-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7861,7 +7861,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-102-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-106-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8002,7 +8002,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-102-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-106-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8266,7 +8266,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-102-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-106-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -10744,6 +10744,12 @@ to which the same question applies.
   measurement, and an operator upsert never clobbers either; a benchmark's admin-state write carries `ram_estimate_mb` through so it
   does not reset it.
 
+**Amended by [ADR-096](#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)
+(cluster totals).** On a llama.cpp RPC cluster head the table also shows the cluster's totals: the head's own effective
+value plus every member's, each part `max(measured, estimate)` by the same rule; an unknown part adds 0 and marks that
+axis's total a lower bound (`cluster_vram_total_complete` / `cluster_ram_total_complete`), and a CPU member has no VRAM
+part. The head's own effective value, which is what its host charges, stays beneath the total.
+
 **Rejected:** **Keeping the lock as a measured/estimate selector** (it is the under-reservation: an estimate below reality served in
 place of the measurement that disproved it). **Measured-wins with no lock** (it rebuilds the one-way loop with no lever at all, and
 replaces a floor with a possibly transient reading). **Replacing the pushed demand with the live reading** (a dip lowers the
@@ -11647,4 +11653,171 @@ minutes to load; the status stream already shows the progress).
 → [Routing & Model Selection §10.4](cross-cutting/routing-and-model-selection.md#104-the-instance-scaler),
 [Agent-Managed Model Runtime §4.1](cross-cutting/agent-runtime-manager.md#41-control-routes) and
 [§5.8](cross-cutting/agent-runtime-manager.md#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor),
+[HTTP API Surface](reference/api-surface.md).
+
+## ADR-096 — llama.cpp RPC cluster mode: the gateway starts members first and stays off the data path; transport and network are chosen per cluster
+**Context:** a model too large for one AI server can run across several with llama.cpp's RPC backend: one
+`llama-server` (the **head**) offloads part of the model to `ggml-rpc-server` processes (the **members**) on other
+hosts. Upstream offers no authentication, no encryption and no orchestration: a member serves whoever connects first
+(a second client blocks in the handshake and takes the member over when the first leaves), a head aborts as soon as a
+member goes away, and the head names member devices `RPC0…` in the order it registered them, so a member that exposes
+one device more or less shifts every later name. The gateway already owns launch specs, admission inputs, routing and
+accounting for single-host models; a cluster needs all of them to span hosts, and a careless design either exposes an
+unauthenticated port to the network, lets one head take another's member, or points device names at the wrong card.
+
+**Decision — thirteen choices, taken together. Migrations 103–106; agent 0.18.0, feature `rpc_cluster` on both sides.**
+
+- **(a) The gateway configures, orders, holds, accounts and secures; it is never on the RPC data path.** A head is an
+  ordinary `llama_cpp` spec with `cluster_enabled`; its members are `rpc_server` processes on **other** servers (a
+  member on the head's own server is refused), each serving exactly one head, and a server is a member of a given head
+  at most once. A head is never replicable and needs an explicit `startup_timeout_seconds`. The RPC protocol itself
+  stays unauthenticated and unencrypted: securing it upstream is not this project's job, so the design narrows who can
+  reach a member instead (b, i).
+- **(b) Transport × network is chosen per cluster.** The **network** is `mesh` (NetBird on the head and every member)
+  or `lan` (no NetBird needed); the **transport** is `direct` (the head dials the member's `ggml-rpc-server`) or
+  `relay` (the head dials an agent-run byte relay that admits only the head and forwards to a loopback-bound member).
+
+  | | `mesh` | `lan` |
+  |---|---|---|
+  | Address in `${RPC_SERVERS}` | the member's mesh IPv4 | the member's `lan_address`, else its `Domain` |
+  | `direct`: member binds | its mesh IPv4 exactly | `0.0.0.0`, or `lan_address` with `lan_bind_only` |
+  | `direct`: who can connect | the NetBird policy, which requires policy management, deny-by-default on and enforced, and NetBird's `Default` policy seen disabled | anyone who reaches the port; the operator acknowledges it per head (`lan_exposure_ack`) |
+  | `relay`: relay binds | its mesh IPv4 exactly | `0.0.0.0`, or `lan_address` with `lan_bind_only` |
+  | `relay`: who can connect | the relay's allowlist: the head's mesh IPv4 | the allowlist: the head's `lan_address`, else the IPv4s its `Domain` resolves to |
+  | Managed NetBird policy | `op-gw-rpc-<member server id>`, one grant per member port | none |
+
+  **Defaults:** the network is `mesh` when the head and every member are NetBird-enabled with a tracking group and a
+  known mesh IP, else `lan`; the transport is `direct` in `lan`, and in `mesh` `direct` where its NetBird
+  preconditions hold, else `relay`. Performance comes first, so `direct` is the default wherever it can be made safe,
+  and a plain LAN without NetBird must work. `direct` + `mesh` without the preconditions is refused
+  (`runtime_spec.cluster_direct_unavailable`), `direct` + `lan` without the acknowledgement too
+  (`runtime.cluster_lan_ack_required`), while `relay` + `mesh` with deny-by-default off only warns: the allowlist is
+  the gate there. A server gains `lan_address` (an IPv4 literal) and `lan_bind_only`; a NetBird-enabled server in a
+  `lan` cluster needs `lan_address`, because the peer sync rewrites its `Domain` to the NetBird name. The managed
+  policy family covers every `mesh` cluster in either transport, with no per-server include or exclude, and a policy
+  switch that a direct mesh cluster relies on cannot be turned off while one exists
+  ([Networking & Mesh §12](cross-cutting/networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)).
+- **(c) Two member modes per head.** `automatic` (the default, since it needs no member-side spec work): the head
+  lists servers with an ordered GPU selection (empty = a CPU member) and member settings (threads, cache, device
+  backend, estimates); the gateway derives one `rpc_server` spec per entry, id `rpca_<head spec id>_<server id>`, with
+  no spec row at all: settings, GPU selection, port and usage live on the membership row. The server must offer RPC
+  membership (`rpc_member_enabled`). `manual`: an operator creates an `rpc_server` spec on the member server (id
+  `rpcm_<hex>`, its own binary, args, GPU rows, estimates and consent list) and the head selects the server and that
+  spec. Manual specs live in their **own tables** (`rpc_member_specs`, `rpc_member_spec_gpus`), not as
+  `agent_runtime_specs` rows with a nullable `mapping_id`: making `mapping_id` nullable needs a SQLite table rebuild,
+  breaks the `on conflict(mapping_id)` upsert, every per-application spec join through `model_mappings`, and the
+  ingest's ownership chain spec → mapping → application → server. Both modes derive the same agent spec kind, so the
+  agent cannot tell them apart. Several members of different heads may share a server; overlapping GPU selections only
+  warn, because whether a GPU is free is the member host's admission's decision at start time, never a save rule.
+- **(d) A binary inventory per server, and version matching.** The agent reports every allowlisted binary with its
+  kind and version (it executes only `llama-server --version`; a `ggml-rpc-server` inherits the version of a
+  `llama-server` beside it, else its path's), the portal adds manual rows and a version override kept in its own
+  column, and specs pick binaries from it. Head and members must run the same build (same RPC protocol, same graph
+  limits): an automatic member gets the member server's `ggml-rpc-server` whose commit, else build, equals the head
+  binary's (servers without one are not offered); a manual member is refused only when both versions are known and
+  differ, and an unknown one warns. The agent's runtime check (`runtime.cluster_version_mismatch`) stays the net.
+- **(e) The placeholder family and the device-order rule.** `${RPC_SERVERS}` (the configured endpoints, never
+  liveness), `${RPC_DEVICES}`, the generic `${DEVICES}` and `${FIRST_LOCAL_DEVICE}`, and the explicit
+  `${CUDA_FIRST_DEVICE}` / `${VULKAN_FIRST_DEVICE}` / `${METAL_FIRST_DEVICE}`; a per-spec `device_backend` names the
+  prefix the generic tokens render, and `auto` is resolved **on the agent** from the host's detected GPU vendor set
+  (one vendor → its native backend, several → Vulkan). The rule: the member order is the operator's, it is the `--rpc`
+  order and therefore the `RPC<n>` numbering and the `--tensor-split` positions, and inside a member its GPU order; the
+  agent owns a member's `-H`, `-p`, `-d` and `-c`, injects `-d` from the member's GPUs, and fails a member whose
+  startup banner shows another device count than the configuration implies (`runtime.rpc_device_count_mismatch`).
+  `${DEVICES}` renders RPC devices first and local GPUs last, because llama.cpp puts the output layer on the last
+  device and `--fit` fills devices back to front. The head's save checks follow llama.cpp's parser: `${RPC_SERVERS}`
+  exactly once (env and argv `--rpc` are additive, so twice registers the members twice), a device list that names
+  the RPC devices, and a device list parsed after the RPC servers exist.
+- **(f) Members first, and only the gateway starts a head.** A start acknowledges the configuration on every agent,
+  ensures the members in parallel through dedicated agent routes (`POST /rpc/ensure|release|stop|purge-cache/{specID}`
+  rather than an overloaded `/ensure/{model}`, because a member has no upstream model to address), starts the head
+  with the `X-OP-Cluster-Start: 1` marker and waits until every member reports the head's hold. An agent refuses any
+  other start of a cold head (`runtime.cluster_not_ready`) and never puts a head into its crash-loop backoff: the
+  gateway owns retries, the 60 s cooldown after a failed start and re-orchestration. A cause no retry can fix (an
+  unsupported build, a version or device mismatch) blocks automatic starts until the head's runtime document changes;
+  an operator's manual start overrides both.
+- **(g) Members are claimed while their head needs them, and released at every head stop.** A reservation armed by the
+  member ensure covers the gap until the head connects; the head's live connection is the hold. Members are released
+  at every stop of the head (manual, watchdog, conditional, the head's exit, a NetBird drift) and after every failed
+  start, but **not** at formation: the agent's release ends the hold along with the reservation, so a release at
+  formation would leave a member evictable while its head runs. A local start on a member host that waits only for a
+  held member makes the gateway ask the head's agent for a conditional stop, which happens only when that agent's own
+  eviction rule lets the head go; otherwise the local start waits.
+- **(h) A watchdog follows a formed cluster on telemetry, and acts only on the head.** Losing a member aborts the head
+  anyway, and a member is removed only through its head. Evidence of a lost member (exit, a new PID, a vanished hold,
+  a relay stall) is a suspicion until a head frame that arrived **after** the member's confirms the head still runs
+  the same process, because a head that stopped on its own ends its members' sessions too and their frames can arrive
+  first. A member server that falls silent counts as lost after **max(3 × its telemetry interval, 15 s)** (3 s at the
+  default 1 s cadence would stop healthy clusters on a reporting hiccup), never in the gateway's boot grace and never
+  before formation. A confirmed loss stops the head, records `runtime.cluster_member_lost` at that member's position
+  and starts the cluster again after the cooldown if the head was serving requests.
+- **(i) Rights on every server, the member side's consent, and positions instead of names.** A write that changes the
+  membership, member mode, network, transport or the head binary needs management rights on the head's server and on
+  every member server, former ones included; one that changes none of them needs rights on the head's server only, so a
+  member the caller cannot see never locks them out of their own head. The member side consents per head-server admin
+  group (`rpc_allowed_head_groups` on the server for automatic members, `allowed_head_groups` on a manual spec; an empty
+  list means the member server's own admin groups), and consent binds **every** caller, system scope included: the
+  derivation re-checks it on every document, so a save past it would store a head that is never pushed. Every refusal
+  about a server the caller may not use is `server.not_found`, checked before any member setting is read. Read views
+  name members by **position** only where the caller may not see the server, and inference refusals may carry the
+  recorded cause code and member position (never a server name).
+- **(j) A cluster is pushed whole or not at all, and only between agents that both understand it.** The derivation
+  reads the configured membership, never liveness; any member that cannot be derived withholds the head and every
+  member spec derived from it, so no agent ever receives a partial endpoint list (which would shift `RPC<n>`). Both
+  sides declare `rpc_cluster` and read the other's declaration fail-closed: the gateway pushes a head or member only to
+  an agent that declares it, and an agent honours `kind`, `cluster` and `rpc` only while the gateway declares it, so a
+  file-mode document or an older gateway can never start a member as a model. A member host whose features are unknown
+  withholds only its heads, never the head server's whole document. Deleting a server that is a member is refused
+  (`409 runtime.cluster_member_in_use`): the membership row would cascade away silently and shorten the endpoint list.
+- **(k) Member usage per run, stored with the head.** A member's agent measures its process while the head holds it;
+  the gateway stores the VRAM per member GPU and the member's RAM on the membership row by a per-run peak rule (rises
+  during a run, a formed run's peak replaces the stored value when the head stops, a run that never formed replaces
+  nothing), and pushes `max(stored, estimate)` as the member's demand. A save that changes the split keeps the old
+  values as a stale floor, held at most at the GPU's budget (else the card's memory) or the host's memory, so a new
+  split that needs less can start. No per-request VRAM or RAM metering.
+- **(l) Energy per host, priced at each host's own price.** A cluster request records every member host in session at
+  its completion; the reconciler prices the head's share and each member's share of that member host's power, and
+  each share is charged at its own server's `price_per_kwh`. Member shares appear under the member server, aggregated
+  only. Formation energy falls into the requests that waited for it.
+- **(m) Manual start and stop of a head go through the orchestration.** A start answers like a model's start; a stop
+  drains the head first, optionally stops the members (`stop_members`), runs under the gateway's lifetime and answers
+  `200` when it finished within the early window, else `202 {"state":"stopping"}`, because a drain can outlast the
+  server's write timeout. A head an operator stopped stays down until a manual start or a gateway restart.
+
+**Consequence:**
+
+- **[ADR-084](#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)'s
+  table rule extends to cluster totals.** A head's `cluster_vram_total_mb` / `cluster_ram_total_mb` are its own
+  effective value plus every member's, each part `max(measured, estimate)`; an unknown part adds 0 and marks that
+  axis's total a lower bound, and a CPU member has no VRAM part. The head's own cell still shows what its host charges.
+- **A cluster's formation has a bounded wait.** A cold request parks for the head's startup timeout plus the slowest
+  member's, clipped by the application's `timeout_ms`; a worst-case start can exceed it, and the client's retry then
+  finds the cluster formed ([Routing & Model Selection §11](cross-cutting/routing-and-model-selection.md#11-cluster-heads-the-cluster-gate)).
+- **Device names follow the backend's own enumeration, not the host index**, an open follow-up: CUDA matches
+  `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, and Vulkan and mixed-vendor hosts enumerate independently.
+  `auto` on a mixed host is the host's vendor set, not the vendor of the spec's GPUs (each collector numbers its cards
+  from 0, so the agent cannot map an index to a vendor). The operator verifies with `--list-devices`
+  ([§11 risks](11-risks-and-technical-debt.md#111-operational-risks)).
+- **A `lan` cluster in direct transport exposes each member's port unauthenticated**, and a `lan` relay trusts DNS when
+  the head is named by `Domain`; both are accepted per cluster and recorded as risks.
+- **No upgrade order.** Each side gates on the other's declaration, so a mixed fleet runs no cluster rather than a
+  broken one.
+
+**Rejected:** **The gateway on the data path** (a proxy for tensor traffic costs the performance clusters exist for, and
+the relay already narrows access on the member host). **Requiring NetBird** (a plain LAN cluster must work).
+**Overloading `/ensure/{model}` for members** (a member has no model; its own routes say what they do). **Manual member
+specs as nullable-mapping runtime specs** (see (c)). **A system-scope bypass of consent** (the derivation would
+withhold what the save accepted). **Releasing members at formation** (see (g)). **A stale threshold of three intervals
+alone** (see (h)). **A save-time GPU exclusivity rule** (admission decides at start; a save cannot know what will be
+free). **"Disable the cluster with a reason" when a member server is deleted** (a silently shortened endpoint list
+shifts `RPC<n>`; the operator removes the member first). **Letting the agent retry a crashed head** (it would restart a
+head whose members are gone; the gateway owns the start). **Resolving `auto` from the spec's GPUs' vendor** (not
+knowable on a mixed host). **Per-request VRAM metering** (left for later).
+→ [Agent-Managed Model Runtime §3.6](cross-cutting/agent-runtime-manager.md#36-rpc-cluster-members-and-heads) and
+[§3.7](cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster),
+[Routing & Model Selection §11](cross-cutting/routing-and-model-selection.md#11-cluster-heads-the-cluster-gate),
+[Telemetry §8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
+[Networking & Mesh §12](cross-cutting/networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc),
+[Security §8.4](cross-cutting/security-auth-rbac.md#84-rpc-clusters-rights-on-every-server-consent-and-anonymous-positions),
+[Runtime View §6.9](06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start),
 [HTTP API Surface](reference/api-surface.md).
