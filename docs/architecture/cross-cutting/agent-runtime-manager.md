@@ -5092,6 +5092,12 @@ gained the member routes, the head start header and the conditional stop (§3.6,
 documents only to an agent that declares the name, and the agent honours them only
 under a gateway that declares it.
 
+**`0.18.0` → `0.18.1` (RPC cluster follow-ups) is PATCH.** No feature flag
+changes (`rpc_cluster` keeps `Since: "0.18.0"`), but what an operator and the
+gateway observe does: the exit classification takes an unreachable member
+before the device error it causes (§3.6), and a member's reported command
+carries the arguments and environment the agent adds (§14.7).
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
