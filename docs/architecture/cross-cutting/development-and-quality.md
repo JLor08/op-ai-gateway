@@ -17,6 +17,7 @@ demand). Everything below is runnable headlessly by a coding agent.
 | Node.js / npm | Node 26 (LTS) | `gateway/frontend` (React/TS/Vite) and `gateway/e2e` (Playwright) |
 | golangci-lint | v2 (pinned in CI, currently v2.15.0) | Go formatting (`fmt`, gofumpt-based) + linting, both modules; CI pins Go 1.26 |
 | Docker | any recent | Deploy images, the Postgres test env, the local SonarQube server |
+| sonar-scanner | 8.0.1+ (optional) | The local SonarQube gate's native scanner, the default on arm64 hosts ([§7.3](#73-scanner-modes-docker-and-native)); `brew install sonar-scanner` |
 
 **Go stays on 1.26 for now (CI `go-version: "1.26"`, both Go builder images pinned to
 `golang:1.26.5`).** Go 1.27 (checked up to go1.27.4) carries a net/http server regression,
@@ -519,7 +520,7 @@ Lifecycle (`scripts/sonar/sonar.sh`, wrapped by make targets):
 |---|---|
 | `make sonar-up` | Starts the server (first run: `sonar.sh bootstrap` sets credentials + token) |
 | `make sonar-coverage` | Generates Go coverprofiles (both modules, `-covermode=atomic`) and the frontend lcov report |
-| `make sonar-scan` | Runs the scanner alone (missing coverage reports are tolerated with a WARN, but the gate's coverage condition then reads 0) |
+| `make sonar-scan` | Runs the scanner alone, in a container or natively ([§7.3](#73-scanner-modes-docker-and-native)); missing coverage reports are tolerated with a WARN, but the gate's coverage condition then reads 0 |
 | `make sonar-gate` | Coverage + scan + waits for the computed quality-gate verdict. The verdict is **advisory**: it exits 0 even on an advisory FAIL (pass `sonar.sh gate --strict` to exit non-zero on it). Community Build cannot compare against main, so this is **not** the branch pass/fail gate — `sonar-branch-findings` is (see §7.1) |
 | `make sonar-findings` | Exports open issues + hotspots as JSON into `.sonar-local/`, and records which analysis the export describes (`analysis-meta.json`: SCM revision + date) so a stale export can be detected |
 | `make sonar-branch-findings` | Filters that export down to the findings on lines **this branch** changed (see below); the **authoritative pre-PR gate** — exits non-zero when the branch owns one, and refuses a stale export whose revision is not `HEAD` |
@@ -627,14 +628,38 @@ Operational notes (encoded in `sonar-project.properties` comments):
   git on the host and is unaffected, which is why it — not the server gate — is
   the authoritative pre-PR check. The git CLI blames the same worktree correctly,
   but SonarQube's git SCM sensor uses JGit with no CLI fallback, so there is no
-  clean in-scanner fix short of scanning a non-worktree checkout.
+  clean in-scanner fix short of scanning a non-worktree checkout. That
+  measurement is the **docker** scanner's; the native scanner
+  ([§7.3](#73-scanner-modes-docker-and-native)) sees the worktree's real paths
+  and does store per-line blame for a linked worktree (measured on SonarQube
+  26.8 with SonarScanner CLI 8.4).
   `sonar.scm.exclusions.disabled=true` keeps the analysis from silently reporting
   "0 non excluded files".
 - **JS/TS bridge memory**: `sonar.javascript.node.maxspace=2048` caps the
   scanner's embedded Node analyzer. Do **not** raise it without raising
   Docker's memory limit — an unbounded bridge balloons into the VM's OOM
   killer and the scan dies with `EXECUTION FAILURE` (which is otherwise safe
-  to retry).
+  to retry). A native scan is not bound by the VM, and can raise it for one
+  run: `SONAR_SCANNER_EXTRA_ARGS=-Dsonar.javascript.node.maxspace=4608`.
+- **Go analysis memory**: the scanner's engine JVM needs about **4 GB of
+  heap** for this repository's Go code. sonar-go converts and deserializes one
+  package (directory) at a time, and `gateway/backend/internal/gateway` alone
+  holds 465 files: measured with SonarQube 26.8 (sonar-go 1.40), the engine
+  runs out of heap in that package at `-Xmx3g` and passes at `-Xmx4g`. sonar-go
+  has no property that limits how much it parses at once or caps its memory
+  (its properties are `sonar.go.exclusions`, the report paths,
+  `sonar.go.converter.validation` and `sonar.go.duration.statistics`), so the
+  heap is the only lever. It is set with `SONAR_SCANNER_JAVA_OPTS`, **not**
+  `SONAR_SCANNER_OPTS` (§7.3). The JVM's own default, a quarter of the memory
+  it sees, is about 3 GB inside a 12 GB docker VM, which fails, and 4 GB on a
+  16 GB host, which is borderline. `sonar.sh` therefore sets the engine heap
+  itself when `SONAR_SCANNER_JAVA_OPTS` is unset: `-Xmx6g` in native mode and
+  `-Xmx5g` in docker mode (in a 12 GB VM, docker mode passes with `-Xmx5g`,
+  measured under Rosetta). Docker mode's default needs a **colima/Docker VM of
+  at least about 8 GB**, room for the 5 GB engine next to the SonarQube
+  server.
+  `SONAR_SCANNER_EXTRA_ARGS=-Dsonar.go.duration.statistics=true` logs the Go
+  sensor's used and peak memory.
 
 ### 7.2 Pinned images and deliberate upgrades
 
@@ -683,11 +708,11 @@ names the two ways out:
    admin credentials, and drops the record; bootstrap mints new credentials,
    and the next scan sets a new baseline (§7).
 
-`SONAR_SCANNER_IMAGE` overrides the scanner the same way, and
-`SONAR_SCANNER_OPTS` sets the scanner's JVM options (default `-Xmx2048m`). The
-scanner keeps no state, but it is pinned too, so the gate is the same
-known-good pair on every machine: a floating `latest` scanner can move ahead
-of the pinned server it has to talk to.
+`SONAR_SCANNER_IMAGE` overrides the scanner the same way (the JVM options are
+in §7.3). The scanner keeps no state, but it is pinned too, so the gate is the
+same known-good pair on every machine: a floating `latest` scanner can move
+ahead of the pinned server it has to talk to. The native scanner is not pinned,
+only held to a minimum release (§7.3).
 
 **Upgrading deliberately.** Moving a pin is an ordinary change made through a
 pull request, and the server pin resets every developer's local Sonar data:
@@ -723,7 +748,77 @@ The startup wait, the record and the override notes, both mismatch directions
 included, are pinned by `scripts/sonar/sonar.test.sh`, which runs offline
 against stubs of `curl`, `docker compose`, `docker` and `sleep`:
 `bash scripts/sonar/sonar.test.sh`. It also checks that both images stay pinned
-to full release tags.
+to full release tags, and covers the scanner modes of §7.3.
+
+### 7.3 Scanner modes: docker and native
+
+`sonar.sh scan` (so `make sonar-scan` and `make sonar-gate`) runs the scanner
+one of two ways, chosen with `SONAR_SCANNER_MODE`:
+
+| Mode | What runs |
+|---|---|
+| `docker` | The pinned scanner image on the compose network, with the repository mounted at `/usr/src` |
+| `native` | A `sonar-scanner` on the host: the one `SONAR_SCANNER_BIN` names, else the one on `PATH`. Install it with `brew install sonar-scanner` |
+| `auto` (default) | `native` when a native scanner is available **and** the docker host (`docker info`) or this machine (`uname -m`) is arm64; `docker` otherwise. The choice and its reason are printed |
+
+**Why native exists.** The scanner image is published for linux/amd64 only, in
+12.1 and still in 12.4, while the server image is multi-arch. On an arm64
+docker host (Apple Silicon) the whole scanner therefore runs emulated: its JVM,
+the Node.js JS/TS analyzer and the sonar-go converter binary. Under colima with
+qemu the converter crashed on several Go packages, a different set on every
+run (core dumps from `qemu-x86_64`), and the scanner silently never analyzed
+those packages; runs were also slow. Rosetta stops the converter crashes, but
+everything is still translated. A native scan runs nothing emulated: on an
+Apple Silicon host the scanner takes about one minute for this repository,
+against about three and a half minutes for the image under Rosetta (SonarQube
+26.8, SonarScanner CLI 8.4 and 8.0.1, measured).
+
+**Same analysis, host paths.** Both modes pass the same properties:
+`sonar-project.properties`, the per-analysis `sonar.projectVersion`, the token
+(in the environment, so it never shows in the host's process list) and
+`SONAR_SCANNER_EXTRA_ARGS`. Native mode runs from the repository root with
+`sonar.projectBaseDir` set to it, so the relative coverage report paths resolve
+the same way they do under `/usr/src`; its working directory is the same
+`.scannerwork/` the report task is read from; and it reaches the server at
+`http://127.0.0.1:9000` instead of the compose network's `sonarqube:9000`. A
+linked worktree needs no extra mount: the host sees the common `.git`.
+
+**A floor, not a pin.** The scanner CLI is only a bootstrapper: it downloads the
+scanner engine, the JRE that runs it (for the host's platform) and every
+language analyzer from the server it talks to (observed with CLI 8.0.1 in the
+image and 8.4 natively, against SonarQube 26.8: both ran engine 13.4.1 on a
+server-provided JRE 21). With the server pinned, the analysis is the same
+whichever CLI release starts it. Native mode
+therefore checks a minimum only: `sonar-scanner -v` must report at least the
+CLI release the pinned image bundles (the tag's part after `_`, today
+`8.0.1`), and the scan stops before anything starts when it reports less, or
+nothing readable. Bumping the image pin raises the floor with it.
+
+**JVM options.** The scanner is two JVMs. `SONAR_SCANNER_OPTS` (default
+`-Xmx2048m`) sets the options of the CLI's own **launcher** JVM, which only
+bootstraps; the analysis runs in a separate **engine** JVM, whose options come
+from `SONAR_SCANNER_JAVA_OPTS`. Heap sizes set in `SONAR_SCANNER_OPTS` never
+reach the analysis. Because the Go analysis needs about 4 GB of engine heap
+(§7.1, operational notes), `sonar.sh` gives the engine a heap of its own when
+`SONAR_SCANNER_JAVA_OPTS` is unset:
+
+| Mode | Engine default | Why |
+|---|---|---|
+| `native` | `-Xmx6g` | Room above the 4 GB the Go analysis needs; a quarter of a 16 GB host's memory falls short |
+| `docker` | `-Xmx5g` | Passes in a 12 GB VM next to the server (measured); the colima/Docker VM needs **at least about 8 GB** for it |
+
+A set `SONAR_SCANNER_JAVA_OPTS` always wins and is passed through unchanged, in
+both modes. Every scan prints the effective engine options and where they came
+from, and adds a note when `SONAR_SCANNER_OPTS` carries `-Xmx` while
+`SONAR_SCANNER_JAVA_OPTS` is unset. For example:
+
+```sh
+SONAR_SCANNER_JAVA_OPTS="-Xmx8g -XX:+UseG1GC" make sonar-scan
+```
+
+`SONAR_SCANNER_EXTRA_ARGS` appends arguments, split on whitespace, to the
+scanner's command line in either mode, for one-off properties such as
+`-Dsonar.javascript.node.maxspace=4608`.
 
 ## 8. License headers & generated code
 

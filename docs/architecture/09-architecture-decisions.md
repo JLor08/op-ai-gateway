@@ -3098,7 +3098,8 @@ routing skips a server a benchmark holds, and so does the model warmer. The
 stop-all is bounded and clears on every exit. It never stops while every frame
 of its 5 s selection window shows traffic in flight: a stop cuts off a stream
 that outlasts the agent's 10 s drain, and the client sees a clean end of
-stream, not an error. When the target itself was stopped, the cold pass
+stream, not an error. When the target itself was stopped, by its own stop-all
+or by an earlier target's whose clear was written, the cold pass
 rides the router's 503 `runtime.admission_blocked` through the load loop
 (`coldPassAfterStop`) until the clear reaches the agent, and keeps the time to
 first token of the attempt that was served, which includes the whole start. The

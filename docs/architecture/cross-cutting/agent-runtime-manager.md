@@ -8905,9 +8905,14 @@ stays resident after its warm pass, so one stop at run start would let target
    (`coldPassAfterStop`, [API Compatibility & Inference
    §7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)). The
    loop keeps the time to first token of the attempt that was served, which
-   includes the whole start. A target that was not in the stop set is served
-   at once, with one plain stream. The load-time gate is unchanged: a confirmed
-   cold start, and a cold pass slower than the warm one.
+   includes the whole start. So does the cold pass of a target whose
+   override an earlier target's stop-all wrote and cleared
+   (`benchmarkOverrides.cleared`): the clear is stored before that stop-all
+   returns, but the agent applies it only when the document reaches it, and
+   nothing waits for that when this target's own stop-all stops nothing, does
+   not run, or no longer may, as after a failed clear. Any other target is
+   served at once, with one plain stream. The load-time gate is unchanged: a
+   confirmed cold start, and a cold pass slower than the warm one.
 
 **Why a quiet frame is enough.** The portal's restart completes on a
 transition ([ADR-026](../09-architecture-decisions.md#adr-026--gatewayagent-control-is-desired-state-not-commands));
