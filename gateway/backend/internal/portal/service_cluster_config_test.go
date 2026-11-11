@@ -4,6 +4,7 @@
 package portal
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -790,5 +791,44 @@ func TestAgentRuntimeConfigWithholdsOnCorruptMemberSpec(t *testing.T) {
 	}
 	if got := f.withheldReason(); got != ClusterWithheldMemberSpecInvalid {
 		t.Fatalf("reason = %q", got)
+	}
+}
+
+// failingSettings is a system settings store whose reads fail while fail is
+// set.
+type failingSettings struct {
+	SystemSettingsStore
+	fail bool
+}
+
+func (s *failingSettings) SystemSettings(ctx context.Context) (map[string]string, error) {
+	if s.fail {
+		return nil, errors.New("settings read failed")
+	}
+	return s.SystemSettingsStore.SystemSettings(ctx)
+}
+
+// TestAgentRuntimeConfigPropagatesSettingsReadError: a failed settings read
+// is an error of the document, never every NetBird switch read as off, which
+// would withhold a running direct mesh cluster and drain it.
+func TestAgentRuntimeConfigPropagatesSettingsReadError(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.clusterAgents(a.ID)
+	f.netbirdReady(f.head.ID, "100.64.0.1")
+	f.netbirdReady(a.ID, "100.64.0.2")
+	f.directMeshPolicies()
+	req := clusterHeadRequest(autoMember(a.ID))
+	req.ClusterNetwork, req.RPCTransport = "mesh", "direct"
+	head := f.mustPut(req)
+	if hs, ok := specByID(f.config(f.head.ID), head.ID); !ok || hs.Cluster == nil {
+		t.Fatalf("head withheld before the failure: %q", f.withheldReason())
+	}
+	settings := &failingSettings{SystemSettingsStore: f.settings, fail: true}
+	f.svc.settings = settings
+	for _, id := range []string{f.head.ID, a.ID} {
+		if _, err := f.svc.AgentRuntimeConfig(f.ctx, id); err == nil {
+			t.Fatalf("AgentRuntimeConfig(%s) served a document over a failed settings read", id)
+		}
 	}
 }

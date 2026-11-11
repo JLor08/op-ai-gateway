@@ -521,7 +521,7 @@ func TestDefaultPolicyStateRecordedAndClustersNotifiedOnChange(t *testing.T) {
 	if e.notifications() == before {
 		t.Fatal("a changed Default state did not notify the cluster servers")
 	}
-	if e.svc.directMeshAvailable(e.ctx) {
+	if direct, err := e.svc.directMeshAvailable(e.ctx); err != nil || direct {
 		t.Fatal("direct mesh must be unavailable while Default is enabled")
 	}
 }

@@ -189,7 +189,10 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 	for _, m := range members {
 		servers = append(servers, m.server)
 	}
-	network, transport := s.resolveClusterNetwork(ctx, head, servers)
+	network, transport, err := s.resolveClusterNetwork(ctx, head, servers)
+	if err != nil {
+		return clusterDerivation{}, err
+	}
 	headIPs, headDomain, reason := clusterHeadIdentity(headServer, network)
 	if reason != "" {
 		return withheld(reason), nil
@@ -202,8 +205,14 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 			return withheld(reason), nil
 		}
 	}
-	if transport == rpcTransportDirect && network == clusterNetworkMesh && !s.directMeshAvailable(ctx) {
-		return withheld(ClusterWithheldDirectUnavailable), nil
+	if transport == rpcTransportDirect && network == clusterNetworkMesh {
+		direct, err := s.directMeshAvailable(ctx)
+		if err != nil {
+			return clusterDerivation{}, err
+		}
+		if !direct {
+			return withheld(ClusterWithheldDirectUnavailable), nil
+		}
 	}
 	if transport == rpcTransportDirect && network == clusterNetworkLAN && !head.LANExposureAck {
 		return withheld(ClusterWithheldLANAckRequired), nil

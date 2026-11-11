@@ -762,20 +762,29 @@ func defaultClusterNetwork(servers []routing.AIServer) string {
 // cluster: the gateway manages policies, deny-by-default is on and enforced,
 // and the last policy pass saw NetBird's catch-all Default policy disabled.
 // Without them every mesh peer could reach a member's unauthenticated RPC
-// port.
-func (s *Service) directMeshAvailable(ctx context.Context) bool {
-	values := s.systemSettingValues(ctx)
+// port. A failed settings read is an error, never every switch read as off:
+// the runtime documents derive from this, and a guessed "off" would withhold
+// and drain every running direct mesh cluster.
+func (s *Service) directMeshAvailable(ctx context.Context) (bool, error) {
+	values, err := s.readSystemSettings(ctx)
+	if err != nil {
+		return false, err
+	}
 	return NetbirdManagePolicies(values) && NetbirdDenyByDefault(values) && NetbirdDenyByDefaultEnforce(values) &&
-		s.netbirdDefaultPolicyDisabled(ctx)
+		defaultPolicyDisabledIn(values), nil
 }
 
 // defaultRPCTransport: in mesh, direct where its NetBird preconditions hold,
 // else relay; in lan, direct.
-func (s *Service) defaultRPCTransport(ctx context.Context, network string) string {
-	if network == clusterNetworkMesh && !s.directMeshAvailable(ctx) {
-		return rpcTransportRelay
+func (s *Service) defaultRPCTransport(ctx context.Context, network string) (string, error) {
+	if network != clusterNetworkMesh {
+		return rpcTransportDirect, nil
 	}
-	return rpcTransportDirect
+	direct, err := s.directMeshAvailable(ctx)
+	if err != nil || !direct {
+		return rpcTransportRelay, err
+	}
+	return rpcTransportDirect, nil
 }
 
 // checkClusterNetwork is step 8 of validateClusterHead; it returns the
@@ -797,10 +806,19 @@ func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AI
 		}
 	}
 	if transport == "" {
-		transport = s.defaultRPCTransport(ctx, network)
+		var err error
+		if transport, err = s.defaultRPCTransport(ctx, network); err != nil {
+			return "", "", err
+		}
 	}
-	if transport == rpcTransportDirect && network == clusterNetworkMesh && !s.directMeshAvailable(ctx) {
-		return "", "", ErrClusterDirectUnavailable
+	if transport == rpcTransportDirect && network == clusterNetworkMesh {
+		direct, err := s.directMeshAvailable(ctx)
+		if err != nil {
+			return "", "", err
+		}
+		if !direct {
+			return "", "", ErrClusterDirectUnavailable
+		}
 	}
 	if transport == rpcTransportDirect && network == clusterNetworkLAN && !lanAck {
 		return "", "", ErrClusterLANAckRequired
@@ -1136,16 +1154,23 @@ func (s *Service) allocateRPCPort(ctx context.Context, serverID string) (int, er
 }
 
 // systemSettingValues reads the system settings; nil (no store, or a failed
-// read) reads every switch as off.
+// read) reads every switch as off. Only for a reader that may guess: the
+// cluster derivation and the save checks use readSystemSettings.
 func (s *Service) systemSettingValues(ctx context.Context) map[string]string {
-	if s.settings == nil {
-		return nil
-	}
-	values, err := s.settings.SystemSettings(ctx)
+	values, err := s.readSystemSettings(ctx)
 	if err != nil {
 		return nil
 	}
 	return values
+}
+
+// readSystemSettings reads the system settings; without a store every switch
+// is off (nil, no error), and a failed read is returned.
+func (s *Service) readSystemSettings(ctx context.Context) (map[string]string, error) {
+	if s.settings == nil {
+		return nil, nil
+	}
+	return s.settings.SystemSettings(ctx)
 }
 
 // netbirdDefaultPolicyState is the stored netbird_default_policy_state.
@@ -1174,7 +1199,13 @@ func parseNetbirdDefaultPolicyState(raw string) netbirdDefaultPolicyState {
 // no settings store -- is not disabled, so a direct mesh cluster is refused
 // until a pass has seen it.
 func (s *Service) netbirdDefaultPolicyDisabled(ctx context.Context) bool {
-	return parseNetbirdDefaultPolicyState(s.systemSettingValues(ctx)[netbirdDefaultPolicyStateKey]).State == NetbirdDefaultPolicyDisabled
+	return defaultPolicyDisabledIn(s.systemSettingValues(ctx))
+}
+
+// defaultPolicyDisabledIn is netbirdDefaultPolicyDisabled over settings
+// already read.
+func defaultPolicyDisabledIn(values map[string]string) bool {
+	return parseNetbirdDefaultPolicyState(values[netbirdDefaultPolicyStateKey]).State == NetbirdDefaultPolicyDisabled
 }
 
 // clusterMemberState is one stored member with what the read view needs.
@@ -1307,7 +1338,9 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 		}
 	}
 	if network != "" {
-		dto.ClusterTransportDefault = s.defaultRPCTransport(ctx, network)
+		if dto.ClusterTransportDefault, err = s.defaultRPCTransport(ctx, network); err != nil {
+			return dto, err
+		}
 	}
 	if dto.ClusterEnabled {
 		if dto.ClusterWithheldReason, err = s.clusterWithheldReason(ctx, dto.ID, headServer); err != nil {
@@ -1468,7 +1501,10 @@ func (s *Service) clusterWarnings(ctx context.Context, headServerID string, dto 
 			}
 		}
 	}
-	values := s.systemSettingValues(ctx)
+	values, err := s.readSystemSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if network == clusterNetworkMesh && transport == rpcTransportRelay && !(NetbirdDenyByDefault(values) && NetbirdDenyByDefaultEnforce(values)) {
 		add(ClusterWarnRelayMeshDenyOff)
 	}

@@ -82,7 +82,9 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) (
 				for _, m := range members {
 					all = append(all, byID[m.ServerID])
 				}
-				c.network, c.transport = s.resolveClusterNetwork(ctx, spec, all)
+				if c.network, c.transport, err = s.resolveClusterNetwork(ctx, spec, all); err != nil {
+					return nil, err
+				}
 				out = append(out, c)
 			}
 		}
@@ -93,15 +95,17 @@ func (s *Service) rpcClusters(ctx context.Context, servers []routing.AIServer) (
 // resolveClusterNetwork is the network and transport of a head: the stored
 // choice, else the defaults over its head and member servers. Shared by the
 // derivation and the policy pass so they cannot disagree.
-func (s *Service) resolveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, servers []routing.AIServer) (network, transport string) {
+func (s *Service) resolveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, servers []routing.AIServer) (network, transport string, err error) {
 	network, transport = head.ClusterNetwork, head.RPCTransport
 	if network == "" {
 		network = defaultClusterNetwork(servers)
 	}
 	if transport == "" {
-		transport = s.defaultRPCTransport(ctx, network)
+		if transport, err = s.defaultRPCTransport(ctx, network); err != nil {
+			return "", "", err
+		}
 	}
-	return network, transport
+	return network, transport, nil
 }
 
 // directMeshClusterExists reports whether a cluster relies on NetBird's policy
