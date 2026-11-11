@@ -663,12 +663,12 @@ func runtimeInstanceTarget(scope portal.RuntimeActionScope, k int) routing.Targe
 }
 
 // lifetime is the server's lifetime context (baseCtx), or the background
-// context on a server built without one.
+// context while none is installed.
 func (s *Server) lifetime() context.Context {
-	if s.baseCtx == nil {
-		return context.Background()
+	if ctx := s.baseCtx.Load(); ctx != nil {
+		return *ctx
 	}
-	return s.baseCtx
+	return context.Background()
 }
 
 // waitRuntimeStarts returns once every manual start's background ensure has

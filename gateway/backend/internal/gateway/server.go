@@ -594,9 +594,10 @@ type Server struct {
 	// derives each open agent WebSocket's lifetime from it: a shutdown watcher sends
 	// 1001 GoingAway when baseCtx is cancelled (SIGTERM), so http.Server.Shutdown
 	// finishes promptly and the agent reconnects via the fast clean-close path.
-	// Defaults to context.Background() in New; cmd/gateway replaces it via
-	// SetBaseContext before serving.
-	baseCtx context.Context
+	// Unset it reads as context.Background() (lifetime); cmd/gateway installs
+	// it via SetBaseContext before serving, after the background loops built
+	// with the server started -- which read it meanwhile, hence the atomic.
+	baseCtx atomic.Pointer[context.Context]
 	// agentMu guards agentListenerActive/agentListenerAddr below: main() sets them
 	// once before serving starts, but the upcoming live-rebind manager (Task 4)
 	// updates them at runtime while request handlers (the netbird_only gate) and
@@ -1164,7 +1165,6 @@ func New(deps ServerDeps) *Server {
 		audioConcurrencyMax:         positiveOr(deps.AudioConcurrencyMax, defaultAudioConcurrencyMax),
 		mux:                         http.NewServeMux(),
 		agentMux:                    http.NewServeMux(),
-		baseCtx:                     context.Background(),
 		internalAuthSecret:          deps.InternalAuthSecret,
 		users:                       deps.Users,
 		ChatRuns:                    deps.ChatRuns,
@@ -1247,7 +1247,7 @@ func New(deps ServerDeps) *Server {
 			},
 			authCtx: s.upstreamAuthCtx,
 			wake:    admission.release,
-			base:    func() context.Context { return s.baseCtx },
+			base:    s.lifetime,
 			now:     time.Now,
 			claims:  s.instanceClaims,
 		}, deps.InstanceScaleCooldown)
@@ -1439,7 +1439,7 @@ func (s *Server) SetBaseContext(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.baseCtx = ctx
+	s.baseCtx.Store(&ctx)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
