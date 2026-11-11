@@ -184,6 +184,18 @@ func (_d *RoutingStoreWithTracing) ClearMappingAudioConcurrency(ctx context.Cont
 	return _d.Store.ClearMappingAudioConcurrency(ctx, mappingID)
 }
 
+func (_d *RoutingStoreWithTracing) ClearServerNetbirdIP(ctx context.Context, id string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.ClearServerNetbirdIP")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ClearServerNetbirdIP(ctx, id)
+}
+
 func (_d *RoutingStoreWithTracing) ClearVendorAccountSharing(ctx context.Context, accountID string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.ClearVendorAccountSharing")
 	defer span.End()
@@ -1922,6 +1934,18 @@ func (_d *RoutingStoreWithTracing) UpdateServerHTTPSSwitchOverride(ctx context.C
 		}
 	}()
 	return _d.Store.UpdateServerHTTPSSwitchOverride(ctx, id, override)
+}
+
+func (_d *RoutingStoreWithTracing) UpdateServerLastSeen(ctx context.Context, id string, lastSeenAt time.Time, updatedAt time.Time) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateServerLastSeen")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateServerLastSeen(ctx, id, lastSeenAt, updatedAt)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateServerNetbirdAllowPing(ctx context.Context, id string, allow bool) (err error) {

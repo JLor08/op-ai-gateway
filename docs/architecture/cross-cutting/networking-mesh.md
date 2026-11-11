@@ -407,7 +407,10 @@ A llama.cpp RPC cluster ([ADR-096](../09-architecture-decisions.md#adr-096--llam
 [Agent-Managed Model Runtime §3.7](agent-runtime-manager.md#37-the-gateways-half-of-a-cluster))
 on the `mesh` network dials its members at their **mesh IPv4**, which the peer
 sync stores per server (`ai_servers.netbird_ip`, written with the domain, peer
-id and connected flag, and cleared when the peer linkage is cleared). A server
+id and connected flag, and cleared when the peer linkage is cleared or the
+server's NetBird flag is turned off). Only these targeted writes set it: the
+full-row server update leaves it, so a portal save from an older read cannot
+bring back an address the sync has since replaced. A server
 takes part in a mesh cluster only with NetBird on, a tracking group and a known
 mesh IP. A `lan` cluster uses no NetBird state at all: it reaches members at
 their `lan_address` (an IPv4 literal, with `lan_bind_only` to listen there

@@ -189,8 +189,8 @@ func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, 
 				run_head_instance, run_started_at)
 			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			headSpecID, m.Position, m.ServerID, m.MemberSpecID, m.Threads, m.CacheEnabled, m.DeviceBackend,
-			m.RAMEstimateMB, m.Port, m.RAMMeasuredMB, nullableTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB,
-			m.RunHeadInstance, runTime(m.RunStartedAt)); err != nil {
+			m.RAMEstimateMB, m.Port, m.RAMMeasuredMB, utcTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB,
+			m.RunHeadInstance, utcTime(m.RunStartedAt)); err != nil {
 			return s.classifyRPCWrite(err, "insert cluster member")
 		}
 	}
@@ -291,10 +291,11 @@ func (s *SQLiteStore) ClusterMemberBySpec(ctx context.Context, memberSpecID stri
 	return m, true, nil
 }
 
-// runTime is a run's start as a query argument: NULL for the zero time,
-// else the instant in UTC, so an equality test against the stored value
-// compares the same representation on every engine.
-func runTime(t time.Time) any {
+// utcTime is an optional instant as a query argument: NULL for the zero time,
+// else the instant in UTC. SQLite stores and compares times as text, so only
+// one zone keeps an equality or ordering test against a stored value true to
+// the instants on every engine.
+func utcTime(t time.Time) any {
 	if t.IsZero() {
 		return nil
 	}
@@ -308,7 +309,7 @@ func inRun(headSpecID, serverID string, startedAt time.Time) (string, []any) {
 	if startedAt.IsZero() {
 		return `head_spec_id = ? and server_id = ? and run_started_at is null`, []any{headSpecID, serverID}
 	}
-	return `head_spec_id = ? and server_id = ? and run_started_at = ?`, []any{headSpecID, serverID, runTime(startedAt)}
+	return `head_spec_id = ? and server_id = ? and run_started_at = ?`, []any{headSpecID, serverID, utcTime(startedAt)}
 }
 
 // clusterMemberExists reports whether (head, server) has a membership row.
@@ -336,7 +337,7 @@ func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.Cl
 	res, err := s.execOn(ctx, tx, `
 		update rpc_cluster_members set ram_measured_mb = ?, measured_at = ?, stale = ?, run_peak_ram_mb = ?
 		where `+where,
-		append([]any{m.RAMMeasuredMB, nullableTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB}, args...)...)
+		append([]any{m.RAMMeasuredMB, utcTime(m.MeasuredAt), m.Stale, m.RunPeakRAMMB}, args...)...)
 	if err != nil {
 		return false, fmt.Errorf("update cluster member usage: %w", err)
 	}
@@ -376,7 +377,7 @@ func (s *SQLiteStore) BeginClusterMemberRun(ctx context.Context, headSpecID stri
 	defer func() { _ = tx.Rollback() }()
 	if _, err := s.execOn(ctx, tx, `
 		update rpc_cluster_members set run_started_at = ?, run_head_instance = ?, run_peak_ram_mb = 0
-		where head_spec_id = ?`, runTime(startedAt), headInstance, headSpecID); err != nil {
+		where head_spec_id = ?`, utcTime(startedAt), headInstance, headSpecID); err != nil {
 		return fmt.Errorf("begin cluster member run: %w", err)
 	}
 	if _, err := s.execOn(ctx, tx, `update rpc_cluster_member_gpus set run_peak_vram_mb = 0 where head_spec_id = ?`, headSpecID); err != nil {
@@ -427,11 +428,11 @@ func (s *SQLiteStore) EndClusterMemberRun(ctx context.Context, headSpecID, serve
 func (s *SQLiteStore) OpenRPCSession(ctx context.Context, sess routing.RPCSession) error {
 	var until any
 	if sess.Until != nil {
-		until = *sess.Until
+		until = sess.Until.UTC()
 	}
 	if _, err := s.exec(ctx, `
 		insert into rpc_sessions (head_spec_id, instance, member_server_id, since, until) values (?, ?, ?, ?, ?)`,
-		sess.HeadSpecID, sess.Instance, sess.MemberServerID, sess.Since, until); err != nil {
+		sess.HeadSpecID, sess.Instance, sess.MemberServerID, sess.Since.UTC(), until); err != nil {
 		return fmt.Errorf("open rpc session: %w", err)
 	}
 	return nil
@@ -443,7 +444,7 @@ func (s *SQLiteStore) CloseRPCSessions(ctx context.Context, headSpecID string, i
 	if _, err := s.exec(ctx, `
 		update rpc_sessions set until = ?
 		where head_spec_id = ? and instance = ? and member_server_id = ? and until is null`,
-		until, headSpecID, instance, memberServerID); err != nil {
+		until.UTC(), headSpecID, instance, memberServerID); err != nil {
 		return fmt.Errorf("close rpc sessions: %w", err)
 	}
 	return nil
@@ -482,7 +483,7 @@ func (s *SQLiteStore) openRPCSessions(ctx context.Context, clause string, args .
 
 // PruneRPCSessions deletes the closed sessions whose until is before before.
 func (s *SQLiteStore) PruneRPCSessions(ctx context.Context, before time.Time) error {
-	if _, err := s.exec(ctx, `delete from rpc_sessions where until is not null and until < ?`, before); err != nil {
+	if _, err := s.exec(ctx, `delete from rpc_sessions where until is not null and until < ?`, before.UTC()); err != nil {
 		return fmt.Errorf("prune rpc sessions: %w", err)
 	}
 	return nil
@@ -494,7 +495,7 @@ func (s *SQLiteStore) RPCSessionsAt(ctx context.Context, headSpecID string, inst
 		select head_spec_id, instance, member_server_id, since, until
 		from rpc_sessions
 		where head_spec_id = ? and instance = ? and since <= ? and (until is null or until >= ?)
-		order by since, member_server_id`, headSpecID, instance, at, at)
+		order by since, member_server_id`, headSpecID, instance, at.UTC(), at.UTC())
 	if err != nil {
 		return nil, fmt.Errorf("list rpc sessions: %w", err)
 	}

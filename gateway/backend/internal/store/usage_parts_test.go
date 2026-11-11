@@ -406,3 +406,109 @@ func assertMemberPartEnergyExcludesByTheRequestFilter(t *testing.T, st usage.Sto
 		t.Fatalf("member parts filtered by the member = %+v err=%v, want srv_m 4000 Wh", got, err)
 	}
 }
+
+// seedMemberPartFilterEvents records three cluster requests that each drew a
+// part on srv_m: ev_a (host srv_h, gpu-a, session sess-1, at t0), ev_b (host
+// srv_h2, gpu-b, sess-1, an hour later) and ev_c (host srv_h2, gpu-b, sess-2,
+// at t0), with distinct member parts (2000, 4000, 8000 Wh).
+func seedMemberPartFilterEvents(t *testing.T, st usage.Store, record func(usage.Event), t0 time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	for _, e := range []struct {
+		ev     usage.Event
+		member float64
+	}{
+		{usage.Event{ID: "ev_a", UserID: "u1", Host: "srv_h", ServerName: "gpu-a", SessionID: "sess-1", EnergyWh: 3000, CreatedAt: t0}, 2000},
+		{usage.Event{ID: "ev_b", UserID: "u1", Host: "srv_h2", ServerName: "gpu-b", SessionID: "sess-1", EnergyWh: 5000, CreatedAt: t0.Add(time.Hour)}, 4000},
+		{usage.Event{ID: "ev_c", UserID: "u1", Host: "srv_h2", ServerName: "gpu-b", SessionID: "sess-2", EnergyWh: 9000, CreatedAt: t0}, 8000},
+	} {
+		e.ev.Status, e.ev.HTTPStatus = "ok", 200
+		record(e.ev)
+		if err := st.SetEnergyParts(ctx, e.ev.ID, []usage.EnergyPart{
+			{ServerID: e.ev.Host, Role: usage.EventHostRoleHead, Wh: 1000, Source: "measured"},
+			{ServerID: "srv_m", Role: usage.EventHostRoleMember, Wh: e.member, Source: "measured"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// assertMemberPartEnergyFilterCombinations pins MemberPartEnergy under a
+// server filter combined with the filters usageWhere binds after the server
+// predicates (SessionIDExact, From, To): a server filter matches a request by
+// its host id as well as by its server name, and every other filter keeps
+// selecting by its own value.
+func assertMemberPartEnergyFilterCombinations(t *testing.T, st usage.Store, t0 time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	memberWh := func(q usage.Query) float64 {
+		t.Helper()
+		got, err := st.MemberPartEnergy(ctx, q, []string{"srv_m"}, "")
+		if err != nil {
+			t.Fatalf("member part energy %+v: %v", q, err)
+		}
+		sum := 0.0
+		for _, b := range got {
+			if b.Host != "srv_m" || !b.MemberParts {
+				t.Fatalf("bucket %+v, want srv_m member parts only", b)
+			}
+			sum += b.EnergyWh
+		}
+		return sum
+	}
+	window := usage.Query{UserID: "u1", From: t0.Add(-time.Minute), To: t0.Add(30 * time.Minute)}
+
+	// The window and the session select ev_a alone; the host-id filter
+	// selects ev_b and ev_c, so ev_a's part counts.
+	q := window
+	q.Server, q.SessionIDExact, q.HasSessionIDExact = "srv_h2", "sess-1", true
+	if got := memberWh(q); !closeTo(got, 2000) {
+		t.Fatalf("host-id filter srv_h2 with session and window = %v Wh, want 2000 (ev_a)", got)
+	}
+	// "srv_h" matches ev_a by its host id (its name gpu-a does not), so the
+	// one request the window and session select is left out.
+	q.Server = "srv_h"
+	if got := memberWh(q); !closeTo(got, 0) {
+		t.Fatalf("host-id filter srv_h with session and window = %v Wh, want 0", got)
+	}
+	// The exact name filter selects ev_c, the only request of sess-2 in the window.
+	q = window
+	q.ServerExact, q.HasServerExact = "gpu-b", true
+	q.SessionIDExact, q.HasSessionIDExact = "sess-2", true
+	if got := memberWh(q); !closeTo(got, 0) {
+		t.Fatalf("exact gpu-b with sess-2 = %v Wh, want 0", got)
+	}
+	// Widened to both hours and sess-1: ev_b is selected by the name, ev_a counts.
+	q.To = t0.Add(2 * time.Hour)
+	q.SessionIDExact = "sess-1"
+	if got := memberWh(q); !closeTo(got, 2000) {
+		t.Fatalf("exact gpu-b with sess-1 over two hours = %v Wh, want 2000 (ev_a)", got)
+	}
+	// Without the session filter the window alone: ev_a and ev_c in the first
+	// half hour, ev_c selected by the name.
+	q = window
+	q.ServerExact, q.HasServerExact = "gpu-b", true
+	if got := memberWh(q); !closeTo(got, 2000) {
+		t.Fatalf("exact gpu-b in the window = %v Wh, want 2000 (ev_a)", got)
+	}
+}
+
+func TestMemberPartEnergyFilterCombinationsMemory(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+	rec := usage.NewRecorder()
+	seedMemberPartFilterEvents(t, rec, func(e usage.Event) { rec.Record(e) }, t0)
+	assertMemberPartEnergyFilterCombinations(t, rec, t0)
+}
+
+func TestMemberPartEnergyFilterCombinationsSQL(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		seedMemberPartFilterEvents(t, s, func(e usage.Event) {
+			s.Record(e)
+			if err := s.LastUsageError(); err != nil {
+				t.Fatalf("record %s: %v", e.ID, err)
+			}
+		}, t0)
+		assertMemberPartEnergyFilterCombinations(t, s, t0)
+	})
+}

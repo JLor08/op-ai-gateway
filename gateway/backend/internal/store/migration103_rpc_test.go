@@ -144,6 +144,9 @@ func TestMigration103AddsRPCClusterColumns(t *testing.T) {
 			if err := s.UpdateAIServer(ctx, srv); err != nil {
 				t.Fatalf("update server: %v", err)
 			}
+			if err := s.UpdateServerNetbirdState(ctx, srv.ID, srv.Domain, srv.NetbirdPeerID, srv.NetbirdIP, srv.NetbirdConnected); err != nil {
+				t.Fatalf("update server mesh ip: %v", err)
+			}
 			if err := s.ReplaceAgentServerBinaries(ctx, "srv_m103", []routing.ServerBinary{
 				{Path: "/opt/llama-server", Kind: "llama-server", Version: "b1", Source: "agent", ReportedAt: now},
 			}); err != nil {

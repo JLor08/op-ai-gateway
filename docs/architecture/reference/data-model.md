@@ -74,7 +74,7 @@ resolves it to the default of that moment and stores the result, so a stored
 `''` is only met on a row no such save wrote, and is then read as the default),
 `lan_exposure_ack` and,
 on every spec, `device_backend` (`auto` default). `ai_servers` gains
-`netbird_ip` (the mesh IPv4 the peer sync records), `lan_address` (an IPv4
+`netbird_ip` (the mesh IPv4 the peer sync records; the full-row server update never writes it), `lan_address` (an IPv4
 literal or `''`), `lan_bind_only`, `rpc_member_enabled` and
 `rpc_allowed_head_groups` (a JSON array of admin-group ids, `'[]'` = the
 server's own admin groups). The service layer normalises an empty

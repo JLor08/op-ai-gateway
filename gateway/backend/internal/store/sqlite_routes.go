@@ -75,6 +75,8 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 	return nil
 }
 
+// UpdateAIServer writes the server row from host, except netbird_ip, which
+// only the NetBird state writes set (see routing.ServerStore).
 func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
@@ -85,7 +87,7 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_ping_exclude = ?, agent_presence_timeout_seconds = ?,
 			estimated_watts = ?, idle_watts = ?, price_per_kwh = ?, pue = ?, price_unit = ?, system_group_id = ?,
 			certificate_override = ?, https_switch_override = ?, runtime_max_processes = ?, managed_runtime_only = ?,
-			netbird_ip = ?, lan_address = ?, lan_bind_only = ?, rpc_member_enabled = ?, rpc_allowed_head_groups = ?
+			lan_address = ?, lan_bind_only = ?, rpc_member_enabled = ?, rpc_allowed_head_groups = ?
 		where id = ?`,
 		host.Name,
 		host.Domain,
@@ -117,7 +119,6 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 		host.HTTPSSwitchOverride,
 		host.RuntimeMaxProcesses,
 		host.ManagedRuntimeOnly,
-		host.NetbirdIP,
 		host.LANAddress,
 		host.LANBindOnly,
 		host.RPCMemberEnabled,
@@ -225,8 +226,9 @@ func (s *SQLiteStore) UpdateServerNetbirdLink(ctx context.Context, id string, en
 
 // UpdateServerNetbirdState writes the peer-synced server state — the domain
 // (from the peer's DNS name), the peer id, the peer's mesh IP, and the
-// connected flag — with a targeted UPDATE (only those four columns), so the
-// peer-sync loop cannot race a concurrent full-row write.
+// connected flag — with a targeted UPDATE (only those four columns), so it
+// overwrites no other column. See routing.NetbirdStateStore for what a
+// concurrent full-row write can still write back.
 func (s *SQLiteStore) UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
@@ -240,6 +242,26 @@ func (s *SQLiteStore) UpdateServerNetbirdState(ctx context.Context, id, domain, 
 	)
 	if err != nil {
 		return fmt.Errorf("update server netbird state: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// ClearServerNetbirdIP empties only netbird_ip, with a targeted UPDATE.
+func (s *SQLiteStore) ClearServerNetbirdIP(ctx context.Context, id string) error {
+	result, err := s.exec(ctx, `update ai_servers set netbird_ip = '' where id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("clear server netbird ip: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateServerLastSeen writes only last_seen_at and updated_at, with a
+// targeted UPDATE, so the telemetry heartbeat overwrites no other column.
+func (s *SQLiteStore) UpdateServerLastSeen(ctx context.Context, id string, lastSeenAt, updatedAt time.Time) error {
+	result, err := s.exec(ctx, `update ai_servers set last_seen_at = ?, updated_at = ? where id = ?`,
+		lastSeenAt.UTC(), updatedAt.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("update server last seen: %w", err)
 	}
 	return requireAffected(result)
 }

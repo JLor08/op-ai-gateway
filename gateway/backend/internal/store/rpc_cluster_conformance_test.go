@@ -407,6 +407,69 @@ func TestConformanceRPCSessions(t *testing.T) {
 	})
 }
 
+// TestConformanceRPCSessionsZoneIndependent pins that a session's bounds are
+// instants, not wall-clock text: sessions opened and closed with times in a
+// zone east and a zone west of UTC are found, missed and pruned by UTC
+// queries exactly as their instants say.
+func TestConformanceRPCSessionsZoneIndependent(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	east := time.FixedZone("UTC+1", 3600)
+	west := time.FixedZone("UTC-5", -5*3600)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		if err := s.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: "rspec_e", MemberServerID: "srv_e", Since: t0.In(east)}); err != nil {
+			t.Fatalf("open east: %v", err)
+		}
+		if err := s.OpenRPCSession(ctx, routing.RPCSession{HeadSpecID: "rspec_w", MemberServerID: "srv_w", Since: t0.In(west)}); err != nil {
+			t.Fatalf("open west: %v", err)
+		}
+		count := func(head string, at time.Time) int {
+			rows, err := s.RPCSessionsAt(ctx, head, 0, at)
+			if err != nil {
+				t.Fatalf("sessions at: %v", err)
+			}
+			return len(rows)
+		}
+		for _, head := range []string{"rspec_e", "rspec_w"} {
+			if n := count(head, t0.Add(-30*time.Minute)); n != 0 {
+				t.Fatalf("%s before its since: %d sessions, want 0", head, n)
+			}
+			if n := count(head, t0.Add(30*time.Minute)); n != 1 {
+				t.Fatalf("%s after its since: %d sessions, want 1", head, n)
+			}
+		}
+		until := t0.Add(time.Hour)
+		if err := s.CloseRPCSessions(ctx, "rspec_e", 0, "srv_e", until.In(east)); err != nil {
+			t.Fatalf("close east: %v", err)
+		}
+		if err := s.CloseRPCSessions(ctx, "rspec_w", 0, "srv_w", until.In(west)); err != nil {
+			t.Fatalf("close west: %v", err)
+		}
+		for _, head := range []string{"rspec_e", "rspec_w"} {
+			if n := count(head, until.Add(-time.Minute)); n != 1 {
+				t.Fatalf("%s before its until: %d sessions, want 1", head, n)
+			}
+			if n := count(head, until.Add(time.Minute)); n != 0 {
+				t.Fatalf("%s after its until: %d sessions, want 0", head, n)
+			}
+		}
+		// A cutoff just before the until, given in the zone west of UTC,
+		// keeps both sessions; one just after it removes both.
+		if err := s.PruneRPCSessions(ctx, until.Add(-time.Minute).In(west)); err != nil {
+			t.Fatalf("prune before until: %v", err)
+		}
+		if count("rspec_e", t0.Add(30*time.Minute)) != 1 || count("rspec_w", t0.Add(30*time.Minute)) != 1 {
+			t.Fatal("a cutoff before the until must keep both sessions")
+		}
+		if err := s.PruneRPCSessions(ctx, until.Add(time.Minute).In(east)); err != nil {
+			t.Fatalf("prune after until: %v", err)
+		}
+		if count("rspec_e", t0.Add(30*time.Minute)) != 0 || count("rspec_w", t0.Add(30*time.Minute)) != 0 {
+			t.Fatal("a cutoff after the until must remove both sessions")
+		}
+	})
+}
+
 // TestConformanceRPCSessionsPrune pins the retention prune: a closed session
 // whose until is before the cutoff goes, one closed at or after it stays, and
 // an open session stays however old it is.

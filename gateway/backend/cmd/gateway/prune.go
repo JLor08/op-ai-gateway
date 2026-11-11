@@ -105,10 +105,11 @@ var startTelemetryPruneLoop = func(pruner telemetryPruner, retention, availabili
 }
 
 // pruneTelemetryOnce deletes telemetry/benchmark samples and closed RPC cluster
-// sessions older than the telemetry retention window and availability samples older than their own (typically longer)
-// retention window. Each block is independently guarded: a non-positive retention
-// disables just that block, so the two windows are decoupled. Errors are logged and
-// swallowed so the loop keeps running.
+// sessions older than the telemetry retention window and availability samples
+// older than their own (typically longer) retention window. Each block is
+// independently guarded: a non-positive retention disables just that block, so
+// the two windows are decoupled. Errors are logged and swallowed so the loop
+// keeps running.
 func pruneTelemetryOnce(ctx context.Context, pruner telemetryPruner, retention, availabilityRetention time.Duration, now time.Time) {
 	if retention > 0 {
 		cutoff := now.Add(-retention)

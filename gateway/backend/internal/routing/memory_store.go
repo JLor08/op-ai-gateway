@@ -260,13 +260,34 @@ func (m *MemoryStore) CreateAIServer(_ context.Context, host AIServer) error {
 	return nil
 }
 
+// UpdateAIServer mirrors the SQL full-row update, which leaves netbird_ip to
+// the NetBird state writes.
 func (m *MemoryStore) UpdateAIServer(_ context.Context, host AIServer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.servers[host.ID]; !ok {
+	stored, ok := m.servers[host.ID]
+	if !ok {
 		return storeerr.ErrNotFound
 	}
-	m.servers[host.ID] = copyAIServer(host)
+	updated := copyAIServer(host)
+	updated.NetbirdIP = stored.NetbirdIP
+	m.servers[host.ID] = updated
+	return nil
+}
+
+// UpdateServerLastSeen mirrors the SQL targeted update: it sets only the
+// last-seen and updated times. An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateServerLastSeen(_ context.Context, id string, lastSeenAt, updatedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	server, ok := m.servers[id]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	seen := lastSeenAt
+	server.LastSeenAt = &seen
+	server.UpdatedAt = updatedAt
+	m.servers[id] = server
 	return nil
 }
 
@@ -358,6 +379,20 @@ func (m *MemoryStore) UpdateServerNetbirdState(_ context.Context, id, domain, pe
 	server.NetbirdPeerID = peerID
 	server.NetbirdIP = ip
 	server.NetbirdConnected = connected
+	m.servers[id] = server
+	return nil
+}
+
+// ClearServerNetbirdIP mirrors the SQL targeted UPDATE: it empties only the
+// mesh IP. An unknown id is ErrNotFound.
+func (m *MemoryStore) ClearServerNetbirdIP(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	server, ok := m.servers[id]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	server.NetbirdIP = ""
 	m.servers[id] = server
 	return nil
 }
