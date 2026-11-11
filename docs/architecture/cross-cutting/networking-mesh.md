@@ -424,13 +424,20 @@ group to the member server's tracking group, on that member's RPC port
 (direct) or relay port (relay) only, so another head on the mesh cannot reach
 it. Grants are deduplicated and sorted so the desired policy is stable, and the
 drift check accepts exactly those rules and the managed description, nothing
-else. The family covers every `mesh` cluster, in either transport, with no
-per-server include or exclude; a policy whose server has no mesh member any
-more is deleted. The prefix is deliberately not `op-gw-access-`, so the status
-endpoint's managed-policy count does not count these. Every cluster,
-membership and member write also runs the pass synchronously, and a cluster
-start runs it first, so a head that was just saved can reach its members before
-it starts. A store error skips the whole pass rather than deleting policies of
+else. The family covers every `mesh` cluster the runtime documents carry, in
+either transport, with no per-server include or exclude: a cluster the
+derivation withholds (a member that withdrew its consent or turned RPC
+membership off, no matching binary, …) runs nowhere and gets no grant. The
+pass derives each cluster as no particular server's document, so after a
+gateway restart a peer agent counts by its last reported version and a running
+cluster keeps its grants. A policy whose server has no such member any more is
+deleted. The prefix is deliberately not `op-gw-access-`, so the status
+endpoint's managed-policy count does not count these. A write that touches a
+cluster (a spec saved or deleted that was or becomes a head or has members, a
+member spec a head uses, an application edit or delete or a server delete on a
+server that takes part in a cluster) also runs the pass synchronously, and a cluster start runs it first, so a head that was just saved
+can reach its members before it starts; a write that touches no cluster never
+waits on NetBird for it. A store error skips the whole pass rather than deleting policies of
 clusters it failed to read.
 
 **NetBird policies only allow; the `Default` policy decides what they are worth.**

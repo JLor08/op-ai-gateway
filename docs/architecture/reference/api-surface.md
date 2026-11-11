@@ -1422,21 +1422,28 @@ which is part of the API (`validateClusterHead`, `internal/portal/service_cluste
 
 | # | Check | Refusal |
 |---|---|---|
-| 1 | Cluster off: no `${RPC_SERVERS}` / `${RPC_DEVICES}` anywhere; rights on every former member server | `400 runtime_spec.cluster_rpc_placeholder_without_cluster`; `404 server.not_found` |
+| 1 | Cluster off: no `${RPC_SERVERS}` / `${RPC_DEVICES}` in args, env or a config file's content. Dropping the membership needs the head's rights only, as deleting the head does | `400 runtime_spec.cluster_rpc_placeholder_without_cluster` |
 | 2 | The head's document: effective type `llama_cpp`; no `=` form of `--rpc`, `--device`/`-dev`, `--tensor-split`/`-ts`, `--mmproj-device`/`-mmdev` (llama-server refuses it); `${RPC_SERVERS}` as the value of `--rpc` or `LLAMA_ARG_RPC`; exactly once through one of the two; a device list that names `${DEVICES}` or `${RPC_DEVICES}`; a device list parsed after the RPC servers (argv `--device` after `--rpc`, or RPC through env); at least one member; not replicable; an explicit `startup_timeout_seconds` | `400 runtime_spec.cluster_type_invalid`, `.cluster_flag_equals_form`, `.cluster_rpc_placeholder_missing`, `.cluster_rpc_twice`, `.cluster_device_list_missing_rpc`, `.cluster_device_order`, `.cluster_members_required`, `.cluster_head_replicable`, `.cluster_startup_timeout_required` |
 | 3 | The member list: one entry per server, none on the head's server | `400 runtime_spec.cluster_member_server_twice`, `.cluster_member_on_head_server` |
-| 4 | Rights on every member server, former ones included; in manual mode the named spec exists on that server; every member's consent (system scope included). Skipped with 5–8 when the membership, member mode, network, transport and head binary are all as stored; the head's own acknowledgement is still required then, so a direct `lan` head saved without `lan_exposure_ack` is refused `runtime.cluster_lan_ack_required` | `404 server.not_found` (rights and consent alike, so nothing leaks), `404 rpc_member_spec.not_found` |
+| 4 | Rights on every member server the write keeps or adds (a member it drops needs none: removal only frees the host); in manual mode the named spec exists on that server; every member's consent (system scope included). Skipped with 5–8 when the membership, member mode, network, transport and head binary are all as stored and every manual member's spec still exists; the head's own acknowledgement is still required then, so a direct `lan` head saved without `lan_exposure_ack` is refused `runtime.cluster_lan_ack_required` | `404 server.not_found` (rights and consent alike, so nothing leaks), `404 rpc_member_spec.not_found` |
 | 5 | Manual specs: enabled, serving no other head | `400 runtime_spec.cluster_member_spec_disabled`, `409 runtime_spec.cluster_member_spec_taken` |
-| 6 | Automatic members: RPC membership on, a `ggml-rpc-server` of the head binary's version | `400 runtime_spec.cluster_member_rpc_disabled`, `.cluster_member_no_matching_binary` |
+| 6 | Automatic members: RPC membership on, a `ggml-rpc-server` of the head binary's version (an unknown head version is refused last, row 12) | `400 runtime_spec.cluster_member_rpc_disabled`, `.cluster_member_no_matching_binary` |
 | 7 | Manual members: a binary whose known version differs from the head's (unknown only warns) | `400 runtime_spec.cluster_version_mismatch` |
 | 8 | Network (mesh: NetBird with a tracking group and mesh IP on every server; lan: a LAN address everywhere, `lan_address` on NetBird-enabled servers), then transport (direct mesh: the NetBird policy preconditions; direct lan: the acknowledgement) | `400 runtime_spec.cluster_mesh_unavailable`, `.cluster_lan_address_required`, `.cluster_direct_unavailable`, `runtime.cluster_lan_ack_required` |
 | 9 | Member GPUs (also for a member the caller cannot see): a GPU budget for an Apple GPU, an estimate for a known non-NVIDIA GPU of an automatic member, `--tensor-split` on the head for any member with known non-NVIDIA GPUs | `400 runtime_spec.cluster_member_budget_required`, `runtime_spec.member_vram_estimate_required`, `runtime_spec.cluster_tensor_split_required` |
-| 10 | Storing the membership: a port in 47000–47999 on each new member's server | `409 runtime_spec.cluster_port_exhausted` |
+| 10 | A port in 26000–26999 on each new member's server (below every default ephemeral range, so no model child holds it) | `409 runtime_spec.cluster_port_exhausted` |
+| 11 | A new or changed fixed `listen_port` equal to a cluster member's port on the server | `409 runtime_spec.port_conflicts_rpc_member` |
+| 12 | Automatic members need the head binary's version known (add it in the Binaries tab); the newest save code, so the last refusal of the write | `400 runtime_spec.cluster_head_binary_version_unknown` |
 
-A new or changed fixed `listen_port` equal to a cluster member's port on the
-server is `409 runtime_spec.port_conflicts_rpc_member` (an application port
-`application.port_conflict`, a TLS proxy port
-`application.proxy_listen_port_conflict`). Refusals that name a server or binary
+An application port is `application.port_conflict`, a TLS proxy port
+`application.proxy_listen_port_conflict`. Storing the membership can still be
+refused by state the checks could not hold (a member spec or port another
+gateway process took since: `409 runtime_spec.cluster_member_spec_taken`,
+`.cluster_port_exhausted`; a member server deleted since: `404
+server.not_found`); such a refusal stores nothing, neither the membership nor
+the spec row. A save that keeps a member carries its measured values over,
+but rewrites the membership only while the stored values are the ones it read,
+so a value the gateway measured during the save survives it. Refusals that name a server or binary
 carry that detail only for a caller who may see the server. The NetBird system
 settings refuse turning policy management, deny-by-default or its enforcement
 off while a direct mesh cluster exists: `409 settings.netbird_direct_cluster_exists`

@@ -598,10 +598,12 @@ that from becoming a way around it (`internal/portal/service_cluster.go`):
 1. **Rights on every server involved.** A head write that changes the
    membership, the member mode, the network, the transport or the head's binary
    needs the runtime write rule on the head's server **and** on every member
-   server, former members included (dropping a member changes that server's
-   document as much as adding one). A write that changes none of them needs it
-   on the head's server only, so a member on a server the caller cannot see
-   never locks them out of their own head. Manual member specs, a server's RPC
+   server the write keeps or adds. A member the write drops needs no rights on
+   its server, and turning the cluster off needs the head's rights only, as
+   deleting the head always did: removal only frees the member host, while
+   consent and rights protect additions. A write that changes none of them
+   needs it on the head's server only, so a member on a server the caller
+   cannot see never locks them out of their own head. Manual member specs, a server's RPC
    settings and its binary inventory authorize through `authorizeServer`, and
    the member usage reset needs both the head's mapping and the member's server.
 2. **The member side's consent, with no bypass.** A member admits a head only

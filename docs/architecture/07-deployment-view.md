@@ -106,8 +106,9 @@ allows. See [Telemetry](cross-cutting/telemetry-usage-observability.md).
 member** ([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)).
 Every other managed process binds loopback behind the agent's router; a member's
 `ggml-rpc-server` (direct transport) or the agent's relay in front of it (relay
-transport) listens on a port the gateway allocates from **47000–47999** on that
-server, bound to the server's mesh IPv4 in a `mesh` cluster, and in a `lan`
+transport) listens on a port the gateway allocates from **26000–26999** on that
+server (below every default ephemeral range, so no process that lets the kernel
+pick its port ever holds it), bound to the server's mesh IPv4 in a `mesh` cluster, and in a `lan`
 cluster to every interface or, with `lan_bind_only`, to the server's
 `lan_address`. A host firewall must let the head's host reach that port; in a
 mesh the gateway's managed `op-gw-rpc-<server id>` NetBird policy grants exactly

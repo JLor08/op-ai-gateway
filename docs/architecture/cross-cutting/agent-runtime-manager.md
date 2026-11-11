@@ -1789,12 +1789,19 @@ per server, none on the head's server); then rights and consent, member specs,
 member binaries, network and transport, and the member GPUs (an Apple GPU needs
 a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
 and `--tensor-split` on the head, because its share is never measured per
-process). The scan of the head's args steps over option values with a table of
+process); last of all, automatic members need the head binary's version known
+(`runtime_spec.cluster_head_binary_version_unknown`). Rights are needed on every
+member server the write keeps or adds; removing members, turning the cluster
+off included, needs the head's rights only, as deleting the head does: removal
+only frees the member host, consent protects additions. Off a head,
+`${RPC_SERVERS}` and `${RPC_DEVICES}` are refused in args, env and config file
+content alike. The scan of the head's args steps over option values with a table of
 llama-server's value-taking options at the pinned build
 (`internal/portal/llama_flags.go`), so `--alias -dev` is one option and its
 value. When the membership, member mode, network, transport and head binary are
 all as stored, the rights-to-network steps are skipped, so a member the caller
-cannot see does not lock them out of their head; the one network check that
+cannot see does not lock them out of their head (unless a manual member's spec
+is gone, which runs the full checks and is refused); the one network check that
 still runs is the head's own acknowledgement, so withdrawing `lan_exposure_ack`
 from a direct `lan` head is refused (`runtime.cluster_lan_ack_required`) like a
 missing one. A save that runs the full checks with an empty `cluster_network` or
@@ -1809,25 +1816,40 @@ save: `cluster_rpc_devices_not_first`, `cluster_mmdev_missing`,
 `cluster_relay_mesh_deny_by_default_off` and `cluster_member_version_unknown`; a
 member the reader may not see adds none.
 
-**Ports.** Each member gets an RPC (or relay) port from 47000–47999 on its
+**Ports.** Each member gets an RPC (or relay) port from 26000–26999 on its
 server: the lowest one no application port, TLS proxy port, fixed `listen_port`
-or other member there uses. A member that stays on its server keeps its port.
-The allocator's lock is per process, so a partial unique index on `(server_id,
-port)` (migration 106) turns a race between two gateway processes into a
-conflict; the write allocates once more and then answers
+or other member there uses. The range lies below every default ephemeral range
+(Linux 32768–60999, Windows and macOS 49152–65535), so a model child, whose port
+the kernel picks, never holds a member's port. A member that stays on its server
+keeps its port. The allocator's lock is per process, so a partial unique index on
+`(server_id, port)` (migration 106) turns a race between two gateway processes
+into a conflict; the write allocates once more and then answers
 `runtime_spec.cluster_port_exhausted`. The other direction is checked where
 ports are typed: a new fixed `listen_port`, application port or TLS proxy port
 equal to a member's port is refused.
+
+**Storing a head.** Head saves, manual member spec writes and member spec
+deletes run under one lock in the gateway process, so a head never claims a
+member spec that is half written, being disabled or being deleted; a member
+spec's row and GPU rows are one store transaction. The membership of an
+existing head is written before its spec row, and a new head's spec row is
+removed again when its membership is refused, so a refusal at that point (a
+spec or port another process took, a member server deleted since) stores
+nothing. A save that keeps a member carries its measured values over, but
+rewrites the membership only while the stored measured and run values are
+still the ones it read (`SetClusterMembersIf`); otherwise it reads again and
+plans once more, so a rise the gateway wrote during the save is never lost. The
+manual member GPU resync rewrites the membership the same way.
 
 **Derivation.** Each server's runtime document is derived on every read from the
 stored **configuration**, never from whether a member is up. For a head the
 document carries the `cluster` block: one endpoint per member in member order
 (`<address>:<port>`, and the member's device count: its deduplicated GPU rows,
 or 1 for a CPU member, which exposes its CPU device), the transport, the
-network, and `generation`, a digest of everything of the members' launch the
-endpoints do not show (binaries and versions, args, device backends, GPU
-selections, bind addresses and ports), so a member-side change relaunches the
-head. For a member server it carries one `rpc_server` spec per membership: the
+network, and `generation`, a digest of every member launch input the
+endpoints do not show (binaries and versions, args, env, the cache switch,
+device backends, GPU selections, bind addresses and ports): whatever relaunches
+a member relaunches the head, which would otherwise lose the member mid-request. For a member server it carries one `rpc_server` spec per membership: the
 manual spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
 member's `ggml-rpc-server` matching the head binary's version, read on every
 derivation, so an inventory change moves it); `-t <threads>` for an automatic
@@ -1852,7 +1874,12 @@ stage that finds a reason stops it:
    `runtime.cluster_member_missing`.
 2. **Features**: `runtime_config.agent_features_pending` while the `rpc_cluster`
    declaration of any agent of the cluster, the head's included, is unknown,
-   else `runtime.cluster_agent_too_old` when one lacks it.
+   else `runtime.cluster_agent_too_old` when one lacks it. A peer whose live
+   declaration is unknown (after a gateway start, until it reports) counts by
+   the agent version of its last telemetry: 0.18.0 or newer declares
+   `rpc_cluster`, an older one is too old, and only a host without a parseable
+   version stays pending. So the host that reports first after a gateway restart
+   keeps its cluster instead of draining it.
 3. **Each member, in member order**: `.cluster_member_missing` (its server, its
    manual spec or its position is gone), `.cluster_member_disabled` (a disabled
    manual spec, or RPC membership turned off on an automatic member's server),
@@ -1863,7 +1890,10 @@ stage that finds a reason stops it:
    automatic member's server has no `ggml-rpc-server` of the head binary's
    version, and also when the **head** binary's own version is unknown (no
    inventory row, or one with neither commit nor build), since then nothing can
-   match. A manual member takes its spec's binary and never fails here.
+   match. A manual member takes its spec's binary and never fails here. An agent
+   re-report of a binary without a version (a `--version` probe that failed or
+   timed out) keeps the version its inventory row already had, so one failed
+   probe does not withhold the host's clusters.
 5. **The head's own address** in the resolved network (the stored choice, else
    the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
    NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;
@@ -1880,7 +1910,9 @@ stage that finds a reason stops it:
 A server whose **own** agent's declaration is unknown has its whole document
 held (the restart case: the gateway cannot yet tell what it runs); a remote
 unknown agent only withholds that cluster from the other servers' documents, so
-it cannot freeze their unrelated models.
+it cannot freeze their unrelated models. A store error during the derivation,
+a failed read of the NetBird settings included, fails the document (the agent
+keeps its last one) rather than withholding the cluster.
 
 **What re-derives a document.** A head write notifies the head's server and
 every former and new member server; a manual member spec write notifies its
