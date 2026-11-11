@@ -610,3 +610,22 @@ func TestExpandSpecAPITokenNearMissIsLiteral(t *testing.T) {
 		t.Errorf("args = %q leaked the api token through a near-miss placeholder", joinArgs(cmd.Args))
 	}
 }
+
+// TestResolvedCommandShowsAHeadsExpandedRPCArguments: a cluster head's
+// agent-supplied --rpc and --device values come from placeholders the one
+// expansion resolves, so the reported command shows them expanded.
+func TestResolvedCommandShowsAHeadsExpandedRPCArguments(t *testing.T) {
+	spec := baseSpec("rspec_h", "big")
+	spec.Cluster = &ClusterHead{Endpoints: []ClusterEndpoint{
+		{Address: "100.64.0.5:26000", DeviceCount: 1},
+		{Address: "100.64.0.6:26001", DeviceCount: 2},
+	}}
+	spec.Args = []string{"--rpc", "${RPC_SERVERS}", "--device", "${RPC_DEVICES}"}
+	cmd := commandFor(t, spec, 8080, GPUVendorNone, func(string) string { return "" }, false)
+	if got, want := joinArgs(cmd.Args), "--rpc 100.64.0.5:26000,100.64.0.6:26001 --device RPC0,RPC1,RPC2"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+	if v, ok := envValue(cmd.Env, "GGML_RPC_NO_COMM"); !ok || v != "1" {
+		t.Errorf("env GGML_RPC_NO_COMM = %q (present=%v), want the agent's 1", v, ok)
+	}
+}

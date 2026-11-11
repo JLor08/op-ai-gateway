@@ -9785,7 +9785,13 @@ assume. The gap between what was typed and what ran is where the bug tends to
 be. Binary, argv, working directory and the **complete** effective environment
 are reported; nothing was retained before this existed, because
 `ExpandPlaceholders` built the resolved form, `exec.Command` consumed it, and it
-was dropped.
+was dropped. For an `rpc_server` member the report includes what the agent
+adds after the expansion (§3.6): the `-d`, `-H`, `-p` and `-c` arguments after
+the operator's, and `GGML_RPC_NO_RDMA` and `LLAMA_CACHE` in the environment.
+These are exactly the values `exec.Command` receives, and they carry no secret
+span. A head's `--rpc` and `--device` values come from the
+`${RPC_SERVERS}`/`${RPC_DEVICES}` placeholders, which the expansion resolves,
+so the report shows them expanded.
 
 **On the marker, and that is the design.** `${PORT}` is resolved afresh on every
 start, so across a crash loop the command *differs* between attempts. Because it
