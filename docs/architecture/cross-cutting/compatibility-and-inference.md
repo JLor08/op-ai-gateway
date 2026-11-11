@@ -2105,7 +2105,8 @@ the Load retrying until the deadline.
 
 **A speed run's cold pass after a stop of its own target runs through the same
 loop.** When a manual speed or both run has force-stopped its own target before
-the cold pass ([Agent-Managed Model Runtime
+the cold pass, in this target's stop-all or in an earlier target's whose clear
+was written ([Agent-Managed Model Runtime
 §11.10](agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)),
 the router answers 503 `runtime.admission_blocked` until the clear reaches the
 agent. The cold pass is then `loadUntilServable` around one stream per attempt

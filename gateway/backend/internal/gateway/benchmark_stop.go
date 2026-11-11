@@ -213,6 +213,7 @@ func logBenchmarkLoadTimeNotMeasured(msg, mappingID, reason string, formerPins [
 func (s *Server) clearBenchmarkStop(ctx context.Context, serverID string, ov *benchmarkOverrides, owed []string, cs *coldStart, err *error) {
 	failed, takenOver := s.restoreBenchmarkOverrides(ctx, owed)
 	ov.stopOwed = benchmarkWithout(ov.stopOwed, benchmarkWithout(owed, failed))
+	ov.cleared = benchmarkWithout(benchmarkUnion(ov.cleared, owed), benchmarkUnion(failed, takenOver))
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
 	if lerr := s.writeBenchmarkLease(lctx, serverID, ov); lerr != nil {
 		slog.Warn("benchmark: could not update the override lease after a clear", "server_id", serverID, "err", lerr)

@@ -141,6 +141,12 @@ type benchmarkOverrides struct {
 	unpinned []string
 	stopOwed []string // force_stopped written or possibly written and a clear owed, sorted
 	stopped  []string // the audit set: every spec a stop batch wrote or may have written, sorted
+	// cleared is every spec whose force_stopped a stop-all's clear lifted
+	// (clearBenchmarkStop), sorted: neither failed nor taken over. The agent
+	// applies a clear when the document reaches it, which can be after a later
+	// target's cold pass has started, so a target among them rides the
+	// router's 503 (agentColdStart).
+	cleared []string
 	// singleProcess is what the run owes a replicable restore and what the
 	// lease's restore_replicable names, sorted: the server's enabled
 	// replicable specs it runs as one process (beginBenchmarkSingleProcess),
