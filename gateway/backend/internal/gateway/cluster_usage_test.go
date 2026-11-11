@@ -655,6 +655,9 @@ func TestClusterRunsFollowTheOrchestration(t *testing.T) {
 	k, kruns := newRunFixture(t)
 	k.ackAll()
 	k.frame(orchHeadServer, watchHeadRow(agentSpecStateRunning))
+	// Handled on its own: a frame that arrives while the watchdog still
+	// holds this one replaces it, and the exit below would never be seen.
+	k.settle()
 	k.hold(0, 1)
 	if err := k.o.Ensure(context.Background(), orchHead); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -1125,4 +1128,11 @@ func TestUnheardSessionCloseNeverPrecedesItsStart(t *testing.T) {
 	if len(rows) != 1 || rows[0].Until == nil || !rows[0].Until.Equal(since) {
 		t.Fatalf("sessions = %+v, want one closed at its start %v", rows, since)
 	}
+}
+
+// size is how many keys the map holds.
+func (k *keyedLocks) size() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.m)
 }

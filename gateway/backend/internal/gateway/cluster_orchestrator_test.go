@@ -42,7 +42,7 @@ func orchTimings() clusterTimings {
 		cooldown: 60 * time.Second, codeWait: 200 * time.Millisecond, stopWait: 300 * time.Millisecond,
 		memberMargin: 20 * time.Millisecond, headMargin: 50 * time.Millisecond, reserveMargin: 60 * time.Millisecond,
 		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
-		sessionWait: 50 * time.Millisecond,
+		sessionWait: 50 * time.Millisecond, planRetry: 5 * time.Second,
 	}
 }
 
@@ -68,17 +68,26 @@ type orchPortal struct {
 	// withheld, when set, is the derivation's reason: the plan is read as
 	// withheld (no members, no network or transport), as the portal answers.
 	withheld string
-	// keptCtxErr is the context error the last kept-up listing saw.
+	// keptCtxErr is the context error the last kept-up listing saw;
+	// keptReads counts the listings.
 	keptCtxErr error
+	keptReads  int
+	// planErr, when set, fails every plan read (a store outage); gone makes
+	// the head read as not found (deleted, or no cluster head any more).
+	planErr error
+	gone    bool
 }
 
 func (p *orchPortal) ClusterPlan(_ context.Context, headSpecID string) (portal.ClusterPlan, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if headSpecID != p.plan.Head.Spec.ID {
+	if headSpecID != p.plan.Head.Spec.ID || p.gone {
 		return portal.ClusterPlan{}, portal.ErrRuntimeSpecNotFound
 	}
 	p.planReads++
+	if p.planErr != nil {
+		return portal.ClusterPlan{}, p.planErr
+	}
 	plan := p.plan
 	plan.Members = slices.Clone(p.plan.Members)
 	if p.withheld != "" {
@@ -128,6 +137,7 @@ func (p *orchPortal) KeptUpClusterHeads(ctx context.Context) ([]string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.keptCtxErr = ctx.Err()
+	p.keptReads++
 	return slices.Clone(p.kept), nil
 }
 
@@ -374,6 +384,23 @@ func clusterErrOf(t *testing.T, err error) *clusterError {
 		t.Fatalf("err = %v (%T), want a *clusterError", err, err)
 	}
 	return ce
+}
+
+// State is head's gate state. A head the orchestration never saw is cold.
+func (o *clusterOrchestrator) State(head string) clusterGateState {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.stateLocked(o.heads[head])
+}
+
+// joiners reports how many Ensure calls joined head's running start.
+func (o *clusterOrchestrator) joiners(head string) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if st := o.heads[head]; st != nil && st.start != nil {
+		return st.start.joined
+	}
+	return 0
 }
 
 func orchRefusal(status int, code string) error {
@@ -774,7 +801,7 @@ func TestClusterHeadExitMarksColdAndTriggers(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 	running := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateRunning, Cluster: &RuntimeClusterStatusDTO{Launched: []string{"a:1"}}}}
-	exited := []RuntimeStatusDTO{{SpecID: orchHead, State: "crashed"}}
+	exited := []RuntimeStatusDTO{{SpecID: orchHead, State: agentSpecStateStopped}}
 	f.o.observeStatus(orchHeadServer, running, exited)
 	f.o.wait()
 	if st := f.o.State(orchHead); st != clusterCold {
@@ -1104,5 +1131,104 @@ func TestDrainingHeadStillOccupiesItsMembers(t *testing.T) {
 	}
 	if n := g.agent.count("member:stop:"); n != 0 {
 		t.Fatalf("calls = %q, want no force-stop of a member a draining head holds", g.agent.recorded())
+	}
+}
+
+// TestSignalBacksOffAfterAPlanReadFailure pins the start a store outage
+// fails: the plan read failed, so nothing cools down and no failure is
+// recorded, but the requests it wakes signal no new start until a short
+// backoff ended -- they would otherwise spin start after failing start.
+func TestSignalBacksOffAfterAPlanReadFailure(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.portal.mu.Lock()
+	f.portal.planErr = errors.New("database is locked")
+	f.portal.mu.Unlock()
+	reads := func() int {
+		f.portal.mu.Lock()
+		defer f.portal.mu.Unlock()
+		return f.portal.planReads
+	}
+	signal := func() {
+		f.o.Signal(routing.DemandSignal{Model: orchHeadModel, ClusterHead: orchHead})
+		f.o.wait()
+	}
+
+	signal()
+	signal()
+	if n := reads(); n != 1 {
+		t.Fatalf("plan reads = %d, want one start until the backoff ended", n)
+	}
+	if st := f.o.State(orchHead); st != clusterCold {
+		t.Fatalf("state = %v, want cold: a failed read is no failed start", st)
+	}
+	if status := f.o.ClusterStatus(orchHead); status.LastFailure != nil || status.CooldownUntil != nil {
+		t.Fatalf("status = %+v, want no failure and no cooldown", status)
+	}
+
+	f.advance(orchTimings().planRetry)
+	f.portal.mu.Lock()
+	f.portal.planErr = nil
+	f.portal.mu.Unlock()
+	f.ackAll()
+	f.holdOnHeadEnsure(0)
+	signal()
+	if st := f.o.State(orchHead); st != clusterFormed {
+		t.Fatalf("state = %v, want formed by the start after the backoff", st)
+	}
+}
+
+// TestReconcileForgetsADeletedHead pins the end of a head's state: a head the
+// reconciler would start again (the watchdog stopped it in use) whose spec is
+// gone is forgotten, not read again on every pass.
+func TestReconcileForgetsADeletedHead(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.o.mu.Lock()
+	f.o.headState(orchHead).resume = true
+	f.o.mu.Unlock()
+	f.portal.mu.Lock()
+	f.portal.gone = true
+	f.portal.mu.Unlock()
+
+	f.o.Reconcile(context.Background())
+	f.o.mu.Lock()
+	_, known := f.o.heads[orchHead]
+	f.o.mu.Unlock()
+	if known {
+		t.Fatal("the reconciler still follows a head whose spec is gone")
+	}
+}
+
+// TestReconcileListsKeptUpHeadsAfterAChange pins the reconciler's cost on a
+// fleet: the kept-up heads are listed again only after a runtime document
+// changed (DocumentsChanged, which also wakes the reconciler) or after
+// clusterKeptUpMaxAge, not on every pass.
+func TestReconcileListsKeptUpHeadsAfterAChange(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	ctx := context.Background()
+	reads := func() int {
+		f.portal.mu.Lock()
+		defer f.portal.mu.Unlock()
+		return f.portal.keptReads
+	}
+
+	f.o.Reconcile(ctx)
+	f.o.Reconcile(ctx)
+	if n := reads(); n != 1 {
+		t.Fatalf("kept-up listings = %d after two passes, want one", n)
+	}
+	f.o.DocumentsChanged()
+	select {
+	case <-f.o.TriggerChannel():
+	default:
+		t.Fatal("a changed document did not wake the reconciler")
+	}
+	f.o.Reconcile(ctx)
+	if n := reads(); n != 2 {
+		t.Fatalf("kept-up listings = %d after a change, want two", n)
+	}
+	f.advance(clusterKeptUpMaxAge)
+	f.o.Reconcile(ctx)
+	if n := reads(); n != 3 {
+		t.Fatalf("kept-up listings = %d once the list aged out, want three", n)
 	}
 }

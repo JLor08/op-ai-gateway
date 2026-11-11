@@ -1990,7 +1990,10 @@ reconciler pass (every 30 s, at boot, and whenever a document was pushed or a
 head exited) lifts a terminal block whose head document changed, and starts
 every cold head that is pinned or `force_running`, or that the watchdog stopped
 while it was serving requests, except one an operator stopped and, inside the
-60 s boot grace, one whose servers have not all reported. The orchestration's state
+60 s boot grace, one whose servers have not all reported. It lists the kept-up
+heads again only after a document was pushed, or after 5 minutes, so a fleet
+without a cluster does not walk every server's specs on every pass; a head whose
+spec is gone is forgotten. The orchestration's state
 is in memory; a restarted gateway learns a running cluster again from the
 agents' telemetry and reports `cold` until then. Its read view is the head's
 `cluster_status` ([HTTP API Surface](../reference/api-surface.md)).

@@ -796,3 +796,23 @@ func TestRuntimeStopFeatureIsAgentDeclaredOnly(t *testing.T) {
 		t.Fatal("runtime_stop is on the gateway's own feature list, want it on the agent's only")
 	}
 }
+
+// TestSetBaseContextIsSafeBesideReaders pins the server lifetime's handoff:
+// cmd/gateway installs it after the background loops started, and the cluster
+// reconciler's first pass reads it meanwhile, so the write and the read must
+// not race (go test -race).
+func TestSetBaseContextIsSafeBesideReaders(t *testing.T) {
+	s := &Server{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.SetBaseContext(ctx)
+	}()
+	_ = s.lifetime()
+	<-done
+	if got := s.lifetime(); got != ctx {
+		t.Fatalf("lifetime = %v, want the installed context", got)
+	}
+}

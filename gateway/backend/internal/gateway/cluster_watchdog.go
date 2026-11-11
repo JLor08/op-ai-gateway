@@ -38,15 +38,22 @@ import (
 //     only on a fresh frame of the head's server that shows the head running,
 //     never inside the gateway's boot grace, and never before the cluster
 //     formed.
-//   - A head that exited (its launch facts gone from its server's telemetry)
+//   - A head that exited (its launch facts gone from its own server's
+//     telemetry: no process, or a process that is no cluster head any more)
 //     is no longer formed; its members are released and the reconciler is
-//     woken. A member that still reports the hold of a direct head that is
-//     not running holds a dead connection, so it is released again.
+//     woken. A frame of any other server never ends a head. A head that
+//     crashed (a new last error) also cools down, as a failed start does, so
+//     a kept-up head is not started again at once; a head whose spec is gone
+//     is forgotten. A member that still reports the hold of a direct head
+//     that is not running holds a dead connection -- a half-open one, which
+//     its agent keeps listing -- so it is stopped, forced.
 //   - A local start on a member's server that waits only for a held member
 //     (admission_blocked_by) makes the gateway ask the head's agent for a
 //     conditional stop: the head goes only when that agent's own eviction
 //     rule lets it go, and the members are released after it; otherwise the
-//     start waits. A head that is forming is left alone.
+//     start waits. A head that is forming is left alone. Once the head is
+//     gone, a direct member that still reports its hold is stopped, forced,
+//     rather than released, for the dead connection's sake.
 //   - A peer a member does not allow, or a hold by another head, is a breach:
 //     logged and listed in the head's cluster status by member position. A
 //     hold by another head is never this head's, so on a formed cluster it is
@@ -63,6 +70,17 @@ import (
 // codeClusterMemberLost: the watchdog stopped a formed cluster's head because
 // a member was lost; the failure names the member's position.
 const codeClusterMemberLost = "runtime.cluster_member_lost"
+
+// codeClusterHeadCrashed: a head ended unexpectedly, with a last error that
+// carries no code of the agent's own; the head cools down.
+const codeClusterHeadCrashed = "runtime.cluster_head_crashed"
+
+// The agent states of a head whose process ended unexpectedly.
+const (
+	agentSpecStateCrashed     = "crashed"
+	agentSpecStateStartFailed = "start_failed"
+	agentSpecStateBackoff     = "backoff"
+)
 
 // codeRuntimeInstanceBusy is the agent's refusal of a conditional stop: its
 // eviction rule does not let the head go right now.
@@ -269,8 +287,8 @@ func (o *clusterOrchestrator) watchViews() []watchView {
 // arrival sequence of next.
 func (w *clusterWatchdog) handle(serverID string, prev, next []RuntimeStatusDTO, seq uint64) {
 	o := w.o
-	for _, head := range exitedHeads(prev, next) {
-		w.headExited(serverID, head)
+	for _, exit := range exitedHeads(prev, next) {
+		w.headExited(serverID, exit)
 	}
 	for _, v := range o.watchViews() {
 		if v.plan.Head.Server.ID == serverID {
@@ -301,20 +319,56 @@ func (w *clusterWatchdog) confirmSuspicion(v watchView, next []RuntimeStatusDTO,
 	w.o.memberLost(v.head, sus.position, sus.evidence, headInUse(r))
 }
 
+// headExit is a cluster head a frame pair shows ended: crash is the last
+// error of a process that ended unexpectedly (nil when it stopped), and inUse
+// that the head's last row before it showed requests.
+type headExit struct {
+	head  string
+	crash *RuntimeErrorDTO
+	inUse bool
+}
+
 // exitedHeads lists the cluster heads that had a process with their launch
-// facts in prev and have none in next. A draining head still has its process.
-func exitedHeads(prev, next []RuntimeStatusDTO) []string {
-	var exited []string
+// facts in prev and have none in next: no process, or a process without them
+// (the spec is no cluster head any more). A draining head still has its
+// process and its launch facts.
+func exitedHeads(prev, next []RuntimeStatusDTO) []headExit {
+	var exited []headExit
 	for i := range prev {
 		p := &prev[i]
 		if p.Cluster == nil || p.Instance != 0 || !stateOccupied(p.State) {
 			continue
 		}
-		if r, ok := findInstanceRow(next, p.SpecID); !ok || !stateOccupied(r.State) {
-			exited = append(exited, p.SpecID)
+		r, ok := findInstanceRow(next, p.SpecID)
+		if ok && stateOccupied(r.State) && r.Cluster != nil {
+			continue
 		}
+		exit := headExit{head: p.SpecID, inUse: headInUse(*p)}
+		if ok && headCrashed(*p, r) {
+			exit.crash = r.LastError
+			if exit.crash == nil {
+				exit.crash = &RuntimeErrorDTO{}
+			}
+		}
+		exited = append(exited, exit)
 	}
 	return exited
+}
+
+// headCrashed reports whether next, the row of a head whose process prev
+// showed, says that process ended unexpectedly: a crash state, or a last
+// error that prev did not show. An idle stop, an eviction or a drain leaves
+// the last error as it was.
+func headCrashed(prev, next RuntimeStatusDTO) bool {
+	switch next.State {
+	case agentSpecStateCrashed, agentSpecStateStartFailed, agentSpecStateBackoff:
+		return true
+	}
+	if next.LastError == nil {
+		return false
+	}
+	p := prev.LastError
+	return p == nil || !p.At.Equal(next.LastError.At) || p.Failures != next.LastError.Failures || p.Message != next.LastError.Message
 }
 
 // findInstanceRow returns spec's instance-0 row in rows.
@@ -326,48 +380,107 @@ func findInstanceRow(rows []RuntimeStatusDTO, spec string) (RuntimeStatusDTO, bo
 	return rows[i], true
 }
 
-// headExited follows a head whose process is gone: no longer formed, its
-// members released unless a start or a stop of it runs (which handles them),
-// then the reconciler woken, since a kept-up head starts again members first.
-// The head's run ends here unless a start runs: that start began a new run,
-// and an exit seen meanwhile is the old process's or a failed start's, whose
-// run ends as unformed when the next one begins.
-func (w *clusterWatchdog) headExited(serverID, head string) {
+// headExited follows a head whose process is gone, as serverID's frame shows
+// it: no longer formed, its members released unless a start or a stop of it
+// runs (which handles them), a crash recorded as a failure that cools the
+// head down, then the reconciler woken, since a kept-up head starts again
+// members first; a head whose spec is gone is forgotten. The head's run ends
+// here unless a start runs: that start began a new run, and an exit seen
+// meanwhile is the old process's or a failed start's, whose run ends as
+// unformed when the next one begins.
+//
+// Only the head's own server ends it: a frame of another server that names
+// the head's spec is ignored, since any agent can send any row, and acting on
+// it would let one server's agent stop another's cluster. A head whose server
+// the orchestration does not know yet has nothing to end but wakes the
+// reconciler.
+func (w *clusterWatchdog) headExited(serverID string, exit headExit) {
 	o := w.o
+	head := exit.head
 	o.mu.Lock()
 	st := o.heads[head]
-	var run time.Time
-	var formed bool
-	if st != nil && st.start == nil {
-		run, formed = endRunLocked(st)
-	}
-	var members []portal.ClusterPlanMember
-	if st != nil {
-		if st.formed {
-			st.formed, st.phase = false, ""
-			for i := range st.members {
-				st.members[i].State, st.members[i].Code = clusterMemberPending, ""
-			}
+	if owner := headServerLocked(st); owner != serverID {
+		o.mu.Unlock()
+		if owner != "" {
+			slog.Warn("cluster watchdog: ignoring a head exit another server reported", "server_id", serverID, "head_server_id", owner, "head_spec_id", head)
+			return
 		}
-		if st.lastPlan != nil && st.start == nil && st.stopping == 0 {
-			members = slices.Clone(st.lastPlan.Members)
-		}
-	}
-	o.mu.Unlock()
-	slog.Info("cluster head exited", "server_id", serverID, "head_spec_id", head)
-	o.runEnded(head, run, formed)
-	if len(members) == 0 {
 		o.Trigger()
 		return
 	}
+	run, formed := time.Time{}, false
+	if st.start == nil {
+		run, formed = endRunLocked(st)
+	}
+	if st.formed {
+		st.formed, st.phase = false, ""
+		for i := range st.members {
+			st.members[i].State, st.members[i].Code = clusterMemberPending, ""
+		}
+	}
+	idle := st.start == nil && st.stopping == 0
+	var members []portal.ClusterPlanMember
+	if st.lastPlan != nil && idle {
+		members = slices.Clone(st.lastPlan.Members)
+	}
+	crashed := exit.crash != nil && idle
+	if crashed {
+		o.recordCrashLocked(st, exit)
+	}
+	o.mu.Unlock()
+	if crashed {
+		slog.Warn("cluster head crashed; it cools down", "server_id", serverID, "head_spec_id", head,
+			"code", exit.crash.Code, "message", exit.crash.Message, "restart_after_cooldown", exit.inUse)
+		if exit.inUse {
+			time.AfterFunc(o.t.cooldown, o.Trigger)
+		}
+	} else {
+		slog.Info("cluster head exited", "server_id", serverID, "head_spec_id", head)
+	}
+	o.runEnded(head, run, formed)
 	now := o.deps.now()
 	for _, m := range members {
 		w.released[memberKey(m.Server.ID, m.SpecID)] = now
 	}
-	o.goAction(func(ctx context.Context) {
+	if !o.goAction(func(ctx context.Context) {
 		defer o.Trigger()
-		o.releaseIdle(ctx, head, members)
-	})
+		if len(members) > 0 {
+			o.releaseIdle(ctx, head, members)
+		}
+		o.forgetIfGone(ctx, head)
+	}) {
+		o.Trigger()
+	}
+}
+
+// headServerLocked is the server of st's head as the orchestration knows it
+// from a plan read, "" when it knows none. The caller holds o.mu.
+func headServerLocked(st *clusterHeadState) string {
+	switch {
+	case st == nil:
+		return ""
+	case st.server != "":
+		return st.server
+	case st.lastPlan != nil:
+		return st.lastPlan.Head.Server.ID
+	}
+	return ""
+}
+
+// recordCrashLocked records exit's crash as st's failure at the head -- the
+// agent's code, or codeClusterHeadCrashed when it named none -- and cools the
+// head down; a head that served requests is started again once the cooldown
+// ended. The caller holds o.mu.
+func (o *clusterOrchestrator) recordCrashLocked(st *clusterHeadState, exit headExit) {
+	now := o.deps.now()
+	code := cmp.Or(exit.crash.Code, codeClusterHeadCrashed)
+	st.failure = &portal.ClusterFailureDTO{Code: code, Head: true, At: now}
+	st.failErr = &clusterError{
+		Code: codeClusterStartFailed, Cause: code, Position: -1, Head: true,
+		Message: "the cluster head ended unexpectedly; it cools down before it starts again",
+	}
+	st.cooldownUntil = now.Add(o.t.cooldown)
+	st.resume = st.resume || exit.inUse
 }
 
 func memberKey(serverID, spec string) string { return serverID + "\x00" + spec }
@@ -457,9 +570,9 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 			continue
 		}
 		w.released[key] = now
-		slog.Info("cluster watchdog: releasing a member that holds a dead connection to its stopped head",
+		slog.Info("cluster watchdog: stopping a member that holds a dead connection to its stopped head",
 			"head_spec_id", v.head, "position", m.Position)
-		o.goAction(func(ctx context.Context) { o.releaseIdle(ctx, v.head, []portal.ClusterPlanMember{m}) })
+		o.goAction(func(ctx context.Context) { o.stopDeadHolds(ctx, v.head, []portal.ClusterPlanMember{m}) })
 	}
 }
 
@@ -708,6 +821,73 @@ func (o *clusterOrchestrator) releaseMembers(ctx context.Context, head string, m
 	wg.Wait()
 }
 
+// stopDeadHolds ends the dead connections of direct members of head, whose
+// head is not running, with a forced stop each, while no start or stop of
+// the head runs (a start that begins meanwhile waits for it). A release would
+// not end them: the member's agent still lists the half-open connection and
+// takes the hold again. A failure is logged; the watchdog tries again later.
+func (o *clusterOrchestrator) stopDeadHolds(ctx context.Context, head string, members []portal.ClusterPlanMember) {
+	done, ok := o.claimRelease(head)
+	if !ok {
+		return
+	}
+	defer done()
+	agents := o.deps.agents()
+	if agents == nil {
+		return
+	}
+	o.forceStopMembers(ctx, head, members, agents)
+}
+
+// forceStopMembers stops each member, forced, in parallel, each call bounded;
+// a failure is logged.
+func (o *clusterOrchestrator) forceStopMembers(ctx context.Context, head string, members []portal.ClusterPlanMember, agents clusterAgentClient) {
+	var wg sync.WaitGroup
+	for _, m := range members {
+		wg.Go(func() {
+			target := clusterMemberTarget(m)
+			sctx, cancel := context.WithTimeout(ctx, runtimeStopTimeout)
+			defer cancel()
+			if _, err := agents.StopRPCMember(o.deps.authCtx(sctx, target), target, m.SpecID, true); err != nil {
+				slog.Warn("cluster: stopping a member with a dead connection failed", "head_spec_id", head, "position", m.Position, "err", err)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// freeMembers ends the claims of head's members once the head is down: a
+// direct member whose telemetry still shows the head's hold may hold a dead
+// connection, so it is stopped, forced; every other member is released.
+func (o *clusterOrchestrator) freeMembers(ctx context.Context, head, transport string, members []portal.ClusterPlanMember, agents clusterAgentClient) {
+	var dead, rest []portal.ClusterPlanMember
+	for _, m := range members {
+		if r, ok := o.row(m.Server.ID, m.SpecID); transport == clusterTransportDirect && ok && r.RPC != nil && r.RPC.HeldBy == head {
+			dead = append(dead, m)
+		} else {
+			rest = append(rest, m)
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { o.forceStopMembers(ctx, head, dead, agents) })
+	wg.Go(func() { o.releaseMembers(ctx, head, rest, agents) })
+	wg.Wait()
+}
+
+// transportOf is plan's transport, or, when the derivation withholds the
+// head (a withheld plan names none), the transport of head's last plan.
+func (o *clusterOrchestrator) transportOf(head string, plan portal.ClusterPlan) string {
+	if plan.WithheldReason == "" {
+		return plan.Transport
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if st := o.heads[head]; st != nil && st.lastPlan != nil {
+		return st.lastPlan.Transport
+	}
+	return ""
+}
+
 // releaseAfterFailedStart releases the members a failed start of head
 // reserved, once the head shows no process (a formation that never came
 // stopped it), bounded by stopWait; a head that keeps running keeps them.
@@ -822,7 +1002,7 @@ func (o *clusterOrchestrator) conditionalStop(ctx context.Context, head string, 
 	}
 	slog.Info("cluster watchdog: removed a cluster, head first, for a local start on a member's server", "head_spec_id", head)
 	o.markStopped(head)
-	o.releaseMembers(ctx, head, members, agents)
+	o.freeMembers(ctx, head, o.transportOf(head, plan), members, agents)
 }
 
 var _ portal.ClusterMeshDriftHandler = (*clusterOrchestrator)(nil)

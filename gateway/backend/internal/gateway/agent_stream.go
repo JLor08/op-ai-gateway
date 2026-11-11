@@ -99,7 +99,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	// (agentStreamConn.runWriter), never through this watcher.
 	go func() {
 		select {
-		case <-s.baseCtx.Done():
+		case <-s.lifetime().Done():
 			_ = conn.Close(websocket.StatusGoingAway, "gateway restart")
 		case <-r.Context().Done():
 			_ = conn.Close(websocket.StatusGoingAway, "gateway listener restart")

@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,9 +70,10 @@ func TestClusterGateVerdicts(t *testing.T) {
 		f.activeMembers()
 		g := newTestClusterGate(f, nil)
 		v := g.ClusterGateState(context.Background(), orchHeadServer, "map_head")
-		// 10 units for the head plus 8 for the slowest member, 10 ms each.
-		if v.State != routing.ClusterGateParkable || v.Head != orchHead || v.ParkBound != 180*time.Millisecond {
-			t.Fatalf("cold verdict = %+v, want parkable for %s with a 180ms bound", v, orchHead)
+		// 10 units for the head plus 8 for the slowest member, 10 ms each,
+		// and the start's configuration wait (300 ms) and margins (20 + 50 ms).
+		if v.State != routing.ClusterGateParkable || v.Head != orchHead || v.ParkBound != 550*time.Millisecond {
+			t.Fatalf("cold verdict = %+v, want parkable for %s with a 550ms bound", v, orchHead)
 		}
 		f.ackAll()
 		f.holdOnHeadEnsure(0, 1)
@@ -443,6 +445,9 @@ func TestClusterRefusalsAnswer503WithTheirCode(t *testing.T) {
 		if body, ok := normalizeImagesUpstreamError(http.StatusServiceUnavailable, envelope); !ok || body.Error.Code != code {
 			t.Fatalf("%s: images relay body = %+v, %v; want the agent's envelope kept", code, body, ok)
 		}
+		if body, ok := normalizeSpeechUpstreamError(envelope, http.StatusServiceUnavailable); !ok || !bytes.Equal(body, envelope) {
+			t.Fatalf("%s: speech relay body = %s, %v; want the agent's envelope kept", code, body, ok)
+		}
 	}
 	failed := &routing.ClusterUnavailableError{Code: codeClusterStartFailed, Cause: codeClusterMemberUnreachable, Head: orchHead}
 	if completionHTTPStatus(failed) != http.StatusServiceUnavailable || completionErrorCode(failed) != codeClusterStartFailed ||
@@ -662,8 +667,8 @@ func TestClusterGateViewFirstReadIsSingleFlight(t *testing.T) {
 	}
 	close(blocking.release)
 	for range askers {
-		if v := <-views; v.bound != 150*time.Millisecond {
-			t.Fatalf("view bound = %v, want the plan's 150ms", v.bound)
+		if v := <-views; v.bound != 520*time.Millisecond {
+			t.Fatalf("view bound = %v, want the plan's 520ms", v.bound)
 		}
 	}
 	if n := blocking.readCount(); n != 1 {

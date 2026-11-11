@@ -92,7 +92,6 @@ const (
 	codeDeviceBackendMismatch    = "runtime.device_backend_mismatch"
 	codeRPCDeviceCountMismatch   = "runtime.rpc_device_count_mismatch"
 	codeClusterMemberUnreachable = "runtime.cluster_member_unreachable"
-	codeBindMismatch             = "runtime.bind_mismatch"
 	codeClusterNotReady          = "runtime.cluster_not_ready"
 	codeClusterMemberInUse       = "runtime.cluster_member_in_use"
 )
@@ -283,6 +282,11 @@ type clusterTimings struct {
 	// sessionWait bounds a reconciler pass's session closes, apart from the
 	// pass's own reads.
 	sessionWait time.Duration
+	// planRetry is how long a demand starts nothing after a head's plan could
+	// not be read (a store error): the start that failed so records no
+	// failure and no cooldown, and the requests it woke would otherwise start
+	// the next failing start at once.
+	planRetry time.Duration
 }
 
 func defaultClusterTimings() clusterTimings {
@@ -291,12 +295,18 @@ func defaultClusterTimings() clusterTimings {
 		cooldown: 60 * time.Second, codeWait: 2 * time.Second, stopWait: 60 * time.Second,
 		memberMargin: 10 * time.Second, headMargin: 30 * time.Second, reserveMargin: 60 * time.Second,
 		bootGrace: 60 * time.Second, minAgentInterval: time.Second, staleFloor: 15 * time.Second, blockedRetry: 10 * time.Second, releaseRetry: 30 * time.Second,
-		sessionWait: 10 * time.Second,
+		sessionWait: 10 * time.Second, planRetry: 5 * time.Second,
 	}
 }
 
 // clusterReadTimeout bounds the portal reads a reconciler pass makes.
 const clusterReadTimeout = 15 * time.Second
+
+// clusterKeptUpMaxAge is how long the reconciler reuses its list of kept-up
+// heads when no runtime document changed meanwhile (DocumentsChanged). Every
+// write that changes whether a head is kept up changes a document, so the
+// age only backs up a change that reached no document.
+const clusterKeptUpMaxAge = 5 * time.Minute
 
 // clusterOrchestrator is the gateway's one cluster orchestration. See the top
 // of this file.
@@ -328,6 +338,15 @@ type clusterOrchestrator struct {
 	// heard from since the gateway started were closed (once, after the boot
 	// grace). Guarded by mu.
 	unheardSwept bool
+
+	// keptUp is the last list of kept-up heads, read at keptUpAt while the
+	// documents were at generation keptUpGen; docGen counts the document
+	// changes (DocumentsChanged). Guarded by mu.
+	keptUp    []string
+	keptUpAt  time.Time
+	keptUpGen uint64
+	keptUpOK  bool
+	docGen    uint64
 }
 
 // clusterHeadState is what the orchestration knows of one head.
@@ -377,6 +396,9 @@ type clusterHeadState struct {
 	// has not been passed on yet (zero: none); runFormed: that run formed.
 	run       time.Time
 	runFormed bool
+	// planRetryAt: the head's plan could not be read (a store error), and a
+	// demand starts nothing before then (clusterTimings.planRetry).
+	planRetryAt time.Time
 }
 
 // clusterStart is one running start that every Ensure of its head joins.
@@ -404,16 +426,6 @@ func (o *clusterOrchestrator) headState(head string) *clusterHeadState {
 		o.heads[head] = st
 	}
 	return st
-}
-
-// State is head's gate state. A head the orchestration never saw is cold.
-func (o *clusterOrchestrator) State(head string) clusterGateState {
-	if o == nil {
-		return clusterCold
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.stateLocked(o.heads[head])
 }
 
 // gateState is head's gate state with the failure the orchestration recorded
@@ -569,9 +581,10 @@ func (o *clusterOrchestrator) startLocked(base context.Context, head string, st 
 // the gateway's fan-out): a request parked for d.ClusterHead, a cold or forming
 // head, asks for its cluster. It starts one in the background under the
 // server's lifetime unless one runs already, a stop of the head is under way,
-// or the head cools down or is blocked -- the automatic start's rules
-// (Ensure). It never blocks: every parked request signals on every park turn,
-// and the signals of one head coalesce into its one start.
+// the head cools down or is blocked -- the automatic start's rules (Ensure) --
+// or its plan could not be read a moment ago (clusterTimings.planRetry). It
+// never blocks: every parked request signals on every park turn, and the
+// signals of one head coalesce into its one start.
 func (o *clusterOrchestrator) Signal(d routing.DemandSignal) {
 	if o == nil || d.ClusterHead == "" {
 		return
@@ -583,6 +596,9 @@ func (o *clusterOrchestrator) Signal(d routing.DemandSignal) {
 		return
 	}
 	if st.failErr != nil && (st.terminal || o.deps.now().Before(st.cooldownUntil)) {
+		return
+	}
+	if o.deps.now().Before(st.planRetryAt) {
 		return
 	}
 	base := o.deps.base()
@@ -599,17 +615,6 @@ func joinClusterStart(ctx context.Context, s *clusterStart) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// joiners reports how many Ensure calls joined head's running start; for
-// tests.
-func (o *clusterOrchestrator) joiners(head string) int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if st := o.heads[head]; st != nil && st.start != nil {
-		return st.start.joined
-	}
-	return 0
 }
 
 // wait returns once every start and reconciler-spawned ensure has ended. The
@@ -687,7 +692,8 @@ func (o *clusterOrchestrator) run(ctx context.Context, head string) (release *po
 	return nil, nil
 }
 
-// plan loads head's plan; a withheld cluster marks the head invalid.
+// plan loads head's plan; a withheld cluster marks the head invalid, and a
+// read that failed holds demands off for planRetry.
 func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.ClusterPlan, error) {
 	plan, err := o.deps.portal.ClusterPlan(ctx, head)
 	if errors.Is(err, portal.ErrRuntimeSpecNotFound) {
@@ -696,6 +702,9 @@ func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.Clu
 	if err != nil {
 		// The store's error stays in the log: it is no answer for a client.
 		slog.Warn("cluster start: reading the head's plan failed", "head_spec_id", head, "err", err)
+		o.mu.Lock()
+		o.headState(head).planRetryAt = o.deps.now().Add(o.t.planRetry)
+		o.mu.Unlock()
 		return plan, &clusterError{Code: codeClusterUnavailable, Cause: codeRuntimeActionFailed, Position: -1}
 	}
 	o.mu.Lock()
@@ -1506,8 +1515,8 @@ func (o *clusterOrchestrator) stopMember(ctx context.Context, m portal.ClusterPl
 	return err
 }
 
-// Trigger wakes the reconciler: a runtime document was pushed, or a head
-// exited. Coalesced: one pending wake is enough.
+// Trigger wakes the reconciler: a head exited, or a runtime document was
+// pushed (DocumentsChanged). Coalesced: one pending wake is enough.
 func (o *clusterOrchestrator) Trigger() {
 	if o == nil {
 		return
@@ -1516,6 +1525,20 @@ func (o *clusterOrchestrator) Trigger() {
 	case o.trigger <- struct{}{}:
 	default:
 	}
+}
+
+// DocumentsChanged is told that a runtime document was pushed: a changed
+// document may change a cluster -- a kept-up head to start, or a head blocked
+// by a terminal cause whose configuration was fixed -- so the next reconciler
+// pass lists the kept-up heads again, and the reconciler is woken.
+func (o *clusterOrchestrator) DocumentsChanged() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.docGen++
+	o.mu.Unlock()
+	o.Trigger()
 }
 
 // TriggerChannel is what the reconciler loop waits on beside its tick.
@@ -1541,8 +1564,9 @@ func (o *clusterOrchestrator) observeStatus(serverID string, prev, next []Runtim
 // and every head the watchdog stopped while it served requests, that is cold
 // -- except one an operator stopped, and, during the boot grace, one whose
 // servers have not all reported, since the gateway cannot yet tell
-// whether that cluster still runs. Each start runs in the background, bounded
-// by its own bounds and the server's lifetime; the pass itself only reads.
+// whether that cluster still runs. A head whose spec is gone is forgotten.
+// Each start runs in the background, bounded by its own bounds and the
+// server's lifetime; the pass itself only reads.
 func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 	if o == nil {
 		return
@@ -1551,7 +1575,7 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
 	defer cancel()
 	o.liftChangedBlocks(ctx)
-	heads, err := o.deps.portal.KeptUpClusterHeads(ctx)
+	heads, err := o.keptUpHeads(ctx)
 	if err != nil {
 		slog.Warn("cluster reconcile: listing the kept-up heads failed", "err", err)
 		return
@@ -1573,6 +1597,10 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 			continue
 		}
 		plan, err := o.plan(ctx, head)
+		if specGone(err) {
+			o.forget(head)
+			continue
+		}
 		if err != nil {
 			continue
 		}
@@ -1586,6 +1614,60 @@ func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
 				slog.Debug("cluster reconcile: start of a kept-up head did not form", "head_spec_id", head, "err", err)
 			}
 		}()
+	}
+}
+
+// keptUpHeads lists the kept-up heads: the list read before while no runtime
+// document changed since and it is younger than clusterKeptUpMaxAge, else a
+// fresh read -- the portal's listing walks every server's specs, which a
+// fleet without a cluster should not pay on every pass.
+func (o *clusterOrchestrator) keptUpHeads(ctx context.Context) ([]string, error) {
+	now := o.deps.now()
+	o.mu.Lock()
+	gen := o.docGen
+	if o.keptUpOK && o.keptUpGen == gen && now.Sub(o.keptUpAt) < clusterKeptUpMaxAge {
+		heads := slices.Clone(o.keptUp)
+		o.mu.Unlock()
+		return heads, nil
+	}
+	o.mu.Unlock()
+	heads, err := o.deps.portal.KeptUpClusterHeads(ctx)
+	if err != nil {
+		return nil, err
+	}
+	o.mu.Lock()
+	o.keptUp, o.keptUpAt, o.keptUpGen, o.keptUpOK = slices.Clone(heads), now, gen, true
+	o.mu.Unlock()
+	return heads, nil
+}
+
+// specGone reports whether err, from plan, says the head's spec is gone: it
+// was deleted, or it is no cluster head any more.
+func specGone(err error) bool {
+	var ce *clusterError
+	return errors.As(err, &ce) && ce.Code == codeClusterUnavailable && ce.Cause == portal.ErrRuntimeSpecNotFound.Error()
+}
+
+// forget drops head's state once its spec is gone, unless a start, a stop or
+// a member release of it runs (they need it; a later exit or pass forgets it).
+func (o *clusterOrchestrator) forget(head string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	st := o.heads[head]
+	if st == nil || st.start != nil || st.stopping > 0 || st.releasing > 0 {
+		return
+	}
+	delete(o.heads, head)
+	delete(o.views, head)
+}
+
+// forgetIfGone reads head's plan and forgets the head when its spec is gone.
+func (o *clusterOrchestrator) forgetIfGone(ctx context.Context, head string) {
+	rctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
+	_, err := o.deps.portal.ClusterPlan(rctx, head)
+	cancel()
+	if errors.Is(err, portal.ErrRuntimeSpecNotFound) {
+		o.forget(head)
 	}
 }
 
@@ -1636,9 +1718,7 @@ func (o *clusterOrchestrator) liftChangedBlocks(ctx context.Context) {
 	for _, head := range blocked {
 		plan, err := o.deps.portal.ClusterPlan(ctx, head)
 		if errors.Is(err, portal.ErrRuntimeSpecNotFound) {
-			o.mu.Lock()
-			delete(o.heads, head)
-			o.mu.Unlock()
+			o.forget(head)
 			continue
 		}
 		if err != nil {

@@ -3623,8 +3623,12 @@ func TestRuntimeStatusCarriesClusterTelemetry(t *testing.T) {
 		t.Fatalf("member rpc = %+v, want every field carried", *rpc)
 	}
 	head := rows[1]
-	if head.Cluster == nil || len(head.Cluster.Launched) != 1 || head.Cluster.Launched[0] != "100.64.0.5:47001" || head.Cluster.Version != "b1" {
+	if head.Cluster == nil || len(head.Cluster.Launched) != 1 || head.Cluster.Launched[0] != "100.64.0.5:47001" {
 		t.Fatalf("head cluster = %+v, want the launch facts", head.Cluster)
+	}
+	// An older agent's always-empty cluster version is not carried on.
+	if out, err := json.Marshal(head.Cluster); err != nil || strings.Contains(string(out), "version") {
+		t.Fatalf("head cluster = %s (%v), want no version", out, err)
 	}
 	waiting := rows[2]
 	if waiting.AdmissionBlockedBy != "rpcm_x" {
