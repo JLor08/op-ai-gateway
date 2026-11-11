@@ -5101,15 +5101,18 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
 
   it('shows a cluster member row without a display name by its id, without the unresolved marker', async () => {
     const { stream } = renderSection({
-      statusRows: [makeStatus({ spec_id: 'rpcm_old', kind: 'rpc_server', model: '', pid: 4301 })],
+      statusRows: [
+        makeStatus({ spec_id: 'rpcm_old', kind: 'rpc_server', model: '', pid: 4301 }),
+        // A plain row no mapping matches: its marker proves the spec loads have
+        // settled, so the member row's missing marker is not just "too early".
+        makeStatus({ spec_id: 'spec_orphan', model: 'orphan-model', pid: 4302 }),
+      ],
     });
     stream.setStatus('open');
     await openStatusTab();
+    expect(await screen.findByText(t.runtimeStatusUnresolvedShort)).toBeInTheDocument();
     const row = inRowWith('4301');
     expect(row.getByText('rpcm_old')).toBeInTheDocument();
-    await act(async () => {
-      await Promise.resolve();
-    });
     expect(row.queryByText(t.runtimeStatusUnresolvedShort)).not.toBeInTheDocument();
   });
 
