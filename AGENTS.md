@@ -235,7 +235,10 @@ Required sequence for substantial work:
    `make sonar-findings && make sonar-branch-findings`, which computes the
    comparison from git; act on **that** before the cleanup below. If Docker
    or the server is unavailable, say so explicitly in the pull request rather
-   than staying silent about a skipped gate. See
+   than staying silent about a skipped gate. On an arm64 host (Apple
+   Silicon) install the native scanner (`brew install sonar-scanner`): the
+   scanner image is amd64-only, and `sonar.sh` uses the native one there
+   automatically. See
    [`development-and-quality.md` §7](docs/architecture/cross-cutting/development-and-quality.md).
 10. **Final step before the pull request:** remove `docs/superpowers/` and
     `docs/implementation-status.md` from the branch (their durable content
