@@ -137,9 +137,16 @@ func (f *clusterFixture) updateServer(id string, mutate func(*routing.AIServer))
 	if err != nil {
 		f.t.Fatalf("server %s: %v", id, err)
 	}
+	ip := s.NetbirdIP
 	mutate(&s)
 	if err := f.routes.UpdateAIServer(f.ctx, s); err != nil {
 		f.t.Fatalf("update server: %v", err)
+	}
+	// The mesh IP is the peer sync's to write: UpdateAIServer leaves it.
+	if s.NetbirdIP != ip {
+		if err := f.routes.UpdateServerNetbirdState(f.ctx, id, s.Domain, s.NetbirdPeerID, s.NetbirdIP, s.NetbirdConnected); err != nil {
+			f.t.Fatalf("update server mesh ip: %v", err)
+		}
 	}
 }
 

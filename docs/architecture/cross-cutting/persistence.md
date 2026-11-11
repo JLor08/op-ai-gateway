@@ -470,7 +470,8 @@ evidence.
 
 **Adding a column to `ai_servers` requires seven edit sites in
 `internal/store/sqlite_routes.go`, not four:** `CreateAIServer` (columns,
-placeholders, args), `UpdateAIServer` (set-list, args), `AIServerByID`,
+placeholders, args), `UpdateAIServer` (set-list, args; a column with its own
+targeted writer, such as `netbird_ip`, is left out of it), `AIServerByID`,
 `AIServers`, `ServersByOwner`, `ServersByAdminGroups`, and `scanAIServer` —
 because each read path inlines its own copy of the column list instead of sharing
 a constant, and all four selects feed the same scanner. New columns are appended

@@ -227,7 +227,8 @@ type AIServer struct {
 	ManagedRuntimeOnly bool
 	// NetbirdIP is the server's NetBird mesh address (migration 103), the
 	// address an RPC cluster head reaches the server's members on over the
-	// mesh. "" = unknown. Routing never reads it.
+	// mesh. "" = unknown. Routing never reads it. Written only by the NetBird
+	// state writes, never by UpdateAIServer.
 	NetbirdIP string
 	// LANAddress is the server's LAN address (migration 103) for cluster
 	// networks that bypass NetBird. "" = none. Routing never reads it.
@@ -1338,7 +1339,15 @@ type Certificate struct {
 // lives in NetbirdStateStore; agent tokens live in AgentTokenStore.
 type ServerStore interface {
 	CreateAIServer(ctx context.Context, host AIServer) error
+	// UpdateAIServer writes the server row from host, except netbird_ip: the
+	// mesh address is written only by the NetBird state writes below
+	// (UpdateServerNetbirdState, UpdateServerNetbirdLink, ClearServerNetbirdIP),
+	// so a full-row write from a stale read cannot bring an old one back.
 	UpdateAIServer(ctx context.Context, host AIServer) error
+	// UpdateServerLastSeen writes only last_seen_at and updated_at, the agent
+	// telemetry heartbeat, so a sample cannot write back a row it read before
+	// a concurrent portal save. An unknown id is ErrNotFound.
+	UpdateServerLastSeen(ctx context.Context, id string, lastSeenAt, updatedAt time.Time) error
 	AIServerByID(ctx context.Context, id string) (AIServer, error)
 	AIServers(ctx context.Context) ([]AIServer, error)
 	SetServerHealth(ctx context.Context, serverID, health string) error
@@ -1398,8 +1407,15 @@ type NetbirdStateStore interface {
 	// UpdateServerNetbirdState writes the peer-synced server state — the domain
 	// (from the peer's DNS name), the peer id, the peer's mesh IP, and the
 	// connected flag — as a targeted UPDATE (only those four columns), so it
-	// cannot race a concurrent full-row write. An empty ip clears netbird_ip.
+	// overwrites no other column. A full-row UpdateAIServer from an older read
+	// can still write back the domain, peer id and connected flag (the next
+	// sync pass restores them), never the mesh IP. An empty ip clears
+	// netbird_ip.
 	UpdateServerNetbirdState(ctx context.Context, id, domain, peerID, ip string, connected bool) error
+	// ClearServerNetbirdIP empties only netbird_ip, for a server whose NetBird
+	// flag was turned off (the peer sync no longer refreshes its address). An
+	// unknown id is ErrNotFound.
+	ClearServerNetbirdIP(ctx context.Context, id string) error
 	// UpdateServerNetbirdGroups writes only netbird_group_ids — the opaque JSON
 	// mirror of the peer's policy groups (a targeted UPDATE that touches only that
 	// one column), so it cannot race a concurrent full-row or state write.

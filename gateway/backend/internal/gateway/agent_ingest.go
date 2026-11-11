@@ -2139,9 +2139,9 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 		slog.Error("agent telemetry: telemetry update failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.telemetry_update_failed", message: "telemetry update failed", cause: err}
 	}
-	server.LastSeenAt = &telemetry.ReportedAt
-	server.UpdatedAt = telemetry.UpdatedAt
-	if err := s.Routes.UpdateAIServer(ctx, server); err != nil {
+	// A targeted write: the server row read above may already be older than a
+	// portal save, and writing it back whole would undo that save.
+	if err := s.Routes.UpdateServerLastSeen(ctx, serverID, telemetry.ReportedAt, telemetry.UpdatedAt); err != nil {
 		slog.Error("agent telemetry: server update failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.server_update_failed", message: "server update failed", cause: err}
 	}

@@ -4145,6 +4145,13 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	if err := s.routes.UpdateAIServer(ctx, server); err != nil {
 		return ServerDTO{}, err
 	}
+	// The full-row write leaves the mesh address to the NetBird state
+	// writes, so the one dropped above is cleared on its own.
+	if req.NetbirdEnabled != nil && !server.NetbirdEnabled {
+		if err := s.routes.ClearServerNetbirdIP(ctx, server.ID); err != nil {
+			return ServerDTO{}, err
+		}
+	}
 	// Best-effort, immediately after the successful row write and long before
 	// the NetBird round trip below: the AI SERVER row is row 1 of THE RULE's
 	// list on notifyRuntimeChanged -- RuntimeMaxProcesses is the document's

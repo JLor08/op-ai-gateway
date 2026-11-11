@@ -231,7 +231,7 @@ sequenceDiagram
     GW->>St: AIServerByID(serverID)
     St-->>GW: server (404 → agent.unknown_server)
     GW->>St: UpsertTelemetry (routing summary: cpu_load, ram_*, vram_*, gpu_count)
-    GW->>St: UpdateAIServer (LastSeenAt)
+    GW->>St: UpdateServerLastSeen (last_seen_at, updated_at only)
     GW->>St: InsertTelemetrySample (per-GPU/host history row)
     GW->>Idle: Observe(serverID, watts)
     GW->>Perf: publish(sample)
