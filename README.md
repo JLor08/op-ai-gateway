@@ -190,9 +190,9 @@ servers, models, launch specifications, users, and policies in a bilingual
 | :---: | :---: |
 | ![Activity view — usage, cost and energy analytics](docs/images/portal-activity.png) | ![Models view — model visibility and model groups](docs/images/portal-models.png) |
 
-| llama.cpp RPC cluster head |
+| llama.cpp RPC cluster head (editor header, then its RPC cluster section) |
 | :---: |
-| ![Runtime spec editor — a cluster head with two automatic members](docs/images/portal-rpc-cluster.png) |
+| ![Runtime spec editor of llama-3.3-70b on gpu-node-a: the header, then the RPC cluster section of a configured cluster that has not been started yet ("Cluster off"), with two automatic members](docs/images/portal-rpc-cluster.png) |
 
 ## How it works
 
