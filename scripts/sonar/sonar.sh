@@ -16,7 +16,7 @@
 #                         Go coverprofiles for gateway/backend and
 #                         server-agent). Reports land at gitignored paths
 #                         (see sonar-project.properties' reportPaths).
-#   scan                  run sonar-scanner-cli against the repo, wait for
+#   scan                  run the scanner against the repo (see below), wait for
 #                         the compute-engine task, report the quality gate.
 #                         `--strict` exits non-zero when the gate fails
 #                         (default: report only -- a legacy codebase's first
@@ -46,7 +46,39 @@
 # bootstrap -- which `up` and `scan` (so also `gate`) run -- records the UP
 # server's version in .sonar-local/server-version, so that message can name the
 # matching image; `findings` does not record.
-# SONAR_SCANNER_OPTS sets the scanner's JVM options (default -Xmx2048m).
+#
+# The scanner runs in one of two ways (SONAR_SCANNER_MODE=docker|native|auto,
+# default auto):
+#   docker   the pinned scanner image on the compose network (the original way).
+#            That image is published for linux/amd64 only, so on an arm64 docker
+#            host (Apple Silicon) the whole scanner -- JVM, the Node.js JS/TS
+#            analyzer, the sonar-go converter binary -- runs emulated. Under
+#            qemu that crashed the converter on a different set of Go packages
+#            every run (those packages were silently never analyzed), and every
+#            run was slow.
+#   native   a sonar-scanner on the host (`brew install sonar-scanner`; or the
+#            one SONAR_SCANNER_BIN names), at least the CLI release the pinned
+#            image bundles. Only the CLI is local: the scanner engine, the JRE it
+#            runs on and every language analyzer are downloaded from the pinned
+#            server, for the host's own platform, so nothing runs emulated and the
+#            CLI needs a floor, not a pin.
+#   auto     native when a sonar-scanner is available and the docker host (or
+#            this machine) is arm64; docker otherwise. The choice is printed.
+# Both ways pass the same properties, token and server.
+#
+# The scanner is two JVMs: a thin launcher, and the engine that does the
+# analysis. SONAR_SCANNER_OPTS sets the LAUNCHER's options (default -Xmx2048m);
+# the heap that matters is the engine's, which SONAR_SCANNER_JAVA_OPTS sets
+# (default -Xmx6g native, -Xmx5g docker; a set value always wins, and the
+# effective options are printed). The Go analysis of this repo needs about 4 GB
+# of it (out of heap at -Xmx3g, passes at -Xmx4g; SonarQube 26.8, sonar-go
+# 1.40): sonar-go converts one package at a time,
+# gateway/backend/internal/gateway holds 465 files, and it has no property that
+# bounds that. The JVM's own default, a quarter of the memory, is about 3 GB
+# inside a 12 GB docker VM: too little. Docker mode's -Xmx5g needs a docker VM
+# of at least about 8 GB. SONAR_SCANNER_EXTRA_ARGS adds arguments (such as
+# -Dsonar.javascript.node.maxspace=4608) to the scanner's command line, in both
+# modes; it is split on whitespace.
 #
 # Credentials (admin password + API token) live in the gitignored
 # .sonar-local/ directory (dir 0700, files 0600) -- never committed. That
@@ -93,6 +125,16 @@ SERVER_VERSION_FILE="$LOCAL_DIR/server-version"
 # `latest` scanner can move ahead of the pinned server it has to talk to.
 SCANNER_IMAGE_DEFAULT="sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1"
 SCANNER_IMAGE="${SONAR_SCANNER_IMAGE:-$SCANNER_IMAGE_DEFAULT}"
+# The oldest native scanner accepted: the SonarScanner CLI release the pinned
+# image bundles (the tag's part after "_"), so the native path is never older
+# than the tested one, and a bump of the pin raises it too.
+NATIVE_SCANNER_MIN_VERSION="${SCANNER_IMAGE_DEFAULT##*_}"
+# The scanner engine's JVM options when SONAR_SCANNER_JAVA_OPTS is unset. The Go
+# analysis needs about 4 GB of heap; the JVM's own default (a quarter of the
+# memory) falls short on a 16 GB host and inside a 12 GB docker VM. 5g still
+# fits that VM next to the server; the VM needs at least about 8 GB for it.
+ENGINE_JAVA_OPTS_NATIVE_DEFAULT="-Xmx6g"
+ENGINE_JAVA_OPTS_DOCKER_DEFAULT="-Xmx5g"
 
 UP_TIMEOUT="${SONAR_UP_TIMEOUT:-300}"     # seconds to wait for the server to report UP
 CE_TIMEOUT="${SONAR_CE_TIMEOUT:-900}"     # seconds to wait for the compute-engine task
@@ -459,27 +501,141 @@ current_token() {
   jq -r '.token // empty' "$CREDS_FILE"
 }
 
-cmd_scan() {
-  require_cmd docker curl jq
-  local strict=0
-  for arg in "$@"; do
-    case "$arg" in
-      --strict) strict=1 ;;
-      *) die "scan: unknown argument: $arg" ;;
-    esac
-  done
+# A sonar-scanner on PATH, or nothing. Its own function so the offline tests can
+# decide what PATH holds without rebuilding PATH.
+scanner_on_path() {
+  command -v sonar-scanner 2>/dev/null || true
+}
 
-  if [ "$(server_status)" != "UP" ]; then
-    log "SonarQube is not running yet; starting it ..."
-    note_image_override
-    compose up -d
-    wait_for_up
+# The native scanner to run: SONAR_SCANNER_BIN when set, else the one on PATH,
+# else nothing.
+native_scanner_bin() {
+  if [ -n "${SONAR_SCANNER_BIN:-}" ]; then
+    printf '%s\n' "$SONAR_SCANNER_BIN"
+  else
+    scanner_on_path
   fi
-  cmd_bootstrap
-  local token
-  token="$(current_token)"
+}
 
-  rm -rf "$ROOT/.scannerwork"
+# The docker daemon's architecture ("aarch64", "x86_64"), or nothing when
+# docker does not answer.
+docker_host_arch() {
+  docker info --format '{{.Architecture}}' 2>/dev/null || true
+}
+
+is_arm64() {
+  case "$1" in
+    arm64|aarch64) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints the scanner mode to use (docker|native) and logs why.
+select_scanner_mode() {
+  local mode="${SONAR_SCANNER_MODE:-auto}"
+  case "$mode" in
+    docker|native)
+      log "Scanner mode: ${mode} (SONAR_SCANNER_MODE=${mode})."
+      printf '%s\n' "$mode"
+      ;;
+    auto)
+      local bin docker_arch host_arch
+      bin="$(native_scanner_bin)"
+      if [ -z "$bin" ]; then
+        log "Scanner mode: docker (auto: no sonar-scanner on PATH or in SONAR_SCANNER_BIN)."
+        printf 'docker\n'
+        return 0
+      fi
+      docker_arch="$(docker_host_arch)"
+      host_arch="$(uname -m 2>/dev/null || true)"
+      if is_arm64 "$docker_arch" || is_arm64 "$host_arch"; then
+        log "Scanner mode: native (auto: ${bin} found; docker host ${docker_arch:-unknown}, this machine ${host_arch:-unknown} -- the scanner image is amd64-only and would run emulated)."
+        printf 'native\n'
+      else
+        log "Scanner mode: docker (auto: docker host ${docker_arch:-unknown}, this machine ${host_arch:-unknown} run the amd64 scanner image natively)."
+        printf 'docker\n'
+      fi
+      ;;
+    *) die "SONAR_SCANNER_MODE must be docker, native or auto (got '${mode}')" ;;
+  esac
+}
+
+# The release `<scanner> -v` reports ("8.4.0.16527"), or nothing. CLI 6+ prints
+# "SonarScanner CLI 8.4.0.16527", older ones "SonarScanner 5.0.1.3006".
+native_scanner_version() {
+  local out re='SonarScanner( CLI)? ([0-9]+(\.[0-9]+)*)'
+  out="$("$1" -v 2>&1 || true)"
+  if [[ "$out" =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  fi
+}
+
+# version_at_least <have> <want>: numeric, component by component.
+version_at_least() {
+  local have want i a b
+  IFS=. read -r -a have <<<"$1"
+  IFS=. read -r -a want <<<"$2"
+  for i in 0 1 2 3; do
+    a="${have[$i]:-0}"
+    b="${want[$i]:-0}"
+    if [ "$((10#$a))" -gt "$((10#$b))" ]; then return 0; fi
+    if [ "$((10#$a))" -lt "$((10#$b))" ]; then return 1; fi
+  done
+  return 0
+}
+
+# Prints the native scanner to run, after checking it exists and is not older
+# than NATIVE_SCANNER_MIN_VERSION.
+resolve_native_scanner() {
+  local bin version
+  bin="$(native_scanner_bin)"
+  [ -n "$bin" ] || die "native scanner mode needs a sonar-scanner on PATH or SONAR_SCANNER_BIN set to one; install it with 'brew install sonar-scanner', or use SONAR_SCANNER_MODE=docker"
+  if [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
+    die "native scanner ${bin} is not an executable file (SONAR_SCANNER_BIN takes a path)"
+  fi
+  version="$(native_scanner_version "$bin")"
+  [ -n "$version" ] || die "could not read a SonarScanner version from '${bin} -v'; check that it runs, or use SONAR_SCANNER_MODE=docker"
+  if ! version_at_least "$version" "$NATIVE_SCANNER_MIN_VERSION"; then
+    die "native sonar-scanner ${version} (${bin}) is older than ${NATIVE_SCANNER_MIN_VERSION}, the release the pinned scanner image bundles; upgrade it ('brew upgrade sonar-scanner'), or use SONAR_SCANNER_MODE=docker"
+  fi
+  log "Native scanner: ${bin} (SonarScanner CLI ${version}; minimum ${NATIVE_SCANNER_MIN_VERSION})."
+  printf '%s\n' "$bin"
+}
+
+# engine_java_opts <mode>: the scanner engine's JVM options -- SONAR_SCANNER_JAVA_OPTS
+# when set, else the mode's default.
+engine_java_opts() {
+  if [ -n "${SONAR_SCANNER_JAVA_OPTS:-}" ]; then
+    printf '%s\n' "$SONAR_SCANNER_JAVA_OPTS"
+  elif [ "$1" = native ]; then
+    printf '%s\n' "$ENGINE_JAVA_OPTS_NATIVE_DEFAULT"
+  else
+    printf '%s\n' "$ENGINE_JAVA_OPTS_DOCKER_DEFAULT"
+  fi
+}
+
+# log_engine_java_opts <mode> <effective options>: print what the analysis JVM
+# gets, and where it came from. SONAR_SCANNER_OPTS looks like the knob for the
+# analysis heap but only reaches the launcher JVM, so a heap size there, with
+# SONAR_SCANNER_JAVA_OPTS unset, gets a note.
+log_engine_java_opts() {
+  if [ -n "${SONAR_SCANNER_JAVA_OPTS:-}" ]; then
+    log "Engine JVM options: $2 (SONAR_SCANNER_JAVA_OPTS)."
+  else
+    log "Engine JVM options: $2 (the ${1} mode default; SONAR_SCANNER_JAVA_OPTS overrides it)."
+    case "${SONAR_SCANNER_OPTS:-}" in
+      *-Xmx*)
+        log "note: SONAR_SCANNER_OPTS sizes only the scanner's launcher JVM; the analysis"
+        log "      (engine) JVM takes its heap from SONAR_SCANNER_JAVA_OPTS."
+        ;;
+    esac
+  fi
+}
+
+# run_docker_scanner <token> <project version> <engine JVM options> [extra scanner args...]
+run_docker_scanner() {
+  local token="$1" project_version="$2" engine_opts="$3"
+  shift 3
 
   # ROOT is a linked git worktree: its .git is a *file* with an absolute
   # "gitdir:" pointer into the main repo's .git/worktrees/<name>, which lives
@@ -496,6 +652,91 @@ cmd_scan() {
       extra_mounts+=(-v "${git_common_dir}:${git_common_dir}:ro")
     fi
   fi
+  # The image's default sonar.working.directory lives under /tmp inside the
+  # container, which vanishes with --rm before we can read report-task.txt.
+  # SCANNER_WORKDIR_PATH (supported by the image's entrypoint) points it at
+  # the mounted tree instead so the report survives the container's exit.
+  docker run --rm \
+    --network sonar-net \
+    -e SONAR_HOST_URL="http://sonarqube:9000" \
+    -e SONAR_TOKEN="${token}" \
+    -e SONAR_SCANNER_OPTS="${SONAR_SCANNER_OPTS:--Xmx2048m}" \
+    -e SONAR_SCANNER_JAVA_OPTS="${engine_opts}" \
+    -e SCANNER_WORKDIR_PATH="/usr/src/.scannerwork" \
+    -v "${ROOT}:/usr/src" \
+    ${extra_mounts[@]+"${extra_mounts[@]}"} \
+    -w /usr/src \
+    "$SCANNER_IMAGE" \
+    -Dsonar.projectVersion="${project_version}" \
+    "$@"
+}
+
+# run_native_scanner <scanner> <token> <project version> <engine JVM options> [extra scanner args...]
+#
+# The same properties the docker path passes, with the host's paths: the repo
+# root instead of the /usr/src mount (so sonar-project.properties' relative
+# report paths resolve against it), its .scannerwork as the working directory
+# (where report-task.txt is read from), and the loopback server URL instead of
+# the compose network's name. The token travels in the environment, like in the
+# container, so it never shows in the host's process list. The git common dir
+# needs no mount: the host sees it.
+run_native_scanner() {
+  local bin="$1" token="$2" project_version="$3" engine_opts="$4"
+  shift 4
+  (
+    cd "$ROOT"
+    SONAR_HOST_URL="$SONAR_URL" \
+      SONAR_TOKEN="$token" \
+      SONAR_SCANNER_OPTS="${SONAR_SCANNER_OPTS:--Xmx2048m}" \
+      SONAR_SCANNER_JAVA_OPTS="$engine_opts" \
+      "$bin" \
+      -Dsonar.host.url="$SONAR_URL" \
+      -Dsonar.projectBaseDir="$ROOT" \
+      -Dsonar.working.directory="$ROOT/.scannerwork" \
+      -Dsonar.projectVersion="${project_version}" \
+      "$@"
+  )
+}
+
+cmd_scan() {
+  require_cmd curl jq
+  local strict=0
+  for arg in "$@"; do
+    case "$arg" in
+      --strict) strict=1 ;;
+      *) die "scan: unknown argument: $arg" ;;
+    esac
+  done
+
+  # Settled before anything starts, so a missing or too-old native scanner
+  # fails fast.
+  local mode scanner_bin=""
+  mode="$(select_scanner_mode)"
+  if [ "$mode" = native ]; then
+    scanner_bin="$(resolve_native_scanner)"
+  else
+    require_cmd docker
+  fi
+  local engine_opts
+  engine_opts="$(engine_java_opts "$mode")"
+  log_engine_java_opts "$mode" "$engine_opts"
+  local extra_args=()
+  if [ -n "${SONAR_SCANNER_EXTRA_ARGS:-}" ]; then
+    read -r -a extra_args <<<"$SONAR_SCANNER_EXTRA_ARGS"
+  fi
+
+  if [ "$(server_status)" != "UP" ]; then
+    require_cmd docker
+    log "SonarQube is not running yet; starting it ..."
+    note_image_override
+    compose up -d
+    wait_for_up
+  fi
+  cmd_bootstrap
+  local token
+  token="$(current_token)"
+
+  rm -rf "$ROOT/.scannerwork"
 
   # Give every analysis a distinct project version so the PREVIOUS_VERSION
   # new-code period has something to advance against. Without it every analysis
@@ -512,24 +753,14 @@ cmd_scan() {
   local project_version
   project_version="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-  log "Running sonar-scanner-cli against ${ROOT} (version ${project_version}) ..."
+  log "Running sonar-scanner (${mode}) against ${ROOT} (version ${project_version}) ..."
   local start_ts end_ts
   start_ts="$(date +%s)"
-  # The image's default sonar.working.directory lives under /tmp inside the
-  # container, which vanishes with --rm before we can read report-task.txt.
-  # SCANNER_WORKDIR_PATH (supported by the image's entrypoint) points it at
-  # the mounted tree instead so the report survives the container's exit.
-  docker run --rm \
-    --network sonar-net \
-    -e SONAR_HOST_URL="http://sonarqube:9000" \
-    -e SONAR_TOKEN="${token}" \
-    -e SONAR_SCANNER_OPTS="${SONAR_SCANNER_OPTS:--Xmx2048m}" \
-    -e SCANNER_WORKDIR_PATH="/usr/src/.scannerwork" \
-    -v "${ROOT}:/usr/src" \
-    ${extra_mounts[@]+"${extra_mounts[@]}"} \
-    -w /usr/src \
-    "$SCANNER_IMAGE" \
-    -Dsonar.projectVersion="${project_version}"
+  if [ "$mode" = native ]; then
+    run_native_scanner "$scanner_bin" "$token" "$project_version" "$engine_opts" ${extra_args[@]+"${extra_args[@]}"}
+  else
+    run_docker_scanner "$token" "$project_version" "$engine_opts" ${extra_args[@]+"${extra_args[@]}"}
+  fi
   end_ts="$(date +%s)"
   log "Scanner finished in $((end_ts - start_ts))s."
 
@@ -752,7 +983,7 @@ Usage: $0 <up|bootstrap|coverage|scan|gate|findings|down|purge> [options]
   up                  start SonarQube, wait for it, bootstrap credentials
   bootstrap           idempotently ensure a working admin token exists
   coverage            generate frontend lcov + both Go coverprofiles
-  scan [--strict]     run sonar-scanner-cli, report the quality gate
+  scan [--strict]     run the scanner, report the quality gate
                       (--strict: exit non-zero if the gate fails). Uses
                       whatever coverage reports already exist on disk;
                       run 'coverage' or 'gate' first to refresh them.
@@ -764,8 +995,23 @@ Usage: $0 <up|bootstrap|coverage|scan|gate|findings|down|purge> [options]
 
 Environment:
   SONAR_IMAGE          server image (default: the pin in docker-compose.yml)
+  SONAR_SCANNER_MODE   docker, native or auto (default: auto -- native when
+                       a sonar-scanner is available and the docker host or
+                       this machine is arm64, where the amd64-only scanner
+                       image would run emulated)
+  SONAR_SCANNER_BIN    native scanner to run (default: sonar-scanner on
+                       PATH; 'brew install sonar-scanner'; at least
+                       ${NATIVE_SCANNER_MIN_VERSION})
   SONAR_SCANNER_IMAGE  scanner image (default: ${SCANNER_IMAGE_DEFAULT})
-  SONAR_SCANNER_OPTS   scanner JVM options (default: -Xmx2048m)
+  SONAR_SCANNER_OPTS   the scanner LAUNCHER's JVM options (default: -Xmx2048m)
+  SONAR_SCANNER_JAVA_OPTS
+                       the analysis (engine) JVM's options. The Go analysis
+                       of this repo needs about 4 GB of heap (default:
+                       ${ENGINE_JAVA_OPTS_NATIVE_DEFAULT} native, ${ENGINE_JAVA_OPTS_DOCKER_DEFAULT} docker; docker
+                       mode needs a docker VM of at least about 8 GB)
+  SONAR_SCANNER_EXTRA_ARGS
+                       extra scanner arguments, split on whitespace, e.g.
+                       -Dsonar.javascript.node.maxspace=4608
   SONAR_UP_TIMEOUT     seconds to wait for the server (default: 300)
   SONAR_CE_TIMEOUT     seconds to wait for the analysis (default: 900)
   SONAR_LOCAL_DIR      credentials and exports (default: the main worktree's
