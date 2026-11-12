@@ -379,7 +379,7 @@ default:
 |---|---|
 | `port` | 8899 (the Engine listener's conventional port) |
 | `health_check_mode` / `health_check_path` | `health_path` / `/v1/systemone/models` — the router's `/health` is on the container's management port (127.0.0.1:8080), unreachable from the gateway, so the authenticated listing doubles as the health probe |
-| `loaded_models_path` / `loaded_models_format` | `/v1/systemone/models` / `openai` |
+| `loaded_models_path` / `loaded_models_format` | `/v1/systemone/models` / `openai` — on an Engine listener a granted model is loaded, so the listing is the loaded set |
 | `timeout_ms` | 600000 (also the backend's default for the type when `timeout_ms` is 0: a request may wait on a cold load or a first-start download) |
 | `api_flavors` | `["decisions"]` |
 | `responses_mode` / `messages_mode` | both `disabled` |
@@ -1221,7 +1221,12 @@ over a name's offering mappings as `decision`).
 
 `any_decision` (`routing.CapabilityAnyDecision`) is a **derived requirement, never a row
 name**, handled in `capabilityRowsSatisfy` the way `image_edit` is: it holds when the
-mapping has `(decision, yes)` **or** `(decision_openai, yes)`. `POST /v1/decisions` sets
+mapping has `(decision, yes)` **or** `(decision_openai, yes)`. The `decision_openai` half
+counts only on a kind that can take a passthrough (`routing.DecisionsPassthroughCapableKind`):
+`filterCapable` and the session-pin check judge the rows for the candidate's application type
+(`capabilityRowsForKind` drops the verdict for `llama_cpp` and `vllm_sr`), so a candidate the
+route would refuse after the resolve is never selected. A `server_agent` candidate's spec type
+is not known before the resolve, so for it only the post-resolve refusal applies. `POST /v1/decisions` sets
 `RequiredCapabilities = ["any_decision"]`, so the one gate funnel (`filterCapable`, the
 session-pin check and the server-override filter alike) admits a mapping that can serve
 either route and refuses the rest `404 routing.model_not_capable`; the list also keeps the
@@ -1234,7 +1239,9 @@ lacks its verdict on one of them therefore answer intermittently: an operator
 configuration issue (use the same mode on both, or `auto`). An operator who tries to write
 a `manual` row named `any_decision` is refused `mapping.capability_reserved`. The unknown-model redirect's
 `ModelOffering.Capable` has the matching fold (`anyDecisionFlagsByName`: every mapping of a
-name has either verdict and passes the decisions flavor half).
+name has either verdict and passes the decisions flavor half); it and `ModelDTO.DecisionOpenAI`
+count `decision_openai` only on a capable effective kind (the spec type of a `server_agent`
+mapping with a spec, else the application type).
 
 **The reserved-list decisions** are not symmetric. `reservedAgentCapabilityNames`
 (`internal/gateway/agent_ingest.go`, the names an agent's open verdict list may

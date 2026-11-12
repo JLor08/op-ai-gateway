@@ -12154,16 +12154,20 @@ text), `ServerAgent` version `0.18.1` → `0.18.2` (PATCH).**
   `decisions_mode` `auto` and `systemone_mode` `passthrough`. The listing needs the application's API key (the listener's
   `api_keys`, a Bearer) and a grant (`listeners[].apis.systemone.models`), so a healthy check also proves both. The
   listener's own **30 s default deadline** (`504 systemone_deadline_exceeded` unless the client sends
-  `options.deadline_ms`) is documented as an operator note and left alone.
-- **(c) The spec binary is the worker, detected before `vllm`.** `DetectRuntimeSpecType` matches `vllm-srun`,
-  `vllm_srun` and `vllm-sr` ahead of `vllm` (the worker's name contains it); `DeriveProbePaths` is `/metrics` and
+  `options.deadline_ms`) is documented as an operator note and left alone. The frontend's loaded-models default for the
+  type is the same `/v1/systemone/models` (format `openai`): on an Engine listener a granted model is loaded, so the
+  listing is the loaded set.
+- **(c) The spec binary is the worker, detected before `vllm`.** `DetectRuntimeSpecType` matches `vllm-srun` and
+  `vllm_srun` ahead of `vllm` (the worker's name contains it). The bare `vllm-sr` is deliberately not a detection
+  substring: the `vllm-sr` CLI is no spec binary (see the rejected alternatives), and the substring would also catch
+  unrelated names such as `vllm-srv` or `vllm-sriov`, which detect as `vllm`. `DeriveProbePaths` is `/metrics` and
   `/v1/models`; the health path stays `/health`. The portal's type note carries the launch template `serve ${MODEL}
   --device cuda:0 --host 127.0.0.1 --port ${PORT}` (device 0 because `set_visible_devices` remaps the GPU), the install
   from a checkout of the pinned commit with `runtime_allow_binary_dirs`, the first-start download and the
   loopback-only rule that follows from the missing authentication. The form defaults a switched spec to the `decisions`
   flavor, and `api_flavors_text_on_vllm_sr` (a `RuntimeWarning`) flags a spec that lists `openai` or `anthropic`.
 - **(d) Passthrough is refused for both types, so `auto` translates.** vllm-sr's `/v1/decisions` returns System One's
-  body, so a passthrough would hand an OpenAI client the wrong shape. `decisionsPassthroughCapableKind` refuses it as it
+  body, so a passthrough would hand an OpenAI client the wrong shape. `routing.DecisionsPassthroughCapableKind` refuses it as it
   does for `llama_cpp` (`application.decisions_passthrough_unsupported` 400, `application.decisions_passthrough_conflict`
   409, `runtime_spec.decisions_passthrough_unsupported` 400; a stored `passthrough` is reset to `auto` on a retype). The
   `decision_openai` probe's scope is unchanged and never reaches the type; the System One probe asks it like any
@@ -12172,7 +12176,11 @@ text), `ServerAgent` version `0.18.1` → `0.18.2` (PATCH).**
   (`Target.EffectiveKind`) and the portal's `decisions_route`, and `routing.EffectiveDecisionsRoute(kind, ...)` ignores a
   `decision_openai` verdict for an incapable kind (a manual `yes`, or one left from a retype), so `auto` translates and a stale
   forced `passthrough` is `404 routing.model_not_capable`. This also closes a Phase 2 gap for `llama_cpp`, whose refusal
-  was a save guard only. The 5.0 error envelope needs no code: the Phase 2 translator already reads `detail`
+  was a save guard only. The pre-resolve `any_decision` gate applies the same rule: the resolver's candidate filter
+  ignores `decision_openai` for an incapable application type, so such a candidate is never selected only to be refused
+  (with several candidates for one name it could otherwise win over a servable one), and the portal's `decision_openai`
+  flag and `any_decision` offering fold ignore it for an incapable effective kind. A `server_agent` candidate's spec type
+  is not known before the resolve, so only the post-resolve refusal covers that case. The 5.0 error envelope needs no code: the Phase 2 translator already reads `detail`
   (string or list) and relays the upstream's status; a test pins a flat 5.0 `422 question_failed`, and a separate test pins a
   `529` status (with an `{error:{...}}` body, not the flat envelope).
 - **(e) The agent reads what the worker gives, and no more (0.18.2).** The context size is

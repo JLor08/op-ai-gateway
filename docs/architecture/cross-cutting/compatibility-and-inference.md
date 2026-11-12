@@ -1983,7 +1983,16 @@ and `vllm`/`custom` specs only), while the System One probe does. The route sett
 `auto` translates when `decision: yes` (else `404 routing.model_not_capable`), and a stale forced
 `passthrough` is `404 routing.model_not_capable` rather than sent to an upstream that cannot parse
 it. The handler (`Target.EffectiveKind`) and the portal's `decisions_route` share the function, so
-they cannot disagree. The same rule closes the gap that existed for `llama_cpp` since Phase 2. The 5.0 runtime
+they cannot disagree. The same rule closes the gap that existed for `llama_cpp` since Phase 2. The
+pre-resolve `any_decision` gate reads it too: the resolver's candidate filter does not count a
+`decision_openai` verdict for an incapable application type (`capabilityRowsForKind`), so such a
+candidate is not selected only to be refused, and cannot win over a servable candidate of the same
+name; the portal's `decision_openai` flag and `any_decision` offering fold do the same on the
+effective kind, the spec type included. A `server_agent` candidate's spec type is not known before
+the resolve, so there only the post-resolve refusal applies (the probe never writes the verdict for
+those spec types; a manual `yes` or a row left from a retype can still reach it). An Engine listener answers a model it does not grant with `404
+systemone_not_published`, which the System One probe records as `decision: no`; if the operator grants
+the model later, clear the verdict in the portal (or restart the gateway) so it is probed again. The 5.0 runtime
 changed its `/v1/systemone` error envelope: it carries `detail` (a string, or a list on a 422)
 plus flat `code`/`question`/`reason` fields, has **no `error` key**, and uses `529` for overload.
 The translate error normalizer of item 6 already reads `detail` in both shapes and relays the

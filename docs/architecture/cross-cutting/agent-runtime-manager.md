@@ -843,7 +843,7 @@ is what tells the gateway — and, through it, the agent — which conventions g
 for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
 not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
 (`routing/runtime_spec_type.go`) matches case-insensitive substrings of the
-launched binary's basename, first match wins — `vllm-srun`/`vllm_srun`/`vllm-sr`
+launched binary's basename, first match wins — `vllm-srun`/`vllm_srun`
 (before `vllm`, whose substring they contain), then `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
 `text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
@@ -939,9 +939,11 @@ so the spec's binary is the worker (`routing.RuntimeSpecTypeVllmSR`, which is a
 different namespace from the application type of the same name). Its facts, each from
 the code:
 
-- **Detection** puts `vllm-srun`, `vllm_srun` and `vllm-sr` before `vllm`
+- **Detection** puts `vllm-srun` and `vllm_srun` before `vllm`
   (`DetectRuntimeSpecType`), because the worker's name contains `vllm`; a plain `vllm`
-  binary still detects as `vllm`, and an explicit `type` always wins.
+  binary still detects as `vllm`, and an explicit `type` always wins. The bare `vllm-sr`
+  is no detection substring: the CLI is no spec binary, and the substring would also
+  catch names such as `vllm-srv` or `vllm-sriov` (both detect as `vllm`).
 - **Probe paths** are `/metrics` and `/v1/models`. The health path keeps the stock
   `/health`: the worker answers 503 until the model is loaded **and** its golden check
   passed (a golden verdict of `unverified`, as on NVIDIA, still answers 200, so the
@@ -5935,7 +5937,8 @@ mirror). Three different cadences share the one collect cycle:
     **This branch is gated too**, below, on its own feature name.
   - `vllm_sr` — **no probe at all** (agent 0.18.2, [ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)): the router
     worker serves no `/props` and no capability document, so nothing is requested and
-    nothing is sent.
+    nothing is sent. The skip sits in the caller, `probeRuntimeChild`, so a `vllm_sr`
+    child never reaches `probeRuntimeChildProps` at all.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
