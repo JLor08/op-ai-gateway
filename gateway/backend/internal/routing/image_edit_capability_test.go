@@ -239,7 +239,7 @@ func TestAffinityGateAppliesTheImageEditDerivation(t *testing.T) {
 				t.Fatalf("seed map_a: %v", err)
 			}
 			r := NewResolver(mem, func() time.Time { return now }, nil)
-			_, satisfied := r.affinityCapabilityVerdict(ctx, "map_a", []string{CapabilityImageEdit})
+			_, satisfied := r.affinityCapabilityVerdict(ctx, "map_a", ProviderVLLM, []string{CapabilityImageEdit})
 			if satisfied != tc.wantSatisfied {
 				t.Fatalf("affinityCapabilityVerdict satisfied = %v, want %v", satisfied, tc.wantSatisfied)
 			}

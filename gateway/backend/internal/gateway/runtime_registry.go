@@ -720,10 +720,11 @@ func representativeRank(instance int, state string) int {
 }
 
 // warnUnsupportedRuntimeAPIVersions logs one Warn for each runtime row whose
-// reported api_version changed into an unsupported major since the previous
-// frame (ADR-099): a worker that keeps reporting the same version does not
-// log again per sample, and an empty version (unknown) never warns. Rows are
-// matched by spec id and instance.
+// reported api_version string changed since the previous frame into one with
+// an unsupported major (ADR-099): a worker that keeps reporting the same
+// version does not log again per sample, a change between two unsupported
+// versions (6.0.0 to 6.1.0) logs again, and an empty version (unknown) never
+// warns. Rows are matched by spec id and instance, and the Warn names both.
 func warnUnsupportedRuntimeAPIVersions(serverID string, prev, next []RuntimeStatusDTO) {
 	type rowKey struct {
 		spec     string
@@ -739,7 +740,7 @@ func warnUnsupportedRuntimeAPIVersions(serverID string, prev, next []RuntimeStat
 			continue
 		}
 		slog.Warn("vllm-sr worker reports an unsupported api_version",
-			"server_id", serverID, "spec_id", rt.SpecID, "api_version", rt.RuntimeAPIVersion,
+			"server_id", serverID, "spec_id", rt.SpecID, "instance", rt.Instance, "api_version", rt.RuntimeAPIVersion,
 			"supported_major", routing.VllmSRSupportedAPIMajor)
 	}
 }

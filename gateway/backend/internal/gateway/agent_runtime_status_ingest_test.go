@@ -3747,3 +3747,29 @@ func TestIngestKeepsTheRuntimeAPIVersionAndWarnsOncePerChange(t *testing.T) {
 		t.Fatalf("warns = %d after returning to 5.0.0 and into 6.0.0 again, want 2", got)
 	}
 }
+
+// TestUnsupportedAPIVersionWarnNamesTheInstance: the Warn names the instance
+// alongside the spec, so a fan-out spec's operator can tell which of its
+// workers reports the unsupported version.
+func TestUnsupportedAPIVersionWarnNamesTheInstance(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	warnUnsupportedRuntimeAPIVersions("srv_1", nil, []RuntimeStatusDTO{
+		{SpecID: "rspec_fan", Instance: 2, RuntimeAPIVersion: "6.0.0"},
+	})
+	var found bool
+	for _, r := range buf.Snapshot() {
+		if r.Level != "WARN" || !strings.Contains(r.Msg, "unsupported api_version") {
+			continue
+		}
+		found = true
+		if got := fmt.Sprint(r.Attrs["instance"]); got != "2" {
+			t.Errorf("instance attr = %q (attrs %+v), want 2", got, r.Attrs)
+		}
+		if got := fmt.Sprint(r.Attrs["spec_id"]); got != "rspec_fan" {
+			t.Errorf("spec_id attr = %q, want rspec_fan", got)
+		}
+	}
+	if !found {
+		t.Fatal("no unsupported api_version Warn logged")
+	}
+}

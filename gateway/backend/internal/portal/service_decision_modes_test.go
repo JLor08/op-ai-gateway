@@ -384,3 +384,46 @@ func TestRuntimeSpecVllmSR(t *testing.T) {
 		t.Fatalf("vllm_sr spec = %+v, %v", dto, err)
 	}
 }
+
+// TestDecisionOpenAIFoldsAreKindAware: the decision_openai listing flag and the
+// any_decision offering both ignore a decision_openai verdict on a kind that
+// cannot take a /v1/decisions passthrough (routing.DecisionsPassthroughCapableKind),
+// judged on the application type, or on a server_agent mapping's effective
+// spec type. A vllm kind with the same verdict keeps both.
+func TestDecisionOpenAIFoldsAreKindAware(t *testing.T) {
+	rs := routing.NewMemoryStore()
+	oa := routing.CapabilityRow{Capability: routing.CapabilityDecisionOpenAI, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceDecisionsProbe, CheckedAt: offeringTime}
+	flavors := []string{routing.APIFlavorDecisions}
+	offerSpeechModel(t, rs, routing.ProviderLlamaCPP, flavors, nil, "oa-llama", oa)
+	offerSpeechModel(t, rs, routing.ProviderVllmSR, flavors, nil, "oa-sr", oa)
+	offerSpeechModel(t, rs, routing.ProviderVLLM, flavors, nil, "oa-vllm", oa)
+	for gateway, specType := range map[string]routing.RuntimeSpecType{
+		"oa-agent-llama": routing.RuntimeSpecTypeLlamaCpp,
+		"oa-agent-sr":    routing.RuntimeSpecTypeVllmSR,
+		"oa-agent-vllm":  routing.RuntimeSpecTypeVLLM,
+	} {
+		offerSpeechModel(t, rs, routing.ProviderServerAgent, flavors, flavors, gateway, oa)
+		if err := rs.UpsertRuntimeSpec(context.Background(), routing.RuntimeSpec{ID: "app_" + gateway + "_spec", MappingID: "map_" + gateway, Binary: "/opt/x/server", Type: string(specType), Args: "[]", Env: "{}", APIFlavors: flavors}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", gateway, err)
+		}
+	}
+	want := map[string]bool{
+		"oa-llama": false, "oa-sr": false, "oa-vllm": true,
+		"oa-agent-llama": false, "oa-agent-sr": false, "oa-agent-vllm": true,
+	}
+	svc := offerSvc(rs, nil)
+	byID := modelsByID(svc.Models(context.Background(), auth.Token{UserID: "usr_1"}))
+	off := svc.ModelOfferingFor(context.Background(), auth.Token{UserID: "usr_1"}, routing.APIFlavorDecisions, []string{routing.CapabilityAnyDecision})
+	for name, w := range want {
+		got, ok := byID[name]
+		if !ok {
+			t.Fatalf("%s missing from the listing", name)
+		}
+		if got.DecisionOpenAI != w {
+			t.Errorf("%s decision_openai = %v, want %v", name, got.DecisionOpenAI, w)
+		}
+		if _, capable := off.Capable[name]; capable != w {
+			t.Errorf("%s any_decision capable = %v, want %v", name, capable, w)
+		}
+	}
+}

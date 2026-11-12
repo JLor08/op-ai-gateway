@@ -210,8 +210,11 @@ func TestRuntimeSpecType_DeriveProbePaths(t *testing.T) {
 }
 
 // TestDetectRuntimeSpecTypeVllmSR pins that the vLLM Semantic Router worker
-// (vllm-srun) detects as vllm_sr, ahead of the vllm substring case, while
-// plain vllm launchers still detect as vllm.
+// (vllm-srun or vllm_srun) detects as vllm_sr, ahead of the vllm substring
+// case, while plain vllm launchers still detect as vllm. The bare vllm-sr
+// substring does not detect: the vllm-sr CLI is rejected as a spec binary
+// (ADR-099), and the substring would also catch unrelated names such as
+// vllm-srv or vllm-sriov.
 func TestDetectRuntimeSpecTypeVllmSR(t *testing.T) {
 	cases := []struct {
 		binary string
@@ -220,7 +223,10 @@ func TestDetectRuntimeSpecTypeVllmSR(t *testing.T) {
 		{"vllm-srun", RuntimeSpecTypeVllmSR},
 		{"/opt/vllm-sr/.venv/bin/vllm-srun", RuntimeSpecTypeVllmSR},
 		{"vllm_srun", RuntimeSpecTypeVllmSR},
-		{"vllm-sr", RuntimeSpecTypeVllmSR},
+		{"/usr/local/bin/my-vllm-srun-wrapper", RuntimeSpecTypeVllmSR},
+		{"vllm-sr", RuntimeSpecTypeVLLM},
+		{"vllm-srv", RuntimeSpecTypeVLLM},
+		{"/opt/x/vllm-sriov", RuntimeSpecTypeVLLM},
 		{"vllm", RuntimeSpecTypeVLLM},
 		{"/usr/bin/vllm", RuntimeSpecTypeVLLM},
 		{"python -m vllm.entrypoints.openai.api_server", RuntimeSpecTypeVLLM},

@@ -3502,23 +3502,38 @@ func viewServesSystemOne(view mappingView, idx runtimeSpecIndex) bool {
 }
 
 // decisionOpenAIFlagsByName is decisionFlagsByName's twin for the
-// decision_openai verdict (the upstream serves /v1/decisions natively).
+// decision_openai verdict (the upstream serves /v1/decisions natively). The
+// verdict counts only on a kind that can take a /v1/decisions passthrough
+// (viewDecisionOpenAI), so a llama_cpp or vllm_sr mapping is never advertised
+// for a route the gateway would not send it.
 func decisionOpenAIFlagsByName(views []mappingView, rows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	return foldMappingFlags(views, func(view mappingView) bool {
-		return rows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+		return viewDecisionOpenAI(view, rows, idx) && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
 	})
+}
+
+// viewDecisionOpenAI reports whether view's decision_openai verdict counts: a
+// yes row on a kind that is routing.DecisionsPassthroughCapableKind, judged on
+// idx.kind (the effective spec type of a server_agent mapping with a spec, the
+// application type otherwise). The resolver's candidate filter applies the
+// same rule on the application type alone (it holds no spec before resolve),
+// and the decisions handler refuses a passthrough to such a kind after
+// resolve, so the listing never offers a route the gateway would not take.
+func viewDecisionOpenAI(view mappingView, rows map[string]routing.CapabilityRow, idx runtimeSpecIndex) bool {
+	return rows[view.mapping.ID].Verdict == routing.CapabilityYes && routing.DecisionsPassthroughCapableKind(idx.kind(view))
 }
 
 // anyDecisionFlagsByName folds the derived routing.CapabilityAnyDecision, the
 // pre-resolve requirement of POST /v1/decisions: every mapping of a name has a
-// yes on decision OR decision_openai and passes the decisions flavor half. It
-// backs ModelOffering.Capable for that endpoint's unknown-model redirect.
+// yes on decision OR decision_openai (counted only where viewDecisionOpenAI
+// allows it) and passes the decisions flavor half. It backs
+// ModelOffering.Capable for that endpoint's unknown-model redirect.
 func anyDecisionFlagsByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	decision := capabilityRowsFor(capsByMapping, routing.CapabilityDecision)
 	openAI := capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI)
 	return foldMappingFlags(views, func(view mappingView) bool {
 		id := view.mapping.ID
-		yes := decision[id].Verdict == routing.CapabilityYes || openAI[id].Verdict == routing.CapabilityYes
+		yes := decision[id].Verdict == routing.CapabilityYes || viewDecisionOpenAI(view, openAI, idx)
 		return yes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
 	})
 }
@@ -3836,6 +3851,19 @@ func (s *Service) runtimeSpecIndexForViews(ctx context.Context, views []mappingV
 func (idx runtimeSpecIndex) effective(view mappingView) routing.EffectiveSpecFields {
 	spec, hasSpec := idx.specs[view.mapping.ID]
 	return routing.EffectiveFields(view.app, spec, hasSpec)
+}
+
+// kind returns view's effective upstream kind: the effective runtime spec type
+// (routing.EffectiveRuntimeSpecType) of a server_agent mapping that has a spec
+// row in the index, the application type otherwise -- the same kind
+// effectiveFlavorMarkers reports as DecisionsKind.
+func (idx runtimeSpecIndex) kind(view mappingView) string {
+	if view.app.Type == routing.ProviderServerAgent {
+		if spec, ok := idx.specs[view.mapping.ID]; ok {
+			return string(routing.EffectiveRuntimeSpecType(spec))
+		}
+	}
+	return view.app.Type
 }
 
 func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (string, []RouteDTO) {

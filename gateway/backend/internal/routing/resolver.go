@@ -1673,6 +1673,11 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 // for the cost this accepts on day one.
 //
 // A store error REFUSES rather than failing open, for the same reason.
+//
+// The rows are judged for the candidate's kind (capabilityRowsForKind): a
+// decision_openai verdict does not count on a kind that cannot take a
+// /v1/decisions passthrough, so such a candidate is not kept for any_decision
+// only to be refused after resolve.
 func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string) ([]MappingCandidate, error) {
 	if len(required) == 0 || len(cands) == 0 {
 		return cands, nil
@@ -1691,7 +1696,7 @@ func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, 
 	}
 	out := cands[:0:0]
 	for _, c := range cands {
-		if capabilityRowsSatisfy(caps[c.Mapping.ID], required) {
+		if capabilityRowsSatisfy(capabilityRowsForKind(caps[c.Mapping.ID], c.Application.Type), required) {
 			out = append(out, c)
 		}
 	}
@@ -1727,6 +1732,32 @@ func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 		}
 	}
 	return true
+}
+
+// capabilityRowsForKind returns rows as a candidate of the given kind can use
+// them: for a kind that is not DecisionsPassthroughCapableKind (llama_cpp,
+// vllm_sr) the decision_openai rows are dropped, because EffectiveDecisionsRoute
+// ignores that verdict there and the request would be refused after resolve.
+// Every other row, and every row of any other kind, is returned unchanged
+// (rows itself when nothing is dropped).
+//
+// kind is the candidate's application type. A server_agent candidate carries
+// no runtime spec before resolve, so its spec type (llama_cpp, vllm_sr) is not
+// seen here and its decision_openai verdict counts. The decisions probe never
+// writes that verdict for those spec types, so only a stale row or a manual
+// yes can reach it, and EffectiveDecisionsRoute still refuses it after
+// resolve.
+func capabilityRowsForKind(rows []CapabilityRow, kind string) []CapabilityRow {
+	if DecisionsPassthroughCapableKind(kind) {
+		return rows
+	}
+	out := make([]CapabilityRow, 0, len(rows))
+	for _, row := range rows {
+		if row.Capability != CapabilityDecisionOpenAI {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 // ImpliedImageEdit is THE image-edit derivation: a mapping may serve an image
@@ -1873,14 +1904,17 @@ func (r *Resolver) affinityServer(ctx context.Context, app Application) (server 
 // satisfied is true for a request that requires nothing (required empty), which
 // is every chat request: the gate is skipped, not evaluated, so no verdict can
 // refuse a pin that was never asked about a capability.
-func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID string, required []string) (liveProgressSupport string, satisfied bool) {
+//
+// kind is the pinned application's type; the gate judges the rows for it
+// (capabilityRowsForKind), as filterCapable does for a fresh candidate.
+func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID, kind string, required []string) (liveProgressSupport string, satisfied bool) {
 	caps, capErr := r.store.MappingCapabilities(ctx, mappingID)
 	if capErr == nil {
 		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
 			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
 		}
 	}
-	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(caps, required)) {
+	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(capabilityRowsForKind(caps, kind), required)) {
 		return liveProgressSupport, false
 	}
 	return liveProgressSupport, true
@@ -1956,7 +1990,7 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 	// one of the pinned mapping's own on the pinned server) -- so unlike the two
 	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
 	// on the capability list, and does not need to be.
-	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, req.RequiredCapabilities)
+	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, app.Type, req.RequiredCapabilities)
 	if !capable {
 		return Target{}, false, nil
 	}

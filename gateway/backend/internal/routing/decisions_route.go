@@ -4,9 +4,10 @@
 package routing
 
 // DecisionsPassthroughCapableKind reports whether an application type or runtime
-// spec type can serve POST /v1/decisions natively. llama-server and the vLLM
-// Semantic Router (decision endpoints of its own, no /v1/decisions route; ADR-098,
-// ADR-099) have no such route; every other kind may (the probe decides per
+// spec type can serve POST /v1/decisions natively. llama-server has no such
+// route (ADR-098). The vLLM Semantic Router's /v1/decisions is its alias of
+// System One, not the OpenAI shape (ADR-099), so an OpenAI-shaped body must
+// never be passed through to it. Every other kind may (the probe decides per
 // model). ProviderLlamaCPP == RuntimeSpecTypeLlamaCpp and ProviderVllmSR ==
 // RuntimeSpecTypeVllmSR, so one comparison covers both vocabularies.
 func DecisionsPassthroughCapableKind(kind string) bool {

@@ -2622,8 +2622,9 @@ const runtimeFlavorNotOnApplicationWarning = "api_flavors_not_on_application"
 const runtimeTextOnStableDiffusionWarning = "api_flavors_text_on_stable_diffusion"
 
 // runtimeTextOnVllmSRWarning: a runtime spec whose effective type is vllm_sr
-// lists the openai or anthropic flavor. vllm-srun serves only the decision
-// endpoints (ADR-099), so text requests of those flavors dispatched to it fail.
+// lists the openai or anthropic flavor. The gateway routes only the decision
+// endpoints to vllm-srun (ADR-099), so text requests of those flavors
+// dispatched to it fail.
 const runtimeTextOnVllmSRWarning = "api_flavors_text_on_vllm_sr"
 
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
