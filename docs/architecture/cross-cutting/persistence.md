@@ -234,7 +234,7 @@ Rules that keep this safe over time:
   twin: two `text not null default ''` columns on both `applications` and
   `agent_runtime_specs`, each blank value then backfilled under a `where ... = ''` guard
   (`decisions_mode` to `auto`, `systemone_mode` to `passthrough`) so a re-run changes
-  nothing ([ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)).
+  nothing; Phase 4 ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)) changed the **write-time default** of `systemone_mode` to `auto` and widened its values with **no migration** (the column is plain text, existing rows keep their stored `passthrough`) ([ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)).
 - **Split a feature's DDL along rollback lines, not for tidiness.** The
   agent-managed runtime arrived as three migrations —
   65 `agent_runtime_manager` (specs, spec GPUs, co-residency),

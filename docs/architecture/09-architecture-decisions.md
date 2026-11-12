@@ -584,6 +584,10 @@ cold-load thrash this decision closes cannot return.
 `decisions_mode` (`auto` | `translate` | `passthrough` | `disabled`, `auto` valid for it alone) and `systemone_mode`
 (`passthrough` | `disabled`), following this entry's effective-value rule (a resolved spec over its application) but with
 defaults of their own and a route settled after the resolve rather than at the gate.
+
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** `systemone_mode` now takes the same four values as `decisions_mode` (`auto` | `passthrough` | `translate` | `disabled`) and
+defaults to `auto` on new rows; existing rows keep their stored `passthrough`.
 **Context:** whether the gateway proxied a Codex (`/v1/responses`) or Claude
 Code (`/v1/messages`) request natively, or translated it to
 `/v1/chat/completions`, was a per-application boolean
@@ -1657,6 +1661,11 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [Glossary](12-glossary.md).
 
 ## ADR-042 — The images gate keys on a required capability, and an absent verdict refuses
+
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** "A capability list keeps a request off the vendor-account path" holds for every list **except** the decision
+endpoints' derived `[any_decision]`, which is the one list the vendor path admits, and then only for an OpenAI api-key account's
+decision model. A request on the decisions flavor without a capability list is now declined by the vendor path too.
 **Context:** `POST /v1/images/generations` (issue #71) is the first endpoint
 whose model requirement is a hard **precondition** rather than a preference. A
 chat model handed an image request does not produce a degraded image; it
@@ -5147,6 +5156,11 @@ opt-in and owner-credentialed).
 
 ## ADR-061 — Speech is the second endpoint on the capability gate: a distinct `speech` capability, a coarse `openai_audio` flavor, the `audio_cpp` kind, and a binary relay that serves WAV only
 
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** The statement that a capability list keeps a request off the vendor-account path is no longer absolute: the decision
+endpoints' `[any_decision]` list is admitted there (OpenAI api-key accounts' decision models only). A `speech` request still never
+reaches a vendor account.
+
 **Context:** `POST /v1/audio/speech` (issue #68) is the next multi-modal endpoint
 after image generation
 ([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
@@ -5488,6 +5502,10 @@ re-encoding, so ADR-063/ADR-064's "never converts or re-encodes" holds.
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-062 — Transcription is multipart in and JSON out on the shared `openai_audio` flavor: a distinct `transcription` capability, billing read from the response body, and every divergence from speech keyed on the endpoint
+
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** As for ADR-061: the capability list still keeps a `transcription` request off the vendor-account path, but the decision
+endpoints' `[any_decision]` list is now the one exception.
 
 **Context:** `POST /v1/audio/transcriptions` (issue #69) is the last of the
 originally paired multipart endpoints, after the image edit
@@ -11866,6 +11884,13 @@ capability, `decision_openai`. Everything else below stands.
 (Phase 3).** vllm-sr is now a first-class type on both sides (the `vllm_sr` application type and runtime spec type), with its
 `decision` verdict established by this entry's one uniform probe, as predicted; its `decisions_mode: passthrough` is refused.
 
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** (b)'s `RequiredCapabilities = ["decision"]` is now the derived `["any_decision"]` (a `decision` **or** a `decision_openai`
+verdict, so a model that only answers OpenAI Decisions is reachable through a System One **translate** route), and "the same list keeps the
+request off the vendor-account path" is replaced by the vendor exception: `[any_decision]` is the one list admitted there, for an OpenAI api-key
+account's decision model. The "no translate path" of this entry is history, and **the relay is value for value only on the passthrough route**.
+`systemone_mode` is `auto` | `passthrough` | `translate` | `disabled`, default `auto` on new rows.
+
 **Context:** System One is a decision protocol: a client sends `{model, state, questions}` and a decision model
 answers each question (`{model, answers, usage}`), with no chat turn, no streaming and no prompt the gateway writes.
 Models that speak it (served by llama.cpp, vLLM or vllm-sr, launched by an agent or run by hand) answer
@@ -11993,6 +12018,13 @@ System One alias, so `auto` there translates, and the `decision_openai` probe (e
 (ADR-099 (d)), so (d) below reads `EffectiveDecisionsRoute(kind, mode, decision, decisionOpenAI)` and a `decision_openai` verdict is ignored for
 `llama_cpp` and `vllm_sr`. Everything else below stands.
 
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** (b)'s sentence "The list also keeps the request off vendor accounts" no longer holds: `[any_decision]` is the one capability list the
+vendor path admits (OpenAI api-key accounts' decision models, which `/v1/decisions` passes through to). (c)'s `systemone_mode`
+(`passthrough` | `disabled`, default `passthrough`) now has the four values of `decisions_mode` and defaults to `auto` on new rows; and
+the "System One translator" of the title gains a twin in the other direction (`TranslateSystemOneRequest`, `TranslateOpenAIDecisionsResponse`) behind
+`systemone_mode: translate`.
+
 **Context:** Phase 1 ([ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373))
 relays System One. Phase 2 adds **OpenAI's Decisions API**, `POST /v1/decisions`, whose clients (the OpenAI SDKs)
 send `{model, input, questions}` with a question list and read `{answers, model, usage}`. The two protocols describe the
@@ -12118,6 +12150,12 @@ operator can read, never a guess. The contract was checked against openai-python
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
+**Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
+(Phase 4).** `translate` is also refused for `systemone_mode` on both types (`application.systemone_translate_unsupported`,
+`application.systemone_translate_conflict`, `runtime_spec.systemone_translate_unsupported`), the portal's `vllm_sr` default
+`systemone_mode` is now `auto` (it passes System One through for a `decision: yes` model), and `routing.EffectiveSystemOneRoute` ignores a
+`decision_openai` verdict for both kinds, as `EffectiveDecisionsRoute` does.
+
 **Context:** Phases 1 and 2 ([ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373),
 [ADR-098](#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373))
 serve System One and OpenAI Decisions from servers an operator registered as `llama_cpp`, `vllm` or `custom` and told
@@ -12242,4 +12280,108 @@ text), `ServerAgent` version `0.18.1` → `0.18.2` (PATCH).**
 → [Compatibility & Inference §3.9 and §3.10](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),
 [Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
 [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+[HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode).
+
+
+## ADR-100 — OpenAI vendor decisions: the Decisions API on api-key accounts, a System One translate route and `systemone_mode` `auto` and `translate` (Phase 4 of #373)
+
+**Context:** Phases 1 to 3 serve decision models an operator runs (llama.cpp, vLLM, the vLLM Semantic Router). OpenAI's own **Decisions API**
+(`POST https://api.openai.com/v1/decisions`, GA 2026-10-22, one model, `gpt-6-luna`) is the same act as a hosted service, and two things stood in the
+way of reaching it from the gateway. **First**, a decision request carries a capability list (`[any_decision]`), and the vendor-account path declined every
+capability-carrying request ([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
+[ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+[ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint),
+[ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373),
+[ADR-098](#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)),
+a rule that kept speech off a hosted model of the same name and now had to give way for exactly one kind of request. **Second**, a System One client
+(`POST /v1/systemone`) can only be passed through to a System One upstream; OpenAI speaks the other shape, so a hosted decision model would reach only
+OpenAI Decisions clients unless the System One request could be **translated** the other way, the reverse of ADR-098's translator. That translation,
+unlike the forward one, has to be reasoned about per field, because OpenAI Decisions has **no counterpart** for several System One fields and a question
+the model **refuses** has no System One representation. Three facts shape the rest: the vendor's models are listed by the vendor and an operator cannot
+declare one (there is no mapping to carry a capability row), OpenAI's own Codex client reaches the endpoint with an **API key only** (a ChatGPT login
+carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_scorer/decisions.rs` and `codex-rs/login/src/auth/manager.rs`), and the
+`openai-python` v3.49.0 types, the public Decisions reference and guide are the only contract the gateway has seen (no live run, below).
+
+**Decision — eight choices, taken together. No migration (the latest stays 108), no agent change.**
+
+- **(a) `systemone_mode` takes the four values of `decisions_mode`, and defaults to `auto` on new rows.** `auto` | `passthrough` | `translate` |
+  `disabled` (`validSystemOneMode` is `validDecisionsMode`). The column is plain text, so **existing rows keep the `passthrough` they stored and
+  an upgrade changes no row's behavior**; **new** application and runtime-spec rows of **every** type default to `auto` (the portal service writes it on create and on every
+  spec write; the form default follows). `translate` needs an OpenAI `/v1/decisions` upstream, which `routing.DecisionsPassthroughCapableKind` says `llama_cpp`
+  and `vllm_sr` lack, so it is **refused at save** for them by the guard `decisions_mode: passthrough` already had (`refuseIncapableDecisionModes`):
+  `400 application.systemone_translate_unsupported` (the request set the mode, on create or on an update that sends `type`),
+  `409 application.systemone_translate_conflict` (the incapable type is the stored one), `400 runtime_spec.systemone_translate_unsupported`
+  (the spec's effective type); a stored `translate` is reset to `auto` when an application is retyped to one of them.
+- **(b) The route is settled after the resolve, by one pure function, and the gate is `any_decision`.**
+  `routing.EffectiveSystemOneRoute(kind, mode, decision, decisionOpenAI)`: `disabled` is disabled; `passthrough` needs `decision`; `translate` needs
+  `decision_openai` **and** a passthrough-capable kind; `auto` is passthrough when `decision` is yes, else translate when `decision_openai` is yes on a capable
+  kind, else no route. `POST /v1/systemone` therefore sets `RequiredCapabilities = ["any_decision"]` like `/v1/decisions` (a mode-aware pre-resolve filter is
+  still impossible, ADR-098 (b)); the handler settles the route after `resolveDecisionsTarget` with `settleDecisionRoute`, the step both endpoints now share: a
+  disabled endpoint is `404 systemone.endpoint_disabled`, a missing route `404 routing.model_not_capable`, and, as before, **no other candidate is
+  re-selected**. `upstreamPath` answers `/v1/decisions` under translate and `/v1/systemone` otherwise, and the route reaches the usage row as `provider_path`.
+  **Every listing surface judges by the route, not by the verdict**: the per-model fold behind `ModelDTO.Decision` and the `decisions` flavor, `GET /v1/systemone/models`,
+  the unknown-model redirect (`MappingServesDecisionEndpoint` asks with both verdicts assumed yes) and the portal mapping DTO, which carries `systemone_route`.
+- **(c) The reverse translator refuses what it cannot express, rather than guessing (matrix B).** `compat.TranslateSystemOneRequest` and
+  `compat.TranslateOpenAIDecisionsResponse` are pure. **Request:** question order is kept (the questions object is decoded in document order); a `noul` becomes a
+  `predicate` whose `criteria` descriptions are **folded into the instructions** (`Answer yes if:` / `Answer no if:`, each after a blank line); a `choice` becomes `choices`, a
+  `score` `levels`; a string `state` is an `input` string, **or, with images, one user message** (`input_text`, then one `input_image` per image); an object or
+  array-of-objects `state` is an `input_json` part. A question `type` other than `noul`, `choice` and `score` is `400 systemone.question_type_unsupported`; every structural
+  problem and every field OpenAI Decisions has no slot for (top-level `instructions`, `assets`, `audio`, `videos`, `roles`, `options`, `preset`, `states`, `joint`,
+  `chat_template_kwargs`, `cache_salt`, `priority`, `request_id`; a missing or scalar state; a non-object array element; a null or empty image; a duplicate key; a null question) is
+  `400 systemone.field_unsupported`, both before any upstream call. **Response:** answers are matched to questions **by name, then by position**; the computed `probabilities` and
+  `confidence` of a predicate are **rounded to 12 decimals**; a **refusal** answer is `422 systemone.refused` naming the keys and **takes precedence over a malformed sibling**
+  (the usage row records the upstream's tokens, since it answered); a missing answer or an unusable body is `502 systemone.upstream_error`; a non-2xx upstream answer is that
+  envelope under the upstream's status, with its message. Usage carries the **cached and cache-write** tokens, so a vendor row records what OpenAI billed.
+- **(d) A vendor decision model is an allowlisted upstream id on an OpenAI api-key account, and nothing else.** `routing.IsOpenAIDecisionModel` is a fixed, unexported
+  set (today exactly `gpt-6-luna`); `routing.IsVendorDecisionModel(account, row)` requires an **OpenAI api-key** account **and** the row's **upstream** model in it (the gateway name,
+  prefix included, never decides). There is no portal flag, no stored row and no operator setting, so a new decision model is a code change, and nothing can widen the set at run time.
+- **(e) The vendor path admits exactly `[any_decision]` on the decisions flavor.** `vendorCapabilitiesEligible`: a request with no list is eligible unless it is on the decisions
+  flavor (**a decisions-flavor request without a capability list is now refused by the vendor path**, where before such a request would have been matched by name), a request with a list
+  only when `isVendorDecisionRequest`. Every other list (`image`, `image_edit`, `speech`, `transcription`, `decision`, ...) stays self-hosted. For a decision request
+  `vendorAccountServes` passes only an OpenAI api-key account, before any model row is read, so **only OpenAI api-key accounts and decision rows are considered**; the active-account check,
+  §11 per-token access and prefixes, the subscription switch and the routing mode are unchanged.
+- **(f) The vendor target synthesizes its verdicts and reaches OpenAI's own endpoint.** `withVendorDecisionRoute` adds `decisions` to the target's flavors, sets `DecisionsMode`
+  `passthrough` and `SystemOneMode` `translate`, and marks it `VendorDecisionModel`. A vendor target has no mapping, so `decisionVerdicts` answers **`decision: false`,
+  `decision_openai: true` with no store read**: `/v1/decisions` passes through to `https://api.openai.com/v1/decisions` and `/v1/systemone` is translated to it, both with the account's sealed key
+  as `Authorization: Bearer`. The usage row carries the `AccountID` and the cached tokens; its **cost is 0** (a vendor target has no mapping energy and price, and there is no per-model
+  pricing).
+- **(g) The listings add `decisions` to a decision model and keep its chat flavors; a refresh keeps the row.** `vendorModelServedFlavors` lists the model under its account's dialects
+  **and** `decisions`, so `/v1/systemone/models` offers it; where a self-hosted model shares the name the vendor decision flags are **ORed** into the listing and the offering
+  (`overlayVendorDecisionFlags`, `addVendorDecisionCandidates`), and the redirect's vendor candidates are guarded to the decisions flavor with exactly `[any_decision]`. The seed catalog of an
+  api-key account has `gpt-6-luna`; an api-key listing keeps decision models by name beside the chat heuristic; and a model refresh **adds the decision rows back** when
+  `/v1/models` omits them (`withOpenAIDecisionModelRows`), without counting them as discovered or letting them satisfy "lists nothing usable".
+- **(h) A ChatGPT subscription cannot reach the Decisions API, and this is not worked around.** The ChatGPT backend has no such endpoint and a ChatGPT login has no API key, so a
+  subscription account is never a decision candidate. Emulating decision requests on a subscription's chat models is an opt-in follow-up, **#380**, and is not part of this.
+
+**Rejected:**
+
+- **An operator flag for vendor decision models** (a switch, a per-account list, a stored decision row). The allowlist is OpenAI's, not the operator's: a flag is a way to mark a chat model
+  as a decision model and send it a request it fails, and a vendor model has no capability rows to hold a verdict. The id set in code is the single source; a new model is a reviewed change.
+- **Subscription accounts.** The backend has no Decisions endpoint; faking one by emulation would silently change what a decision means (a chat completion in disguise), so it is the explicit,
+  opt-in #380, not a default of this change.
+- **A per-model pricing table.** OpenAI publishes `gpt-6-luna` prices, but the gateway has no per-model price store for vendors anywhere (vendor usage is attributed to the account, §5 of
+  external vendor accounts), and a hand-kept table would drift from OpenAI's. The row records tokens, cached tokens and the account; cost is 0.
+- **Refusing a mapping per question.** System One has no way to say "this question was refused", so a per-question partial answer would be a lie of the shape; `422 systemone.refused` names the keys
+  and the client retries with fewer questions. The same reasoning refuses an unmappable field rather than dropping it.
+- **Opening the vendor path to every capability list.** A decision endpoint's `[any_decision]` is safe because only a decision model of one account type can answer it; admitting `image`, `speech` or
+  `transcription` would route those to a hosted model of the same name that cannot serve them, the failure ADR-061 and ADR-062 pinned a test against.
+- **Keeping `systemone_mode` passthrough-only.** It leaves a System One client unable to use any model that answers OpenAI Decisions only (the vendor model, and a vLLM model with a `decision_openai`
+  verdict and no System One read), and it gives `auto` on `/v1/systemone` nothing to decide.
+- **A `decision` verdict for the vendor model.** The vendor answers OpenAI Decisions natively and System One not at all; claiming a System One verdict would make `auto` pass a System One body through to an
+  endpoint that cannot parse it.
+
+**Consequence:**
+
+- **Existing deployments change nothing on upgrade.** Stored `passthrough` rows stay; a System One client reaches a vendor decision model only by name, through a token that already has §11 access
+  to an OpenAI api-key account that lists it.
+- **`auto` on `/v1/systemone` can now translate.** A model with only a `decision_openai` verdict (a vLLM decision model, the vendor model) is served to System One clients; one with both verdicts keeps passing
+  through. A forced mode whose verdict is missing is still an intermittent 404 when two applications share a name.
+- **The translated route buffers the answer** (the cost the forward translate route already pays), and refuses a malformed request with a 400 instead of relaying it.
+- **A new decision model is a release.** `openAIDecisionModels` is a constant; until it changes, a model OpenAI adds is a chat-routed name that fails if used on a decision endpoint (it is not offered there).
+- **Not verified live:** a real OpenAI api-key account with `gpt-6-luna` through `/v1/decisions` and `/v1/systemone`; the official OpenAI SDK against the vendor route; OpenAI's real error envelope on this endpoint; and
+  whether the api-key `/v1/models` lists `gpt-6-luna` (the refresh keeps the row either way). The contract was read off the SDK types and the public reference; these are operator steps, as the earlier phases' live runs were.
+
+→ [Compatibility & Inference §3.9 and §3.10](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),
+[External Vendor Accounts §4.2 and §6](cross-cutting/external-vendor-accounts.md#42-openai),
+[Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode).
