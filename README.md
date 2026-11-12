@@ -299,7 +299,8 @@ Browsers authenticate with a session cookie + `X-OP-CSRF` header instead.
 `/v1/chat/completions` additionally accepts that session; the image and audio
 endpoints additionally accept the gateway's own internal loopback pair (the
 portal's background runs) — never a browser session; every other inference
-endpoint, including `/v1/responses` and `/v1/messages`, is bearer-only. The
+endpoint, including `/v1/responses`, `/v1/messages` and the System One
+`/v1/systemone`, is bearer-only. The
 portal's chat runs each turn as a server-side run and streams it to the
 browser over SSE. The complete endpoint reference is in
 [HTTP API Surface](docs/architecture/reference/api-surface.md).

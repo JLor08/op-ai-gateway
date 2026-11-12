@@ -57,6 +57,7 @@ flowchart TD
         Speech["POST /v1/audio/speech<br/>/openai/v1/audio/speech"]
         Transcribe["POST /v1/audio/transcriptions (multipart)<br/>/openai/v1/audio/transcriptions"]
         TranscribeD["POST /v1/audio/transcriptions/details (multipart, one-shot)<br/>/openai/v1/audio/transcriptions/details"]
+        SysOne["POST /v1/systemone<br/>(bearer only, no /openai alias)"]
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
@@ -77,6 +78,10 @@ flowchart TD
     CapGateT -->|refused| Reject6["404 routing.model_not_capable /<br/>transcription.unavailable"]
     CapGateT -->|target| Native6["relayTranscription -> proxyNative:<br/>multipart body verbatim (or rebuilt once)<br/>to upstream /v1/audio/transcriptions<br/>(or /details for the one-shot twin),<br/>JSON response buffered, metered, written"]
 
+    SysOne --> CapGateD{"Resolve with<br/>RequiredCapabilities=[decision]"}
+    CapGateD -->|refused| Reject7["404 routing.model_not_capable /<br/>routing.no_model_route"]
+    CapGateD -->|target| Native7["relaySystemOne -> proxyNative:<br/>JSON body, model rewritten,<br/>to upstream /v1/systemone,<br/>answer relayed verbatim, metered in tokens"]
+
     NativeGate -->|passthrough| Native["proxyNative:<br/>forward raw body byte-for-byte<br/>to upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
     NativeGate -->|disabled| Reject1["404 responses.endpoint_disabled"]
@@ -96,6 +101,7 @@ flowchart TD
     Native4 --> ProxyMux
     Native5 --> ProxyMux
     Native6 --> ProxyMux
+    Native7 --> ProxyMux
 
     Mux --> Ollama["OllamaClient<br/>/api/chat"]
     Mux --> OAIC["OpenAICompatibleClient<br/>{prefix}/chat/completions (default /v1)"]
@@ -117,10 +123,9 @@ llama-swap, LiteLLM) reachable from every client protocol: a Claude Code session
 can be served by an Ollama-backed mapping, and a Codex session by a vLLM one,
 with no special-casing.
 
-`routing.NormalizeAPIFlavor` (`internal/routing/resolver.go`) reduces the five
-fine-grained `APIFlavor` strings (`openai_chat_completions`, `openai_responses`,
-`anthropic_messages`, `openai_images`, `openai_audio`) to the four coarse buckets
-(`openai`, `anthropic`, `openai_images`, `openai_audio`) that a `model_mapping`'s
+`routing.NormalizeAPIFlavor` (`internal/routing/resolver.go`) reduces the fine-grained `APIFlavor` strings (`openai_chat_completions`, `openai_responses`,
+`anthropic_messages`, `openai_images`, `openai_audio`, `decisions`) to the five coarse buckets
+(`openai`, `anthropic`, `openai_images`, `openai_audio`, `decisions`) that a `model_mapping`'s
 application declares
 support for (§6) — see
 [Routing & Model Selection](routing-and-model-selection.md) for how a mapping is
@@ -143,6 +148,8 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI audio speech | `/v1/audio/speech`, `/openai/v1/audio/speech` | `handleOpenAISpeech` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a binary-response relay, no translate path (§3.6) |
 | OpenAI audio transcriptions (multipart) | `/v1/audio/transcriptions`, `/openai/v1/audio/transcriptions` | `handleOpenAITranscription` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart-in, JSON-out relay, no translate path (§3.7) |
 | Diarized transcription (multipart, one-shot) | `/v1/audio/transcriptions/details`, `/openai/v1/audio/transcriptions/details` | `handleOpenAITranscriptionDetails` (the same `serveTranscription` as the row above) | `requireInternalOrBearerAnyScope` (as generations) | **always** — the transcription relay's one-shot second route, never streamed (§3.7 item 12) |
+| System One decisions | `/v1/systemone` (no `/openai` alias) | `handleSystemOne` | `requireAnyScope` (bearer only — never a session cookie or the internal loopback) | **always** — a JSON relay, no translate path (§3.9) |
+| System One model discovery | `/v1/systemone/models` | `handleSystemOneModels` | `requireAnyScope` (bearer only) | n/a (§3.9) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -1525,6 +1532,140 @@ both paths, **not yet against a real audio.cpp `/live`** ([ADR-072](../09-archit
 
 **A second loopback client: Voice Chat.** The portal's hands-free spoken conversation ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts)) is a further client of this endpoint, not a new relay: its WebSocket state machine opens a **fresh** loopback live relay for each chunk of the user's speech (on the first mic frame its half-duplex gate admits, closed with the end-of-input at the chunk end, so each chunk is admitted, takes the per-route slot, and bills one `audio_second` row on its own) and never holds one for the whole session. A relay does exist whenever the mic gate is open (while listening and through the continuation window, reopening about 100 ms after each chunk end), so the route's one live slot is held then and free only while the answer is spoken or the session is idle (or, since issue #335, after a sustained microphone mute has torn the relay down, unless the operator chose keepalive), and a second session on the route meets `transcription.live_busy` (one `error` frame) continuously while the first one's mic is open and live. Its ticket carries three targets instead of one and is minted by `POST /api/portal/voice-chat-ticket`, which also runs the co-load gate; everything this section says about the relay itself holds unchanged. (The portal's section re-synthesis, `POST /api/portal/voice-chat-synth`, issue #324, is not part of this loop: it touches the speech relay alone, one-shot, and no live relay, WebSocket or ticket, [§3.6](#36-openai-audio-speech) item 12.)
 
+### 3.9 System One decisions
+
+`POST /v1/systemone` (`handleSystemOne`, `internal/gateway/systemone_handler.go`) relays a
+**System One decision request**, `{model, state, questions}`, to a model that answers
+decisions, and hands the upstream's own answer, `{model, answers, usage}`, back
+([ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373), Phase 1 of issue #373). It is the images and speech twin in structure and keeps
+§3.4's shape: **no translate path**, two gates (the application's coarse `decisions`
+flavor, §6, and the model's `decision` capability,
+`RequiredCapabilities = ["decision"]`, [Routing & Model Selection
+§2.3](routing-and-model-selection.md#23-the-capability-gate)), a handler that validates
+its own shape and never calls `inference.Request.Validate()` (which requires `messages`),
+`upstreamPath` answering `/v1/systemone` directly (`apiFlavorSystemOne` is
+`routing.APIFlavorDecisions`, and it has no `EndpointMode`), an empty `sessionEndpoint`
+case (a decision request is a one-shot verdict with no session signal), and **no
+affinity pin**. What it decides differently:
+
+**1. Auth: bearer only.** `requireAnyScope` accepts a `gateway:use` principal or a service
+token's `llm:invoke`, and **nothing else**: a portal session cookie and the internal
+loopback are no way in (the images and audio endpoints accept the loopback for the portal composer; this one has no portal client in Phase 1). There is
+no `/openai` alias, since no OpenAI client speaks this protocol. The run-as block
+(`runAsPrincipal`) applies as everywhere.
+
+**2. The request.** The handler reads the body with `readRawJSONLimit` under
+`decisionsBodyLimit()`: `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`, default 32 MiB, which
+equals the agent router's JSON buffer, so a body the gateway accepts is one the router
+can take; over it is `413 request.body_too_large` (§10). A System One state can be a
+whole document, which is why this endpoint, unlike a chat body, is capped at all.
+`validateSystemOneRequest` decodes each field as `json.RawMessage` and type-checks it, so
+a wrongly typed field is never silently zeroed, and answers a gateway 400 before the
+preflight: a non-blank string `model` (`systemone.model_required`; the routing name is
+read by the same tolerant `sniffRoutingModel` probe as every native endpoint), a non-empty
+JSON object `questions` (`systemone.questions_required`), and no streaming
+(`systemone.stream_unsupported`): `stream` must be absent, `null` or `false`. A JSON `null`
+counts as "not set" (so `"stream": null` is accepted), as in the speech validator. `state`, the
+questions' contents and every other field are the upstream's business and reach it
+unexamined.
+
+**3. The gates and the relay.** `inferencePreflight` runs once with
+`systemOneInferenceShape`: the coarse flavor, the endpoint and the one required
+capability. A model without a `(decision, yes)` verdict, an unprobed one included, is
+refused `404 routing.model_not_capable`; a name no application that declares `decisions`
+offers is `404 routing.no_model_route`. The capability list also keeps the request **off
+the vendor-account path**, which declines a capability-carrying request while a vendor
+model is matched by name and never by flavor: dropping the list would skip the gate **and**
+make a decision routable to a hosted vendor model of the same name. For a `server_agent`
+mapping the resolved runtime spec is the authority for its flavors
+(`resolveSystemOneTarget` applies `targetServesFlavor` after the resolve), so a spec that
+leaves `decisions` out is `404 routing.no_model_route`. `relaySystemOne` then hands the
+request to `proxyNative` with no translate fallback: every resolve failure is terminal and
+recorded as a routing-failure usage row (`recordSystemOneRoutingFailure`), and the
+instance re-selection of a gone sibling (`relayAgain`) works as on the other native
+relays. **The body is relayed value for value, not byte for byte:** the shared JSON model
+rewrite that `proxyNative` applies on every native relay re-serializes it, replacing
+`model` (the client's gateway name) with the mapping's own application model name. No other
+field is changed on purpose, but whitespace and key order are not preserved.
+
+**4. Usage and errors.** The answer's `usage` object, `{input_tokens, output_tokens}`,
+is read in the Responses spelling (`mergePassthroughUsage`); the call is **token-metered**
+(`billing_unit` empty, the default unit), and an answer without a usage object records
+zero tokens. An upstream non-2xx is relayed verbatim, body and status, and recorded as
+`upstream.<status>`; the gateway adds no envelope to an answer the upstream wrote.
+
+**5. Model discovery.** `GET /v1/systemone/models` (`handleSystemOneModels`, bearer only)
+answers `{"object":"list","data":[{"id","object":"model","api":"systemone"}]}`, `data` an
+empty array rather than `null` when nothing qualifies. A model is listed when its
+mapping lists the `decisions` flavor (`modelDTOsOnFlavor`) **and** its folded
+`ModelDTO.Decision` is true (a `decision: yes` verdict), so a model the gate would refuse
+is never offered. Visibility **mirrors `GET /v1/models` exactly** (`Portal.Models`):
+unfiltered by a service token's own allowlist, because the allowlist restricts
+*invocation*, not discovery (§9), and filtered by resource-group provisioning, aliases and
+hidden models included.
+
+**6. The decisions-only rule.** A mapping whose effective flavors name `decisions` and
+neither text flavor (`routing.FlavorsAreDecisionsOnly`) is not a chat model, and every
+path that would send it a chat prompt leaves it alone: the three chat listings, the text
+translate dispatch (404 `routing.no_model_route`), the model warmer, manual and scheduled
+benchmarks and Load (`409 benchmark.decisions_only`, the skip reason `decisions_only`),
+the context and VRAM probes, the swap sibling and the speech-rate trigger. The full
+inventory is in [Routing & Model
+Selection §1](routing-and-model-selection.md#1-data-model). The flavor is **opt-in**
+like `openai_audio`: an empty list still saves as `[openai, anthropic]`, and the portal's
+mapping form offers it as an unticked checkbox that a new runtime spec does not inherit.
+
+**7. The verdict probe.** No agent reports a `decision` verdict and Phase 1 reads no model listing for one, so the gateway's health loop establishes
+it by asking: `probeSystemOne` (`cmd/gateway/app_health.go`) runs as a pass of
+`probeServer` for every active application that declares `decisions`, for each of its
+mappings whose **effective** flavors include it. The provider half is
+`provider.SystemOneProber` / `probeSystemOne` (`internal/provider/systemone_probe.go`),
+one `POST {endpoint}/v1/systemone` with the exact body
+
+```json
+{"model":"<app_model_name>","state":"ok","questions":{"probe":{"type":"noul","instructions":"Is the state non-empty?"}}}
+```
+
+- **The verdict.** A 2xx whose JSON `answers.probe` is an object is `decision: yes`. A
+  `404` or a `501` is `decision: no`: no such route, or a model the server cannot read. A
+  `404` that carries the agent router's own `{"error":{"code":"runtime.…"}}` envelope is
+  **not** a no, because the router answers it before any child was asked
+  (`runtime.model_not_managed` for a model whose spec it no longer holds); it says
+  nothing about the model, so it states **no verdict**. Everything else (a transport
+  failure, a timeout, a 400, a 401/403, any other 5xx, a 2xx without the answer or not JSON)
+  is no verdict too: nothing is written and the pass retries after
+  `systemOneRetryBackoff` (5 min), so an upstream that cannot answer costs one tiny POST
+  per window, not one per health tick. A 401/403 is logged as a token problem.
+- **Its own timeout.** `systemOneProbeTimeout` is 30 s, not the 3 s `probeTimeout` of a
+  reachability probe: the answer is a real inference, which a slow model would never
+  finish inside a few seconds, so the verdict would never settle and each retry would
+  refresh an agent child's idle timer.
+- **Who is asked, how often.** An **external** application is asked at its endpoint with
+  its own credential, once per (mapping, app model name). A **`server_agent`** mapping is
+  asked through the agent router at the same endpoint with its runtime spec's credential
+  (`routing.SpecUpstreamAuth`), once per (mapping, `agentSpecIdentity`), and **only while
+  the agent reports the model loaded** (`LoadedAppModels`): the router starts a child for
+  any request naming it and refreshes its idle timer on each, so the pass never wakes an
+  unloaded model. The loaded set is a snapshot, so a model that unloads within its
+  staleness can still be started once. A settled key (`systemOneSettled`) is not asked
+  again in this process, so a **gateway restart re-probes once**; a model that leaves the
+  loaded set has its back-off cleared, so a reload is asked at once; and a verdict the
+  store failed to take (`writeCapabilityRows` returning false) is **not** remembered as
+  settled but backed off. A failed runtime-spec read asks none of the application's
+  mappings that tick.
+- **Unmetered, and the source.** The probe goes straight through the prober, not the
+  relay, so it leaves no usage row and no capture. Its rows carry the source
+  `systemone_probe` (`routing.CapabilitySourceSystemOneProbe`, rank 1): an operator's
+  `manual` `yes` outranks it, and `(decision, no)` is reserved from manual edits so this
+  source alone can state a `no`.
+
+**8. Two deliberate Phase 1 deviations from issue #373** (rejected alternatives in
+[ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373)): there is **no `systemone_mode` column** (the flavor and the verdict already
+answer "is this model served?"; modes arrive in Phase 2 with `decisions_mode`), and the
+verdict comes from **one uniform POST probe** rather than from reading llama.cpp's
+`/v1/models` `output_modalities` (no agent change, and it works for llama.cpp, vLLM and
+vllm-sr alike). No `ServerAgent` version moved and there is no migration.
+
 ## 4. Session / continuity signals
 
 `extractClientSession` (`internal/gateway/session_extract.go`) derives a
@@ -2835,6 +2976,7 @@ gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../
 | The six JSON inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/generations`, `/v1/audio/speech`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full (a speech body is a short JSON object, read the same way) |
 | The image edit endpoint (`/v1/images/edits`), whose body is `multipart/form-data` | `readImageEditBody` (`internal/gateway/images_edit_handler.go`; `readRawJSONLimit` would refuse anything but one JSON value) | `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB: a declared `Content-Length` over it is refused without a read, an undeclared body is stopped by `http.MaxBytesReader`, both `413 request.body_too_large` |
 | The audio transcription endpoint (`/v1/audio/transcriptions`, and its one-shot `/details` route, one handler), whose body is `multipart/form-data` | `readTranscriptionBody` (`internal/gateway/transcription_handler.go`; the same reasoning) | `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, default 32 MiB, a variable of its own, independent of the image-edit one: the same two refusals, both `413 request.body_too_large`; the same value also bounds the **response** the relay buffers (§3.7) |
+| The System One endpoint (`/v1/systemone`) | `readRawJSONLimit` | `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`, default 32 MiB, the agent router's JSON buffer: an over-cap body is `413 request.body_too_large` (§3.9) |
 | The portal chat documents (`POST /api/portal/chats`, `PUT /api/portal/chats/{id}`, `POST /api/portal/chats/{id}/runs`) | `readRawJSONLimit` | `portal.MaxChatRequestBytes` = 5 MiB (the 4 MiB content cap plus the JSON envelope); the bundled nginx allows the same on `/api/portal/chats` |
 | Everything else (control plane: `/api/portal/*`, `/api/admin/*`, `/api/system/*`) | `readRawJSON` | `maxJSONBodyBytes` = 1 MiB (`http.MaxBytesReader`) |
 
@@ -4065,6 +4207,9 @@ Every inference error response uses the gateway-wide envelope
 | `images.edit_unavailable` | 404 | an edit resolved to an agent-launched model whose agent has not declared `multipart_proxy` (an agent older than 0.9.0, or one that has not reported since the gateway restarted or the agent was upgraded); nothing is relayed (§3.5) |
 | `request.body_too_large` | 413 | an edit body over `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, a transcription body over `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, or either one over the agent router's 32 MiB once the gateway has prepared it (§10) |
 | `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) — an edit relays it the same way |
+| `systemone.model_required` | 400 | `validateSystemOneRequest` (§3.9): `model` absent, not a string, or blank |
+| `systemone.questions_required` | 400 | `validateSystemOneRequest` (§3.9): `questions` absent, not an object, or `{}` |
+| `systemone.stream_unsupported` | 400 | `validateSystemOneRequest` (§3.9): `stream` present and neither `false` nor `null` (System One has no streaming) |
 | `speech.model_required` / `speech.input_required` | 400 | the speech body failed `validateSpeechRequest` (§3.6): no `model`, or no non-empty string `input` |
 | `speech.response_format_unsupported` | 400 | on a request that does not stream, a `response_format` other than `wav`, `pcm` or absent — `mp3`, `opus`, `flac`, `aac`, `json`, `b64_json` and any non-string value (the compressed ones are issue #264); on a streamed request, one other than `pcm` or absent (§3.6) |
 | `speech.stream_unsupported` | 400 | a speech request whose stream fields the relay cannot honor: a non-boolean `stream`, a `stream_format` other than `sse` or `audio` or one on a request that does not stream, or `response_format=wav` beside `stream: true` (audio.cpp serves streaming only as `pcm`) (§3.6) |

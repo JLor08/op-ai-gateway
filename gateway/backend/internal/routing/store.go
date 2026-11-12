@@ -113,7 +113,7 @@ const (
 	// a COARSE flavor of its own with the same opt-in rule. It is what lets an
 	// application serve the decision endpoints and not text (or the reverse), and
 	// normalizeFlavors' empty-list default stays [openai, anthropic] exactly.
-	// See docs/superpowers/specs/2026-11-11-decisions-systemone-phase1-design.md.
+	// See docs/architecture/09-architecture-decisions.md ADR-097.
 	APIFlavorDecisions = "decisions"
 
 	// PrincipalTypeService / PrincipalTypeUser are the two supported

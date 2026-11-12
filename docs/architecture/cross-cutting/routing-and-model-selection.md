@@ -25,7 +25,7 @@ erDiagram
     }
     APPLICATION {
         string type "ollama/vllm/llama_cpp/llama_swap/litellm/server_agent/stable_diffusion_cpp/audio_cpp/mock"
-        string api_flavors "openai | anthropic | openai_images | openai_audio -- saved empty = openai + anthropic, stored empty = none"
+        string api_flavors "openai | anthropic | openai_images | openai_audio | decisions -- saved empty = openai + anthropic, stored empty = none"
         int port
         string scheme "http/https"
         int priority
@@ -50,7 +50,7 @@ erDiagram
     MODEL_MAPPING_CAPABILITY {
         string capability "mtp | live_progress | vision | speculation_observed | ..."
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | sdcpp_capabilities | audiocpp_models | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | sdcpp_capabilities | audiocpp_models | systemone_probe | legacy"
     }
     MODEL_GROUP {
         bool loaded_only
@@ -68,8 +68,8 @@ gatewayModel, apiFlavor)` returns every candidate whose mapping is
 server exists — health/enablement are filtered later, in the resolver, not the
 store query.
 
-**The coarse API flavors are `openai`, `anthropic`, `openai_images` and
-`openai_audio`.** A request's fine flavor (`openai_chat_completions`,
+**The coarse API flavors are `openai`, `anthropic`, `openai_images`,
+`openai_audio` and `decisions`.** A request's fine flavor (`openai_chat_completions`,
 `openai_responses`, `anthropic_messages`, `openai_images`, `openai_audio`) is folded
 by `NormalizeAPIFlavor`, which tests the images and audio prefixes **before** the
 generic `openai` one — every fine images or audio flavor also starts with `openai`,
@@ -145,6 +145,27 @@ through the router's ensure route without generating
 ([Agent-Managed Model Runtime
 §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)).
 
+**A decisions-only server is kept out of the chat flavors the same way.**
+`decisions` (`routing.APIFlavorDecisions`) is the System One flavor ([ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373)): a coarse
+flavor of its own, never implied (an empty list still saves as `[openai, anthropic]`
+exactly), and `NormalizeAPIFlavor` folds it to itself. `routing.FlavorsAreDecisionsOnly`
+(a list naming `decisions` and neither `openai` nor `anthropic`; an empty list is
+never decisions-only) joins the images and audio tests at every place they gate, so
+the `openai` row of `MappingHasAPIFlavor`/`MappingServesAPIFlavor` also needs effective
+flavors that are not decisions-only: a decisions-only mapping is in none of the three
+chat listings, not in `Callable(openai)` and not a text redirect target. The text
+translate dispatch refuses it (`targetIsDecisionsOnly`, 404 `routing.no_model_route`),
+the model warmer drops it, the speech-rate trigger skips it, a scheduled or manual
+benchmark skips or refuses it (the skipped reason `decisions_only`, the refusal
+`benchmark.decisions_only`, checked after the images-only and audio-only ones so a list
+naming `openai_audio` too keeps the audio code), and the context probe, the VRAM probe
+and the swap-sibling lookup leave it alone; a Load refuses it on a non-agent
+application and, for an agent child, starts it through the router's ensure route
+without generating. `score_servers` still ranks it, because the portal's server list is
+read-only ordering and gating it would empty the operator's list. The portal's mapping
+DTO carries the marker as `decisions_only`. A list `[openai_audio, decisions]` is both
+audio-only and decisions-only, the same "both kinds" shape `[openai_images, openai_audio]` has. See [API Compatibility & Inference §3.9](compatibility-and-inference.md#39-system-one-decisions).
+
 **Flavor exclusion is two-staged, by design.** Candidacy filters on the
 **application's** flavors. A `server_agent` mapping's runtime spec carries its
 own, possibly narrower, set — `targetFrom` makes the spec the sole authority for
@@ -159,8 +180,10 @@ is enforced afterwards, and not to the same degree everywhere:
 - **In full** on `/v1/images/generations` and `/v1/images/edits`, by
   `targetServesFlavor` in the images relays, and on `/v1/audio/speech` and
   `/v1/audio/transcriptions`, by the same check in the speech and transcription
-  relays (`resolveSpeechTarget`, `resolveTranscriptionTarget`).
-- **Only against an images-only or audio-only spec** on the text translate dispatch
+  relays (`resolveSpeechTarget`, `resolveTranscriptionTarget`), and on `/v1/systemone`
+  by `resolveSystemOneTarget`, which applies `targetServesFlavor` to the resolved target
+  before it relays.
+- **Only against an images-only, audio-only or decisions-only spec** on the text translate dispatch
   (`complete`/`beginStream`, through `resolveTranslateTarget`), which every
   `/v1/chat/completions` request takes, and so does every `/v1/responses` or
   `/v1/messages` request whose target `tryProxyNative` did not judge: a body
@@ -169,7 +192,8 @@ is enforced afterwards, and not to the same degree everywhere:
   whose re-resolve lands on a different candidate ([API Compatibility &
   Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
   A spec that lists `openai_images` and neither `openai` nor `anthropic`
-  (`targetIsImagesOnly`), or `openai_audio` and neither (`targetIsAudioOnly`), is
+  (`targetIsImagesOnly`), `openai_audio` and neither (`targetIsAudioOnly`), or `decisions` and neither
+  (`targetIsDecisionsOnly`), is
   refused there with 404 `routing.no_model_route`.
   A spec that keeps a text flavor is not held to its list there, so one
   narrowed to `["anthropic"]`, or stored as `[]`, still serves chat
@@ -489,6 +513,8 @@ redirect each of these answers a 404:
 | `/v1/images/generations`, `/v1/images/edits` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict (for an edit: without the derived `image_edit`) |
 | `/v1/audio/speech`, `/v1/audio/transcriptions` | the same shape for `openai_audio`: every mapping an agent child whose spec lacks the flavor while its application declares it, or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a `speech: yes` (a transcription: `transcription: yes`) verdict |
 | `/v1/chat/completions` | an audio-only child | `routing.no_model_route` |
+| `/v1/chat/completions` | a decisions-only child | `routing.no_model_route` |
+| `/v1/systemone` | an agent child whose spec lacks `decisions` while its application declares it (the text children of a mixed application) | `routing.no_model_route` |
 
 An override that targets such a child counts the same way, because step 4
 judges the effective name. A **messages-disabled** model — its effective
@@ -1092,6 +1118,26 @@ sentinel — the agent must have declared the `multipart_proxy` feature, else 40
 §3.5](compatibility-and-inference.md#35-openai-images-edits), [Agent-Managed Model
 Runtime §7](agent-runtime-manager.md#7-feature-negotiation)).
 
+**Who writes the `decision` verdict.** `decision` (`routing.CapabilityDecision`) is the
+capability `POST /v1/systemone` gates on (`RequiredCapabilities = ["decision"]`, [ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373)),
+and it has **one** writer, the gateway's own System One probe
+(`probeSystemOne`, `cmd/gateway/app_health.go`, source `systemone_probe`, rank 1 like every
+probe, so an operator's `manual` `yes` outranks it). The probe asks the model one tiny
+decision and states **yes** for a 2xx answer carrying an `answers.probe` object, **no** for a
+404 or a 501, and nothing for everything else (a timeout, a 400, a 503 while the model loads,
+and a 404 that is the agent router's own `runtime.*` envelope), which it retries after a five-minute back-off.
+An absent row refuses, as for every capability but `image_edit`: a model nobody has probed
+serves no decision. The probe, its cadence and its auth are in [API Compatibility & Inference §3.9](compatibility-and-inference.md#39-system-one-decisions).
+
+- **Two lists keep the writer unique.** `(decision, no)` is in `reservedManualVerdicts`
+  (a manual `no` would outrank the probe forever; the `yes` direction stays an operator's
+  override), and `decision` is in `reservedAgentCapabilityNames`: nothing an agent observes
+  produces it, and a buggy agent's `{decision, no}` at rank 1 would otherwise shadow the
+  probe. The portal folds the verdict into `ModelDTO.Decision`.
+- **The request stays off the vendor-account path** only because it carries the capability
+  list, as speech and transcription do; the handler always sets it, and dropping it would
+  also skip the gate.
+
 **The reserved-list decisions** are not symmetric. `reservedAgentCapabilityNames`
 (`internal/gateway/agent_ingest.go`, the names an agent's open verdict list may
 not carry — its criterion is names this codebase reasons about that no agent probe
@@ -1151,9 +1197,9 @@ required-capability list to gate on. `ScoreModelServers`
 gating it would silently empty an operator's server list. The model warmer
 (`internal/gateway/model_warmer.go`) pre-loads a model by trying the two text
 flavors in turn, and it is endpoint-agnostic by definition. It leaves
-`openai_images` and `openai_audio` out on purpose, because its warm call is a chat
+`openai_images`, `openai_audio` and `decisions` out on purpose, because its warm call is a chat
 prompt, and for the same reason it drops a candidate whose effective flavors serve
-only images or only audio — an agent-launched child whose spec lists only
+only images, only audio or only decisions — an agent-launched child whose spec lists only
 `openai_images` (or `openai_audio`), which candidacy still admits under a parent that
 declares `openai` — so an images-only or audio-only model is never warmed. That makes five production callers of `ActiveMappingsForModel` in
 total: sites 1–3 of the table above, plus these two. Site 4 is not one of them —
