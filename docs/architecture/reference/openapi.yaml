@@ -894,6 +894,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: The Error envelope with code `systemone.upstream_error`; only for a token with `decisions_confidence_normalize` whose upstream answer is over the buffer bound or broken off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/decisions:
     post:
       tags: [inference]
@@ -978,8 +983,13 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: The Error envelope with code `request.body_too_large`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '502':
-          description: The Error envelope with code `systemone.upstream_error`; only for a token with `decisions_confidence_normalize` whose upstream answer is over the buffer bound or broken off.
+          description: The Error envelope with code `decisions.upstream_error`, as /v1/decisions.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
