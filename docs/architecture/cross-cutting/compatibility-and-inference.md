@@ -1983,13 +1983,13 @@ places, because the mode and the verdicts are only known together after the reso
   **Refusal rows.** A decision request refused **after** the target is resolved records that
   target on its usage row (server, route and `provider_path`; still no tokens and no upstream
   call): a `*.endpoint_disabled` from a `server_agent` spec, the post-resolve
-  `routing.model_not_capable`, a translator refusal (`decisions.input_unsupported`,
-  `decisions.question_invalid`, `systemone.field_unsupported`, ...) and a failed verdict
-  read, so Activity shows which server's configuration refused. A refusal **before** the
-  resolve (the resolver's own routing errors) keeps an empty target. One known residual:
-  `resolveDecisionsTarget`'s flavor-mismatch `routing.no_model_route` (the resolved target's
-  effective flavors exclude the decision endpoint) is raised after a target exists but still
-  records an empty one.
+  `routing.model_not_capable`, the flavor-mismatch `routing.no_model_route` (the resolved
+  target's effective flavors exclude the decision endpoint), a translator refusal
+  (`decisions.input_unsupported`, `decisions.question_invalid`, `systemone.field_unsupported`,
+  ...) and a failed verdict read, so Activity shows which server's configuration refused. On a
+  refusal that fires before the route settles, `provider_path` is the path `upstreamPath`
+  derives from the target's unsettled mode, and no upstream call was made. A refusal
+  **before** the resolve (the resolver's own routing errors) keeps an empty target.
 
   The route taken is visible on the usage row's `provider_path`: `/v1/systemone` for a
   translate, `/v1/decisions` for a passthrough (`upstreamPath` answers the route the
@@ -2022,7 +2022,7 @@ Request side (OpenAI to System One):
 | `input_image` part with a `data:` `image_url` | `images[]` in order, `detail` dropped |
 | `input_image` with any other URL, or a `file_id` | **refused** `decisions.input_unsupported`: the gateway fetches no image |
 | roles `developer`, `system`, `assistant`; item types other than `message`; an `input` that is neither string nor array; an `input_text` part without `text` (`an input_text part has no text`, also in `instructions` parts), an `input_json` part without `data`, any other part type | **refused** `decisions.input_unsupported` |
-| an `input` array that is empty, or whose messages carry no content and no images | **refused** `decisions.input_unsupported`, `input carries no content` |
+| an `input` array that is empty, or whose messages carry no parts at all (empty `content` arrays; no text or JSON piece, no image) | **refused** `decisions.input_unsupported`, `input carries no content`; `input: ""` is not refused, and a message with empty-string `content` still yields a (blank) piece |
 | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_breakpoint`, `safety_identifier`, any other top-level field | dropped (emulated; tolerated, not relayed) |
 | `questions[i]` order | the System One `questions` object **written in request order** (hand-built JSON, never a Go map) |
 | `questions[i].name` | the key; a missing or `null` name, or `""`, becomes `q<i>` (zero-based); a key already used gets `-<n>` (n from 2) until unique. The **original** name is restored on the answer: absent or `null` stays `null`, `""` stays `""` |
@@ -4776,7 +4776,7 @@ Every inference error response uses the gateway-wide envelope
 | `systemone.questions_required` | 400 | `validateSystemOneRequest` (§3.9): `questions` absent, not an object, or `{}` |
 | `systemone.stream_unsupported` | 400 | `validateSystemOneRequest` (§3.9): `stream` present and neither `false` nor `null` (System One has no streaming) |
 | `decisions.model_required` / `decisions.questions_required` / `decisions.stream_unsupported` | 400 | `validateDecisionsRequest` (§3.10): `model` absent, not a string or blank; `questions` absent, not an array or empty; `stream` present and neither `false` nor `null` |
-| `decisions.input_unsupported` / `decisions.question_invalid` | 400 | the translate route's request translation (§3.10 item 5) refused an `input` or an instruction it cannot express (a non-user role, an item type other than `message`, an image that is not a `data:` URL, any other part type) or a malformed question (unknown type, no choices or levels, a choice value that is not a non-empty string or boolean, a choice description that is not a string, colliding choice keys); an `input` array with no content and no images is refused `input carries no content`; nothing was sent upstream. Once a target is resolved, the refusal's usage row carries it (§3.9 item 11, *Refusal rows*) |
+| `decisions.input_unsupported` / `decisions.question_invalid` | 400 | the translate route's request translation (§3.10 item 5) refused an `input` or an instruction it cannot express (a non-user role, an item type other than `message`, an image that is not a `data:` URL, any other part type) or a malformed question (unknown type, no choices or levels, a choice value that is not a non-empty string or boolean, a choice description that is not a string, colliding choice keys); an empty `input` array, or messages that carry no parts at all (empty `content` arrays), is refused `input carries no content` (not `input: ""`); nothing was sent upstream. Once a target is resolved, the refusal's usage row carries it (§3.9 item 11, *Refusal rows*) |
 | `decisions.endpoint_disabled` / `systemone.endpoint_disabled` | 404 | the resolved target's effective `decisions_mode` / `systemone_mode` is `disabled` (§6); only a `server_agent` spec reaches it, an ordinary application with the mode disabled is no candidate (`routing.no_model_route`) |
 | `decisions.upstream_error` | the upstream's status (translate, non-2xx), else 502 | the gateway's own envelope: a translated request's non-2xx System One answer (message naming the upstream status and message; a 501 adds guidance), or `502` for a decisions answer that is over the buffer bound, broken off or untranslatable (§3.10 items 6-7); a passthrough non-2xx is relayed verbatim instead |
 | `systemone.upstream_error` | 502; the upstream's status for a translated non-2xx | `/v1/systemone`: for a token that opted into confidence normalization, an answer over the buffer bound or broken off (§3.9 item 9); on the **translate** route, a 2xx OpenAI Decisions answer that cannot be expressed in System One (a wrong type, a missing answer, an unusable body: `502`) and a non-2xx upstream answer (the upstream's own status, the message naming it; a `501` adds guidance) (§3.9 item 12) |
