@@ -234,6 +234,22 @@ var portalApplicationErrRows = []errRow{
 			return strings.TrimPrefix(err.Error(), portal.ErrApplicationDecisionsPassthroughConflict.Error()+": ")
 		},
 	},
+	{
+		err:    portal.ErrApplicationSystemOneTranslateUnsupported,
+		status: http.StatusBadRequest,
+		code:   "application.systemone_translate_unsupported",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationSystemOneTranslateUnsupported.Error()+": ")
+		},
+	},
+	{
+		err:    portal.ErrApplicationSystemOneTranslateConflict,
+		status: http.StatusConflict,
+		code:   "application.systemone_translate_conflict",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationSystemOneTranslateConflict.Error()+": ")
+		},
+	},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeApplicationNotFound, msg: msgApplicationNotFound},
 }
 

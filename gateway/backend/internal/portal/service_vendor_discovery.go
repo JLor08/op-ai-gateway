@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/vendorauth"
+	"slices"
 	"strings"
 	"time"
 )
@@ -267,7 +268,8 @@ func newVendorDiscoveryState(discoverers VendorModelDiscoverers, refresher Vendo
 // letter or digit, or containing "..") drops its row, a repeated slug is stored
 // once, a display name that is not printable ASCII is stored empty and an
 // over-long one is cut, and at most maxDiscoveredModels rows are stored. An OpenAI
-// api-key listing is narrowed to chat-capable models first (isChatCapableOpenAIModel).
+// api-key listing is narrowed to chat-capable and decision models first
+// (isServedOpenAIAPIKeyModel).
 //
 // An OpenAI subscription account, and an OpenRouter/Kilo api-key account, also get
 // their usage snapshot refreshed on the way (refreshVendorUsage), with the very
@@ -327,7 +329,11 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 	if len(rows) == 0 {
 		return s.keptVendorModels(ctx, principal, acc.ID, "the vendor listed no usable model")
 	}
-	acc, rows, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
+	// Counted before the store step adds the decision models back: only what
+	// the vendor listed is discovered, and a listing with nothing usable was
+	// kept above.
+	discovered := len(rows)
+	acc, _, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
@@ -335,11 +341,36 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
-	detail := fmt.Sprintf("discovered %d models", len(rows))
+	detail := fmt.Sprintf("discovered %d models", discovered)
 	if dropped > 0 {
 		detail += fmt.Sprintf("; %d unusable entries were dropped", dropped)
 	}
-	return dto, RefreshResult{Status: VendorRefreshOK, Discovered: len(rows), Detail: detail}, nil
+	return dto, RefreshResult{Status: VendorRefreshOK, Discovered: discovered, Detail: detail}, nil
+}
+
+// withOpenAIDecisionModelRows returns rows plus a row for every OpenAI
+// Decisions model (routing.OpenAIDecisionModelIDs) it lacks, for an OpenAI
+// api-key account only (routing.IsVendorDecisionModel); every other account
+// gets rows unchanged. The decision models are seeded (VendorCatalog), and
+// whether api.openai.com's /v1/models lists them is not known, so a refresh
+// keeps them rather than letting an omission drop them. Like the discovered
+// rows they carry no prefix yet (GatewayModel = the slug); the store step
+// applies the account's current one. They do not count as discovered.
+//
+// acc must be the account as storeDiscoveredVendorModels re-loaded it under
+// the model-write lock, not the copy loaded before the vendor call: an OAuth
+// connect can turn the account into a subscription meanwhile, and a
+// subscription account carries no decision row.
+func withOpenAIDecisionModelRows(acc routing.VendorAccount, rows []routing.VendorAccountModel) []routing.VendorAccountModel {
+	flavor, _ := vendorAPIFlavor(acc.Vendor)
+	for _, id := range routing.OpenAIDecisionModelIDs() {
+		row := routing.VendorAccountModel{GatewayModel: id, UpstreamModel: id, APIFlavor: flavor}
+		if !routing.IsVendorDecisionModel(acc, row) || slices.ContainsFunc(rows, func(r routing.VendorAccountModel) bool { return r.UpstreamModel == id }) {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 // storeDiscoveredVendorModels replaces the account's model rows with rows (the
@@ -347,8 +378,10 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 // that produced rows was a network round trip, so the account is re-loaded INSIDE
 // the lock: a prefix change made meanwhile is not overwritten (the rows are written
 // under the prefix current now, and a re-label that arrives later re-labels these
-// rows), and an account deleted meanwhile is reported rather than written to. It
-// returns the re-loaded account and the rows as stored.
+// rows), and an account deleted meanwhile is reported rather than written to.
+// The decision models are added for the re-loaded account too
+// (withOpenAIDecisionModelRows), so an account that became a subscription
+// meanwhile gets none. It returns the re-loaded account and the rows as stored.
 func (s *Service) storeDiscoveredVendorModels(ctx context.Context, id string, rows []routing.VendorAccountModel) (routing.VendorAccount, []routing.VendorAccountModel, error) {
 	unlock, err := s.vendorModelWrites.lock(ctx, id)
 	if err != nil {
@@ -359,7 +392,7 @@ func (s *Service) storeDiscoveredVendorModels(ctx context.Context, id string, ro
 	if err != nil {
 		return routing.VendorAccount{}, nil, notFoundAsVendorAccountNotFound(err)
 	}
-	rows, _ = relabelVendorModels(rows, acc.ModelPrefix)
+	rows, _ = relabelVendorModels(withOpenAIDecisionModelRows(acc, rows), acc.ModelPrefix)
 	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, rows); err != nil {
 		return routing.VendorAccount{}, nil, notFoundAsVendorAccountNotFound(err)
 	}
@@ -818,7 +851,8 @@ func chatGPTAccountID(ts vendorauth.TokenSet) string {
 // serves: the vendor's flavor, UpstreamModel = the slug, the validated display
 // name, and the prefix NOT yet applied (GatewayModel = the slug; the caller
 // applies the account's current prefix). An OpenAI api-key listing is narrowed to
-// chat-capable models. Invalid and repeated slugs and anything beyond
+// the models it serves: chat-capable and decision models
+// (isServedOpenAIAPIKeyModel). Invalid and repeated slugs and anything beyond
 // maxDiscoveredModels are dropped; dropped counts every entry that did not become
 // a row.
 func vendorModelRows(acc routing.VendorAccount, found []vendorauth.DiscoveredModel) (rows []routing.VendorAccountModel, dropped int) {
@@ -828,7 +862,7 @@ func vendorModelRows(acc routing.VendorAccount, found []vendorauth.DiscoveredMod
 	rows = make([]routing.VendorAccountModel, 0, len(found))
 	for _, m := range found {
 		slug, ok := vendorModelSlug(m.Slug)
-		if !ok || (chatOnly && !isChatCapableOpenAIModel(slug)) || len(rows) >= maxDiscoveredModels {
+		if !ok || (chatOnly && !isServedOpenAIAPIKeyModel(slug)) || len(rows) >= maxDiscoveredModels {
 			continue
 		}
 		if _, dup := seen[slug]; dup {
@@ -928,6 +962,16 @@ func isChatCapableOpenAIModel(id string) bool {
 		return true
 	}
 	return len(base) >= 2 && base[0] == 'o' && base[1] >= '0' && base[1] <= '9'
+}
+
+// isServedOpenAIAPIKeyModel is the filter an OpenAI api-key listing passes
+// through: the chat-capable models (isChatCapableOpenAIModel) and the OpenAI
+// Decisions models (routing.IsOpenAIDecisionModel, ADR-100), which no chat
+// marker describes but the two decision endpoints serve. gpt-6-luna passes the
+// chat heuristic today; the name match guards against a future marker that
+// would drop it.
+func isServedOpenAIAPIKeyModel(id string) bool {
+	return routing.IsOpenAIDecisionModel(id) || isChatCapableOpenAIModel(id)
 }
 
 // relabelVendorModels returns rows with GatewayModel = prefix + UpstreamModel and

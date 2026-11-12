@@ -153,7 +153,7 @@ func TestFilterCapableAnyDecisionIsKindAware(t *testing.T) {
 	got, err := r.filterCapable(context.Background(), []MappingCandidate{
 		cand("llama_oa", ProviderLlamaCPP), cand("sr_oa", ProviderVllmSR), cand("vllm_oa", ProviderVLLM),
 		cand("llama_dec", ProviderLlamaCPP), cand("sr_dec", ProviderVllmSR),
-	}, []string{CapabilityAnyDecision})
+	}, []string{CapabilityAnyDecision}, "")
 	if err != nil {
 		t.Fatalf("filterCapable: %v", err)
 	}

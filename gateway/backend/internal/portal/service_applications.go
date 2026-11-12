@@ -50,11 +50,18 @@ var (
 	// well-formed, but it collides with the application's own state (the
 	// live-timings conflict pattern). HTTP 409.
 	ErrApplicationDecisionsPassthroughConflict = errors.New("application.decisions_passthrough_conflict")
-	ErrApplicationStatusInvalid                = errors.New("application.status_invalid")
-	ErrApplicationTuningInvalid                = errors.New("application.tuning_invalid")
-	ErrApplicationHealthPathInvalid            = errors.New("application.health_path_invalid")
-	ErrApplicationHealthIntervalInvalid        = errors.New("application.health_interval_invalid")
-	ErrApplicationHealthModeInvalid            = errors.New("application.health_mode_invalid")
+	// ErrApplicationSystemOneTranslateUnsupported rejects systemone_mode
+	// "translate" for a type that has no OpenAI /v1/decisions to translate to
+	// (llama_cpp, vllm_sr; ADR-100), where the request supplied the type. HTTP 400.
+	ErrApplicationSystemOneTranslateUnsupported = errors.New("application.systemone_translate_unsupported")
+	// ErrApplicationSystemOneTranslateConflict is the same refusal when the
+	// incapable type is the STORED one. HTTP 409.
+	ErrApplicationSystemOneTranslateConflict = errors.New("application.systemone_translate_conflict")
+	ErrApplicationStatusInvalid              = errors.New("application.status_invalid")
+	ErrApplicationTuningInvalid              = errors.New("application.tuning_invalid")
+	ErrApplicationHealthPathInvalid          = errors.New("application.health_path_invalid")
+	ErrApplicationHealthIntervalInvalid      = errors.New("application.health_interval_invalid")
+	ErrApplicationHealthModeInvalid          = errors.New("application.health_mode_invalid")
 	// ErrApplicationBenchmarkIntervalInvalid rejects a negative or absurdly large
 	// scheduled-benchmark interval (0 = off is allowed).
 	ErrApplicationBenchmarkIntervalInvalid = errors.New("application.benchmark_interval_invalid")
@@ -494,8 +501,8 @@ type ApplicationDTO struct {
 	ResponsesMode string `json:"responses_mode"`
 	MessagesMode  string `json:"messages_mode"`
 	// DecisionsMode (auto | translate | passthrough | disabled) and
-	// SystemOneMode (passthrough | disabled) are the modes of POST
-	// /v1/decisions and POST /v1/systemone (ADR-098).
+	// SystemOneMode (auto | passthrough | translate | disabled) are the modes of
+	// POST /v1/decisions and POST /v1/systemone (ADR-098, ADR-100).
 	DecisionsMode string `json:"decisions_mode"`
 	SystemOneMode string `json:"systemone_mode"`
 	// LoadedModelsPath / LoadedModelsFormat configure the optional loaded-model
@@ -1172,8 +1179,13 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// /v1/decisions route) is reset to auto, the same "clear when the type
 	// cannot carry it" rule as the live-timings flag; an explicit passthrough
 	// request is refused further below instead.
-	if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(app.Type) {
-		app.DecisionsMode = routing.EndpointModeAuto
+	if !routing.DecisionsPassthroughCapableKind(app.Type) {
+		if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough {
+			app.DecisionsMode = routing.EndpointModeAuto
+		}
+		if req.SystemOneMode == nil && app.SystemOneMode == routing.EndpointModeTranslate {
+			app.SystemOneMode = routing.EndpointModeAuto
+		}
 	}
 	if req.LoadedModelsPath != nil {
 		app.LoadedModelsPath = strings.TrimSpace(*req.LoadedModelsPath)
@@ -1423,13 +1435,15 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
 			liveTimingsRefusal, app.Type)
 	}
-	if req.DecisionsMode != nil && decisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(app.Type) {
-		refusal := ErrApplicationDecisionsPassthroughConflict
-		if req.Type != nil {
-			refusal = ErrApplicationDecisionsPassthroughUnsupported
-		}
-		return ApplicationDTO{}, fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",
-			refusal, app.Type)
+	// decisionsMode / systemOneMode are blank unless the request sent them, so
+	// only an explicit request is refused here.
+	decisionsRefusal, systemOneRefusal := ErrApplicationDecisionsPassthroughConflict, ErrApplicationSystemOneTranslateConflict
+	if req.Type != nil {
+		decisionsRefusal, systemOneRefusal = ErrApplicationDecisionsPassthroughUnsupported, ErrApplicationSystemOneTranslateUnsupported
+	}
+	if err := refuseIncapableDecisionModes(decisionsMode, systemOneMode, app.Type, "an application of type",
+		decisionsRefusal, systemOneRefusal); err != nil {
+		return ApplicationDTO{}, err
 	}
 	warnProxyExclusionOwnTLS(server, app, previousProxyListenPort)
 	app.UpdatedAt = s.clock().UTC()
@@ -2045,20 +2059,15 @@ func validDecisionsMode(raw string) (routing.EndpointMode, bool) {
 	}
 }
 
-// validSystemOneMode accepts the two systemone_mode values: System One has no
-// translate path yet (ADR-098).
+// validSystemOneMode accepts the four systemone_mode values, the same set as
+// decisions_mode (ADR-100).
 func validSystemOneMode(raw string) (routing.EndpointMode, bool) {
-	switch m := routing.EndpointMode(strings.TrimSpace(raw)); m {
-	case routing.EndpointModeDisabled, routing.EndpointModePassthrough:
-		return m, true
-	default:
-		return "", false
-	}
+	return validDecisionsMode(raw)
 }
 
 // resolveDecisionModes resolves a decisions_mode / systemone_mode pair as a
-// create or a runtime-spec write takes it: absent or "" defaults to auto /
-// passthrough, and any other value must be valid for its field, else invalid
+// create or a runtime-spec write takes it: absent or "" defaults to auto for
+// both, and any other value must be valid for its field, else invalid
 // (the caller's endpoint-mode sentinel) is returned.
 func resolveDecisionModes(rawDecisions, rawSystemOne string, invalid error) (decisions, systemOne routing.EndpointMode, err error) {
 	decisions = routing.EndpointModeAuto
@@ -2069,7 +2078,7 @@ func resolveDecisionModes(rawDecisions, rawSystemOne string, invalid error) (dec
 		}
 		decisions = m
 	}
-	systemOne = routing.EndpointModePassthrough
+	systemOne = routing.EndpointModeAuto
 	if strings.TrimSpace(rawSystemOne) != "" {
 		m, ok := validSystemOneMode(rawSystemOne)
 		if !ok {
@@ -2081,18 +2090,38 @@ func resolveDecisionModes(rawDecisions, rawSystemOne string, invalid error) (dec
 }
 
 // createDecisionModes resolves decisions_mode and systemone_mode of a create:
-// absent or "" defaults to auto / passthrough, any other value must be valid,
-// and an explicit decisions passthrough on an incapable type is refused (400).
+// absent or "" defaults to auto / auto, any other value must be valid, and an
+// explicit decisions passthrough or systemone translate on an incapable type is
+// refused (400).
 func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions, systemOne routing.EndpointMode, err error) {
 	decisions, systemOne, err = resolveDecisionModes(rawDecisions, rawSystemOne, ErrApplicationEndpointModeInvalid)
 	if err != nil {
 		return "", "", err
 	}
-	if decisions == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(appType) {
-		return "", "", fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",
-			ErrApplicationDecisionsPassthroughUnsupported, appType)
+	if err := refuseIncapableDecisionModes(decisions, systemOne, appType, "an application of type",
+		ErrApplicationDecisionsPassthroughUnsupported, ErrApplicationSystemOneTranslateUnsupported); err != nil {
+		return "", "", err
 	}
 	return decisions, systemOne, nil
+}
+
+// refuseIncapableDecisionModes is the save guard shared by applications and
+// runtime specs: a decisions_mode passthrough or a systemone_mode translate
+// needs an OpenAI /v1/decisions upstream, which a kind that is not
+// routing.DecisionsPassthroughCapableKind lacks (ADR-098, ADR-100). A blank
+// mode (not sent) is never refused. subject completes "... not available for
+// <subject> %q"; decisionsErr and systemOneErr are the sentinels to wrap.
+func refuseIncapableDecisionModes(decisions, systemOne routing.EndpointMode, kind, subject string, decisionsErr, systemOneErr error) error {
+	if routing.DecisionsPassthroughCapableKind(kind) {
+		return nil
+	}
+	if decisions == routing.EndpointModePassthrough {
+		return fmt.Errorf("%w: decisions_mode passthrough is not available for %s %q", decisionsErr, subject, kind)
+	}
+	if systemOne == routing.EndpointModeTranslate {
+		return fmt.Errorf("%w: systemone_mode translate is not available for %s %q", systemOneErr, subject, kind)
+	}
+	return nil
 }
 
 func normalizeApplicationStatus(raw string) (string, error) {
@@ -2242,6 +2271,11 @@ type ModelMappingDTO struct {
 	// "passthrough" (routing.EffectiveDecisionsRoute over the decision and
 	// decision_openai verdicts). Advisory and always present.
 	DecisionsRoute string `json:"decisions_route"`
+	// SystemOneRoute is DecisionsRoute's twin for POST /v1/systemone (ADR-100):
+	// "passthrough", "translate" or "disabled" by routing.EffectiveSystemOneRoute
+	// over the effective systemone_mode and the decision and decision_openai
+	// verdicts, "" when the flavors do not list decisions or no route exists.
+	SystemOneRoute string `json:"systemone_route"`
 }
 
 type MappingListResponse struct {
@@ -3447,6 +3481,7 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		AudioOnly:                    markers.AudioOnly,
 		DecisionsOnly:                markers.DecisionsOnly,
 		DecisionsRoute:               mappingDecisionsRoute(markers, caps),
+		SystemOneRoute:               mappingSystemOneRoute(markers, caps),
 	}
 }
 
@@ -3454,16 +3489,31 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 // of POST /v1/decisions for a mapping with these effective flavors, mode and
 // verdict rows.
 func mappingDecisionsRoute(markers mappingFlavorMarkers, caps map[string]routing.CapabilityRow) string {
+	return mappingDecisionRoute(markers, caps, markers.DecisionsMode, routing.EffectiveDecisionsRoute)
+}
+
+// mappingSystemOneRoute is ModelMappingDTO.SystemOneRoute, mappingDecisionsRoute's
+// twin for POST /v1/systemone (routing.EffectiveSystemOneRoute).
+func mappingSystemOneRoute(markers mappingFlavorMarkers, caps map[string]routing.CapabilityRow) string {
+	return mappingDecisionRoute(markers, caps, markers.SystemOneMode, routing.EffectiveSystemOneRoute)
+}
+
+// mappingDecisionRoute is the shared body of the two route fields: "" when the
+// effective flavors do not list decisions or the route function finds no
+// route, else the route over the decision and decision_openai verdicts.
+func mappingDecisionRoute(markers mappingFlavorMarkers, caps map[string]routing.CapabilityRow, mode routing.EndpointMode,
+	route func(kind string, mode routing.EndpointMode, decision, decisionOpenAI bool) (routing.EndpointMode, bool),
+) string {
 	if !markers.DecisionsListed {
 		return ""
 	}
-	route, ok := routing.EffectiveDecisionsRoute(markers.DecisionsKind, markers.DecisionsMode,
+	r, ok := route(markers.DecisionsKind, mode,
 		capabilityVerdictBool(caps, routing.CapabilityDecision),
 		capabilityVerdictBool(caps, routing.CapabilityDecisionOpenAI))
 	if !ok {
 		return ""
 	}
-	return string(route)
+	return string(r)
 }
 
 // mappingMetrics bundles the eight numeric per-mapping metric values shared by

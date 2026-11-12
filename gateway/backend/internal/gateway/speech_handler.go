@@ -68,9 +68,10 @@ const (
 //     It feeds the capability gate (a model without a (speech, yes) verdict is
 //     refused, an unprobed one included). And it keeps a speech request off the
 //     vendor-account path: vendorAccountRoutingEligible excludes the images
-//     flavor by name but has no openai_audio twin, and declines a request only
-//     because it carries a capability list, while a vendor account's model match
-//     reads the model name and never the flavor. A handler that dropped the list
+//     flavor by name but has no openai_audio twin, and declines a request because
+//     it carries a capability list (every list but a decision request's
+//     [any_decision], ADR-100), while a vendor account's model match reads the
+//     model name and never the flavor. A handler that dropped the list
 //     would skip the gate AND become routable to a vendor model of the same name.
 //   - requiredVoice is the voice the body names (sniffSpeechVoice), "" for none. It is
 //     a routing PREFERENCE that fails open -- see inference.Request.RequiredVoice -- so

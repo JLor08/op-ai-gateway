@@ -86,6 +86,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'application.decisions_passthrough_conflict': 'errorApplicationDecisionsPassthroughConflict',
   'runtime_spec.decisions_passthrough_unsupported':
     'errorRuntimeSpecDecisionsPassthroughUnsupported',
+  // #373 phase 4: systemone_mode translate is refused for llama.cpp and
+  // vllm_sr. Three labels, as for the passthrough trio above.
+  'application.systemone_translate_unsupported': 'errorApplicationSystemOneTranslateUnsupported',
+  'application.systemone_translate_conflict': 'errorApplicationSystemOneTranslateConflict',
+  'runtime_spec.systemone_translate_unsupported': 'errorRuntimeSpecSystemOneTranslateUnsupported',
   'runtime_coresidency.pair_invalid': 'errorRuntimeCoresidencyPairInvalid',
   'runtime_coresidency.mode_invalid': 'errorRuntimeCoresidencyModeInvalid',
   'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',

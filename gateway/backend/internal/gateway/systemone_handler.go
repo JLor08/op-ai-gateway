@@ -43,10 +43,9 @@ func (s *Server) decisionsBodyLimit() int64 {
 // the same local alias for routing.APIFlavorDecisions that apiFlavorSpeech is for
 // the coarse audio flavor: NormalizeAPIFlavor folds it to itself, so it filters
 // candidacy (only an application declaring decisions is a candidate), labels
-// usage rows, and answers upstreamPath. Like images and speech it has no
-// translate path; its one mode, SystemOneMode, only switches it on or off
-// (ADR-098). Whether a MODEL can give a verdict is the capability gate's job,
-// keyed on routing.CapabilityDecision.
+// usage rows, and answers upstreamPath. Its mode, SystemOneMode, is settled
+// after the resolve to a concrete route (systemOneRoute): passthrough to the
+// upstream's /v1/systemone, or translate to its /v1/decisions (ADR-100).
 const apiFlavorSystemOne = routing.APIFlavorDecisions
 
 // The request-error codes validateSystemOneRequest answers with. They are API
@@ -60,25 +59,30 @@ const (
 // systemOneInferenceShape is the shape handleSystemOne hands the ONE preflight
 // gate (inferencePreflight). It is a function so the values the handler uses are
 // the ones its test pins: the exact coarse flavor (upstreamPath matches it by
-// string equality), the System One endpoint, and the decision capability. The
-// capability list does two jobs: it feeds the capability gate (a model without a
-// (decision, yes) verdict is refused, an unprobed one included), and it keeps the
-// request off the vendor-account path, which declines a request only because it
-// carries a capability list while a vendor model's match reads the model name and
-// never the flavor.
+// string equality), the System One endpoint, and the derived any_decision
+// requirement. The requirement admits a mapping with either verdict (decision
+// or decision_openai, the latter only on a kind with an OpenAI /v1/decisions);
+// which one the request then needs is decided after the resolve
+// (systemOneRoute), as for /v1/decisions. The capability list is also the one
+// the vendor-account path admits (ADR-100): there only the decision model of an
+// OpenAI api-key account (routing.IsVendorDecisionModel) is considered, and its
+// route is translate, to the vendor's /v1/decisions.
 func systemOneInferenceShape(model string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorSystemOne,
 		endpoint:             endpointSystemOne,
 		model:                model,
-		requiredCapabilities: []string{routing.CapabilityDecision},
+		requiredCapabilities: []string{routing.CapabilityAnyDecision},
 	}
 }
 
 // handleSystemOne serves POST /v1/systemone: a System One decision request
-// ({model, state, questions}) relayed to a decision-capable model and answered
-// with the upstream's own body ({model, answers, usage}). Bearer only (gateway:use
-// or llm:invoke): a browser session cookie and the internal loopback are no way in.
+// ({model, state, questions}) relayed to a decision-capable model, either passed
+// through to the upstream's own /v1/systemone and answered with its body
+// ({model, answers, usage}), or translated to OpenAI Decisions and back, as the
+// effective systemone mode and the mapping's verdicts decide (ADR-100). Bearer
+// only (gateway:use or llm:invoke): a browser session cookie and the internal
+// loopback are no way in.
 func (s *Server) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -193,9 +197,9 @@ func (s *Server) recordDecisionsRefusal(w http.ResponseWriter, r *http.Request, 
 // decision request and applies the effective-served conjunct's flavor half to
 // it, as resolveSpeechTarget does: for a server_agent mapping the resolved
 // runtime spec is the authority for its model's flavors, and the relay reaches
-// proxyNative directly. The mode half is each endpoint's own (System One's
-// SystemOneMode in relaySystemOne, the decisions route in decisionsRoute). On a
-// refusal it has already answered and recorded, and returns ok == false.
+// proxyNative directly. The mode half is each endpoint's own route
+// (systemOneRoute, decisionsRoute). On a refusal it has already answered and
+// recorded, and returns ok == false.
 func (s *Server) resolveDecisionsTarget(w http.ResponseWriter, r *http.Request, c *decisionsCall) (routing.Target, bool) {
 	target, err := s.resolveTarget(r.Context(), &c.token, c.req)
 	if err != nil {
@@ -212,26 +216,31 @@ func (s *Server) resolveDecisionsTarget(w http.ResponseWriter, r *http.Request, 
 	return target, true
 }
 
-// relaySystemOne relays an already-gated System One request via proxyNative with
-// no translate fallback: every resolve failure is terminal and recorded directly.
-// req is pf.Req, already carrying RequiredCapabilities = [decision]. A resolved
-// target whose effective System One mode is disabled (a server_agent spec can
-// disable it per model; an ordinary application is no candidate then) is
-// refused 404 systemone.endpoint_disabled. proxyNative rewrites the model to the
-// mapping's own name and relays the upstream's status and body verbatim; usage
-// is read from the body's usage object (mergePassthroughUsage), and a body
-// without one records zero tokens. A token that opted into confidence
-// normalization gets the buffered relay instead, which rewrites the confidence
-// of a 2xx answer (ADR-098) and relays everything else as the copier would.
+// relaySystemOne resolves an already-gated System One request, settles its
+// concrete route (systemOneRoute) and relays it via proxyNative; req is pf.Req,
+// already carrying RequiredCapabilities = [any_decision]. Every refusal is
+// answered and recorded here; a gone instance re-runs this whole path
+// (relayAgain).
+//
+//   - passthrough (the Phase 1 relay): proxyNative rewrites the model to the
+//     mapping's own name and relays the upstream's status and body verbatim
+//     through the streaming copier; usage is read from the body's usage object
+//     (mergePassthroughUsage), and a body without one records zero tokens. A
+//     token that opted into confidence normalization gets the buffered relay
+//     instead, which rewrites the confidence of a 2xx answer (ADR-098) and
+//     relays everything else as the copier would.
+//   - translate (ADR-100): the OpenAI Decisions body
+//     compat.TranslateSystemOneRequest builds goes to the upstream's
+//     /v1/decisions, and the answer is translated back (reverseDecisionsRewrite).
+//     A body the translator cannot express is a 400 with its code and no
+//     upstream call.
 func (s *Server) relaySystemOne(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {
 	c := decisionsCall{token: token, req: req, raw: raw, start: time.Now(), endpoint: endpointSystemOne}
 	target, ok := s.resolveDecisionsTarget(w, r, &c)
 	if !ok {
 		return
 	}
-	if target.SystemOneMode == routing.EndpointModeDisabled {
-		slog.Debug("systemone request rejected: endpoint disabled", "path", r.URL.Path, "model", c.req.Model, "server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.refuseDecisionsRequest(w, r, c, statusEndpointDisabled, codeSystemOneEndpointDisabled, msgEndpointDisabled)
+	if target, ok = s.systemOneRoute(w, r, c, target); !ok {
 		return
 	}
 	rel := nativeRelay{
@@ -243,16 +252,56 @@ func (s *Server) relaySystemOne(w http.ResponseWriter, r *http.Request, token au
 		endpoint: endpointSystemOne,
 		reselect: relayAgain(c.req, func(again inference.Request) { s.relaySystemOne(w, r, c.token, again, raw) }),
 	}
-	if c.token.DecisionsConfidenceNormalize {
-		rel.decisionsRewrite = &decisionsRewrite{normalize: true, dialect: compat.DialectSystemOne, failCode: codeSystemOneUpstreamError}
+	if target.SystemOneMode == routing.EndpointModeTranslate {
+		if !s.translateSystemOneRelay(w, r, c, &rel) {
+			return
+		}
+	} else if c.token.DecisionsConfidenceNormalize {
+		rel.decisionsRewrite = normalizeDecisionsRewrite(compat.DialectSystemOne)
 	}
 	s.proxyNative(w, r, rel)
 }
 
+// translateSystemOneRelay fills rel for the translate route: the OpenAI
+// Decisions body as rel.upstreamBody and the reverse rewrite of its answer. The
+// body already names the upstream model, the one proxyNative's model rewrite
+// would set (target.ProviderModel), so that rewrite is a no-op on it. A request
+// the translator refuses is answered 400 with the translator's code and
+// recorded, and ok is false.
+func (s *Server) translateSystemOneRelay(w http.ResponseWriter, r *http.Request, c decisionsCall, rel *nativeRelay) bool {
+	body, table, derr := compat.TranslateSystemOneRequest(c.raw, effectiveProviderModel(rel.target, c.req.Model))
+	if derr != nil {
+		slog.Debug("systemone request refused by the translator", "path", r.URL.Path, "model", c.req.Model, "code", derr.Code, "err", derr.Message)
+		s.refuseDecisionsRequest(w, r, c, http.StatusBadRequest, derr.Code, derr.Message)
+		return false
+	}
+	rel.upstreamBody = body
+	rel.decisionsRewrite = reverseDecisionsRewrite(table, c.req.Model, c.token.DecisionsConfidenceNormalize)
+	return true
+}
+
+// systemOneRoute settles the concrete route of a resolved System One request
+// (ADR-100): settleDecisionRoute with the target's effective systemone mode and
+// routing.EffectiveSystemOneRoute. A disabled endpoint (a server_agent
+// application or spec can disable it per model; an ordinary application is no
+// candidate then) is answered 404 systemone.endpoint_disabled. On success the
+// returned target carries the route (translate or passthrough) as its
+// SystemOneMode, which is what upstreamPath and the usage row's provider_path
+// read.
+func (s *Server) systemOneRoute(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target) (routing.Target, bool) {
+	route, ok := s.settleDecisionRoute(w, r, c, target, target.SystemOneMode, routing.EffectiveSystemOneRoute, codeSystemOneEndpointDisabled)
+	if !ok {
+		return routing.Target{}, false
+	}
+	target.SystemOneMode = route
+	return target, true
+}
+
 // handleSystemOneModels serves GET /v1/systemone/models: the models a System One
 // client can name in POST /v1/systemone. It is /v1/models narrowed to the
-// decisions flavor and to the rows that carry a (decision, yes) verdict, so a
-// model the gate would refuse is never offered. Like /v1/models it is
+// decisions flavor and to the rows whose System One route is ok
+// (ModelDTO.Decision: passthrough or translate), so a model the gate or the
+// route would refuse is never offered. Like /v1/models it is
 // bearer-only, reachable to a service token (llm:invoke), and lists the
 // portal's caller-visible rows (provisioning visibility, groups and aliases
 // included); data is [] rather than null when nothing qualifies.

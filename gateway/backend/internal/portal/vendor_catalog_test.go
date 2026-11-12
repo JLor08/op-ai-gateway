@@ -25,8 +25,8 @@ func TestVendorCatalogShape(t *testing.T) {
 	for vendor, flavor := range wantFlavor {
 		for _, authType := range vendorAuthTypes {
 			catalog := VendorCatalog(vendor, authType)
-			if n := len(catalog); n < 2 || n > 4 {
-				t.Errorf("%s/%s catalog has %d entries, want a small curated set of 2-4", vendor, authType, n)
+			if n := len(catalog); n < 2 || n > 5 {
+				t.Errorf("%s/%s catalog has %d entries, want a small curated set of 2-5", vendor, authType, n)
 			}
 			seen := map[string]bool{}
 			for _, m := range catalog {
@@ -71,7 +71,7 @@ func TestVendorCatalogOpenAISplitsByAuthType(t *testing.T) {
 		want     []string
 	}{
 		{routing.VendorAuthSubscription, []string{"gpt-5", "gpt-5-mini"}},
-		{routing.VendorAuthAPIKey, []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3"}},
+		{routing.VendorAuthAPIKey, []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3", "gpt-6-luna"}},
 	} {
 		t.Run(tc.authType, func(t *testing.T) {
 			got := catalogGatewayModels(VendorCatalog(routing.VendorOpenAI, tc.authType))

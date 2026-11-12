@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -397,11 +398,14 @@ func TestSystemOneServesAServerAgentChildWhoseSpecIncludesDecisions(t *testing.T
 	}
 }
 
-// A vendor model of the same name is never chosen for a System One request: the
-// shape's capability list keeps it off the vendor-account path, whose model match
-// reads the name and never the flavor. The control proves the same account does
-// serve the same model name on a plain chat request.
-func TestSystemOneIsNeverVendorRoutable(t *testing.T) {
+// Only the OpenAI api-key decision model is vendor-routable for a decision
+// request (ADR-100): [any_decision] is the one capability list that opts into
+// the vendor path, and there only an OpenAI api-key account's decision model
+// (routing.IsVendorDecisionModel) is considered. An Anthropic model, and a chat
+// model of the very account that serves the decision model, are never chosen
+// for either decision endpoint, although the control proves both accounts are
+// vendor-routable on a plain chat request.
+func TestSystemOneIsVendorRoutableOnlyForTheOpenAIAPIKeyDecisionModel(t *testing.T) {
 	cipher, err := capture.New(testCaptureKey)
 	if err != nil {
 		t.Fatalf("capture.New: %v", err)
@@ -409,19 +413,43 @@ func TestSystemOneIsNeverVendorRoutable(t *testing.T) {
 	routes := routing.NewMemoryStore()
 	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
 	seedAPIKeyAnthropicAccount(t, routes, cipher, apiKeyAnthropicOwnerID, now)
+	ctx := context.Background()
+	if err := routes.CreateVendorAccount(ctx, routing.VendorAccount{
+		ID: "acc_oai_decisions", OwnerUserID: apiKeyAnthropicOwnerID, Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+		Name: "acc_oai_decisions", Status: routing.VendorAccountStatusActive, APIKey: "enc:key", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	if err := routes.SetVendorAccountModels(ctx, "acc_oai_decisions", []routing.VendorAccountModel{
+		{AccountID: "acc_oai_decisions", GatewayModel: "gpt-6-luna", UpstreamModel: "gpt-6-luna", APIFlavor: routing.APIFlavorOpenAI},
+		{AccountID: "acc_oai_decisions", GatewayModel: "gpt-5", UpstreamModel: "gpt-5", APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
 	resolver := routing.NewResolver(routes, func() time.Time { return now }, nil)
 	resolver.SetVendorAccountAccessors(func() bool { return true }, nil, nil)
 	tok := auth.Token{ID: "tok_vendor", UserID: apiKeyAnthropicOwnerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}
 
-	control, err := resolver.Resolve(context.Background(), tok, inference.Request{Model: apiKeyAnthropicModel, APIFlavor: routing.APIFlavorAnthropic})
-	if err != nil || control.Provider != routing.ProviderVendorAnthropic {
-		t.Fatalf("control Resolve = %+v, %v; want the vendor target (the fixture must be vendor-routable)", control, err)
+	for _, model := range []string{apiKeyAnthropicModel, "gpt-5"} {
+		control, err := resolver.Resolve(ctx, tok, inference.Request{Model: model, APIFlavor: routing.APIFlavorOpenAI})
+		if err != nil || control.VendorAccountID == "" {
+			t.Fatalf("control Resolve(%s) = %+v, %v; want a vendor target (the fixture must be vendor-routable)", model, control, err)
+		}
 	}
 
-	shape := systemOneInferenceShape(apiKeyAnthropicModel)
-	_, err = resolver.Resolve(context.Background(), tok, inference.Request{Model: shape.model, APIFlavor: shape.apiFlavor, RequiredCapabilities: shape.requiredCapabilities})
-	if !errors.Is(err, routing.ErrNoModelRoute) {
-		t.Fatalf("Resolve(System One shape) = %v, want ErrNoModelRoute (never a vendor target)", err)
+	for _, shape := range []inferenceShape{systemOneInferenceShape(""), decisionsInferenceShape("")} {
+		req := func(model string) inference.Request {
+			return inference.Request{Model: model, APIFlavor: shape.apiFlavor, RequiredCapabilities: shape.requiredCapabilities}
+		}
+		for _, model := range []string{apiKeyAnthropicModel, "gpt-5"} {
+			if _, err := resolver.Resolve(ctx, tok, req(model)); !errors.Is(err, routing.ErrNoModelRoute) {
+				t.Fatalf("Resolve(%s shape, %s) = %v, want ErrNoModelRoute (never a vendor target)", shape.apiFlavor, model, err)
+			}
+		}
+		target, err := resolver.Resolve(ctx, tok, req("gpt-6-luna"))
+		if err != nil || target.VendorAccountID != "acc_oai_decisions" || !targetServesFlavor(target, shape.apiFlavor) {
+			t.Fatalf("Resolve(%s shape, gpt-6-luna) = %+v, %v; want the OpenAI api-key vendor target serving the decisions flavor", shape.apiFlavor, target, err)
+		}
 	}
 }
 
@@ -641,5 +669,328 @@ func TestSystemOneDoesNotHonourAnAffinityPinToANonDecisionMapping(t *testing.T) 
 	key := routing.AffinityKey{APITokenID: "tok_dev", Model: "no-decision", APIFlavor: routing.APIFlavorDecisions, SessionID: "sess-pin"}
 	if _, ok, err := srv.Routes.Affinity(ctx, key); err != nil || !ok {
 		t.Fatalf("the affinity row did not survive the refusal (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// The /v1/systemone translate route (ADR-100): a System One request for a
+// mapping that answers only OpenAI Decisions is translated to /v1/decisions and
+// its answer back. The fixture is the decisions one (newDecisionsTestServer):
+// dec-both, dec-s1 and dec-oai on a vLLM application.
+
+// systemOneTranslateRequestFor is a System One request for model whose
+// translation is answered by decisionsOAIAnswer: a noul "ok" and a choice "q1"
+// (the answer's unnamed second entry matches it by position).
+func systemOneTranslateRequestFor(model string) string {
+	return `{"model":"` + model + `","state":"Ein Text: über alles","questions":{` +
+		`"ok":{"type":"noul","instructions":"Is it ok?"},` +
+		`"q1":{"type":"choice","instructions":"Mood?","criteria":{"calm":null,"angry":"upset"}}}}`
+}
+
+// The OpenAI Decisions body the translate route must send for
+// systemOneTranslateRequestFor(decisionsModelOAI).
+const systemOneTranslatedOAIBody = `{"model":"dec_oai_real","input":"Ein Text: über alles","questions":[` +
+	`{"type":"predicate","name":"ok","instructions":"Is it ok?"},` +
+	`{"type":"choice","name":"q1","instructions":"Mood?","choices":[{"value":"calm"},{"value":"angry","description":"upset"}]}]}`
+
+// systemOneTranslatedAnswer is what the client gets for decisionsOAIAnswer.
+const systemOneTranslatedAnswer = `{"answers":{` +
+	`"ok":{"type":"noul","noul":0.9,"probabilities":{"yes":0.9,"no":0.1},"confidence":0.9},` +
+	`"q1":{"type":"choice","choice":"calm","probabilities":{"calm":0.6,"angry":0.2},"confidence":0.5}},` +
+	`"model":"dec-oai","usage":{"input_tokens":100,"output_tokens":2}}`
+
+// postSystemOneAs posts body to /v1/systemone with secret.
+func postSystemOneAs(t *testing.T, srv *Server, secret, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postImagesWithHeaders(t, srv, "/v1/systemone", body, map[string]string{"Authorization": "Bearer " + secret})
+}
+
+// postSystemOneTranslate posts systemOneTranslateRequestFor(dec-oai) with
+// secret to an auto-mode fixture whose upstream answers replies.
+func postSystemOneTranslate(t *testing.T, replies map[string]decisionsReply, secret string) (*Server, <-chan systemOneUpstreamCall, *httptest.ResponseRecorder) {
+	t.Helper()
+	up, calls := newDecisionsUpstream(t, replies)
+	srv := newDecisionsTestServerWithModes(t, up.URL, routing.EndpointModeAuto, routing.EndpointModeAuto, routing.ProviderVLLM)
+	return srv, calls, postSystemOneAs(t, srv, secret, systemOneTranslateRequestFor(decisionsModelOAI))
+}
+
+func TestSystemOneAutoWithOnlyDecisionOpenAITranslates(t *testing.T) {
+	srv, calls, rec := postSystemOneTranslate(t, defaultDecisionsReplies(), "dev-secret")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != jsonContentType {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != strconv.Itoa(rec.Body.Len()) {
+		t.Fatalf("Content-Length = %q, want %d", cl, rec.Body.Len())
+	}
+	requireJSONEqual(t, "client body", rec.Body.Bytes(), systemOneTranslatedAnswer)
+	call := receivedSystemOneCall(t, calls)
+	if call.method != http.MethodPost || call.path != "/v1/decisions" {
+		t.Fatalf("upstream saw %s %s, want POST /v1/decisions", call.method, call.path)
+	}
+	requireJSONEqual(t, "upstream body", call.body, systemOneTranslatedOAIBody)
+
+	got := lastUsageEvent(t, srv)
+	if got.ProviderPath != "/v1/decisions" || got.ReqPath != "/v1/systemone" || got.APIFlavor != apiFlavorSystemOne || got.Status != "success" || got.HTTPStatus != http.StatusOK {
+		t.Fatalf("row = %+v, want a success decisions row on /v1/systemone with provider_path /v1/decisions", got)
+	}
+	if got.InputTokens != 50 || got.CachedTokens != 40 || got.CacheWriteTokens != 10 || got.OutputTokens != 2 {
+		t.Fatalf("row tokens = in %d cached %d write %d out %d, want 50/40/10/2", got.InputTokens, got.CachedTokens, got.CacheWriteTokens, got.OutputTokens)
+	}
+}
+
+// A mapping that answers System One keeps the Phase 1 relay under auto: the
+// streaming copier, byte for byte, even when it also answers /v1/decisions.
+func TestSystemOneAutoWithDecisionPassesThroughByteIdentical(t *testing.T) {
+	for _, model := range []string{decisionsModelS1, decisionsModelBoth} {
+		t.Run(model, func(t *testing.T) {
+			up, calls := newDecisionsUpstream(t, defaultDecisionsReplies())
+			srv := newDecisionsTestServerWithModes(t, up.URL, routing.EndpointModeAuto, routing.EndpointModeAuto, routing.ProviderVLLM)
+			body := systemOneTranslateRequestFor(model)
+
+			rec := postSystemOneAs(t, srv, "dev-secret", body)
+
+			if rec.Code != http.StatusOK || rec.Body.String() != decisionsS1Answer || rec.Header().Get("Content-Length") != "" {
+				t.Fatalf("status = %d body = %q Content-Length = %q, want 200 and the upstream's bytes through the copier", rec.Code, rec.Body.String(), rec.Header().Get("Content-Length"))
+			}
+			call := receivedSystemOneCall(t, calls)
+			if call.path != "/v1/systemone" {
+				t.Fatalf("upstream path = %q, want /v1/systemone", call.path)
+			}
+			var sent map[string]any
+			_ = json.Unmarshal([]byte(body), &sent)
+			sent["model"] = map[string]string{decisionsModelS1: decisionsUpstreamS1, decisionsModelBoth: decisionsUpstreamBoth}[model]
+			want, _ := json.Marshal(sent)
+			requireJSONEqual(t, "upstream body", call.body, string(want))
+			if got := lastUsageEvent(t, srv); got.ProviderPath != "/v1/systemone" || got.Status != "success" {
+				t.Fatalf("row = %+v, want a success row on /v1/systemone", got)
+			}
+		})
+	}
+}
+
+func TestSystemOneForcedModesNeedTheirVerdict(t *testing.T) {
+	cases := []struct {
+		name  string
+		mode  routing.EndpointMode
+		model string
+	}{
+		{"translate without decision_openai", routing.EndpointModeTranslate, decisionsModelS1},
+		{"passthrough without decision", routing.EndpointModePassthrough, decisionsModelOAI},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up, calls := newDecisionsUpstream(t, defaultDecisionsReplies())
+			srv := newDecisionsTestServerWithModes(t, up.URL, routing.EndpointModeAuto, tc.mode, routing.ProviderVLLM)
+
+			rec := postSystemOneAs(t, srv, "dev-secret", systemOneTranslateRequestFor(tc.model))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
+			requireNoSystemOneUpstreamCall(t, calls)
+			got := lastUsageEvent(t, srv)
+			if got.ErrorCode != "routing.model_not_capable" || got.Status != "error" || got.HTTPStatus != http.StatusNotFound || got.ProviderPath != "" || got.ReqPath != "/v1/systemone" {
+				t.Fatalf("row = %+v, want an upstream-less model_not_capable 404 row", got)
+			}
+		})
+	}
+}
+
+// A forced translate with its verdict takes that route even when auto would
+// pass through.
+func TestSystemOneForcedTranslateOnAMappingWithBothVerdicts(t *testing.T) {
+	up, calls := newDecisionsUpstream(t, defaultDecisionsReplies())
+	srv := newDecisionsTestServerWithModes(t, up.URL, routing.EndpointModeAuto, routing.EndpointModeTranslate, routing.ProviderVLLM)
+
+	rec := postSystemOneAs(t, srv, "dev-secret", systemOneTranslateRequestFor(decisionsModelBoth))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if call := receivedSystemOneCall(t, calls); call.path != "/v1/decisions" {
+		t.Fatalf("upstream path = %q, want /v1/decisions", call.path)
+	}
+}
+
+// On a kind with no OpenAI /v1/decisions (llama.cpp) a decision_openai verdict
+// is no route: auto is not capable rather than translating.
+func TestSystemOneAutoIgnoresDecisionOpenAIOnKindsWithoutTheRoute(t *testing.T) {
+	up, calls := newDecisionsUpstream(t, defaultDecisionsReplies())
+	srv := newDecisionsTestServerWithModes(t, up.URL, routing.EndpointModeAuto, routing.EndpointModeAuto, routing.ProviderLlamaCPP)
+
+	rec := postSystemOneAs(t, srv, "dev-secret", systemOneTranslateRequestFor(decisionsModelOAI))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
+	requireNoSystemOneUpstreamCall(t, calls)
+}
+
+// A server_agent application or its runtime spec can disable System One per
+// model; the route answers it before the verdicts matter.
+func TestSystemOneDisabledServerAgentIs404(t *testing.T) {
+	cases := []struct {
+		name          string
+		appSystemOne  routing.EndpointMode
+		withSpec      bool
+		specSystemOne routing.EndpointMode
+	}{
+		{"server_agent application disabled, no spec", routing.EndpointModeDisabled, false, ""},
+		{"spec disables it over an auto application", routing.EndpointModeAuto, true, routing.EndpointModeDisabled},
+		// Phase 1 compatibility: migration 107 stored passthrough on every
+		// existing application; the spec's disabled still wins over it.
+		{"spec disables it over a stored-passthrough application", routing.EndpointModePassthrough, true, routing.EndpointModeDisabled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: decisionsS1Answer}
+			srv := newServerAgentDecisionsTestServer(t, prov, routing.EndpointModeAuto, tc.appSystemOne, tc.withSpec, routing.EndpointModeAuto, tc.specSystemOne)
+
+			rec := postSystemOne(t, srv, `{"model":"agent-decider","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}}`)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), codeSystemOneEndpointDisabled)
+			if prov.proxyCalls != 0 {
+				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+			}
+			got := lastUsageEvent(t, srv)
+			if got.ErrorCode != codeSystemOneEndpointDisabled || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/systemone" || got.ProviderPath != "" {
+				t.Fatalf("row = %+v, want an upstream-less systemone.endpoint_disabled 404 row", got)
+			}
+		})
+	}
+}
+
+func TestSystemOneTranslatorRefusalIs400WithoutAnUpstreamCall(t *testing.T) {
+	cases := []struct {
+		name, body, code string
+	}{
+		{"field without a counterpart", `{"model":"` + decisionsModelOAI + `","state":"s","instructions":"be brief","questions":{"q":{"type":"noul"}}}`, "systemone.field_unsupported"},
+		{"question type without a counterpart", `{"model":"` + decisionsModelOAI + `","state":"s","questions":{"q":{"type":"rank","instructions":"x"}}}`, "systemone.question_type_unsupported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up, calls := newDecisionsUpstream(t, defaultDecisionsReplies())
+			srv := newDecisionsTestServerWithModes(t, up.URL, routing.EndpointModeAuto, routing.EndpointModeAuto, routing.ProviderVLLM)
+
+			rec := postSystemOneAs(t, srv, "dev-secret", tc.body)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), tc.code)
+			requireNoSystemOneUpstreamCall(t, calls)
+			got := lastUsageEvent(t, srv)
+			if got.ErrorCode != tc.code || got.Status != "error" || got.HTTPStatus != http.StatusBadRequest || got.ReqPath != "/v1/systemone" || got.ProviderPath != "" {
+				t.Fatalf("row = %+v, want an upstream-less %s 400 error row", got, tc.code)
+			}
+		})
+	}
+}
+
+func TestSystemOneTranslateUpstreamRefusalIs422(t *testing.T) {
+	const refused = `{"answers":[{"type":"refusal","name":"ok"},{"type":"refusal","name":"q1"}],"model":"dec_oai_real",` +
+		`"usage":{"input_tokens":30,"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":0},"output_tokens":1}}`
+	srv, _, rec := postSystemOneTranslate(t, map[string]decisionsReply{"/v1/decisions": {http.StatusOK, refused}}, "dev-secret")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Error struct{ Code, Message string } `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil || env.Error.Code != codeSystemOneRefused || !strings.Contains(env.Error.Message, "ok, q1") {
+		t.Fatalf("body = %s, want a systemone.refused envelope naming ok and q1", rec.Body.String())
+	}
+	got := lastUsageEvent(t, srv)
+	if got.ErrorCode != codeSystemOneRefused || got.Status != "error" || got.HTTPStatus != http.StatusUnprocessableEntity || got.ProviderPath != "/v1/decisions" {
+		t.Fatalf("row = %+v, want a systemone.refused 422 row on /v1/decisions", got)
+	}
+	// The upstream answered and was paid for: its tokens are recorded.
+	if got.InputTokens != 10 || got.CachedTokens != 20 || got.OutputTokens != 1 {
+		t.Fatalf("row tokens = in %d cached %d out %d, want 10/20/1", got.InputTokens, got.CachedTokens, got.OutputTokens)
+	}
+}
+
+func TestSystemOneTranslateUpstreamErrorsAreNormalized(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		body        string
+		wantMessage string
+	}{
+		{"400 error object", http.StatusBadRequest, `{"error":{"message":"too many questions","type":"invalid_request_error","param":null,"code":null}}`, "too many questions"},
+		{"422 detail string", http.StatusUnprocessableEntity, `{"detail":"bad input"}`, "bad input"},
+		{"501 adds guidance", http.StatusNotImplemented, `{"error":{"message":"no read strategy"}}`, systemOneNotImplementedGuidance},
+		{"500 unknown shape", http.StatusInternalServerError, `<html>oops</html>`, "the OpenAI Decisions upstream answered 500"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, rec := postSystemOneTranslate(t, map[string]decisionsReply{"/v1/decisions": {tc.status, tc.body}}, "dev-secret")
+
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, tc.status, rec.Body.String())
+			}
+			var env struct {
+				Error struct{ Code, Message, Type string } `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("body is not an error envelope: %v; %s", err, rec.Body.String())
+			}
+			if env.Error.Code != codeSystemOneUpstreamError || env.Error.Type != "upstream_error" || !strings.Contains(env.Error.Message, tc.wantMessage) || !strings.Contains(env.Error.Message, "OpenAI Decisions upstream") {
+				t.Fatalf("envelope = %+v, want systemone.upstream_error/upstream_error naming the OpenAI Decisions upstream and carrying %q", env.Error, tc.wantMessage)
+			}
+			got := lastUsageEvent(t, srv)
+			if got.Status != "error" || got.HTTPStatus != tc.status || got.ErrorCode != "upstream."+strconv.Itoa(tc.status) || got.ProviderPath != "/v1/decisions" {
+				t.Fatalf("row = %+v, want an upstream.%d error row on /v1/decisions", got, tc.status)
+			}
+		})
+	}
+}
+
+func TestSystemOneTranslateIncompleteAnswerIs502(t *testing.T) {
+	const missing = `{"answers":[{"type":"predicate","name":"ok","probability":0.9}],"usage":{"input_tokens":5,"output_tokens":1}}`
+	srv, _, rec := postSystemOneTranslate(t, map[string]decisionsReply{"/v1/decisions": {http.StatusOK, missing}}, "dev-secret")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), codeSystemOneUpstreamError)
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.ErrorCode != codeSystemOneUpstreamError || got.HTTPStatus != http.StatusBadGateway || got.ProviderPath != "/v1/decisions" {
+		t.Fatalf("row = %+v, want a systemone.upstream_error 502 row on /v1/decisions", got)
+	}
+}
+
+func TestSystemOneTranslateNormalization(t *testing.T) {
+	cases := []struct {
+		secret string
+		want   float64
+	}{
+		{decisionsNormSecret, 0.75}, // 0.6 / 0.8
+		{"dev-secret", 0.5},         // the upstream's own
+	}
+	for _, tc := range cases {
+		t.Run(tc.secret, func(t *testing.T) {
+			_, _, rec := postSystemOneTranslate(t, defaultDecisionsReplies(), tc.secret)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+			var got struct {
+				Answers map[string]struct {
+					Confidence float64 `json:"confidence"`
+				} `json:"answers"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || math.Abs(got.Answers["q1"].Confidence-tc.want) > 1e-9 {
+				t.Fatalf("body = %s, want q1 confidence %v", rec.Body.String(), tc.want)
+			}
+		})
 	}
 }

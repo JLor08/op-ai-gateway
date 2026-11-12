@@ -44,6 +44,8 @@ import {
   decisionsModeForKind,
   decisionsModeOrDefault,
   decisionsPassthroughOffered,
+  systemOneModeForKind,
+  systemOneTranslateOffered,
   defaultDecisionsMode,
   defaultSystemOneMode,
   systemOneModeOrDefault,
@@ -417,6 +419,7 @@ export function ApplicationSection({
     // A selected passthrough is not servable by llama.cpp: the backend would
     // refuse the save, so it becomes auto here (and resets server-side too).
     setDecisionsMode(decisionsModeForKind(decisionsMode, newType));
+    setSystemOneMode(systemOneModeForKind(systemOneMode, newType));
     setType(newType);
   }
 
@@ -494,7 +497,7 @@ export function ApplicationSection({
       // update keeps the stored value, but the form shows the value it sends.
       // passthrough is refused for llama_cpp, so it is coerced to auto there.
       decisions_mode: decisionsModeForKind(decisionsMode, type),
-      systemone_mode: systemOneMode,
+      systemone_mode: systemOneModeForKind(systemOneMode, type),
       // Sent ONLY for a type that can honour it. buildBody restates `type` on
       // every save, and the backend selects the 400 arm
       // (application.responses_live_timings_unsupported) over the 409
@@ -994,6 +997,7 @@ export function ApplicationSection({
               decisionsMode={decisionsMode}
               systemOneMode={systemOneMode}
               decisionsPassthroughOffered={decisionsPassthroughOffered(type)}
+              systemOneTranslateOffered={systemOneTranslateOffered(type)}
               onDecisionsModeChange={setDecisionsMode}
               onSystemOneModeChange={setSystemOneMode}
               onLiveTimingsChange={setLiveTimings}

@@ -3481,6 +3481,10 @@ describe('decisions phase 2 i18n keys', () => {
       'errorApplicationDecisionsPassthroughUnsupported',
       'errorApplicationDecisionsPassthroughConflict',
       'errorRuntimeSpecDecisionsPassthroughUnsupported',
+      'errorApplicationSystemOneTranslateUnsupported',
+      'errorApplicationSystemOneTranslateConflict',
+      'errorRuntimeSpecSystemOneTranslateUnsupported',
+      'mappingSystemOneRoute',
     ] as const;
     for (const k of keys) {
       expect(messages.de[k].length, `de ${k}`).toBeGreaterThan(0);
@@ -3488,6 +3492,14 @@ describe('decisions phase 2 i18n keys', () => {
     }
     for (const locale of ['de', 'en'] as const) {
       expect(messages[locale].mappingDecisionsRoute('X')).toContain('X');
+      expect(messages[locale].mappingSystemOneRoute('X')).toContain('X');
+      // The note describes auto and translate for System One, not the old
+      // "passed through or disabled" pair.
+      expect(messages[locale].applicationDecisionsModeNote).toContain('/v1/systemone');
+      expect(messages[locale].applicationDecisionsModeNote).not.toMatch(
+        /durchgereicht oder deaktiviert|passed through or disabled/,
+      );
+      expect(messages[locale].providersIntro).toContain('gpt-6-luna');
     }
   });
 });

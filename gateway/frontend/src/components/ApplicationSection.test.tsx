@@ -1261,7 +1261,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(await screen.findByRole('option', { name: optionLabel }));
     }
 
-    it('sends the defaults auto and passthrough on create and keeps the selects disabled without the flavor', async () => {
+    it('sends the defaults auto and auto on create and keeps the selects disabled without the flavor', async () => {
       const { created } = renderSection();
       openCreate();
       expect(decisionsField()).toHaveAttribute('aria-disabled', 'true');
@@ -1269,7 +1269,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
       await waitFor(() => expect(created).toHaveLength(1));
       expect(created[0].decisions_mode).toBe('auto');
-      expect(created[0].systemone_mode).toBe('passthrough');
+      expect(created[0].systemone_mode).toBe('auto');
     });
 
     it('sends the chosen modes once the decisions flavor is ticked', async () => {
@@ -1303,6 +1303,59 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(updated).toHaveLength(1));
       expect(updated[0].body.decisions_mode).toBe('passthrough');
       expect(updated[0].body.systemone_mode).toBe('disabled');
+    });
+
+    // Phase 1 compatibility: migration 107 stored systemone_mode passthrough on
+    // every existing application. A save that never touches the control must
+    // resend it, with and without the decisions flavor, never the new default.
+    it.each([
+      ['with', ['openai', 'decisions']],
+      ['without', ['openai']],
+    ])(
+      'resends a stored systemone_mode passthrough untouched %s the decisions flavor',
+      async (_label, flavors) => {
+        const { updated } = renderSection({
+          apps: [makeApp({ id: 'app_1', api_flavors: flavors, systemone_mode: 'passthrough' })],
+        });
+        await screen.findByText('https://s1.example.test:8000');
+        fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+        fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+        await waitFor(() => expect(updated).toHaveLength(1));
+        expect(updated[0].body.systemone_mode).toBe('passthrough');
+      },
+    );
+
+    it('offers no System One translate for llama_cpp and vllm_sr and resets a selected one to auto', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.click(decisionsBox());
+      await pick(systemOneField(), t.applicationModeTranslate);
+      expect(systemOneField()).toHaveTextContent(t.applicationModeTranslate);
+
+      await selectType('llama_cpp');
+      expect(systemOneField()).toHaveTextContent(t.applicationDecisionsModeAuto);
+      fireEvent.mouseDown(systemOneField());
+      expect(screen.queryByRole('option', { name: t.applicationModeTranslate })).toBeNull();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+      await selectType('vllm_sr');
+      fireEvent.mouseDown(systemOneField());
+      expect(screen.queryByRole('option', { name: t.applicationModeTranslate })).toBeNull();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].systemone_mode).toBe('auto');
+    });
+
+    it('sends and seeds the System One translate mode', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.click(decisionsBox());
+      await pick(systemOneField(), t.applicationModeTranslate);
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].systemone_mode).toBe('translate');
     });
 
     it('offers no passthrough for llama_cpp and turns a selected passthrough into auto on the type change', async () => {
@@ -1352,7 +1405,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(created[0].responses_mode).toBe('disabled');
       expect(created[0].messages_mode).toBe('disabled');
       expect(created[0].decisions_mode).toBe('auto');
-      expect(created[0].systemone_mode).toBe('passthrough');
+      expect(created[0].systemone_mode).toBe('auto');
       expect(created[0].timeout_ms).toBe(600000);
       expect(created[0].health_check_path).toBe('/v1/systemone/models');
     });

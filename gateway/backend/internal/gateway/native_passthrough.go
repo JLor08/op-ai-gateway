@@ -233,10 +233,16 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	if apiFlavor == apiFlavorSpeech {
 		return "/v1/audio/speech"
 	}
-	// System One is answered here for the same reason: no EndpointMode to look
-	// up, no translate fallback, and none of the provider fallbacks below applies
-	// (they would answer {prefix}/chat/completions).
+	// System One has a mode, but not one endpointModeFor reads: like OpenAI
+	// Decisions below, the handler resolves the effective systemone mode to its
+	// concrete route after the target is chosen and stores it on its copy of the
+	// target (ADR-100). Translate calls the upstream's OpenAI /v1/decisions, any
+	// other route its own /v1/systemone; none of the provider fallbacks below
+	// applies (they would answer {prefix}/chat/completions).
 	if apiFlavor == apiFlavorSystemOne {
+		if target.SystemOneMode == routing.EndpointModeTranslate {
+			return "/v1/decisions"
+		}
 		return "/v1/systemone"
 	}
 	// OpenAI Decisions has a mode, but not one endpointModeFor reads: the
@@ -1220,10 +1226,11 @@ type nativeRelay struct {
 	reselect func(lost routing.Target, gone error)
 	// decisionsRewrite hands a decisions response to the buffered
 	// relayDecisionsResponse instead of the streaming copier: set on every
-	// translated /v1/decisions relay (the System One answer must be rewritten
-	// into the OpenAI shape), and on a /v1/decisions or /v1/systemone passthrough
-	// only for a token that opted into confidence normalization. Nil on every
-	// other relay, which keeps them on the copier byte for byte.
+	// translated /v1/decisions or /v1/systemone relay (the answer must be
+	// rewritten into the client's dialect), and on a /v1/decisions or
+	// /v1/systemone passthrough only for a token that opted into confidence
+	// normalization. Nil on every other relay, which keeps them on the copier
+	// byte for byte.
 	decisionsRewrite *decisionsRewrite
 }
 

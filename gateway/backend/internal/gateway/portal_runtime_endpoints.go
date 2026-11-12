@@ -173,6 +173,14 @@ var portalRuntimeSpecErrRows = []errRow{
 			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecDecisionsPassthroughUnsupported.Error()+": ")
 		},
 	},
+	{
+		err:    portal.ErrRuntimeSpecSystemOneTranslateUnsupported,
+		status: http.StatusBadRequest,
+		code:   "runtime_spec.systemone_translate_unsupported",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecSystemOneTranslateUnsupported.Error()+": ")
+		},
+	},
 	// Dynamic message, same shape as the row above: the service wraps the
 	// sentinel with the offending file's name and the rule it broke (never its
 	// content), and the operator needs that to fix the entry.

@@ -119,6 +119,13 @@ func newDecisionsTestServer(t *testing.T, upstreamURL string, mode routing.Endpo
 // the given type.
 func newDecisionsTestServerOfType(t *testing.T, upstreamURL string, mode routing.EndpointMode, appType string) *Server {
 	t.Helper()
+	return newDecisionsTestServerWithModes(t, upstreamURL, mode, routing.EndpointModePassthrough, appType)
+}
+
+// newDecisionsTestServerWithModes is newDecisionsTestServerOfType with the
+// application's systemone mode as well.
+func newDecisionsTestServerWithModes(t *testing.T, upstreamURL string, mode, systemOneMode routing.EndpointMode, appType string) *Server {
+	t.Helper()
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
@@ -145,7 +152,7 @@ func newDecisionsTestServerOfType(t *testing.T, upstreamURL string, mode routing
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-dec", Name: "Decisions Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-dec", ServerID: "srv-dec", Type: appType, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorDecisions}, DecisionsMode: mode, SystemOneMode: routing.EndpointModePassthrough, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-dec", ServerID: "srv-dec", Type: appType, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorDecisions}, DecisionsMode: mode, SystemOneMode: systemOneMode, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	for _, m := range []struct {
@@ -254,8 +261,8 @@ func TestValidateDecisionsRequest(t *testing.T) {
 
 // The codes are API surface: clients branch on them.
 func TestDecisionsErrorCodesAreStable(t *testing.T) {
-	got := []string{decisionsModelRequired, decisionsQuestionsRequired, decisionsStreamUnsupported, codeDecisionsEndpointDisabled, codeSystemOneEndpointDisabled, codeDecisionsUpstreamError, codeSystemOneUpstreamError}
-	want := []string{"decisions.model_required", "decisions.questions_required", "decisions.stream_unsupported", "decisions.endpoint_disabled", "systemone.endpoint_disabled", "decisions.upstream_error", "systemone.upstream_error"}
+	got := []string{decisionsModelRequired, decisionsQuestionsRequired, decisionsStreamUnsupported, codeDecisionsEndpointDisabled, codeSystemOneEndpointDisabled, codeDecisionsUpstreamError, codeSystemOneUpstreamError, codeSystemOneRefused}
+	want := []string{"decisions.model_required", "decisions.questions_required", "decisions.stream_unsupported", "decisions.endpoint_disabled", "systemone.endpoint_disabled", "decisions.upstream_error", "systemone.upstream_error", "systemone.refused"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("codes = %v, want %v", got, want)
 	}
@@ -505,25 +512,6 @@ func TestDecisionsServerAgentSpecPassthroughIsServed(t *testing.T) {
 
 	if rec.Code != http.StatusOK || prov.proxyCalls != 1 || prov.gotPath != "/v1/decisions" {
 		t.Fatalf("status = %d, calls = %d on %q, want 200 and one call on /v1/decisions; body = %s", rec.Code, prov.proxyCalls, prov.gotPath, rec.Body.String())
-	}
-}
-
-func TestSystemOneDisabledBySpecIs404(t *testing.T) {
-	prov := &recordingProxyProvider{respBody: decisionsS1Answer}
-	srv := newServerAgentDecisionsTestServer(t, prov, routing.EndpointModeAuto, routing.EndpointModePassthrough, true, routing.EndpointModeAuto, routing.EndpointModeDisabled)
-
-	rec := postSystemOne(t, srv, `{"model":"agent-decider","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}}`)
-
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
-	}
-	requireErrorCode(t, rec.Body.String(), codeSystemOneEndpointDisabled)
-	if prov.proxyCalls != 0 {
-		t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
-	}
-	got := lastUsageEvent(t, srv)
-	if got.ErrorCode != codeSystemOneEndpointDisabled || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/systemone" {
-		t.Fatalf("row = %+v, want a systemone.endpoint_disabled 404 row", got)
 	}
 }
 

@@ -50,7 +50,7 @@ const endpointModeLabelByKey: Record<
 };
 
 const decisionsModeOptions: DecisionsMode[] = ['auto', 'translate', 'passthrough', 'disabled'];
-const systemOneModeOptions: SystemOneMode[] = ['passthrough', 'disabled'];
+const systemOneModeOptions: SystemOneMode[] = ['auto', 'passthrough', 'translate', 'disabled'];
 
 const decisionsModeLabelByKey: Record<
   DecisionsMode,
@@ -94,6 +94,7 @@ export function ApiVariantControls({
   decisionsMode,
   systemOneMode,
   decisionsPassthroughOffered,
+  systemOneTranslateOffered,
   onDecisionsModeChange,
   onSystemOneModeChange,
   flavorsError,
@@ -116,13 +117,15 @@ export function ApiVariantControls({
   onLiveTimingsChange: (enabled: boolean) => void;
   // The POST /v1/decisions and POST /v1/systemone modes. Both only apply while
   // the decisions flavor is ticked, so both selects are disabled and show the
-  // defaults (auto / passthrough) while it is not -- the stored values are left
+  // defaults (auto / auto) while it is not -- the stored values are left
   // untouched, as with the responses/messages selects. Passthrough is not
   // offered for decisions where the server kind cannot answer OpenAI Decisions
   // natively (llama.cpp): decisionsPassthroughOffered says so.
   decisionsMode: DecisionsMode;
   systemOneMode: SystemOneMode;
   decisionsPassthroughOffered: boolean;
+  // false for the types the backend refuses systemone_mode translate for.
+  systemOneTranslateOffered: boolean;
   onDecisionsModeChange: (mode: DecisionsMode) => void;
   onSystemOneModeChange: (mode: SystemOneMode) => void;
   // A validation message for the flavor group, or undefined for none. The
@@ -203,11 +206,13 @@ export function ApiVariantControls({
         onChange={(e) => onSystemOneModeChange(e.target.value as SystemOneMode)}
         disabled={!decisionsEnabled}
       >
-        {systemOneModeOptions.map((m) => (
-          <option value={m} key={m}>
-            {t[decisionsModeLabelByKey[m]]}
-          </option>
-        ))}
+        {systemOneModeOptions
+          .filter((m) => m !== 'translate' || systemOneTranslateOffered)
+          .map((m) => (
+            <option value={m} key={m}>
+              {t[decisionsModeLabelByKey[m]]}
+            </option>
+          ))}
       </SelectField>
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>
         {t.applicationDecisionsModeNote}

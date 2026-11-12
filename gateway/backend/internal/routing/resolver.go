@@ -305,6 +305,15 @@ type Target struct {
 	// (vendorSubscription{Anthropic,OpenAI}Target); false on the api-key
 	// vendorAccountTarget and every self-hosted target.
 	Subscription bool
+	// VendorDecisionModel marks the target of a DECISION request for a vendor
+	// decision model (IsVendorDecisionModel: an OpenAI api-key account's
+	// gpt-6-luna, ADR-100). A vendor target has no mapping and so no capability
+	// rows; this mark is where the gateway's decisionVerdicts reads its one
+	// verdict from (decision_openai yes, decision no). Only vendorAccountModelTarget
+	// sets it, and only for a decision request (isVendorDecisionRequest), so a
+	// chat request for the same model keeps its target unchanged; false on every
+	// other target.
+	VendorDecisionModel bool
 	// OpenAIPathPrefix is the URL path segment OpenAICompatibleClient puts between
 	// Endpoint and the OpenAI-dialect resource ("/chat/completions", "/models"):
 	// the composed URLs are {Endpoint}{prefix}/chat/completions and {prefix}/models.
@@ -945,7 +954,7 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// posture (404, indistinguishable from an unknown model) the rest of the
 	// codebase takes and the e2e suite pins for chat.
 	capableFrom := len(candidates)
-	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities)
+	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities, req.APIFlavor)
 	if err != nil {
 		return Target{}, err
 	}
@@ -1123,9 +1132,16 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 //   - req.ServerOverrideID == "": a server-override request is a distinct routing
 //     path (handled before this is ever called) and must never land on a vendor.
 //     Re-checked here so the guarantee holds at this method's own boundary.
-//   - len(req.RequiredCapabilities) == 0: capability-gated routing (vision/image
-//     verdicts) is a self-hosted-mapping concern; a vendor Target carries no
-//     per-capability verdicts, so such a request skips the branch entirely.
+//   - no capability list, or a decision request (vendorCapabilitiesEligible):
+//     capability-gated routing (vision/image/speech verdicts) is a
+//     self-hosted-mapping concern; a vendor Target carries no per-capability
+//     verdicts, so such a request skips the branch entirely. The ONE opt-in is a
+//     decision request (isVendorDecisionRequest: the decisions flavor with
+//     exactly [any_decision], ADR-100), and for it only an OpenAI api-key
+//     account's decision models are considered (IsVendorDecisionModel), so an
+//     Anthropic, subscription, Gemini or OpenAI-compatible account is never
+//     chosen for one, whatever its rows are named. A request on the decisions
+//     flavor WITHOUT that requirement is declined too.
 //   - apiFlavor != APIFlavorOpenAIImages: the images relay has no vendor path in
 //     this milestone (the Target serves the text flavors via translate only).
 //
@@ -1155,47 +1171,10 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 	if err != nil {
 		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
 	}
+	decision := isVendorDecisionRequest(req, apiFlavor)
 	for _, acc := range accounts {
-		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
-		// disabled accounts are skipped and fall through to the standard path.
-		if acc.Status != VendorAccountStatusActive {
-			continue
-		}
-		// The vendor_subscriptions_enabled switch: while it is off a SUBSCRIPTION
-		// account does not serve (api_key accounts are untouched) and falls through
-		// to the standard path like any other skipped account. The account is not
-		// deleted, so switching the setting back on restores it. The model listing
-		// applies the same skip (portal ownVendorAccountModels); the two must move
-		// together or served_flavors parity breaks.
-		if acc.AuthType == VendorAuthSubscription && !r.subscriptionsAllowed() {
-			continue
-		}
-		// Per-token access (the opt-in): the grant above decided REACH; a token only
-		// USES the accounts its VendorAccess policy covers, under the token-effective
-		// prefix. all:true covers the principal's OWN accounts only; an account
-		// shared with it is used only when the policy names it (per-account opt-in).
-		// The zero policy denies every account, so a token that was never granted
-		// vendor access resolves nothing here. TokenVendorPrefix is the same helper
-		// the model listing uses, so advertised names equal routable names.
-		prefix, allowed := TokenVendorPrefix(token, acc)
-		if !allowed {
-			continue
-		}
-		// An OpenAI SUBSCRIPTION account now serves BOTH openai inbound shapes
-		// (Milestone 5c): a fine openai_responses request is forwarded LOSSLESSLY to
-		// the ChatGPT backend via native passthrough (unchanged M5b behaviour), and a
-		// chat-flavor request is TRANSLATED to the Responses protocol by
-		// provider.OpenAIResponsesClient. vendorSubscriptionOpenAITarget reads
-		// req.APIFlavor (the FINE flavor, not the coarse apiFlavor param, which folds
-		// the two to "openai") to pick passthrough vs translate. It does NOT serve the
-		// anthropic dialect (the ChatGPT backend speaks Responses only, and the target
-		// carries [openai] only), so an anthropic_messages request to one is skipped
-		// here and falls through to the standard path and ErrNoModelRoute — the
-		// resolveVendorAccount branch bypasses filterServesEndpoint, so this flavor
-		// guard is explicit. (Anthropic subscription and every api_key account serve
-		// both dialects and are unaffected: translate, apart from an OpenAI api_key
-		// account's openai_responses passthrough.)
-		if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
+		prefix, ok := r.vendorAccountServes(token, acc, apiFlavor, decision)
+		if !ok {
 			continue
 		}
 		models, err := r.store.VendorAccountModels(ctx, acc.ID)
@@ -1207,6 +1186,65 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		}
 	}
 	return Target{}, false, nil
+}
+
+// vendorAccountServes is resolveVendorAccount's per-account gate, before any
+// model row is read: whether acc may serve this request for this token, and
+// under which token-effective prefix (TokenVendorPrefix). decision is
+// isVendorDecisionRequest for the request; for a decision request only an
+// OpenAI api-key account (isVendorDecisionAccount) serves, the model row then
+// decides (vendorAccountModelTarget).
+func (r *Resolver) vendorAccountServes(token auth.Token, acc VendorAccount, apiFlavor string, decision bool) (prefix string, ok bool) {
+	// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
+	// disabled accounts are skipped and fall through to the standard path.
+	if acc.Status != VendorAccountStatusActive {
+		return "", false
+	}
+	// The vendor_subscriptions_enabled switch: while it is off a SUBSCRIPTION
+	// account does not serve (api_key accounts are untouched) and falls through
+	// to the standard path like any other skipped account. The account is not
+	// deleted, so switching the setting back on restores it. The model listing
+	// applies the same skip (portal ownVendorAccountModels); the two must move
+	// together or served_flavors parity breaks.
+	if acc.AuthType == VendorAuthSubscription && !r.subscriptionsAllowed() {
+		return "", false
+	}
+	// Per-token access (the opt-in): the grant (routableVendorAccounts, in the
+	// caller) decided REACH; a token only USES the accounts its VendorAccess
+	// policy covers, under the token-effective prefix. all:true covers the
+	// principal's OWN accounts only; an account shared with it is used only when
+	// the policy names it (per-account opt-in).
+	// The zero policy denies every account, so a token that was never granted
+	// vendor access resolves nothing here. TokenVendorPrefix is the same helper
+	// the model listing uses, so advertised names equal routable names.
+	prefix, allowed := TokenVendorPrefix(token, acc)
+	if !allowed {
+		return "", false
+	}
+	// An OpenAI SUBSCRIPTION account now serves BOTH openai inbound shapes
+	// (Milestone 5c): a fine openai_responses request is forwarded LOSSLESSLY to
+	// the ChatGPT backend via native passthrough (unchanged M5b behaviour), and a
+	// chat-flavor request is TRANSLATED to the Responses protocol by
+	// provider.OpenAIResponsesClient. vendorSubscriptionOpenAITarget reads
+	// req.APIFlavor (the FINE flavor, not the coarse apiFlavor param, which folds
+	// the two to "openai") to pick passthrough vs translate. It does NOT serve the
+	// anthropic dialect (the ChatGPT backend speaks Responses only, and the target
+	// carries [openai] only), so an anthropic_messages request to one is skipped
+	// here and falls through to the standard path and ErrNoModelRoute — the
+	// resolveVendorAccount branch bypasses filterServesEndpoint, so this flavor
+	// guard is explicit. (Anthropic subscription and every api_key account serve
+	// both dialects and are unaffected: translate, apart from an OpenAI api_key
+	// account's openai_responses passthrough.)
+	if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
+		return "", false
+	}
+	// A decision request (ADR-100) is served by an OpenAI api-key account only:
+	// the one vendor backend with an OpenAI /v1/decisions. Checked here, before the
+	// model read, so no other account is even asked for its rows.
+	if decision && !isVendorDecisionAccount(acc) {
+		return "", false
+	}
+	return prefix, true
 }
 
 // vendorAccountModelMatch returns the dispatch target for the FIRST model row whose
@@ -1234,12 +1272,14 @@ func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, pre
 // vendorAccountRoutingEligible reports whether the request is one the vendor-account
 // path may serve at all, before any store lookup. A request that overrides the
 // server, demands capabilities, or is the images flavor (none of which a vendor
-// account models) is left to the standard path.
+// account models) is left to the standard path. The one capability list it
+// admits is a decision request's [any_decision] (vendorCapabilitiesEligible,
+// ADR-100), which the decision model of an OpenAI api-key account answers.
 func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.Request, apiFlavor string) bool {
 	return r.vendorOn() &&
 		vendorPrincipalEligible(token) &&
 		req.ServerOverrideID == "" &&
-		len(req.RequiredCapabilities) == 0 &&
+		vendorCapabilitiesEligible(req, apiFlavor) &&
 		apiFlavor != APIFlavorOpenAIImages
 }
 
@@ -1276,8 +1316,18 @@ func (r *Resolver) routableVendorAccounts(ctx context.Context, token auth.Token)
 // rather than defaulting to either vendor's endpoint, which would misroute its
 // sealed OAuth token. An api_key account builds a target, except a preset-vendor
 // one (OpenAI-compatible or native Gemini) with no stored root URL, which fails
-// closed the same way.
+// closed the same way. A decision request (isVendorDecisionRequest) builds one
+// only for a decision model (IsVendorDecisionModel), with the decision route
+// (withVendorDecisionRoute), and fails closed for any other row.
 func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+	if isVendorDecisionRequest(req, apiFlavor) {
+		// A decision request builds a target for a decision model only, and fails
+		// closed for every other row (the caller then tries the next account).
+		if !IsVendorDecisionModel(acc, m) {
+			return Target{}, false
+		}
+		return withVendorDecisionRoute(vendorAccountTarget(acc, m, req.Model, apiFlavor, req.APIFlavor)), true
+	}
 	if acc.AuthType != VendorAuthSubscription {
 		if IsPresetVendor(acc.Vendor) && strings.TrimSpace(acc.BaseURL) == "" {
 			// A misconfigured account (no root url) must not route to a broken
@@ -1562,7 +1612,7 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 		}
 	}
 	mine = filterServesEndpoint(mine, req.APIFlavor)
-	mine, err = r.filterCapable(ctx, mine, req.RequiredCapabilities)
+	mine, err = r.filterCapable(ctx, mine, req.RequiredCapabilities, req.APIFlavor)
 	if err != nil {
 		return Target{}, err
 	}
@@ -1677,8 +1727,10 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 // The rows are judged for the candidate's kind (capabilityRowsForKind): a
 // decision_openai verdict does not count on a kind that cannot take a
 // /v1/decisions passthrough, so such a candidate is not kept for any_decision
-// only to be refused after resolve.
-func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string) ([]MappingCandidate, error) {
+// only to be refused after resolve. For a decision request (fineFlavor) an
+// ordinary candidate must also have a route under its endpoint mode
+// (candidateCapable, decisionRouteServes).
+func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string, fineFlavor string) ([]MappingCandidate, error) {
 	if len(required) == 0 || len(cands) == 0 {
 		return cands, nil
 	}
@@ -1696,19 +1748,63 @@ func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, 
 	}
 	out := cands[:0:0]
 	for _, c := range cands {
-		if capabilityRowsSatisfy(capabilityRowsForKind(caps[c.Mapping.ID], c.Application.Type), required) {
+		if candidateCapable(c.Application, caps[c.Mapping.ID], required, fineFlavor) {
 			out = append(out, c)
 		}
 	}
 	return out, nil
 }
 
+// candidateCapable is the capability verdict on one candidate, shared by
+// filterCapable and the affinity gate (affinityCapabilityVerdict): rows, the
+// mapping's verdict rows, judged for app's kind (capabilityRowsForKind),
+// satisfy every required capability, and for a decision request app has a
+// route under its endpoint mode (decisionRouteServes).
+func candidateCapable(app Application, rows []CapabilityRow, required []string, fineFlavor string) bool {
+	rows = capabilityRowsForKind(rows, app.Type)
+	return capabilityRowsSatisfy(rows, required) && decisionRouteServes(app, rows, fineFlavor)
+}
+
+// decisionRouteServes reports whether an ORDINARY application has a route for a
+// decision request of fineFlavor: EffectiveSystemOneRoute over its
+// SystemOneMode for /v1/systemone (the coarse decisions flavor),
+// EffectiveDecisionsRoute over its DecisionsMode for /v1/decisions
+// (openai_decisions), each over the mapping's decision and decision_openai
+// verdicts in rows. [any_decision] alone admits a mapping with either verdict,
+// but the stored mode can leave it no route: migration 107 stored
+// systemone_mode passthrough on every existing row, and such a row with only
+// decision_openai cannot answer /v1/systemone. Kept as a candidate it could
+// win the selection against a decision-capable sibling and be refused after
+// resolve with routing.model_not_capable. A disabled mode is ok here;
+// filterServesEndpoint already dropped it.
+//
+// A server_agent application is always true: its effective mode lives on the
+// runtime spec, unknown before resolve, so the post-resolve route decides
+// (settleDecisionRoute). Every other flavor is true.
+func decisionRouteServes(app Application, rows []CapabilityRow, fineFlavor string) bool {
+	if app.Type == ProviderServerAgent {
+		return true
+	}
+	route, mode := EffectiveSystemOneRoute, app.SystemOneMode
+	switch fineFlavor {
+	case APIFlavorDecisions:
+	case APIFlavorOpenAIDecisions:
+		route, mode = EffectiveDecisionsRoute, app.DecisionsMode
+	default:
+		return true
+	}
+	byName := CapabilityRowsByName(rows)
+	_, ok := route(app.Type, mode, byName[CapabilityDecision].Verdict == CapabilityYes, byName[CapabilityDecisionOpenAI].Verdict == CapabilityYes)
+	return ok
+}
+
 // capabilityRowsSatisfy reports whether rows satisfy every required
 // capability. A name is satisfied by a literal "yes" verdict row, except
 // CapabilityImageEdit, which is DERIVED (ImpliedImageEdit). Shared by
-// filterCapable and resolveAffinity's own gate, which reads its rows from a
-// different place; every satisfaction decision funnels through here, so the
-// derivation has exactly one place to apply in routing.
+// filterCapable and resolveAffinity's own gate (both via candidateCapable),
+// which read their rows from different places; every satisfaction decision
+// funnels through here, so the derivation has exactly one place to apply in
+// routing.
 func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 	byName := CapabilityRowsByName(rows)
 	for _, name := range required {
@@ -1905,16 +2001,18 @@ func (r *Resolver) affinityServer(ctx context.Context, app Application) (server 
 // is every chat request: the gate is skipped, not evaluated, so no verdict can
 // refuse a pin that was never asked about a capability.
 //
-// kind is the pinned application's type; the gate judges the rows for it
-// (capabilityRowsForKind), as filterCapable does for a fresh candidate.
-func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID, kind string, required []string) (liveProgressSupport string, satisfied bool) {
+// app is the pinned application and fineFlavor the request's fine flavor; the
+// gate judges the rows as filterCapable does for a fresh candidate
+// (candidateCapable: the rows for the app's kind, and for a decision request
+// the route under its endpoint mode).
+func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID string, app Application, required []string, fineFlavor string) (liveProgressSupport string, satisfied bool) {
 	caps, capErr := r.store.MappingCapabilities(ctx, mappingID)
 	if capErr == nil {
 		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
 			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
 		}
 	}
-	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(capabilityRowsForKind(caps, kind), required)) {
+	if len(required) > 0 && (capErr != nil || !candidateCapable(app, caps, required, fineFlavor)) {
 		return liveProgressSupport, false
 	}
 	return liveProgressSupport, true
@@ -1990,7 +2088,7 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 	// one of the pinned mapping's own on the pinned server) -- so unlike the two
 	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
 	// on the capability list, and does not need to be.
-	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, app.Type, req.RequiredCapabilities)
+	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, app, req.RequiredCapabilities, req.APIFlavor)
 	if !capable {
 		return Target{}, false, nil
 	}
@@ -3003,7 +3101,7 @@ func (r *Resolver) memberPool(ctx context.Context, token auth.Token, name, apiFl
 	// all capability-gated must read as memberNoMapping (unknown model), the same
 	// no-leak posture the provisioning gate above already uses, not as
 	// memberUnavailable (a gated-but-real member).
-	return r.filterCapable(ctx, cands, required)
+	return r.filterCapable(ctx, cands, required, fineFlavor)
 }
 
 // groupVoiceScope is the group-level voice PRE-PASS: before any member is visited it

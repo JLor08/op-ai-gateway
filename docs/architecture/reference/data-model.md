@@ -751,9 +751,9 @@ plausible-looking validation rule would break the normal case:
 - **`decisions_mode`/`systemone_mode` (`applications`, `agent_runtime_specs`) are
   `text` like the pair below**, storing the lowercase `EndpointMode` string, with no CHECK
   constraint: `decisions_mode` is `auto`, `translate`, `passthrough` or `disabled` (`auto`
-  exists for this field only), `systemone_mode` is `passthrough` or `disabled`. The scan
-  normalizes a blank value to the default, migration 107 backfills every existing row, and
-  the portal substitutes `auto`/`passthrough` for a blank request field before the write.
+  exists for this field only), `systemone_mode` takes the same four values since Phase 4 (ADR-100). The scan
+  normalizes a blank value to the read-time default (`auto` for `decisions_mode`, `passthrough` for `systemone_mode`, which keeps a pre-Phase-4 blank column behaving as before), migration 107 backfills every existing row, and
+  the portal and API write `auto`/`auto` for a blank request field on a **new** row; existing rows keep their stored value.
   `decisions_mode = 'passthrough'` is never stored for a `llama_cpp` application or spec
   (refused at save, reset to `auto` on a retype), but nothing in the schema enforces it
   ([API Surface](api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode)).

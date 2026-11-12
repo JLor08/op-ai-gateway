@@ -90,7 +90,7 @@ func TestPortalApplicationDecisionModesReachTheWire(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if created.DecisionsMode != "auto" || created.SystemOneMode != "passthrough" {
+	if created.DecisionsMode != "auto" || created.SystemOneMode != "auto" {
 		t.Fatalf("defaults = %q/%q", created.DecisionsMode, created.SystemOneMode)
 	}
 
@@ -99,7 +99,9 @@ func TestPortalApplicationDecisionModesReachTheWire(t *testing.T) {
 		status           int
 	}{
 		{"bad decisions_mode", `{"type":"vllm","port":8401,"scheme":"http","decisions_mode":"bogus"}`, "application.endpoint_mode_invalid", http.StatusBadRequest},
-		{"systemone translate", `{"type":"vllm","port":8402,"scheme":"http","systemone_mode":"translate"}`, "application.endpoint_mode_invalid", http.StatusBadRequest},
+		{"bad systemone_mode", `{"type":"vllm","port":8402,"scheme":"http","systemone_mode":"bogus"}`, "application.endpoint_mode_invalid", http.StatusBadRequest},
+		{"llama_cpp systemone translate", `{"type":"llama_cpp","port":8406,"scheme":"http","systemone_mode":"translate"}`, "application.systemone_translate_unsupported", http.StatusBadRequest},
+		{"vllm_sr systemone translate", `{"type":"vllm_sr","port":8407,"scheme":"http","systemone_mode":"translate"}`, "application.systemone_translate_unsupported", http.StatusBadRequest},
 		{"llama_cpp passthrough", `{"type":"llama_cpp","port":8403,"scheme":"http","decisions_mode":"passthrough"}`, "application.decisions_passthrough_unsupported", http.StatusBadRequest},
 		{"vllm_sr passthrough", `{"type":"vllm_sr","port":8405,"scheme":"http","decisions_mode":"passthrough"}`, "application.decisions_passthrough_unsupported", http.StatusBadRequest},
 	} {
@@ -123,6 +125,11 @@ func TestPortalApplicationDecisionModesReachTheWire(t *testing.T) {
 		srv.ServeHTTP(patch, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+llama.ID, `{"decisions_mode":"passthrough"}`))
 		if patch.Code != http.StatusConflict || errorBodyOf(t, patch) != "application.decisions_passthrough_conflict" {
 			t.Fatalf("status = %d code = %q, body = %s", patch.Code, errorBodyOf(t, patch), patch.Body.String())
+		}
+		patch = httptest.NewRecorder()
+		srv.ServeHTTP(patch, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+llama.ID, `{"systemone_mode":"translate"}`))
+		if patch.Code != http.StatusConflict || errorBodyOf(t, patch) != "application.systemone_translate_conflict" {
+			t.Fatalf("systemone translate: status = %d code = %q, body = %s", patch.Code, errorBodyOf(t, patch), patch.Body.String())
 		}
 	})
 }

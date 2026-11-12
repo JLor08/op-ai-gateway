@@ -93,6 +93,10 @@ var (
 	// "passthrough" on a runtime spec whose effective type is llama_cpp
 	// (llama-server has no /v1/decisions route; ADR-098). HTTP 400.
 	ErrRuntimeSpecDecisionsPassthroughUnsupported = errors.New("runtime_spec.decisions_passthrough_unsupported")
+	// ErrRuntimeSpecSystemOneTranslateUnsupported rejects systemone_mode
+	// "translate" on a runtime spec whose effective type has no OpenAI
+	// /v1/decisions (llama_cpp, vllm_sr; ADR-100). HTTP 400.
+	ErrRuntimeSpecSystemOneTranslateUnsupported = errors.New("runtime_spec.systemone_translate_unsupported")
 	// ErrRuntimeSpecFlavorInvalid rejects an api_flavors entry that is not
 	// openai/anthropic. HTTP 400.
 	ErrRuntimeSpecFlavorInvalid = errors.New("runtime_spec.flavor_invalid")
@@ -705,8 +709,8 @@ type PutRuntimeSpecRequest struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
-	// DecisionsMode / SystemOneMode: absent or "" defaults to auto /
-	// passthrough, like the modes above (see validateRuntimeSpecRequest).
+	// DecisionsMode / SystemOneMode: absent or "" defaults to auto / auto,
+	// like the modes above (see validateRuntimeSpecRequest).
 	DecisionsMode string `json:"decisions_mode"`
 	SystemOneMode string `json:"systemone_mode"`
 	// ResponsesLiveTimingsEnabled: a POINTER inside an otherwise
@@ -1317,9 +1321,9 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		return runtimeSpecFields{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
 			ErrRuntimeSpecResponsesLiveTimingsUnsupported, string(effectiveSpecKind))
 	}
-	if f.decisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(string(effectiveSpecKind)) {
-		return runtimeSpecFields{}, fmt.Errorf("%w: decisions_mode passthrough is not available for a runtime spec of effective type %q",
-			ErrRuntimeSpecDecisionsPassthroughUnsupported, string(effectiveSpecKind))
+	if err := refuseIncapableDecisionModes(f.decisionsMode, f.systemOneMode, string(effectiveSpecKind), "a runtime spec of effective type",
+		ErrRuntimeSpecDecisionsPassthroughUnsupported, ErrRuntimeSpecSystemOneTranslateUnsupported); err != nil {
+		return runtimeSpecFields{}, err
 	}
 	// VisibleDevicesMode: an omitted mode defaults to "env" (today's
 	// behavior); a bad value is a LATER task's validation (mode validation
@@ -1510,7 +1514,7 @@ func runtimeSpecEndpointModes(req PutRuntimeSpecRequest) (responses, messages ro
 }
 
 // runtimeSpecDecisionModes resolves decisions_mode and systemone_mode: absent
-// or empty is auto / passthrough, anything else must be valid for its field.
+// or empty is auto / auto, anything else must be valid for its field.
 func runtimeSpecDecisionModes(req PutRuntimeSpecRequest) (decisions, systemOne routing.EndpointMode, err error) {
 	return resolveDecisionModes(req.DecisionsMode, req.SystemOneMode, ErrRuntimeSpecEndpointModeInvalid)
 }

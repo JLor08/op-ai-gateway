@@ -1053,7 +1053,7 @@ func TestCreateVendorAccountSeedsTheCatalogByAuthType(t *testing.T) {
 		{
 			"api_key",
 			CreateVendorAccountRequest{Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey, Name: "Platform", APIKey: vendorAccountTestKey},
-			[]string{"gpt-4.1", "gpt-5", "gpt-5-mini", "o3"},
+			[]string{"gpt-4.1", "gpt-5", "gpt-5-mini", "gpt-6-luna", "o3"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -152,6 +152,12 @@ type vendorAccountModels struct {
 //     anthropic dialect (its Target carries [openai] only). So its models map to
 //     {openai} here. Listing them under anthropic would put them in
 //     /anthropic/v1/models where an anthropic call then 404s, breaking parity.
+//   - A DECISION model of an OpenAI api-key account (routing.IsVendorDecisionModel,
+//     gpt-6-luna, ADR-100) is listed under its account's dialects AND the
+//     decisions flavor (vendorModelServedFlavors): the resolver routes a chat
+//     request for it exactly as for any other model of the account, and opts a
+//     decision request into the vendor path for it, so each of those flavors is
+//     routable and advertised.
 //
 // A name several accounts serve is advertised under the UNION of the dialects they
 // serve it on, because the resolver chooses an account per (name, dialect), not per
@@ -184,8 +190,8 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) (
 	}
 	out := make(map[string]map[string]struct{})
 	for _, am := range owned {
-		flavors := vendorAccountServedFlavors(am.Account)
 		for _, m := range am.Models {
+			flavors := vendorModelServedFlavors(am.Account, m)
 			set := out[m.GatewayModel]
 			if set == nil {
 				set = make(map[string]struct{}, len(flavors))
@@ -228,6 +234,20 @@ func (s *Service) vendorDashboardRoutes(ctx context.Context, token auth.Token) [
 	return out
 }
 
+// vendorModelServedFlavors is the flavors model m of account acc is listed
+// under: its account's dialects (vendorAccountServedFlavors), plus the
+// decisions flavor for a decision model (routing.IsVendorDecisionModel, served
+// by /v1/decisions via passthrough and by /v1/systemone via translate,
+// ADR-100). A chat request for a decision model routes as before, so its chat
+// dialects stay listed.
+func vendorModelServedFlavors(acc routing.VendorAccount, m routing.VendorAccountModel) []string {
+	flavors := vendorAccountServedFlavors(acc)
+	if routing.IsVendorDecisionModel(acc, m) {
+		flavors = append(flavors, routing.APIFlavorDecisions)
+	}
+	return flavors
+}
+
 // vendorAccountServedFlavors is the dialects an account's models are dispatched
 // under. An OpenAI subscription account serves the openai dialect only (the ChatGPT
 // backend speaks Responses only); every other account serves both via translate.
@@ -236,6 +256,25 @@ func vendorAccountServedFlavors(acc routing.VendorAccount) []string {
 		return []string{routing.APIFlavorOpenAI}
 	}
 	return []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
+}
+
+// overlayVendorDecisionFlags sets the Decision and DecisionOpenAI listing flags
+// of the vendor decision models in vendor (the names it lists under the
+// decisions flavor, vendorModelServedFlavors) as their route implies (ADR-100):
+// /v1/decisions passes through to the vendor (decision_openai) and
+// /v1/systemone translates to it (decision). The flags are ORed in: a name a
+// self-hosted model shares is a decision model of the vendor too, and under
+// vendor_first the vendor serves it, so it is listed as one. The offering's
+// Capable makes the same choice (addVendorDecisionCandidates), so the listing
+// and the redirect agree.
+func overlayVendorDecisionFlags(decisionOn, decisionOpenAIOn map[string]bool, vendor map[string]map[string]struct{}) {
+	for name, flavors := range vendor {
+		if _, ok := flavors[routing.APIFlavorDecisions]; !ok {
+			continue
+		}
+		decisionOn[name] = true
+		decisionOpenAIOn[name] = true
+	}
 }
 
 // overlayVendorModels unions a principal's vendor-model flavor overlay (the

@@ -532,7 +532,7 @@ matrix:
 
 | Account | Serves | How |
 |---|---|---|
-| **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. |
+| **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. **A second exception, for the decision model only** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): a decision request (`POST /v1/decisions`, `POST /v1/systemone`) for `gpt-6-luna` gets the `decisions` flavor added, `DecisionsMode = passthrough` and `SystemOneMode = translate`, and reaches `https://api.openai.com/v1/decisions` (§4.2, *Api-key Decisions*). Its chat dialects stay listed and unchanged: chat completions and the `anthropic` dialect stay translate, and a `/v1/responses` request for it stays the passthrough of the first exception. |
 | **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed verbatim to `https://api.anthropic.com/v1/messages` instead (§4.1). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
@@ -543,8 +543,15 @@ The vendor branch is **skipped entirely** — the request falls through to the
 self-hosted path — when the module flag is off, the principal has **no identity the
 grant can be asked about** (neither a user id nor, for a service token, a service id),
 a **server-override** is set, the request is
-**capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image/speech/transcription), or
-the flavor is **images** (`openai_images`). A speech request (`/v1/audio/speech`,
+**capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image/speech/transcription)
+**with one exception**, or the flavor is **images** (`openai_images`). The exception is a
+**decision request**: the decisions flavor with exactly the derived `[any_decision]` list that both
+decision endpoints carry (`isVendorDecisionRequest`, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)). It is the **one** capability list that
+opts into this path, and for it only an OpenAI api-key account's decision model is considered (§4.2,
+*Api-key Decisions*); every other list (`image`, `image_edit`, `speech`, `transcription`, and any other)
+still skips the branch, and a request on the decisions flavor **without** the `[any_decision]` list is
+declined too (previously such a request, carrying no list, would have been admitted and matched a vendor
+model by name). A speech request (`/v1/audio/speech`,
 flavor `openai_audio`) is kept off this path by the capability list alone: the
 check has no `openai_audio` twin of the images test, so the speech handler always
 sets `RequiredCapabilities = ["speech"]`
@@ -1040,6 +1047,64 @@ to the serving account (§5).
   is a documented follow-up, not part of this passthrough.
   `previous_response_id` itself rides the create body and so reaches OpenAI
   intact.
+
+#### Api-key Decisions
+
+A **decision request** to an OpenAI **api-key** account is served by the platform's
+`https://api.openai.com/v1/decisions` ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373), Phase 4 of issue #373; the
+endpoints are [Compatibility & Inference §3.9 and §3.10](compatibility-and-inference.md#39-system-one-decisions)).
+Both decision endpoints reach it: `POST /v1/decisions` is **passed through**, and `POST /v1/systemone` is
+**translated** to it and back (§3.9 item 11). Nothing about the account changes; the vendor path just
+learns one more kind of request.
+
+- **Which models.** A model is a decision model when its account is an OpenAI api-key account and its row's
+  **upstream** id (the id sent to OpenAI, never the gateway name, so a prefix renames a model and does not make
+  one) is in a **fixed allowlist**: `routing.IsOpenAIDecisionModel`, today exactly `gpt-6-luna`
+  (`routing.IsVendorDecisionModel` adds the account test). The set is an unexported map in
+  `internal/routing/vendor_decisions.go`: there is **no portal flag, no stored row and no operator setting**,
+  so a new decision model is a code change. The match is exact (no prefix, no case folding).
+- **Admission.** `vendorAccountRoutingEligible` admits the request when it is a decision request
+  (`vendorCapabilitiesEligible`). `vendorAccountServes` then keeps its usual gates (the account **active**, the
+  token's §11 access and the token-effective prefix, which are **unchanged**, and the subscription skip) and adds
+  one: for a decision request only an OpenAI api-key account passes (`isVendorDecisionAccount`), **before any
+  model row is read**, so an Anthropic, Gemini, OpenAI-compatible or **subscription** account is never asked for
+  its rows. The model row then decides (`vendorAccountModelTarget`): a decision model builds a target, any other
+  row of the account fails closed and the next account is tried. A name matches on the effective public name
+  exactly as in §4.
+- **The target.** `withVendorDecisionRoute` takes the ordinary api-key target and adds `decisions` to its
+  `APIFlavors`, sets `DecisionsMode = passthrough` and `SystemOneMode = translate`, and marks it
+  `VendorDecisionModel`. The kind stays `vendor_openai`, which is a
+  `DecisionsPassthroughCapableKind`. A **chat** request for the same model builds the unchanged target, so
+  `gpt-6-luna` stays a chat model of the account.
+- **Verdicts without a mapping.** A vendor target has no mapping and so no capability rows. The post-resolve
+  route step (`decisionVerdicts`) therefore synthesizes them with **no store read**: `decision = false`,
+  `decision_openai = true`. `routing.EffectiveDecisionsRoute` then gives passthrough for
+  `/v1/decisions`, and `routing.EffectiveSystemOneRoute` gives translate for `/v1/systemone`. A vendor target
+  that is not a decision model answers no to both.
+- **The relay.** Both endpoints send `upstreamPath` = `/v1/decisions` to `https://api.openai.com`, with the
+  account's opened sealed key as `Authorization: Bearer` (§4.3), through the same native relay as a self-hosted
+  `vllm`: a `/v1/decisions` passthrough uses the streaming copier unless the token opted into confidence
+  normalization, and only the `/v1/systemone` translate route and a normalizing token take the buffered answer path (§3.10 item 7). The `/v1/systemone` body is rewritten by the reverse translator
+  (§3.9 item 12) and a vendor answer that refuses a question is the gateway's 422 `systemone.refused`.
+- **Usage.** The row carries the serving `AccountID`, the route in `provider_path` (`/v1/decisions` for both
+  routes, since both reach the vendor's endpoint) and the tokens read from the answer, **cached and cache-write
+  tokens included**. The **cost is 0**: the gateway's cost is derived from a mapping's energy and price-per-kWh,
+  which a vendor target does not have, and there is **no per-model pricing table** for vendor models.
+- **No ChatGPT subscription.** The subscription backend (`chatgpt.com/backend-api/codex`) has no Decisions
+  endpoint, so a subscription account is never a candidate and the seed catalog gives it no decision model. This
+  follows what OpenAI's own Codex client does: it calls `https://api.openai.com/v1/decisions` with an **API key
+  only**, and a ChatGPT login carries no api key (`openai/codex` at `d2f76324`,
+  `codex-rs/ext/guardian-v2/src/async_scorer/decisions.rs` and `codex-rs/login/src/auth/manager.rs`). Serving
+  decision requests from a subscription account by emulating them on a chat model is a separate, opt-in
+  follow-up, issue #380, and is not part of this.
+- **Upgrade note (live on upgrade).** No stored row changes, but the vendor decision route is live as soon as this
+  version runs, for **every token that already has §11 access to an OpenAI api-key account carrying `gpt-6-luna`**,
+  and that account is **billed** for what such a token sends. `gpt-6-luna` already passes the `gpt-*` chat heuristic,
+  and every api-key refresh now adds the row. The only switches are `vendor_accounts_enabled` and the per-token §11
+  policy (§7, §11); there is no decision-specific flag.
+- **Not verified live** (§10): an OpenAI api-key account with `gpt-6-luna` through both endpoints, the official
+  SDK against the vendor route, OpenAI's real error envelope on this endpoint, and whether the api-key
+  `/v1/models` lists `gpt-6-luna` at all (the refresh keeps it either way, §6.3).
 
 ### 4.3 Credential resolution at the edge
 
@@ -1871,7 +1936,7 @@ transaction.
 | Credential | Request | Kept | Provenance |
 |---|---|---|---|
 | OpenAI **subscription** | `GET https://chatgpt.com/backend-api/codex/models?client_version=<V>` with `Authorization: Bearer`, `ChatGPT-Account-Id` (left out when the account id is unknown) and `originator: codex_cli_rs` | entries whose `visibility` is `list` **and** whose `supported_in_api` is `true`; slug and display name | reverse-engineered, **live-confirmed** |
-| OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | ids that look chat-capable (below); the listing has no display name, so the id doubles as one | documented public API |
+| OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | ids that look chat-capable (below), plus the OpenAI Decisions models by name (`gpt-6-luna`); the listing has no display name, so the id doubles as one | documented public API |
 | Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models?limit=1000` with `x-api-key`, `anthropic-version` | every `data[].id` with its `display_name` | documented public API |
 | Anthropic **subscription** | the same URL with `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version` | as above | reverse-engineered, **VERIFY-LIVE** |
 | **OpenAI-compatible `api_key`** (x.ai, OpenRouter, Kilo, Google, Custom) | `GET {base}{prefix}/models` with `Authorization: Bearer`, the URL composed by the portal from the account's `base_url` and its preset (§4.4) and fetched by `vendorauth.DiscoverOpenAICompatibleModels(modelsURL, key)`, **not** through the provider client | every `data[].id`; display name from `display_name`, else `name` (OpenRouter sends `name`), else the id. For Google a leading `models/` is stripped from the id (and from a display name that was only the id standing in) | the providers' own endpoints, confirmed live 2026-10-10, **VERIFY-LIVE** |
@@ -1880,7 +1945,9 @@ transaction.
 An OpenAI api-key listing names every model the key reaches, with no capability
 data, so it is narrowed by a small heuristic: the `gpt-*`, `chatgpt-*` and
 o-series families (and fine-tunes of them), minus ids that mark an embedding,
-speech, image, moderation, realtime or completion-only model. A model the rule
+speech, image, moderation, realtime or completion-only model. **The OpenAI Decisions
+models are kept by name on top of the heuristic** (`isServedOpenAIAPIKeyModel`:
+`routing.IsOpenAIDecisionModel` or chat-capable). `gpt-6-luna` already passes the `gpt-*` chat heuristic today, so the name match only guards against a future marker that would drop it (§4.2, *Api-key Decisions*, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)). A model the rule
 does not recognize is left out — a missing model is added by a newer rule, while
 a non-chat model offered wrongly fails every request routed to it. **That heuristic
 stays OpenAI-only**: the OpenAI-compatible vendors keep every listed id exactly as
@@ -1940,7 +2007,16 @@ usable, the existing rows stay exactly as they were and the answer is
 deliberately `unverifiable` and not "OK, no models": a changed vendor schema or
 a filtered-out catalog is far likelier than a credential with no models, and an
 empty OK would let a schema change wipe a working set. A missing credential (no
-key set, subscription not connected) reads `unverifiable` too. Only a stored
+key set, subscription not connected) reads `unverifiable` too.
+
+**The decision models are kept across a refresh.** The seed catalog of an OpenAI api-key account
+carries `gpt-6-luna` (the OpenAI Decisions model, §4.2), and whether `api.openai.com/v1/models` lists it is
+**not known** (§10). So after a successful discovery, `withOpenAIDecisionModelRows` adds back a row for every
+decision model the vendor's listing lacks, for an OpenAI api-key account only (never a subscription or another
+vendor's account), with the account's current prefix like any discovered row. Those re-added rows are **not
+counted as discovered** (`refresh.discovered` and the `detail` text count what the vendor listed) and **do not
+satisfy** the "lists nothing usable" test above: a listing whose only usable model is the kept one is still
+`unverifiable`, and the existing rows stay. Only a stored
 credential that cannot be opened (lost key, corrupt blob) is an error,
 `409 vendor_account.credential_unreadable`; after a connect it is logged and
 ignored.
@@ -2065,7 +2141,7 @@ which applies to self-hosted models.
 
 | Surface | Vendor models of the accounts the caller can route to |
 |---|---|
-| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`, `/openai/api/v1/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). A vendor-only model has no `context_size`, so `/v1/models` lists it without `context_length` and `/api/v1/models` with `max_context_length: 0`. |
+| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`, `/openai/api/v1/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). A **decision model** of an OpenAI api-key account (`gpt-6-luna`) keeps its chat dialects and is **also** listed under the `decisions` flavor (`vendorModelServedFlavors`), so `GET /v1/systemone/models` offers it and its `decision` and `decision_openai` flags are both true (`overlayVendorDecisionFlags`). When a self-hosted model shares the name, the vendor flags are ORed into the listing and into the redirect offering, so the listing and the unknown-model redirect agree; the redirect's vendor candidates are guarded to the decisions flavor with exactly `[any_decision]` (`addVendorDecisionCandidates`), the one request the resolver serves from a vendor account. A vendor-only model has no `context_size`, so `/v1/models` lists it without `context_length` and `/api/v1/models` with `max_context_length: 0`. |
 | Portal chat picker and a regular user's **Models** page | Listed. |
 | **Dashboard "Live Model Routes"** (`GET /api/portal/dashboard`) | Listed, one row per model: the prefixed name, the vendor as provider, the account's name as host, status `active`. A vendor model has no server, so its row id is the account id plus the model; the portal keys rows by that id because two accounts may share a name and a model. |
 | **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
@@ -2482,7 +2558,7 @@ reasons are recorded deliberately, not in denial of them
   at connect, and an Anthropic subscription account for as long as that vendor's
   consumer-bearer listing stays unconfirmed. An OpenAI **`api_key`** account talks
   to `api.openai.com` and gets the full set (`gpt-5`, `gpt-5-mini`, `gpt-4.1`,
-  `o3`). An OpenAI **subscription** account is served by the Codex ChatGPT
+  `o3`, and `gpt-6-luna`, the OpenAI Decisions model of §4.2). An OpenAI **subscription** account is served by the Codex ChatGPT
   backend, which, as far as is known, does not serve `gpt-4.1` or `o3`; it is
   therefore seeded with only `gpt-5` and `gpt-5-mini`, so a working credential is
   never paired with a model its backend is known to refuse — the auth-versus-model
@@ -2497,6 +2573,14 @@ reasons are recorded deliberately, not in denial of them
   its owner refreshes the models or reconnects, so a subscription account created
   before the auth-type split still carries `gpt-4.1` and `o3` (which that backend
   rejects) until a successful discovery replaces them.
+- **The Decisions path on api-key accounts is built from OpenAI's documentation and the SDK
+  contract, not yet run live** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)).
+  **Not verified:** a real OpenAI api-key account with `gpt-6-luna` through both `/v1/decisions`
+  and `/v1/systemone`; the official OpenAI SDK against the vendor route; OpenAI's real error envelope
+  on this endpoint (the gateway relays a passthrough error verbatim and normalizes a translated one by
+  the shapes it knows); and whether the api-key `/v1/models` lists `gpt-6-luna` (which is why a refresh
+  keeps the row, §6.3). The model id comes from the Codex catalog, which listed it (§6.1), and from
+  OpenAI's own client calling the endpoint with an API key (§4.2).
 - **Discovery needs a live credential and a high enough `client_version`.** An
   access token that is expired and cannot be renewed — no refresh token came with
   it, the vendor rejects the refresh token (the account then reads

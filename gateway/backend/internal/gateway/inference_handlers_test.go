@@ -358,8 +358,9 @@ func TestSpeechInferenceShapeIsTheSpeechEndpointsIdentity(t *testing.T) {
 // TestSystemOneInferenceShapeIsTheEndpointsIdentity pins the shape
 // handleSystemOne hands the ONE preflight gate, through the function the handler
 // itself calls: the exact coarse flavor, the System One endpoint, and the
-// decision capability, which feeds the capability gate and keeps the request off
-// the vendor-account path.
+// any_decision requirement, which feeds the capability gate (either verdict
+// admits; the route is settled after the resolve) and keeps the request off the
+// vendor-account path.
 func TestSystemOneInferenceShapeIsTheEndpointsIdentity(t *testing.T) {
 	shape := systemOneInferenceShape("sys-decider")
 	if shape.apiFlavor != "decisions" {
@@ -371,8 +372,8 @@ func TestSystemOneInferenceShapeIsTheEndpointsIdentity(t *testing.T) {
 	if shape.model != "sys-decider" || shape.stream {
 		t.Fatalf("model/stream = %q/%v, want the routing model and a non-stream request", shape.model, shape.stream)
 	}
-	if !reflect.DeepEqual(shape.requiredCapabilities, []string{routing.CapabilityDecision}) {
-		t.Fatalf("requiredCapabilities = %v, want [%s]", shape.requiredCapabilities, routing.CapabilityDecision)
+	if !reflect.DeepEqual(shape.requiredCapabilities, []string{routing.CapabilityAnyDecision}) {
+		t.Fatalf("requiredCapabilities = %v, want [%s]", shape.requiredCapabilities, routing.CapabilityAnyDecision)
 	}
 }
 

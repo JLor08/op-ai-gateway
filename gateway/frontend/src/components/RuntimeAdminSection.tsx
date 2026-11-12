@@ -83,6 +83,8 @@ import {
   decisionsModeForKind,
   decisionsModeOrDefault,
   decisionsPassthroughOffered,
+  systemOneModeForKind,
+  systemOneTranslateOffered,
   defaultDecisionsMode,
   defaultSystemOneMode,
   systemOneModeOrDefault,
@@ -318,7 +320,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
     decisions_mode: 'auto',
-    systemone_mode: 'passthrough',
+    systemone_mode: 'auto',
     responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
@@ -3368,7 +3370,7 @@ export function RuntimeAdminSection({
       // Always sent: omitting them on this full-document PUT would reset them to
       // the defaults. passthrough is refused for llama_cpp, so it is coerced.
       decisions_mode: decisionsModeForKind(specDecisionsMode, specType),
-      systemone_mode: specSystemOneMode,
+      systemone_mode: systemOneModeForKind(specSystemOneMode, specType),
       // Two independent reasons to omit, and both must hold before the key is
       // sent.
       //
@@ -4931,6 +4933,7 @@ export function RuntimeAdminSection({
               decisionsMode={specDecisionsMode}
               systemOneMode={specSystemOneMode}
               decisionsPassthroughOffered={decisionsPassthroughOffered(specType)}
+              systemOneTranslateOffered={systemOneTranslateOffered(specType)}
               onDecisionsModeChange={setSpecDecisionsMode}
               onSystemOneModeChange={setSpecSystemOneMode}
               onLiveTimingsChange={setSpecLiveTimings}
@@ -4986,6 +4989,7 @@ export function RuntimeAdminSection({
                 }
                 applySpecTypeFlavorDefaults(next);
                 setSpecDecisionsMode(decisionsModeForKind(specDecisionsMode, next));
+                setSpecSystemOneMode(systemOneModeForKind(specSystemOneMode, next));
                 setSpecType(next);
               }}
               sx={{ maxWidth: 340 }}

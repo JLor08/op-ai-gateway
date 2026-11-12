@@ -263,6 +263,8 @@ export type PortalModelMapping = {
   // otherwise translate, passthrough or disabled. Advisory and always present
   // on the wire; optional here like decisions_only.
   decisions_route?: DecisionsRoute;
+  // The same for POST /v1/systemone (#373 phase 4). Advisory, optional here.
+  systemone_route?: SystemOneRoute;
   // The audio performance metrics (#340), written by the audio measurement a
   // speed, capacity or both run takes on a speech or transcription mapping and
   // editable like the text metrics above, under the same metrics_locked:
@@ -413,9 +415,15 @@ export type DecisionsRoute = '' | 'translate' | 'passthrough' | 'disabled';
 
 export type DecisionsMode = 'auto' | EndpointMode;
 
-// POST /v1/systemone: the System One relay is either served as a raw
-// passthrough (the default) or not at all; it has no translate path.
-export type SystemOneMode = 'passthrough' | 'disabled';
+// POST /v1/systemone (#373 phase 4): 'auto' (the default) passes through when
+// the model answers System One and otherwise translates to OpenAI Decisions
+// when the model answers that; 'translate' always converts to OpenAI
+// Decisions (refused for llama_cpp and vllm_sr). For vllm_sr, auto behaves
+// like passthrough.
+export type SystemOneMode = 'auto' | 'passthrough' | 'translate' | 'disabled';
+
+// The route POST /v1/systemone takes for a mapping; '' when it has none.
+export type SystemOneRoute = '' | 'passthrough' | 'translate' | 'disabled';
 
 // How a group's members are walked: the manual priority order, or fastest
 // measured generation speed first.

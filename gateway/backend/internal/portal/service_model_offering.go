@@ -325,10 +325,37 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	if err != nil {
 		return emptyModelOffering()
 	}
+	addVendorDecisionCandidates(capable, callable, vendor, flavor, required)
 	return ModelOffering{
 		Callable: callable,
 		Capable:  capable,
 		Existing: existing,
+	}
+}
+
+// addVendorDecisionCandidates adds to capable the callable vendor decision
+// models (the names the vendor overlay lists under the decisions flavor,
+// vendorModelServedFlavors) for a decision request: flavor (coarse, as
+// ModelOfferingFor folds it) is decisions, which /v1/decisions and
+// /v1/systemone share, and required is exactly [any_decision]. That is the one
+// request the resolver opts into the vendor path (ADR-100), and such a model is
+// served by either decision endpoint, so it is a redirect candidate for both.
+// capableNames cannot see it, because it folds mapping views and a vendor model
+// has none. Every other flavor or list adds nothing, as the resolver serves
+// none of them from a vendor account. Like the listing's flags
+// (overlayVendorDecisionFlags) it is ORed in, also for a name a self-hosted
+// model shares.
+func addVendorDecisionCandidates(capable, callable map[string]struct{}, vendor map[string]map[string]struct{}, flavor string, required []string) {
+	if flavor != routing.APIFlavorDecisions || len(required) != 1 || required[0] != routing.CapabilityAnyDecision {
+		return
+	}
+	for name, flavors := range vendor {
+		if _, ok := flavors[routing.APIFlavorDecisions]; !ok {
+			continue
+		}
+		if _, ok := callable[name]; ok {
+			capable[name] = struct{}{}
+		}
 	}
 }
 
@@ -435,7 +462,7 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 	case routing.CapabilityTranscription:
 		return transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
 	case routing.CapabilityDecision:
-		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 	case routing.CapabilityDecisionOpenAI:
 		return decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 	case routing.CapabilityAnyDecision:
