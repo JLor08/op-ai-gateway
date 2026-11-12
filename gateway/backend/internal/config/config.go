@@ -323,9 +323,11 @@ func Load() (Config, error) {
 		MaxChatBlobBytes:          l.integer("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", 20<<20),
 		MaxRunHistoryBytes:        l.integer("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", 32<<20),
 		MaxImageEditBodyBytes:     l.integer("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", 32<<20),
+		// System One / decisions body cap: its own setting, the agent router's
+		// JSON buffer by default. Junk/0/negative -> the 32 MiB default.
+		MaxDecisionsBodyBytes: l.integer("OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES", 32<<20),
 		// Audio-transcription upload cap: a dedicated setting so operators can size
 		// audio independently of images. Junk/0/negative -> the 32 MiB default.
-		MaxDecisionsBodyBytes:          l.integer("OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES", 32<<20),
 		MaxAudioTranscriptionBodyBytes: l.integer("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES", 32<<20),
 		// Total-audio cap for one chat run (#279): long speech audio is spread across
 		// several blobs, each still under MaxChatBlobBytes, and this bounds their sum.

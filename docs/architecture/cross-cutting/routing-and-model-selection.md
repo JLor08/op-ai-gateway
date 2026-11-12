@@ -1122,12 +1122,14 @@ Runtime §7](agent-runtime-manager.md#7-feature-negotiation)).
 
 **Who writes the `decision` verdict.** `decision` (`routing.CapabilityDecision`) is the
 capability `POST /v1/systemone` gates on (`RequiredCapabilities = ["decision"]`, [ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373)),
-and it has **one** writer, the gateway's own System One probe
+and it has **one** automatic writer, the gateway's own System One probe
 (`probeSystemOne`, `cmd/gateway/app_health.go`, source `systemone_probe`, rank 1 like every
-probe, so an operator's `manual` `yes` outranks it). The probe asks the model one tiny
+probe), beside an operator's `manual` `yes`, which outranks it and which the probe never
+overwrites; the probe alone can state a `no`. The probe asks the model one tiny
 decision and states **yes** for a 2xx answer carrying an `answers.probe` object, **no** for a
 404 or a 501, and nothing for everything else (a timeout, a 400, a 503 while the model loads,
-and a 404 that is the agent router's own `runtime.*` envelope), which it retries after a five-minute back-off.
+and a 404 that is the agent router's own `runtime.*` envelope), which it retries after a five-minute back-off
+(doubling up to an hour for a 400, 405 or 422 refusal).
 An absent row refuses, as for every capability but `image_edit`: a model nobody has probed
 serves no decision. The probe, its cadence and its auth are in [API Compatibility & Inference §3.9](compatibility-and-inference.md#39-system-one-decisions).
 

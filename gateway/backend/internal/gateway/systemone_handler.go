@@ -19,7 +19,12 @@ import (
 // defaultDecisionsBodyBytes is the default bound on the JSON body of
 // POST /v1/systemone (and, later, /v1/decisions), an operator setting
 // (ServerDeps.MaxDecisionsBodyBytes, config
-// OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES). It equals the agent router's JSON buffer.
+// OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES). It equals the agent router's JSON
+// buffer, but the two are separate checks: this one counts the client's bytes,
+// the router the relayed ones, and the shared model rewrite (rewriteModelField)
+// re-encodes the body with HTML escaping and the mapping's model name, so a
+// body near the cap can grow past the router's buffer and draw the router's own
+// 413, relayed like any upstream error.
 const defaultDecisionsBodyBytes = 32 << 20
 
 // decisionsBodyLimit is the JSON read cap in force: the configured one, or the

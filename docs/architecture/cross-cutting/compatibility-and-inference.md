@@ -1556,8 +1556,12 @@ no `/openai` alias, since no OpenAI client speaks this protocol. The run-as bloc
 
 **2. The request.** The handler reads the body with `readRawJSONLimit` under
 `decisionsBodyLimit()`: `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`, default 32 MiB, which
-equals the agent router's JSON buffer, so a body the gateway accepts is one the router
-can take; over it is `413 request.body_too_large` (§10). A System One state can be a
+equals the agent router's JSON buffer; over it is `413 request.body_too_large` (§10). The
+two caps are equal but not one check: the gateway counts the client's bytes, the router
+the relayed ones, and the shared model rewrite (item 3) re-encodes the body with HTML
+escaping (`<`, `>` and `&` become six-byte `\u003c`-style escapes) and a different model
+name, so a body close to the cap can grow past the router's buffer and draw the router's
+own 413, relayed like any upstream error (item 4). A System One state can be a
 whole document, which is why this endpoint, unlike a chat body, is capped at all.
 `validateSystemOneRequest` decodes each field as `json.RawMessage` and type-checks it, so
 a wrongly typed field is never silently zeroed, and answers a gateway 400 before the
@@ -1573,7 +1577,12 @@ unexamined.
 `systemOneInferenceShape`: the coarse flavor, the endpoint and the one required
 capability. A model without a `(decision, yes)` verdict, an unprobed one included, is
 refused `404 routing.model_not_capable`; a name no application that declares `decisions`
-offers is `404 routing.no_model_route`. The capability list also keeps the request **off
+offers is `404 routing.no_model_route`. The gate holds on the two paths that bypass
+ordinary candidacy: a session pin under the request's key is not honoured for a mapping
+without the verdict (`404 routing.model_not_capable`, the pin left in place), and a
+token's server override runs the same capability filter over the pinned server's own
+pool, so a model there without the verdict is answered as one that server does not offer
+(`404 server_override.model_unavailable`). Neither path calls the upstream. The capability list also keeps the request **off
 the vendor-account path**, which declines a capability-carrying request while a vendor
 model is matched by name and never by flavor: dropping the list would skip the gate **and**
 make a decision routable to a hosted vendor model of the same name. For a `server_agent`
@@ -1620,9 +1629,9 @@ like `openai_audio`: an empty list still saves as `[openai, anthropic]`, and the
 mapping form offers it as an unticked checkbox that a new runtime spec does not inherit.
 
 **7. The verdict probe.** No agent reports a `decision` verdict and Phase 1 reads no model listing for one, so the gateway's health loop establishes
-it by asking: `probeSystemOne` (`cmd/gateway/app_health.go`) runs as a pass of
-`probeServer` for every active application that declares `decisions`, for each of its
-mappings whose **effective** flavors include it. The provider half is
+it by asking: `probeSystemOne` (`cmd/gateway/app_health.go`) asks, for every active
+application that declares `decisions`, each of its mappings whose **effective** flavors
+include it. The provider half is
 `provider.SystemOneProber` / `probeSystemOne` (`internal/provider/systemone_probe.go`),
 one `POST {endpoint}/v1/systemone` with the exact body
 
@@ -1630,6 +1639,18 @@ one `POST {endpoint}/v1/systemone` with the exact body
 {"model":"<app_model_name>","state":"ok","questions":{"probe":{"type":"noul","instructions":"Is the state non-empty?"}}}
 ```
 
+- **Detached from the health cycle.** `probeServer` starts the pass
+  (`startSystemOnePasses`) after its probes and outside the cycle's wait group, one
+  goroutine per application, **at most one in flight per application**
+  (`systemOneInFlight`): a decision probe is a real inference with a 30 s timeout, asked
+  of an application's mappings one after another, so a blackholed host or a stuck model
+  would otherwise hold every server's health derivation and the next cycle for 30 s per
+  unsettled mapping. A tick that finds the application's pass still running starts none
+  (and leaves its cadence unstamped, so the first due tick after it ends starts the
+  next). An application whose **last observed reachability is false** (this cycle's
+  probe, or the one a not-yet-due application reuses; an off-mesh server under
+  `netbird_only` included) is not asked at all. The pass keeps the application's own
+  cadence key, `systemone:<id>`.
 - **The verdict.** A 2xx whose JSON `answers.probe` is an object is `decision: yes`. A
   `404` or a `501` is `decision: no`: no such route, or a model the server cannot read. A
   `404` that carries the agent router's own `{"error":{"code":"runtime.…"}}` envelope is
@@ -1637,9 +1658,17 @@ one `POST {endpoint}/v1/systemone` with the exact body
   (`runtime.model_not_managed` for a model whose spec it no longer holds); it says
   nothing about the model, so it states **no verdict**. Everything else (a transport
   failure, a timeout, a 400, a 401/403, any other 5xx, a 2xx without the answer or not JSON)
-  is no verdict too: nothing is written and the pass retries after
-  `systemOneRetryBackoff` (5 min), so an upstream that cannot answer costs one tiny POST
-  per window, not one per health tick. A 401/403 is logged as a token problem.
+  is no verdict too: nothing is written and the pass backs off, so an upstream that
+  cannot answer costs one tiny POST per window, not one per health tick. A 401/403 is
+  logged as a token problem.
+- **Two back-offs.** An answer that can pass on its own (a timeout, a 408, a 429, a 5xx,
+  a router 404) waits `systemOneRetryBackoff` (5 min). A **refusal** that will not, a
+  `400`, `405` or `422` (`provider.ErrSystemOneProbeRefused`), doubles the window with
+  each refusal of the same identity in a row, 5, 10, 20, 40 min, then
+  `systemOneRefusedBackoffCap` (1 h) (`settleSystemOne`, `escalatingBackoff`), so a
+  loaded model that refuses the probe is not re-POSTed, and kept resident, every 5
+  minutes forever. A verdict, or a new identity behind the mapping, starts the streak
+  over.
 - **Its own timeout.** `systemOneProbeTimeout` is 30 s, not the 3 s `probeTimeout` of a
   reachability probe: the answer is a real inference, which a slow model would never
   finish inside a few seconds, so the verdict would never settle and each retry would
@@ -1652,16 +1681,35 @@ one `POST {endpoint}/v1/systemone` with the exact body
   any request naming it and refreshes its idle timer on each, so the pass never wakes an
   unloaded model. The loaded set is a snapshot, so a model that unloads within its
   staleness can still be started once. A settled key (`systemOneSettled`) is not asked
-  again in this process, so a **gateway restart re-probes once**; a model that leaves the
+  again in this process **while the mapping still has a `decision` row on file**: an
+  operator who clears the verdict in the portal deletes the row, and the next pass asks
+  again (`systemOneDue`), so the portal's "the probe detects it automatically" holds
+  without a restart; a **gateway restart re-probes once**. A model that leaves the
   loaded set has its back-off cleared, so a reload is asked at once; and a verdict the
   store failed to take (`writeCapabilityRows` returning false) is **not** remembered as
   settled but backed off. A failed runtime-spec read asks none of the application's
-  mappings that tick.
+  mappings that pass.
+- **External applications have no loaded-only guard.** Nothing tells the gateway
+  whether an external upstream holds a model, so an upstream that routes `/v1/systemone`
+  by model and loads models on demand (llama-server in router mode, say) can cold-load
+  each mapping of an application that lists `decisions` once for its probe, a model that
+  cannot answer it included (it then states its 404/501 `no` and is not asked again in
+  this process). Operator guidance: list `decisions` only on an application whose mapped
+  models are decision models, or set the verdict by hand (a manual `yes` is honoured and
+  never overwritten; a mapping that should not answer simply leaves the flavor off).
 - **Unmetered, and the source.** The probe goes straight through the prober, not the
   relay, so it leaves no usage row and no capture. Its rows carry the source
   `systemone_probe` (`routing.CapabilitySourceSystemOneProbe`, rank 1): an operator's
   `manual` `yes` outranks it, and `(decision, no)` is reserved from manual edits so this
   source alone can state a `no`.
+- **Checked against the upstream sources, not yet against a live model.** The probe
+  contract was read off the two servers' sources: vLLM v0.33.0
+  (`vllm/entrypoints/generate/structured_decisions`) keys its answers by question id,
+  reports usage as `input_tokens`/`output_tokens`, and answers a model that cannot serve
+  decisions with `NotImplementedError`, a `501`; llama.cpp `tools/server` at `2cbe0ec4`
+  answers a non-decision model with `501 not_supported_error`, and its `noul` question
+  needs `instructions`, which the probe sends. A run against a real decision model is
+  still an operator step.
 
 **8. Two deliberate Phase 1 deviations from issue #373** (rejected alternatives in
 [ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373)): there is **no `systemone_mode` column** (the flavor and the verdict already

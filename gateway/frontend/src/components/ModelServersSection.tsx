@@ -208,6 +208,10 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // "transcription" and shows only on a `yes` -- the one-shot model (`no`) and the unknown
   // (no row) both render no chip, as for every other known capability.
   { capability: 'transcription_streaming', label: (t) => t.capabilityTranscriptionStreaming },
+  // "decision" gates POST /v1/systemone: the model serves System One decisions
+  // (verdicts yes/no). A trait of the endpoint, probed (or an operator's yes), so a `yes` reads as a chip
+  // and a `no` or an absent row renders none.
+  { capability: 'decision', label: (t) => t.capabilityDecision },
   // "embedding" and "rerank" name the model's ROLE (a vector encoder / a reranker, not a
   // text generator) rather than an endpoint it serves. Unlike the audio chips they are
   // operator-stated -- nothing probes either one, the mapping form is where they are set --
@@ -216,10 +220,6 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // Ollama-declared "embedding" row would otherwise land). A `no` and an absent row render
   // no chip, as for every other known capability. They sit with the declared traits, ahead
   // of the observed "speculation_observed".
-  // "decision" gates POST /v1/systemone: the model serves System One decisions
-  // (verdicts yes/no). A probed trait of the endpoint, so a `yes` reads as a chip
-  // and a `no` or an absent row renders none.
-  { capability: 'decision', label: (t) => t.capabilityDecision },
   { capability: 'embedding', label: (t) => t.capabilityEmbedding },
   { capability: 'rerank', label: (t) => t.capabilityRerank },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },

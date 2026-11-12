@@ -134,13 +134,14 @@ const probeRefusalHintId = 'mapping-probe-context-hint';
  * The context-size probe's button, on the edit form only (the create form has
  * no mapping to probe yet). Disabled while a probe runs, while the server is
  * busy, without a `context_probe_path` unless the gateway derives the probe
- * (`contextProbeDerived`), and for an images-only or audio-only mapping: the
- * probe loads the model with a chat prompt, which the gateway refuses for it
- * (`benchmark.images_only`, `benchmark.audio_only`). That last reason shows
- * nowhere else on the form, so the button is described by a hint that names
- * it. A mapping that is both (its flavors name openai_images and openai_audio
- * and no text flavor) gets the images hint alone: one sentence, and it names a
- * flavor that holds.
+ * (`contextProbeDerived`), and for an images-only, audio-only or
+ * decisions-only mapping: the probe loads the model with a chat prompt, which
+ * the gateway refuses for it (`benchmark.images_only`, `benchmark.audio_only`,
+ * `benchmark.decisions_only`). That last reason shows nowhere else on the
+ * form, so the button is described by a hint that names it. A mapping that is
+ * several (its flavors name more than one non-text flavor and no text flavor)
+ * gets one hint, the first of images, audio, decisions: one sentence, and it
+ * names a flavor that holds.
  */
 function ContextProbeButton({
   t,

@@ -12,11 +12,12 @@ import type { Translation } from './types';
 // The API-Varianten capability checkboxes. openai gates /v1/responses (Codex)
 // AND /v1/chat/completions; anthropic gates /v1/messages (Claude Code);
 // openai_images gates /v1/images/generations; openai_audio gates
-// /v1/audio/speech; decisions gates POST /v1/systemone. The last three are coarse flavors of their own with no
-// endpoint-mode dropdown (images and speech have no translate path to
-// choose), and both are opt-in: nothing here ticks them -- only the
-// stable_diffusion_cpp / audio_cpp type defaults and an operator do (decisions
-// has no type default: only an operator ticks it).
+// /v1/audio/speech; decisions gates POST /v1/systemone. The last three are
+// coarse flavors of their own with no endpoint-mode dropdown (images, speech
+// and decisions have no translate path to choose), and all three are opt-in:
+// nothing here ticks them -- only the stable_diffusion_cpp / audio_cpp type
+// defaults and an operator do (decisions has no type default: only an
+// operator ticks it).
 const apiVariantFlavorOptions = [
   'openai',
   'anthropic',

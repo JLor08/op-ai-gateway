@@ -149,12 +149,14 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 //
 // The warm-load is a chat prompt, so before the reservation the probe reads the mapping's
 // runtime spec once (starterSpec) and refuses a mapping that serves only images with 409
-// benchmark.images_only, and one that serves only audio with 409 benchmark.audio_only (images
-// first, for a list naming both non-text flavors, as loadRefusal does). The probe's target is
-// built from that same spec.
+// benchmark.images_only, one that serves only audio with 409 benchmark.audio_only and one that
+// serves only decisions with 409 benchmark.decisions_only (in that order, for a list naming
+// several non-text flavors, as loadRefusal does). The probe's target is built from that same
+// spec.
 //
-// The check and TryStart are not atomic: a mapping that becomes images-only or audio-only in
-// between is warm-loaded anyway, and the failed warm-load is the probe's result.
+// The check and TryStart are not atomic: a mapping that becomes images-, audio- or
+// decisions-only in between is warm-loaded anyway, and the failed warm-load is the probe's
+// result.
 func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID string) {
 	server, views, err := s.Portal.AuthorizeBenchmarkScope(r.Context(), token, "mapping", mappingID)
 	if err != nil {
@@ -209,8 +211,8 @@ func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token
 //
 // Before the reservation it reads the mapping's runtime spec once (starterSpec) and asks
 // loadRefusal whether the Load can succeed: a refusal answers its 409 and reserves nothing. A
-// Load that passes is built from that same spec (loadTargetFor), so an images-only or
-// audio-only agent child is loaded without generating.
+// Load that passes is built from that same spec (loadTargetFor), so an images-only,
+// audio-only or decisions-only agent child is loaded without generating.
 //
 // The check and TryStart are not atomic: a spec that becomes force_stopped in between is not
 // refused, and the agent's 503 for it keeps the Load retrying until loadUntilServable's bound,

@@ -93,9 +93,13 @@ type BenchmarkResult struct {
 	// when it cannot be measured as audio either (no speech or transcription
 	// verdict); and "not_speech" (benchmarkSkippedNotSpeech) or "speech_clone"
 	// (benchmarkSkippedSpeechClone) for a speech run, the latter also for a
-	// speed, capacity or both run of a clone model without a preset voice. A
-	// skipped result carries no metrics and no error, and no history row is
-	// written for it.
+	// speed, capacity or both run of a clone model without a preset voice;
+	// "decisions_only" (benchmarkSkippedDecisionsOnly) for a mapping that serves
+	// only decisions, in every run, since it answers no chat prompt and has no
+	// audio to measure; and "cluster_head" (benchmarkSkippedClusterHead) for a
+	// llama.cpp RPC cluster head, which no benchmark measures yet. A skipped
+	// result carries no metrics and no error, and no history row is written for
+	// it.
 	Skipped string `json:"skipped,omitempty"`
 	// The speech benchmark's figures (a speech run; omitted on every other mode
 	// and on a speech result that failed). OutputByteRate is the mapping's output

@@ -22,10 +22,10 @@ export type RuntimeSpecTemplate = {
  * writes start from the same values. The Type select's flavor defaults
  * (specFlavorsAfterTypeSwitch) also judge untouched flavors against it.
  *
- * `openai_images` and `openai_audio` are left out: both are opt-in on the spec
- * as everywhere else. A server_agent parent declares them for its image and
- * speech children, and copying them would make every new text model's spec
- * admit image and speech requests too. UNLESS the parent has no text flavor to
+ * `openai_images`, `openai_audio` and `decisions` are left out: all three are
+ * opt-in on the spec as everywhere else. A server_agent parent declares them
+ * for its image, speech and decision children, and copying them would make
+ * every new text model's spec admit those requests too. UNLESS the parent has no text flavor to
  * fall back to: dropping them from a parent whose flavors are exactly
  * [openai_images] (or [openai_audio]) would leave every flavor unticked, and
  * the form cannot be saved like that (the launch-spec form refuses an empty

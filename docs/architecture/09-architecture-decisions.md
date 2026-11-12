@@ -11888,12 +11888,18 @@ vocabulary must not be named after one path.
   `provider.SystemOneProber`, unmetered. A 2xx with an object `answers.probe` is `yes`; a 404 or 501 is `no`, **except**
   a 404 carrying the agent router's own `runtime.*` error envelope, which is the router answering before any child
   was asked and so is no verdict; everything else (a timeout, a 400, a 401/403, a 5xx, an unreadable answer) is no
-  verdict and is retried after a five-minute back-off. The probe has its own 30 s timeout, because the answer is a real
-  inference. External applications are asked with their own credential once per (mapping, app model name); a
-  `server_agent` mapping only **while the agent reports the model loaded** (the router would otherwise start a child
-  and refresh its idle timer), with its spec's credential, once per (mapping, `agentSpecIdentity`). A settled
-  verdict is not asked again in the process, so a gateway restart re-probes once, and a verdict the store failed to
-  write is not remembered as settled. The source is `systemone_probe`, rank 1.
+  verdict. It is retried after a five-minute back-off, except a refusal that will not pass on its own (a 400, 405 or
+  422), whose window doubles per refusal of the same identity in a row up to one hour, so a loaded model that refuses
+  the probe is not kept resident by it. The probe has its own 30 s timeout, because the answer is a real inference,
+  and so the pass runs **detached from the health cycle**, one in flight per application, skipping an application
+  last observed unreachable: a cycle never waits on it. External applications are asked with their own credential
+  once per (mapping, app model name); a `server_agent` mapping only **while the agent reports the model loaded** (the
+  router would otherwise start a child and refresh its idle timer), with its spec's credential, once per (mapping,
+  `agentSpecIdentity`). A settled verdict is not asked again in the process while its row stays on file (a verdict
+  the operator clears is asked again on the next pass), so a gateway restart re-probes once, and a verdict the store
+  failed to write is not remembered as settled. The source is `systemone_probe`, rank 1. The contract was checked
+  against the vLLM v0.33.0 and llama.cpp `tools/server` (`2cbe0ec4`) sources (both answer a model that cannot serve
+  decisions with a 501); a run against a live decision model is still pending.
 - **(d) The endpoint is bearer-only and a value-for-value relay.** `POST /v1/systemone` accepts `gateway:use` or
   `llm:invoke` and nothing else (never a session cookie or the internal loopback; no `/openai` alias). The validator
   owns only `model` (`systemone.model_required`), `questions` (`systemone.questions_required`, a non-empty object) and
@@ -11949,7 +11955,13 @@ vocabulary must not be named after one path.
   router 404 never turns into a sticky `no`.
 - **The probe is the only unmetered System One call.** It leaves no usage row and no capture; relayed calls are metered
   in tokens as any native relay.
-- **A gateway restart asks each decision model once more**, which an idle agent child bears as one request.
+- **A gateway restart asks each decision model once more**: each external mapping once, and each agent mapping
+  whose model is loaded once, as one request to an already running child. An agent model that is not loaded is not
+  asked until the agent reports it loaded.
+- **An external application has no loaded-only guard.** An upstream that routes `/v1/systemone` by model and loads
+  on demand (llama-server's router mode, say) can load each mapping of an application listing `decisions` once for
+  its probe; an operator lists `decisions` only where the mapped models are decision models, or sets the verdict by
+  hand.
 - **No upgrade order and no new migration.** Neither the agent nor the schema moved.
 
 → [Compatibility & Inference §3.9](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),

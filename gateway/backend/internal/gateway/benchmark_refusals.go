@@ -85,8 +85,9 @@ const (
 	// only through the agent's ensure route, and the server's agent has not
 	// declared runtime_ensure. That is an older agent, or one that has not
 	// reported since the gateway restarted: the feature registry is in memory.
-	// An audio-only agent child is refused with the same code, and for now with
-	// this message's images wording: the audio agent path is not built yet.
+	// An audio-only or decisions-only agent child is refused with the same
+	// code, and for now with this message's images wording: the audio and
+	// decision agent paths are not built yet.
 	codeBenchmarkAgentEnsureUnsupported = "benchmark.agent_ensure_unsupported"
 	msgBenchmarkAgentEnsureUnsupported  = "this model serves only images, and starting it without a chat prompt needs the agent feature runtime_ensure (agent 0.8.0 or newer), or the agent has not reported since the gateway restarted"
 
@@ -146,7 +147,7 @@ var loadRefusalErrs = map[string]error{
 
 // benchmarkSkippedImagesOnly is BenchmarkResult.Skipped for a mapping an
 // application- or server-scope run did not measure because it serves only
-// images. It is the field's one value.
+// images, one value of that field's closed set.
 const benchmarkSkippedImagesOnly = "images_only"
 
 // benchmarkSkippedAudioOnly is benchmarkSkippedImagesOnly for a mapping that
@@ -240,17 +241,18 @@ func AudioTargetFlavors(app routing.Application, spec routing.RuntimeSpec, hasSp
 // (hasSpec: whether the mapping has one), and ensureSupported, whether the
 // mapping's server declared runtime_ensure.
 //
-// A mapping that serves only images, or only audio, cannot load by
-// generating, because the Load's one-token chat completion is exactly what it
-// cannot answer:
+// A mapping that serves only images, only audio or only decisions cannot
+// load by generating, because the Load's one-token chat completion is exactly
+// what it cannot answer:
 //   - a server_agent child loads through the agent's ensure route instead, so
 //     it is refused only while its agent has not declared that route;
 //   - on any other application nothing can start it without a request, so it
-//     is refused outright, with the reason for its kind (a list naming both
-//     non-text flavors is both kinds, and takes the images-only reason).
+//     is refused outright, with the reason for its kind (a list naming several
+//     non-text flavors takes the first of images-only, audio-only,
+//     decisions-only).
 //
 // Then a spec carrying the admin override force_stopped refuses every Load,
-// text, images-only and audio-only alike. The images-only and audio-only
+// text, images-only, audio-only and decisions-only alike. The non-text
 // reasons come first because clearing the override would not make such a Load
 // possible.
 //
@@ -287,8 +289,8 @@ func loadRefusal(app routing.Application, spec routing.RuntimeSpec, hasSpec bool
 
 // loadTargetFor builds a Load's target from the spec its starter read, for a
 // mapping loadRefusal did not refuse. Such a mapping, if it serves only
-// images or only audio, is a server_agent child whose agent declared
-// runtime_ensure, so its target loads without generating.
+// images, only audio or only decisions, is a server_agent child whose agent
+// declared runtime_ensure, so its target loads without generating.
 func (s *Server) loadTargetFor(ctx context.Context, v portal.BenchmarkTargetView, spec routing.RuntimeSpec, hasSpec bool) benchmarkTarget {
 	tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
 	tgt.loadWithoutGenerating = mappingSpecIsImagesOnly(v.App, spec, hasSpec) || mappingSpecIsAudioOnly(v.App, spec, hasSpec) || mappingSpecIsDecisionsOnly(v.App, spec, hasSpec)

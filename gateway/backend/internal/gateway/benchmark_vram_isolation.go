@@ -467,10 +467,10 @@ func vramClusterMemberClaimed(rows []RuntimeStatusDTO, now time.Time) bool {
 }
 
 // vramEnsurePlan decides how the run starts the target: false for a text
-// target, which loads by generating as always, and true for an images-only or
-// audio-only or decisions-only one (mappingSpecIsImagesOnly, mappingSpecIsAudioOnly,
-// mappingSpecIsDecisionsOnly on
-// targetSpec), which has no chat endpoint to generate on and is started
+// target, which loads by generating as always, and true for an images-only,
+// audio-only or decisions-only one (mappingSpecIsImagesOnly,
+// mappingSpecIsAudioOnly, mappingSpecIsDecisionsOnly on targetSpec), which has
+// no chat endpoint to generate on and is started
 // through the agent router's ensure route instead. That route needs an agent
 // that declares runtime_ensure; without it the target cannot be started at
 // all, which is refused before anything is written.
@@ -484,8 +484,8 @@ func (s *Server) vramEnsurePlan(serverID string, app routing.Application, target
 	return true, nil
 }
 
-// vramEnsureUnsupported is the refusal of an images-only or audio-only target on an agent
-// that does not declare runtime_ensure: at the trigger (vramEnsurePlan), and
+// vramEnsureUnsupported is the refusal of an images-only, audio-only or decisions-only target
+// on an agent that does not declare runtime_ensure: at the trigger (vramEnsurePlan), and
 // again by the run before it drains.
 func vramEnsureUnsupported() *vramRefusal {
 	return &vramRefusal{code: codeBenchmarkVRAMAgentEnsureUnsupported, msg: msgBenchmarkVRAMAgentEnsureUnsupported}

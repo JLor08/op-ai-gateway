@@ -1830,10 +1830,14 @@ const (
 	CapabilitySpeechStreaming = "speech_streaming"
 
 	// CapabilityDecision means the model is a System One DECISION model: it
-	// answers the decision endpoints (flavor APIFlavorDecisions) and is no chat
-	// model. It is orthogonal to every name above, and it is written only by the
-	// systemone_probe (CapabilitySourceSystemOneProbe): a manual (decision, no)
-	// and an agent-reported row are both refused.
+	// answers the decision endpoints (flavor APIFlavorDecisions). It says
+	// nothing about chat: a mapping whose flavors are [decisions] only is kept
+	// off every chat path (decisions-only), while one that also lists openai
+	// stays a chat model too. It is orthogonal to every name above. Two
+	// sources write it: the systemone_probe (CapabilitySourceSystemOneProbe),
+	// the only one that may establish decision: no, and an operator's manual
+	// yes, which the probe never overwrites. A manual (decision, no) and an
+	// agent-reported row are both refused.
 	CapabilityDecision = "decision"
 
 	// CapabilityEmbedding means the model produces text EMBEDDINGS: it is a

@@ -993,9 +993,12 @@ const de = {
   // anthropic nennt sie neben dem API-Wert auch den Zweck, weil der Wert allein
   // nicht verrät, dass er die Bilderzeugung (/v1/images/generations) freischaltet.
   applicationFlavorOpenaiImages: 'openai_images (Bilderzeugung)',
+  // Beschriftung des Kontrollkästchens der Variante decisions: nennt den Zweck
+  // statt des API-Werts, weil „decisions“ allein nicht verrät, dass es die
+  // System-One-Entscheidungen (/v1/systemone) freischaltet.
+  applicationFlavorDecisions: 'Entscheidungen (System One)',
   // The fourth flavor checkbox's label, for the same reason as the third's: it
   // enables speech synthesis (/v1/audio/speech).
-  applicationFlavorDecisions: 'Entscheidungen (System One)',
   applicationFlavorOpenaiAudio: 'openai_audio (Sprachsynthese)',
   // Steht unter den Varianten-Kontrollkästchen, wenn keines angehakt ist.
   // Eine leere Liste speichert das Backend als openai + anthropic -- das
@@ -4976,9 +4979,12 @@ const en: PortalMessages = {
   // the purpose next to the API value, because the value alone does not say
   // that it enables image generation (/v1/images/generations).
   applicationFlavorOpenaiImages: 'openai_images (image generation)',
+  // The decisions flavor checkbox's label. It names the purpose instead of the
+  // API value, because "decisions" alone does not say that it enables System
+  // One decisions (/v1/systemone).
+  applicationFlavorDecisions: 'Decisions (System One)',
   // The fourth flavor checkbox's label, for the same reason as the third's: it
   // enables speech synthesis (/v1/audio/speech).
-  applicationFlavorDecisions: 'Decisions (System One)',
   applicationFlavorOpenaiAudio: 'openai_audio (speech synthesis)',
   // Shown under the flavor checkboxes when none is ticked. The backend stores
   // an empty list as openai + anthropic, so the form would save something
