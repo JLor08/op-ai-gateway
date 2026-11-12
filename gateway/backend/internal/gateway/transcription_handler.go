@@ -428,9 +428,10 @@ var errTranscriptionLiveBusy = errors.New(liveBearerBusyCode)
 //     as speech's does. It feeds the capability gate (a model without a
 //     (transcription, yes) verdict is refused, an unprobed one included). And it keeps
 //     the request off the vendor-account path: vendorAccountRoutingEligible has no
-//     openai_audio twin of its images exclusion and declines a request only because it
-//     carries a capability list, while a vendor account's model match reads the model
-//     name and never the flavor. A handler that dropped the list would skip the gate
+//     openai_audio twin of its images exclusion and declines a request because it
+//     carries a capability list (every list but a decision request's [any_decision],
+//     ADR-100), while a vendor account's model match reads the model name and never
+//     the flavor. A handler that dropped the list would skip the gate
 //     AND become routable to a vendor model of the same name.
 func transcriptionInferenceShape(model string) inferenceShape {
 	return inferenceShape{

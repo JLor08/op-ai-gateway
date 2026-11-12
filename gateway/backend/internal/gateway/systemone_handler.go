@@ -63,10 +63,10 @@ const (
 // requirement. The requirement admits a mapping with either verdict (decision
 // or decision_openai, the latter only on a kind with an OpenAI /v1/decisions);
 // which one the request then needs is decided after the resolve
-// (systemOneRoute), as for /v1/decisions. The capability list also keeps the
-// request off the vendor-account path, which declines a request only because it
-// carries a capability list while a vendor model's match reads the model name
-// and never the flavor.
+// (systemOneRoute), as for /v1/decisions. The capability list is also the one
+// the vendor-account path admits (ADR-100): there only the decision model of an
+// OpenAI api-key account (routing.IsVendorDecisionModel) is considered, and its
+// route is translate, to the vendor's /v1/decisions.
 func systemOneInferenceShape(model string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorSystemOne,

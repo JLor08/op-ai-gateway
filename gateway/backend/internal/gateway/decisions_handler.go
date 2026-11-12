@@ -46,8 +46,10 @@ const (
 // openai_decisions request flavor, the decisions endpoint, and the derived
 // any_decision requirement. The requirement admits a mapping with either
 // verdict (decision or decision_openai); which one the request then needs is
-// decided after the resolve (decisionsRoute). Like System One's list, it also
-// keeps the request off the vendor-account path.
+// decided after the resolve (decisionsRoute). Like System One's list, it is the
+// one capability list the vendor-account path admits (ADR-100), and there only
+// for the decision model of an OpenAI api-key account
+// (routing.IsVendorDecisionModel), which it passes through to.
 func decisionsInferenceShape(model string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorOpenAIDecisions,
@@ -214,7 +216,19 @@ func (s *Server) settleDecisionRoute(w http.ResponseWriter, r *http.Request, c d
 // decisionVerdicts reads whether the target's mapping carries (decision, yes)
 // and (decision_openai, yes): one read of its capability rows. It takes the
 // whole target so every source of a verdict answers in this one place.
+//
+// A vendor target (VendorAccountID set) has no mapping and so no rows: its
+// verdicts are synthesized with no store read (ADR-100). The resolver marks the
+// target of a decision request for a vendor decision model
+// (routing.IsVendorDecisionModel, an OpenAI api-key account's gpt-6-luna) as
+// VendorDecisionModel, which answers OpenAI Decisions natively and System One
+// not at all: decision no, decision_openai yes. So /v1/decisions passes through
+// to the vendor's /v1/decisions and /v1/systemone translates to it. Any other
+// vendor target answers no to both.
 func (s *Server) decisionVerdicts(ctx context.Context, target routing.Target) (decision, decisionOpenAI bool, err error) {
+	if target.VendorAccountID != "" {
+		return false, target.VendorDecisionModel, nil
+	}
 	rows, err := s.Routes.MappingCapabilities(ctx, target.RouteID)
 	if err != nil {
 		return false, false, fmt.Errorf("read capability rows of mapping %s: %w", target.RouteID, err)

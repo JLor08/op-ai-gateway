@@ -267,7 +267,8 @@ func newVendorDiscoveryState(discoverers VendorModelDiscoverers, refresher Vendo
 // letter or digit, or containing "..") drops its row, a repeated slug is stored
 // once, a display name that is not printable ASCII is stored empty and an
 // over-long one is cut, and at most maxDiscoveredModels rows are stored. An OpenAI
-// api-key listing is narrowed to chat-capable models first (isChatCapableOpenAIModel).
+// api-key listing is narrowed to chat-capable and decision models first
+// (isServedOpenAIAPIKeyModel).
 //
 // An OpenAI subscription account, and an OpenRouter/Kilo api-key account, also get
 // their usage snapshot refreshed on the way (refreshVendorUsage), with the very
@@ -818,7 +819,8 @@ func chatGPTAccountID(ts vendorauth.TokenSet) string {
 // serves: the vendor's flavor, UpstreamModel = the slug, the validated display
 // name, and the prefix NOT yet applied (GatewayModel = the slug; the caller
 // applies the account's current prefix). An OpenAI api-key listing is narrowed to
-// chat-capable models. Invalid and repeated slugs and anything beyond
+// the models it serves: chat-capable and decision models
+// (isServedOpenAIAPIKeyModel). Invalid and repeated slugs and anything beyond
 // maxDiscoveredModels are dropped; dropped counts every entry that did not become
 // a row.
 func vendorModelRows(acc routing.VendorAccount, found []vendorauth.DiscoveredModel) (rows []routing.VendorAccountModel, dropped int) {
@@ -828,7 +830,7 @@ func vendorModelRows(acc routing.VendorAccount, found []vendorauth.DiscoveredMod
 	rows = make([]routing.VendorAccountModel, 0, len(found))
 	for _, m := range found {
 		slug, ok := vendorModelSlug(m.Slug)
-		if !ok || (chatOnly && !isChatCapableOpenAIModel(slug)) || len(rows) >= maxDiscoveredModels {
+		if !ok || (chatOnly && !isServedOpenAIAPIKeyModel(slug)) || len(rows) >= maxDiscoveredModels {
 			continue
 		}
 		if _, dup := seen[slug]; dup {
@@ -928,6 +930,18 @@ func isChatCapableOpenAIModel(id string) bool {
 		return true
 	}
 	return len(base) >= 2 && base[0] == 'o' && base[1] >= '0' && base[1] <= '9'
+}
+
+// isServedOpenAIAPIKeyModel is the filter an OpenAI api-key listing passes
+// through: the chat-capable models (isChatCapableOpenAIModel) and the OpenAI
+// Decisions models (routing.OpenAIDecisionModels, ADR-100), which no chat
+// marker describes but the two decision endpoints serve. The decision models
+// are kept by name, so no future chat marker can drop them.
+func isServedOpenAIAPIKeyModel(id string) bool {
+	if _, ok := routing.OpenAIDecisionModels[id]; ok {
+		return true
+	}
+	return isChatCapableOpenAIModel(id)
 }
 
 // relabelVendorModels returns rows with GatewayModel = prefix + UpstreamModel and

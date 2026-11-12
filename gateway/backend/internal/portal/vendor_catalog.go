@@ -25,12 +25,16 @@ import "op-ai-gateway/internal/routing"
 // while an api_key account talks to api.openai.com, which serves all four. Only
 // the shared gpt-5 / gpt-5-mini are seeded on a subscription account, so that a
 // working credential is never paired with a model its backend rejects. The
+// api_key set also carries gpt-6-luna, the OpenAI Decisions model
+// (routing.OpenAIDecisionModels, ADR-100): it is no chat model, the listings
+// offer it to the two decision endpoints only, and the ChatGPT backend has no
+// Decisions endpoint, so a subscription account never gets it. The
 // subscription set is the less certain of the two (VERIFY-LIVE: a plan may serve
 // further codex-* ids that are not seeded until confirmed). Anthropic's OAuth
 // Messages path and its api key serve the same ids, so its set does not vary.
 var (
 	openAISubscriptionModels = []string{"gpt-5", "gpt-5-mini"}
-	openAIAPIKeyModels       = []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3"}
+	openAIAPIKeyModels       = []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3", "gpt-6-luna"}
 	anthropicModels          = []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"}
 )
 

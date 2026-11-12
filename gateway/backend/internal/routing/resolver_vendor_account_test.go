@@ -490,8 +490,9 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 // cannot be silently forgotten here. It describes the openai_responses
 // (passthrough) shape, so ResponsesMode is deliberately absent.
 var vendorTargetMayBeZero = map[string]bool{
-	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
-	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
+	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
+	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
+	"VendorDecisionModel":         true, // set only on a decision request's target
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
@@ -516,8 +517,9 @@ var vendorTargetMayBeZero = map[string]bool{
 // is zero-OK (an Anthropic upstream has no Responses surface). ExtraHeaders stays
 // zero-OK: AnthropicClient.ProxyNative guarantees anthropic-version itself.
 var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
-	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
-	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
+	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
+	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
+	"VendorDecisionModel":         true, // set only on a decision request's target
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; Anthropic has no Responses surface
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
@@ -540,8 +542,9 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 // endpoint modes are zero by design: the compat vendors are translate-only and never
 // enter the OpenAI-Responses / Anthropic-Messages passthrough branches.
 var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
-	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
-	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
+	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
+	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
+	"VendorDecisionModel":         true, // set only on a decision request's target
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; the compat vendors never pass Responses through
 	"MessagesMode":                true, // zero == translate; the compat vendors never pass Messages through
@@ -556,6 +559,28 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
+}
+
+// vendorDecisionTargetMayBeZero is the shape of an OpenAI api-key account's
+// target for a DECISION request (ADR-100): its decision modes and the decision
+// model mark are non-zero (the whole point), so they are NOT listed;
+// ResponsesMode is zero-OK (a decision request is no Responses request).
+var vendorDecisionTargetMayBeZero = map[string]bool{
+	"ServerID":                    true, // a vendor target has no on-prem server
+	"ResponsesMode":               true, // zero == translate; a decision request is no Responses request
+	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)
+	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
+	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
+	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
+	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
+	"InstanceKey":                 true, // names an instance of a mapping; a vendor target addresses none
+	"InstanceCapable":             true, // a vendor target runs no instances
+	"InstancePool":                true, // a vendor target is not selected from a pool of instances
+	"APITokenHeader":              true, // "" for an OpenAI vendor (Bearer default)
+	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
+	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
+	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
+	"OpenAIPathPrefix":            true, // empty => /v1; the api.openai.com vendor target uses the default
 }
 
 // TestVendorAccountTargetCompleteness is the vendor-Target analogue of
@@ -589,6 +614,8 @@ func TestVendorAccountTargetCompleteness(t *testing.T) {
 		{"anthropic_messages", vendorAccountTarget(anthropicAcc, anthropicModel, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages"), vendorAnthropicMessagesTargetMayBeZero},
 		// OpenAI-compatible (x.ai) api-key: translate-only, Endpoint + OpenAIPathPrefix carried.
 		{"openai_compatible", vendorAccountTarget(xaiAcc, xaiModel, "grok-4", APIFlavorOpenAI, "openai_chat"), vendorOpenAICompatibleTargetMayBeZero},
+		// OpenAI api-key + a decision request for the decision model: the decision modes and mark.
+		{"decisions", vendorDecisionTarget(t, openAIAcc), vendorDecisionTargetMayBeZero},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -605,6 +632,19 @@ func TestVendorAccountTargetCompleteness(t *testing.T) {
 			}
 		})
 	}
+}
+
+// vendorDecisionTarget builds acc's target for a /v1/decisions request for the
+// decision model through the builder Resolve uses.
+func vendorDecisionTarget(t *testing.T, acc VendorAccount) Target {
+	t.Helper()
+	m := VendorAccountModel{AccountID: acc.ID, GatewayModel: "oa/gpt-6-luna", UpstreamModel: "gpt-6-luna", APIFlavor: APIFlavorOpenAI}
+	req := inference.Request{Model: "oa/gpt-6-luna", APIFlavor: APIFlavorOpenAIDecisions, RequiredCapabilities: []string{CapabilityAnyDecision}}
+	target, ok := vendorAccountModelTarget(acc, m, req, APIFlavorDecisions)
+	if !ok {
+		t.Fatal("vendorAccountModelTarget built no decision target for the OpenAI api-key decision model")
+	}
+	return target
 }
 
 // TestOpenAICompatibleVendorResolvesToTranslateTarget pins the OpenAI-compatible

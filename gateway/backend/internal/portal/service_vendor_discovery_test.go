@@ -1488,6 +1488,22 @@ func TestRefreshVendorAccountModelsFiltersAnOpenAIAPIKeyListingToChatModels(t *t
 	}
 }
 
+// The OpenAI Decisions model is no chat model, but an api_key account serves
+// it to the two decision endpoints (ADR-100), so the chat filter keeps it.
+func TestRefreshVendorAccountModelsKeepsTheOpenAIDecisionModel(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAIAPIKey, "gpt-5", "gpt-6-luna", "text-embedding-3-small")
+	acc := apiKeyAccount(t, svc, routing.VendorOpenAI, "")
+
+	if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+		t.Fatalf("RefreshVendorAccountModels = %+v, %v; want ok", res, err)
+	}
+	want := []string{"gpt-5", "gpt-6-luna"}
+	if got := gatewayModels(storedModels(t, routeStore, acc.ID)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("gateway models = %v, want %v", got, want)
+	}
+}
+
 // A listing with nothing chat-capable is no usable list: the rows are kept.
 func TestRefreshVendorAccountModelsKeepsTheRowsWhenAnAPIKeyListsNoChatModel(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)

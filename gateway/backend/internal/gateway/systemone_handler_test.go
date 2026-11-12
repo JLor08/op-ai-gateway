@@ -398,11 +398,14 @@ func TestSystemOneServesAServerAgentChildWhoseSpecIncludesDecisions(t *testing.T
 	}
 }
 
-// A vendor model of the same name is never chosen for a System One request: the
-// shape's capability list keeps it off the vendor-account path, whose model match
-// reads the name and never the flavor. The control proves the same account does
-// serve the same model name on a plain chat request.
-func TestSystemOneIsNeverVendorRoutable(t *testing.T) {
+// Only the OpenAI api-key decision model is vendor-routable for a decision
+// request (ADR-100): [any_decision] is the one capability list that opts into
+// the vendor path, and there only an OpenAI api-key account's decision model
+// (routing.IsVendorDecisionModel) is considered. An Anthropic model, and a chat
+// model of the very account that serves the decision model, are never chosen
+// for either decision endpoint, although the control proves both accounts are
+// vendor-routable on a plain chat request.
+func TestSystemOneIsVendorRoutableOnlyForTheOpenAIAPIKeyDecisionModel(t *testing.T) {
 	cipher, err := capture.New(testCaptureKey)
 	if err != nil {
 		t.Fatalf("capture.New: %v", err)
@@ -410,19 +413,43 @@ func TestSystemOneIsNeverVendorRoutable(t *testing.T) {
 	routes := routing.NewMemoryStore()
 	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
 	seedAPIKeyAnthropicAccount(t, routes, cipher, apiKeyAnthropicOwnerID, now)
+	ctx := context.Background()
+	if err := routes.CreateVendorAccount(ctx, routing.VendorAccount{
+		ID: "acc_oai_decisions", OwnerUserID: apiKeyAnthropicOwnerID, Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+		Name: "acc_oai_decisions", Status: routing.VendorAccountStatusActive, APIKey: "enc:key", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	if err := routes.SetVendorAccountModels(ctx, "acc_oai_decisions", []routing.VendorAccountModel{
+		{AccountID: "acc_oai_decisions", GatewayModel: "gpt-6-luna", UpstreamModel: "gpt-6-luna", APIFlavor: routing.APIFlavorOpenAI},
+		{AccountID: "acc_oai_decisions", GatewayModel: "gpt-5", UpstreamModel: "gpt-5", APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
 	resolver := routing.NewResolver(routes, func() time.Time { return now }, nil)
 	resolver.SetVendorAccountAccessors(func() bool { return true }, nil, nil)
 	tok := auth.Token{ID: "tok_vendor", UserID: apiKeyAnthropicOwnerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}
 
-	control, err := resolver.Resolve(context.Background(), tok, inference.Request{Model: apiKeyAnthropicModel, APIFlavor: routing.APIFlavorAnthropic})
-	if err != nil || control.Provider != routing.ProviderVendorAnthropic {
-		t.Fatalf("control Resolve = %+v, %v; want the vendor target (the fixture must be vendor-routable)", control, err)
+	for _, model := range []string{apiKeyAnthropicModel, "gpt-5"} {
+		control, err := resolver.Resolve(ctx, tok, inference.Request{Model: model, APIFlavor: routing.APIFlavorOpenAI})
+		if err != nil || control.VendorAccountID == "" {
+			t.Fatalf("control Resolve(%s) = %+v, %v; want a vendor target (the fixture must be vendor-routable)", model, control, err)
+		}
 	}
 
-	shape := systemOneInferenceShape(apiKeyAnthropicModel)
-	_, err = resolver.Resolve(context.Background(), tok, inference.Request{Model: shape.model, APIFlavor: shape.apiFlavor, RequiredCapabilities: shape.requiredCapabilities})
-	if !errors.Is(err, routing.ErrNoModelRoute) {
-		t.Fatalf("Resolve(System One shape) = %v, want ErrNoModelRoute (never a vendor target)", err)
+	for _, shape := range []inferenceShape{systemOneInferenceShape(""), decisionsInferenceShape("")} {
+		req := func(model string) inference.Request {
+			return inference.Request{Model: model, APIFlavor: shape.apiFlavor, RequiredCapabilities: shape.requiredCapabilities}
+		}
+		for _, model := range []string{apiKeyAnthropicModel, "gpt-5"} {
+			if _, err := resolver.Resolve(ctx, tok, req(model)); !errors.Is(err, routing.ErrNoModelRoute) {
+				t.Fatalf("Resolve(%s shape, %s) = %v, want ErrNoModelRoute (never a vendor target)", shape.apiFlavor, model, err)
+			}
+		}
+		target, err := resolver.Resolve(ctx, tok, req("gpt-6-luna"))
+		if err != nil || target.VendorAccountID != "acc_oai_decisions" || !targetServesFlavor(target, shape.apiFlavor) {
+			t.Fatalf("Resolve(%s shape, gpt-6-luna) = %+v, %v; want the OpenAI api-key vendor target serving the decisions flavor", shape.apiFlavor, target, err)
+		}
 	}
 }
 
