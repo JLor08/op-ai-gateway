@@ -3342,9 +3342,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// data (not loaded, offered-on 0, context unknown), Visibility "shown".
 			if suppress {
 				// The vendor decision models' Decision/DecisionOpenAI flags come from
-				// their route, not from a mapping's capability rows; set before the
-				// overlay, while flavors still holds the self-hosted names only.
-				overlayVendorDecisionFlags(decisionOn, decisionOpenAIOn, flavors, vendor)
+				// their route, not from a mapping's capability rows.
+				overlayVendorDecisionFlags(decisionOn, decisionOpenAIOn, vendor)
 				overlayVendorModels(flavors, vendor)
 			}
 			ids := make([]string, 0, len(flavors))

@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/vendorauth"
+	"slices"
 	"strings"
 	"time"
 )
@@ -328,7 +329,11 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 	if len(rows) == 0 {
 		return s.keptVendorModels(ctx, principal, acc.ID, "the vendor listed no usable model")
 	}
-	acc, rows, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
+	// Counted before the decision models are added back: only what the vendor
+	// listed is discovered, and a listing with nothing usable was kept above.
+	discovered := len(rows)
+	rows = withOpenAIDecisionModelRows(acc, rows)
+	acc, _, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
@@ -336,11 +341,31 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
-	detail := fmt.Sprintf("discovered %d models", len(rows))
+	detail := fmt.Sprintf("discovered %d models", discovered)
 	if dropped > 0 {
 		detail += fmt.Sprintf("; %d unusable entries were dropped", dropped)
 	}
-	return dto, RefreshResult{Status: VendorRefreshOK, Discovered: len(rows), Detail: detail}, nil
+	return dto, RefreshResult{Status: VendorRefreshOK, Discovered: discovered, Detail: detail}, nil
+}
+
+// withOpenAIDecisionModelRows returns rows plus a row for every OpenAI
+// Decisions model (routing.OpenAIDecisionModelIDs) it lacks, for an OpenAI
+// api-key account only (routing.IsVendorDecisionModel); every other account
+// gets rows unchanged. The decision models are seeded (VendorCatalog), and
+// whether api.openai.com's /v1/models lists them is not known, so a refresh
+// keeps them rather than letting an omission drop them. Like the discovered
+// rows they carry no prefix yet (GatewayModel = the slug); the store step
+// applies the account's current one. They do not count as discovered.
+func withOpenAIDecisionModelRows(acc routing.VendorAccount, rows []routing.VendorAccountModel) []routing.VendorAccountModel {
+	flavor, _ := vendorAPIFlavor(acc.Vendor)
+	for _, id := range routing.OpenAIDecisionModelIDs() {
+		row := routing.VendorAccountModel{GatewayModel: id, UpstreamModel: id, APIFlavor: flavor}
+		if !routing.IsVendorDecisionModel(acc, row) || slices.ContainsFunc(rows, func(r routing.VendorAccountModel) bool { return r.UpstreamModel == id }) {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 // storeDiscoveredVendorModels replaces the account's model rows with rows (the
@@ -934,14 +959,11 @@ func isChatCapableOpenAIModel(id string) bool {
 
 // isServedOpenAIAPIKeyModel is the filter an OpenAI api-key listing passes
 // through: the chat-capable models (isChatCapableOpenAIModel) and the OpenAI
-// Decisions models (routing.OpenAIDecisionModels, ADR-100), which no chat
+// Decisions models (routing.IsOpenAIDecisionModel, ADR-100), which no chat
 // marker describes but the two decision endpoints serve. The decision models
 // are kept by name, so no future chat marker can drop them.
 func isServedOpenAIAPIKeyModel(id string) bool {
-	if _, ok := routing.OpenAIDecisionModels[id]; ok {
-		return true
-	}
-	return isChatCapableOpenAIModel(id)
+	return routing.IsOpenAIDecisionModel(id) || isChatCapableOpenAIModel(id)
 }
 
 // relabelVendorModels returns rows with GatewayModel = prefix + UpstreamModel and

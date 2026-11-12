@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
@@ -201,6 +202,9 @@ func TestVendorSystemOneTranslatesToTheOpenAIAPIKeyAccount(t *testing.T) {
 	if len(calls) != 1 || calls[0].host != "https://api.openai.com" || calls[0].path != "/v1/decisions" {
 		t.Fatalf("upstream calls = %+v, want one call to https://api.openai.com/v1/decisions", calls)
 	}
+	if got := calls[0].header.Get("Authorization"); got != "Bearer "+vendorDecisionPlainKey {
+		t.Fatalf("Authorization = %q, want Bearer <the opened key>", got)
+	}
 	var upstream map[string]any
 	if err := json.Unmarshal([]byte(systemOneTranslatedOAIBody), &upstream); err != nil {
 		t.Fatalf("fixture: %v", err)
@@ -219,6 +223,9 @@ func TestVendorSystemOneTranslatesToTheOpenAIAPIKeyAccount(t *testing.T) {
 	}
 	if got.CachedTokens != 40 || got.CacheWriteTokens != 10 {
 		t.Fatalf("row cached/write = %d/%d, want 40/10", got.CachedTokens, got.CacheWriteTokens)
+	}
+	if got.CostEUR != 0 || got.EnergyWh != 0 {
+		t.Fatalf("row cost/energy = %v/%v, want 0/0 (vendor rows are cost-free)", got.CostEUR, got.EnergyWh)
 	}
 }
 
@@ -248,8 +255,8 @@ func TestVendorDecisionEndpointsRefuseWithoutAccessOrForAChatModel(t *testing.T)
 }
 
 // The listings show the decision model to an entitled token only: GET
-// /v1/systemone/models names it, /api/portal/models lists it with the
-// decisions flavor and both decision flags.
+// /v1/systemone/models names it, /api/portal/models lists it with its chat
+// flavors plus the decisions flavor and both decision flags.
 func TestVendorDecisionModelIsListedForAnEntitledToken(t *testing.T) {
 	srv, _ := newVendorDecisionsServer(t)
 
@@ -294,10 +301,38 @@ func TestVendorDecisionModelIsListedForAnEntitledToken(t *testing.T) {
 	if found == nil {
 		t.Fatalf("/api/portal/models = %s, want %s listed", rec.Body.String(), vendorDecisionModel)
 	}
-	if !reflect.DeepEqual(found.Flavors, []string{routing.APIFlavorDecisions}) || !found.Decision || !found.DecisionOpenAI {
-		t.Fatalf("row = %+v, want flavors [decisions] with decision and decision_openai", *found)
+	if !reflect.DeepEqual(found.Flavors, []string{routing.APIFlavorAnthropic, routing.APIFlavorDecisions, routing.APIFlavorOpenAI}) || !found.Decision || !found.DecisionOpenAI {
+		t.Fatalf("row = %+v, want flavors [anthropic decisions openai] with decision and decision_openai", *found)
 	}
 	if strings.Contains(rec.Body.String(), vendorDecisionPlainKey) {
 		t.Fatal("the key leaked into the listing")
+	}
+}
+
+// Chat behavior for the decision model is unchanged: the chat offering still
+// holds it, so a redirect-enabled chat request naming it is not redirected,
+// while an unknown name is (the control proves the redirect is armed).
+func TestVendorDecisionModelIsNotRedirectedOnChat(t *testing.T) {
+	srv, _ := newVendorDecisionsServer(t)
+	// The owner's all-access token (tok_va_a), with the redirect switched on.
+	token := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{All: true}}
+	token.UnknownModelRedirect = true
+	token.UnknownModelRedirectBlocked = true
+	token.UnknownModelFallback = vendorDecisionPrefix + "gpt-5"
+
+	for _, flavor := range []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic} {
+		off := srv.Portal.ModelOfferingFor(context.Background(), token, flavor, nil)
+		if _, ok := off.Callable[vendorDecisionModel]; !ok {
+			t.Fatalf("%s offering = %+v, want %s callable", flavor, off, vendorDecisionModel)
+		}
+		if _, ok := off.Existing[vendorDecisionModel]; !ok {
+			t.Fatalf("%s offering = %+v, want %s existing", flavor, off, vendorDecisionModel)
+		}
+		if to := redirectUnknownModel(token, vendorDecisionModel, off); to != "" {
+			t.Fatalf("%s: %s redirected to %q, want no redirect", flavor, vendorDecisionModel, to)
+		}
+		if to := redirectUnknownModel(token, "no-such-model", off); to != vendorDecisionPrefix+"gpt-5" {
+			t.Fatalf("%s: control redirect = %q, want the fallback %s", flavor, to, vendorDecisionPrefix+"gpt-5")
+		}
 	}
 }

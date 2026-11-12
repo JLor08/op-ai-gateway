@@ -56,8 +56,19 @@ func decisionRequest(model, flavor string) inference.Request {
 var decisionFlavors = []string{APIFlavorOpenAIDecisions, APIFlavorDecisions}
 
 func TestOpenAIDecisionModelsIsTheGAAllowlist(t *testing.T) {
-	if !reflect.DeepEqual(OpenAIDecisionModels, map[string]struct{}{vendorDecisionModel: {}}) {
-		t.Fatalf("OpenAIDecisionModels = %v, want exactly {%s}", OpenAIDecisionModels, vendorDecisionModel)
+	if got := OpenAIDecisionModelIDs(); !reflect.DeepEqual(got, []string{vendorDecisionModel}) {
+		t.Fatalf("OpenAIDecisionModelIDs = %v, want exactly [%s]", got, vendorDecisionModel)
+	}
+	for id, want := range map[string]bool{vendorDecisionModel: true, "GPT-6-LUNA": false, "oa/" + vendorDecisionModel: false, "gpt-5": false, "": false} {
+		if got := IsOpenAIDecisionModel(id); got != want {
+			t.Errorf("IsOpenAIDecisionModel(%q) = %v, want %v", id, got, want)
+		}
+	}
+	// The ids are a fresh slice: changing it changes nothing.
+	ids := OpenAIDecisionModelIDs()
+	ids[0] = "gpt-5"
+	if IsOpenAIDecisionModel("gpt-5") || !IsOpenAIDecisionModel(vendorDecisionModel) {
+		t.Fatal("modifying OpenAIDecisionModelIDs' result changed the allowlist")
 	}
 }
 
@@ -324,5 +335,52 @@ func TestVendorDecisionRequestUnderAServerOverrideIsNotVendor(t *testing.T) {
 	req.ServerOverrideID = "srv_missing"
 	if target, err := resolver.Resolve(ctx, ownerToken(), req); err == nil || target.VendorAccountID != "" {
 		t.Fatalf("Resolve = %+v, %v; want an override refusal, never a vendor target", target, err)
+	}
+}
+
+// A shared account serves a decision request only to a token whose policy names
+// it: all:true covers a principal's OWN accounts and never borrows one, for a
+// user and for a service token alike, and a service token routes only under its
+// own named policy.
+func TestVendorDecisionRequestOnASharedAccountNeedsThePerAccountGrant(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedDecisionVendorAccount(t, store, now, "acc_shared", VendorOpenAI, VendorAuthAPIKey, "", vendorDecisionModel) // owned by vendorOwner
+	acc, err := store.VendorAccountByID(ctx, "acc_shared")
+	must(t, err)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+	resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{accounts: []VendorAccount{acc}})
+
+	allTrue := auth.VendorAccess{All: true}
+	refused := map[string]auth.Token{
+		"borrower with all:true":       {ID: "tok_b", UserID: sharingBorrower, Active: true, VendorAccess: allTrue},
+		"borrower without access":      {ID: "tok_b", UserID: sharingBorrower, Active: true},
+		"borrower naming another":      borrowerToken("acc_other"),
+		"service token with all:true":  {ID: "tok_s", Kind: "service", ServiceID: sharingServiceA, Active: true, VendorAccess: allTrue},
+		"service token without access": {ID: "tok_s", Kind: "service", ServiceID: sharingServiceA, Active: true},
+	}
+	for name, token := range refused {
+		t.Run(name, func(t *testing.T) {
+			for _, flavor := range decisionFlavors {
+				if target, err := resolver.Resolve(ctx, token, decisionRequest(vendorDecisionModel, flavor)); !errors.Is(err, ErrNoModelRoute) {
+					t.Fatalf("Resolve(%s) = %+v, %v; want ErrNoModelRoute without a per-account grant", flavor, target, err)
+				}
+			}
+		})
+	}
+	granted := map[string]auth.Token{
+		"borrower naming it":      borrowerToken("acc_shared"),
+		"service token naming it": serviceToken(sharingServiceA, "acc_shared"),
+	}
+	for name, token := range granted {
+		t.Run(name, func(t *testing.T) {
+			for _, flavor := range decisionFlavors {
+				target, err := resolver.Resolve(ctx, token, decisionRequest(vendorDecisionModel, flavor))
+				if err != nil || target.VendorAccountID != "acc_shared" || !target.VendorDecisionModel {
+					t.Fatalf("Resolve(%s) = %+v, %v; want the shared account's decision target", flavor, target, err)
+				}
+			}
+		})
 	}
 }

@@ -325,7 +325,7 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	if err != nil {
 		return emptyModelOffering()
 	}
-	addVendorDecisionCandidates(capable, callable, vendor, required)
+	addVendorDecisionCandidates(capable, callable, vendor, flavor, required)
 	return ModelOffering{
 		Callable: callable,
 		Capable:  capable,
@@ -335,14 +335,18 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 
 // addVendorDecisionCandidates adds to capable the callable vendor decision
 // models (the names the vendor overlay lists under the decisions flavor,
-// vendorModelServedFlavors) when required is exactly [any_decision], the one
-// capability list the resolver opts into the vendor path (ADR-100): such a
-// model is served by either decision endpoint, so it is a redirect candidate
-// for both. capableNames cannot see it, because it folds mapping views and a
-// vendor model has none. Any other list adds nothing, as the resolver serves
-// none from a vendor account.
-func addVendorDecisionCandidates(capable, callable map[string]struct{}, vendor map[string]map[string]struct{}, required []string) {
-	if len(required) != 1 || required[0] != routing.CapabilityAnyDecision {
+// vendorModelServedFlavors) for a decision request: flavor (coarse, as
+// ModelOfferingFor folds it) is decisions, which /v1/decisions and
+// /v1/systemone share, and required is exactly [any_decision]. That is the one
+// request the resolver opts into the vendor path (ADR-100), and such a model is
+// served by either decision endpoint, so it is a redirect candidate for both.
+// capableNames cannot see it, because it folds mapping views and a vendor model
+// has none. Every other flavor or list adds nothing, as the resolver serves
+// none of them from a vendor account. Like the listing's flags
+// (overlayVendorDecisionFlags) it is ORed in, also for a name a self-hosted
+// model shares.
+func addVendorDecisionCandidates(capable, callable map[string]struct{}, vendor map[string]map[string]struct{}, flavor string, required []string) {
+	if flavor != routing.APIFlavorDecisions || len(required) != 1 || required[0] != routing.CapabilityAnyDecision {
 		return
 	}
 	for name, flavors := range vendor {

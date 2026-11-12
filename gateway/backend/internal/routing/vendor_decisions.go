@@ -3,37 +3,57 @@
 
 package routing
 
-import "op-ai-gateway/internal/inference"
+import (
+	"op-ai-gateway/internal/inference"
+	"slices"
+)
 
-// OpenAIDecisionModels is the fixed allowlist of the OpenAI models that answer
+// openAIDecisionModels is the fixed allowlist of the OpenAI models that answer
 // OpenAI Decisions (POST /v1/decisions) on api.openai.com (ADR-100). OpenAI
 // Decisions went GA on 2026-10-22 with one model, gpt-6-luna. It is the ONLY
 // source of a vendor decision verdict: there is no portal flag and no stored
-// row, so a new decision model is a change to this set. Read-only.
-var OpenAIDecisionModels = map[string]struct{}{
+// row, so a new decision model is a change to this set. Unexported and never
+// handed out, so nothing can widen it at run time; IsOpenAIDecisionModel and
+// OpenAIDecisionModelIDs read it.
+var openAIDecisionModels = map[string]struct{}{
 	"gpt-6-luna": {},
+}
+
+// IsOpenAIDecisionModel reports whether upstream, a model id as sent to
+// api.openai.com, is an OpenAI Decisions model (openAIDecisionModels). The
+// match is exact: no prefix, no case folding.
+func IsOpenAIDecisionModel(upstream string) bool {
+	_, ok := openAIDecisionModels[upstream]
+	return ok
+}
+
+// OpenAIDecisionModelIDs returns the OpenAI Decisions model ids, sorted, in a
+// fresh slice the caller may keep or modify.
+func OpenAIDecisionModelIDs() []string {
+	ids := make([]string, 0, len(openAIDecisionModels))
+	for id := range openAIDecisionModels {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // IsVendorDecisionModel reports whether model row m of vendor account acc is a
 // decision model: the account is an OpenAI API-KEY account (api.openai.com, the
 // one vendor backend with an OpenAI Decisions endpoint; a subscription account
 // talks to the ChatGPT backend, which has none, and an Anthropic, Gemini or
-// OpenAI-compatible preset account is another vendor's API), and the row's
-// UPSTREAM model, the id sent to OpenAI, is in OpenAIDecisionModels. The gateway
-// name never decides: a prefix renames a model, it does not make one.
+// OpenAI-compatible preset account is another vendor's API, never the openai
+// vendor id), and the row's UPSTREAM model, the id sent to OpenAI, is an OpenAI
+// Decisions model (IsOpenAIDecisionModel). The gateway name never decides: a
+// prefix renames a model, it does not make one.
 func IsVendorDecisionModel(acc VendorAccount, m VendorAccountModel) bool {
-	if !isVendorDecisionAccount(acc) {
-		return false
-	}
-	_, ok := OpenAIDecisionModels[m.UpstreamModel]
-	return ok
+	return isVendorDecisionAccount(acc) && IsOpenAIDecisionModel(m.UpstreamModel)
 }
 
 // isVendorDecisionAccount reports whether acc can serve a decision model at
-// all: an OpenAI api-key account, and never a preset vendor (OpenAI-compatible
-// or Gemini), whose root URL is another vendor's API.
+// all: an OpenAI api-key account.
 func isVendorDecisionAccount(acc VendorAccount) bool {
-	return acc.Vendor == VendorOpenAI && acc.AuthType == VendorAuthAPIKey && !IsPresetVendor(acc.Vendor)
+	return acc.Vendor == VendorOpenAI && acc.AuthType == VendorAuthAPIKey
 }
 
 // isVendorDecisionRequest reports whether req is a decision request the vendor

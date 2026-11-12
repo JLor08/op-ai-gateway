@@ -565,6 +565,11 @@ func TestRefreshVendorAccountModelsPicksTheFetcherAndFlavorPerAccountKind(t *tes
 				t.Fatalf("call = %+v, want a client with a 10s timeout", call)
 			}
 			want := []routing.VendorAccountModel{modelRow(acc.ID, "p-"+slug, slug, tc.flavor, "Display")}
+			if tc.vendor == routing.VendorOpenAI && tc.authType == routing.VendorAuthAPIKey {
+				// An OpenAI api-key account keeps its decision model, which the listing
+				// omitted; it is not counted as discovered (Discovered stays 1).
+				want = append(want, modelRow(acc.ID, "p-gpt-6-luna", "gpt-6-luna", tc.flavor, ""))
+			}
 			if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, want) {
 				t.Fatalf("stored rows = %+v, want %+v", got, want)
 			}
@@ -1466,7 +1471,9 @@ func TestIsChatCapableOpenAIModel(t *testing.T) {
 }
 
 // OpenAI's /v1/models lists everything the key can reach (embeddings, speech,
-// image, moderation): an api_key account is seeded with the chat-capable ones only.
+// image, moderation): an api_key account is seeded with the chat-capable ones only,
+// plus its decision model, which the refresh keeps although the listing omits it
+// (not counted as discovered).
 func TestRefreshVendorAccountModelsFiltersAnOpenAIAPIKeyListingToChatModels(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
 	fake.okSlugs(kindOpenAIAPIKey,
@@ -1482,9 +1489,9 @@ func TestRefreshVendorAccountModelsFiltersAnOpenAIAPIKeyListingToChatModels(t *t
 	if res.Status != VendorRefreshOK || res.Discovered != 4 {
 		t.Fatalf("result = %+v, want ok with the 4 chat models", res)
 	}
-	want := []string{"chatgpt-4o-latest", "gpt-4.1", "gpt-5", "o4-mini"}
+	want := []string{"chatgpt-4o-latest", "gpt-4.1", "gpt-5", "gpt-6-luna", "o4-mini"}
 	if got := gatewayModels(storedModels(t, routeStore, acc.ID)); !reflect.DeepEqual(got, want) {
-		t.Fatalf("gateway models = %v, want only the chat models %v", got, want)
+		t.Fatalf("gateway models = %v, want only the chat models and the decision model %v", got, want)
 	}
 }
 
@@ -1501,6 +1508,56 @@ func TestRefreshVendorAccountModelsKeepsTheOpenAIDecisionModel(t *testing.T) {
 	want := []string{"gpt-5", "gpt-6-luna"}
 	if got := gatewayModels(storedModels(t, routeStore, acc.ID)); !reflect.DeepEqual(got, want) {
 		t.Fatalf("gateway models = %v, want %v", got, want)
+	}
+}
+
+// A refresh whose listing omits the decision model keeps it, under the
+// account's prefix, and does not count it as discovered. Only an OpenAI
+// api-key account gets it back.
+func TestRefreshVendorAccountModelsKeepsTheDecisionModelTheListingOmits(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAIAPIKey, "gpt-5", "o3")
+	acc := apiKeyAccount(t, svc, routing.VendorOpenAI, "oa/")
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshOK || res.Discovered != 2 || res.Detail != "discovered 2 models" {
+		t.Fatalf("RefreshVendorAccountModels = %+v, %v; want ok with 2 discovered", res, err)
+	}
+	want := []routing.VendorAccountModel{
+		modelRow(acc.ID, "oa/gpt-5", "gpt-5", routing.APIFlavorOpenAI, "gpt-5"),
+		modelRow(acc.ID, "oa/gpt-6-luna", "gpt-6-luna", routing.APIFlavorOpenAI, ""),
+		modelRow(acc.ID, "oa/o3", "o3", routing.APIFlavorOpenAI, "o3"),
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored rows = %+v, want %+v", got, want)
+	}
+
+	// Anthropic never gets it.
+	fake.ok(kindAnthropicAPIKey, discovered("claude-opus-5", ""))
+	ant := apiKeyAccount(t, svc, routing.VendorAnthropic, "")
+	if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), ant.ID); err != nil || res.Status != VendorRefreshOK {
+		t.Fatalf("anthropic refresh = %+v, %v; want ok", res, err)
+	}
+	if got := gatewayModels(storedModels(t, routeStore, ant.ID)); !reflect.DeepEqual(got, []string{"claude-opus-5"}) {
+		t.Fatalf("anthropic gateway models = %v, want [claude-opus-5]", got)
+	}
+}
+
+// A listing with nothing usable stays no usable list for an OpenAI api-key
+// account too: the decision model a refresh adds back does not make it usable,
+// so the rows are kept and the result is unverifiable.
+func TestRefreshVendorAccountModelsDecisionModelDoesNotMakeAnEmptyListingUsable(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAIAPIKey, "text-embedding-3-small")
+	acc := apiKeyAccount(t, svc, routing.VendorOpenAI, "")
+	before := storedModels(t, routeStore, acc.ID)
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable || res.Discovered != 0 {
+		t.Fatalf("RefreshVendorAccountModels = %+v, %v; want unverifiable with 0 discovered", res, err)
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+		t.Fatalf("stored rows = %+v, want the kept rows %+v", got, before)
 	}
 }
 
