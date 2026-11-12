@@ -34,7 +34,9 @@ const (
 	systemOneUpstreamModel = "system_one_real"
 
 	// systemOneBody carries state and questions with spacing, key order and
-	// unicode a decode/re-encode would normalise, so a byte-exact relay is observable.
+	// unicode a decode/re-encode would normalise. The relay is value-lossless
+	// (only the model is rewritten, through the shared JSON rewrite), not
+	// byte-exact, so the tests compare values, never bytes.
 	systemOneBody = `{"model":"sys-decider",  "state":"Ein Text: über alles", "questions":{"zz":{"type":"noul","instructions":"Is it ok?"},"aa":{"type":"score","instructions":"How much?","criteria":[1,2,3]}}}`
 )
 
@@ -560,5 +562,84 @@ func TestSystemOneModelsIsBearerOnly(t *testing.T) {
 	rec := postImagesWithHeaders(t, srv, "/v1/systemone/models", "{}", map[string]string{"Authorization": "Bearer dev-secret"})
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST: status = %d, want 405; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSystemOneGateHoldsUnderTheServerOverride: a token pinned to the decision
+// server (server_override) still reaches only a mapping with a (decision, yes)
+// verdict there. The override's own candidate pool runs the capability gate, so
+// a mapping on the pinned server without that verdict is refused -- as the
+// override refuses any model the server does not offer for the request, 404
+// server_override.model_unavailable -- and its upstream is never called, while
+// the decision model on it is served (the control). The user owns the server,
+// so the override survives its write-time check and the request's
+// re-authorization and really is applied.
+func TestSystemOneGateHoldsUnderTheServerOverride(t *testing.T) {
+	up, calls := newSystemOneUpstream(t, http.StatusOK, systemOneOKBody)
+	srv := newSystemOneCapableTestServer(t, up.URL)
+	if err := srv.Routes.SetServerOwners(context.Background(), "srv-sysone", []string{"usr_dev"}); err != nil {
+		t.Fatalf("SetServerOwners: %v", err)
+	}
+	setTokenServerOverride(t, srv, "tok_dev", "srv-sysone", false)
+
+	for _, model := range []string{"no-decision", "unprobed-decision"} {
+		rec := postSystemOne(t, srv, `{"model":"`+model+`","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}}`)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s under the override: status = %d, want 404; body = %s", model, rec.Code, rec.Body.String())
+		}
+		requireErrorCode(t, rec.Body.String(), "server_override.model_unavailable")
+		requireNoSystemOneUpstreamCall(t, calls)
+	}
+
+	rec := postSystemOne(t, srv, systemOneBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the decision model under the override: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if call := receivedSystemOneCall(t, calls); call.path != "/v1/systemone" {
+		t.Fatalf("the upstream received %s, want /v1/systemone", call.path)
+	}
+}
+
+// TestSystemOneDoesNotHonourAnAffinityPinToANonDecisionMapping: a session pin to
+// the decision server's application, under the System One request's own key
+// (token, model, the decisions flavor, the explicit session header -- the only
+// key the resolve looks up), is not honoured for a mapping without a (decision,
+// yes) verdict: the request is refused as not capable and the upstream never
+// called. The refusal is non-destructive: the pin survives.
+func TestSystemOneDoesNotHonourAnAffinityPinToANonDecisionMapping(t *testing.T) {
+	up, calls := newSystemOneUpstream(t, http.StatusOK, systemOneOKBody)
+	srv := newSystemOneCapableTestServer(t, up.URL)
+	// A pin is honoured only for an application with an affinity TTL, so the
+	// decision application gets one: the test is about the gate, not about that
+	// precondition.
+	ctx := context.Background()
+	app, err := srv.Routes.ApplicationByID(ctx, "app-sysone")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.AffinityTTLSeconds = 1800
+	if err := srv.Routes.UpdateApplication(ctx, app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	now := time.Now()
+	pin := routing.RouteAffinity{
+		ID: "aff_systemone_pin", APITokenID: "tok_dev", Model: "no-decision", APIFlavor: routing.APIFlavorDecisions, SessionID: "sess-pin",
+		ApplicationID: "app-sysone", ServerID: "srv-sysone", ExpiresAt: now.Add(time.Hour), LastUsedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := srv.Routes.UpsertAffinity(ctx, pin); err != nil {
+		t.Fatalf("seed affinity: %v", err)
+	}
+
+	rec := postImagesWithHeaders(t, srv, "/v1/systemone", `{"model":"no-decision","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}}`,
+		map[string]string{"Authorization": "Bearer dev-secret", sessionHeaderName: "sess-pin"})
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (the pinned mapping has no decision verdict); body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
+	requireNoSystemOneUpstreamCall(t, calls)
+	key := routing.AffinityKey{APITokenID: "tok_dev", Model: "no-decision", APIFlavor: routing.APIFlavorDecisions, SessionID: "sess-pin"}
+	if _, ok, err := srv.Routes.Affinity(ctx, key); err != nil || !ok {
+		t.Fatalf("the affinity row did not survive the refusal (ok=%v, err=%v)", ok, err)
 	}
 }

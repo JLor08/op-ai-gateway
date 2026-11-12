@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -63,6 +64,26 @@ func TestModelMappingDTODecisionsOnlyWireName(t *testing.T) {
 		}
 		if want := fmt.Sprintf(`"decisions_only":%t`, v); !strings.Contains(string(raw), want) {
 			t.Fatalf("mapping DTO JSON = %s, want %s", raw, want)
+		}
+	}
+}
+
+// TestModelDTODecisionIsAlwaysOnTheWire: the decision flag is always present,
+// like its sibling fold flags (speech, transcription, ...): a model that is no
+// decision model sends "decision": false, never an omitted key.
+func TestModelDTODecisionIsAlwaysOnTheWire(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		raw, err := json.Marshal(ModelDTO{ID: "m", Decision: want})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &keys); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		got, ok := keys["decision"]
+		if !ok || string(got) != strconv.FormatBool(want) {
+			t.Fatalf("decision on the wire = %s (present %v), want %v", got, ok, want)
 		}
 	}
 }

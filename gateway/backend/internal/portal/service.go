@@ -1457,10 +1457,15 @@ type ModelDTO struct {
 	// model SYNTHESISES audio from text, and another capability's yes verdict
 	// never makes a model a speech candidate.
 	Speech bool `json:"speech"`
-	// Decision is true only when every offering mapping (or, for a group, every
-	// offerable member) has a (decision, yes) verdict and declares the decisions
-	// flavor: decisionFlagsByName, the speech fold's twin.
-	Decision bool `json:"decision,omitempty"`
+	// Decision is true only when POST /v1/systemone would serve the model --
+	// EVERY offering mapping (or, for a group, every offerable member) has a
+	// (decision, yes) verdict and declares the decisions flavor (the
+	// application's and, for an agent-launched model with a spec, the spec's):
+	// AND aggregation, fail-closed, exactly like Speech. It is
+	// decisionFlagsByName's result, the one decision fold ModelOffering.Capable
+	// asks too, and GET /v1/systemone/models lists only the rows that carry it.
+	// Always present, like its sibling flags.
+	Decision bool `json:"decision"`
 	// Transcription is true only when the transcription endpoint would serve the
 	// model -- EVERY offering mapping (or, for a group, every offerable member) has
 	// a (transcription, yes) verdict and passes both flavor stages of a

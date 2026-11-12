@@ -383,6 +383,31 @@ func TestBenchmarkSiblingModelSkipsAnAudioOnlySibling(t *testing.T) {
 	})
 }
 
+// TestBenchmarkSiblingModelReadsEachSpecOnce: benchmarkSiblingModel passes over a sibling that
+// serves only decisions, as it does an images-only or audio-only one, and asks all three of one
+// read of each sibling's runtime spec, not one read per question.
+func TestBenchmarkSiblingModelReadsEachSpecOnce(t *testing.T) {
+	text := []string{routing.APIFlavorOpenAI}
+	mem, app := coldSeedAgentStore(t,
+		map[string]string{"map1": "up-model", "map2": "decider", "map4": "up-model-4"},
+		map[string][]string{"map1": text, "map2": {routing.APIFlavorDecisions}, "map4": text})
+	specs := &refusalSpecStore{Store: mem, fail: map[string]bool{}, reads: map[string]int{}}
+	srv := &Server{Routes: specs}
+	tgt := coldTestTarget()
+	tgt.app = app
+	sib, ok := srv.benchmarkSiblingModel(context.Background(), tgt)
+	if !ok || sib != "up-model-4" {
+		t.Fatalf("benchmarkSiblingModel = %q, %v; want up-model-4, true: not the decisions-only sibling", sib, ok)
+	}
+	specs.mu.Lock()
+	defer specs.mu.Unlock()
+	for _, id := range []string{"map2", "map4"} {
+		if n := specs.reads[id]; n != 1 {
+			t.Fatalf("runtime spec of %s read %d times, want once", id, n)
+		}
+	}
+}
+
 // TestEnsureColdLoadAgentTargetNeverSwapsOrUnloads: the cold pass never evicts a resident
 // target of a server_agent application, not even through a provider that could unload it or
 // swap it out through a text sibling. It cannot confirm a cold start then. The agent's runtime
