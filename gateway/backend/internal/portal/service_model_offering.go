@@ -415,6 +415,13 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 		}
 		folds[i] = flags
 	}
+	return namesInEveryFold(callable, folds), nil
+}
+
+// namesInEveryFold returns the names in callable that every fold flags true:
+// the intersection capableNames needs when a request requires several
+// capabilities.
+func namesInEveryFold(callable map[string]struct{}, folds []map[string]bool) map[string]struct{} {
 	out := make(map[string]struct{})
 	for name := range callable {
 		capable := true
@@ -428,7 +435,7 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 			out[name] = struct{}{}
 		}
 	}
-	return out, nil
+	return out
 }
 
 // hasCapabilityFold reports whether capability is one capableNames can fold:
