@@ -123,8 +123,8 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
 - **LocalSystem is refused:** `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`, "Running WSL as local system is not supported." *(source-read)*. An agent installed as a Windows service with NSSM runs as LocalSystem unless configured otherwise: "Services, unless explicitly configured otherwise, run under the LOCALSYSTEM account" ([NSSM usage](https://nssm.cc/usage)). In `wsl` mode the agent service must run under the Windows user that owns the distro.
 - **Session 0** (services, tasks that run "whether logged on or not", SSH) is unreliable for `wsl.exe`. [WSL#9231](https://github.com/microsoft/WSL/issues/9231), "Store WSL isn't accessible from Session 0", has been open since 2022 ("Known issue, we're working on a solution"). Reports since then disagree by Windows edition.
   - **Measured (Phase 0, B4, same host, Windows 11 Pro):** an NSSM service running as the distro-owning user, with `C:\Program Files\WSL\wsl.exe -d Ubuntu-24.04 --exec <script>` as its application and `WSL_UTF8=1`, **started and kept running**. The script saw the expected Linux user and distro, and `nvidia-smi -L` listed all three GPUs from inside the service.
-  - At the time, the user was also logged on interactively and their VM was probably already running. A cold start (after `wsl --shutdown`, and after a reboot with nobody logged on) is B4b.
-  - If B4b fails, a per-user helper in the interactive session is needed. That would be a larger design and gets its own phase.
+  - **Measured (B4b, cold):** the same service was set to start automatically and the host was rebooted with nobody logged on. The script ran **29 s after boot**, cold-starting the WSL VM from the service, and again saw the user, the distro and all three GPUs. The first interactive logon (RDP) came about six minutes later.
+  - **So on Windows 11 Pro, WSL works from a service running as the distro-owning user, with nobody logged on.** The per-user helper (Phase 4) is not needed there. It stays documented only as a fallback for editions where Session 0 fails.
 - **Model files** belong in the distro's ext4 filesystem, not on `/mnt/c`: "For the fastest performance speed, store your files in the WSL file system" ([filesystems](https://learn.microsoft.com/en-us/windows/wsl/filesystems)).
 
 ## Goals
@@ -289,7 +289,7 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 - **B2b** ✅ Read through the PDH array API (`PdhAddEnglishCounterW` plus `PdhGetFormattedCounterArrayW`, as the agent does): with two WSL GPU processes, does `vmwp` appear as two same-named instances whose values match each process? Answer: yes, one instance per guest GPU process, in an order that is not stable.
 - **B3** ✅ Multi-GPU: do the GPU indices and PCI bus IDs inside WSL match the host, and does `CUDA_VISIBLE_DEVICES` select the intended card? Answer: yes. With `CUDA_DEVICE_ORDER=PCI_BUS_ID`, the VRAM lands on the selected host index.
 - **B4** ✅ Does `wsl.exe` work from an NSSM service running as the distro-owning user (Session 0) on Windows 11 Pro? Answer: yes, with the user logged on interactively.
-- **B4b** Does it also work from a cold VM: after `wsl --shutdown`, and after a reboot with the service set to start automatically and nobody logged on?
+- **B4b** ✅ Does it also work from a cold VM, after a reboot with the service set to start automatically and nobody logged on? Answer: yes. It ran 29 s after boot; the first logon was about six minutes later.
 - **B5** What happens to vLLM, and to its VRAM, when `wsl.exe` is killed?
 - **B6** With linger enabled, does `wsl.exe -u <user> --exec systemd-run --user --scope --unit=… -- vllm serve …` work, without root? What do `memory.current`, `anon` and `file` of the scope show, compared with the RSS of the individual vLLM processes? Does `systemctl --user kill --signal=SIGTERM` stop vLLM cleanly and free its VRAM?
 
@@ -317,7 +317,7 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 - vLLM and SGLang presets: `--host 127.0.0.1 --port ${PORT}`, the memory-fraction hint, and the estimate suggestion from that fraction;
 - an `sglang` runtime kind with probe paths, if it is worth it.
 
-**Phase 4 (only if B4 fails): a per-user helper** in the interactive session that performs the WSL steps for a service-hosted agent.
+**Phase 4 (not needed on Windows 11 Pro per B4/B4b; only for an edition where Session 0 fails): a per-user helper** in the interactive session that performs the WSL steps for a service-hosted agent.
 
 ## Open questions
 
