@@ -842,6 +842,9 @@ func TestSystemOneDisabledServerAgentIs404(t *testing.T) {
 	}{
 		{"server_agent application disabled, no spec", routing.EndpointModeDisabled, false, ""},
 		{"spec disables it over an auto application", routing.EndpointModeAuto, true, routing.EndpointModeDisabled},
+		// Phase 1 compatibility: migration 107 stored passthrough on every
+		// existing application; the spec's disabled still wins over it.
+		{"spec disables it over a stored-passthrough application", routing.EndpointModePassthrough, true, routing.EndpointModeDisabled},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -43,6 +43,10 @@ type vendorDecisionsStub struct {
 	srv   *httptest.Server
 	mu    sync.Mutex
 	calls []vendorDecisionsCall
+	// answer, when set, replaces vendorDecisionsAnswer, and header is added to
+	// every response; a test sets them before its first request.
+	answer string
+	header http.Header
 }
 
 type vendorDecisionsCall struct {
@@ -61,12 +65,19 @@ func newVendorDecisionsStub(t *testing.T) *vendorDecisionsStub {
 		st.calls = append(st.calls, vendorDecisionsCall{host: r.Header.Get("X-Original-Host"), path: r.URL.Path, header: r.Header.Clone(), body: b})
 		st.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		for k, v := range st.header {
+			w.Header()[k] = v
+		}
 		if r.URL.Path != "/v1/decisions" {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = io.WriteString(w, `{"error":{"message":"not found","type":"invalid_request_error","code":null}}`)
 			return
 		}
-		_, _ = io.WriteString(w, vendorDecisionsAnswer)
+		answer := vendorDecisionsAnswer
+		if st.answer != "" {
+			answer = st.answer
+		}
+		_, _ = io.WriteString(w, answer)
 	}))
 	t.Cleanup(st.srv.Close)
 	return st
@@ -226,6 +237,39 @@ func TestVendorSystemOneTranslatesToTheOpenAIAPIKeyAccount(t *testing.T) {
 	}
 	if got.CostEUR != 0 || got.EnergyWh != 0 {
 		t.Fatalf("row cost/energy = %v/%v, want 0/0 (vendor rows are cost-free)", got.CostEUR, got.EnergyWh)
+	}
+}
+
+// A translated /v1/systemone answer that becomes the gateway's own error -- the
+// 422 systemone.refused, the 502 of an untranslatable body -- still came from
+// the vendor, so its rate-limit headers reach the account's usage snapshot
+// like any other vendor answer's.
+func TestVendorSystemOneGatewayErrorsScrapeTheRateLimitHeaders(t *testing.T) {
+	cases := []struct {
+		name, answer, code string
+		status             int
+	}{
+		{"refused", `{"answers":[{"type":"refusal","name":"ok"},{"type":"refusal","name":"q1"}],"model":"gpt-6-luna","usage":{"input_tokens":3,"output_tokens":1}}`, codeSystemOneRefused, http.StatusUnprocessableEntity},
+		{"untranslatable", `{"answers":"nope"}`, codeSystemOneUpstreamError, http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, stub := newVendorDecisionsServer(t)
+			stub.answer = tc.answer
+			stub.header = http.Header{}
+			stub.header.Set(hdrCodexPrimaryPct, "42")
+
+			rec := postSystemOneAs(t, srv, vaOwnerSecret, systemOneTranslateRequestFor(vendorDecisionModel))
+
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d body = %s, want %d", rec.Code, rec.Body.String(), tc.status)
+			}
+			requireErrorCode(t, rec.Body.String(), tc.code)
+			usage, ok, err := srv.Routes.VendorAccountUsageByID(context.Background(), vendorDecisionAccountID)
+			if err != nil || !ok || usage.FiveHourPct != 42 {
+				t.Fatalf("account usage = %+v ok=%v err=%v, want the scraped 42%% five-hour window", usage, ok, err)
+			}
+		})
 	}
 }
 

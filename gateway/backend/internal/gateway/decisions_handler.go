@@ -161,7 +161,7 @@ func (s *Server) relayDecisions(w http.ResponseWriter, r *http.Request, token au
 		rel.upstreamBody = body
 		rel.decisionsRewrite = forwardDecisionsRewrite(table, c.req.Model, c.token.DecisionsConfidenceNormalize)
 	} else if c.token.DecisionsConfidenceNormalize {
-		rel.decisionsRewrite = normalizeDecisionsRewrite(compat.DialectOpenAI, codeDecisionsUpstreamError)
+		rel.decisionsRewrite = normalizeDecisionsRewrite(compat.DialectOpenAI)
 	}
 	s.proxyNative(w, r, rel)
 }

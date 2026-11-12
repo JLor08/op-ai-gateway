@@ -257,7 +257,7 @@ func (s *Server) relaySystemOne(w http.ResponseWriter, r *http.Request, token au
 			return
 		}
 	} else if c.token.DecisionsConfidenceNormalize {
-		rel.decisionsRewrite = normalizeDecisionsRewrite(compat.DialectSystemOne, codeSystemOneUpstreamError)
+		rel.decisionsRewrite = normalizeDecisionsRewrite(compat.DialectSystemOne)
 	}
 	s.proxyNative(w, r, rel)
 }
