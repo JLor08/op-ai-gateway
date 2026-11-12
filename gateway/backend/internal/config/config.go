@@ -161,7 +161,7 @@ type Config struct {
 	MaxChatAudioBytes               int // total ceiling on the decoded PCM bytes one chat run may store across its audio blobs (#279); default 256 MiB; the per-blob cap above still bounds each blob; config only, enforced by the gateway run executor
 	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
 	MaxImageEditBodyBytes           int // cap on the multipart body POST /v1/images/edits holds in memory; default 32 MiB, the server agent's own cap (an edit to an agent-launched model is also refused past that, whatever this is set to)
-	MaxDecisionsBodyBytes           int // cap on the JSON body of POST /v1/systemone (and, later, /v1/decisions) held in memory; default 32 MiB, the agent router's JSON buffer
+	MaxDecisionsBodyBytes           int // cap on the JSON body of POST /v1/systemone and POST /v1/decisions (and a buffered decisions answer) held in memory; default 32 MiB, the agent router's JSON buffer
 	MaxAudioTranscriptionBodyBytes  int // cap on the multipart body POST /v1/audio/transcriptions (and /v1/audio/transcriptions/details) holds in memory, and on the JSON response it buffers to read the billable duration; default 32 MiB, the server agent's own cap (its own setting, independent of the image-edit cap)
 	MockDelay                       time.Duration
 	MockUnreachable                 bool

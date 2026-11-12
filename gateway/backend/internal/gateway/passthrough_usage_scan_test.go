@@ -1498,3 +1498,17 @@ func TestNewUsageScannerSkipsImages(t *testing.T) {
 		t.Fatalf("nil scanner usage() = %+v, want the zero Usage", got)
 	}
 }
+
+// An OpenAI Decisions answer carries Responses-shaped usage, cache details
+// included; the streaming passthrough reads it under the openai_decisions flavor.
+func TestParsePassthroughUsageReadsOpenAIDecisionsUsage(t *testing.T) {
+	const body = `{"answers":[],"model":"m","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":10},"output_tokens":2,"total_tokens":102}}`
+	u := parsePassthroughUsage(routing.APIFlavorOpenAIDecisions, []byte(body))
+	if u.InputTokens != 100 || u.CachedTokens != 40 || u.CacheWriteTokens != 10 || u.OutputTokens != 2 || u.TotalTokens != 102 {
+		t.Fatalf("usage = %+v, want in 100 cached 40 write 10 out 2 total 102", u)
+	}
+	// The Responses reader learns cache_write_tokens too.
+	if r := parsePassthroughUsage("openai_responses", []byte(body)); r.CacheWriteTokens != 10 {
+		t.Fatalf("responses usage = %+v, want cache_write_tokens 10", r)
+	}
+}

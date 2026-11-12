@@ -44,7 +44,8 @@ type Event struct {
 	OutputTokens int    `json:"output_tokens"`
 	TotalTokens  int    `json:"total_tokens"`
 	// CachedTokens = prompt cache READ tokens; CacheWriteTokens = prompt cache WRITE
-	// (Anthropic cache_creation, 0 for OpenAI/Responses). Disjoint from InputTokens
+	// (Anthropic cache_creation, OpenAI Decisions cache_write_tokens, 0 for other
+	// OpenAI/Responses traffic). Disjoint from InputTokens
 	// here (the accounting split happens in gateway.recordUsage), so
 	// input + cached + write + output == total.
 	CachedTokens     int     `json:"cached_tokens"`

@@ -160,8 +160,9 @@ type ServerDeps struct {
 	// OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES). <= 0 defaults in New to
 	// defaultMaxAudioTranscriptionBodyBytes.
 	MaxAudioTranscriptionBodyBytes int
-	// MaxDecisionsBodyBytes caps the JSON body of POST /v1/systemone (and, in a
-	// later phase, /v1/decisions). A value <= 0 uses defaultDecisionsBodyBytes.
+	// MaxDecisionsBodyBytes caps the JSON body of POST /v1/systemone and POST
+	// /v1/decisions, and a decisions answer the gateway buffers. A value <= 0
+	// uses defaultDecisionsBodyBytes.
 	MaxDecisionsBodyBytes int
 	// MaxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
 	// WAV headers) one chat run may store across its audio blobs when a long
@@ -1699,6 +1700,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/v1/systemone", s.handleSystemOne)
 	s.mux.HandleFunc("/v1/systemone/models", s.handleSystemOneModels)
+	s.mux.HandleFunc("/openai/v1/decisions", s.handleOpenAIDecisions)
+	s.mux.HandleFunc("/v1/decisions", s.handleOpenAIDecisions)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)

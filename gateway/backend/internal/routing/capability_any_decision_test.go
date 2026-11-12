@@ -3,7 +3,10 @@
 
 package routing
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestCapabilityAnyDecisionSatisfied(t *testing.T) {
 	yes := func(name string) CapabilityRow { return CapabilityRow{Capability: name, Verdict: CapabilityYes} }
@@ -86,5 +89,33 @@ func TestEffectiveFieldsDecisionModes(t *testing.T) {
 	got = EffectiveFields(app, RuntimeSpec{}, false)
 	if got.DecisionsMode != EndpointModeAuto || got.SystemOneMode != EndpointModePassthrough {
 		t.Errorf("without a spec: got %q/%q, want auto/passthrough", got.DecisionsMode, got.SystemOneMode)
+	}
+}
+
+// The resolver's candidacy filter applies the decision endpoint modes too: an
+// ordinary application whose mode for the request's endpoint is disabled is no
+// candidate, a server_agent application is (its spec decides at dispatch).
+func TestFilterServesEndpointAppliesDecisionModes(t *testing.T) {
+	cand := func(id, typ string, decisions, systemOne EndpointMode) MappingCandidate {
+		return MappingCandidate{Application: Application{ID: id, Type: typ, APIFlavors: []string{APIFlavorDecisions}, DecisionsMode: decisions, SystemOneMode: systemOne}}
+	}
+	cands := []MappingCandidate{
+		cand("both", ProviderVLLM, EndpointModeAuto, EndpointModePassthrough),
+		cand("no-decisions", ProviderVLLM, EndpointModeDisabled, EndpointModePassthrough),
+		cand("no-systemone", ProviderVLLM, EndpointModeAuto, EndpointModeDisabled),
+		cand("agent", ProviderServerAgent, EndpointModeDisabled, EndpointModeDisabled),
+	}
+	ids := func(cs []MappingCandidate) []string {
+		out := []string{}
+		for _, c := range cs {
+			out = append(out, c.Application.ID)
+		}
+		return out
+	}
+	if got := ids(filterServesEndpoint(append([]MappingCandidate(nil), cands...), APIFlavorOpenAIDecisions)); !slices.Equal(got, []string{"both", "no-systemone", "agent"}) {
+		t.Errorf("openai_decisions candidates = %v", got)
+	}
+	if got := ids(filterServesEndpoint(append([]MappingCandidate(nil), cands...), APIFlavorDecisions)); !slices.Equal(got, []string{"both", "no-decisions", "agent"}) {
+		t.Errorf("decisions (System One) candidates = %v", got)
 	}
 }

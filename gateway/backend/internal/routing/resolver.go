@@ -1744,12 +1744,16 @@ func ImpliedImageEdit(rows []CapabilityRow) bool {
 }
 
 // filterServesEndpoint drops candidates whose application does not serve the
-// request's FINE api flavor once the per-endpoint mode is applied. It refines only
-// the two coding-agent endpoints (openai_responses / anthropic_messages); for
-// openai_chat_completions and any coarse flavor it is a no-op, so the coarse
-// openai/anthropic gate the store already applied stands unchanged.
+// request's FINE api flavor once the per-endpoint mode is applied. It refines the
+// two coding-agent endpoints (openai_responses / anthropic_messages) and the two
+// decision endpoints (openai_decisions for /v1/decisions, the coarse decisions
+// flavor for /v1/systemone, ADR-098); for openai_chat_completions and any other
+// coarse flavor it is a no-op, so the coarse gate the store already applied
+// stands unchanged.
 func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []MappingCandidate {
-	if fineFlavor != inference.APIFlavorOpenAIResponses && fineFlavor != "anthropic_messages" {
+	switch fineFlavor {
+	case inference.APIFlavorOpenAIResponses, "anthropic_messages", APIFlavorOpenAIDecisions, APIFlavorDecisions:
+	default:
 		return cands
 	}
 	out := cands[:0:0]

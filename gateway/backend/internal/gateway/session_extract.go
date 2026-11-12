@@ -33,6 +33,7 @@ const (
 	endpointTranscription                               // /v1/audio/transcriptions (OpenAI speech-to-text, multipart)
 	endpointTranscriptionDetails                        // /v1/audio/transcriptions/details (OpenAI speech-to-text with speaker turns, multipart, one-shot)
 	endpointSystemOne                                   // /v1/systemone (System One decisions)
+	endpointDecisions                                   // /v1/decisions (OpenAI Decisions)
 )
 
 // sessionInfo is the extractor result. ExplicitHeader is the raw
@@ -92,9 +93,10 @@ func extractClientSession(h http.Header, raw []byte, endpoint sessionEndpoint) s
 	case endpointSpeech:
 		// /v1/audio/speech has no per-endpoint header signal either; see the
 		// fuller comment on sessionFromBody's speech case below.
-	case endpointSystemOne:
-		// /v1/systemone has no per-endpoint header signal either; see the
-		// fuller comment on sessionFromBody's System One case below.
+	case endpointSystemOne, endpointDecisions:
+		// /v1/systemone and /v1/decisions have no per-endpoint header signal
+		// either; see the fuller comment on sessionFromBody's decisions case
+		// below.
 	case endpointTranscription, endpointTranscriptionDetails:
 		// /v1/audio/transcriptions and its one-shot diarized twin
 		// /v1/audio/transcriptions/details have no per-endpoint header signal
@@ -168,6 +170,12 @@ func sessionFromBody(raw []byte, endpoint sessionEndpoint) (id, source string) {
 		// affinity to. Stated as a case rather than left to the switch's absent
 		// default, so a reader can tell "considered, and there is none" from
 		// "nobody thought about it".
+	case endpointDecisions:
+		// /v1/decisions is read the same way as /v1/systemone. Its request does
+		// carry a prompt_cache_key, but that is a prompt-cache hint (the
+		// translate route drops it, ADR-098), not a conversation: a decision is
+		// a one-shot verdict like a System One one. The explicit session header
+		// (step 1 of extractClientSession) still applies.
 	case endpointTranscription, endpointTranscriptionDetails:
 		// /v1/audio/transcriptions (and its /details twin, which takes the same
 		// form) carries no session signal: OpenAI's

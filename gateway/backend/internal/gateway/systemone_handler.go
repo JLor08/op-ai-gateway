@@ -8,7 +8,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/compat"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -17,7 +19,8 @@ import (
 )
 
 // defaultDecisionsBodyBytes is the default bound on the JSON body of
-// POST /v1/systemone (and, later, /v1/decisions), an operator setting
+// POST /v1/systemone and POST /v1/decisions, and on a decisions answer the
+// gateway buffers (relayDecisionsResponse), an operator setting
 // (ServerDeps.MaxDecisionsBodyBytes, config
 // OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES). It equals the agent router's JSON
 // buffer, but the two are separate checks: this one counts the client's bytes,
@@ -40,10 +43,10 @@ func (s *Server) decisionsBodyLimit() int64 {
 // the same local alias for routing.APIFlavorDecisions that apiFlavorSpeech is for
 // the coarse audio flavor: NormalizeAPIFlavor folds it to itself, so it filters
 // candidacy (only an application declaring decisions is a candidate), labels
-// usage rows, and answers upstreamPath. Like images and speech it is a
-// single-purpose flavor with no EndpointMode and no translate path; whether a
-// MODEL can give a verdict is the capability gate's job, keyed on
-// routing.CapabilityDecision.
+// usage rows, and answers upstreamPath. Like images and speech it has no
+// translate path; its one mode, SystemOneMode, only switches it on or off
+// (ADR-098). Whether a MODEL can give a verdict is the capability gate's job,
+// keyed on routing.CapabilityDecision.
 const apiFlavorSystemOne = routing.APIFlavorDecisions
 
 // The request-error codes validateSystemOneRequest answers with. They are API
@@ -140,43 +143,70 @@ func validateSystemOneRequest(raw []byte) *inference.Error {
 	return nil
 }
 
-// recordSystemOneRoutingFailure answers and records a System One request refused
-// before any upstream call (routing, capability or effective-flavor refusal),
-// the System One twin of recordSpeechRoutingFailure. The row carries the
-// endpoint and no host or route: no server saw the request. The billing unit
-// stays the default (tokens), the endpoint's unit.
-func (s *Server) recordSystemOneRoutingFailure(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, err error) {
-	id := nextRequestID()
-	capturing := s.capturingEnabled(token)
+// decisionsCall is the request-scoped identity of a decision request (System
+// One or OpenAI Decisions) between its preflight and its relay: what every
+// refusal before the upstream call needs to answer and record it. token is
+// refreshed by the resolve (resolveTarget updates the last-used-model snapshot),
+// which is why resolveDecisionsTarget takes the call by pointer.
+type decisionsCall struct {
+	token    auth.Token
+	req      inference.Request
+	raw      []byte
+	start    time.Time
+	endpoint sessionEndpoint
+}
+
+// recordDecisionsRoutingFailure answers and records a decision request refused
+// before any upstream call by a routing error (routing, capability or
+// effective-flavor refusal), the decisions twin of recordSpeechRoutingFailure.
+func (s *Server) recordDecisionsRoutingFailure(w http.ResponseWriter, r *http.Request, c decisionsCall, err error) {
 	status := completionHTTPStatus(err)
 	code := completionErrorCode(err)
 	if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
-		slog.Warn("systemone request admission rejected", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status)
+		slog.Warn("decisions request admission rejected", "path", r.URL.Path, "api_flavor", c.req.APIFlavor, "model", c.req.Model, "code", code, "status", status)
 	} else {
-		slog.Debug("systemone request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
+		slog.Debug("decisions request rejected: routing failed", "path", r.URL.Path, "api_flavor", c.req.APIFlavor, "model", c.req.Model, "code", code, "status", status, "err", err)
 	}
 	body := writeCompletionErrorCaptured(w, err)
-	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, Endpoint: endpointSystemOne}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
+	s.recordDecisionsRefusal(w, r, c, status, code, body)
 }
 
-// resolveSystemOneTarget resolves the routing target for an already-gated System
-// One request and applies the effective-served conjunct (flavor in APIFlavors AND
-// the endpoint not disabled) to it, as resolveSpeechTarget does: for a
-// server_agent mapping the resolved runtime spec is the authority for its model's
-// flavors, and the relay reaches proxyNative directly. On a refusal it has
-// already answered and recorded, and returns ok == false. token is a pointer
-// because resolveTarget refreshes the caller's last-used-model snapshot.
-func (s *Server) resolveSystemOneTarget(w http.ResponseWriter, r *http.Request, token *auth.Token, req inference.Request, raw []byte, start time.Time) (routing.Target, bool) {
-	target, err := s.resolveTarget(r.Context(), token, req)
+// refuseDecisionsRequest answers a decision request the gateway itself refuses
+// before any upstream call -- an endpoint its effective mode disables, a body
+// the translator cannot express -- with status and an error object carrying
+// code and message, and records it like recordDecisionsRoutingFailure.
+func (s *Server) refuseDecisionsRequest(w http.ResponseWriter, r *http.Request, c decisionsCall, status int, code, message string) {
+	body := writeJSONCaptured(w, status, apierror.Response(code, message, ""))
+	s.recordDecisionsRefusal(w, r, c, status, code, body)
+}
+
+// recordDecisionsRefusal records the usage row of a refused decision request.
+// The row carries the endpoint and no host or route: no server saw the request
+// (even a refusal that comes after the resolve is recorded so). The billing
+// unit stays the default (tokens), the endpoints' unit.
+func (s *Server) recordDecisionsRefusal(w http.ResponseWriter, r *http.Request, c decisionsCall, status int, code string, body []byte) {
+	capture := buildCaptureInput(s.capturingEnabled(c.token), c.token.UserID, c.token.Secret, r, c.raw, w.Header(), body, status, c.req.APIFlavor)
+	s.recordUsage(c.start, c.token, c.req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, Endpoint: c.endpoint}, nextRequestID(), capture, nil)
+}
+
+// resolveDecisionsTarget resolves the routing target for an already-gated
+// decision request and applies the effective-served conjunct's flavor half to
+// it, as resolveSpeechTarget does: for a server_agent mapping the resolved
+// runtime spec is the authority for its model's flavors, and the relay reaches
+// proxyNative directly. The mode half is each endpoint's own (System One's
+// SystemOneMode in relaySystemOne, the decisions route in decisionsRoute). On a
+// refusal it has already answered and recorded, and returns ok == false.
+func (s *Server) resolveDecisionsTarget(w http.ResponseWriter, r *http.Request, c *decisionsCall) (routing.Target, bool) {
+	target, err := s.resolveTarget(r.Context(), &c.token, c.req)
 	if err != nil {
-		s.recordSystemOneRoutingFailure(w, r, *token, req, raw, start, err)
+		s.recordDecisionsRoutingFailure(w, r, *c, err)
 		return routing.Target{}, false
 	}
-	if !targetServesFlavor(target, req.APIFlavor) {
-		slog.Debug("systemone request rejected: resolved target's effective flavors exclude decisions",
-			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
+	if !targetServesFlavor(target, c.req.APIFlavor) {
+		slog.Debug("decisions request rejected: resolved target's effective flavors exclude decisions",
+			"path", r.URL.Path, "api_flavor", c.req.APIFlavor, "model", c.req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.recordSystemOneRoutingFailure(w, r, *token, req, raw, start, routing.ErrNoModelRoute)
+		s.recordDecisionsRoutingFailure(w, r, *c, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
 	return target, true
@@ -184,25 +214,39 @@ func (s *Server) resolveSystemOneTarget(w http.ResponseWriter, r *http.Request, 
 
 // relaySystemOne relays an already-gated System One request via proxyNative with
 // no translate fallback: every resolve failure is terminal and recorded directly.
-// req is pf.Req, already carrying RequiredCapabilities = [decision]. proxyNative
-// rewrites the model to the mapping's own name and relays the upstream's status
-// and body verbatim; usage is read from the body's usage object
-// (mergePassthroughUsage), and a body without one records zero tokens.
+// req is pf.Req, already carrying RequiredCapabilities = [decision]. A resolved
+// target whose effective System One mode is disabled (a server_agent spec can
+// disable it per model; an ordinary application is no candidate then) is
+// refused 404 systemone.endpoint_disabled. proxyNative rewrites the model to the
+// mapping's own name and relays the upstream's status and body verbatim; usage
+// is read from the body's usage object (mergePassthroughUsage), and a body
+// without one records zero tokens. A token that opted into confidence
+// normalization gets the buffered relay instead, which rewrites the confidence
+// of a 2xx answer (ADR-098) and relays everything else as the copier would.
 func (s *Server) relaySystemOne(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {
-	start := time.Now()
-	target, ok := s.resolveSystemOneTarget(w, r, &token, req, raw, start)
+	c := decisionsCall{token: token, req: req, raw: raw, start: time.Now(), endpoint: endpointSystemOne}
+	target, ok := s.resolveDecisionsTarget(w, r, &c)
 	if !ok {
 		return
 	}
-	s.proxyNative(w, r, nativeRelay{
-		token:    token,
+	if target.SystemOneMode == routing.EndpointModeDisabled {
+		slog.Debug("systemone request rejected: endpoint disabled", "path", r.URL.Path, "model", c.req.Model, "server", s.serverName(target.ServerID), "route_id", target.RouteID)
+		s.refuseDecisionsRequest(w, r, c, statusEndpointDisabled, codeSystemOneEndpointDisabled, msgEndpointDisabled)
+		return
+	}
+	rel := nativeRelay{
+		token:    c.token,
 		target:   target,
 		path:     upstreamPath(target, apiFlavorSystemOne, endpointSystemOne),
 		raw:      raw,
-		pfReq:    req,
+		pfReq:    c.req,
 		endpoint: endpointSystemOne,
-		reselect: relayAgain(req, func(again inference.Request) { s.relaySystemOne(w, r, token, again, raw) }),
-	})
+		reselect: relayAgain(c.req, func(again inference.Request) { s.relaySystemOne(w, r, c.token, again, raw) }),
+	}
+	if c.token.DecisionsConfidenceNormalize {
+		rel.decisionsRewrite = &decisionsRewrite{normalize: true, dialect: compat.DialectSystemOne, failCode: codeSystemOneUpstreamError}
+	}
+	s.proxyNative(w, r, rel)
 }
 
 // handleSystemOneModels serves GET /v1/systemone/models: the models a System One
