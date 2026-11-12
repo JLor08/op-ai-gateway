@@ -881,6 +881,90 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/decisions:
+    post:
+      tags: [inference]
+      summary: OpenAI Decisions request (passthrough to the upstream's /v1/decisions, or translation to and from System One)
+      description: >
+        Bearer-only (scope `gateway:use` or `llm:invoke`): a portal session
+        cookie and the internal loopback are no way in. Required: a non-blank
+        string `model` (400 `decisions.model_required`) and a non-empty ARRAY
+        `questions` (400 `decisions.questions_required`; System One's object
+        form is refused). The protocol does not stream: `stream` must be
+        absent, `null` or `false` (400 `decisions.stream_unsupported`).
+        Admission takes an application that declares the `decisions` API
+        flavor (otherwise 404 `routing.no_model_route`) and a mapping whose
+        `decision` OR `decision_openai` verdict is `yes` (the derived
+        `any_decision` requirement; otherwise 404
+        `routing.model_not_capable`; an unprobed model is refused too). The
+        body is read under `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES` (default
+        32 MiB; 413 `request.body_too_large`). After the resolve the
+        effective `decisions_mode` of the application or runtime spec picks the
+        route: `disabled` is 404 `decisions.endpoint_disabled`; `auto` (the
+        default) passes through when the mapping has `decision_openai: yes`
+        and otherwise translates; `translate` needs `decision: yes` and
+        `passthrough` needs `decision_openai: yes`, else 404
+        `routing.model_not_capable` (no other candidate is tried). PASSTHROUGH
+        relays the body to the upstream `/v1/decisions` with `model` rewritten
+        to the mapping's own name and returns the upstream's status and body
+        verbatim, a non-2xx one included. TRANSLATE converts the request to a
+        System One request, asks the upstream's `/v1/systemone` and converts
+        the answer back; it refuses what System One cannot express (400
+        `decisions.input_unsupported` or `decisions.question_invalid`), answers
+        a non-2xx System One answer as the Error envelope with code
+        `decisions.upstream_error` under the upstream's status, and a 502 with
+        the same code when an answer is incomplete, malformed or over the
+        buffer bound. A token with the `decisions_confidence_normalize` flag
+        gets the `confidence` of its choice and score answers recomputed as
+        max(p)/sum(p) in every mode. Metered in tokens (a passthrough also
+        records `input_tokens_details.cached_tokens` and `cache_write_tokens`).
+        Never routed to a vendor account. Beyond those it answers the same
+        statuses as every other inference path (429/402 from the principal
+        limiter, 503 from the capacity queue or no healthy host).
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionsRequest' }
+      responses:
+        '200':
+          description: The answers, one per question in request order (a passthrough relays the upstream's own body).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DecisionsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: The Error envelope with code `request.body_too_large`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: The Error envelope with code `decisions.upstream_error`; the gateway could not relay or translate the upstream's answer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /openai/v1/decisions:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/decisions
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionsRequest' }
+      responses:
+        '200':
+          description: As /v1/decisions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DecisionsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/systemone/models:
     get:
       tags: [inference]
@@ -1164,7 +1248,11 @@ paths:
       MANAGEMENT-ONLY to set: only a portal session or an admin-scope bearer
       may create a token with it true or send it on an update; an
       inference-only bearer (even on its own token) gets 403
-      portal.principal_forbidden and nothing is written.
+      portal.principal_forbidden and nothing is written. A token also
+      carries the opt-in decisions_confidence_normalize flag (default false,
+      always present on a read): when true, the confidence of the choice and
+      score answers of /v1/decisions and /v1/systemone is recomputed from
+      their probabilities. It is NOT management-gated.
     get:
       tags: [portal]
       summary: List own API tokens (each row carries vendor_access when the token has any)
@@ -1192,6 +1280,7 @@ paths:
                         vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
                         claude_model_aliases: { type: boolean }
                         claude_effort_compatibility: { type: boolean }
+                        decisions_confidence_normalize: { type: boolean }
     post:
       tags: [portal]
       summary: Create an API token (optionally with a vendor_access policy)
@@ -1217,8 +1306,9 @@ paths:
               type: object
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
-                only vendor_access, claude_model_aliases and
-                claude_effort_compatibility are modeled here.
+                only vendor_access, claude_model_aliases,
+                claude_effort_compatibility and
+                decisions_confidence_normalize are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1232,6 +1322,11 @@ paths:
                     off. MANAGEMENT-ONLY: true is accepted only from a portal
                     session or an admin-scope bearer (otherwise 403
                     portal.principal_forbidden); false needs no privilege.
+                decisions_confidence_normalize:
+                  type: boolean
+                  description: >
+                    Opt into recomputed decision confidence. Absent means off.
+                    Not management-gated.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1259,8 +1354,9 @@ paths:
               type: object
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
-                only vendor_access, claude_model_aliases and
-                claude_effort_compatibility are modeled here.
+                only vendor_access, claude_model_aliases,
+                claude_effort_compatibility and
+                decisions_confidence_normalize are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1276,6 +1372,11 @@ paths:
                     session or an admin-scope bearer (otherwise 403
                     portal.principal_forbidden, and no other field of the same
                     request is applied either).
+                decisions_confidence_normalize:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. Not management-gated.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -3016,7 +3117,8 @@ paths:
       the same way, with the same management-only rule: creating a service
       token with it true from an inference-only bearer is a 403
       portal.principal_forbidden, while a portal session or an admin-scope
-      bearer may.
+      bearer may. It takes the opt-in decisions_confidence_normalize flag on
+      create only too, ungated.
     get:
       tags: [portal]
       summary: List services
@@ -5150,6 +5252,139 @@ components:
           properties:
             input_tokens: { type: integer, minimum: 0 }
             output_tokens: { type: integer, minimum: 0 }
+      additionalProperties: true
+    DecisionsRequest:
+      type: object
+      description: >
+        The body of POST /v1/decisions (OpenAI's Decisions API). The gateway
+        itself checks only `model`, `questions` and `stream`; on the
+        translate route it also reads `input` and each question (see
+        api-surface.md and compatibility-and-inference.md), on the
+        passthrough route the rest is the upstream's business. Other fields
+        (for example `prompt_cache_key`) are dropped on the translate route.
+      required: [model, questions]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: The gateway model name, rewritten to the mapping's own model name on the way out.
+        input:
+          description: >
+            The text or items the questions are asked about: a string, or an
+            array of message items (`type` `message` or absent, `role` `user`,
+            content a string or parts `input_text`, `input_json`,
+            `input_image`). The translate route supports user messages only,
+            and images only as `data:` URLs.
+          oneOf:
+            - { type: string }
+            - type: array
+              items: { type: object, additionalProperties: true }
+        questions:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/DecisionsQuestion' }
+        stream:
+          type: [boolean, 'null']
+          description: Absent, null or false; true is 400 `decisions.stream_unsupported`.
+      additionalProperties: true
+    DecisionsQuestion:
+      type: object
+      description: One question of a decisions request.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [predicate, choice, score]
+        name:
+          type: [string, 'null']
+          description: >
+            Echoed on the answer. On the translate route a missing, null or
+            empty name is keyed `q<i>` towards System One and restored as it
+            was sent.
+        instructions:
+          description: A string, or an array of `input_text` parts.
+          oneOf:
+            - { type: string }
+            - { type: array, items: { type: object, additionalProperties: true } }
+        choices:
+          type: array
+          description: For `choice`; each value is a string or a boolean.
+          items:
+            type: object
+            required: [value]
+            properties:
+              value:
+                oneOf:
+                  - { type: string }
+                  - { type: boolean }
+              description: { type: string }
+        levels:
+          type: array
+          description: For `score`; ordered, the index is the score.
+          items:
+            type: object
+            required: [label]
+            properties:
+              label: { type: string }
+              description: { type: string }
+      additionalProperties: true
+    DecisionsResponse:
+      type: object
+      description: >
+        The answers of POST /v1/decisions. The translate route builds exactly
+        this shape; a passthrough relays the upstream's body and the gateway
+        reads only `usage` (and, for a normalizing token, `answers`).
+      required: [answers, model, usage]
+      properties:
+        answers:
+          type: array
+          items: { $ref: '#/components/schemas/DecisionsAnswer' }
+        model: { type: string, description: The model name the client asked for. }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer, minimum: 0 }
+            input_tokens_details:
+              type: object
+              properties:
+                cached_tokens: { type: integer, minimum: 0 }
+                cache_write_tokens: { type: integer, minimum: 0 }
+            output_tokens: { type: integer, minimum: 0 }
+            output_tokens_details:
+              type: object
+              properties:
+                reasoning_tokens: { type: integer, minimum: 0 }
+            total_tokens: { type: integer, minimum: 0 }
+      additionalProperties: true
+    DecisionsAnswer:
+      type: object
+      description: One answer; the shape depends on `type`.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [predicate, choice, score]
+        name: { type: [string, 'null'] }
+        probability:
+          type: number
+          description: For `predicate`.
+        choice:
+          description: For `choice`; the original string or boolean value.
+          oneOf:
+            - { type: string }
+            - { type: boolean }
+        score:
+          type: number
+          description: For `score`.
+        confidence:
+          type: number
+          description: For `choice` and `score`; 0 when the System One upstream sent none.
+        probabilities:
+          type: array
+          description: >
+            For `choice` (`value`, `probability`) and `score` (`value` the
+            level index, `label`, `probability`), in the request's order.
+          items: { type: object, additionalProperties: true }
       additionalProperties: true
     SystemOneModelList:
       type: object

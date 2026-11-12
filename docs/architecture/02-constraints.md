@@ -65,8 +65,8 @@ several architectural decisions exist specifically to satisfy them.
   inference endpoint other than those five
   accepts the loopback pair (the `/details` route is not a sixth: it is served by the
   transcription endpoint's own loopback-admitting handler), and none accepts the
-  session cookie other than `/v1/chat/completions`; the System One endpoints
-  (`/v1/systemone`, `/v1/systemone/models`) accept neither, bearer only.
+  session cookie other than `/v1/chat/completions`; the decision endpoints
+  (`/v1/systemone`, `/v1/systemone/models`, `/v1/decisions`) accept neither, bearer only.
 - **The public listener and the mesh (agent) listener are separate enforcement
   surfaces** with independent TLS and authorization.
 

@@ -168,6 +168,26 @@ read-only ordering and gating it would empty the operator's list. The portal's m
 DTO carries the marker as `decisions_only`. A list `[openai_audio, decisions]` is both
 audio-only and decisions-only, the same "both kinds" shape `[openai_images, openai_audio]` has. See [API Compatibility & Inference §3.9](compatibility-and-inference.md#39-system-one-decisions).
 
+**`openai_decisions` is a request flavor, not a second stored one.**
+`POST /v1/decisions` ([ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)) reaches the resolver under the **fine** flavor
+`openai_decisions` (`routing.APIFlavorOpenAIDecisions`), the twin of the fine
+`openai_responses`: it is never stored, and `NormalizeAPIFlavor` folds it onto the coarse
+`decisions` (tested before the generic `openai` prefix, like the images and audio flavors),
+so one opt-in per application serves both decision endpoints and candidacy is unchanged.
+Its job is the mode: `applicationServesEndpoint` reads **`DecisionsMode`** for
+`openai_decisions` and **`SystemOneMode`** for the coarse `decisions` that
+`POST /v1/systemone` sends, and `filterServesEndpoint` now refines those two flavors the
+way it refines `openai_responses` and `anthropic_messages`. An **ordinary** application
+with the request's mode `disabled` drops out of candidacy, a `server_agent` application
+never does (its resolved runtime spec decides after the resolve, where
+`Target.DecisionsMode`/`Target.SystemOneMode`, resolved by `EffectiveFields` like
+`ResponsesMode`, carry the spec's values). The mode defaults are `auto`
+(`routing.EndpointModeAuto`, valid for `decisions_mode` only) and `passthrough`, and neither
+depends on the application type: the `stable_diffusion_cpp` and `audio_cpp` default tables
+below never declare `decisions`, and the type enters only through the save-time refusal of
+`decisions_mode: passthrough` on `llama_cpp` (API surface, "Decision endpoint modes").
+See [API Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions).
+
 **Flavor exclusion is two-staged, by design.** Candidacy filters on the
 **application's** flavors. A `server_agent` mapping's runtime spec carries its
 own, possibly narrower, set — `targetFrom` makes the spec the sole authority for
@@ -430,8 +450,9 @@ Steps 1–3 are `resolveModelOverride`; step 4 is `redirectUnknownModel`
 (`internal/gateway/inference_redirect.go`). For a request that requires a
 capability — today the two image endpoints, `/v1/images/generations`, which
 requires `image`, and `/v1/images/edits`, which requires the derived `image_edit`,
-`/v1/audio/speech`, which requires `speech`, and `/v1/audio/transcriptions`, which
-requires `transcription` (§2.3) — step 4
+`/v1/audio/speech`, which requires `speech`, `/v1/audio/transcriptions`, which
+requires `transcription`, `/v1/systemone`, which requires `decision`, and `/v1/decisions`,
+which requires the derived `any_decision` (§2.3) — step 4
 takes a `LastUsedModel` or fallback only when that name also carries every
 required capability (`ModelOffering.Capable`, §2.2). A candidate without it is
 skipped and the chain moves on, because the capability gate would refuse it
@@ -1141,6 +1162,38 @@ serves no decision. The probe, its cadence and its auth are in [API Compatibilit
 - **The request stays off the vendor-account path** only because it carries the capability
   list, as speech and transcription do; the handler always sets it, and dropping it would
   also skip the gate.
+
+**`decision_openai` and the derived `any_decision`** ([ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)).
+`decision_openai` (`routing.CapabilityDecisionOpenAI`) says the upstream answers OpenAI's
+`/v1/decisions` **natively**, so a request may be passed through instead of translated to
+System One. It is **orthogonal** to `decision` (System One): a model can answer either,
+both or neither. Its one automatic writer is the
+gateway's OpenAI Decisions probe (source `decisions_probe`, `routing.CapabilitySourceDecisionsProbe`,
+rank 1 like `systemone_probe`), which asks only an external `vllm` application and a
+`server_agent` mapping whose runtime spec type is `vllm` or `custom`, with separate
+settled and back-off state (a probe settling does not suppress the other, [API Compatibility &
+Inference §3.10](compatibility-and-inference.md#310-openai-decisions) item 10). The two lists keep the writer unique exactly as for
+`decision`: `(decision_openai, no)` is in `reservedManualVerdicts` (an operator's `yes` stays an
+override that outranks the probe), and the name is in `reservedAgentCapabilityNames`. The
+portal folds the verdict into `ModelDTO.DecisionOpenAI` (`decision_openai`, the same AND
+over a name's offering mappings as `decision`).
+
+`any_decision` (`routing.CapabilityAnyDecision`) is a **derived requirement, never a row
+name**, handled in `capabilityRowsSatisfy` the way `image_edit` is: it holds when the
+mapping has `(decision, yes)` **or** `(decision_openai, yes)`. `POST /v1/decisions` sets
+`RequiredCapabilities = ["any_decision"]`, so the one gate funnel (`filterCapable`, the
+session-pin check and the server-override filter alike) admits a mapping that can serve
+either route and refuses the rest `404 routing.model_not_capable`; the list also keeps the
+request off the vendor-account path. The gate is deliberately **not mode-aware**: the
+route a request needs follows from the mode, which is only known once a target is chosen,
+so the post-resolve step (`routing.EffectiveDecisionsRoute`) refuses a forced mode whose
+verdict is missing with the same `404 routing.model_not_capable` and **does not re-select
+another candidate**. Two applications serving one model name with a forced mode that
+lacks its verdict on one of them therefore answer intermittently: an operator
+configuration issue (use the same mode on both, or `auto`). An operator who tries to write
+a `manual` row named `any_decision` is refused `mapping.capability_reserved`. The unknown-model redirect's
+`ModelOffering.Capable` has the matching fold (`anyDecisionFlagsByName`: every mapping of a
+name has either verdict and passes the decisions flavor half).
 
 **The reserved-list decisions** are not symmetric. `reservedAgentCapabilityNames`
 (`internal/gateway/agent_ingest.go`, the names an agent's open verdict list may

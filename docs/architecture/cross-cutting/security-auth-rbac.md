@@ -273,6 +273,25 @@ operation:
   (`AuthorizeRunAsToken` copies the field), while the portal session principal
   itself never has it, so portal chat gets no effort edit.
 
+#### Decision confidence normalization is an ordinary, non-gated token setting
+
+The per-token `decisions_confidence_normalize` setting (a plain boolean, default off, on
+user tokens and, at creation, on service tokens) makes the gateway recompute `confidence`
+on the answers of `/v1/decisions` and `/v1/systemone`
+([API Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions),
+[ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)).
+It is a **sibling of `claude_model_aliases`, not of `claude_effort_compatibility`**: any
+holder of `gateway:use` may set it on their own tokens, an inference-only bearer included,
+and no `principalMayManageTokenSetting` check applies. The difference from the effort flag
+is what it touches: the effort flag changes **what the gateway sends to the upstream**, this
+one changes only **a number in the answer the token's own client receives** (the request
+reaches the model unchanged), so it confers no reach and no cost that the token did not
+already have. Its one operational effect is that the token's decision answers are buffered
+rather than streamed (bounded by `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`), a memory
+cost borne per in-flight request of an opted-in token. A run-as token carries the setting
+onto the run (`AuthorizeRunAsToken` copies the field); the portal session principal itself
+never has it.
+
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
 Portal chat runs as the logged-in **session** principal, but the operator may

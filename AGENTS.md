@@ -139,9 +139,9 @@ Always-on engineering rules (details in the documents above):
   internal loopback path); `/v1/images/generations`, `/v1/images/edits`,
   `/v1/audio/speech` and `/v1/audio/transcriptions` additionally accept the
   internal loopback pair but **never** the session cookie; `/v1/responses`
-  and `/v1/messages` are bearer-only, and so are `/v1/systemone` and
-  `/v1/systemone/models` (System One decisions: never the session cookie or
-  the internal loopback).
+  and `/v1/messages` are bearer-only, and so are `/v1/systemone`,
+  `/v1/systemone/models` and `/v1/decisions` (System One and OpenAI
+  Decisions: never the session cookie or the internal loopback).
 - Keep compatibility mapping isolated in `internal/compat`; keep the internal
   inference model provider-neutral.
 - Keep all three store drivers (memory/sqlite/postgres) working; dialect
