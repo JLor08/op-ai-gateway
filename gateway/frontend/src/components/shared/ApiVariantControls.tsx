@@ -12,21 +12,29 @@ import type { Translation } from './types';
 // The API-Varianten capability checkboxes. openai gates /v1/responses (Codex)
 // AND /v1/chat/completions; anthropic gates /v1/messages (Claude Code);
 // openai_images gates /v1/images/generations; openai_audio gates
-// /v1/audio/speech. The last two are coarse flavors of their own with no
+// /v1/audio/speech; decisions gates POST /v1/systemone. The last three are coarse flavors of their own with no
 // endpoint-mode dropdown (images and speech have no translate path to
 // choose), and both are opt-in: nothing here ticks them -- only the
-// stable_diffusion_cpp / audio_cpp type defaults and an operator do.
-const apiVariantFlavorOptions = ['openai', 'anthropic', 'openai_images', 'openai_audio'];
+// stable_diffusion_cpp / audio_cpp type defaults and an operator do (decisions
+// has no type default: only an operator ticks it).
+const apiVariantFlavorOptions = [
+  'openai',
+  'anthropic',
+  'openai_images',
+  'openai_audio',
+  'decisions',
+];
 
 // The flavors whose checkbox label says more than the API value: it names the
 // purpose too, because the value alone does not say what it unlocks. openai and
 // anthropic are not here and show their raw value.
 const flavorLabelKey: Record<
   string,
-  'applicationFlavorOpenaiImages' | 'applicationFlavorOpenaiAudio'
+  'applicationFlavorOpenaiImages' | 'applicationFlavorOpenaiAudio' | 'applicationFlavorDecisions'
 > = {
   openai_images: 'applicationFlavorOpenaiImages',
   openai_audio: 'applicationFlavorOpenaiAudio',
+  decisions: 'applicationFlavorDecisions',
 };
 const endpointModeOptions: EndpointMode[] = ['disabled', 'translate', 'passthrough'];
 

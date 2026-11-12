@@ -166,8 +166,12 @@ function ContextProbeButton({
 }>) {
   if (!row) return null;
   const imagesOnly = row.images_only === true;
-  const refused = imagesOnly || row.audio_only === true;
-  const refusalHint = imagesOnly ? t.mappingProbeContextImagesOnly : t.mappingProbeContextAudioOnly;
+  const decisionsOnly = row.decisions_only === true;
+  const refused = imagesOnly || row.audio_only === true || decisionsOnly;
+  let refusalHint = t.mappingProbeContextAudioOnly;
+  if (imagesOnly) refusalHint = t.mappingProbeContextImagesOnly;
+  else if (row.audio_only !== true && decisionsOnly)
+    refusalHint = t.mappingProbeContextDecisionsOnly;
   return (
     <Box>
       <Button
@@ -323,6 +327,8 @@ export function MappingForm({
   );
   const [transcriptionCapable, setTranscriptionCapable] =
     useState<CapabilityChoice>(transcriptionCapableSeed);
+  const [decisionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'decision'));
+  const [decisionCapable, setDecisionCapable] = useState<CapabilityChoice>(decisionCapableSeed);
   const [embeddingCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'embedding'));
   const [embeddingCapable, setEmbeddingCapable] = useState<CapabilityChoice>(embeddingCapableSeed);
   const [rerankCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'rerank'));
@@ -457,6 +463,7 @@ export function MappingForm({
       { capability: 'image_edit', value: imageEdit, seed: imageEditSeed },
       { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
       { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
+      { capability: 'decision', value: decisionCapable, seed: decisionCapableSeed },
       { capability: 'embedding', value: embeddingCapable, seed: embeddingCapableSeed },
       { capability: 'rerank', value: rerankCapable, seed: rerankCapableSeed },
     ] as const) {
@@ -807,6 +814,24 @@ export function MappingForm({
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
           {transcriptionCapableSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
+        {/* decision follows speech: yes is the operator's override of the
+            decision-model probe, and (decision, no) is reserved for that
+            probe, so no is only ever shown, disabled, when it is stored. */}
+        <SelectField
+          id="mapping-decision-capable"
+          label={t.mappingDecisionCapable}
+          value={decisionCapable}
+          onChange={(e) => setDecisionCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(decisionCapable, t.mappingDecisionCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {decisionCapableSeed === 'no' && (
             <option value="no" disabled>
               {t.mappingCapabilityNo}
             </option>

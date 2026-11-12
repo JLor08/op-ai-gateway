@@ -99,6 +99,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // `load_refusal` reuses these labels as the disabled Load action's tooltip.
   'benchmark.images_only': 'errorBenchmarkImagesOnly',
   'benchmark.audio_only': 'errorBenchmarkAudioOnly',
+  'benchmark.decisions_only': 'errorBenchmarkDecisionsOnly',
   // A run with nothing it can measure as audio: the speech run with no
   // speech target, or a speed/capacity/both scope whose audio-only models
   // cannot be measured yet (beside images-only ones or not). The gateway

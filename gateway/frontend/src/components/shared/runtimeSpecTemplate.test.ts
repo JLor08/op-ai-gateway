@@ -52,6 +52,23 @@ describe('runtimeSpecTemplate', () => {
     ).toEqual(['openai', 'anthropic']);
   });
 
+  it('does not inherit decisions while a text flavor survives, but keeps it when alone', () => {
+    expect(
+      runtimeSpecTemplate({
+        api_flavors: ['openai', 'decisions'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      }).apiFlavors,
+    ).toEqual(['openai']);
+    expect(
+      runtimeSpecTemplate({
+        api_flavors: ['decisions'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      }).apiFlavors,
+    ).toEqual(['decisions']);
+  });
+
   it('keeps openai_audio when the parent has no text flavor', () => {
     expect(
       runtimeSpecTemplate({

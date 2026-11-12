@@ -136,6 +136,7 @@ describe('formatPortalError', () => {
   it.each([
     ['benchmark.images_only', 'errorBenchmarkImagesOnly'],
     ['benchmark.audio_only', 'errorBenchmarkAudioOnly'],
+    ['benchmark.decisions_only', 'errorBenchmarkDecisionsOnly'],
     ['benchmark.agent_ensure_unsupported', 'errorBenchmarkAgentEnsureUnsupported'],
     ['benchmark.spec_force_stopped', 'errorBenchmarkSpecForceStopped'],
   ] as const)('labels the %s refusal with %s, in both locales', (code, key) => {
@@ -410,6 +411,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'benchmark.request_failed',
     'benchmark.images_only',
     'benchmark.audio_only',
+    'benchmark.decisions_only',
     'benchmark.agent_ensure_unsupported',
     'benchmark.spec_force_stopped',
     'benchmark.speech_unavailable',

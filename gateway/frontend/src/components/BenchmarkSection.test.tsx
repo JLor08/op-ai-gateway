@@ -1663,6 +1663,37 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       mappings: [makeMapping({ id: 'map_tts', gateway_model_name: 'tts-model', audio_only: true })],
     };
 
+    it('refuses Start for a decisions-only mapping and says why', async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_dec', name: 'dec-model' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [
+            makeMapping({ id: 'map_dec', gateway_model_name: 'dec-model', decisions_only: true }),
+          ],
+        },
+      );
+      await screen.findByText(t.benchmarkDecisionsOnlyHint);
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeDisabled();
+      expect(start).toHaveAccessibleDescription(t.benchmarkDecisionsOnlyHint);
+    });
+
+    it('renders a decisions-only skip as its own skip', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: true,
+          total: 1,
+          done: 1,
+          results: [result({ gateway_model_name: 'dec-model', skipped: 'decisions_only' })],
+        }),
+      );
+      expect(
+        await screen.findByText(`dec-model: ${t.benchmarkResultSkippedDecisionsOnly}`),
+      ).toBeInTheDocument();
+    });
+
     it('renders an audio-only skip as its own skip, never as "0 tok/s, 0 ms"', async () => {
       renderSection(
         { kind: 'server' },

@@ -415,7 +415,13 @@ export type BenchmarkResult = {
   // omit them.
   // "cluster_head" marks a llama.cpp RPC cluster head, which no benchmark
   // measures yet: it starts only together with its members.
-  skipped?: 'images_only' | 'audio_only' | 'not_speech' | 'speech_clone' | 'cluster_head';
+  skipped?:
+    | 'images_only'
+    | 'audio_only'
+    | 'decisions_only'
+    | 'not_speech'
+    | 'speech_clone'
+    | 'cluster_head';
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;

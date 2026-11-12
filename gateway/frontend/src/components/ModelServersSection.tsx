@@ -216,6 +216,10 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // Ollama-declared "embedding" row would otherwise land). A `no` and an absent row render
   // no chip, as for every other known capability. They sit with the declared traits, ahead
   // of the observed "speculation_observed".
+  // "decision" gates POST /v1/systemone: the model serves System One decisions
+  // (verdicts yes/no). A probed trait of the endpoint, so a `yes` reads as a chip
+  // and a `no` or an absent row renders none.
+  { capability: 'decision', label: (t) => t.capabilityDecision },
   { capability: 'embedding', label: (t) => t.capabilityEmbedding },
   { capability: 'rerank', label: (t) => t.capabilityRerank },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },

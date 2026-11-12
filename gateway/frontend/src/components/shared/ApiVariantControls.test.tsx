@@ -64,6 +64,14 @@ for (const locale of locales) {
 
   const responsesField = () => screen.getByRole('combobox', { name: t.applicationResponsesMode });
   const messagesField = () => screen.getByRole('combobox', { name: t.applicationMessagesMode });
+  it('offers an unticked decisions flavor checkbox with its own label', () => {
+    render(<Harness />);
+    const box = screen.getByRole('checkbox', { name: t.applicationFlavorDecisions });
+    expect(box).not.toBeChecked();
+    fireEvent.click(box);
+    expect(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions })).toBeChecked();
+  });
+
   const liveTimingsBox = () => screen.getByRole('checkbox', { name: t.applicationLiveTimings });
 
   describe(`ApiVariantControls [${locale}]`, () => {

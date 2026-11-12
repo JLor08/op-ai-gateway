@@ -105,10 +105,24 @@ const audioOnlyRefusedModes: ReadonlySet<string> = new Set<BenchType>(['vision']
 const noRefusedModes: ReadonlySet<string> = new Set<BenchType>();
 
 /** The run kinds the model scope's mapping is refused, by why it is. */
-function refusedModesFor(refusal: 'images_only' | 'audio_only' | null): ReadonlySet<string> {
-  if (refusal === 'images_only') return promptModes;
+function refusedModesFor(
+  refusal: 'images_only' | 'audio_only' | 'decisions_only' | null,
+): ReadonlySet<string> {
+  // A decisions-only model answers no chat prompt at all, so it is refused
+  // every prompt run, like an images-only one.
+  if (refusal === 'images_only' || refusal === 'decisions_only') return promptModes;
   if (refusal === 'audio_only') return audioOnlyRefusedModes;
   return noRefusedModes;
+}
+
+/** The hint sentence for a chat refusal reason. */
+function chatRefusalHint(
+  refusal: 'images_only' | 'audio_only' | 'decisions_only',
+  t: Translation,
+): string {
+  if (refusal === 'images_only') return t.benchmarkImagesOnlyHint;
+  if (refusal === 'decisions_only') return t.benchmarkDecisionsOnlyHint;
+  return t.benchmarkAudioOnlyHint;
 }
 
 /**
@@ -129,12 +143,13 @@ function selectedMappingChatRefusal(
   scopeKind: ScopeKind,
   mappings: readonly PortalModelMapping[],
   mappingId: string,
-): 'images_only' | 'audio_only' | null {
+): 'images_only' | 'audio_only' | 'decisions_only' | null {
   if (scopeKind !== 'mapping') return null;
   const id = mappingId || mappings[0]?.id;
   const mapping = mappings.find((m) => m.id === id);
   if (mapping?.images_only === true) return 'images_only';
   if (mapping?.audio_only === true) return 'audio_only';
+  if (mapping?.decisions_only === true) return 'decisions_only';
   return null;
 }
 
@@ -377,6 +392,7 @@ function audioResultLine(r: BenchmarkResult, t: Translation): string {
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
   if (r.skipped === 'audio_only') return t.benchmarkResultSkippedAudioOnly;
+  if (r.skipped === 'decisions_only') return t.benchmarkResultSkippedDecisionsOnly;
   if (r.skipped === 'not_speech') return t.benchmarkResultSkippedNotSpeech;
   if (r.skipped === 'speech_clone') return t.benchmarkResultSkippedSpeechClone;
   if (r.skipped === 'cluster_head') return t.benchmarkResultSkippedClusterHead;
@@ -1233,7 +1249,7 @@ export function BenchmarkSection({
           </Typography>
           {chatRefusal !== null && (
             <Typography id="benchmark-chat-refusal-hint" variant="caption" color="text.secondary">
-              {chatRefusal === 'images_only' ? t.benchmarkImagesOnlyHint : t.benchmarkAudioOnlyHint}
+              {chatRefusalHint(chatRefusal, t)}
             </Typography>
           )}
           <Box>

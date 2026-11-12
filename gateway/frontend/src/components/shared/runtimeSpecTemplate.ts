@@ -5,7 +5,7 @@ import type { EndpointMode, PortalApplication } from '../../api';
 
 // The coarse flavors that are never inherited from the parent into a spec's
 // first write while a text flavor survives (see runtimeSpecTemplate).
-const optInFlavors: ReadonlySet<string> = new Set(['openai_images', 'openai_audio']);
+const optInFlavors: ReadonlySet<string> = new Set(['openai_images', 'openai_audio', 'decisions']);
 
 export type RuntimeSpecTemplate = {
   apiFlavors: string[];

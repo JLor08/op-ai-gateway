@@ -342,6 +342,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     it.each([
       ['images_only', 'errorBenchmarkImagesOnly'],
       ['audio_only', 'errorBenchmarkAudioOnly'],
+      ['decisions_only', 'errorBenchmarkDecisionsOnly'],
       ['agent_ensure_unsupported', 'errorBenchmarkAgentEnsureUnsupported'],
       ['spec_force_stopped', 'errorBenchmarkSpecForceStopped'],
       // A cluster head's Load is refused under the runtime.* code, not a
@@ -1248,6 +1249,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         .getAllByText((_, el) => el?.getAttribute('data-status') === 'active')
         .map((el) => el.textContent);
       expect(labels).toEqual([t.capabilitySpeech, t.capabilitySpeechClone]);
+    });
+
+    it('renders a translated Decisions chip for a decision yes, never the raw name', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('decision', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityDecision)).toBeInTheDocument();
+      expect(within(cell).queryByText('decision')).not.toBeInTheDocument();
     });
 
     it('renders no speech_clone chip for a `no` verdict, and never a raw one', async () => {
