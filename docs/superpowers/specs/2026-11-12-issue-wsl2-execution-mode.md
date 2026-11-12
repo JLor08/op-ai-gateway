@@ -129,7 +129,11 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
   - distros are registered under HKCU;
   - every user SID gets its own utility VM;
   - `.wslconfig` is read from that user's profile *(source-read, `registry.cpp`, `LxssUserSessionFactory.cpp`, `helpers.cpp`)*.
-- **LocalSystem is refused:** `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`, "Running WSL as local system is not supported." *(source-read)*. An agent installed as a Windows service with NSSM runs as LocalSystem unless configured otherwise: "Services, unless explicitly configured otherwise, run under the LOCALSYSTEM account" ([NSSM usage](https://nssm.cc/usage)). In `wsl` mode the agent service must run under the Windows user that owns the distro.
+- **LocalSystem is refused:** `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`, "Running WSL as local system is not supported." *(source-read)*. An agent installed as a Windows service with NSSM runs as LocalSystem unless configured otherwise: "Services, unless explicitly configured otherwise, run under the LOCALSYSTEM account" ([NSSM usage](https://nssm.cc/usage)). In `wsl` mode the agent must run as the Windows user that owns the distro.
+  - It may run **either as a service** under that account (verified in B4/B4b, Session 0, nobody logged on) **or as a plain process in that user's interactive session**, which is `wsl.exe`'s ordinary case; every other Phase 0 test ran that way.
+  - Run interactively, the agent lives only as long as the session: a logoff ends it, and with it every `wsl.exe` child (B5: the vLLM tree dies with `wsl.exe`).
+  - If the agent itself crashes, its `wsl.exe` children keep running, because the agent uses no Job Object on Windows (`proc_windows.go`). The orphan sweep at the next agent start removes them.
+  - Both ways need the user's systemd manager, which is why linger is recommended.
 - **Session 0** (services, tasks that run "whether logged on or not", SSH) is unreliable for `wsl.exe`. [WSL#9231](https://github.com/microsoft/WSL/issues/9231), "Store WSL isn't accessible from Session 0", has been open since 2022 ("Known issue, we're working on a solution"). Reports since then disagree by Windows edition.
   - **Measured (Phase 0, B4, same host, Windows 11 Pro):** an NSSM service running as the distro-owning user, with `C:\Program Files\WSL\wsl.exe -d Ubuntu-24.04 --exec <script>` as its application and `WSL_UTF8=1`, **started and kept running**. The script saw the expected Linux user and distro, and `nvidia-smi -L` listed all three GPUs from inside the service.
   - **Measured (B4b, cold):** the same service was set to start automatically and the host was rebooted with nobody logged on. The script ran **29 s after boot**, cold-starting the WSL VM from the service, and again saw the user, the distro and all three GPUs. The first interactive logon (RDP) came about six minutes later.
@@ -288,7 +292,7 @@ The drain grace (10 s) and kill grace (5 s) carry over unchanged. The generation
 
 - No shell anywhere: always `--exec`, never `--` or `sh -c` with gateway input. The few agent-owned helper commands (the cgroup read, `systemctl --user`) use fixed argv.
 - The gateway can choose only an allowlisted distro and an allowlisted Linux binary. It can never choose the Linux user, and nothing it chooses ever reaches a root process (the invariant under "Launch").
-- **The WSL boundary is not a security boundary, and this design does not claim it is.** A Linux process can reach the Windows user's files through `/mnt/c` and, through interop, start Windows executables as that user. A `wsl` workload therefore has the same trust level as a native binary run as the agent's Windows account. That is acceptable only because the agent service now runs as an unprivileged Windows user rather than LocalSystem. The README should recommend a dedicated distro with `[interop] enabled=false` where config files are not needed through `/mnt/c`.
+- **The WSL boundary is not a security boundary, and this design does not claim it is.** A Linux process can reach the Windows user's files through `/mnt/c` and, through interop, start Windows executables as that user. A `wsl` workload therefore has the same trust level as a native binary run as the agent's Windows account. That is acceptable only because the agent, as a service or interactively, now runs as an unprivileged Windows user rather than LocalSystem. The README should recommend a dedicated distro with `[interop] enabled=false` where config files are not needed through `/mnt/c`.
 - Secrets: `${AGENT_ENV:NAME}` and `${API_TOKEN}` in `env` travel through `WSLENV`. In `args` they behave as for native specs (allowed, with the portal warning). The upward-report redaction (§8.3) is unchanged.
 
 ## Phased plan
@@ -319,7 +323,7 @@ The owner ran Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, th
   - logs and the resolved command;
   - feature flag `runtime_exec_wsl` and the MINOR bump.
 - Portal: mode selector and distro field.
-- Docs: a new agent-runtime-manager section, an ADR, and the README (agent service under a user account, `.wslconfig` recommendations).
+- Docs: a new agent-runtime-manager section, an ADR, and the README (the agent as the distro-owning user, as a service or interactively, never LocalSystem; `.wslconfig` recommendations; linger).
 - Windows-specific logic follows the `nvidia_pdh.go` split: pure logic untagged and unit-tested on Linux CI, with only the syscalls and exec calls behind `//go:build windows` (CI runs no Windows job; §11.3).
 
 **Phase 2: VRAM attribution from the VM process.**
@@ -342,7 +346,7 @@ The owner ran Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, th
 4. **Session 0.** If B4 fails, is a per-user helper acceptable, or should WSL mode require an interactive logon?
 5. **User systemd scope versus a shim.** If `systemd-run --user` is unavailable or unreliable in WSL, should a tiny root-free Linux shim, cross-built from `server-agent`, own the process group and signal forwarding (SIGHUP → SIGTERM with grace) instead? Per-workload RAM would then come from the sum of PSS over the group instead of a cgroup.
 6. **Config files on hosts with automount disabled.** Write them into the distro through a fixed `wsl.exe --exec` helper instead of `/mnt/c`?
-7. **Host facts upward.** Should the agent report its WSL facts upward so the portal can display them: the VM's `MemTotal`, and whether WSL works for the service account? It must not list the allowlists, for the same reason the work-dir allowlist is never listed (§3.1).
+7. **Host facts upward.** Should the agent report its WSL facts upward so the portal can display them: the VM's `MemTotal`, and whether WSL works for the agent's account? It must not list the allowlists, for the same reason the work-dir allowlist is never listed (§3.1).
 8. **Exit cause after the scope is gone.** A transient scope is removed once its last process exits, so a counter read at exit time may already be gone. Which record survives long enough to tell an OOM kill or a SIGKILL from `exit(9)`: the last per-beat `memory.events` reading, systemd's unit result, or the VM kernel log? To be settled in Phase 1, with B6 as the testbed.
 9. **Per-instance attribution.** B2b confirmed one PDH instance per guest GPU process, without identity and in an unstable order. Is matching worth doing? The agent would compare the multiset of instance values before and after a start window, and the instances that are new or grew belong to the starting workload. That would give a per-workload *live* figure instead of a frozen start delta. It would also take on the complexity of values that keep changing during startup and of small helper contexts (the 22 MiB instance in B2b). The baseline design does not depend on it: start delta plus the aggregate invariant.
 
@@ -355,7 +359,7 @@ The owner ran Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, th
   - plus a new section for execution modes.
 - ADRs: ADR-024 (authority), ADR-025 (feature flags), ADR-031 (PDH chain, extended to the VM process), ADR-032 (unknown VRAM), ADR-066 (config files), ADR-083/084/085/086 (budgets, the max rule, the RAM pool, the bootstrap), ADR-090 (instances: unit names carry the instance key), ADR-095 (manual start and stop). Plus a **new ADR** for the execution mode and its accounting invariant.
 - `docs/architecture/11-risks-and-technical-debt.md` §11.3 (no Windows CI) and §11.4 (deliberate acceptances: start-delta attribution).
-- `server-agent/README.md`: the agent service under a user account instead of LocalSystem; WSL host setup.
+- `server-agent/README.md`: the agent as the distro-owning user (service or interactive) instead of LocalSystem; WSL host setup.
 
 ## Related
 
