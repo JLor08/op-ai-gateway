@@ -112,6 +112,21 @@ function capabilitySeed(row: PortalModelMapping | null, capability: string): Cap
 }
 
 /** A capability select's props for its hint: shown only while the choice is unknown. */
+// The translated label of a mapping's decisions_route, or '' when there is
+// nothing to show.
+function decisionsRouteText(route: string | undefined, t: Translation): string {
+  switch (route) {
+    case 'translate':
+      return t.mappingDecisionsRouteTranslate;
+    case 'passthrough':
+      return t.mappingDecisionsRoutePassthrough;
+    case 'disabled':
+      return t.mappingDecisionsRouteDisabled;
+    default:
+      return '';
+  }
+}
+
 function unknownHint(choice: CapabilityChoice, hint: string): { helperText?: string } {
   return choice === '' ? { helperText: hint } : {};
 }
@@ -330,6 +345,12 @@ export function MappingForm({
     useState<CapabilityChoice>(transcriptionCapableSeed);
   const [decisionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'decision'));
   const [decisionCapable, setDecisionCapable] = useState<CapabilityChoice>(decisionCapableSeed);
+  const decisionsRouteLabel = decisionsRouteText(row?.decisions_route, t);
+  const [decisionOpenaiCapableSeed] = useState<CapabilityChoice>(() =>
+    capabilitySeed(row, 'decision_openai'),
+  );
+  const [decisionOpenaiCapable, setDecisionOpenaiCapable] =
+    useState<CapabilityChoice>(decisionOpenaiCapableSeed);
   const [embeddingCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'embedding'));
   const [embeddingCapable, setEmbeddingCapable] = useState<CapabilityChoice>(embeddingCapableSeed);
   const [rerankCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'rerank'));
@@ -465,6 +486,11 @@ export function MappingForm({
       { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
       { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
       { capability: 'decision', value: decisionCapable, seed: decisionCapableSeed },
+      {
+        capability: 'decision_openai',
+        value: decisionOpenaiCapable,
+        seed: decisionOpenaiCapableSeed,
+      },
       { capability: 'embedding', value: embeddingCapable, seed: embeddingCapableSeed },
       { capability: 'rerank', value: rerankCapable, seed: rerankCapableSeed },
     ] as const) {
@@ -838,6 +864,32 @@ export function MappingForm({
             </option>
           )}
         </SelectField>
+        {/* decision_openai is decision's twin for a model that answers POST
+            /v1/decisions natively: the same rule, yes as the operator's
+            override of the probe and no reserved for it. */}
+        <SelectField
+          id="mapping-decision-openai-capable"
+          label={t.mappingDecisionOpenaiCapable}
+          value={decisionOpenaiCapable}
+          onChange={(e) => setDecisionOpenaiCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(decisionOpenaiCapable, t.mappingDecisionOpenaiCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {decisionOpenaiCapableSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
+        {/* The route POST /v1/decisions takes for this mapping (advisory, from
+            the saved row): next to the verdict selects it follows from. Empty
+            means the mapping does not serve /v1/decisions, so nothing shows. */}
+        {decisionsRouteLabel && (
+          <Typography variant="caption" color="text.secondary">
+            {t.mappingDecisionsRoute(decisionsRouteLabel)}
+          </Typography>
+        )}
         {/* embedding and rerank are the OPERATOR-stated role capabilities and
             offer all three states, exactly like vision: nothing probes either
             one (an Ollama-declared "embedding" is the only incidental source)

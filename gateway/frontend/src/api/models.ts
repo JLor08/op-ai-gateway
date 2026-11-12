@@ -60,6 +60,12 @@ export type PortalApplication = {
   // native_* booleans).
   responses_mode: EndpointMode;
   messages_mode: EndpointMode;
+  // The /v1/decisions and /v1/systemone modes (only effective while the
+  // decisions flavor is ticked). Always present on the real wire DTO;
+  // optional here so existing fixtures compile unchanged, and an absent value
+  // reads as the defaults (auto / passthrough).
+  decisions_mode?: DecisionsMode;
+  systemone_mode?: SystemOneMode;
   // The operator's opt-in to asking a capable upstream (llama.cpp only) for
   // live per-token timings on streamed /v1/responses. Always present on read;
   // the two request shapes below make it optional, because absent there means
@@ -108,6 +114,13 @@ export type CreateApplicationRequest = {
   health_check_interval_seconds?: number;
   responses_mode?: EndpointMode;
   messages_mode?: EndpointMode;
+  // Absent keeps the stored value on an update (a create takes the defaults,
+  // auto / passthrough); an explicit "" is refused. decisions_mode
+  // 'passthrough' is refused for the llama_cpp type (400
+  // application.decisions_passthrough_unsupported, 409 ..._conflict when the
+  // stored type is the offender), so the form never sends that pair.
+  decisions_mode?: DecisionsMode;
+  systemone_mode?: SystemOneMode;
   // Absent is NOT the same as false. Absent on a create takes the type's own
   // default (true for llama_cpp, false otherwise); absent on an update keeps
   // the stored value, except that the backend CLEARS a stored true whenever
@@ -153,6 +166,13 @@ export type UpdateApplicationRequest = {
   health_check_interval_seconds?: number;
   responses_mode?: EndpointMode;
   messages_mode?: EndpointMode;
+  // Absent keeps the stored value on an update (a create takes the defaults,
+  // auto / passthrough); an explicit "" is refused. decisions_mode
+  // 'passthrough' is refused for the llama_cpp type (400
+  // application.decisions_passthrough_unsupported, 409 ..._conflict when the
+  // stored type is the offender), so the form never sends that pair.
+  decisions_mode?: DecisionsMode;
+  systemone_mode?: SystemOneMode;
   // Absent is NOT the same as false. Absent on a create takes the type's own
   // default (true for llama_cpp, false otherwise); absent on an update keeps
   // the stored value, except that the backend CLEARS a stored true whenever
@@ -234,6 +254,11 @@ export type PortalModelMapping = {
   // chat-prompt run is refused for it (`benchmark.decisions_only`). Same
   // advisory contract and optionality as images_only.
   decisions_only?: boolean;
+  // The route POST /v1/decisions takes for this mapping: "" when its flavors do
+  // not list decisions or the effective mode needs a verdict it lacks,
+  // otherwise translate, passthrough or disabled. Advisory and always present
+  // on the wire; optional here like decisions_only.
+  decisions_route?: DecisionsRoute;
   // The audio performance metrics (#340), written by the audio measurement a
   // speed, capacity or both run takes on a speech or transcription mapping and
   // editable like the text metrics above, under the same metrics_locked:
@@ -375,6 +400,18 @@ export type ModelVisibility = 'shown' | 'hidden' | 'locked';
 // Claude Code /v1/messages): 'disabled' = not served, 'translate' = converted to
 // /v1/chat/completions (lossy), 'passthrough' = proxied raw to the native path.
 export type EndpointMode = 'disabled' | 'translate' | 'passthrough';
+
+// POST /v1/decisions (OpenAI Decisions, #373 phase 2): the EndpointMode values
+// plus 'auto' (the default), which takes the model's verdicts to choose: the
+// native upstream path when it answers OpenAI Decisions, else translation to
+// System One.
+export type DecisionsRoute = '' | 'translate' | 'passthrough' | 'disabled';
+
+export type DecisionsMode = 'auto' | EndpointMode;
+
+// POST /v1/systemone: the System One relay is either served as a raw
+// passthrough (the default) or not at all; it has no translate path.
+export type SystemOneMode = 'passthrough' | 'disabled';
 
 // How a group's members are walked: the manual priority order, or fastest
 // measured generation speed first.
@@ -562,6 +599,10 @@ export type ModelOption = {
   // OPTIONAL and fail-closed: a model that omits it derives `speech_clone_voices
   // === false`, so a clone model stays hidden unless the backend vouches for it.
   speech_clone_voices?: boolean;
+  // True when this model -- and, for a group, EVERY offered member -- answers
+  // POST /v1/decisions natively (the decision_openai verdict). decision's twin;
+  // the backend's own fold, never recomputed here. OPTIONAL and fail-closed.
+  decision_openai?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options

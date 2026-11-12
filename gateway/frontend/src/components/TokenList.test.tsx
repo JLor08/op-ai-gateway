@@ -1046,6 +1046,56 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`TokenList decisions confidence normalization toggle (#373) [${locale}]`, () => {
+    const box = () => screen.getByRole('checkbox', { name: t.tokenDecisionsConfidenceNormalize });
+    function updateBody(fakeApi: { updateToken: unknown }) {
+      const [, body] = (fakeApi.updateToken as { mock: { calls: unknown[][] } }).mock.calls[0];
+      return body;
+    }
+
+    it('defaults to off and sends false on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      expect(box()).not.toBeChecked();
+      expect(screen.getByText(t.tokenDecisionsConfidenceNormalizeHint)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ decisions_confidence_normalize: false });
+    });
+
+    it('sends true on create once toggled', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ decisions_confidence_normalize: true });
+    });
+
+    it('seeds from the stored value on edit and resends it on save', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_edit', decisions_confidence_normalize: true })],
+      });
+      openEdit();
+      expect(box()).toBeChecked();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(updateBody(fakeApi)).toMatchObject({ decisions_confidence_normalize: true });
+    });
+
+    it('treats a token without the field as off and sends the toggled value on edit', async () => {
+      const { fakeApi } = renderTokenList({ tokens: [makeToken({ id: 'tok_edit' })] });
+      openEdit();
+      expect(box()).not.toBeChecked();
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(updateBody(fakeApi)).toMatchObject({ decisions_confidence_normalize: true });
+    });
+  });
+
   describe(`TokenList Claude Code effort compatibility toggle (#230) [${locale}]`, () => {
     function updateBody(fakeApi: { updateToken: unknown }) {
       const [, body] = (fakeApi.updateToken as { mock: { calls: unknown[][] } }).mock.calls[0];

@@ -88,6 +88,10 @@ export type PortalToken = {
   // it is a management operation on the server (portal session or admin
   // bearer), unlike claude_model_aliases.
   claude_effort_compatibility?: boolean;
+  // Opt-in decision-confidence normalization (#373): when true, /v1/decisions
+  // and /v1/systemone report a confidence on a 0..1 scale whatever the
+  // model's own scale is. Ungated: any token owner may set it.
+  decisions_confidence_normalize?: boolean;
   log_communication: boolean;
   secret: boolean;
   is_chat_session: boolean;
@@ -123,6 +127,8 @@ export type CreateTokenRequest = {
   claude_model_aliases?: boolean;
   // Claude Code effort compatibility (see PortalToken); omitted = off.
   claude_effort_compatibility?: boolean;
+  // Decision-confidence normalization (see PortalToken); omitted = off.
+  decisions_confidence_normalize?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // Optional project attribution (§6); "" = no project. Membership-checked
@@ -158,6 +164,9 @@ export type UpdateTokenRequest = {
   // Claude Code effort compatibility (see PortalToken). Omitted = keep the
   // current value.
   claude_effort_compatibility?: boolean;
+  // Decision-confidence normalization (see PortalToken). Omitted = keep the
+  // current value.
+  decisions_confidence_normalize?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // nil (omitted) = keep the current project attribution; "" = clear it;

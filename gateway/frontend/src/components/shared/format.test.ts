@@ -474,6 +474,16 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     ).toEqual(liveTimingsWireCodes.slice().sort());
   });
 
+  it('maps the decisions passthrough refusal codes', () => {
+    for (const code of [
+      'application.decisions_passthrough_unsupported',
+      'application.decisions_passthrough_conflict',
+      'runtime_spec.decisions_passthrough_unsupported',
+    ]) {
+      expect(errorLabelByCode[code], `${code} is not mapped`).toBeDefined();
+    }
+  });
+
   /**
    * Task 8's chat-run-lifecycle codes, plus the mapping capability-form
    * refusal reachable from the operator form this feature added, pinned as

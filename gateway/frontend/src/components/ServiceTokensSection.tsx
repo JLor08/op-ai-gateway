@@ -157,6 +157,7 @@ export function ServiceTokensSection({
   const [tokenClaudeAliases, setTokenClaudeAliases] = useState(false);
   // Opt-in Claude Code effort compatibility — see TokenList.
   const [tokenClaudeEffort, setTokenClaudeEffort] = useState(false);
+  const [tokenDecisionsNormalize, setTokenDecisionsNormalize] = useState(false);
   const [tokenLogCommunication, setTokenLogCommunication] = useState(false);
   const [tokenSecretFlag, setTokenSecretFlag] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -207,6 +208,7 @@ export function ServiceTokensSection({
     setTokenUnknownFallback('');
     setTokenClaudeAliases(false);
     setTokenClaudeEffort(false);
+    setTokenDecisionsNormalize(false);
     setTokenLogCommunication(false);
     setTokenSecretFlag(false);
     setTokenVaEntries([]);
@@ -239,6 +241,7 @@ export function ServiceTokensSection({
         unknown_model_fallback: tokenUnknownFallback,
         claude_model_aliases: tokenClaudeAliases,
         claude_effort_compatibility: tokenClaudeEffort,
+        decisions_confidence_normalize: tokenDecisionsNormalize,
         log_communication: tokenLogCommunication,
         secret: tokenSecretFlag,
         vendor_access: buildVendorAccess(),
@@ -525,6 +528,20 @@ export function ServiceTokensSection({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenClaudeEffortHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenDecisionsNormalize}
+                    onChange={(e) => setTokenDecisionsNormalize(e.target.checked)}
+                  />
+                }
+                label={t.tokenDecisionsConfidenceNormalize}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenDecisionsConfidenceNormalizeHint}
               </Typography>
             </Box>
             {/* Hidden entirely while the vendor-accounts master flag is off. Create

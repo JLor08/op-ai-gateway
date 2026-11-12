@@ -1026,6 +1026,11 @@ const de = {
   applicationModeDisabled: 'Deaktiviert',
   applicationModeTranslate: 'Umwandlung',
   applicationModePassthrough: 'Durchreichen',
+  applicationDecisionsMode: 'Entscheidungen (OpenAI Decisions)',
+  applicationDecisionsModeAuto: 'Automatisch',
+  applicationSystemOneMode: 'Entscheidungen (System One)',
+  applicationDecisionsModeNote:
+    'Gelten nur bei angehaktem decisions. OpenAI Decisions (/v1/decisions): Automatisch reicht an Upstreams durch, die es nativ beantworten, und wandelt sonst in System One um; Durchreichen ist für llama.cpp nicht verfügbar. System One (/v1/systemone) wird entweder durchgereicht oder deaktiviert.',
   applicationLoadedModelsLegend: 'Geladene Modelle',
   applicationLoadedModelsPath: 'Status-Pfad',
   applicationLoadedModelsFormat: 'Format',
@@ -1182,6 +1187,9 @@ const de = {
   mappingDecisionCapable: 'Entscheidungen (System One)',
   mappingDecisionCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es System-One-Entscheidungen liefert. Das ermittelt die Prüfung der Entscheidungsmodelle automatisch. Wo sie noch kein Ergebnis geliefert hat, setze es auf Ja, um POST /v1/systemone für dieses Modell freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
+  mappingDecisionOpenaiCapable: 'Entscheidungen (OpenAI Decisions)',
+  mappingDecisionOpenaiCapableUnknownHint:
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob sein Upstream OpenAI Decisions nativ beantwortet. Das ermittelt die Prüfung der Entscheidungsmodelle automatisch. Wo sie noch kein Ergebnis geliefert hat, setze es auf Ja, um POST /v1/decisions für dieses Modell durchzureichen. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
   mappingTranscriptionCapable: 'Transkription',
   mappingTranscriptionCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Audio transkribiert. Das wird automatisch aus dem Feld „task“ in /v1/models des audio.cpp-Servers erkannt („asr“ steht für Transkription): durch das Gateway mit dem nächsten Health-Check bei einem statischen Server, den es direkt erreicht, und durch den Server-Agent (ab Version 0.9.1) bei einem Modell, das er startet. Wo das noch kein Ergebnis geliefert hat, etwa bei einem älteren Agent oder einem Modell, das die Auflistung nicht nennt, setze es auf Ja, um die Transkription freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
@@ -2066,6 +2074,11 @@ const de = {
   // (audio.cpp mode=streaming) instead of as one document at the end.
   capabilityTranscriptionStreaming: 'Streaming-Transkription',
   capabilityDecision: 'Entscheidungen',
+  capabilityDecisionOpenai: 'Entscheidungen (OpenAI)',
+  mappingDecisionsRouteTranslate: 'Umwandlung',
+  mappingDecisionsRoutePassthrough: 'Durchreichen',
+  mappingDecisionsRouteDisabled: 'Deaktiviert',
+  mappingDecisionsRoute: (route: string) => `Entscheidungen: ${route}`,
   capabilitySpeech: 'Sprachsynthese',
   capabilitySpeechClone: 'Stimmklon',
   // Refines "Sprachsynthese": the model delivers its audio as it is generated
@@ -2191,6 +2204,12 @@ const de = {
     'Diese Anwendung hat einen Typ, der keine Live-Timings liefern kann. Ändern Sie zuerst den Typ, oder lassen Sie die Einstellung aus.',
   errorRuntimeSpecResponsesLiveTimingsUnsupported:
     'Live-Timings sind für die Art dieses Servers nicht verfügbar; nur llama.cpp kann sie liefern. Die Meldung nennt die erkannte Art.',
+  errorApplicationDecisionsPassthroughUnsupported:
+    'Durchreichen von OpenAI Decisions ist für llama.cpp nicht verfügbar, weil es den Endpunkt nicht nativ beantwortet. Wählen Sie Automatisch oder Umwandlung.',
+  errorApplicationDecisionsPassthroughConflict:
+    'Diese Anwendung hat den Typ llama.cpp, der OpenAI Decisions nicht durchreichen kann. Ändern Sie zuerst den Typ, oder wählen Sie Automatisch oder Umwandlung.',
+  errorRuntimeSpecDecisionsPassthroughUnsupported:
+    'Durchreichen von OpenAI Decisions ist für die Art dieses Servers (llama.cpp) nicht verfügbar. Wählen Sie Automatisch oder Umwandlung.',
   errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
   errorRuntimeCoresidencyModeInvalid: 'Ungültiger Koresidenz-Modus',
   errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
@@ -3357,6 +3376,9 @@ const de = {
   tokenClaudeEffort: 'Claude-Code-Effort-Kompatibilität',
   tokenClaudeEffortHint:
     'Reicht die in Claude Code gewählte Denktiefe (Effort) an das lokale Modell weiter, damit sie dessen Reasoning tatsächlich steuert. Das Upstream-Modell muss Reasoning-Effort unterstützen, etwa Qwen auf llama.cpp oder vLLM.',
+  tokenDecisionsConfidenceNormalize: 'Entscheidungs-Konfidenz normalisieren',
+  tokenDecisionsConfidenceNormalizeHint:
+    'Meldet die Konfidenz von Entscheidungen (/v1/decisions und /v1/systemone) immer auf einer Skala von 0 bis 1, auch wenn das Modell eine andere Skala verwendet.',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -5011,6 +5033,11 @@ const en: PortalMessages = {
   applicationModeDisabled: 'Disabled',
   applicationModeTranslate: 'Translate',
   applicationModePassthrough: 'Pass-through',
+  applicationDecisionsMode: 'Decisions (OpenAI Decisions)',
+  applicationDecisionsModeAuto: 'Automatic',
+  applicationSystemOneMode: 'Decisions (System One)',
+  applicationDecisionsModeNote:
+    'Only apply while decisions is ticked. OpenAI Decisions (/v1/decisions): Automatic passes through to upstreams that answer it natively and translates to System One otherwise; Pass-through is not available for llama.cpp. System One (/v1/systemone) is either passed through or disabled.',
   applicationLoadedModelsLegend: 'Loaded models',
   applicationLoadedModelsPath: 'Status path',
   applicationLoadedModelsFormat: 'Format',
@@ -5157,6 +5184,9 @@ const en: PortalMessages = {
   mappingDecisionCapable: 'Decisions (System One)',
   mappingDecisionCapableUnknownHint:
     'Unknown: whether this mapping serves System One decisions is not on file. The decision-model probe detects it automatically. Where it has not produced a verdict yet, set it to Yes to enable POST /v1/systemone for this model. A Yes set here takes precedence over the automatic detection.',
+  mappingDecisionOpenaiCapable: 'Decisions (OpenAI Decisions)',
+  mappingDecisionOpenaiCapableUnknownHint:
+    "Unknown: whether this mapping's upstream answers OpenAI Decisions natively is not on file. The decision-model probe detects it automatically. Where it has not produced a verdict yet, set it to Yes to pass POST /v1/decisions through for this model. A Yes set here takes precedence over the automatic detection.",
   mappingTranscriptionCapable: 'Transcription',
   mappingTranscriptionCapableUnknownHint:
     'Unknown: whether this mapping transcribes audio is not on file. It is detected automatically from the "task" field of the audio.cpp server\'s /v1/models ("asr" means transcription): by the gateway on the next health check for a static server it reaches directly, and by the server agent (version 0.9.1 or later) for a model it launches. Where that has not produced a verdict yet, for example with an older agent or a model the listing does not name, set it to Yes to enable transcription. A Yes set here takes precedence over the automatic detection.',
@@ -5965,6 +5995,11 @@ const en: PortalMessages = {
   // (audio.cpp mode=streaming) instead of as one document at the end.
   capabilityTranscriptionStreaming: 'Streaming transcription',
   capabilityDecision: 'Decisions',
+  capabilityDecisionOpenai: 'Decisions (OpenAI)',
+  mappingDecisionsRouteTranslate: 'Translate',
+  mappingDecisionsRoutePassthrough: 'Pass-through',
+  mappingDecisionsRouteDisabled: 'Disabled',
+  mappingDecisionsRoute: (route: string) => `Decisions: ${route}`,
   capabilitySpeech: 'Speech synthesis',
   capabilitySpeechClone: 'Voice clone',
   // Refines "Speech synthesis": the model delivers its audio as it is generated
@@ -6077,6 +6112,12 @@ const en: PortalMessages = {
     'This application has a type that cannot report live timings. Change the type first, or leave the setting off.',
   errorRuntimeSpecResponsesLiveTimingsUnsupported:
     'Live timings are not available for this runtime kind; only llama.cpp can report them. The message names the detected kind.',
+  errorApplicationDecisionsPassthroughUnsupported:
+    'Passing OpenAI Decisions through is not available for llama.cpp, because it does not answer the endpoint natively. Choose Automatic or Translate.',
+  errorApplicationDecisionsPassthroughConflict:
+    'This application has the llama.cpp type, which cannot pass OpenAI Decisions through. Change the type first, or choose Automatic or Translate.',
+  errorRuntimeSpecDecisionsPassthroughUnsupported:
+    'Passing OpenAI Decisions through is not available for this server kind (llama.cpp). Choose Automatic or Translate.',
   errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
   errorRuntimeCoresidencyModeInvalid: 'Invalid co-residency mode',
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',
@@ -7185,6 +7226,9 @@ const en: PortalMessages = {
   tokenClaudeEffort: 'Claude Code effort compatibility',
   tokenClaudeEffortHint:
     'Passes the reasoning effort chosen in Claude Code on to the local model so it actually controls its reasoning. The upstream model must support reasoning effort, for example Qwen on llama.cpp or vLLM.',
+  tokenDecisionsConfidenceNormalize: 'Normalize decision confidence',
+  tokenDecisionsConfidenceNormalizeHint:
+    'Reports the confidence of decisions (/v1/decisions and /v1/systemone) on a 0 to 1 scale whatever scale the model uses itself.',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',

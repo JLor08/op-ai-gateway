@@ -40,7 +40,9 @@ import type {
   ApplicationStatus,
   BenchmarkRunDTO,
   CoResidency,
+  DecisionsMode,
   EndpointMode,
+  SystemOneMode,
   GPUBudget,
   HardwareGPU,
   PortalApplication,
@@ -77,6 +79,14 @@ import {
   type LoadedSpecType,
   type RuntimeSpecFlavorValues,
 } from './shared/runtimeSpecTypeFlavors';
+import {
+  decisionsModeForKind,
+  decisionsModeOrDefault,
+  decisionsPassthroughOffered,
+  defaultDecisionsMode,
+  defaultSystemOneMode,
+  systemOneModeOrDefault,
+} from './shared/decisionsModes';
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
 import { CONFIG_FILES_MAX, configFileIssues, type ConfigFileIssue } from './shared/configFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
@@ -306,6 +316,8 @@ function emptySpec(mappingId: string): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    decisions_mode: 'auto',
+    systemone_mode: 'passthrough',
     responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
@@ -2750,6 +2762,11 @@ export function RuntimeAdminSection({
   }, [specFlavorRefusals]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
   const [specMessagesMode, setSpecMessagesMode] = useState<EndpointMode>('passthrough');
+  // The decisions modes are NOT part of the parent template (runtimeSpecTemplate):
+  // a spec starts at the defaults, and a PUT that omits them resets them, so the
+  // body always carries both.
+  const [specDecisionsMode, setSpecDecisionsMode] = useState<DecisionsMode>(defaultDecisionsMode);
+  const [specSystemOneMode, setSpecSystemOneMode] = useState<SystemOneMode>(defaultSystemOneMode);
   // The API-variant values a switch of Type to stable_diffusion_cpp or
   // audio_cpp replaced, so a switch back can restore them
   // (specFlavorsAfterTypeSwitch). null when no such switch happened since the
@@ -2882,6 +2899,8 @@ export function RuntimeAdminSection({
     setApiTokenCleared(false);
     setApiTokenRotate(false);
     setGpuRows([]);
+    setSpecDecisionsMode(defaultDecisionsMode);
+    setSpecSystemOneMode(defaultSystemOneMode);
     setSpecType('');
     setSpecLiveTimings(undefined);
     setMetricsPath('');
@@ -2935,6 +2954,8 @@ export function RuntimeAdminSection({
     setSpecApiFlavors([...spec.api_flavors]);
     setSpecResponsesMode(spec.responses_mode);
     setSpecMessagesMode(spec.messages_mode);
+    setSpecDecisionsMode(decisionsModeOrDefault(spec.decisions_mode));
+    setSpecSystemOneMode(systemOneModeOrDefault(spec.systemone_mode));
     setSpecType(spec.type);
     // `configured: false` means the mapping has no spec row, so what the
     // document carries are zero values, defaults and app-derived echoes
@@ -3342,6 +3363,10 @@ export function RuntimeAdminSection({
       api_flavors: specApiFlavors,
       responses_mode: specResponsesMode,
       messages_mode: specMessagesMode,
+      // Always sent: omitting them on this full-document PUT would reset them to
+      // the defaults. passthrough is refused for llama_cpp, so it is coerced.
+      decisions_mode: decisionsModeForKind(specDecisionsMode, specType),
+      systemone_mode: specSystemOneMode,
       // Two independent reasons to omit, and both must hold before the key is
       // sent.
       //
@@ -4901,6 +4926,11 @@ export function RuntimeAdminSection({
               flavorsGroupRef={specFlavorsGroupRef}
               onResponsesModeChange={setSpecResponsesMode}
               onMessagesModeChange={setSpecMessagesMode}
+              decisionsMode={specDecisionsMode}
+              systemOneMode={specSystemOneMode}
+              decisionsPassthroughOffered={decisionsPassthroughOffered(specType)}
+              onDecisionsModeChange={setSpecDecisionsMode}
+              onSystemOneModeChange={setSpecSystemOneMode}
               onLiveTimingsChange={setSpecLiveTimings}
             />
             {showFlavorsNotOnApplication && (
@@ -4953,6 +4983,7 @@ export function RuntimeAdminSection({
                   setHealthPath(runtimeSpecHealthPathDefault(next));
                 }
                 applySpecTypeFlavorDefaults(next);
+                setSpecDecisionsMode(decisionsModeForKind(specDecisionsMode, next));
                 setSpecType(next);
               }}
               sx={{ maxWidth: 340 }}

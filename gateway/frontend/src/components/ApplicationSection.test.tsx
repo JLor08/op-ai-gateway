@@ -1248,6 +1248,82 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // OpenAI Decisions (#373 phase 2): decisions_mode and systemone_mode sit in
+  // the shared API-variant block and only apply while the decisions flavor is
+  // ticked.
+  describe(`ApplicationSection decisions modes [${locale}]`, () => {
+    const decisionsField = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
+    const systemOneField = () => screen.getByRole('combobox', { name: t.applicationSystemOneMode });
+    const decisionsBox = () => screen.getByRole('checkbox', { name: t.applicationFlavorDecisions });
+
+    async function pick(field: HTMLElement, optionLabel: string) {
+      fireEvent.mouseDown(field);
+      fireEvent.click(await screen.findByRole('option', { name: optionLabel }));
+    }
+
+    it('sends the defaults auto and passthrough on create and keeps the selects disabled without the flavor', async () => {
+      const { created } = renderSection();
+      openCreate();
+      expect(decisionsField()).toHaveAttribute('aria-disabled', 'true');
+      expect(systemOneField()).toHaveAttribute('aria-disabled', 'true');
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].decisions_mode).toBe('auto');
+      expect(created[0].systemone_mode).toBe('passthrough');
+    });
+
+    it('sends the chosen modes once the decisions flavor is ticked', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.click(decisionsBox());
+      await pick(decisionsField(), t.applicationModeTranslate);
+      await pick(systemOneField(), t.applicationModeDisabled);
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].decisions_mode).toBe('translate');
+      expect(created[0].systemone_mode).toBe('disabled');
+    });
+
+    it('seeds both modes from the stored application on edit and resends them', async () => {
+      const { updated } = renderSection({
+        apps: [
+          makeApp({
+            id: 'app_1',
+            api_flavors: ['openai', 'decisions'],
+            decisions_mode: 'passthrough',
+            systemone_mode: 'disabled',
+          }),
+        ],
+      });
+      await screen.findByText('https://s1.example.test:8000');
+      fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+      expect(decisionsField()).toHaveTextContent(t.applicationModePassthrough);
+      expect(systemOneField()).toHaveTextContent(t.applicationModeDisabled);
+      fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+      await waitFor(() => expect(updated).toHaveLength(1));
+      expect(updated[0].body.decisions_mode).toBe('passthrough');
+      expect(updated[0].body.systemone_mode).toBe('disabled');
+    });
+
+    it('offers no passthrough for llama_cpp and turns a selected passthrough into auto on the type change', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.click(decisionsBox());
+      await pick(decisionsField(), t.applicationModePassthrough);
+      expect(decisionsField()).toHaveTextContent(t.applicationModePassthrough);
+
+      await selectType('llama_cpp');
+      expect(decisionsField()).toHaveTextContent(t.applicationDecisionsModeAuto);
+      fireEvent.mouseDown(decisionsField());
+      expect(screen.queryByRole('option', { name: t.applicationModePassthrough })).toBeNull();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].decisions_mode).toBe('auto');
+    });
+  });
+
   // openai_images is the third flavor checkbox: opt-in, never ticked by
   // default, so an operator can add it to any application -- a server_agent
   // one included, whose agent-launched image child needs it for candidacy.
