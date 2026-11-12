@@ -928,13 +928,15 @@ type Application struct {
 	ResponsesMode EndpointMode
 	MessagesMode  EndpointMode
 	// DecisionsMode / SystemOneMode are the per-application modes of the two
-	// decision endpoints (migration 107, ADR-098): DecisionsMode (POST
+	// decision endpoints (migration 107, ADR-098, ADR-100): DecisionsMode (POST
 	// /v1/decisions) is EndpointModeDisabled, Translate, Passthrough or
-	// EndpointModeAuto (the default); SystemOneMode (POST /v1/systemone) is
-	// EndpointModeAuto (the default), Passthrough, Translate or Disabled. Whether the endpoint is served
-	// also depends on the decisions APIFlavors entry (see
-	// applicationServesEndpoint). An empty value read from the store is
-	// normalized to the default in the scan.
+	// EndpointModeAuto; SystemOneMode (POST /v1/systemone) is EndpointModeAuto,
+	// Passthrough, Translate or Disabled. A create defaults both to auto. The
+	// store scan maps an empty stored value to auto for DecisionsMode and to
+	// passthrough for SystemOneMode (a row written by an older binary, the
+	// Phase 1 behavior; migration 107 backfilled existing rows the same way).
+	// Whether the endpoint is served also depends on the decisions APIFlavors
+	// entry (see applicationServesEndpoint).
 	DecisionsMode EndpointMode
 	SystemOneMode EndpointMode
 	// LoadedModelsPath is an optional upstream endpoint path the gateway (and/or the

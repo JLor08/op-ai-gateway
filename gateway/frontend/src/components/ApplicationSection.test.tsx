@@ -1305,6 +1305,26 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(updated[0].body.systemone_mode).toBe('disabled');
     });
 
+    // Phase 1 compatibility: migration 107 stored systemone_mode passthrough on
+    // every existing application. A save that never touches the control must
+    // resend it, with and without the decisions flavor, never the new default.
+    it.each([
+      ['with', ['openai', 'decisions']],
+      ['without', ['openai']],
+    ])(
+      'resends a stored systemone_mode passthrough untouched %s the decisions flavor',
+      async (_label, flavors) => {
+        const { updated } = renderSection({
+          apps: [makeApp({ id: 'app_1', api_flavors: flavors, systemone_mode: 'passthrough' })],
+        });
+        await screen.findByText('https://s1.example.test:8000');
+        fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+        fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+        await waitFor(() => expect(updated).toHaveLength(1));
+        expect(updated[0].body.systemone_mode).toBe('passthrough');
+      },
+    );
+
     it('offers no System One translate for llama_cpp and vllm_sr and resets a selected one to auto', async () => {
       const { created } = renderSection();
       openCreate();

@@ -117,7 +117,7 @@ export function ApiVariantControls({
   onLiveTimingsChange: (enabled: boolean) => void;
   // The POST /v1/decisions and POST /v1/systemone modes. Both only apply while
   // the decisions flavor is ticked, so both selects are disabled and show the
-  // defaults (auto / passthrough) while it is not -- the stored values are left
+  // defaults (auto / auto) while it is not -- the stored values are left
   // untouched, as with the responses/messages selects. Passthrough is not
   // offered for decisions where the server kind cannot answer OpenAI Decisions
   // natively (llama.cpp): decisionsPassthroughOffered says so.

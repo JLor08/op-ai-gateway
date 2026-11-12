@@ -1400,6 +1400,25 @@ describe('RuntimeAdminSection decisions modes in the spec form', () => {
     expect(putSpecs[0].body.systemone_mode).toBe('auto');
   });
 
+  // Phase 1 compatibility: migration 107 stored systemone_mode passthrough on
+  // every existing spec. A save that never touches the control must resend it,
+  // with and without the decisions flavor, never the new default.
+  it.each([
+    ['with', ['openai', 'decisions']],
+    ['without', ['openai']],
+  ])(
+    'resends a stored systemone_mode passthrough untouched %s the decisions flavor',
+    async (_label, flavors) => {
+      const { putSpecs } = await openApiTokenSpecEdit({
+        api_flavors: flavors,
+        systemone_mode: 'passthrough',
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.systemone_mode).toBe('passthrough');
+    },
+  );
+
   it('offers no System One translate for the llama.cpp type and resets a selected one to auto', async () => {
     const { putSpecs } = await openCreate();
     fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
