@@ -862,7 +862,7 @@ paths:
         served by translation to api.openai.com. The translate route refuses
         what OpenAI Decisions cannot express with 400
         `systemone.question_type_unsupported` or `systemone.field_unsupported`,
-        answers a refused question 422 `systemone.refused`, and answers a
+        answers a refused question 422 `systemone.refused` (error type `refusal`), and answers a
         non-2xx upstream answer with `systemone.upstream_error` under the
         upstream's status. The
         body is read under `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES` (default
@@ -918,7 +918,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
-          description: The Error envelope with code `systemone.refused`: on the translate route the upstream refused one or more questions; the message names the refused keys.
+          description: The Error envelope with code `systemone.refused` and error `type` `refusal` (the other decision errors keep `upstream_error`): on the translate route the upstream refused one or more questions; the message names the refused keys.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

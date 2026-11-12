@@ -12341,7 +12341,7 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   `400 systemone.field_unsupported`, both before any upstream call. **A default value counts as absent**, since it asks for nothing the upstream would miss:
   `null` for every field; `false`, `0`, `[]` and `{}` for `joint`, `priority`, `assets`, `audio`, `videos`, `options`, `states`, `roles` and
   `chat_template_kwargs`; `""` for `cache_salt` and the top-level `instructions`. `request_id`, a correlation id, is dropped silently. **Response:** answers are matched to questions **by name, then by position**; the computed `probabilities` and
-  `confidence` of a predicate are **rounded to 12 decimals**; a **refusal** answer is `422 systemone.refused` naming the keys and **takes precedence over a malformed sibling**
+  `confidence` of a predicate are **rounded to 12 decimals**; a **refusal** answer is `422 systemone.refused` (error `type` `refusal`, every other decision error keeps `upstream_error`) naming the keys and **takes precedence over a malformed sibling**
   (the usage row records the upstream's tokens, since it answered); a missing answer or an unusable body is `502 systemone.upstream_error`; a non-2xx upstream answer is that
   envelope under the upstream's status, with its message. Usage carries the **cached and cache-write** tokens, so a vendor row records what OpenAI billed.
 - **(d) A vendor decision model is an allowlisted upstream id on an OpenAI api-key account, and nothing else.** `routing.IsOpenAIDecisionModel` (exported) reads a fixed, unexported
@@ -12389,7 +12389,14 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   decision-specific flag.
 - **`auto` on `/v1/systemone` can now translate.** A model with only a `decision_openai` verdict (a vLLM decision model, the vendor model) is served to System One clients; one with both verdicts keeps passing
   through. A forced mode whose verdict is missing is still an intermittent 404 when two `server_agent` applications share a name; an ordinary
-  application without a route is no candidate.
+  application without a route is no candidate. **Confirmed as intended (#384):** the post-resolve route check does not re-select another
+  `server_agent` candidate; it fails closed with the 404, because re-selection would need an exclude-and-re-resolve loop to cure what is an operator
+  configuration error (two applications under one name with different forced spec modes).
+- **A group whose members all lack a route answers `routing.no_model_route`.** That is the Phase 1 posture, confirmed as intended (#384); under
+  `fallback_only` such a name can fall through to a same-named vendor model only when the names collide.
+- **The two decision probes run one after the other per mapping**, each with the 30 s `systemOneProbeTimeout`, so on an unreachable host one detached
+  per-application pass can run for up to 60 s per unsettled mapping. That is intended and harmless (the pass is off the health cycle and at most one runs
+  per application), confirmed as intended (#384).
 - **The translated route buffers the answer** (the cost the forward translate route already pays), and refuses a malformed request with a 400 instead of relaying it.
 - **A new decision model is a release.** `routing.IsOpenAIDecisionModel` reads the unexported package-level map `openAIDecisionModels`, a var that nothing mutates; until it changes, a model OpenAI adds is a chat-routed name that fails if used on a decision endpoint (it is not offered there).
 - **Not verified live:** a real OpenAI api-key account with `gpt-6-luna` through `/v1/decisions` and `/v1/systemone`; the official OpenAI SDK against the vendor route; OpenAI's real error envelope on this endpoint; the zero-based score index of a reverse `score` answer; and

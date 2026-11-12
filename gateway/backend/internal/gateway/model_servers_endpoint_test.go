@@ -767,16 +767,20 @@ func TestModelServersRowExposesTheVllmSRAPIVersion(t *testing.T) {
 		version     string
 		wantVersion string
 		wantUnsup   bool
+		wantMajor   int
 	}{
-		{"supported", routing.RuntimeSpecTypeVllmSR, "5.0.0", "5.0.0", false},
-		{"unsupported major", routing.RuntimeSpecTypeVllmSR, "6.0.0", "6.0.0", true},
-		{"unknown", routing.RuntimeSpecTypeVllmSR, "", "", false},
-		{"other kind is never unsupported", routing.RuntimeSpecTypeVLLM, "6.0.0", "6.0.0", false},
+		{"supported", routing.RuntimeSpecTypeVllmSR, "5.0.0", "5.0.0", false, routing.VllmSRSupportedAPIMajor},
+		{"unsupported major", routing.RuntimeSpecTypeVllmSR, "6.0.0", "6.0.0", true, routing.VllmSRSupportedAPIMajor},
+		{"unknown", routing.RuntimeSpecTypeVllmSR, "", "", false, routing.VllmSRSupportedAPIMajor},
+		{"other kind is never unsupported", routing.RuntimeSpecTypeVLLM, "6.0.0", "6.0.0", false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			row := modelServersRowWithRuntimeAPIVersion(t, tc.specType, tc.version)
 			if row.RuntimeAPIVersion != tc.wantVersion || row.RuntimeAPIVersionUnsupported != tc.wantUnsup {
 				t.Fatalf("row = (version %q, unsupported %v), want (%q, %v)", row.RuntimeAPIVersion, row.RuntimeAPIVersionUnsupported, tc.wantVersion, tc.wantUnsup)
+			}
+			if row.RuntimeAPISupportedMajor != tc.wantMajor {
+				t.Fatalf("runtime_api_supported_major = %d, want %d", row.RuntimeAPISupportedMajor, tc.wantMajor)
 			}
 		})
 	}

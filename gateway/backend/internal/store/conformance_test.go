@@ -617,7 +617,7 @@ func testTokenClaudeEffortCompatibilityRoundTrip(t *testing.T, s *SQLStore) {
 // token path on both dialects, so the Postgres leg exercises the widened
 // INSERT/SELECT/UPDATE lock-step and not only the SQLite one: written by
 // CreatePlainToken, read back by TokenByID, TokensByUser and the request-time
-// LookupBearer (which assembles the auth.Token the effort-delivery path
+// LookupBearer (which assembles the auth.Token the decisions-normalize path
 // reads), and rewritten in BOTH directions by UpdateTokenMetadata. A token
 // created without the field must read false everywhere -- the flag defaults
 // off, and "off" has to be the stored value, not merely the Go zero value a
@@ -631,7 +631,7 @@ func testTokenDecisionsConfidenceNormalizeRoundTrip(t *testing.T, s *SQLStore) {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := s.CreateUser(ctx, newTestUser("usr_dcn", "cec@example.test", now)); err != nil {
+	if err := s.CreateUser(ctx, newTestUser("usr_dcn", "dcn@example.test", now)); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
 	on := TokenRecord{ID: "tok_dcn_on", UserID: "usr_dcn", Name: "on", CreatedAt: now, UpdatedAt: now, DecisionsConfidenceNormalize: true}
@@ -673,7 +673,7 @@ func testTokenDecisionsConfidenceNormalizeRoundTrip(t *testing.T, s *SQLStore) {
 		t.Fatalf("TokensByUser flags = %v, want on=true off=false", listed)
 	}
 
-	// The request path: LookupBearer hands the effort-delivery path an auth.Token.
+	// The request path: LookupBearer hands the decisions-normalize path an auth.Token.
 	bearerOn, ok := s.LookupBearer("Bearer dcn-on-secret")
 	if !ok || !bearerOn.DecisionsConfidenceNormalize {
 		t.Fatalf("LookupBearer(on) ok=%v DecisionsConfidenceNormalize=%v, want true", ok, bearerOn.DecisionsConfidenceNormalize)

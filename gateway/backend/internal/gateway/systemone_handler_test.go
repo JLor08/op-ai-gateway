@@ -310,6 +310,7 @@ func TestSystemOneRefusesAMappingWithoutADecisionVerdict(t *testing.T) {
 			}
 			requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 			requireNoSystemOneUpstreamCall(t, calls)
+			requireRefusalUnattributed(t, lastUsageEvent(t, srv))
 		})
 	}
 }
@@ -377,9 +378,12 @@ func TestSystemOneRefusesAServerAgentChildWhoseSpecExcludesDecisions(t *testing.
 	if len(events) != 1 || events[0].ErrorCode != "routing.no_model_route" {
 		t.Fatalf("usage events = %+v, want one routing.no_model_route error", events)
 	}
-	if got := events[0]; got.Host != "" || got.RouteID != "" || got.ProviderPath != "" || got.ReqPath != "/v1/systemone" || got.HTTPStatus != http.StatusNotFound {
+	if got := events[0]; got.ReqPath != "/v1/systemone" || got.HTTPStatus != http.StatusNotFound {
 		t.Fatalf("usage row = %+v, want an upstream-less 404 row on /v1/systemone", got)
 	}
+	// The target was resolved before the spec's flavors refused it, so the row
+	// carries it.
+	requireRefusalAttributedTo(t, events[0], "srv-agent-sys", "route-agent-sys")
 }
 
 // The positive control of the test above: the same fixture with a spec listing
@@ -793,9 +797,10 @@ func TestSystemOneForcedModesNeedTheirVerdict(t *testing.T) {
 			requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 			requireNoSystemOneUpstreamCall(t, calls)
 			got := lastUsageEvent(t, srv)
-			if got.ErrorCode != "routing.model_not_capable" || got.Status != "error" || got.HTTPStatus != http.StatusNotFound || got.ProviderPath != "" || got.ReqPath != "/v1/systemone" {
-				t.Fatalf("row = %+v, want an upstream-less model_not_capable 404 row", got)
+			if got.ErrorCode != "routing.model_not_capable" || got.Status != "error" || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/systemone" {
+				t.Fatalf("row = %+v, want a model_not_capable 404 row", got)
 			}
+			requireRefusalUnattributed(t, got) // the resolver refused it: no target existed
 		})
 	}
 }
@@ -829,6 +834,7 @@ func TestSystemOneAutoIgnoresDecisionOpenAIOnKindsWithoutTheRoute(t *testing.T) 
 	}
 	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 	requireNoSystemOneUpstreamCall(t, calls)
+	requireRefusalUnattributed(t, lastUsageEvent(t, srv)) // the resolver refused it: no target existed
 }
 
 // A server_agent application or its runtime spec can disable System One per
@@ -861,9 +867,10 @@ func TestSystemOneDisabledServerAgentIs404(t *testing.T) {
 				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
 			}
 			got := lastUsageEvent(t, srv)
-			if got.ErrorCode != codeSystemOneEndpointDisabled || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/systemone" || got.ProviderPath != "" {
-				t.Fatalf("row = %+v, want an upstream-less systemone.endpoint_disabled 404 row", got)
+			if got.ErrorCode != codeSystemOneEndpointDisabled || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/systemone" {
+				t.Fatalf("row = %+v, want a systemone.endpoint_disabled 404 row", got)
 			}
+			requireRefusalAttributedTo(t, got, "srv-agent-dec", "route-agent-dec")
 		})
 	}
 }
@@ -888,9 +895,10 @@ func TestSystemOneTranslatorRefusalIs400WithoutAnUpstreamCall(t *testing.T) {
 			requireErrorCode(t, rec.Body.String(), tc.code)
 			requireNoSystemOneUpstreamCall(t, calls)
 			got := lastUsageEvent(t, srv)
-			if got.ErrorCode != tc.code || got.Status != "error" || got.HTTPStatus != http.StatusBadRequest || got.ReqPath != "/v1/systemone" || got.ProviderPath != "" {
-				t.Fatalf("row = %+v, want an upstream-less %s 400 error row", got, tc.code)
+			if got.ErrorCode != tc.code || got.Status != "error" || got.HTTPStatus != http.StatusBadRequest || got.ReqPath != "/v1/systemone" {
+				t.Fatalf("row = %+v, want a %s 400 error row", got, tc.code)
 			}
+			requireRefusalAttributedTo(t, got, "srv-dec", decisionsRouteIDs[decisionsModelOAI])
 		})
 	}
 }
@@ -904,10 +912,13 @@ func TestSystemOneTranslateUpstreamRefusalIs422(t *testing.T) {
 		t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
 	}
 	var env struct {
-		Error struct{ Code, Message string } `json:"error"`
+		Error struct{ Code, Message, Type string } `json:"error"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil || env.Error.Code != codeSystemOneRefused || !strings.Contains(env.Error.Message, "ok, q1") {
 		t.Fatalf("body = %s, want a systemone.refused envelope naming ok and q1", rec.Body.String())
+	}
+	if env.Error.Type != "refusal" {
+		t.Fatalf("error type = %q, want refusal (the upstream answered; this is not an upstream failure)", env.Error.Type)
 	}
 	got := lastUsageEvent(t, srv)
 	if got.ErrorCode != codeSystemOneRefused || got.Status != "error" || got.HTTPStatus != http.StatusUnprocessableEntity || got.ProviderPath != "/v1/decisions" {

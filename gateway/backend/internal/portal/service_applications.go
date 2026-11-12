@@ -2115,13 +2115,37 @@ func refuseIncapableDecisionModes(decisions, systemOne routing.EndpointMode, kin
 	if routing.DecisionsPassthroughCapableKind(kind) {
 		return nil
 	}
-	if decisions == routing.EndpointModePassthrough {
+	badDecisions := decisions == routing.EndpointModePassthrough
+	badSystemOne := systemOne == routing.EndpointModeTranslate
+	switch {
+	case badDecisions && badSystemOne:
+		return &bothDecisionModesRefusedError{
+			decisionsErr: decisionsErr, systemOneErr: systemOneErr,
+			msg: fmt.Sprintf("decisions_mode passthrough and systemone_mode translate are not available for %s %q", subject, kind),
+		}
+	case badDecisions:
 		return fmt.Errorf("%w: decisions_mode passthrough is not available for %s %q", decisionsErr, subject, kind)
-	}
-	if systemOne == routing.EndpointModeTranslate {
+	case badSystemOne:
 		return fmt.Errorf("%w: systemone_mode translate is not available for %s %q", systemOneErr, subject, kind)
 	}
 	return nil
+}
+
+// bothDecisionModesRefusedError reports a save that sends both an incapable
+// decisions_mode and an incapable systemone_mode. It unwraps to both sentinels
+// (errors.Is holds for each, as with errors.Join) but prints one message that
+// leads with the decisions sentinel: the HTTP mappings match the decisions row
+// first and trim exactly that prefix, so the client sees one clean sentence
+// naming both modes.
+type bothDecisionModesRefusedError struct {
+	decisionsErr, systemOneErr error
+	msg                        string
+}
+
+func (e *bothDecisionModesRefusedError) Error() string { return e.decisionsErr.Error() + ": " + e.msg }
+
+func (e *bothDecisionModesRefusedError) Unwrap() []error {
+	return []error{e.decisionsErr, e.systemOneErr}
 }
 
 func normalizeApplicationStatus(raw string) (string, error) {

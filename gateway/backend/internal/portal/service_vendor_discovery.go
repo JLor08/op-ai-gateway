@@ -355,7 +355,10 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 // whether api.openai.com's /v1/models lists them is not known, so a refresh
 // keeps them rather than letting an omission drop them. Like the discovered
 // rows they carry no prefix yet (GatewayModel = the slug); the store step
-// applies the account's current one. They do not count as discovered.
+// applies the account's current one. They do not count as discovered, and they
+// sit outside maxDiscoveredModels (vendorModelRows has already applied that cap
+// to what the vendor listed), so a full listing can store one row more than the
+// cap per decision model that was not in it.
 //
 // acc must be the account as storeDiscoveredVendorModels re-loaded it under
 // the model-write lock, not the copy loaded before the vendor call: an OAuth

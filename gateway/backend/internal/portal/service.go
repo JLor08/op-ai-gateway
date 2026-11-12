@@ -1480,9 +1480,13 @@ type ModelDTO struct {
 	// asks too, and GET /v1/systemone/models lists only the rows that carry it.
 	// Always present, like its sibling flags.
 	Decision bool `json:"decision"`
-	// DecisionOpenAI is Decision's twin for POST /v1/decisions served natively
-	// (the decision_openai verdict, ADR-098): the same AND aggregation over the
-	// offering mappings, via decisionOpenAIFlagsByName. Always present.
+	// DecisionOpenAI is true only when the upstream serves POST /v1/decisions
+	// natively (the decision_openai verdict, ADR-098, counted only on a kind that
+	// can take that passthrough): the same AND aggregation over the offering
+	// mappings, via decisionOpenAIFlagsByName. It is the native-verdict flag
+	// alone: Decision folds the System One route, which a decision_openai-only
+	// mapping can also have by translation, so the two flags are independent.
+	// Always present.
 	DecisionOpenAI bool `json:"decision_openai"`
 	// Transcription is true only when the transcription endpoint would serve the
 	// model -- EVERY offering mapping (or, for a group, every offerable member) has
@@ -3492,13 +3496,25 @@ func speechFlagsByName(views []mappingView, speechRows map[string]routing.Capabi
 // ModelDTO.Decision, GET /v1/systemone/models and the /v1/systemone redirect's
 // ModelOffering.Capable.
 func decisionFlagsByName(views []mappingView, decisionRows, openAIRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
-	return foldMappingFlags(views, func(view mappingView) bool {
+	return foldDecisionViews(views, decisionRows, openAIRows, idx, func(view mappingView, decision, openAI bool) bool {
 		if !viewServesSystemOne(view, idx) {
 			return false
 		}
-		route, ok := routing.EffectiveSystemOneRoute(idx.kind(view), idx.effective(view).SystemOneMode,
-			decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes, viewDecisionOpenAI(view, openAIRows, idx))
+		route, ok := routing.EffectiveSystemOneRoute(idx.kind(view), idx.effective(view).SystemOneMode, decision, openAI)
 		return ok && route != routing.EndpointModeDisabled
+	})
+}
+
+// foldDecisionViews is the one loop behind the three decision folds
+// (decisionFlagsByName, decisionOpenAIFlagsByName, anyDecisionFlagsByName):
+// foldMappingFlags over views with, per view, its decision verdict (a yes in
+// decisionRows, keyed by mapping id) and its decision_openai verdict (a yes in
+// openAIRows that counts for the view's kind, viewDecisionOpenAI), handed to
+// the per-fold predicate that says what the endpoint additionally needs. A nil
+// rows map reads as no verdict.
+func foldDecisionViews(views []mappingView, decisionRows, openAIRows map[string]routing.CapabilityRow, idx runtimeSpecIndex, ok func(view mappingView, decision, openAI bool) bool) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return ok(view, decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes, viewDecisionOpenAI(view, openAIRows, idx))
 	})
 }
 
@@ -3520,8 +3536,8 @@ func viewServesSystemOne(view mappingView, idx runtimeSpecIndex) bool {
 // (viewDecisionOpenAI), so a llama_cpp or vllm_sr mapping is never advertised
 // for a route the gateway would not send it.
 func decisionOpenAIFlagsByName(views []mappingView, rows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
-	return foldMappingFlags(views, func(view mappingView) bool {
-		return viewDecisionOpenAI(view, rows, idx) && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+	return foldDecisionViews(views, nil, rows, idx, func(view mappingView, _, openAI bool) bool {
+		return openAI && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
 	})
 }
 
@@ -3537,18 +3553,26 @@ func viewDecisionOpenAI(view mappingView, rows map[string]routing.CapabilityRow,
 }
 
 // anyDecisionFlagsByName folds the derived routing.CapabilityAnyDecision, the
-// pre-resolve requirement of POST /v1/decisions: every mapping of a name has a
-// yes on decision OR decision_openai (counted only where viewDecisionOpenAI
-// allows it) and passes the decisions flavor half. It backs
-// ModelOffering.Capable for that endpoint's unknown-model redirect.
-func anyDecisionFlagsByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
-	decision := capabilityRowsFor(capsByMapping, routing.CapabilityDecision)
-	openAI := capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI)
-	return foldMappingFlags(views, func(view mappingView) bool {
-		id := view.mapping.ID
-		yes := decision[id].Verdict == routing.CapabilityYes || viewDecisionOpenAI(view, openAI, idx)
-		return yes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
-	})
+// pre-resolve requirement of the two decision endpoints: every mapping of a
+// name has a yes on decision OR decision_openai (counted only where
+// viewDecisionOpenAI allows it), passes the decisions flavor half, and has a
+// route for the endpoint asked (requestFlavor: decisions for POST /v1/systemone,
+// openai_decisions for POST /v1/decisions) under its EFFECTIVE kind and modes
+// (routing.DecisionRouteExists, the rule the resolver's candidate filter
+// applies). An ordinary application's effective fields are its own; a
+// server_agent mapping's are its spec's, which the portal knows where the
+// resolver does not until after resolve. It backs ModelOffering.Capable for the
+// two endpoints' unknown-model redirect, so the hint names only a model the
+// resolver would accept.
+func anyDecisionFlagsByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex, requestFlavor string) map[string]bool {
+	return foldDecisionViews(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx,
+		func(view mappingView, decision, openAI bool) bool {
+			if !(decision || openAI) || !viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions) {
+				return false
+			}
+			eff := idx.effective(view)
+			return routing.DecisionRouteExists(requestFlavor, idx.kind(view), eff.SystemOneMode, eff.DecisionsMode, decision, openAI)
+		})
 }
 
 // transcriptionFlagsByName is THE transcription fold, speechFlagsByName's twin:

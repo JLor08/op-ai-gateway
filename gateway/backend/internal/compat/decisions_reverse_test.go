@@ -137,6 +137,7 @@ func TestSystemOneRequestRefusals(t *testing.T) {
 		{"chat_template_kwargs", `{"model":"m","state":"s","chat_template_kwargs":{"enable_thinking":false},` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"cache_salt", `{"model":"m","state":"s","cache_salt":"x",` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"priority", `{"model":"m","state":"s","priority":1,` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"priority tiny nonzero", `{"model":"m","state":"s","priority":1e-400,"questions":{"a":{"type":"noul"}}}`, CodeSystemOneFieldUnsupported},
 		{"priority -1", `{"model":"m","state":"s","priority":-1,` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"joint as string", `{"model":"m","state":"s","joint":"false",` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"top-level instructions blank", `{"model":"m","state":"s","instructions":" ",` + q + `}`, CodeSystemOneFieldUnsupported},
@@ -186,7 +187,7 @@ func TestSystemOneRequestDefaultFieldsCountAsAbsent(t *testing.T) {
 	q := `"questions":{"a":{"type":"noul"}}`
 	for _, field := range []string{
 		`"joint":false`, `"joint":null`,
-		`"priority":0`, `"priority":0.0`, `"priority":null`,
+		`"priority":0`, `"priority":0.0`, `"priority":-0`, `"priority":0e5`, `"priority":null`,
 		`"assets":[]`, `"assets":null`, `"audio":[]`, `"videos":[ ]`,
 		`"options":{}`, `"options":null`, `"states":[]`, `"roles":{}`,
 		`"chat_template_kwargs":{}`, `"chat_template_kwargs":null`,
@@ -288,6 +289,9 @@ func TestOpenAIDecisionsResponseErrors(t *testing.T) {
 		{"choice probabilities not array", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":{}},{}]}`},
 		{"choice unknown probability value", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":[{"value":"zzz","probability":1}]},{}]}`},
 		{"score no score", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":[]},{"type":"score","name":"urgency","probabilities":[]}]}`},
+		{"score probability value string", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":[]},{"type":"score","name":"urgency","score":1,"probabilities":[{"value":"1","label":"x","probability":1}]}]}`},
+		{"score probability value fractional", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":[]},{"type":"score","name":"urgency","score":1,"probabilities":[{"value":1.5,"label":"x","probability":1}]}]}`},
+		{"score probability value negative", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":[]},{"type":"score","name":"urgency","score":1,"probabilities":[{"value":-1,"label":"x","probability":1}]}]}`},
 		{"score index out of range", `{"answers":[{"type":"predicate","name":"nice","probability":0.5},{"type":"choice","name":"mood","choice":"calm","probabilities":[]},{"type":"score","name":"urgency","score":1,"probabilities":[{"value":9,"label":"x","probability":1}]}]}`},
 	}
 	for _, tt := range tests {
@@ -330,5 +334,78 @@ func TestOpenAIDecisionsResponseRefusalOutranksMalformedSibling(t *testing.T) {
 	var re *SystemOneRefusedError
 	if !errors.Is(err, ErrSystemOneRefused) || !errors.As(err, &re) || !reflect.DeepEqual(re.Keys, []string{"nice"}) {
 		t.Fatalf("err = %v, want a refusal naming nice", err)
+	}
+}
+
+func TestOpenAIDecisionsResponseScoreValueIntegralFloat(t *testing.T) {
+	_, table := reverseOK(t, `{"model":"m","state":"s","questions":{"u":{"type":"score","criteria":["low","high"]}}}`)
+	body := `{"answers":[{"type":"score","name":"u","score":0.5,"confidence":0.6,"probabilities":[{"value":0.0,"label":"low","probability":0.4},{"value":1.0,"label":"high","probability":0.6}]}],"model":"x","usage":{}}`
+	out, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, decodeAny(t, out), `{"answers":{"u":{"type":"score","score":0.5,"legend":{"0":"low","1":"high"},"probabilities":{"0":0.4,"1":0.6},"confidence":0.6}},"model":"c","usage":{"input_tokens":0,"output_tokens":0}}`)
+}
+
+// The translated answers object follows question order byte for byte, even
+// when the upstream reorders its named answers.
+func TestOpenAIDecisionsResponseRawAnswerOrder(t *testing.T) {
+	_, table := reverseOK(t, `{"model":"m","state":"s","questions":{"a":{"type":"noul"},"b":{"type":"noul"},"c":{"type":"noul"}}}`)
+	body := `{"answers":[{"type":"predicate","name":"c","probability":0.3},{"type":"predicate","name":"a","probability":0.1},{"type":"predicate","name":"b","probability":0.2}],"model":"x","usage":{}}`
+	out, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	ia, ib, ic := strings.Index(s, `"a":{`), strings.Index(s, `"b":{`), strings.Index(s, `"c":{`)
+	if ia < 0 || !(ia < ib && ib < ic) {
+		t.Fatalf("answers not in question order: %s", s)
+	}
+}
+
+// An answer whose name matches no question is taken by position.
+func TestOpenAIDecisionsResponsePositionalFallbackForUnknownName(t *testing.T) {
+	_, table := reverseOK(t, `{"model":"m","state":"s","questions":{"a":{"type":"noul"},"b":{"type":"noul"}}}`)
+	body := `{"answers":[{"type":"predicate","name":"zzz","probability":0.5},{"type":"predicate","name":"b","probability":0.1}],"model":"x","usage":{}}`
+	out, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, decodeAny(t, out), `{"answers":{"a":{"type":"noul","noul":0.5,"probabilities":{"yes":0.5,"no":0.5},"confidence":0.5},"b":{"type":"noul","noul":0.1,"probabilities":{"yes":0.1,"no":0.9},"confidence":0.9}},"model":"c","usage":{"input_tokens":0,"output_tokens":0}}`)
+}
+
+func TestOpenAIDecisionsResponseMultipleRefusedKeys(t *testing.T) {
+	_, table := reverseOK(t, reverseReq)
+	body := `{"answers":[{"type":"refusal","name":"nice"},{"type":"refusal","name":"mood"},{"type":"refusal","name":"urgency"}],"model":"x","usage":{}}`
+	_, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c")
+	var re *SystemOneRefusedError
+	if !errors.As(err, &re) || !reflect.DeepEqual(re.Keys, []string{"nice", "mood", "urgency"}) {
+		t.Fatalf("refused keys = %+v (err %v)", re, err)
+	}
+	if want := "the upstream refused to answer: nice, mood, urgency"; err.Error() != want {
+		t.Fatalf("message = %q, want %q", err.Error(), want)
+	}
+}
+
+// An upstream answer with an absent or null choice names nothing: it must not
+// match a System One option whose key is the empty string.
+func TestOpenAIDecisionsResponseChoiceMustBeNamed(t *testing.T) {
+	_, table := reverseOK(t, `{"model":"m","state":"s","questions":{"q":{"type":"choice","criteria":{"":null,"b":null}}}}`)
+	for name, choice := range map[string]string{"absent": ``, "null": `"choice":null,`} {
+		t.Run(name, func(t *testing.T) {
+			body := `{"answers":[{"type":"choice","name":"q",` + choice + `"confidence":1,"probabilities":[]}],"model":"x","usage":{}}`
+			_, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c")
+			if err == nil {
+				t.Fatal("expected an error for an answer that names no choice")
+			}
+			if errors.Is(err, ErrSystemOneRefused) {
+				t.Fatalf("malformed answer must not read as a refusal: %v", err)
+			}
+		})
+	}
+	// Control: the empty key named explicitly is still a valid choice.
+	body := `{"answers":[{"type":"choice","name":"q","choice":"","confidence":1,"probabilities":[]}],"model":"x","usage":{}}`
+	if _, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c"); err != nil {
+		t.Fatalf("explicit empty choice: %v", err)
 	}
 }

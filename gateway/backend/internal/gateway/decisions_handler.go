@@ -155,7 +155,7 @@ func (s *Server) relayDecisions(w http.ResponseWriter, r *http.Request, token au
 		body, table, derr := compat.TranslateDecisionsRequest(raw, effectiveProviderModel(target, c.req.Model))
 		if derr != nil {
 			slog.Debug("decisions request refused by the translator", "path", r.URL.Path, "model", c.req.Model, "code", derr.Code, "err", derr.Message)
-			s.refuseDecisionsRequest(w, r, c, http.StatusBadRequest, derr.Code, derr.Message)
+			s.refuseDecisionsRequest(w, r, c, target, http.StatusBadRequest, derr.Code, derr.Message)
 			return
 		}
 		rel.upstreamBody = body
@@ -196,18 +196,18 @@ func (s *Server) settleDecisionRoute(w http.ResponseWriter, r *http.Request, c d
 	decision, decisionOpenAI, err := s.decisionVerdicts(r.Context(), target)
 	if err != nil {
 		slog.Error("decision request: the mapping's verdicts could not be read", "path", r.URL.Path, "model", c.req.Model, "route_id", target.RouteID, "err", err)
-		s.recordDecisionsRoutingFailure(w, r, c, err)
+		s.recordDecisionsRoutingFailure(w, r, c, target, err)
 		return "", false
 	}
 	route, ok := effective(target.EffectiveKind(), mode, decision, decisionOpenAI)
 	switch {
 	case route == routing.EndpointModeDisabled:
 		slog.Debug("decision request rejected: endpoint disabled", "path", r.URL.Path, "model", c.req.Model, "server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.refuseDecisionsRequest(w, r, c, statusEndpointDisabled, disabledCode, msgEndpointDisabled)
+		s.refuseDecisionsRequest(w, r, c, target, statusEndpointDisabled, disabledCode, msgEndpointDisabled)
 		return "", false
 	case !ok:
 		slog.Debug("decision request rejected: the mapping has no verdict for the route its mode asks for", "path", r.URL.Path, "model", c.req.Model, "mode", string(mode), "route_id", target.RouteID)
-		s.recordDecisionsRoutingFailure(w, r, c, routing.ErrModelNotCapable)
+		s.recordDecisionsRoutingFailure(w, r, c, target, routing.ErrModelNotCapable)
 		return "", false
 	}
 	return route, true

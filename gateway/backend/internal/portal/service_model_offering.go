@@ -321,7 +321,7 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 		callable[name] = struct{}{}
 		existing[name] = struct{}{}
 	}
-	capable, err := s.capableNames(ctx, callable, visible, idx, overlay, required)
+	capable, err := s.capableNames(ctx, callable, visible, idx, overlay, requestFlavor, required)
 	if err != nil {
 		return emptyModelOffering()
 	}
@@ -368,7 +368,9 @@ func addVendorDecisionCandidates(capable, callable map[string]struct{}, vendor m
 // "transcription"), and groupCapabilityFlags over the group overlay for a group
 // name -- so Capable and the listing's ModelDTO flags are one rule, not two.
 // idx is the caller's runtime-spec index and must cover views; capableNames
-// makes no spec read of its own.
+// makes no spec read of its own. requestFlavor is the flavor the request was
+// asked under (not normalised: openai_decisions stays fine), which only the
+// any_decision fold reads, to judge the route of the decision endpoint asked.
 //
 // "image", "image_edit", "speech" and "transcription" are the capabilities with
 // a fold here; any other makes the result empty (fail-closed), alone or beside
@@ -385,7 +387,7 @@ func addVendorDecisionCandidates(capable, callable map[string]struct{}, vendor m
 // reverse). A request requiring more than one folded capability gets the
 // intersection. An error is a failed capability read, which the caller turns
 // into the all-or-nothing empty offering.
-func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
+func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, requestFlavor string, required []string) (map[string]struct{}, error) {
 	if len(required) == 0 {
 		return callable, nil
 	}
@@ -407,12 +409,19 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 	entries, _ := buildGroupOverlay(overlay, perNameFlavors(views, idx, routing.MappingServesAPIFlavor))
 	folds := make([]map[string]bool, len(required))
 	for i, capability := range required {
-		flags := capabilityFlagsByName(capability, views, capsByMapping, idx)
+		flags := capabilityFlagsByName(capability, requestFlavor, views, capsByMapping, idx)
 		for name, flag := range groupCapabilityFlags(entries, flags) {
 			flags[name] = flag
 		}
 		folds[i] = flags
 	}
+	return namesInEveryFold(callable, folds), nil
+}
+
+// namesInEveryFold returns the names in callable that every fold flags true:
+// the intersection capableNames needs when a request requires several
+// capabilities.
+func namesInEveryFold(callable map[string]struct{}, folds []map[string]bool) map[string]struct{} {
 	out := make(map[string]struct{})
 	for name := range callable {
 		capable := true
@@ -426,7 +435,7 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 			out[name] = struct{}{}
 		}
 	}
-	return out, nil
+	return out
 }
 
 // hasCapabilityFold reports whether capability is one capableNames can fold:
@@ -451,7 +460,7 @@ func hasCapabilityFold(capability string) bool {
 // FAIL-CLOSED -- an empty map, so nothing is offered -- rather than the image fold:
 // a capability added to hasCapabilityFold but not to this switch must offer
 // nothing, not silently inherit another capability's answer.
-func capabilityFlagsByName(capability string, views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+func capabilityFlagsByName(capability, requestFlavor string, views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	switch capability {
 	case routing.CapabilityImage:
 		return imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
@@ -466,7 +475,7 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 	case routing.CapabilityDecisionOpenAI:
 		return decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 	case routing.CapabilityAnyDecision:
-		return anyDecisionFlagsByName(views, capsByMapping, idx)
+		return anyDecisionFlagsByName(views, capsByMapping, idx, requestFlavor)
 	default:
 		return map[string]bool{}
 	}

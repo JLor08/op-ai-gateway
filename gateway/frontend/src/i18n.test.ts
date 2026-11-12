@@ -4680,7 +4680,6 @@ describe('vllm_sr i18n keys', () => {
       'runtimeTextOnVllmSrWarning',
       'modelServerColRuntimeApiVersion',
       'modelServerRuntimeApiVersionUnsupported',
-      'modelServerRuntimeApiVersionTooltipUnsupported',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');
@@ -4693,6 +4692,26 @@ describe('vllm_sr i18n keys', () => {
       const note = messages[locale].runtimeSpecTypeVllmSrNote;
       expect(note).toContain('vllm-project/semantic-router');
       expect(note).toContain('4ec449f358ce7805228fb341bdc55ea5211707fd');
+    }
+  });
+
+  it('interpolates the gateway-supplied major into the unsupported tooltip, and keeps the spec note number-free', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const tip = messages[locale].modelServerRuntimeApiVersionTooltipUnsupported(7);
+      expect(tip).toContain('(7)');
+      expect(tip).not.toContain('(5)');
+      expect(messages[locale].runtimeSpecTypeVllmSrNote).not.toMatch(
+        /Hauptversion als 5|major other than 5/,
+      );
+    }
+    expect(messages.de.modelServerRuntimeApiVersionTooltipUnsupported(5)).not.toBe(
+      messages.en.modelServerRuntimeApiVersionTooltipUnsupported(5),
+    );
+  });
+
+  it('says the decisions-mode note an OpenAI api-key account serves gpt-6-luna on both endpoints', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].applicationDecisionsModeNote).toContain('gpt-6-luna');
     }
   });
 

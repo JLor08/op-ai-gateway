@@ -1509,7 +1509,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           return { ...r, runtime_api_version: '5.0.0', runtime_api_version_unsupported: false };
         }
         if (r.mapping_id === 'map-b') {
-          return { ...r, runtime_api_version: '6.1.0', runtime_api_version_unsupported: true };
+          return {
+            ...r,
+            runtime_api_version: '6.1.0',
+            runtime_api_version_unsupported: true,
+            runtime_api_supported_major: 7,
+          };
         }
         return r;
       });
@@ -1525,6 +1530,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const bad = cellForColumn('GPU-Box-B', t.modelServerColRuntimeApiVersion);
       expect(bad).toHaveTextContent('6.1.0');
       expect(within(bad).getByText(t.modelServerRuntimeApiVersionUnsupported)).toBeInTheDocument();
+      // The tooltip names the major the gateway reported on the row.
+      expect(
+        within(bad).getByLabelText(t.modelServerRuntimeApiVersionTooltipUnsupported(7)),
+      ).toBeInTheDocument();
       // A row that reports no version renders the shared placeholder.
       expect(cellForColumn('GPU-Box-C', t.modelServerColRuntimeApiVersion)).toHaveTextContent('—');
     });

@@ -104,7 +104,7 @@ func isDefaultJSON(raw json.RawMessage) bool {
 	case bool:
 		return !v
 	case float64:
-		return v == 0
+		return isZeroNumberLiteral(raw)
 	case []any:
 		return len(v) == 0
 	case map[string]any:
@@ -112,6 +112,18 @@ func isDefaultJSON(raw json.RawMessage) bool {
 	default:
 		return false
 	}
+}
+
+// isZeroNumberLiteral reports whether the JSON number literal has an all-zero
+// mantissa (0, 0.0, -0, 0e5). A literal that only underflows to zero when
+// parsed (1e-400) is not zero: the client asked for a nonzero value.
+func isZeroNumberLiteral(raw json.RawMessage) bool {
+	t := strings.TrimPrefix(string(bytes.TrimSpace(raw)), "-")
+	if i := strings.IndexAny(t, "eE"); i >= 0 {
+		t = t[:i]
+	}
+	t = strings.ReplaceAll(t, ".", "")
+	return t != "" && strings.Trim(t, "0") == ""
 }
 
 // ---------------------------------------------------------------------------
@@ -400,17 +412,12 @@ func foldNoulCriteria(key, instructions string, raw json.RawMessage) (string, *D
 	}
 	seen := make(map[string]*string, len(members))
 	for _, m := range members {
-		if m.key != "true" && m.key != "false" {
-			return "", s1FieldErr("question %q: noul criteria accepts only the keys true and false, got %q", key, m.key)
-		}
 		if _, dup := seen[m.key]; dup {
 			return "", s1FieldErr("question %q: noul criteria key %q appears more than once", key, m.key)
 		}
-		var desc *string
-		if isPresentJSON(m.raw) {
-			if err := json.Unmarshal(m.raw, &desc); err != nil {
-				return "", s1FieldErr("question %q: the %s description must be a string or null", key, m.key)
-			}
+		desc, derr := decodeNoulDescription(key, m)
+		if derr != nil {
+			return "", derr
 		}
 		seen[m.key] = desc
 	}
@@ -421,6 +428,21 @@ func foldNoulCriteria(key, instructions string, raw json.RawMessage) (string, *D
 		instructions += decisionsTextSeparator + "Answer no if: " + *seen["false"]
 	}
 	return instructions, nil
+}
+
+// decodeNoulDescription reads one noul criteria member: the key must be true or
+// false, the value a string or null.
+func decodeNoulDescription(key string, m orderedMember) (*string, *DecisionsError) {
+	if m.key != "true" && m.key != "false" {
+		return nil, s1FieldErr("question %q: noul criteria accepts only the keys true and false, got %q", key, m.key)
+	}
+	var desc *string
+	if isPresentJSON(m.raw) {
+		if err := json.Unmarshal(m.raw, &desc); err != nil {
+			return nil, s1FieldErr("question %q: the %s description must be a string or null", key, m.key)
+		}
+	}
+	return desc, nil
 }
 
 func buildOpenAIChoices(key string, raw json.RawMessage) ([]openAIChoice, []string, *DecisionsError) {
@@ -708,13 +730,16 @@ func translateOpenAIChoice(q s1TableQuestion, a openAIAnswerIn) (any, error) {
 	if err := expectOpenAIType(a, oaTypeChoice); err != nil {
 		return nil, err
 	}
-	chosen := probKeyString(a.Choice)
+	chosen, named := probKeyString(a.Choice)
+	if !named {
+		return nil, errors.New("choice answer names no choice")
+	}
 	if !containsString(q.choices, chosen) {
 		return nil, fmt.Errorf("choice %q is not one of the asked options", chosen)
 	}
 	probs, err := decodeOpenAIProbs(a.Probabilities, func(raw json.RawMessage) (string, bool) {
-		k := probKeyString(raw)
-		return k, containsString(q.choices, k)
+		k, present := probKeyString(raw)
+		return k, present && containsString(q.choices, k)
 	})
 	if err != nil {
 		return nil, err
@@ -730,8 +755,8 @@ func translateOpenAIScore(q s1TableQuestion, a openAIAnswerIn) (any, error) {
 		return nil, errors.New("score answer carries no score")
 	}
 	probs, err := decodeOpenAIProbs(a.Probabilities, func(raw json.RawMessage) (string, bool) {
-		idx, convErr := strconv.Atoi(probKeyString(raw))
-		return strconv.Itoa(idx), convErr == nil && idx >= 0 && idx < len(q.levels)
+		idx, ok := scoreLevelIndex(raw, len(q.levels))
+		return strconv.Itoa(idx), ok
 	})
 	if err != nil {
 		return nil, err
@@ -741,6 +766,21 @@ func translateOpenAIScore(q s1TableQuestion, a openAIAnswerIn) (any, error) {
 		legend[strconv.Itoa(i)] = label
 	}
 	return s1ScoreOut{Type: s1TypeScore, Score: *a.Score, Legend: legend, Probabilities: probs, Confidence: confidenceOr(a.Confidence, probs)}, nil
+}
+
+// scoreLevelIndex reads a score probability's value: a JSON number with an
+// integral value (1 and 1.0 both name level 1) inside [0, levels). A string,
+// a fraction or an out-of-range number is not a level.
+func scoreLevelIndex(raw json.RawMessage, levels int) (int, bool) {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || t[0] == '"' {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(string(t), 64)
+	if err != nil || f != math.Trunc(f) || f < 0 || f >= float64(levels) {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // decodeOpenAIProbs reads an OpenAI probabilities array into a map keyed by

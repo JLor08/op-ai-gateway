@@ -543,8 +543,11 @@ func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.
 	// it rides State's unconditional injection. Only a vllm_sr spec can be
 	// unsupported; an empty version is unknown and never is.
 	row.RuntimeAPIVersion = rep.RuntimeAPIVersion
-	row.RuntimeAPIVersionUnsupported = routing.EffectiveRuntimeSpecType(spec) == routing.RuntimeSpecTypeVllmSR &&
-		routing.VllmSRAPIVersionUnsupported(rep.RuntimeAPIVersion)
+	isVllmSR := routing.EffectiveRuntimeSpecType(spec) == routing.RuntimeSpecTypeVllmSR
+	row.RuntimeAPIVersionUnsupported = isVllmSR && routing.VllmSRAPIVersionUnsupported(rep.RuntimeAPIVersion)
+	if isVllmSR {
+		row.RuntimeAPISupportedMajor = routing.VllmSRSupportedAPIMajor
+	}
 }
 
 // runtimeRowRepresentative returns the one of a spec's status rows that speaks for the spec,

@@ -67,6 +67,10 @@ type ModelServerDTO struct {
 	// from the runtime-status registry.
 	RuntimeAPIVersion            string `json:"runtime_api_version,omitempty"`
 	RuntimeAPIVersionUnsupported bool   `json:"runtime_api_version_unsupported"`
+	// RuntimeAPISupportedMajor is the major the gateway supports
+	// (routing.VllmSRSupportedAPIMajor); set only on a vllm_sr row, omitted
+	// (0) otherwise, so the portal never hard-codes the number.
+	RuntimeAPISupportedMajor int `json:"runtime_api_supported_major,omitempty"`
 
 	// LoadRefusal is why a Load of this mapping would be refused right now:
 	// "images_only", "audio_only", "agent_ensure_unsupported" or "spec_force_stopped", the

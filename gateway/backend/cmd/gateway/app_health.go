@@ -48,24 +48,24 @@ var (
 	// health tick. A rate that appears ends the wait on the next tick, and a model
 	// whose identity changed is not held by it.
 	speechRateRetryBackoff = 5 * time.Minute
-	// systemOneRetryBackoff is how long a mapping whose System One decision probe
+	// decisionProbeRetryBackoff is how long a mapping whose decision probe (either verdict)
 	// stated no verdict (a timeout, a 503 while the model loads, an answer
 	// without the probe's answer) is left alone before the pass asks again (see
 	// settleSystemOne), so an upstream that cannot answer costs one tiny POST per
 	// window instead of one per health tick. It is also the first window of a
 	// probe the upstream refused (a 400, 405 or 422), which doubles from there.
-	systemOneRetryBackoff = 5 * time.Minute
-	// systemOneRefusedBackoffCap bounds the window a refused System One probe
+	decisionProbeRetryBackoff = 5 * time.Minute
+	// decisionProbeRefusedBackoffCap bounds the window a refused decision probe (either verdict)
 	// doubles towards: a model that keeps refusing the probe is asked once an
 	// hour at most, so the probe does not keep it loaded.
-	systemOneRefusedBackoffCap = time.Hour
+	decisionProbeRefusedBackoffCap = time.Hour
 )
 
 // systemOneProbeTimeout bounds one System One decision probe (probeSystemOne).
 // It is the probe's own, not the loop's probeTimeout: the answer is a real
 // inference, which a slow model would never finish within the few seconds a
 // reachability probe gets, so the verdict would never settle and the retry
-// every systemOneRetryBackoff would keep refreshing an agent child's idle timer.
+// every decisionProbeRetryBackoff would keep refreshing an agent child's idle timer.
 const systemOneProbeTimeout = 30 * time.Second
 
 // healthStore is the store surface the app-health loop needs. *store.SQLiteStore
@@ -2201,25 +2201,25 @@ func (r *appHealthRunner) decisionRowOnFile(ctx context.Context, mappingID, capa
 // settleDecisionProbe records what probe p of candidate c answered at now. A
 // verdict (yes or no) that landed settles the key for this process (so a
 // gateway restart re-probes once) and ends any refusal streak. No verdict
-// writes nothing and opens a back-off: one systemOneRetryBackoff long for an
+// writes nothing and opens a back-off: one decisionProbeRetryBackoff long for an
 // answer that can pass on its own (a timeout, a 408, a 429, a 5xx), and, for
 // one that will not (p.refused: a 400, 405 or 422), a window that doubles with
-// each refusal of the same identity in a row up to systemOneRefusedBackoffCap,
+// each refusal of the same identity in a row up to decisionProbeRefusedBackoffCap,
 // so a model that refuses the probe is not kept loaded by it. A verdict the
-// store failed to take opens a systemOneRetryBackoff window too.
+// store failed to take opens a decisionProbeRetryBackoff window too.
 func (r *appHealthRunner) settleDecisionProbe(ctx context.Context, app routing.Application, c systemOneCandidate, p decisionProbe, verdict string, err error, now time.Time) {
 	rows := p.rows(verdict, now)
 	if len(rows) == 0 {
-		window := systemOneRetryBackoff
+		window := decisionProbeRetryBackoff
 		if errors.Is(err, p.refused) {
-			window = p.refusals.next(c.mp.ID, p.key, systemOneRetryBackoff, systemOneRefusedBackoffCap)
+			window = p.refusals.next(c.mp.ID, p.key, decisionProbeRetryBackoff, decisionProbeRefusedBackoffCap)
 		}
 		p.backoff.start(p.key, now, now.Add(window))
-		logSystemOneNoVerdict(app, c.mp, p.capability, err)
+		logDecisionProbeNoVerdict(app, c.mp, p.capability, err)
 		return
 	}
 	if !r.writeCapabilityRows(ctx, c.mp, rows) {
-		p.backoff.start(p.key, now, now.Add(systemOneRetryBackoff))
+		p.backoff.start(p.key, now, now.Add(decisionProbeRetryBackoff))
 		return
 	}
 	p.backoff.clear(p.key)
@@ -2227,10 +2227,10 @@ func (r *appHealthRunner) settleDecisionProbe(ctx context.Context, app routing.A
 	p.settled.add(p.key)
 }
 
-// logSystemOneNoVerdict logs a decision probe that stated no verdict: a
+// logDecisionProbeNoVerdict logs a decision probe that stated no verdict: a
 // rejected credential at the default level, since only the operator can fix
 // it, anything else at debug.
-func logSystemOneNoVerdict(app routing.Application, mp routing.ModelMapping, capability string, err error) {
+func logDecisionProbeNoVerdict(app routing.Application, mp routing.ModelMapping, capability string, err error) {
 	if errors.Is(err, provider.ErrAuthRejected) {
 		log.Printf("app health: %s probe for app %s model %q rejected by the upstream (401/403): check the API token", capability, app.ID, mp.AppModelName)
 		return

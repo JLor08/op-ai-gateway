@@ -611,10 +611,6 @@ export type ModelOption = {
   // OPTIONAL and fail-closed: a model that omits it derives `speech_clone_voices
   // === false`, so a clone model stays hidden unless the backend vouches for it.
   speech_clone_voices?: boolean;
-  // True when this model -- and, for a group, EVERY offered member -- answers
-  // POST /v1/decisions natively (the decision_openai verdict). decision's twin;
-  // the backend's own fold, never recomputed here. OPTIONAL and fail-closed.
-  decision_openai?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options
@@ -737,9 +733,12 @@ export type ModelServerRow = {
   live_progress_checked_at?: string | null;
   // The api_version a vllm-srun worker reported on its context probe (#373);
   // empty or absent for every other kind. runtime_api_version_unsupported is
-  // the gateway's verdict: the major differs from the supported one (5).
+  // the gateway's verdict: the major differs from the supported one.
+  // runtime_api_supported_major is that supported major, set by the gateway
+  // on a vllm-srun row only (absent otherwise); the portal never hard-codes it.
   runtime_api_version?: string;
   runtime_api_version_unsupported?: boolean;
+  runtime_api_supported_major?: number;
   // Every DETERMINED capability row for this (server, mapping) (the
   // capability-table migration): one entry per capability that has ever been
   // established -- "vision", "video", "audio", "tools", "mtp",

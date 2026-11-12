@@ -1086,3 +1086,32 @@ func TestHandlePortalMappingRuntimeSpecPutDecisionModes(t *testing.T) {
 		t.Fatalf("round trip = %+v, %v, body = %s", got, err, rec.Body.String())
 	}
 }
+
+// A runtime spec whose decisions_mode and systemone_mode are both invalid for
+// the kind is one 400 whose message names both modes without the raw sentinel
+// text.
+func TestHandlePortalMappingRuntimeSpecPutBothDecisionModesInvalid(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec",
+		`{"binary":"/usr/local/bin/llama-server","type":"llama_cpp","decisions_mode":"passthrough","systemone_mode":"translate"}`))
+	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.decisions_passthrough_unsupported" {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	msg := body.Error.Message
+	if !strings.Contains(msg, "decisions_mode") || !strings.Contains(msg, "systemone_mode") {
+		t.Fatalf("message = %q, want both modes named", msg)
+	}
+	if strings.Contains(msg, "runtime_spec.decisions_passthrough_unsupported") || strings.Contains(msg, "runtime_spec.systemone_translate_unsupported") {
+		t.Fatalf("message = %q repeats the raw sentinel text", msg)
+	}
+}
