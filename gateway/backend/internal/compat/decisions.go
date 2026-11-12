@@ -137,6 +137,9 @@ func TranslateDecisionsRequest(raw []byte, upstreamModel string) ([]byte, Decisi
 	if derr != nil {
 		return nil, table, derr
 	}
+	if len(pieces) == 0 && len(images) == 0 {
+		return nil, table, decisionsInputErr("input carries no content")
+	}
 	questions, tq, derr := buildSystemOneQuestions(in.Questions)
 	if derr != nil {
 		return nil, table, derr
@@ -242,7 +245,7 @@ func decodeDecisionsParts(parts []decisionsPart) ([]decisionsPiece, []string, *D
 		switch p.Type {
 		case "input_text":
 			if p.Text == nil {
-				return nil, nil, decisionsInputErr("an input_text part needs text")
+				return nil, nil, decisionsInputErr("an input_text part has no text")
 			}
 			pieces = append(pieces, decisionsPiece{text: *p.Text})
 		case "input_json":
@@ -431,8 +434,11 @@ func decodeQuestionInstructions(raw json.RawMessage) (string, *DecisionsError) {
 		}
 		texts := make([]string, 0, len(parts))
 		for _, p := range parts {
-			if p.Type != "input_text" || p.Text == nil {
+			if p.Type != "input_text" {
 				return "", decisionsInputErr("question instruction parts of type %q are not supported; only input_text is", p.Type)
+			}
+			if p.Text == nil {
+				return "", decisionsInputErr("an input_text part has no text")
 			}
 			texts = append(texts, *p.Text)
 		}
@@ -444,7 +450,7 @@ func decodeQuestionInstructions(raw json.RawMessage) (string, *DecisionsError) {
 
 type decisionsChoiceIn struct {
 	Value       json.RawMessage `json:"value"`
-	Description *string         `json:"description"`
+	Description json.RawMessage `json:"description"`
 }
 
 // buildChoiceCriteria writes {key: description|null} in choice order and
@@ -467,6 +473,10 @@ func buildChoiceCriteria(raws []json.RawMessage, qi int) ([]byte, []decisionsTab
 		if derr != nil {
 			return nil, nil, derr
 		}
+		desc, derr := choiceDescription(c.Description, qi, ci)
+		if derr != nil {
+			return nil, nil, derr
+		}
 		if seen[key] {
 			return nil, nil, decisionsQuestionErr("question %d: choice values collide on the key %q (a string and a boolean map to the same System One name)", qi, key)
 		}
@@ -477,14 +487,27 @@ func buildChoiceCriteria(raws []json.RawMessage, qi int) ([]byte, []decisionsTab
 		}
 		writeJSONValue(&buf, key)
 		buf.WriteByte(':')
-		if c.Description == nil || *c.Description == "" {
+		if desc == "" {
 			buf.WriteString("null")
 		} else {
-			writeJSONValue(&buf, *c.Description)
+			writeJSONValue(&buf, desc)
 		}
 	}
 	buf.WriteByte('}')
 	return buf.Bytes(), choices, nil
+}
+
+// choiceDescription reads a choice's optional description: absent or null is
+// empty, anything but a string is refused.
+func choiceDescription(raw json.RawMessage, qi, ci int) (string, *DecisionsError) {
+	if !isPresentJSON(raw) {
+		return "", nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", decisionsQuestionErr("question %d: choice %d description must be a string", qi, ci)
+	}
+	return s, nil
 }
 
 // choiceKey returns the System One option name and the compact typed original
@@ -495,7 +518,7 @@ func choiceKey(raw json.RawMessage, qi, ci int) (string, json.RawMessage, *Decis
 		switch {
 		case trimmed[0] == '"':
 			var s string
-			if err := json.Unmarshal(trimmed, &s); err == nil {
+			if err := json.Unmarshal(trimmed, &s); err == nil && s != "" {
 				typed, _ := json.Marshal(s)
 				return s, typed, nil
 			}
@@ -503,7 +526,7 @@ func choiceKey(raw json.RawMessage, qi, ci int) (string, json.RawMessage, *Decis
 			return string(trimmed), json.RawMessage(trimmed), nil
 		}
 	}
-	return "", nil, decisionsQuestionErr("question %d: choice %d needs a string or boolean value", qi, ci)
+	return "", nil, decisionsQuestionErr("question %d: choice %d needs a non-empty string or boolean value", qi, ci)
 }
 
 type decisionsLevelIn struct {
@@ -694,8 +717,8 @@ func translateSystemOneAnswer(q decisionsTableQuestion, raw json.RawMessage) (an
 }
 
 func translateChoiceAnswer(q decisionsTableQuestion, a systemOneAnswerIn, confidence float64) (any, error) {
-	chosen := probKeyString(a.Choice)
-	if chosen == "" {
+	chosen, named := probKeyString(a.Choice)
+	if !named {
 		return nil, errors.New("choice answer names no choice")
 	}
 	var chosenValue json.RawMessage
@@ -740,19 +763,20 @@ func translateScoreAnswer(q decisionsTableQuestion, a systemOneAnswerIn, confide
 }
 
 // probKeyString renders a JSON string as its text and any other literal (a
-// number or boolean) as its raw form; empty for absent or null.
-func probKeyString(raw json.RawMessage) string {
+// number or boolean) as its raw form. The bool is false for an absent or null
+// value, so the empty string stays a present, distinct key.
+func probKeyString(raw json.RawMessage) (string, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return ""
+		return "", false
 	}
 	if trimmed[0] == '"' {
 		var s string
 		if json.Unmarshal(trimmed, &s) == nil {
-			return s
+			return s, true
 		}
 	}
-	return string(trimmed)
+	return string(trimmed), true
 }
 
 // decodedProbs holds System One probabilities, which may arrive as a map
@@ -811,11 +835,11 @@ func decodeProbEntry(raw json.RawMessage) (probEntry, error) {
 		if err := json.Unmarshal(trimmed, &o); err != nil || o.Probability == nil {
 			return probEntry{}, errors.New("a probabilities element needs a numeric probability")
 		}
-		key := probKeyString(o.Value)
-		if key == "" {
-			key = probKeyString(o.Name)
+		key, hasKey := probKeyString(o.Value)
+		if !hasKey {
+			key, hasKey = probKeyString(o.Name)
 		}
-		return probEntry{key: key, hasKey: key != "", p: *o.Probability}, nil
+		return probEntry{key: key, hasKey: hasKey, p: *o.Probability}, nil
 	}
 	var p float64
 	if err := json.Unmarshal(trimmed, &p); err != nil {

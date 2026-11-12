@@ -108,6 +108,9 @@ func TestTranslateDecisionsRequestInputRefusals(t *testing.T) {
 		"other item":    `[{"type":"custom_tool_call_output","call_id":"c","output":"o"}]`,
 		"unknown part":  `[{"role":"user","content":[{"type":"input_audio"}]}]`,
 		"input number":  `5`,
+		"empty array":   `[]`,
+		"empty content": `[{"role":"user","content":[]}]`,
+		"empty parts":   `[{"role":"user","content":[]},{"role":"user","content":[]}]`,
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -207,6 +210,8 @@ func TestTranslateDecisionsRequestQuestionRefusals(t *testing.T) {
 		{"choice numeric value", `{"type":"choice","instructions":"i","choices":[{"value":3}]}`, "decisions.question_invalid"},
 		{"question not object", `"str"`, "decisions.question_invalid"},
 		{"non-string name", `{"type":"predicate","name":5,"instructions":"i"}`, "decisions.question_invalid"},
+		{"empty string choice value", `{"type":"choice","instructions":"i","choices":[{"value":""},{"value":"a"}]}`, "decisions.question_invalid"},
+		{"non-string choice description", `{"type":"choice","instructions":"i","choices":[{"value":"a","description":5}]}`, "decisions.question_invalid"},
 		{"image in instructions", `{"type":"predicate","instructions":[{"type":"input_image","image_url":"data:image/png;base64,A"}]}`, "decisions.input_unsupported"},
 		{"json in instructions", `{"type":"predicate","instructions":[{"type":"input_json","data":{}}]}`, "decisions.input_unsupported"},
 	}
@@ -516,4 +521,64 @@ func TestTranslateSystemOneResponseEmptyNameRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertJSONEqual(t, m["answers"].([]any)[0], `{"type":"predicate","name":"","probability":0.2}`)
+}
+
+func TestTranslateDecisionsRequestEmptyInputMessage(t *testing.T) {
+	for _, input := range []string{`[]`, `[{"role":"user","content":[]}]`} {
+		_, _, derr := TranslateDecisionsRequest([]byte(`{"model":"m","input":`+input+`,`+onePredicate+`}`), "u")
+		if derr == nil || derr.Code != CodeDecisionsInputUnsupported || derr.Message != "input carries no content" {
+			t.Fatalf("input %s: got %+v", input, derr)
+		}
+	}
+}
+
+func TestTranslateDecisionsRequestErrorMessages(t *testing.T) {
+	cases := []struct{ name, q, want string }{
+		{"instruction part without text", `{"type":"predicate","instructions":[{"type":"input_text"}]}`, "an input_text part has no text"},
+		{"non-string description", `{"type":"choice","instructions":"i","choices":[{"value":"a"},{"value":"b","description":5}]}`, "question 0: choice 1 description must be a string"},
+		{"empty choice value", `{"type":"choice","instructions":"i","choices":[{"value":"a"},{"value":""}]}`, "question 0: choice 1 needs a non-empty string or boolean value"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, derr := TranslateDecisionsRequest([]byte(`{"model":"m","input":"x","questions":[`+tc.q+`]}`), "u")
+			if derr == nil || !strings.Contains(derr.Message, tc.want) {
+				t.Fatalf("got %+v want message containing %q", derr, tc.want)
+			}
+		})
+	}
+}
+
+// The forward response answers follow question order byte for byte, whatever
+// order the upstream's answers object carries.
+func TestTranslateSystemOneResponseRawAnswerOrder(t *testing.T) {
+	_, _, table := mustTranslate(t, `{"model":"c","input":"x","questions":[
+		{"type":"predicate","name":"a","instructions":"i"},
+		{"type":"predicate","name":"b","instructions":"i"},
+		{"type":"predicate","name":"c","instructions":"i"}]}`)
+	up := `{"answers":{"c":{"type":"noul","noul":0.3},"a":{"type":"noul","noul":0.1},"b":{"type":"noul","noul":0.2}}}`
+	out, _, err := TranslateSystemOneResponse([]byte(up), table, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	ia, ib, ic := strings.Index(s, `"name":"a"`), strings.Index(s, `"name":"b"`), strings.Index(s, `"name":"c"`)
+	if ia < 0 || !(ia < ib && ib < ic) {
+		t.Fatalf("answers not in question order: %s", s)
+	}
+}
+
+// An upstream choice of "" is no longer a "names no choice" sentinel: the
+// empty string is a present value that matches no asked choice.
+func TestTranslateSystemOneResponseEmptyChoiceIsNotAbsent(t *testing.T) {
+	_, _, table := mustTranslate(t, `{"model":"c","input":"x","questions":[{"type":"choice","name":"q","instructions":"i","choices":[{"value":"a"}]}]}`)
+	for _, tc := range []struct{ up, want string }{
+		{`{"answers":{"q":{"type":"choice","choice":""}}}`, "not one of the asked choices"},
+		{`{"answers":{"q":{"type":"choice"}}}`, "names no choice"},
+		{`{"answers":{"q":{"type":"choice","choice":null}}}`, "names no choice"},
+	} {
+		_, _, err := TranslateSystemOneResponse([]byte(tc.up), table, "m")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: err = %v, want %q", tc.up, err, tc.want)
+		}
+	}
 }
