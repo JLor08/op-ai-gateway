@@ -1728,11 +1728,24 @@ type runtimeCapabilityEntry struct {
 // literally 0, or smaller), are both deliberately never cached, so a
 // transient condition (e.g. the child's HTTP server still warming up) is
 // retried next cycle instead of sticking at 0 forever.
+//
+// The capability half (probeRuntimeChildProps) runs for every type but one:
+//
+//   - "vllm_sr": no capability probe at all -- the vLLM Semantic Router
+//     worker serves no /props and no capability document, so a probe would
+//     spend a request to learn nothing. Its context probe still runs (the
+//     /v1/models read is also where its api_version comes from).
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 
 	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
+	if st.Type == "vllm_sr" {
+		// No capability probe: the vLLM Semantic Router worker serves no
+		// /props and no capability document, so nothing is requested and
+		// nothing is sent.
+		return
+	}
 	a.probeRuntimeChildProps(ctx, client, base, st, rs)
 }
 
@@ -1930,9 +1943,10 @@ func (a *Agent) clock() time.Time {
 // was that a child is never asked a second time just to answer a second
 // question.
 //
-// WHICH document is read, one of four (or none, for vllm_sr), is what st.Type decides here (and,
-// for two of them, whether the gateway lets it be sent at all -- see the
-// gate below):
+// WHICH of four documents is read is what st.Type decides here (and, for
+// two of them, whether the gateway lets it be sent at all -- see the gate
+// below). A "vllm_sr" child never reaches this function: probeRuntimeChild
+// skips the capability probe for it.
 //
 //   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
 //     {"model": <probeModel>} (#54). Ollama serves no /props at all, so probing
@@ -1955,9 +1969,6 @@ func (a *Agent) clock() time.Time {
 //     its mode (for a tts or clon model, speech_streaming from its mode),
 //     and nothing else; its LiveProgress is ALWAYS "", because audio.cpp has no
 //     timings surface.
-//   - "vllm_sr": no probe at all -- the vLLM Semantic Router worker serves
-//     no /props and no capability document, so nothing is requested and
-//     nothing is sent.
 //   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
 //     GETs collector.LiveProgressProbePath ("/props").
 //
@@ -2074,11 +2085,6 @@ func (a *Agent) clock() time.Time {
 // miss both set it after the gate checks above, never before them. No other
 // probe sets the collector field, so it stays nil for every other type.
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
-	if st.Type == "vllm_sr" {
-		// vllm-sr serves no /props and no capability document; probing it
-		// would spend a request to learn nothing.
-		return
-	}
 	key, model := runtimeProbeKey(st), probeModel(st)
 	if entry, ok := a.runtimeCapabilityCache[key]; ok && entry.pid == st.PID &&
 		entry.specType == st.Type && entry.model == model {
