@@ -1785,17 +1785,9 @@ func decisionRouteServes(app Application, rows []CapabilityRow, fineFlavor strin
 	if app.Type == ProviderServerAgent {
 		return true
 	}
-	route, mode := EffectiveSystemOneRoute, app.SystemOneMode
-	switch fineFlavor {
-	case APIFlavorDecisions:
-	case APIFlavorOpenAIDecisions:
-		route, mode = EffectiveDecisionsRoute, app.DecisionsMode
-	default:
-		return true
-	}
 	byName := CapabilityRowsByName(rows)
-	_, ok := route(app.Type, mode, byName[CapabilityDecision].Verdict == CapabilityYes, byName[CapabilityDecisionOpenAI].Verdict == CapabilityYes)
-	return ok
+	return DecisionRouteExists(fineFlavor, app.Type, app.SystemOneMode, app.DecisionsMode,
+		byName[CapabilityDecision].Verdict == CapabilityYes, byName[CapabilityDecisionOpenAI].Verdict == CapabilityYes)
 }
 
 // capabilityRowsSatisfy reports whether rows satisfy every required

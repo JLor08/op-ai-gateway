@@ -781,12 +781,12 @@ func TestCapabilityFlagsByNameFailsClosedForAnUnnamedCapability(t *testing.T) {
 	idx := runtimeSpecIndex{}
 
 	for _, capability := range []string{routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech} {
-		if flags := capabilityFlagsByName(capability, views, caps, idx); !flags["m"] {
+		if flags := capabilityFlagsByName(capability, "", views, caps, idx); !flags["m"] {
 			t.Errorf("capabilityFlagsByName(%q) = %v, want m flagged: the named folds are unchanged", capability, flags)
 		}
 	}
 	for _, capability := range []string{"teleportation", routing.CapabilityVision, ""} {
-		flags := capabilityFlagsByName(capability, views, caps, idx)
+		flags := capabilityFlagsByName(capability, "", views, caps, idx)
 		if flags == nil {
 			t.Errorf("capabilityFlagsByName(%q) = nil, want an empty non-nil map the caller can add group names to", capability)
 			continue

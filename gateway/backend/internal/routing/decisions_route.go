@@ -92,3 +92,25 @@ func EffectiveSystemOneRoute(kind string, mode EndpointMode, decision, decisionO
 		return "", false
 	}
 }
+
+// DecisionRouteExists reports whether a mapping of the effective upstream kind
+// has a route for a decision request of fineFlavor: EffectiveSystemOneRoute
+// over systemOneMode for /v1/systemone (the coarse decisions flavor),
+// EffectiveDecisionsRoute over decisionsMode for /v1/decisions
+// (openai_decisions), each over the decision and decisionOpenAI verdicts. A
+// disabled mode is a route here (the endpoint-disabled answer is a separate
+// gate). Any other flavor is not a decision request and is true. It is the one
+// rule the resolver's candidate filter (decisionRouteServes) and the portal's
+// unknown-model redirect share.
+func DecisionRouteExists(fineFlavor, kind string, systemOneMode, decisionsMode EndpointMode, decision, decisionOpenAI bool) bool {
+	var ok bool
+	switch fineFlavor {
+	case APIFlavorDecisions:
+		_, ok = EffectiveSystemOneRoute(kind, systemOneMode, decision, decisionOpenAI)
+	case APIFlavorOpenAIDecisions:
+		_, ok = EffectiveDecisionsRoute(kind, decisionsMode, decision, decisionOpenAI)
+	default:
+		return true
+	}
+	return ok
+}
