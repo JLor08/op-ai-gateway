@@ -633,7 +633,11 @@ export function ModelServersSection({
         if (!r.runtime_api_version) return '—';
         if (!r.runtime_api_version_unsupported) return r.runtime_api_version;
         return (
-          <Tooltip title={t.modelServerRuntimeApiVersionTooltipUnsupported}>
+          <Tooltip
+            title={t.modelServerRuntimeApiVersionTooltipUnsupported(
+              r.runtime_api_supported_major ?? 0,
+            )}
+          >
             <span>
               {r.runtime_api_version}{' '}
               <StatusChip status="watch" label={t.modelServerRuntimeApiVersionUnsupported} />

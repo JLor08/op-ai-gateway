@@ -1032,7 +1032,7 @@ const de = {
   applicationDecisionsModeAuto: 'Automatisch',
   applicationSystemOneMode: 'Entscheidungen (System One)',
   applicationDecisionsModeNote:
-    'Gelten nur bei angehaktem decisions. OpenAI Decisions (/v1/decisions): Automatisch reicht an Upstreams durch, die es nativ beantworten, und wandelt sonst in System One um; Durchreichen ist für llama.cpp nicht verfügbar. System One (/v1/systemone): Automatisch reicht durch, wenn das Modell System One beantwortet, und wandelt sonst in OpenAI Decisions um, wenn das Modell dies beantwortet; Umwandlung ist für llama.cpp und vllm-sr nicht verfügbar.',
+    'Gelten nur bei angehaktem decisions. OpenAI Decisions (/v1/decisions): Automatisch reicht an Upstreams durch, die es nativ beantworten, und wandelt sonst in System One um; Durchreichen ist für llama.cpp nicht verfügbar. System One (/v1/systemone): Automatisch reicht durch, wenn das Modell System One beantwortet, und wandelt sonst in OpenAI Decisions um, wenn das Modell dies beantwortet; Umwandlung ist für llama.cpp und vllm-sr nicht verfügbar. Ein OpenAI-Vendor-Konto mit API-Schlüssel bedient gpt-6-luna an beiden Decisions-Endpunkten (/v1/decisions durchgereicht, /v1/systemone umgewandelt).',
   applicationLoadedModelsLegend: 'Geladene Modelle',
   applicationLoadedModelsPath: 'Status-Pfad',
   applicationLoadedModelsFormat: 'Format',
@@ -1603,7 +1603,7 @@ const de = {
   runtimeSpecTypeAudioCppNote:
     'audiocpp_server liefert nur Sprachsynthese. Unter „API-Varianten“ hier nur „openai_audio (Sprachsynthese)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein.',
   runtimeSpecTypeVllmSrNote:
-    'vllm-srun startet vLLM Semantic Router als Worker. Startvorlage: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (Gerät 0, weil die GPU durch die sichtbaren Geräte neu zugeordnet wird). vllm-srun aus einem Checkout des festgelegten Commits (vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd) installieren (pip install ./src/model-runtime) und dessen venv in runtime_allow_binary_dirs aufnehmen. Der erste Start lädt das Modell herunter – den Start-Timeout entsprechend erhöhen. Der Worker hat keine Authentifizierung und muss auf Loopback bleiben. Das Portal warnt, wenn der Worker eine api_version mit einer anderen Hauptversion als 5 meldet. Unter „API-Varianten“ hier nur „decisions“ ankreuzen; an der übergeordneten server_agent-Anwendung muss „decisions“ ebenfalls angekreuzt sein. Decisions-Durchreichen wird nicht angeboten.',
+    'vllm-srun startet vLLM Semantic Router als Worker. Startvorlage: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (Gerät 0, weil die GPU durch die sichtbaren Geräte neu zugeordnet wird). vllm-srun aus einem Checkout des festgelegten Commits (vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd) installieren (pip install ./src/model-runtime) und dessen venv in runtime_allow_binary_dirs aufnehmen. Der erste Start lädt das Modell herunter – den Start-Timeout entsprechend erhöhen. Der Worker hat keine Authentifizierung und muss auf Loopback bleiben. Das Portal warnt, wenn der Worker eine api_version mit einer anderen als der unterstützten Hauptversion meldet. Unter „API-Varianten“ hier nur „decisions“ ankreuzen; an der übergeordneten server_agent-Anwendung muss „decisions“ ebenfalls angekreuzt sein. Decisions-Durchreichen wird nicht angeboten.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -2044,8 +2044,8 @@ const de = {
   modelServerColQueue: 'Warteschlange',
   modelServerColRuntimeApiVersion: 'Runtime-API-Version',
   modelServerRuntimeApiVersionUnsupported: 'Version nicht unterstützt',
-  modelServerRuntimeApiVersionTooltipUnsupported:
-    'Der Worker meldet eine api_version mit einer anderen Hauptversion als der unterstützten (5). Das Gateway spricht ihn weiter an; Antworten können abweichen.',
+  modelServerRuntimeApiVersionTooltipUnsupported: (major: number) =>
+    `Der Worker meldet eine api_version mit einer anderen Hauptversion als der unterstützten (${major}). Das Gateway spricht ihn weiter an; Antworten können abweichen.`,
   // Task 6 (timings-capability-detection): the PERSISTED live-progress-support
   // verdict, beside the Kontext column -- see ModelServersSection.tsx's
   // liveProgressChipInfo for why this is not probe-gated, and why "" renders
@@ -5057,7 +5057,7 @@ const en: PortalMessages = {
   applicationDecisionsModeAuto: 'Automatic',
   applicationSystemOneMode: 'Decisions (System One)',
   applicationDecisionsModeNote:
-    'Only apply while decisions is ticked. OpenAI Decisions (/v1/decisions): Automatic passes through to upstreams that answer it natively and translates to System One otherwise; Pass-through is not available for llama.cpp. System One (/v1/systemone): Automatic passes through when the model answers System One and otherwise translates to OpenAI Decisions when the model answers that; Translate is not available for llama.cpp and vllm-sr.',
+    'Only apply while decisions is ticked. OpenAI Decisions (/v1/decisions): Automatic passes through to upstreams that answer it natively and translates to System One otherwise; Pass-through is not available for llama.cpp. System One (/v1/systemone): Automatic passes through when the model answers System One and otherwise translates to OpenAI Decisions when the model answers that; Translate is not available for llama.cpp and vllm-sr. An OpenAI vendor account with an API key serves gpt-6-luna on both decision endpoints (/v1/decisions passes through, /v1/systemone is translated).',
   applicationLoadedModelsLegend: 'Loaded models',
   applicationLoadedModelsPath: 'Status path',
   applicationLoadedModelsFormat: 'Format',
@@ -5587,7 +5587,7 @@ const en: PortalMessages = {
   runtimeSpecTypeAudioCppNote:
     'audiocpp_server serves speech synthesis only. Under "API flavors", tick only "openai_audio (speech synthesis)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_audio (speech synthesis)" ticked too.',
   runtimeSpecTypeVllmSrNote:
-    'vllm-srun launches vLLM Semantic Router as a worker. Launch template: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (device 0, because the GPU is remapped by the visible devices). Install vllm-srun from a checkout of the pinned commit (vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd) (pip install ./src/model-runtime) and add its venv to runtime_allow_binary_dirs. The first start downloads the model, so raise the startup timeout. The worker has no authentication and must stay on loopback. The portal warns when the worker reports an api_version with a major other than 5. Under "API flavors", tick only "decisions" here; the parent server_agent application needs "decisions" ticked too. Decisions passthrough is not offered.',
+    'vllm-srun launches vLLM Semantic Router as a worker. Launch template: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (device 0, because the GPU is remapped by the visible devices). Install vllm-srun from a checkout of the pinned commit (vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd) (pip install ./src/model-runtime) and add its venv to runtime_allow_binary_dirs. The first start downloads the model, so raise the startup timeout. The worker has no authentication and must stay on loopback. The portal warns when the worker reports an api_version with a major other than the supported one. Under "API flavors", tick only "decisions" here; the parent server_agent application needs "decisions" ticked too. Decisions passthrough is not offered.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:
@@ -5999,8 +5999,8 @@ const en: PortalMessages = {
   modelServerColQueue: 'Queue',
   modelServerColRuntimeApiVersion: 'Runtime API version',
   modelServerRuntimeApiVersionUnsupported: 'Version not supported',
-  modelServerRuntimeApiVersionTooltipUnsupported:
-    'The worker reports an api_version with a major other than the supported one (5). The gateway keeps calling it; responses may differ.',
+  modelServerRuntimeApiVersionTooltipUnsupported: (major: number) =>
+    `The worker reports an api_version with a major other than the supported one (${major}). The gateway keeps calling it; responses may differ.`,
   modelServerColLiveProgress: 'Live progress',
   modelServerLiveProgressSupported: 'Supported',
   modelServerLiveProgressUnsupported: 'Not supported',
