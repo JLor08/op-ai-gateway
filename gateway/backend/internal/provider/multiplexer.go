@@ -413,6 +413,37 @@ func (m *Multiplexer) dispatchProbeSystemOne(ctx context.Context, target routing
 	return "", ErrUnavailable
 }
 
+var _ DecisionsProber = (*Multiplexer)(nil)
+
+// ProbeOpenAIDecisions routes the OpenAI Decisions probe like ProbeSystemOne:
+// to the provider's client, falling back to the fallback client. A provider
+// whose client does not implement DecisionsProber yields ("", ErrUnavailable).
+func (m *Multiplexer) ProbeOpenAIDecisions(ctx context.Context, target routing.Target, model string) (string, error) {
+	ctx, span := tracing.Start(ctx, "provider.ProbeOpenAIDecisions")
+	defer span.End()
+	verdict, err := m.dispatchProbeOpenAIDecisions(ctx, target, model)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return verdict, err
+}
+
+func (m *Multiplexer) dispatchProbeOpenAIDecisions(ctx context.Context, target routing.Target, model string) (string, error) {
+	if m == nil {
+		return "", ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if p, ok := client.(DecisionsProber); ok {
+			return p.ProbeOpenAIDecisions(ctx, target, model)
+		}
+	}
+	if p, ok := m.fallback.(DecisionsProber); ok {
+		return p.ProbeOpenAIDecisions(ctx, target, model)
+	}
+	return "", ErrUnavailable
+}
+
 var _ AudioCppModelsProber = (*Multiplexer)(nil)
 
 // ProbeAudioCppModels routes the audio.cpp /v1/models speech probe to the
