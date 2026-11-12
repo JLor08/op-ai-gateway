@@ -117,6 +117,11 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
   - `memory.events` counts `oom_kill`.
   - Docker's `docker stats` reports `memory.current − inactive_file` ([docker stats](https://docs.docker.com/reference/cli/docker/container/stats/)).
   - A systemd scope gives each workload its own cgroup, and that cgroup covers vLLM's worker processes too. The native path counts only the child's own PID (§13).
+  - **Measured (Phase 0, B6, same host, vLLM 0.33.0, Qwen2.5-1.5B, `--gpu-memory-utilization 0.5`, in a user scope):**
+    - The scope's figures: `memory.current` 8030 MiB, `anon` 3223 MiB, `file` 4705 MiB, of which `inactive_file` 4325 MiB is safetensors page cache.
+    - So `memory.current − inactive_file`, the figure proposed below, is **3705 MiB**.
+    - The RSS of the individual processes: API server 1390 MiB, `VLLM::EngineCore` 2851 MiB, resource tracker 14 MiB. Their sum, 4255 MiB, double-counts shared pages.
+    - **The main PID alone, which is what the native path measures, would have been 1390 MiB, about a third of the workload.**
 
 ### Host requirements
 
@@ -210,7 +215,9 @@ wsl.exe -d <distro> -u <runtime_wsl_user> --cd <work_dir> --exec
   - The first Linux process `wsl.exe` starts inherits every `WSLENV` variable, so a root wrapper would run with environment the gateway chose. `LD_PRELOAD` would then give the gateway root in the distro, and the native reserved-name list does not cover it.
   - The chain therefore uses the user's **own systemd manager** (`systemd-run --user --scope`) and never `-u root`. The scope's cgroup is delegated to the user, so it can still be read and signalled.
   - This needs a running user manager. The operator enables it once with `loginctl enable-linger <user>`. The agent sets `XDG_RUNTIME_DIR=/run/user/<uid>` so `systemd-run --user` finds the bus.
-  - Whether this works in a stock Ubuntu 24.04 WSL image is **unverified** (Phase 0, B6). The fallback is a small agent-shipped Linux shim that is root-free as well (open question 5).
+  - **Measured (Phase 0, B6):** on a stock Ubuntu 24.04 WSL image, `wsl.exe -d Ubuntu-24.04 --exec systemd-run --user --scope --unit=optest -- <vllm> serve …` worked **without root**, with only `XDG_RUNTIME_DIR` passed through `WSLENV`. `systemctl --user show optest.scope -p ControlGroup` returned the scope's cgroup under `user@<uid>.service/app.slice/`, and its files were readable by the user.
+  - During the test an interactive session also kept the user manager running. Whether linger alone keeps it up for a service-started agent with nobody logged on is part of the Phase 1 acceptance run. B4b showed that the WSL side of that works.
+  - The fallback, if the user manager ever proves unreliable, is a small agent-shipped Linux shim that is root-free as well (open question 5).
 - **Environment.** The spec's `env`, the agent's GPU variables (`CUDA_VISIBLE_DEVICES`, plus `CUDA_DEVICE_ORDER=PCI_BUS_ID`), `XDG_RUNTIME_DIR`, `PYTHONUNBUFFERED=1` and `WSL_UTF8=1` are set on `wsl.exe`'s environment. Every name the Linux side needs is listed in `WSLENV` with `/u`.
 - **Secrets** should travel by environment rather than argv, because an argv inside the VM is visible in `ps`. The rule for `${API_TOKEN}` and `${AGENT_ENV:…}` in `args` stays what it is for native specs: allowed, with the existing portal warning (§3.2). The vLLM preset uses `VLLM_API_KEY` from the environment instead of `--api-key`.
 - **Port.** `${PORT}` is chosen on the Windows side, as today (`grabEphemeralPort`). The workload binds `127.0.0.1:${PORT}` inside the VM, and NAT forwarding or mirrored networking makes it reachable from Windows.
@@ -295,7 +302,11 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 - **B4** ✅ Does `wsl.exe` work from an NSSM service running as the distro-owning user (Session 0) on Windows 11 Pro? Answer: yes, with the user logged on interactively.
 - **B4b** ✅ Does it also work from a cold VM, after a reboot with the service set to start automatically and nobody logged on? Answer: yes. It ran 29 s after boot; the first logon was about six minutes later.
 - **B5** ✅ What happens to vLLM, and to its VRAM, when `wsl.exe` is killed? Answer: the whole vLLM tree is gone and its VRAM is free, with no orphans. Whether the shutdown was clean is not observable.
-- **B6** With linger enabled, does `wsl.exe -u <user> --exec systemd-run --user --scope --unit=… -- vllm serve …` work, without root? What do `memory.current`, `anon` and `file` of the scope show, compared with the RSS of the individual vLLM processes? Does `systemctl --user kill --signal=SIGTERM` stop vLLM cleanly and free its VRAM?
+- **B6** ✅ Does `wsl.exe --exec systemd-run --user --scope --unit=… -- vllm serve …` work without root? What do `memory.current`, `anon` and `file` of the scope show, compared with the RSS of the individual vLLM processes? Does `systemctl --user kill --signal=SIGTERM` stop vLLM cleanly?
+  - It works without root (see "Launch"), and the numbers are under "RAM".
+  - `systemctl --user kill --signal=SIGTERM optest.scope` reached **both** vLLM processes: the API server logged "shutdown triggered" and the EngineCore "received signal=SIGTERM".
+  - vLLM then shut down in its own `mode=abort timeout=0s`, force-killed its EngineCore as part of that, and ended with "Application shutdown complete", all within about one second.
+  - VRAM release after this stop was not read separately; B5 showed the release on process death.
 
 **Phase 1: execution-mode seam, WSL lifecycle and RAM.**
 - Gateway: migration, store on all three drivers, DTOs, document builder, feature gate.
