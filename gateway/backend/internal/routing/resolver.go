@@ -954,7 +954,7 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	// posture (404, indistinguishable from an unknown model) the rest of the
 	// codebase takes and the e2e suite pins for chat.
 	capableFrom := len(candidates)
-	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities)
+	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities, req.APIFlavor)
 	if err != nil {
 		return Target{}, err
 	}
@@ -1612,7 +1612,7 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 		}
 	}
 	mine = filterServesEndpoint(mine, req.APIFlavor)
-	mine, err = r.filterCapable(ctx, mine, req.RequiredCapabilities)
+	mine, err = r.filterCapable(ctx, mine, req.RequiredCapabilities, req.APIFlavor)
 	if err != nil {
 		return Target{}, err
 	}
@@ -1727,8 +1727,10 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 // The rows are judged for the candidate's kind (capabilityRowsForKind): a
 // decision_openai verdict does not count on a kind that cannot take a
 // /v1/decisions passthrough, so such a candidate is not kept for any_decision
-// only to be refused after resolve.
-func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string) ([]MappingCandidate, error) {
+// only to be refused after resolve. For a decision request (fineFlavor) an
+// ordinary candidate must also have a route under its endpoint mode
+// (candidateCapable, decisionRouteServes).
+func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string, fineFlavor string) ([]MappingCandidate, error) {
 	if len(required) == 0 || len(cands) == 0 {
 		return cands, nil
 	}
@@ -1746,19 +1748,63 @@ func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, 
 	}
 	out := cands[:0:0]
 	for _, c := range cands {
-		if capabilityRowsSatisfy(capabilityRowsForKind(caps[c.Mapping.ID], c.Application.Type), required) {
+		if candidateCapable(c.Application, caps[c.Mapping.ID], required, fineFlavor) {
 			out = append(out, c)
 		}
 	}
 	return out, nil
 }
 
+// candidateCapable is the capability verdict on one candidate, shared by
+// filterCapable and the affinity gate (affinityCapabilityVerdict): rows, the
+// mapping's verdict rows, judged for app's kind (capabilityRowsForKind),
+// satisfy every required capability, and for a decision request app has a
+// route under its endpoint mode (decisionRouteServes).
+func candidateCapable(app Application, rows []CapabilityRow, required []string, fineFlavor string) bool {
+	rows = capabilityRowsForKind(rows, app.Type)
+	return capabilityRowsSatisfy(rows, required) && decisionRouteServes(app, rows, fineFlavor)
+}
+
+// decisionRouteServes reports whether an ORDINARY application has a route for a
+// decision request of fineFlavor: EffectiveSystemOneRoute over its
+// SystemOneMode for /v1/systemone (the coarse decisions flavor),
+// EffectiveDecisionsRoute over its DecisionsMode for /v1/decisions
+// (openai_decisions), each over the mapping's decision and decision_openai
+// verdicts in rows. [any_decision] alone admits a mapping with either verdict,
+// but the stored mode can leave it no route: migration 107 stored
+// systemone_mode passthrough on every existing row, and such a row with only
+// decision_openai cannot answer /v1/systemone. Kept as a candidate it could
+// win the selection against a decision-capable sibling and be refused after
+// resolve with routing.model_not_capable. A disabled mode is ok here;
+// filterServesEndpoint already dropped it.
+//
+// A server_agent application is always true: its effective mode lives on the
+// runtime spec, unknown before resolve, so the post-resolve route decides
+// (settleDecisionRoute). Every other flavor is true.
+func decisionRouteServes(app Application, rows []CapabilityRow, fineFlavor string) bool {
+	if app.Type == ProviderServerAgent {
+		return true
+	}
+	route, mode := EffectiveSystemOneRoute, app.SystemOneMode
+	switch fineFlavor {
+	case APIFlavorDecisions:
+	case APIFlavorOpenAIDecisions:
+		route, mode = EffectiveDecisionsRoute, app.DecisionsMode
+	default:
+		return true
+	}
+	byName := CapabilityRowsByName(rows)
+	_, ok := route(app.Type, mode, byName[CapabilityDecision].Verdict == CapabilityYes, byName[CapabilityDecisionOpenAI].Verdict == CapabilityYes)
+	return ok
+}
+
 // capabilityRowsSatisfy reports whether rows satisfy every required
 // capability. A name is satisfied by a literal "yes" verdict row, except
 // CapabilityImageEdit, which is DERIVED (ImpliedImageEdit). Shared by
-// filterCapable and resolveAffinity's own gate, which reads its rows from a
-// different place; every satisfaction decision funnels through here, so the
-// derivation has exactly one place to apply in routing.
+// filterCapable and resolveAffinity's own gate (both via candidateCapable),
+// which read their rows from different places; every satisfaction decision
+// funnels through here, so the derivation has exactly one place to apply in
+// routing.
 func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 	byName := CapabilityRowsByName(rows)
 	for _, name := range required {
@@ -1955,16 +2001,18 @@ func (r *Resolver) affinityServer(ctx context.Context, app Application) (server 
 // is every chat request: the gate is skipped, not evaluated, so no verdict can
 // refuse a pin that was never asked about a capability.
 //
-// kind is the pinned application's type; the gate judges the rows for it
-// (capabilityRowsForKind), as filterCapable does for a fresh candidate.
-func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID, kind string, required []string) (liveProgressSupport string, satisfied bool) {
+// app is the pinned application and fineFlavor the request's fine flavor; the
+// gate judges the rows as filterCapable does for a fresh candidate
+// (candidateCapable: the rows for the app's kind, and for a decision request
+// the route under its endpoint mode).
+func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID string, app Application, required []string, fineFlavor string) (liveProgressSupport string, satisfied bool) {
 	caps, capErr := r.store.MappingCapabilities(ctx, mappingID)
 	if capErr == nil {
 		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
 			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
 		}
 	}
-	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(capabilityRowsForKind(caps, kind), required)) {
+	if len(required) > 0 && (capErr != nil || !candidateCapable(app, caps, required, fineFlavor)) {
 		return liveProgressSupport, false
 	}
 	return liveProgressSupport, true
@@ -2040,7 +2088,7 @@ func (r *Resolver) resolveAffinity(ctx context.Context, token auth.Token, key Af
 	// one of the pinned mapping's own on the pinned server) -- so unlike the two
 	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
 	// on the capability list, and does not need to be.
-	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, app.Type, req.RequiredCapabilities)
+	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, app, req.RequiredCapabilities, req.APIFlavor)
 	if !capable {
 		return Target{}, false, nil
 	}
@@ -3053,7 +3101,7 @@ func (r *Resolver) memberPool(ctx context.Context, token auth.Token, name, apiFl
 	// all capability-gated must read as memberNoMapping (unknown model), the same
 	// no-leak posture the provisioning gate above already uses, not as
 	// memberUnavailable (a gated-but-real member).
-	return r.filterCapable(ctx, cands, required)
+	return r.filterCapable(ctx, cands, required, fineFlavor)
 }
 
 // groupVoiceScope is the group-level voice PRE-PASS: before any member is visited it

@@ -68,7 +68,7 @@ func TestFilterCapableDropsMappingWithoutVerdict(t *testing.T) {
 	store := imageGateFixture(t, now, "") // map_a: no row at all
 	r := NewResolver(store, func() time.Time { return now }, nil)
 
-	got, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImage})
+	got, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImage}, "")
 	if err != nil {
 		t.Fatalf("filterCapable: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestFilterCapableDropsExplicitNo(t *testing.T) {
 	store := imageGateFixture(t, now, CapabilityNo)
 	r := NewResolver(store, func() time.Time { return now }, nil)
 
-	got, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImage})
+	got, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImage}, "")
 	if err != nil {
 		t.Fatalf("filterCapable: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestFilterCapableIsANoOpForChat(t *testing.T) {
 	r := NewResolver(store, func() time.Time { return now }, nil)
 	cands := imageGateCandidates()
 
-	got, err := r.filterCapable(context.Background(), cands, nil)
+	got, err := r.filterCapable(context.Background(), cands, nil, "")
 	if err != nil {
 		t.Fatalf("filterCapable: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestFilterCapableRefusesOnStoreError(t *testing.T) {
 	store.failBulk = true
 	r := NewResolver(store, func() time.Time { return now }, nil)
 
-	if _, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImage}); err == nil {
+	if _, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImage}, ""); err == nil {
 		t.Fatal("filterCapable must return an error when the capability read fails, not fail open")
 	}
 }

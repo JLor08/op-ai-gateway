@@ -142,7 +142,7 @@ func TestFilterCapableAppliesTheImageEditDerivation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := imageEditFixture(t, now, tc.imageA, tc.imageEditA)
 			r := NewResolver(store, func() time.Time { return now }, nil)
-			got, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImageEdit})
+			got, err := r.filterCapable(context.Background(), imageGateCandidates(), []string{CapabilityImageEdit}, "")
 			if err != nil {
 				t.Fatalf("filterCapable: %v", err)
 			}
@@ -239,7 +239,7 @@ func TestAffinityGateAppliesTheImageEditDerivation(t *testing.T) {
 				t.Fatalf("seed map_a: %v", err)
 			}
 			r := NewResolver(mem, func() time.Time { return now }, nil)
-			_, satisfied := r.affinityCapabilityVerdict(ctx, "map_a", ProviderVLLM, []string{CapabilityImageEdit})
+			_, satisfied := r.affinityCapabilityVerdict(ctx, "map_a", Application{Type: ProviderVLLM}, []string{CapabilityImageEdit}, "")
 			if satisfied != tc.wantSatisfied {
 				t.Fatalf("affinityCapabilityVerdict satisfied = %v, want %v", satisfied, tc.wantSatisfied)
 			}
