@@ -38,6 +38,7 @@ for (const locale of locales) {
     decisions = 'auto',
     systemOne = 'passthrough',
     passthroughOffered = true,
+    translateOffered = true,
   }: {
     flavors?: string[];
     responses?: EndpointMode;
@@ -47,6 +48,7 @@ for (const locale of locales) {
     decisions?: DecisionsMode;
     systemOne?: SystemOneMode;
     passthroughOffered?: boolean;
+    translateOffered?: boolean;
   }) {
     const [apiFlavors, setApiFlavors] = useState<string[]>(flavors);
     const [responsesMode, setResponsesMode] = useState<EndpointMode>(responses);
@@ -69,6 +71,7 @@ for (const locale of locales) {
         decisionsMode={decisionsMode}
         systemOneMode={systemOneMode}
         decisionsPassthroughOffered={passthroughOffered}
+        systemOneTranslateOffered={translateOffered}
         onDecisionsModeChange={setDecisionsMode}
         onSystemOneModeChange={setSystemOneMode}
       />
@@ -97,7 +100,7 @@ for (const locale of locales) {
     expect(decisionsField()).toHaveAttribute('aria-disabled', 'true');
     expect(systemOneField()).toHaveAttribute('aria-disabled', 'true');
     expect(decisionsField()).toHaveTextContent(t.applicationDecisionsModeAuto);
-    expect(systemOneField()).toHaveTextContent(t.applicationModePassthrough);
+    expect(systemOneField()).toHaveTextContent(t.applicationDecisionsModeAuto);
     fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
     expect(decisionsField()).not.toHaveAttribute('aria-disabled', 'true');
     expect(systemOneField()).not.toHaveAttribute('aria-disabled', 'true');
@@ -115,9 +118,20 @@ for (const locale of locales) {
     ]);
   });
 
-  it('offers passthrough or disabled for System One', () => {
+  it('offers auto, passthrough, translate and disabled for System One', () => {
     render(<Harness flavors={['openai', 'decisions']} />);
     expect(optionLabels(systemOneField())).toEqual([
+      t.applicationDecisionsModeAuto,
+      t.applicationModePassthrough,
+      t.applicationModeTranslate,
+      t.applicationModeDisabled,
+    ]);
+  });
+
+  it('leaves translate out of the System One select when the type cannot serve it', () => {
+    render(<Harness flavors={['openai', 'decisions']} translateOffered={false} />);
+    expect(optionLabels(systemOneField())).toEqual([
+      t.applicationDecisionsModeAuto,
       t.applicationModePassthrough,
       t.applicationModeDisabled,
     ]);
@@ -192,6 +206,7 @@ for (const locale of locales) {
           decisionsMode="auto"
           systemOneMode="passthrough"
           decisionsPassthroughOffered
+          systemOneTranslateOffered
           onDecisionsModeChange={() => {}}
           onSystemOneModeChange={() => {}}
         />,

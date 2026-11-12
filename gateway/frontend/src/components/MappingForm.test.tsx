@@ -640,6 +640,23 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ).toBeInTheDocument();
     });
 
+    it('shows the mapping System One route beside the decisions route', () => {
+      renderForm({
+        row: makeMapping({ decisions_route: 'passthrough', systemone_route: 'translate' }),
+      });
+      expect(
+        screen.getByText(t.mappingSystemOneRoute(t.mappingDecisionsRouteTranslate)),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(t.mappingDecisionsRoute(t.mappingDecisionsRoutePassthrough)),
+      ).toBeInTheDocument();
+    });
+
+    it('shows no System One route when the mapping has none', () => {
+      renderForm({ row: makeMapping({ systemone_route: '' }) });
+      expect(screen.queryByText(t.mappingSystemOneRoute(''))).not.toBeInTheDocument();
+    });
+
     it('shows no decisions route when the mapping has none', () => {
       renderForm({ row: makeMapping({ decisions_route: '' }) });
       expect(

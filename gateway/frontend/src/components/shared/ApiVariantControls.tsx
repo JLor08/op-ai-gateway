@@ -50,7 +50,7 @@ const endpointModeLabelByKey: Record<
 };
 
 const decisionsModeOptions: DecisionsMode[] = ['auto', 'translate', 'passthrough', 'disabled'];
-const systemOneModeOptions: SystemOneMode[] = ['passthrough', 'disabled'];
+const systemOneModeOptions: SystemOneMode[] = ['auto', 'passthrough', 'translate', 'disabled'];
 
 const decisionsModeLabelByKey: Record<
   DecisionsMode,
@@ -94,6 +94,7 @@ export function ApiVariantControls({
   decisionsMode,
   systemOneMode,
   decisionsPassthroughOffered,
+  systemOneTranslateOffered,
   onDecisionsModeChange,
   onSystemOneModeChange,
   flavorsError,
@@ -123,6 +124,8 @@ export function ApiVariantControls({
   decisionsMode: DecisionsMode;
   systemOneMode: SystemOneMode;
   decisionsPassthroughOffered: boolean;
+  // false for the types the backend refuses systemone_mode translate for.
+  systemOneTranslateOffered: boolean;
   onDecisionsModeChange: (mode: DecisionsMode) => void;
   onSystemOneModeChange: (mode: SystemOneMode) => void;
   // A validation message for the flavor group, or undefined for none. The
@@ -203,11 +206,13 @@ export function ApiVariantControls({
         onChange={(e) => onSystemOneModeChange(e.target.value as SystemOneMode)}
         disabled={!decisionsEnabled}
       >
-        {systemOneModeOptions.map((m) => (
-          <option value={m} key={m}>
-            {t[decisionsModeLabelByKey[m]]}
-          </option>
-        ))}
+        {systemOneModeOptions
+          .filter((m) => m !== 'translate' || systemOneTranslateOffered)
+          .map((m) => (
+            <option value={m} key={m}>
+              {t[decisionsModeLabelByKey[m]]}
+            </option>
+          ))}
       </SelectField>
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>
         {t.applicationDecisionsModeNote}

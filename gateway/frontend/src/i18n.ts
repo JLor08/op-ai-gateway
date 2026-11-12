@@ -1032,7 +1032,7 @@ const de = {
   applicationDecisionsModeAuto: 'Automatisch',
   applicationSystemOneMode: 'Entscheidungen (System One)',
   applicationDecisionsModeNote:
-    'Gelten nur bei angehaktem decisions. OpenAI Decisions (/v1/decisions): Automatisch reicht an Upstreams durch, die es nativ beantworten, und wandelt sonst in System One um; Durchreichen ist für llama.cpp nicht verfügbar. System One (/v1/systemone) wird entweder durchgereicht oder deaktiviert.',
+    'Gelten nur bei angehaktem decisions. OpenAI Decisions (/v1/decisions): Automatisch reicht an Upstreams durch, die es nativ beantworten, und wandelt sonst in System One um; Durchreichen ist für llama.cpp nicht verfügbar. System One (/v1/systemone): Automatisch reicht durch, wenn das Modell System One beantwortet, und wandelt sonst in OpenAI Decisions um, wenn das Modell dies beantwortet; Umwandlung ist für llama.cpp und vllm-sr nicht verfügbar.',
   applicationLoadedModelsLegend: 'Geladene Modelle',
   applicationLoadedModelsPath: 'Status-Pfad',
   applicationLoadedModelsFormat: 'Format',
@@ -2090,6 +2090,7 @@ const de = {
   mappingDecisionsRoutePassthrough: 'Durchreichen',
   mappingDecisionsRouteDisabled: 'Deaktiviert',
   mappingDecisionsRoute: (route: string) => `Entscheidungen: ${route}`,
+  mappingSystemOneRoute: (route: string) => `System One: ${route}`,
   capabilitySpeech: 'Sprachsynthese',
   capabilitySpeechClone: 'Stimmklon',
   // Refines "Sprachsynthese": the model delivers its audio as it is generated
@@ -2221,6 +2222,12 @@ const de = {
     'Diese Anwendung hat den Typ llama.cpp, der OpenAI Decisions nicht durchreichen kann. Ändern Sie zuerst den Typ, oder wählen Sie Automatisch oder Umwandlung.',
   errorRuntimeSpecDecisionsPassthroughUnsupported:
     'Durchreichen von OpenAI Decisions ist für die Art dieses Servers (llama.cpp) nicht verfügbar. Wählen Sie Automatisch oder Umwandlung.',
+  errorApplicationSystemOneTranslateUnsupported:
+    'Die Umwandlung von System One ist für llama.cpp und vllm-sr nicht verfügbar. Wählen Sie Automatisch oder Durchreichen.',
+  errorApplicationSystemOneTranslateConflict:
+    'Diese Anwendung hat einen Typ (llama.cpp oder vllm-sr), der System One nicht umwandeln kann. Ändern Sie zuerst den Typ, oder wählen Sie Automatisch oder Durchreichen.',
+  errorRuntimeSpecSystemOneTranslateUnsupported:
+    'Die Umwandlung von System One ist für die Art dieses Servers (llama.cpp oder vllm-sr) nicht verfügbar. Wählen Sie Automatisch oder Durchreichen.',
   errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
   errorRuntimeCoresidencyModeInvalid: 'Ungültiger Koresidenz-Modus',
   errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
@@ -3822,7 +3829,7 @@ const de = {
   // (portal_vendor_account_endpoints.go); they stay distinct on purpose.
   providers: 'Anbieter',
   providersIntro:
-    'Eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) verwalten. Zugangsdaten werden nur gespeichert und nie wieder angezeigt.',
+    'Eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) verwalten. Zugangsdaten werden nur gespeichert und nie wieder angezeigt. Ein OpenAI-Konto mit API-Schlüssel stellt gpt-6-luna an beiden Entscheidungs-Endpunkten bereit.',
   vendorAccountListTitle: 'Anbieter-Konten',
   vendorAccountListEmpty: 'Noch keine Anbieter-Konten angelegt.',
   vendorAccountCreate: 'Anbieter-Konto anlegen',
@@ -5050,7 +5057,7 @@ const en: PortalMessages = {
   applicationDecisionsModeAuto: 'Automatic',
   applicationSystemOneMode: 'Decisions (System One)',
   applicationDecisionsModeNote:
-    'Only apply while decisions is ticked. OpenAI Decisions (/v1/decisions): Automatic passes through to upstreams that answer it natively and translates to System One otherwise; Pass-through is not available for llama.cpp. System One (/v1/systemone) is either passed through or disabled.',
+    'Only apply while decisions is ticked. OpenAI Decisions (/v1/decisions): Automatic passes through to upstreams that answer it natively and translates to System One otherwise; Pass-through is not available for llama.cpp. System One (/v1/systemone): Automatic passes through when the model answers System One and otherwise translates to OpenAI Decisions when the model answers that; Translate is not available for llama.cpp and vllm-sr.',
   applicationLoadedModelsLegend: 'Loaded models',
   applicationLoadedModelsPath: 'Status path',
   applicationLoadedModelsFormat: 'Format',
@@ -6022,6 +6029,7 @@ const en: PortalMessages = {
   mappingDecisionsRoutePassthrough: 'Pass-through',
   mappingDecisionsRouteDisabled: 'Disabled',
   mappingDecisionsRoute: (route: string) => `Decisions: ${route}`,
+  mappingSystemOneRoute: (route: string) => `System One: ${route}`,
   capabilitySpeech: 'Speech synthesis',
   capabilitySpeechClone: 'Voice clone',
   // Refines "Speech synthesis": the model delivers its audio as it is generated
@@ -6140,6 +6148,12 @@ const en: PortalMessages = {
     'This application has the llama.cpp type, which cannot pass OpenAI Decisions through. Change the type first, or choose Automatic or Translate.',
   errorRuntimeSpecDecisionsPassthroughUnsupported:
     'Passing OpenAI Decisions through is not available for this server kind (llama.cpp). Choose Automatic or Translate.',
+  errorApplicationSystemOneTranslateUnsupported:
+    'Translating System One is not available for llama.cpp and vllm-sr. Choose Automatic or Pass-through.',
+  errorApplicationSystemOneTranslateConflict:
+    'This application has a type (llama.cpp or vllm-sr) that cannot translate System One. Change the type first, or choose Automatic or Pass-through.',
+  errorRuntimeSpecSystemOneTranslateUnsupported:
+    'Translating System One is not available for this server kind (llama.cpp or vllm-sr). Choose Automatic or Pass-through.',
   errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
   errorRuntimeCoresidencyModeInvalid: 'Invalid co-residency mode',
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',
@@ -7680,7 +7694,7 @@ const en: PortalMessages = {
   // (portal_vendor_account_endpoints.go); they stay distinct on purpose.
   providers: 'Providers',
   providersIntro:
-    'Manage your own accounts with external AI providers (e.g. OpenAI, Anthropic). Credentials are only stored and never shown again.',
+    'Manage your own accounts with external AI providers (e.g. OpenAI, Anthropic). Credentials are only stored and never shown again. An OpenAI account with an API key serves gpt-6-luna on both decisions endpoints.',
   vendorAccountListTitle: 'Provider accounts',
   vendorAccountListEmpty: 'No provider accounts yet.',
   vendorAccountCreate: 'Add provider account',

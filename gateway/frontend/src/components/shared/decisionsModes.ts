@@ -5,7 +5,7 @@ import type { DecisionsMode, SystemOneMode } from '../../api';
 
 /** The create defaults of the two modes; also what a spec starts from. */
 export const defaultDecisionsMode: DecisionsMode = 'auto';
-export const defaultSystemOneMode: SystemOneMode = 'passthrough';
+export const defaultSystemOneMode: SystemOneMode = 'auto';
 
 /**
  * Reads a stored mode, treating an absent or empty one (a fixture, an older
@@ -42,4 +42,24 @@ export function decisionsPassthroughOffered(kind: string): boolean {
  */
 export function decisionsModeForKind(mode: DecisionsMode, kind: string): DecisionsMode {
   return mode === 'passthrough' && !decisionsPassthroughOffered(kind) ? 'auto' : mode;
+}
+
+/**
+ * Whether systemone_mode "translate" can be chosen for a server kind. A
+ * HAND-COPY of the backend's refusal (application.systemone_translate_
+ * unsupported / runtime_spec.systemone_translate_unsupported): llama.cpp
+ * answers neither endpoint natively and vllm_sr is System One itself, so
+ * translation to OpenAI Decisions is refused for both. Every other kind, ""
+ * (auto-detect) included, may translate; the backend decides.
+ */
+export function systemOneTranslateOffered(kind: string): boolean {
+  return kind !== 'llama_cpp' && kind !== 'vllm_sr';
+}
+
+/**
+ * The System One mode to keep after the type changed: a selected translate
+ * becomes "auto" for a kind that cannot serve it. Mirrors the backend reset.
+ */
+export function systemOneModeForKind(mode: SystemOneMode, kind: string): SystemOneMode {
+  return mode === 'translate' && !systemOneTranslateOffered(kind) ? 'auto' : mode;
 }

@@ -111,8 +111,8 @@ function capabilitySeed(row: PortalModelMapping | null, capability: string): Cap
   return verdict === 'yes' || verdict === 'no' ? verdict : '';
 }
 
-// The translated label of a mapping's decisions_route, or '' when there is
-// nothing to show.
+// The translated label of a mapping's decisions_route or systemone_route, or
+// '' when there is nothing to show.
 function decisionsRouteText(route: string | undefined, t: Translation): string {
   switch (route) {
     case 'translate':
@@ -346,6 +346,7 @@ export function MappingForm({
   const [decisionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'decision'));
   const [decisionCapable, setDecisionCapable] = useState<CapabilityChoice>(decisionCapableSeed);
   const decisionsRouteLabel = decisionsRouteText(row?.decisions_route, t);
+  const systemOneRouteLabel = decisionsRouteText(row?.systemone_route, t);
   const [decisionOpenaiCapableSeed] = useState<CapabilityChoice>(() =>
     capabilitySeed(row, 'decision_openai'),
   );
@@ -888,6 +889,11 @@ export function MappingForm({
         {decisionsRouteLabel && (
           <Typography variant="caption" color="text.secondary">
             {t.mappingDecisionsRoute(decisionsRouteLabel)}
+          </Typography>
+        )}
+        {systemOneRouteLabel && (
+          <Typography variant="caption" color="text.secondary">
+            {t.mappingSystemOneRoute(systemOneRouteLabel)}
           </Typography>
         )}
         {/* embedding and rerank are the OPERATOR-stated role capabilities and

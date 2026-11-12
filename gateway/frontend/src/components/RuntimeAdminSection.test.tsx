@@ -186,7 +186,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     messages_mode: 'passthrough',
     // The wire always carries both; a configured spec stores the defaults.
     decisions_mode: 'auto',
-    systemone_mode: 'passthrough',
+    systemone_mode: 'auto',
     responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
@@ -1374,7 +1374,7 @@ describe('RuntimeAdminSection decisions modes in the spec form', () => {
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.decisions_mode).toBe('auto');
-    expect(putSpecs[0].body.systemone_mode).toBe('passthrough');
+    expect(putSpecs[0].body.systemone_mode).toBe('auto');
   });
 
   it('sends the chosen modes once the decisions flavor is ticked', async () => {
@@ -1397,7 +1397,26 @@ describe('RuntimeAdminSection decisions modes in the spec form', () => {
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.decisions_mode).toBe('auto');
-    expect(putSpecs[0].body.systemone_mode).toBe('passthrough');
+    expect(putSpecs[0].body.systemone_mode).toBe('auto');
+  });
+
+  it('offers no System One translate for the llama.cpp type and resets a selected one to auto', async () => {
+    const { putSpecs } = await openCreate();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
+    fireEvent.mouseDown(systemOneField());
+    fireEvent.click(await screen.findByRole('option', { name: t.applicationModeTranslate }));
+    expect(systemOneField()).toHaveTextContent(t.applicationModeTranslate);
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    expect(systemOneField()).toHaveTextContent(t.applicationDecisionsModeAuto);
+    fireEvent.mouseDown(systemOneField());
+    expect(screen.queryByRole('option', { name: t.applicationModeTranslate })).toBeNull();
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.systemone_mode).toBe('auto');
   });
 
   it('offers no passthrough for the llama.cpp type and turns a selected one into auto', async () => {

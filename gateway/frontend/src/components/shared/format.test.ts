@@ -479,6 +479,9 @@ describe('errorLabelByCode (whole-map invariants)', () => {
       'application.decisions_passthrough_unsupported',
       'application.decisions_passthrough_conflict',
       'runtime_spec.decisions_passthrough_unsupported',
+      'application.systemone_translate_unsupported',
+      'application.systemone_translate_conflict',
+      'runtime_spec.systemone_translate_unsupported',
     ]) {
       expect(errorLabelByCode[code], `${code} is not mapped`).toBeDefined();
     }
