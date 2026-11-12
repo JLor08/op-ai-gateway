@@ -3975,13 +3975,13 @@ capability verdicts and its effective runtime type, **first match wins**:
 | 6a | none of the above, and the type is `stable_diffusion_cpp` | `image` |
 | 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
 | 7 | any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) is yes | `chat` |
-| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server, a `vllm_sr` worker, which serves decisions only) | `other` |
+| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server, a `vllm_sr` worker, to which the gateway routes decisions only) | `other` |
 
 Capabilities outrank the type because they are specific and the type is not (an
 operator's `embedding` verdict on a `vllm` server is how that model becomes an
 embedding model); a model that both transcribes and synthesises is `asr`;
 `audio_cpp` is deliberately no type fallback, because one server hosts asr or tts
-and the type cannot say which, and `vllm_sr` is none because it serves no chat. `embedding` and `rerank` are capabilities of their
+and the type cannot say which, and `vllm_sr` is none because the gateway routes no chat to it. `embedding` and `rerank` are capabilities of their
 own, **operator-stated** on the mapping form (no probe; no reserved verdict, so a
 manual `no` is selectable), and gate no route, since the gateway serves no
 embeddings endpoint. The role is derived on every read and **never stored**, so a
@@ -6265,7 +6265,7 @@ Nothing found is recorded as 0, which the history shows as "—". Per spec type:
 | `ollama` | 404, so telemetry decides | `POST /api/show`; Ollama has no auth | `model_info.<arch>.context_length`: the model maximum, the column's documented meaning | agents before 0.6.0 |
 | `stable_diffusion_cpp` | not applicable | not applicable | none | always: an images-only mapping gets no speed row, and the standalone context probe is refused and disabled for it |
 | `audio_cpp` | not applicable | not applicable | none | always: an audio-only mapping gets no speed row, and the standalone context probe is refused (`benchmark.audio_only`) and disabled for it |
-| `vllm_sr` | not applicable (no `/props`) | `/v1/models`, the worker's own listing | `data[].limits.max_input_tokens` (best effort; the worker's input limit) | an agent before 0.18.2 (its scan finds no such key) |
+| `vllm_sr` | not applicable | not applicable | none from a benchmark | always: a `vllm_sr` mapping is decisions-only, so it gets no speed row and the standalone context probe is refused (`benchmark.decisions_only`). The context the agent reads (`data[].limits.max_input_tokens` of `/v1/models`, best effort) reaches the mapping through the ingest write-back, not through a benchmark |
 | `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
 | Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
 

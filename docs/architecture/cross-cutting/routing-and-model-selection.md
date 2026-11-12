@@ -369,7 +369,7 @@ The type's `speech` and `transcription` verdicts come from the `audiocpp_models`
 
 `vllm_sr` is the application type for an **operator-run vLLM Semantic Router in Engine
 mode** (`routing.ProviderVllmSR`, [ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)), a static application with no
-runtime spec that serves only the decision endpoints, so it dispatches to the same shared
+runtime spec to which the gateway routes only the decision endpoints, so it dispatches to the same shared
 client (`providerClients`) and `viewRuntimeType` maps it to the runtime spec kind of the same
 name (the agent-launched `vllm-srun`, a different namespace). Router mode is not supported.
 Its defaults, which the form fills in only where a field still holds the previous type's

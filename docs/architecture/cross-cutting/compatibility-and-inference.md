@@ -1814,7 +1814,7 @@ places, because the mode and the verdicts are only known together after the reso
 - **After the resolve.** `resolveDecisionsTarget` applies the flavor half
   (`targetServesFlavor`, else `404 routing.no_model_route`), and `decisionsRoute` hands the
   target's effective `decisions_mode` and the mapping's two verdicts to
-  `routing.EffectiveDecisionsRoute`:
+  `routing.EffectiveDecisionsRoute` (with the effective kind: for `llama_cpp` and `vllm_sr`, which have no native `/v1/decisions` route, a `decision_openai` verdict is ignored, so `auto` translates and a stale forced `passthrough` is `404 routing.model_not_capable`):
 
 | Effective mode | Route taken | Needs | Without it |
 |---|---|---|---|
@@ -1973,17 +1973,23 @@ both or neither.
 **11. vllm-sr serves only System One, so its modes never pass through
 ([ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).** vllm-sr's `/v1/decisions` is the router's alias of its System One
 endpoint (the body is System One's, not OpenAI's), so a passthrough would hand an OpenAI
-client a System One answer. `decisionsPassthroughCapableKind` therefore refuses
-`passthrough` for `vllm_sr` exactly as for `llama_cpp` (§6: the three refusal codes, and a
+client a System One answer. `routing.DecisionsPassthroughCapableKind` is therefore false
+for `vllm_sr` exactly as for `llama_cpp`, and the save refuses `passthrough` for both (§6: the three refusal codes, and a
 stored `passthrough` is reset to `auto` when an application is retyped to `vllm_sr`), and the
 `decision_openai` probe never targets it (`openAIDecisionsInScope` admits `vllm` applications
-and `vllm`/`custom` specs only), while the System One probe does. `auto` there always resolves
-to **translate** (a `decision` verdict is the only one it can carry). The 5.0 runtime
+and `vllm`/`custom` specs only), while the System One probe does. The route settles on the **effective kind** too:
+`routing.EffectiveDecisionsRoute(kind, mode, decision, decisionOpenAI)` ignores a
+`decision_openai` verdict for an incapable kind (a manual `yes`, or one left from a retype), so
+`auto` translates when `decision: yes` (else `404 routing.model_not_capable`), and a stale forced
+`passthrough` is `404 routing.model_not_capable` rather than sent to an upstream that cannot parse
+it. The handler (`Target.EffectiveKind`) and the portal's `decisions_route` share the function, so
+they cannot disagree. The same rule closes the gap that existed for `llama_cpp` since Phase 2. The 5.0 runtime
 changed its `/v1/systemone` error envelope: it carries `detail` (a string, or a list on a 422)
 plus flat `code`/`question`/`reason` fields, has **no `error` key**, and uses `529` for overload.
 The translate error normalizer of item 6 already reads `detail` in both shapes and relays the
-upstream's status, so a `422 question_failed` and a `529` surface as `decisions.upstream_error`
-under their own status (tests pin both); a `501` never comes from vllm-sr (an unsupported question
+upstream's status, so a `422 question_failed` (a test pins the flat 5.0 body) and a `529`
+(a test pins the status, with an `{error:{...}}` body, not the flat envelope) surface as
+`decisions.upstream_error` under their own status; a `501` never comes from vllm-sr (an unsupported question
 type is a 422). Nothing here is a gateway code path of its own.
 
 **12. Checked against the sources, not yet live.** The wire contract was read off the
@@ -2369,7 +2375,9 @@ redirect's `ModelOffering.Callable` judges a name per endpoint
 `systemone_mode`. A name whose endpoint is disabled stays `Existing`, the "exists but you
 cannot call it" case `UnknownModelRedirectBlocked` redirects. A forced mode whose verdict the mapping lacks is `404
 routing.model_not_capable` after the resolve (no re-selection), and `routing.EffectiveDecisionsRoute`
-is the one function that maps mode and verdicts to a route.
+is the one function that maps the effective kind, mode and verdicts to a route (for a kind without a native
+`/v1/decisions` route, `llama_cpp` and `vllm_sr`, a `decision_openai` verdict is ignored, so `auto`
+translates and a stale forced `passthrough` is `404 routing.model_not_capable`, §3.10 item 11).
 `passthrough` is **refused at save for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, §3.10 item 11):
 `application.decisions_passthrough_unsupported` (400, the request supplied the type),
 `application.decisions_passthrough_conflict` (409, an update that sends no `type` and
