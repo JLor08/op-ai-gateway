@@ -21,6 +21,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -497,5 +498,67 @@ func TestSystemOneHasNoOpenAIAlias(t *testing.T) {
 	rec := postImagesWithHeaders(t, srv, "/openai/v1/systemone", systemOneBody, map[string]string{"Authorization": "Bearer dev-secret"})
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func getSystemOneModels(t *testing.T, srv *Server, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/systemone/models", nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestSystemOneModelsListsOnlyCallableDecisionModels(t *testing.T) {
+	up, _ := newSystemOneUpstream(t, http.StatusOK, systemOneOKBody)
+	srv := newSystemOneCapableTestServer(t, up.URL)
+
+	rec := getSystemOneModels(t, srv, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Object string              `json:"object"`
+		Data   []map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v; body = %s", err, rec.Body.String())
+	}
+	want := []map[string]string{{"id": systemOneGatewayModel, "object": "model", "api": "systemone"}}
+	if got.Object != "list" || !reflect.DeepEqual(got.Data, want) {
+		t.Fatalf("listing = %+v, want only %v (decision-no, unprobed and openai-only models must be absent)", got, want)
+	}
+}
+
+func TestSystemOneModelsIsAnEmptyArrayNotNull(t *testing.T) {
+	srv := NewTestServer()
+
+	rec := getSystemOneModels(t, srv, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"data":[]`) {
+		t.Fatalf("body = %s, want \"data\":[]", rec.Body.String())
+	}
+}
+
+func TestSystemOneModelsIsBearerOnly(t *testing.T) {
+	up, _ := newSystemOneUpstream(t, http.StatusOK, systemOneOKBody)
+	srv := newSystemOneCapableTestServer(t, up.URL)
+
+	if rec := getSystemOneModels(t, srv, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no bearer: status = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := getSystemOneModels(t, srv, map[string]string{"Cookie": "op_session=x"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cookie: status = %d, want 401", rec.Code)
+	}
+	rec := postImagesWithHeaders(t, srv, "/v1/systemone/models", "{}", map[string]string{"Authorization": "Bearer dev-secret"})
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST: status = %d, want 405; body = %s", rec.Code, rec.Body.String())
 	}
 }

@@ -199,3 +199,29 @@ func (s *Server) relaySystemOne(w http.ResponseWriter, r *http.Request, token au
 		reselect: relayAgain(req, func(again inference.Request) { s.relaySystemOne(w, r, token, again, raw) }),
 	})
 }
+
+// handleSystemOneModels serves GET /v1/systemone/models: the models a System One
+// client can name in POST /v1/systemone. It is /v1/models narrowed to the
+// decisions flavor and to the rows that carry a (decision, yes) verdict, so a
+// model the gate would refuse is never offered. Like /v1/models it is
+// bearer-only, reachable to a service token (llm:invoke), and lists the
+// portal's caller-visible rows (provisioning visibility, groups and aliases
+// included); data is [] rather than null when nothing qualifies.
+func (s *Server) handleSystemOneModels(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	token, ok := s.requireAnyScope(w, r, scopeGatewayUse, scopeLLMInvoke)
+	if !ok {
+		return
+	}
+	models := modelDTOsOnFlavor(s.Portal.Models(r.Context(), token).Data, apiFlavorSystemOne)
+	data := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		if !m.Decision {
+			continue
+		}
+		data = append(data, map[string]any{"id": m.ID, "object": "model", "api": "systemone"})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
