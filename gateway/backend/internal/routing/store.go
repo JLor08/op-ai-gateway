@@ -931,7 +931,7 @@ type Application struct {
 	// decision endpoints (migration 107, ADR-098): DecisionsMode (POST
 	// /v1/decisions) is EndpointModeDisabled, Translate, Passthrough or
 	// EndpointModeAuto (the default); SystemOneMode (POST /v1/systemone) is
-	// Disabled or Passthrough (the default). Whether the endpoint is served
+	// EndpointModeAuto (the default), Passthrough, Translate or Disabled. Whether the endpoint is served
 	// also depends on the decisions APIFlavors entry (see
 	// applicationServesEndpoint). An empty value read from the store is
 	// normalized to the default in the scan.

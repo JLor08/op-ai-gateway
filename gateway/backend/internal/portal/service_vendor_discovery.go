@@ -960,8 +960,9 @@ func isChatCapableOpenAIModel(id string) bool {
 // isServedOpenAIAPIKeyModel is the filter an OpenAI api-key listing passes
 // through: the chat-capable models (isChatCapableOpenAIModel) and the OpenAI
 // Decisions models (routing.IsOpenAIDecisionModel, ADR-100), which no chat
-// marker describes but the two decision endpoints serve. The decision models
-// are kept by name, so no future chat marker can drop them.
+// marker describes but the two decision endpoints serve. gpt-6-luna passes the
+// chat heuristic today; the name match guards against a future marker that
+// would drop it.
 func isServedOpenAIAPIKeyModel(id string) bool {
 	return routing.IsOpenAIDecisionModel(id) || isChatCapableOpenAIModel(id)
 }

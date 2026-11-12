@@ -185,7 +185,7 @@ never does (its resolved runtime spec decides after the resolve, where
 redirect read the **effective** modes for an ordinary application and a spec alike: the
 listed `decisions` flavor (`MappingServesAPIFlavor`) means at least one of the two
 endpoints is served, and `MappingServesDecisionEndpoint` answers each endpoint by its own
-mode for `GET /v1/systemone/models` and the redirect's `ModelOffering.Callable`, which
+mode for `GET /v1/systemone/models` and the redirect's `ModelOffering.Callable` (for System One by the application type's route, not the effective spec kind; the save guards make that spec case practically unreachable), which
 `/v1/decisions` asks under `openai_decisions`; for System One that is the **route**
 (`routing.EffectiveSystemOneRoute`, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)), not the mode alone. `systemone_mode` takes
 `auto` | `passthrough` | `translate` | `disabled` like `decisions_mode`, and the mode defaults are `auto`
@@ -211,7 +211,7 @@ is enforced afterwards, and not to the same degree everywhere:
   `targetServesFlavor` in the images relays, and on `/v1/audio/speech` and
   `/v1/audio/transcriptions`, by the same check in the speech and transcription
   relays (`resolveSpeechTarget`, `resolveTranscriptionTarget`), and on `/v1/systemone`
-  by `resolveSystemOneTarget`, which applies `targetServesFlavor` to the resolved target
+  by `resolveDecisionsTarget`, which applies `targetServesFlavor` to the resolved target
   before it relays.
 - **Only against an images-only, audio-only or decisions-only spec** on the text translate dispatch
   (`complete`/`beginStream`, through `resolveTranslateTarget`), which every

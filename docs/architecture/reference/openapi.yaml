@@ -837,20 +837,31 @@ paths:
   /v1/systemone:
     post:
       tags: [inference]
-      summary: System One decision request (value-for-value relay to a decision model, no translate path)
+      summary: System One decision request (passed through to a decision model, or translated to OpenAI Decisions)
       description: >
         Bearer-only (scope `gateway:use` or `llm:invoke`): a portal session
         cookie and the internal loopback are no way in, and there is no
         /openai alias. Required: a non-blank string `model` (400
         `systemone.model_required`) and a non-empty object `questions` (400
         `systemone.questions_required`); `state` and the questions' contents
-        reach the upstream unexamined. The protocol does not stream: `stream`
+        reach the upstream unexamined on the passthrough route (the translate route validates them). The protocol does not stream: `stream`
         must be absent, `null` or `false` (400 `systemone.stream_unsupported`).
         Admission takes an application that declares the `decisions` API
         flavor (otherwise 404 `routing.no_model_route`; an agent-launched
-        model's runtime spec must declare it too) and a mapping whose
-        `decision` verdict is `yes` (otherwise 404
-        `routing.model_not_capable`; an unprobed model is refused too). The
+        model's runtime spec must declare it too) and a mapping with a
+        `decision` or a `decision_openai` verdict of `yes` (the derived
+        `any_decision`; otherwise 404 `routing.model_not_capable`, an unprobed
+        model included). The effective `systemone_mode` (`auto`, `passthrough`,
+        `translate`, `disabled`) then settles the route: passthrough to the
+        upstream `/v1/systemone`, or translate to its `/v1/decisions` (a
+        verdict missing for a forced mode is 404 `routing.model_not_capable`).
+        A decision model of an OpenAI api-key vendor account (`gpt-6-luna`) is
+        served by translation to api.openai.com. The translate route refuses
+        what OpenAI Decisions cannot express with 400
+        `systemone.question_type_unsupported` or `systemone.field_unsupported`,
+        answers a refused question 422 `systemone.refused`, and answers a
+        failure or a non-2xx upstream answer with `systemone.upstream_error`
+        (502, or the upstream's status). The
         body is read under `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES` (default
         32 MiB; 413 `request.body_too_large`). The request is relayed to the
         upstream `/v1/systemone` with `model` rewritten to the mapping's own
@@ -862,10 +873,10 @@ paths:
         JSON body (a non-2xx or non-JSON body is still relayed as sent).
         A resolved agent-launched model whose runtime spec has
         `systemone_mode` `disabled` is 404 `systemone.endpoint_disabled`; for
-        such a token a 502 `systemone.upstream_error` answers an upstream body
+        such a token (and on the translate route) a 502 `systemone.upstream_error` answers an upstream body
         that is over the buffer bound or broken off. Metered in tokens from
-        the answer's `usage.input_tokens` and `usage.output_tokens`. Never
-        routed to a vendor account. Beyond those it answers the same
+        the answer's `usage.input_tokens` and `usage.output_tokens`. Routed to a
+        vendor account only for that decision model. Beyond those it answers the same
         statuses as every other inference path (429/402 from the principal
         limiter, 503 from the capacity queue or no healthy host).
       security: [{ bearerAuth: [] }]
@@ -936,7 +947,8 @@ paths:
         gets the `confidence` of its choice and score answers recomputed as
         max(p)/sum(p) in every mode. Metered in tokens (a passthrough also
         records `input_tokens_details.cached_tokens` and `cache_write_tokens`).
-        Never routed to a vendor account. Beyond those it answers the same
+        Routed to a vendor account only for an OpenAI api-key account's
+        decision model (`gpt-6-luna`), by passthrough to api.openai.com. Beyond those it answers the same
         statuses as every other inference path (429/402 from the principal
         limiter, 503 from the capacity queue or no healthy host).
       security: [{ bearerAuth: [] }]

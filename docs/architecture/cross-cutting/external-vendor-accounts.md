@@ -532,7 +532,7 @@ matrix:
 
 | Account | Serves | How |
 |---|---|---|
-| **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. **A second exception, for the decision model only** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): a decision request (`POST /v1/decisions`, `POST /v1/systemone`) for `gpt-6-luna` gets the `decisions` flavor added, `DecisionsMode = passthrough` and `SystemOneMode = translate`, and reaches `https://api.openai.com/v1/decisions` (§4.2, *Api-key Decisions*). Its chat dialects stay listed and stay translate. |
+| **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. **A second exception, for the decision model only** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): a decision request (`POST /v1/decisions`, `POST /v1/systemone`) for `gpt-6-luna` gets the `decisions` flavor added, `DecisionsMode = passthrough` and `SystemOneMode = translate`, and reaches `https://api.openai.com/v1/decisions` (§4.2, *Api-key Decisions*). Its chat dialects stay listed and unchanged: chat completions and the `anthropic` dialect stay translate, and a `/v1/responses` request for it stays the passthrough of the first exception. |
 | **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed verbatim to `https://api.anthropic.com/v1/messages` instead (§4.1). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
@@ -1082,8 +1082,9 @@ learns one more kind of request.
   `/v1/decisions`, and `routing.EffectiveSystemOneRoute` gives translate for `/v1/systemone`. A vendor target
   that is not a decision model answers no to both.
 - **The relay.** Both endpoints send `upstreamPath` = `/v1/decisions` to `https://api.openai.com`, with the
-  account's opened sealed key as `Authorization: Bearer` (§4.3), through the same native relay, buffered answer
-  path and error rules as a self-hosted `vllm`. The `/v1/systemone` body is rewritten by the reverse translator
+  account's opened sealed key as `Authorization: Bearer` (§4.3), through the same native relay as a self-hosted
+  `vllm`: a `/v1/decisions` passthrough uses the streaming copier unless the token opted into confidence
+  normalization, and only the `/v1/systemone` translate route and a normalizing token take the buffered answer path (§3.10 item 7). The `/v1/systemone` body is rewritten by the reverse translator
   (§3.9 item 12) and a vendor answer that refuses a question is the gateway's 422 `systemone.refused`.
 - **Usage.** The row carries the serving `AccountID`, the route in `provider_path` (`/v1/decisions` for both
   routes, since both reach the vendor's endpoint) and the tokens read from the answer, **cached and cache-write
@@ -1096,6 +1097,11 @@ learns one more kind of request.
   `codex-rs/ext/guardian-v2/src/async_scorer/decisions.rs` and `codex-rs/login/src/auth/manager.rs`). Serving
   decision requests from a subscription account by emulating them on a chat model is a separate, opt-in
   follow-up, issue #380, and is not part of this.
+- **Upgrade note (live on upgrade).** No stored row changes, but the vendor decision route is live as soon as this
+  version runs, for **every token that already has §11 access to an OpenAI api-key account carrying `gpt-6-luna`**,
+  and that account is **billed** for what such a token sends. `gpt-6-luna` already passes the `gpt-*` chat heuristic,
+  and every api-key refresh now adds the row. The only switches are `vendor_accounts_enabled` and the per-token §11
+  policy (§7, §11); there is no decision-specific flag.
 - **Not verified live** (§10): an OpenAI api-key account with `gpt-6-luna` through both endpoints, the official
   SDK against the vendor route, OpenAI's real error envelope on this endpoint, and whether the api-key
   `/v1/models` lists `gpt-6-luna` at all (the refresh keeps it either way, §6.3).
@@ -1941,8 +1947,7 @@ data, so it is narrowed by a small heuristic: the `gpt-*`, `chatgpt-*` and
 o-series families (and fine-tunes of them), minus ids that mark an embedding,
 speech, image, moderation, realtime or completion-only model. **The OpenAI Decisions
 models are kept by name on top of the heuristic** (`isServedOpenAIAPIKeyModel`:
-`routing.IsOpenAIDecisionModel` or chat-capable), because no chat marker describes
-them but the two decision endpoints serve them (§4.2, *Api-key Decisions*, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373));
+`routing.IsOpenAIDecisionModel` or chat-capable). `gpt-6-luna` already passes the `gpt-*` chat heuristic today, so the name match only guards against a future marker that would drop it (§4.2, *Api-key Decisions*, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373));
 the name match cannot be dropped by a future chat marker. A model the rule
 does not recognize is left out — a missing model is added by a newer rule, while
 a non-chat model offered wrongly fails every request routed to it. **That heuristic

@@ -148,7 +148,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI audio speech | `/v1/audio/speech`, `/openai/v1/audio/speech` | `handleOpenAISpeech` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a binary-response relay, no translate path (§3.6) |
 | OpenAI audio transcriptions (multipart) | `/v1/audio/transcriptions`, `/openai/v1/audio/transcriptions` | `handleOpenAITranscription` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart-in, JSON-out relay, no translate path (§3.7) |
 | Diarized transcription (multipart, one-shot) | `/v1/audio/transcriptions/details`, `/openai/v1/audio/transcriptions/details` | `handleOpenAITranscriptionDetails` (the same `serveTranscription` as the row above) | `requireInternalOrBearerAnyScope` (as generations) | **always** — the transcription relay's one-shot second route, never streamed (§3.7 item 12) |
-| System One decisions | `/v1/systemone` (no `/openai` alias) | `handleSystemOne` | `requireAnyScope` (bearer only — never a session cookie or the internal loopback) | **always** — a JSON relay, no translate path; `Target.SystemOneMode` only switches it on or off (§3.9, §6) |
+| System One decisions | `/v1/systemone` (no `/openai` alias) | `handleSystemOne` | `requireAnyScope` (bearer only — never a session cookie or the internal loopback) | **always** — a JSON relay; since Phase 4 the route is passthrough or a translate to the upstream's `/v1/decisions`, settled after the resolve from `Target.SystemOneMode` and the verdicts (`systemOneRoute`, §3.9 item 11, §6) |
 | OpenAI Decisions | `/v1/decisions`, `/openai/v1/decisions` | `handleOpenAIDecisions` | `requireAnyScope` (bearer only — never a session cookie or the internal loopback) | `Target.DecisionsMode` (§6): **passthrough** to the upstream's `/v1/decisions`, or **translate** to and from System One, chosen after the resolve (§3.10) |
 | System One model discovery | `/v1/systemone/models` | `handleSystemOneModels` | `requireAnyScope` (bearer only) | n/a (§3.9) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
@@ -1599,7 +1599,7 @@ mapping the resolved runtime spec is the authority for its flavors
 (`resolveDecisionsTarget`, shared with `/v1/decisions`, applies `targetServesFlavor` after the resolve), so a spec that
 leaves `decisions` out is `404 routing.no_model_route`. `relaySystemOne` then settles the route (item 11) and hands the
 request to `proxyNative`: every resolve failure is terminal and
-recorded as a routing-failure usage row (`recordSystemOneRoutingFailure`), and the
+recorded as a routing-failure usage row (`recordDecisionsRoutingFailure`), and the
 instance re-selection of a gone sibling (`relayAgain`) works as on the other native
 relays. **The body is relayed value for value, not byte for byte:** the shared JSON model
 rewrite that `proxyNative` applies on every native relay re-serializes it, replacing
@@ -1804,7 +1804,7 @@ the verdict alone: the per-model fold behind `ModelDTO.Decision` and the `decisi
 `/v1/systemone` unknown-model redirect, and the portal's mapping DTO, which carries
 `systemone_route` (`"passthrough"`, `"translate"`, `"disabled"`, or `""` when the effective flavors do not list `decisions` or no route exists),
 `decisions_route`'s twin. The verdict-free half, `routing.MappingServesDecisionEndpoint`, asks the route with both verdicts assumed `yes`,
-so a disabled mode, and a `translate` row on a kind with no `/v1/decisions`, are not "served". A gone instance re-runs the whole path
+so a disabled mode, and a `translate` row on a kind with no `/v1/decisions`, are not "served". It judges by the **application type** (`app.Type`), not the effective spec kind; the save guards refuse `translate` for an incapable spec type, so the spec case is practically unreachable. A gone instance re-runs the whole path
 (`relayAgain`), route and translation included.
 
 **12. The reverse translator: System One to OpenAI Decisions (matrix B).** On the translate route

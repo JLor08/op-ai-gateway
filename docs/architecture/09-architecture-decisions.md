@@ -588,6 +588,7 @@ defaults of their own and a route settled after the resolve rather than at the g
 **Amended by [ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)
 (Phase 4).** `systemone_mode` now takes the same four values as `decisions_mode` (`auto` | `passthrough` | `translate` | `disabled`) and
 defaults to `auto` on new rows; existing rows keep their stored `passthrough`.
+
 **Context:** whether the gateway proxied a Codex (`/v1/responses`) or Claude
 Code (`/v1/messages`) request natively, or translated it to
 `/v1/chat/completions`, was a per-application boolean
@@ -1666,6 +1667,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 (Phase 4).** "A capability list keeps a request off the vendor-account path" holds for every list **except** the decision
 endpoints' derived `[any_decision]`, which is the one list the vendor path admits, and then only for an OpenAI api-key account's
 decision model. A request on the decisions flavor without a capability list is now declined by the vendor path too.
+
 **Context:** `POST /v1/images/generations` (issue #71) is the first endpoint
 whose model requirement is a hard **precondition** rather than a preference. A
 chat model handed an image request does not produce a degraded image; it
@@ -12332,8 +12334,8 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   `confidence` of a predicate are **rounded to 12 decimals**; a **refusal** answer is `422 systemone.refused` naming the keys and **takes precedence over a malformed sibling**
   (the usage row records the upstream's tokens, since it answered); a missing answer or an unusable body is `502 systemone.upstream_error`; a non-2xx upstream answer is that
   envelope under the upstream's status, with its message. Usage carries the **cached and cache-write** tokens, so a vendor row records what OpenAI billed.
-- **(d) A vendor decision model is an allowlisted upstream id on an OpenAI api-key account, and nothing else.** `routing.IsOpenAIDecisionModel` is a fixed, unexported
-  set (today exactly `gpt-6-luna`); `routing.IsVendorDecisionModel(account, row)` requires an **OpenAI api-key** account **and** the row's **upstream** model in it (the gateway name,
+- **(d) A vendor decision model is an allowlisted upstream id on an OpenAI api-key account, and nothing else.** `routing.IsOpenAIDecisionModel` (exported) reads a fixed, unexported
+  package-level map (today exactly `gpt-6-luna`); `routing.IsVendorDecisionModel(account, row)` requires an **OpenAI api-key** account **and** the row's **upstream** model in it (the gateway name,
   prefix included, never decides). There is no portal flag, no stored row and no operator setting, so a new decision model is a code change, and nothing can widen the set at run time.
 - **(e) The vendor path admits exactly `[any_decision]` on the decisions flavor.** `vendorCapabilitiesEligible`: a request with no list is eligible unless it is on the decisions
   flavor (**a decisions-flavor request without a capability list is now refused by the vendor path**, where before such a request would have been matched by name), a request with a list
@@ -12361,8 +12363,8 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   opt-in #380, not a default of this change.
 - **A per-model pricing table.** OpenAI publishes `gpt-6-luna` prices, but the gateway has no per-model price store for vendors anywhere (vendor usage is attributed to the account, §5 of
   external vendor accounts), and a hand-kept table would drift from OpenAI's. The row records tokens, cached tokens and the account; cost is 0.
-- **Refusing a mapping per question.** System One has no way to say "this question was refused", so a per-question partial answer would be a lie of the shape; `422 systemone.refused` names the keys
-  and the client retries with fewer questions. The same reasoning refuses an unmappable field rather than dropping it.
+- **A per-question partial answer.** System One has no way to say "this question was refused", so a per-question partial answer would be a lie of the shape; `422 systemone.refused` names the keys
+  and the client retries with fewer questions. Matrix B likewise refuses only the System One fields OpenAI Decisions has no slot for (the listed ones) and drops unknown top-level fields.
 - **Opening the vendor path to every capability list.** A decision endpoint's `[any_decision]` is safe because only a decision model of one account type can answer it; admitting `image`, `speech` or
   `transcription` would route those to a hosted model of the same name that cannot serve them, the failure ADR-061 and ADR-062 pinned a test against.
 - **Keeping `systemone_mode` passthrough-only.** It leaves a System One client unable to use any model that answers OpenAI Decisions only (the vendor model, and a vLLM model with a `decision_openai`
@@ -12372,13 +12374,14 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
 
 **Consequence:**
 
-- **Existing deployments change nothing on upgrade.** Stored `passthrough` rows stay; a System One client reaches a vendor decision model only by name, through a token that already has §11 access
-  to an OpenAI api-key account that lists it.
+- **No stored row changes on upgrade, but the vendor decision route is live.** It is live for every token that already has §11 access to an OpenAI api-key account carrying `gpt-6-luna`, and that account is
+  billed. `gpt-6-luna` already passes the `gpt-*` chat heuristic and every api-key refresh now adds the row. The only switches are `vendor_accounts_enabled` and the per-token §11 policy; there is no
+  decision-specific flag.
 - **`auto` on `/v1/systemone` can now translate.** A model with only a `decision_openai` verdict (a vLLM decision model, the vendor model) is served to System One clients; one with both verdicts keeps passing
   through. A forced mode whose verdict is missing is still an intermittent 404 when two applications share a name.
 - **The translated route buffers the answer** (the cost the forward translate route already pays), and refuses a malformed request with a 400 instead of relaying it.
-- **A new decision model is a release.** `openAIDecisionModels` is a constant; until it changes, a model OpenAI adds is a chat-routed name that fails if used on a decision endpoint (it is not offered there).
-- **Not verified live:** a real OpenAI api-key account with `gpt-6-luna` through `/v1/decisions` and `/v1/systemone`; the official OpenAI SDK against the vendor route; OpenAI's real error envelope on this endpoint; and
+- **A new decision model is a release.** `routing.IsOpenAIDecisionModel` reads the unexported package-level map `openAIDecisionModels`, a var that nothing mutates; until it changes, a model OpenAI adds is a chat-routed name that fails if used on a decision endpoint (it is not offered there).
+- **Not verified live:** a real OpenAI api-key account with `gpt-6-luna` through `/v1/decisions` and `/v1/systemone`; the official OpenAI SDK against the vendor route; OpenAI's real error envelope on this endpoint; the zero-based score index of a reverse `score` answer; and
   whether the api-key `/v1/models` lists `gpt-6-luna` (the refresh keeps the row either way). The contract was read off the SDK types and the public reference; these are operator steps, as the earlier phases' live runs were.
 
 → [Compatibility & Inference §3.9 and §3.10](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),
