@@ -4677,5 +4677,10 @@ describe('vllm_sr i18n keys', () => {
       // The product name is the same in both locales; everything else is text.
       if (k !== 'runtimeSpecTypeVllmSr') expect(messages.en[k]).not.toBe(messages.de[k]);
     }
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].runtimeSpecTypeVllmSrNote;
+      expect(note).toContain('vllm-project/semantic-router');
+      expect(note).toContain('4ec449f358ce7805228fb341bdc55ea5211707fd');
+    }
   });
 });
