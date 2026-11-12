@@ -35,8 +35,8 @@ func TestSystemOneRequestInputAndQuestions(t *testing.T) {
 			`{"model":"gpt-6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_json","data":{"k":1}}]}],"questions":[{"type":"predicate","name":"a","instructions":""}]}`,
 		},
 		{
-			"array state", `{"model":"m","state":[1,"x"],"questions":{"a":{"type":"noul"}}}`,
-			`{"model":"gpt-6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_json","data":[1,"x"]}]}],"questions":[{"type":"predicate","name":"a","instructions":""}]}`,
+			"array state", `{"model":"m","state":[{"a":1},{"b":"x"}],"questions":{"a":{"type":"noul"}}}`,
+			`{"model":"gpt-6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_json","data":[{"a":1},{"b":"x"}]}]}],"questions":[{"type":"predicate","name":"a","instructions":""}]}`,
 		},
 		{
 			"object state with images", `{"model":"m","state":{"k":1},"images":["data:image/png;base64,AAA","https://x.test/i.png"],"questions":{"a":{"type":"noul"}}}`,
@@ -149,6 +149,13 @@ func TestSystemOneRequestRefusals(t *testing.T) {
 		{"score without criteria", `{"model":"m","state":"s","questions":{"a":{"type":"score"}}}`, CodeSystemOneFieldUnsupported},
 		{"noul bad key", `{"model":"m","state":"s","questions":{"a":{"type":"noul","criteria":{"maybe":"x"}}}}`, CodeSystemOneFieldUnsupported},
 		{"non-string instructions", `{"model":"m","state":"s","questions":{"a":{"type":"noul","instructions":[1]}}}`, CodeSystemOneFieldUnsupported},
+		{"null image", `{"model":"m","state":"s","images":[null],` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"empty image", `{"model":"m","state":"s","images":[""],` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"duplicate noul key", `{"model":"m","state":"s","questions":{"a":{"type":"noul","criteria":{"true":"A","true":"B"}}}}`, CodeSystemOneFieldUnsupported},
+		{"number state", `{"model":"m","state":5,` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"bool state", `{"model":"m","state":true,` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"array state with scalar", `{"model":"m","state":[1,"x"],` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"null question", `{"model":"m","state":"s","questions":{"a":null}}`, CodeSystemOneFieldUnsupported},
 		{"duplicate question key", `{"model":"m","state":"s","questions":{"a":{"type":"noul"},"a":{"type":"noul"}}}`, CodeSystemOneFieldUnsupported},
 	}
 	for _, tt := range tests {
@@ -176,7 +183,7 @@ const reverseResp = `{"answers":[
 	"model":"gpt-6-luna","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":64,"cache_write_tokens":16},"output_tokens":9,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":129}}`
 
 const reverseWant = `{"answers":{
-	"nice":{"type":"noul","noul":0.8,"probabilities":{"yes":0.8,"no":0.19999999999999996},"confidence":0.8},
+	"nice":{"type":"noul","noul":0.8,"probabilities":{"yes":0.8,"no":0.2},"confidence":0.8},
 	"mood":{"type":"choice","choice":"angry","probabilities":{"calm":0.3,"angry":0.6,"glad":0.1},"confidence":0.6},
 	"urgency":{"type":"score","score":1.7,"legend":{"0":"low","1":"mid","2":"high"},"probabilities":{"0":0.1,"1":0.1,"2":0.8},"confidence":0.7}},
 	"model":"client-model","usage":{"input_tokens":120,"output_tokens":9}}`
@@ -283,4 +290,14 @@ func TestOpenAIDecisionsResponseBooleanChoiceValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertJSONEqual(t, decodeAny(t, out), `{"answers":{"q":{"type":"choice","choice":"true","probabilities":{"true":0.9,"false":0.1},"confidence":0.9}},"model":"c","usage":{"input_tokens":0,"output_tokens":0}}`)
+}
+
+func TestOpenAIDecisionsResponseRefusalOutranksMalformedSibling(t *testing.T) {
+	_, table := reverseOK(t, reverseReq)
+	body := `{"answers":[{"type":"refusal","name":"nice"},{"type":"choice","name":"mood","choice":"meh","probabilities":[]}],"model":"x","usage":{}}`
+	_, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c")
+	var re *SystemOneRefusedError
+	if !errors.Is(err, ErrSystemOneRefused) || !errors.As(err, &re) || !reflect.DeepEqual(re.Keys, []string{"nice"}) {
+		t.Fatalf("err = %v, want a refusal naming nice", err)
+	}
 }

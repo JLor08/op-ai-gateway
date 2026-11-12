@@ -183,6 +183,9 @@ func buildOpenAIInput(state, imagesRaw json.RawMessage) ([]byte, *DecisionsError
 		}
 		first = openAIInputPart{Type: "input_text", Text: &s}
 	} else {
+		if derr := checkS1JSONState(st); derr != nil {
+			return nil, derr
+		}
 		first = openAIInputPart{Type: "input_json", Data: json.RawMessage(st)}
 	}
 	parts := []openAIInputPart{first}
@@ -200,13 +203,42 @@ func marshalS1(v any) ([]byte, *DecisionsError) {
 	return b, nil
 }
 
+// checkS1JSONState accepts an object or an array of objects, the shapes an
+// input_json part carries.
+func checkS1JSONState(st []byte) *DecisionsError {
+	switch st[0] {
+	case '{':
+		return nil
+	case '[':
+		var elems []json.RawMessage
+		if err := json.Unmarshal(st, &elems); err != nil {
+			return s1FieldErr("state is not a valid array")
+		}
+		for i, e := range elems {
+			if t := bytes.TrimSpace(e); len(t) == 0 || t[0] != '{' {
+				return s1FieldErr("state array element %d must be an object", i)
+			}
+		}
+		return nil
+	default:
+		return s1FieldErr("state must be a string, an object or an array of objects")
+	}
+}
+
 func decodeS1Images(raw json.RawMessage) ([]string, *DecisionsError) {
 	if !isPresentJSON(raw) {
 		return nil, nil
 	}
-	var images []string
-	if err := json.Unmarshal(raw, &images); err != nil {
+	var entries []*string
+	if err := json.Unmarshal(raw, &entries); err != nil {
 		return nil, s1FieldErr("images must be an array of image URL strings")
+	}
+	images := make([]string, 0, len(entries))
+	for i, e := range entries {
+		if e == nil || *e == "" {
+			return nil, s1FieldErr("image %d must be a non-empty URL string", i)
+		}
+		images = append(images, *e)
 	}
 	return images, nil
 }
@@ -266,6 +298,9 @@ func buildOpenAIQuestions(raw json.RawMessage) ([]byte, []s1TableQuestion, *Deci
 
 func buildOpenAIQuestion(key string, raw json.RawMessage) (openAIQuestionOut, s1TableQuestion, *DecisionsError) {
 	var in s1QuestionIn
+	if !isPresentJSON(raw) {
+		return openAIQuestionOut{}, s1TableQuestion{}, s1FieldErr("question %q must be an object", key)
+	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return openAIQuestionOut{}, s1TableQuestion{}, s1FieldErr("question %q is not a valid object", key)
 	}
@@ -315,20 +350,31 @@ func foldNoulCriteria(key, instructions string, raw json.RawMessage) (string, *D
 	if !isPresentJSON(raw) {
 		return instructions, nil
 	}
-	var c map[string]*string
-	if err := json.Unmarshal(raw, &c); err != nil {
+	members, ok := decodeOrderedObject(raw)
+	if !ok {
 		return "", s1FieldErr("question %q: noul criteria must be an object of true/false descriptions", key)
 	}
-	for k := range c {
-		if k != "true" && k != "false" {
-			return "", s1FieldErr("question %q: noul criteria accepts only the keys true and false, got %q", key, k)
+	seen := make(map[string]*string, len(members))
+	for _, m := range members {
+		if m.key != "true" && m.key != "false" {
+			return "", s1FieldErr("question %q: noul criteria accepts only the keys true and false, got %q", key, m.key)
 		}
+		if _, dup := seen[m.key]; dup {
+			return "", s1FieldErr("question %q: noul criteria key %q appears more than once", key, m.key)
+		}
+		var desc *string
+		if isPresentJSON(m.raw) {
+			if err := json.Unmarshal(m.raw, &desc); err != nil {
+				return "", s1FieldErr("question %q: the %s description must be a string or null", key, m.key)
+			}
+		}
+		seen[m.key] = desc
 	}
-	if c["true"] != nil {
-		instructions += decisionsTextSeparator + "Answer yes if: " + *c["true"]
+	if seen["true"] != nil {
+		instructions += decisionsTextSeparator + "Answer yes if: " + *seen["true"]
 	}
-	if c["false"] != nil {
-		instructions += decisionsTextSeparator + "Answer no if: " + *c["false"]
+	if seen["false"] != nil {
+		instructions += decisionsTextSeparator + "Answer no if: " + *seen["false"]
 	}
 	return instructions, nil
 }
@@ -521,15 +567,20 @@ func matchOpenAIAnswer(table SystemOneAnswerTable, answers []openAIAnswerIn, i i
 }
 
 // translateOpenAIAnswers renders the System One answers object in question
-// order and collects the keys of refused questions.
+// order and collects the keys of refused questions. A refusal outranks a
+// malformed or missing sibling answer: the first such problem is returned only
+// when nothing was refused.
 func translateOpenAIAnswers(table SystemOneAnswerTable, answers []openAIAnswerIn) (json.RawMessage, []string, error) {
 	var buf bytes.Buffer
 	buf.WriteByte('{')
 	var refused []string
+	var firstErr error
+	n := 0
 	for i, q := range table.questions {
 		a, ok := matchOpenAIAnswer(table, answers, i)
 		if !ok {
-			return nil, nil, fmt.Errorf("the upstream's answer is incomplete: no answer for question %d (%q)", i, q.key)
+			firstErr = firstError(firstErr, fmt.Errorf("the upstream's answer is incomplete: no answer for question %d (%q)", i, q.key))
+			continue
 		}
 		if a.Type == "refusal" {
 			refused = append(refused, q.key)
@@ -537,21 +588,37 @@ func translateOpenAIAnswers(table SystemOneAnswerTable, answers []openAIAnswerIn
 		}
 		ans, err := translateOpenAIAnswer(q, a)
 		if err != nil {
-			return nil, nil, fmt.Errorf("the upstream's answer for question %d (%q) is unusable: %w", i, q.key, err)
+			firstErr = firstError(firstErr, fmt.Errorf("the upstream's answer for question %d (%q) is unusable: %w", i, q.key, err))
+			continue
 		}
 		encoded, err := json.Marshal(ans)
 		if err != nil {
-			return nil, nil, err
+			firstErr = firstError(firstErr, err)
+			continue
 		}
-		if i > 0 {
+		if n > 0 {
 			buf.WriteByte(',')
 		}
+		n++
 		writeJSONValue(&buf, q.key)
 		buf.WriteByte(':')
 		buf.Write(encoded)
 	}
 	buf.WriteByte('}')
-	return buf.Bytes(), refused, nil
+	if len(refused) > 0 {
+		return nil, refused, nil
+	}
+	if firstErr != nil {
+		return nil, nil, firstErr
+	}
+	return buf.Bytes(), nil, nil
+}
+
+func firstError(cur, next error) error {
+	if cur != nil {
+		return cur
+	}
+	return next
 }
 
 func translateOpenAIAnswer(q s1TableQuestion, a openAIAnswerIn) (any, error) {
@@ -582,10 +649,14 @@ func translatePredicateAnswer(a openAIAnswerIn) (any, error) {
 	p := *a.Probability
 	return s1NoulOut{
 		Type: s1TypeNoul, Noul: p,
-		Probabilities: map[string]float64{"yes": p, "no": 1 - p},
-		Confidence:    math.Max(p, 1-p),
+		Probabilities: map[string]float64{"yes": p, "no": roundFloat(1 - p)},
+		Confidence:    roundFloat(math.Max(p, 1-p)),
 	}, nil
 }
+
+// roundFloat rounds a computed value to 12 decimals so it carries no float
+// noise (1 - 0.8 prints as 0.19999999999999996 otherwise).
+func roundFloat(x float64) float64 { return math.Round(x*1e12) / 1e12 }
 
 func validProbability(p float64) bool { return p >= 0 && p <= 1 }
 
