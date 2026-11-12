@@ -1543,3 +1543,14 @@ func TestProbeContextInfo_VLLMSRReturnsAPIVersion(t *testing.T) {
 		t.Errorf("vllm info = %+v, err %v; want size 4096, no api_version", info, err)
 	}
 }
+
+func TestProbeContextInfo_VLLMSRAPIVersionWithoutLimit(t *testing.T) {
+	ts := newProbeServer(t, `{"api_version":"5.0.0","data":[{"id":"a"}]}`)
+	info, err := ProbeContextInfo(context.Background(), ts.Client(), ts.URL, "vllm_sr", "/v1/models", "")
+	if err == nil {
+		t.Fatal("want an error when no context limit exists")
+	}
+	if info.APIVersion != "5.0.0" || info.Size != 0 {
+		t.Errorf("info = %+v, want api_version 5.0.0 and size 0", info)
+	}
+}

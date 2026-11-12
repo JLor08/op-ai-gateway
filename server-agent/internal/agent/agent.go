@@ -1799,6 +1799,9 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 	info, err := collector.ProbeContextInfo(cctx, client, base, st.Type, st.ContextProbePath, model)
 	cancel()
 	size := info.Size
+	// A vllm_sr api_version is reported whenever the body was read, even when
+	// no context size came out of it; it is cached only with a real size.
+	rs.RuntimeAPIVersion = info.APIVersion
 	if errors.Is(err, collector.ErrRouterMode) {
 		// llama.cpp router mode: /props answered with the router dummy
 		// ("role": "router", n_ctx 0). Report the mode itself rather than

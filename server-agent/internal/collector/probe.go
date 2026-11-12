@@ -131,7 +131,8 @@ type ContextInfo struct {
 // ProbeContextInfo is ProbeContext plus the vllm-sr api_version read from the
 // same response body (ADR-099), so no second request is spent on it. The agent
 // only records the version; it never judges it. Errors and the router-mode
-// verdict are exactly ProbeContext's.
+// verdict are exactly ProbeContext's, except that a vllm_sr body that parsed
+// but carries no context limit returns its APIVersion together with the error.
 func ProbeContextInfo(ctx context.Context, client *http.Client, baseURL, specType, contextPath, model string) (ContextInfo, error) {
 	var zero ContextInfo
 	path := strings.TrimSpace(contextPath)
@@ -180,14 +181,19 @@ func ProbeContextInfo(ctx context.Context, client *http.Client, baseURL, specTyp
 		}
 	}
 
-	n, ok := extractContext(normalizedType, v)
-	if !ok {
-		return zero, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
-	}
-	info := ContextInfo{Size: n}
+	// The vllm-sr api_version is read whenever the body was fetched and parsed,
+	// independent of whether a context limit exists; it is returned alongside
+	// the no-context error and a non-positive size so the caller can still
+	// report it (it is never cached as a final context result).
+	var info ContextInfo
 	if normalizedType == "vllm_sr" {
 		info.APIVersion = extractVLLMSRAPIVersion(v)
 	}
+	n, ok := extractContext(normalizedType, v)
+	if !ok {
+		return info, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
+	}
+	info.Size = n
 	return info, nil
 }
 

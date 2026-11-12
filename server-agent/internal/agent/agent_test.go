@@ -5421,7 +5421,7 @@ func TestCollectOnceVLLMSRRecordsAPIVersionAndSkipsProps(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/models":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"api_version":"5.0.0","data":[{"id":"m"},{"id":"n","limits":{"max_input_tokens":32768}}]}`))
+			_, _ = w.Write([]byte(`{"api_version":"5.0.0","data":[{"id":"m","max_model_len":4096},{"id":"n","limits":{"max_input_tokens":32768}}]}`))
 		case "/metrics":
 			_, _ = w.Write([]byte("vllm_srun_queue_depth 3\n"))
 		case "/props":
@@ -5459,7 +5459,55 @@ func TestCollectOnceVLLMSRRecordsAPIVersionAndSkipsProps(t *testing.T) {
 	if n := atomic.LoadInt32(&propsHits); n != 0 {
 		t.Errorf("/props hits for vllm_sr = %d, want 0", n)
 	}
-	if v := run("vllm"); v.RuntimeAPIVersion != "" {
+	v := run("vllm")
+	if v.ContextProbe != "ok" || v.ContextSize != 4096 {
+		t.Fatalf("vllm context = %q/%d, want ok/4096 (the probe must succeed so the gate is what is tested)", v.ContextProbe, v.ContextSize)
+	}
+	if v.RuntimeAPIVersion != "" {
 		t.Errorf("vllm sample api_version = %q, want empty", v.RuntimeAPIVersion)
+	}
+}
+
+// TestCollectOnceVLLMSRAPIVersionWithoutContextLimit proves the api_version is
+// reported whenever /v1/models was read, even with no context limit (absent or
+// a literal 0), while the context probe state stays unreachable and nothing is
+// cached as a final context result.
+func TestCollectOnceVLLMSRAPIVersionWithoutContextLimit(t *testing.T) {
+	for name, body := range map[string]string{
+		"no limits":  `{"api_version":"5.0.0","data":[{"id":"m"}]}`,
+		"zero limit": `{"api_version":"5.0.0","data":[{"id":"m","limits":{"max_input_tokens":0}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/models" {
+					http.NotFound(w, r)
+					return
+				}
+				atomic.AddInt32(&hits, 1)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			drv := newFakeRuntimeDriver()
+			drv.setActive(true)
+			drv.setStatuses([]runtimectl.Status{{
+				SpecID: "rspec_sr2", Model: "m", State: runtimectl.StateRunning, PID: 4646,
+				Port: portFromURL(t, srv.URL), Type: "vllm_sr", ContextProbePath: "/v1/models",
+			}})
+			poster := &capturePoster{}
+			a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+			a.collectOnce(context.Background())
+			a.collectOnce(context.Background())
+			rt := poster.last().Runtimes[0]
+			if rt.RuntimeAPIVersion != "5.0.0" {
+				t.Errorf("runtime_api_version = %q, want 5.0.0", rt.RuntimeAPIVersion)
+			}
+			if rt.ContextProbe != "unreachable" || rt.ContextSize != 0 {
+				t.Errorf("context = %q/%d, want unreachable/0", rt.ContextProbe, rt.ContextSize)
+			}
+			if got := atomic.LoadInt32(&hits); got != 2 {
+				t.Errorf("hits = %d, want 2 (re-read each cycle, nothing cached)", got)
+			}
+		})
 	}
 }
