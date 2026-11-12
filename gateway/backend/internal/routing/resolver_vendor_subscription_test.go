@@ -339,6 +339,8 @@ func TestVendorSubscriptionUnknownVendorDoesNotMatch(t *testing.T) {
 // Crucially ExtraHeaders/Masquerade/VendorAccountID are NOT listed either -- an
 // Anthropic subscription target that forgot any of them is a bug.
 var vendorSubscriptionTargetMayBeZero = map[string]bool{
+	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
+	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here
 	"APITokenHeader":              true, // Authorization is set by the dispatch layer, not a static header
@@ -359,6 +361,8 @@ var vendorSubscriptionTargetMayBeZero = map[string]bool{
 // Masquerade IS zero-OK (the ChatGPT backend wants the real Codex body, no system
 // block). ExtraHeaders/VendorAccountID stay required.
 var vendorSubscriptionOpenAITargetMayBeZero = map[string]bool{
+	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
+	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here
 	"APITokenHeader":              true, // Authorization is set by the dispatch layer, not a static header

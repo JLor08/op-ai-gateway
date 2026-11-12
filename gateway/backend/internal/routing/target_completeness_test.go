@@ -82,6 +82,8 @@ func TestTargetFromPopulatesEveryField(t *testing.T) {
 		APIFlavors:                  []string{APIFlavorOpenAI},
 		ResponsesMode:               EndpointModePassthrough,
 		MessagesMode:                EndpointModeTranslate,
+		DecisionsMode:               EndpointModeAuto,
+		SystemOneMode:               EndpointModePassthrough,
 		ResponsesLiveTimingsEnabled: true,
 		APITokenMode:                string(RuntimeAPITokenModeSet),
 		APIToken:                    "enc:spec",

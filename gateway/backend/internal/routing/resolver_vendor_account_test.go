@@ -490,6 +490,8 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 // cannot be silently forgotten here. It describes the openai_responses
 // (passthrough) shape, so ResponsesMode is deliberately absent.
 var vendorTargetMayBeZero = map[string]bool{
+	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
+	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
@@ -514,6 +516,8 @@ var vendorTargetMayBeZero = map[string]bool{
 // is zero-OK (an Anthropic upstream has no Responses surface). ExtraHeaders stays
 // zero-OK: AnthropicClient.ProxyNative guarantees anthropic-version itself.
 var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
+	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
+	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; Anthropic has no Responses surface
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
@@ -536,6 +540,8 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 // endpoint modes are zero by design: the compat vendors are translate-only and never
 // enter the OpenAI-Responses / Anthropic-Messages passthrough branches.
 var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
+	"DecisionsMode":               true, // a vendor target never serves the decision endpoints
+	"SystemOneMode":               true, // a vendor target never serves the decision endpoints
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; the compat vendors never pass Responses through
 	"MessagesMode":                true, // zero == translate; the compat vendors never pass Messages through

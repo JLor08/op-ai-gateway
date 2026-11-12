@@ -115,6 +115,14 @@ const (
 	// normalizeFlavors' empty-list default stays [openai, anthropic] exactly.
 	// See docs/architecture/09-architecture-decisions.md ADR-097.
 	APIFlavorDecisions = "decisions"
+	// APIFlavorOpenAIDecisions is the FINE request flavor of OpenAI's
+	// /v1/decisions endpoint, the twin of the fine openai_responses: it is
+	// never stored (the coarse stored flavor stays APIFlavorDecisions) and
+	// NormalizeAPIFlavor folds it onto that coarse flavor. It exists so
+	// applicationServesEndpoint can apply the decisions mode to it while the
+	// /v1/systemone request, flavored APIFlavorDecisions, applies the System
+	// One mode (ADR-098).
+	APIFlavorOpenAIDecisions = "openai_decisions"
 
 	// PrincipalTypeService / PrincipalTypeUser are the two supported
 	// principal_limits owner kinds (Phase 2 of the service-accounts work):
@@ -911,6 +919,16 @@ type Application struct {
 	// also depends on the matching APIFlavors entry (see applicationServesEndpoint).
 	ResponsesMode EndpointMode
 	MessagesMode  EndpointMode
+	// DecisionsMode / SystemOneMode are the per-application modes of the two
+	// decision endpoints (migration 107, ADR-098): DecisionsMode (POST
+	// /v1/decisions) is EndpointModeDisabled, Translate, Passthrough or
+	// EndpointModeAuto (the default); SystemOneMode (POST /v1/systemone) is
+	// Disabled or Passthrough (the default). Whether the endpoint is served
+	// also depends on the decisions APIFlavors entry (see
+	// applicationServesEndpoint). An empty value read from the store is
+	// normalized to the default in the scan.
+	DecisionsMode EndpointMode
+	SystemOneMode EndpointMode
 	// LoadedModelsPath is an optional upstream endpoint path the gateway (and/or the
 	// server-agent) polls to learn which model(s) are currently LOADED/RUNNING (e.g.
 	// llama-swap "/running", llama.cpp "/props", "/v1/models"). Empty = not tracked.
@@ -1840,6 +1858,20 @@ const (
 	// agent-reported row are both refused.
 	CapabilityDecision = "decision"
 
+	// CapabilityDecisionOpenAI means the upstream serves OpenAI's /v1/decisions
+	// natively, so the gateway may pass a decisions request through rather than
+	// translate it to System One. It is orthogonal to CapabilityDecision (a
+	// model can answer System One without serving /v1/decisions and the
+	// reverse). Its probe source is CapabilitySourceDecisionsProbe; an
+	// operator's manual row wins like any other (ADR-098).
+	CapabilityDecisionOpenAI = "decision_openai"
+
+	// CapabilityAnyDecision is a DERIVED requirement, never a stored row name:
+	// it is satisfied when the mapping answers either decision endpoint, i.e.
+	// a yes on CapabilityDecision or on CapabilityDecisionOpenAI. See
+	// capabilityRowsSatisfy.
+	CapabilityAnyDecision = "any_decision"
+
 	// CapabilityEmbedding means the model produces text EMBEDDINGS: it is a
 	// vector encoder, not a generator. It is orthogonal to every name above (an
 	// embedding model neither accepts images nor synthesises speech), and it is
@@ -2009,6 +2041,7 @@ const (
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
 	CapabilitySourceAudioCppModels    = "audiocpp_models"
 	CapabilitySourceSystemOneProbe    = "systemone_probe"
+	CapabilitySourceDecisionsProbe    = "decisions_probe"
 	CapabilitySourceLegacy            = "legacy"
 )
 
@@ -2057,7 +2090,8 @@ func capabilitySourceRank(source string) int {
 		return 3
 	case CapabilitySourceVisionBenchmark:
 		return 2
-	case CapabilitySourceLlamaCppProps, CapabilitySourceLegacy:
+	case CapabilitySourceLlamaCppProps, CapabilitySourceLegacy,
+		CapabilitySourceSystemOneProbe, CapabilitySourceDecisionsProbe:
 		return 1
 	case "":
 		return 0
@@ -3072,6 +3106,12 @@ type RuntimeSpec struct {
 	APIFlavors    []string
 	ResponsesMode EndpointMode
 	MessagesMode  EndpointMode
+	// DecisionsMode / SystemOneMode are the spec's snapshot of the two
+	// decision-endpoint modes, with the same authority as ResponsesMode: for a
+	// server_agent mapping the resolved spec's values win over the
+	// application's (see Application.DecisionsMode).
+	DecisionsMode EndpointMode
+	SystemOneMode EndpointMode
 	// ResponsesLiveTimingsEnabled is this spec's own copy of the
 	// per-application live-timings opt-in (migration 80), snapshotted from the
 	// parent application at migration time and operator-owned thereafter. It
@@ -3581,6 +3621,16 @@ func applicationServesEndpoint(app Application, fineFlavor string) bool {
 			return false
 		}
 		return app.Type == ProviderServerAgent || app.MessagesMode != EndpointModeDisabled
+	case APIFlavorOpenAIDecisions:
+		if !applicationHasAPIFlavor(app, APIFlavorDecisions) {
+			return false
+		}
+		return app.Type == ProviderServerAgent || app.DecisionsMode != EndpointModeDisabled
+	case APIFlavorDecisions:
+		if !applicationHasAPIFlavor(app, APIFlavorDecisions) {
+			return false
+		}
+		return app.Type == ProviderServerAgent || app.SystemOneMode != EndpointModeDisabled
 	default:
 		return applicationHasAPIFlavor(app, NormalizeAPIFlavor(fineFlavor))
 	}

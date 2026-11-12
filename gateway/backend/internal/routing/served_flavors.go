@@ -14,6 +14,8 @@ type EffectiveSpecFields struct {
 	APIFlavors                  []string
 	ResponsesMode               EndpointMode
 	MessagesMode                EndpointMode
+	DecisionsMode               EndpointMode
+	SystemOneMode               EndpointMode
 	ResponsesLiveTimingsEnabled bool
 }
 
@@ -37,6 +39,8 @@ func EffectiveFields(app Application, spec RuntimeSpec, hasSpec bool) EffectiveS
 			APIFlavors:                  spec.APIFlavors,
 			ResponsesMode:               spec.ResponsesMode,
 			MessagesMode:                spec.MessagesMode,
+			DecisionsMode:               spec.DecisionsMode,
+			SystemOneMode:               spec.SystemOneMode,
 			ResponsesLiveTimingsEnabled: spec.ResponsesLiveTimingsEnabled,
 		}
 	}
@@ -44,6 +48,8 @@ func EffectiveFields(app Application, spec RuntimeSpec, hasSpec bool) EffectiveS
 		APIFlavors:                  app.APIFlavors,
 		ResponsesMode:               app.ResponsesMode,
 		MessagesMode:                app.MessagesMode,
+		DecisionsMode:               app.DecisionsMode,
+		SystemOneMode:               app.SystemOneMode,
 		ResponsesLiveTimingsEnabled: app.ResponsesLiveTimingsEnabled,
 	}
 }

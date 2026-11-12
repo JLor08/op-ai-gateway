@@ -51,6 +51,23 @@ func seedBaselineMapping(ctx context.Context, t *testing.T, s *SQLStore, m routi
 		m.ID, m.ApplicationID, m.GatewayModelName, m.AppModelName, m.Status, m.CreatedAt, m.UpdatedAt)
 }
 
+// seedBaselineApplication inserts an applications row naming only the columns
+// every schema version has (the sibling of seedBaselineServer): CreateApplication
+// names every column added since, which an older database lacks.
+func seedBaselineApplication(ctx context.Context, t *testing.T, s *SQLStore, a routing.Application) {
+	t.Helper()
+	flavors, err := encodeAPIFlavors(a.APIFlavors)
+	if err != nil {
+		t.Fatalf("encode flavors: %v", err)
+	}
+	mustExec(ctx, t, s, `insert into applications (
+		id, server_id, type, port, scheme, api_flavors, priority, weight, timeout_ms, affinity_ttl_seconds,
+		status, health_check_mode, created_at, updated_at
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.ServerID, a.Type, a.Port, a.Scheme, flavors, a.Priority, a.Weight, a.TimeoutMS, a.AffinityTTLSeconds,
+		a.Status, a.HealthCheckMode, a.CreatedAt, a.UpdatedAt)
+}
+
 // seedBaselineServer inserts an ai_servers row naming only the columns every
 // schema version has, so a test that seeds before migrating forward does not
 // depend on the head's column set (CreateAIServer names every column added
@@ -129,13 +146,11 @@ func seedMigration101Mapping(ctx context.Context, t *testing.T, s *SQLStore, now
 		Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 		CreatedAt: now, UpdatedAt: now,
 	})
-	if err := s.CreateApplication(ctx, routing.Application{
+	seedBaselineApplication(ctx, t, s, routing.Application{
 		ID: "app_m101", ServerID: "srv_m101", Type: routing.ProviderAudioCpp, Port: 8101, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive,
 		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create application: %v", err)
-	}
+	})
 	seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 		ID: "map_m101", ApplicationID: "app_m101", GatewayModelName: "m101-tts", AppModelName: "up-m101",
 		Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,

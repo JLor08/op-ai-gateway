@@ -52,13 +52,11 @@ func TestMigration97DropsVRAMLockedFromAnUpgradedDatabase(t *testing.T) {
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
-		if err := s.CreateApplication(ctx, routing.Application{
+		seedBaselineApplication(ctx, t, s, routing.Application{
 			ID: "app_m97", ServerID: "srv_m97", Type: routing.ProviderServerAgent, Port: 8097, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create application: %v", err)
-		}
+		})
 		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m97", ApplicationID: "app_m97", GatewayModelName: "m97-model", AppModelName: "up-m97",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,

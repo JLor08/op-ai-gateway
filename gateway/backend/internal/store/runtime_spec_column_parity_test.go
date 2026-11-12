@@ -108,6 +108,14 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 		messagesModes := [runtimeSpecParityRows]routing.EndpointMode{
 			routing.EndpointModeTranslate, routing.EndpointModePassthrough, routing.EndpointModeDisabled,
 		}
+		// decisions/systemone modes never hold the empty string a read
+		// normalizes to a default, and differ from each other per row.
+		decisionsModes := [runtimeSpecParityRows]routing.EndpointMode{
+			routing.EndpointModeAuto, routing.EndpointModeTranslate, routing.EndpointModeDisabled,
+		}
+		systemOneModes := [runtimeSpecParityRows]routing.EndpointMode{
+			routing.EndpointModePassthrough, routing.EndpointModeDisabled, routing.EndpointModePassthrough,
+		}
 		// Distinct, all non-empty, so admin_state cannot be confused with the
 		// other string columns and an omitted read is caught.
 		adminStates := [runtimeSpecParityRows]string{"force_running", "force_stopped", "force_running"}
@@ -179,6 +187,8 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				APIFlavors:                  apiFlavors[i],
 				ResponsesMode:               responsesModes[i],
 				MessagesMode:                messagesModes[i],
+				DecisionsMode:               decisionsModes[i],
+				SystemOneMode:               systemOneModes[i],
 				ResponsesLiveTimingsEnabled: runtimeSpecParityBools[3][i],
 				CreatedAt:                   now.Add(time.Duration(-10-i) * time.Minute),
 				UpdatedAt:                   now.Add(time.Duration(-i) * time.Minute),
@@ -272,7 +282,7 @@ func TestAgentRuntimeSpecsSchemaColumnsAllCovered(t *testing.T) {
 			bools: runtimeSpecParityBoolNames,
 			seeded: []string{
 				"admin_state", "admission_wait_timeout_seconds", "api_flavors", "api_token",
-				"api_token_header", "api_token_header_source", "api_token_mode", "args", "binary_path",
+				"api_token_header", "api_token_header_source", "decisions_mode", "systemone_mode", "api_token_mode", "args", "binary_path",
 				"cluster_network", "config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
 				"device_backend", "id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
 				"max_instances", "member_mode", "messages_mode", "metrics_path", "min_instances", "ram_estimate_mb",

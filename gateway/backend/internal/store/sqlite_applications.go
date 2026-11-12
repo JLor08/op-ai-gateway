@@ -23,13 +23,13 @@ func (s *SQLiteStore) CreateApplication(ctx context.Context, app routing.Applica
 		insert into applications (
 			id, server_id, type, port, scheme, api_flavors, priority, weight,
 			timeout_ms, affinity_ttl_seconds, admission_queue_timeout_seconds, status, always_reachable, health_check_path,
-			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode,
+			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode, decisions_mode, systemone_mode,
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
 			proxy_listen_port, proxy_excluded, responses_live_timings_enabled,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		app.ID,
 		app.ServerID,
 		app.Type,
@@ -48,6 +48,8 @@ func (s *SQLiteStore) CreateApplication(ctx context.Context, app routing.Applica
 		app.HealthCheckIntervalSeconds,
 		app.ResponsesMode,
 		app.MessagesMode,
+		app.DecisionsMode,
+		app.SystemOneMode,
 		app.LoadedModelsPath,
 		app.LoadedModelsFormat,
 		app.ContextProbePath,
@@ -88,7 +90,7 @@ func (s *SQLiteStore) UpdateApplication(ctx context.Context, app routing.Applica
 			admission_queue_timeout_seconds = ?,
 			status = ?, always_reachable = ?, health_check_path = ?,
 			health_check_mode = ?, health_check_interval_seconds = ?,
-			responses_mode = ?, messages_mode = ?,
+			responses_mode = ?, messages_mode = ?, decisions_mode = ?, systemone_mode = ?,
 			loaded_models_path = ?, loaded_models_format = ?, context_probe_path = ?,
 			capacity_probe_path = ?,
 			app_path_suffix = ?, api_token = ?, api_token_header = ?,
@@ -114,6 +116,8 @@ func (s *SQLiteStore) UpdateApplication(ctx context.Context, app routing.Applica
 		app.HealthCheckIntervalSeconds,
 		app.ResponsesMode,
 		app.MessagesMode,
+		app.DecisionsMode,
+		app.SystemOneMode,
 		app.LoadedModelsPath,
 		app.LoadedModelsFormat,
 		app.ContextProbePath,
@@ -146,7 +150,7 @@ func (s *SQLiteStore) ApplicationByID(ctx context.Context, id string) (routing.A
 	row := s.queryRow(ctx, `
 		select id, server_id, type, port, scheme, api_flavors, priority, weight,
 			timeout_ms, affinity_ttl_seconds, admission_queue_timeout_seconds, status, always_reachable, health_check_path,
-			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode,
+			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode, decisions_mode, systemone_mode,
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
@@ -161,7 +165,7 @@ func (s *SQLiteStore) ApplicationsByServer(ctx context.Context, serverID string)
 	rows, err := s.query(ctx, `
 		select id, server_id, type, port, scheme, api_flavors, priority, weight,
 			timeout_ms, affinity_ttl_seconds, admission_queue_timeout_seconds, status, always_reachable, health_check_path,
-			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode,
+			health_check_mode, health_check_interval_seconds, responses_mode, messages_mode, decisions_mode, systemone_mode,
 			loaded_models_path, loaded_models_format, context_probe_path, capacity_probe_path,
 			app_path_suffix, api_token, api_token_header,
 			benchmark_schedule_enabled, benchmark_schedule_interval_seconds, opportunistic_metrics_enabled,
@@ -671,7 +675,7 @@ func (s *SQLiteStore) ActiveMappingsForModel(ctx context.Context, gatewayModel s
 			a.id, a.server_id, a.type, a.port, a.scheme, a.api_flavors, a.priority,
 			a.weight, a.timeout_ms, a.affinity_ttl_seconds, a.admission_queue_timeout_seconds, a.status, a.always_reachable,
 			a.health_check_path, a.health_check_mode, a.health_check_interval_seconds,
-			a.responses_mode, a.messages_mode, a.loaded_models_path, a.loaded_models_format,
+			a.responses_mode, a.messages_mode, a.decisions_mode, a.systemone_mode, a.loaded_models_path, a.loaded_models_format,
 			a.context_probe_path, a.capacity_probe_path,
 			a.app_path_suffix, a.api_token, a.api_token_header,
 			a.benchmark_schedule_enabled, a.benchmark_schedule_interval_seconds, a.opportunistic_metrics_enabled,
@@ -754,6 +758,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		&c.Application.AffinityTTLSeconds, &c.Application.AdmissionQueueTimeoutSeconds, &c.Application.Status, &alwaysReachable, &c.Application.HealthCheckPath,
 		&c.Application.HealthCheckMode, &c.Application.HealthCheckIntervalSeconds,
 		&c.Application.ResponsesMode, &c.Application.MessagesMode,
+		&c.Application.DecisionsMode, &c.Application.SystemOneMode,
 		&c.Application.LoadedModelsPath, &c.Application.LoadedModelsFormat,
 		&c.Application.ContextProbePath, &c.Application.CapacityProbePath,
 		&c.Application.AppPathSuffix, &c.Application.APIToken, &c.Application.APITokenHeader,
@@ -773,6 +778,7 @@ func scanMappingCandidate(row rowScanner) (routing.MappingCandidate, error) {
 		return routing.MappingCandidate{}, fmt.Errorf("scan mapping candidate: %w", err)
 	}
 	c.Application.AlwaysReachable = alwaysReachable != 0
+	c.Application.DecisionsMode, c.Application.SystemOneMode = decisionModesOrDefault(c.Application.DecisionsMode, c.Application.SystemOneMode)
 	c.Application.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	c.Application.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	c.Application.ProxyExcluded = proxyExcluded != 0
@@ -845,6 +851,8 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 		&app.HealthCheckIntervalSeconds,
 		&app.ResponsesMode,
 		&app.MessagesMode,
+		&app.DecisionsMode,
+		&app.SystemOneMode,
 		&app.LoadedModelsPath,
 		&app.LoadedModelsFormat,
 		&app.ContextProbePath,
@@ -868,6 +876,7 @@ func scanApplication(row rowScanner) (routing.Application, error) {
 		return routing.Application{}, fmt.Errorf("scan application: %w", err)
 	}
 	app.AlwaysReachable = alwaysReachable != 0
+	app.DecisionsMode, app.SystemOneMode = decisionModesOrDefault(app.DecisionsMode, app.SystemOneMode)
 	app.BenchmarkScheduleEnabled = benchScheduleEnabled != 0
 	app.OpportunisticMetricsEnabled = oppMetricsEnabled != 0
 	app.ProxyExcluded = proxyExcluded != 0
@@ -982,4 +991,19 @@ func decodeAPIFlavors(raw string) ([]string, error) {
 		return nil, fmt.Errorf("decode api flavors: %w", err)
 	}
 	return append([]string(nil), flavors...), nil
+}
+
+// decisionModesOrDefault maps an empty decisions_mode / systemone_mode to its
+// default ("auto" and "passthrough"). Migration 107 backfills existing rows,
+// but a row written by an older binary during a rolling upgrade still carries
+// the column default ”, and an empty mode must read as the default, never as
+// an unknown value (ADR-098).
+func decisionModesOrDefault(decisions, systemOne routing.EndpointMode) (routing.EndpointMode, routing.EndpointMode) {
+	if decisions == "" {
+		decisions = routing.EndpointModeAuto
+	}
+	if systemOne == "" {
+		systemOne = routing.EndpointModePassthrough
+	}
+	return decisions, systemOne
 }

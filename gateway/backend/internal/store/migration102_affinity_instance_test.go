@@ -66,13 +66,11 @@ func seedMigration102Pin(ctx context.Context, t *testing.T, s *SQLStore, now tim
 		Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 		CreatedAt: now, UpdatedAt: now,
 	})
-	if err := s.CreateApplication(ctx, routing.Application{
+	seedBaselineApplication(ctx, t, s, routing.Application{
 		ID: "app_m102", ServerID: "srv_m102", Type: routing.ProviderServerAgent, Port: 8102, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create application: %v", err)
-	}
+	})
 	mustExec(ctx, t, s, `insert into route_affinity (
 		id, api_token_id, user_id, model, api_flavor, session_id,
 		application_id, server_id, expires_at, last_used_at, created_at, updated_at, resolved_model

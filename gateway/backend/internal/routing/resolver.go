@@ -233,6 +233,11 @@ type Target struct {
 	APIFlavors    []string
 	ResponsesMode EndpointMode
 	MessagesMode  EndpointMode
+	// DecisionsMode / SystemOneMode are the EFFECTIVE modes of the two decision
+	// endpoints, resolved like ResponsesMode (spec for a server_agent mapping
+	// with a spec, else the application).
+	DecisionsMode EndpointMode
+	SystemOneMode EndpointMode
 	// OpportunisticMetrics mirrors the resolved application's per-app toggle: when
 	// set, a successful real inference EWMA-updates the served mapping's throughput
 	// metrics from the usage event.
@@ -1698,6 +1703,15 @@ func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 			}
 			continue
 		}
+		// CapabilityAnyDecision is derived, never stored: the mapping answers
+		// either decision endpoint (System One or OpenAI /v1/decisions). A
+		// row of that name is inert, like an image_edit:yes row.
+		if name == CapabilityAnyDecision {
+			if byName[CapabilityDecision].Verdict != CapabilityYes && byName[CapabilityDecisionOpenAI].Verdict != CapabilityYes {
+				return false
+			}
+			continue
+		}
 		if byName[name].Verdict != CapabilityYes {
 			return false
 		}
@@ -1750,6 +1764,10 @@ func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []Mapping
 func NormalizeAPIFlavor(apiFlavor string) string {
 	normalized := strings.ToLower(strings.TrimSpace(apiFlavor))
 	switch {
+	// openai_decisions is the fine /v1/decisions flavor; like the images and
+	// audio flavors it must be tested BEFORE the generic "openai" prefix.
+	case normalized == APIFlavorOpenAIDecisions:
+		return APIFlavorDecisions
 	// BEFORE the generic "openai" prefix, deliberately: every fine images and
 	// audio flavor also starts with "openai", so testing the generic prefix
 	// first would fold images and speech into text and defeat the separation
@@ -2873,6 +2891,8 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		APIFlavors:           append([]string(nil), eff.APIFlavors...),
 		ResponsesMode:        eff.ResponsesMode,
 		MessagesMode:         eff.MessagesMode,
+		DecisionsMode:        eff.DecisionsMode,
+		SystemOneMode:        eff.SystemOneMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
 		// ResponsesLiveTimingsEnabled carries EffectiveFields' spec-then-app
 		// resolution, NOT app.ResponsesLiveTimingsEnabled: the flag qualifies

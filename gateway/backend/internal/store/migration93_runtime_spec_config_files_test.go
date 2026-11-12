@@ -54,13 +54,11 @@ func TestMigration93AddsRuntimeSpecConfigFiles(t *testing.T) {
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
-		if err := s.CreateApplication(ctx, routing.Application{
+		seedBaselineApplication(ctx, t, s, routing.Application{
 			ID: "app_m93", ServerID: "srv_m93", Type: routing.ProviderServerAgent, Port: 8093, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create application: %v", err)
-		}
+		})
 		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m93", ApplicationID: "app_m93", GatewayModelName: "m93-model", AppModelName: "up-m93",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,

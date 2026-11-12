@@ -20,4 +20,9 @@ const (
 	EndpointModeDisabled    EndpointMode = "disabled"
 	EndpointModeTranslate   EndpointMode = "translate"
 	EndpointModePassthrough EndpointMode = "passthrough"
+	// EndpointModeAuto is the decisions endpoint's own fourth state (never a
+	// valid responses/messages/System One mode): pass the request through
+	// where the upstream serves /v1/decisions natively, translate it to
+	// System One otherwise (ADR-098).
+	EndpointModeAuto EndpointMode = "auto"
 )

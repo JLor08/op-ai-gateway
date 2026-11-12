@@ -176,6 +176,15 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 			routing.EndpointModeTranslate, routing.EndpointModePassthrough, routing.EndpointModeDisabled,
 		}
 
+		// decisions/systemone modes never hold the empty string a read
+		// normalizes to a default, and differ from each other per row.
+		decisionsModes := [applicationParityRows]routing.EndpointMode{
+			routing.EndpointModeAuto, routing.EndpointModeTranslate, routing.EndpointModeDisabled,
+		}
+		systemOneModes := [applicationParityRows]routing.EndpointMode{
+			routing.EndpointModePassthrough, routing.EndpointModeDisabled, routing.EndpointModePassthrough,
+		}
+
 		want := make([]routing.Application, 0, applicationParityRows)
 		for i := 0; i < applicationParityRows; i++ {
 			idx := strconv.Itoa(i)
@@ -195,6 +204,8 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 				HealthCheckIntervalSeconds:       61 + i,
 				ResponsesMode:                    responsesModes[i],
 				MessagesMode:                     messagesModes[i],
+				DecisionsMode:                    decisionsModes[i],
+				SystemOneMode:                    systemOneModes[i],
 				LoadedModelsPath:                 "/loaded-" + idx,
 				LoadedModelsFormat:               "format-" + idx,
 				ContextProbePath:                 "/context-" + idx,
@@ -354,7 +365,7 @@ func TestApplicationsSchemaColumnsAllCovered(t *testing.T) {
 			bools: applicationParityBoolNames,
 			seeded: []string{
 				"admission_queue_timeout_seconds", "affinity_ttl_seconds", "api_flavors",
-				"api_token", "api_token_header", "app_path_suffix",
+				"api_token", "api_token_header", "app_path_suffix", "decisions_mode", "systemone_mode",
 				"benchmark_schedule_interval_seconds", "capacity_probe_path", "context_probe_path",
 				"created_at", "health_check_interval_seconds", "health_check_mode", "health_check_path",
 				"id", "loaded_models_format", "loaded_models_path", "messages_mode", "port", "priority",
