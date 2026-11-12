@@ -500,3 +500,247 @@ func TestSystemOnePassTreatsARouter404AsNoVerdict(t *testing.T) {
 		t.Fatalf("a router 404 wrote %+v, want no decision row", row)
 	}
 }
+
+// blockingSystemOneProber holds every System One probe until release is
+// closed (or the probe's context ends), sending on started as each one
+// begins. It embeds fakeProber for the loop's other probes.
+type blockingSystemOneProber struct {
+	*fakeProber
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// unblock releases every probe, held or still to come; it may be called
+// more than once.
+func (b *blockingSystemOneProber) unblock() { b.once.Do(func() { close(b.release) }) }
+
+func newBlockingSystemOneProber() *blockingSystemOneProber {
+	return &blockingSystemOneProber{fakeProber: newFakeProber(), started: make(chan struct{}, 8), release: make(chan struct{})}
+}
+
+func (b *blockingSystemOneProber) ProbeSystemOne(ctx context.Context, _ routing.Target, _ string) (string, error) {
+	b.started <- struct{}{}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	return routing.CapabilityYes, nil
+}
+
+// blockedSystemOneRunner is one external application declaring decisions,
+// with one decisions mapping, behind a blocking prober. Its cleanup releases
+// the probe and waits for the pass, so no goroutine outlives the test.
+func blockedSystemOneRunner(t *testing.T) (*appHealthRunner, *fakeHealthStore, *blockingSystemOneProber) {
+	t.Helper()
+	shrinkRetryGap(t)
+	app := systemOneApp(routing.ProviderLlamaCPP, 8001, routing.APIFlavorDecisions)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{"a1": {systemOneMapping("m1", "decider")}}
+	prober := newBlockingSystemOneProber()
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+	t.Cleanup(func() {
+		prober.unblock()
+		runner.systemOnePasses.Wait()
+	})
+	return runner, st, prober
+}
+
+// runOnceWithin runs one cycle against state and fails the test unless it
+// returns within d.
+func runOnceWithin(t *testing.T, runner *appHealthRunner, state *cycleState, d time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runner.runOnce(context.Background(), state)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("the health cycle did not return within %v: it waits on the decision probe", d)
+	}
+}
+
+// awaitProbeStart fails the test unless a System One probe starts within d.
+func awaitProbeStart(t *testing.T, prober *blockingSystemOneProber, d time.Duration) {
+	t.Helper()
+	select {
+	case <-prober.started:
+	case <-time.After(d):
+		t.Fatalf("no decision probe started within %v", d)
+	}
+}
+
+// TestSystemOnePassDoesNotHoldTheHealthCycle: a decision probe is a real
+// inference with its own 30 s timeout, so the pass runs detached from the
+// cycle. A probe that hangs leaves the cycle free: it returns at once, well
+// within the probe's timeout, and the server's health is written.
+func TestSystemOnePassDoesNotHoldTheHealthCycle(t *testing.T) {
+	runner, st, prober := blockedSystemOneRunner(t)
+
+	runOnceWithin(t, runner, &cycleState{lastProbed: map[string]time.Time{}, lastAvail: map[string]availWriteState{}}, 5*time.Second)
+
+	awaitProbeStart(t, prober, 5*time.Second)
+	st.mu.Lock()
+	health := st.health["s1"]
+	st.mu.Unlock()
+	if health != routing.HealthHealthy {
+		t.Fatalf("server health = %q, want %q written while the probe hangs", health, routing.HealthHealthy)
+	}
+}
+
+// TestSystemOnePassRunsOncePerApplication: a tick that finds the
+// application's pass still in flight starts no second one, although the
+// application's cadence is due again; the tick after the pass ended does.
+func TestSystemOnePassRunsOncePerApplication(t *testing.T) {
+	runner, st, prober := blockedSystemOneRunner(t)
+	var clockMu sync.Mutex
+	current := time.Unix(10_000, 0).UTC()
+	runner.now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return current
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		current = current.Add(d)
+	}
+	state := &cycleState{lastProbed: map[string]time.Time{}, lastAvail: map[string]availWriteState{}}
+
+	runOnceWithin(t, runner, state, 5*time.Second)
+	awaitProbeStart(t, prober, 5*time.Second)
+
+	advance(time.Hour)
+	runOnceWithin(t, runner, state, 5*time.Second)
+	select {
+	case <-prober.started:
+		t.Fatal("a second decision pass started while the first was in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	prober.unblock()
+	runner.systemOnePasses.Wait()
+	st.assertCapability(t, "m1", routing.CapabilityDecision, routing.CapabilityYes, routing.CapabilitySourceSystemOneProbe)
+
+	// Rename the model, so the next pass has a new identity to ask about:
+	// the pass ended, so the next due tick starts one.
+	st.mu.Lock()
+	st.mappings["a1"] = []routing.ModelMapping{systemOneMapping("m1", "decider-v2")}
+	st.mu.Unlock()
+	advance(time.Hour)
+	runOnceWithin(t, runner, state, 5*time.Second)
+	awaitProbeStart(t, prober, 5*time.Second)
+}
+
+// TestSystemOnePassSkipsAnUnreachableApplication: an application whose last
+// observed reachability is false is not asked for a decision at all.
+func TestSystemOnePassSkipsAnUnreachableApplication(t *testing.T) {
+	shrinkRetryGap(t)
+	app := systemOneApp(routing.ProviderLlamaCPP, 8001, routing.APIFlavorDecisions)
+	app.HealthCheckMode = routing.HealthCheckModeHealthPath
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{"a1": {systemOneMapping("m1", "decider")}}
+	prober := &systemOneFakeProber{fakeProber: newFakeProber()}
+	prober.down["http://s1.local:8001"] = true
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+
+	runCapabilityCycle(runner)
+
+	prober.soMu.Lock()
+	defer prober.soMu.Unlock()
+	if len(prober.soModels) != 0 {
+		t.Fatalf("an unreachable application was asked for %v, want no probe", prober.soModels)
+	}
+}
+
+// TestSystemOnePassReprobesAClearedVerdict: a settled verdict the operator
+// clears in the portal (the row is deleted) is asked about again on the next
+// pass, not only after a gateway restart, and then settles again.
+func TestSystemOnePassReprobesAClearedVerdict(t *testing.T) {
+	up := newSystemOneUpstream(t)
+	_, port := up.hostPort(t)
+	runner, st, _ := systemOneRunner(t, up, systemOneApp(routing.ProviderLlamaCPP, port, routing.APIFlavorDecisions), systemOneMapping("m1", "decider"))
+
+	runCapabilityCycle(runner)
+	st.assertCapability(t, "m1", routing.CapabilityDecision, routing.CapabilityYes, routing.CapabilitySourceSystemOneProbe)
+
+	st.mu.Lock()
+	delete(st.caps["m1"], routing.CapabilityDecision)
+	st.mu.Unlock()
+	runCapabilityCycle(runner)
+	if n := len(up.requests()); n != 2 {
+		t.Fatalf("after the clear the upstream saw %d requests, want 2", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilityDecision, routing.CapabilityYes, routing.CapabilitySourceSystemOneProbe)
+
+	runCapabilityCycle(runner)
+	if n := len(up.requests()); n != 2 {
+		t.Fatalf("with the verdict back on file the upstream saw %d requests, want still 2", n)
+	}
+}
+
+// TestSystemOnePassEscalatesTheBackoffOnARefusal: an upstream that refuses
+// the probe request itself (a 400, 405 or 422) will refuse it again, so each
+// refusal in a row doubles the window before the next probe, from
+// systemOneRetryBackoff up to systemOneRefusedBackoffCap. A verdict, or a new
+// identity behind the mapping, starts again from systemOneRetryBackoff.
+func TestSystemOnePassEscalatesTheBackoffOnARefusal(t *testing.T) {
+	up := newSystemOneUpstream(t)
+	up.answer(http.StatusBadRequest, `{"error":"bad request"}`)
+	_, port := up.hostPort(t)
+	runner, st, _ := systemOneRunner(t, up, systemOneApp(routing.ProviderLlamaCPP, port, routing.APIFlavorDecisions), systemOneMapping("m1", "decider"))
+	current := time.Unix(10_000, 0).UTC()
+	runner.now = func() time.Time { return current }
+	if systemOneRefusedBackoffCap != time.Hour {
+		t.Fatalf("systemOneRefusedBackoffCap = %v, want 1h", systemOneRefusedBackoffCap)
+	}
+
+	// expectWindow asserts the next probe comes exactly window after the last.
+	expectWindow := func(step string, window time.Duration) {
+		t.Helper()
+		before := len(up.requests())
+		current = current.Add(window - time.Second)
+		runCapabilityCycle(runner)
+		if n := len(up.requests()); n != before {
+			t.Fatalf("%s: %v into a %v window the upstream saw %d requests, want still %d", step, window-time.Second, window, n, before)
+		}
+		current = current.Add(time.Second)
+		runCapabilityCycle(runner)
+		if n := len(up.requests()); n != before+1 {
+			t.Fatalf("%s: at the end of a %v window the upstream saw %d requests, want %d", step, window, n, before+1)
+		}
+	}
+
+	runCapabilityCycle(runner)
+	for i, window := range []time.Duration{5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 40 * time.Minute, time.Hour, time.Hour} {
+		expectWindow("refusal "+strconv.Itoa(i+1), window)
+	}
+
+	// A verdict ends the streak: once it is cleared again, a refusal backs
+	// off from the start.
+	up.answer(http.StatusOK, `{"answers":{"probe":{"type":"noul","noul":0.9}}}`)
+	expectWindow("the verdict", time.Hour)
+	st.assertCapability(t, "m1", routing.CapabilityDecision, routing.CapabilityYes, routing.CapabilitySourceSystemOneProbe)
+	up.answer(http.StatusBadRequest, `{"error":"bad request"}`)
+	st.mu.Lock()
+	delete(st.caps["m1"], routing.CapabilityDecision)
+	st.mu.Unlock()
+	runCapabilityCycle(runner)
+	expectWindow("after a verdict", systemOneRetryBackoff)
+	expectWindow("after a verdict, second refusal", 2*systemOneRetryBackoff)
+
+	// A new identity starts from the start as well.
+	st.mu.Lock()
+	st.mappings["a1"] = []routing.ModelMapping{systemOneMapping("m1", "decider-v2")}
+	st.mu.Unlock()
+	runCapabilityCycle(runner)
+	expectWindow("a new identity", systemOneRetryBackoff)
+}

@@ -49,11 +49,16 @@ var (
 	// whose identity changed is not held by it.
 	speechRateRetryBackoff = 5 * time.Minute
 	// systemOneRetryBackoff is how long a mapping whose System One decision probe
-	// stated no verdict (a timeout, a 400, a 503 while the model loads, an answer
+	// stated no verdict (a timeout, a 503 while the model loads, an answer
 	// without the probe's answer) is left alone before the pass asks again (see
-	// probeSystemOne), so an upstream that cannot answer costs one tiny POST per
-	// window instead of one per health tick.
+	// settleSystemOne), so an upstream that cannot answer costs one tiny POST per
+	// window instead of one per health tick. It is also the first window of a
+	// probe the upstream refused (a 400, 405 or 422), which doubles from there.
 	systemOneRetryBackoff = 5 * time.Minute
+	// systemOneRefusedBackoffCap bounds the window a refused System One probe
+	// doubles towards: a model that keeps refusing the probe is asked once an
+	// hour at most, so the probe does not keep it loaded.
+	systemOneRefusedBackoffCap = time.Hour
 )
 
 // systemOneProbeTimeout bounds one System One decision probe (probeSystemOne).
@@ -328,12 +333,20 @@ type appHealthRunner struct {
 	speechParamsBackoff mappingBackoff
 	// systemOneSettled remembers the System One decision probes that stated a
 	// verdict in this process, keyed by systemOneProbeKey (the mapping and the
-	// identity of what serves it), so probeSystemOne asks each identity once and
-	// a gateway restart asks it once again. systemOneBackoff paces the probes
-	// that stated none (systemOneRetryBackoff), under the same key. Their zero
-	// values are ready; the runner is used by pointer, never copied.
-	systemOneSettled mappingSet
-	systemOneBackoff mappingBackoff
+	// identity of what serves it), so probeSystemOne asks each identity once
+	// while its verdict stays on file (systemOneDue) and a gateway restart asks
+	// it once again. systemOneBackoff paces the probes that stated none, under
+	// the same key, and systemOneRefusals holds how long the window of a
+	// refused one has grown (settleSystemOne). systemOneInFlight holds the ids
+	// of the applications whose detached pass is running (startSystemOnePasses),
+	// and systemOnePasses counts those passes, so a caller can wait for them;
+	// the loop never does. Their zero values are ready; the runner is used by
+	// pointer, never copied.
+	systemOneSettled  mappingSet
+	systemOneBackoff  mappingBackoff
+	systemOneRefusals escalatingBackoff
+	systemOneInFlight mappingSet
+	systemOnePasses   sync.WaitGroup
 }
 
 // mappingSet is a set of mapping ids, safe for concurrent use: the loop's per-server cycles
@@ -366,6 +379,64 @@ func (m *mappingSet) remove(mappingID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.ids, mappingID)
+}
+
+// tryAdd puts id in the set and reports true, or reports false when it is in
+// the set already: one atomic step, for a caller that claims id.
+func (m *mappingSet) tryAdd(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.ids[id]; ok {
+		return false
+	}
+	if m.ids == nil {
+		m.ids = map[string]struct{}{}
+	}
+	m.ids[id] = struct{}{}
+	return true
+}
+
+// escalatingBackoff remembers, per mapping, the last back-off window a step
+// opened for one key of that mapping, so the next window for the same key
+// doubles (settleSystemOne: a System One probe the upstream refused). A
+// different key -- a new identity behind the mapping -- starts from the base
+// window again, and reset ends the streak. It is keyed by mapping id, so it
+// is bounded by the mappings that ever opened a window. Mutex-guarded, since
+// the detached passes of several applications share it; its zero value is
+// ready.
+type escalatingBackoff struct {
+	mu   sync.Mutex
+	last map[string]escalatedWindow
+}
+
+// escalatedWindow is the last window escalatingBackoff opened for a mapping,
+// and the key it opened it for.
+type escalatedWindow struct {
+	key    string
+	window time.Duration
+}
+
+// next returns the window to open for key of mappingID: base the first time,
+// then twice the last one for the same key, at most ceiling.
+func (e *escalatingBackoff) next(mappingID, key string, base, ceiling time.Duration) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.last == nil {
+		e.last = map[string]escalatedWindow{}
+	}
+	window := base
+	if prev, ok := e.last[mappingID]; ok && prev.key == key {
+		window = min(2*prev.window, ceiling)
+	}
+	e.last[mappingID] = escalatedWindow{key: key, window: window}
+	return window
+}
+
+// reset ends mappingID's streak, if it has one.
+func (e *escalatingBackoff) reset(mappingID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.last, mappingID)
 }
 
 // lateSpeechRateTrigger is the app-health runner's handle on the gateway Server's
@@ -659,7 +730,7 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 // Best-effort: a read or write failure is logged and the pass carries on.
 // settled reports whether the store now holds what it should for these rows
 // (written, already on file, or outranked); it is false only after such a
-// failure, for a caller that remembers a settled probe (probeSystemOne) and
+// failure, for a caller that remembers a settled probe (settleSystemOne) and
 // must not remember one whose verdict never landed.
 func (r *appHealthRunner) writeCapabilityRows(ctx context.Context, mp routing.ModelMapping, reported []routing.CapabilityRow) (settled bool) {
 	if len(reported) == 0 {
@@ -1801,57 +1872,158 @@ func systemOneProbeKey(mappingID, identity string) string {
 	return "systemone:" + mappingID + ":" + identity
 }
 
-// probeSystemOne is the System One decision pass for ONE application: for each
-// active mapping whose EFFECTIVE flavors include decisions
-// (routing.MappingHasAPIFlavor over routing.EffectiveFields, so a server_agent
-// spec's flavors win) it sends one tiny POST /v1/systemone naming the mapping's
-// app model name (provider.SystemOneProber) and writes the decision verdict the
-// answer states (systemOneCapabilityRows through writeCapabilityRows, so the
-// precedence and change-detection guards hold: an operator's yes is never
-// overwritten). The probe is unmetered: it goes straight through the prober,
-// not the gateway relay, so it leaves no usage row and no capture.
+// startSystemOnePasses is the System One decision step of probeServer: for
+// every active application that declares decisions and whose last observed
+// reachability (reachable, this cycle's probe or the one it reused) is true,
+// it starts probeSystemOne DETACHED from the cycle, at most one pass per
+// application at a time (systemOneInFlight). A decision probe is a real
+// inference with its own timeout (systemOneProbeTimeout), asked of the
+// application's mappings one after another, so a blackholed host or a stuck
+// model would otherwise hold every server's health derivation and the next
+// cycle for that long per unsettled mapping. An application whose pass is
+// still in flight is skipped without stamping its cadence, so the first due
+// tick after the pass ends starts the next one.
+//
+// An application that does not declare decisions has no mapping the rule
+// could admit (routing.MappingHasAPIFlavor asks the application first), so it
+// costs no goroutine and no store read. Its own "systemone:"+id cadence key,
+// seen-marked for every such app, paced by the application's effective
+// interval; a settled verdict is not asked again within this process while it
+// stays on file (systemOneSettled, systemOneDue). An off-mesh server under
+// netbird_only is never dialed: its applications are unreachable here. It
+// returns the finest cadence it saw, narrowed from nextSeconds.
+func (r *appHealthRunner) startSystemOnePasses(ctx context.Context, server routing.AIServer, active []routing.Application, reachable []bool, cfg cycleCfg, state *cycleState, nextSeconds int) int {
+	soProber, ok := r.prober.(provider.SystemOneProber)
+	if !ok {
+		return nextSeconds
+	}
+	for i, app := range active {
+		if !slices.Contains(app.APIFlavors, routing.APIFlavorDecisions) {
+			continue
+		}
+		key := "systemone:" + app.ID
+		state.seen[key] = true
+		eff := routing.EffectiveHealthCheckIntervalSeconds(app, cfg.systemSeconds, portal.MinHealthCheckIntervalSeconds, portal.MaxHealthCheckIntervalSeconds)
+		nextSeconds = min(nextSeconds, eff)
+		if last, ok := state.lastProbed[key]; ok && cfg.tNow.Sub(last) < time.Duration(eff)*time.Second {
+			continue
+		}
+		if !reachable[i] || !r.systemOneInFlight.tryAdd(app.ID) {
+			continue
+		}
+		state.lastProbed[key] = cfg.tNow
+		r.systemOnePasses.Add(1)
+		go func(app routing.Application) {
+			defer r.systemOnePasses.Done()
+			defer r.systemOneInFlight.remove(app.ID)
+			r.probeSystemOne(ctx, server, app, soProber)
+		}(app)
+	}
+	return nextSeconds
+}
+
+// systemOneAppView is what probeSystemOne reads once per application before
+// it looks at the mappings: for a server_agent application its runtime specs
+// by mapping id and the app model names its agent reports loaded.
+type systemOneAppView struct {
+	agent  bool
+	specs  map[string]routing.RuntimeSpec
+	loaded map[string]struct{}
+}
+
+// systemOneView reads app's systemOneAppView. ok is false when the runtime
+// specs of a server_agent application cannot be read: their effective
+// flavors cannot be told, so none of its mappings is asked this pass.
+func (r *appHealthRunner) systemOneView(ctx context.Context, server routing.AIServer, app routing.Application) (systemOneAppView, bool) {
+	view := systemOneAppView{agent: app.Type == routing.ProviderServerAgent, specs: map[string]routing.RuntimeSpec{}, loaded: map[string]struct{}{}}
+	if !view.agent {
+		return view, true
+	}
+	specs, err := r.store.RuntimeSpecsByApplication(ctx, app.ID)
+	if err != nil {
+		log.Printf("app health: runtime specs for app %s failed: %v (no decision probe this tick)", app.ID, err)
+		return view, false
+	}
+	for _, sp := range specs {
+		view.specs[sp.MappingID] = sp
+	}
+	if r.loaded != nil {
+		for _, name := range r.loaded.LoadedAppModels(app.ID, server.ID) {
+			view.loaded[name] = struct{}{}
+		}
+	}
+	return view, true
+}
+
+// systemOneCandidate is one mapping the System One pass may probe: its key
+// (systemOneProbeKey), the credential to send, and whether what serves it
+// may be asked at all (false only for a server_agent mapping its agent does
+// not report loaded).
+type systemOneCandidate struct {
+	mp                    routing.ModelMapping
+	key                   string
+	authToken, authHeader string
+	loaded                bool
+}
+
+// systemOneCandidateFor reports whether mp is one the pass asks about -- an
+// active mapping with an app model name whose EFFECTIVE flavors include
+// decisions (routing.MappingHasAPIFlavor over routing.EffectiveFields, so a
+// server_agent spec's flavors win) -- and builds its systemOneCandidate: the
+// app model name and the application's credential for an external
+// application, the launch spec's identity (agentSpecIdentity) and credential
+// (routing.SpecUpstreamAuth) for an agent-launched one.
+func systemOneCandidateFor(app routing.Application, mp routing.ModelMapping, view systemOneAppView) (systemOneCandidate, bool) {
+	if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
+		return systemOneCandidate{}, false
+	}
+	spec, hasSpec := view.specs[mp.ID]
+	if !routing.MappingHasAPIFlavor(app, routing.EffectiveFields(app, spec, hasSpec), routing.APIFlavorDecisions) {
+		return systemOneCandidate{}, false
+	}
+	c := systemOneCandidate{mp: mp, authToken: app.APIToken, authHeader: app.APITokenHeader, loaded: true}
+	identity := mp.AppModelName
+	if view.agent {
+		identity = agentSpecIdentity(spec)
+		c.authToken, c.authHeader = routing.SpecUpstreamAuth(spec, app)
+		_, c.loaded = view.loaded[mp.AppModelName]
+	}
+	c.key = systemOneProbeKey(mp.ID, identity)
+	return c, true
+}
+
+// probeSystemOne is the System One decision pass for ONE application, run
+// detached from the health cycle (startSystemOnePasses): for each mapping the
+// pass asks about (systemOneCandidateFor) it sends one tiny POST /v1/systemone
+// naming the mapping's app model name (provider.SystemOneProber) and writes
+// the decision verdict the answer states (systemOneCapabilityRows through
+// writeCapabilityRows, so the precedence and change-detection guards hold: an
+// operator's yes is never overwritten). The probe is unmetered: it goes
+// straight through the prober, not the gateway relay, so it leaves no usage
+// row and no capture.
 //
 //   - An external application (any type but server_agent) is asked at its
 //     ApplicationEndpoint with its own credential, once per (mapping, app model
-//     name).
+//     name). Nothing tells the pass whether such a model is loaded, so an
+//     upstream that loads models on demand can load each one once for it.
 //   - A server_agent mapping is asked through the agent router at the same
-//     endpoint, with its runtime spec's credential (routing.SpecUpstreamAuth),
-//     once per (mapping, agentSpecIdentity), and only while the agent reports
-//     its model loaded (LoadedAppModels): the router starts a child for any
-//     request naming it and refreshes its idle timer on every one, so the pass
-//     does not ask a model the agent reports unloaded, and does not ask a loaded
-//     one again once settled. The loaded set is a snapshot, so a model that
-//     unloads within its staleness can still be started once by the probe. A
-//     runtime spec read that fails asks none of the application's mappings this
-//     tick, since their effective flavors cannot be told.
+//     endpoint, with its runtime spec's credential, once per (mapping,
+//     agentSpecIdentity), and only while the agent reports its model loaded
+//     (LoadedAppModels): the router starts a child for any request naming it
+//     and refreshes its idle timer on every one, so the pass does not ask a
+//     model the agent reports unloaded, and does not ask a loaded one again
+//     once settled. The loaded set is a snapshot, so a model that unloads
+//     within its staleness can still be started once by the probe.
 //
 // The probe target carries systemOneProbeTimeout, not the loop's probeTimeout:
-// the answer is a real inference.
-//
-// A verdict (yes or no) that landed settles the key for this process
-// (systemOneSettled), so a gateway restart re-probes once. No verdict writes
-// nothing and opens a back-off (systemOneRetryBackoff), as does a verdict the
-// store failed to take. A model that leaves the loaded set has its back-off
-// cleared, so a reload is asked at once. Best-effort: every failure is logged
-// and the pass carries on.
+// the answer is a real inference. One instant (r.now at the start of the
+// pass) stamps the back-off windows the pass opens and the CheckedAt of the
+// rows it writes. Best-effort: every failure is logged and the pass carries
+// on.
 func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.SystemOneProber) {
-	agent := app.Type == routing.ProviderServerAgent
-	specByMapping := map[string]routing.RuntimeSpec{}
-	loadedSet := map[string]struct{}{}
-	if agent {
-		specs, err := r.store.RuntimeSpecsByApplication(ctx, app.ID)
-		if err != nil {
-			log.Printf("app health: runtime specs for app %s failed: %v (no decision probe this tick)", app.ID, err)
-			return
-		}
-		for _, sp := range specs {
-			specByMapping[sp.MappingID] = sp
-		}
-		if r.loaded != nil {
-			for _, name := range r.loaded.LoadedAppModels(app.ID, server.ID) {
-				loadedSet[name] = struct{}{}
-			}
-		}
+	view, ok := r.systemOneView(ctx, server, app)
+	if !ok {
+		return
 	}
 	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -1863,52 +2035,103 @@ func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIS
 		Endpoint: routing.ApplicationEndpoint(server, app),
 		Timeout:  systemOneProbeTimeout,
 	}
-	// One instant for the whole pass: the back-off windows it opens and the
-	// CheckedAt of the rows it writes.
 	now := r.now()
 	for _, mp := range mappings {
-		if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
-			continue
+		if c, ok := systemOneCandidateFor(app, mp, view); ok {
+			r.probeSystemOneMapping(ctx, app, prober, target, c, now)
 		}
-		spec, hasSpec := specByMapping[mp.ID]
-		if !routing.MappingHasAPIFlavor(app, routing.EffectiveFields(app, spec, hasSpec), routing.APIFlavorDecisions) {
-			continue
-		}
-		identity, authToken, authHeader := mp.AppModelName, app.APIToken, app.APITokenHeader
-		if agent {
-			identity = agentSpecIdentity(spec)
-			authToken, authHeader = routing.SpecUpstreamAuth(spec, app)
-		}
-		key := systemOneProbeKey(mp.ID, identity)
-		if agent {
-			if _, loaded := loadedSet[mp.AppModelName]; !loaded {
-				r.systemOneBackoff.clear(key)
-				continue
-			}
-		}
-		if r.systemOneSettled.has(key) || r.systemOneBackoff.active(key, now) {
-			continue
-		}
-		// Attach the credential to the probe (fail-open).
-		token, _ := capture.OpenSecret(r.cipher, authToken)
-		verdict, err := prober.ProbeSystemOne(provider.WithUpstreamAuth(ctx, authHeader, token), target, mp.AppModelName)
-		rows := systemOneCapabilityRows(verdict, now)
-		if len(rows) == 0 {
-			r.systemOneBackoff.start(key, now, now.Add(systemOneRetryBackoff))
-			if errors.Is(err, provider.ErrAuthRejected) {
-				log.Printf("app health: decision probe for app %s model %q rejected by the upstream (401/403): check the API token", app.ID, mp.AppModelName)
-			} else {
-				slog.Debug("app health: decision probe stated no verdict", "app_id", app.ID, "mapping_id", mp.ID, "model", mp.AppModelName, "error", err)
-			}
-			continue
-		}
-		if !r.writeCapabilityRows(ctx, mp, rows) {
-			r.systemOneBackoff.start(key, now, now.Add(systemOneRetryBackoff))
-			continue
-		}
-		r.systemOneBackoff.clear(key)
-		r.systemOneSettled.add(key)
 	}
+}
+
+// probeSystemOneMapping is probeSystemOne for one candidate mapping. A model
+// its agent does not report loaded is not asked and has its back-off cleared,
+// so a reload is asked at once; a mapping that is not due (systemOneDue) is
+// not asked either. Otherwise the probe's answer is settled by
+// settleSystemOne.
+func (r *appHealthRunner) probeSystemOneMapping(ctx context.Context, app routing.Application, prober provider.SystemOneProber, target routing.Target, c systemOneCandidate, now time.Time) {
+	if !c.loaded {
+		r.systemOneBackoff.clear(c.key)
+		return
+	}
+	if !r.systemOneDue(ctx, c, now) {
+		return
+	}
+	// Attach the credential to the probe (fail-open).
+	token, _ := capture.OpenSecret(r.cipher, c.authToken)
+	verdict, err := prober.ProbeSystemOne(provider.WithUpstreamAuth(ctx, c.authHeader, token), target, c.mp.AppModelName)
+	r.settleSystemOne(ctx, app, c, verdict, err, now)
+}
+
+// systemOneDue reports whether candidate c is to be probed at now. A key that
+// settled in this process (systemOneSettled) is not -- as long as the mapping
+// still has a decision row on file. An operator who clears the verdict in the
+// portal deletes that row, and the probe is the one writer that can restore
+// it, so a settled key without a row is forgotten and probed again. A
+// capability read that fails keeps the key settled for this pass. A key
+// inside its back-off window (systemOneBackoff) is not due either.
+func (r *appHealthRunner) systemOneDue(ctx context.Context, c systemOneCandidate, now time.Time) bool {
+	if r.systemOneSettled.has(c.key) {
+		if r.decisionRowOnFile(ctx, c.mp.ID) {
+			return false
+		}
+		r.systemOneSettled.remove(c.key)
+	}
+	return !r.systemOneBackoff.active(c.key, now)
+}
+
+// decisionRowOnFile reports whether mappingID has a routing.CapabilityDecision
+// row, whatever its verdict and source. A read that fails reports true, so a
+// store glitch does not turn into a probe.
+func (r *appHealthRunner) decisionRowOnFile(ctx context.Context, mappingID string) bool {
+	rows, err := r.store.MappingCapabilities(ctx, mappingID)
+	if err != nil {
+		slog.Debug("app health: capability read for the decision probe failed", "mapping_id", mappingID, "error", err)
+		return true
+	}
+	_, ok := routing.CapabilityRowsByName(rows)[routing.CapabilityDecision]
+	return ok
+}
+
+// settleSystemOne records what one decision probe of candidate c answered at
+// now. A verdict (yes or no) that landed settles the key for this process
+// (systemOneSettled, so a gateway restart re-probes once) and ends any
+// refusal streak. No verdict writes nothing and opens a back-off: one
+// systemOneRetryBackoff long for an answer that can pass on its own (a
+// timeout, a 408, a 429, a 5xx), and, for one that will not
+// (provider.ErrSystemOneProbeRefused: a 400, 405 or 422), a window that
+// doubles with each refusal of the same identity in a row up to
+// systemOneRefusedBackoffCap (systemOneRefusals), so a model that refuses the
+// probe is not kept loaded by it. A verdict the store failed to take opens a
+// systemOneRetryBackoff window too.
+func (r *appHealthRunner) settleSystemOne(ctx context.Context, app routing.Application, c systemOneCandidate, verdict string, err error, now time.Time) {
+	rows := systemOneCapabilityRows(verdict, now)
+	if len(rows) == 0 {
+		window := systemOneRetryBackoff
+		if errors.Is(err, provider.ErrSystemOneProbeRefused) {
+			window = r.systemOneRefusals.next(c.mp.ID, c.key, systemOneRetryBackoff, systemOneRefusedBackoffCap)
+		}
+		r.systemOneBackoff.start(c.key, now, now.Add(window))
+		logSystemOneNoVerdict(app, c.mp, err)
+		return
+	}
+	if !r.writeCapabilityRows(ctx, c.mp, rows) {
+		r.systemOneBackoff.start(c.key, now, now.Add(systemOneRetryBackoff))
+		return
+	}
+	r.systemOneBackoff.clear(c.key)
+	r.systemOneRefusals.reset(c.mp.ID)
+	r.systemOneSettled.add(c.key)
+}
+
+// logSystemOneNoVerdict logs a decision probe that stated no verdict: a
+// rejected credential at the default level, since only the operator can fix
+// it, anything else at debug.
+func logSystemOneNoVerdict(app routing.Application, mp routing.ModelMapping, err error) {
+	if errors.Is(err, provider.ErrAuthRejected) {
+		log.Printf("app health: decision probe for app %s model %q rejected by the upstream (401/403): check the API token", app.ID, mp.AppModelName)
+		return
+	}
+	slog.Debug("app health: decision probe stated no verdict", "app_id", app.ID, "mapping_id", mp.ID, "model", mp.AppModelName, "error", err)
 }
 
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe
@@ -2484,45 +2707,6 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 				}(app)
 			}
 		}
-
-		// System One decision pass: for every active application that
-		// declares decisions, probe each of its mappings whose effective
-		// flavors include decisions with one tiny POST /v1/systemone and write
-		// the decision verdict (probeSystemOne). External applications and
-		// agent-launched children alike; a child only while the agent reports
-		// it loaded (a model that unloads within the loaded snapshot's
-		// staleness can still be started once by the probe). An application that
-		// does not declare decisions has no mapping the rule could admit
-		// (routing.MappingHasAPIFlavor asks the application first), so it
-		// costs no goroutine and no store read. Its own "systemone:"+id
-		// cadence key, seen-marked for every such app, sharing the
-		// application's effective interval and wg+sem; a settled verdict is
-		// not asked again within this process (systemOneSettled).
-		if soProber, ok := r.prober.(provider.SystemOneProber); ok {
-			for i := range active {
-				app := active[i]
-				if !slices.Contains(app.APIFlavors, routing.APIFlavorDecisions) {
-					continue
-				}
-				key := "systemone:" + app.ID
-				state.seen[key] = true
-				eff := routing.EffectiveHealthCheckIntervalSeconds(app, cfg.systemSeconds, portal.MinHealthCheckIntervalSeconds, portal.MaxHealthCheckIntervalSeconds)
-				if eff < nextSeconds {
-					nextSeconds = eff
-				}
-				if last, ok := state.lastProbed[key]; ok && cfg.tNow.Sub(last) < time.Duration(eff)*time.Second {
-					continue
-				}
-				state.lastProbed[key] = cfg.tNow
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(app routing.Application) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					r.probeSystemOne(ctx, server, app, soProber)
-				}(app)
-			}
-		}
 	}
 	wg.Wait()
 	// Only now, with every probe goroutine done, is state.lastProbed safe to
@@ -2534,6 +2718,9 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 	// asks only about applications this cycle found reachable, with the
 	// capability verdicts the audio.cpp pass just wrote.
 	r.startAudioBenchmarks(ctx, server, active, reachable)
+	// The System One decision pass starts after the probes too, detached from
+	// this cycle, for the applications this cycle found reachable.
+	nextSeconds = r.startSystemOnePasses(ctx, server, active, reachable, cfg, state, nextSeconds)
 
 	reachableCount := 0
 	for _, ok := range reachable {

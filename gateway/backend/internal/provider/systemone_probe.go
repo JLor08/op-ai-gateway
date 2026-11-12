@@ -26,6 +26,23 @@ const (
 	SystemOneProbeNo  = routing.CapabilityNo
 )
 
+// ErrSystemOneProbeRefused marks a probe answer that is no verdict and will
+// not change on its own: a 400, 405 or 422, the upstream refusing the request
+// itself. It wraps ErrUnavailable like every other no-verdict error, and only
+// paces the caller's retries (the health loop stretches its back-off for it);
+// a timeout, a 408, a 429 or a 5xx can pass on their own and is not marked.
+var ErrSystemOneProbeRefused = fmt.Errorf("%w (the upstream refused the probe request)", ErrUnavailable)
+
+// systemOneProbeRefusal reports whether status is one ErrSystemOneProbeRefused
+// marks.
+func systemOneProbeRefusal(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
 // systemOneProbeQuestion is the one question of the probe: a tiny noul
 // question about a non-empty state, which any System One server answers
 // without loading anything the model does not already hold.
@@ -49,8 +66,9 @@ const systemOneProbeQuestion = "Is the state non-empty?"
 //
 // "" is the only verdict that is not an answer, so the caller writes nothing
 // for it and asks again later. err is nil for both real verdicts and, for "",
-// says why there was none (for the log); a caller decides by the verdict
-// alone.
+// says why there was none: for the log, and, through ErrSystemOneProbeRefused
+// (a 400, 405 or 422), for how long the caller waits before asking again. A
+// caller decides what to write by the verdict alone.
 //
 // It is a client method, like ProbeSdcppCapabilities, because the request must
 // ride the client's own *http.Client, which cmd/gateway builds on the outbound
@@ -139,6 +157,8 @@ func probeSystemOne(ctx context.Context, httpClient *http.Client, target routing
 	switch {
 	case resp.StatusCode == http.StatusNotImplemented:
 		return SystemOneProbeNo, nil
+	case systemOneProbeRefusal(resp.StatusCode):
+		return "", fmt.Errorf("%w: upstream status %d", ErrSystemOneProbeRefused, resp.StatusCode)
 	case resp.StatusCode != http.StatusNotFound && (resp.StatusCode < 200 || resp.StatusCode >= 300):
 		return "", unavailableStatus(resp.StatusCode)
 	}

@@ -6,6 +6,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -72,6 +73,64 @@ func TestProbeSystemOneClassifies(t *testing.T) {
 			}
 			if tc.want != "" && err != nil {
 				t.Fatalf("a %q verdict came with error %v, want nil", tc.want, err)
+			}
+		})
+	}
+}
+
+// probeSystemOneAgainst runs one probe against a server that answers status
+// with a small error body, after delay; a delay outlasts the probe's timeout.
+func probeSystemOneAgainst(t *testing.T, status int, delay time.Duration) (string, error) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"error":"x"}`))
+	}))
+	defer srv.Close()
+	target := routing.Target{Endpoint: srv.URL, Timeout: time.Second}
+	if delay > 0 {
+		target.Timeout = 20 * time.Millisecond
+	}
+	return NewOpenAICompatibleClient(srv.Client()).ProbeSystemOne(context.Background(), target, "m")
+}
+
+// TestProbeSystemOneMarksARefusal: a 400, 405 or 422 is no verdict, but one
+// that will not change on its own -- the upstream refuses the request itself --
+// so the probe marks it ErrSystemOneProbeRefused and the caller can stretch its
+// back-off. A timeout, a 408, a 429, a 5xx and a rejected credential are no
+// verdict without that mark: they can pass on their own.
+func TestProbeSystemOneMarksARefusal(t *testing.T) {
+	cases := []struct {
+		status  int
+		delay   time.Duration
+		refused bool
+	}{
+		{http.StatusBadRequest, 0, true},
+		{http.StatusMethodNotAllowed, 0, true},
+		{http.StatusUnprocessableEntity, 0, true},
+		{http.StatusRequestTimeout, 0, false},
+		{http.StatusTooManyRequests, 0, false},
+		{http.StatusInternalServerError, 0, false},
+		{http.StatusServiceUnavailable, 0, false},
+		{http.StatusUnauthorized, 0, false},
+		{http.StatusOK, 200 * time.Millisecond, false},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status)+"/"+tc.delay.String(), func(t *testing.T) {
+			got, err := probeSystemOneAgainst(t, tc.status, tc.delay)
+			if got != "" || err == nil {
+				t.Fatalf("verdict = %q, err = %v; want no verdict and an error", got, err)
+			}
+			if refused := errors.Is(err, ErrSystemOneProbeRefused); refused != tc.refused {
+				t.Fatalf("errors.Is(%v, ErrSystemOneProbeRefused) = %v, want %v", err, refused, tc.refused)
+			}
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("err = %v, want it to wrap ErrUnavailable", err)
 			}
 		})
 	}
