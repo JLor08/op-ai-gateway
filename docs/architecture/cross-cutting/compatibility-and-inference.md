@@ -1606,10 +1606,14 @@ zero tokens. An upstream non-2xx is relayed verbatim, body and status, and recor
 
 **5. Model discovery.** `GET /v1/systemone/models` (`handleSystemOneModels`, bearer only)
 answers `{"object":"list","data":[{"id","object":"model","api":"systemone"}]}`, `data` an
-empty array rather than `null` when nothing qualifies. A model is listed when its
-mapping lists the `decisions` flavor (`modelDTOsOnFlavor`) **and** its folded
-`ModelDTO.Decision` is true (a `decision: yes` verdict), so a model the gate would refuse
-is never offered. Visibility **mirrors `GET /v1/models` exactly** (`Portal.Models`):
+empty array rather than `null` when nothing qualifies. A model is listed when it carries
+the `decisions` flavor (`modelDTOsOnFlavor`) **and** its folded `ModelDTO.Decision` is
+true: every mapping has a `decision: yes` verdict **and** an effective `systemone_mode`
+that is not `disabled` (`routing.MappingServesDecisionEndpoint`, the spec's mode for a
+`server_agent` mapping with a spec), so a model the gate or the mode would refuse is never
+offered. The `decisions` flavor alone does not qualify a model here: in every listing it
+means "at least one decision endpoint is served" (§6), so a model whose only served
+decision endpoint is `/v1/decisions` keeps it and is still left out. Visibility **mirrors `GET /v1/models` exactly** (`Portal.Models`):
 unfiltered by a service token's own allowlist, because the allowlist restricts
 *invocation*, not discovery (§9), and filtered by resource-group provisioning, aliases and
 hidden models included.
@@ -2308,7 +2312,17 @@ application whose mode for the request's flavor is `disabled` is removed at cand
 `decisions` reads `SystemOneMode`), so the model is `404 routing.no_model_route` when
 nothing else serves it; a **`server_agent`** application is never removed there, its resolved
 spec decides after the resolve: `404 decisions.endpoint_disabled` /
-`404 systemone.endpoint_disabled`. A forced mode whose verdict the mapping lacks is `404
+`404 systemone.endpoint_disabled`. The listings and the unknown-model redirect read the
+**effective** modes instead, for an ordinary application and a `server_agent` spec alike:
+a model's `decisions` flavor (`routing.MappingServesAPIFlavor`, on `/api/portal/models`,
+`/v1/models` and every per-flavor listing) means **at least one** decision endpoint is
+served (effective `systemone_mode` or `decisions_mode` not `disabled`);
+`GET /v1/systemone/models` lists by the effective `systemone_mode` (§3.9 item 5); and the
+redirect's `ModelOffering.Callable` judges a name per endpoint
+(`routing.MappingServesDecisionEndpoint`): `/v1/decisions` asks under the fine
+`openai_decisions` (`offeringFlavor`) and is judged by `decisions_mode`, `/v1/systemone` by
+`systemone_mode`. A name whose endpoint is disabled stays `Existing`, the "exists but you
+cannot call it" case `UnknownModelRedirectBlocked` redirects. A forced mode whose verdict the mapping lacks is `404
 routing.model_not_capable` after the resolve (no re-selection), and `routing.EffectiveDecisionsRoute`
 is the one function that maps mode and verdicts to a route.
 `passthrough` is **refused at save for `llama_cpp`**, which has no `/v1/decisions` route:

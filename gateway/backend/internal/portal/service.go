@@ -1470,9 +1470,11 @@ type ModelDTO struct {
 	Speech bool `json:"speech"`
 	// Decision is true only when POST /v1/systemone would serve the model --
 	// EVERY offering mapping (or, for a group, every offerable member) has a
-	// (decision, yes) verdict and declares the decisions flavor (the
-	// application's and, for an agent-launched model with a spec, the spec's):
-	// AND aggregation, fail-closed, exactly like Speech. It is
+	// (decision, yes) verdict, declares the decisions flavor (the
+	// application's and, for an agent-launched model with a spec, the spec's)
+	// and has its effective systemone mode not disabled
+	// (routing.MappingServesDecisionEndpoint): AND aggregation, fail-closed,
+	// exactly like Speech. It is
 	// decisionFlagsByName's result, the one decision fold ModelOffering.Capable
 	// asks too, and GET /v1/systemone/models lists only the rows that carry it.
 	// Always present, like its sibling flags.
@@ -2242,7 +2244,9 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 //
 // Every known flavor counts, openai_images and openai_audio included: a name
 // valid for only one of them is still a valid setting, and every consumer
-// re-checks the flavor per request. A name that no flavor serves
+// re-checks the flavor per request. The decisions flavor is asked as its two
+// endpoints (ModelOfferingFor: decisions for /v1/systemone, openai_decisions
+// for /v1/decisions), so a name either one serves counts. A name that no flavor serves
 // (routing.MappingServesAPIFlavor) is in no Callable set and therefore not a
 // valid setting, although Models() still lists it. Groups share the model
 // namespace and are therefore included by the same lookup.
@@ -2252,7 +2256,7 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 // load and one runtime-spec read per server_agent application, per flavor.
 func (s *Service) callableModelNames(ctx context.Context, owner auth.Token) map[string]struct{} {
 	out := make(map[string]struct{})
-	for _, flavor := range knownAPIFlavors {
+	for _, flavor := range append(slices.Clone(knownAPIFlavors), routing.APIFlavorOpenAIDecisions) {
 		for name := range s.ModelOfferingFor(ctx, owner, flavor, nil).Callable {
 			out[name] = struct{}{}
 		}
@@ -3475,12 +3479,26 @@ func speechFlagsByName(views []mappingView, speechRows map[string]routing.Capabi
 
 // decisionFlagsByName is speechFlagsByName's decision twin: a name carries the
 // decision capability only when EVERY one of its mappings has a (decision, yes)
-// verdict (decisionRows, keyed by mapping id) AND passes the decisions flavor
-// half. Fail-closed, independent of every other capability.
+// verdict (decisionRows, keyed by mapping id) AND POST /v1/systemone serves it:
+// the decisions flavor half and the effective systemone mode not disabled
+// (viewServesSystemOne). Fail-closed, independent of every other capability.
+// It backs ModelDTO.Decision, GET /v1/systemone/models and the /v1/systemone
+// redirect's ModelOffering.Capable.
 func decisionFlagsByName(views []mappingView, decisionRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	return foldMappingFlags(views, func(view mappingView) bool {
-		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesSystemOne(view, idx)
 	})
+}
+
+// viewServesSystemOne is viewHasAPIFlavorFailClosed for POST /v1/systemone:
+// the mapping passes routing.MappingServesDecisionEndpoint for the systemone
+// endpoint under its effective flavors and modes, and an application whose spec
+// read failed passes nothing, since the unreadable spec may disable it.
+func viewServesSystemOne(view mappingView, idx runtimeSpecIndex) bool {
+	if _, failed := idx.failed[view.app.ID]; failed {
+		return false
+	}
+	return routing.MappingServesDecisionEndpoint(view.app, idx.effective(view), routing.APIFlavorDecisions)
 }
 
 // decisionOpenAIFlagsByName is decisionFlagsByName's twin for the

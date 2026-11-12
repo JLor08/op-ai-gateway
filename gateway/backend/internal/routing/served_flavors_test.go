@@ -570,3 +570,88 @@ func TestMappingServesAPIFlavorDecisionsOnlyIsNotOpenAI(t *testing.T) {
 		}
 	}
 }
+
+// decisionModeCase is one (systemone_mode, decisions_mode) pair and what the
+// listings and the two decision endpoints make of it.
+type decisionModeCase struct {
+	name                string
+	systemOne, decision EndpointMode
+	listed              bool // the decisions flavor in a listing: either endpoint served
+	systemOneServed     bool // POST /v1/systemone: the systemone mode
+	decisionsServed     bool // POST /v1/decisions: the decisions mode
+}
+
+var decisionModeCases = []decisionModeCase{
+	{"both on", EndpointModePassthrough, EndpointModeAuto, true, true, true},
+	{"systemone disabled", EndpointModeDisabled, EndpointModeAuto, true, false, true},
+	{"decisions disabled", EndpointModePassthrough, EndpointModeDisabled, true, true, false},
+	{"both disabled", EndpointModeDisabled, EndpointModeDisabled, false, false, false},
+	{"blank modes", "", "", true, true, true},
+}
+
+// The decisions flavor in a listing means "at least one decision endpoint is
+// served": listed, and the effective systemone mode or the effective decisions
+// mode not disabled. An ordinary application and a server_agent spec answer
+// alike, the spec's modes winning over its application's (which are set to the
+// opposite here so a rule reading the wrong row fails).
+func TestMappingServesAPIFlavorDecisionsFollowsEitherEffectiveMode(t *testing.T) {
+	flip := func(m EndpointMode) EndpointMode {
+		if m == EndpointModeDisabled {
+			return EndpointModePassthrough
+		}
+		return EndpointModeDisabled
+	}
+	for _, tc := range decisionModeCases {
+		plain := Application{Type: ProviderVLLM, APIFlavors: []string{APIFlavorDecisions}, SystemOneMode: tc.systemOne, DecisionsMode: tc.decision}
+		if got := MappingServesAPIFlavor(plain, EffectiveFields(plain, RuntimeSpec{}, false), APIFlavorDecisions); got != tc.listed {
+			t.Errorf("%s, ordinary application: MappingServesAPIFlavor(decisions) = %v, want %v", tc.name, got, tc.listed)
+		}
+		agent := Application{Type: ProviderServerAgent, APIFlavors: []string{APIFlavorOpenAI, APIFlavorDecisions}, SystemOneMode: flip(tc.systemOne), DecisionsMode: flip(tc.decision)}
+		spec := RuntimeSpec{APIFlavors: []string{APIFlavorDecisions}, SystemOneMode: tc.systemOne, DecisionsMode: tc.decision}
+		if got := MappingServesAPIFlavor(agent, EffectiveFields(agent, spec, true), APIFlavorDecisions); got != tc.listed {
+			t.Errorf("%s, server_agent spec: MappingServesAPIFlavor(decisions) = %v, want %v", tc.name, got, tc.listed)
+		}
+	}
+}
+
+// MappingServesDecisionEndpoint judges each decision endpoint by its own
+// effective mode: /v1/systemone (the decisions request flavor) by the
+// systemone mode, /v1/decisions (openai_decisions) by the decisions mode. Any
+// other flavor is not a decision endpoint.
+func TestMappingServesDecisionEndpointJudgesEachEndpointByItsOwnMode(t *testing.T) {
+	flip := func(m EndpointMode) EndpointMode {
+		if m == EndpointModeDisabled {
+			return EndpointModePassthrough
+		}
+		return EndpointModeDisabled
+	}
+	for _, tc := range decisionModeCases {
+		plain := Application{Type: ProviderVLLM, APIFlavors: []string{APIFlavorDecisions}, SystemOneMode: tc.systemOne, DecisionsMode: tc.decision}
+		agent := Application{Type: ProviderServerAgent, APIFlavors: []string{APIFlavorOpenAI, APIFlavorDecisions}, SystemOneMode: flip(tc.systemOne), DecisionsMode: flip(tc.decision)}
+		spec := RuntimeSpec{APIFlavors: []string{APIFlavorDecisions}, SystemOneMode: tc.systemOne, DecisionsMode: tc.decision}
+		for label, m := range map[string]struct {
+			app Application
+			eff EffectiveSpecFields
+		}{
+			"ordinary application": {plain, EffectiveFields(plain, RuntimeSpec{}, false)},
+			"server_agent spec":    {agent, EffectiveFields(agent, spec, true)},
+		} {
+			if got := MappingServesDecisionEndpoint(m.app, m.eff, APIFlavorDecisions); got != tc.systemOneServed {
+				t.Errorf("%s, %s: systemone endpoint served = %v, want %v", tc.name, label, got, tc.systemOneServed)
+			}
+			if got := MappingServesDecisionEndpoint(m.app, m.eff, APIFlavorOpenAIDecisions); got != tc.decisionsServed {
+				t.Errorf("%s, %s: decisions endpoint served = %v, want %v", tc.name, label, got, tc.decisionsServed)
+			}
+			if MappingServesDecisionEndpoint(m.app, m.eff, APIFlavorOpenAI) {
+				t.Errorf("%s, %s: openai is no decision endpoint", tc.name, label)
+			}
+		}
+	}
+	// The flavor half still applies: a mapping without the decisions flavor
+	// serves neither endpoint, whatever its modes say.
+	textOnly := Application{Type: ProviderVLLM, APIFlavors: []string{APIFlavorOpenAI}}
+	eff := EffectiveFields(textOnly, RuntimeSpec{}, false)
+	if MappingServesDecisionEndpoint(textOnly, eff, APIFlavorDecisions) || MappingServesDecisionEndpoint(textOnly, eff, APIFlavorOpenAIDecisions) {
+		t.Error("an application without the decisions flavor must serve no decision endpoint")
+	}
+}

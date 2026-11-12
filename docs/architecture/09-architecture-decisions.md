@@ -12004,7 +12004,10 @@ operator can read, never a guess. The contract was checked against openai-python
   stored, and `NormalizeAPIFlavor` folds it onto `decisions`, so one opt-in per application serves both decision
   endpoints and candidacy is unchanged. Its job is to let `applicationServesEndpoint` read the right mode: `DecisionsMode`
   for `openai_decisions`, `SystemOneMode` for the coarse `decisions` that `/v1/systemone` sends. `any_decision` (b) and
-  the request flavor are request side only.
+  the request flavor are request side only. The listings read the effective modes instead: a model's `decisions`
+  flavor means at least one decision endpoint is served, `GET /v1/systemone/models` lists by `systemone_mode`, and the
+  unknown-model redirect asks under the request flavor, so its `Callable` judges `/v1/decisions` by `decisions_mode`
+  and `/v1/systemone` by `systemone_mode` (`routing.MappingServesDecisionEndpoint`).
 - **(b) The pre-resolve gate is a derived requirement, `any_decision`.** `POST /v1/decisions` sets
   `RequiredCapabilities = ["any_decision"]`, satisfied by `(decision, yes)` **or** `(decision_openai, yes)` in the one
   `capabilityRowsSatisfy` funnel (the `image_edit` precedent: derived, never a row name; a manual row of that name is

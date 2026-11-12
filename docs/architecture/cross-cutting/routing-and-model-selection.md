@@ -181,7 +181,12 @@ way it refines `openai_responses` and `anthropic_messages`. An **ordinary** appl
 with the request's mode `disabled` drops out of candidacy, a `server_agent` application
 never does (its resolved runtime spec decides after the resolve, where
 `Target.DecisionsMode`/`Target.SystemOneMode`, resolved by `EffectiveFields` like
-`ResponsesMode`, carry the spec's values). The mode defaults are `auto`
+`ResponsesMode`, carry the spec's values). The model listings and the unknown-model
+redirect read the **effective** modes for an ordinary application and a spec alike: the
+listed `decisions` flavor (`MappingServesAPIFlavor`) means at least one of the two
+endpoints is served, and `MappingServesDecisionEndpoint` answers each endpoint by its own
+mode for `GET /v1/systemone/models` and the redirect's `ModelOffering.Callable`, which
+`/v1/decisions` asks under `openai_decisions`. The mode defaults are `auto`
 (`routing.EndpointModeAuto`, valid for `decisions_mode` only) and `passthrough`, and neither
 depends on the application type: the `stable_diffusion_cpp` and `audio_cpp` default tables
 below never declare `decisions`, and the type enters only through the save-time refusal of
@@ -693,6 +698,12 @@ holds for `openai` when `openai` ∈ A and E is neither images-only nor audio-on
 `anthropic`, `openai_images` or `openai_audio` when the flavor is in both A and E; the
 **served** rule (`routing.MappingServesAPIFlavor`) adds M ≠ `disabled` for
 `anthropic`, and reads A through candidacy's own `applicationServesEndpoint`.
+`decisions` stands for two endpoints: its flavor half is `decisions` in both A and E
+(and not a chat flavor), and the served rule adds that the effective `systemone_mode`
+**or** the effective `decisions_mode` is not `disabled` (at least one endpoint served).
+`Callable` asks one endpoint (`routing.MappingServesDecisionEndpoint`): the request flavor
+`openai_decisions` (`/v1/decisions`) is judged by `decisions_mode`, the coarse `decisions`
+(`/v1/systemone`) by `systemone_mode`.
 `openai` is narrow because chat completions refuses only an images-only or
 audio-only target, so a `["anthropic"]` or `[]` child stays callable under it; `anthropic`
 is the full effective-served rule because `/v1/messages` applies it ([API

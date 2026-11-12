@@ -151,9 +151,21 @@ func MappingHasAPIFlavor(app Application, eff EffectiveSpecFields, flavor string
 // for a server_agent application it checks the coarse flavor only, and eff
 // completes the rule.
 //
-// For an ordinary application whose messages endpoint is not disabled the rule
-// is exactly the application's flavors among the four coarse flavors.
+// decisions stands for TWO endpoints, POST /v1/systemone and POST
+// /v1/decisions, so a listing's decisions flavor means "at least one of them
+// is served": the flavor half, and eff's systemone mode or eff's decisions
+// mode not disabled (MappingServesDecisionEndpoint asks each endpoint on its
+// own). It reads eff's modes for an ordinary application and a server_agent
+// spec alike, so the two cannot disagree.
+//
+// For an ordinary application whose messages endpoint is not disabled, and
+// whose two decision endpoints are not both disabled, the rule is exactly the
+// application's flavors among the five coarse flavors.
 func MappingServesAPIFlavor(app Application, eff EffectiveSpecFields, flavor string) bool {
+	if flavor == APIFlavorDecisions {
+		return MappingServesDecisionEndpoint(app, eff, APIFlavorDecisions) ||
+			MappingServesDecisionEndpoint(app, eff, APIFlavorOpenAIDecisions)
+	}
 	endpoint, known := listedEndpoint(flavor)
 	if !known || !applicationServesEndpoint(app, endpoint) || !effectiveHasAPIFlavor(eff, flavor) {
 		return false
@@ -161,11 +173,38 @@ func MappingServesAPIFlavor(app Application, eff EffectiveSpecFields, flavor str
 	return flavor != APIFlavorAnthropic || eff.MessagesMode != EndpointModeDisabled
 }
 
+// MappingServesDecisionEndpoint is the served rule for ONE decision endpoint,
+// named by its request flavor: decisions for POST /v1/systemone, judged by
+// eff's systemone mode, and openai_decisions for POST /v1/decisions, judged by
+// eff's decisions mode. Both also need the decisions flavor half
+// (MappingHasAPIFlavor). eff's modes are the spec's for a server_agent mapping
+// with a spec row and the application's otherwise, the modes the two handlers
+// read after resolve. Any other flavor is false.
+//
+// The unknown-model redirect's ModelOffering.Callable and the Decision flag
+// GET /v1/systemone/models lists by ask it per endpoint; MappingServesAPIFlavor
+// ORs the two for the listings' decisions flavor.
+func MappingServesDecisionEndpoint(app Application, eff EffectiveSpecFields, requestFlavor string) bool {
+	var mode EndpointMode
+	switch requestFlavor {
+	case APIFlavorDecisions:
+		mode = eff.SystemOneMode
+	case APIFlavorOpenAIDecisions:
+		mode = eff.DecisionsMode
+	default:
+		return false
+	}
+	return mode != EndpointModeDisabled && MappingHasAPIFlavor(app, eff, APIFlavorDecisions)
+}
+
 // listedEndpoint is the fine flavor a listed coarse flavor stands for, the one
 // MappingServesAPIFlavor asks applicationServesEndpoint about: chat
 // completions for openai (never openai_responses, whose mode no listing
 // reflects), the Messages endpoint for anthropic, and openai_images and
-// openai_audio and decisions themselves. known is false for any other value.
+// openai_audio themselves. decisions is known too, for MappingHasAPIFlavor,
+// but MappingServesAPIFlavor answers it from the two decision endpoints'
+// modes instead (MappingServesDecisionEndpoint). known is false for any other
+// value.
 func listedEndpoint(flavor string) (endpoint string, known bool) {
 	switch flavor {
 	case APIFlavorOpenAI:
