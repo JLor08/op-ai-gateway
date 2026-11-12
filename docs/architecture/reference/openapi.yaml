@@ -837,7 +837,7 @@ paths:
   /v1/systemone:
     post:
       tags: [inference]
-      summary: System One decision request (verbatim relay to a decision model, no translate path)
+      summary: System One decision request (value-for-value relay to a decision model, no translate path)
       description: >
         Bearer-only (scope `gateway:use` or `llm:invoke`): a portal session
         cookie and the internal loopback are no way in, and there is no

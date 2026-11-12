@@ -146,7 +146,7 @@ through the router's ensure route without generating
 §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)).
 
 **A decisions-only server is kept out of the chat flavors the same way.**
-`decisions` (`routing.APIFlavorDecisions`) is the System One flavor ([ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373)): a coarse
+`decisions` (`routing.APIFlavorDecisions`) is the System One flavor ([ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373)): a coarse
 flavor of its own, never implied (an empty list still saves as `[openai, anthropic]`
 exactly), and `NormalizeAPIFlavor` folds it to itself. `routing.FlavorsAreDecisionsOnly`
 (a list naming `decisions` and neither `openai` nor `anthropic`; an empty list is
@@ -158,10 +158,12 @@ translate dispatch refuses it (`targetIsDecisionsOnly`, 404 `routing.no_model_ro
 the model warmer drops it, the speech-rate trigger skips it, a scheduled or manual
 benchmark skips or refuses it (the skipped reason `decisions_only`, the refusal
 `benchmark.decisions_only`, checked after the images-only and audio-only ones so a list
-naming `openai_audio` too keeps the audio code), and the context probe, the VRAM probe
-and the swap-sibling lookup leave it alone; a Load refuses it on a non-agent
-application and, for an agent child, starts it through the router's ensure route
-without generating. `score_servers` still ranks it, because the portal's server list is
+naming `openai_audio` too keeps the audio code), and the context probe and the swap-sibling lookup
+leave it alone; a Load refuses it on a non-agent
+application and, for an agent child whose agent declares `runtime_ensure`, starts it through the router's ensure route
+without generating. The VRAM probe treats it like an images-only or audio-only agent
+target: it ensure-starts it through that route, and refuses with `vramEnsureUnsupported`
+when the agent lacks `runtime_ensure`. `score_servers` still ranks it, because the portal's server list is
 read-only ordering and gating it would empty the operator's list. The portal's mapping
 DTO carries the marker as `decisions_only`. A list `[openai_audio, decisions]` is both
 audio-only and decisions-only, the same "both kinds" shape `[openai_images, openai_audio]` has. See [API Compatibility & Inference §3.9](compatibility-and-inference.md#39-system-one-decisions).
@@ -1119,7 +1121,7 @@ sentinel — the agent must have declared the `multipart_proxy` feature, else 40
 Runtime §7](agent-runtime-manager.md#7-feature-negotiation)).
 
 **Who writes the `decision` verdict.** `decision` (`routing.CapabilityDecision`) is the
-capability `POST /v1/systemone` gates on (`RequiredCapabilities = ["decision"]`, [ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373)),
+capability `POST /v1/systemone` gates on (`RequiredCapabilities = ["decision"]`, [ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373)),
 and it has **one** writer, the gateway's own System One probe
 (`probeSystemOne`, `cmd/gateway/app_health.go`, source `systemone_probe`, rank 1 like every
 probe, so an operator's `manual` `yes` outranks it). The probe asks the model one tiny

@@ -11847,7 +11847,7 @@ knowable on a mixed host). **Per-request VRAM metering** (left for later).
 [Runtime View §6.9](06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start),
 [HTTP API Surface](reference/api-surface.md).
 
-## ADR-097 — System One decisions: a third non-text flavor, a probe-written `decision` capability, and a verbatim relay (Phase 1 of #373)
+## ADR-097 — System One decisions: a third non-text flavor, a probe-written `decision` capability, and a value-for-value relay (Phase 1 of #373)
 
 **Context:** System One is a decision protocol: a client sends `{model, state, questions}` and a decision model
 answers each question (`{model, answers, usage}`), with no chat turn, no streaming and no prompt the gateway writes.
@@ -11871,8 +11871,11 @@ vocabulary must not be named after one path.
   chat-prompt path asks: the three chat listings (through the `openai` row of `MappingHasAPIFlavor`/
   `MappingServesAPIFlavor`), the text translate dispatch (404 `routing.no_model_route`), the model warmer, manual and
   scheduled benchmarks and Load (`409 benchmark.decisions_only`, the skipped reason `decisions_only`, checked **after**
-  the images-only and audio-only refusals so `[openai_audio, decisions]` answers `benchmark.audio_only`), the context
-  probe, the VRAM probe, the swap sibling and the speech-rate trigger. `score_servers` still ranks it (the portal's
+  the images-only and audio-only refusals so `[openai_audio, decisions]` answers `benchmark.audio_only`; a Load of a
+  `server_agent` mapping whose agent declares `runtime_ensure` is allowed and starts it through the router's ensure route
+  without generating), the context probe, the swap sibling and the speech-rate trigger. The VRAM probe treats it like
+  an images-only or audio-only agent target: it ensure-starts it, and refuses with `vramEnsureUnsupported` when the
+  agent lacks `runtime_ensure`. `score_servers` still ranks it (the portal's
   ordering path is read-only). The portal mapping DTO carries `decisions_only`.
 - **(b) `decision` is a capability, and the gate is the existing one.** `POST /v1/systemone` sets
   `RequiredCapabilities = ["decision"]`, so a model with no `(decision, yes)` verdict, an unprobed one included, is
@@ -11891,7 +11894,7 @@ vocabulary must not be named after one path.
   and refresh its idle timer), with its spec's credential, once per (mapping, `agentSpecIdentity`). A settled
   verdict is not asked again in the process, so a gateway restart re-probes once, and a verdict the store failed to
   write is not remembered as settled. The source is `systemone_probe`, rank 1.
-- **(d) The endpoint is bearer-only and a near-verbatim relay.** `POST /v1/systemone` accepts `gateway:use` or
+- **(d) The endpoint is bearer-only and a value-for-value relay.** `POST /v1/systemone` accepts `gateway:use` or
   `llm:invoke` and nothing else (never a session cookie or the internal loopback; no `/openai` alias). The validator
   owns only `model` (`systemone.model_required`), `questions` (`systemone.questions_required`, a non-empty object) and
   `stream` (`systemone.stream_unsupported`: absent, `null` and `false` are accepted, `null` meaning "not set");
@@ -11939,8 +11942,9 @@ vocabulary must not be named after one path.
   child is still started through the router's ensure route without generating.
 - **A new model is not usable until it is probed.** An application's mapping starts with no verdict and is refused
   (`routing.model_not_capable`) until the next health pass settles it; an agent-launched one is probed only once the
-  agent reports it loaded, so a request that wakes it cold is refused the first time. An operator who cannot wait sets
-  `decision: yes` by hand.
+  agent reports it loaded. A request naming a decision model that has not been probed yet (an agent model never loaded,
+  say) is refused at the capability gate (`404 routing.model_not_capable`) and never reaches the agent: Load it (the
+  next health pass then probes it) or set a manual `decision: yes`.
 - **A model unloading within the loaded snapshot's staleness can still be started once by the probe**, and a transient
   router 404 never turns into a sticky `no`.
 - **The probe is the only unmetered System One call.** It leaves no usage row and no capture; relayed calls are metered

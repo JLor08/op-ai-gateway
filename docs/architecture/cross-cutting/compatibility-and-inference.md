@@ -1537,7 +1537,7 @@ both paths, **not yet against a real audio.cpp `/live`** ([ADR-072](../09-archit
 `POST /v1/systemone` (`handleSystemOne`, `internal/gateway/systemone_handler.go`) relays a
 **System One decision request**, `{model, state, questions}`, to a model that answers
 decisions, and hands the upstream's own answer, `{model, answers, usage}`, back
-([ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373), Phase 1 of issue #373). It is the images and speech twin in structure and keeps
+([ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373), Phase 1 of issue #373). It is the images and speech twin in structure and keeps
 §3.4's shape: **no translate path**, two gates (the application's coarse `decisions`
 flavor, §6, and the model's `decision` capability,
 `RequiredCapabilities = ["decision"]`, [Routing & Model Selection
@@ -1608,8 +1608,12 @@ hidden models included.
 neither text flavor (`routing.FlavorsAreDecisionsOnly`) is not a chat model, and every
 path that would send it a chat prompt leaves it alone: the three chat listings, the text
 translate dispatch (404 `routing.no_model_route`), the model warmer, manual and scheduled
-benchmarks and Load (`409 benchmark.decisions_only`, the skip reason `decisions_only`),
-the context and VRAM probes, the swap sibling and the speech-rate trigger. The full
+benchmarks and Load (`409 benchmark.decisions_only`, the skip reason `decisions_only`;
+a Load of a `server_agent` mapping whose agent declares `runtime_ensure` is allowed and
+starts it through the router's ensure route without generating), the context probe, the
+swap sibling and the speech-rate trigger. The VRAM probe treats it like an images-only or
+audio-only agent target: it ensure-starts it, and refuses with `vramEnsureUnsupported`
+when the agent lacks `runtime_ensure`. The full
 inventory is in [Routing & Model
 Selection §1](routing-and-model-selection.md#1-data-model). The flavor is **opt-in**
 like `openai_audio`: an empty list still saves as `[openai, anthropic]`, and the portal's
@@ -1660,7 +1664,7 @@ one `POST {endpoint}/v1/systemone` with the exact body
   source alone can state a `no`.
 
 **8. Two deliberate Phase 1 deviations from issue #373** (rejected alternatives in
-[ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-verbatim-relay-phase-1-of-373)): there is **no `systemone_mode` column** (the flavor and the verdict already
+[ADR-097](../09-architecture-decisions.md#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373)): there is **no `systemone_mode` column** (the flavor and the verdict already
 answer "is this model served?"; modes arrive in Phase 2 with `decisions_mode`), and the
 verdict comes from **one uniform POST probe** rather than from reading llama.cpp's
 `/v1/models` `output_modalities` (no agent change, and it works for llama.cpp, vLLM and
