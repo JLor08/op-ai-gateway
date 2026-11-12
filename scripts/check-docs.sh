@@ -631,7 +631,9 @@ AWK
 
   # One flag name per line. The registration block is uniform:
   #   name := fs.String("flag-name", ...)  /  fs.Bool("flag-name", ...)
-  AGENT_FLAGS="$(sed -n 's/.*fs\.\(String\|Bool\|Int\|Int64\|Duration\)("\([a-z0-9-]*\)".*/\2/p' "$AGENT_CONFIG_GO" | sort -u)"
+  # An ERE (sed -E), because `\|` alternation in a basic regular expression
+  # is a GNU extension that BSD/macOS sed reads as a literal.
+  AGENT_FLAGS="$(sed -nE 's/.*fs\.(String|Bool|Int|Int64|Duration)\("([a-z0-9-]*)".*/\2/p' "$AGENT_CONFIG_GO" | sort -u)"
   if [ -z "$AGENT_FLAGS" ]; then
     echo "  $AGENT_CONFIG_GO: no fs.String/fs.Bool registrations found -- the extractor no longer matches the source" >&2
     rc=1
