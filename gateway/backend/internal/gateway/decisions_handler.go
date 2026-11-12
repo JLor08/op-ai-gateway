@@ -27,7 +27,8 @@ const apiFlavorOpenAIDecisions = routing.APIFlavorOpenAIDecisions
 
 // The request-error codes validateDecisionsRequest answers with, and the
 // codes of the refusals and upstream failures this endpoint and /v1/systemone
-// answer with (ADR-098). They are API surface: clients branch on them.
+// answer with (ADR-098; systemone.refused is the translated /v1/systemone's
+// upstream refusal, ADR-100). They are API surface: clients branch on them.
 const (
 	decisionsModelRequired     = "decisions.model_required"
 	decisionsQuestionsRequired = "decisions.questions_required"
@@ -37,6 +38,7 @@ const (
 	codeSystemOneEndpointDisabled = "systemone.endpoint_disabled"
 	codeDecisionsUpstreamError    = "decisions.upstream_error"
 	codeSystemOneUpstreamError    = "systemone.upstream_error"
+	codeSystemOneRefused          = "systemone.refused"
 )
 
 // decisionsInferenceShape is the shape handleOpenAIDecisions hands the ONE
@@ -155,48 +157,67 @@ func (s *Server) relayDecisions(w http.ResponseWriter, r *http.Request, token au
 			return
 		}
 		rel.upstreamBody = body
-		rel.decisionsRewrite = &decisionsRewrite{table: &table, clientModel: c.req.Model, normalize: c.token.DecisionsConfidenceNormalize, dialect: compat.DialectOpenAI, failCode: codeDecisionsUpstreamError}
+		rel.decisionsRewrite = forwardDecisionsRewrite(table, c.req.Model, c.token.DecisionsConfidenceNormalize)
 	} else if c.token.DecisionsConfidenceNormalize {
-		rel.decisionsRewrite = &decisionsRewrite{normalize: true, dialect: compat.DialectOpenAI, failCode: codeDecisionsUpstreamError}
+		rel.decisionsRewrite = normalizeDecisionsRewrite(compat.DialectOpenAI, codeDecisionsUpstreamError)
 	}
 	s.proxyNative(w, r, rel)
 }
 
 // decisionsRoute settles the concrete route of a resolved OpenAI Decisions
-// request (ADR-098): it reads the mapping's two verdicts and hands them, with
-// the target's effective decisions mode, to routing.EffectiveDecisionsRoute. A
-// disabled endpoint is answered 404 decisions.endpoint_disabled, a route whose
-// verdict is missing 404 routing.model_not_capable; otherwise the returned
-// target carries the route (translate or passthrough) as its DecisionsMode, which
-// is what upstreamPath and the usage row's provider_path read.
+// request (ADR-098): settleDecisionRoute with the target's effective decisions
+// mode and routing.EffectiveDecisionsRoute. On success the returned target
+// carries the route (translate or passthrough) as its DecisionsMode, which is
+// what upstreamPath and the usage row's provider_path read.
 func (s *Server) decisionsRoute(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target) (routing.Target, bool) {
-	decision, decisionOpenAI, err := s.decisionVerdicts(r.Context(), target.RouteID)
-	if err != nil {
-		slog.Error("decisions request: the mapping's verdicts could not be read", "path", r.URL.Path, "model", c.req.Model, "route_id", target.RouteID, "err", err)
-		s.recordDecisionsRoutingFailure(w, r, c, err)
-		return routing.Target{}, false
-	}
-	route, ok := routing.EffectiveDecisionsRoute(target.EffectiveKind(), target.DecisionsMode, decision, decisionOpenAI)
-	switch {
-	case route == routing.EndpointModeDisabled:
-		slog.Debug("decisions request rejected: endpoint disabled", "path", r.URL.Path, "model", c.req.Model, "server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.refuseDecisionsRequest(w, r, c, statusEndpointDisabled, codeDecisionsEndpointDisabled, msgEndpointDisabled)
-		return routing.Target{}, false
-	case !ok:
-		slog.Debug("decisions request rejected: the mapping has no verdict for the route its mode asks for", "path", r.URL.Path, "model", c.req.Model, "mode", string(target.DecisionsMode), "route_id", target.RouteID)
-		s.recordDecisionsRoutingFailure(w, r, c, routing.ErrModelNotCapable)
+	route, ok := s.settleDecisionRoute(w, r, c, target, target.DecisionsMode, routing.EffectiveDecisionsRoute, codeDecisionsEndpointDisabled)
+	if !ok {
 		return routing.Target{}, false
 	}
 	target.DecisionsMode = route
 	return target, true
 }
 
-// decisionVerdicts reads whether the mapping carries (decision, yes) and
-// (decision_openai, yes): one read of its capability rows.
-func (s *Server) decisionVerdicts(ctx context.Context, mappingID string) (decision, decisionOpenAI bool, err error) {
-	rows, err := s.Routes.MappingCapabilities(ctx, mappingID)
+// decisionRouteFunc computes a decision endpoint's concrete route from the
+// effective upstream kind, the endpoint's effective mode and the mapping's two
+// verdicts: routing.EffectiveDecisionsRoute or routing.EffectiveSystemOneRoute.
+type decisionRouteFunc func(kind string, mode routing.EndpointMode, decision, decisionOpenAI bool) (routing.EndpointMode, bool)
+
+// settleDecisionRoute is the post-resolve route step both decision endpoints
+// share (ADR-098, ADR-100): it reads the target's two verdicts
+// (decisionVerdicts) and hands them, with mode, to effective. A disabled
+// endpoint is answered 404 disabledCode, a route whose verdict is missing 404
+// routing.model_not_capable, a verdict read that fails as the routing error it
+// is; each refusal is answered and recorded here, and ok is false. Otherwise
+// it returns the concrete route (translate or passthrough).
+func (s *Server) settleDecisionRoute(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target, mode routing.EndpointMode, effective decisionRouteFunc, disabledCode string) (routing.EndpointMode, bool) {
+	decision, decisionOpenAI, err := s.decisionVerdicts(r.Context(), target)
 	if err != nil {
-		return false, false, fmt.Errorf("read capability rows of mapping %s: %w", mappingID, err)
+		slog.Error("decision request: the mapping's verdicts could not be read", "path", r.URL.Path, "model", c.req.Model, "route_id", target.RouteID, "err", err)
+		s.recordDecisionsRoutingFailure(w, r, c, err)
+		return "", false
+	}
+	route, ok := effective(target.EffectiveKind(), mode, decision, decisionOpenAI)
+	switch {
+	case route == routing.EndpointModeDisabled:
+		slog.Debug("decision request rejected: endpoint disabled", "path", r.URL.Path, "model", c.req.Model, "server", s.serverName(target.ServerID), "route_id", target.RouteID)
+		s.refuseDecisionsRequest(w, r, c, statusEndpointDisabled, disabledCode, msgEndpointDisabled)
+		return "", false
+	case !ok:
+		slog.Debug("decision request rejected: the mapping has no verdict for the route its mode asks for", "path", r.URL.Path, "model", c.req.Model, "mode", string(mode), "route_id", target.RouteID)
+		s.recordDecisionsRoutingFailure(w, r, c, routing.ErrModelNotCapable)
+		return "", false
+	}
+	return route, true
+}
+
+// decisionVerdicts reads whether the target's mapping carries (decision, yes)
+// and (decision_openai, yes): one read of its capability rows. It takes the
+// whole target so every source of a verdict answers in this one place.
+func (s *Server) decisionVerdicts(ctx context.Context, target routing.Target) (decision, decisionOpenAI bool, err error) {
+	rows, err := s.Routes.MappingCapabilities(ctx, target.RouteID)
+	if err != nil {
+		return false, false, fmt.Errorf("read capability rows of mapping %s: %w", target.RouteID, err)
 	}
 	byName := routing.CapabilityRowsByName(rows)
 	return byName[routing.CapabilityDecision].Verdict == routing.CapabilityYes,

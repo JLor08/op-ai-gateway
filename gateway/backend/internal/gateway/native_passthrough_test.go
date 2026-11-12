@@ -1791,6 +1791,35 @@ func TestResponsesMessagesLastUsedModelWrittenOncePerRequest(t *testing.T) {
 	}
 }
 
+// TestUpstreamPathSystemOneFollowsTheConcreteRoute pins the System One branch
+// (ADR-100): the handler stores the concrete route on the target as its
+// SystemOneMode, translate answers the upstream's /v1/decisions and every
+// other route /v1/systemone, before any mode lookup or provider fallback.
+func TestUpstreamPathSystemOneFollowsTheConcreteRoute(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		mode     routing.EndpointMode
+		want     string
+	}{
+		{"translate", routing.ProviderVLLM, routing.EndpointModeTranslate, "/v1/decisions"},
+		{"passthrough", routing.ProviderVLLM, routing.EndpointModePassthrough, "/v1/systemone"},
+		{"unrouted auto", routing.ProviderVLLM, routing.EndpointModeAuto, "/v1/systemone"},
+		{"blank", routing.ProviderVLLM, "", "/v1/systemone"},
+		{"ollama translate", routing.ProviderOllama, routing.EndpointModeTranslate, "/v1/decisions"},
+		{"ollama passthrough", routing.ProviderOllama, routing.EndpointModePassthrough, "/v1/systemone"},
+		{"unresolved target keeps the empty answer", "", routing.EndpointModeTranslate, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := routing.Target{Provider: tc.provider, SystemOneMode: tc.mode}
+			if got := upstreamPath(target, apiFlavorSystemOne, endpointSystemOne); got != tc.want {
+				t.Fatalf("upstreamPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUpstreamPathOpenAIDecisionsFollowsTheConcreteRoute pins the
 // openai_decisions branch: the handler stores the concrete route on the target
 // (ADR-098), translate answers /v1/systemone and passthrough /v1/decisions,

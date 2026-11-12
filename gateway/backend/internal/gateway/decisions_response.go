@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,35 +20,112 @@ import (
 
 // decisionsUpstreamErrorType is the OpenAI-client-facing type of the gateway's
 // own decisions error envelopes (decisions.upstream_error,
-// systemone.upstream_error), the type the transcription twin uses.
+// systemone.upstream_error, systemone.refused), the type the transcription twin
+// uses.
 const decisionsUpstreamErrorType = "upstream_error"
 
-// decisionsNotImplementedGuidance is the sentence a translated request's 501
-// adds: both vLLM decision endpoints answer 501 for a model without a read
-// strategy, which on the translate route means the model has no System One
-// read on that upstream.
+// decisionsNotImplementedGuidance is the sentence a translated /v1/decisions
+// request's 501 adds: both vLLM decision endpoints answer 501 for a model
+// without a read strategy, which on the forward translate route means the model
+// has no System One read on that upstream.
 const decisionsNotImplementedGuidance = "the model does not answer System One decisions on this upstream"
 
+// systemOneNotImplementedGuidance is the reverse route's twin: a translated
+// /v1/systemone request's 501 means the model has no OpenAI Decisions read on
+// that upstream (ADR-100).
+const systemOneNotImplementedGuidance = "the model does not answer OpenAI Decisions on this upstream"
+
+// decisionsDirection is which translation, if any, a decisions answer takes on
+// its way back to the client.
+type decisionsDirection int
+
+const (
+	// decisionsNormalizeOnly: a passthrough a token asked to normalize; the
+	// answer is in the client's own dialect already.
+	decisionsNormalizeOnly decisionsDirection = iota
+	// decisionsForward: /v1/decisions translated to a System One upstream
+	// (ADR-098); its answer is translated System One -> OpenAI Decisions.
+	decisionsForward
+	// decisionsReverse: /v1/systemone translated to an OpenAI Decisions
+	// upstream (ADR-100); its answer is translated OpenAI Decisions -> System
+	// One.
+	decisionsReverse
+)
+
+// upstreamAPI names the API a translated request's upstream speaks, the one
+// the gateway's error envelope blames.
+func (d decisionsDirection) upstreamAPI() string {
+	if d == decisionsReverse {
+		return "OpenAI Decisions"
+	}
+	return "System One"
+}
+
+// failCode is the code of the gateway's own error envelopes on a translated
+// route: the client's endpoint's upstream_error.
+func (d decisionsDirection) failCode() string {
+	if d == decisionsReverse {
+		return codeSystemOneUpstreamError
+	}
+	return codeDecisionsUpstreamError
+}
+
+// notImplementedGuidance is the sentence a translated request's 501 adds.
+func (d decisionsDirection) notImplementedGuidance() string {
+	if d == decisionsReverse {
+		return systemOneNotImplementedGuidance
+	}
+	return decisionsNotImplementedGuidance
+}
+
 // decisionsRewrite is what relayDecisionsResponse does to a decisions answer
-// (nativeRelay.decisionsRewrite; ADR-098):
+// (nativeRelay.decisionsRewrite; ADR-098, ADR-100):
 //
-//   - table != nil: the translate route. The upstream answered System One; a 2xx
-//     is translated into the OpenAI Decisions shape (clientModel as its model) and,
-//     with normalize, its confidences recomputed; a non-2xx becomes the gateway's
-//     decisions.upstream_error envelope under the upstream's status.
-//   - table == nil: a passthrough the token asked to normalize. A 2xx JSON body
-//     in dialect gets its confidences recomputed; anything else -- a non-2xx, a
-//     body that is not JSON -- is relayed as the upstream sent it.
+//   - direction decisionsForward or decisionsReverse: a translate route. A 2xx
+//     is translated into the client's dialect (clientModel as its model) and,
+//     with normalize, its confidences recomputed in that dialect; a non-2xx
+//     becomes the gateway's <endpoint>.upstream_error envelope under the
+//     upstream's status. A reverse answer whose upstream refused a question is
+//     the gateway's 422 systemone.refused.
+//   - decisionsNormalizeOnly: a passthrough the token asked to normalize. A 2xx
+//     JSON body in dialect gets its confidences recomputed; anything else -- a
+//     non-2xx, a body that is not JSON -- is relayed as the upstream sent it.
 //
+// dialect is always the CLIENT's dialect, the one the written answer is in.
 // failCode is the code of the gateway's own 502 when the answer cannot be
 // relayed at all (over the bound, unreadable, untranslatable):
 // decisions.upstream_error, or systemone.upstream_error on /v1/systemone.
 type decisionsRewrite struct {
-	table       *compat.DecisionsAnswerTable
+	direction   decisionsDirection
+	forward     *compat.DecisionsAnswerTable
+	reverse     *compat.SystemOneAnswerTable
 	clientModel string
 	normalize   bool
 	dialect     compat.DecisionsDialect
 	failCode    string
+}
+
+// forwardDecisionsRewrite is the rewrite of a /v1/decisions request translated
+// to System One.
+func forwardDecisionsRewrite(table compat.DecisionsAnswerTable, clientModel string, normalize bool) *decisionsRewrite {
+	return &decisionsRewrite{direction: decisionsForward, forward: &table, clientModel: clientModel, normalize: normalize, dialect: compat.DialectOpenAI, failCode: decisionsForward.failCode()}
+}
+
+// reverseDecisionsRewrite is the rewrite of a /v1/systemone request translated
+// to OpenAI Decisions.
+func reverseDecisionsRewrite(table compat.SystemOneAnswerTable, clientModel string, normalize bool) *decisionsRewrite {
+	return &decisionsRewrite{direction: decisionsReverse, reverse: &table, clientModel: clientModel, normalize: normalize, dialect: compat.DialectSystemOne, failCode: decisionsReverse.failCode()}
+}
+
+// normalizeDecisionsRewrite is the rewrite of a passthrough answer in dialect
+// for a token that opted into confidence normalization.
+func normalizeDecisionsRewrite(dialect compat.DecisionsDialect, failCode string) *decisionsRewrite {
+	return &decisionsRewrite{direction: decisionsNormalizeOnly, normalize: true, dialect: dialect, failCode: failCode}
+}
+
+// translates reports whether the answer changes dialect on its way back.
+func (rw *decisionsRewrite) translates() bool {
+	return rw.direction != decisionsNormalizeOnly
 }
 
 // decisionsAnswer is a rewritten 2xx answer: the client's bytes, their
@@ -60,15 +138,15 @@ type decisionsAnswer struct {
 
 // apply rewrites a 2xx upstream body. upstreamContentType is the upstream's
 // own (or JSON when it named none); a passthrough body that is not JSON keeps
-// it. The error is a translation failure only.
+// it. The error is a translation failure only (a reverse refusal included).
 func (rw *decisionsRewrite) apply(body []byte, upstreamContentType string) (decisionsAnswer, error) {
-	if rw.table != nil {
-		out, u, err := compat.TranslateSystemOneResponse(body, *rw.table, rw.clientModel)
+	if rw.translates() {
+		out, u, err := rw.translate(body)
 		if err != nil {
 			return decisionsAnswer{}, err
 		}
 		if rw.normalize {
-			out, _ = compat.NormalizeDecisionsConfidence(out, compat.DialectOpenAI)
+			out, _ = compat.NormalizeDecisionsConfidence(out, rw.dialect)
 		}
 		return decisionsAnswer{body: out, contentType: jsonContentType, usage: decisionsInferenceUsage(u)}, nil
 	}
@@ -80,6 +158,17 @@ func (rw *decisionsRewrite) apply(body []byte, upstreamContentType string) (deci
 		contentType = jsonContentType
 	}
 	return decisionsAnswer{body: out, contentType: contentType, usage: decisionsInferenceUsage(compat.ParseDecisionsUsage(body, rw.dialect))}, nil
+}
+
+// translate turns a translated route's 2xx upstream body into the client's
+// dialect. The usage is the UPSTREAM body's: the reverse translator reads it
+// with compat.ParseDecisionsUsage(body, DialectOpenAI), so the cached and
+// cache-write tokens an OpenAI Decisions answer reports reach the row.
+func (rw *decisionsRewrite) translate(body []byte) ([]byte, compat.DecisionsUsage, error) {
+	if rw.direction == decisionsReverse {
+		return compat.TranslateOpenAIDecisionsResponse(body, *rw.reverse, rw.clientModel)
+	}
+	return compat.TranslateSystemOneResponse(body, *rw.forward, rw.clientModel)
 }
 
 // decisionsInferenceUsage is u in the gateway's usage type: input_tokens
@@ -123,19 +212,34 @@ func (s *Server) relayDecisionsResponse(w http.ResponseWriter, r *http.Request, 
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		answer := decisionsAnswer{body: body, contentType: upstreamContentType}
-		if rw.table != nil {
-			answer = decisionsAnswer{body: decisionsUpstreamErrorBody(resp.StatusCode, body), contentType: jsonContentType}
+		if rw.translates() {
+			answer = decisionsAnswer{body: decisionsUpstreamErrorBody(rw.direction, resp.StatusCode, body), contentType: jsonContentType}
 		}
 		s.writeDecisionsAnswer(w, r, ex, resp, answer)
 		return
 	}
 	answer, err := rw.apply(body, upstreamContentType)
 	if err != nil {
-		slog.Warn("decisions upstream answer could not be translated", "path", r.URL.Path, "model", ex.req.Model, "server", ex.serverName, "err", err)
-		s.failDecisionsRelay(w, r, ex, rw, rw.failCode, err.Error())
+		s.failDecisionsTranslation(w, r, ex, rw, body, err)
 		return
 	}
 	s.writeDecisionsAnswer(w, r, ex, resp, answer)
+}
+
+// failDecisionsTranslation answers a 2xx upstream answer the translator could
+// not express in the client's dialect. A reverse answer whose upstream refused
+// one or more questions is the gateway's 422 systemone.refused naming their
+// keys, recorded with the tokens the upstream reports (it answered, and is paid
+// for); anything else is the gateway's 502 rw.failCode.
+func (s *Server) failDecisionsTranslation(w http.ResponseWriter, r *http.Request, ex nativeExchange, rw *decisionsRewrite, body []byte, err error) {
+	if rw.direction == decisionsReverse && errors.Is(err, compat.ErrSystemOneRefused) {
+		slog.Debug("decisions upstream refused to answer", "path", r.URL.Path, "model", ex.req.Model, "server", ex.serverName, "err", err)
+		usage := decisionsInferenceUsage(compat.ParseDecisionsUsage(body, compat.DialectOpenAI))
+		s.writeDecisionsGatewayError(w, r, ex, http.StatusUnprocessableEntity, codeSystemOneRefused, codeSystemOneRefused, err.Error(), usage)
+		return
+	}
+	slog.Warn("decisions upstream answer could not be translated", "path", r.URL.Path, "model", ex.req.Model, "server", ex.serverName, "err", err)
+	s.failDecisionsRelay(w, r, ex, rw, rw.failCode, err.Error())
 }
 
 // writeDecisionsAnswer writes answer under the upstream's status and records
@@ -162,30 +266,38 @@ func (s *Server) writeDecisionsAnswer(w http.ResponseWriter, r *http.Request, ex
 // gateway's own 502 (rw.failCode, type upstream_error) carrying message, and
 // records it as a failed relay with errorCode on the row and no tokens.
 func (s *Server) failDecisionsRelay(w http.ResponseWriter, r *http.Request, ex nativeExchange, rw *decisionsRewrite, errorCode, message string) {
-	payload := writeJSONCaptured(w, http.StatusBadGateway, apierror.Body{Error: apierror.ErrorBody{
-		Code:    rw.failCode,
+	s.writeDecisionsGatewayError(w, r, ex, http.StatusBadGateway, rw.failCode, errorCode, message, inference.Usage{})
+}
+
+// writeDecisionsGatewayError answers a relayed decisions request with the
+// gateway's own error envelope (code, type upstream_error, message) under
+// status, and records it as a failed relay with errorCode and usage on the row.
+func (s *Server) writeDecisionsGatewayError(w http.ResponseWriter, r *http.Request, ex nativeExchange, status int, code, errorCode, message string, usage inference.Usage) {
+	payload := writeJSONCaptured(w, status, apierror.Body{Error: apierror.ErrorBody{
+		Code:    code,
 		Message: message,
 		Type:    decisionsUpstreamErrorType,
 	}})
-	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(ex.req.APIFlavor), Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), payload, http.StatusBadGateway, ex.req.APIFlavor), nil)
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{Usage: usage}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: billingUnitFor(ex.req.APIFlavor), Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), payload, status, ex.req.APIFlavor), nil)
 }
 
 // decisionsUpstreamErrorBody is the gateway envelope a translated request's
-// non-2xx System One answer becomes: decisions.upstream_error, type
-// upstream_error, and a message naming the upstream's status and -- when one of
-// the known shapes yields it -- the upstream's own message; a 501 adds
-// decisionsNotImplementedGuidance. The status itself is relayed by the caller.
-func decisionsUpstreamErrorBody(status int, body []byte) []byte {
-	message := fmt.Sprintf("the System One upstream answered %d", status)
+// non-2xx answer becomes: dir's failCode (decisions.upstream_error forward,
+// systemone.upstream_error reverse), type upstream_error, and a message naming
+// the upstream dir translates to, its status and -- when one of the known
+// shapes yields it -- the upstream's own message; a 501 adds dir's
+// notImplementedGuidance. The status itself is relayed by the caller.
+func decisionsUpstreamErrorBody(dir decisionsDirection, status int, body []byte) []byte {
+	message := fmt.Sprintf("the %s upstream answered %d", dir.upstreamAPI(), status)
 	if upstream := decisionsUpstreamMessage(body); upstream != "" {
 		message += ": " + upstream
 	}
 	if status == http.StatusNotImplemented {
-		message += "; " + decisionsNotImplementedGuidance
+		message += "; " + dir.notImplementedGuidance()
 	}
 	// Marshal cannot fail on this type (strings only).
 	out, _ := json.Marshal(apierror.Body{Error: apierror.ErrorBody{
-		Code:    codeDecisionsUpstreamError,
+		Code:    dir.failCode(),
 		Message: message,
 		Type:    decisionsUpstreamErrorType,
 	}})
