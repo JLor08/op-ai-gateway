@@ -1690,6 +1690,12 @@ one `POST {endpoint}/v1/systemone` with the exact body
   reachability probe: the answer is a real inference, which a slow model would never
   finish inside a few seconds, so the verdict would never settle and each retry would
   refresh an agent child's idle timer.
+- **Two probes, one after the other.** A mapping is asked for both verdicts, the System One
+  `decision` probe and then the OpenAI Decisions `decision_openai` probe, sequentially, each with
+  its own 30 s timeout (`decisionProbeRetryBackoff` and `decisionProbeRefusedBackoffCap` apply
+  per probe). On an unreachable host that can hold one detached pass for up to 60 s per
+  unsettled mapping; that is intended and harmless, since the pass is off the health cycle
+  and at most one runs per application.
 - **Who is asked, how often.** An **external** application is asked at its endpoint with
   its own credential, once per (mapping, app model name). A **`server_agent`** mapping is
   asked through the agent router at the same endpoint with its runtime spec's credential
@@ -1808,14 +1814,19 @@ check: it is never removed at candidacy, because its effective mode lives on the
 and the post-resolve route decides. The handler takes the route from `systemOneRoute`
 (`settleDecisionRoute`, shared with `decisionsRoute`: it reads the verdicts, applies the route function with the
 effective kind, and answers a disabled endpoint `404 systemone.endpoint_disabled` and a missing route `404
-routing.model_not_capable`; each refusal is recorded as a usage row with no host and no route); the route is stored on
+routing.model_not_capable`; each refusal is recorded as a usage row that carries the resolved target's server, route and `provider_path`, see §3.10 item 3); the route is stored on
 the handler's copy of the target's `SystemOneMode`, which `upstreamPath` and the row's `provider_path` read. As on
 `/v1/decisions`, the check **does not re-select another candidate** (§3.10 item 3); after the route-aware filter only a
 `server_agent` target can reach it without a route. Every listing surface judges by the same route, not by
 the verdict alone: the per-model fold behind `ModelDTO.Decision` and the `decisions` flavor, `GET /v1/systemone/models`, the
 `/v1/systemone` unknown-model redirect, and the portal's mapping DTO, which carries
 `systemone_route` (`"passthrough"`, `"translate"`, `"disabled"`, or `""` when the effective flavors do not list `decisions` or no route exists),
-`decisions_route`'s twin. The verdict-free half, `routing.MappingServesDecisionEndpoint`, asks the route with both verdicts assumed `yes`,
+`decisions_route`'s twin. **The unknown-model redirect hint is route-aware** (`anyDecisionFlagsByName`, which
+`ModelOffering.Capable` reads for both decision endpoints): besides a verdict and the decisions flavor half, every mapping of a name must have a route for the
+endpoint asked, `routing.DecisionRouteExists(requestFlavor, kind, systemone_mode, decisions_mode, decision, decision_openai)`, the rule the resolver's candidate
+filter (`decisionRouteServes`) shares. An ordinary mapping is judged by its own modes, a `server_agent` mapping by its runtime spec's effective kind and
+modes (the portal knows the spec where the resolver does not until after the resolve), so the hint names only a model the resolver would accept; vendor
+candidates are unchanged. The verdict-free half, `routing.MappingServesDecisionEndpoint`, asks the route with both verdicts assumed `yes`,
 so a disabled mode, and a `translate` row on a kind with no `/v1/decisions`, are not "served". It judges by the **application type** (`app.Type`), not the effective spec kind; the save guards refuse `translate` for an incapable spec type, so the spec case is practically unreachable. A gone instance re-runs the whole path
 (`relayAgain`), route and translation included.
 
@@ -1843,7 +1854,7 @@ Request side (System One to OpenAI Decisions):
 | `score`, `criteria [level, ...]` | `score` with `levels[{label}]` in order; a number is accepted as its literal text (System One `str()`s its items) |
 | `instructions` (a question's, a string or absent) | `instructions`; absent is `""` |
 | any other question `type` | **refused** `400 systemone.question_type_unsupported` (only `noul`, `choice` and `score` are mapped) |
-| a top-level `instructions`, `assets`, `audio`, `videos`, `roles`, `options`, `preset`, `states`, `joint`, `chat_template_kwargs`, `cache_salt`, `priority` that is present with a value other than its default | **refused** `400 systemone.field_unsupported`: OpenAI Decisions has no counterpart. A **default value counts as absent** and is dropped: `null` for every field; `false`, `0`, `[]` and `{}` for `joint`, `priority`, `assets`, `audio`, `videos`, `options`, `states`, `roles` and `chat_template_kwargs`; `""` for `cache_salt` and the top-level `instructions`. `preset` has no default other than `null` |
+| a top-level `instructions`, `assets`, `audio`, `videos`, `roles`, `options`, `preset`, `states`, `joint`, `chat_template_kwargs`, `cache_salt`, `priority` that is present with a value other than its default | **refused** `400 systemone.field_unsupported`: OpenAI Decisions has no counterpart. A **default value counts as absent** and is dropped: `null` for every field; `false`, a zero number (`0`, `0.0` and `-0` alike; a literal that is zero only by underflow, such as `1e-400`, is not zero and is refused), `[]` and `{}` for `joint`, `priority`, `assets`, `audio`, `videos`, `options`, `states`, `roles` and `chat_template_kwargs`; `""` for `cache_salt` and the top-level `instructions`. `preset` has no default other than `null` |
 | `request_id` | dropped silently whatever its value (a correlation id; emulated) |
 | a missing, `null` or scalar `state` other than a string; a `state` array with a non-object element; an `images` value that is not an array of strings, or an entry that is `null` or `""`; a duplicate question key; a `null` or non-object question; instructions that are not a string; `noul` criteria that are not an object of `true`/`false` keys (an extra key, a duplicate key, or a description that is neither a string nor `null`); `choice` criteria that are not a non-empty object (a duplicate option, a bad description); `score` criteria that are not a non-empty array of strings or numbers | **refused** `400 systemone.field_unsupported` with a message naming the question |
 | any other top-level field (`stream`, a missing model and a missing or empty `questions` object are refused earlier, item 2) | dropped (emulated; not relayed) |
@@ -1854,8 +1865,8 @@ Response side (OpenAI Decisions to System One):
 |---|---|
 | `answers[]` | `answers{}` keyed by question key in **request order**. An answer is matched **by `name` first**; one the name does not find is taken **by position** when the answer there is unnamed or carries a name no question owns |
 | `predicate` `{probability}` | `{type:"noul", noul: p, probabilities:{yes: p, no: 1-p}, confidence: max(p, 1-p)}`; `probability` must lie in [0, 1]. The computed `no` and `confidence` are **rounded to 12 decimals** (`1 - 0.8` would otherwise print as `0.19999999999999996`) |
-| `choice`, `probabilities[{value, probability}]` | `{type:"choice", choice, probabilities{option: p}, confidence}`; `choice` and every `value` must be one of the asked options; `confidence` is the upstream's when it sends one, else the largest probability |
-| `score`, `probabilities[{value: i, probability}]` | `{type:"score", score, legend{"0": label, ...}, probabilities{"i": p}, confidence}`; the legend is built from the **asked** levels (index = position, zero-based); a value must be an index in range |
+| `choice`, `probabilities[{value, probability}]` | `{type:"choice", choice, probabilities{option: p}, confidence}`; `choice` and every `value` must be one of the asked options (the empty string is a present key, distinct from an absent one); `confidence` is the upstream's when it sends one, else the largest probability |
+| `score`, `probabilities[{value: i, probability}]` | `{type:"score", score, legend{"0": label, ...}, probabilities{"i": p}, confidence}`; the legend is built from the **asked** levels (index = position, zero-based); a value must be an integral JSON number (`1` and `1.0` both name level 1; a string or a fraction is not a level) in range |
 | a `refusal` answer | the whole request is a **`422 systemone.refused`** naming every refused key (below) |
 | a wrong `type`, a missing answer, a missing probability or score, a chosen option or level that was not asked, an answer that is not an object, a body with no `answers` array or that is not JSON | `502 systemone.upstream_error` with a message naming the question; nothing is relayed |
 | `usage` | `{input_tokens, output_tokens}`; the cached and cache-write token counts are **not** shown to the client but are recorded (item 9 of §3.10) |
@@ -1955,7 +1966,7 @@ places, because the mode and the verdicts are only known together after the reso
   `systemone.endpoint_disabled` (`404`) is the System One twin, answered by
   `relaySystemOne` for a resolved `server_agent` target whose spec disables System One;
   for an ordinary application the disabled mode already removed it at candidacy. Every
-  refusal here is recorded as a usage row with no host and no route.
+  refusal here is recorded as a usage row (see *Refusal rows* below).
 
   **For an ordinary application the candidate filter applies the route already**
   ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373),
@@ -1968,6 +1979,17 @@ places, because the mode and the verdicts are only known together after the reso
   the request is answered `404 routing.model_not_capable` although the other application
   could have served it, and a later request may land on the other one: an intermittent 404
   that is an operator configuration issue (set the same mode on both, or use `auto`).
+
+  **Refusal rows.** A decision request refused **after** the target is resolved records that
+  target on its usage row (server, route and `provider_path`; still no tokens and no upstream
+  call): a `*.endpoint_disabled` from a `server_agent` spec, the post-resolve
+  `routing.model_not_capable`, a translator refusal (`decisions.input_unsupported`,
+  `decisions.question_invalid`, `systemone.field_unsupported`, ...) and a failed verdict
+  read, so Activity shows which server's configuration refused. A refusal **before** the
+  resolve (the resolver's own routing errors) keeps an empty target. One known residual:
+  `resolveDecisionsTarget`'s flavor-mismatch `routing.no_model_route` (the resolved target's
+  effective flavors exclude the decision endpoint) is raised after a target exists but still
+  records an empty one.
 
   The route taken is visible on the usage row's `provider_path`: `/v1/systemone` for a
   translate, `/v1/decisions` for a passthrough (`upstreamPath` answers the route the
@@ -1994,21 +2016,22 @@ Request side (OpenAI to System One):
 | OpenAI | System One |
 |---|---|
 | `model` | `model`: the mapping's own name |
-| `input` string | `state` string |
+| `input` string | `state` string (`""` is accepted) |
 | `input` items: `type:"message"` (or no `type`) with `role:"user"`, content a string or parts | `state`: text parts and string contents joined with a blank line (`"\n\n"`) in order (emulated when more than one) |
 | `input_json` part | kept as a JSON value: a lone `input_json` becomes `state` itself; mixed with text it makes `state` an **array of the pieces in order** (text pieces as strings) (emulated) |
 | `input_image` part with a `data:` `image_url` | `images[]` in order, `detail` dropped |
 | `input_image` with any other URL, or a `file_id` | **refused** `decisions.input_unsupported`: the gateway fetches no image |
-| roles `developer`, `system`, `assistant`; item types other than `message`; an `input` that is neither string nor array; an `input_text` part without `text`, an `input_json` part without `data`, any other part type | **refused** `decisions.input_unsupported` |
+| roles `developer`, `system`, `assistant`; item types other than `message`; an `input` that is neither string nor array; an `input_text` part without `text` (`an input_text part has no text`, also in `instructions` parts), an `input_json` part without `data`, any other part type | **refused** `decisions.input_unsupported` |
+| an `input` array that is empty, or whose messages carry no content and no images | **refused** `decisions.input_unsupported`, `input carries no content` |
 | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_breakpoint`, `safety_identifier`, any other top-level field | dropped (emulated; tolerated, not relayed) |
 | `questions[i]` order | the System One `questions` object **written in request order** (hand-built JSON, never a Go map) |
 | `questions[i].name` | the key; a missing or `null` name, or `""`, becomes `q<i>` (zero-based); a key already used gets `-<n>` (n from 2) until unique. The **original** name is restored on the answer: absent or `null` stays `null`, `""` stays `""` |
 | `predicate` | `noul`, no `criteria` |
-| `choice` with `choices[{value, description}]` | `choice` with `criteria {key: description or null}`; the key is the string value, or `"true"`/`"false"` for a boolean value; an empty or absent description is `null` |
+| `choice` with `choices[{value, description}]` | `choice` with `criteria {key: description or null}`; the key is the string value, or `"true"`/`"false"` for a boolean value; an empty or absent description is `null`; a description that is not a string is refused (`choice N description must be a string`) |
 | `score` with `levels[{label, description}]` | `score` with `criteria [..]` in level order; a level **with** a description is sent as `"label: description"` (emulated) |
 | `instructions` string, or an array of `input_text` parts | `instructions`, parts joined with a blank line |
 | `instructions` parts of any other type | **refused** `decisions.input_unsupported` |
-| an unknown question `type`, a choice question with no choices, a score question with no levels, a choice or level that is not an object (a level without a `label`), a choice `value` that is neither string nor boolean, a `name` that is not a string, malformed instructions, two choices that map to one key (`"true"` and `true`) | **refused** `decisions.question_invalid` |
+| an unknown question `type`, a choice question with no choices, a score question with no levels, a choice or level that is not an object (a level without a `label`), a choice `value` that is neither string nor boolean or is the empty string `""`, a choice `description` that is not a string, a `name` that is not a string, malformed instructions, two choices that map to one key (`"true"` and `true`) | **refused** `decisions.question_invalid` |
 | the OpenAI limits (400 questions, 255 choices, 10 levels) | not pre-validated; the upstream's own 400 comes back through the error rule below |
 
 Response side (System One to OpenAI):
@@ -2060,7 +2083,9 @@ value for value. It reads the OpenAI shape (`answers` an array) on `/v1/decision
 System One shape (`answers` an object) on `/v1/systemone`, on the translate route after
 the translation. On a **passthrough** `/v1/decisions` relay and on `/v1/systemone`, only an opted-in token takes the buffered path (item 7; a translated `/v1/decisions` request is always buffered, whatever the token); a **2xx body
 that is not JSON is relayed unchanged** under the upstream's `Content-Type`, and a
-non-2xx is relayed as the copier would.
+non-2xx is relayed as the copier would. A JSON body the normalization left byte for byte
+(nothing to recompute) also keeps the upstream's `Content-Type`; only a rewritten body is
+sent as `application/json`.
 
 **9. Usage.** The call is token-metered. A translated call records the System One tokens
 (`usage.input_tokens`/`output_tokens`) read before the translation; a malformed `usage`
@@ -2532,7 +2557,9 @@ collides with the stored one) and `runtime_spec.decisions_passthrough_unsupporte
 the spec's effective type). **`systemone_mode: translate` is refused for the same two kinds**
 (they have no OpenAI `/v1/decisions` to translate to, §3.9 item 11) with
 `application.systemone_translate_unsupported` (400), `application.systemone_translate_conflict` (409)
-and `runtime_spec.systemone_translate_unsupported` (400), by the same rules. An application **retyped** to `llama_cpp` or `vllm_sr` with a stored
+and `runtime_spec.systemone_translate_unsupported` (400), by the same rules. A save that sends **both** an incapable `decisions_mode`
+(`passthrough`) and an incapable `systemone_mode` (`translate`) for such a kind is refused once, with one message that names both modes; the HTTP status and
+code are the decisions refusal's (the error matches both sentinels, and the mapping reads the decisions row first). An application **retyped** to `llama_cpp` or `vllm_sr` with a stored
 `passthrough` (decisions) or `translate` (System One) is reset to `auto` rather than refused (the "clear when the type cannot carry
 it" rule `responses_live_timings_enabled` follows). An unrecognized mode is
 `application.endpoint_mode_invalid` / `runtime_spec.endpoint_mode_invalid`, for either field. API shapes are in [HTTP API
@@ -4749,11 +4776,11 @@ Every inference error response uses the gateway-wide envelope
 | `systemone.questions_required` | 400 | `validateSystemOneRequest` (§3.9): `questions` absent, not an object, or `{}` |
 | `systemone.stream_unsupported` | 400 | `validateSystemOneRequest` (§3.9): `stream` present and neither `false` nor `null` (System One has no streaming) |
 | `decisions.model_required` / `decisions.questions_required` / `decisions.stream_unsupported` | 400 | `validateDecisionsRequest` (§3.10): `model` absent, not a string or blank; `questions` absent, not an array or empty; `stream` present and neither `false` nor `null` |
-| `decisions.input_unsupported` / `decisions.question_invalid` | 400 | the translate route's request translation (§3.10 item 5) refused an `input` or an instruction it cannot express (a non-user role, an item type other than `message`, an image that is not a `data:` URL, any other part type) or a malformed question (unknown type, no choices or levels, a choice value that is not a string or boolean, colliding choice keys); nothing was sent upstream |
+| `decisions.input_unsupported` / `decisions.question_invalid` | 400 | the translate route's request translation (§3.10 item 5) refused an `input` or an instruction it cannot express (a non-user role, an item type other than `message`, an image that is not a `data:` URL, any other part type) or a malformed question (unknown type, no choices or levels, a choice value that is not a non-empty string or boolean, a choice description that is not a string, colliding choice keys); an `input` array with no content and no images is refused `input carries no content`; nothing was sent upstream. Once a target is resolved, the refusal's usage row carries it (§3.9 item 11, *Refusal rows*) |
 | `decisions.endpoint_disabled` / `systemone.endpoint_disabled` | 404 | the resolved target's effective `decisions_mode` / `systemone_mode` is `disabled` (§6); only a `server_agent` spec reaches it, an ordinary application with the mode disabled is no candidate (`routing.no_model_route`) |
 | `decisions.upstream_error` | the upstream's status (translate, non-2xx), else 502 | the gateway's own envelope: a translated request's non-2xx System One answer (message naming the upstream status and message; a 501 adds guidance), or `502` for a decisions answer that is over the buffer bound, broken off or untranslatable (§3.10 items 6-7); a passthrough non-2xx is relayed verbatim instead |
 | `systemone.upstream_error` | 502; the upstream's status for a translated non-2xx | `/v1/systemone`: for a token that opted into confidence normalization, an answer over the buffer bound or broken off (§3.9 item 9); on the **translate** route, a 2xx OpenAI Decisions answer that cannot be expressed in System One (a wrong type, a missing answer, an unusable body: `502`) and a non-2xx upstream answer (the upstream's own status, the message naming it; a `501` adds guidance) (§3.9 item 12) |
-| `systemone.refused` | 422 | the translate route's OpenAI Decisions upstream refused one or more questions; the message names the keys. It wins over a malformed sibling answer, and the row records the upstream's tokens (§3.9 item 12) |
+| `systemone.refused` | 422 | the translate route's OpenAI Decisions upstream refused one or more questions; the message names the keys. It is the one decision error whose `type` is `refusal` (the upstream answered and declined, which is not an upstream failure); the others keep `upstream_error`. It wins over a malformed sibling answer, and the row records the upstream's tokens (§3.9 item 12) |
 | `systemone.question_type_unsupported` / `systemone.field_unsupported` | 400 | the translate route's request translation (§3.9 item 12) refused a question `type` other than `noul`, `choice` and `score`, or a field or shape OpenAI Decisions cannot express (an unsupported top-level field, a missing or scalar `state`, a duplicate or `null` question, a bad `images` entry, malformed criteria); nothing was sent upstream |
 | `speech.model_required` / `speech.input_required` | 400 | the speech body failed `validateSpeechRequest` (§3.6): no `model`, or no non-empty string `input` |
 | `speech.response_format_unsupported` | 400 | on a request that does not stream, a `response_format` other than `wav`, `pcm` or absent — `mp3`, `opus`, `flac`, `aac`, `json`, `b64_json` and any non-string value (the compressed ones are issue #264); on a streamed request, one other than `pcm` or absent (§3.6) |

@@ -1253,7 +1253,8 @@ one model name with a forced spec mode that lacks its verdict on one of them the
 operator configuration issue (use the same mode on both, or `auto`). An operator who tries to write
 a `manual` row named `any_decision` is refused `mapping.capability_reserved`. The unknown-model redirect's
 `ModelOffering.Capable` has the matching fold (`anyDecisionFlagsByName`: every mapping of a
-name has either verdict and passes the decisions flavor half); it and `ModelDTO.DecisionOpenAI`
+name has either verdict, passes the decisions flavor half, and has a route for the endpoint asked, `routing.DecisionRouteExists`, the rule `decisionRouteServes` shares:
+an ordinary mapping is judged by its own modes, a `server_agent` mapping by its runtime spec's effective kind and modes; vendor candidates are unchanged, §3.9 item 11 of compatibility and inference); it and `ModelDTO.DecisionOpenAI`
 count `decision_openai` only on a capable effective kind (the spec type of a `server_agent`
 mapping with a spec, else the application type).
 
