@@ -126,18 +126,22 @@ func TestSystemOneRequestRefusals(t *testing.T) {
 		{"track", `{"model":"m","state":"s","questions":{"a":{"type":"track"}}}`, CodeSystemOneQuestionTypeUnsupported},
 		{"unknown type", `{"model":"m","state":"s","questions":{"a":{"type":"wat"}}}`, CodeSystemOneQuestionTypeUnsupported},
 		{"missing type", `{"model":"m","state":"s","questions":{"a":{}}}`, CodeSystemOneQuestionTypeUnsupported},
-		{"assets", `{"model":"m","state":"s","assets":[],` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"assets", `{"model":"m","state":"s","assets":["a"],` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"audio", `{"model":"m","state":"s","audio":["a"],` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"videos", `{"model":"m","state":"s","videos":["a"],` + q + `}`, CodeSystemOneFieldUnsupported},
-		{"roles", `{"model":"m","state":"s","roles":{},` + q + `}`, CodeSystemOneFieldUnsupported},
-		{"options", `{"model":"m","state":"s","options":{},` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"roles", `{"model":"m","state":"s","roles":{"r":"x"},` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"options", `{"model":"m","state":"s","options":{"o":1},` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"preset", `{"model":"m","state":"s","preset":"p",` + q + `}`, CodeSystemOneFieldUnsupported},
-		{"states", `{"model":"m","state":"s","states":[],` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"states", `{"model":"m","state":"s","states":["x"],` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"joint", `{"model":"m","state":"s","joint":true,` + q + `}`, CodeSystemOneFieldUnsupported},
-		{"chat_template_kwargs", `{"model":"m","state":"s","chat_template_kwargs":{},` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"chat_template_kwargs", `{"model":"m","state":"s","chat_template_kwargs":{"enable_thinking":false},` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"cache_salt", `{"model":"m","state":"s","cache_salt":"x",` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"priority", `{"model":"m","state":"s","priority":1,` + q + `}`, CodeSystemOneFieldUnsupported},
-		{"request_id", `{"model":"m","state":"s","request_id":"r",` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"priority -1", `{"model":"m","state":"s","priority":-1,` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"joint as string", `{"model":"m","state":"s","joint":"false",` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"top-level instructions blank", `{"model":"m","state":"s","instructions":" ",` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"top-level instructions empty array", `{"model":"m","state":"s","instructions":[],` + q + `}`, CodeSystemOneFieldUnsupported},
+		{"preset empty", `{"model":"m","state":"s","preset":"",` + q + `}`, CodeSystemOneFieldUnsupported},
 		{"not json", `nope`, CodeSystemOneFieldUnsupported},
 		{"null body", `null`, CodeSystemOneFieldUnsupported},
 		{"missing state", `{"model":"m",` + q + `}`, CodeSystemOneFieldUnsupported},
@@ -167,6 +171,33 @@ func TestSystemOneRequestRefusals(t *testing.T) {
 			if derr.Code != tt.code {
 				t.Fatalf("code = %s, want %s (%s)", derr.Code, tt.code, derr.Message)
 			}
+		})
+	}
+}
+
+// TestSystemOneRequestDefaultFieldsCountAsAbsent: a field without an OpenAI
+// Decisions counterpart that carries its default value (false, 0, [], {} or
+// null) changes nothing upstream, so it counts as absent and is not refused;
+// cache_salt and top-level instructions count as absent when empty, and
+// request_id, a correlation id, is dropped whatever its value. None of them
+// reaches the translated body.
+func TestSystemOneRequestDefaultFieldsCountAsAbsent(t *testing.T) {
+	const want = `{"model":"gpt-6-luna","input":"s","questions":[{"type":"predicate","name":"a","instructions":""}]}`
+	q := `"questions":{"a":{"type":"noul"}}`
+	for _, field := range []string{
+		`"joint":false`, `"joint":null`,
+		`"priority":0`, `"priority":0.0`, `"priority":null`,
+		`"assets":[]`, `"assets":null`, `"audio":[]`, `"videos":[ ]`,
+		`"options":{}`, `"options":null`, `"states":[]`, `"roles":{}`,
+		`"chat_template_kwargs":{}`, `"chat_template_kwargs":null`,
+		`"request_id":"req-1"`, `"request_id":42`, `"request_id":null`,
+		`"cache_salt":""`, `"cache_salt":null`,
+		`"instructions":""`, `"instructions":null`,
+		`"preset":null`,
+	} {
+		t.Run(field, func(t *testing.T) {
+			body, _ := reverseOK(t, `{"model":"m","state":"s",`+field+`,`+q+`}`)
+			assertJSONEqual(t, decodeAny(t, []byte(body)), want)
 		})
 	}
 }

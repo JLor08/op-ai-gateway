@@ -64,10 +64,54 @@ func s1TypeErr(format string, args ...any) *DecisionsError {
 }
 
 // s1UnsupportedFields are request fields that have no OpenAI Decisions
-// counterpart. Top-level instructions are listed first.
+// counterpart; a present one is refused (s1FieldAbsent says which values count
+// as absent). Top-level instructions are listed first. request_id is not
+// among them: it is a correlation id, dropped silently whatever its value,
+// since the translated body is built from the known fields only.
 var s1UnsupportedFields = []string{
 	"instructions", "assets", "audio", "videos", "roles", "options", "preset",
-	"states", "joint", "chat_template_kwargs", "cache_salt", "priority", "request_id",
+	"states", "joint", "chat_template_kwargs", "cache_salt", "priority",
+}
+
+// s1FieldAbsent reports whether the unsupported field name, with the raw value
+// raw, counts as absent: a missing member or null always does. Top-level
+// instructions and cache_salt also do as the empty string. preset has no
+// default. Every other field also does with its default value -- false, 0, []
+// or {} -- since a client that sends the default asks for nothing the OpenAI
+// Decisions upstream would miss.
+func s1FieldAbsent(name string, raw json.RawMessage) bool {
+	if !isPresentJSON(raw) {
+		return true
+	}
+	switch name {
+	case "instructions", "cache_salt":
+		return bytes.Equal(bytes.TrimSpace(raw), []byte(`""`))
+	case "preset":
+		return false
+	default:
+		return isDefaultJSON(raw)
+	}
+}
+
+// isDefaultJSON reports whether raw is false, a numeric zero, an empty array or
+// an empty object.
+func isDefaultJSON(raw json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	switch v := v.(type) {
+	case bool:
+		return !v
+	case float64:
+		return v == 0
+	case []any:
+		return len(v) == 0
+	case map[string]any:
+		return len(v) == 0
+	default:
+		return false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +129,7 @@ func TranslateSystemOneRequest(raw []byte, upstreamModel string) ([]byte, System
 		return nil, table, s1FieldErr("the request body is not a valid System One request")
 	}
 	for _, f := range s1UnsupportedFields {
-		if isPresentJSON(top[f]) {
+		if !s1FieldAbsent(f, top[f]) {
 			return nil, table, s1FieldErr("the field %q has no OpenAI Decisions counterpart", f)
 		}
 	}
