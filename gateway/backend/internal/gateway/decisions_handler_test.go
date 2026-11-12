@@ -540,6 +540,8 @@ func TestDecisionsTranslateUpstreamErrorsAreNormalized(t *testing.T) {
 		{"501 adds guidance", http.StatusNotImplemented, `{"error":{"message":"The model does not support the structured decision API","type":"NotImplementedError","code":501}}`, "The model does not support the structured decision API"},
 		{"400 error object", http.StatusBadRequest, `{"error":{"message":"too many questions","type":"BadRequestError","param":null,"code":400}}`, "too many questions"},
 		{"422 detail list", http.StatusUnprocessableEntity, `{"detail":[{"loc":["body","questions"],"msg":"field required","type":"missing"}]}`, "field required"},
+		{"422 vllm-sr 5.0 question_failed", http.StatusUnprocessableEntity, `{"detail":[{"loc":["body","questions","q0"],"msg":"type_unsupported","type":"value_error"}],"code":"question_failed"}`, "type_unsupported"},
+		{"529 overloaded", 529, `{"error":{"message":"overloaded","type":"OverloadedError","code":529}}`, "overloaded"},
 		{"404 detail string", http.StatusNotFound, `{"detail":"Not Found"}`, "Not Found"},
 		{"500 unknown shape", http.StatusInternalServerError, `<html>oops</html>`, "the System One upstream answered 500"},
 	}

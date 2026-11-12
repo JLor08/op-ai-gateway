@@ -5,6 +5,7 @@ package routing
 
 import (
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -37,6 +38,27 @@ const (
 // worker that reports a different major is not known to speak the decision
 // endpoints the way this gateway expects (ADR-099).
 const VllmSRSupportedAPIMajor = 5
+
+// VllmSRAPIVersionUnsupported reports whether a vllm-srun worker's reported
+// api_version names a major other than VllmSRSupportedAPIMajor. It is true
+// only when a major can be parsed from the version's leading integer and it
+// differs; an empty or unparsable version means unknown (an older agent, a
+// failed probe) and is never unsupported (ADR-099).
+func VllmSRAPIVersionUnsupported(version string) bool {
+	version = strings.TrimSpace(version)
+	end := 0
+	for end < len(version) && version[end] >= '0' && version[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return false
+	}
+	major, err := strconv.Atoi(version[:end])
+	if err != nil {
+		return false
+	}
+	return major != VllmSRSupportedAPIMajor
+}
 
 // defaultPrometheusMetricsPath is the Prometheus-style metrics path shared by every runtime
 // kind that serves one at a fixed location: vLLM, llama.cpp, and TGI all default here.

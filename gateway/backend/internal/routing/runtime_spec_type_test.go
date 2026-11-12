@@ -244,3 +244,16 @@ func TestDeriveProbePathsVllmSR(t *testing.T) {
 		t.Fatalf("overrides = (%q, %q), want (/m, /c)", m, c)
 	}
 }
+
+func TestVllmSRAPIVersionUnsupported(t *testing.T) {
+	cases := map[string]bool{
+		"5.0.0": false, "5.1.0": false, "5": false,
+		"6.0.0": true, "4.0.0": true,
+		"": false, "garbage": false,
+	}
+	for version, want := range cases {
+		if got := VllmSRAPIVersionUnsupported(version); got != want {
+			t.Errorf("VllmSRAPIVersionUnsupported(%q) = %v, want %v", version, got, want)
+		}
+	}
+}

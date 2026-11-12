@@ -397,6 +397,10 @@ type agentRuntimeSample struct {
 	QueueDepth     int       `json:"queue_depth"`
 	MetricsProbe   string    `json:"metrics_probe"`
 	ContextProbe   string    `json:"context_probe"`
+	// RuntimeAPIVersion is a vllm_sr child's reported api_version (ADR-099),
+	// sent by the agent for that kind only and omitted when unknown; an older
+	// agent never sends it, which decodes to "" (unknown).
+	RuntimeAPIVersion string `json:"runtime_api_version,omitempty"`
 	// LiveProgressSupport is this child's build's verdict on the live-progress
 	// request parameters (issue #51 / timings-capability-detection Task 4):
 	// "" (never determined -- an older agent that predates this field, or a
@@ -621,6 +625,7 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			QueueDepth:          rt.QueueDepth,
 			MetricsProbe:        rt.MetricsProbe,
 			ContextProbe:        rt.ContextProbe,
+			RuntimeAPIVersion:   rt.RuntimeAPIVersion,
 			LiveProgressSupport: rt.LiveProgressSupport,
 			ImageOptions:        rt.ImageOptions.toProvider(),
 			Kind:                rt.Kind,
@@ -2259,6 +2264,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	statuses := runtimeStatusDTOsFromSamples(req.Runtimes, now)
 	prevStatuses := s.RuntimeStatus.statusRows(serverID)
 	s.RuntimeStatus.publish(serverID, statuses)
+	warnUnsupportedRuntimeAPIVersions(serverID, prevStatuses, statuses)
 	// Every frame, a cluster head's and a member's alike, goes to the cluster
 	// watchdog (clusterOrchestrator.observeStatus): an exited head, a lost
 	// member, a breach, a local start a held member blocks. It only enqueues

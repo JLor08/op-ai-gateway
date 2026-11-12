@@ -3689,3 +3689,61 @@ func TestAgentIngestDropsDecisionOpenAIAndAnyDecisionRows(t *testing.T) {
 	}
 	assertCapabilityRow(t, srv, "map_rspec_decision_openai", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
+
+func runtimeAPIVersionBody(version string) string {
+	field := ""
+	if version != "" {
+		field = `,"runtime_api_version":"` + version + `"`
+	}
+	return `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_apiver","model":"sr","state":"running","since":"2026-08-20T10:00:00Z"` + field + `}]}`
+}
+
+func ingestRuntimeAPIVersion(t *testing.T, srv *Server, version string) {
+	t.Helper()
+	req, raw := ingestReq(t, runtimeAPIVersionBody(version))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+}
+
+func countUnsupportedAPIVersionWarns(buf *logbuffer.Buffer) int {
+	n := 0
+	for _, r := range buf.Snapshot() {
+		if r.Level == "WARN" && strings.Contains(r.Msg, "unsupported api_version") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestIngestKeepsTheRuntimeAPIVersionAndWarnsOncePerChange: the version rides
+// the sample into the registry; one Warn per change into an unsupported major,
+// none for a repeated sample, a supported version or an unknown one.
+func TestIngestKeepsTheRuntimeAPIVersionAndWarnsOncePerChange(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_apiver")
+
+	ingestRuntimeAPIVersion(t, srv, "5.0.0")
+	ingestRuntimeAPIVersion(t, srv, "")
+	if got := countUnsupportedAPIVersionWarns(buf); got != 0 {
+		t.Fatalf("warns = %d for supported/unknown versions, want 0", got)
+	}
+
+	ingestRuntimeAPIVersion(t, srv, "6.0.0")
+	ingestRuntimeAPIVersion(t, srv, "6.0.0")
+	ingestRuntimeAPIVersion(t, srv, "6.0.0")
+	if got := countUnsupportedAPIVersionWarns(buf); got != 1 {
+		t.Fatalf("warns = %d after three samples of 6.0.0, want 1", got)
+	}
+	rows := srv.RuntimeStatus.statusRows("mock-host-qwen")
+	if len(rows) != 1 || rows[0].RuntimeAPIVersion != "6.0.0" {
+		t.Fatalf("registry rows = %+v, want one carrying runtime_api_version 6.0.0", rows)
+	}
+
+	ingestRuntimeAPIVersion(t, srv, "5.0.0")
+	ingestRuntimeAPIVersion(t, srv, "6.0.0")
+	if got := countUnsupportedAPIVersionWarns(buf); got != 2 {
+		t.Fatalf("warns = %d after returning to 5.0.0 and into 6.0.0 again, want 2", got)
+	}
+}

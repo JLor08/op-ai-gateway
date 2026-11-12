@@ -539,6 +539,12 @@ func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.
 		row.MetricsProbe = rep.MetricsProbe
 		row.ContextProbe = rep.ContextProbe
 	}
+	// The api_version is a vllm_sr worker's own report, not a probed count, so
+	// it rides State's unconditional injection. Only a vllm_sr spec can be
+	// unsupported; an empty version is unknown and never is.
+	row.RuntimeAPIVersion = rep.RuntimeAPIVersion
+	row.RuntimeAPIVersionUnsupported = routing.EffectiveRuntimeSpecType(spec) == routing.RuntimeSpecTypeVllmSR &&
+		routing.VllmSRAPIVersionUnsupported(rep.RuntimeAPIVersion)
 }
 
 // runtimeRowRepresentative returns the one of a spec's status rows that speaks for the spec,
