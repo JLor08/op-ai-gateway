@@ -233,6 +233,11 @@ type Target struct {
 	APIFlavors    []string
 	ResponsesMode EndpointMode
 	MessagesMode  EndpointMode
+	// DecisionsMode / SystemOneMode are the EFFECTIVE modes of the two decision
+	// endpoints, resolved like ResponsesMode (spec for a server_agent mapping
+	// with a spec, else the application).
+	DecisionsMode EndpointMode
+	SystemOneMode EndpointMode
 	// OpportunisticMetrics mirrors the resolved application's per-app toggle: when
 	// set, a successful real inference EWMA-updates the served mapping's throughput
 	// metrics from the usage event.
@@ -1698,6 +1703,15 @@ func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 			}
 			continue
 		}
+		// CapabilityAnyDecision is derived, never stored: the mapping answers
+		// either decision endpoint (System One or OpenAI /v1/decisions). A
+		// row of that name is inert, like an image_edit:yes row.
+		if name == CapabilityAnyDecision {
+			if byName[CapabilityDecision].Verdict != CapabilityYes && byName[CapabilityDecisionOpenAI].Verdict != CapabilityYes {
+				return false
+			}
+			continue
+		}
 		if byName[name].Verdict != CapabilityYes {
 			return false
 		}
@@ -1730,12 +1744,16 @@ func ImpliedImageEdit(rows []CapabilityRow) bool {
 }
 
 // filterServesEndpoint drops candidates whose application does not serve the
-// request's FINE api flavor once the per-endpoint mode is applied. It refines only
-// the two coding-agent endpoints (openai_responses / anthropic_messages); for
-// openai_chat_completions and any coarse flavor it is a no-op, so the coarse
-// openai/anthropic gate the store already applied stands unchanged.
+// request's FINE api flavor once the per-endpoint mode is applied. It refines the
+// two coding-agent endpoints (openai_responses / anthropic_messages) and the two
+// decision endpoints (openai_decisions for /v1/decisions, the coarse decisions
+// flavor for /v1/systemone, ADR-098); for openai_chat_completions and any other
+// coarse flavor it is a no-op, so the coarse gate the store already applied
+// stands unchanged.
 func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []MappingCandidate {
-	if fineFlavor != inference.APIFlavorOpenAIResponses && fineFlavor != "anthropic_messages" {
+	switch fineFlavor {
+	case inference.APIFlavorOpenAIResponses, "anthropic_messages", APIFlavorOpenAIDecisions, APIFlavorDecisions:
+	default:
 		return cands
 	}
 	out := cands[:0:0]
@@ -1750,6 +1768,10 @@ func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []Mapping
 func NormalizeAPIFlavor(apiFlavor string) string {
 	normalized := strings.ToLower(strings.TrimSpace(apiFlavor))
 	switch {
+	// openai_decisions is the fine /v1/decisions flavor; like the images and
+	// audio flavors it must be tested BEFORE the generic "openai" prefix.
+	case normalized == APIFlavorOpenAIDecisions:
+		return APIFlavorDecisions
 	// BEFORE the generic "openai" prefix, deliberately: every fine images and
 	// audio flavor also starts with "openai", so testing the generic prefix
 	// first would fold images and speech into text and defeat the separation
@@ -2873,6 +2895,8 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		APIFlavors:           append([]string(nil), eff.APIFlavors...),
 		ResponsesMode:        eff.ResponsesMode,
 		MessagesMode:         eff.MessagesMode,
+		DecisionsMode:        eff.DecisionsMode,
+		SystemOneMode:        eff.SystemOneMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
 		// ResponsesLiveTimingsEnabled carries EffectiveFields' spec-then-app
 		// resolution, NOT app.ResponsesLiveTimingsEnabled: the flag qualifies

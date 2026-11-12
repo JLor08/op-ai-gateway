@@ -71,6 +71,8 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
+		DecisionsMode:               dto.DecisionsMode,
+		SystemOneMode:               dto.SystemOneMode,
 		// A *bool on the request against a bool on the DTO, so this is a
 		// conversion rather than a copy -- the one line in this spread that is
 		// not a straight assignment. A loaded document always HAS an opinion,

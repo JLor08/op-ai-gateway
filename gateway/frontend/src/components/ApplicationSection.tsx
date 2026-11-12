@@ -13,7 +13,9 @@ import type {
   ApplicationStatus,
   ApplicationType,
   CreateApplicationRequest,
+  DecisionsMode,
   EndpointMode,
+  SystemOneMode,
   PortalApplication,
   PortalServer,
   UpdateApplicationRequest,
@@ -38,6 +40,14 @@ import {
   migrateTypeFields,
   stockApplicationHealthPath,
 } from './shared/applicationTypeDefaults';
+import {
+  decisionsModeForKind,
+  decisionsModeOrDefault,
+  decisionsPassthroughOffered,
+  defaultDecisionsMode,
+  defaultSystemOneMode,
+  systemOneModeOrDefault,
+} from './shared/decisionsModes';
 import { applicationLiveTimingsKind, applicationSendsLiveTimings } from './shared/liveTimings';
 import { MappingSection } from './MappingSection';
 import { RuntimeAdminSection } from './RuntimeAdminSection';
@@ -270,6 +280,8 @@ export function ApplicationSection({
   );
   const [responsesMode, setResponsesMode] = useState<EndpointMode>('passthrough');
   const [messagesMode, setMessagesMode] = useState<EndpointMode>('passthrough');
+  const [decisionsMode, setDecisionsMode] = useState<DecisionsMode>(defaultDecisionsMode);
+  const [systemOneMode, setSystemOneMode] = useState<SystemOneMode>(defaultSystemOneMode);
   const [loadedModelsPath, setLoadedModelsPath] = useState('');
   const [loadedModelsFormat, setLoadedModelsFormat] = useState('auto');
   const [contextProbePath, setContextProbePath] = useState('');
@@ -358,6 +370,8 @@ export function ApplicationSection({
     setHealthIntervalSeconds(defaultCustomHealthIntervalSeconds);
     setResponsesMode(d.responsesMode);
     setMessagesMode(d.messagesMode);
+    setDecisionsMode(defaultDecisionsMode);
+    setSystemOneMode(defaultSystemOneMode);
     setLoadedModelsPath(d.loadedModelsPath);
     setLoadedModelsFormat(d.loadedModelsFormat);
     setContextProbePath(d.contextProbePath);
@@ -399,6 +413,9 @@ export function ApplicationSection({
     if (patch.healthCheckMode !== undefined) setHealthMode(patch.healthCheckMode);
     if (patch.healthCheckPath !== undefined) setHealthPath(patch.healthCheckPath);
     if (patch.apiFlavors !== undefined) setFlavors(patch.apiFlavors);
+    // A selected passthrough is not servable by llama.cpp: the backend would
+    // refuse the save, so it becomes auto here (and resets server-side too).
+    setDecisionsMode(decisionsModeForKind(decisionsMode, newType));
     setType(newType);
   }
 
@@ -424,6 +441,8 @@ export function ApplicationSection({
     );
     setResponsesMode(app.responses_mode);
     setMessagesMode(app.messages_mode);
+    setDecisionsMode(decisionsModeOrDefault(app.decisions_mode));
+    setSystemOneMode(systemOneModeOrDefault(app.systemone_mode));
     setLoadedModelsPath(app.loaded_models_path ?? '');
     setLoadedModelsFormat(app.loaded_models_format || 'auto');
     setContextProbePath(app.context_probe_path ?? '');
@@ -470,6 +489,11 @@ export function ApplicationSection({
       health_check_interval_seconds: healthIntervalMode === 'custom' ? healthIntervalSeconds : 0,
       responses_mode: responsesMode,
       messages_mode: messagesMode,
+      // Always sent, never "": a create takes the defaults when absent and an
+      // update keeps the stored value, but the form shows the value it sends.
+      // passthrough is refused for llama_cpp, so it is coerced to auto there.
+      decisions_mode: decisionsModeForKind(decisionsMode, type),
+      systemone_mode: systemOneMode,
       // Sent ONLY for a type that can honour it. buildBody restates `type` on
       // every save, and the backend selects the 400 arm
       // (application.responses_live_timings_unsupported) over the 409
@@ -964,6 +988,11 @@ export function ApplicationSection({
               flavorsGroupRef={flavorsGroupRef}
               onResponsesModeChange={setResponsesMode}
               onMessagesModeChange={setMessagesMode}
+              decisionsMode={decisionsMode}
+              systemOneMode={systemOneMode}
+              decisionsPassthroughOffered={decisionsPassthroughOffered(type)}
+              onDecisionsModeChange={setDecisionsMode}
+              onSystemOneModeChange={setSystemOneMode}
               onLiveTimingsChange={setLiveTimings}
             />
             <Box

@@ -3666,3 +3666,26 @@ func TestAgentIngestDropsADecisionCapabilityRow(t *testing.T) {
 	}
 	assertCapabilityRow(t, srv, "map_rspec_decision", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
 }
+
+// decision_openai is the gateway decisions_probe's to write, and any_decision
+// is derived and never a row: an agent may report neither.
+func TestAgentIngestDropsDecisionOpenAIAndAnyDecisionRows(t *testing.T) {
+	for _, name := range []string{routing.CapabilityDecisionOpenAI, routing.CapabilityAnyDecision} {
+		if !reservedAgentCapabilityNames[name] {
+			t.Fatalf("%s must be a reserved agent capability name", name)
+		}
+	}
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_decision_openai")
+	req, raw := ingestReq(t, capabilitiesBody("rspec_decision_openai",
+		`{"verdicts":[{"name":"decision_openai","verdict":"yes"},{"name":"any_decision","verdict":"yes"},{"name":"vision","verdict":"yes"}],"source":"`+routing.CapabilitySourceLlamaCppProps+`"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	for _, name := range []string{routing.CapabilityDecisionOpenAI, routing.CapabilityAnyDecision} {
+		if row, ok := capabilityRow(t, srv, "map_rspec_decision_openai", name); ok {
+			t.Fatalf("a %s row exists (%+v), want none", name, row)
+		}
+	}
+	assertCapabilityRow(t, srv, "map_rspec_decision_openai", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps)
+}

@@ -5,8 +5,9 @@ import { Checkbox, FormControlLabel, Typography } from '@mui/material';
 import type { Ref } from 'react';
 import { CheckboxGroup } from './CheckboxGroup';
 import { SelectField } from './SelectField';
-import type { EndpointMode } from '../../api';
+import type { DecisionsMode, EndpointMode, SystemOneMode } from '../../api';
 import { liveTimingsControlLayout, type LiveTimingsKind } from './liveTimings';
+import { defaultDecisionsMode, defaultSystemOneMode } from './decisionsModes';
 import type { Translation } from './types';
 
 // The API-Varianten capability checkboxes. openai gates /v1/responses (Codex)
@@ -48,6 +49,22 @@ const endpointModeLabelByKey: Record<
   passthrough: 'applicationModePassthrough',
 };
 
+const decisionsModeOptions: DecisionsMode[] = ['auto', 'translate', 'passthrough', 'disabled'];
+const systemOneModeOptions: SystemOneMode[] = ['passthrough', 'disabled'];
+
+const decisionsModeLabelByKey: Record<
+  DecisionsMode,
+  | 'applicationDecisionsModeAuto'
+  | 'applicationModeDisabled'
+  | 'applicationModeTranslate'
+  | 'applicationModePassthrough'
+> = {
+  auto: 'applicationDecisionsModeAuto',
+  disabled: 'applicationModeDisabled',
+  translate: 'applicationModeTranslate',
+  passthrough: 'applicationModePassthrough',
+};
+
 function toggleFlavor(list: string[], flavor: string): string[] {
   return list.includes(flavor) ? list.filter((item) => item !== flavor) : [...list, flavor];
 }
@@ -74,6 +91,11 @@ export function ApiVariantControls({
   onResponsesModeChange,
   onMessagesModeChange,
   onLiveTimingsChange,
+  decisionsMode,
+  systemOneMode,
+  decisionsPassthroughOffered,
+  onDecisionsModeChange,
+  onSystemOneModeChange,
   flavorsError,
   flavorsGroupRef,
 }: Readonly<{
@@ -92,6 +114,17 @@ export function ApiVariantControls({
   onResponsesModeChange: (mode: EndpointMode) => void;
   onMessagesModeChange: (mode: EndpointMode) => void;
   onLiveTimingsChange: (enabled: boolean) => void;
+  // The POST /v1/decisions and POST /v1/systemone modes. Both only apply while
+  // the decisions flavor is ticked, so both selects are disabled and show the
+  // defaults (auto / passthrough) while it is not -- the stored values are left
+  // untouched, as with the responses/messages selects. Passthrough is not
+  // offered for decisions where the server kind cannot answer OpenAI Decisions
+  // natively (llama.cpp): decisionsPassthroughOffered says so.
+  decisionsMode: DecisionsMode;
+  systemOneMode: SystemOneMode;
+  decisionsPassthroughOffered: boolean;
+  onDecisionsModeChange: (mode: DecisionsMode) => void;
+  onSystemOneModeChange: (mode: SystemOneMode) => void;
   // A validation message for the flavor group, or undefined for none. The
   // CALLER decides whether an empty selection is an error; both callers, the
   // application form and the launch-spec form, refuse it.
@@ -102,6 +135,7 @@ export function ApiVariantControls({
 }>) {
   const openaiEnabled = apiFlavors.includes('openai');
   const anthropicEnabled = apiFlavors.includes('anthropic');
+  const decisionsEnabled = apiFlavors.includes('decisions');
   // The exhaustive replacement for the plain-comparison suppression that once
   // let a fourth kind fall through to a working, do-nothing checkbox (issue #88).
   const liveTimingsLayout = liveTimingsControlLayout(liveTimingsKind);
@@ -146,6 +180,37 @@ export function ApiVariantControls({
       </SelectField>
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>
         {t.applicationNativeNote}
+      </Typography>
+      <SelectField
+        id="application-decisions-mode"
+        label={t.applicationDecisionsMode}
+        value={decisionsEnabled ? decisionsMode : defaultDecisionsMode}
+        onChange={(e) => onDecisionsModeChange(e.target.value as DecisionsMode)}
+        disabled={!decisionsEnabled}
+      >
+        {decisionsModeOptions
+          .filter((m) => m !== 'passthrough' || decisionsPassthroughOffered)
+          .map((m) => (
+            <option value={m} key={m}>
+              {t[decisionsModeLabelByKey[m]]}
+            </option>
+          ))}
+      </SelectField>
+      <SelectField
+        id="application-systemone-mode"
+        label={t.applicationSystemOneMode}
+        value={decisionsEnabled ? systemOneMode : defaultSystemOneMode}
+        onChange={(e) => onSystemOneModeChange(e.target.value as SystemOneMode)}
+        disabled={!decisionsEnabled}
+      >
+        {systemOneModeOptions.map((m) => (
+          <option value={m} key={m}>
+            {t[decisionsModeLabelByKey[m]]}
+          </option>
+        ))}
+      </SelectField>
+      <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+        {t.applicationDecisionsModeNote}
       </Typography>
       {liveTimingsLayout.checkbox ? (
         <>

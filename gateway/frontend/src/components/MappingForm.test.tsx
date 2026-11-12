@@ -584,6 +584,70 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // decision_openai is decision's twin for a model that answers OpenAI
+    // Decisions natively: the same operator-yes rule, (decision_openai, no)
+    // reserved for the probe.
+    describe('decision_openai verdict', () => {
+      const label = t.mappingDecisionOpenaiCapable;
+
+      it('offers unknown and yes, never a selectable no, with the unknown hint', () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+        expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual([
+          t.mappingCapabilityUnknown,
+          t.mappingCapabilityYes,
+        ]);
+        expect(screen.getByText(t.mappingDecisionOpenaiCapableUnknownHint)).toBeInTheDocument();
+      });
+
+      it('sends yes once picked and nothing when untouched', async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await pickOption(label, t.mappingCapabilityYes);
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ decision_openai: 'yes' });
+      });
+
+      it('shows a stored no as a disabled option and does not resend it', async () => {
+        const { submitted } = renderForm({
+          row: makeMapping({
+            capabilities: [
+              {
+                capability: 'decision_openai',
+                verdict: 'no',
+                source: 'decision_probe',
+                checked_at: '2026-09-25T12:00:00Z',
+              },
+            ],
+          }),
+        });
+        const combo = screen.getByRole('combobox', { name: label });
+        expect(combo.textContent).toBe(t.mappingCapabilityNo);
+        fireEvent.mouseDown(combo);
+        const no = await screen.findByRole('option', { name: t.mappingCapabilityNo });
+        expect(no).toHaveAttribute('aria-disabled', 'true');
+        fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+      });
+    });
+
+    it('shows the mapping decisions route beside the decision verdicts', () => {
+      renderForm({ row: makeMapping({ decisions_route: 'translate' }) });
+      expect(
+        screen.getByText(t.mappingDecisionsRoute(t.mappingDecisionsRouteTranslate)),
+      ).toBeInTheDocument();
+    });
+
+    it('shows no decisions route when the mapping has none', () => {
+      renderForm({ row: makeMapping({ decisions_route: '' }) });
+      expect(
+        screen.queryByText(t.mappingDecisionsRoute(t.mappingDecisionsRouteTranslate)),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(t.mappingDecisionsRoute(''))).not.toBeInTheDocument();
+    });
+
     // embedding and rerank mark a model's ROLE (a vector encoder / a reranker,
     // not a text generator). Unlike the audio and image controls above, nothing
     // probes either one and neither pair is reserved, so there is no automated

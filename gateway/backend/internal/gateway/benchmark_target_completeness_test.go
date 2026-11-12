@@ -41,13 +41,16 @@ var benchmarkOmits = map[string]bool{
 	// CompleteStream path (dispatch keys on Provider); the benchmark's directly built
 	// request needs no flavor.
 	"APIFlavor": true,
-	// APIFlavors / ResponsesMode / MessagesMode / ResponsesLiveTimingsEnabled are all
+	// APIFlavors / ResponsesMode / MessagesMode / DecisionsMode / SystemOneMode /
+	// ResponsesLiveTimingsEnabled are all
 	// read only by the native-passthrough dispatch layer (native_passthrough.go,
 	// wantsResponsesLiveTimings), which a chat-completions benchmark stream never
 	// enters.
 	"APIFlavors":                  true,
 	"ResponsesMode":               true,
 	"MessagesMode":                true,
+	"DecisionsMode":               true,
+	"SystemOneMode":               true,
 	"ResponsesLiveTimingsEnabled": true,
 	// Read only on the real-inference usage path (inference_complete.go), itself
 	// gated on RouteID != ""; a benchmark computes its own throughput and must not

@@ -113,6 +113,9 @@ export type ServiceTokenDTO = {
   // Opt-in Claude Code effort compatibility, identical in meaning to
   // PortalToken's.
   claude_effort_compatibility?: boolean;
+  // Opt-in decision-confidence normalization, identical in meaning to
+  // PortalToken's.
+  decisions_confidence_normalize?: boolean;
   // The token's vendor-account access (see VendorAccessDTO); absent when it has
   // none. A service owns no account, so it can only name accounts SHARED with it
   // (the service provisioned into a resource group that contains them). Set at
@@ -138,6 +141,8 @@ export type CreateServiceTokenRequest = {
   claude_model_aliases?: boolean;
   // Claude Code effort compatibility (see ServiceTokenDTO); omitted = off.
   claude_effort_compatibility?: boolean;
+  // Decision-confidence normalization (see ServiceTokenDTO); omitted = off.
+  decisions_confidence_normalize?: boolean;
   // Vendor-account access (see ServiceTokenDTO); omitted = the strict default, no
   // vendor access. Each named account must be reachable for THIS SERVICE (not for
   // the admin or delegate creating the token), else 400

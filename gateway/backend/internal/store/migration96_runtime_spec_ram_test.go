@@ -59,13 +59,11 @@ func TestMigration96AddsRuntimeSpecRAMColumns(t *testing.T) {
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
-		if err := s.CreateApplication(ctx, routing.Application{
+		seedBaselineApplication(ctx, t, s, routing.Application{
 			ID: "app_m96", ServerID: "srv_m96", Type: routing.ProviderServerAgent, Port: 8096, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create application: %v", err)
-		}
+		})
 		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m96", ApplicationID: "app_m96", GatewayModelName: "m96-model", AppModelName: "up-m96",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,

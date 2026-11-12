@@ -1790,3 +1790,30 @@ func TestResponsesMessagesLastUsedModelWrittenOncePerRequest(t *testing.T) {
 		})
 	}
 }
+
+// TestUpstreamPathOpenAIDecisionsFollowsTheConcreteRoute pins the
+// openai_decisions branch: the handler stores the concrete route on the target
+// (ADR-098), translate answers /v1/systemone and passthrough /v1/decisions,
+// before any mode lookup or provider fallback.
+func TestUpstreamPathOpenAIDecisionsFollowsTheConcreteRoute(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		mode     routing.EndpointMode
+		want     string
+	}{
+		{"translate", routing.ProviderVLLM, routing.EndpointModeTranslate, "/v1/systemone"},
+		{"passthrough", routing.ProviderVLLM, routing.EndpointModePassthrough, "/v1/decisions"},
+		{"ollama translate", routing.ProviderOllama, routing.EndpointModeTranslate, "/v1/systemone"},
+		{"ollama passthrough", routing.ProviderOllama, routing.EndpointModePassthrough, "/v1/decisions"},
+		{"unresolved target keeps the empty answer", "", routing.EndpointModePassthrough, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := routing.Target{Provider: tc.provider, DecisionsMode: tc.mode}
+			if got := upstreamPath(target, routing.APIFlavorOpenAIDecisions, endpointDecisions); got != tc.want {
+				t.Fatalf("upstreamPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

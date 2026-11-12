@@ -170,6 +170,9 @@ export function TokenList({
   // Opt-in Claude Code effort compatibility: delivers the reasoning effort
   // Claude Code selects to chat-template-driven local backends.
   const [claudeEffort, setClaudeEffort] = useState(false);
+  // Opt-in decision-confidence normalization (#373): /v1/decisions and
+  // /v1/systemone report a 0..1 confidence whatever the model's own scale is.
+  const [decisionsNormalize, setDecisionsNormalize] = useState(false);
   const [logCommunication, setLogCommunication] = useState(false);
   const [secret, setSecret] = useState(false);
   // Project attribution (spec: 2026-08-08-projects-design.md §6): "" = no project.
@@ -294,6 +297,7 @@ export function TokenList({
     setUnknownFallback('');
     setClaudeAliases(false);
     setClaudeEffort(false);
+    setDecisionsNormalize(false);
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
@@ -329,6 +333,7 @@ export function TokenList({
     setUnknownFallback(row.unknown_model_fallback ?? '');
     setClaudeAliases(row.claude_model_aliases ?? false);
     setClaudeEffort(row.claude_effort_compatibility ?? false);
+    setDecisionsNormalize(row.decisions_confidence_normalize ?? false);
     setLogCommunication(row.log_communication);
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
@@ -380,6 +385,7 @@ export function TokenList({
         unknown_model_fallback: unknownFallback,
         claude_model_aliases: claudeAliases,
         claude_effort_compatibility: claudeEffort,
+        decisions_confidence_normalize: decisionsNormalize,
         log_communication: logCommunication,
         secret,
         project_id: projectId,
@@ -414,6 +420,7 @@ export function TokenList({
       body.unknown_model_fallback = unknownFallback;
       body.claude_model_aliases = claudeAliases;
       body.claude_effort_compatibility = claudeEffort;
+      body.decisions_confidence_normalize = decisionsNormalize;
       body.log_communication = logCommunication;
       body.secret = secret;
       body.project_id = projectId;
@@ -769,6 +776,20 @@ export function TokenList({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenClaudeEffortHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={decisionsNormalize}
+                    onChange={(e) => setDecisionsNormalize(e.target.checked)}
+                  />
+                }
+                label={t.tokenDecisionsConfidenceNormalize}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenDecisionsConfidenceNormalizeHint}
               </Typography>
             </Box>
             {/* The vendor-access section is hidden entirely while the vendor-accounts

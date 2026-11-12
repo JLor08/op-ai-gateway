@@ -581,19 +581,26 @@ func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token aut
 	// native endpoints that carry any set them from their own identity:
 	// /v1/images/generations ["image"], /v1/images/edits ["image_edit"],
 	// /v1/audio/speech ["speech"], /v1/audio/transcriptions and its /details twin
-	// ["transcription"] and /v1/systemone ["decision"];
-	// the translate-capable text endpoints require none. The capability gate
-	// refuses a model without them, so a candidate is taken only when it
-	// carries every one (ModelOffering.Capable): a
+	// ["transcription"], /v1/systemone ["decision"] and /v1/decisions
+	// ["any_decision"]; the translate-capable text endpoints require none. The
+	// capability gate refuses a model without them, so a candidate is taken
+	// only when it carries every one (ModelOffering.Capable): a
 	// LastUsedModel or fallback that lacks the capability is skipped rather than
 	// turned into a 404 model_not_capable about a model the client never named.
 	// Every required capability a native endpoint sets has a portal fold
-	// (image, image_edit, speech, transcription and decision), so Capable is never empty
-	// for want of one. A capability added to RequiredCapabilities without a fold
-	// in hasCapabilityFold/capabilityFlagsByName would leave Capable empty, and
-	// no candidate would ever be taken for it.
+	// (image, image_edit, speech, transcription, decision and any_decision), so
+	// Capable is never empty for want of one. A capability added to
+	// RequiredCapabilities without a fold in hasCapabilityFold/
+	// capabilityFlagsByName would leave Capable empty, and no candidate would
+	// ever be taken for it.
+	//
+	//
+	// The offering is asked by offeringFlavor: the two decision endpoints share
+	// the coarse decisions flavor, so /v1/decisions keeps its fine
+	// openai_decisions, and Callable judges a name by the mode of the endpoint
+	// asked (decisions_mode, systemone_mode).
 	if token.UnknownModelRedirect && s.Portal != nil {
-		off := s.Portal.ModelOfferingFor(r.Context(), token, routing.NormalizeAPIFlavor(shape.apiFlavor), shape.requiredCapabilities)
+		off := s.Portal.ModelOfferingFor(r.Context(), token, offeringFlavor(shape.apiFlavor), shape.requiredCapabilities)
 		if to := redirectUnknownModel(token, req.Model, off); to != "" {
 			req.Model = to
 		}
@@ -616,6 +623,18 @@ func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token aut
 	// it ran on last; nothing else can.
 	req.RealtimeRequired, req.PreferredInstanceKey = s.loopbackRouting(r)
 	return preflight{Req: req}, false
+}
+
+// offeringFlavor is the flavor inferenceGate asks the portal's ModelOffering
+// about: the request's coarse flavor (routing.NormalizeAPIFlavor), except
+// openai_decisions, which stays fine. The coarse decisions flavor is POST
+// /v1/systemone's, judged by systemone_mode; POST /v1/decisions is judged by
+// decisions_mode, and only its fine flavor tells the offering which one.
+func offeringFlavor(apiFlavor string) string {
+	if apiFlavor == routing.APIFlavorOpenAIDecisions {
+		return apiFlavor
+	}
+	return routing.NormalizeAPIFlavor(apiFlavor)
 }
 
 // writeLimitDenied writes the HTTP response for a PrincipalLimiter.Admit

@@ -184,6 +184,9 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_flavors: ['openai', 'anthropic'],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    // The wire always carries both; a configured spec stores the defaults.
+    decisions_mode: 'auto',
+    systemone_mode: 'passthrough',
     responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
@@ -1283,6 +1286,72 @@ describe('RuntimeAdminSection launch specs list', () => {
     expect(messages.en.runtimeTextOnStableDiffusionWarning).not.toBe(
       t.runtimeTextOnStableDiffusionWarning,
     );
+  });
+});
+
+describe('RuntimeAdminSection decisions modes in the spec form', () => {
+  const decisionsField = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
+  const systemOneField = () => screen.getByRole('combobox', { name: t.applicationSystemOneMode });
+
+  async function openCreate(app?: Parameters<typeof renderSection>[0]) {
+    const view = renderSection(app);
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    return view;
+  }
+
+  it('always sends both modes, at their defaults when untouched', async () => {
+    const { putSpecs } = await openCreate();
+    expect(decisionsField()).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.decisions_mode).toBe('auto');
+    expect(putSpecs[0].body.systemone_mode).toBe('passthrough');
+  });
+
+  it('sends the chosen modes once the decisions flavor is ticked', async () => {
+    const { putSpecs } = await openCreate();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
+    fireEvent.mouseDown(decisionsField());
+    fireEvent.click(await screen.findByRole('option', { name: t.applicationModeTranslate }));
+    fireEvent.mouseDown(systemOneField());
+    fireEvent.click(await screen.findByRole('option', { name: t.applicationModeDisabled }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.decisions_mode).toBe('translate');
+    expect(putSpecs[0].body.systemone_mode).toBe('disabled');
+  });
+
+  it('does not inherit the application modes into a new spec', async () => {
+    const { putSpecs } = await openCreate({
+      application: { ...application, decisions_mode: 'translate', systemone_mode: 'disabled' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.decisions_mode).toBe('auto');
+    expect(putSpecs[0].body.systemone_mode).toBe('passthrough');
+  });
+
+  it('offers no passthrough for the llama.cpp type and turns a selected one into auto', async () => {
+    const { putSpecs } = await openCreate();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
+    fireEvent.mouseDown(decisionsField());
+    fireEvent.click(await screen.findByRole('option', { name: t.applicationModePassthrough }));
+    expect(decisionsField()).toHaveTextContent(t.applicationModePassthrough);
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    expect(decisionsField()).toHaveTextContent(t.applicationDecisionsModeAuto);
+    fireEvent.mouseDown(decisionsField());
+    expect(screen.queryByRole('option', { name: t.applicationModePassthrough })).toBeNull();
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.decisions_mode).toBe('auto');
   });
 });
 
@@ -3430,6 +3499,9 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
     messages_mode: spec.messages_mode,
+    // Replayed verbatim like the endpoint modes: a PUT that omitted them would reset them.
+    decisions_mode: spec.decisions_mode,
+    systemone_mode: spec.systemone_mode,
     type: spec.type,
     metrics_path: spec.metrics_path,
     context_probe_path: spec.context_probe_path,

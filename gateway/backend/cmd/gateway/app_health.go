@@ -347,6 +347,14 @@ type appHealthRunner struct {
 	systemOneRefusals escalatingBackoff
 	systemOneInFlight mappingSet
 	systemOnePasses   sync.WaitGroup
+	// decisionsSettled, decisionsBackoff and decisionsRefusals are the same
+	// three memories for the OpenAI Decisions probe (ADR-098), under
+	// decisionsProbeKey: separate from System One's, so one probe settling or
+	// backing off never stops the other. It rides the same detached pass
+	// (systemOneInFlight, systemOnePasses). Zero values are ready.
+	decisionsSettled  mappingSet
+	decisionsBackoff  mappingBackoff
+	decisionsRefusals escalatingBackoff
 }
 
 // mappingSet is a set of mapping ids, safe for concurrent use: the loop's per-server cycles
@@ -1856,13 +1864,21 @@ func (r *appHealthRunner) cacheSdcppImageOptions(ctx context.Context, app routin
 // this source -- and only it, (decision, no) being reserved from manual
 // edits -- to establish decision: no.
 func systemOneCapabilityRows(verdict string, at time.Time) []routing.CapabilityRow {
+	return decisionCapabilityRows(routing.CapabilityDecision, routing.CapabilitySourceSystemOneProbe, verdict, at)
+}
+
+// decisionsCapabilityRows is systemOneCapabilityRows for the OpenAI Decisions
+// probe: one routing.CapabilityDecisionOpenAI row attributed to
+// routing.CapabilitySourceDecisionsProbe.
+func decisionsCapabilityRows(verdict string, at time.Time) []routing.CapabilityRow {
+	return decisionCapabilityRows(routing.CapabilityDecisionOpenAI, routing.CapabilitySourceDecisionsProbe, verdict, at)
+}
+
+func decisionCapabilityRows(capability, source, verdict string, at time.Time) []routing.CapabilityRow {
 	if verdict != routing.CapabilityYes && verdict != routing.CapabilityNo {
 		return nil
 	}
-	return []routing.CapabilityRow{{
-		Capability: routing.CapabilityDecision, Verdict: verdict,
-		Source: routing.CapabilitySourceSystemOneProbe, CheckedAt: at,
-	}}
+	return []routing.CapabilityRow{{Capability: capability, Verdict: verdict, Source: source, CheckedAt: at}}
 }
 
 // systemOneProbeKey is the settled-memory and back-off key of one System One
@@ -1870,6 +1886,12 @@ func systemOneCapabilityRows(verdict string, at time.Time) []routing.CapabilityR
 // is a new key and is probed again.
 func systemOneProbeKey(mappingID, identity string) string {
 	return "systemone:" + mappingID + ":" + identity
+}
+
+// decisionsProbeKey is systemOneProbeKey for the OpenAI Decisions probe, a key
+// of its own so the two probes keep separate settled and back-off state.
+func decisionsProbeKey(mappingID, identity string) string {
+	return "decisions:" + mappingID + ":" + identity
 }
 
 // startSystemOnePasses is the System One decision step of probeServer: for
@@ -1897,6 +1919,8 @@ func (r *appHealthRunner) startSystemOnePasses(ctx context.Context, server routi
 	if !ok {
 		return nextSeconds
 	}
+	dProber, _ := r.prober.(provider.DecisionsProber)
+	probers := decisionProbers{systemOne: soProber, openAI: dProber}
 	for i, app := range active {
 		if !slices.Contains(app.APIFlavors, routing.APIFlavorDecisions) {
 			continue
@@ -1916,7 +1940,7 @@ func (r *appHealthRunner) startSystemOnePasses(ctx context.Context, server routi
 		go func(app routing.Application) {
 			defer r.systemOnePasses.Done()
 			defer r.systemOneInFlight.remove(app.ID)
-			r.probeSystemOne(ctx, server, app, soProber)
+			r.probeSystemOne(ctx, server, app, probers)
 		}(app)
 	}
 	return nextSeconds
@@ -1955,15 +1979,34 @@ func (r *appHealthRunner) systemOneView(ctx context.Context, server routing.AISe
 	return view, true
 }
 
-// systemOneCandidate is one mapping the System One pass may probe: its key
-// (systemOneProbeKey), the credential to send, and whether what serves it
-// may be asked at all (false only for a server_agent mapping its agent does
-// not report loaded).
+// systemOneCandidate is one mapping the decision pass may probe: its keys
+// (systemOneProbeKey, decisionsProbeKey), the credential to send, whether
+// what serves it may be asked at all (false only for a server_agent mapping
+// its agent does not report loaded) and whether it is also in scope for the
+// OpenAI Decisions probe (openAI).
 type systemOneCandidate struct {
 	mp                    routing.ModelMapping
-	key                   string
+	key, decisionsKey     string
 	authToken, authHeader string
-	loaded                bool
+	loaded, openAI        bool
+}
+
+// openAIDecisionsInScope reports whether a candidate mapping is asked the
+// OpenAI Decisions question as well (ADR-098): an external vllm application,
+// or a server_agent mapping whose runtime spec type is vllm or custom. Every
+// other type never gets the request.
+func openAIDecisionsInScope(app routing.Application, spec routing.RuntimeSpec, hasSpec, agent bool) bool {
+	if !agent {
+		return app.Type == routing.ProviderVLLM
+	}
+	if !hasSpec {
+		return false
+	}
+	switch routing.EffectiveRuntimeSpecType(spec) {
+	case routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeCustom:
+		return true
+	}
+	return false
 }
 
 // systemOneCandidateFor reports whether mp is one the pass asks about -- an
@@ -1989,17 +2032,64 @@ func systemOneCandidateFor(app routing.Application, mp routing.ModelMapping, vie
 		_, c.loaded = view.loaded[mp.AppModelName]
 	}
 	c.key = systemOneProbeKey(mp.ID, identity)
+	c.decisionsKey = decisionsProbeKey(mp.ID, identity)
+	c.openAI = openAIDecisionsInScope(app, spec, hasSpec, view.agent)
 	return c, true
 }
 
-// probeSystemOne is the System One decision pass for ONE application, run
-// detached from the health cycle (startSystemOnePasses): for each mapping the
-// pass asks about (systemOneCandidateFor) it sends one tiny POST /v1/systemone
-// naming the mapping's app model name (provider.SystemOneProber) and writes
-// the decision verdict the answer states (systemOneCapabilityRows through
+// decisionProbers are the probes a pass may send: System One always, the
+// OpenAI Decisions one only when the provider chain implements it (openAI nil
+// otherwise).
+type decisionProbers struct {
+	systemOne provider.SystemOneProber
+	openAI    provider.DecisionsProber
+}
+
+// decisionProbe is one probe of one candidate: the state it keeps under its
+// own key, the row it writes, and the call. Both probes share the settling
+// logic in settleDecisionProbe.
+type decisionProbe struct {
+	key        string
+	capability string
+	settled    *mappingSet
+	backoff    *mappingBackoff
+	refusals   *escalatingBackoff
+	refused    error
+	rows       func(verdict string, at time.Time) []routing.CapabilityRow
+	ask        func(ctx context.Context, target routing.Target, model string) (string, error)
+}
+
+// decisionProbesFor lists the probes to send for candidate c: System One
+// first, then the OpenAI one when c is in scope and a prober exists.
+func (r *appHealthRunner) decisionProbesFor(c systemOneCandidate, probers decisionProbers) []decisionProbe {
+	var out []decisionProbe
+	if probers.systemOne != nil {
+		out = append(out, decisionProbe{
+			key: c.key, capability: routing.CapabilityDecision,
+			settled: &r.systemOneSettled, backoff: &r.systemOneBackoff, refusals: &r.systemOneRefusals,
+			refused: provider.ErrSystemOneProbeRefused, rows: systemOneCapabilityRows, ask: probers.systemOne.ProbeSystemOne,
+		})
+	}
+	if c.openAI && probers.openAI != nil {
+		out = append(out, decisionProbe{
+			key: c.decisionsKey, capability: routing.CapabilityDecisionOpenAI,
+			settled: &r.decisionsSettled, backoff: &r.decisionsBackoff, refusals: &r.decisionsRefusals,
+			refused: provider.ErrDecisionsProbeRefused, rows: decisionsCapabilityRows, ask: probers.openAI.ProbeOpenAIDecisions,
+		})
+	}
+	return out
+}
+
+// probeSystemOne is the decision pass for ONE application, run detached from
+// the health cycle (startSystemOnePasses): for each mapping the pass asks
+// about (systemOneCandidateFor) it sends one tiny POST /v1/systemone naming
+// the mapping's app model name (provider.SystemOneProber) and, for a mapping
+// in scope (openAIDecisionsInScope), one tiny POST /v1/decisions
+// (provider.DecisionsProber, ADR-098), and writes the verdicts the answers
+// state (systemOneCapabilityRows, decisionsCapabilityRows through
 // writeCapabilityRows, so the precedence and change-detection guards hold: an
-// operator's yes is never overwritten). The probe is unmetered: it goes
-// straight through the prober, not the gateway relay, so it leaves no usage
+// operator's yes is never overwritten). The probes are unmetered: they go
+// straight through the prober, not the gateway relay, so they leave no usage
 // row and no capture.
 //
 //   - An external application (any type but server_agent) is asked at its
@@ -2020,7 +2110,7 @@ func systemOneCandidateFor(app routing.Application, mp routing.ModelMapping, vie
 // pass) stamps the back-off windows the pass opens and the CheckedAt of the
 // rows it writes. Best-effort: every failure is logged and the pass carries
 // on.
-func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.SystemOneProber) {
+func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIServer, app routing.Application, probers decisionProbers) {
 	view, ok := r.systemOneView(ctx, server, app)
 	if !ok {
 		return
@@ -2038,100 +2128,114 @@ func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIS
 	now := r.now()
 	for _, mp := range mappings {
 		if c, ok := systemOneCandidateFor(app, mp, view); ok {
-			r.probeSystemOneMapping(ctx, app, prober, target, c, now)
+			r.probeSystemOneMapping(ctx, app, probers, target, c, now)
 		}
 	}
 }
+
+// decisionProbeOpenSecret unseals a decision probe's credential. A variable
+// so a test can count the unseals; production code never reassigns it.
+var decisionProbeOpenSecret = capture.OpenSecret
 
 // probeSystemOneMapping is probeSystemOne for one candidate mapping. A model
 // its agent does not report loaded is not asked and has its back-off cleared,
-// so a reload is asked at once; a mapping that is not due (systemOneDue) is
-// not asked either. Otherwise the probe's answer is settled by
-// settleSystemOne.
-func (r *appHealthRunner) probeSystemOneMapping(ctx context.Context, app routing.Application, prober provider.SystemOneProber, target routing.Target, c systemOneCandidate, now time.Time) {
+// so a reload is asked at once; a probe that is not due (decisionProbeDue) is
+// not sent either, and with none due the credential is not even unsealed.
+// Otherwise each due probe's answer is settled by settleDecisionProbe.
+func (r *appHealthRunner) probeSystemOneMapping(ctx context.Context, app routing.Application, probers decisionProbers, target routing.Target, c systemOneCandidate, now time.Time) {
+	probes := r.decisionProbesFor(c, probers)
 	if !c.loaded {
-		r.systemOneBackoff.clear(c.key)
+		for _, p := range probes {
+			p.backoff.clear(p.key)
+		}
 		return
 	}
-	if !r.systemOneDue(ctx, c, now) {
+	due := make([]decisionProbe, 0, len(probes))
+	for _, p := range probes {
+		if r.decisionProbeDue(ctx, c, p, now) {
+			due = append(due, p)
+		}
+	}
+	if len(due) == 0 {
 		return
 	}
 	// Attach the credential to the probe (fail-open).
-	token, _ := capture.OpenSecret(r.cipher, c.authToken)
-	verdict, err := prober.ProbeSystemOne(provider.WithUpstreamAuth(ctx, c.authHeader, token), target, c.mp.AppModelName)
-	r.settleSystemOne(ctx, app, c, verdict, err, now)
+	token, _ := decisionProbeOpenSecret(r.cipher, c.authToken)
+	probeCtx := provider.WithUpstreamAuth(ctx, c.authHeader, token)
+	for _, p := range due {
+		verdict, err := p.ask(probeCtx, target, c.mp.AppModelName)
+		r.settleDecisionProbe(ctx, app, c, p, verdict, err, now)
+	}
 }
 
-// systemOneDue reports whether candidate c is to be probed at now. A key that
-// settled in this process (systemOneSettled) is not -- as long as the mapping
-// still has a decision row on file. An operator who clears the verdict in the
-// portal deletes that row, and the probe is the one writer that can restore
-// it, so a settled key without a row is forgotten and probed again. A
-// capability read that fails keeps the key settled for this pass. A key
-// inside its back-off window (systemOneBackoff) is not due either.
-func (r *appHealthRunner) systemOneDue(ctx context.Context, c systemOneCandidate, now time.Time) bool {
-	if r.systemOneSettled.has(c.key) {
-		if r.decisionRowOnFile(ctx, c.mp.ID) {
+// decisionProbeDue reports whether probe p of candidate c is to be sent at
+// now. A key that settled in this process is not -- as long as the mapping
+// still has a row of p's capability on file. An operator who clears the
+// verdict in the portal deletes that row, and the probe is the one writer that
+// can restore it, so a settled key without a row is forgotten and probed
+// again. A capability read that fails keeps the key settled for this pass. A
+// key inside its back-off window is not due either.
+func (r *appHealthRunner) decisionProbeDue(ctx context.Context, c systemOneCandidate, p decisionProbe, now time.Time) bool {
+	if p.settled.has(p.key) {
+		if r.decisionRowOnFile(ctx, c.mp.ID, p.capability) {
 			return false
 		}
-		r.systemOneSettled.remove(c.key)
+		p.settled.remove(p.key)
 	}
-	return !r.systemOneBackoff.active(c.key, now)
+	return !p.backoff.active(p.key, now)
 }
 
-// decisionRowOnFile reports whether mappingID has a routing.CapabilityDecision
-// row, whatever its verdict and source. A read that fails reports true, so a
-// store glitch does not turn into a probe.
-func (r *appHealthRunner) decisionRowOnFile(ctx context.Context, mappingID string) bool {
+// decisionRowOnFile reports whether mappingID has a row of capability,
+// whatever its verdict and source. A read that fails reports true, so a store
+// glitch does not turn into a probe.
+func (r *appHealthRunner) decisionRowOnFile(ctx context.Context, mappingID, capability string) bool {
 	rows, err := r.store.MappingCapabilities(ctx, mappingID)
 	if err != nil {
 		slog.Debug("app health: capability read for the decision probe failed", "mapping_id", mappingID, "error", err)
 		return true
 	}
-	_, ok := routing.CapabilityRowsByName(rows)[routing.CapabilityDecision]
+	_, ok := routing.CapabilityRowsByName(rows)[capability]
 	return ok
 }
 
-// settleSystemOne records what one decision probe of candidate c answered at
-// now. A verdict (yes or no) that landed settles the key for this process
-// (systemOneSettled, so a gateway restart re-probes once) and ends any
-// refusal streak. No verdict writes nothing and opens a back-off: one
-// systemOneRetryBackoff long for an answer that can pass on its own (a
-// timeout, a 408, a 429, a 5xx), and, for one that will not
-// (provider.ErrSystemOneProbeRefused: a 400, 405 or 422), a window that
-// doubles with each refusal of the same identity in a row up to
-// systemOneRefusedBackoffCap (systemOneRefusals), so a model that refuses the
-// probe is not kept loaded by it. A verdict the store failed to take opens a
-// systemOneRetryBackoff window too.
-func (r *appHealthRunner) settleSystemOne(ctx context.Context, app routing.Application, c systemOneCandidate, verdict string, err error, now time.Time) {
-	rows := systemOneCapabilityRows(verdict, now)
+// settleDecisionProbe records what probe p of candidate c answered at now. A
+// verdict (yes or no) that landed settles the key for this process (so a
+// gateway restart re-probes once) and ends any refusal streak. No verdict
+// writes nothing and opens a back-off: one systemOneRetryBackoff long for an
+// answer that can pass on its own (a timeout, a 408, a 429, a 5xx), and, for
+// one that will not (p.refused: a 400, 405 or 422), a window that doubles with
+// each refusal of the same identity in a row up to systemOneRefusedBackoffCap,
+// so a model that refuses the probe is not kept loaded by it. A verdict the
+// store failed to take opens a systemOneRetryBackoff window too.
+func (r *appHealthRunner) settleDecisionProbe(ctx context.Context, app routing.Application, c systemOneCandidate, p decisionProbe, verdict string, err error, now time.Time) {
+	rows := p.rows(verdict, now)
 	if len(rows) == 0 {
 		window := systemOneRetryBackoff
-		if errors.Is(err, provider.ErrSystemOneProbeRefused) {
-			window = r.systemOneRefusals.next(c.mp.ID, c.key, systemOneRetryBackoff, systemOneRefusedBackoffCap)
+		if errors.Is(err, p.refused) {
+			window = p.refusals.next(c.mp.ID, p.key, systemOneRetryBackoff, systemOneRefusedBackoffCap)
 		}
-		r.systemOneBackoff.start(c.key, now, now.Add(window))
-		logSystemOneNoVerdict(app, c.mp, err)
+		p.backoff.start(p.key, now, now.Add(window))
+		logSystemOneNoVerdict(app, c.mp, p.capability, err)
 		return
 	}
 	if !r.writeCapabilityRows(ctx, c.mp, rows) {
-		r.systemOneBackoff.start(c.key, now, now.Add(systemOneRetryBackoff))
+		p.backoff.start(p.key, now, now.Add(systemOneRetryBackoff))
 		return
 	}
-	r.systemOneBackoff.clear(c.key)
-	r.systemOneRefusals.reset(c.mp.ID)
-	r.systemOneSettled.add(c.key)
+	p.backoff.clear(p.key)
+	p.refusals.reset(c.mp.ID)
+	p.settled.add(p.key)
 }
 
 // logSystemOneNoVerdict logs a decision probe that stated no verdict: a
 // rejected credential at the default level, since only the operator can fix
 // it, anything else at debug.
-func logSystemOneNoVerdict(app routing.Application, mp routing.ModelMapping, err error) {
+func logSystemOneNoVerdict(app routing.Application, mp routing.ModelMapping, capability string, err error) {
 	if errors.Is(err, provider.ErrAuthRejected) {
-		log.Printf("app health: decision probe for app %s model %q rejected by the upstream (401/403): check the API token", app.ID, mp.AppModelName)
+		log.Printf("app health: %s probe for app %s model %q rejected by the upstream (401/403): check the API token", capability, app.ID, mp.AppModelName)
 		return
 	}
-	slog.Debug("app health: decision probe stated no verdict", "app_id", app.ID, "mapping_id", mp.ID, "model", mp.AppModelName, "error", err)
+	slog.Debug("app health: decision probe stated no verdict", "capability", capability, "app_id", app.ID, "mapping_id", mp.ID, "model", mp.AppModelName, "error", err)
 }
 
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe

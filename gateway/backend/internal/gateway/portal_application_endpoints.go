@@ -218,6 +218,22 @@ var portalApplicationErrRows = []errRow{
 			return strings.TrimPrefix(err.Error(), portal.ErrApplicationResponsesLiveTimingsConflict.Error()+": ")
 		},
 	},
+	{
+		err:    portal.ErrApplicationDecisionsPassthroughUnsupported,
+		status: http.StatusBadRequest,
+		code:   "application.decisions_passthrough_unsupported",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationDecisionsPassthroughUnsupported.Error()+": ")
+		},
+	},
+	{
+		err:    portal.ErrApplicationDecisionsPassthroughConflict,
+		status: http.StatusConflict,
+		code:   "application.decisions_passthrough_conflict",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationDecisionsPassthroughConflict.Error()+": ")
+		},
+	},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeApplicationNotFound, msg: msgApplicationNotFound},
 }
 

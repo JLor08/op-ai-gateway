@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 106 migrations in order, same as
+- **Only-pending.** A fresh install runs all 108 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -223,7 +223,18 @@ Rules that keep this safe over time:
   §4](security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting)).
   `TestMigration89AddsTokenClaudeEffortCompatibility` pins it against a genuine
   v88 database the way the migration-88 test does, and the migration-40 rebuild
-  test re-applies this column too.
+  test re-applies this column too. Migration 108
+  (`token_decisions_confidence_normalize`) is the third sibling and takes the identical
+  shape (`api_tokens.decisions_confidence_normalize`, `integer not null default 0` through
+  `addColumnIfMissing`, the default backfilling every existing token to *off*, one more
+  name at the same token sites and at `AuthorizeRunAsToken`'s field-by-field copy); it is
+  **ungated**, like `claude_model_aliases` ([Security, Authentication & Authorization
+  §4](security-auth-rbac.md#decision-confidence-normalization-is-an-ordinary-non-gated-token-setting)).
+  Migration 107 (`application_decision_modes`) is the endpoint-mode migration 72's
+  twin: two `text not null default ''` columns on both `applications` and
+  `agent_runtime_specs`, each blank value then backfilled under a `where ... = ''` guard
+  (`decisions_mode` to `auto`, `systemone_mode` to `passthrough`) so a re-run changes
+  nothing ([ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)).
 - **Split a feature's DDL along rollback lines, not for tidiness.** The
   agent-managed runtime arrived as three migrations —
   65 `agent_runtime_manager` (specs, spec GPUs, co-residency),

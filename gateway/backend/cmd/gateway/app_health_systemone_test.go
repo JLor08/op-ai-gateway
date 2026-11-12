@@ -35,6 +35,14 @@ type systemOneUpstream struct {
 	seen   []systemOneRequest
 	status int
 	body   string
+	// byPath overrides status and body for one request path (answerPath), so
+	// a test can answer /v1/systemone and /v1/decisions differently.
+	byPath map[string]systemOneAnswer
+}
+
+type systemOneAnswer struct {
+	status int
+	body   string
 }
 
 func newSystemOneUpstream(t *testing.T) *systemOneUpstream {
@@ -49,6 +57,9 @@ func newSystemOneUpstream(t *testing.T) *systemOneUpstream {
 		u.mu.Lock()
 		u.seen = append(u.seen, systemOneRequest{method: r.Method, path: r.URL.Path, model: req.Model, authorization: r.Header.Get("Authorization")})
 		status, body := u.status, u.body
+		if o, ok := u.byPath[r.URL.Path]; ok {
+			status, body = o.status, o.body
+		}
 		u.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -62,6 +73,17 @@ func (u *systemOneUpstream) answer(status int, body string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.status, u.body = status, body
+}
+
+// answerPath answers requests for path with status and body, whatever answer
+// sets for the rest.
+func (u *systemOneUpstream) answerPath(path string, status int, body string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.byPath == nil {
+		u.byPath = map[string]systemOneAnswer{}
+	}
+	u.byPath[path] = systemOneAnswer{status: status, body: body}
 }
 
 func (u *systemOneUpstream) requests() []systemOneRequest {

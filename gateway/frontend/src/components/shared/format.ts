@@ -79,6 +79,13 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'application.responses_live_timings_conflict': 'errorApplicationResponsesLiveTimingsConflict',
   'runtime_spec.responses_live_timings_unsupported':
     'errorRuntimeSpecResponsesLiveTimingsUnsupported',
+  // #373 phase 2: decisions_mode passthrough is refused for llama.cpp. Three
+  // labels, for the same reason as the live-timings trio above.
+  'application.decisions_passthrough_unsupported':
+    'errorApplicationDecisionsPassthroughUnsupported',
+  'application.decisions_passthrough_conflict': 'errorApplicationDecisionsPassthroughConflict',
+  'runtime_spec.decisions_passthrough_unsupported':
+    'errorRuntimeSpecDecisionsPassthroughUnsupported',
   'runtime_coresidency.pair_invalid': 'errorRuntimeCoresidencyPairInvalid',
   'runtime_coresidency.mode_invalid': 'errorRuntimeCoresidencyModeInvalid',
   'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',

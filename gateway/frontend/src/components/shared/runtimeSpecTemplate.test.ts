@@ -97,4 +97,15 @@ describe('runtimeSpecTemplate', () => {
     };
     expect(runtimeSpecTemplate(parent).apiFlavors).not.toBe(parent.api_flavors);
   });
+
+  it('carries no decisions modes: the spec starts those at the defaults', () => {
+    const template = runtimeSpecTemplate({
+      api_flavors: ['openai'],
+      responses_mode: 'passthrough',
+      messages_mode: 'passthrough',
+      decisions_mode: 'translate',
+      systemone_mode: 'disabled',
+    } as Parameters<typeof runtimeSpecTemplate>[0]);
+    expect(Object.keys(template).sort()).toEqual(['apiFlavors', 'messagesMode', 'responsesMode']);
+  });
 });

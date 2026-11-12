@@ -39,12 +39,22 @@ var (
 	// ErrApplicationEndpointModeInvalid rejects a responses_mode/messages_mode
 	// that is not one of the three EndpointMode values. HTTP 400 (a malformed
 	// request), mirroring ErrApplicationFlavorInvalid.
-	ErrApplicationEndpointModeInvalid   = errors.New("application.endpoint_mode_invalid")
-	ErrApplicationStatusInvalid         = errors.New("application.status_invalid")
-	ErrApplicationTuningInvalid         = errors.New("application.tuning_invalid")
-	ErrApplicationHealthPathInvalid     = errors.New("application.health_path_invalid")
-	ErrApplicationHealthIntervalInvalid = errors.New("application.health_interval_invalid")
-	ErrApplicationHealthModeInvalid     = errors.New("application.health_mode_invalid")
+	ErrApplicationEndpointModeInvalid = errors.New("application.endpoint_mode_invalid")
+	// ErrApplicationDecisionsPassthroughUnsupported rejects decisions_mode
+	// "passthrough" for an application type whose server has no /v1/decisions
+	// route (llama_cpp; ADR-098), where the request itself supplied the type:
+	// every create and any update that sends "type". HTTP 400.
+	ErrApplicationDecisionsPassthroughUnsupported = errors.New("application.decisions_passthrough_unsupported")
+	// ErrApplicationDecisionsPassthroughConflict is the same refusal when the
+	// incapable type is the STORED one and the update does not send "type":
+	// well-formed, but it collides with the application's own state (the
+	// live-timings conflict pattern). HTTP 409.
+	ErrApplicationDecisionsPassthroughConflict = errors.New("application.decisions_passthrough_conflict")
+	ErrApplicationStatusInvalid                = errors.New("application.status_invalid")
+	ErrApplicationTuningInvalid                = errors.New("application.tuning_invalid")
+	ErrApplicationHealthPathInvalid            = errors.New("application.health_path_invalid")
+	ErrApplicationHealthIntervalInvalid        = errors.New("application.health_interval_invalid")
+	ErrApplicationHealthModeInvalid            = errors.New("application.health_mode_invalid")
 	// ErrApplicationBenchmarkIntervalInvalid rejects a negative or absurdly large
 	// scheduled-benchmark interval (0 = off is allowed).
 	ErrApplicationBenchmarkIntervalInvalid = errors.New("application.benchmark_interval_invalid")
@@ -389,6 +399,12 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// fact -- the gateway's systemone_probe (routing.CapabilitySourceSystemOneProbe).
 	// (decision, yes) stays writable as the operator's override of that probe.
 	routing.CapabilityDecision: {routing.CapabilityNo: true},
+	// routing.CapabilityDecisionOpenAI + CapabilityNo likewise: the gateway's
+	// decisions_probe (routing.CapabilitySourceDecisionsProbe) is the writer
+	// entitled to establish the fact; (decision_openai, yes) stays writable as
+	// the operator's override. routing.CapabilityAnyDecision is derived and
+	// never a row name at all: see normalizeCapabilityVerdicts.
+	routing.CapabilityDecisionOpenAI: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 
@@ -473,6 +489,11 @@ type ApplicationDTO struct {
 	// Claude Code /v1/messages. Serialized as the lowercase enum string.
 	ResponsesMode string `json:"responses_mode"`
 	MessagesMode  string `json:"messages_mode"`
+	// DecisionsMode (auto | translate | passthrough | disabled) and
+	// SystemOneMode (passthrough | disabled) are the modes of POST
+	// /v1/decisions and POST /v1/systemone (ADR-098).
+	DecisionsMode string `json:"decisions_mode"`
+	SystemOneMode string `json:"systemone_mode"`
 	// LoadedModelsPath / LoadedModelsFormat configure the optional loaded-model
 	// probe: the upstream endpoint path to poll + the response-parser hint
 	// ("" / "auto" / "openai" / "llama_swap" / "llama_cpp"). Empty path = off.
@@ -548,6 +569,8 @@ type CreateApplicationRequest struct {
 	HealthCheckIntervalSeconds       int      `json:"health_check_interval_seconds"`
 	ResponsesMode                    string   `json:"responses_mode"`
 	MessagesMode                     string   `json:"messages_mode"`
+	DecisionsMode                    string   `json:"decisions_mode"`
+	SystemOneMode                    string   `json:"systemone_mode"`
 	LoadedModelsPath                 string   `json:"loaded_models_path"`
 	LoadedModelsFormat               string   `json:"loaded_models_format"`
 	ContextProbePath                 string   `json:"context_probe_path"`
@@ -602,6 +625,8 @@ type UpdateApplicationRequest struct {
 	HealthCheckIntervalSeconds   *int      `json:"health_check_interval_seconds,omitempty"`
 	ResponsesMode                *string   `json:"responses_mode,omitempty"`
 	MessagesMode                 *string   `json:"messages_mode,omitempty"`
+	DecisionsMode                *string   `json:"decisions_mode,omitempty"`
+	SystemOneMode                *string   `json:"systemone_mode,omitempty"`
 	LoadedModelsPath             *string   `json:"loaded_models_path,omitempty"`
 	LoadedModelsFormat           *string   `json:"loaded_models_format,omitempty"`
 	ContextProbePath             *string   `json:"context_probe_path,omitempty"`
@@ -705,6 +730,10 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		}
 		messagesMode = m
 	}
+	decisionsMode, systemOneMode, err := createDecisionModes(req.DecisionsMode, req.SystemOneMode, appType)
+	if err != nil {
+		return ApplicationDTO{}, err
+	}
 	status, err := normalizeApplicationStatus(req.Status)
 	if err != nil {
 		return ApplicationDTO{}, err
@@ -792,6 +821,8 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		HealthCheckIntervalSeconds:       req.HealthCheckIntervalSeconds,
 		ResponsesMode:                    responsesMode,
 		MessagesMode:                     messagesMode,
+		DecisionsMode:                    decisionsMode,
+		SystemOneMode:                    systemOneMode,
 		LoadedModelsPath:                 strings.TrimSpace(req.LoadedModelsPath),
 		LoadedModelsFormat:               normalizeLoadedModelsFormat(req.LoadedModelsFormat),
 		ContextProbePath:                 strings.TrimSpace(req.ContextProbePath),
@@ -1021,6 +1052,24 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		}
 		messagesMode = m
 	}
+	// The decision modes: nil keeps the stored value (never blanked), a non-nil
+	// value is validated here and applied below. The type guard needs the
+	// RESULTING type, so it runs after the mutation block.
+	var decisionsMode, systemOneMode routing.EndpointMode
+	if req.DecisionsMode != nil {
+		m, ok := validDecisionsMode(*req.DecisionsMode)
+		if !ok {
+			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
+		}
+		decisionsMode = m
+	}
+	if req.SystemOneMode != nil {
+		m, ok := validSystemOneMode(*req.SystemOneMode)
+		if !ok {
+			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
+		}
+		systemOneMode = m
+	}
 	if req.BenchmarkScheduleIntervalSeconds != nil {
 		if err := validateApplicationBenchmarkInterval(*req.BenchmarkScheduleIntervalSeconds); err != nil {
 			return ApplicationDTO{}, err
@@ -1108,6 +1157,19 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	}
 	if req.MessagesMode != nil {
 		app.MessagesMode = messagesMode
+	}
+	if req.DecisionsMode != nil {
+		app.DecisionsMode = decisionsMode
+	}
+	if req.SystemOneMode != nil {
+		app.SystemOneMode = systemOneMode
+	}
+	// A stored passthrough on a type that cannot carry it (llama-server has no
+	// /v1/decisions route) is reset to auto, the same "clear when the type
+	// cannot carry it" rule as the live-timings flag; an explicit passthrough
+	// request is refused further below instead.
+	if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(app.Type) {
+		app.DecisionsMode = routing.EndpointModeAuto
 	}
 	if req.LoadedModelsPath != nil {
 		app.LoadedModelsPath = strings.TrimSpace(*req.LoadedModelsPath)
@@ -1357,6 +1419,14 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
 			liveTimingsRefusal, app.Type)
 	}
+	if req.DecisionsMode != nil && decisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(app.Type) {
+		refusal := ErrApplicationDecisionsPassthroughConflict
+		if req.Type != nil {
+			refusal = ErrApplicationDecisionsPassthroughUnsupported
+		}
+		return ApplicationDTO{}, fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",
+			refusal, app.Type)
+	}
 	warnProxyExclusionOwnTLS(server, app, previousProxyListenPort)
 	app.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateApplication(ctx, app); err != nil {
@@ -1473,6 +1543,8 @@ func applicationDTO(server routing.AIServer, app routing.Application) Applicatio
 		HealthCheckIntervalSeconds:   app.HealthCheckIntervalSeconds,
 		ResponsesMode:                string(app.ResponsesMode),
 		MessagesMode:                 string(app.MessagesMode),
+		DecisionsMode:                string(app.DecisionsMode),
+		SystemOneMode:                string(app.SystemOneMode),
 		LoadedModelsPath:             app.LoadedModelsPath,
 		LoadedModelsFormat:           app.LoadedModelsFormat,
 		ContextProbePath:             app.ContextProbePath,
@@ -1956,6 +2028,74 @@ func validEndpointMode(raw string) (routing.EndpointMode, bool) {
 	}
 }
 
+// validDecisionsMode accepts the four decisions_mode values (auto is valid only
+// here, ADR-098). Case-sensitive and rejecting "" like validEndpointMode.
+func validDecisionsMode(raw string) (routing.EndpointMode, bool) {
+	switch m := routing.EndpointMode(strings.TrimSpace(raw)); m {
+	case routing.EndpointModeAuto, routing.EndpointModeDisabled, routing.EndpointModeTranslate, routing.EndpointModePassthrough:
+		return m, true
+	default:
+		return "", false
+	}
+}
+
+// validSystemOneMode accepts the two systemone_mode values: System One has no
+// translate path yet (ADR-098).
+func validSystemOneMode(raw string) (routing.EndpointMode, bool) {
+	switch m := routing.EndpointMode(strings.TrimSpace(raw)); m {
+	case routing.EndpointModeDisabled, routing.EndpointModePassthrough:
+		return m, true
+	default:
+		return "", false
+	}
+}
+
+// decisionsPassthroughCapableKind reports whether an application or runtime
+// spec type can serve POST /v1/decisions natively. llama-server has no such
+// route; every other kind may (the probe, not this guard, decides per model).
+func decisionsPassthroughCapableKind(kind string) bool {
+	return kind != routing.ProviderLlamaCPP
+}
+
+// resolveDecisionModes resolves a decisions_mode / systemone_mode pair as a
+// create or a runtime-spec write takes it: absent or "" defaults to auto /
+// passthrough, and any other value must be valid for its field, else invalid
+// (the caller's endpoint-mode sentinel) is returned.
+func resolveDecisionModes(rawDecisions, rawSystemOne string, invalid error) (decisions, systemOne routing.EndpointMode, err error) {
+	decisions = routing.EndpointModeAuto
+	if strings.TrimSpace(rawDecisions) != "" {
+		m, ok := validDecisionsMode(rawDecisions)
+		if !ok {
+			return "", "", invalid
+		}
+		decisions = m
+	}
+	systemOne = routing.EndpointModePassthrough
+	if strings.TrimSpace(rawSystemOne) != "" {
+		m, ok := validSystemOneMode(rawSystemOne)
+		if !ok {
+			return "", "", invalid
+		}
+		systemOne = m
+	}
+	return decisions, systemOne, nil
+}
+
+// createDecisionModes resolves decisions_mode and systemone_mode of a create:
+// absent or "" defaults to auto / passthrough, any other value must be valid,
+// and an explicit decisions passthrough on an incapable type is refused (400).
+func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions, systemOne routing.EndpointMode, err error) {
+	decisions, systemOne, err = resolveDecisionModes(rawDecisions, rawSystemOne, ErrApplicationEndpointModeInvalid)
+	if err != nil {
+		return "", "", err
+	}
+	if decisions == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(appType) {
+		return "", "", fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",
+			ErrApplicationDecisionsPassthroughUnsupported, appType)
+	}
+	return decisions, systemOne, nil
+}
+
 func normalizeApplicationStatus(raw string) (string, error) {
 	status := strings.TrimSpace(raw)
 	if status == "" {
@@ -2094,6 +2234,13 @@ type ModelMappingDTO struct {
 	// gateway refuses to send it a chat prompt (409 benchmark.decisions_only).
 	// Advisory and always present, like the other markers.
 	DecisionsOnly bool `json:"decisions_only"`
+	// DecisionsRoute is the route POST /v1/decisions takes for this mapping
+	// (ADR-098): "" when its effective flavors do not list decisions, or when
+	// the effective mode needs a verdict the mapping lacks; "disabled" when the
+	// effective decisions_mode is disabled; otherwise "translate" or
+	// "passthrough" (routing.EffectiveDecisionsRoute over the decision and
+	// decision_openai verdicts). Advisory and always present.
+	DecisionsRoute string `json:"decisions_route"`
 }
 
 type MappingListResponse struct {
@@ -3171,7 +3318,7 @@ func normalizeCapabilityVerdicts(verdicts map[string]string, sentBooleans map[st
 		// validation that preceded it. reservedManualVerdict never refuses the
 		// empty verdict: a reset has to keep working on these names, or a row an
 		// older build allowed would be uncorrectable forever.
-		if reservedManualVerdict(name, verdict) {
+		if reservedManualVerdict(name, verdict) || name == routing.CapabilityAnyDecision {
 			return nil, ErrMappingCapabilityReserved
 		}
 		if sentBooleans[name] {
@@ -3298,7 +3445,24 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		ImagesOnly:                   markers.ImagesOnly,
 		AudioOnly:                    markers.AudioOnly,
 		DecisionsOnly:                markers.DecisionsOnly,
+		DecisionsRoute:               mappingDecisionsRoute(markers, caps),
 	}
+}
+
+// mappingDecisionsRoute is ModelMappingDTO.DecisionsRoute: the effective route
+// of POST /v1/decisions for a mapping with these effective flavors, mode and
+// verdict rows.
+func mappingDecisionsRoute(markers mappingFlavorMarkers, caps map[string]routing.CapabilityRow) string {
+	if !markers.DecisionsListed {
+		return ""
+	}
+	route, ok := routing.EffectiveDecisionsRoute(markers.DecisionsMode,
+		capabilityVerdictBool(caps, routing.CapabilityDecision),
+		capabilityVerdictBool(caps, routing.CapabilityDecisionOpenAI))
+	if !ok {
+		return ""
+	}
+	return string(route)
 }
 
 // mappingMetrics bundles the eight numeric per-mapping metric values shared by

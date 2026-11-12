@@ -1036,3 +1036,36 @@ func TestHandlePortalServerRuntimeMaxProcessesNegativeReturns400(t *testing.T) {
 		t.Fatalf("error code = %q, want server.runtime_limit_invalid", code)
 	}
 }
+
+// TestHandlePortalMappingRuntimeSpecPutDecisionModes pins the wire mapping of
+// the decision modes on a runtime spec: a bad mode is
+// runtime_spec.endpoint_mode_invalid, passthrough on a llama_cpp spec is
+// runtime_spec.decisions_passthrough_unsupported, and valid modes round-trip.
+func TestHandlePortalMappingRuntimeSpecPutDecisionModes(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+		return rec
+	}
+	rec := put(`{"binary":"/usr/local/bin/vllm","type":"vllm","systemone_mode":"translate"}`)
+	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.endpoint_mode_invalid" {
+		t.Fatalf("bad systemone_mode: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = put(`{"binary":"/usr/local/bin/llama-server","type":"llama_cpp","decisions_mode":"passthrough"}`)
+	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.decisions_passthrough_unsupported" {
+		t.Fatalf("llama_cpp passthrough: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = put(`{"binary":"/usr/local/bin/vllm","type":"vllm","decisions_mode":"passthrough","systemone_mode":"disabled"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid put: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		DecisionsMode string `json:"decisions_mode"`
+		SystemOneMode string `json:"systemone_mode"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || got.DecisionsMode != "passthrough" || got.SystemOneMode != "disabled" {
+		t.Fatalf("round trip = %+v, %v, body = %s", got, err, rec.Body.String())
+	}
+}

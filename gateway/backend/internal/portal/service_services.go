@@ -160,6 +160,9 @@ type ServiceTokenDTO struct {
 	// compatibility, identical in meaning to TokenDTO's — see there. Settable on
 	// create only, like ClaudeModelAliases.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// DecisionsConfidenceNormalize opts the token into recomputed /v1/decisions
+	// confidence (ADR-098), ungated like ClaudeModelAliases; create only.
+	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 	// VendorAccess is the token's vendor-account access policy, the same shape and
 	// meaning as TokenDTO's: nil is the strict default (no vendor-account models).
 	// A service owns no vendor account, so the only accounts it can use are the ones
@@ -193,6 +196,9 @@ type CreateServiceTokenRequest struct {
 	// ClaudeEffortCompatibility opts the new token into Claude Code effort
 	// compatibility (see TokenDTO). Off when omitted.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// DecisionsConfidenceNormalize opts the new token into recomputed
+	// /v1/decisions confidence (ADR-098). Off when omitted.
+	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 	// VendorAccess optionally opts the new token into shared vendor accounts (see
 	// ServiceTokenDTO); nil (omitted) is the strict default, no vendor access. Each
 	// named account must be reachable for THIS SERVICE (its service provisioned into
@@ -802,12 +808,13 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		Secret:           req.Secret,
 		// LastUsedModel is deliberately absent: a fresh token has never routed
 		// anything, and only the inference path ever writes the marker.
-		UnknownModelRedirect:        redirect,
-		UnknownModelRedirectBlocked: redirectBlocked,
-		UnknownModelFallback:        fallback,
-		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
-		ClaudeModelAliases:          req.ClaudeModelAliases,
-		ClaudeEffortCompatibility:   req.ClaudeEffortCompatibility,
+		UnknownModelRedirect:         redirect,
+		UnknownModelRedirectBlocked:  redirectBlocked,
+		UnknownModelFallback:         fallback,
+		VendorProviderAccess:         encodeVendorAccessDTO(req.VendorAccess),
+		ClaudeModelAliases:           req.ClaudeModelAliases,
+		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateServiceTokenResponse{}, err
@@ -1102,26 +1109,27 @@ func (s *Service) serviceDTO(ctx context.Context, svc routing.Service) (ServiceD
 // NEVER carries the secret value, only SecretPrefix.
 func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 	return ServiceTokenDTO{
-		ID:                          record.ID,
-		ServiceID:                   record.ServiceID,
-		Name:                        record.Name,
-		SecretPrefix:                record.SecretPrefix,
-		Status:                      record.Status,
-		Scopes:                      parseScopes(record.Scopes),
-		ExpiresAt:                   record.ExpiresAt,
-		LastUsedAt:                  record.LastUsedAt,
-		CreatedAt:                   record.CreatedAt,
-		ModelOverride:               record.ModelOverride,
-		ModelOverrideMap:            store.DecodeModelOverrideRules(record.ModelOverrideMap),
-		LogCommunication:            record.LogCommunication,
-		Secret:                      record.Secret,
-		LastUsedModel:               record.LastUsedModel,
-		UnknownModelRedirect:        record.UnknownModelRedirect,
-		UnknownModelRedirectBlocked: record.UnknownModelRedirectBlocked,
-		UnknownModelFallback:        record.UnknownModelFallback,
-		VendorAccess:                decodeVendorAccessDTO(record.VendorProviderAccess),
-		ClaudeModelAliases:          record.ClaudeModelAliases,
-		ClaudeEffortCompatibility:   record.ClaudeEffortCompatibility,
+		ID:                           record.ID,
+		ServiceID:                    record.ServiceID,
+		Name:                         record.Name,
+		SecretPrefix:                 record.SecretPrefix,
+		Status:                       record.Status,
+		Scopes:                       parseScopes(record.Scopes),
+		ExpiresAt:                    record.ExpiresAt,
+		LastUsedAt:                   record.LastUsedAt,
+		CreatedAt:                    record.CreatedAt,
+		ModelOverride:                record.ModelOverride,
+		ModelOverrideMap:             store.DecodeModelOverrideRules(record.ModelOverrideMap),
+		LogCommunication:             record.LogCommunication,
+		Secret:                       record.Secret,
+		LastUsedModel:                record.LastUsedModel,
+		UnknownModelRedirect:         record.UnknownModelRedirect,
+		UnknownModelRedirectBlocked:  record.UnknownModelRedirectBlocked,
+		UnknownModelFallback:         record.UnknownModelFallback,
+		VendorAccess:                 decodeVendorAccessDTO(record.VendorProviderAccess),
+		ClaudeModelAliases:           record.ClaudeModelAliases,
+		ClaudeEffortCompatibility:    record.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize: record.DecisionsConfidenceNormalize,
 	}
 }
 

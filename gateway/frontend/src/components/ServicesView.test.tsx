@@ -1140,6 +1140,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       return { fakeApi, createDialog };
     }
 
+    it('defaults decisions_confidence_normalize to off and sends it on a service token create', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog('svc_dcn');
+      const box = () =>
+        createDialog.getByRole('checkbox', { name: t.tokenDecisionsConfidenceNormalize });
+      expect(box()).not.toBeChecked();
+      expect(createDialog.getByText(t.tokenDecisionsConfidenceNormalizeHint)).toBeInTheDocument();
+      fireEvent.click(box());
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+        'svc_dcn',
+        expect.objectContaining({ decisions_confidence_normalize: true }),
+      );
+    });
+
     it('defaults to off and sends claude_effort_compatibility: false when creating a service token', async () => {
       const { fakeApi, createDialog } = await openCreateDialog('svc_effort_default');
       expect(createDialog.getByRole('checkbox', { name: t.tokenClaudeEffort })).not.toBeChecked();

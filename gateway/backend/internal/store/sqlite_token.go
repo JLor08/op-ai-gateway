@@ -51,8 +51,9 @@ func (s *SQLiteStore) CreatePlainToken(ctx context.Context, token TokenRecord, s
 			log_communication, secret, service_id, kind, project_id,
 			server_override, server_override_force_unreachable,
 			last_used_model, unknown_model_redirect, unknown_model_redirect_blocked, unknown_model_fallback,
-			vendor_provider_access, claude_model_aliases, claude_effort_compatibility
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			vendor_provider_access, claude_model_aliases, claude_effort_compatibility,
+			decisions_confidence_normalize
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		token.ID,
 		nullableTokenRef(token.UserID),
 		token.Name,
@@ -80,6 +81,7 @@ func (s *SQLiteStore) CreatePlainToken(ctx context.Context, token TokenRecord, s
 		token.VendorProviderAccess,
 		token.ClaudeModelAliases,
 		token.ClaudeEffortCompatibility,
+		token.DecisionsConfidenceNormalize,
 	)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
@@ -115,7 +117,7 @@ const tokenColumns = `id, coalesce(user_id,''), name, secret_hash, secret_prefix
 		expires_at, last_used_at, created_at, updated_at, model_override, model_override_map, log_communication, secret,
 		coalesce(service_id,''), kind, coalesce(project_id,''), server_override, server_override_force_unreachable,
 		last_used_model, unknown_model_redirect, unknown_model_redirect_blocked, unknown_model_fallback,
-		vendor_provider_access, claude_model_aliases, claude_effort_compatibility`
+		vendor_provider_access, claude_model_aliases, claude_effort_compatibility, decisions_confidence_normalize`
 
 func (s *SQLiteStore) TokenByID(ctx context.Context, id string) (TokenRecord, error) {
 	row := s.queryRow(ctx, `
@@ -226,12 +228,12 @@ func (s *SQLiteStore) UpdateTokenMetadata(ctx context.Context, token TokenRecord
 		set name = ?, scopes = ?, status = ?, updated_at = ?, model_override = ?, model_override_map = ?, log_communication = ?, secret = ?, project_id = ?,
 			server_override = ?, server_override_force_unreachable = ?,
 			unknown_model_redirect = ?, unknown_model_redirect_blocked = ?, unknown_model_fallback = ?,
-			vendor_provider_access = ?, claude_model_aliases = ?, claude_effort_compatibility = ?
+			vendor_provider_access = ?, claude_model_aliases = ?, claude_effort_compatibility = ?, decisions_confidence_normalize = ?
 		where id = ?`,
 		token.Name, token.Scopes, token.Status, token.UpdatedAt, token.ModelOverride, token.ModelOverrideMap, token.LogCommunication, token.Secret, nullableTokenRef(token.ProjectID),
 		token.ServerOverride, token.ServerOverrideForceUnreachable,
 		token.UnknownModelRedirect, token.UnknownModelRedirectBlocked, token.UnknownModelFallback,
-		token.VendorProviderAccess, token.ClaudeModelAliases, token.ClaudeEffortCompatibility,
+		token.VendorProviderAccess, token.ClaudeModelAliases, token.ClaudeEffortCompatibility, token.DecisionsConfidenceNormalize,
 		token.ID)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -373,6 +375,7 @@ func (s *SQLiteStore) LookupBearer(header string) (auth.Token, bool) {
 		VendorAccess:                   DecodeVendorAccess(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 	}, true
 }
 
@@ -395,6 +398,7 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 	var unknownModelRedirectBlocked int64
 	var claudeModelAliases int64
 	var claudeEffortCompatibility int64
+	var decisionsConfidenceNormalize int64
 	err := row.Scan(
 		&token.ID,
 		&token.UserID,
@@ -423,6 +427,7 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 		&token.VendorProviderAccess,
 		&claudeModelAliases,
 		&claudeEffortCompatibility,
+		&decisionsConfidenceNormalize,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TokenRecord{}, ErrNotFound
@@ -443,6 +448,7 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 	token.UnknownModelRedirectBlocked = unknownModelRedirectBlocked != 0
 	token.ClaudeModelAliases = claudeModelAliases != 0
 	token.ClaudeEffortCompatibility = claudeEffortCompatibility != 0
+	token.DecisionsConfidenceNormalize = decisionsConfidenceNormalize != 0
 	return token, nil
 }
 

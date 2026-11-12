@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiVariantControls } from './ApiVariantControls';
 import { messages, type Locale } from '../../i18n';
-import type { EndpointMode } from '../../api';
+import type { DecisionsMode, EndpointMode, SystemOneMode } from '../../api';
 import type { LiveTimingsKind } from './liveTimings';
 
 afterEach(cleanup);
@@ -35,17 +35,25 @@ for (const locale of locales) {
     // the cases below is about.
     timings,
     timingsKind = 'capable',
+    decisions = 'auto',
+    systemOne = 'passthrough',
+    passthroughOffered = true,
   }: {
     flavors?: string[];
     responses?: EndpointMode;
     msgs?: EndpointMode;
     timings?: boolean;
     timingsKind?: LiveTimingsKind;
+    decisions?: DecisionsMode;
+    systemOne?: SystemOneMode;
+    passthroughOffered?: boolean;
   }) {
     const [apiFlavors, setApiFlavors] = useState<string[]>(flavors);
     const [responsesMode, setResponsesMode] = useState<EndpointMode>(responses);
     const [messagesMode, setMessagesMode] = useState<EndpointMode>(msgs);
     const [liveTimings, setLiveTimings] = useState<boolean | undefined>(timings);
+    const [decisionsMode, setDecisionsMode] = useState<DecisionsMode>(decisions);
+    const [systemOneMode, setSystemOneMode] = useState<SystemOneMode>(systemOne);
     return (
       <ApiVariantControls
         t={t}
@@ -58,6 +66,11 @@ for (const locale of locales) {
         onResponsesModeChange={setResponsesMode}
         onMessagesModeChange={setMessagesMode}
         onLiveTimingsChange={setLiveTimings}
+        decisionsMode={decisionsMode}
+        systemOneMode={systemOneMode}
+        decisionsPassthroughOffered={passthroughOffered}
+        onDecisionsModeChange={setDecisionsMode}
+        onSystemOneModeChange={setSystemOneMode}
       />
     );
   }
@@ -70,6 +83,53 @@ for (const locale of locales) {
     expect(box).not.toBeChecked();
     fireEvent.click(box);
     expect(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions })).toBeChecked();
+  });
+
+  const decisionsField = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
+  const systemOneField = () => screen.getByRole('combobox', { name: t.applicationSystemOneMode });
+  const optionLabels = (field: HTMLElement) => {
+    fireEvent.mouseDown(field);
+    return screen.getAllByRole('option').map((o) => o.textContent);
+  };
+
+  it('disables both decisions selects showing the defaults while the decisions flavor is unticked', () => {
+    render(<Harness decisions="translate" systemOne="disabled" />);
+    expect(decisionsField()).toHaveAttribute('aria-disabled', 'true');
+    expect(systemOneField()).toHaveAttribute('aria-disabled', 'true');
+    expect(decisionsField()).toHaveTextContent(t.applicationDecisionsModeAuto);
+    expect(systemOneField()).toHaveTextContent(t.applicationModePassthrough);
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
+    expect(decisionsField()).not.toHaveAttribute('aria-disabled', 'true');
+    expect(systemOneField()).not.toHaveAttribute('aria-disabled', 'true');
+    expect(decisionsField()).toHaveTextContent(t.applicationModeTranslate);
+    expect(systemOneField()).toHaveTextContent(t.applicationModeDisabled);
+  });
+
+  it('offers auto, translate, passthrough and disabled for decisions', () => {
+    render(<Harness flavors={['openai', 'decisions']} />);
+    expect(optionLabels(decisionsField())).toEqual([
+      t.applicationDecisionsModeAuto,
+      t.applicationModeTranslate,
+      t.applicationModePassthrough,
+      t.applicationModeDisabled,
+    ]);
+  });
+
+  it('offers passthrough or disabled for System One', () => {
+    render(<Harness flavors={['openai', 'decisions']} />);
+    expect(optionLabels(systemOneField())).toEqual([
+      t.applicationModePassthrough,
+      t.applicationModeDisabled,
+    ]);
+  });
+
+  it('leaves passthrough out of the decisions select when the type cannot serve it', () => {
+    render(<Harness flavors={['openai', 'decisions']} passthroughOffered={false} />);
+    expect(optionLabels(decisionsField())).toEqual([
+      t.applicationDecisionsModeAuto,
+      t.applicationModeTranslate,
+      t.applicationModeDisabled,
+    ]);
   });
 
   const liveTimingsBox = () => screen.getByRole('checkbox', { name: t.applicationLiveTimings });
@@ -129,6 +189,11 @@ for (const locale of locales) {
           onFlavorsChange={onFlavorsChange}
           onResponsesModeChange={() => {}}
           onMessagesModeChange={() => {}}
+          decisionsMode="auto"
+          systemOneMode="passthrough"
+          decisionsPassthroughOffered
+          onDecisionsModeChange={() => {}}
+          onSystemOneModeChange={() => {}}
         />,
       );
       fireEvent.click(screen.getByRole('checkbox', { name: 'anthropic' }));

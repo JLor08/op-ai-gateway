@@ -15,6 +15,14 @@ import (
 // requires. The sets are deliberately distinct, and confusing them produces a
 // wrong redirect.
 //
+// The decisions flavor stands for two endpoints, so the offering is asked by
+// REQUEST flavor (see ModelOfferingFor): openai_decisions for POST
+// /v1/decisions and decisions for POST /v1/systemone. Callable then holds only
+// the names whose endpoint is served by its own effective mode
+// (routing.MappingServesDecisionEndpoint: decisions_mode, systemone_mode); a
+// name whose endpoint is disabled stays Existing, the "exists but you cannot
+// call it" case, like a name whose messages endpoint is disabled.
+//
 // Callable is the ACCESS set: what this token can actually route to under its
 // real name, i.e. exactly the names a direct request can succeed with. Its
 // flavor test is the listing's served rule (routing.MappingServesAPIFlavor:
@@ -185,7 +193,12 @@ func applyGeneratedClaudeAliases(sets, preSuppress map[string]map[string]struct{
 
 // ModelOfferingFor answers the questions the unknown-model redirect asks: can
 // this token route to a name, does the name exist at all, and does it carry
-// every capability in required (see ModelOffering.Capable). Existing
+// every capability in required (see ModelOffering.Capable). flavor is the
+// request's api flavor, fine or coarse (routing.NormalizeAPIFlavor folds it
+// for the flavor sets), and it tells the two decision endpoints apart:
+// openai_decisions is POST /v1/decisions and the coarse decisions is POST
+// /v1/systemone (decisionEndpointNames narrows Callable to each one's
+// mode). Existing
 // deliberately ignores per-token visibility and the listing switches — only
 // then can the redirect tell "no such model" from "not yours".
 //
@@ -231,6 +244,8 @@ func applyGeneratedClaudeAliases(sets, preSuppress map[string]map[string]struct{
 // per-request path in the redirect and Service caches nothing. A required
 // capability adds the image fold's one batch capability read.
 func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string, required []string) ModelOffering {
+	requestFlavor := flavor
+	flavor = routing.NormalizeAPIFlavor(flavor)
 	if s.routes == nil {
 		return seedModelOffering(flavor, required)
 	}
@@ -277,6 +292,11 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// reaches.
 	_, preSuppress := flavorSetsFromViews(visible, idx, &overlay, token)
 	callable := callableNamesForFlavor(preSuppress, flavor, overlay.visByLower)
+	if flavor == routing.APIFlavorDecisions {
+		// The listing's decisions flavor admits a name either decision
+		// endpoint serves; Callable is about the one this request asked.
+		keepNames(callable, decisionEndpointNames(visible, idx, overlay, requestFlavor))
+	}
 	existing := existingNamesForFlavor(views, idx, overlay, flavor)
 	// Fold in the token's vendor-account models (its principal's own and the shared
 	// ones it can route to) under the token-effective
@@ -387,7 +407,8 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 // transcription and decision. Keep it in step with capabilityFlagsByName.
 func hasCapabilityFold(capability string) bool {
 	switch capability {
-	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityDecision:
+	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityDecision,
+		routing.CapabilityDecisionOpenAI, routing.CapabilityAnyDecision:
 		return true
 	}
 	return false
@@ -415,6 +436,10 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 		return transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
 	case routing.CapabilityDecision:
 		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+	case routing.CapabilityDecisionOpenAI:
+		return decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
+	case routing.CapabilityAnyDecision:
+		return anyDecisionFlagsByName(views, capsByMapping, idx)
 	default:
 		return map[string]bool{}
 	}
@@ -473,6 +498,42 @@ func callableNamesForFlavor(preSuppress map[string]map[string]struct{}, flavor s
 		out[name] = struct{}{}
 	}
 	return out
+}
+
+// decisionEndpointNames is every name among views that the ONE decision
+// endpoint named by requestFlavor serves (routing.MappingServesDecisionEndpoint
+// for at least one of its mappings: openai_decisions by decisions_mode, the
+// coarse decisions, POST /v1/systemone, by systemone_mode), plus every group
+// with such an offerable member. Like the listing's flavor fold it reads an
+// application whose spec read failed by its own modes (fail-open), and idx must
+// cover views.
+func decisionEndpointNames(views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, requestFlavor string) map[string]struct{} {
+	rule := func(app routing.Application, eff routing.EffectiveSpecFields, flavor string) bool {
+		return flavor == routing.APIFlavorDecisions && routing.MappingServesDecisionEndpoint(app, eff, requestFlavor)
+	}
+	perName := perNameFlavors(views, idx, rule)
+	out := make(map[string]struct{})
+	for name, flavors := range perName {
+		if _, ok := flavors[routing.APIFlavorDecisions]; ok {
+			out[name] = struct{}{}
+		}
+	}
+	entries, _ := buildGroupOverlay(overlay, perName)
+	for _, e := range entries {
+		if _, ok := e.Flavors[routing.APIFlavorDecisions]; ok {
+			out[e.Name] = struct{}{}
+		}
+	}
+	return out
+}
+
+// keepNames deletes from names every name that is not in keep.
+func keepNames(names, keep map[string]struct{}) {
+	for name := range names {
+		if _, ok := keep[name]; !ok {
+			delete(names, name)
+		}
+	}
 }
 
 // existingNamesForFlavor is every name that exists at all for one flavor: the

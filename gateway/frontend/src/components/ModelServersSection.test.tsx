@@ -1266,6 +1266,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText('decision')).not.toBeInTheDocument();
     });
 
+    it('renders a translated decision_openai chip for a yes, never the raw name', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('decision_openai', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityDecisionOpenai)).toBeInTheDocument();
+      expect(within(cell).queryByText('decision_openai')).not.toBeInTheDocument();
+    });
+
     it('renders no speech_clone chip for a `no` verdict, and never a raw one', async () => {
       const rows = makeRows().map((r) =>
         r.mapping_id === 'map-a'

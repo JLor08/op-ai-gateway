@@ -740,7 +740,8 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// wire-correct — OpenAI prompt_tokens includes cached, Anthropic input_tokens
 	// excludes it via compat.AnthropicInputTokens). The split happens HERE, at the
 	// single accounting choke point, by subtracting both cache buckets. Only the
-	// Anthropic format carries a write count, so cache_write_tokens is 0 for
+	// Anthropic format and OpenAI Decisions (input_tokens_details.cache_write_tokens)
+	// carry a write count, so cache_write_tokens is 0 for the other
 	// OpenAI/Responses/translate traffic. total_tokens stays the full total, so
 	// input + cached + write + output == total.
 	freshInputTokens := resp.Usage.InputTokens - resp.Usage.CachedTokens - resp.Usage.CacheWriteTokens

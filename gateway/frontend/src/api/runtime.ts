@@ -11,7 +11,7 @@
 // comment, as the source of truth if the two ever drift.
 
 import { type Fetcher, buildQueryString, request, subscribeSSE } from './transport';
-import type { EndpointMode } from './models';
+import type { DecisionsMode, EndpointMode, SystemOneMode } from './models';
 import type { RPCMemberSpec } from './rpcMembers';
 
 // One per-GPU VRAM demand row on a runtime spec. vram_estimate_mb is
@@ -289,6 +289,13 @@ export interface RuntimeSpec {
   api_flavors: string[];
   responses_mode: EndpointMode;
   messages_mode: EndpointMode;
+  // The /v1/decisions and /v1/systemone modes of this spec. A PUT that omits
+  // them RESETS them to the defaults (auto / passthrough), so the spec form
+  // always sends both. Optional on the type like the live-timings flag's
+  // fixtures; the wire always carries them ("" on a `configured: false`
+  // document, which the form reads as the defaults).
+  decisions_mode?: DecisionsMode;
+  systemone_mode?: SystemOneMode;
   // This spec's OWN live-timings opt-in (not inherited from the parent
   // application, and it is the spec's copy that wins for a server_agent
   // model). Always present on read; on the request shape below it is optional

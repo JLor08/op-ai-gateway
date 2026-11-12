@@ -612,6 +612,109 @@ func testTokenClaudeEffortCompatibilityRoundTrip(t *testing.T, s *SQLStore) {
 	}
 }
 
+// TestConformanceTokenDecisionsConfidenceNormalizeRoundTrip proves the opt-in
+// api_tokens.decisions_confidence_normalize flag (#373) is carried by the whole
+// token path on both dialects, so the Postgres leg exercises the widened
+// INSERT/SELECT/UPDATE lock-step and not only the SQLite one: written by
+// CreatePlainToken, read back by TokenByID, TokensByUser and the request-time
+// LookupBearer (which assembles the auth.Token the effort-delivery path
+// reads), and rewritten in BOTH directions by UpdateTokenMetadata. A token
+// created without the field must read false everywhere -- the flag defaults
+// off, and "off" has to be the stored value, not merely the Go zero value a
+// dropped column would also produce. The flag is independent of
+// claude_model_aliases, which both tokens leave off here.
+func TestConformanceTokenDecisionsConfidenceNormalizeRoundTrip(t *testing.T) {
+	forEachDialect(t, testTokenDecisionsConfidenceNormalizeRoundTrip)
+}
+
+func testTokenDecisionsConfidenceNormalizeRoundTrip(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_dcn", "cec@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	on := TokenRecord{ID: "tok_dcn_on", UserID: "usr_dcn", Name: "on", CreatedAt: now, UpdatedAt: now, DecisionsConfidenceNormalize: true}
+	off := TokenRecord{ID: "tok_dcn_off", UserID: "usr_dcn", Name: "off", CreatedAt: now, UpdatedAt: now}
+	if err := s.CreatePlainToken(ctx, on, "dcn-on-secret"); err != nil {
+		t.Fatalf("CreatePlainToken(on): %v", err)
+	}
+	if err := s.CreatePlainToken(ctx, off, "dcn-off-secret"); err != nil {
+		t.Fatalf("CreatePlainToken(off): %v", err)
+	}
+
+	gotOn, err := s.TokenByID(ctx, "tok_dcn_on")
+	if err != nil {
+		t.Fatalf("TokenByID(on): %v", err)
+	}
+	if !gotOn.DecisionsConfidenceNormalize {
+		t.Fatalf("decisions_confidence_normalize did not round-trip through TokenByID: %+v", gotOn)
+	}
+	if gotOn.ClaudeModelAliases {
+		t.Fatalf("decisions_confidence_normalize leaked into claude_model_aliases: %+v", gotOn)
+	}
+	gotOff, err := s.TokenByID(ctx, "tok_dcn_off")
+	if err != nil {
+		t.Fatalf("TokenByID(off): %v", err)
+	}
+	if gotOff.DecisionsConfidenceNormalize {
+		t.Fatalf("a token created without the flag reads true: %+v", gotOff)
+	}
+
+	byUser, err := s.TokensByUser(ctx, "usr_dcn")
+	if err != nil {
+		t.Fatalf("TokensByUser: %v", err)
+	}
+	listed := map[string]bool{}
+	for _, rec := range byUser {
+		listed[rec.ID] = rec.DecisionsConfidenceNormalize
+	}
+	if len(listed) != 2 || !listed["tok_dcn_on"] || listed["tok_dcn_off"] {
+		t.Fatalf("TokensByUser flags = %v, want on=true off=false", listed)
+	}
+
+	// The request path: LookupBearer hands the effort-delivery path an auth.Token.
+	bearerOn, ok := s.LookupBearer("Bearer dcn-on-secret")
+	if !ok || !bearerOn.DecisionsConfidenceNormalize {
+		t.Fatalf("LookupBearer(on) ok=%v DecisionsConfidenceNormalize=%v, want true", ok, bearerOn.DecisionsConfidenceNormalize)
+	}
+	if bearerOn.ClaudeModelAliases {
+		t.Fatalf("LookupBearer(on) leaked DecisionsConfidenceNormalize into ClaudeModelAliases")
+	}
+	bearerOff, ok := s.LookupBearer("Bearer dcn-off-secret")
+	if !ok || bearerOff.DecisionsConfidenceNormalize {
+		t.Fatalf("LookupBearer(off) ok=%v DecisionsConfidenceNormalize=%v, want false", ok, bearerOff.DecisionsConfidenceNormalize)
+	}
+
+	// UpdateTokenMetadata rewrites the flag in both directions.
+	gotOn.DecisionsConfidenceNormalize = false
+	gotOn.UpdatedAt = now.Add(time.Minute)
+	if err := s.UpdateTokenMetadata(ctx, gotOn); err != nil {
+		t.Fatalf("UpdateTokenMetadata(on->off): %v", err)
+	}
+	gotOff.DecisionsConfidenceNormalize = true
+	gotOff.UpdatedAt = now.Add(time.Minute)
+	if err := s.UpdateTokenMetadata(ctx, gotOff); err != nil {
+		t.Fatalf("UpdateTokenMetadata(off->on): %v", err)
+	}
+	afterOn, err := s.TokenByID(ctx, "tok_dcn_on")
+	if err != nil || afterOn.DecisionsConfidenceNormalize {
+		t.Fatalf("after on->off: err=%v DecisionsConfidenceNormalize=%v, want false", err, afterOn.DecisionsConfidenceNormalize)
+	}
+	afterOff, err := s.TokenByID(ctx, "tok_dcn_off")
+	if err != nil || !afterOff.DecisionsConfidenceNormalize {
+		t.Fatalf("after off->on: err=%v DecisionsConfidenceNormalize=%v, want true", err, afterOff.DecisionsConfidenceNormalize)
+	}
+	bearerOn, ok = s.LookupBearer("Bearer dcn-on-secret")
+	if !ok || bearerOn.DecisionsConfidenceNormalize {
+		t.Fatalf("LookupBearer(on->off) ok=%v DecisionsConfidenceNormalize=%v, want false", ok, bearerOn.DecisionsConfidenceNormalize)
+	}
+	bearerOff, ok = s.LookupBearer("Bearer dcn-off-secret")
+	if !ok || !bearerOff.DecisionsConfidenceNormalize {
+		t.Fatalf("LookupBearer(off->on) ok=%v DecisionsConfidenceNormalize=%v, want true", ok, bearerOff.DecisionsConfidenceNormalize)
+	}
+}
+
 // TestConformanceTokenVendorProviderAccessUpdateAndLookup proves
 // api_tokens.vendor_provider_access is rewritten by UpdateTokenMetadata (it is
 // user-editable, unlike last_used_model) and decoded onto the auth.Token that
@@ -6420,6 +6523,10 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 		// ...and v89's per-token Claude Code effort compatibility opt-in.
 		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column claude_effort_compatibility integer not null default 0`); err != nil {
 			t.Fatalf("reapply api_tokens.claude_effort_compatibility after migration40RawUp: %v", err)
+		}
+		// ...and v108's per-token decisions confidence normalization opt-in.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column decisions_confidence_normalize integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.decisions_confidence_normalize after migration40RawUp: %v", err)
 		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW

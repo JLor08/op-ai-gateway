@@ -86,13 +86,11 @@ func seedMigration100Spec(ctx context.Context, t *testing.T, s *SQLStore, now ti
 		Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 		CreatedAt: now, UpdatedAt: now,
 	})
-	if err := s.CreateApplication(ctx, routing.Application{
+	seedBaselineApplication(ctx, t, s, routing.Application{
 		ID: "app_m100", ServerID: "srv_m100", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create application: %v", err)
-	}
+	})
 	seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 		ID: "map_m100", ApplicationID: "app_m100", GatewayModelName: "m100-model", AppModelName: "up-m100",
 		Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,

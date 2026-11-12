@@ -89,6 +89,10 @@ var (
 	// ErrRuntimeSpecEndpointModeInvalid rejects a responses_mode/messages_mode
 	// that is not one of the three EndpointMode values. HTTP 400.
 	ErrRuntimeSpecEndpointModeInvalid = errors.New("runtime_spec.endpoint_mode_invalid")
+	// ErrRuntimeSpecDecisionsPassthroughUnsupported rejects decisions_mode
+	// "passthrough" on a runtime spec whose effective type is llama_cpp
+	// (llama-server has no /v1/decisions route; ADR-098). HTTP 400.
+	ErrRuntimeSpecDecisionsPassthroughUnsupported = errors.New("runtime_spec.decisions_passthrough_unsupported")
 	// ErrRuntimeSpecFlavorInvalid rejects an api_flavors entry that is not
 	// openai/anthropic. HTTP 400.
 	ErrRuntimeSpecFlavorInvalid = errors.New("runtime_spec.flavor_invalid")
@@ -535,6 +539,10 @@ type RuntimeSpecDTO struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// DecisionsMode / SystemOneMode: the spec's snapshot of the two decision
+	// endpoint modes (see ApplicationDTO).
+	DecisionsMode string `json:"decisions_mode"`
+	SystemOneMode string `json:"systemone_mode"`
 	// ResponsesLiveTimingsEnabled is this spec's own copy of the live-timings
 	// opt-in (migration 80) -- stored explicitly on the spec rather than
 	// inherited from the parent server_agent application, exactly like the trio
@@ -697,6 +705,10 @@ type PutRuntimeSpecRequest struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// DecisionsMode / SystemOneMode: absent or "" defaults to auto /
+	// passthrough, like the modes above (see validateRuntimeSpecRequest).
+	DecisionsMode string `json:"decisions_mode"`
+	SystemOneMode string `json:"systemone_mode"`
 	// ResponsesLiveTimingsEnabled: a POINTER inside an otherwise
 	// apply-verbatim full-document request, the same exception APIToken below
 	// already makes (nil = keep the stored value), and it carries two loads.
@@ -1175,6 +1187,8 @@ type runtimeSpecFields struct {
 	contextProbePath   string
 	responsesMode      routing.EndpointMode
 	messagesMode       routing.EndpointMode
+	decisionsMode      routing.EndpointMode
+	systemOneMode      routing.EndpointMode
 	flavors            []string
 	liveTimingsCapable bool // the spec's EFFECTIVE kind can honour responses_live_timings_enabled
 	visibleMode        routing.VisibleDevicesMode
@@ -1207,6 +1221,10 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	// only supplies a sane default when a field is absent or empty, on every
 	// write). See TestPutRuntimeSpecDoesNotInheritAppModes.
 	f.responsesMode, f.messagesMode, err = runtimeSpecEndpointModes(req)
+	if err != nil {
+		return runtimeSpecFields{}, err
+	}
+	f.decisionsMode, f.systemOneMode, err = runtimeSpecDecisionModes(req)
 	if err != nil {
 		return runtimeSpecFields{}, err
 	}
@@ -1298,6 +1316,10 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !f.liveTimingsCapable {
 		return runtimeSpecFields{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
 			ErrRuntimeSpecResponsesLiveTimingsUnsupported, string(effectiveSpecKind))
+	}
+	if f.decisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(string(effectiveSpecKind)) {
+		return runtimeSpecFields{}, fmt.Errorf("%w: decisions_mode passthrough is not available for a runtime spec of effective type %q",
+			ErrRuntimeSpecDecisionsPassthroughUnsupported, string(effectiveSpecKind))
 	}
 	// VisibleDevicesMode: an omitted mode defaults to "env" (today's
 	// behavior); a bad value is a LATER task's validation (mode validation
@@ -1487,6 +1509,12 @@ func runtimeSpecEndpointModes(req PutRuntimeSpecRequest) (responses, messages ro
 	return responses, messages, nil
 }
 
+// runtimeSpecDecisionModes resolves decisions_mode and systemone_mode: absent
+// or empty is auto / passthrough, anything else must be valid for its field.
+func runtimeSpecDecisionModes(req PutRuntimeSpecRequest) (decisions, systemOne routing.EndpointMode, err error) {
+	return resolveDecisionModes(req.DecisionsMode, req.SystemOneMode, ErrRuntimeSpecEndpointModeInvalid)
+}
+
 // runtimeSpecPrior is what a runtime-spec write keeps from the mapping's
 // stored spec: the row itself (ok is false when there is none -- its id,
 // created_at and measured RAM carry forward) and its measured VRAM per GPU
@@ -1620,6 +1648,8 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		APIFlavors:                  f.flavors,
 		ResponsesMode:               f.responsesMode,
 		MessagesMode:                f.messagesMode,
+		DecisionsMode:               f.decisionsMode,
+		SystemOneMode:               f.systemOneMode,
 		ResponsesLiveTimingsEnabled: liveTimings,
 		Type:                        f.specType,
 		MetricsPath:                 f.metricsPath,
@@ -2189,6 +2219,8 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
+		DecisionsMode:               string(spec.DecisionsMode),
+		SystemOneMode:               string(spec.SystemOneMode),
 		ResponsesLiveTimingsEnabled: spec.ResponsesLiveTimingsEnabled,
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		APITokenMode:                normalizeRuntimeAPITokenMode(spec.APITokenMode),

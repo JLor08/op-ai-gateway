@@ -63,13 +63,11 @@ func TestMigration95AddsAudioPerfMetricColumns(t *testing.T) {
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
-		if err := s.CreateApplication(ctx, routing.Application{
+		seedBaselineApplication(ctx, t, s, routing.Application{
 			ID: "app_m95", ServerID: "srv_m95", Type: routing.ProviderAudioCpp, Port: 8095, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive,
 			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create application: %v", err)
-		}
+		})
 		seedBaselineMapping(ctx, t, s, routing.ModelMapping{
 			ID: "map_m95", ApplicationID: "app_m95", GatewayModelName: "m95-tts", AppModelName: "up-m95",
 			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,

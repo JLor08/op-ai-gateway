@@ -578,6 +578,12 @@ cold-load thrash this decision closes cannot return.
 → [Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates), [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement).
 
 ## ADR-033 — Endpoint modes replace the `native_*` booleans: independent per-endpoint disable, per-spec snapshot
+
+**Amended by [ADR-098](#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)
+(the decision endpoints).** `POST /v1/decisions` and `POST /v1/systemone` have a mode pair of their own,
+`decisions_mode` (`auto` | `translate` | `passthrough` | `disabled`, `auto` valid for it alone) and `systemone_mode`
+(`passthrough` | `disabled`), following this entry's effective-value rule (a resolved spec over its application) but with
+defaults of their own and a route settled after the resolve rather than at the gate.
 **Context:** whether the gateway proxied a Codex (`/v1/responses`) or Claude
 Code (`/v1/messages`) request natively, or translated it to
 `/v1/chat/completions`, was a per-application boolean
@@ -636,7 +642,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -692,7 +698,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -861,7 +867,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1056,7 +1062,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1271,7 +1277,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-106-migrations),
+[§4](reference/data-model.md#4-migration-history-108-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1497,7 +1503,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-106-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-108-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1644,7 +1650,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-106-migrations),
+[§4](reference/data-model.md#4-migration-history-108-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3609,7 +3615,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-106-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-108-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3833,7 +3839,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-106-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-108-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4865,7 +4871,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4991,7 +4997,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5134,7 +5140,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-106-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-108-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7639,7 +7645,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-106-migrations),
+[Data Model](reference/data-model.md#4-migration-history-108-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7862,7 +7868,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-106-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-108-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8003,7 +8009,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-106-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-108-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8267,7 +8273,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-106-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-108-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -11849,6 +11855,13 @@ knowable on a mixed host). **Per-request VRAM metering** (left for later).
 
 ## ADR-097 — System One decisions: a third non-text flavor, a probe-written `decision` capability, and a value-for-value relay (Phase 1 of #373)
 
+**Amended by [ADR-098](#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)
+(Phase 2).** `systemone_mode` now exists (migration 107, `passthrough` | `disabled`, default `passthrough`), so the
+"no `systemone_mode` column" decision and the "Rejected" item below it are **history**: the column arrived with
+`decisions_mode` once `/v1/decisions` gave a mode something to choose between. `/v1/systemone` also gains, for a token
+with `decisions_confidence_normalize`, a buffered relay that recomputes `confidence`, and `decision` gains a sibling
+capability, `decision_openai`. Everything else below stands.
+
 **Context:** System One is a decision protocol: a client sends `{model, state, questions}` and a decision model
 answers each question (`{model, answers, usage}`), with no chat turn, no streaming and no prompt the gateway writes.
 Models that speak it (served by llama.cpp, vLLM or vllm-sr, launched by an agent or run by hand) answer
@@ -11967,3 +11980,128 @@ vocabulary must not be named after one path.
 → [Compatibility & Inference §3.9](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md).
+
+## ADR-098 — OpenAI Decisions: a request flavor, decision modes, a probe-written `decision_openai` capability and a System One translator (Phase 2 of #373)
+
+**Context:** Phase 1 ([ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373))
+relays System One. Phase 2 adds **OpenAI's Decisions API**, `POST /v1/decisions`, whose clients (the OpenAI SDKs)
+send `{model, input, questions}` with a question list and read `{answers, model, usage}`. The two protocols describe the
+same act in different shapes (a keyed object of questions against an ordered list, a `state` against an `input`, typed
+choice values and score levels against string options and a flat criteria list), and the servers differ: vLLM answers
+both, a System One-only model answers only `/v1/systemone`, and llama.cpp has no `/v1/decisions`.
+So one client-facing endpoint has to be served two ways, **passing the request through** where the upstream speaks
+OpenAI natively and **translating** it where it only speaks System One, without a second opt-in to configure, without
+a model refused for a route it could serve, and without the gate knowing a mode it cannot yet see. Three more facts
+shape it: a confidence figure is a model-specific number that clients compare across models, which is why an operator
+may want it recomputed from the probabilities; OpenAI's `usage` carries cached and cache-write token counts that a
+metered passthrough should record; and an upstream that is asked a question it cannot answer must stay a `no` the
+operator can read, never a guess. The contract was checked against openai-python v3.49.0 and vLLM v0.33.0 sources.
+
+**Decision — eight choices, taken together. Two migrations (107, 108), no agent change, no `ServerAgent` version bump.**
+
+- **(a) `openai_decisions` is a request flavor beside the coarse `decisions`, not a second stored flavor.**
+  `routing.APIFlavorOpenAIDecisions` is the fine flavor `POST /v1/decisions` reaches the resolver under; it is never
+  stored, and `NormalizeAPIFlavor` folds it onto `decisions`, so one opt-in per application serves both decision
+  endpoints and candidacy is unchanged. Its job is to let `applicationServesEndpoint` read the right mode: `DecisionsMode`
+  for `openai_decisions`, `SystemOneMode` for the coarse `decisions` that `/v1/systemone` sends. `any_decision` (b) and
+  the request flavor are request side only. The listings read the effective modes instead: a model's `decisions`
+  flavor means at least one decision endpoint is served, `GET /v1/systemone/models` lists by `systemone_mode`, and the
+  unknown-model redirect asks under the request flavor, so its `Callable` judges `/v1/decisions` by `decisions_mode`
+  and `/v1/systemone` by `systemone_mode` (`routing.MappingServesDecisionEndpoint`).
+- **(b) The pre-resolve gate is a derived requirement, `any_decision`.** `POST /v1/decisions` sets
+  `RequiredCapabilities = ["any_decision"]`, satisfied by `(decision, yes)` **or** `(decision_openai, yes)` in the one
+  `capabilityRowsSatisfy` funnel (the `image_edit` precedent: derived, never a row name; a manual row of that name is
+  refused `mapping.capability_reserved`). The list also keeps the request off vendor accounts. The gate is deliberately
+  **not mode-aware**: the route depends on the mode, the mode on the resolved target, and a mode-aware pre-resolve filter
+  would have to resolve every candidate's mode before choosing one.
+- **(c) Modes are `decisions_mode` and `systemone_mode`, on applications and runtime specs (migration 107).**
+  `decisions_mode` is `auto` | `translate` | `passthrough` | `disabled`, default `auto`; `systemone_mode` is
+  `passthrough` | `disabled`, default `passthrough` (Phase 1's behavior). They follow `responses_mode`'s effective-value rule
+  (a resolved spec over its application) and are backfilled to the defaults. `passthrough` for decisions is refused for
+  `llama_cpp` (400 on create and on an update that sends `type`, 409 where only the stored type collides, 400 on a spec),
+  and a stored `passthrough` is reset to `auto` when an application is retyped to `llama_cpp`. An **ordinary** application
+  with the mode disabled is removed **at candidacy** (`404 routing.no_model_route` when nothing else serves the model);
+  `decisions.endpoint_disabled` and `systemone.endpoint_disabled` (404) come from a `server_agent` spec resolved after it.
+- **(d) The route is settled after the resolve, by one pure function.** `routing.EffectiveDecisionsRoute(mode, decision,
+  decisionOpenAI)`: `auto` passes through when `decision_openai` is `yes`, else translates when `decision` is `yes`;
+  `translate` and `passthrough` are forced and need their own verdict (`404 routing.model_not_capable`, ADR-042's refuse
+  on unknown); `disabled` answers the endpoint-disabled error. The check **does not re-select another candidate**: two
+  applications serving one model with a forced mode lacking its verdict on one answer intermittently, an operator
+  configuration issue. The route taken is recorded in the usage row's `provider_path` (`/v1/systemone` for a translate,
+  `/v1/decisions` for a passthrough); there is **no usage column**.
+- **(e) `decision_openai` is a probe-written capability, orthogonal to `decision`.** The health loop's decision pass asks
+  one more tiny question, `POST /v1/decisions` with a one-predicate body (`internal/provider/decisions_probe.go`), **only
+  of external `vllm` applications and `server_agent` mappings whose spec type is `vllm` or `custom`** (a mapping with no
+  spec is not probed). It has **separate** settled and back-off state from the System One probe and the same verdict rules
+  (2xx with an object answer is `yes`; 404 or 501 is `no` except the router's own `runtime.*` 404; a 400, 405 or 422 backs
+  off with the doubling window; everything else is no verdict), is loaded-only for agent mappings, has the 30 s timeout and
+  is unmetered. The source is `decisions_probe`, rank 1 like `systemone_probe`; `(decision_openai, no)` is reserved from
+  manual edits, an operator's `yes` is an override, and an agent may not report the name.
+- **(f) Translate is a faithful-or-refuse translator onto System One** (`internal/compat/decisions.go`, matrix A in
+  [Compatibility & Inference §3.10](cross-cutting/compatibility-and-inference.md#310-openai-decisions)). It refuses what
+  System One cannot express (`decisions.input_unsupported`, `decisions.question_invalid`, 400, before any upstream call)
+  and emulates the rest with documented choices: questions are written **in request order**; a missing or `null` name is
+  keyed `q<i>` and an empty-string name restored as `""`; duplicates get `-<n>`; boolean choice values **round-trip typed**;
+  a score level with a description is sent as `"label: description"` but answered with the **original label**; JSON mixed
+  with text becomes a state **array** with each piece in order; an answer **without** `type` is accepted as the asked type;
+  a missing `confidence` is `0`; usage details are zero-filled; a missing or mistyped answer fails the whole translation
+  (`502 decisions.upstream_error`). A translated request's non-2xx answer is the gateway's `decisions.upstream_error`
+  envelope under the **upstream's status** with the upstream's message extracted (a 501 adds guidance); a passthrough
+  non-2xx is relayed verbatim. A translated answer is **read whole**, bounded by `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`.
+- **(g) Confidence normalization is a per-token, ungated opt-in** (`decisions_confidence_normalize`, migration 108, portal
+  and service tokens). For an opted-in token, on **both** endpoints and in **every** mode, the gateway recomputes
+  `confidence = max(p) / Σp` on each choice and score answer that carries a `type` and usable probabilities. On a passthrough
+  `/v1/decisions` relay and on `/v1/systemone`, only an opted-in token's answers take the buffered parse-and-rewrite path
+  (and a non-JSON 2xx is relayed unchanged); every other token keeps the streaming relay **byte for byte** there. A
+  translated `/v1/decisions` request is always buffered, whatever the token (f).
+- **(h) Usage is metered from what each route sees.** A translate records the System One tokens it read before the
+  translation (a malformed `usage` records zero rather than failing the answers); a passthrough reads the
+  Responses-shaped `usage` of the answer (`mergePassthroughUsage` on the streaming copier, `compat.ParseDecisionsUsage`
+  on the buffered path) and records `input_tokens_details.cached_tokens` and `cache_write_tokens` as the cached and
+  cache-write columns.
+
+**Rejected:**
+
+- **A second coarse flavor for `/v1/decisions`.** Two opt-ins per application for one decision capability would let a
+  model be listed for one endpoint and silently absent from the other; the fine request flavor carries the mode without a
+  second stored value.
+- **A byte-for-byte translate.** The two shapes share no bytes, and the translated body must be re-serialized anyway
+  (ordered questions, restored names and typed values); fidelity here means the same *decision*, not the same bytes.
+- **Pre-resolve mode-aware gating.** It needs each candidate's effective mode, which exists only on the resolved
+  target; the derived `any_decision` plus a post-resolve route check gives the same refusals with one resolve. The price
+  (no re-selection) is the documented intermittent-404 case.
+- **A usage mode column.** `provider_path` already distinguishes `/v1/systemone` from `/v1/decisions` per row, and a
+  column is a migration with the same information.
+- **Gating `decisions_confidence_normalize` to admins** (as `claude_effort_compatibility` is). That flag changes what the
+  gateway *sends upstream*; this one changes a number in the token's own answer and grants no reach, so it follows
+  `claude_model_aliases`.
+- **Probing every application type.** llama.cpp has no `/v1/decisions` route, and an unrelated upstream could load a model or
+  bill for a probe it can never answer; the scope is the types that can serve it, and passthrough for llama.cpp is refused
+  at save instead.
+- **Mapping upstream errors to refusals.** A translated upstream's error is an error under its own status; folding it into
+  `routing.*` or a refusal would hide a model that is down behind a message that says it is not capable.
+- **Fetching `http(s)` images for the translate route.** The gateway holds no outbound-fetch policy for a client-supplied URL;
+  a `data:` image is carried, anything else is `decisions.input_unsupported`.
+
+**Consequence:**
+
+- **A model answering only System One needs no configuration to serve `/v1/decisions`**: `auto` translates, and the day the
+  upstream starts answering natively the probe flips the route to passthrough with no operator step. The cost is that a
+  translated request is read whole and re-encoded, and that a client must tolerate the emulations (a `0` confidence where the
+  model sent none, zero-filled usage details).
+- **A new model is not usable until probed**, as in Phase 1: a mapping with neither verdict is refused
+  `routing.model_not_capable`, and a vLLM mapping is asked twice (System One, OpenAI) with independent back-off.
+- **A forced mode is a verdict requirement**, not a preference: `translate` on a model that only has `decision_openai` is a 404.
+- **Intermittent 404 for two applications and a forced mode** (above), until the operator makes the modes agree.
+- **Memory is bounded per in-flight request** by the body cap for a translated request and for an opted-in token's answer,
+  and an answer over the bound is refused with a `502` rather than truncated; every other relay is unchanged.
+- **Two upgrades, no order:** migration 107 backfills `auto`/`passthrough` (Phase 1's behavior), migration 108 leaves every
+  token off, and neither agent nor router changed.
+- **Not verified live:** a live translate run against a System One model (the score index base in particular), a vLLM Qwen3
+  passthrough, and the official OpenAI SDK against either route. The contract was read off the sources; these remain
+  operator steps, as ADR-097's live-model run was.
+
+→ [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
+[Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
+[HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
+[Data Model §4](reference/data-model.md#4-migration-history-108-migrations).

@@ -259,6 +259,33 @@ func TestPreflightAsksTheOfferingForTheNormalizedFlavor(t *testing.T) {
 	}
 }
 
+// TestPreflightAsksTheOfferingForEachDecisionEndpoint: the two decision
+// endpoints share the coarse decisions flavor, so /v1/decisions asks by its
+// fine openai_decisions (Callable then judges decisions_mode) while
+// /v1/systemone asks by the coarse decisions (systemone_mode).
+func TestPreflightAsksTheOfferingForEachDecisionEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		shape inferenceShape
+		want  string
+	}{
+		{"decisions", decisionsInferenceShape("totally-unknown"), routing.APIFlavorOpenAIDecisions},
+		{"systemone", systemOneInferenceShape("totally-unknown"), routing.APIFlavorDecisions},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := newOfferingPortal("last-model")
+			s := &Server{Portal: fp}
+			token := auth.Token{UnknownModelRedirect: true, LastUsedModel: "last-model"}
+			if _, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, tc.shape); handled {
+				t.Fatal("preflight refused the request")
+			}
+			if fp.flavor != tc.want {
+				t.Fatalf("offering asked for flavor %q, want %q", fp.flavor, tc.want)
+			}
+		})
+	}
+}
+
 // TestPreflightRedirectSurvivesAServerWithoutAPortal proves the redirect is
 // nil-safe like the rest of the preflight: a Server built without a portal
 // (ServerDeps.Portal is optional) declines the redirect instead of panicking.

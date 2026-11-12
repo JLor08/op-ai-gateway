@@ -239,6 +239,18 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	if apiFlavor == apiFlavorSystemOne {
 		return "/v1/systemone"
 	}
+	// OpenAI Decisions has a mode, but not one endpointModeFor reads: the
+	// handler resolves the effective decisions mode to its concrete route after
+	// the target is chosen and stores it on its copy of the target (ADR-098), so
+	// DecisionsMode here is translate or passthrough. Translate calls the
+	// upstream's System One endpoint, passthrough its own /v1/decisions; the
+	// usage row's provider_path is what records the route taken.
+	if apiFlavor == apiFlavorOpenAIDecisions {
+		if target.DecisionsMode == routing.EndpointModeTranslate {
+			return "/v1/systemone"
+		}
+		return "/v1/decisions"
+	}
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
 	}
@@ -797,6 +809,15 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		slog.Error("audio upstream refused to stream and the buffered retry could not be built; relaying the refusal", "path", r.URL.Path, "model", rel.pfReq.Model, "server", serverName, "err", buildErr)
 	}
 
+	// A decisions response that must be rewritten (translated, or normalized for
+	// a token that opted in) is read whole, bounded, before a byte is written --
+	// see relayDecisionsResponse. A decisions request never streams, so no
+	// watchdog was armed for it; the total timeout above bounds the read.
+	if rel.decisionsRewrite != nil {
+		s.relayDecisionsResponse(w, r, ex, resp, rel.decisionsRewrite)
+		return
+	}
+
 	// A non-2xx from the IMAGES upstream (sd-server) needs its error shape
 	// normalised into an OpenAI-compatible object before the client sees it --
 	// see normalizeImagesUpstreamError's own doc comment for why the type/code
@@ -1197,6 +1218,13 @@ type nativeRelay struct {
 	// cannot take. Set by every relay caller; nil for a relay that is never re-selected,
 	// whose gone refusal proxyNative answers with gone's error itself.
 	reselect func(lost routing.Target, gone error)
+	// decisionsRewrite hands a decisions response to the buffered
+	// relayDecisionsResponse instead of the streaming copier: set on every
+	// translated /v1/decisions relay (the System One answer must be rewritten
+	// into the OpenAI shape), and on a /v1/decisions or /v1/systemone passthrough
+	// only for a token that opted into confidence normalization. Nil on every
+	// other relay, which keeps them on the copier byte for byte.
+	decisionsRewrite *decisionsRewrite
 }
 
 // failNativeExchange answers a relay that ends before any upstream answer reached the
@@ -1626,6 +1654,10 @@ func mergePassthroughUsage(dst *inference.Usage, apiFlavor string, body []byte) 
 			// A System One answer carries usage {input_tokens, output_tokens} in the
 			// Responses spelling.
 			mergeResponsesUsage(dst, payload)
+		case apiFlavorOpenAIDecisions:
+			// An OpenAI Decisions answer carries Responses-shaped usage, with
+			// input_tokens_details.{cached_tokens, cache_write_tokens}.
+			mergeResponsesUsage(dst, payload)
 		}
 	}
 }
@@ -1660,6 +1692,10 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 		// semantics), so only the cached count is lifted out — InputTokens is
 		// left untouched (matches the translate/chat path).
 		takeMax(&dst.CachedTokens, uu.InputTokensDetails.CachedTokens)
+		// cache_write_tokens is the prompt-cache WRITE subset of input_tokens,
+		// reported by OpenAI Decisions (and absent from every other Responses
+		// answer, which leaves it 0); lifted out the same way.
+		takeMax(&dst.CacheWriteTokens, uu.InputTokensDetails.CacheWriteTokens)
 	}
 	if m.Timings != nil {
 		takeMaxF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
@@ -1744,6 +1780,9 @@ type responsesUsage struct {
 		// Responses reports it under input_tokens_details; input_tokens already
 		// includes it).
 		CachedTokens int `json:"cached_tokens"`
+		// CacheWriteTokens is the prompt-cache-write subset of input_tokens
+		// (OpenAI Decisions reports it beside cached_tokens).
+		CacheWriteTokens int `json:"cache_write_tokens"`
 	} `json:"input_tokens_details"`
 }
 

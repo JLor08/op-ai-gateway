@@ -212,6 +212,9 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // (verdicts yes/no). A trait of the endpoint, probed (or an operator's yes), so a `yes` reads as a chip
   // and a `no` or an absent row renders none.
   { capability: 'decision', label: (t) => t.capabilityDecision },
+  // "decision_openai" is its twin for POST /v1/decisions served natively by the
+  // upstream: same reading, a `yes` is a chip and anything else renders none.
+  { capability: 'decision_openai', label: (t) => t.capabilityDecisionOpenai },
   // "embedding" and "rerank" name the model's ROLE (a vector encoder / a reranker, not a
   // text generator) rather than an endpoint it serves. Unlike the audio chips they are
   // operator-stated -- nothing probes either one, the mapping form is where they are set --

@@ -1249,6 +1249,11 @@ type TokenDTO struct {
 	// Plain opt-in flag, off by default; always emitted so a client reading a
 	// token and writing it back preserves it.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// DecisionsConfidenceNormalize opts the token into the gateway recomputing
+	// `confidence` on /v1/decisions answers (ADR-098). Plain opt-in flag, off by
+	// default and ungated like ClaudeModelAliases; always emitted so a client
+	// reading a token and writing it back preserves it.
+	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1320,6 +1325,9 @@ type CreateTokenRequest struct {
 	// ClaudeEffortCompatibility opts the token into Claude Code effort
 	// compatibility (see TokenDTO). Off when omitted.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// DecisionsConfidenceNormalize opts the token into recomputed decision
+	// confidence (see TokenDTO). Off when omitted.
+	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 }
 
 type CreateTokenResponse struct {
@@ -1362,6 +1370,9 @@ type UpdateTokenRequest struct {
 	// ClaudeEffortCompatibility: nil = keep the stored flag, a non-nil value
 	// replaces it.
 	ClaudeEffortCompatibility *bool `json:"claude_effort_compatibility,omitempty"`
+	// DecisionsConfidenceNormalize: nil = keep the stored flag, a non-nil value
+	// replaces it.
+	DecisionsConfidenceNormalize *bool `json:"decisions_confidence_normalize,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1459,13 +1470,19 @@ type ModelDTO struct {
 	Speech bool `json:"speech"`
 	// Decision is true only when POST /v1/systemone would serve the model --
 	// EVERY offering mapping (or, for a group, every offerable member) has a
-	// (decision, yes) verdict and declares the decisions flavor (the
-	// application's and, for an agent-launched model with a spec, the spec's):
-	// AND aggregation, fail-closed, exactly like Speech. It is
+	// (decision, yes) verdict, declares the decisions flavor (the
+	// application's and, for an agent-launched model with a spec, the spec's)
+	// and has its effective systemone mode not disabled
+	// (routing.MappingServesDecisionEndpoint): AND aggregation, fail-closed,
+	// exactly like Speech. It is
 	// decisionFlagsByName's result, the one decision fold ModelOffering.Capable
 	// asks too, and GET /v1/systemone/models lists only the rows that carry it.
 	// Always present, like its sibling flags.
 	Decision bool `json:"decision"`
+	// DecisionOpenAI is Decision's twin for POST /v1/decisions served natively
+	// (the decision_openai verdict, ADR-098): the same AND aggregation over the
+	// offering mappings, via decisionOpenAIFlagsByName. Always present.
+	DecisionOpenAI bool `json:"decision_openai"`
 	// Transcription is true only when the transcription endpoint would serve the
 	// model -- EVERY offering mapping (or, for a group, every offerable member) has
 	// a (transcription, yes) verdict and passes both flavor stages of a
@@ -1962,12 +1979,13 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		ServerOverrideForceUnreachable: serverOverrideForce,
 		// LastUsedModel is deliberately absent: a fresh token has never routed
 		// anything, and only the inference path ever writes the marker.
-		UnknownModelRedirect:        redirect,
-		UnknownModelRedirectBlocked: redirectBlocked,
-		UnknownModelFallback:        fallback,
-		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
-		ClaudeModelAliases:          req.ClaudeModelAliases,
-		ClaudeEffortCompatibility:   req.ClaudeEffortCompatibility,
+		UnknownModelRedirect:         redirect,
+		UnknownModelRedirectBlocked:  redirectBlocked,
+		UnknownModelFallback:         fallback,
+		VendorProviderAccess:         encodeVendorAccessDTO(req.VendorAccess),
+		ClaudeModelAliases:           req.ClaudeModelAliases,
+		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -2073,6 +2091,9 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.ClaudeEffortCompatibility != nil {
 		record.ClaudeEffortCompatibility = *req.ClaudeEffortCompatibility
+	}
+	if req.DecisionsConfidenceNormalize != nil {
+		record.DecisionsConfidenceNormalize = *req.DecisionsConfidenceNormalize
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -2223,7 +2244,9 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 //
 // Every known flavor counts, openai_images and openai_audio included: a name
 // valid for only one of them is still a valid setting, and every consumer
-// re-checks the flavor per request. A name that no flavor serves
+// re-checks the flavor per request. The decisions flavor is asked as its two
+// endpoints (ModelOfferingFor: decisions for /v1/systemone, openai_decisions
+// for /v1/decisions), so a name either one serves counts. A name that no flavor serves
 // (routing.MappingServesAPIFlavor) is in no Callable set and therefore not a
 // valid setting, although Models() still lists it. Groups share the model
 // namespace and are therefore included by the same lookup.
@@ -2233,7 +2256,7 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 // load and one runtime-spec read per server_agent application, per flavor.
 func (s *Service) callableModelNames(ctx context.Context, owner auth.Token) map[string]struct{} {
 	out := make(map[string]struct{})
-	for _, flavor := range knownAPIFlavors {
+	for _, flavor := range append(slices.Clone(knownAPIFlavors), routing.APIFlavorOpenAIDecisions) {
 		for name := range s.ModelOfferingFor(ctx, owner, flavor, nil).Callable {
 			out[name] = struct{}{}
 		}
@@ -2945,6 +2968,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// so the flag costs no further store read.
 			speechOn := speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
 			decisionOn := decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+			decisionOpenAIOn := decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 			// transcription is transcriptionFlagsByName, speech's twin and the one
 			// transcription fold the redirect asks too: the (transcription, yes)
 			// verdict and the same openai_audio flavor half, from the same
@@ -3344,6 +3368,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.ImageEdit = imageEditOn[id]
 				dto.Speech = speechOn[id]
 				dto.Decision = decisionOn[id]
+				dto.DecisionOpenAI = decisionOpenAIOn[id]
 				dto.Transcription = transcriptionOn[id]
 				dto.SpeechClone = speechCloneOn[id]
 				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
@@ -3454,11 +3479,47 @@ func speechFlagsByName(views []mappingView, speechRows map[string]routing.Capabi
 
 // decisionFlagsByName is speechFlagsByName's decision twin: a name carries the
 // decision capability only when EVERY one of its mappings has a (decision, yes)
-// verdict (decisionRows, keyed by mapping id) AND passes the decisions flavor
-// half. Fail-closed, independent of every other capability.
+// verdict (decisionRows, keyed by mapping id) AND POST /v1/systemone serves it:
+// the decisions flavor half and the effective systemone mode not disabled
+// (viewServesSystemOne). Fail-closed, independent of every other capability.
+// It backs ModelDTO.Decision, GET /v1/systemone/models and the /v1/systemone
+// redirect's ModelOffering.Capable.
 func decisionFlagsByName(views []mappingView, decisionRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	return foldMappingFlags(views, func(view mappingView) bool {
-		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesSystemOne(view, idx)
+	})
+}
+
+// viewServesSystemOne is viewHasAPIFlavorFailClosed for POST /v1/systemone:
+// the mapping passes routing.MappingServesDecisionEndpoint for the systemone
+// endpoint under its effective flavors and modes, and an application whose spec
+// read failed passes nothing, since the unreadable spec may disable it.
+func viewServesSystemOne(view mappingView, idx runtimeSpecIndex) bool {
+	if _, failed := idx.failed[view.app.ID]; failed {
+		return false
+	}
+	return routing.MappingServesDecisionEndpoint(view.app, idx.effective(view), routing.APIFlavorDecisions)
+}
+
+// decisionOpenAIFlagsByName is decisionFlagsByName's twin for the
+// decision_openai verdict (the upstream serves /v1/decisions natively).
+func decisionOpenAIFlagsByName(views []mappingView, rows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return rows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+	})
+}
+
+// anyDecisionFlagsByName folds the derived routing.CapabilityAnyDecision, the
+// pre-resolve requirement of POST /v1/decisions: every mapping of a name has a
+// yes on decision OR decision_openai and passes the decisions flavor half. It
+// backs ModelOffering.Capable for that endpoint's unknown-model redirect.
+func anyDecisionFlagsByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	decision := capabilityRowsFor(capsByMapping, routing.CapabilityDecision)
+	openAI := capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI)
+	return foldMappingFlags(views, func(view mappingView) bool {
+		id := view.mapping.ID
+		yes := decision[id].Verdict == routing.CapabilityYes || openAI[id].Verdict == routing.CapabilityYes
+		return yes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
 	})
 }
 
@@ -5742,6 +5803,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -5779,6 +5841,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		VendorAccess:                   decodeVendorAccessDTO(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 	}
 }
 

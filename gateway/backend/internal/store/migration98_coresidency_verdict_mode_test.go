@@ -87,13 +87,11 @@ func TestMigration98And99UpgradeAnExistingCoResidencyDeployment(t *testing.T) {
 				Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 				CreatedAt: now, UpdatedAt: now,
 			})
-			if err := s.CreateApplication(ctx, routing.Application{
+			seedBaselineApplication(ctx, t, s, routing.Application{
 				ID: host.appID, ServerID: host.serverID, Type: host.appType, Port: host.port, Scheme: "http",
 				APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 				HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-			}); err != nil {
-				t.Fatalf("create application %s: %v", host.appID, err)
-			}
+			})
 		}
 		for _, mid := range []string{"map_m98_a", "map_m98_b", "map_m98_c"} {
 			seedBaselineMapping(ctx, t, s, routing.ModelMapping{
@@ -155,13 +153,11 @@ func TestMigration98And99UpgradeAnExistingCoResidencyDeployment(t *testing.T) {
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
-		if err := s.CreateApplication(ctx, routing.Application{
+		seedBaselineApplication(ctx, t, s, routing.Application{
 			ID: "app_m98_new", ServerID: "srv_m98_new", Type: routing.ProviderServerAgent, Port: 8101, Scheme: "http",
 			APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
 			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create post-upgrade application: %v", err)
-		}
+		})
 		if got := rawText(ctx, t, s, `select coresidency_mode from applications where id = ?`, "app_m98_new"); got != "opt_out" {
 			t.Fatalf("post-upgrade application coresidency_mode = %q, want opt_out (the new standard)", got)
 		}

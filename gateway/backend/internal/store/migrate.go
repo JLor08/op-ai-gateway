@@ -139,6 +139,8 @@ var migrations = []migration{
 	{version: 104, name: "rpc_cluster_tables", up: migration104Up},
 	{version: 105, name: "usage_event_hosts", up: migration105Up},
 	{version: 106, name: "rpc_member_port_unique", up: migration106Up},
+	{version: 107, name: "application_decision_modes", up: migration107Up},
+	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4751,4 +4753,44 @@ func migration105Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 func migration106Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return execTx(ctx, tx, dl, `create unique index if not exists idx_rpc_cluster_members_server_port
 		on rpc_cluster_members(server_id, port) where port <> 0`)
+}
+
+// migration107Up adds the two decision-endpoint mode columns, decisions_mode
+// (POST /v1/decisions) and systemone_mode (POST /v1/systemone), to
+// applications and agent_runtime_specs, following migration72Up's pattern: a
+// text column, not null, default the empty string, then a backfill guarded on
+// the blank value so a re-run is idempotent. decisions_mode backfills to
+// 'auto' (translate where the upstream lacks the endpoint, pass-through
+// where it has it) and systemone_mode to 'passthrough', the behaviour
+// /v1/systemone has always had (ADR-098). A spec is backfilled to the same
+// defaults rather than copied from its application: no operator has set
+// either mode yet, so the two agree.
+func migration107Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, table := range []string{"applications", "agent_runtime_specs"} {
+		for _, col := range []string{
+			"decisions_mode text not null default ''",
+			"systemone_mode text not null default ''",
+		} {
+			if err := addColumnIfMissing(ctx, tx, dl, table, col); err != nil {
+				return err
+			}
+		}
+		if err := execTx(ctx, tx, dl, "update "+table+" set decisions_mode = 'auto' where decisions_mode = ''"); err != nil {
+			return err
+		}
+		if err := execTx(ctx, tx, dl, "update "+table+" set systemone_mode = 'passthrough' where systemone_mode = ''"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration108Up adds the opt-in api_tokens.decisions_confidence_normalize flag
+// (#373, ADR-098): when set, the gateway recomputes `confidence` on a
+// /v1/decisions answer for this token. A boolean is `integer not null default
+// 0` on both dialects (ADR-005's wide-column rule is about numeric widths, not
+// flags), and existing tokens land on 0 = off, so the upgrade changes no
+// behavior. addColumnIfMissing keeps it re-runnable.
+func migration108Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "decisions_confidence_normalize integer not null default 0")
 }

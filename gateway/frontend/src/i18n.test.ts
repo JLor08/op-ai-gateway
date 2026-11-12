@@ -3461,6 +3461,37 @@ describe('responses live-timings i18n keys', () => {
   });
 });
 
+// OpenAI Decisions (#373 phase 2): the mode selects, the decision_openai
+// verdict and chip, the route label, the token opt-in and the refusals.
+describe('decisions phase 2 i18n keys', () => {
+  it('defines every new key in de and en', () => {
+    const keys = [
+      'applicationDecisionsMode',
+      'applicationDecisionsModeAuto',
+      'applicationDecisionsModeNote',
+      'applicationSystemOneMode',
+      'mappingDecisionOpenaiCapable',
+      'mappingDecisionOpenaiCapableUnknownHint',
+      'capabilityDecisionOpenai',
+      'mappingDecisionsRouteTranslate',
+      'mappingDecisionsRoutePassthrough',
+      'mappingDecisionsRouteDisabled',
+      'tokenDecisionsConfidenceNormalize',
+      'tokenDecisionsConfidenceNormalizeHint',
+      'errorApplicationDecisionsPassthroughUnsupported',
+      'errorApplicationDecisionsPassthroughConflict',
+      'errorRuntimeSpecDecisionsPassthroughUnsupported',
+    ] as const;
+    for (const k of keys) {
+      expect(messages.de[k].length, `de ${k}`).toBeGreaterThan(0);
+      expect(messages.en[k].length, `en ${k}`).toBeGreaterThan(0);
+    }
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].mappingDecisionsRoute('X')).toContain('X');
+    }
+  });
+});
+
 // Portal chat image generation (task 8): the chat run lifecycle's own error
 // codes, the mapping capability-form refusal, and the four images.* codes now
 // reachable from a chat run rather than only from a direct API client. The

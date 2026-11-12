@@ -188,6 +188,11 @@ type TokenRecord struct {
 	// OpenAI translate path. Stored as api_tokens.claude_effort_compatibility;
 	// off means no behaviour change. Independent of ClaudeModelAliases.
 	ClaudeEffortCompatibility bool
+	// DecisionsConfidenceNormalize is the opt-in (default false) that makes the
+	// gateway recompute `confidence` on a /v1/decisions answer for this token
+	// (ADR-098). Stored as api_tokens.decisions_confidence_normalize; off means
+	// no behaviour change. Ungated, like ClaudeModelAliases.
+	DecisionsConfidenceNormalize bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored

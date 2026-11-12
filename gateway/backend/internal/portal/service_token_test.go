@@ -839,3 +839,201 @@ func TestCreateServiceTokenClaudeEffortCompatibility(t *testing.T) {
 		t.Fatalf("listed default service token claude_effort_compatibility = %v (present=%v), want false", v, ok)
 	}
 }
+
+// storedDecisionsConfidenceNormalize reads a token's persisted
+// decisions_confidence_normalize flag back out of the store, so the tests below
+// prove persistence and not merely that the DTO echoes the request.
+func storedDecisionsConfidenceNormalize(t *testing.T, dir *MemoryDirectory, id string) bool {
+	t.Helper()
+	record, err := dir.TokenByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("TokenByID %s: %v", id, err)
+	}
+	return record.DecisionsConfidenceNormalize
+}
+
+// TestCreateTokenDecisionsConfidenceNormalize pins the opt-in flag on the
+// user-token create + read path: it is persisted when requested, off when
+// omitted, and it reads back through both the create response and the token
+// listing. It is a separate switch from claude_model_aliases, so enabling one
+// must never turn the other on.
+func TestCreateTokenDecisionsConfidenceNormalize(t *testing.T) {
+	ctx := context.Background()
+	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
+
+	on, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "dcn-on", Scopes: []string{"gateway:use"}, DecisionsConfidenceNormalize: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(on): %v", err)
+	}
+	if !on.Token.DecisionsConfidenceNormalize {
+		t.Fatalf("create response decisions_confidence_normalize = false, want true: %+v", on.Token)
+	}
+	if on.Token.ClaudeModelAliases || storedClaudeModelAliases(t, f.dir, on.Token.ID) {
+		t.Fatalf("decisions_confidence_normalize leaked into claude_model_aliases: %+v", on.Token)
+	}
+	if !storedDecisionsConfidenceNormalize(t, f.dir, on.Token.ID) {
+		t.Fatal("decisions_confidence_normalize was not persisted for the opted-in token")
+	}
+
+	off, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "effort-off", Scopes: []string{"gateway:use"},
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(off): %v", err)
+	}
+	if off.Token.DecisionsConfidenceNormalize {
+		t.Fatalf("create response decisions_confidence_normalize = true for an omitted flag: %+v", off.Token)
+	}
+	if storedDecisionsConfidenceNormalize(t, f.dir, off.Token.ID) {
+		t.Fatal("decisions_confidence_normalize persisted true for a token created without it")
+	}
+
+	list, err := f.svc.tokensForUser(ctx, "usr_1")
+	if err != nil {
+		t.Fatalf("tokensForUser: %v", err)
+	}
+	got := map[string]bool{}
+	for _, dto := range list.Data {
+		got[dto.ID] = dto.DecisionsConfidenceNormalize
+	}
+	if v, ok := got[on.Token.ID]; !ok || !v {
+		t.Fatalf("listed opted-in token decisions_confidence_normalize = %v (present=%v), want true", v, ok)
+	}
+	if v, ok := got[off.Token.ID]; !ok || v {
+		t.Fatalf("listed default token decisions_confidence_normalize = %v (present=%v), want false", v, ok)
+	}
+}
+
+// TestUpdateTokenDecisionsConfidenceNormalize pins the PATCH semantics of the
+// flag: nil (field omitted) keeps whatever is stored — in BOTH directions, so
+// an unrelated update can neither switch it on nor clear it — while a non-nil
+// value replaces it.
+func TestUpdateTokenDecisionsConfidenceNormalize(t *testing.T) {
+	ctx := context.Background()
+	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
+
+	enabled, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "enabled", Scopes: []string{"gateway:use"}, DecisionsConfidenceNormalize: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(enabled): %v", err)
+	}
+	disabled, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "disabled", Scopes: []string{"gateway:use"},
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(disabled): %v", err)
+	}
+
+	// Omitted: an unrelated update leaves both values exactly as stored.
+	dto, err := f.svc.UpdateToken(ctx, f.owner, enabled.Token.ID, UpdateTokenRequest{LogCommunication: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateToken(enabled, unrelated): %v", err)
+	}
+	if !dto.DecisionsConfidenceNormalize || !storedDecisionsConfidenceNormalize(t, f.dir, enabled.Token.ID) {
+		t.Fatalf("an unrelated update cleared decisions_confidence_normalize: dto=%+v", dto)
+	}
+	dto, err = f.svc.UpdateToken(ctx, f.owner, disabled.Token.ID, UpdateTokenRequest{LogCommunication: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateToken(disabled, unrelated): %v", err)
+	}
+	if dto.DecisionsConfidenceNormalize || storedDecisionsConfidenceNormalize(t, f.dir, disabled.Token.ID) {
+		t.Fatalf("an unrelated update switched decisions_confidence_normalize on: dto=%+v", dto)
+	}
+
+	// Explicit false clears it; explicit true sets it.
+	dto, err = f.svc.UpdateToken(ctx, f.owner, enabled.Token.ID, UpdateTokenRequest{DecisionsConfidenceNormalize: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("UpdateToken(enabled, false): %v", err)
+	}
+	if dto.DecisionsConfidenceNormalize || storedDecisionsConfidenceNormalize(t, f.dir, enabled.Token.ID) {
+		t.Fatalf("explicit false did not clear decisions_confidence_normalize: dto=%+v", dto)
+	}
+	dto, err = f.svc.UpdateToken(ctx, f.owner, disabled.Token.ID, UpdateTokenRequest{DecisionsConfidenceNormalize: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateToken(disabled, true): %v", err)
+	}
+	if !dto.DecisionsConfidenceNormalize || !storedDecisionsConfidenceNormalize(t, f.dir, disabled.Token.ID) {
+		t.Fatalf("explicit true did not set decisions_confidence_normalize: dto=%+v", dto)
+	}
+	if dto.ClaudeModelAliases || storedClaudeModelAliases(t, f.dir, disabled.Token.ID) {
+		t.Fatalf("setting decisions_confidence_normalize switched claude_model_aliases on: dto=%+v", dto)
+	}
+}
+
+// TestCreateServiceTokenDecisionsConfidenceNormalize is the service-token half:
+// the flag is accepted on create and read back through both the create
+// response and the listing. Service tokens have no field-PATCH, so there is no
+// update to pin.
+func TestCreateServiceTokenDecisionsConfidenceNormalize(t *testing.T) {
+	ctx := context.Background()
+	svc, dir, _, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := createTestService(t, ctx, svc)
+
+	on, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{
+		Name: "dcn-on", DecisionsConfidenceNormalize: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateServiceToken(on): %v", err)
+	}
+	if !on.Token.DecisionsConfidenceNormalize {
+		t.Fatalf("create response decisions_confidence_normalize = false, want true: %+v", on.Token)
+	}
+	if on.Token.ClaudeModelAliases || storedClaudeModelAliases(t, dir, on.Token.ID) {
+		t.Fatalf("decisions_confidence_normalize leaked into claude_model_aliases: %+v", on.Token)
+	}
+	if !storedDecisionsConfidenceNormalize(t, dir, on.Token.ID) {
+		t.Fatal("decisions_confidence_normalize was not persisted for the opted-in service token")
+	}
+
+	off, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{Name: "effort-off"})
+	if err != nil {
+		t.Fatalf("CreateServiceToken(off): %v", err)
+	}
+	if off.Token.DecisionsConfidenceNormalize || storedDecisionsConfidenceNormalize(t, dir, off.Token.ID) {
+		t.Fatalf("a service token created without the flag reads on: %+v", off.Token)
+	}
+
+	list, err := svc.ListServiceTokens(ctx, svcAdminToken(), created.ID)
+	if err != nil {
+		t.Fatalf("ListServiceTokens: %v", err)
+	}
+	got := map[string]bool{}
+	for _, dto := range list {
+		got[dto.ID] = dto.DecisionsConfidenceNormalize
+	}
+	if v, ok := got[on.Token.ID]; !ok || !v {
+		t.Fatalf("listed opted-in service token decisions_confidence_normalize = %v (present=%v), want true", v, ok)
+	}
+	if v, ok := got[off.Token.ID]; !ok || v {
+		t.Fatalf("listed default service token decisions_confidence_normalize = %v (present=%v), want false", v, ok)
+	}
+}
+
+// TestDecisionsConfidenceNormalizeIsUngated pins that, unlike
+// claude_effort_compatibility, the flag needs no management principal: an
+// inference-only bearer may set it on create and flip it on update.
+func TestDecisionsConfidenceNormalizeIsUngated(t *testing.T) {
+	ctx := context.Background()
+	f, _ := newEffortAuthzFixture(t)
+	caller := effortInferenceBearer("tok_caller")
+
+	created, err := f.svc.CreateToken(ctx, caller, CreateTokenRequest{
+		Name: "own", Scopes: []string{"gateway:use"}, DecisionsConfidenceNormalize: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(inference bearer, flag on) = %v, want success", err)
+	}
+	if !created.Token.DecisionsConfidenceNormalize || !storedDecisionsConfidenceNormalize(t, f.dir, created.Token.ID) {
+		t.Fatalf("create did not persist the flag: %+v", created.Token)
+	}
+	dto, err := f.svc.UpdateToken(ctx, caller, created.Token.ID, UpdateTokenRequest{DecisionsConfidenceNormalize: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("UpdateToken(inference bearer, flag off) = %v, want success", err)
+	}
+	if dto.DecisionsConfidenceNormalize || storedDecisionsConfidenceNormalize(t, f.dir, created.Token.ID) {
+		t.Fatalf("update did not clear the flag: %+v", dto)
+	}
+}
