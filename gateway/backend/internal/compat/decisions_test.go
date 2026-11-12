@@ -63,6 +63,7 @@ func TestTranslateDecisionsRequestState(t *testing.T) {
 		{"text parts joined", `[{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}]}]`, `"a\n\nb"`},
 		{"lone input_json", `[{"role":"user","content":[{"type":"input_json","data":{"k":1}}]}]`, `{"k":1}`},
 		{"json plus text", `[{"role":"user","content":[{"type":"input_json","data":{"k":1}},{"type":"input_text","text":"note"}]}]`, `[{"k":1},"note"]`},
+		{"text json text keeps pieces", `[{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_json","data":{"k":1}},{"type":"input_text","text":"b"}]}]`, `["a",{"k":1},"b"]`},
 		{"text then json", `[{"role":"user","content":[{"type":"input_text","text":"note"},{"type":"input_json","data":[{"a":1}]}]}]`, `["note",[{"a":1}]]`},
 	}
 	for _, tc := range cases {
@@ -339,7 +340,6 @@ func TestTranslateSystemOneResponseErrors(t *testing.T) {
 	cases := map[string]string{
 		"missing answer":       `{"answers":{"p":{"type":"noul","noul":0.5}}}`,
 		"type mismatch":        `{"answers":{"p":{"type":"choice","choice":"a"},"q1":{"type":"choice","choice":"a","probabilities":{}},"s":{"type":"score","score":0}}}`,
-		"missing type":         `{"answers":{"p":{"noul":0.5},"q1":{"type":"choice","choice":"a"},"s":{"type":"score","score":0}}}`,
 		"not json":             `nope`,
 		"not object":           `[1]`,
 		"no answers":           `{"usage":{}}`,
@@ -469,4 +469,22 @@ func TestParseDecisionsUsage(t *testing.T) {
 			t.Fatalf("bad %q usage = %+v", bad, u)
 		}
 	}
+}
+
+func TestTranslateSystemOneResponseMissingTypeAccepted(t *testing.T) {
+	up := `{"answers":{"p":{"noul":0.5},"q1":{"choice":"a","probabilities":{"a":1}},"s":{"score":0,"probabilities":{"0":1}}}}`
+	m, _, err := translateResp(t, translateFixture, up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, m["answers"].([]any)[0], `{"type":"predicate","name":"p","probability":0.5}`)
+}
+
+func TestTranslateSystemOneResponseEmptyNameRestored(t *testing.T) {
+	fixture := `{"model":"m","input":"x","questions":[{"type":"predicate","name":"","instructions":"i"}]}`
+	m, _, err := translateResp(t, fixture, `{"answers":{"q0":{"type":"noul","noul":0.2}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEqual(t, m["answers"].([]any)[0], `{"type":"predicate","name":"","probability":0.2}`)
 }

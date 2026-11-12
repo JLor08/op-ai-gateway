@@ -671,7 +671,7 @@ func translateSystemOneAnswer(q decisionsTableQuestion, raw json.RawMessage) (an
 		return nil, err
 	}
 	want := map[string]string{oaTypePredicate: s1TypeNoul, oaTypeChoice: s1TypeChoice, oaTypeScore: s1TypeScore}[q.oaType]
-	if a.Type != want {
+	if a.Type != "" && a.Type != want {
 		return nil, fmt.Errorf("answer type %q, expected %q", a.Type, want)
 	}
 	confidence := 0.0
