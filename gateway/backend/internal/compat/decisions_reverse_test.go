@@ -386,3 +386,26 @@ func TestOpenAIDecisionsResponseMultipleRefusedKeys(t *testing.T) {
 		t.Fatalf("message = %q, want %q", err.Error(), want)
 	}
 }
+
+// An upstream answer with an absent or null choice names nothing: it must not
+// match a System One option whose key is the empty string.
+func TestOpenAIDecisionsResponseChoiceMustBeNamed(t *testing.T) {
+	_, table := reverseOK(t, `{"model":"m","state":"s","questions":{"q":{"type":"choice","criteria":{"":null,"b":null}}}}`)
+	for name, choice := range map[string]string{"absent": ``, "null": `"choice":null,`} {
+		t.Run(name, func(t *testing.T) {
+			body := `{"answers":[{"type":"choice","name":"q",` + choice + `"confidence":1,"probabilities":[]}],"model":"x","usage":{}}`
+			_, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c")
+			if err == nil {
+				t.Fatal("expected an error for an answer that names no choice")
+			}
+			if errors.Is(err, ErrSystemOneRefused) {
+				t.Fatalf("malformed answer must not read as a refusal: %v", err)
+			}
+		})
+	}
+	// Control: the empty key named explicitly is still a valid choice.
+	body := `{"answers":[{"type":"choice","name":"q","choice":"","confidence":1,"probabilities":[]}],"model":"x","usage":{}}`
+	if _, _, err := TranslateOpenAIDecisionsResponse([]byte(body), table, "c"); err != nil {
+		t.Fatalf("explicit empty choice: %v", err)
+	}
+}

@@ -730,7 +730,10 @@ func translateOpenAIChoice(q s1TableQuestion, a openAIAnswerIn) (any, error) {
 	if err := expectOpenAIType(a, oaTypeChoice); err != nil {
 		return nil, err
 	}
-	chosen, _ := probKeyString(a.Choice)
+	chosen, named := probKeyString(a.Choice)
+	if !named {
+		return nil, errors.New("choice answer names no choice")
+	}
 	if !containsString(q.choices, chosen) {
 		return nil, fmt.Errorf("choice %q is not one of the asked options", chosen)
 	}

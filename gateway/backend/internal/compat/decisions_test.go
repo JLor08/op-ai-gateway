@@ -582,3 +582,23 @@ func TestTranslateSystemOneResponseEmptyChoiceIsNotAbsent(t *testing.T) {
 		}
 	}
 }
+
+// An image-only input has no text piece but is still content: the empty-input
+// refusal must not catch it. The image is carried and the state is empty.
+func TestTranslateDecisionsRequestImageOnlyInputAccepted(t *testing.T) {
+	in := `{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}],` + onePredicate + `}`
+	out, _, derr := TranslateDecisionsRequest([]byte(in), "u")
+	if derr != nil {
+		t.Fatalf("image-only input refused: %+v", derr)
+	}
+	var got struct {
+		State  string   `json:"state"`
+		Images []string `json:"images"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "" || !reflect.DeepEqual(got.Images, []string{"data:image/png;base64,AAAA"}) {
+		t.Fatalf("state = %q, images = %v, want an empty state and the one image", got.State, got.Images)
+	}
+}
