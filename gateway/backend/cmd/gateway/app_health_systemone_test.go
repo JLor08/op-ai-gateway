@@ -393,7 +393,7 @@ func TestSystemOnePassBacksOffOnATransientResult(t *testing.T) {
 		t.Fatalf("inside the back-off the upstream saw %d requests, want still 1", n)
 	}
 
-	current = current.Add(systemOneRetryBackoff)
+	current = current.Add(decisionProbeRetryBackoff)
 	runCapabilityCycle(runner)
 	if n := len(up.requests()); n != 2 {
 		t.Fatalf("after the back-off the upstream saw %d requests, want 2", n)
@@ -444,7 +444,7 @@ func TestSystemOnePassRetriesAVerdictTheStoreDidNotTake(t *testing.T) {
 	st.mu.Lock()
 	st.capsReadErr = false
 	st.mu.Unlock()
-	current = current.Add(systemOneRetryBackoff)
+	current = current.Add(decisionProbeRetryBackoff)
 	runCapabilityCycle(runner)
 	if n := len(up.requests()); n != 2 {
 		t.Fatalf("after the back-off the upstream saw %d requests, want 2", n)
@@ -712,8 +712,8 @@ func TestSystemOnePassReprobesAClearedVerdict(t *testing.T) {
 // TestSystemOnePassEscalatesTheBackoffOnARefusal: an upstream that refuses
 // the probe request itself (a 400, 405 or 422) will refuse it again, so each
 // refusal in a row doubles the window before the next probe, from
-// systemOneRetryBackoff up to systemOneRefusedBackoffCap. A verdict, or a new
-// identity behind the mapping, starts again from systemOneRetryBackoff.
+// decisionProbeRetryBackoff up to decisionProbeRefusedBackoffCap. A verdict, or a new
+// identity behind the mapping, starts again from decisionProbeRetryBackoff.
 func TestSystemOnePassEscalatesTheBackoffOnARefusal(t *testing.T) {
 	up := newSystemOneUpstream(t)
 	up.answer(http.StatusBadRequest, `{"error":"bad request"}`)
@@ -721,8 +721,8 @@ func TestSystemOnePassEscalatesTheBackoffOnARefusal(t *testing.T) {
 	runner, st, _ := systemOneRunner(t, up, systemOneApp(routing.ProviderLlamaCPP, port, routing.APIFlavorDecisions), systemOneMapping("m1", "decider"))
 	current := time.Unix(10_000, 0).UTC()
 	runner.now = func() time.Time { return current }
-	if systemOneRefusedBackoffCap != time.Hour {
-		t.Fatalf("systemOneRefusedBackoffCap = %v, want 1h", systemOneRefusedBackoffCap)
+	if decisionProbeRefusedBackoffCap != time.Hour {
+		t.Fatalf("decisionProbeRefusedBackoffCap = %v, want 1h", decisionProbeRefusedBackoffCap)
 	}
 
 	// expectWindow asserts the next probe comes exactly window after the last.
@@ -756,13 +756,13 @@ func TestSystemOnePassEscalatesTheBackoffOnARefusal(t *testing.T) {
 	delete(st.caps["m1"], routing.CapabilityDecision)
 	st.mu.Unlock()
 	runCapabilityCycle(runner)
-	expectWindow("after a verdict", systemOneRetryBackoff)
-	expectWindow("after a verdict, second refusal", 2*systemOneRetryBackoff)
+	expectWindow("after a verdict", decisionProbeRetryBackoff)
+	expectWindow("after a verdict, second refusal", 2*decisionProbeRetryBackoff)
 
 	// A new identity starts from the start as well.
 	st.mu.Lock()
 	st.mappings["a1"] = []routing.ModelMapping{systemOneMapping("m1", "decider-v2")}
 	st.mu.Unlock()
 	runCapabilityCycle(runner)
-	expectWindow("a new identity", systemOneRetryBackoff)
+	expectWindow("a new identity", decisionProbeRetryBackoff)
 }

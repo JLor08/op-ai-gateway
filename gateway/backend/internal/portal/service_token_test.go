@@ -878,7 +878,7 @@ func TestCreateTokenDecisionsConfidenceNormalize(t *testing.T) {
 	}
 
 	off, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
-		Name: "effort-off", Scopes: []string{"gateway:use"},
+		Name: "normalize-off", Scopes: []string{"gateway:use"},
 	})
 	if err != nil {
 		t.Fatalf("CreateToken(off): %v", err)
@@ -988,7 +988,7 @@ func TestCreateServiceTokenDecisionsConfidenceNormalize(t *testing.T) {
 		t.Fatal("decisions_confidence_normalize was not persisted for the opted-in service token")
 	}
 
-	off, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{Name: "effort-off"})
+	off, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{Name: "normalize-off"})
 	if err != nil {
 		t.Fatalf("CreateServiceToken(off): %v", err)
 	}

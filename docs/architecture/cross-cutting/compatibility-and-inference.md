@@ -1679,10 +1679,10 @@ one `POST {endpoint}/v1/systemone` with the exact body
   cannot answer costs one tiny POST per window, not one per health tick. A 401/403 is
   logged as a token problem.
 - **Two back-offs.** An answer that can pass on its own (a timeout, a 408, a 429, a 5xx,
-  a router 404) waits `systemOneRetryBackoff` (5 min). A **refusal** that will not, a
+  a router 404) waits `decisionProbeRetryBackoff` (5 min). A **refusal** that will not, a
   `400`, `405` or `422` (`provider.ErrSystemOneProbeRefused`), doubles the window with
   each refusal of the same identity in a row, 5, 10, 20, 40 min, then
-  `systemOneRefusedBackoffCap` (1 h) (`settleSystemOne`, `escalatingBackoff`), so a
+  `decisionProbeRefusedBackoffCap` (1 h) (`settleSystemOne`, `escalatingBackoff`), so a
   loaded model that refuses the probe is not re-POSTed, and kept resident, every 5
   minutes forever. A verdict, or a new identity behind the mapping, starts the streak
   over.

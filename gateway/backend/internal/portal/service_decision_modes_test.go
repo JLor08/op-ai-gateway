@@ -645,3 +645,48 @@ func TestSystemOneDecisionFoldJudgesTheRoute(t *testing.T) {
 		}
 	}
 }
+
+// TestBothIncapableDecisionModesReportBoth: a save that sends decisions_mode
+// passthrough AND systemone_mode translate for a kind lacking /v1/decisions
+// reports both refusals, not only the first. errors.Is holds for both
+// sentinels, the message names both modes, and the first sentinel (decisions)
+// stays the one an HTTP mapping reaches first.
+func TestBothIncapableDecisionModesReportBoth(t *testing.T) {
+	ctx := context.Background()
+	assertBoth := func(t *testing.T, err, decisionsErr, systemOneErr error) {
+		t.Helper()
+		if !errors.Is(err, decisionsErr) || !errors.Is(err, systemOneErr) {
+			t.Fatalf("err = %v, want both %v and %v", err, decisionsErr, systemOneErr)
+		}
+		if msg := err.Error(); !strings.HasPrefix(msg, decisionsErr.Error()+": ") ||
+			!strings.Contains(msg, "decisions_mode passthrough") || !strings.Contains(msg, "systemone_mode translate") {
+			t.Fatalf("message %q must lead with the decisions sentinel and name both modes", msg)
+		}
+	}
+
+	t.Run("application create", func(t *testing.T) {
+		svc, _, serverID := decisionModesFixture(t)
+		_, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+			Type: routing.ProviderLlamaCPP, Port: 8330, Scheme: "http", DecisionsMode: "passthrough", SystemOneMode: "translate",
+		})
+		assertBoth(t, err, ErrApplicationDecisionsPassthroughUnsupported, ErrApplicationSystemOneTranslateUnsupported)
+	})
+	t.Run("application update", func(t *testing.T) {
+		svc, _, serverID := decisionModesFixture(t)
+		llama, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{Type: routing.ProviderLlamaCPP, Port: 8331, Scheme: "http"})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		_, err = svc.UpdateApplication(ctx, ownerToken(), llama.ID, UpdateApplicationRequest{
+			Type: strPtr(routing.ProviderLlamaCPP), DecisionsMode: strPtr("passthrough"), SystemOneMode: strPtr("translate"),
+		})
+		assertBoth(t, err, ErrApplicationDecisionsPassthroughUnsupported, ErrApplicationSystemOneTranslateUnsupported)
+	})
+	t.Run("runtime spec", func(t *testing.T) {
+		svc, _, _, newMapping := liveTimingsSpecFixture(t)
+		_, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("both-modes"), PutRuntimeSpecRequest{
+			Binary: "/x/server", Type: "llama_cpp", DecisionsMode: "passthrough", SystemOneMode: "translate",
+		})
+		assertBoth(t, err, ErrRuntimeSpecDecisionsPassthroughUnsupported, ErrRuntimeSpecSystemOneTranslateUnsupported)
+	})
+}
