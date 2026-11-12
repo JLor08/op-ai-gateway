@@ -329,10 +329,10 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 	if len(rows) == 0 {
 		return s.keptVendorModels(ctx, principal, acc.ID, "the vendor listed no usable model")
 	}
-	// Counted before the decision models are added back: only what the vendor
-	// listed is discovered, and a listing with nothing usable was kept above.
+	// Counted before the store step adds the decision models back: only what
+	// the vendor listed is discovered, and a listing with nothing usable was
+	// kept above.
 	discovered := len(rows)
-	rows = withOpenAIDecisionModelRows(acc, rows)
 	acc, _, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
@@ -356,6 +356,11 @@ func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.
 // keeps them rather than letting an omission drop them. Like the discovered
 // rows they carry no prefix yet (GatewayModel = the slug); the store step
 // applies the account's current one. They do not count as discovered.
+//
+// acc must be the account as storeDiscoveredVendorModels re-loaded it under
+// the model-write lock, not the copy loaded before the vendor call: an OAuth
+// connect can turn the account into a subscription meanwhile, and a
+// subscription account carries no decision row.
 func withOpenAIDecisionModelRows(acc routing.VendorAccount, rows []routing.VendorAccountModel) []routing.VendorAccountModel {
 	flavor, _ := vendorAPIFlavor(acc.Vendor)
 	for _, id := range routing.OpenAIDecisionModelIDs() {
@@ -373,8 +378,10 @@ func withOpenAIDecisionModelRows(acc routing.VendorAccount, rows []routing.Vendo
 // that produced rows was a network round trip, so the account is re-loaded INSIDE
 // the lock: a prefix change made meanwhile is not overwritten (the rows are written
 // under the prefix current now, and a re-label that arrives later re-labels these
-// rows), and an account deleted meanwhile is reported rather than written to. It
-// returns the re-loaded account and the rows as stored.
+// rows), and an account deleted meanwhile is reported rather than written to.
+// The decision models are added for the re-loaded account too
+// (withOpenAIDecisionModelRows), so an account that became a subscription
+// meanwhile gets none. It returns the re-loaded account and the rows as stored.
 func (s *Service) storeDiscoveredVendorModels(ctx context.Context, id string, rows []routing.VendorAccountModel) (routing.VendorAccount, []routing.VendorAccountModel, error) {
 	unlock, err := s.vendorModelWrites.lock(ctx, id)
 	if err != nil {
@@ -385,7 +392,7 @@ func (s *Service) storeDiscoveredVendorModels(ctx context.Context, id string, ro
 	if err != nil {
 		return routing.VendorAccount{}, nil, notFoundAsVendorAccountNotFound(err)
 	}
-	rows, _ = relabelVendorModels(rows, acc.ModelPrefix)
+	rows, _ = relabelVendorModels(withOpenAIDecisionModelRows(acc, rows), acc.ModelPrefix)
 	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, rows); err != nil {
 		return routing.VendorAccount{}, nil, notFoundAsVendorAccountNotFound(err)
 	}

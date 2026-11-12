@@ -1561,6 +1561,35 @@ func TestRefreshVendorAccountModelsDecisionModelDoesNotMakeAnEmptyListingUsable(
 	}
 }
 
+// The decision model is added back for the account as it is when the rows are
+// written, not as the refresh loaded it before the vendor call: an account that
+// became a subscription meanwhile (an OAuth connect racing the refresh) gets no
+// decision row, which no subscription account may carry.
+func TestRefreshVendorAccountModelsGatesTheDecisionModelOnTheReloadedAccount(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAIAPIKey, "gpt-5", "o3")
+	acc := apiKeyAccount(t, svc, routing.VendorOpenAI, "")
+	listAPIKey := svc.vendorDiscovery.discoverers.OpenAIAPIKey
+	svc.vendorDiscovery.discoverers.OpenAIAPIKey = func(ctx context.Context, client *http.Client, credential string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		row, err := routeStore.VendorAccountByID(ctx, acc.ID)
+		if err != nil {
+			t.Errorf("VendorAccountByID: %v", err)
+		}
+		row.AuthType = routing.VendorAuthSubscription
+		if err := routeStore.UpdateVendorAccount(ctx, row); err != nil {
+			t.Errorf("UpdateVendorAccount: %v", err)
+		}
+		return listAPIKey(ctx, client, credential)
+	}
+
+	if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+		t.Fatalf("RefreshVendorAccountModels = %+v, %v; want ok", res, err)
+	}
+	if got := gatewayModels(storedModels(t, routeStore, acc.ID)); !reflect.DeepEqual(got, []string{"gpt-5", "o3"}) {
+		t.Fatalf("gateway models = %v, want [gpt-5 o3] without the decision model", got)
+	}
+}
+
 // A listing with nothing chat-capable is no usable list: the rows are kept.
 func TestRefreshVendorAccountModelsKeepsTheRowsWhenAnAPIKeyListsNoChatModel(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
