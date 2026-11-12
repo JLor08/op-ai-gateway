@@ -99,7 +99,7 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
   - `nvidia-smi` inside WSL reports **the same indices and PCI bus IDs as on the host** (0 → `21:00.0`, 1 → `C1:00.0`, 2 → `E1:00.0`).
   - With `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1`, torch sees exactly one device, an RTX 5090. Selection by `CUDA_VISIBLE_DEVICES` works inside WSL; NVIDIA's "not possible to filter" note concerns Docker's `--gpus`.
   - vLLM itself warns on this mixed host to set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
-  - Still open, because both 5090s look the same to torch: whether the VRAM then lands on host index 1.
+  - A vLLM started with that selection and `--gpu-memory-utilization 0.3` raised **host index 1** (`C1:00.0`) to 9973 MiB (0.3 × 32 GB ≈ 9.8 GB plus context), while index 2 stayed at 45 MiB. **Selection by host index works end to end.**
 
   The background, for reference: NVIDIA lists "On multi-GPU systems it is not possible to filter for specific GPU devices" next to its Docker `--gpus all` note. Whether `CUDA_VISIBLE_DEVICES` plus `CUDA_DEVICE_ORDER=PCI_BUS_ID` inside WSL selects the intended card, and whether the PCI bus IDs match the host's, is Phase 0, B3. It matters because a model that spans all three cards of a Windows host is a real case (agent-runtime-manager §5.3).
 
@@ -284,7 +284,7 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 - **B1** ✅ Which host process holds the VM's GPU memory, per adapter, and do its LUIDs resolve? Answer: `vmwp`, carrying the host's adapter LUIDs (see "GPU and VRAM").
 - **B2** ✅ (adapter level) Is the VM's per-GPU figure additive across two vLLM starts, and does it fall when one stops? Answer: yes. WMI collapses same-named instances (see "GPU and VRAM").
 - **B2b** ✅ Read through the PDH array API (`PdhAddEnglishCounterW` plus `PdhGetFormattedCounterArrayW`, as the agent does): with two WSL GPU processes, does `vmwp` appear as two same-named instances whose values match each process? Answer: yes, one instance per guest GPU process, in an order that is not stable.
-- **B3** 🟡 Multi-GPU: do the GPU indices and PCI bus IDs inside WSL match the host, and does `CUDA_VISIBLE_DEVICES` select the intended card? Answer so far: the indices and bus IDs match, and selection works. Still to confirm on the host side: the VRAM of a pinned vLLM lands on host index 1.
+- **B3** ✅ Multi-GPU: do the GPU indices and PCI bus IDs inside WSL match the host, and does `CUDA_VISIBLE_DEVICES` select the intended card? Answer: yes. With `CUDA_DEVICE_ORDER=PCI_BUS_ID`, the VRAM lands on the selected host index.
 - **B4** Does `wsl.exe` work from an NSSM service running as the distro-owning user (Session 0) on Windows 11 Pro?
 - **B5** What happens to vLLM, and to its VRAM, when `wsl.exe` is killed?
 - **B6** With linger enabled, does `wsl.exe -u <user> --exec systemd-run --user --scope --unit=… -- vllm serve …` work, without root? What do `memory.current`, `anon` and `file` of the scope show, compared with the RSS of the individual vLLM processes? Does `systemctl --user kill --signal=SIGTERM` stop vLLM cleanly and free its VRAM?
