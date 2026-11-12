@@ -157,6 +157,7 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		VendorAccess:                   store.DecodeVendorAccess(token.VendorProviderAccess),
 		ClaudeModelAliases:             token.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
 	}, secret)
 	return nil
 }
@@ -216,6 +217,7 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			VendorAccess:                   store.DecodeVendorAccess(token.VendorProviderAccess),
 			ClaudeModelAliases:             token.ClaudeModelAliases,
 			ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
+			DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
 		})
 	}
 	return nil
@@ -305,6 +307,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.VendorProviderAccess = token.VendorProviderAccess
 	existing.ClaudeModelAliases = token.ClaudeModelAliases
 	existing.ClaudeEffortCompatibility = token.ClaudeEffortCompatibility
+	existing.DecisionsConfidenceNormalize = token.DecisionsConfidenceNormalize
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
 		ID:                 existing.ID,
@@ -335,6 +338,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		VendorAccess:                   store.DecodeVendorAccess(existing.VendorProviderAccess),
 		ClaudeModelAliases:             existing.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      existing.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   existing.DecisionsConfidenceNormalize,
 	})
 	return nil
 }

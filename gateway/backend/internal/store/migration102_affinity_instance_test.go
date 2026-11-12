@@ -57,9 +57,7 @@ func seedMigration102Pin(ctx context.Context, t *testing.T, s *SQLStore, now tim
 	if err := s.CreateUser(ctx, newTestUser("u_m102", "m102@example.test", now)); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	if err := s.CreatePlainToken(ctx, TokenRecord{ID: "tok_m102", UserID: "u_m102", Name: "m102", CreatedAt: now, UpdatedAt: now}, "m102-affinity-secret"); err != nil {
-		t.Fatalf("create token: %v", err)
-	}
+	seedBaselineToken(ctx, t, s, "tok_m102", "u_m102", "m102", "m102-affinity-secret", now)
 	seedBaselineServer(ctx, t, s, routing.AIServer{
 		ID: "srv_m102", Name: "m102", Provider: routing.ProviderVLLM,
 		Endpoint: "http://srv_m102:8000",

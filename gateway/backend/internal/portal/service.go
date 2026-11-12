@@ -1249,6 +1249,11 @@ type TokenDTO struct {
 	// Plain opt-in flag, off by default; always emitted so a client reading a
 	// token and writing it back preserves it.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// DecisionsConfidenceNormalize opts the token into the gateway recomputing
+	// `confidence` on /v1/decisions answers (ADR-098). Plain opt-in flag, off by
+	// default and ungated like ClaudeModelAliases; always emitted so a client
+	// reading a token and writing it back preserves it.
+	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1320,6 +1325,9 @@ type CreateTokenRequest struct {
 	// ClaudeEffortCompatibility opts the token into Claude Code effort
 	// compatibility (see TokenDTO). Off when omitted.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// DecisionsConfidenceNormalize opts the token into recomputed decision
+	// confidence (see TokenDTO). Off when omitted.
+	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 }
 
 type CreateTokenResponse struct {
@@ -1362,6 +1370,9 @@ type UpdateTokenRequest struct {
 	// ClaudeEffortCompatibility: nil = keep the stored flag, a non-nil value
 	// replaces it.
 	ClaudeEffortCompatibility *bool `json:"claude_effort_compatibility,omitempty"`
+	// DecisionsConfidenceNormalize: nil = keep the stored flag, a non-nil value
+	// replaces it.
+	DecisionsConfidenceNormalize *bool `json:"decisions_confidence_normalize,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1966,12 +1977,13 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		ServerOverrideForceUnreachable: serverOverrideForce,
 		// LastUsedModel is deliberately absent: a fresh token has never routed
 		// anything, and only the inference path ever writes the marker.
-		UnknownModelRedirect:        redirect,
-		UnknownModelRedirectBlocked: redirectBlocked,
-		UnknownModelFallback:        fallback,
-		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
-		ClaudeModelAliases:          req.ClaudeModelAliases,
-		ClaudeEffortCompatibility:   req.ClaudeEffortCompatibility,
+		UnknownModelRedirect:         redirect,
+		UnknownModelRedirectBlocked:  redirectBlocked,
+		UnknownModelFallback:         fallback,
+		VendorProviderAccess:         encodeVendorAccessDTO(req.VendorAccess),
+		ClaudeModelAliases:           req.ClaudeModelAliases,
+		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -2077,6 +2089,9 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.ClaudeEffortCompatibility != nil {
 		record.ClaudeEffortCompatibility = *req.ClaudeEffortCompatibility
+	}
+	if req.DecisionsConfidenceNormalize != nil {
+		record.DecisionsConfidenceNormalize = *req.DecisionsConfidenceNormalize
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -5770,6 +5785,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -5807,6 +5823,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		VendorAccess:                   decodeVendorAccessDTO(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
+		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 	}
 }
 

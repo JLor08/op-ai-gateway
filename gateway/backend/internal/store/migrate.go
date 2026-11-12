@@ -140,6 +140,7 @@ var migrations = []migration{
 	{version: 105, name: "usage_event_hosts", up: migration105Up},
 	{version: 106, name: "rpc_member_port_unique", up: migration106Up},
 	{version: 107, name: "application_decision_modes", up: migration107Up},
+	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4782,4 +4783,14 @@ func migration107Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration108Up adds the opt-in api_tokens.decisions_confidence_normalize flag
+// (#373, ADR-098): when set, the gateway recomputes `confidence` on a
+// /v1/decisions answer for this token. A boolean is `integer not null default
+// 0` on both dialects (ADR-005's wide-column rule is about numeric widths, not
+// flags), and existing tokens land on 0 = off, so the upgrade changes no
+// behavior. addColumnIfMissing keeps it re-runnable.
+func migration108Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "decisions_confidence_normalize integer not null default 0")
 }

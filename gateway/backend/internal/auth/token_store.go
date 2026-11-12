@@ -81,6 +81,10 @@ type Token struct {
 	// Claude Code's effort to llama.cpp / vLLM as chat_template_kwargs — see
 	// store.TokenRecord.
 	ClaudeEffortCompatibility bool
+	// DecisionsConfidenceNormalize mirrors the token record's opt-in for
+	// recomputing `confidence` on /v1/decisions answers — see
+	// store.TokenRecord.
+	DecisionsConfidenceNormalize bool
 }
 
 // IsService reports whether t is a service token (Kind=="service") — the
