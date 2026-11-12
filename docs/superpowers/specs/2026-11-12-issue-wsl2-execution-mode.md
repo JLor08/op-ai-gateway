@@ -47,7 +47,11 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
 - **Killing `wsl.exe` sends no signal.** The Linux relay exits and closes the pty master. The workload, a `forkpty` session leader, then gets **SIGHUP** *(source-read, plus pty semantics)*. [WSL#3766](https://github.com/microsoft/WSL/issues/3766) reports that processes with redirected streams "receive only SIGHUP".
   - Python installs no SIGHUP handler, so vLLM dies abruptly, with no clean shutdown.
   - A child that called `setsid` survives as an orphan. It lives until the distro idles out, and only if nothing else keeps the distro running.
-  - **Unverified on a host** (Phase 0, B5).
+  - **Measured (Phase 0, B5, same host, vLLM 0.33.0):** `wsl.exe` running `vllm serve` was started from PowerShell with redirected stdout and stderr, then killed with `Stop-Process -Force` once `/health` answered 200.
+    - Afterwards `pgrep -af vllm` inside the distro found **no vLLM process at all**, neither the API server nor the EngineCore. `vmwp`'s GPU memory fell from about 12 GB to the 22 MiB that is there even without vLLM.
+    - So for vLLM, killing `wsl.exe` tears down the whole process tree and frees its VRAM, with no orphans.
+    - Whether vLLM shut down *cleanly* cannot be seen: its log ends at "Application startup complete", because the pipe it would have logged into died with `wsl.exe`.
+    - The kill is therefore a working **backstop** for vLLM. It is not a graceful stop, and an engine whose children call `setsid` could still leave orphans. The scope-based stop below stays the primary path.
 - **A graceful stop has to signal from inside the distro.** One way: `kill -TERM -- -<pgid>`; the PGID equals the workload's PID because of `forkpty`. A better way, when systemd runs in the distro:
   - run the workload under `systemd-run --scope --unit=<name>`;
   - stop it with `systemctl kill --signal=SIGTERM <name>.scope`, which reaches every process in the cgroup, including processes that called `setsid`.
@@ -290,7 +294,7 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 - **B3** ✅ Multi-GPU: do the GPU indices and PCI bus IDs inside WSL match the host, and does `CUDA_VISIBLE_DEVICES` select the intended card? Answer: yes. With `CUDA_DEVICE_ORDER=PCI_BUS_ID`, the VRAM lands on the selected host index.
 - **B4** ✅ Does `wsl.exe` work from an NSSM service running as the distro-owning user (Session 0) on Windows 11 Pro? Answer: yes, with the user logged on interactively.
 - **B4b** ✅ Does it also work from a cold VM, after a reboot with the service set to start automatically and nobody logged on? Answer: yes. It ran 29 s after boot; the first logon was about six minutes later.
-- **B5** What happens to vLLM, and to its VRAM, when `wsl.exe` is killed?
+- **B5** ✅ What happens to vLLM, and to its VRAM, when `wsl.exe` is killed? Answer: the whole vLLM tree is gone and its VRAM is free, with no orphans. Whether the shutdown was clean is not observable.
 - **B6** With linger enabled, does `wsl.exe -u <user> --exec systemd-run --user --scope --unit=… -- vllm serve …` work, without root? What do `memory.current`, `anon` and `file` of the scope show, compared with the RSS of the individual vLLM processes? Does `systemctl --user kill --signal=SIGTERM` stop vLLM cleanly and free its VRAM?
 
 **Phase 1: execution-mode seam, WSL lifecycle and RAM.**
