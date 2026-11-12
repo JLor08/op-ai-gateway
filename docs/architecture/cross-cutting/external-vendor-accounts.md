@@ -1947,8 +1947,7 @@ data, so it is narrowed by a small heuristic: the `gpt-*`, `chatgpt-*` and
 o-series families (and fine-tunes of them), minus ids that mark an embedding,
 speech, image, moderation, realtime or completion-only model. **The OpenAI Decisions
 models are kept by name on top of the heuristic** (`isServedOpenAIAPIKeyModel`:
-`routing.IsOpenAIDecisionModel` or chat-capable). `gpt-6-luna` already passes the `gpt-*` chat heuristic today, so the name match only guards against a future marker that would drop it (§4.2, *Api-key Decisions*, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373));
-the name match cannot be dropped by a future chat marker. A model the rule
+`routing.IsOpenAIDecisionModel` or chat-capable). `gpt-6-luna` already passes the `gpt-*` chat heuristic today, so the name match only guards against a future marker that would drop it (§4.2, *Api-key Decisions*, [ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)). A model the rule
 does not recognize is left out — a missing model is added by a newer rule, while
 a non-chat model offered wrongly fails every request routed to it. **That heuristic
 stays OpenAI-only**: the OpenAI-compatible vendors keep every listed id exactly as

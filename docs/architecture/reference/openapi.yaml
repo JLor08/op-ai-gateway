@@ -891,7 +891,14 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SystemOneResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: >
+            The Error envelope: `systemone.model_required`, `systemone.questions_required`,
+            `systemone.stream_unsupported`, or, on the translate route,
+            `systemone.question_type_unsupported` / `systemone.field_unsupported`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: >
@@ -905,8 +912,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: The Error envelope with code `systemone.refused`: on the translate route the upstream refused one or more questions; the message names the refused keys.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '502':
-          description: The Error envelope with code `systemone.upstream_error`; only for a token with `decisions_confidence_normalize` whose upstream answer is over the buffer bound or broken off.
+          description: The Error envelope with code `systemone.upstream_error`, for a token with `decisions_confidence_normalize` whose upstream answer is over the buffer bound or broken off, and on the translate route for a missing answer, an unreadable or unusable body, or a body over the buffer bound. A translated non-2xx upstream answer carries the upstream's own status instead.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
