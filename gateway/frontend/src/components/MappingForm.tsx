@@ -111,7 +111,6 @@ function capabilitySeed(row: PortalModelMapping | null, capability: string): Cap
   return verdict === 'yes' || verdict === 'no' ? verdict : '';
 }
 
-/** A capability select's props for its hint: shown only while the choice is unknown. */
 // The translated label of a mapping's decisions_route, or '' when there is
 // nothing to show.
 function decisionsRouteText(route: string | undefined, t: Translation): string {
@@ -127,6 +126,7 @@ function decisionsRouteText(route: string | undefined, t: Translation): string {
   }
 }
 
+/** A capability select's props for its hint: shown only while the choice is unknown. */
 function unknownHint(choice: CapabilityChoice, hint: string): { helperText?: string } {
   return choice === '' ? { helperText: hint } : {};
 }

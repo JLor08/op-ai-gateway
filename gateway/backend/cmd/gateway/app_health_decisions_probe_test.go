@@ -5,6 +5,7 @@ package main
 
 import (
 	"net/http"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"testing"
 	"time"
@@ -214,5 +215,48 @@ func TestDecisionsPassRefusalEscalatesIndependently(t *testing.T) {
 		if countPath(up, decisionsPathValue) != i+2 || countPath(up, systemOnePathValue) != i+2 {
 			t.Fatalf("step %d: at the window end saw %v, want both probed once more", i, pathsSeen(up))
 		}
+	}
+}
+
+// countDecisionProbeUnseals swaps the decision probes' credential unseal for a
+// counting one for the test's duration.
+func countDecisionProbeUnseals(t *testing.T) *int {
+	t.Helper()
+	orig := decisionProbeOpenSecret
+	n := 0
+	decisionProbeOpenSecret = func(c *capture.Cipher, stored string) (string, error) {
+		n++
+		return orig(c, stored)
+	}
+	t.Cleanup(func() { decisionProbeOpenSecret = orig })
+	return &n
+}
+
+// TestDecisionPassUnsealsTheCredentialOnlyWhenAProbeIsDue: once both probes of
+// a mapping settled, a later pass sends nothing and must not unseal the
+// application's credential either; the first pass, which probes, unseals it
+// once for both probes.
+func TestDecisionPassUnsealsTheCredentialOnlyWhenAProbeIsDue(t *testing.T) {
+	up := newSystemOneUpstream(t)
+	up.answerPath(systemOnePathValue, http.StatusOK, systemOneYesBody)
+	up.answerPath(decisionsPathValue, http.StatusOK, decisionsYesBody)
+	_, port := up.hostPort(t)
+	app := systemOneApp(routing.ProviderVLLM, port, routing.APIFlavorDecisions)
+	app.APIToken = "plain:app-tok"
+	runner, _, _ := systemOneRunner(t, up, app, systemOneMapping("m1", "decider"))
+	unseals := countDecisionProbeUnseals(t)
+
+	runCapabilityCycle(runner)
+	if *unseals != 1 || len(up.requests()) != 2 {
+		t.Fatalf("first pass: unseals = %d, upstream saw %v; want one unseal and both probes", *unseals, pathsSeen(up))
+	}
+
+	*unseals = 0
+	runCapabilityCycle(runner)
+	if len(up.requests()) != 2 {
+		t.Fatalf("second pass probed again: upstream saw %v", pathsSeen(up))
+	}
+	if *unseals != 0 {
+		t.Fatalf("second pass: unseals = %d, want 0 -- no probe was due", *unseals)
 	}
 }

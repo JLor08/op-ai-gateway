@@ -613,7 +613,8 @@ type scoreProbOut struct {
 // TranslateSystemOneResponse converts a System One response body into the
 // OpenAI Decisions shape using the table built by TranslateDecisionsRequest.
 // model is the client's requested model name. Any malformed or incomplete
-// upstream body is an error, never a panic.
+// upstream body is an error, never a panic, except a malformed usage, which
+// counts as zero usage (decodeSystemOneUsage).
 func TranslateSystemOneResponse(body []byte, table DecisionsAnswerTable, clientModel string) ([]byte, DecisionsUsage, error) {
 	var in systemOneResponseIn
 	if err := json.Unmarshal(body, &in); err != nil {
@@ -622,10 +623,7 @@ func TranslateSystemOneResponse(body []byte, table DecisionsAnswerTable, clientM
 	if in.Answers == nil {
 		return nil, DecisionsUsage{}, errors.New("the upstream's answer carries no answers object")
 	}
-	usage, err := decodeSystemOneUsage(in.Usage)
-	if err != nil {
-		return nil, DecisionsUsage{}, err
-	}
+	usage := decodeSystemOneUsage(in.Usage)
 	out := decisionsOut{Answers: make([]any, 0, len(table.questions)), Model: clientModel}
 	for i, q := range table.questions {
 		raw, ok := in.Answers[q.key]
@@ -650,19 +648,23 @@ func TranslateSystemOneResponse(body []byte, table DecisionsAnswerTable, clientM
 	return encoded, usage, nil
 }
 
-func decodeSystemOneUsage(raw json.RawMessage) (DecisionsUsage, error) {
+// decodeSystemOneUsage reads a System One response's usage object. A missing,
+// null or malformed usage (not an object, or counts that are not integers)
+// yields zero usage rather than an error, as ParseDecisionsUsage does on the
+// passthrough path: a bad usage block must not fail a valid answer set.
+func decodeSystemOneUsage(raw json.RawMessage) DecisionsUsage {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return DecisionsUsage{}, nil
+		return DecisionsUsage{}
 	}
 	var u struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	}
 	if err := json.Unmarshal(trimmed, &u); err != nil {
-		return DecisionsUsage{}, fmt.Errorf("the upstream's usage is malformed: %w", err)
+		return DecisionsUsage{}
 	}
-	return DecisionsUsage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}, nil
+	return DecisionsUsage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}
 }
 
 func translateSystemOneAnswer(q decisionsTableQuestion, raw json.RawMessage) (any, error) {

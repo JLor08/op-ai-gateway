@@ -1599,7 +1599,9 @@ rewrite that `proxyNative` applies on every native relay re-serializes it, repla
 field is changed on purpose, but whitespace and key order are not preserved.
 
 **4. Usage and errors.** The answer's `usage` object, `{input_tokens, output_tokens}`,
-is read in the Responses spelling (`mergePassthroughUsage`); the call is **token-metered**
+is read in the Responses spelling: by `mergePassthroughUsage` on the streaming copier, and
+by `compat.ParseDecisionsUsage` on the buffered path a confidence-normalizing token takes
+(§3.10 item 8); the call is **token-metered**
 (`billing_unit` empty, the default unit), and an answer without a usage object records
 zero tokens. An upstream non-2xx is relayed verbatim, body and status, and recorded as
 `upstream.<status>`; the gateway adds no envelope to an answer the upstream wrote.
@@ -1907,9 +1909,11 @@ that is not JSON is relayed unchanged** under the upstream's `Content-Type`, and
 non-2xx is relayed as the copier would.
 
 **9. Usage.** The call is token-metered. A translated call records the System One tokens
-(`usage.input_tokens`/`output_tokens`) read before the translation; a passthrough call
-reads the Responses-shaped `usage` of the answer, **streaming copier or buffered**
-(`mergePassthroughUsage` for the `openai_decisions` flavor), and lifts
+(`usage.input_tokens`/`output_tokens`) read before the translation; a malformed `usage`
+(not an object, or counts that are not integers) records zero tokens and does not fail the
+answer set. A passthrough call reads the Responses-shaped `usage` of the answer: by
+`mergePassthroughUsage` (for the `openai_decisions` flavor) on the streaming copier, and by
+`compat.ParseDecisionsUsage` on the buffered path (item 8), and lifts
 `input_tokens_details.cached_tokens` and `input_tokens_details.cache_write_tokens` into
 the row's cached and cache-write columns (`input_tokens` includes both subsets, as in
 OpenAI's Responses, and `recordUsage` splits them). The route is `provider_path` (item 3).

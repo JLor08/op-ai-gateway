@@ -996,8 +996,8 @@ func decodeAPIFlavors(raw string) ([]string, error) {
 // decisionModesOrDefault maps an empty decisions_mode / systemone_mode to its
 // default ("auto" and "passthrough"). Migration 107 backfills existing rows,
 // but a row written by an older binary during a rolling upgrade still carries
-// the column default ”, and an empty mode must read as the default, never as
-// an unknown value (ADR-098).
+// the column default, the empty string, and an empty mode must read as the
+// default, never as an unknown value (ADR-098).
 func decisionModesOrDefault(decisions, systemOne routing.EndpointMode) (routing.EndpointMode, routing.EndpointMode) {
 	if decisions == "" {
 		decisions = routing.EndpointModeAuto

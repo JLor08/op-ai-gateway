@@ -2133,11 +2133,15 @@ func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIS
 	}
 }
 
+// decisionProbeOpenSecret unseals a decision probe's credential. A variable
+// so a test can count the unseals; production code never reassigns it.
+var decisionProbeOpenSecret = capture.OpenSecret
+
 // probeSystemOneMapping is probeSystemOne for one candidate mapping. A model
 // its agent does not report loaded is not asked and has its back-off cleared,
 // so a reload is asked at once; a probe that is not due (decisionProbeDue) is
-// not sent either. Otherwise each probe's answer is settled by
-// settleDecisionProbe.
+// not sent either, and with none due the credential is not even unsealed.
+// Otherwise each due probe's answer is settled by settleDecisionProbe.
 func (r *appHealthRunner) probeSystemOneMapping(ctx context.Context, app routing.Application, probers decisionProbers, target routing.Target, c systemOneCandidate, now time.Time) {
 	probes := r.decisionProbesFor(c, probers)
 	if !c.loaded {
@@ -2146,13 +2150,19 @@ func (r *appHealthRunner) probeSystemOneMapping(ctx context.Context, app routing
 		}
 		return
 	}
-	// Attach the credential to the probe (fail-open).
-	token, _ := capture.OpenSecret(r.cipher, c.authToken)
-	probeCtx := provider.WithUpstreamAuth(ctx, c.authHeader, token)
+	due := make([]decisionProbe, 0, len(probes))
 	for _, p := range probes {
-		if !r.decisionProbeDue(ctx, c, p, now) {
-			continue
+		if r.decisionProbeDue(ctx, c, p, now) {
+			due = append(due, p)
 		}
+	}
+	if len(due) == 0 {
+		return
+	}
+	// Attach the credential to the probe (fail-open).
+	token, _ := decisionProbeOpenSecret(r.cipher, c.authToken)
+	probeCtx := provider.WithUpstreamAuth(ctx, c.authHeader, token)
+	for _, p := range due {
 		verdict, err := p.ask(probeCtx, target, c.mp.AppModelName)
 		r.settleDecisionProbe(ctx, app, c, p, verdict, err, now)
 	}

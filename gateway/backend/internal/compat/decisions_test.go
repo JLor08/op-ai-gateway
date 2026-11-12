@@ -352,7 +352,6 @@ func TestTranslateSystemOneResponseErrors(t *testing.T) {
 		"probabilities string": `{"answers":{"p":{"type":"noul","noul":1},"q1":{"type":"choice","choice":"a","probabilities":"x"},"s":{"type":"score","score":0}}}`,
 		"prob element bad":     `{"answers":{"p":{"type":"noul","noul":1},"q1":{"type":"choice","choice":"a","probabilities":["x"]},"s":{"type":"score","score":0}}}`,
 		"prob object no p":     `{"answers":{"p":{"type":"noul","noul":1},"q1":{"type":"choice","choice":"a","probabilities":[{"value":"a"}]},"s":{"type":"score","score":0}}}`,
-		"usage bad":            `{"answers":{"p":{"type":"noul","noul":1},"q1":{"type":"choice","choice":"a"},"s":{"type":"score","score":0}},"usage":5}`,
 	}
 	for name, up := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -365,6 +364,36 @@ func TestTranslateSystemOneResponseErrors(t *testing.T) {
 			if _, _, err := TranslateSystemOneResponse([]byte(up), table, "c"); err == nil {
 				t.Fatalf("expected error")
 			}
+		})
+	}
+}
+
+// A malformed usage does not fail a valid answer set: the translation records
+// zero usage, as ParseDecisionsUsage does for a body it cannot read, and the
+// client still gets its answers.
+func TestTranslateSystemOneResponseMalformedUsageIsZero(t *testing.T) {
+	answers := `"answers":{"p":{"type":"noul","noul":1},"q1":{"type":"choice","choice":"a"},"s":{"type":"score","score":0}}`
+	cases := map[string]string{
+		"usage not an object":     `{` + answers + `,"usage":5}`,
+		"usage an array":          `{` + answers + `,"usage":[1,2]}`,
+		"input tokens a string":   `{` + answers + `,"usage":{"input_tokens":"ten","output_tokens":3}}`,
+		"output tokens a float":   `{` + answers + `,"usage":{"input_tokens":10,"output_tokens":2.5}}`,
+		"input tokens an object":  `{` + answers + `,"usage":{"input_tokens":{},"output_tokens":3}}`,
+		"output tokens too large": `{` + answers + `,"usage":{"input_tokens":1,"output_tokens":1e400}}`,
+	}
+	for name, up := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, usage, err := translateResp(t, translateFixture, up)
+			if err != nil {
+				t.Fatalf("a malformed usage failed the translation: %v", err)
+			}
+			if len(m["answers"].([]any)) != 3 {
+				t.Fatalf("answers = %v, want all three", m["answers"])
+			}
+			if usage != (DecisionsUsage{}) {
+				t.Fatalf("usage = %+v, want zero", usage)
+			}
+			assertJSONEqual(t, m["usage"], `{"input_tokens":0,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}`)
 		})
 	}
 }

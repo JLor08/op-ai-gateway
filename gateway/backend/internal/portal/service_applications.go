@@ -2057,15 +2057,16 @@ func decisionsPassthroughCapableKind(kind string) bool {
 	return kind != routing.ProviderLlamaCPP
 }
 
-// createDecisionModes resolves decisions_mode and systemone_mode of a create:
-// absent or "" defaults to auto / passthrough, any other value must be valid,
-// and an explicit decisions passthrough on an incapable type is refused (400).
-func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions, systemOne routing.EndpointMode, err error) {
+// resolveDecisionModes resolves a decisions_mode / systemone_mode pair as a
+// create or a runtime-spec write takes it: absent or "" defaults to auto /
+// passthrough, and any other value must be valid for its field, else invalid
+// (the caller's endpoint-mode sentinel) is returned.
+func resolveDecisionModes(rawDecisions, rawSystemOne string, invalid error) (decisions, systemOne routing.EndpointMode, err error) {
 	decisions = routing.EndpointModeAuto
 	if strings.TrimSpace(rawDecisions) != "" {
 		m, ok := validDecisionsMode(rawDecisions)
 		if !ok {
-			return "", "", ErrApplicationEndpointModeInvalid
+			return "", "", invalid
 		}
 		decisions = m
 	}
@@ -2073,9 +2074,20 @@ func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions,
 	if strings.TrimSpace(rawSystemOne) != "" {
 		m, ok := validSystemOneMode(rawSystemOne)
 		if !ok {
-			return "", "", ErrApplicationEndpointModeInvalid
+			return "", "", invalid
 		}
 		systemOne = m
+	}
+	return decisions, systemOne, nil
+}
+
+// createDecisionModes resolves decisions_mode and systemone_mode of a create:
+// absent or "" defaults to auto / passthrough, any other value must be valid,
+// and an explicit decisions passthrough on an incapable type is refused (400).
+func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions, systemOne routing.EndpointMode, err error) {
+	decisions, systemOne, err = resolveDecisionModes(rawDecisions, rawSystemOne, ErrApplicationEndpointModeInvalid)
+	if err != nil {
+		return "", "", err
 	}
 	if decisions == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(appType) {
 		return "", "", fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",

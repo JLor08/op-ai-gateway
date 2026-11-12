@@ -1512,23 +1512,7 @@ func runtimeSpecEndpointModes(req PutRuntimeSpecRequest) (responses, messages ro
 // runtimeSpecDecisionModes resolves decisions_mode and systemone_mode: absent
 // or empty is auto / passthrough, anything else must be valid for its field.
 func runtimeSpecDecisionModes(req PutRuntimeSpecRequest) (decisions, systemOne routing.EndpointMode, err error) {
-	decisions = routing.EndpointModeAuto
-	if strings.TrimSpace(req.DecisionsMode) != "" {
-		m, ok := validDecisionsMode(req.DecisionsMode)
-		if !ok {
-			return "", "", ErrRuntimeSpecEndpointModeInvalid
-		}
-		decisions = m
-	}
-	systemOne = routing.EndpointModePassthrough
-	if strings.TrimSpace(req.SystemOneMode) != "" {
-		m, ok := validSystemOneMode(req.SystemOneMode)
-		if !ok {
-			return "", "", ErrRuntimeSpecEndpointModeInvalid
-		}
-		systemOne = m
-	}
-	return decisions, systemOne, nil
+	return resolveDecisionModes(req.DecisionsMode, req.SystemOneMode, ErrRuntimeSpecEndpointModeInvalid)
 }
 
 // runtimeSpecPrior is what a runtime-spec write keeps from the mapping's
