@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -132,4 +133,40 @@ func TestPortalApplicationDecisionModesReachTheWire(t *testing.T) {
 			t.Fatalf("systemone translate: status = %d code = %q, body = %s", patch.Code, errorBodyOf(t, patch), patch.Body.String())
 		}
 	})
+}
+
+// A body whose decisions_mode and systemone_mode are both invalid for the kind
+// is one 400 whose message names both modes, and it does not repeat the raw
+// sentinel text the joined error carries.
+func TestPortalApplicationBothDecisionModesInvalidJoinsOneMessage(t *testing.T) {
+	srv := NewTestServerWithGroups([]string{"gateway:use", "admin"})
+	serverID := newProxyExclusionTestServer(t, srv, "both-modes.example.test")
+	for _, kind := range []string{"llama_cpp", "vllm_sr"} {
+		t.Run(kind, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+serverID+"/applications",
+				`{"type":"`+kind+`","port":8500,"scheme":"http","decisions_mode":"passthrough","systemone_mode":"translate"}`))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+			if code := errorBodyOf(t, rec); code != "application.decisions_passthrough_unsupported" {
+				t.Fatalf("code = %q, body = %s", code, rec.Body.String())
+			}
+			var body struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			msg := body.Error.Message
+			if !strings.Contains(msg, "decisions_mode") || !strings.Contains(msg, "systemone_mode") {
+				t.Fatalf("message = %q, want both modes named", msg)
+			}
+			if strings.Contains(msg, "application.decisions_passthrough_unsupported") || strings.Contains(msg, "application.systemone_translate_unsupported") {
+				t.Fatalf("message = %q repeats the raw sentinel text", msg)
+			}
+		})
+	}
 }

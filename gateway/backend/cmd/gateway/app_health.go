@@ -48,14 +48,14 @@ var (
 	// health tick. A rate that appears ends the wait on the next tick, and a model
 	// whose identity changed is not held by it.
 	speechRateRetryBackoff = 5 * time.Minute
-	// decisionProbeRetryBackoff is how long a mapping whose System One decision probe
+	// decisionProbeRetryBackoff is how long a mapping whose decision probe (either verdict)
 	// stated no verdict (a timeout, a 503 while the model loads, an answer
 	// without the probe's answer) is left alone before the pass asks again (see
 	// settleSystemOne), so an upstream that cannot answer costs one tiny POST per
 	// window instead of one per health tick. It is also the first window of a
 	// probe the upstream refused (a 400, 405 or 422), which doubles from there.
 	decisionProbeRetryBackoff = 5 * time.Minute
-	// decisionProbeRefusedBackoffCap bounds the window a refused System One probe
+	// decisionProbeRefusedBackoffCap bounds the window a refused decision probe (either verdict)
 	// doubles towards: a model that keeps refusing the probe is asked once an
 	// hour at most, so the probe does not keep it loaded.
 	decisionProbeRefusedBackoffCap = time.Hour

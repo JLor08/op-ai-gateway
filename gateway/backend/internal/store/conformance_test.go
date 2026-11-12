@@ -514,7 +514,7 @@ func testTokenClaudeModelAliasesRoundTrip(t *testing.T, s *SQLStore) {
 // token path on both dialects, so the Postgres leg exercises the widened
 // INSERT/SELECT/UPDATE lock-step and not only the SQLite one: written by
 // CreatePlainToken, read back by TokenByID, TokensByUser and the request-time
-// LookupBearer (which assembles the auth.Token the decisions-normalize path
+// LookupBearer (which assembles the auth.Token the effort-delivery path
 // reads), and rewritten in BOTH directions by UpdateTokenMetadata. A token
 // created without the field must read false everywhere -- the flag defaults
 // off, and "off" has to be the stored value, not merely the Go zero value a
