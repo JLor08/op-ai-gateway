@@ -245,6 +245,15 @@ func TestHandlePortalMappingRuntimeSpecPutAcceptsAudioCppAndOpenAIAudio(t *testi
 	if !strings.Contains(bad.Body.String(), "audio_cpp") {
 		t.Fatalf("type_invalid body = %s, want the message to list audio_cpp", bad.Body.String())
 	}
+	if !strings.Contains(bad.Body.String(), "vllm_sr") {
+		t.Fatalf("type_invalid body = %s, want the message to list vllm_sr", bad.Body.String())
+	}
+
+	ok := httptest.NewRecorder()
+	srv.ServeHTTP(ok, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", `{"binary":"/opt/vllm-sr/.venv/bin/vllm-srun","type":"vllm_sr","api_flavors":["decisions"]}`))
+	if ok.Code != http.StatusOK {
+		t.Fatalf("vllm_sr spec status = %d, want 200, body = %s", ok.Code, ok.Body.String())
+	}
 }
 
 // TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400
@@ -1056,6 +1065,10 @@ func TestHandlePortalMappingRuntimeSpecPutDecisionModes(t *testing.T) {
 	rec = put(`{"binary":"/usr/local/bin/llama-server","type":"llama_cpp","decisions_mode":"passthrough"}`)
 	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.decisions_passthrough_unsupported" {
 		t.Fatalf("llama_cpp passthrough: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = put(`{"binary":"/opt/vllm-sr/.venv/bin/vllm-srun","type":"vllm_sr","decisions_mode":"passthrough"}`)
+	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.decisions_passthrough_unsupported" {
+		t.Fatalf("vllm_sr passthrough: status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	rec = put(`{"binary":"/usr/local/bin/vllm","type":"vllm","decisions_mode":"passthrough","systemone_mode":"disabled"}`)
 	if rec.Code != http.StatusOK {

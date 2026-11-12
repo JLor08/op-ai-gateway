@@ -13,6 +13,7 @@ import {
   textFlavorsOnStableDiffusion,
   tickedFlavorMissingOnApplication,
   type RuntimeSpecFlavorValues,
+  vllmSrSpecFlavorDefaults,
 } from './runtimeSpecTypeFlavors';
 
 describe('flavorsAreImagesOnly', () => {
@@ -469,5 +470,46 @@ describe('formSpecIsLlamaCpp', () => {
     };
     expect(formSpecIsLlamaCpp('', '/opt/custom', loaded)).toBe(true);
     expect(formSpecIsLlamaCpp('', '/opt/other', loaded)).toBe(false);
+  });
+});
+
+describe('specFlavorsAfterTypeSwitch for vllm_sr', () => {
+  const template: RuntimeSpecFlavorValues = {
+    apiFlavors: ['openai', 'anthropic'],
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
+  };
+  const srDefault: RuntimeSpecFlavorValues = {
+    apiFlavors: ['decisions'],
+    responsesMode: 'disabled',
+    messagesMode: 'disabled',
+  };
+
+  it('is the decisions default with both coding modes disabled', () => {
+    expect(vllmSrSpecFlavorDefaults).toEqual(srDefault);
+  });
+
+  it('sets the default and remembers the values when switching to vllm_sr untouched', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'llama_cpp',
+        to: 'vllm_sr',
+        current: template,
+        template,
+        remembered: null,
+      }),
+    ).toEqual({ values: srDefault, remembered: template });
+  });
+
+  it('restores the remembered values when leaving vllm_sr untouched', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'vllm_sr',
+        to: 'llama_cpp',
+        current: srDefault,
+        template,
+        remembered: template,
+      }),
+    ).toEqual({ values: template, remembered: null });
   });
 });

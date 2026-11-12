@@ -837,13 +837,14 @@ have emitted).
 ### 3.4 Runtime-server kind and per-kind probe-path derivation
 
 A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` |
-`stable_diffusion_cpp` | `audio_cpp` | `custom`; migration 75, `text not null default ''`)
+`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `custom`; migration 75, `text not null default ''`)
 is what tells the gateway — and, through it, the agent — which conventions govern
 *this* child's metrics and context-window endpoints (design 2026-09-07), and,
 for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
 not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
 (`routing/runtime_spec_type.go`) matches case-insensitive substrings of the
-launched binary's basename, first match wins — `vllm`, then
+launched binary's basename, first match wins — `vllm-srun`/`vllm_srun`
+(before `vllm`, whose substring they contain), then `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
 `text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
 `audiocpp_server`/`audio.cpp`, then `ollama` — and falls back to `custom` when nothing
@@ -863,6 +864,7 @@ winning **per field** over the type's own default:
 | `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` — **POST**, body `{"model": "<the spec's model>"}` (see below) | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
 | `stable_diffusion_cpp` | *(none)* — measured: `sd-server` serves no metrics endpoint of any kind | *(none)* — no `/props`, no context-length field in its capability document, and an image model has no context window | — |
 | `audio_cpp` | *(none)* — an audio server's design relies on no Prometheus-style scrape | *(none)* — `/v1/models` entries carry `family`, `task`, `mode`, `loaded` and `path`, not a context length, and a speech or transcription model has no context window | — |
+| `vllm_sr` | `/metrics` (Prometheus; `vllm_srun_queue_depth`=queue, **no** running gauge, so active stays 0) | `/v1/models` | `data[].limits.max_input_tokens` (the first entry that carries it; the best-effort scan is the fallback) |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -929,6 +931,51 @@ and the gateway gates the relay on the same `multipart_proxy` feature as the ima
 §2.3](routing-and-model-selection.md#23-the-capability-gate),
 [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
 [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
+
+**`vllm_sr` is the agent-launched vLLM Semantic Router worker `vllm-srun`, not the
+Docker-orchestrating `vllm-sr` CLI ([ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).**
+The agent supervises one child process, and the `vllm-sr serve` CLI starts containers,
+so the spec's binary is the worker (`routing.RuntimeSpecTypeVllmSR`, which is a
+different namespace from the application type of the same name). Its facts, each from
+the code:
+
+- **Detection** puts `vllm-srun` and `vllm_srun` before `vllm`
+  (`DetectRuntimeSpecType`), because the worker's name contains `vllm`; a plain `vllm`
+  binary still detects as `vllm`, and an explicit `type` always wins. The bare `vllm-sr`
+  is no detection substring: the CLI is no spec binary, and the substring would also
+  catch names such as `vllm-srv` or `vllm-sriov` (both detect as `vllm`).
+- **Probe paths** are `/metrics` and `/v1/models`. The health path keeps the stock
+  `/health`: the worker answers 503 until the model is loaded **and** its golden check
+  passed (a golden verdict of `unverified`, as on NVIDIA, still answers 200, so the
+  agent's readiness poll treats it as ready).
+- **Launch shape** (the portal form's type note): `serve ${MODEL} --device cuda:0 --host
+  127.0.0.1 --port ${PORT}`. The device is `cuda:0` because `set_visible_devices`
+  remaps the GPU the child sees (§3.3).
+- **Install**: `vllm-srun` is **not on PyPI**. It is installed from a checkout of the
+  pinned commit (`pip install ./src/model-runtime`), and the venv's binary directory
+  is allowed through `runtime_allow_binary_dirs` (§3.1.2). The first start downloads
+  the model, so the first ensure can take minutes.
+- **No authentication.** The worker checks no key, so it stays on loopback (the
+  launch template's `--host 127.0.0.1`); the agent router in front of it is the
+  authenticated surface.
+- **Context** is read from `data[].limits.max_input_tokens` of the same `/v1/models`
+  body (`extractVLLMSRContext`), best effort.
+- **Metrics:** only a waiting gauge exists. The scrape reads `vllm_srun_queue_depth`
+  as the queue depth after the vLLM, llama.cpp and TGI names, and reports no running
+  count.
+- **`runtime_api_version`** (a runtime-sample field, omitted when unknown): the
+  top-level `api_version` of that same `/v1/models` body, read by the context probe with
+  no second request (`collector.ProbeContextInfo`). It is reported **whenever the body
+  parsed, even when no context limit came out of it**, and is cached only together
+  with a real context size. The agent records it and never judges it; the gateway does
+  ([Routing & Model Selection](routing-and-model-selection.md#1-data-model), ADR-099).
+- **No `/props` probe:** a `vllm_sr` child serves no `/props` and no capability
+  document, so the capability probe (§10) returns before sending a request, and no
+  verdict is reported for it.
+- **Agent `0.18.1` → `0.18.2` is PATCH** (§7.1): no `agent.Features` entry changed.
+  Against an older agent the type is harmless: it ignores the type string, so
+  the gateway sees a best-effort context, no queue gauge and no `runtime_api_version`
+  (unknown, never a warning).
 
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
@@ -3930,13 +3977,13 @@ capability verdicts and its effective runtime type, **first match wins**:
 | 6a | none of the above, and the type is `stable_diffusion_cpp` | `image` |
 | 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
 | 7 | any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) is yes | `chat` |
-| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server) | `other` |
+| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server, a `vllm_sr` worker, to which the gateway routes decisions only) | `other` |
 
 Capabilities outrank the type because they are specific and the type is not (an
 operator's `embedding` verdict on a `vllm` server is how that model becomes an
 embedding model); a model that both transcribes and synthesises is `asr`;
 `audio_cpp` is deliberately no type fallback, because one server hosts asr or tts
-and the type cannot say which. `embedding` and `rerank` are capabilities of their
+and the type cannot say which, and `vllm_sr` is none because the gateway routes no chat to it. `embedding` and `rerank` are capabilities of their
 own, **operator-stated** on the mapping form (no probe; no reserved verdict, so a
 manual `no` is selectable), and gate no route, since the gateway serves no
 embeddings endpoint. The role is derived on every read and **never stored**, so a
@@ -5109,6 +5156,14 @@ gateway observe does: the exit classification takes an unreachable member
 before the device error it causes (§3.6), and a member's reported command
 carries the arguments and environment the agent adds (§14.7).
 
+**`0.18.1` → `0.18.2` (the vLLM Semantic Router worker, #373 Phase 3) is PATCH.** No
+feature flag changes: the `vllm_sr` spec type adds a context extractor
+(`data[].limits.max_input_tokens`), a waiting-gauge name (`vllm_srun_queue_depth`), the
+additive `runtime_api_version` sample field and a skipped `/props` probe (§3.4), none of
+which the gateway needs to negotiate. An older agent keeps working against a newer
+gateway and the reverse; there is **no upgrade order**
+([ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -5880,6 +5935,10 @@ mirror). Three different cadences share the one collect cycle:
     `/props` and sd-server's, this probe takes the model. Its `LiveProgressSupport` is always `""` as well,
     because audio.cpp has no timings surface, and it yields no image options.
     **This branch is gated too**, below, on its own feature name.
+  - `vllm_sr` — **no probe at all** (agent 0.18.2, [ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)): the router
+    worker serves no `/props` and no capability document, so nothing is requested and
+    nothing is sent. The skip sits in the caller, `probeRuntimeChild`, so a `vllm_sr`
+    child never reaches `probeRuntimeChildProps` at all.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
@@ -5892,7 +5951,7 @@ mirror). Three different cadences share the one collect cycle:
   either capability, which is exactly the case this probe exists to recover.
   A type may be claimed by name only when its binary serves no `/props` at
   all, so that claiming it loses nothing a `/props` probe could have found —
-  true of `ollama`, of `stable_diffusion_cpp` and of `audio_cpp`, and of nothing else; `custom`
+  true of `ollama`, of `stable_diffusion_cpp`, of `audio_cpp` and of `vllm_sr`, and of nothing else; `custom`
   can never be claimed, whatever binary it turns out to run, or that fallback
   loses its probe. Either way it is one extra loopback request per child
   lifetime once a verdict set is cached, on a path that is a package
@@ -6209,6 +6268,7 @@ Nothing found is recorded as 0, which the history shows as "—". Per spec type:
 | `ollama` | 404, so telemetry decides | `POST /api/show`; Ollama has no auth | `model_info.<arch>.context_length`: the model maximum, the column's documented meaning | agents before 0.6.0 |
 | `stable_diffusion_cpp` | not applicable | not applicable | none | always: an images-only mapping gets no speed row, and the standalone context probe is refused and disabled for it |
 | `audio_cpp` | not applicable | not applicable | none | always: an audio-only mapping gets no speed row, and the standalone context probe is refused (`benchmark.audio_only`) and disabled for it |
+| `vllm_sr` | not applicable | not applicable | none from a benchmark | always: a `vllm_sr` mapping is decisions-only, so it gets no speed row and the standalone context probe is refused (`benchmark.decisions_only`). The context the agent reads (`data[].limits.max_input_tokens` of `/v1/models`, best effort) reaches the mapping through the ingest write-back, not through a benchmark |
 | `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
 | Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
 
@@ -9237,7 +9297,7 @@ consistent if configured together.
 
 | Bound | Where | Default | Covers |
 |---|---|---|---|
-| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent`, `stable_diffusion_cpp` and `audio_cpp` (30000 elsewhere) | **Total** deadline of a non-streaming request, never reset by upstream activity. On the gateway's own benchmark streams it also sets the first-data budget (below). |
+| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent`, `stable_diffusion_cpp`, `audio_cpp` and `vllm_sr` (30000 elsewhere) | **Total** deadline of a non-streaming request, never reset by upstream activity. On the gateway's own benchmark streams it also sets the first-data budget (below). |
 | `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | Gateway | 120 s (2 min on a benchmark stream when set to `0` or less) | Idle watchdog on streaming responses. On a benchmark stream the router's heartbeats also reset it until the first event, up to the first-data budget (below). |
 | `spec.admission_wait_timeout_seconds` | Agent, per spec | `0` = until the client disconnects | Queueing for a slot. |
 | `spec.startup_timeout_seconds` | Agent, per spec | 180 (floored at 30 when unset) | Process start until first green health probe. |

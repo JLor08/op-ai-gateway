@@ -272,8 +272,36 @@ describe('audio_cpp defaults', () => {
   // them.
   it('keeps the stock /v1/health path for every other type', () => {
     for (const [type, d] of Object.entries(applicationTypeDefaults)) {
-      if (type === 'audio_cpp') continue;
+      if (type === 'audio_cpp' || type === 'vllm_sr') continue;
       expect(d.healthCheckPath, type).toBe('/v1/health');
     }
+  });
+});
+
+// vllm_sr is an operator-run Engine-mode instance: its models are discovered at
+// /v1/systemone/models and it answers POST /v1/systemone only, so the stock
+// text flavors are replaced by the decisions flavor and the coding-agent
+// endpoints are disabled.
+describe('vllm_sr defaults', () => {
+  it('defaults to the decisions flavor, disabled coding endpoints and the 10-minute timeout', () => {
+    const d = applicationTypeDefaults.vllm_sr;
+    expect(d.port).toBe(8899);
+    expect(d.apiFlavors).toEqual(['decisions']);
+    expect(d.responsesMode).toBe('disabled');
+    expect(d.messagesMode).toBe('disabled');
+    expect(d.timeoutMs).toBe(600000);
+    expect(d.healthCheckMode).toBe('health_path');
+    expect(d.healthCheckPath).toBe('/v1/systemone/models');
+    expect(d.loadedModelsPath).toBe('/v1/systemone/models');
+    expect(d.loadedModelsFormat).toBe('openai');
+    expect(d.contextProbePath).toBe('');
+  });
+
+  it('migrates an untouched text form to the vllm_sr defaults on a type switch', () => {
+    const current = { ...applicationTypeDefaults.ollama };
+    const patch = migrateTypeFields('ollama', 'vllm_sr', current);
+    expect(patch.apiFlavors).toEqual(['decisions']);
+    expect(patch.timeoutMs).toBe(600000);
+    expect(patch.healthCheckPath).toBe('/v1/systemone/models');
   });
 });

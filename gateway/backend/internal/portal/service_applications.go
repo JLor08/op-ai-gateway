@@ -455,6 +455,10 @@ const (
 	// long input can take longer than the stock 30s to render. With that
 	// default it would fail as 502 provider.timeout.
 	defaultAudioCppTimeoutMS = 600000
+	// defaultVllmSRTimeoutMS is the TimeoutMS default for ProviderVllmSR: a
+	// decision request may wait on a cold model load or a first-start model
+	// download in the router, which routinely exceeds the stock 30s.
+	defaultVllmSRTimeoutMS = 600000
 )
 
 // ApplicationDTO is the portal-facing representation of a routing.Application.
@@ -1168,7 +1172,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// /v1/decisions route) is reset to auto, the same "clear when the type
 	// cannot carry it" rule as the live-timings flag; an explicit passthrough
 	// request is refused further below instead.
-	if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(app.Type) {
+	if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(app.Type) {
 		app.DecisionsMode = routing.EndpointModeAuto
 	}
 	if req.LoadedModelsPath != nil {
@@ -1419,7 +1423,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
 			liveTimingsRefusal, app.Type)
 	}
-	if req.DecisionsMode != nil && decisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(app.Type) {
+	if req.DecisionsMode != nil && decisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(app.Type) {
 		refusal := ErrApplicationDecisionsPassthroughConflict
 		if req.Type != nil {
 			refusal = ErrApplicationDecisionsPassthroughUnsupported
@@ -1714,6 +1718,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderStableDiffusionCpp, nil
 	case routing.ProviderAudioCpp:
 		return routing.ProviderAudioCpp, nil
+	case routing.ProviderVllmSR:
+		return routing.ProviderVllmSR, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}
@@ -2050,13 +2056,6 @@ func validSystemOneMode(raw string) (routing.EndpointMode, bool) {
 	}
 }
 
-// decisionsPassthroughCapableKind reports whether an application or runtime
-// spec type can serve POST /v1/decisions natively. llama-server has no such
-// route; every other kind may (the probe, not this guard, decides per model).
-func decisionsPassthroughCapableKind(kind string) bool {
-	return kind != routing.ProviderLlamaCPP
-}
-
 // resolveDecisionModes resolves a decisions_mode / systemone_mode pair as a
 // create or a runtime-spec write takes it: absent or "" defaults to auto /
 // passthrough, and any other value must be valid for its field, else invalid
@@ -2089,7 +2088,7 @@ func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions,
 	if err != nil {
 		return "", "", err
 	}
-	if decisions == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(appType) {
+	if decisions == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(appType) {
 		return "", "", fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",
 			ErrApplicationDecisionsPassthroughUnsupported, appType)
 	}
@@ -2120,7 +2119,7 @@ func validateApplicationTuning(priority, weight, timeoutMS, affinityTTLSeconds, 
 }
 
 // applicationTimeoutDefaultFor is the TimeoutMS default for an application
-// type. Three types override the stock value because for them it is a
+// type. Four types override the stock value because for them it is a
 // correctness matter rather than tuning: an agent-managed cold model load, an
 // image generation and a long speech synthesis all routinely exceed 30s (see
 // each constant's doc).
@@ -2132,6 +2131,8 @@ func applicationTimeoutDefaultFor(appType string) int {
 		return defaultStableDiffusionTimeoutMS
 	case routing.ProviderAudioCpp:
 		return defaultAudioCppTimeoutMS
+	case routing.ProviderVllmSR:
+		return defaultVllmSRTimeoutMS
 	default:
 		return defaultApplicationTimeoutMS
 	}
@@ -3456,7 +3457,7 @@ func mappingDecisionsRoute(markers mappingFlavorMarkers, caps map[string]routing
 	if !markers.DecisionsListed {
 		return ""
 	}
-	route, ok := routing.EffectiveDecisionsRoute(markers.DecisionsMode,
+	route, ok := routing.EffectiveDecisionsRoute(markers.DecisionsKind, markers.DecisionsMode,
 		capabilityVerdictBool(caps, routing.CapabilityDecision),
 		capabilityVerdictBool(caps, routing.CapabilityDecisionOpenAI))
 	if !ok {

@@ -297,6 +297,26 @@ func TestMappingDTODecisionsRoute(t *testing.T) {
 			}
 		})
 	}
+	// A kind without an OpenAI /v1/decisions route ignores a decision_openai
+	// verdict, like the gateway's handler (the same routing helper).
+	for _, kind := range []string{routing.ProviderVllmSR, routing.ProviderLlamaCPP} {
+		a := routing.Application{Type: kind, APIFlavors: []string{"decisions"}, DecisionsMode: "auto"}
+		if got := mappingDTO(routing.ModelMapping{}, caps(dec, oa), effectiveFlavorMarkers(a, routing.RuntimeSpec{}, false)).DecisionsRoute; got != "translate" {
+			t.Fatalf("%s application, decision + decision_openai: decisions_route = %q, want translate", kind, got)
+		}
+	}
+	for name, sp := range map[string]routing.RuntimeSpec{
+		"vllm_sr spec":          {Type: "vllm_sr"},
+		"llama_cpp spec":        {Type: "llama_cpp"},
+		"detected vllm-srun":    {Binary: "/opt/vllm-srun"},
+		"detected llama-server": {Binary: "/opt/llama-server"},
+	} {
+		sp.APIFlavors, sp.DecisionsMode = []string{"decisions"}, "auto"
+		a := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{"decisions"}, DecisionsMode: "auto"}
+		if got := mappingDTO(routing.ModelMapping{}, caps(dec, oa), effectiveFlavorMarkers(a, sp, true)).DecisionsRoute; got != "translate" {
+			t.Fatalf("%s: decisions_route = %q, want translate", name, got)
+		}
+	}
 	// The server_agent spec wins over the application.
 	agent := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{"decisions"}, DecisionsMode: "auto"}
 	spec := routing.RuntimeSpec{APIFlavors: []string{"decisions"}, DecisionsMode: "disabled"}
@@ -306,5 +326,104 @@ func TestMappingDTODecisionsRoute(t *testing.T) {
 	raw, _ := json.Marshal(mappingDTO(routing.ModelMapping{}, nil, mappingFlavorMarkers{}))
 	if !strings.Contains(string(raw), `"decisions_route":""`) {
 		t.Fatalf("decisions_route not always on the wire: %s", raw)
+	}
+}
+
+// TestVllmSRRefusesDecisionsPassthrough: the vllm_sr application and spec
+// types serve the decision endpoints themselves but have no native
+// /v1/decisions route, so passthrough is refused like llama_cpp.
+func TestVllmSRRefusesDecisionsPassthrough(t *testing.T) {
+	ctx := context.Background()
+	svc, _, serverID := decisionModesFixture(t)
+
+	_, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+		Type: routing.ProviderVllmSR, Port: 8330, Scheme: "http", DecisionsMode: "passthrough",
+	})
+	if !errors.Is(err, ErrApplicationDecisionsPassthroughUnsupported) {
+		t.Fatalf("create vllm_sr passthrough: %v", err)
+	}
+	sr, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{Type: routing.ProviderVllmSR, Port: 8331, Scheme: "http"})
+	if err != nil {
+		t.Fatalf("create vllm_sr: %v", err)
+	}
+	_, err = svc.UpdateApplication(ctx, ownerToken(), sr.ID, UpdateApplicationRequest{DecisionsMode: strPtr("passthrough")})
+	if !errors.Is(err, ErrApplicationDecisionsPassthroughConflict) {
+		t.Fatalf("update stored vllm_sr: %v, want conflict", err)
+	}
+
+	vllm, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8332, Scheme: "http", DecisionsMode: "passthrough",
+	})
+	if err != nil {
+		t.Fatalf("create vllm: %v", err)
+	}
+	retyped, err := svc.UpdateApplication(ctx, ownerToken(), vllm.ID, UpdateApplicationRequest{Type: strPtr(routing.ProviderVllmSR)})
+	if err != nil || retyped.DecisionsMode != "auto" {
+		t.Fatalf("retype = %+v, %v; want decisions_mode auto", retyped, err)
+	}
+}
+
+func TestRuntimeSpecVllmSR(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sr1"), PutRuntimeSpecRequest{
+		Binary: "/opt/vllm-sr/.venv/bin/vllm-srun", Type: "vllm_sr", DecisionsMode: "passthrough",
+	}); !errors.Is(err, ErrRuntimeSpecDecisionsPassthroughUnsupported) {
+		t.Fatalf("explicit vllm_sr passthrough: %v", err)
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sr2"), PutRuntimeSpecRequest{
+		Binary: "/opt/vllm-sr/.venv/bin/vllm-srun", DecisionsMode: "passthrough",
+	}); !errors.Is(err, ErrRuntimeSpecDecisionsPassthroughUnsupported) {
+		t.Fatalf("detected vllm_sr passthrough: %v", err)
+	}
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sr3"), PutRuntimeSpecRequest{
+		Binary: "/opt/vllm-sr/.venv/bin/vllm-srun", Type: "vllm_sr",
+	})
+	if err != nil || dto.Type != "vllm_sr" {
+		t.Fatalf("vllm_sr spec = %+v, %v", dto, err)
+	}
+}
+
+// TestDecisionOpenAIFoldsAreKindAware: the decision_openai listing flag and the
+// any_decision offering both ignore a decision_openai verdict on a kind that
+// cannot take a /v1/decisions passthrough (routing.DecisionsPassthroughCapableKind),
+// judged on the application type, or on a server_agent mapping's effective
+// spec type. A vllm kind with the same verdict keeps both.
+func TestDecisionOpenAIFoldsAreKindAware(t *testing.T) {
+	rs := routing.NewMemoryStore()
+	oa := routing.CapabilityRow{Capability: routing.CapabilityDecisionOpenAI, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceDecisionsProbe, CheckedAt: offeringTime}
+	flavors := []string{routing.APIFlavorDecisions}
+	offerSpeechModel(t, rs, routing.ProviderLlamaCPP, flavors, nil, "oa-llama", oa)
+	offerSpeechModel(t, rs, routing.ProviderVllmSR, flavors, nil, "oa-sr", oa)
+	offerSpeechModel(t, rs, routing.ProviderVLLM, flavors, nil, "oa-vllm", oa)
+	for gateway, specType := range map[string]routing.RuntimeSpecType{
+		"oa-agent-llama": routing.RuntimeSpecTypeLlamaCpp,
+		"oa-agent-sr":    routing.RuntimeSpecTypeVllmSR,
+		"oa-agent-vllm":  routing.RuntimeSpecTypeVLLM,
+	} {
+		offerSpeechModel(t, rs, routing.ProviderServerAgent, flavors, flavors, gateway, oa)
+		if err := rs.UpsertRuntimeSpec(context.Background(), routing.RuntimeSpec{ID: "app_" + gateway + "_spec", MappingID: "map_" + gateway, Binary: "/opt/x/server", Type: string(specType), Args: "[]", Env: "{}", APIFlavors: flavors}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", gateway, err)
+		}
+	}
+	want := map[string]bool{
+		"oa-llama": false, "oa-sr": false, "oa-vllm": true,
+		"oa-agent-llama": false, "oa-agent-sr": false, "oa-agent-vllm": true,
+	}
+	svc := offerSvc(rs, nil)
+	byID := modelsByID(svc.Models(context.Background(), auth.Token{UserID: "usr_1"}))
+	off := svc.ModelOfferingFor(context.Background(), auth.Token{UserID: "usr_1"}, routing.APIFlavorDecisions, []string{routing.CapabilityAnyDecision})
+	for name, w := range want {
+		got, ok := byID[name]
+		if !ok {
+			t.Fatalf("%s missing from the listing", name)
+		}
+		if got.DecisionOpenAI != w {
+			t.Errorf("%s decision_openai = %v, want %v", name, got.DecisionOpenAI, w)
+		}
+		if _, capable := off.Capable[name]; capable != w {
+			t.Errorf("%s any_decision capable = %v, want %v", name, capable, w)
+		}
 	}
 }

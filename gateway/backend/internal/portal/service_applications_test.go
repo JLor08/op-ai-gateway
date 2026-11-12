@@ -622,7 +622,7 @@ func TestCreateApplicationAllowsLlamaSwapTypeAndAcceptsAllValidTypes(t *testing.
 	server := createTestServer(t, svc, "S", "s.example.test")
 
 	port := 9000
-	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp} {
+	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp, routing.ProviderVllmSR} {
 		port++
 		if _, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
 			Type: typ, Port: port, Scheme: "http",
@@ -4563,5 +4563,20 @@ func TestReservedManualVerdictRefusesDecisionNo(t *testing.T) {
 	}
 	if reservedManualVerdict(routing.CapabilityDecision, "") {
 		t.Error("the reset must never be refused")
+	}
+}
+
+func TestCreateApplicationVllmSRTimeoutDefault(t *testing.T) {
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVllmSR, Port: 9100, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if dto.TimeoutMS != 600000 {
+		t.Fatalf("TimeoutMS = %d, want 600000", dto.TimeoutMS)
 	}
 }

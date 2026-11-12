@@ -25,18 +25,20 @@ export function systemOneModeOrDefault(mode: SystemOneMode | '' | undefined): Sy
  * HAND-COPY of the backend's refusal (application.decisions_passthrough_
  * unsupported / runtime_spec.decisions_passthrough_unsupported): llama.cpp
  * never answers OpenAI Decisions natively, so passthrough is refused for the
- * llama_cpp type. Every other kind, "" (auto-detect) included, may pass
+ * llama_cpp type; vllm_sr answers only /v1/systemone, so it is refused there
+ * too. Every other kind, "" (auto-detect) included, may pass
  * through: under Auto the form cannot know the detected kind, and the backend
  * decides.
  */
 export function decisionsPassthroughOffered(kind: string): boolean {
-  return kind !== 'llama_cpp';
+  return kind !== 'llama_cpp' && kind !== 'vllm_sr';
 }
 
 /**
  * The mode to keep after the type changed: a selected passthrough becomes
  * "auto" for a kind that cannot serve it, anything else stays. Mirrors the
- * backend, which resets a stored passthrough on a type change to llama_cpp.
+ * backend, which resets a stored passthrough on a type change to llama_cpp or
+ * vllm_sr.
  */
 export function decisionsModeForKind(mode: DecisionsMode, kind: string): DecisionsMode {
   return mode === 'passthrough' && !decisionsPassthroughOffered(kind) ? 'auto' : mode;

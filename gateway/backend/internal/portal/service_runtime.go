@@ -1317,7 +1317,7 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		return runtimeSpecFields{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
 			ErrRuntimeSpecResponsesLiveTimingsUnsupported, string(effectiveSpecKind))
 	}
-	if f.decisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(string(effectiveSpecKind)) {
+	if f.decisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(string(effectiveSpecKind)) {
 		return runtimeSpecFields{}, fmt.Errorf("%w: decisions_mode passthrough is not available for a runtime spec of effective type %q",
 			ErrRuntimeSpecDecisionsPassthroughUnsupported, string(effectiveSpecKind))
 	}
@@ -1903,19 +1903,19 @@ func validRuntimeAPITokenMode(s string) bool {
 }
 
 // validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
-// default and every pre-feature row's stored value) or one of the seven
+// default and every pre-feature row's stored value) or one of the eight
 // routing.RuntimeSpecType values (vllm, llama_cpp, tgi, ollama,
-// stable_diffusion_cpp, audio_cpp, custom). Unlike validRuntimeAPITokenMode,
+// stable_diffusion_cpp, audio_cpp, vllm_sr, custom). Unlike validRuntimeAPITokenMode,
 // empty IS accepted directly here (mirrors validVisibleDevicesMode) -- callers
 // pass req.Type through untouched, they don't normalize "" to a concrete value
 // first, because "" is itself a legitimate stored/wire value (auto), not a
-// default that collapses into one of the seven kinds.
+// default that collapses into one of the eight kinds.
 func validRuntimeSpecType(s string) bool {
 	switch routing.RuntimeSpecType(s) {
 	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
 		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama,
 		routing.RuntimeSpecTypeStableDiffusionCpp, routing.RuntimeSpecTypeAudioCpp,
-		routing.RuntimeSpecTypeCustom:
+		routing.RuntimeSpecTypeVllmSR, routing.RuntimeSpecTypeCustom:
 		return true
 	}
 	return false
@@ -2621,6 +2621,12 @@ const runtimeFlavorNotOnApplicationWarning = "api_flavors_not_on_application"
 // those requests fail.
 const runtimeTextOnStableDiffusionWarning = "api_flavors_text_on_stable_diffusion"
 
+// runtimeTextOnVllmSRWarning: a runtime spec whose effective type is vllm_sr
+// lists the openai or anthropic flavor. The gateway routes only the decision
+// endpoints to vllm-srun (ADR-099), so text requests of those flavors
+// dispatched to it fail.
+const runtimeTextOnVllmSRWarning = "api_flavors_text_on_vllm_sr"
+
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
 // warnings about appID's current runtime configuration. authorizeApplication
 // gates it (404-no-leak). Always a non-nil slice, even when empty.
@@ -2658,6 +2664,9 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 	}
 	if anyStableDiffusionSpecNotImagesOnly(app, specs) {
 		warnings = append(warnings, runtimeTextOnStableDiffusionWarning)
+	}
+	if anyVllmSRSpecListsTextFlavor(app, specs) {
+		warnings = append(warnings, runtimeTextOnVllmSRWarning)
 	}
 	return warnings, nil
 }
@@ -2753,6 +2762,26 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 	}
 	for _, spec := range specs {
 		if routing.EffectiveRuntimeSpecType(spec) == routing.RuntimeSpecTypeStableDiffusionCpp && !routing.FlavorsAreImagesOnly(spec.APIFlavors) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyVllmSRSpecListsTextFlavor backs runtimeTextOnVllmSRWarning: a spec whose
+// effective type is vllm_sr (explicit, or detected from a vllm-srun binary)
+// that lists openai or anthropic. Same scope as
+// anyStableDiffusionSpecNotImagesOnly: a server_agent application only,
+// disabled specs included.
+func anyVllmSRSpecListsTextFlavor(app routing.Application, specs []routing.RuntimeSpec) bool {
+	if app.Type != routing.ProviderServerAgent {
+		return false
+	}
+	for _, spec := range specs {
+		if routing.EffectiveRuntimeSpecType(spec) != routing.RuntimeSpecTypeVllmSR {
+			continue
+		}
+		if slices.Contains(spec.APIFlavors, routing.APIFlavorOpenAI) || slices.Contains(spec.APIFlavors, routing.APIFlavorAnthropic) {
 			return true
 		}
 	}

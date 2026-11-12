@@ -34,6 +34,9 @@ const (
 	llamacppWaitingMetric = "llamacpp:requests_deferred"   // llama.cpp
 	tgiRunningMetric      = "tgi_batch_current_size"       // TGI
 	tgiWaitingMetric      = "tgi_queue_size"               // TGI
+	// vllm-sr (vLLM Semantic Router worker) exports only a queue-depth gauge;
+	// no running/in-flight metric exists for it, so active stays 0.
+	vllmSRWaitingMetric = "vllm_srun_queue_depth"
 )
 
 // parsePromText parses a Prometheus text-exposition body into a map summing the
@@ -112,7 +115,7 @@ func (s *promScraper) Scrape(ctx context.Context) (active int, queue int, err er
 	}
 	m := parsePromText(body)
 	active = int(firstPresent(m, vllmRunningMetric, llamacppRunningMetric, tgiRunningMetric))
-	queue = int(firstPresent(m, vllmWaitingMetric, llamacppWaitingMetric, tgiWaitingMetric))
+	queue = int(firstPresent(m, vllmWaitingMetric, llamacppWaitingMetric, tgiWaitingMetric, vllmSRWaitingMetric))
 	return active, queue, nil
 }
 

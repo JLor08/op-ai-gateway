@@ -60,6 +60,14 @@ type ModelServerDTO struct {
 	MetricsProbe string `json:"metrics_probe"`
 	ContextProbe string `json:"context_probe"`
 
+	// RuntimeAPIVersion is the api_version a vllm_sr worker reported (ADR-099),
+	// "" (omitted) when unknown, and RuntimeAPIVersionUnsupported is true when
+	// that is a major this gateway is not built against. Like the probe states,
+	// Service.ModelServers leaves them zero and the gateway layer injects them
+	// from the runtime-status registry.
+	RuntimeAPIVersion            string `json:"runtime_api_version,omitempty"`
+	RuntimeAPIVersionUnsupported bool   `json:"runtime_api_version_unsupported"`
+
 	// LoadRefusal is why a Load of this mapping would be refused right now:
 	// "images_only", "audio_only", "agent_ensure_unsupported" or "spec_force_stopped", the
 	// codes the Load starter answers 409 with minus their "benchmark." prefix,

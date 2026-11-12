@@ -1319,6 +1319,44 @@ func TestListModelsDiscoversStableDiffusionCppFromSdModels(t *testing.T) {
 	}
 }
 
+// TestListModelsDiscoversVllmSRFromSystemOneModels pins that discovery for a
+// vllm_sr target reads the System One listing, not /v1/models (which lists the
+// router's own models, not the decision models the gateway can route to).
+func TestListModelsDiscoversVllmSRFromSystemOneModels(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"wrong"}]}`))
+		case "/v1/systemone/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"d3-mini","object":"model","api":"systemone"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{
+		Provider: routing.ProviderVllmSR,
+		Endpoint: srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("ListModels error = %v", err)
+	}
+	if !slices.Equal(got, []string{"d3-mini"}) {
+		t.Fatalf("ListModels = %v, want [d3-mini]", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(paths, []string{"/v1/systemone/models"}) {
+		t.Fatalf("requested %v, want exactly [/v1/systemone/models]", paths)
+	}
+}
+
 // TestListModelsKeepsV1ModelsForEveryOtherType is the regression guard for
 // every type that existed before stable_diffusion_cpp, plus the empty
 // provider: discovery is derived from the type, so each must still ask

@@ -16,6 +16,9 @@ import { type Fetcher, request, subscribeSSE } from './transport';
 // same kind of form default: 'openai_audio' alone and a 10-minute timeout,
 // and a health path of /health (the stock /v1/health answers 404 there), under
 // the stock health_path mode, since it has a real GET /health.
+// 'vllm_sr': an operator-run vLLM Semantic Router (Engine mode); it serves
+// POST /v1/systemone only, so the form defaults to the 'decisions' flavor, and
+// its models and health are read from GET /v1/systemone/models.
 export type ApplicationType =
   | 'ollama'
   | 'vllm'
@@ -24,7 +27,8 @@ export type ApplicationType =
   | 'litellm'
   | 'server_agent'
   | 'stable_diffusion_cpp'
-  | 'audio_cpp';
+  | 'audio_cpp'
+  | 'vllm_sr';
 export type ApplicationScheme = 'http' | 'https';
 export type ApplicationStatus = 'active' | 'disabled';
 
@@ -723,6 +727,11 @@ export type ModelServerRow = {
   // When that verdict was last determined; undefined/null when never
   // determined. Diagnostic/tooltip only -- no UI decision may branch on it.
   live_progress_checked_at?: string | null;
+  // The api_version a vllm-srun worker reported on its context probe (#373);
+  // empty or absent for every other kind. runtime_api_version_unsupported is
+  // the gateway's verdict: the major differs from the supported one (5).
+  runtime_api_version?: string;
+  runtime_api_version_unsupported?: boolean;
   // Every DETERMINED capability row for this (server, mapping) (the
   // capability-table migration): one entry per capability that has ever been
   // established -- "vision", "video", "audio", "tools", "mtp",

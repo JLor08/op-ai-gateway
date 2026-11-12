@@ -112,6 +112,13 @@ func defaultDecisionsReplies() map[string]decisionsReply {
 // normalization) and decisionsNormSecret (normalization on).
 func newDecisionsTestServer(t *testing.T, upstreamURL string, mode routing.EndpointMode) *Server {
 	t.Helper()
+	return newDecisionsTestServerOfType(t, upstreamURL, mode, routing.ProviderVLLM)
+}
+
+// newDecisionsTestServerOfType is newDecisionsTestServer with the application of
+// the given type.
+func newDecisionsTestServerOfType(t *testing.T, upstreamURL string, mode routing.EndpointMode, appType string) *Server {
+	t.Helper()
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
@@ -138,7 +145,7 @@ func newDecisionsTestServer(t *testing.T, upstreamURL string, mode routing.Endpo
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-dec", Name: "Decisions Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-dec", ServerID: "srv-dec", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorDecisions}, DecisionsMode: mode, SystemOneMode: routing.EndpointModePassthrough, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-dec", ServerID: "srv-dec", Type: appType, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorDecisions}, DecisionsMode: mode, SystemOneMode: routing.EndpointModePassthrough, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	for _, m := range []struct {
@@ -404,6 +411,14 @@ func TestDecisionsDisabledOrdinaryApplicationIsNoCandidate(t *testing.T) {
 // carries both verdicts; withSpec adds a runtime spec with the spec modes.
 func newServerAgentDecisionsTestServer(t *testing.T, prov provider.Client, appDecisions, appSystemOne routing.EndpointMode, withSpec bool, specDecisions, specSystemOne routing.EndpointMode) *Server {
 	t.Helper()
+	return newServerAgentDecisionsTestServerOfSpec(t, prov, appDecisions, appSystemOne, withSpec, specDecisions, specSystemOne, "", "")
+}
+
+// newServerAgentDecisionsTestServerOfSpec is newServerAgentDecisionsTestServer
+// with the runtime spec carrying the given explicit type and launch binary
+// (either may be empty: the type is then detected from the binary).
+func newServerAgentDecisionsTestServerOfSpec(t *testing.T, prov provider.Client, appDecisions, appSystemOne routing.EndpointMode, withSpec bool, specDecisions, specSystemOne routing.EndpointMode, specType, specBinary string) *Server {
+	t.Helper()
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
@@ -430,7 +445,7 @@ func newServerAgentDecisionsTestServer(t *testing.T, prov provider.Client, appDe
 		t.Fatalf("UpsertMappingCapabilities: %v", err)
 	}
 	if withSpec {
-		if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-dec", MappingID: "route-agent-dec", APIFlavors: []string{routing.APIFlavorDecisions}, DecisionsMode: specDecisions, SystemOneMode: specSystemOne, CreatedAt: now, UpdatedAt: now}); err != nil {
+		if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-dec", MappingID: "route-agent-dec", Type: specType, Binary: specBinary, APIFlavors: []string{routing.APIFlavorDecisions}, DecisionsMode: specDecisions, SystemOneMode: specSystemOne, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("UpsertRuntimeSpec: %v", err)
 		}
 	}
@@ -540,6 +555,8 @@ func TestDecisionsTranslateUpstreamErrorsAreNormalized(t *testing.T) {
 		{"501 adds guidance", http.StatusNotImplemented, `{"error":{"message":"The model does not support the structured decision API","type":"NotImplementedError","code":501}}`, "The model does not support the structured decision API"},
 		{"400 error object", http.StatusBadRequest, `{"error":{"message":"too many questions","type":"BadRequestError","param":null,"code":400}}`, "too many questions"},
 		{"422 detail list", http.StatusUnprocessableEntity, `{"detail":[{"loc":["body","questions"],"msg":"field required","type":"missing"}]}`, "field required"},
+		{"422 vllm-sr 5.0 question_failed", http.StatusUnprocessableEntity, `{"detail":[{"loc":["body","questions","q0"],"msg":"type_unsupported","type":"value_error"}],"code":"question_failed"}`, "type_unsupported"},
+		{"529 overloaded", 529, `{"error":{"message":"overloaded","type":"OverloadedError","code":529}}`, "overloaded"},
 		{"404 detail string", http.StatusNotFound, `{"detail":"Not Found"}`, "Not Found"},
 		{"500 unknown shape", http.StatusInternalServerError, `<html>oops</html>`, "the System One upstream answered 500"},
 	}
@@ -854,4 +871,65 @@ func TestDecisionsRefusesAModelWithoutADecisionVerdict(t *testing.T) {
 	}
 	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 	requireNoSystemOneUpstreamCall(t, calls)
+}
+
+// A kind with no OpenAI /v1/decisions route (llama.cpp, the vLLM Semantic
+// Router; ADR-098, ADR-099) never receives the OpenAI shape: a decision_openai
+// verdict that exists anyway (a manual yes, a retyped vllm application's probe
+// yes) is ignored, and auto translates onto /v1/systemone.
+func TestDecisionsAutoIgnoresDecisionOpenAIOnKindsWithoutTheRoute(t *testing.T) {
+	for _, appType := range []string{routing.ProviderVllmSR, routing.ProviderLlamaCPP} {
+		t.Run(appType, func(t *testing.T) {
+			up, calls := newDecisionsUpstream(t, defaultDecisionsReplies())
+			srv := newDecisionsTestServerOfType(t, up.URL, routing.EndpointModeAuto, appType)
+
+			rec := postDecisions(t, srv, "dev-secret", decisionsRequestFor(decisionsModelBoth))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+			}
+			if call := receivedSystemOneCall(t, calls); call.path != "/v1/systemone" {
+				t.Fatalf("upstream path = %q, want /v1/systemone", call.path)
+			}
+			if got := lastUsageEvent(t, srv); got.ProviderPath != "/v1/systemone" {
+				t.Fatalf("provider_path = %q, want /v1/systemone", got.ProviderPath)
+			}
+		})
+	}
+}
+
+// A server_agent mapping is judged by its spec's effective type: an explicit
+// vllm_sr / llama_cpp, or one detected from the launch binary.
+func TestDecisionsServerAgentSpecKindWithoutTheRouteTranslates(t *testing.T) {
+	cases := []struct{ name, specType, binary string }{
+		{"explicit vllm_sr", "vllm_sr", ""},
+		{"explicit llama_cpp", "llama_cpp", ""},
+		{"detected from vllm-srun", "", "/opt/bin/vllm-srun"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: decisionsS1Answer}
+			srv := newServerAgentDecisionsTestServerOfSpec(t, prov, routing.EndpointModeAuto, routing.EndpointModePassthrough, true, routing.EndpointModeAuto, routing.EndpointModePassthrough, tc.specType, tc.binary)
+
+			rec := postDecisions(t, srv, "dev-secret", decisionsRequestFor("agent-decider"))
+
+			if rec.Code != http.StatusOK || prov.proxyCalls != 1 || prov.gotPath != "/v1/systemone" {
+				t.Fatalf("status = %d, calls = %d on %q, want 200 and one call on /v1/systemone; body = %s", rec.Code, prov.proxyCalls, prov.gotPath, rec.Body.String())
+			}
+		})
+	}
+}
+
+// A forced passthrough that is stored anyway on such a kind (a stale row) is
+// refused model_not_capable instead of being sent.
+func TestDecisionsForcedPassthroughOnKindWithoutTheRouteIsNotCapable(t *testing.T) {
+	up, _ := newDecisionsUpstream(t, defaultDecisionsReplies())
+	srv := newDecisionsTestServerOfType(t, up.URL, routing.EndpointModePassthrough, routing.ProviderVllmSR)
+
+	rec := postDecisions(t, srv, "dev-secret", decisionsRequestFor(decisionsModelBoth))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s, want 404", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 }

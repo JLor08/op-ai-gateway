@@ -408,7 +408,14 @@ import (
 // (runtime.cluster_member_unreachable, non-terminal, instead of a terminal
 // device_backend_mismatch), and a member's reported command carries the
 // arguments and environment the agent adds.
-const Version = "0.18.1"
+//
+// 0.18.1 -> 0.18.2 is the single bump for the vLLM Semantic Router worker
+// (#373 Phase 3). PATCH: no agent.Features entry changes, but a vllm_sr child's
+// context size is read from data[].limits.max_input_tokens, its
+// vllm_srun_queue_depth gauge feeds queue_depth, its /v1/models api_version
+// rides the runtime sample as runtime_api_version, and the /props capability
+// probe is skipped for it.
+const Version = "0.18.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1609,6 +1616,8 @@ type runtimeCtxEntry struct {
 	contextProbePath string
 	model            string
 	size             int
+	// apiVersion is the vllm_sr api_version read from the same body as size.
+	apiVersion string
 }
 
 // runtimeCapabilityEntry is one cached capability-probe result: the PID it
@@ -1719,11 +1728,24 @@ type runtimeCapabilityEntry struct {
 // literally 0, or smaller), are both deliberately never cached, so a
 // transient condition (e.g. the child's HTTP server still warming up) is
 // retried next cycle instead of sticking at 0 forever.
+//
+// The capability half (probeRuntimeChildProps) runs for every type but one:
+//
+//   - "vllm_sr": no capability probe at all -- the vLLM Semantic Router
+//     worker serves no /props and no capability document, so a probe would
+//     spend a request to learn nothing. Its context probe still runs (the
+//     /v1/models read is also where its api_version comes from).
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 
 	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
+	if st.Type == "vllm_sr" {
+		// No capability probe: the vLLM Semantic Router worker serves no
+		// /props and no capability document, so nothing is requested and
+		// nothing is sent.
+		return
+	}
 	a.probeRuntimeChildProps(ctx, client, base, st, rs)
 }
 
@@ -1783,11 +1805,16 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		// A cached size means a prior probe on this exact (pid, type, path,
 		// model) generation already succeeded.
 		rs.ContextSize = entry.size
+		rs.RuntimeAPIVersion = entry.apiVersion
 		return "ok"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, model)
+	info, err := collector.ProbeContextInfo(cctx, client, base, st.Type, st.ContextProbePath, model)
 	cancel()
+	size := info.Size
+	// A vllm_sr api_version is reported whenever the body was read, even when
+	// no context size came out of it; it is cached only with a real size.
+	rs.RuntimeAPIVersion = info.APIVersion
 	if errors.Is(err, collector.ErrRouterMode) {
 		// llama.cpp router mode: /props answered with the router dummy
 		// ("role": "router", n_ctx 0). Report the mode itself rather than
@@ -1818,8 +1845,10 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		contextProbePath: st.ContextProbePath,
 		model:            model,
 		size:             size,
+		apiVersion:       info.APIVersion,
 	}
 	rs.ContextSize = size
+	rs.RuntimeAPIVersion = info.APIVersion
 	return "ok"
 }
 
@@ -1914,9 +1943,10 @@ func (a *Agent) clock() time.Time {
 // was that a child is never asked a second time just to answer a second
 // question.
 //
-// WHICH document is read, one of four, is what st.Type decides here (and,
-// for two of them, whether the gateway lets it be sent at all -- see the
-// gate below):
+// WHICH of four documents is read is what st.Type decides here (and, for
+// two of them, whether the gateway lets it be sent at all -- see the gate
+// below). A "vllm_sr" child never reaches this function: probeRuntimeChild
+// skips the capability probe for it.
 //
 //   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
 //     {"model": <probeModel>} (#54). Ollama serves no /props at all, so probing

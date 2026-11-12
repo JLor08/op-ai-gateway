@@ -5,6 +5,7 @@ package routing
 
 import (
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -24,8 +25,40 @@ const (
 	RuntimeSpecTypeOllama             RuntimeSpecType = "ollama"
 	RuntimeSpecTypeStableDiffusionCpp RuntimeSpecType = "stable_diffusion_cpp"
 	RuntimeSpecTypeAudioCpp           RuntimeSpecType = "audio_cpp"
-	RuntimeSpecTypeCustom             RuntimeSpecType = "custom"
+	// RuntimeSpecTypeVllmSR is the agent-launched vLLM Semantic Router worker
+	// (vllm-srun): the gateway routes only the decision endpoints to it.
+	RuntimeSpecTypeVllmSR RuntimeSpecType = "vllm_sr"
+	RuntimeSpecTypeCustom RuntimeSpecType = "custom"
 )
+
+// VllmSRSupportedAPIMajor is the major version of the vllm-srun runtime API
+// (the api_version field of its /v1/models body) this gateway is built
+// against: runtime api_version 5.0.0 at
+// vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd. A
+// worker that reports a different major is not known to speak the decision
+// endpoints the way this gateway expects (ADR-099).
+const VllmSRSupportedAPIMajor = 5
+
+// VllmSRAPIVersionUnsupported reports whether a vllm-srun worker's reported
+// api_version names a major other than VllmSRSupportedAPIMajor. It is true
+// only when a major can be parsed from the version's leading integer and it
+// differs; an empty or unparsable version means unknown (an older agent, a
+// failed probe) and is never unsupported (ADR-099).
+func VllmSRAPIVersionUnsupported(version string) bool {
+	version = strings.TrimSpace(version)
+	end := 0
+	for end < len(version) && version[end] >= '0' && version[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return false
+	}
+	major, err := strconv.Atoi(version[:end])
+	if err != nil {
+		return false
+	}
+	return major != VllmSRSupportedAPIMajor
+}
 
 // defaultPrometheusMetricsPath is the Prometheus-style metrics path shared by every runtime
 // kind that serves one at a fixed location: vLLM, llama.cpp, and TGI all default here.
@@ -33,7 +66,10 @@ const defaultPrometheusMetricsPath = "/metrics"
 
 // DetectRuntimeSpecType infers the runtime server kind from the launched
 // binary's basename when no explicit RuntimeSpec.Type is set. It matches on
-// case-insensitive substrings -- vllm, llama-server/llama_cpp/llama.cpp,
+// case-insensitive substrings -- vllm-srun/vllm_srun (checked before vllm;
+// the bare vllm-sr is deliberately not one: the vllm-sr CLI is no spec binary,
+// ADR-099, and the substring would catch names like vllm-srv), vllm,
+// llama-server/llama_cpp/llama.cpp,
 // text-generation-launcher/tgi, sd-server/stable-diffusion,
 // audiocpp_server/audio.cpp, ollama -- in the order below (first match wins),
 // and falls back to RuntimeSpecTypeCustom when nothing matches.
@@ -41,6 +77,9 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 	name := strings.ToLower(filepath.Base(binary))
 
 	switch {
+	case strings.Contains(name, "vllm-srun"), strings.Contains(name, "vllm_srun"):
+		// Before the vllm case: the router worker's name contains "vllm".
+		return RuntimeSpecTypeVllmSR
 	case strings.Contains(name, "vllm"):
 		return RuntimeSpecTypeVLLM
 	case strings.Contains(name, "llama-server"), strings.Contains(name, "llama_cpp"), strings.Contains(name, "llama.cpp"):
@@ -110,6 +149,10 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 		// relies on a Prometheus-style /metrics scrape, so there is nothing
 		// honest to default either path to. An explicit override still wins.
 		defaultMetrics, defaultContext = "", ""
+	case RuntimeSpecTypeVllmSR:
+		// vllm-srun serves Prometheus metrics at /metrics and lists its models,
+		// with their limits and the runtime api_version, at /v1/models.
+		defaultMetrics, defaultContext = defaultPrometheusMetricsPath, "/v1/models"
 	case RuntimeSpecTypeCustom:
 		defaultMetrics, defaultContext = "", ""
 	default:

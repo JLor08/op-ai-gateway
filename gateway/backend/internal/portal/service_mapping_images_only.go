@@ -27,6 +27,10 @@ type mappingFlavorMarkers struct {
 	// decisions, and the effective decisions mode.
 	DecisionsListed bool
 	DecisionsMode   routing.EndpointMode
+	// DecisionsKind is the effective upstream kind (the runtime spec type for a
+	// server_agent mapping with a spec, else the application type): the kind
+	// routing.EffectiveDecisionsRoute judges the route by.
+	DecisionsKind string
 }
 
 // mappingsFlavorMarkers returns ModelMappingDTO.ImagesOnly and AudioOnly for
@@ -79,7 +83,12 @@ func (s *Service) mappingFlavorMarkersFor(ctx context.Context, app routing.Appli
 // one, the application's otherwise.
 func effectiveFlavorMarkers(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) mappingFlavorMarkers {
 	eff := routing.EffectiveFields(app, spec, hasSpec)
+	kind := app.Type
+	if app.Type == routing.ProviderServerAgent && hasSpec {
+		kind = string(routing.EffectiveRuntimeSpecType(spec))
+	}
 	return mappingFlavorMarkers{
+		DecisionsKind:   kind,
 		ImagesOnly:      effectiveFlavorsAreImagesOnly(app, spec, hasSpec),
 		AudioOnly:       effectiveFlavorsAreAudioOnly(app, spec, hasSpec),
 		DecisionsOnly:   routing.FlavorsAreDecisionsOnly(eff.APIFlavors),

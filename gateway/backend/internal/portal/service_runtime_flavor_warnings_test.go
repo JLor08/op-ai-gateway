@@ -246,3 +246,41 @@ func TestRuntimeWarningsReportsSpecFlavorContradictions(t *testing.T) {
 	putSpec(text.ID, string(routing.RuntimeSpecTypeStableDiffusionCpp), []string{routing.APIFlavorOpenAIImages})
 	requireWarnings("after the sd spec is narrowed to images", []string{})
 }
+
+// TestAnyVllmSRSpecListsTextFlavor is the truth table behind
+// api_flavors_text_on_vllm_sr: a vllm_sr spec (explicit, or Auto with a
+// vllm-srun binary) that lists openai or anthropic warns; decisions alone does
+// not.
+func TestAnyVllmSRSpecListsTextFlavor(t *testing.T) {
+	const srBinary = "/opt/vllm-sr/.venv/bin/vllm-srun"
+	agent := flavorWarningAgentApp(routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorDecisions)
+	cases := []struct {
+		name  string
+		app   routing.Application
+		specs []routing.RuntimeSpec
+		want  bool
+	}{
+		{"explicit, openai and decisions", agent, []routing.RuntimeSpec{{Type: "vllm_sr", Binary: srBinary, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorDecisions}}}, true},
+		{"detected, anthropic", agent, []routing.RuntimeSpec{{Binary: srBinary, APIFlavors: []string{routing.APIFlavorAnthropic}}}, true},
+		{"decisions only", agent, []routing.RuntimeSpec{{Type: "vllm_sr", Binary: srBinary, APIFlavors: []string{routing.APIFlavorDecisions}}}, false},
+		{"plain vllm with openai", agent, []routing.RuntimeSpec{{Binary: "/usr/bin/vllm", APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
+		{"non-agent application", routing.Application{Type: routing.ProviderVLLM}, []routing.RuntimeSpec{{Type: "vllm_sr", APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anyVllmSRSpecListsTextFlavor(tc.app, tc.specs); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestViewRuntimeTypeVllmSRApplication(t *testing.T) {
+	view := mappingView{
+		app:     routing.Application{Type: routing.ProviderVllmSR},
+		mapping: routing.ModelMapping{ID: "m1"},
+	}
+	if got := viewRuntimeType(view, runtimeSpecIndex{}); got != routing.RuntimeSpecTypeVllmSR {
+		t.Fatalf("viewRuntimeType = %q, want vllm_sr", got)
+	}
+}

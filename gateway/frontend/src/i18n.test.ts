@@ -4658,3 +4658,48 @@ describe('RPC cluster wording', () => {
     expect(messages.de.binariesNewTitle).toBe('Neues Binary');
   });
 });
+
+describe('vllm_sr i18n keys', () => {
+  it('defines the type notes, the spec type label, the warning and the api_version texts in de and en', () => {
+    const keys = [
+      'applicationTypeVllmSrNote',
+      'runtimeSpecTypeVllmSr',
+      'runtimeSpecTypeVllmSrNote',
+      'runtimeTextOnVllmSrWarning',
+      'modelServerColRuntimeApiVersion',
+      'modelServerRuntimeApiVersionUnsupported',
+      'modelServerRuntimeApiVersionTooltipUnsupported',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      // The product name is the same in both locales; everything else is text.
+      if (k !== 'runtimeSpecTypeVllmSr') expect(messages.en[k]).not.toBe(messages.de[k]);
+    }
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].runtimeSpecTypeVllmSrNote;
+      expect(note).toContain('vllm-project/semantic-router');
+      expect(note).toContain('4ec449f358ce7805228fb341bdc55ea5211707fd');
+    }
+  });
+
+  it('tells the spec note that the parent server_agent application lists decisions too', () => {
+    expect(messages.de.runtimeSpecTypeVllmSrNote).toContain(
+      'an der übergeordneten server_agent-Anwendung muss „decisions“ ebenfalls angekreuzt sein',
+    );
+    expect(messages.en.runtimeSpecTypeVllmSrNote).toContain(
+      'the parent server_agent application needs "decisions" ticked too',
+    );
+  });
+
+  it('tells the application note how to re-probe a model granted after a not-published verdict', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].applicationTypeVllmSrNote;
+      expect(note).toContain('404 systemone_not_published');
+      expect(note).toContain('decision: no');
+    }
+    expect(messages.de.applicationTypeVllmSrNote).toContain('das Urteil im Portal löschen');
+    expect(messages.en.applicationTypeVllmSrNote).toContain('clear the verdict in the portal');
+  });
+});

@@ -208,3 +208,58 @@ func TestRuntimeSpecType_DeriveProbePaths(t *testing.T) {
 		})
 	}
 }
+
+// TestDetectRuntimeSpecTypeVllmSR pins that the vLLM Semantic Router worker
+// (vllm-srun or vllm_srun) detects as vllm_sr, ahead of the vllm substring
+// case, while plain vllm launchers still detect as vllm. The bare vllm-sr
+// substring does not detect: the vllm-sr CLI is rejected as a spec binary
+// (ADR-099), and the substring would also catch unrelated names such as
+// vllm-srv or vllm-sriov.
+func TestDetectRuntimeSpecTypeVllmSR(t *testing.T) {
+	cases := []struct {
+		binary string
+		want   RuntimeSpecType
+	}{
+		{"vllm-srun", RuntimeSpecTypeVllmSR},
+		{"/opt/vllm-sr/.venv/bin/vllm-srun", RuntimeSpecTypeVllmSR},
+		{"vllm_srun", RuntimeSpecTypeVllmSR},
+		{"/usr/local/bin/my-vllm-srun-wrapper", RuntimeSpecTypeVllmSR},
+		{"vllm-sr", RuntimeSpecTypeVLLM},
+		{"vllm-srv", RuntimeSpecTypeVLLM},
+		{"/opt/x/vllm-sriov", RuntimeSpecTypeVLLM},
+		{"vllm", RuntimeSpecTypeVLLM},
+		{"/usr/bin/vllm", RuntimeSpecTypeVLLM},
+		{"python -m vllm.entrypoints.openai.api_server", RuntimeSpecTypeVLLM},
+	}
+	for _, tc := range cases {
+		if got := DetectRuntimeSpecType(tc.binary); got != tc.want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", tc.binary, got, tc.want)
+		}
+	}
+	if got := EffectiveRuntimeSpecType(RuntimeSpec{Binary: "/opt/vllm-sr/.venv/bin/vllm-srun"}); got != RuntimeSpecTypeVllmSR {
+		t.Errorf("EffectiveRuntimeSpecType(vllm-srun) = %q, want vllm_sr", got)
+	}
+}
+
+func TestDeriveProbePathsVllmSR(t *testing.T) {
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeVllmSR, "", "")
+	if metrics != "/metrics" || context != "/v1/models" {
+		t.Fatalf("probe paths = (%q, %q), want (/metrics, /v1/models)", metrics, context)
+	}
+	if m, c := DeriveProbePaths(RuntimeSpecTypeVllmSR, "/m", "/c"); m != "/m" || c != "/c" {
+		t.Fatalf("overrides = (%q, %q), want (/m, /c)", m, c)
+	}
+}
+
+func TestVllmSRAPIVersionUnsupported(t *testing.T) {
+	cases := map[string]bool{
+		"5.0.0": false, "5.1.0": false, "5": false,
+		"6.0.0": true, "4.0.0": true,
+		"": false, "garbage": false,
+	}
+	for version, want := range cases {
+		if got := VllmSRAPIVersionUnsupported(version); got != want {
+			t.Errorf("VllmSRAPIVersionUnsupported(%q) = %v, want %v", version, got, want)
+		}
+	}
+}

@@ -726,3 +726,58 @@ func TestModelServersRowCarriesReplicable(t *testing.T) {
 		}
 	}
 }
+
+// modelServersRowWithRuntimeAPIVersion publishes one runtime status carrying
+// apiVersion for a spec of specType under msMappingID and returns the
+// model-servers row the endpoint answers with.
+func modelServersRowWithRuntimeAPIVersion(t *testing.T, specType routing.RuntimeSpecType, apiVersion string) portal.ModelServerDTO {
+	t.Helper()
+	s, _ := newModelServersEndpointFixture(t)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const specID = "rspec_ms_api"
+	if err := s.Routes.UpsertRuntimeSpec(context.Background(), routing.RuntimeSpec{
+		ID: specID, MappingID: msMappingID, Enabled: true, Type: string(specType), Binary: "/usr/bin/runtime", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(msServerID, []RuntimeStatusDTO{
+		{SpecID: specID, Model: msAppModel, State: "running", RuntimeAPIVersion: apiVersion},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-servers?name="+url.QueryEscape(msModel), nil)
+	req.Header.Set("Authorization", "Bearer "+msOwnerSecret)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []portal.ModelServerDTO `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Data) != 1 {
+		t.Fatalf("decode: %v, rows = %d (%s)", err, len(out.Data), rec.Body.String())
+	}
+	return out.Data[0]
+}
+
+func TestModelServersRowExposesTheVllmSRAPIVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		specType    routing.RuntimeSpecType
+		version     string
+		wantVersion string
+		wantUnsup   bool
+	}{
+		{"supported", routing.RuntimeSpecTypeVllmSR, "5.0.0", "5.0.0", false},
+		{"unsupported major", routing.RuntimeSpecTypeVllmSR, "6.0.0", "6.0.0", true},
+		{"unknown", routing.RuntimeSpecTypeVllmSR, "", "", false},
+		{"other kind is never unsupported", routing.RuntimeSpecTypeVLLM, "6.0.0", "6.0.0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := modelServersRowWithRuntimeAPIVersion(t, tc.specType, tc.version)
+			if row.RuntimeAPIVersion != tc.wantVersion || row.RuntimeAPIVersionUnsupported != tc.wantUnsup {
+				t.Fatalf("row = (version %q, unsupported %v), want (%q, %v)", row.RuntimeAPIVersion, row.RuntimeAPIVersionUnsupported, tc.wantVersion, tc.wantUnsup)
+			}
+		})
+	}
+}

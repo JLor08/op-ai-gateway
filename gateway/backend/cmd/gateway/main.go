@@ -1362,6 +1362,10 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// provider.AudioCppModelsProber, and the Multiplexer dispatches the
 		// probe by the application's type.
 		routing.ProviderAudioCpp: openAICompatible,
+		// ProviderVllmSR: the Semantic Router's decision endpoints are reached
+		// through the same OpenAI-compatible client (System One probe, model
+		// discovery).
+		routing.ProviderVllmSR: openAICompatible,
 		// ProviderVendorOpenAI: api.openai.com speaks the OpenAI-compatible
 		// dialect, so a vendor-account target reuses the same client.
 		routing.ProviderVendorOpenAI: openAICompatible,

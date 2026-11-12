@@ -203,6 +203,11 @@ type RuntimeSample struct {
 	// versa. Additive and byte-neutral: an older agent simply never
 	// populates it, and "" already means unknown to every consumer.
 	LiveProgressSupport string `json:"live_progress_support"`
+	// RuntimeAPIVersion is the top-level api_version of a vllm_sr child's
+	// /v1/models body, read by the same context probe that yields ContextSize
+	// (ADR-099). Set for vllm_sr children only and omitted when unknown; the
+	// agent records it and never judges it -- the gateway does.
+	RuntimeAPIVersion string `json:"runtime_api_version,omitempty"`
 	// Capabilities is the auto-detected capability verdict set from the same
 	// document that yields LiveProgressSupport above (#49-2): /props, or
 	// /api/show for an ollama child (#54), or /sdcpp/v1/capabilities for a

@@ -4,7 +4,9 @@
 package gateway
 
 import (
+	"log/slog"
 	"op-ai-gateway/internal/provider"
+	"op-ai-gateway/internal/routing"
 	"sync"
 	"time"
 )
@@ -138,6 +140,9 @@ type RuntimeStatusDTO struct {
 	QueueDepth     int       `json:"queue_depth"`
 	MetricsProbe   string    `json:"metrics_probe"`
 	ContextProbe   string    `json:"context_probe"`
+	// RuntimeAPIVersion mirrors agentRuntimeSample.RuntimeAPIVersion: a
+	// vllm_sr child's reported api_version, "" (omitted) when unknown.
+	RuntimeAPIVersion string `json:"runtime_api_version,omitempty"`
 	// LiveProgressSupport mirrors agentRuntimeSample.LiveProgressSupport
 	// field-for-field: "" (undetermined), "supported", or "unsupported" for
 	// this child's build's live-progress request parameters (issue #51 /
@@ -711,5 +716,31 @@ func representativeRank(instance int, state string) int {
 		return 2
 	default:
 		return 3
+	}
+}
+
+// warnUnsupportedRuntimeAPIVersions logs one Warn for each runtime row whose
+// reported api_version string changed since the previous frame into one with
+// an unsupported major (ADR-099): a worker that keeps reporting the same
+// version does not log again per sample, a change between two unsupported
+// versions (6.0.0 to 6.1.0) logs again, and an empty version (unknown) never
+// warns. Rows are matched by spec id and instance, and the Warn names both.
+func warnUnsupportedRuntimeAPIVersions(serverID string, prev, next []RuntimeStatusDTO) {
+	type rowKey struct {
+		spec     string
+		instance int
+	}
+	before := make(map[rowKey]string, len(prev))
+	for _, rt := range prev {
+		before[rowKey{rt.SpecID, rt.Instance}] = rt.RuntimeAPIVersion
+	}
+	for _, rt := range next {
+		if !routing.VllmSRAPIVersionUnsupported(rt.RuntimeAPIVersion) ||
+			before[rowKey{rt.SpecID, rt.Instance}] == rt.RuntimeAPIVersion {
+			continue
+		}
+		slog.Warn("vllm-sr worker reports an unsupported api_version",
+			"server_id", serverID, "spec_id", rt.SpecID, "instance", rt.Instance, "api_version", rt.RuntimeAPIVersion,
+			"supported_major", routing.VllmSRSupportedAPIMajor)
 	}
 }
