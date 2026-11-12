@@ -163,7 +163,9 @@ type decisionsCall struct {
 // recordDecisionsRoutingFailure answers and records a decision request refused
 // before any upstream call by a routing error (routing, capability or
 // effective-flavor refusal), the decisions twin of recordSpeechRoutingFailure.
-func (s *Server) recordDecisionsRoutingFailure(w http.ResponseWriter, r *http.Request, c decisionsCall, err error) {
+// target is the resolved target when the refusal comes after the resolve (the
+// row is then attributed to it) and the zero Target when routing itself failed.
+func (s *Server) recordDecisionsRoutingFailure(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target, err error) {
 	status := completionHTTPStatus(err)
 	code := completionErrorCode(err)
 	if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
@@ -172,25 +174,30 @@ func (s *Server) recordDecisionsRoutingFailure(w http.ResponseWriter, r *http.Re
 		slog.Debug("decisions request rejected: routing failed", "path", r.URL.Path, "api_flavor", c.req.APIFlavor, "model", c.req.Model, "code", code, "status", status, "err", err)
 	}
 	body := writeCompletionErrorCaptured(w, err)
-	s.recordDecisionsRefusal(w, r, c, status, code, body)
+	s.recordDecisionsRefusal(w, r, c, target, status, code, body)
 }
 
 // refuseDecisionsRequest answers a decision request the gateway itself refuses
 // before any upstream call -- an endpoint its effective mode disables, a body
 // the translator cannot express -- with status and an error object carrying
-// code and message, and records it like recordDecisionsRoutingFailure.
-func (s *Server) refuseDecisionsRequest(w http.ResponseWriter, r *http.Request, c decisionsCall, status int, code, message string) {
+// code and message, and records it like recordDecisionsRoutingFailure (target
+// is the resolved target of a post-resolve refusal).
+func (s *Server) refuseDecisionsRequest(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target, status int, code, message string) {
 	body := writeJSONCaptured(w, status, apierror.Response(code, message, ""))
-	s.recordDecisionsRefusal(w, r, c, status, code, body)
+	s.recordDecisionsRefusal(w, r, c, target, status, code, body)
 }
 
 // recordDecisionsRefusal records the usage row of a refused decision request.
-// The row carries the endpoint and no host or route: no server saw the request
-// (even a refusal that comes after the resolve is recorded so). The billing
-// unit stays the default (tokens), the endpoints' unit.
-func (s *Server) recordDecisionsRefusal(w http.ResponseWriter, r *http.Request, c decisionsCall, status int, code string, body []byte) {
+// The row carries the endpoint and the target's host and route when the refusal
+// comes after the resolve (an endpoint a spec disables, a mapping without the
+// verdict its mode asks for, a body the translator cannot express), so Activity
+// shows which server's configuration refused; a routing failure before any
+// target exists passes the zero Target and records none. No server saw the
+// request either way. The billing unit stays the default (tokens), the
+// endpoints' unit.
+func (s *Server) recordDecisionsRefusal(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target, status int, code string, body []byte) {
 	capture := buildCaptureInput(s.capturingEnabled(c.token), c.token.UserID, c.token.Secret, r, c.raw, w.Header(), body, status, c.req.APIFlavor)
-	s.recordUsage(c.start, c.token, c.req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, Endpoint: c.endpoint}, nextRequestID(), capture, nil)
+	s.recordUsage(c.start, c.token, c.req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, Endpoint: c.endpoint}, nextRequestID(), capture, nil)
 }
 
 // resolveDecisionsTarget resolves the routing target for an already-gated
@@ -203,14 +210,14 @@ func (s *Server) recordDecisionsRefusal(w http.ResponseWriter, r *http.Request, 
 func (s *Server) resolveDecisionsTarget(w http.ResponseWriter, r *http.Request, c *decisionsCall) (routing.Target, bool) {
 	target, err := s.resolveTarget(r.Context(), &c.token, c.req)
 	if err != nil {
-		s.recordDecisionsRoutingFailure(w, r, *c, err)
+		s.recordDecisionsRoutingFailure(w, r, *c, routing.Target{}, err)
 		return routing.Target{}, false
 	}
 	if !targetServesFlavor(target, c.req.APIFlavor) {
 		slog.Debug("decisions request rejected: resolved target's effective flavors exclude decisions",
 			"path", r.URL.Path, "api_flavor", c.req.APIFlavor, "model", c.req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.recordDecisionsRoutingFailure(w, r, *c, routing.ErrNoModelRoute)
+		s.recordDecisionsRoutingFailure(w, r, *c, routing.Target{}, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
 	return target, true
@@ -272,7 +279,7 @@ func (s *Server) translateSystemOneRelay(w http.ResponseWriter, r *http.Request,
 	body, table, derr := compat.TranslateSystemOneRequest(c.raw, effectiveProviderModel(rel.target, c.req.Model))
 	if derr != nil {
 		slog.Debug("systemone request refused by the translator", "path", r.URL.Path, "model", c.req.Model, "code", derr.Code, "err", derr.Message)
-		s.refuseDecisionsRequest(w, r, c, http.StatusBadRequest, derr.Code, derr.Message)
+		s.refuseDecisionsRequest(w, r, c, rel.target, http.StatusBadRequest, derr.Code, derr.Message)
 		return false
 	}
 	rel.upstreamBody = body

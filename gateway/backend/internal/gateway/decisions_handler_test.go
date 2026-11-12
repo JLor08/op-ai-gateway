@@ -40,6 +40,33 @@ const (
 	decisionsNormSecret = "norm-secret"
 )
 
+// decisionsRouteIDs maps a gateway model of the decisions fixture to its
+// mapping's route id.
+var decisionsRouteIDs = map[string]string{
+	decisionsModelBoth: "route-dec-both",
+	decisionsModelS1:   "route-dec-s1",
+	decisionsModelOAI:  "route-dec-oai",
+}
+
+// requireRefusalAttributedTo fails unless the refusal row carries the resolved
+// target's host and route: a refusal made after the resolve is attributed to
+// the server whose configuration refused.
+func requireRefusalAttributedTo(t *testing.T, got usage.Event, host, route string) {
+	t.Helper()
+	if got.Host != host || got.RouteID != route {
+		t.Fatalf("row host = %q route = %q, want %q and %q (the resolved target)", got.Host, got.RouteID, host, route)
+	}
+}
+
+// requireRefusalUnattributed fails unless the refusal row carries no target:
+// routing failed before one existed.
+func requireRefusalUnattributed(t *testing.T, got usage.Event) {
+	t.Helper()
+	if got.Host != "" || got.RouteID != "" || got.ServerName != "" || got.ProviderPath != "" {
+		t.Fatalf("row host = %q route = %q server = %q provider_path = %q, want none (no target resolved)", got.Host, got.RouteID, got.ServerName, got.ProviderPath)
+	}
+}
+
 // decisionsRequestFor is an OpenAI Decisions request for model: a named
 // predicate and an unnamed choice, plus a prompt_cache_key the translator drops.
 func decisionsRequestFor(model string) string {
@@ -369,9 +396,10 @@ func TestDecisionsForcedModesNeedTheirVerdict(t *testing.T) {
 			requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 			requireNoSystemOneUpstreamCall(t, calls)
 			got := lastUsageEvent(t, srv)
-			if got.ErrorCode != "routing.model_not_capable" || got.Status != "error" || got.HTTPStatus != http.StatusNotFound || got.ProviderPath != "" {
-				t.Fatalf("row = %+v, want an upstream-less model_not_capable 404 row", got)
+			if got.ErrorCode != "routing.model_not_capable" || got.Status != "error" || got.HTTPStatus != http.StatusNotFound {
+				t.Fatalf("row = %+v, want a model_not_capable 404 row", got)
 			}
+			requireRefusalUnattributed(t, got) // the resolver refused it: no target existed
 		})
 	}
 }
@@ -495,9 +523,10 @@ func TestDecisionsDisabledEndpointIs404(t *testing.T) {
 				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
 			}
 			got := lastUsageEvent(t, srv)
-			if got.ErrorCode != codeDecisionsEndpointDisabled || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/decisions" || got.ProviderPath != "" {
-				t.Fatalf("row = %+v, want an upstream-less decisions.endpoint_disabled 404 row", got)
+			if got.ErrorCode != codeDecisionsEndpointDisabled || got.HTTPStatus != http.StatusNotFound || got.ReqPath != "/v1/decisions" {
+				t.Fatalf("row = %+v, want a decisions.endpoint_disabled 404 row", got)
 			}
+			requireRefusalAttributedTo(t, got, "srv-agent-dec", "route-agent-dec")
 		})
 	}
 }
@@ -531,6 +560,7 @@ func TestDecisionsTranslatorRefusalIs400WithoutAnUpstreamCall(t *testing.T) {
 	if got.ErrorCode != "decisions.input_unsupported" || got.Status != "error" || got.HTTPStatus != http.StatusBadRequest || got.ReqPath != "/v1/decisions" {
 		t.Fatalf("row = %+v, want a decisions.input_unsupported 400 error row", got)
 	}
+	requireRefusalAttributedTo(t, got, "srv-dec", decisionsRouteIDs[decisionsModelS1])
 }
 
 func TestDecisionsTranslateUpstreamErrorsAreNormalized(t *testing.T) {
@@ -647,7 +677,21 @@ func TestDecisionsOversizeUpstreamBodyIs502(t *testing.T) {
 			if strings.Contains(rec.Body.String(), "xxxx") {
 				t.Fatalf("body = %s, want nothing of the upstream's answer", rec.Body.String())
 			}
+			requireFailedRelayRow(t, lastUsageEvent(t, srv), codeDecisionsUpstreamError)
 		})
+	}
+}
+
+// requireFailedRelayRow fails unless got is the row of a gateway 502 over an
+// upstream answer that could not be relayed: status 502, wantCode (when
+// non-empty, else any code) and no tokens.
+func requireFailedRelayRow(t *testing.T, got usage.Event, wantCode string) {
+	t.Helper()
+	if got.Status != "error" || got.HTTPStatus != http.StatusBadGateway || got.ErrorCode == "" || (wantCode != "" && got.ErrorCode != wantCode) {
+		t.Fatalf("row = %+v, want an error row with status 502 and code %q", got, wantCode)
+	}
+	if got.InputTokens != 0 || got.OutputTokens != 0 || got.TotalTokens != 0 {
+		t.Fatalf("row tokens = in %d out %d total %d, want none", got.InputTokens, got.OutputTokens, got.TotalTokens)
 	}
 }
 
@@ -759,11 +803,12 @@ func TestSystemOneNormalizationRelaysAnUpstreamErrorVerbatim(t *testing.T) {
 
 func TestSystemOneNormalizationOversizeAnswerIsSystemOneUpstreamError(t *testing.T) {
 	big := `{"answers":{},"pad":"` + strings.Repeat("x", 4096) + `"}`
-	_, rec := postSystemOneOn(t, http.StatusOK, big, decisionsNormSecret, 1024)
+	srv, rec := postSystemOneOn(t, http.StatusOK, big, decisionsNormSecret, 1024)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
 	}
 	requireErrorCode(t, rec.Body.String(), codeSystemOneUpstreamError)
+	requireFailedRelayRow(t, lastUsageEvent(t, srv), codeSystemOneUpstreamError)
 }
 
 func TestDecisionsAnswersAValidationErrorWith400(t *testing.T) {
@@ -859,6 +904,7 @@ func TestDecisionsRefusesAModelWithoutADecisionVerdict(t *testing.T) {
 	}
 	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 	requireNoSystemOneUpstreamCall(t, calls)
+	requireRefusalUnattributed(t, lastUsageEvent(t, srv))
 }
 
 // A kind with no OpenAI /v1/decisions route (llama.cpp, the vLLM Semantic
@@ -920,4 +966,130 @@ func TestDecisionsForcedPassthroughOnKindWithoutTheRouteIsNotCapable(t *testing.
 		t.Fatalf("status = %d body = %s, want 404", rec.Code, rec.Body.String())
 	}
 	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
+	got := lastUsageEvent(t, srv)
+	requireRefusalUnattributed(t, got) // the resolver refused it: no target existed
+	if got.ErrorCode != "routing.model_not_capable" || got.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("row = %+v, want a model_not_capable 404 row", got)
+	}
+}
+
+// A pre-5.0-style flat vllm-sr error ({"detail","code"}, no nested error
+// object) still yields its message in the gateway envelope, under the
+// upstream's own status.
+func TestDecisionsTranslateFlatVllmSR5ErrorKeepsStatusAndMessage(t *testing.T) {
+	const flat = `{"detail":"overloaded","code":"overloaded"}`
+	_, rec := postDecisionsOn(t, map[string]decisionsReply{"/v1/systemone": {529, flat}}, "dev-secret", decisionsModelS1)
+
+	if rec.Code != 529 {
+		t.Fatalf("status = %d, want 529; body = %s", rec.Code, rec.Body.String())
+	}
+	msg := requireDecisionsEnvelope(t, rec.Body.Bytes(), codeDecisionsUpstreamError, []string{"overloaded"})
+	if !strings.Contains(msg, "answered 529") {
+		t.Fatalf("message = %q, want it to name the upstream status 529", msg)
+	}
+}
+
+// A body that breaks off mid-read (the upstream declares more than it sends and
+// closes) is the gateway's 502 with nothing of the partial body written, on
+// both buffered routes, and records a failed-relay row with no tokens.
+func TestDecisionsBrokenOffUpstreamBodyIs502(t *testing.T) {
+	cases := []struct {
+		name, secret, model, path string
+	}{
+		{"translate", "dev-secret", decisionsModelS1, "/v1/systemone"},
+		{"normalized passthrough", decisionsNormSecret, decisionsModelBoth, "/v1/decisions"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", "4096")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"answers":[{"type":"predicate","name":"PARTIALBODY`)
+			}))
+			t.Cleanup(up.Close)
+			srv := newDecisionsTestServer(t, up.URL, routing.EndpointModeAuto)
+
+			rec := postDecisions(t, srv, tc.secret, decisionsRequestFor(tc.model))
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), codeDecisionsUpstreamError)
+			if strings.Contains(rec.Body.String(), "PARTIALBODY") {
+				t.Fatalf("body = %s, want nothing of the broken-off answer", rec.Body.String())
+			}
+			requireFailedRelayRow(t, lastUsageEvent(t, srv), "")
+		})
+	}
+}
+
+// A normalizing passthrough whose answer needs no rewrite is relayed under the
+// upstream's own Content-Type; one the normalizer rewrote is the gateway's JSON.
+func TestDecisionsNormalizedPassthroughContentType(t *testing.T) {
+	const upstreamType = "application/json; charset=utf-8"
+	cases := []struct {
+		name, body, want string
+	}{
+		// A predicate answer has no confidence to normalize.
+		{"unchanged keeps the upstream's", `{"answers":[{"type":"predicate","name":"ok","probability":0.9}],"model":"m"}`, upstreamType},
+		{"rewritten is application/json", decisionsOAIAnswer, "application/json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", upstreamType)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(up.Close)
+			srv := newDecisionsTestServer(t, up.URL, routing.EndpointModeAuto)
+
+			rec := postDecisions(t, srv, decisionsNormSecret, decisionsRequestFor(decisionsModelBoth))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != tc.want {
+				t.Fatalf("Content-Type = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A server_agent mapping's route is only known after the resolve, from its
+// spec: a forced mode its kind has no route for is refused model_not_capable
+// post-resolve, and the row is attributed to the resolved target (the resolver
+// refusals above are not: no target existed).
+func TestDecisionsPostResolveModelNotCapableIsAttributedToTheTarget(t *testing.T) {
+	cases := []struct {
+		name, path, body string
+		specDecisions    routing.EndpointMode
+		specSystemOne    routing.EndpointMode
+	}{
+		{"decisions passthrough on a vllm_sr spec", "/v1/decisions", agentDecisionsBody, routing.EndpointModePassthrough, routing.EndpointModeAuto},
+		{"systemone translate on a vllm_sr spec", "/v1/systemone", `{"model":"agent-decider","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}}`, routing.EndpointModeAuto, routing.EndpointModeTranslate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: decisionsS1Answer}
+			srv := newServerAgentDecisionsTestServerOfSpec(t, prov, routing.EndpointModeAuto, routing.EndpointModeAuto, true, tc.specDecisions, tc.specSystemOne, routing.ProviderVllmSR, "")
+
+			rec := postImagesWithHeaders(t, srv, tc.path, tc.body, map[string]string{"Authorization": "Bearer dev-secret"})
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
+			if prov.proxyCalls != 0 {
+				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+			}
+			got := lastUsageEvent(t, srv)
+			if got.ErrorCode != "routing.model_not_capable" || got.Status != "error" || got.HTTPStatus != http.StatusNotFound || got.ReqPath != tc.path {
+				t.Fatalf("row = %+v, want a model_not_capable 404 row on %s", got, tc.path)
+			}
+			requireRefusalAttributedTo(t, got, "srv-agent-dec", "route-agent-dec")
+		})
+	}
 }

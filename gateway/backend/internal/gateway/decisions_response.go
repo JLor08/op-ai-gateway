@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,9 +21,13 @@ import (
 
 // decisionsUpstreamErrorType is the OpenAI-client-facing type of the gateway's
 // own decisions error envelopes (decisions.upstream_error,
-// systemone.upstream_error, systemone.refused), the type the transcription twin
-// uses.
+// systemone.upstream_error), the type the transcription twin uses.
 const decisionsUpstreamErrorType = "upstream_error"
+
+// decisionsRefusalErrorType is the type of the 422 systemone.refused envelope:
+// the upstream answered, and refused to answer a question, which is not an
+// upstream failure.
+const decisionsRefusalErrorType = "refusal"
 
 // decisionsNotImplementedGuidance is the sentence a translated /v1/decisions
 // request's 501 adds: both vLLM decision endpoints answer 501 for a model
@@ -169,9 +174,11 @@ func (rw *decisionsRewrite) apply(body []byte, upstreamContentType string) (deci
 	}
 	// Only normalization buffers a passthrough; it is best effort, so a body
 	// that is not JSON goes out unchanged under the upstream's Content-Type.
+	// A body that was rewritten is the gateway's JSON; one left byte for byte
+	// keeps the upstream's Content-Type.
 	out, isJSON := compat.NormalizeDecisionsConfidence(body, rw.dialect)
 	contentType := upstreamContentType
-	if isJSON {
+	if isJSON && !bytes.Equal(out, body) {
 		contentType = jsonContentType
 	}
 	return decisionsAnswer{body: out, contentType: contentType, usage: decisionsInferenceUsage(compat.ParseDecisionsUsage(body, rw.dialect))}, nil
@@ -312,16 +319,21 @@ type decisionsGatewayError struct {
 }
 
 // writeDecisionsGatewayError answers a relayed decisions request with the
-// gateway's own error envelope (code, type upstream_error, message) under
+// gateway's own error envelope (code, type upstream_error -- refusal for
+// systemone.refused -- and message) under
 // e.status, and records it as a failed relay with e.errorCode and e.usage on
 // the row. upstreamHeaders are the upstream answer's headers, which recordUsage
 // scrapes for a vendor account's rate limits.
 func (s *Server) writeDecisionsGatewayError(w http.ResponseWriter, r *http.Request, ex nativeExchange, upstreamHeaders http.Header, e decisionsGatewayError) {
 	status := e.status
+	errType := decisionsUpstreamErrorType
+	if e.code == codeSystemOneRefused {
+		errType = decisionsRefusalErrorType
+	}
 	payload := writeJSONCaptured(w, status, apierror.Body{Error: apierror.ErrorBody{
 		Code:    e.code,
 		Message: e.message,
-		Type:    decisionsUpstreamErrorType,
+		Type:    errType,
 	}})
 	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{Usage: e.usage}, e.errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: billingUnitFor(ex.req.APIFlavor), Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), payload, status, ex.req.APIFlavor), upstreamHeaders)
 }
