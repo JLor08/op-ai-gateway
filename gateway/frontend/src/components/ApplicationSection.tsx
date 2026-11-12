@@ -794,16 +794,14 @@ export function ApplicationSection({
     // that tells the operator so; the values themselves are silent. Riding the
     // same slot is what gets it announced with the field (aria-describedby),
     // as the launch-spec form's type note is. audio_cpp's three diverging
-    // defaults (API flavors, timeout, health path) are explained the same way.
+    // defaults (API flavors, timeout, health path) are explained the same way,
+    // and so are vllm_sr's (port, timeout, API flavor).
     const typeDescriptions = [
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
       type === 'stable_diffusion_cpp' ? t.applicationTypeStableDiffusionCppNote : undefined,
-      type === 'audio_cpp'
-        ? t.applicationTypeAudioCppNote
-        : type === 'vllm_sr'
-          ? t.applicationTypeVllmSrNote
-          : undefined,
+      type === 'audio_cpp' ? t.applicationTypeAudioCppNote : undefined,
+      type === 'vllm_sr' ? t.applicationTypeVllmSrNote : undefined,
     ].filter((reason): reason is string => reason !== undefined);
     // The scheme is the GATEWAY's field only while the application actually
     // takes part in the proxy on a server that runs one. In every other case --
