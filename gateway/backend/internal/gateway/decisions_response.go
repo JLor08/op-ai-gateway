@@ -253,7 +253,13 @@ func (s *Server) failDecisionsTranslation(w http.ResponseWriter, r *http.Request
 	if rw.direction == decisionsReverse && errors.Is(err, compat.ErrSystemOneRefused) {
 		slog.Debug("decisions upstream refused to answer", "path", r.URL.Path, "model", ex.req.Model, "server", ex.serverName, "err", err)
 		usage := decisionsInferenceUsage(compat.ParseDecisionsUsage(body, compat.DialectOpenAI))
-		s.writeDecisionsGatewayError(w, r, ex, resp.Header, http.StatusUnprocessableEntity, codeSystemOneRefused, codeSystemOneRefused, err.Error(), usage)
+		s.writeDecisionsGatewayError(w, r, ex, resp.Header, decisionsGatewayError{
+			status:    http.StatusUnprocessableEntity,
+			code:      codeSystemOneRefused,
+			errorCode: codeSystemOneRefused,
+			message:   err.Error(),
+			usage:     usage,
+		})
 		return
 	}
 	slog.Warn("decisions upstream answer could not be translated", "path", r.URL.Path, "model", ex.req.Model, "server", ex.serverName, "err", err)
@@ -285,21 +291,39 @@ func (s *Server) writeDecisionsAnswer(w http.ResponseWriter, r *http.Request, ex
 // records it as a failed relay with errorCode on the row, no tokens and resp's
 // headers (the upstream did answer).
 func (s *Server) failDecisionsRelay(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse, rw *decisionsRewrite, errorCode, message string) {
-	s.writeDecisionsGatewayError(w, r, ex, resp.Header, http.StatusBadGateway, rw.failCode(), errorCode, message, inference.Usage{})
+	s.writeDecisionsGatewayError(w, r, ex, resp.Header, decisionsGatewayError{
+		status:    http.StatusBadGateway,
+		code:      rw.failCode(),
+		errorCode: errorCode,
+		message:   message,
+	})
+}
+
+// decisionsGatewayError is the gateway's own error answer to a relayed
+// decisions request: the HTTP status, the envelope's code and message, and what
+// the usage row records -- errorCode and the tokens (zero when the upstream
+// reported none).
+type decisionsGatewayError struct {
+	status    int
+	code      string
+	errorCode string
+	message   string
+	usage     inference.Usage
 }
 
 // writeDecisionsGatewayError answers a relayed decisions request with the
 // gateway's own error envelope (code, type upstream_error, message) under
-// status, and records it as a failed relay with errorCode and usage on the row.
-// upstreamHeaders are the upstream answer's headers, which recordUsage scrapes
-// for a vendor account's rate limits.
-func (s *Server) writeDecisionsGatewayError(w http.ResponseWriter, r *http.Request, ex nativeExchange, upstreamHeaders http.Header, status int, code, errorCode, message string, usage inference.Usage) {
+// e.status, and records it as a failed relay with e.errorCode and e.usage on
+// the row. upstreamHeaders are the upstream answer's headers, which recordUsage
+// scrapes for a vendor account's rate limits.
+func (s *Server) writeDecisionsGatewayError(w http.ResponseWriter, r *http.Request, ex nativeExchange, upstreamHeaders http.Header, e decisionsGatewayError) {
+	status := e.status
 	payload := writeJSONCaptured(w, status, apierror.Body{Error: apierror.ErrorBody{
-		Code:    code,
-		Message: message,
+		Code:    e.code,
+		Message: e.message,
 		Type:    decisionsUpstreamErrorType,
 	}})
-	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{Usage: usage}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: billingUnitFor(ex.req.APIFlavor), Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), payload, status, ex.req.APIFlavor), upstreamHeaders)
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{Usage: e.usage}, e.errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: billingUnitFor(ex.req.APIFlavor), Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), payload, status, ex.req.APIFlavor), upstreamHeaders)
 }
 
 // decisionsUpstreamErrorBody is the gateway envelope a translated request's
