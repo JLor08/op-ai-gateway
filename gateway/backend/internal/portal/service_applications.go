@@ -1172,7 +1172,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	// /v1/decisions route) is reset to auto, the same "clear when the type
 	// cannot carry it" rule as the live-timings flag; an explicit passthrough
 	// request is refused further below instead.
-	if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(app.Type) {
+	if req.DecisionsMode == nil && app.DecisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(app.Type) {
 		app.DecisionsMode = routing.EndpointModeAuto
 	}
 	if req.LoadedModelsPath != nil {
@@ -1423,7 +1423,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
 			liveTimingsRefusal, app.Type)
 	}
-	if req.DecisionsMode != nil && decisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(app.Type) {
+	if req.DecisionsMode != nil && decisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(app.Type) {
 		refusal := ErrApplicationDecisionsPassthroughConflict
 		if req.Type != nil {
 			refusal = ErrApplicationDecisionsPassthroughUnsupported
@@ -2056,15 +2056,6 @@ func validSystemOneMode(raw string) (routing.EndpointMode, bool) {
 	}
 }
 
-// decisionsPassthroughCapableKind reports whether an application or runtime
-// spec type can serve POST /v1/decisions natively. llama-server and the vLLM
-// Semantic Router (decision endpoints of its own, no /v1/decisions) have no
-// such route; every other kind may (the probe, not this guard, decides per
-// model).
-func decisionsPassthroughCapableKind(kind string) bool {
-	return kind != routing.ProviderLlamaCPP && kind != routing.ProviderVllmSR
-}
-
 // resolveDecisionModes resolves a decisions_mode / systemone_mode pair as a
 // create or a runtime-spec write takes it: absent or "" defaults to auto /
 // passthrough, and any other value must be valid for its field, else invalid
@@ -2097,7 +2088,7 @@ func createDecisionModes(rawDecisions, rawSystemOne, appType string) (decisions,
 	if err != nil {
 		return "", "", err
 	}
-	if decisions == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(appType) {
+	if decisions == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(appType) {
 		return "", "", fmt.Errorf("%w: decisions_mode passthrough is not available for an application of type %q",
 			ErrApplicationDecisionsPassthroughUnsupported, appType)
 	}
@@ -3466,7 +3457,7 @@ func mappingDecisionsRoute(markers mappingFlavorMarkers, caps map[string]routing
 	if !markers.DecisionsListed {
 		return ""
 	}
-	route, ok := routing.EffectiveDecisionsRoute(markers.DecisionsMode,
+	route, ok := routing.EffectiveDecisionsRoute(markers.DecisionsKind, markers.DecisionsMode,
 		capabilityVerdictBool(caps, routing.CapabilityDecision),
 		capabilityVerdictBool(caps, routing.CapabilityDecisionOpenAI))
 	if !ok {

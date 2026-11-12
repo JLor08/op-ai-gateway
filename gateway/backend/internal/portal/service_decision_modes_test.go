@@ -297,6 +297,26 @@ func TestMappingDTODecisionsRoute(t *testing.T) {
 			}
 		})
 	}
+	// A kind without an OpenAI /v1/decisions route ignores a decision_openai
+	// verdict, like the gateway's handler (the same routing helper).
+	for _, kind := range []string{routing.ProviderVllmSR, routing.ProviderLlamaCPP} {
+		a := routing.Application{Type: kind, APIFlavors: []string{"decisions"}, DecisionsMode: "auto"}
+		if got := mappingDTO(routing.ModelMapping{}, caps(dec, oa), effectiveFlavorMarkers(a, routing.RuntimeSpec{}, false)).DecisionsRoute; got != "translate" {
+			t.Fatalf("%s application, decision + decision_openai: decisions_route = %q, want translate", kind, got)
+		}
+	}
+	for name, sp := range map[string]routing.RuntimeSpec{
+		"vllm_sr spec":          {Type: "vllm_sr"},
+		"llama_cpp spec":        {Type: "llama_cpp"},
+		"detected vllm-srun":    {Binary: "/opt/vllm-srun"},
+		"detected llama-server": {Binary: "/opt/llama-server"},
+	} {
+		sp.APIFlavors, sp.DecisionsMode = []string{"decisions"}, "auto"
+		a := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{"decisions"}, DecisionsMode: "auto"}
+		if got := mappingDTO(routing.ModelMapping{}, caps(dec, oa), effectiveFlavorMarkers(a, sp, true)).DecisionsRoute; got != "translate" {
+			t.Fatalf("%s: decisions_route = %q, want translate", name, got)
+		}
+	}
 	// The server_agent spec wins over the application.
 	agent := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{"decisions"}, DecisionsMode: "auto"}
 	spec := routing.RuntimeSpec{APIFlavors: []string{"decisions"}, DecisionsMode: "disabled"}

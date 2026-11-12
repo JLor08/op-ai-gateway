@@ -1317,7 +1317,7 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		return runtimeSpecFields{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
 			ErrRuntimeSpecResponsesLiveTimingsUnsupported, string(effectiveSpecKind))
 	}
-	if f.decisionsMode == routing.EndpointModePassthrough && !decisionsPassthroughCapableKind(string(effectiveSpecKind)) {
+	if f.decisionsMode == routing.EndpointModePassthrough && !routing.DecisionsPassthroughCapableKind(string(effectiveSpecKind)) {
 		return runtimeSpecFields{}, fmt.Errorf("%w: decisions_mode passthrough is not available for a runtime spec of effective type %q",
 			ErrRuntimeSpecDecisionsPassthroughUnsupported, string(effectiveSpecKind))
 	}

@@ -3,6 +3,16 @@
 
 package routing
 
+// DecisionsPassthroughCapableKind reports whether an application type or runtime
+// spec type can serve POST /v1/decisions natively. llama-server and the vLLM
+// Semantic Router (decision endpoints of its own, no /v1/decisions route; ADR-098,
+// ADR-099) have no such route; every other kind may (the probe decides per
+// model). ProviderLlamaCPP == RuntimeSpecTypeLlamaCpp and ProviderVllmSR ==
+// RuntimeSpecTypeVllmSR, so one comparison covers both vocabularies.
+func DecisionsPassthroughCapableKind(kind string) bool {
+	return kind != ProviderLlamaCPP && kind != ProviderVllmSR
+}
+
 // EffectiveDecisionsRoute computes the concrete route of an OpenAI Decisions
 // request from the effective decisions mode and the mapping's two verdicts
 // (ADR-098): decision (System One yes) and decisionOpenAI (native /v1/decisions
@@ -14,9 +24,18 @@ package routing
 //   - translate: translate, ok only with the decision verdict.
 //   - passthrough: passthrough, ok only with the decision_openai verdict.
 //
+// kind is the effective upstream kind (the runtime spec type for a server_agent
+// mapping with a spec, else the application type). For a kind that is not
+// DecisionsPassthroughCapableKind a decisionOpenAI verdict is ignored, so auto
+// resolves to translate, and a forced passthrough (a stale row; the save guards
+// refuse it) is not ok rather than sent to an upstream that cannot parse it.
+//
 // ok == false means the mapping has no verdict for the route; the handler
 // answers routing.model_not_capable.
-func EffectiveDecisionsRoute(mode EndpointMode, decision, decisionOpenAI bool) (route EndpointMode, ok bool) {
+func EffectiveDecisionsRoute(kind string, mode EndpointMode, decision, decisionOpenAI bool) (route EndpointMode, ok bool) {
+	if !DecisionsPassthroughCapableKind(kind) {
+		decisionOpenAI = false
+	}
 	switch mode {
 	case EndpointModeDisabled:
 		return EndpointModeDisabled, true

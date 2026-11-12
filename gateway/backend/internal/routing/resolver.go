@@ -316,6 +316,16 @@ type Target struct {
 	OpenAIPathPrefix string
 }
 
+// EffectiveKind is the upstream kind that governs this target's behavior: the
+// effective runtime spec type for a server_agent target (LiveProgressSpecType),
+// else the application type (Provider).
+func (t Target) EffectiveKind() string {
+	if t.LiveProgressSpecType != "" {
+		return t.LiveProgressSpecType
+	}
+	return t.Provider
+}
+
 // OpenAIPathPrefixOrDefault returns the normalised OpenAI-dialect path prefix:
 // the trimmed OpenAIPathPrefix with a leading "/" and no trailing "/", or "/v1"
 // when it is blank. It is the one place the "/v1" default lives, shared by the

@@ -176,7 +176,7 @@ func (s *Server) decisionsRoute(w http.ResponseWriter, r *http.Request, c decisi
 		s.recordDecisionsRoutingFailure(w, r, c, err)
 		return routing.Target{}, false
 	}
-	route, ok := routing.EffectiveDecisionsRoute(target.DecisionsMode, decision, decisionOpenAI)
+	route, ok := routing.EffectiveDecisionsRoute(target.EffectiveKind(), target.DecisionsMode, decision, decisionOpenAI)
 	switch {
 	case route == routing.EndpointModeDisabled:
 		slog.Debug("decisions request rejected: endpoint disabled", "path", r.URL.Path, "model", c.req.Model, "server", s.serverName(target.ServerID), "route_id", target.RouteID)
